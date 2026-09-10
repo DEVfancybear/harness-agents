@@ -1,0 +1,3 @@
+# Generated JSON Schemas are byte-stable UTF-8/LF artifacts. Keep their line
+# endings independent of a Windows checkout's core.autocrlf setting.
+schemas/*.json text eol=lf

@@ -92,6 +92,12 @@ fn p0_f02_cli_rejects_unknown_config_and_option_inputs() {
 #[test]
 fn p0_f03_contract_schemas_are_generated_from_real_types() {
     let schema_root = repository_root().join("schemas");
+    let attributes = fs::read_to_string(repository_root().join(".gitattributes"))
+        .expect("schema line-ending policy must exist");
+    assert!(
+        attributes.contains("schemas/*.json text eol=lf"),
+        "generated schemas must retain LF in every checkout"
+    );
     let documents = generated_schema_documents();
     assert_eq!(documents.len(), 9);
     for document in documents {
