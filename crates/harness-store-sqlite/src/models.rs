@@ -5,8 +5,10 @@ use std::{
 };
 
 use harness_types::{
-    ArtifactId, ContentHash, EventEnvelope, EventId, HostId, InputId, InstructionLedgerEntry,
-    PluginManifest, SessionId, SnapshotId, TaskId, ToolExecutionReceipt, WorkingState,
+    AgentRunId, ArtifactId, CompositionSnapshotId, ContentHash, ContextPacket, ContextPacketId,
+    EventEnvelope, EventId, HostId, InputId, InstructionLedgerEntry, PluginManifest,
+    ProviderAttemptId, RequestId, RuntimeCommandId, SessionId, SnapshotId, TaskId,
+    ToolExecutionReceipt, WorkingState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +18,9 @@ pub const STORE_SCHEMA_VERSION: i64 = 1;
 pub const DATABASE_FILE_NAME: &str = "harness.sqlite3";
 pub const ARTIFACT_DIRECTORY_NAME: &str = "artifacts";
 pub const WRITER_LOCK_FILE_NAME: &str = "writer.lock";
+/// Additive runtime tables retain the P1 store schema version and have their
+/// own migration marker so older P1 databases remain readable.
+pub const RUNTIME_SCHEMA_VERSION: i64 = 1;
 
 /// All durable paths owned by a local harness data directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -221,4 +226,119 @@ pub struct SessionSummary {
 pub struct PersistedPluginManifest {
     pub manifest: PluginManifest,
     pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeCommandState {
+    Pending,
+    Claimed,
+    Completed,
+    Canceled,
+}
+
+impl RuntimeCommandState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Claimed => "claimed",
+            Self::Completed => "completed",
+            Self::Canceled => "canceled",
+        }
+    }
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "claimed" => Some(Self::Claimed),
+            "completed" => Some(Self::Completed),
+            "canceled" => Some(Self::Canceled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeCommandRecord {
+    pub command_id: RuntimeCommandId,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub state: RuntimeCommandState,
+    pub attempts: u32,
+    pub owner_generation: u64,
+    pub payload: Value,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentStateRecord {
+    pub agent_run_id: AgentRunId,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub state: String,
+    pub generation: u64,
+    pub revision: u64,
+    pub detail: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompositionSnapshotRecord {
+    pub snapshot_id: CompositionSnapshotId,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub revision: u64,
+    pub content: Value,
+    pub content_hash: ContentHash,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextCheckpointRecord {
+    pub checkpoint_id: String,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub through_sequence: u64,
+    pub revision: u64,
+    pub content: Value,
+    pub content_hash: ContentHash,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ContextPacketRecord {
+    pub packet: ContextPacket,
+    pub composition_snapshot_id: Option<CompositionSnapshotId>,
+    pub omitted_optional: Vec<String>,
+    pub degradation: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FrozenRequestRecord {
+    pub request_id: RequestId,
+    pub packet_id: ContextPacketId,
+    pub composition_snapshot_id: Option<CompositionSnapshotId>,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub request_json: Value,
+    pub content_hash: ContentHash,
+    pub provider_id: String,
+    pub model: String,
+    pub config_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderAttemptRecord {
+    pub attempt_id: ProviderAttemptId,
+    pub request_id: RequestId,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub attempt_number: u32,
+    pub state: String,
+    pub events: Value,
+    pub response_hash: Option<ContentHash>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContinuationLinkRecord {
+    pub source_session_id: SessionId,
+    pub new_session_id: SessionId,
+    pub task_id: TaskId,
 }

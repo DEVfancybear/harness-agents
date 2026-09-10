@@ -17,6 +17,13 @@ use harness_types::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+mod context;
+
+pub use context::{
+    ContextBlock, ContextBlockKind, ContextBuildRequest, ContextBuildResult, ContextBuilder,
+    ContextError,
+};
+
 /// Input accepted by the durable admission command.
 #[derive(Clone, Debug)]
 pub struct AdmitInputRequest {
@@ -385,6 +392,184 @@ impl SessionService {
         })
     }
 
+    /// Record a continuity-critical decision and optionally supersede an
+    /// earlier decision. The event and projection are committed atomically.
+    pub async fn record_decision(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        text: &str,
+        supersedes: Option<SourceRef>,
+    ) -> Result<SourceRef, StoreError> {
+        if text.trim().is_empty() {
+            return Err(StoreError::new(
+                harness_types::ErrorCode::InvalidPayload,
+                "decision text must not be empty",
+            ));
+        }
+        let mut state = self
+            .store
+            .current_projection(task_id)
+            .await?
+            .ok_or_else(|| {
+                StoreError::new(
+                    harness_types::ErrorCode::InvalidPayload,
+                    "decision requires an admitted task",
+                )
+            })?;
+        if state.session_id != *session_id {
+            return Err(StoreError::new(
+                harness_types::ErrorCode::IdempotencyConflict,
+                "decision session does not own task",
+            ));
+        }
+        let sequence = self.store.next_sequence(session_id).await?;
+        let event_id = EventId::generate();
+        let mut payload = Map::new();
+        payload.insert(
+            "task_id".to_owned(),
+            Value::String(task_id.as_str().to_owned()),
+        );
+        payload.insert("text".to_owned(), Value::String(text.to_owned()));
+        if let Some(ref source) = supersedes {
+            payload.insert(
+                "supersedes".to_owned(),
+                serde_json::to_value(source).map_err(|_| {
+                    StoreError::new(
+                        harness_types::ErrorCode::InvalidPayload,
+                        "decision supersession is invalid",
+                    )
+                })?,
+            );
+        }
+        let payload_hash = ContentHash::from_canonical_json(&Value::Object(payload.clone()))
+            .map_err(|error| {
+                StoreError::new(
+                    error.code(),
+                    format!("decision payload is not canonical: {error}"),
+                )
+            })?;
+        let source = SourceRef {
+            event_id: event_id.clone(),
+            sequence,
+            content_hash: payload_hash.clone(),
+        };
+        if let Some(old) = supersedes.clone() {
+            state.decision_refs.retain(|current| current != &old);
+            state.superseded_decision_refs.push(old);
+        }
+        state.decision_refs.push(source.clone());
+        state.revision = sequence;
+        state.through_event_seq = sequence;
+        let event = EventEnvelope {
+            schema_version: P0_SCHEMA_VERSION,
+            event_id: event_id.clone(),
+            session_id: session_id.clone(),
+            seq: sequence,
+            event_type: "decision.updated".to_owned(),
+            producer: ProducerIdentity {
+                plugin_id: "p2.session".to_owned(),
+                implementation_version: env!("CARGO_PKG_VERSION").to_owned(),
+            },
+            authority: SourceAuthority::User,
+            correlation_id: None,
+            causation_id: None,
+            continuity_critical: true,
+            payload,
+            payload_hash,
+        };
+        self.store
+            .commit_projected_event(
+                event,
+                task_id,
+                state,
+                SourceWorkMarker {
+                    marker_id: format!("decision:{sequence}"),
+                    event_id,
+                    sequence,
+                    kind: "decision_update".to_owned(),
+                    status: "committed".to_owned(),
+                },
+            )
+            .await?;
+        Ok(source)
+    }
+
+    /// Append a runtime event while preserving the current projection.
+    pub async fn append_runtime_event(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        event_type: &str,
+        payload: Map<String, Value>,
+        continuity_critical: bool,
+    ) -> Result<SourceRef, StoreError> {
+        let mut state = self
+            .store
+            .current_projection(task_id)
+            .await?
+            .ok_or_else(|| {
+                StoreError::new(
+                    harness_types::ErrorCode::InvalidPayload,
+                    "runtime event requires an admitted task",
+                )
+            })?;
+        if state.session_id != *session_id {
+            return Err(StoreError::new(
+                harness_types::ErrorCode::IdempotencyConflict,
+                "runtime event session does not own task",
+            ));
+        }
+        let sequence = self.store.next_sequence(session_id).await?;
+        let event_id = EventId::generate();
+        let payload_hash = ContentHash::from_canonical_json(&Value::Object(payload.clone()))
+            .map_err(|error| {
+                StoreError::new(
+                    error.code(),
+                    format!("runtime payload is not canonical: {error}"),
+                )
+            })?;
+        state.revision = sequence;
+        state.through_event_seq = sequence;
+        let source = SourceRef {
+            event_id: event_id.clone(),
+            sequence,
+            content_hash: payload_hash.clone(),
+        };
+        let event = EventEnvelope {
+            schema_version: P0_SCHEMA_VERSION,
+            event_id: event_id.clone(),
+            session_id: session_id.clone(),
+            seq: sequence,
+            event_type: event_type.to_owned(),
+            producer: ProducerIdentity {
+                plugin_id: "p2.session".to_owned(),
+                implementation_version: env!("CARGO_PKG_VERSION").to_owned(),
+            },
+            authority: SourceAuthority::RuntimeObserved,
+            correlation_id: None,
+            causation_id: None,
+            continuity_critical,
+            payload,
+            payload_hash,
+        };
+        self.store
+            .commit_projected_event(
+                event,
+                task_id,
+                state,
+                SourceWorkMarker {
+                    marker_id: format!("runtime:{event_id}"),
+                    event_id,
+                    sequence,
+                    kind: "runtime_event".to_owned(),
+                    status: "committed".to_owned(),
+                },
+            )
+            .await?;
+        Ok(source)
+    }
+
     pub async fn list_plugins(&self) -> Result<Vec<PersistedPluginManifest>, StoreError> {
         self.store.list_plugin_manifests().await
     }
@@ -652,6 +837,36 @@ fn fold_event(
             current.revision = event.seq;
             current.through_event_seq = event.seq;
             receipts.push(receipt);
+        }
+        "decision.updated" => {
+            let current = state.as_mut().ok_or_else(|| {
+                StoreError::new(
+                    harness_types::ErrorCode::InvalidPayload,
+                    "decision precedes admitted input",
+                )
+            })?;
+            let text = payload_string(&event.payload, "text")?;
+            let source = SourceRef {
+                event_id: event.event_id.clone(),
+                sequence: event.seq,
+                content_hash: event.payload_hash.clone(),
+            };
+            if let Some(raw) = event.payload.get("supersedes") {
+                let old: SourceRef = serde_json::from_value(raw.clone()).map_err(|_| {
+                    StoreError::new(
+                        harness_types::ErrorCode::InvalidPayload,
+                        "decision supersession is invalid",
+                    )
+                })?;
+                current.decision_refs.retain(|existing| existing != &old);
+                if !current.superseded_decision_refs.contains(&old) {
+                    current.superseded_decision_refs.push(old);
+                }
+            }
+            current.decision_refs.push(source);
+            current.revision = event.seq;
+            current.through_event_seq = event.seq;
+            instruction_texts.push(text);
         }
         _ if event.continuity_critical => {
             return Err(StoreError::new(

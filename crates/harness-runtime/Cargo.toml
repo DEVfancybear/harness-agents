@@ -1,0 +1,21 @@
+[package]
+name = "harness-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+harness-providers = { path = "../harness-providers" }
+harness-session = { path = "../harness-session" }
+harness-store-sqlite = { path = "../harness-store-sqlite" }
+harness-types = { path = "../harness-types" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true

@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 [CmdletBinding()]
 param(
-    [ValidateSet('P0', 'P1')]
+    [ValidateSet('P0', 'P1', 'P2')]
     [string] $Phase = 'P0',
     [string] $RepositoryRoot = (Join-Path $PSScriptRoot '..'),
     [switch] $SelfTest,
@@ -233,7 +233,7 @@ foreach ($case in $phaseCases) {
     }
 }
 
-$activePhases = @('P0', 'P1')
+$activePhases = @('P0', 'P1', 'P2')
 $activeCases = @($registry.cases | Where-Object { $_.phase -in $activePhases })
 foreach ($activeCase in $activeCases) {
     if ($activeCase.readiness -cne 'implemented' -or $activeCase.required -ne $true) {
@@ -252,12 +252,12 @@ foreach ($futureCase in $futureCases) {
 }
 
 $targets = @($phaseCases | ForEach-Object { $_.target } | Sort-Object -Unique)
-$expectedTarget = if ($Phase -eq 'P0') { 'phase_p0' } else { 'phase_p1' }
+$expectedTarget = "phase_$($Phase.ToLowerInvariant())"
 if ($targets.Count -ne 1 -or $targets[0] -cne $expectedTarget) {
     throw (New-GateError -Code 'gate_configuration_error' -Message "$Phase registry must use the $expectedTarget target only")
 }
 $requiredTests = @($phaseCases | ForEach-Object { $_.test_names } | Sort-Object -Unique)
-    $phaseTestFile = if ($Phase -eq 'P0') { 'phase_p0' } else { 'phase_p1' }
+$phaseTestFile = "phase_$($Phase.ToLowerInvariant())"
 
 $results = [System.Collections.Generic.List[object]]::new()
 Push-Location -LiteralPath $repoRoot
@@ -272,18 +272,24 @@ try {
         if (-not $Json) { Write-Output "GATE_STEP_OK: $($step.Name)" }
     }
 
-    if ($Phase -eq 'P1') {
-        $predecessorCases = @($registry.cases | Where-Object { $_.phase -ceq 'P0' -and $_.required -eq $true })
+    $predecessorPhases = switch ($Phase) {
+        'P1' { @('P0') }
+        'P2' { @('P0', 'P1') }
+        default { @() }
+    }
+    foreach ($predecessorPhase in $predecessorPhases) {
+        $predecessorCases = @($registry.cases | Where-Object { $_.phase -ceq $predecessorPhase -and $_.required -eq $true })
         $predecessorTests = @($predecessorCases | ForEach-Object { $_.test_names } | Sort-Object -Unique)
-        $predecessorDiscovery = Invoke-CheckedCommand -Name 'predecessor-p0-test-discovery' -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', 'phase_p0', '--locked', '--', '--list')
+        $predecessorTestFile = "phase_$($predecessorPhase.ToLowerInvariant())"
+        $predecessorDiscovery = Invoke-CheckedCommand -Name "predecessor-$predecessorPhase-test-discovery" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $predecessorTestFile, '--locked', '--', '--list')
         $predecessorDiscovered = Get-DiscoveredTestNames -Output $predecessorDiscovery.Output
         Assert-RequiredTestDiscovery -Discovered $predecessorDiscovered -Required $predecessorTests
         foreach ($testName in $predecessorTests) {
-            $result = Invoke-CheckedCommand -Name "predecessor-test:$testName" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', 'phase_p0', '--locked', $testName, '--', '--exact')
+            $result = Invoke-CheckedCommand -Name "predecessor-$predecessorPhase-test:$testName" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $predecessorTestFile, '--locked', $testName, '--', '--exact')
             Assert-RequiredTestResult -TestName $testName -Output $result.Output
         }
-        $results.Add([pscustomobject]@{ name = 'predecessor-p0-regression'; result = 'passed'; count = $predecessorTests.Count })
-        if (-not $Json) { Write-Output "GATE_STEP_OK: predecessor-p0-regression ($($predecessorTests.Count) tests)" }
+        $results.Add([pscustomobject]@{ name = "predecessor-$predecessorPhase-regression"; result = 'passed'; count = $predecessorTests.Count })
+        if (-not $Json) { Write-Output "GATE_STEP_OK: predecessor-$predecessorPhase-regression ($($predecessorTests.Count) tests)" }
     }
 
     $discovery = Invoke-CheckedCommand -Name 'phase-test-discovery' -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $phaseTestFile, '--locked', '--', '--list')

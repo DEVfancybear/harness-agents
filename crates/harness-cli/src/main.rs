@@ -3,11 +3,13 @@
 use std::{fs, path::PathBuf, process::ExitCode, sync::Arc};
 
 use clap::{Args, Parser, Subcommand};
+use harness_providers::MockProvider;
+use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
 use harness_session::SessionService;
 use harness_store_sqlite::{SqliteStore, StoreDiagnostics, StoreError, WriterOpenOptions};
 use harness_types::{
-    ErrorCode, HarnessConfig, HarnessError, HostId, PluginInstanceId, PluginManifest, ScopeId,
-    ServiceContract,
+    ContentHash, ErrorCode, HarnessConfig, HarnessError, HostId, InputId, PluginInstanceId,
+    PluginManifest, ProjectId, ScopeId, ServiceContract, SessionId, TaskId, WorkspaceObservation,
 };
 
 /// Personal coding-agent harness.
@@ -50,6 +52,77 @@ enum Command {
     },
     /// List or inspect persisted plugin metadata without loading a plugin.
     Plugins(PluginsCommand),
+    /// Execute one keyless local mock-provider run.
+    Run {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        text: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Recover a session without dispatching a provider.
+    Resume {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        session_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Continue a task in a new session using the previous task checkpoint.
+    Continue {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        task_id: String,
+        #[arg(long)]
+        text: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect persisted context packets.
+    Context(ContextCommand),
+    /// Session replay and offline inspection commands.
+    Session(SessionCommand),
+}
+
+#[derive(Debug, Args)]
+struct ContextCommand {
+    #[command(subcommand)]
+    command: ContextSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ContextSubcommand {
+    Inspect {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        session_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct SessionCommand {
+    #[command(subcommand)]
+    command: SessionSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionSubcommand {
+    Replay {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        session_id: String,
+        #[arg(long)]
+        offline: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -200,8 +273,265 @@ async fn run(cli: Cli) -> Result<(), HarnessError> {
                     json,
                 },
         })) => inspect_plugin(&data_dir, &instance_id, json).await,
+        Some(Command::Run {
+            data_dir,
+            text,
+            json,
+        }) => run_runtime(&data_dir, &text, json).await,
+        Some(Command::Resume {
+            data_dir,
+            session_id,
+            json,
+        }) => resume_runtime(&data_dir, &session_id, json).await,
+        Some(Command::Continue {
+            data_dir,
+            task_id,
+            text,
+            json,
+        }) => continue_runtime(&data_dir, &task_id, &text, json).await,
+        Some(Command::Context(ContextCommand {
+            command:
+                ContextSubcommand::Inspect {
+                    data_dir,
+                    session_id,
+                    json,
+                },
+        })) => inspect_context(&data_dir, &session_id, json).await,
+        Some(Command::Session(SessionCommand {
+            command:
+                SessionSubcommand::Replay {
+                    data_dir,
+                    session_id,
+                    offline,
+                    json,
+                },
+        })) => replay_session(&data_dir, &session_id, offline, json).await,
         None => Ok(()),
     }
+}
+
+fn demo_workspace() -> WorkspaceObservation {
+    WorkspaceObservation {
+        project_id: ProjectId::generate(),
+        worktree_id: "cli-demo".to_owned(),
+        base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        observed_fingerprint: ContentHash::from_bytes(b"cli-demo"),
+    }
+}
+
+async fn run_runtime(
+    data_dir: &PathBuf,
+    text: &str,
+    json_output: bool,
+) -> Result<(), HarnessError> {
+    let store = Arc::new(
+        SqliteStore::open_writer(WriterOpenOptions::new(data_dir, HostId::generate()))
+            .await
+            .map_err(store_error)?,
+    );
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        Arc::new(MockProvider::text("mock response")),
+        RuntimeConfig::default(),
+    );
+    let request = RunRequest::new(
+        SessionId::generate(),
+        TaskId::generate(),
+        InputId::generate(),
+        text,
+        demo_workspace(),
+    );
+    let result = runtime
+        .run(request)
+        .await
+        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+    let output = serde_json::json!({"schema_version": 1, "session_id": result.session_id, "task_id": result.task_id, "request_id": result.request_id, "packet_id": result.packet_id, "response": result.response, "attempts": result.attempts});
+    drop(runtime);
+    Arc::try_unwrap(store)
+        .map_err(|_| {
+            HarnessError::new(
+                ErrorCode::StorageWriteFailed,
+                "runtime store consumers were not released",
+            )
+        })?
+        .close()
+        .await
+        .map_err(store_error)?;
+    if json_output {
+        println!("{output}");
+    } else {
+        println!("run {} completed", output["session_id"]);
+    }
+    Ok(())
+}
+
+async fn resume_runtime(
+    data_dir: &PathBuf,
+    session_text: &str,
+    json_output: bool,
+) -> Result<(), HarnessError> {
+    let session_id = SessionId::parse(session_text.to_owned())?;
+    let store = Arc::new(
+        SqliteStore::open_read_only(data_dir)
+            .await
+            .map_err(store_error)?,
+    );
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        Arc::new(MockProvider::text("must not dispatch")),
+        RuntimeConfig::default(),
+    );
+    let report = runtime
+        .resume(&session_id)
+        .await
+        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+    let output = serde_json::json!({"schema_version": 1, "session_id": session_id, "blocked": report.blocked, "replayed_through_sequence": report.working_state.through_event_seq, "packet": report.packet});
+    drop(runtime);
+    Arc::try_unwrap(store)
+        .map_err(|_| {
+            HarnessError::new(
+                ErrorCode::StorageWriteFailed,
+                "runtime store consumers were not released",
+            )
+        })?
+        .close()
+        .await
+        .map_err(store_error)?;
+    if json_output {
+        println!("{output}");
+    } else {
+        println!("session recovered");
+    }
+    Ok(())
+}
+
+async fn continue_runtime(
+    data_dir: &PathBuf,
+    task_text: &str,
+    text: &str,
+    json_output: bool,
+) -> Result<(), HarnessError> {
+    let task_id = TaskId::parse(task_text.to_owned())?;
+    let store = Arc::new(
+        SqliteStore::open_writer(WriterOpenOptions::new(data_dir, HostId::generate()))
+            .await
+            .map_err(store_error)?,
+    );
+    let source = store
+        .list_sessions()
+        .await
+        .map_err(store_error)?
+        .into_iter()
+        .find(|summary| summary.task_id == task_id)
+        .ok_or_else(|| HarnessError::new(ErrorCode::InvalidPayload, "task was not found"))?;
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        Arc::new(MockProvider::text("mock continuation")),
+        RuntimeConfig::default(),
+    );
+    let request = RunRequest::new(
+        SessionId::generate(),
+        task_id,
+        InputId::generate(),
+        text,
+        demo_workspace(),
+    );
+    let result = runtime
+        .continue_task(&source.session_id, request)
+        .await
+        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+    let output = serde_json::json!({"schema_version": 1, "session_id": result.session_id, "task_id": result.task_id, "request_id": result.request_id, "packet_id": result.packet_id, "response": result.response});
+    drop(runtime);
+    Arc::try_unwrap(store)
+        .map_err(|_| {
+            HarnessError::new(
+                ErrorCode::StorageWriteFailed,
+                "runtime store consumers were not released",
+            )
+        })?
+        .close()
+        .await
+        .map_err(store_error)?;
+    if json_output {
+        println!("{output}");
+    } else {
+        println!("task continued");
+    }
+    Ok(())
+}
+
+async fn inspect_context(
+    data_dir: &PathBuf,
+    session_text: &str,
+    json_output: bool,
+) -> Result<(), HarnessError> {
+    let session_id = SessionId::parse(session_text.to_owned())?;
+    let store = SqliteStore::open_read_only(data_dir)
+        .await
+        .map_err(store_error)?;
+    let packets = store
+        .list_context_packets(&session_id)
+        .await
+        .map_err(store_error)?;
+    let output =
+        serde_json::json!({"schema_version": 1, "session_id": session_id, "packets": packets});
+    store.close().await.map_err(store_error)?;
+    if json_output {
+        println!("{output}");
+    } else {
+        println!(
+            "context packets: {}",
+            output["packets"].as_array().map_or(0, Vec::len)
+        );
+    }
+    Ok(())
+}
+
+async fn replay_session(
+    data_dir: &PathBuf,
+    session_text: &str,
+    offline: bool,
+    json_output: bool,
+) -> Result<(), HarnessError> {
+    if !offline {
+        return Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            "P2 replay requires --offline",
+        ));
+    }
+    let session_id = SessionId::parse(session_text.to_owned())?;
+    let store = Arc::new(
+        SqliteStore::open_read_only(data_dir)
+            .await
+            .map_err(store_error)?,
+    );
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        Arc::new(MockProvider::text("must not dispatch")),
+        RuntimeConfig::default(),
+    );
+    let report = runtime
+        .offline_replay(&session_id)
+        .await
+        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+    let output = serde_json::json!({"schema_version": 1, "session_id": session_id, "offline": true, "blocked": report.blocked, "dispatch_count": report.dispatch_count, "packets": report.packets, "requests": report.requests});
+    drop(runtime);
+    Arc::try_unwrap(store)
+        .map_err(|_| {
+            HarnessError::new(
+                ErrorCode::StorageWriteFailed,
+                "runtime store consumers were not released",
+            )
+        })?
+        .close()
+        .await
+        .map_err(store_error)?;
+    if json_output {
+        println!("{output}");
+    } else {
+        println!("offline replay dispatches: {}", output["dispatch_count"]);
+    }
+    Ok(())
 }
 
 async fn init_store(data_dir: &PathBuf, json: bool) -> Result<(), HarnessError> {

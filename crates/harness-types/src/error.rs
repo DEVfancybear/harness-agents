@@ -39,6 +39,14 @@ pub enum ErrorCode {
     DuplicateRegistration,
     ServiceUnavailable,
     ShutdownFailed,
+    InvalidStateTransition,
+    MandatoryContextOverflow,
+    ProviderCanceled,
+    ProviderProtocol,
+    RetryExhausted,
+    CompactionConflict,
+    RuntimeCommandConflict,
+    RuntimeBlocked,
 }
 
 impl ErrorCode {
@@ -77,6 +85,14 @@ impl ErrorCode {
             Self::DuplicateRegistration => "duplicate_registration",
             Self::ServiceUnavailable => "service_unavailable",
             Self::ShutdownFailed => "shutdown_failed",
+            Self::InvalidStateTransition => "invalid_state_transition",
+            Self::MandatoryContextOverflow => "mandatory_context_overflow",
+            Self::ProviderCanceled => "provider_canceled",
+            Self::ProviderProtocol => "provider_protocol",
+            Self::RetryExhausted => "retry_exhausted",
+            Self::CompactionConflict => "compaction_conflict",
+            Self::RuntimeCommandConflict => "runtime_command_conflict",
+            Self::RuntimeBlocked => "runtime_blocked",
         }
     }
 }

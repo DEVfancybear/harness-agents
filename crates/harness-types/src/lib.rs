@@ -24,9 +24,10 @@ pub use error::{ErrorCode, HarnessError};
 pub use fixture::{ContinuationFixtureReport, verify_continuation_fixture};
 pub use hash::{ContentHash, canonical_json_bytes};
 pub use ids::{
-    AgentProfileId, AgentRunId, ArtifactId, ContextPacketId, EventId, HostId, InputId,
-    InstructionId, MemoryAssetId, PlanItemId, PluginInstanceId, ProjectId, ScopeId, SessionId,
-    SnapshotId, TaskId, ToolExecutionId,
+    AgentProfileId, AgentRunId, ArtifactId, CompositionSnapshotId, ContextPacketId, EventId,
+    HostId, InputId, InstructionId, MemoryAssetId, PlanItemId, PluginInstanceId, ProjectId,
+    ProviderAttemptId, RequestId, RuntimeCommandId, ScopeId, SessionId, SnapshotId, TaskId,
+    ToolExecutionId,
 };
 pub use schema::{SchemaDocument, generated_schema_documents};
 

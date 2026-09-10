@@ -6,8 +6,9 @@ use std::{
 
 use fs2::FileExt;
 use harness_types::{
-    ArtifactId, ContentHash, ErrorCode, EventEnvelope, EventId, HostId, PluginInstanceId,
-    PluginManifest, SessionId, SnapshotId, TaskId, WorkingState,
+    AgentRunId, ArtifactId, CompositionSnapshotId, ContentHash, ContextPacket, ContextPacketId,
+    ErrorCode, EventEnvelope, EventId, HostId, PluginInstanceId, PluginManifest, ProviderAttemptId,
+    RequestId, RuntimeCommandId, SessionId, SnapshotId, TaskId, WorkingState,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -17,9 +18,12 @@ use sqlx::{
 };
 
 use crate::{
-    AdmissionAck, AdmissionCommit, HostFence, PersistedPluginManifest, PublishedArtifact,
-    ReceiptAck, ReceiptCommit, STORE_SCHEMA_VERSION, SessionSummary, SnapshotRecord,
-    StoreDiagnostics, StoreError, StoreFaultPlan, StoreFaultPoint, StorePaths, WriterOpenOptions,
+    AdmissionAck, AdmissionCommit, AgentStateRecord, CompositionSnapshotRecord,
+    ContextCheckpointRecord, ContextPacketRecord, ContinuationLinkRecord, FrozenRequestRecord,
+    HostFence, PersistedPluginManifest, ProviderAttemptRecord, PublishedArtifact,
+    RUNTIME_SCHEMA_VERSION, ReceiptAck, ReceiptCommit, RuntimeCommandRecord, RuntimeCommandState,
+    STORE_SCHEMA_VERSION, SessionSummary, SnapshotRecord, SourceWorkMarker, StoreDiagnostics,
+    StoreError, StoreFaultPlan, StoreFaultPoint, StorePaths, WriterOpenOptions,
 };
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -136,6 +140,16 @@ pub struct SqliteStore {
     fault_plan: StoreFaultPlan,
 }
 
+impl std::fmt::Debug for SqliteStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SqliteStore")
+            .field("paths", &self.paths)
+            .field("writer", &self.writer.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl SqliteStore {
     /// Open a writable, migrated store and acquire a new fenced host generation.
     pub async fn open_writer(options: WriterOpenOptions) -> Result<Self, StoreError> {
@@ -167,6 +181,10 @@ impl SqliteStore {
 
         let pool = open_pool(&paths, false).await?;
         if let Err(error) = run_migrations(&pool, &options.fault_plan).await {
+            let _ = FileExt::unlock(&lock_file);
+            return Err(error);
+        }
+        if let Err(error) = ensure_runtime_schema(&pool).await {
             let _ = FileExt::unlock(&lock_file);
             return Err(error);
         }
@@ -1088,6 +1106,496 @@ impl SqliteStore {
         })
     }
 
+    /// Low-level event append used by runtime continuity fixtures. It retains
+    /// the same fence and sequence checks as the P1 test helper.
+    pub async fn append_event(&self, event: EventEnvelope) -> Result<(), StoreError> {
+        self.append_event_for_test(event).await
+    }
+
+    /// Return the next unallocated journal sequence for a session.
+    pub async fn next_sequence(&self, session_id: &SessionId) -> Result<u64, StoreError> {
+        let value =
+            sqlx::query_scalar::<_, i64>("SELECT next_sequence FROM sessions WHERE session_id = ?")
+                .bind(session_id.as_str())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|error| {
+                    database_error(ErrorCode::StorageWriteFailed, "read next sequence", error)
+                })?;
+        value
+            .map(|value| to_u64(value, "next sequence"))
+            .transpose()?
+            .ok_or_else(|| StoreError::new(ErrorCode::InvalidPayload, "session does not exist"))
+    }
+
+    /// Commit an event, projection and source marker as one durable unit.
+    pub async fn commit_projected_event(
+        &self,
+        event: EventEnvelope,
+        task_id: &TaskId,
+        state: WorkingState,
+        marker: SourceWorkMarker,
+    ) -> Result<(), StoreError> {
+        event.validate().map_err(|error| {
+            StoreError::new(error.code(), format!("runtime event is invalid: {error}"))
+        })?;
+        state.validate().map_err(|error| {
+            StoreError::new(
+                error.code(),
+                format!("runtime projection is invalid: {error}"),
+            )
+        })?;
+        if event.session_id != state.session_id
+            || event.seq != state.through_event_seq
+            || state.task_id != *task_id
+        {
+            return Err(StoreError::new(
+                ErrorCode::InvalidPayload,
+                "runtime event and projection identity do not match",
+            ));
+        }
+        let fence = self.fence()?;
+        let mut transaction = self.begin_write(&fence).await?;
+        ensure_session_existing(&mut transaction, &event.session_id, task_id).await?;
+        claim_task(&mut transaction, task_id, &event.session_id, &fence).await?;
+        ensure_expected_sequence(&mut transaction, &event.session_id, event.seq).await?;
+        sqlx::query("INSERT INTO events(session_id, sequence, event_id, event_json, continuity_critical) VALUES (?, ?, ?, ?, ?)")
+            .bind(event.session_id.as_str()).bind(to_i64(event.seq, "runtime event sequence")?).bind(event.event_id.as_str())
+            .bind(to_json(&event, "serialize runtime event")?).bind(i64::from(u8::from(event.continuity_critical)))
+            .execute(&mut *transaction).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "insert runtime event", error))?;
+        upsert_projection(
+            &mut transaction,
+            task_id,
+            &event.session_id,
+            &state,
+            to_json(&state, "serialize runtime projection")?,
+        )
+        .await?;
+        insert_marker(
+            &mut transaction,
+            &event.session_id,
+            task_id,
+            &marker,
+            to_json(&marker, "serialize runtime marker")?,
+        )
+        .await?;
+        advance_sequence(&mut transaction, &event.session_id, event.seq).await?;
+        transaction.commit().await.map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "commit runtime event", error)
+        })
+    }
+
+    pub async fn persist_composition_snapshot(
+        &self,
+        record: CompositionSnapshotRecord,
+    ) -> Result<(), StoreError> {
+        validate_hashed_json(&record.content, &record.content_hash)?;
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        let json = to_json(&record.content, "serialize composition snapshot")?;
+        let result = sqlx::query("INSERT INTO composition_snapshots(snapshot_id, session_id, task_id, revision, content_json, content_hash) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(snapshot_id) DO NOTHING")
+            .bind(record.snapshot_id.as_str()).bind(record.session_id.as_str()).bind(record.task_id.as_str()).bind(to_i64(record.revision, "composition revision")?).bind(json).bind(record.content_hash.as_str())
+            .execute(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "persist composition snapshot", error))?;
+        if result.rows_affected() == 0 {
+            let existing = sqlx::query_scalar::<_, String>(
+                "SELECT content_hash FROM composition_snapshots WHERE snapshot_id = ?",
+            )
+            .bind(record.snapshot_id.as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::StorageWriteFailed,
+                    "read composition idempotency",
+                    error,
+                )
+            })?;
+            if existing != record.content_hash.as_str() {
+                return Err(StoreError::new(
+                    ErrorCode::IdempotencyConflict,
+                    "composition snapshot ID is immutable",
+                ));
+            }
+        }
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit composition snapshot",
+                error,
+            )
+        })
+    }
+
+    pub async fn latest_composition_snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<CompositionSnapshotRecord>, StoreError> {
+        let row = sqlx::query("SELECT snapshot_id, session_id, task_id, revision, content_json, content_hash FROM composition_snapshots WHERE session_id = ? ORDER BY revision DESC LIMIT 1").bind(session_id.as_str()).fetch_optional(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read composition snapshot", error))?;
+        row.map(|row| composition_from_row(&row)).transpose()
+    }
+
+    pub async fn persist_context_packet(
+        &self,
+        record: ContextPacketRecord,
+    ) -> Result<(), StoreError> {
+        record.packet.validate().map_err(|error| {
+            StoreError::new(error.code(), format!("context packet is invalid: {error}"))
+        })?;
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        let result = sqlx::query("INSERT INTO context_packets(packet_id, session_id, task_id, packet_json, composition_snapshot_id, omitted_json, degradation) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(packet_id) DO NOTHING")
+            .bind(record.packet.packet_id.as_str()).bind(record.packet.session_id.as_str()).bind(record.packet.task_id.as_str()).bind(to_json(&record.packet, "serialize context packet")?)
+            .bind(record.composition_snapshot_id.as_ref().map(harness_types::CompositionSnapshotId::as_str)).bind(to_json(&record.omitted_optional, "serialize omitted context")?).bind(record.degradation.as_deref())
+            .execute(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "persist context packet", error))?;
+        if result.rows_affected() == 0 {
+            let existing = sqlx::query_scalar::<_, String>(
+                "SELECT packet_json FROM context_packets WHERE packet_id = ?",
+            )
+            .bind(record.packet.packet_id.as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::StorageWriteFailed,
+                    "read packet idempotency",
+                    error,
+                )
+            })?;
+            if existing != to_json(&record.packet, "serialize context packet")? {
+                return Err(StoreError::new(
+                    ErrorCode::IdempotencyConflict,
+                    "context packet ID is immutable",
+                ));
+            }
+        }
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit context packet",
+                error,
+            )
+        })
+    }
+
+    pub async fn list_context_packets(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ContextPacketRecord>, StoreError> {
+        let rows = sqlx::query("SELECT packet_json, composition_snapshot_id, omitted_json, degradation FROM context_packets WHERE session_id = ? ORDER BY rowid").bind(session_id.as_str()).fetch_all(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list context packets", error))?;
+        rows.into_iter()
+            .map(|row| context_packet_from_row(&row))
+            .collect()
+    }
+
+    pub async fn latest_context_packet(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<ContextPacketRecord>, StoreError> {
+        let row = sqlx::query("SELECT packet_json, composition_snapshot_id, omitted_json, degradation FROM context_packets WHERE session_id = ? ORDER BY rowid DESC LIMIT 1").bind(session_id.as_str()).fetch_optional(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "latest context packet", error))?;
+        row.map(|row| context_packet_from_row(&row)).transpose()
+    }
+
+    pub async fn persist_frozen_request(
+        &self,
+        record: FrozenRequestRecord,
+    ) -> Result<(), StoreError> {
+        validate_hashed_json(&record.request_json, &record.content_hash)?;
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        let result = sqlx::query("INSERT INTO frozen_requests(request_id, packet_id, composition_snapshot_id, session_id, task_id, request_json, content_hash, provider_id, model, config_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_id) DO NOTHING")
+            .bind(record.request_id.as_str()).bind(record.packet_id.as_str()).bind(record.composition_snapshot_id.as_ref().map(harness_types::CompositionSnapshotId::as_str)).bind(record.session_id.as_str()).bind(record.task_id.as_str())
+            .bind(to_json(&record.request_json, "serialize frozen request")?).bind(record.content_hash.as_str()).bind(&record.provider_id).bind(&record.model).bind(to_i64(record.config_revision, "config revision")?)
+            .execute(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "persist frozen request", error))?;
+        if result.rows_affected() == 0 {
+            let existing = sqlx::query_scalar::<_, String>(
+                "SELECT content_hash FROM frozen_requests WHERE request_id = ?",
+            )
+            .bind(record.request_id.as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::StorageWriteFailed,
+                    "read frozen idempotency",
+                    error,
+                )
+            })?;
+            if existing != record.content_hash.as_str() {
+                return Err(StoreError::new(
+                    ErrorCode::IdempotencyConflict,
+                    "frozen request ID is immutable",
+                ));
+            }
+        }
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit frozen request",
+                error,
+            )
+        })
+    }
+
+    pub async fn list_frozen_requests(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<FrozenRequestRecord>, StoreError> {
+        let rows = sqlx::query("SELECT request_id, packet_id, composition_snapshot_id, session_id, task_id, request_json, content_hash, provider_id, model, config_revision FROM frozen_requests WHERE session_id = ? ORDER BY rowid").bind(session_id.as_str()).fetch_all(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list frozen requests", error))?;
+        rows.into_iter()
+            .map(|row| frozen_request_from_row(&row))
+            .collect()
+    }
+
+    pub async fn persist_provider_attempt(
+        &self,
+        record: ProviderAttemptRecord,
+    ) -> Result<(), StoreError> {
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        sqlx::query("INSERT INTO provider_attempts(attempt_id, request_id, session_id, task_id, attempt_number, state, events_json, response_hash, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(attempt_id) DO NOTHING")
+            .bind(record.attempt_id.as_str()).bind(record.request_id.as_str()).bind(record.session_id.as_str()).bind(record.task_id.as_str()).bind(i64::from(record.attempt_number)).bind(&record.state).bind(to_json(&record.events, "serialize provider attempt")?).bind(record.response_hash.as_ref().map(harness_types::ContentHash::as_str)).bind(record.error.as_deref())
+            .execute(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "persist provider attempt", error))?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit provider attempt",
+                error,
+            )
+        })
+    }
+
+    pub async fn list_provider_attempts(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ProviderAttemptRecord>, StoreError> {
+        let rows = sqlx::query("SELECT attempt_id, request_id, session_id, task_id, attempt_number, state, events_json, response_hash, error FROM provider_attempts WHERE session_id = ? ORDER BY attempt_number").bind(session_id.as_str()).fetch_all(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list provider attempts", error))?;
+        rows.into_iter()
+            .map(|row| provider_attempt_from_row(&row))
+            .collect()
+    }
+
+    pub async fn write_context_checkpoint_cas(
+        &self,
+        record: ContextCheckpointRecord,
+        expected_last_sequence: u64,
+    ) -> Result<(), StoreError> {
+        validate_hashed_json(&record.content, &record.content_hash)?;
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        let actual = session_next_sequence(&mut tx, &record.session_id)
+            .await?
+            .checked_sub(1)
+            .ok_or_else(|| {
+                StoreError::new(ErrorCode::CompactionConflict, "session sequence is invalid")
+            })?;
+        if actual != expected_last_sequence {
+            return Err(StoreError::new(
+                ErrorCode::CompactionConflict,
+                format!("context checkpoint CAS expected {expected_last_sequence}, found {actual}"),
+            ));
+        }
+        let prior = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(revision) FROM context_checkpoints WHERE session_id = ?",
+        )
+        .bind(record.session_id.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "read checkpoint revision",
+                error,
+            )
+        })?;
+        if prior.is_some_and(|value| record.revision <= u64::try_from(value).unwrap_or(u64::MAX)) {
+            return Err(StoreError::new(
+                ErrorCode::CompactionConflict,
+                "context checkpoint revision is stale",
+            ));
+        }
+        sqlx::query("INSERT INTO context_checkpoints(checkpoint_id, session_id, task_id, through_sequence, revision, content_json, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?)")
+            .bind(&record.checkpoint_id).bind(record.session_id.as_str()).bind(record.task_id.as_str()).bind(to_i64(record.through_sequence, "checkpoint sequence")?).bind(to_i64(record.revision, "checkpoint revision")?).bind(to_json(&record.content, "serialize checkpoint")?).bind(record.content_hash.as_str())
+            .execute(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "write context checkpoint", error))?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit context checkpoint",
+                error,
+            )
+        })
+    }
+
+    pub async fn latest_context_checkpoint(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<ContextCheckpointRecord>, StoreError> {
+        let row = sqlx::query("SELECT checkpoint_id, session_id, task_id, through_sequence, revision, content_json, content_hash FROM context_checkpoints WHERE session_id = ? ORDER BY revision DESC LIMIT 1").bind(session_id.as_str()).fetch_optional(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "latest context checkpoint", error))?;
+        row.map(|row| checkpoint_from_row(&row)).transpose()
+    }
+
+    pub async fn enqueue_runtime_command(
+        &self,
+        record: RuntimeCommandRecord,
+    ) -> Result<bool, StoreError> {
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        let payload = to_json(&record.payload, "serialize runtime command")?;
+        let result = sqlx::query("INSERT INTO runtime_commands(command_id, session_id, task_id, state, attempts, owner_generation, payload_json, last_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(command_id) DO NOTHING")
+            .bind(record.command_id.as_str()).bind(record.session_id.as_str()).bind(record.task_id.as_str()).bind(record.state.as_str()).bind(i64::from(record.attempts)).bind(to_i64(record.owner_generation, "command generation")?).bind(payload).bind(record.last_error.as_deref())
+            .execute(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "enqueue runtime command", error))?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit runtime command",
+                error,
+            )
+        })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn runtime_command(
+        &self,
+        command_id: &RuntimeCommandId,
+    ) -> Result<Option<RuntimeCommandRecord>, StoreError> {
+        let row = sqlx::query("SELECT command_id, session_id, task_id, state, attempts, owner_generation, payload_json, last_error FROM runtime_commands WHERE command_id = ?").bind(command_id.as_str()).fetch_optional(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read runtime command", error))?;
+        row.map(|row| runtime_command_from_row(&row)).transpose()
+    }
+
+    pub async fn claim_runtime_command(
+        &self,
+        command_id: &RuntimeCommandId,
+        max_attempts: u32,
+    ) -> Result<RuntimeCommandRecord, StoreError> {
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        let mut record = sqlx::query("SELECT command_id, session_id, task_id, state, attempts, owner_generation, payload_json, last_error FROM runtime_commands WHERE command_id = ?").bind(command_id.as_str()).fetch_optional(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "claim runtime command", error))?.ok_or_else(|| StoreError::new(ErrorCode::InvalidPayload, "runtime command does not exist")).and_then(|row| runtime_command_from_row(&row))?;
+        if record.state == RuntimeCommandState::Completed
+            || record.state == RuntimeCommandState::Canceled
+        {
+            tx.rollback().await.ok();
+            return Ok(record);
+        }
+        if record.attempts >= max_attempts {
+            tx.rollback().await.ok();
+            return Err(StoreError::new(
+                ErrorCode::RetryExhausted,
+                "runtime command retry limit reached",
+            ));
+        }
+        record.attempts = record.attempts.saturating_add(1);
+        record.state = RuntimeCommandState::Claimed;
+        record.owner_generation = fence.generation;
+        sqlx::query("UPDATE runtime_commands SET state = ?, attempts = ?, owner_generation = ?, last_error = NULL WHERE command_id = ?")
+            .bind(record.state.as_str()).bind(i64::from(record.attempts)).bind(to_i64(record.owner_generation, "command generation")?).bind(command_id.as_str()).execute(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "update runtime command claim", error))?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit runtime command claim",
+                error,
+            )
+        })?;
+        Ok(record)
+    }
+
+    pub async fn complete_runtime_command(
+        &self,
+        command_id: &RuntimeCommandId,
+        owner_generation: u64,
+        state: RuntimeCommandState,
+        error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        assert_fence_in_tx(&mut tx, &fence).await?;
+        let result = sqlx::query("UPDATE runtime_commands SET state = ?, last_error = ? WHERE command_id = ? AND owner_generation = ?")
+            .bind(state.as_str()).bind(error).bind(command_id.as_str()).bind(to_i64(owner_generation, "command generation")?).execute(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "complete runtime command", error))?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::new(
+                ErrorCode::RuntimeCommandConflict,
+                "runtime command owner is stale",
+            ));
+        }
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit runtime command completion",
+                error,
+            )
+        })
+    }
+
+    pub async fn record_agent_state(&self, record: AgentStateRecord) -> Result<(), StoreError> {
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        sqlx::query("INSERT INTO agent_states(agent_run_id, session_id, task_id, state, generation, revision, detail_json) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(agent_run_id) DO UPDATE SET state=excluded.state, generation=excluded.generation, revision=excluded.revision, detail_json=excluded.detail_json")
+            .bind(record.agent_run_id.as_str()).bind(record.session_id.as_str()).bind(record.task_id.as_str()).bind(&record.state).bind(to_i64(record.generation, "agent generation")?).bind(to_i64(record.revision, "agent revision")?).bind(to_json(&record.detail, "serialize agent state")?)
+            .execute(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "record agent state", error))?;
+        tx.commit().await.map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "commit agent state", error)
+        })
+    }
+
+    pub async fn agent_state(
+        &self,
+        agent_run_id: &AgentRunId,
+    ) -> Result<Option<AgentStateRecord>, StoreError> {
+        let row = sqlx::query("SELECT agent_run_id, session_id, task_id, state, generation, revision, detail_json FROM agent_states WHERE agent_run_id = ?")
+            .bind(agent_run_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read agent state", error))?;
+        row.map(|row| {
+            Ok(AgentStateRecord {
+                agent_run_id: AgentRunId::parse(row_get::<String>(&row, "agent_run_id")?).map_err(
+                    |_| StoreError::new(ErrorCode::StorageWriteFailed, "agent run ID is invalid"),
+                )?,
+                session_id: parse_session(row_get::<String>(&row, "session_id")?)?,
+                task_id: parse_task(row_get::<String>(&row, "task_id")?)?,
+                state: row_get::<String>(&row, "state")?,
+                generation: to_u64(row_get::<i64>(&row, "generation")?, "agent generation")?,
+                revision: to_u64(row_get::<i64>(&row, "revision")?, "agent revision")?,
+                detail: serde_json::from_str(&row_get::<String>(&row, "detail_json")?).map_err(
+                    |_| StoreError::new(ErrorCode::StorageWriteFailed, "agent detail is invalid"),
+                )?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn record_continuation_link(
+        &self,
+        source_session_id: &SessionId,
+        new_session_id: &SessionId,
+        task_id: &TaskId,
+    ) -> Result<(), StoreError> {
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        sqlx::query("INSERT INTO session_lineage(source_session_id, new_session_id, task_id) VALUES (?, ?, ?) ON CONFLICT(new_session_id) DO UPDATE SET source_session_id=excluded.source_session_id, task_id=excluded.task_id")
+            .bind(source_session_id.as_str()).bind(new_session_id.as_str()).bind(task_id.as_str()).execute(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "record continuation link", error))?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit continuation link",
+                error,
+            )
+        })
+    }
+
+    pub async fn continuation_link(
+        &self,
+        new_session_id: &SessionId,
+    ) -> Result<Option<ContinuationLinkRecord>, StoreError> {
+        let row = sqlx::query("SELECT source_session_id, new_session_id, task_id FROM session_lineage WHERE new_session_id = ?").bind(new_session_id.as_str()).fetch_optional(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read continuation link", error))?;
+        row.map(|row| {
+            Ok(ContinuationLinkRecord {
+                source_session_id: parse_session(row_get(&row, "source_session_id")?)?,
+                new_session_id: parse_session(row_get(&row, "new_session_id")?)?,
+                task_id: parse_task(row_get(&row, "task_id")?)?,
+            })
+        })
+        .transpose()
+    }
+
     /// Close the connection pool explicitly. The lock is released only after
     /// the pool is closed, allowing the kernel to make storage its last phase.
     pub async fn close(mut self) -> Result<(), StoreError> {
@@ -1246,6 +1754,119 @@ async fn run_migrations(pool: &SqlitePool, fault_plan: &StoreFaultPlan) -> Resul
         database_error(
             ErrorCode::MigrationFailed,
             "commit migration transaction",
+            error,
+        )
+    })
+}
+
+impl SqliteStore {
+    /// Persist the next retry attempt while retaining the same fenced owner.
+    pub async fn bump_runtime_command_attempt(
+        &self,
+        command_id: &RuntimeCommandId,
+        owner_generation: u64,
+        max_attempts: u32,
+    ) -> Result<u32, StoreError> {
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        assert_fence_in_tx(&mut tx, &fence).await?;
+        let attempts = sqlx::query_scalar::<_, i64>(
+            "SELECT attempts FROM runtime_commands WHERE command_id = ? AND owner_generation = ?",
+        )
+        .bind(command_id.as_str())
+        .bind(to_i64(owner_generation, "command generation")?)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "read retry attempt", error)
+        })?
+        .ok_or_else(|| {
+            StoreError::new(
+                ErrorCode::RuntimeCommandConflict,
+                "runtime command owner is stale",
+            )
+        })?;
+        let attempts = u32::try_from(to_u64(attempts, "command attempts")?).map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "command attempts exceed range",
+            )
+        })?;
+        if attempts >= max_attempts {
+            return Err(StoreError::new(
+                ErrorCode::RetryExhausted,
+                "runtime command retry limit reached",
+            ));
+        }
+        let next = attempts.saturating_add(1);
+        sqlx::query("UPDATE runtime_commands SET attempts = ?, state = 'claimed' WHERE command_id = ? AND owner_generation = ?")
+            .bind(i64::from(next))
+            .bind(command_id.as_str())
+            .bind(to_i64(owner_generation, "command generation")?)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "persist retry attempt", error))?;
+        tx.commit().await.map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "commit retry attempt", error)
+        })?;
+        Ok(next)
+    }
+}
+
+async fn ensure_runtime_schema(pool: &SqlitePool) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await.map_err(|error| {
+        database_error(ErrorCode::MigrationFailed, "begin runtime migration", error)
+    })?;
+    let statements = [
+        "CREATE TABLE IF NOT EXISTS runtime_schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS runtime_commands (command_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL, owner_generation INTEGER NOT NULL, payload_json TEXT NOT NULL, last_error TEXT)",
+        "CREATE TABLE IF NOT EXISTS agent_states (agent_run_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, revision INTEGER NOT NULL, detail_json TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS composition_snapshots (snapshot_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, revision INTEGER NOT NULL, content_json TEXT NOT NULL, content_hash TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS context_checkpoints (checkpoint_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, through_sequence INTEGER NOT NULL, revision INTEGER NOT NULL, content_json TEXT NOT NULL, content_hash TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS context_packets (packet_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, packet_json TEXT NOT NULL, composition_snapshot_id TEXT, omitted_json TEXT NOT NULL, degradation TEXT)",
+        "CREATE TABLE IF NOT EXISTS frozen_requests (request_id TEXT PRIMARY KEY, packet_id TEXT NOT NULL, composition_snapshot_id TEXT, session_id TEXT NOT NULL, task_id TEXT NOT NULL, request_json TEXT NOT NULL, content_hash TEXT NOT NULL, provider_id TEXT NOT NULL, model TEXT NOT NULL, config_revision INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS provider_attempts (attempt_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT NOT NULL, attempt_number INTEGER NOT NULL, state TEXT NOT NULL, events_json TEXT NOT NULL, response_hash TEXT, error TEXT)",
+        "CREATE TABLE IF NOT EXISTS session_lineage (new_session_id TEXT PRIMARY KEY, source_session_id TEXT NOT NULL, task_id TEXT NOT NULL)",
+    ];
+    for statement in statements {
+        sqlx::query(statement)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::MigrationFailed, "apply runtime schema", error)
+            })?;
+    }
+    let current =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM runtime_schema_migrations")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::MigrationFailed,
+                    "read runtime schema version",
+                    error,
+                )
+            })?
+            .unwrap_or(0);
+    if current > RUNTIME_SCHEMA_VERSION {
+        return Err(StoreError::new(
+            ErrorCode::MigrationFailed,
+            "runtime schema is newer than this host supports",
+        ));
+    }
+    if current < RUNTIME_SCHEMA_VERSION {
+        sqlx::query("INSERT INTO runtime_schema_migrations(version) VALUES (?)")
+            .bind(RUNTIME_SCHEMA_VERSION)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::MigrationFailed, "record runtime schema", error)
+            })?;
+    }
+    tx.commit().await.map_err(|error| {
+        database_error(
+            ErrorCode::MigrationFailed,
+            "commit runtime migration",
             error,
         )
     })
@@ -1419,23 +2040,36 @@ async fn claim_task(
     session_id: &SessionId,
     fence: &HostFence,
 ) -> Result<(), StoreError> {
-    let existing = sqlx::query("SELECT session_id FROM task_leases WHERE task_id = ?")
-        .bind(task_id.as_str())
-        .fetch_optional(&mut **transaction)
-        .await
-        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read task lease", error))?;
+    let existing =
+        sqlx::query("SELECT session_id, host_id, generation FROM task_leases WHERE task_id = ?")
+            .bind(task_id.as_str())
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::StorageWriteFailed, "read task lease", error)
+            })?;
     if let Some(row) = existing {
         let existing_session: String = row_get(&row, "session_id")?;
-        if existing_session != session_id.as_str() {
+        let existing_host: String = row_get(&row, "host_id")?;
+        let existing_generation = to_u64(row_get(&row, "generation")?, "task lease generation")?;
+        if existing_session != session_id.as_str()
+            && (existing_generation > fence.generation
+                || (existing_generation == fence.generation
+                    && existing_host == fence.host_id.as_str()))
+        {
             return Err(StoreError::new(
                 ErrorCode::TaskLeaseConflict,
-                "another session currently owns this task",
+                format!(
+                    "another session currently owns this task (lease_session={existing_session}, lease_host={existing_host}, lease_generation={existing_generation}, current_host={}, current_generation={})",
+                    fence.host_id, fence.generation
+                ),
             ));
         }
         sqlx::query(
-            "UPDATE task_leases SET host_id = ?, generation = ?, claimed_at = CURRENT_TIMESTAMP
+            "UPDATE task_leases SET session_id = ?, host_id = ?, generation = ?, claimed_at = CURRENT_TIMESTAMP
              WHERE task_id = ?",
         )
+        .bind(session_id.as_str())
         .bind(fence.host_id.as_str())
         .bind(to_i64(fence.generation, "task lease generation")?)
         .bind(task_id.as_str())
@@ -1695,6 +2329,301 @@ fn snapshot_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SnapshotRecord, St
                 "snapshot schema version is invalid",
             )
         })?,
+        content,
+        content_hash,
+    })
+}
+
+fn validate_hashed_json(content: &Value, expected: &ContentHash) -> Result<(), StoreError> {
+    let actual = ContentHash::from_canonical_json(content).map_err(|error| {
+        StoreError::new(error.code(), format!("content is not canonical: {error}"))
+    })?;
+    if &actual != expected {
+        return Err(StoreError::new(
+            ErrorCode::InvalidHash,
+            "content hash does not match canonical content",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_session(value: String) -> Result<SessionId, StoreError> {
+    SessionId::parse(value).map_err(|_| {
+        StoreError::new(
+            ErrorCode::StorageWriteFailed,
+            "stored session ID is invalid",
+        )
+    })
+}
+fn parse_task(value: String) -> Result<TaskId, StoreError> {
+    TaskId::parse(value)
+        .map_err(|_| StoreError::new(ErrorCode::StorageWriteFailed, "stored task ID is invalid"))
+}
+
+fn runtime_command_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<RuntimeCommandRecord, StoreError> {
+    let state = RuntimeCommandState::parse(&row_get::<String>(row, "state")?).ok_or_else(|| {
+        StoreError::new(
+            ErrorCode::StorageWriteFailed,
+            "stored runtime command state is invalid",
+        )
+    })?;
+    Ok(RuntimeCommandRecord {
+        command_id: RuntimeCommandId::parse(row_get::<String>(row, "command_id")?).map_err(
+            |_| {
+                StoreError::new(
+                    ErrorCode::StorageWriteFailed,
+                    "stored command ID is invalid",
+                )
+            },
+        )?,
+        session_id: parse_session(row_get::<String>(row, "session_id")?)?,
+        task_id: parse_task(row_get::<String>(row, "task_id")?)?,
+        state,
+        attempts: u32::try_from(to_u64(
+            row_get::<i64>(row, "attempts")?,
+            "command attempts",
+        )?)
+        .map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "command attempts exceed range",
+            )
+        })?,
+        owner_generation: to_u64(
+            row_get::<i64>(row, "owner_generation")?,
+            "command generation",
+        )?,
+        payload: serde_json::from_str(&row_get::<String>(row, "payload_json")?).map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "stored command payload is invalid",
+            )
+        })?,
+        last_error: row.try_get("last_error").map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "stored command error is invalid",
+            )
+        })?,
+    })
+}
+
+fn composition_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<CompositionSnapshotRecord, StoreError> {
+    let content: Value =
+        serde_json::from_str(&row_get::<String>(row, "content_json")?).map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "composition snapshot JSON is invalid",
+            )
+        })?;
+    let hash = ContentHash::parse(row_get::<String>(row, "content_hash")?).map_err(|_| {
+        StoreError::new(
+            ErrorCode::StorageWriteFailed,
+            "composition snapshot hash is invalid",
+        )
+    })?;
+    validate_hashed_json(&content, &hash)?;
+    Ok(CompositionSnapshotRecord {
+        snapshot_id: CompositionSnapshotId::parse(row_get::<String>(row, "snapshot_id")?).map_err(
+            |_| {
+                StoreError::new(
+                    ErrorCode::StorageWriteFailed,
+                    "composition snapshot ID is invalid",
+                )
+            },
+        )?,
+        session_id: parse_session(row_get::<String>(row, "session_id")?)?,
+        task_id: parse_task(row_get::<String>(row, "task_id")?)?,
+        revision: to_u64(row_get::<i64>(row, "revision")?, "composition revision")?,
+        content,
+        content_hash: hash,
+    })
+}
+
+fn context_packet_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<ContextPacketRecord, StoreError> {
+    let packet: ContextPacket = serde_json::from_str(&row_get::<String>(row, "packet_json")?)
+        .map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "context packet JSON is invalid",
+            )
+        })?;
+    packet.validate().map_err(|error| {
+        StoreError::new(
+            error.code(),
+            format!("stored context packet is invalid: {error}"),
+        )
+    })?;
+    let composition_snapshot_id = row
+        .try_get::<Option<String>, _>("composition_snapshot_id")
+        .map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "composition snapshot reference is invalid",
+            )
+        })?
+        .map(|value| {
+            CompositionSnapshotId::parse(value).map_err(|_| {
+                StoreError::new(
+                    ErrorCode::StorageWriteFailed,
+                    "composition snapshot ID is invalid",
+                )
+            })
+        })
+        .transpose()?;
+    let omitted_optional =
+        serde_json::from_str(&row_get::<String>(row, "omitted_json")?).map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "omitted context JSON is invalid",
+            )
+        })?;
+    Ok(ContextPacketRecord {
+        packet,
+        composition_snapshot_id,
+        omitted_optional,
+        degradation: row.try_get("degradation").map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "context degradation is invalid",
+            )
+        })?,
+    })
+}
+
+#[allow(clippy::needless_borrow)]
+fn frozen_request_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<FrozenRequestRecord, StoreError> {
+    let request_json: Value = serde_json::from_str(&row_get::<String>(&row, "request_json")?)
+        .map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "frozen request JSON is invalid",
+            )
+        })?;
+    let content_hash =
+        ContentHash::parse(row_get::<String>(&row, "content_hash")?).map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "frozen request hash is invalid",
+            )
+        })?;
+    validate_hashed_json(&request_json, &content_hash)?;
+    let composition_snapshot_id = row
+        .try_get::<Option<String>, _>("composition_snapshot_id")
+        .map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "frozen composition reference is invalid",
+            )
+        })?
+        .map(|value| {
+            CompositionSnapshotId::parse(value).map_err(|_| {
+                StoreError::new(
+                    ErrorCode::StorageWriteFailed,
+                    "composition snapshot ID is invalid",
+                )
+            })
+        })
+        .transpose()?;
+    Ok(FrozenRequestRecord {
+        request_id: RequestId::parse(row_get::<String>(&row, "request_id")?)
+            .map_err(|_| StoreError::new(ErrorCode::StorageWriteFailed, "request ID is invalid"))?,
+        packet_id: ContextPacketId::parse(row_get::<String>(&row, "packet_id")?)
+            .map_err(|_| StoreError::new(ErrorCode::StorageWriteFailed, "packet ID is invalid"))?,
+        composition_snapshot_id,
+        session_id: parse_session(row_get::<String>(&row, "session_id")?)?,
+        task_id: parse_task(row_get::<String>(&row, "task_id")?)?,
+        request_json,
+        content_hash,
+        provider_id: row_get::<String>(&row, "provider_id")?,
+        model: row_get::<String>(&row, "model")?,
+        config_revision: to_u64(row_get::<i64>(&row, "config_revision")?, "config revision")?,
+    })
+}
+
+#[allow(clippy::needless_borrow)]
+fn provider_attempt_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<ProviderAttemptRecord, StoreError> {
+    let events = serde_json::from_str(&row_get::<String>(&row, "events_json")?).map_err(|_| {
+        StoreError::new(
+            ErrorCode::StorageWriteFailed,
+            "provider events JSON is invalid",
+        )
+    })?;
+    let response_hash = row
+        .try_get::<Option<String>, _>("response_hash")
+        .map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "provider response hash is invalid",
+            )
+        })?
+        .map(|value| {
+            ContentHash::parse(value).map_err(|_| {
+                StoreError::new(
+                    ErrorCode::StorageWriteFailed,
+                    "provider response hash is invalid",
+                )
+            })
+        })
+        .transpose()?;
+    Ok(ProviderAttemptRecord {
+        attempt_id: ProviderAttemptId::parse(row_get::<String>(&row, "attempt_id")?)
+            .map_err(|_| StoreError::new(ErrorCode::StorageWriteFailed, "attempt ID is invalid"))?,
+        request_id: RequestId::parse(row_get::<String>(&row, "request_id")?)
+            .map_err(|_| StoreError::new(ErrorCode::StorageWriteFailed, "request ID is invalid"))?,
+        session_id: parse_session(row_get::<String>(&row, "session_id")?)?,
+        task_id: parse_task(row_get::<String>(&row, "task_id")?)?,
+        attempt_number: u32::try_from(to_u64(
+            row_get::<i64>(&row, "attempt_number")?,
+            "attempt number",
+        )?)
+        .map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "attempt number exceeds range",
+            )
+        })?,
+        state: row_get::<String>(&row, "state")?,
+        events,
+        response_hash,
+        error: row.try_get("error").map_err(|_| {
+            StoreError::new(ErrorCode::StorageWriteFailed, "provider error is invalid")
+        })?,
+    })
+}
+
+#[allow(clippy::needless_borrow)]
+fn checkpoint_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<ContextCheckpointRecord, StoreError> {
+    let content: Value =
+        serde_json::from_str(&row_get::<String>(&row, "content_json")?).map_err(|_| {
+            StoreError::new(ErrorCode::StorageWriteFailed, "checkpoint JSON is invalid")
+        })?;
+    let content_hash =
+        ContentHash::parse(row_get::<String>(&row, "content_hash")?).map_err(|_| {
+            StoreError::new(ErrorCode::StorageWriteFailed, "checkpoint hash is invalid")
+        })?;
+    validate_hashed_json(&content, &content_hash)?;
+    Ok(ContextCheckpointRecord {
+        checkpoint_id: row_get::<String>(&row, "checkpoint_id")?,
+        session_id: parse_session(row_get::<String>(&row, "session_id")?)?,
+        task_id: parse_task(row_get::<String>(&row, "task_id")?)?,
+        through_sequence: to_u64(
+            row_get::<i64>(&row, "through_sequence")?,
+            "checkpoint sequence",
+        )?,
+        revision: to_u64(row_get::<i64>(&row, "revision")?, "checkpoint revision")?,
         content,
         content_hash,
     })
