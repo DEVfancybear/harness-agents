@@ -194,7 +194,7 @@ fn sleep_script(milliseconds: u64) -> String {
 
 #[cfg(not(windows))]
 fn sleep_script(milliseconds: u64) -> String {
-    format!("sleep {}", milliseconds as f64 / 1_000.0)
+    format!("sleep {}.{:03}", milliseconds / 1_000, milliseconds % 1_000)
 }
 
 #[cfg(windows)]
