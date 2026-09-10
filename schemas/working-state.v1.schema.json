@@ -1,0 +1,408 @@
+{
+  "$defs": {
+    "CheckEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "pattern": "^artifact_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "command": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/CheckOutcome"
+        },
+        "tested_revision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "outcome",
+        "tested_revision"
+      ],
+      "type": "object"
+    },
+    "CheckOutcome": {
+      "enum": [
+        "passed",
+        "failed",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "ChildRunStatus": {
+      "enum": [
+        "pending",
+        "running",
+        "completed",
+        "failed",
+        "canceled"
+      ],
+      "type": "string"
+    },
+    "ChildState": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_run_id": {
+          "pattern": "^agent_run_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        },
+        "result_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/ChildRunStatus"
+        },
+        "task_id": {
+          "pattern": "^task_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent_run_id",
+        "task_id",
+        "status"
+      ],
+      "type": "object"
+    },
+    "ContentHash": {
+      "description": "A SHA-256 digest in the sole P0 external spelling: `sha256:<lowercase hex>`.",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "NextActionProposal": {
+      "additionalProperties": false,
+      "properties": {
+        "authority": {
+          "$ref": "#/$defs/SourceAuthority"
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "authority",
+        "description"
+      ],
+      "type": "object"
+    },
+    "PendingToolCall": {
+      "additionalProperties": false,
+      "properties": {
+        "execution_id": {
+          "pattern": "^tool_execution_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        },
+        "reconciliation_hint": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/PendingToolState"
+        }
+      },
+      "required": [
+        "execution_id",
+        "state",
+        "reconciliation_hint"
+      ],
+      "type": "object"
+    },
+    "PendingToolState": {
+      "enum": [
+        "pending",
+        "outcome_unknown"
+      ],
+      "type": "string"
+    },
+    "PlanItem": {
+      "additionalProperties": false,
+      "properties": {
+        "dependencies": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "evidence_refs": {
+          "items": {
+            "$ref": "#/$defs/SourceRef"
+          },
+          "type": "array"
+        },
+        "id": {
+          "pattern": "^plan_item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/PlanItemStatus"
+        }
+      },
+      "required": [
+        "id",
+        "status",
+        "dependencies",
+        "evidence_refs"
+      ],
+      "type": "object"
+    },
+    "PlanItemStatus": {
+      "enum": [
+        "pending",
+        "in_progress",
+        "completed",
+        "blocked"
+      ],
+      "type": "string"
+    },
+    "SourceAuthority": {
+      "description": "The authority class of a durable source. It must be explicit rather than\ninferred from untrusted payload data.",
+      "enum": [
+        "user",
+        "host_policy",
+        "runtime_observed",
+        "model_proposed",
+        "external_plugin"
+      ],
+      "type": "string"
+    },
+    "SourceRef": {
+      "additionalProperties": false,
+      "description": "A stable reference to an event-derived datum.",
+      "properties": {
+        "content_hash": {
+          "$ref": "#/$defs/ContentHash"
+        },
+        "event_id": {
+          "pattern": "^event_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "event_id",
+        "sequence",
+        "content_hash"
+      ],
+      "type": "object"
+    },
+    "WorkspaceChange": {
+      "additionalProperties": false,
+      "properties": {
+        "after_hash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContentHash"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "before_hash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContentHash"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "tool_execution_id": {
+          "pattern": "^tool_execution_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "WorkspaceObservation": {
+      "additionalProperties": false,
+      "properties": {
+        "base_commit": {
+          "type": "string"
+        },
+        "observed_fingerprint": {
+          "$ref": "#/$defs/ContentHash"
+        },
+        "project_id": {
+          "pattern": "^project_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        },
+        "worktree_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "worktree_id",
+        "base_commit",
+        "observed_fingerprint"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://harness-agents.local/schemas/working-state.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The task projection required for resume and compaction. It remains a\nprojection, not a second authoritative event store.",
+  "properties": {
+    "acceptance_criteria_refs": {
+      "items": {
+        "$ref": "#/$defs/SourceRef"
+      },
+      "type": "array"
+    },
+    "active_instruction_refs": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "blockers": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "changes": {
+      "items": {
+        "$ref": "#/$defs/WorkspaceChange"
+      },
+      "type": "array"
+    },
+    "checks": {
+      "items": {
+        "$ref": "#/$defs/CheckEvidence"
+      },
+      "type": "array"
+    },
+    "children": {
+      "items": {
+        "$ref": "#/$defs/ChildState"
+      },
+      "type": "array"
+    },
+    "decision_refs": {
+      "items": {
+        "$ref": "#/$defs/SourceRef"
+      },
+      "type": "array"
+    },
+    "next_action_proposals": {
+      "items": {
+        "$ref": "#/$defs/NextActionProposal"
+      },
+      "type": "array"
+    },
+    "objective_ref": {
+      "$ref": "#/$defs/SourceRef"
+    },
+    "pending_questions": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "pending_tool_calls": {
+      "items": {
+        "$ref": "#/$defs/PendingToolCall"
+      },
+      "type": "array"
+    },
+    "plan_items": {
+      "items": {
+        "$ref": "#/$defs/PlanItem"
+      },
+      "type": "array"
+    },
+    "revision": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": 1,
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "session_id": {
+      "pattern": "^session_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "superseded_decision_refs": {
+      "items": {
+        "$ref": "#/$defs/SourceRef"
+      },
+      "type": "array"
+    },
+    "task_id": {
+      "pattern": "^task_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "through_event_seq": {
+      "format": "uint64",
+      "minimum": 1,
+      "type": "integer"
+    },
+    "workspace": {
+      "$ref": "#/$defs/WorkspaceObservation"
+    }
+  },
+  "required": [
+    "schema_version",
+    "session_id",
+    "task_id",
+    "revision",
+    "through_event_seq",
+    "objective_ref",
+    "acceptance_criteria_refs",
+    "active_instruction_refs",
+    "decision_refs",
+    "superseded_decision_refs",
+    "plan_items",
+    "workspace",
+    "changes",
+    "checks",
+    "pending_tool_calls",
+    "children",
+    "blockers",
+    "pending_questions",
+    "next_action_proposals"
+  ],
+  "title": "WorkingState",
+  "type": "object",
+  "x-harness-schema-version": 1
+}

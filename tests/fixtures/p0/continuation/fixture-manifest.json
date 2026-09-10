@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "fixture_id": "p0-continuation-v1",
+  "main_events": "events.ndjson",
+  "expected_state": "expected-state.json",
+  "expected_event_count": 10,
+  "negative_cases": [
+    {
+      "id": "duplicate_input_id",
+      "path": "duplicate-input-id.ndjson",
+      "expected_error": "duplicate_input_id"
+    },
+    {
+      "id": "unknown_critical_event",
+      "path": "unknown-critical-event.ndjson",
+      "expected_outcome": "blocked"
+    },
+    {
+      "id": "truncated_artifact",
+      "path": "artifacts/receipt-truncated.txt",
+      "expected_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "must_mismatch": true
+    },
+    {
+      "id": "corrupt_artifact",
+      "path": "artifacts/receipt-corrupt.bin",
+      "expected_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "must_mismatch": true
+    }
+  ]
+}

@@ -4,7 +4,7 @@ Personal coding-agent harness planned in Rust: CLI first, multiple delegated age
 
 Harness coding agent cá nhân dự kiến viết bằng Rust: CLI trước, giao việc cho nhiều agent, bổ sung Web UI sau.
 
-**Status / Trạng thái:** architecture and planning only. No Rust runtime, SDK or `ha` commands exist yet. / Chỉ có kiến trúc và kế hoạch; chưa có Rust runtime, SDK hay lệnh `ha` thực thi được.
+**Status / Trạng thái:** P0 foundation is implemented locally and stops at contracts, schema generation, fixture verification, and the minimal `ha` CLI. It has no session store, provider/model loop, tool runtime, memory runtime, multi-agent orchestration, Web API, or UI; P1 and later remain unimplemented. See the bilingual [P0 evidence](docs/evidence/P0.en.md) and [restart handoff](docs/handoffs/P0.en.md). / Nền tảng P0 đã được triển khai cục bộ và chỉ dừng ở contracts, tạo schema, kiểm chứng fixture và CLI `ha` tối thiểu. Chưa có session store, vòng lặp provider/model, tool runtime, memory runtime, điều phối đa agent, Web API hay UI; P1 trở đi chưa được triển khai. Xem [evidence P0](docs/evidence/P0.vi.md) và [bàn giao khởi động lại](docs/handoffs/P0.vi.md) song ngữ.
 
 ## Documentation / Tài liệu
 
@@ -16,6 +16,7 @@ Harness coding agent cá nhân dự kiến viết bằng Rust: CLI trước, gia
 | 4. Memory and work continuity / Memory và tiếp tục công việc | [Memory](docs/MEMORY_AND_CONTINUITY.vi.md) | [Memory](docs/MEMORY_AND_CONTINUITY.en.md) |
 | 5. Phase-by-phase implementation / Triển khai từng phase | [Sổ tay giao việc](docs/implementation/README.vi.md) | [Implementation handbook](docs/implementation/README.en.md) |
 | 6. Acceptance ownership / Phân công nghiệm thu | [Bảng nghiệm thu](docs/implementation/ACCEPTANCE_MAP.vi.md) | [Acceptance map](docs/implementation/ACCEPTANCE_MAP.en.md) |
+| 7. P0 implementation record / Hồ sơ triển khai P0 | [Evidence](docs/evidence/P0.vi.md), [bàn giao](docs/handoffs/P0.vi.md) | [Evidence](docs/evidence/P0.en.md), [handoff](docs/handoffs/P0.en.md) |
 
 The central design separates an execution journal, structured WorkingState and reusable memory. Resuming work must not depend on a final LLM summary or a live extraction worker.
 
@@ -23,9 +24,9 @@ Thiết kế tách journal thực thi, WorkingState có cấu trúc và memory t
 
 ## Start implementation / Bắt đầu triển khai
 
-Assign [P0 in English](docs/implementation/P0_FOUNDATION.en.md) or [P0 tiếng Việt](docs/implementation/P0_FOUNDATION.vi.md) first. Copy its section 9 prompt to the coding agent. The pack has nine phases, 63 ordered steps, scoped file ownership, tests, exit gates and bilingual evidence/handoff requirements. Accept each predecessor before starting the next phase; Web is optional P8. This documentation does not mark any phase implemented.
+P0 was implemented against [P0 in English](docs/implementation/P0_FOUNDATION.en.md) and [P0 tiếng Việt](docs/implementation/P0_FOUNDATION.vi.md), with a phase SPEC and evidence/handoff above. It remains uncommitted and unpublished because neither action was authorized. Accept its evidence before assigning P1; the pack has nine phases, 63 ordered steps, scoped file ownership, tests, exit gates and bilingual evidence/handoff requirements. Web is optional P8.
 
-Giao P0 trước, copy prompt ở mục 9 cho coding agent. Bộ tài liệu có chín phases, 63 bước, phạm vi files, tests, điều kiện nghiệm thu và yêu cầu evidence/handoff hai ngôn ngữ. Nghiệm thu phase trước rồi mới bắt đầu phase sau; Web là P8 tùy chọn. Chưa phase nào được coi là đã triển khai chỉ vì có tài liệu này.
+P0 đã được triển khai theo [P0 tiếng Việt](docs/implementation/P0_FOUNDATION.vi.md) và [P0 in English](docs/implementation/P0_FOUNDATION.en.md), có SPEC và evidence/handoff ở trên. Thay đổi vẫn chưa commit hay publish vì hai việc đó chưa được giao. Hãy nghiệm thu evidence trước khi giao P1; bộ tài liệu có chín phase, 63 bước, phạm vi files, tests, điều kiện nghiệm thu và evidence/handoff song ngữ. Web là P8 tùy chọn.
 
 ## Documentation checks / Kiểm tra tài liệu
 

@@ -1,0 +1,130 @@
+{
+  "$defs": {
+    "ContentHash": {
+      "description": "A SHA-256 digest in the sole P0 external spelling: `sha256:<lowercase hex>`.",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "MemoryVersionRef": {
+      "additionalProperties": false,
+      "properties": {
+        "memory_asset_id": {
+          "pattern": "^memory_asset_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        },
+        "version": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "memory_asset_id",
+        "version"
+      ],
+      "type": "object"
+    },
+    "SourceRef": {
+      "additionalProperties": false,
+      "description": "A stable reference to an event-derived datum.",
+      "properties": {
+        "content_hash": {
+          "$ref": "#/$defs/ContentHash"
+        },
+        "event_id": {
+          "pattern": "^event_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "event_id",
+        "sequence",
+        "content_hash"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://harness-agents.local/schemas/context-packet.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "checkpoint_id": {
+      "type": "string"
+    },
+    "content": {
+      "type": "string"
+    },
+    "content_hash": {
+      "$ref": "#/$defs/ContentHash"
+    },
+    "memory_versions": {
+      "items": {
+        "$ref": "#/$defs/MemoryVersionRef"
+      },
+      "type": "array"
+    },
+    "packet_id": {
+      "pattern": "^context_packet_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "rendering_version": {
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": 1,
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "session_id": {
+      "pattern": "^session_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "source_manifest": {
+      "items": {
+        "$ref": "#/$defs/SourceRef"
+      },
+      "type": "array"
+    },
+    "task_id": {
+      "pattern": "^task_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "through_event_seq": {
+      "format": "uint64",
+      "minimum": 1,
+      "type": "integer"
+    },
+    "token_estimate": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "packet_id",
+    "session_id",
+    "task_id",
+    "checkpoint_id",
+    "through_event_seq",
+    "memory_versions",
+    "rendering_version",
+    "token_estimate",
+    "content_hash",
+    "content",
+    "source_manifest"
+  ],
+  "title": "ContextPacket",
+  "type": "object",
+  "x-harness-schema-version": 1
+}

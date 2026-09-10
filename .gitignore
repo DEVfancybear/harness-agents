@@ -1,0 +1,7 @@
+/target/
+/.harness/runtime/
+/.harness/artifacts/
+/.harness/backups/
+/.harness/*.db
+/.harness/*.db-shm
+/.harness/*.db-wal

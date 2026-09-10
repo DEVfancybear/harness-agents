@@ -1,0 +1,98 @@
+{
+  "$defs": {
+    "ServiceContract": {
+      "additionalProperties": false,
+      "properties": {
+        "api_version": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "service_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "service_id",
+        "api_version"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://harness-agents.local/schemas/plugin-manifest.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "blocks_recovery_when_absent": {
+      "type": "boolean"
+    },
+    "capabilities": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "config_schema_version": {
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "host_api_version": {
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "implementation_version": {
+      "type": "string"
+    },
+    "instance_id": {
+      "pattern": "^plugin_instance_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "plugin_id": {
+      "type": "string"
+    },
+    "provides": {
+      "items": {
+        "$ref": "#/$defs/ServiceContract"
+      },
+      "type": "array"
+    },
+    "requires": {
+      "items": {
+        "$ref": "#/$defs/ServiceContract"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1,
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "scope_id": {
+      "pattern": "^scope_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "plugin_id",
+    "implementation_version",
+    "instance_id",
+    "scope_id",
+    "host_api_version",
+    "config_schema_version",
+    "provides",
+    "requires",
+    "capabilities",
+    "blocks_recovery_when_absent"
+  ],
+  "title": "PluginManifest",
+  "type": "object",
+  "x-harness-schema-version": 1
+}

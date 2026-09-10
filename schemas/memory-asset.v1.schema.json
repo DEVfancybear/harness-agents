@@ -1,0 +1,95 @@
+{
+  "$defs": {
+    "MemoryAssetStatus": {
+      "enum": [
+        "candidate",
+        "active",
+        "superseded",
+        "invalidated",
+        "archived"
+      ],
+      "type": "string"
+    },
+    "MemoryScope": {
+      "enum": [
+        "user",
+        "project",
+        "task",
+        "agent_profile",
+        "session"
+      ],
+      "type": "string"
+    },
+    "SourceAuthority": {
+      "description": "The authority class of a durable source. It must be explicit rather than\ninferred from untrusted payload data.",
+      "enum": [
+        "user",
+        "host_policy",
+        "runtime_observed",
+        "model_proposed",
+        "external_plugin"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://harness-agents.local/schemas/memory-asset.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "created_by": {
+      "$ref": "#/$defs/SourceAuthority"
+    },
+    "current_version": {
+      "format": "uint64",
+      "minimum": 1,
+      "type": "integer"
+    },
+    "kind": {
+      "type": "string"
+    },
+    "memory_asset_id": {
+      "pattern": "^memory_asset_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "owner_id": {
+      "type": "string"
+    },
+    "project_id": {
+      "pattern": "^project_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "schema_version": {
+      "const": 1,
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "scope": {
+      "$ref": "#/$defs/MemoryScope"
+    },
+    "status": {
+      "$ref": "#/$defs/MemoryAssetStatus"
+    },
+    "visibility": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "memory_asset_id",
+    "kind",
+    "owner_id",
+    "scope",
+    "visibility",
+    "status",
+    "current_version",
+    "created_by"
+  ],
+  "title": "MemoryAsset",
+  "type": "object",
+  "x-harness-schema-version": 1
+}

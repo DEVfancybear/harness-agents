@@ -1,0 +1,116 @@
+{
+  "$defs": {
+    "ContentHash": {
+      "description": "A SHA-256 digest in the sole P0 external spelling: `sha256:<lowercase hex>`.",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "ToolIntentState": {
+      "enum": [
+        "validated",
+        "denied",
+        "intent_recorded"
+      ],
+      "type": "string"
+    },
+    "ToolOutcomeState": {
+      "enum": [
+        "not_started",
+        "settled",
+        "outcome_unknown",
+        "denied"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://harness-agents.local/schemas/tool-execution-receipt.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Immutable execution evidence. A future presentation/result view may never\nrewrite the outcome represented here.",
+  "properties": {
+    "after_fingerprint": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ContentHash"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "approval_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "artifact_id": {
+      "pattern": "^artifact_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "before_fingerprint": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ContentHash"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "input_hash": {
+      "$ref": "#/$defs/ContentHash"
+    },
+    "intent_state": {
+      "$ref": "#/$defs/ToolIntentState"
+    },
+    "invocation_id": {
+      "type": "string"
+    },
+    "observed_at_seq": {
+      "format": "uint64",
+      "minimum": 1,
+      "type": "integer"
+    },
+    "outcome_state": {
+      "$ref": "#/$defs/ToolOutcomeState"
+    },
+    "policy_revision": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": 1,
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "task_id": {
+      "pattern": "^task_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "tool_execution_id": {
+      "pattern": "^tool_execution_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "tool_execution_id",
+    "task_id",
+    "invocation_id",
+    "input_hash",
+    "policy_revision",
+    "intent_state",
+    "outcome_state",
+    "observed_at_seq"
+  ],
+  "title": "ToolExecutionReceipt",
+  "type": "object",
+  "x-harness-schema-version": 1
+}

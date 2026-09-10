@@ -1,0 +1,106 @@
+{
+  "$defs": {
+    "ContentHash": {
+      "description": "A SHA-256 digest in the sole P0 external spelling: `sha256:<lowercase hex>`.",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "InstructionStatus": {
+      "enum": [
+        "effective",
+        "superseded",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "SourceAuthority": {
+      "description": "The authority class of a durable source. It must be explicit rather than\ninferred from untrusted payload data.",
+      "enum": [
+        "user",
+        "host_policy",
+        "runtime_observed",
+        "model_proposed",
+        "external_plugin"
+      ],
+      "type": "string"
+    },
+    "SourceRef": {
+      "additionalProperties": false,
+      "description": "A stable reference to an event-derived datum.",
+      "properties": {
+        "content_hash": {
+          "$ref": "#/$defs/ContentHash"
+        },
+        "event_id": {
+          "pattern": "^event_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "event_id",
+        "sequence",
+        "content_hash"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://harness-agents.local/schemas/instruction-ledger.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The raw admitted instruction is retained by its source event; this ledger\nrecords authority and mandatory status without relying on model extraction.",
+  "properties": {
+    "authority": {
+      "$ref": "#/$defs/SourceAuthority"
+    },
+    "instruction_id": {
+      "pattern": "^instruction_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "mandatory": {
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": 1,
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "scope": {
+      "type": "string"
+    },
+    "source": {
+      "$ref": "#/$defs/SourceRef"
+    },
+    "source_hash": {
+      "$ref": "#/$defs/ContentHash"
+    },
+    "status": {
+      "$ref": "#/$defs/InstructionStatus"
+    },
+    "superseded_by": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "instruction_id",
+    "source",
+    "scope",
+    "authority",
+    "mandatory",
+    "status",
+    "source_hash"
+  ],
+  "title": "InstructionLedgerEntry",
+  "type": "object",
+  "x-harness-schema-version": 1
+}

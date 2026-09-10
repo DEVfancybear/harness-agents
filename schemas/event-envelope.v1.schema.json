@@ -1,0 +1,111 @@
+{
+  "$defs": {
+    "ContentHash": {
+      "description": "A SHA-256 digest in the sole P0 external spelling: `sha256:<lowercase hex>`.",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "ProducerIdentity": {
+      "additionalProperties": false,
+      "description": "A producer is part of event provenance, not a trusted service lookup.",
+      "properties": {
+        "implementation_version": {
+          "type": "string"
+        },
+        "plugin_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "implementation_version"
+      ],
+      "type": "object"
+    },
+    "SourceAuthority": {
+      "description": "The authority class of a durable source. It must be explicit rather than\ninferred from untrusted payload data.",
+      "enum": [
+        "user",
+        "host_policy",
+        "runtime_observed",
+        "model_proposed",
+        "external_plugin"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://harness-agents.local/schemas/event-envelope.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The durable event envelope. Payloads are object-shaped and hashed before\nthey can be referenced by later contracts.",
+  "properties": {
+    "authority": {
+      "$ref": "#/$defs/SourceAuthority"
+    },
+    "causation_id": {
+      "pattern": "^event_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "continuity_critical": {
+      "type": "boolean"
+    },
+    "correlation_id": {
+      "pattern": "^event_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "event_id": {
+      "pattern": "^event_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "event_type": {
+      "type": "string"
+    },
+    "payload": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "payload_hash": {
+      "$ref": "#/$defs/ContentHash"
+    },
+    "producer": {
+      "$ref": "#/$defs/ProducerIdentity"
+    },
+    "schema_version": {
+      "const": 1,
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "seq": {
+      "format": "uint64",
+      "minimum": 1,
+      "type": "integer"
+    },
+    "session_id": {
+      "pattern": "^session_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "event_id",
+    "session_id",
+    "seq",
+    "event_type",
+    "producer",
+    "authority",
+    "continuity_critical",
+    "payload",
+    "payload_hash"
+  ],
+  "title": "EventEnvelope",
+  "type": "object",
+  "x-harness-schema-version": 1
+}

@@ -1,0 +1,46 @@
+{
+  "$defs": {
+    "CliOutputFormat": {
+      "enum": [
+        "text",
+        "json"
+      ],
+      "type": "string"
+    },
+    "CliPresentationConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "output": {
+          "$ref": "#/$defs/CliOutputFormat",
+          "default": "text"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$id": "https://harness-agents.local/schemas/harness-config.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Strict configuration available to P0. It contains no provider or credential\nsetting, intentionally preventing configuration from activating runtime work.",
+  "properties": {
+    "cli": {
+      "$ref": "#/$defs/CliPresentationConfig",
+      "default": {
+        "output": "text"
+      }
+    },
+    "schema_version": {
+      "const": 1,
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version"
+  ],
+  "title": "HarnessConfig",
+  "type": "object",
+  "x-harness-schema-version": 1
+}

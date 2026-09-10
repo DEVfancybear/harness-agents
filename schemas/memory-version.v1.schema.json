@@ -1,0 +1,106 @@
+{
+  "$defs": {
+    "ContentHash": {
+      "description": "A SHA-256 digest in the sole P0 external spelling: `sha256:<lowercase hex>`.",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "Validity": {
+      "enum": [
+        "valid",
+        "stale",
+        "unknown"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://harness-agents.local/schemas/memory-version.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "confidence_annotation": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "content_hash": {
+      "$ref": "#/$defs/ContentHash"
+    },
+    "content_or_artifact_hash": {
+      "$ref": "#/$defs/ContentHash"
+    },
+    "evidence_state": {
+      "type": "string"
+    },
+    "extractor_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "memory_asset_id": {
+      "pattern": "^memory_asset_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "provenance_kind": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "source_commit": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_event_refs": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "source_file_hashes": {
+      "items": {
+        "$ref": "#/$defs/ContentHash"
+      },
+      "type": "array"
+    },
+    "supersedes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "validity": {
+      "$ref": "#/$defs/Validity"
+    },
+    "version": {
+      "format": "uint64",
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "memory_asset_id",
+    "version",
+    "content_or_artifact_hash",
+    "content_hash",
+    "source_event_refs",
+    "source_file_hashes",
+    "provenance_kind",
+    "evidence_state",
+    "validity"
+  ],
+  "title": "MemoryVersion",
+  "type": "object",
+  "x-harness-schema-version": 1
+}
