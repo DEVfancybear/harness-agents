@@ -215,7 +215,7 @@ fn p0_f07_phase_gate_self_test_exercises_negative_controls() {
 }
 
 #[test]
-fn p0_f08_registry_and_ci_declare_only_p0_capabilities() {
+fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
     let root = repository_root();
     let registry: Value = serde_json::from_str(
         &fs::read_to_string(root.join("tests/acceptance/registry.json"))
@@ -257,7 +257,9 @@ fn p0_f08_registry_and_ci_declare_only_p0_capabilities() {
     assert!(
         future_cases
             .iter()
-            .filter(|case| case["phase"] != "P1" && case["phase"] != "P2")
+            .filter(|case| {
+                case["phase"] != "P1" && case["phase"] != "P2" && case["phase"] != "P3"
+            })
             .all(|case| { case["readiness"] == "not_implemented" && case["required"] == false })
     );
     let p2_cases = future_cases
@@ -267,6 +269,16 @@ fn p0_f08_registry_and_ci_declare_only_p0_capabilities() {
     assert_eq!(p2_cases.len(), 8);
     assert!(
         p2_cases
+            .iter()
+            .all(|case| { case["readiness"] == "implemented" && case["required"] == true })
+    );
+    let p3_cases = future_cases
+        .iter()
+        .filter(|case| case["phase"] == "P3")
+        .collect::<Vec<_>>();
+    assert_eq!(p3_cases.len(), 6);
+    assert!(
+        p3_cases
             .iter()
             .all(|case| { case["readiness"] == "implemented" && case["required"] == true })
     );

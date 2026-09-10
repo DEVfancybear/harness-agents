@@ -27,7 +27,7 @@ pub use ids::{
     AgentProfileId, AgentRunId, ArtifactId, CompositionSnapshotId, ContextPacketId, EventId,
     HostId, InputId, InstructionId, MemoryAssetId, PlanItemId, PluginInstanceId, ProjectId,
     ProviderAttemptId, RequestId, RuntimeCommandId, ScopeId, SessionId, SnapshotId, TaskId,
-    ToolExecutionId,
+    ToolApprovalId, ToolExecutionId, ToolInvocationId,
 };
 pub use schema::{SchemaDocument, generated_schema_documents};
 

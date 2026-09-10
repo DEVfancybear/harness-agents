@@ -75,6 +75,8 @@ pub struct ProviderRequest {
     pub request_id: RequestId,
     pub model: String,
     pub messages: Vec<ProviderMessage>,
+    #[serde(default)]
+    pub tool_schemas: Vec<Value>,
     pub temperature: Option<f32>,
     pub metadata: Value,
 }
@@ -90,9 +92,16 @@ impl ProviderRequest {
             request_id,
             model: model.into(),
             messages,
+            tool_schemas: Vec::new(),
             temperature: None,
             metadata: json!({}),
         }
+    }
+
+    #[must_use]
+    pub fn with_tool_schemas(mut self, tool_schemas: Vec<Value>) -> Self {
+        self.tool_schemas = tool_schemas;
+        self
     }
 }
 
@@ -372,7 +381,12 @@ impl ModelProvider for DeepSeekAdapter {
         let client = self.client.clone();
         Box::pin(async move {
             let token = credentials.resolve()?;
-            let body = json!({ "model": request.model, "messages": request.messages, "stream": true, "temperature": request.temperature });
+            let mut body = json!({ "model": request.model, "messages": request.messages, "stream": true, "temperature": request.temperature });
+            if !request.tool_schemas.is_empty()
+                && let Some(object) = body.as_object_mut()
+            {
+                object.insert("tools".to_owned(), Value::Array(request.tool_schemas));
+            }
             let response = tokio::select! {
                 result = client.post(endpoint).bearer_auth(token).json(&body).send() => result.map_err(|error| ProviderError::new(ErrorCode::ProviderProtocol, format!("provider request failed: {error}")))?,
                 () = cancellation.cancelled() => return Err(ProviderError::new(ErrorCode::ProviderCanceled, "provider request canceled")),

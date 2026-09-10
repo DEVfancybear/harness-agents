@@ -9,8 +9,8 @@ use std::sync::{
 };
 
 use harness_providers::{
-    CancellationToken, MessageRole, ModelProvider, ProviderError, ProviderMessage, ProviderRequest,
-    assemble_stream,
+    CancellationToken, MessageRole, ModelProvider, NormalizedToolCall, ProviderError,
+    ProviderMessage, ProviderRequest, assemble_stream,
 };
 use harness_session::{
     AdmitInputRequest, ContextBlock, ContextBuildRequest, ContextBuilder, RecoveryView,
@@ -153,6 +153,7 @@ pub struct RunRequest {
     pub workspace: WorkspaceObservation,
     pub system_policy: String,
     pub continuation_context: Option<String>,
+    pub tool_schemas: Vec<Value>,
 }
 
 impl RunRequest {
@@ -172,6 +173,7 @@ impl RunRequest {
             workspace,
             system_policy: "You are a careful coding agent.".to_owned(),
             continuation_context: None,
+            tool_schemas: Vec::new(),
         }
     }
     #[must_use]
@@ -185,6 +187,12 @@ impl RunRequest {
         self.continuation_context = Some(context.into());
         self
     }
+
+    #[must_use]
+    pub fn with_tool_schemas(mut self, tool_schemas: Vec<Value>) -> Self {
+        self.tool_schemas = tool_schemas;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -195,6 +203,8 @@ pub struct RunResult {
     pub packet_id: harness_types::ContextPacketId,
     pub response: String,
     pub attempts: u32,
+    pub tool_calls: Vec<NormalizedToolCall>,
+    pub incomplete_tool_calls: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -374,7 +384,7 @@ impl RuntimeService {
         let recovery = session.recover(&request.session_id).await?;
         let built = self.build_context(&request, recovery)?;
         let capabilities = self.provider.capabilities();
-        let composition_content = json!({"config_revision": config.config_revision, "provider_id": capabilities.provider_id, "model": capabilities.model, "packet_checkpoint": built.packet.checkpoint_id});
+        let composition_content = json!({"config_revision": config.config_revision, "provider_id": capabilities.provider_id, "model": capabilities.model, "packet_checkpoint": built.packet.checkpoint_id, "tool_schemas": request.tool_schemas});
         let composition_id = harness_types::CompositionSnapshotId::generate();
         let composition = CompositionSnapshotRecord {
             snapshot_id: composition_id.clone(),
@@ -393,7 +403,8 @@ impl RuntimeService {
                 ProviderMessage::new(MessageRole::System, request.system_policy.clone()),
                 ProviderMessage::new(MessageRole::User, built.packet.content.clone()),
             ],
-        );
+        )
+        .with_tool_schemas(request.tool_schemas.clone());
         self.store
             .persist_context_packet(ContextPacketRecord {
                 packet: built.packet.clone(),
@@ -442,7 +453,15 @@ impl RuntimeService {
             match result {
                 Ok(events) => {
                     let assembled = assemble_stream(&events)?;
-                    let response_hash = ContentHash::from_bytes(assembled.text.as_bytes());
+                    let response_hash = ContentHash::from_canonical_json(
+                        &serde_json::to_value(&assembled).map_err(|_| {
+                            RuntimeError::new(
+                                ErrorCode::InvalidPayload,
+                                "provider response cannot be serialized",
+                            )
+                        })?,
+                    )
+                    .map_err(|error| RuntimeError::new(error.code(), error.to_string()))?;
                     self.store
                         .persist_provider_attempt(ProviderAttemptRecord {
                             attempt_id: harness_types::ProviderAttemptId::generate(),
@@ -456,7 +475,7 @@ impl RuntimeService {
                             error: None,
                         })
                         .await?;
-                    final_response = Some(assembled.text);
+                    final_response = Some(assembled);
                     attempts = attempt_number;
                     break;
                 }
@@ -502,7 +521,20 @@ impl RuntimeService {
                 "request_id".to_owned(),
                 Value::String(provider_request.request_id.to_string()),
             );
-            payload.insert("text".to_owned(), Value::String(response.clone()));
+            payload.insert("text".to_owned(), Value::String(response.text.clone()));
+            payload.insert(
+                "tool_calls".to_owned(),
+                serde_json::to_value(&response.tool_calls).map_err(|_| {
+                    RuntimeError::new(
+                        ErrorCode::InvalidPayload,
+                        "provider tool calls cannot be serialized",
+                    )
+                })?,
+            );
+            payload.insert(
+                "incomplete_tool_calls".to_owned(),
+                Value::Bool(response.incomplete_tool_calls),
+            );
             let _ = session
                 .append_runtime_event(
                     &request.session_id,
@@ -532,8 +564,10 @@ impl RuntimeService {
                 task_id: request.task_id,
                 request_id: provider_request.request_id,
                 packet_id: built.packet.packet_id,
-                response,
+                response: response.text,
                 attempts,
+                tool_calls: response.tool_calls,
+                incomplete_tool_calls: response.incomplete_tool_calls,
             })
         } else {
             let error = last_error.unwrap_or_else(|| {

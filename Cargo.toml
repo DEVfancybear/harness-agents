@@ -7,6 +7,7 @@ members = [
     "crates/harness-kernel",
     "crates/harness-providers",
     "crates/harness-runtime",
+    "crates/harness-tools",
 ]
 resolver = "2"
 
@@ -31,9 +32,11 @@ sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-toki
 tempfile = "=3.27.0"
 thiserror = "=2.0.20"
 toml = "=1.1.5"
-tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util"] }
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "process"] }
 tokio-util = { version = "=0.7.16", features = ["rt"] }
 uuid = { version = "=1.26.1", features = ["serde", "v7"] }
+ignore = "=0.4.25"
+process-wrap = { version = "=10.0.0", default-features = false, features = ["tokio1", "job-object", "process-session", "kill-on-drop"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

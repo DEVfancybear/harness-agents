@@ -180,6 +180,16 @@ contract_id!(
     "^tool_execution_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 );
 contract_id!(
+    ToolApprovalId,
+    "tool_approval",
+    "^tool_approval_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+);
+contract_id!(
+    ToolInvocationId,
+    "tool_invocation",
+    "^tool_invocation_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+);
+contract_id!(
     RuntimeCommandId,
     "runtime_command",
     "^runtime_command_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"

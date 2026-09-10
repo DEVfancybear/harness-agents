@@ -1,14 +1,15 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use fs2::FileExt;
 use harness_types::{
     AgentRunId, ArtifactId, CompositionSnapshotId, ContentHash, ContextPacket, ContextPacketId,
-    ErrorCode, EventEnvelope, EventId, HostId, PluginInstanceId, PluginManifest, ProviderAttemptId,
-    RequestId, RuntimeCommandId, SessionId, SnapshotId, TaskId, WorkingState,
+    ErrorCode, EventEnvelope, EventId, HostId, PluginInstanceId, PluginManifest, ProjectId,
+    ProviderAttemptId, RequestId, RuntimeCommandId, SessionId, SnapshotId, TaskId, ToolApprovalId,
+    ToolExecutionId, WorkingState,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -20,10 +21,13 @@ use sqlx::{
 use crate::{
     AdmissionAck, AdmissionCommit, AgentStateRecord, CompositionSnapshotRecord,
     ContextCheckpointRecord, ContextPacketRecord, ContinuationLinkRecord, FrozenRequestRecord,
-    HostFence, PersistedPluginManifest, ProviderAttemptRecord, PublishedArtifact,
-    RUNTIME_SCHEMA_VERSION, ReceiptAck, ReceiptCommit, RuntimeCommandRecord, RuntimeCommandState,
-    STORE_SCHEMA_VERSION, SessionSummary, SnapshotRecord, SourceWorkMarker, StoreDiagnostics,
-    StoreError, StoreFaultPlan, StoreFaultPoint, StorePaths, WriterOpenOptions,
+    HostFence, PersistedPluginManifest, ProjectRegistrationRecord, ProviderAttemptRecord,
+    PublishedArtifact, RUNTIME_SCHEMA_VERSION, ReceiptAck, ReceiptCommit, RuntimeCommandRecord,
+    RuntimeCommandState, STORE_SCHEMA_VERSION, SessionSummary, SnapshotRecord, SourceWorkMarker,
+    StoreDiagnostics, StoreError, StoreFaultPlan, StoreFaultPoint, StorePaths,
+    TOOLS_SCHEMA_VERSION, ToolApprovalBinding, ToolApprovalRecord, ToolApprovalState,
+    ToolIntentCommit, ToolIntentRecord, ToolIntentStatus, ToolSettlementCommit,
+    ToolTaskUpdateCommit, WriterOpenOptions,
 };
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -185,6 +189,10 @@ impl SqliteStore {
             return Err(error);
         }
         if let Err(error) = ensure_runtime_schema(&pool).await {
+            let _ = FileExt::unlock(&lock_file);
+            return Err(error);
+        }
+        if let Err(error) = ensure_tools_schema(&pool).await {
             let _ = FileExt::unlock(&lock_file);
             return Err(error);
         }
@@ -619,6 +627,648 @@ impl SqliteStore {
             sequence,
             idempotent_replay: false,
         })
+    }
+
+    /// Persist an immutable, single-use approval before a P3 tool crosses its
+    /// side-effect boundary.
+    pub async fn issue_tool_approval(&self, record: ToolApprovalRecord) -> Result<(), StoreError> {
+        validate_tool_approval(&record)?;
+        let fence = self.fence()?;
+        let mut transaction = self.begin_write(&fence).await?;
+        let inserted = sqlx::query(
+            "INSERT INTO tool_approvals(approval_id, actor_id, binding_hash, action_hash, workspace_root, workspace_fingerprint, policy_revision, tool_revision, expires_at_unix_ms, state, approval_json, consumed_by, revoked_reason)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+             ON CONFLICT(approval_id) DO NOTHING",
+        )
+        .bind(record.approval_id.as_str())
+        .bind(&record.actor_id)
+        .bind(record.binding_hash.as_str())
+        .bind(record.action_hash.as_str())
+        .bind(&record.workspace_root)
+        .bind(record.workspace_fingerprint.as_str())
+        .bind(to_i64(record.policy_revision, "tool approval policy revision")?)
+        .bind(to_i64(record.tool_revision, "tool approval revision")?)
+        .bind(record.expires_at_unix_ms.map(|value| to_i64(value, "tool approval expiry")).transpose()?)
+        .bind(record.state.as_str())
+        .bind(to_json(&record.approval_json, "serialize tool approval")?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "insert tool approval", error))?;
+        if inserted.rows_affected() == 0 {
+            let existing = sqlx::query(
+                "SELECT binding_hash, approval_json FROM tool_approvals WHERE approval_id = ?",
+            )
+            .bind(record.approval_id.as_str())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::StorageWriteFailed,
+                    "read tool approval idempotency",
+                    error,
+                )
+            })?;
+            let binding: String = row_get(&existing, "binding_hash")?;
+            let approval_json: String = row_get(&existing, "approval_json")?;
+            if binding != record.binding_hash.as_str()
+                || approval_json != to_json(&record.approval_json, "serialize tool approval")?
+            {
+                return Err(StoreError::new(
+                    ErrorCode::IdempotencyConflict,
+                    "tool approval ID is already bound to different authority",
+                ));
+            }
+        }
+        transaction.commit().await.map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "commit tool approval", error)
+        })
+    }
+
+    /// Revoke an unused approval. A consumed approval remains immutable.
+    pub async fn revoke_tool_approval(
+        &self,
+        approval_id: &ToolApprovalId,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        if reason.trim().is_empty() {
+            return Err(StoreError::new(
+                ErrorCode::InvalidPayload,
+                "tool approval revocation reason must not be empty",
+            ));
+        }
+        let fence = self.fence()?;
+        let mut transaction = self.begin_write(&fence).await?;
+        let result = sqlx::query(
+            "UPDATE tool_approvals SET state = 'revoked', revoked_reason = ?
+             WHERE approval_id = ? AND state = 'active'",
+        )
+        .bind(reason)
+        .bind(approval_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "revoke tool approval", error)
+        })?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::new(
+                ErrorCode::ApprovalRevoked,
+                "tool approval is absent, consumed, or already revoked",
+            ));
+        }
+        transaction.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit tool approval revocation",
+                error,
+            )
+        })
+    }
+
+    /// Read one durable approval for restart diagnostics.
+    pub async fn tool_approval(
+        &self,
+        approval_id: &ToolApprovalId,
+    ) -> Result<Option<ToolApprovalRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT approval_id, actor_id, binding_hash, action_hash, workspace_root, workspace_fingerprint, policy_revision, tool_revision, expires_at_unix_ms, state, approval_json
+             FROM tool_approvals WHERE approval_id = ?",
+        )
+        .bind(approval_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read tool approval", error))?;
+        row.map(|row| tool_approval_from_row(&row)).transpose()
+    }
+
+    /// Register one canonical workspace root. The same project may have
+    /// linked worktrees only when they share the same Git common directory.
+    pub async fn register_project(
+        &self,
+        record: ProjectRegistrationRecord,
+    ) -> Result<(), StoreError> {
+        validate_project_registration(&record)?;
+        let fence = self.fence()?;
+        let mut transaction = self.begin_write(&fence).await?;
+        insert_project_registration(&mut transaction, &record).await?;
+        transaction.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit project registration",
+                error,
+            )
+        })
+    }
+
+    /// Explicitly reassociate a moved root. Callers cannot silently turn a
+    /// moved repository into the same project identity.
+    pub async fn reassociate_project(
+        &self,
+        project_id: &ProjectId,
+        old_canonical_root: &str,
+        replacement: ProjectRegistrationRecord,
+    ) -> Result<(), StoreError> {
+        if replacement.project_id != *project_id || old_canonical_root.trim().is_empty() {
+            return Err(StoreError::new(
+                ErrorCode::ProjectIdentityConflict,
+                "project reassociation identity is invalid",
+            ));
+        }
+        validate_project_registration(&replacement)?;
+        let fence = self.fence()?;
+        let mut transaction = self.begin_write(&fence).await?;
+        let removed = sqlx::query(
+            "DELETE FROM project_registrations WHERE project_id = ? AND canonical_root = ?",
+        )
+        .bind(project_id.as_str())
+        .bind(old_canonical_root)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "remove old project root",
+                error,
+            )
+        })?;
+        if removed.rows_affected() != 1 {
+            return Err(StoreError::new(
+                ErrorCode::ProjectIdentityConflict,
+                "old project root is not registered",
+            ));
+        }
+        insert_project_registration(&mut transaction, &replacement).await?;
+        transaction.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit project reassociation",
+                error,
+            )
+        })
+    }
+
+    /// Consume a bound approval and record the pre-side-effect intent in the
+    /// same durable transaction.
+    #[allow(clippy::too_many_lines)]
+    pub async fn commit_tool_intent(&self, commit: ToolIntentCommit) -> Result<(), StoreError> {
+        validate_tool_intent_commit(&commit)?;
+        let fence = self.fence()?;
+        let mut transaction = self.begin_write(&fence).await?;
+        let existing =
+            sqlx::query("SELECT tool_execution_id FROM tool_intents WHERE tool_execution_id = ?")
+                .bind(commit.intent.tool_execution_id.as_str())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    database_error(ErrorCode::StorageWriteFailed, "read tool intent", error)
+                })?;
+        if existing.is_some() {
+            return Err(StoreError::new(
+                ErrorCode::ToolIntentConflict,
+                "tool execution already has a durable intent; reconcile instead of rerunning",
+            ));
+        }
+        ensure_session_existing(
+            &mut transaction,
+            &commit.intent.session_id,
+            &commit.intent.task_id,
+        )
+        .await?;
+        claim_task(
+            &mut transaction,
+            &commit.intent.task_id,
+            &commit.intent.session_id,
+            &fence,
+        )
+        .await?;
+        ensure_expected_sequence(
+            &mut transaction,
+            &commit.intent.session_id,
+            commit.expected_sequence,
+        )
+        .await?;
+        consume_tool_approval(
+            &mut transaction,
+            &commit.intent.approval,
+            &commit.intent.tool_execution_id,
+        )
+        .await?;
+        let event_json = to_json(&commit.event, "serialize tool intent event")?;
+        let state_json = to_json(&commit.working_state, "serialize tool intent state")?;
+        let marker_json = to_json(&commit.marker, "serialize tool intent marker")?;
+        sqlx::query(
+            "INSERT INTO events(session_id, sequence, event_id, event_json, continuity_critical)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(commit.intent.session_id.as_str())
+        .bind(to_i64(commit.event.seq, "tool intent sequence")?)
+        .bind(commit.event.event_id.as_str())
+        .bind(event_json)
+        .bind(i64::from(u8::from(commit.event.continuity_critical)))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "insert tool intent event",
+                error,
+            )
+        })?;
+        sqlx::query(
+            "INSERT INTO tool_intents(tool_execution_id, session_id, task_id, invocation_id, actor_id, tool_name, action_json, action_hash, workspace_root, workspace_fingerprint, before_fingerprint, policy_revision, tool_revision, approval_id, status, intent_sequence, intent_event_id, settlement_receipt_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+        )
+        .bind(commit.intent.tool_execution_id.as_str())
+        .bind(commit.intent.session_id.as_str())
+        .bind(commit.intent.task_id.as_str())
+        .bind(&commit.intent.invocation_id)
+        .bind(&commit.intent.actor_id)
+        .bind(&commit.intent.tool_name)
+        .bind(to_json(&commit.intent.action_json, "serialize tool action")?)
+        .bind(commit.intent.action_hash.as_str())
+        .bind(&commit.intent.workspace_root)
+        .bind(commit.intent.workspace_fingerprint.as_str())
+        .bind(commit.intent.before_fingerprint.as_ref().map(ContentHash::as_str))
+        .bind(to_i64(commit.intent.policy_revision, "tool intent policy revision")?)
+        .bind(to_i64(commit.intent.tool_revision, "tool intent revision")?)
+        .bind(commit.intent.approval.approval_id.as_str())
+        .bind(commit.intent.status.as_str())
+        .bind(to_i64(commit.intent.intent_sequence, "tool intent sequence")?)
+        .bind(commit.event.event_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "insert tool intent", error))?;
+        upsert_projection(
+            &mut transaction,
+            &commit.intent.task_id,
+            &commit.intent.session_id,
+            &commit.working_state,
+            state_json,
+        )
+        .await?;
+        insert_marker(
+            &mut transaction,
+            &commit.intent.session_id,
+            &commit.intent.task_id,
+            &commit.marker,
+            marker_json,
+        )
+        .await?;
+        advance_sequence(
+            &mut transaction,
+            &commit.intent.session_id,
+            commit.expected_sequence,
+        )
+        .await?;
+        self.inject(StoreFaultPoint::BeforeToolIntentCommit)?;
+        transaction.commit().await.map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "commit tool intent", error)
+        })
+    }
+
+    /// Settle a tool intent after its real side effect has completed. A failed
+    /// transaction never turns an external effect into a claimed success.
+    #[allow(clippy::too_many_lines)]
+    pub async fn commit_tool_settlement(
+        &self,
+        commit: ToolSettlementCommit,
+    ) -> Result<ReceiptAck, StoreError> {
+        validate_tool_settlement_commit(&commit)?;
+        if let Some(artifact) = &commit.artifact {
+            self.validate_published_artifact(artifact)?;
+        }
+        let fence = self.fence()?;
+        let mut transaction = self.begin_write(&fence).await?;
+        let receipt_json = to_json(&commit.receipt, "serialize tool settlement receipt")?;
+        let existing_receipt = sqlx::query(
+            "SELECT event_id, sequence, receipt_json FROM receipts WHERE tool_execution_id = ?",
+        )
+        .bind(commit.receipt.tool_execution_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "read tool settlement receipt",
+                error,
+            )
+        })?;
+        if let Some(row) = existing_receipt {
+            let stored: String = row_get(&row, "receipt_json")?;
+            if stored == receipt_json {
+                let event_id =
+                    EventId::parse(row_get::<String>(&row, "event_id")?).map_err(|_| {
+                        StoreError::new(
+                            ErrorCode::StorageWriteFailed,
+                            "stored tool receipt event ID is invalid",
+                        )
+                    })?;
+                let sequence = to_u64(
+                    row_get::<i64>(&row, "sequence")?,
+                    "stored tool receipt sequence",
+                )?;
+                transaction.rollback().await.map_err(|error| {
+                    database_error(
+                        ErrorCode::StorageWriteFailed,
+                        "rollback idempotent tool settlement",
+                        error,
+                    )
+                })?;
+                return Ok(ReceiptAck {
+                    event_id,
+                    sequence,
+                    idempotent_replay: true,
+                });
+            }
+            return Err(StoreError::new(
+                ErrorCode::IdempotencyConflict,
+                "tool execution receipt is immutable",
+            ));
+        }
+        let intent = sqlx::query(
+            "SELECT session_id, task_id, status FROM tool_intents WHERE tool_execution_id = ?",
+        )
+        .bind(commit.receipt.tool_execution_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "read settlement intent",
+                error,
+            )
+        })?
+        .ok_or_else(|| {
+            StoreError::new(
+                ErrorCode::ToolIntentConflict,
+                "tool settlement has no durable intent",
+            )
+        })?;
+        let intent_session: String = row_get(&intent, "session_id")?;
+        let intent_task: String = row_get(&intent, "task_id")?;
+        let intent_status: String = row_get(&intent, "status")?;
+        if intent_session != commit.event.session_id.as_str()
+            || intent_task != commit.receipt.task_id.as_str()
+            || ToolIntentStatus::parse(&intent_status) != Some(ToolIntentStatus::Recorded)
+        {
+            return Err(StoreError::new(
+                ErrorCode::ToolIntentConflict,
+                "tool intent is not eligible for settlement",
+            ));
+        }
+        ensure_session_existing(
+            &mut transaction,
+            &commit.event.session_id,
+            &commit.receipt.task_id,
+        )
+        .await?;
+        claim_task(
+            &mut transaction,
+            &commit.receipt.task_id,
+            &commit.event.session_id,
+            &fence,
+        )
+        .await?;
+        ensure_expected_sequence(
+            &mut transaction,
+            &commit.event.session_id,
+            commit.expected_sequence,
+        )
+        .await?;
+        if let Some(artifact) = &commit.artifact {
+            sqlx::query(
+                "INSERT INTO artifacts(artifact_id, content_hash, byte_len, relative_path)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(artifact_id) DO NOTHING",
+            )
+            .bind(artifact.artifact_id.as_str())
+            .bind(artifact.content_hash.as_str())
+            .bind(to_i64(artifact.byte_len, "tool artifact byte length")?)
+            .bind(&artifact.relative_path)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::StorageWriteFailed, "record tool artifact", error)
+            })?;
+            sqlx::query(
+                "INSERT INTO tool_artifact_scopes(artifact_id, project_id, task_id, tool_execution_id)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(artifact.artifact_id.as_str())
+            .bind(commit.working_state.workspace.project_id.as_str())
+            .bind(commit.receipt.task_id.as_str())
+            .bind(commit.receipt.tool_execution_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "scope tool artifact", error))?;
+        }
+        let event_json = to_json(&commit.event, "serialize tool settlement event")?;
+        let state_json = to_json(&commit.working_state, "serialize tool settlement state")?;
+        let marker_json = to_json(&commit.marker, "serialize tool settlement marker")?;
+        sqlx::query(
+            "INSERT INTO events(session_id, sequence, event_id, event_json, continuity_critical)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(commit.event.session_id.as_str())
+        .bind(to_i64(commit.event.seq, "tool settlement sequence")?)
+        .bind(commit.event.event_id.as_str())
+        .bind(event_json)
+        .bind(i64::from(u8::from(commit.event.continuity_critical)))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "insert tool settlement event",
+                error,
+            )
+        })?;
+        sqlx::query(
+            "INSERT INTO receipts(tool_execution_id, session_id, task_id, event_id, sequence, receipt_json, artifact_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(commit.receipt.tool_execution_id.as_str())
+        .bind(commit.event.session_id.as_str())
+        .bind(commit.receipt.task_id.as_str())
+        .bind(commit.event.event_id.as_str())
+        .bind(to_i64(commit.event.seq, "tool settlement receipt sequence")?)
+        .bind(receipt_json)
+        .bind(commit.artifact.as_ref().map(|artifact| artifact.artifact_id.as_str()))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "insert tool settlement receipt", error))?;
+        sqlx::query(
+            "UPDATE tool_intents SET status = ?, settlement_receipt_id = ? WHERE tool_execution_id = ? AND status = 'recorded'",
+        )
+        .bind(commit.final_status.as_str())
+        .bind(commit.receipt.tool_execution_id.as_str())
+        .bind(commit.receipt.tool_execution_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "settle tool intent", error))?;
+        upsert_projection(
+            &mut transaction,
+            &commit.receipt.task_id,
+            &commit.event.session_id,
+            &commit.working_state,
+            state_json,
+        )
+        .await?;
+        insert_marker(
+            &mut transaction,
+            &commit.event.session_id,
+            &commit.receipt.task_id,
+            &commit.marker,
+            marker_json,
+        )
+        .await?;
+        advance_sequence(
+            &mut transaction,
+            &commit.event.session_id,
+            commit.expected_sequence,
+        )
+        .await?;
+        self.inject(StoreFaultPoint::BeforeToolSettlementCommit)?;
+        transaction.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit tool settlement",
+                error,
+            )
+        })?;
+        Ok(ReceiptAck {
+            event_id: commit.event.event_id,
+            sequence: commit.event.seq,
+            idempotent_replay: false,
+        })
+    }
+
+    /// Commit a task projection update under the same approval binding used by
+    /// coding tools, without creating a process execution receipt.
+    pub async fn commit_tool_task_update(
+        &self,
+        commit: ToolTaskUpdateCommit,
+    ) -> Result<(), StoreError> {
+        validate_tool_task_update_commit(&commit)?;
+        let fence = self.fence()?;
+        let mut transaction = self.begin_write(&fence).await?;
+        ensure_session_existing(&mut transaction, &commit.session_id, &commit.task_id).await?;
+        claim_task(
+            &mut transaction,
+            &commit.task_id,
+            &commit.session_id,
+            &fence,
+        )
+        .await?;
+        ensure_expected_sequence(
+            &mut transaction,
+            &commit.session_id,
+            commit.expected_sequence,
+        )
+        .await?;
+        consume_tool_approval_for_task_update(&mut transaction, &commit.approval).await?;
+        sqlx::query(
+            "INSERT INTO events(session_id, sequence, event_id, event_json, continuity_critical)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(commit.session_id.as_str())
+        .bind(to_i64(commit.event.seq, "tool task update sequence")?)
+        .bind(commit.event.event_id.as_str())
+        .bind(to_json(&commit.event, "serialize tool task update event")?)
+        .bind(i64::from(u8::from(commit.event.continuity_critical)))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "insert tool task update",
+                error,
+            )
+        })?;
+        upsert_projection(
+            &mut transaction,
+            &commit.task_id,
+            &commit.session_id,
+            &commit.working_state,
+            to_json(&commit.working_state, "serialize tool task update state")?,
+        )
+        .await?;
+        insert_marker(
+            &mut transaction,
+            &commit.session_id,
+            &commit.task_id,
+            &commit.marker,
+            to_json(&commit.marker, "serialize tool task update marker")?,
+        )
+        .await?;
+        advance_sequence(
+            &mut transaction,
+            &commit.session_id,
+            commit.expected_sequence,
+        )
+        .await?;
+        transaction.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit tool task update",
+                error,
+            )
+        })
+    }
+
+    /// Pending durable intents are the restart handoff for work that cannot be
+    /// assumed safe to repeat.
+    pub async fn pending_tool_intents(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ToolIntentRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT tool_execution_id, session_id, task_id, invocation_id, actor_id, tool_name, action_json, action_hash, workspace_root, workspace_fingerprint, before_fingerprint, policy_revision, tool_revision, approval_id, status, intent_sequence
+             FROM tool_intents WHERE session_id = ? AND status = 'recorded' ORDER BY intent_sequence",
+        )
+        .bind(session_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list pending tool intents", error))?;
+        rows.into_iter()
+            .map(|row| tool_intent_from_row(&row))
+            .collect()
+    }
+
+    /// Lookup a tool intent for reconciliation after a restart or storage
+    /// fault. It exposes no side effect.
+    pub async fn tool_intent(
+        &self,
+        tool_execution_id: &ToolExecutionId,
+    ) -> Result<Option<ToolIntentRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT tool_execution_id, session_id, task_id, invocation_id, actor_id, tool_name, action_json, action_hash, workspace_root, workspace_fingerprint, before_fingerprint, policy_revision, tool_revision, approval_id, status, intent_sequence
+             FROM tool_intents WHERE tool_execution_id = ?",
+        )
+        .bind(tool_execution_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read tool intent", error))?;
+        row.map(|row| tool_intent_from_row(&row)).transpose()
+    }
+
+    /// Artifact reads must be authorized by both project and task scope rather
+    /// than by an artifact ID supplied by an untrusted caller.
+    pub async fn artifact_is_scoped_to(
+        &self,
+        artifact_id: &ArtifactId,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+    ) -> Result<bool, StoreError> {
+        let found = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM tool_artifact_scopes WHERE artifact_id = ? AND project_id = ? AND task_id = ?",
+        )
+        .bind(artifact_id.as_str())
+        .bind(project_id.as_str())
+        .bind(task_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read tool artifact scope", error))?;
+        Ok(found == 1)
     }
 
     /// Persist a validated snapshot after all covered journal records exist.
@@ -1872,6 +2522,59 @@ async fn ensure_runtime_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     })
 }
 
+async fn ensure_tools_schema(pool: &SqlitePool) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await.map_err(|error| {
+        database_error(ErrorCode::MigrationFailed, "begin tools migration", error)
+    })?;
+    let statements = [
+        "CREATE TABLE IF NOT EXISTS tools_schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS tool_approvals (approval_id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, binding_hash TEXT NOT NULL, action_hash TEXT NOT NULL, workspace_root TEXT NOT NULL, workspace_fingerprint TEXT NOT NULL, policy_revision INTEGER NOT NULL, tool_revision INTEGER NOT NULL, expires_at_unix_ms INTEGER, state TEXT NOT NULL, approval_json TEXT NOT NULL, consumed_by TEXT, revoked_reason TEXT)",
+        "CREATE TABLE IF NOT EXISTS tool_intents (tool_execution_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(session_id), task_id TEXT NOT NULL, invocation_id TEXT NOT NULL, actor_id TEXT NOT NULL, tool_name TEXT NOT NULL, action_json TEXT NOT NULL, action_hash TEXT NOT NULL, workspace_root TEXT NOT NULL, workspace_fingerprint TEXT NOT NULL, before_fingerprint TEXT, policy_revision INTEGER NOT NULL, tool_revision INTEGER NOT NULL, approval_id TEXT NOT NULL REFERENCES tool_approvals(approval_id), status TEXT NOT NULL, intent_sequence INTEGER NOT NULL, intent_event_id TEXT NOT NULL REFERENCES events(event_id), settlement_receipt_id TEXT)",
+        "CREATE INDEX IF NOT EXISTS tool_intents_by_session_status ON tool_intents(session_id, status, intent_sequence)",
+        "CREATE TABLE IF NOT EXISTS project_registrations (project_id TEXT NOT NULL, canonical_root TEXT NOT NULL UNIQUE, git_common_dir TEXT, identity_hash TEXT NOT NULL, PRIMARY KEY(project_id, canonical_root))",
+        "CREATE INDEX IF NOT EXISTS project_registrations_by_project ON project_registrations(project_id)",
+        "CREATE TABLE IF NOT EXISTS tool_artifact_scopes (artifact_id TEXT PRIMARY KEY REFERENCES artifacts(artifact_id), project_id TEXT NOT NULL, task_id TEXT NOT NULL, tool_execution_id TEXT NOT NULL UNIQUE REFERENCES tool_intents(tool_execution_id))",
+    ];
+    for statement in statements {
+        sqlx::query(statement)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::MigrationFailed, "apply tools schema", error)
+            })?;
+    }
+    let current =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM tools_schema_migrations")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::MigrationFailed,
+                    "read tools schema version",
+                    error,
+                )
+            })?
+            .unwrap_or(0);
+    if current > TOOLS_SCHEMA_VERSION {
+        return Err(StoreError::new(
+            ErrorCode::MigrationFailed,
+            "tools schema is newer than this host supports",
+        ));
+    }
+    if current < TOOLS_SCHEMA_VERSION {
+        sqlx::query("INSERT INTO tools_schema_migrations(version) VALUES (?)")
+            .bind(TOOLS_SCHEMA_VERSION)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::MigrationFailed, "record tools schema", error)
+            })?;
+    }
+    tx.commit().await.map_err(|error| {
+        database_error(ErrorCode::MigrationFailed, "commit tools migration", error)
+    })
+}
+
 async fn acquire_fence(pool: &SqlitePool, host_id: HostId) -> Result<HostFence, StoreError> {
     let mut transaction = pool.begin().await.map_err(|error| {
         database_error(
@@ -2206,6 +2909,384 @@ async fn insert_marker(
     Ok(())
 }
 
+fn validate_tool_approval(record: &ToolApprovalRecord) -> Result<(), StoreError> {
+    if record.state != ToolApprovalState::Active
+        || record.actor_id.trim().is_empty()
+        || record.workspace_root.trim().is_empty()
+        || record.policy_revision == 0
+        || record.tool_revision == 0
+    {
+        return Err(StoreError::new(
+            ErrorCode::InvalidPayload,
+            "tool approval has an invalid immutable binding",
+        ));
+    }
+    let expected = ContentHash::from_canonical_json(&record.approval_json).map_err(|error| {
+        StoreError::new(
+            error.code(),
+            format!("tool approval binding is not canonical: {error}"),
+        )
+    })?;
+    if expected != record.binding_hash {
+        return Err(StoreError::new(
+            ErrorCode::InvalidHash,
+            "tool approval binding hash does not match canonical approval JSON",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tool_intent_commit(commit: &ToolIntentCommit) -> Result<(), StoreError> {
+    commit.event.validate().map_err(|error| {
+        StoreError::new(
+            error.code(),
+            format!("tool intent event is invalid: {error}"),
+        )
+    })?;
+    commit.working_state.validate().map_err(|error| {
+        StoreError::new(
+            error.code(),
+            format!("tool intent state is invalid: {error}"),
+        )
+    })?;
+    let intent = &commit.intent;
+    if intent.status != ToolIntentStatus::Recorded
+        || intent.invocation_id.trim().is_empty()
+        || intent.actor_id.trim().is_empty()
+        || intent.tool_name.trim().is_empty()
+        || intent.workspace_root.trim().is_empty()
+        || intent.policy_revision == 0
+        || intent.tool_revision == 0
+        || intent.intent_sequence != commit.expected_sequence
+        || intent.approval.actor_id != intent.actor_id
+        || intent.approval.action_hash != intent.action_hash
+        || intent.approval.workspace_root != intent.workspace_root
+        || intent.approval.workspace_fingerprint != intent.workspace_fingerprint
+        || intent.approval.policy_revision != intent.policy_revision
+        || intent.approval.tool_revision != intent.tool_revision
+    {
+        return Err(StoreError::new(
+            ErrorCode::InvalidPayload,
+            "tool intent binding is inconsistent",
+        ));
+    }
+    let action_hash = ContentHash::from_canonical_json(&intent.action_json).map_err(|error| {
+        StoreError::new(
+            error.code(),
+            format!("tool intent action is not canonical: {error}"),
+        )
+    })?;
+    if action_hash != intent.action_hash
+        || commit.event.session_id != intent.session_id
+        || commit.event.seq != commit.expected_sequence
+        || commit.working_state.session_id != intent.session_id
+        || commit.working_state.task_id != intent.task_id
+        || commit.working_state.through_event_seq != commit.expected_sequence
+        || commit.marker.event_id != commit.event.event_id
+        || commit.marker.sequence != commit.expected_sequence
+    {
+        return Err(StoreError::new(
+            ErrorCode::InvalidPayload,
+            "tool intent records do not describe one consistent event",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tool_settlement_commit(commit: &ToolSettlementCommit) -> Result<(), StoreError> {
+    commit.event.validate().map_err(|error| {
+        StoreError::new(
+            error.code(),
+            format!("tool settlement event is invalid: {error}"),
+        )
+    })?;
+    commit.receipt.validate().map_err(|error| {
+        StoreError::new(
+            error.code(),
+            format!("tool settlement receipt is invalid: {error}"),
+        )
+    })?;
+    commit.working_state.validate().map_err(|error| {
+        StoreError::new(
+            error.code(),
+            format!("tool settlement state is invalid: {error}"),
+        )
+    })?;
+    if !matches!(
+        commit.final_status,
+        ToolIntentStatus::Settled | ToolIntentStatus::OutcomeUnknown
+    ) || commit.event.seq != commit.expected_sequence
+        || commit.receipt.observed_at_seq != commit.expected_sequence
+        || commit.event.session_id != commit.working_state.session_id
+        || commit.receipt.task_id != commit.working_state.task_id
+        || commit.working_state.through_event_seq != commit.expected_sequence
+        || commit.marker.event_id != commit.event.event_id
+        || commit.marker.sequence != commit.expected_sequence
+    {
+        return Err(StoreError::new(
+            ErrorCode::InvalidPayload,
+            "tool settlement records do not describe one consistent event",
+        ));
+    }
+    match (&commit.receipt.artifact_id, &commit.artifact) {
+        (None, None) => {}
+        (Some(receipt_artifact), Some(published)) if receipt_artifact == &published.artifact_id => {
+        }
+        _ => {
+            return Err(StoreError::new(
+                ErrorCode::ArtifactWriteFailed,
+                "tool settlement artifact binding is inconsistent",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_tool_task_update_commit(commit: &ToolTaskUpdateCommit) -> Result<(), StoreError> {
+    commit.event.validate().map_err(|error| {
+        StoreError::new(
+            error.code(),
+            format!("tool task update event is invalid: {error}"),
+        )
+    })?;
+    commit.working_state.validate().map_err(|error| {
+        StoreError::new(
+            error.code(),
+            format!("tool task update state is invalid: {error}"),
+        )
+    })?;
+    if commit.approval.actor_id.trim().is_empty()
+        || commit.approval.workspace_root.trim().is_empty()
+        || commit.approval.policy_revision == 0
+        || commit.approval.tool_revision == 0
+        || commit.event.session_id != commit.session_id
+        || commit.event.seq != commit.expected_sequence
+        || commit.working_state.session_id != commit.session_id
+        || commit.working_state.task_id != commit.task_id
+        || commit.working_state.through_event_seq != commit.expected_sequence
+        || commit.marker.event_id != commit.event.event_id
+        || commit.marker.sequence != commit.expected_sequence
+    {
+        return Err(StoreError::new(
+            ErrorCode::InvalidPayload,
+            "tool task update records do not describe one consistent event",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_project_registration(record: &ProjectRegistrationRecord) -> Result<(), StoreError> {
+    if record.canonical_root.trim().is_empty() {
+        return Err(StoreError::new(
+            ErrorCode::ProjectIdentityConflict,
+            "project canonical root must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+async fn insert_project_registration(
+    transaction: &mut Transaction<'_, Sqlite>,
+    record: &ProjectRegistrationRecord,
+) -> Result<(), StoreError> {
+    let root_owner = sqlx::query(
+        "SELECT project_id, git_common_dir, identity_hash FROM project_registrations WHERE canonical_root = ?",
+    )
+    .bind(&record.canonical_root)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read registered project root", error))?;
+    if let Some(row) = root_owner {
+        let project: String = row_get(&row, "project_id")?;
+        let git_common_dir: Option<String> = row.try_get("git_common_dir").map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "stored Git common directory is invalid",
+            )
+        })?;
+        let identity_hash: String = row_get(&row, "identity_hash")?;
+        if project == record.project_id.as_str()
+            && git_common_dir == record.git_common_dir
+            && identity_hash == record.identity_hash.as_str()
+        {
+            return Ok(());
+        }
+        return Err(StoreError::new(
+            ErrorCode::ProjectIdentityConflict,
+            "canonical workspace root is already bound to a different project identity",
+        ));
+    }
+    let prior =
+        sqlx::query("SELECT git_common_dir FROM project_registrations WHERE project_id = ?")
+            .bind(record.project_id.as_str())
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::StorageWriteFailed,
+                    "read registered project identity",
+                    error,
+                )
+            })?;
+    for row in prior {
+        let prior_common_dir: Option<String> = row.try_get("git_common_dir").map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "stored Git common directory is invalid",
+            )
+        })?;
+        if prior_common_dir.is_none()
+            || record.git_common_dir.is_none()
+            || prior_common_dir != record.git_common_dir
+        {
+            return Err(StoreError::new(
+                ErrorCode::ProjectIdentityConflict,
+                "a moved or unrelated root requires explicit reassociation",
+            ));
+        }
+    }
+    sqlx::query(
+        "INSERT INTO project_registrations(project_id, canonical_root, git_common_dir, identity_hash)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(record.project_id.as_str())
+    .bind(&record.canonical_root)
+    .bind(record.git_common_dir.as_deref())
+    .bind(record.identity_hash.as_str())
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "insert project registration", error))?;
+    Ok(())
+}
+
+async fn consume_tool_approval(
+    transaction: &mut Transaction<'_, Sqlite>,
+    binding: &ToolApprovalBinding,
+    tool_execution_id: &ToolExecutionId,
+) -> Result<(), StoreError> {
+    consume_tool_approval_inner(transaction, binding, tool_execution_id.as_str()).await
+}
+
+async fn consume_tool_approval_for_task_update(
+    transaction: &mut Transaction<'_, Sqlite>,
+    binding: &ToolApprovalBinding,
+) -> Result<(), StoreError> {
+    consume_tool_approval_inner(transaction, binding, "task_update").await
+}
+
+async fn consume_tool_approval_inner(
+    transaction: &mut Transaction<'_, Sqlite>,
+    binding: &ToolApprovalBinding,
+    consumed_by: &str,
+) -> Result<(), StoreError> {
+    let row = sqlx::query(
+        "SELECT actor_id, action_hash, workspace_root, workspace_fingerprint, policy_revision, tool_revision, expires_at_unix_ms, state
+         FROM tool_approvals WHERE approval_id = ?",
+    )
+    .bind(binding.approval_id.as_str())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read tool approval for consumption", error))?
+    .ok_or_else(|| StoreError::new(ErrorCode::ApprovalRequired, "tool action has no durable approval"))?;
+    let state = ToolApprovalState::parse(&row_get::<String>(&row, "state")?).ok_or_else(|| {
+        StoreError::new(
+            ErrorCode::StorageWriteFailed,
+            "stored tool approval state is invalid",
+        )
+    })?;
+    match state {
+        ToolApprovalState::Active => {}
+        ToolApprovalState::Consumed => {
+            return Err(StoreError::new(
+                ErrorCode::ApprovalConsumed,
+                "tool approval has already been consumed",
+            ));
+        }
+        ToolApprovalState::Revoked => {
+            return Err(StoreError::new(
+                ErrorCode::ApprovalRevoked,
+                "tool approval has been revoked",
+            ));
+        }
+    }
+    let expires_at: Option<i64> = row.try_get("expires_at_unix_ms").map_err(|_| {
+        StoreError::new(
+            ErrorCode::StorageWriteFailed,
+            "stored tool approval expiry is invalid",
+        )
+    })?;
+    if let Some(expires_at) = expires_at {
+        let expires_at = to_u64(expires_at, "tool approval expiry")?;
+        if current_unix_ms()? > expires_at {
+            return Err(StoreError::new(
+                ErrorCode::ApprovalStale,
+                "tool approval has expired",
+            ));
+        }
+    }
+    let actor_id: String = row_get(&row, "actor_id")?;
+    let action_hash: String = row_get(&row, "action_hash")?;
+    let workspace_root: String = row_get(&row, "workspace_root")?;
+    let workspace_fingerprint: String = row_get(&row, "workspace_fingerprint")?;
+    let policy_revision = to_u64(
+        row_get::<i64>(&row, "policy_revision")?,
+        "tool approval policy revision",
+    )?;
+    let tool_revision = to_u64(
+        row_get::<i64>(&row, "tool_revision")?,
+        "tool approval revision",
+    )?;
+    if actor_id != binding.actor_id
+        || action_hash != binding.action_hash.as_str()
+        || workspace_root != binding.workspace_root
+        || workspace_fingerprint != binding.workspace_fingerprint.as_str()
+        || policy_revision != binding.policy_revision
+        || tool_revision != binding.tool_revision
+    {
+        return Err(StoreError::new(
+            ErrorCode::ApprovalStale,
+            "tool approval binding no longer matches the final action",
+        ));
+    }
+    let updated = sqlx::query(
+        "UPDATE tool_approvals SET state = 'consumed', consumed_by = ?
+         WHERE approval_id = ? AND state = 'active'",
+    )
+    .bind(consumed_by)
+    .bind(binding.approval_id.as_str())
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| {
+        database_error(
+            ErrorCode::StorageWriteFailed,
+            "consume tool approval",
+            error,
+        )
+    })?;
+    if updated.rows_affected() != 1 {
+        return Err(StoreError::new(
+            ErrorCode::ApprovalConsumed,
+            "tool approval was concurrently consumed",
+        ));
+    }
+    Ok(())
+}
+
+fn current_unix_ms() -> Result<u64, StoreError> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+        StoreError::new(
+            ErrorCode::ApprovalStale,
+            "system clock is before Unix epoch",
+        )
+    })?;
+    u64::try_from(duration.as_millis()).map_err(|_| {
+        StoreError::new(
+            ErrorCode::ApprovalStale,
+            "system clock milliseconds exceed range",
+        )
+    })
+}
+
 fn validate_admission(commit: &AdmissionCommit) -> Result<(), StoreError> {
     if commit.raw_text.trim().is_empty() {
         return Err(StoreError::new(
@@ -2358,6 +3439,202 @@ fn parse_session(value: String) -> Result<SessionId, StoreError> {
 fn parse_task(value: String) -> Result<TaskId, StoreError> {
     TaskId::parse(value)
         .map_err(|_| StoreError::new(ErrorCode::StorageWriteFailed, "stored task ID is invalid"))
+}
+
+fn tool_approval_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ToolApprovalRecord, StoreError> {
+    let state = ToolApprovalState::parse(&row_get::<String>(row, "state")?).ok_or_else(|| {
+        StoreError::new(
+            ErrorCode::StorageWriteFailed,
+            "stored tool approval state is invalid",
+        )
+    })?;
+    let expires_at_unix_ms = row
+        .try_get::<Option<i64>, _>("expires_at_unix_ms")
+        .map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "stored tool approval expiry is invalid",
+            )
+        })?
+        .map(|value| to_u64(value, "tool approval expiry"))
+        .transpose()?;
+    let approval_json: Value = serde_json::from_str(&row_get::<String>(row, "approval_json")?)
+        .map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "stored tool approval JSON is invalid",
+            )
+        })?;
+    let record = ToolApprovalRecord {
+        approval_id: ToolApprovalId::parse(row_get::<String>(row, "approval_id")?).map_err(
+            |_| {
+                StoreError::new(
+                    ErrorCode::StorageWriteFailed,
+                    "stored tool approval ID is invalid",
+                )
+            },
+        )?,
+        actor_id: row_get(row, "actor_id")?,
+        binding_hash: ContentHash::parse(row_get::<String>(row, "binding_hash")?).map_err(
+            |_| {
+                StoreError::new(
+                    ErrorCode::StorageWriteFailed,
+                    "stored tool approval binding hash is invalid",
+                )
+            },
+        )?,
+        action_hash: ContentHash::parse(row_get::<String>(row, "action_hash")?).map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "stored tool approval action hash is invalid",
+            )
+        })?,
+        workspace_root: row_get(row, "workspace_root")?,
+        workspace_fingerprint: ContentHash::parse(row_get::<String>(row, "workspace_fingerprint")?)
+            .map_err(|_| {
+                StoreError::new(
+                    ErrorCode::StorageWriteFailed,
+                    "stored tool approval workspace fingerprint is invalid",
+                )
+            })?,
+        policy_revision: to_u64(
+            row_get::<i64>(row, "policy_revision")?,
+            "tool approval policy revision",
+        )?,
+        tool_revision: to_u64(
+            row_get::<i64>(row, "tool_revision")?,
+            "tool approval revision",
+        )?,
+        expires_at_unix_ms,
+        state,
+        approval_json,
+    };
+    validate_tool_approval_loaded(&record)?;
+    Ok(record)
+}
+
+fn validate_tool_approval_loaded(record: &ToolApprovalRecord) -> Result<(), StoreError> {
+    if record.actor_id.trim().is_empty()
+        || record.workspace_root.trim().is_empty()
+        || record.policy_revision == 0
+        || record.tool_revision == 0
+    {
+        return Err(StoreError::new(
+            ErrorCode::StorageWriteFailed,
+            "stored tool approval is incomplete",
+        ));
+    }
+    let expected = ContentHash::from_canonical_json(&record.approval_json).map_err(|error| {
+        StoreError::new(
+            error.code(),
+            format!("stored tool approval JSON is not canonical: {error}"),
+        )
+    })?;
+    if expected != record.binding_hash {
+        return Err(StoreError::new(
+            ErrorCode::StorageWriteFailed,
+            "stored tool approval binding hash does not match",
+        ));
+    }
+    Ok(())
+}
+
+fn tool_intent_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ToolIntentRecord, StoreError> {
+    let action_json: Value = serde_json::from_str(&row_get::<String>(row, "action_json")?)
+        .map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "stored tool action JSON is invalid",
+            )
+        })?;
+    let action_hash = ContentHash::parse(row_get::<String>(row, "action_hash")?).map_err(|_| {
+        StoreError::new(
+            ErrorCode::StorageWriteFailed,
+            "stored tool action hash is invalid",
+        )
+    })?;
+    validate_hashed_json(&action_json, &action_hash)?;
+    let status = ToolIntentStatus::parse(&row_get::<String>(row, "status")?).ok_or_else(|| {
+        StoreError::new(
+            ErrorCode::StorageWriteFailed,
+            "stored tool intent status is invalid",
+        )
+    })?;
+    let actor_id: String = row_get(row, "actor_id")?;
+    let workspace_root: String = row_get(row, "workspace_root")?;
+    let workspace_fingerprint =
+        ContentHash::parse(row_get::<String>(row, "workspace_fingerprint")?).map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "stored tool workspace fingerprint is invalid",
+            )
+        })?;
+    let policy_revision = to_u64(
+        row_get::<i64>(row, "policy_revision")?,
+        "stored tool policy revision",
+    )?;
+    let tool_revision = to_u64(
+        row_get::<i64>(row, "tool_revision")?,
+        "stored tool revision",
+    )?;
+    let approval_id =
+        ToolApprovalId::parse(row_get::<String>(row, "approval_id")?).map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "stored tool approval ID is invalid",
+            )
+        })?;
+    Ok(ToolIntentRecord {
+        tool_execution_id: ToolExecutionId::parse(row_get::<String>(row, "tool_execution_id")?)
+            .map_err(|_| {
+                StoreError::new(
+                    ErrorCode::StorageWriteFailed,
+                    "stored tool execution ID is invalid",
+                )
+            })?,
+        session_id: parse_session(row_get(row, "session_id")?)?,
+        task_id: parse_task(row_get(row, "task_id")?)?,
+        invocation_id: row_get(row, "invocation_id")?,
+        actor_id: actor_id.clone(),
+        tool_name: row_get(row, "tool_name")?,
+        action_json,
+        action_hash: action_hash.clone(),
+        workspace_root: workspace_root.clone(),
+        workspace_fingerprint: workspace_fingerprint.clone(),
+        before_fingerprint: row
+            .try_get::<Option<String>, _>("before_fingerprint")
+            .map_err(|_| {
+                StoreError::new(
+                    ErrorCode::StorageWriteFailed,
+                    "stored before fingerprint is invalid",
+                )
+            })?
+            .map(|value| {
+                ContentHash::parse(value).map_err(|_| {
+                    StoreError::new(
+                        ErrorCode::StorageWriteFailed,
+                        "stored before fingerprint hash is invalid",
+                    )
+                })
+            })
+            .transpose()?,
+        policy_revision,
+        tool_revision,
+        approval: ToolApprovalBinding {
+            approval_id,
+            actor_id,
+            action_hash,
+            workspace_root,
+            workspace_fingerprint,
+            policy_revision,
+            tool_revision,
+        },
+        status,
+        intent_sequence: to_u64(
+            row_get::<i64>(row, "intent_sequence")?,
+            "tool intent sequence",
+        )?,
+    })
 }
 
 fn runtime_command_from_row(

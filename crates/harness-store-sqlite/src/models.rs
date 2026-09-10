@@ -6,9 +6,9 @@ use std::{
 
 use harness_types::{
     AgentRunId, ArtifactId, CompositionSnapshotId, ContentHash, ContextPacket, ContextPacketId,
-    EventEnvelope, EventId, HostId, InputId, InstructionLedgerEntry, PluginManifest,
-    ProviderAttemptId, RequestId, RuntimeCommandId, SessionId, SnapshotId, TaskId,
-    ToolExecutionReceipt, WorkingState,
+    EventEnvelope, EventId, HostId, InputId, InstructionLedgerEntry, PluginManifest, ProjectId,
+    ProviderAttemptId, RequestId, RuntimeCommandId, SessionId, SnapshotId, TaskId, ToolApprovalId,
+    ToolExecutionId, ToolExecutionReceipt, WorkingState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,6 +21,9 @@ pub const WRITER_LOCK_FILE_NAME: &str = "writer.lock";
 /// Additive runtime tables retain the P1 store schema version and have their
 /// own migration marker so older P1 databases remain readable.
 pub const RUNTIME_SCHEMA_VERSION: i64 = 1;
+/// Additive P3 tool tables use their own revision so P0/P1/P2 storage remains
+/// byte-for-byte compatible.
+pub const TOOLS_SCHEMA_VERSION: i64 = 1;
 
 /// All durable paths owned by a local harness data directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +69,8 @@ pub enum StoreFaultPoint {
     BeforeAdmissionCommit,
     BeforeReceiptCommit,
     BeforeSnapshotCommit,
+    BeforeToolIntentCommit,
+    BeforeToolSettlementCommit,
 }
 
 /// A one-shot, deterministic fault injector for component tests.
@@ -187,6 +192,157 @@ pub struct ReceiptAck {
     pub event_id: EventId,
     pub sequence: u64,
     pub idempotent_replay: bool,
+}
+
+/// Lifecycle state of a durable P3 tool approval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolApprovalState {
+    Active,
+    Consumed,
+    Revoked,
+}
+
+impl ToolApprovalState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Consumed => "consumed",
+            Self::Revoked => "revoked",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "consumed" => Some(Self::Consumed),
+            "revoked" => Some(Self::Revoked),
+            _ => None,
+        }
+    }
+}
+
+/// Immutable binding persisted for a single-use P3 approval.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolApprovalRecord {
+    pub approval_id: ToolApprovalId,
+    pub actor_id: String,
+    pub binding_hash: ContentHash,
+    pub action_hash: ContentHash,
+    pub workspace_root: String,
+    pub workspace_fingerprint: ContentHash,
+    pub policy_revision: u64,
+    pub tool_revision: u64,
+    pub expires_at_unix_ms: Option<u64>,
+    pub state: ToolApprovalState,
+    pub approval_json: Value,
+}
+
+/// The durable action binding referenced by an intent or task update.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolApprovalBinding {
+    pub approval_id: ToolApprovalId,
+    pub actor_id: String,
+    pub action_hash: ContentHash,
+    pub workspace_root: String,
+    pub workspace_fingerprint: ContentHash,
+    pub policy_revision: u64,
+    pub tool_revision: u64,
+}
+
+/// State stored for an execution that has crossed the side-effect boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolIntentStatus {
+    Recorded,
+    Settled,
+    OutcomeUnknown,
+}
+
+impl ToolIntentStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::Settled => "settled",
+            Self::OutcomeUnknown => "outcome_unknown",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "recorded" => Some(Self::Recorded),
+            "settled" => Some(Self::Settled),
+            "outcome_unknown" => Some(Self::OutcomeUnknown),
+            _ => None,
+        }
+    }
+}
+
+/// The record committed before a coding-tool side effect begins.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolIntentRecord {
+    pub tool_execution_id: ToolExecutionId,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub invocation_id: String,
+    pub actor_id: String,
+    pub tool_name: String,
+    pub action_json: Value,
+    pub action_hash: ContentHash,
+    pub workspace_root: String,
+    pub workspace_fingerprint: ContentHash,
+    pub before_fingerprint: Option<ContentHash>,
+    pub policy_revision: u64,
+    pub tool_revision: u64,
+    pub approval: ToolApprovalBinding,
+    pub status: ToolIntentStatus,
+    pub intent_sequence: u64,
+}
+
+/// Everything required to durably consume an approval and record an intent.
+#[derive(Clone, Debug)]
+pub struct ToolIntentCommit {
+    pub expected_sequence: u64,
+    pub event: EventEnvelope,
+    pub intent: ToolIntentRecord,
+    pub working_state: WorkingState,
+    pub marker: SourceWorkMarker,
+}
+
+/// Everything required to settle a previously committed P3 intent.
+#[derive(Clone, Debug)]
+pub struct ToolSettlementCommit {
+    pub expected_sequence: u64,
+    pub event: EventEnvelope,
+    pub receipt: ToolExecutionReceipt,
+    pub working_state: WorkingState,
+    pub marker: SourceWorkMarker,
+    pub artifact: Option<PublishedArtifact>,
+    pub final_status: ToolIntentStatus,
+}
+
+/// An atomic task update that consumes a tool approval but never fabricates a
+/// process runner receipt.
+#[derive(Clone, Debug)]
+pub struct ToolTaskUpdateCommit {
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub expected_sequence: u64,
+    pub event: EventEnvelope,
+    pub working_state: WorkingState,
+    pub marker: SourceWorkMarker,
+    pub approval: ToolApprovalBinding,
+}
+
+/// Durable root/Git identity used to prevent accidental project conflation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectRegistrationRecord {
+    pub project_id: ProjectId,
+    pub canonical_root: String,
+    pub git_common_dir: Option<String>,
+    pub identity_hash: ContentHash,
 }
 
 /// A snapshot is stored as canonical JSON with its coverage and checksum.

@@ -10,9 +10,10 @@ use harness_store_sqlite::{
 };
 use harness_types::{
     CheckEvidence, ContentHash, EventEnvelope, EventId, InputId, InstructionId,
-    InstructionLedgerEntry, InstructionStatus, NextActionProposal, P0_SCHEMA_VERSION, PlanItem,
-    ProducerIdentity, SessionId, SnapshotId, SourceAuthority, SourceRef, TaskId,
-    ToolExecutionReceipt, WorkingState, WorkspaceObservation,
+    InstructionLedgerEntry, InstructionStatus, NextActionProposal, P0_SCHEMA_VERSION,
+    PendingToolCall, PendingToolState, PlanItem, ProducerIdentity, SessionId, SnapshotId,
+    SourceAuthority, SourceRef, TaskId, ToolExecutionId, ToolExecutionReceipt, ToolOutcomeState,
+    WorkingState, WorkspaceObservation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -381,6 +382,22 @@ impl SessionService {
             )
         })?;
         let replayed_through_sequence = working_state.through_event_seq;
+        let unknown_receipts = receipts
+            .iter()
+            .filter(|receipt| receipt.outcome_state == ToolOutcomeState::OutcomeUnknown)
+            .count();
+        let pending_execution_count = u64::try_from(
+            working_state
+                .pending_tool_calls
+                .len()
+                .saturating_add(unknown_receipts),
+        )
+        .map_err(|_| {
+            StoreError::new(
+                harness_types::ErrorCode::StorageWriteFailed,
+                "pending execution count exceeds u64",
+            )
+        })?;
         Ok(RecoveryView {
             working_state,
             receipts,
@@ -388,7 +405,7 @@ impl SessionService {
             snapshot_sequence,
             replayed_through_sequence,
             snapshot_diagnostic,
-            pending_execution_count: 0,
+            pending_execution_count,
         })
     }
 
@@ -836,7 +853,62 @@ fn fold_event(
             }
             current.revision = event.seq;
             current.through_event_seq = event.seq;
+            current
+                .pending_tool_calls
+                .retain(|pending| pending.execution_id != receipt.tool_execution_id);
             receipts.push(receipt);
+        }
+        "tool.intent.recorded" => {
+            let current = state.as_mut().ok_or_else(|| {
+                StoreError::new(
+                    harness_types::ErrorCode::InvalidPayload,
+                    "tool intent precedes admitted input",
+                )
+            })?;
+            let execution_id =
+                ToolExecutionId::parse(payload_string(&event.payload, "tool_execution_id")?)
+                    .map_err(|_| {
+                        StoreError::new(
+                            harness_types::ErrorCode::InvalidPayload,
+                            "tool intent execution ID is invalid",
+                        )
+                    })?;
+            let hint = payload_string(&event.payload, "reconciliation_hint")?;
+            if current
+                .pending_tool_calls
+                .iter()
+                .any(|pending| pending.execution_id == execution_id)
+                || receipts
+                    .iter()
+                    .any(|receipt| receipt.tool_execution_id == execution_id)
+            {
+                return Err(StoreError::new(
+                    harness_types::ErrorCode::IdempotencyConflict,
+                    "journal contains a duplicate tool execution ID",
+                ));
+            }
+            current.pending_tool_calls.push(PendingToolCall {
+                execution_id,
+                state: PendingToolState::Pending,
+                reconciliation_hint: hint,
+            });
+            current.revision = event.seq;
+            current.through_event_seq = event.seq;
+        }
+        "task.updated" => {
+            let current = state.as_mut().ok_or_else(|| {
+                StoreError::new(
+                    harness_types::ErrorCode::InvalidPayload,
+                    "task update precedes admitted input",
+                )
+            })?;
+            let note = payload_string(&event.payload, "note")?;
+            current.next_action_proposals.push(NextActionProposal {
+                authority: event.authority,
+                description: note,
+            });
+            current.revision = event.seq;
+            current.through_event_seq = event.seq;
         }
         "decision.updated" => {
             let current = state.as_mut().ok_or_else(|| {
