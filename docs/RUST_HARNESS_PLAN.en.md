@@ -4,6 +4,8 @@ English | [Tiếng Việt](RUST_HARNESS_PLAN.vi.md)
 
 Revision 2 — September 10, 2026. Status: proposed architecture and implementation plan; no runtime has been built or tested. Start with the [review and decisions](ARCHITECTURE_REVIEW.en.md), then the [plugin contract](PLUGIN_ARCHITECTURE.en.md) and [memory contract](MEMORY_AND_CONTINUITY.en.md) for implementation detail.
 
+For coding assignments, use the [phase-by-phase implementation handbook](implementation/README.en.md): P0–P8, 63 ordered work items, acceptance ownership and ready-to-use agent prompts. Runbooks decompose this architecture; they do not claim implementation is complete.
+
 ## 1. Confirmed objective
 
 Build a personal coding agent in Rust, with a CLI first, delegation to multiple agents, and a Web UI later. The highest priority is continuity: after context exhaustion, application shutdown, or reopening a session, the agent must continue the actual work.

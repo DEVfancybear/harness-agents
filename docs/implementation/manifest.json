@@ -1,0 +1,329 @@
+{
+  "schema_version": 1,
+  "status": "planning_only",
+  "architecture_base_commit": "b636208c7d81464525b38e0f32f5e2743c083357",
+  "execution_policy": "sequential_phase_gates; parallel_tasks_only_when_explicitly_assigned",
+  "phases": [
+    {
+      "id": "P0",
+      "en": "P0_FOUNDATION.en.md",
+      "vi": "P0_FOUNDATION.vi.md",
+      "depends_on": [],
+      "person_days": [
+        3,
+        4
+      ],
+      "optional": false,
+      "status": "not_started",
+      "primary_cases": [],
+      "strengthen": [],
+      "steps": [
+        "P0-S01",
+        "P0-S02",
+        "P0-S03",
+        "P0-S04",
+        "P0-S05",
+        "P0-S06",
+        "P0-S07"
+      ]
+    },
+    {
+      "id": "P1",
+      "en": "P1_KERNEL_STORAGE.en.md",
+      "vi": "P1_KERNEL_STORAGE.vi.md",
+      "depends_on": [
+        "P0"
+      ],
+      "person_days": [
+        8,
+        11
+      ],
+      "optional": false,
+      "status": "not_started",
+      "primary_cases": [
+        "C01",
+        "C02",
+        "C15",
+        "C21",
+        "C24",
+        "K01",
+        "K02",
+        "K03",
+        "K04",
+        "K05",
+        "K06",
+        "K07"
+      ],
+      "strengthen": [],
+      "steps": [
+        "P1-S01",
+        "P1-S02",
+        "P1-S03",
+        "P1-S04",
+        "P1-S05",
+        "P1-S06",
+        "P1-S07"
+      ]
+    },
+    {
+      "id": "P2",
+      "en": "P2_RUNTIME_CONTEXT.en.md",
+      "vi": "P2_RUNTIME_CONTEXT.vi.md",
+      "depends_on": [
+        "P1"
+      ],
+      "person_days": [
+        7,
+        10
+      ],
+      "optional": false,
+      "status": "not_started",
+      "primary_cases": [
+        "C04",
+        "C06",
+        "C09",
+        "C14",
+        "C18",
+        "C19",
+        "K10",
+        "K11"
+      ],
+      "strengthen": [
+        "C01",
+        "C02",
+        "C15",
+        "C24",
+        "K02"
+      ],
+      "steps": [
+        "P2-S01",
+        "P2-S02",
+        "P2-S03",
+        "P2-S04",
+        "P2-S05",
+        "P2-S06",
+        "P2-S07"
+      ]
+    },
+    {
+      "id": "P3",
+      "en": "P3_CODING_TOOLS.en.md",
+      "vi": "P3_CODING_TOOLS.vi.md",
+      "depends_on": [
+        "P2"
+      ],
+      "person_days": [
+        7,
+        10
+      ],
+      "optional": false,
+      "status": "not_started",
+      "primary_cases": [
+        "C03",
+        "C10",
+        "C23",
+        "C29",
+        "K08",
+        "K09"
+      ],
+      "strengthen": [
+        "C02",
+        "C21",
+        "K06",
+        "K07"
+      ],
+      "steps": [
+        "P3-S01",
+        "P3-S02",
+        "P3-S03",
+        "P3-S04",
+        "P3-S05",
+        "P3-S06",
+        "P3-S07"
+      ]
+    },
+    {
+      "id": "P4",
+      "en": "P4_MEMORY.en.md",
+      "vi": "P4_MEMORY.vi.md",
+      "depends_on": [
+        "P3"
+      ],
+      "person_days": [
+        7,
+        10
+      ],
+      "optional": false,
+      "status": "not_started",
+      "primary_cases": [
+        "C05",
+        "C07",
+        "C08",
+        "C12",
+        "C13",
+        "C16",
+        "C17",
+        "C20",
+        "C22",
+        "C26",
+        "C30"
+      ],
+      "strengthen": [
+        "C09",
+        "C18",
+        "C19",
+        "C29",
+        "K02",
+        "K10"
+      ],
+      "steps": [
+        "P4-S01",
+        "P4-S02",
+        "P4-S03",
+        "P4-S04",
+        "P4-S05",
+        "P4-S06",
+        "P4-S07"
+      ]
+    },
+    {
+      "id": "P5",
+      "en": "P5_MULTI_AGENT.en.md",
+      "vi": "P5_MULTI_AGENT.vi.md",
+      "depends_on": [
+        "P4"
+      ],
+      "person_days": [
+        8,
+        12
+      ],
+      "optional": false,
+      "status": "not_started",
+      "primary_cases": [
+        "C11",
+        "C25"
+      ],
+      "strengthen": [
+        "C03",
+        "C07",
+        "C08",
+        "C10",
+        "C15",
+        "C23",
+        "C24",
+        "K04",
+        "K06",
+        "K07"
+      ],
+      "steps": [
+        "P5-S01",
+        "P5-S02",
+        "P5-S03",
+        "P5-S04",
+        "P5-S05",
+        "P5-S06",
+        "P5-S07"
+      ]
+    },
+    {
+      "id": "P6",
+      "en": "P6_EXTENSIONS.en.md",
+      "vi": "P6_EXTENSIONS.vi.md",
+      "depends_on": [
+        "P5"
+      ],
+      "person_days": [
+        5,
+        8
+      ],
+      "optional": false,
+      "status": "not_started",
+      "primary_cases": [
+        "K12",
+        "K13",
+        "K14"
+      ],
+      "strengthen": [
+        "C03",
+        "C08",
+        "C14",
+        "C20",
+        "C29",
+        "K01",
+        "K03",
+        "K05",
+        "K08",
+        "K10",
+        "K11"
+      ],
+      "steps": [
+        "P6-S01",
+        "P6-S02",
+        "P6-S03",
+        "P6-S04",
+        "P6-S05",
+        "P6-S06",
+        "P6-S07"
+      ]
+    },
+    {
+      "id": "P7",
+      "en": "P7_RELEASE.en.md",
+      "vi": "P7_RELEASE.vi.md",
+      "depends_on": [
+        "P6"
+      ],
+      "person_days": [
+        8,
+        11
+      ],
+      "optional": false,
+      "status": "not_started",
+      "primary_cases": [
+        "C27",
+        "C28"
+      ],
+      "strengthen": [
+        "ALL_C",
+        "ALL_K"
+      ],
+      "steps": [
+        "P7-S01",
+        "P7-S02",
+        "P7-S03",
+        "P7-S04",
+        "P7-S05",
+        "P7-S06",
+        "P7-S07"
+      ]
+    },
+    {
+      "id": "P8",
+      "en": "P8_WEB.en.md",
+      "vi": "P8_WEB.vi.md",
+      "depends_on": [
+        "P7"
+      ],
+      "person_days": [
+        10,
+        15
+      ],
+      "optional": true,
+      "status": "not_started",
+      "primary_cases": [],
+      "strengthen": [
+        "ALL_C",
+        "ALL_K"
+      ],
+      "steps": [
+        "P8-S01",
+        "P8-S02",
+        "P8-S03",
+        "P8-S04",
+        "P8-S05",
+        "P8-S06",
+        "P8-S07"
+      ]
+    }
+  ]
+}

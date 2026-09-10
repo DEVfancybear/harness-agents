@@ -4,6 +4,8 @@
 
 Revision 2 — 10/09/2026. Trạng thái: đề xuất kiến trúc và kế hoạch triển khai; chưa có runtime được xây hoặc kiểm thử. Đọc [rà soát và quyết định](ARCHITECTURE_REVIEW.vi.md), rồi [hợp đồng plugin](PLUGIN_ARCHITECTURE.vi.md) và [hợp đồng memory](MEMORY_AND_CONTINUITY.vi.md) để đi vào chi tiết triển khai.
 
+Khi giao coding, dùng [sổ tay triển khai từng phase](implementation/README.vi.md): P0–P8, 63 work items có thứ tự, phân công nghiệm thu và prompt giao agent dùng ngay. Runbooks chia nhỏ kiến trúc này, không có nghĩa implementation đã hoàn tất.
+
 ## 1. Mục tiêu đã chốt
 
 Xây coding agent cá nhân bằng Rust, dùng CLI trước, giao việc cho nhiều agent, bổ sung Web UI sau. Ưu tiên cao nhất: sau khi hết context, đóng ứng dụng hoặc mở lại phiên, agent tiếp tục đúng công việc đang làm.
