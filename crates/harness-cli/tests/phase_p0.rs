@@ -244,9 +244,20 @@ fn p0_f08_registry_and_ci_declare_only_p0_capabilities() {
         })
         .collect::<Vec<_>>();
     assert_eq!(future_cases.len(), 44);
+    let p1_cases = future_cases
+        .iter()
+        .filter(|case| case["phase"] == "P1")
+        .collect::<Vec<_>>();
+    assert_eq!(p1_cases.len(), 12);
+    assert!(
+        p1_cases
+            .iter()
+            .all(|case| { case["readiness"] == "implemented" && case["required"] == true })
+    );
     assert!(
         future_cases
             .iter()
+            .filter(|case| case["phase"] != "P1")
             .all(|case| { case["readiness"] == "not_implemented" && case["required"] == false })
     );
 

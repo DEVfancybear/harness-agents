@@ -13,8 +13,19 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 harness-types = { path = "../harness-types" }
+harness-session = { path = "../harness-session" }
+harness-store-sqlite = { path = "../harness-store-sqlite" }
 serde_json.workspace = true
 toml.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+harness-kernel = { path = "../harness-kernel" }
+harness-session = { path = "../harness-session" }
+harness-store-sqlite = { path = "../harness-store-sqlite" }
+proptest.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

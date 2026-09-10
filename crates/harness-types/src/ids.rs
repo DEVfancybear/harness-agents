@@ -110,6 +110,16 @@ contract_id!(
     "^instruction_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 );
 contract_id!(
+    HostId,
+    "host",
+    "^host_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+);
+contract_id!(
+    InputId,
+    "input",
+    "^input_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+);
+contract_id!(
     MemoryAssetId,
     "memory_asset",
     "^memory_asset_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -138,6 +148,11 @@ contract_id!(
     SessionId,
     "session",
     "^session_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+);
+contract_id!(
+    SnapshotId,
+    "snapshot",
+    "^snapshot_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 );
 contract_id!(
     TaskId,

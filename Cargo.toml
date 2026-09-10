@@ -2,6 +2,9 @@
 members = [
     "crates/harness-types",
     "crates/harness-cli",
+    "crates/harness-store-sqlite",
+    "crates/harness-session",
+    "crates/harness-kernel",
 ]
 resolver = "2"
 
@@ -14,12 +17,17 @@ repository = "https://github.com/DEVfancybear/harness-agents"
 
 [workspace.dependencies]
 clap = { version = "=4.6.6", features = ["derive"] }
+fs2 = "=0.4.3"
+proptest = "=1.11.0"
 schemars = { version = "=1.2.2" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "migrate", "uuid"] }
+tempfile = "=3.27.0"
 thiserror = "=2.0.20"
 toml = "=1.1.5"
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "=1.26.1", features = ["serde", "v7"] }
 
 [workspace.lints.rust]

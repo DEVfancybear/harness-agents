@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 [CmdletBinding()]
 param(
-    [ValidateSet('P0')]
+    [ValidateSet('P0', 'P1')]
     [string] $Phase = 'P0',
     [string] $RepositoryRoot = (Join-Path $PSScriptRoot '..'),
     [switch] $SelfTest,
@@ -57,7 +57,7 @@ function Assert-RequiredTestDiscovery {
     )
 
     if ($Required.Count -eq 0) {
-        throw (New-GateError -Code 'gate_configuration_error' -Message 'registry has no required P0 tests')
+        throw (New-GateError -Code 'gate_configuration_error' -Message 'registry has no required tests for this phase')
     }
     if ($Discovered.Count -eq 0) {
         throw (New-GateError -Code 'gate_test_discovery_empty' -Message 'cargo test discovery returned zero tests')
@@ -198,7 +198,7 @@ function Invoke-GateSelfTest {
     Invoke-NegativeControl -Name 'required-test-ignored' -ExpectedCode 'gate_required_test_ignored' -Action {
         Assert-RequiredTestResult -TestName $expectedTest -Output @("test $expectedTest ... ignored")
     }
-    Write-Output 'PHASE_GATE_SELFTEST_OK: P0'
+    Write-Output "PHASE_GATE_SELFTEST_OK: $Phase"
 }
 
 if ($SelfTest) {
@@ -233,21 +233,31 @@ foreach ($case in $phaseCases) {
     }
 }
 
+$activePhases = @('P0', 'P1')
+$activeCases = @($registry.cases | Where-Object { $_.phase -in $activePhases })
+foreach ($activeCase in $activeCases) {
+    if ($activeCase.readiness -cne 'implemented' -or $activeCase.required -ne $true) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "accepted case is not implemented and required: $($activeCase.id)")
+    }
+}
 $futureCases = @($registry.cases | Where-Object { $_.id -match '^[CK]\d{2}$' })
 if ($futureCases.Count -ne 44) {
     throw (New-GateError -Code 'gate_configuration_error' -Message 'registry must contain all 44 C/K future cases')
 }
 foreach ($futureCase in $futureCases) {
-    if ($futureCase.readiness -cne 'not_implemented' -or $futureCase.required -ne $false) {
+    if ($futureCase.phase -notin $activePhases -and
+        ($futureCase.readiness -cne 'not_implemented' -or $futureCase.required -ne $false)) {
         throw (New-GateError -Code 'gate_configuration_error' -Message "future case is falsely marked ready: $($futureCase.id)")
     }
 }
 
 $targets = @($phaseCases | ForEach-Object { $_.target } | Sort-Object -Unique)
-if ($targets.Count -ne 1 -or $targets[0] -cne 'phase_p0') {
-    throw (New-GateError -Code 'gate_configuration_error' -Message 'P0 registry must use the phase_p0 target only')
+$expectedTarget = if ($Phase -eq 'P0') { 'phase_p0' } else { 'phase_p1' }
+if ($targets.Count -ne 1 -or $targets[0] -cne $expectedTarget) {
+    throw (New-GateError -Code 'gate_configuration_error' -Message "$Phase registry must use the $expectedTarget target only")
 }
 $requiredTests = @($phaseCases | ForEach-Object { $_.test_names } | Sort-Object -Unique)
+    $phaseTestFile = if ($Phase -eq 'P0') { 'phase_p0' } else { 'phase_p1' }
 
 $results = [System.Collections.Generic.List[object]]::new()
 Push-Location -LiteralPath $repoRoot
@@ -262,14 +272,28 @@ try {
         if (-not $Json) { Write-Output "GATE_STEP_OK: $($step.Name)" }
     }
 
-    $discovery = Invoke-CheckedCommand -Name 'phase-test-discovery' -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', 'phase_p0', '--locked', '--', '--list')
+    if ($Phase -eq 'P1') {
+        $predecessorCases = @($registry.cases | Where-Object { $_.phase -ceq 'P0' -and $_.required -eq $true })
+        $predecessorTests = @($predecessorCases | ForEach-Object { $_.test_names } | Sort-Object -Unique)
+        $predecessorDiscovery = Invoke-CheckedCommand -Name 'predecessor-p0-test-discovery' -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', 'phase_p0', '--locked', '--', '--list')
+        $predecessorDiscovered = Get-DiscoveredTestNames -Output $predecessorDiscovery.Output
+        Assert-RequiredTestDiscovery -Discovered $predecessorDiscovered -Required $predecessorTests
+        foreach ($testName in $predecessorTests) {
+            $result = Invoke-CheckedCommand -Name "predecessor-test:$testName" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', 'phase_p0', '--locked', $testName, '--', '--exact')
+            Assert-RequiredTestResult -TestName $testName -Output $result.Output
+        }
+        $results.Add([pscustomobject]@{ name = 'predecessor-p0-regression'; result = 'passed'; count = $predecessorTests.Count })
+        if (-not $Json) { Write-Output "GATE_STEP_OK: predecessor-p0-regression ($($predecessorTests.Count) tests)" }
+    }
+
+    $discovery = Invoke-CheckedCommand -Name 'phase-test-discovery' -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $phaseTestFile, '--locked', '--', '--list')
     $discoveredTests = Get-DiscoveredTestNames -Output $discovery.Output
     Assert-RequiredTestDiscovery -Discovered $discoveredTests -Required $requiredTests
     $results.Add([pscustomobject]@{ name = 'phase-test-discovery'; result = 'passed'; tests = $discoveredTests })
     if (-not $Json) { Write-Output "GATE_STEP_OK: phase-test-discovery ($($discoveredTests.Count) tests)" }
 
     foreach ($testName in $requiredTests) {
-        $result = Invoke-CheckedCommand -Name "required-test:$testName" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', 'phase_p0', '--locked', $testName, '--', '--exact')
+        $result = Invoke-CheckedCommand -Name "required-test:$testName" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $phaseTestFile, '--locked', $testName, '--', '--exact')
         Assert-RequiredTestResult -TestName $testName -Output $result.Output
     }
     $results.Add([pscustomobject]@{ name = 'required-tests'; result = 'passed'; count = $requiredTests.Count })
