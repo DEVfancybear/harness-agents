@@ -753,6 +753,30 @@ fn p1_k05_late_disposer_cannot_remove_replacement_generation() {
 }
 
 #[tokio::test]
+async fn review_p1_duplicate_active_call_ids_are_rejected() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let provider = ServiceProvider::new(
+        "store",
+        1,
+        RecordingResource::new("provider", Arc::clone(&events), false),
+    );
+    let lease = provider.lease();
+    let first = lease.begin_call("same-id").unwrap();
+    assert!(
+        lease.begin_call("same-id").is_err(),
+        "duplicate call hid active work"
+    );
+    first.settle();
+    lease.begin_call("same-id").unwrap().settle();
+    let report = provider.lose_and_drain().await;
+    assert!(report.outcome_uncertainties.is_empty());
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["shutdown:provider", "join:provider"]
+    );
+}
+
+#[tokio::test]
 async fn p1_k06_provider_loss_stops_admission_drains_dependents_and_marks_unknown() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let resource = RecordingResource::new("provider", Arc::clone(&events), false);

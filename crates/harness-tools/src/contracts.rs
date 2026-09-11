@@ -267,6 +267,37 @@ impl CodingToolAction {
                 "provider tool arguments must be a JSON object",
             )
         })?;
+        let allowed: &[&str] = match name {
+            "read_file" | "list_files" | "git_diff" => &["path"],
+            "search_text" => &["query", "path"],
+            "apply_patch" => &["path", "expected_hash", "replacement"],
+            "run_process" => &["executable", "args", "timeout_ms", "isolation"],
+            "run_shell" => &["command", "timeout_ms", "isolation"],
+            "git_status" => &[],
+            "task_update" => &["note"],
+            _ => {
+                return Err(harness_types::HarnessError::new(
+                    harness_types::ErrorCode::PolicyDenied,
+                    "provider requested an unsupported P3 tool",
+                ));
+            }
+        };
+        if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+            return Err(harness_types::HarnessError::new(
+                harness_types::ErrorCode::InvalidPayload,
+                "provider tool arguments contain an unknown field",
+            ));
+        }
+        if matches!(name, "list_files" | "search_text" | "git_diff")
+            && object
+                .get("path")
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            return Err(harness_types::HarnessError::new(
+                harness_types::ErrorCode::InvalidPayload,
+                "provider tool path must be a string or null",
+            ));
+        }
         match name {
             "read_file" => Ok(Self::ReadFile {
                 path: required_string(object, "path")?,
@@ -373,9 +404,10 @@ fn required_string(
 }
 
 fn parse_isolation(value: Option<&Value>) -> Result<IsolationMode, harness_types::HarnessError> {
-    match value.and_then(Value::as_str).unwrap_or("best_effort") {
-        "best_effort" => Ok(IsolationMode::BestEffort),
-        "strict" => Ok(IsolationMode::Strict),
+    match value {
+        None => Ok(IsolationMode::BestEffort),
+        Some(Value::String(value)) if value == "best_effort" => Ok(IsolationMode::BestEffort),
+        Some(Value::String(value)) if value == "strict" => Ok(IsolationMode::Strict),
         _ => Err(harness_types::HarnessError::new(
             harness_types::ErrorCode::InvalidPayload,
             "provider isolation is invalid",

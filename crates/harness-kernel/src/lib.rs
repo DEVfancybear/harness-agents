@@ -490,6 +490,12 @@ impl ServiceProvider {
                 ),
             ));
         }
+        if active_calls.contains(&call_id) {
+            return Err(KernelError::new(
+                ErrorCode::InvalidPayload,
+                "service call ID is already active",
+            ));
+        }
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         if !self.healthy.load(Ordering::Acquire)
             || self.generation.load(Ordering::Acquire) != lease_generation

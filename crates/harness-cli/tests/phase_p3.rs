@@ -1,5 +1,166 @@
 #![forbid(unsafe_code)]
 
+#[test]
+fn review_p3_provider_parser_rejects_invalid_optional_fields() {
+    for (name, arguments) in [
+        ("list_files", r#"{"path":42}"#),
+        ("search_text", r#"{"query":"x","path":false}"#),
+        ("git_diff", r#"{"path":[]}"#),
+        ("git_status", r#"{"unexpected":true}"#),
+        (
+            "read_file",
+            r#"{"path":"src/parser.txt","unexpected":true}"#,
+        ),
+        (
+            "run_shell",
+            r#"{"command":"echo x","timeout_ms":1,"isolation":true}"#,
+        ),
+        (
+            "run_shell",
+            r#"{"command":"echo x","timeout_ms":1,"isolation":null}"#,
+        ),
+    ] {
+        assert!(
+            CodingToolAction::from_provider_call(name, arguments).is_err(),
+            "accepted {name} {arguments}"
+        );
+    }
+    for arguments in ["{}", r#"{"path":null}"#, r#"{"path":"src"}"#] {
+        CodingToolAction::from_provider_call("list_files", arguments).unwrap();
+    }
+}
+
+#[test]
+fn review_p3_policy_cannot_be_bypassed_by_path_spelling_or_ancestor() {
+    let policy = ToolPolicy::new(1, vec![PolicyRule::deny("src/private", "denied")]);
+    for path in [
+        "./src/private/file.txt",
+        "src/./private/file.txt",
+        "src//private/file.txt",
+    ] {
+        assert!(
+            policy
+                .denial_for(&CodingToolAction::ReadFile { path: path.into() })
+                .is_some(),
+            "policy bypass: {path}"
+        );
+    }
+    #[cfg(windows)]
+    assert!(
+        policy
+            .denial_for(&CodingToolAction::ReadFile {
+                path: "SRC\\PRIVATE\\file.txt".into()
+            })
+            .is_some()
+    );
+    for action in [
+        CodingToolAction::ListFiles { path: None },
+        CodingToolAction::SearchText {
+            query: "x".into(),
+            path: Some("src".into()),
+        },
+        CodingToolAction::GitDiff { path: None },
+    ] {
+        assert!(
+            policy.denial_for(&action).is_some(),
+            "ancestor read bypass: {action:?}"
+        );
+    }
+    assert!(
+        policy
+            .denial_for(&CodingToolAction::ReadFile {
+                path: "src/private-other/file.txt".into()
+            })
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn review_p3_explicit_workspace_root_can_be_listed() {
+    let temp = TempDir::new().unwrap();
+    let root = setup_workspace(&temp);
+    let store = writer(&temp).await;
+    let (session, task, _) = admit(&store, &root).await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    for path in [".", "./"] {
+        let (prepared, approval) = prepared_and_approved(
+            &tools,
+            &session,
+            &task,
+            &root,
+            CodingToolAction::ListFiles {
+                path: Some(path.into()),
+            },
+        )
+        .await;
+        let view = tools.execute(prepared, Some(approval)).await.unwrap();
+        assert!(
+            matches!(view.output, ToolOutput::ListFiles { ref paths, .. } if paths.contains(&"src/parser.txt".to_owned()))
+        );
+    }
+    drop(tools);
+    close_writer(store).await;
+}
+
+#[tokio::test]
+async fn review_p3_large_invalid_utf8_is_not_silently_repaired() {
+    let temp = TempDir::new().unwrap();
+    let root = setup_workspace(&temp);
+    let mut bytes = vec![b'a'; 140 * 1024];
+    bytes[1] = 0xff;
+    fs::write(root.join("invalid.txt"), bytes).unwrap();
+    let store = writer(&temp).await;
+    let (session, task, _) = admit(&store, &root).await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let (prepared, approval) = prepared_and_approved(
+        &tools,
+        &session,
+        &task,
+        &root,
+        CodingToolAction::ReadFile {
+            path: "invalid.txt".into(),
+        },
+    )
+    .await;
+    let result = tools.execute(prepared, Some(approval)).await;
+    assert!(
+        !matches!(result, Ok(ref view) if matches!(view.output, ToolOutput::ReadFile { .. })),
+        "malformed file was reported as text: {result:?}"
+    );
+    drop(tools);
+    close_writer(store).await;
+}
+
+#[tokio::test]
+async fn review_p3_search_redacts_before_truncation() {
+    let temp = TempDir::new().unwrap();
+    let root = setup_workspace(&temp);
+    let line = format!("FAKE_VALUE_ONLY_FOR_TEST {} token", "x".repeat(300));
+    fs::write(root.join("output.txt"), line).unwrap();
+    let store = writer(&temp).await;
+    let (session, task, _) = admit(&store, &root).await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let (prepared, approval) = prepared_and_approved(
+        &tools,
+        &session,
+        &task,
+        &root,
+        CodingToolAction::SearchText {
+            query: "FAKE_VALUE_ONLY_FOR_TEST".into(),
+            path: None,
+        },
+    )
+    .await;
+    let view = tools.execute(prepared, Some(approval)).await.unwrap();
+    let ToolOutput::SearchText { matches, .. } = view.output else {
+        panic!("expected search output")
+    };
+    assert_eq!(matches.len(), 1);
+    assert!(!matches[0].preview.contains("FAKE_VALUE_ONLY_FOR_TEST"));
+    drop(tools);
+    close_writer(store).await;
+}
+
 use std::{
     collections::BTreeSet,
     fs,

@@ -17,6 +17,21 @@ use serde_json::{Value, json};
 
 const UUID: &str = "018f8b64-5c8d-7a0a-8f21-123456789abc";
 
+#[test]
+fn review_p0_ids_reject_non_rfc_variants() {
+    for variant in ["0f21", "7f21", "cf21", "ff21"] {
+        let value = format!("session_018f8b64-5c8d-7a0a-{variant}-123456789abc");
+        assert!(
+            SessionId::parse(value).is_err(),
+            "accepted variant {variant}"
+        );
+    }
+    for variant in ["8f21", "9f21", "af21", "bf21"] {
+        SessionId::parse(format!("session_018f8b64-5c8d-7a0a-{variant}-123456789abc"))
+            .expect("RFC variant must remain accepted");
+    }
+}
+
 fn project_id() -> ProjectId {
     ProjectId::parse(format!("project_{UUID}")).unwrap()
 }

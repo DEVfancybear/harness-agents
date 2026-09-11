@@ -201,6 +201,9 @@ pub(crate) fn resolve_relative(
             ));
         }
     }
+    if candidate == root && allow_root {
+        return Ok(candidate);
+    }
     let parent = candidate.parent().ok_or_else(|| {
         HarnessError::new(ErrorCode::WorkspaceEscape, "workspace path has no parent")
     })?;
@@ -275,8 +278,12 @@ pub(crate) fn read_text_output(path: &Path) -> Result<TextOutput, HarnessError> 
     let truncated = bytes.len() > MAX_OUTPUT_BYTES;
     if truncated {
         bytes.truncate(MAX_OUTPUT_BYTES);
-        while std::str::from_utf8(&bytes).is_err() {
-            let _ = bytes.pop();
+        if let Err(error) = std::str::from_utf8(&bytes) {
+            // Only an incomplete trailing character is attributable to the
+            // byte cap. Invalid bytes inside the prefix must still be denied.
+            if error.error_len().is_none() {
+                bytes.truncate(error.valid_up_to());
+            }
         }
     }
     let text = decode_utf8(&bytes)?;
@@ -356,7 +363,7 @@ pub(crate) fn search_text(
                     path: relative_text(relative),
                     line: u64::try_from(line_index.saturating_add(1)).unwrap_or(u64::MAX),
                     column: u64::try_from(column.saturating_add(1)).unwrap_or(u64::MAX),
-                    preview: redact_text(&truncate_text(line, 240)),
+                    preview: truncate_text(&redact_text(line), 240),
                 });
             }
             if truncated {
@@ -689,4 +696,34 @@ fn truncate_text(value: &str, max_bytes: usize) -> String {
         end = end.saturating_sub(1);
     }
     format!("{}…", &value[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_bounded_reader_rejects_invalid_utf8_inside_prefix() {
+        let path = std::env::temp_dir().join(format!("{}.txt", harness_types::InputId::generate()));
+        let mut bytes = vec![b'a'; MAX_OUTPUT_BYTES + 10];
+        bytes[1] = 0xff;
+        fs::write(&path, bytes).unwrap();
+        let result = read_text_output(&path);
+        fs::remove_file(path).unwrap();
+        assert!(
+            matches!(result, Err(ref error) if error.code() == ErrorCode::UnsupportedTextEncoding)
+        );
+    }
+
+    #[test]
+    fn review_bounded_reader_preserves_valid_unicode_prefix() {
+        let path = std::env::temp_dir().join(format!("{}.txt", harness_types::InputId::generate()));
+        let prefix = "a".repeat(MAX_OUTPUT_BYTES - 1);
+        fs::write(&path, format!("{prefix}€more")).unwrap();
+        let result = read_text_output(&path);
+        fs::remove_file(path).unwrap();
+        let output = result.unwrap();
+        assert!(output.truncated);
+        assert_eq!(output.text, prefix);
+    }
 }

@@ -120,10 +120,22 @@ impl ToolPolicy {
     /// execution authority. A matching parent deny always wins.
     #[must_use]
     pub fn denial_for(&self, action: &CodingToolAction) -> Option<String> {
-        let path = action.path_hint()?;
+        let recursive = matches!(
+            action,
+            CodingToolAction::ListFiles { .. }
+                | CodingToolAction::SearchText { .. }
+                | CodingToolAction::GitDiff { .. }
+                | CodingToolAction::GitStatus
+        );
+        let path = action
+            .path_hint()
+            .or(if recursive { Some("") } else { None })?;
         self.rules
             .iter()
-            .filter(|rule| rule_matches(&rule.path_prefix, path))
+            .filter(|rule| {
+                rule_matches(&rule.path_prefix, path)
+                    || (recursive && rule_matches(path, &rule.path_prefix))
+            })
             .find(|rule| rule.effect == PolicyEffect::Deny)
             .map(|rule| {
                 if rule.reason.trim().is_empty() {
@@ -193,13 +205,25 @@ fn validate_action_shape(action: &CodingToolAction) -> Result<(), HarnessError> 
 }
 
 fn rule_matches(prefix: &str, path: &str) -> bool {
-    let prefix = prefix.trim_matches(&['/', '\\'][..]);
-    let path = path.trim_matches(&['/', '\\'][..]);
-    prefix.is_empty()
-        || path == prefix
-        || path
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
+    let prefix = policy_components(prefix);
+    let path = policy_components(path);
+    path.starts_with(&prefix)
+}
+
+fn policy_components(path: &str) -> Vec<String> {
+    path.split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(|part| {
+            #[cfg(windows)]
+            {
+                part.to_lowercase()
+            }
+            #[cfg(not(windows))]
+            {
+                part.to_owned()
+            }
+        })
+        .collect()
 }
 
 #[allow(dead_code)]

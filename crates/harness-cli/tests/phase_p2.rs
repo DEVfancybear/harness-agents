@@ -24,6 +24,70 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+#[tokio::test]
+async fn review_p2_context_budget_includes_rendered_headers() {
+    let temp = TempDir::new().unwrap();
+    let store = writer(&temp).await;
+    let session = SessionService::new(Arc::clone(&store));
+    let session_id = SessionId::generate();
+    let task_id = TaskId::generate();
+    session
+        .admit_input(harness_session::AdmitInputRequest {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            input_id: InputId::generate(),
+            expected_sequence: 1,
+            authority: SourceAuthority::User,
+            raw_text: "keep this".into(),
+            workspace: workspace(),
+            initial_plan_items: vec![],
+        })
+        .await
+        .unwrap();
+    let recovery = session.recover(&session_id).await.unwrap();
+    let build = |window, optional_blocks| {
+        ContextBuilder::new().build(ContextBuildRequest {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            checkpoint_id: "review".into(),
+            through_event_seq: recovery.replayed_through_sequence,
+            recovery: recovery.clone(),
+            system_policy: "policy".into(),
+            project_rules: vec![],
+            optional_blocks,
+            recent_tail: vec![],
+            context_window_tokens: window,
+            output_reservation_tokens: 1,
+            protocol_overhead_tokens: 1,
+            safety_margin_tokens: 1,
+            optional_token_budget: 100_000,
+            memory_versions: vec![],
+        })
+    };
+    let baseline = build(100_000, vec![]).unwrap();
+    let mandatory = build(baseline.packet.token_estimate + 2, vec![]);
+    assert!(
+        matches!(mandatory, Err(ref error) if error.code() == ErrorCode::MandatoryContextOverflow),
+        "mandatory rendered packet exceeded budget: {mandatory:?}"
+    );
+    let available = baseline.packet.token_estimate + 10;
+    let optional = build(
+        available + 3,
+        vec![ContextBlock::optional(
+            "long-label".repeat(100),
+            ContextBlockKind::Memory,
+            "x",
+            10,
+        )],
+    )
+    .unwrap();
+    assert!(optional.packet.token_estimate <= available);
+    assert_eq!(optional.omitted_optional.len(), 1);
+    assert!(build(baseline.packet.token_estimate + 3, vec![]).is_ok());
+    drop(session);
+    close_writer(store).await;
+}
+
 fn workspace() -> WorkspaceObservation {
     WorkspaceObservation {
         project_id: ProjectId::generate(),

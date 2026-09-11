@@ -38,6 +38,7 @@ macro_rules! contract_id {
                     )
                 })?;
                 if uuid.is_nil()
+                    || uuid.get_variant() != uuid::Variant::RFC4122
                     || uuid.get_version_num() != 7
                     || uuid.hyphenated().to_string() != suffix
                 {

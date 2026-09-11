@@ -177,10 +177,12 @@ impl ContextBuilder {
             block.mandatory = true;
             mandatory.push(block);
         }
-        let mandatory_tokens: u64 = mandatory
+        let mut content = mandatory
             .iter()
-            .map(|block| estimate_tokens(&block.text))
-            .sum();
+            .map(render_block)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mandatory_tokens = estimate_tokens(&content);
         if mandatory_tokens > available {
             return Err(ContextError::new(
                 harness_types::ErrorCode::MandatoryContextOverflow,
@@ -204,21 +206,22 @@ impl ContextBuilder {
             .optional_token_budget
             .min(available - mandatory_tokens);
         for block in optional {
-            let tokens = estimate_tokens(&block.text);
-            if optional_tokens.saturating_add(tokens) <= optional_budget {
-                optional_tokens = optional_tokens.saturating_add(tokens);
+            let rendered = render_block(&block);
+            let candidate_bytes = content
+                .len()
+                .saturating_add(2)
+                .saturating_add(rendered.len());
+            let candidate_optional_tokens =
+                estimate_bytes(candidate_bytes).saturating_sub(mandatory_tokens);
+            if candidate_optional_tokens <= optional_budget {
+                optional_tokens = candidate_optional_tokens;
+                content.push_str("\n\n");
+                content.push_str(&rendered);
                 optional_kept.push(block);
             } else {
                 omitted_optional.push(block.id);
             }
         }
-        let mut all = mandatory.clone();
-        all.extend(optional_kept.iter().cloned());
-        let content = all
-            .iter()
-            .map(|block| format!("[{}:{}]\n{}", block.kind.as_str(), block.id, block.text))
-            .collect::<Vec<_>>()
-            .join("\n\n");
         let packet = ContextPacket {
             schema_version: P0_SCHEMA_VERSION,
             packet_id: ContextPacketId::generate(),
@@ -265,7 +268,15 @@ impl ContextBlockKind {
 }
 
 fn estimate_tokens(text: &str) -> u64 {
-    u64::try_from(text.len().saturating_add(3) / 4)
+    estimate_bytes(text.len())
+}
+
+fn render_block(block: &ContextBlock) -> String {
+    format!("[{}:{}]\n{}", block.kind.as_str(), block.id, block.text)
+}
+
+fn estimate_bytes(bytes: usize) -> u64 {
+    u64::try_from(bytes.saturating_add(3) / 4)
         .unwrap_or(u64::MAX)
         .max(1)
 }
