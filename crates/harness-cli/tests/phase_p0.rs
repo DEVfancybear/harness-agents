@@ -258,7 +258,10 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
         future_cases
             .iter()
             .filter(|case| {
-                case["phase"] != "P1" && case["phase"] != "P2" && case["phase"] != "P3"
+                case["phase"] != "P1"
+                    && case["phase"] != "P2"
+                    && case["phase"] != "P3"
+                    && case["phase"] != "P4"
             })
             .all(|case| { case["readiness"] == "not_implemented" && case["required"] == false })
     );
@@ -290,5 +293,16 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
         ci.contains("rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt")
     );
     assert!(ci.contains("scripts/Verify-Phase.ps1 -Phase P0"));
+    assert!(ci.contains("scripts/Verify-Phase.ps1 -Phase P4"));
+    let p4_cases = future_cases
+        .iter()
+        .filter(|case| case["phase"] == "P4")
+        .collect::<Vec<_>>();
+    assert_eq!(p4_cases.len(), 11);
+    assert!(
+        p4_cases
+            .iter()
+            .all(|case| case["readiness"] == "implemented" && case["required"] == true)
+    );
     assert!(!ci.contains("secrets."));
 }

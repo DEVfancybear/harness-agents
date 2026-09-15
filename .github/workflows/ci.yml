@@ -62,3 +62,20 @@ jobs:
       - name: Run P3 gate without credentials
         shell: pwsh
         run: ./scripts/Verify-Phase.ps1 -Phase P3
+
+  verify-p4:
+    name: P4 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+      - name: Run P4 gate and predecessor regressions without credentials
+        shell: pwsh
+        run: ./scripts/Verify-Phase.ps1 -Phase P4

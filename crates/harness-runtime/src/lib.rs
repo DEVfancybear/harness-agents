@@ -154,6 +154,7 @@ pub struct RunRequest {
     pub system_policy: String,
     pub continuation_context: Option<String>,
     pub tool_schemas: Vec<Value>,
+    pub memory: Option<harness_memory::MemoryContribution>,
 }
 
 impl RunRequest {
@@ -174,6 +175,7 @@ impl RunRequest {
             system_policy: "You are a careful coding agent.".to_owned(),
             continuation_context: None,
             tool_schemas: Vec::new(),
+            memory: None,
         }
     }
     #[must_use]
@@ -191,6 +193,12 @@ impl RunRequest {
     #[must_use]
     pub fn with_tool_schemas(mut self, tool_schemas: Vec<Value>) -> Self {
         self.tool_schemas = tool_schemas;
+        self
+    }
+
+    #[must_use]
+    pub fn with_memory(mut self, contribution: harness_memory::MemoryContribution) -> Self {
+        self.memory = Some(contribution);
         self
     }
 }
@@ -382,6 +390,35 @@ impl RuntimeService {
             .await?;
         self.last_attempts.store(command.attempts, Ordering::SeqCst);
         let recovery = session.recover(&request.session_id).await?;
+        let mut request = request;
+        if let Some(contribution) = &request.memory {
+            let principal = &contribution.principal;
+            if principal
+                .project_id
+                .as_ref()
+                .is_some_and(|project| project != &request.workspace.project_id)
+                || principal
+                    .task_id
+                    .as_ref()
+                    .is_some_and(|task| task != &request.task_id)
+                || principal
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|session| session != &request.session_id)
+            {
+                return Err(RuntimeError::new(
+                    ErrorCode::PolicyDenied,
+                    "memory contribution is outside run scope",
+                ));
+            }
+            if harness_memory::MemoryService::new(Arc::clone(&self.store))
+                .validate_contribution(contribution)
+                .await
+                .is_err()
+            {
+                request.memory = None;
+            }
+        }
         let built = self.build_context(&request, recovery)?;
         let capabilities = self.provider.capabilities();
         let composition_content = json!({"config_revision": config.config_revision, "provider_id": capabilities.provider_id, "model": capabilities.model, "packet_checkpoint": built.packet.checkpoint_id, "tool_schemas": request.tool_schemas});
@@ -442,6 +479,17 @@ impl RuntimeService {
                 last_error = Some(RuntimeError::new(
                     ErrorCode::ProviderCanceled,
                     "run canceled before provider dispatch",
+                ));
+                break;
+            }
+            if let Some(contribution) = &request.memory
+                && let Err(error) = harness_memory::MemoryService::new(Arc::clone(&self.store))
+                    .validate_contribution(contribution)
+                    .await
+            {
+                last_error = Some(RuntimeError::new(
+                    error.code(),
+                    "memory changed after freeze; rebuild context before dispatch",
                 ));
                 break;
             }
@@ -785,14 +833,20 @@ impl RuntimeService {
                 recovery,
                 system_policy: request.system_policy.clone(),
                 project_rules: Vec::<ContextBlock>::new(),
-                optional_blocks: Vec::new(),
+                optional_blocks: request
+                    .memory
+                    .as_ref()
+                    .map_or_else(Vec::new, |memory| memory.blocks.clone()),
                 recent_tail: continuation,
                 context_window_tokens: config.context_window_tokens,
                 output_reservation_tokens: config.output_reservation_tokens,
                 protocol_overhead_tokens: config.protocol_overhead_tokens,
                 safety_margin_tokens: config.safety_margin_tokens,
                 optional_token_budget: config.optional_token_budget,
-                memory_versions: Vec::new(),
+                memory_versions: request
+                    .memory
+                    .as_ref()
+                    .map_or_else(Vec::new, |memory| memory.versions.clone()),
             })
             .map_err(RuntimeError::from)
     }

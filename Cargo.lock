@@ -661,6 +661,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "harness-kernel",
+ "harness-memory",
  "harness-providers",
  "harness-runtime",
  "harness-session",
@@ -669,6 +670,7 @@ dependencies = [
  "harness-types",
  "proptest",
  "serde_json",
+ "sqlx",
  "tempfile",
  "tokio",
  "toml",
@@ -681,6 +683,21 @@ dependencies = [
  "harness-types",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "harness-memory"
+version = "0.1.0"
+dependencies = [
+ "harness-session",
+ "harness-store-sqlite",
+ "harness-types",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -701,6 +718,7 @@ dependencies = [
 name = "harness-runtime"
 version = "0.1.0"
 dependencies = [
+ "harness-memory",
  "harness-providers",
  "harness-session",
  "harness-store-sqlite",

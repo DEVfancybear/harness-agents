@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod memory_cli;
+
 use std::{fs, path::PathBuf, process::ExitCode, sync::Arc};
 
 use clap::{Args, Parser, Subcommand};
@@ -18,9 +20,7 @@ use harness_types::{
 
 /// Personal coding-agent harness.
 ///
-/// P3 provides a durable local coding-tool boundary. Live providers,
-/// multi-agent scheduling, memory extraction, and a Web UI remain outside the
-/// current CLI scope.
+/// P4 adds scoped local memory and bounded, explicit extraction catch-up.
 #[derive(Debug, Parser)]
 #[command(name = "ha", version, about)]
 struct Cli {
@@ -30,6 +30,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Search, inspect and maintain scoped reusable memory.
+    Memory(memory_cli::MemoryCommand),
     /// Initialize a local P1 `SQLite` data directory and inspectable built-in metadata.
     Init {
         /// Directory owned by this local harness store.
@@ -264,6 +266,7 @@ async fn main() -> ExitCode {
 #[allow(clippy::too_many_lines)]
 async fn run(cli: Cli) -> Result<(), HarnessError> {
     match cli.command {
+        Some(Command::Memory(command)) => memory_cli::run(command).await,
         Some(Command::Init { data_dir, json }) => init_store(&data_dir, json).await,
         Some(Command::Config(ConfigCommand {
             command: ConfigSubcommand::Validate { config, json },

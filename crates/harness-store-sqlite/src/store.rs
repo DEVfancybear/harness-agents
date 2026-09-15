@@ -30,6 +30,8 @@ use crate::{
     ToolTaskUpdateCommit, WriterOpenOptions,
 };
 
+mod memory;
+
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MIGRATION_1: &[&str] = &[
@@ -193,6 +195,10 @@ impl SqliteStore {
             return Err(error);
         }
         if let Err(error) = ensure_tools_schema(&pool).await {
+            let _ = FileExt::unlock(&lock_file);
+            return Err(error);
+        }
+        if let Err(error) = memory::ensure_memory_schema(&pool).await {
             let _ = FileExt::unlock(&lock_file);
             return Err(error);
         }

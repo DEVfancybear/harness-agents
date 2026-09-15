@@ -10,12 +10,14 @@ pub use error::StoreError;
 pub use models::{
     AdmissionAck, AdmissionCommit, AgentStateRecord, CompositionSnapshotRecord,
     ContextCheckpointRecord, ContextPacketRecord, ContinuationLinkRecord, DATABASE_FILE_NAME,
-    FrozenRequestRecord, HostFence, PersistedPluginManifest, ProjectRegistrationRecord,
-    ProviderAttemptRecord, PublishedArtifact, RUNTIME_SCHEMA_VERSION, ReceiptAck, ReceiptCommit,
-    RuntimeCommandRecord, RuntimeCommandState, STORE_SCHEMA_VERSION, SessionSummary,
-    SnapshotRecord, SourceWorkMarker, StoreDiagnostics, StoreFaultPlan, StoreFaultPoint,
-    StorePaths, TOOLS_SCHEMA_VERSION, ToolApprovalBinding, ToolApprovalRecord, ToolApprovalState,
-    ToolIntentCommit, ToolIntentRecord, ToolIntentStatus, ToolSettlementCommit,
+    FrozenRequestRecord, HostFence, MEMORY_SCHEMA_VERSION, MemoryCreateCommit, MemoryVersionCommit,
+    PersistedPluginManifest, ProjectRegistrationRecord, ProviderAttemptRecord, PublishedArtifact,
+    RUNTIME_SCHEMA_VERSION, ReceiptAck, ReceiptCommit, RuntimeCommandRecord, RuntimeCommandState,
+    STORE_SCHEMA_VERSION, SessionSummary, SnapshotRecord, SourceWorkMarker, StoreDiagnostics,
+    StoreFaultPlan, StoreFaultPoint, StoreMemoryPrincipal, StorePaths, StoredExtractionJobRecord,
+    StoredExtractionLeaseRecord, StoredMemoryAssetRecord, StoredMemoryGrantRecord,
+    StoredMemoryVersionRecord, TOOLS_SCHEMA_VERSION, ToolApprovalBinding, ToolApprovalRecord,
+    ToolApprovalState, ToolIntentCommit, ToolIntentRecord, ToolIntentStatus, ToolSettlementCommit,
     ToolTaskUpdateCommit, WRITER_LOCK_FILE_NAME, WriterOpenOptions,
 };
 pub use store::SqliteStore;

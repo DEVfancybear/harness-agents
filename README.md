@@ -4,7 +4,7 @@ Personal coding-agent harness planned in Rust: CLI first, multiple delegated age
 
 Harness coding agent cá nhân dự kiến viết bằng Rust: CLI trước, giao việc cho nhiều agent, bổ sung Web UI sau.
 
-**Status / Trạng thái:** P0 foundation is implemented locally and stops at contracts, schema generation, fixture verification, and the minimal `ha` CLI. It has no session store, provider/model loop, tool runtime, memory runtime, multi-agent orchestration, Web API, or UI; P1 and later remain unimplemented. See the bilingual [P0 evidence](docs/evidence/P0.en.md) and [restart handoff](docs/handoffs/P0.en.md). / Nền tảng P0 đã được triển khai cục bộ và chỉ dừng ở contracts, tạo schema, kiểm chứng fixture và CLI `ha` tối thiểu. Chưa có session store, vòng lặp provider/model, tool runtime, memory runtime, điều phối đa agent, Web API hay UI; P1 trở đi chưa được triển khai. Xem [evidence P0](docs/evidence/P0.vi.md) và [bàn giao khởi động lại](docs/handoffs/P0.vi.md) song ngữ.
+**Status / Trạng thái:** P0–P3 are accepted; P4 adds scoped reusable memory, SQLite FTS5 and explicit bounded extraction catch-up. Final P4 verification and delivery state are recorded in the [English evidence](docs/evidence/P4.en.md) / [evidence tiếng Việt](docs/evidence/P4.vi.md). P5 multi-agent orchestration and later phases have not started. / P0–P3 đã được chấp nhận; P4 bổ sung memory có scope, SQLite FTS5 và extraction catch-up hữu hạn. Trạng thái kiểm chứng và bàn giao P4 nằm trong evidence; chưa bắt đầu P5 hoặc phase sau.
 
 ## Documentation / Tài liệu
 
@@ -24,9 +24,20 @@ Thiết kế tách journal thực thi, WorkingState có cấu trúc và memory t
 
 ## Start implementation / Bắt đầu triển khai
 
-P0 was implemented against [P0 in English](docs/implementation/P0_FOUNDATION.en.md) and [P0 tiếng Việt](docs/implementation/P0_FOUNDATION.vi.md), with a phase SPEC and evidence/handoff above. It remains uncommitted and unpublished because neither action was authorized. Accept its evidence before assigning P1; the pack has nine phases, 63 ordered steps, scoped file ownership, tests, exit gates and bilingual evidence/handoff requirements. Web is optional P8.
+Use the [P4 SPEC](docs/specs/P4.en.md) and [restart handoff](docs/handoffs/P4.en.md) for the current phase. The nine-phase plan preserves CLI-first delivery; Web is optional P8.
 
-P0 đã được triển khai theo [P0 tiếng Việt](docs/implementation/P0_FOUNDATION.vi.md) và [P0 in English](docs/implementation/P0_FOUNDATION.en.md), có SPEC và evidence/handoff ở trên. Thay đổi vẫn chưa commit hay publish vì hai việc đó chưa được giao. Hãy nghiệm thu evidence trước khi giao P1; bộ tài liệu có chín phase, 63 bước, phạm vi files, tests, điều kiện nghiệm thu và evidence/handoff song ngữ. Web là P8 tùy chọn.
+Đọc [SPEC P4](docs/specs/P4.vi.md) và [bàn giao khởi động lại](docs/handoffs/P4.vi.md) cho phase hiện tại. Kế hoạch chín phase giữ CLI trước; Web là P8 tùy chọn.
+
+```powershell
+cargo build -p harness-cli --bin ha --locked
+ha memory --data-dir <data-dir> --session-id <session-id> catch-up --budget 4 --extractor mock
+ha memory --data-dir <data-dir> --session-id <session-id> jobs --json
+pwsh -NoProfile -File scripts/Verify-P4Gauntlet.ps1
+```
+
+The extractor defaults to disabled. The explicit mock is a deterministic local fixture; inferred memories stay candidates until manual confirmation. See `ha memory --help` for search/read/inspect, versioned publication, summaries and invalidation. Host CLI identity options are trusted local user input and must never be populated directly from model arguments.
+
+Extractor mặc định tắt. Mock là fixture local xác định; memory suy luận giữ candidate đến khi được xác nhận thủ công. `ha memory --help` liệt kê search/read/inspect, publication có version, summary và invalidation. Các option identity CLI thuộc host/user local, không lấy trực tiếp từ model arguments.
 
 ## Documentation checks / Kiểm tra tài liệu
 
@@ -36,9 +47,9 @@ Requires PowerShell 7; no additional packages. / Cần PowerShell 7, không cầ
 pwsh -NoProfile -File scripts/Verify-Docs.ps1 -SelfTest
 ```
 
-Checks local links, paired sections, acceptance IDs/ownership, phase dependencies and steps, milestone estimates, fixed source revisions and fenced blocks. Includes in-memory negative controls. It does **not** execute the 30 continuity, 14 plugin or six optional Web cases; those are future runtime acceptance specifications. The GitHub workflow runs documentation checks only.
+Checks local links, paired sections, acceptance IDs/ownership, phase dependencies and steps, milestone estimates, fixed source revisions and fenced blocks. Includes in-memory negative controls. It does **not** execute the 30 continuity, 14 plugin or six optional Web cases; those are future runtime acceptance specifications. The GitHub workflow runs Rust phase gates and predecessor regressions on Ubuntu and Windows.
 
-Kiểm tra links local, sections hai ngôn ngữ, acceptance IDs/ownership, dependencies và steps của phase, dự toán mốc, revision nguồn cố định, code fences; có negative controls trong RAM. **Không** chạy 30 ca continuity, 14 ca plugin hay sáu ca Web tùy chọn: đó là đặc tả nghiệm thu runtime tương lai. GitHub workflow hiện chỉ kiểm tra tài liệu.
+Kiểm tra links local, sections hai ngôn ngữ, acceptance IDs/ownership, dependencies và steps của phase, dự toán mốc, revision nguồn cố định, code fences; có negative controls trong RAM. **Không** chạy 30 ca continuity, 14 ca plugin hay sáu ca Web tùy chọn: đó là đặc tả nghiệm thu runtime tương lai. GitHub workflow chạy Rust phase gates và regressions tiền nhiệm trên Ubuntu và Windows.
 
 ## Research references / Nguồn khảo sát
 

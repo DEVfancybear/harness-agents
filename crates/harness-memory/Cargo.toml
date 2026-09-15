@@ -1,5 +1,5 @@
 [package]
-name = "harness-runtime"
+name = "harness-memory"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,16 +7,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-harness-providers = { path = "../harness-providers" }
-harness-session = { path = "../harness-session" }
 harness-store-sqlite = { path = "../harness-store-sqlite" }
 harness-types = { path = "../harness-types" }
-harness-memory = { path = "../harness-memory" }
+harness-session = { path = "../harness-session" }
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+unicode-normalization.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

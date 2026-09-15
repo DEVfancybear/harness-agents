@@ -229,7 +229,16 @@ impl ContextBuilder {
             task_id: request.task_id,
             checkpoint_id: request.checkpoint_id,
             through_event_seq: request.through_event_seq,
-            memory_versions: request.memory_versions,
+            memory_versions: request
+                .memory_versions
+                .into_iter()
+                .filter(|reference| {
+                    let id = format!("{}@{}", reference.memory_asset_id, reference.version);
+                    optional_kept
+                        .iter()
+                        .any(|block| block.kind == ContextBlockKind::Memory && block.id == id)
+                })
+                .collect(),
             rendering_version: 1,
             token_estimate: estimate_tokens(&content),
             content_hash: ContentHash::from_bytes(content.as_bytes()),

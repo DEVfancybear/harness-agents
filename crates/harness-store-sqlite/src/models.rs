@@ -5,10 +5,11 @@ use std::{
 };
 
 use harness_types::{
-    AgentRunId, ArtifactId, CompositionSnapshotId, ContentHash, ContextPacket, ContextPacketId,
-    EventEnvelope, EventId, HostId, InputId, InstructionLedgerEntry, PluginManifest, ProjectId,
-    ProviderAttemptId, RequestId, RuntimeCommandId, SessionId, SnapshotId, TaskId, ToolApprovalId,
-    ToolExecutionId, ToolExecutionReceipt, WorkingState,
+    AgentProfileId, AgentRunId, ArtifactId, CompositionSnapshotId, ContentHash, ContextPacket,
+    ContextPacketId, EventEnvelope, EventId, HostId, InputId, InstructionLedgerEntry, MemoryAsset,
+    MemoryAssetId, MemoryVersion, PluginManifest, ProjectId, ProviderAttemptId, RequestId,
+    RuntimeCommandId, SessionId, SnapshotId, TaskId, ToolApprovalId, ToolExecutionId,
+    ToolExecutionReceipt, WorkingState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,6 +25,8 @@ pub const RUNTIME_SCHEMA_VERSION: i64 = 1;
 /// Additive P3 tool tables use their own revision so P0/P1/P2 storage remains
 /// byte-for-byte compatible.
 pub const TOOLS_SCHEMA_VERSION: i64 = 1;
+/// Additive P4 memory tables retain all earlier schema revisions.
+pub const MEMORY_SCHEMA_VERSION: i64 = 1;
 
 /// All durable paths owned by a local harness data directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,6 +74,7 @@ pub enum StoreFaultPoint {
     BeforeSnapshotCommit,
     BeforeToolIntentCommit,
     BeforeToolSettlementCommit,
+    BeforeMemorySettlementCommit,
 }
 
 /// A one-shot, deterministic fault injector for component tests.
@@ -497,4 +501,83 @@ pub struct ContinuationLinkRecord {
     pub source_session_id: SessionId,
     pub new_session_id: SessionId,
     pub task_id: TaskId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreMemoryPrincipal {
+    pub principal_id: String,
+    pub project_id: Option<ProjectId>,
+    pub task_id: Option<TaskId>,
+    pub agent_profile_id: Option<AgentProfileId>,
+    pub session_id: Option<SessionId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredMemoryVersionRecord {
+    pub record: MemoryVersion,
+    pub content: String,
+    pub normalized_content: String,
+    pub strategy_digest: Option<ContentHash>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredMemoryAssetRecord {
+    pub asset: MemoryAsset,
+    pub layer: String,
+    pub task_id: Option<TaskId>,
+    pub agent_profile_id: Option<AgentProfileId>,
+    pub session_id: Option<SessionId>,
+    pub current: StoredMemoryVersionRecord,
+}
+
+#[derive(Clone, Debug)]
+pub struct MemoryCreateCommit {
+    pub record: StoredMemoryAssetRecord,
+}
+
+#[derive(Clone, Debug)]
+pub struct MemoryVersionCommit {
+    pub source_assets: Vec<harness_types::MemoryVersionRef>,
+    pub authorization: StoreMemoryPrincipal,
+    pub action: String,
+    pub memory_asset_id: MemoryAssetId,
+    pub expected_version: u64,
+    pub asset: MemoryAsset,
+    pub version: StoredMemoryVersionRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredMemoryGrantRecord {
+    pub principal_id: String,
+    pub memory_asset_id: MemoryAssetId,
+    pub project_id: Option<ProjectId>,
+    pub allowed_actions: Vec<String>,
+    pub revision: u64,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredExtractionJobRecord {
+    pub job_id: String,
+    pub source_stream: SessionId,
+    pub start_sequence: u64,
+    pub end_sequence: u64,
+    pub source_digest: ContentHash,
+    pub source_event_ids: Vec<EventId>,
+    pub extractor_version: String,
+    pub strategy_digest: ContentHash,
+    pub status: String,
+    pub attempts: u32,
+    pub lease_owner: Option<String>,
+    pub lease_generation: u64,
+    pub last_error: Option<String>,
+    pub disposition: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StoredExtractionLeaseRecord {
+    pub job: StoredExtractionJobRecord,
+    pub source_events: Vec<EventEnvelope>,
+    pub owner: String,
+    pub generation: u64,
 }
