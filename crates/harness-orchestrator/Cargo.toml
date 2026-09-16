@@ -1,0 +1,28 @@
+[package]
+name = "harness-orchestrator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+harness-kernel = { path = "../harness-kernel" }
+harness-memory = { path = "../harness-memory" }
+harness-providers = { path = "../harness-providers" }
+harness-runtime = { path = "../harness-runtime" }
+harness-session = { path = "../harness-session" }
+harness-store-sqlite = { path = "../harness-store-sqlite" }
+harness-types = { path = "../harness-types" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

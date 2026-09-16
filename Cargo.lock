@@ -662,6 +662,7 @@ dependencies = [
  "clap",
  "harness-kernel",
  "harness-memory",
+ "harness-orchestrator",
  "harness-providers",
  "harness-runtime",
  "harness-session",
@@ -698,6 +699,25 @@ dependencies = [
  "tokio",
  "tokio-util",
  "unicode-normalization",
+]
+
+[[package]]
+name = "harness-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "harness-kernel",
+ "harness-memory",
+ "harness-providers",
+ "harness-runtime",
+ "harness-session",
+ "harness-store-sqlite",
+ "harness-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod delegation_cli;
 mod memory_cli;
 
 use std::{fs, path::PathBuf, process::ExitCode, sync::Arc};
@@ -94,6 +95,8 @@ enum Command {
     Session(SessionCommand),
     /// P3 coding-tool capabilities and a deterministic local fixture.
     Code(CodingCommand),
+    /// P5 delegation: coordinator/worker runs and durable task views.
+    Tasks(delegation_cli::TaskCommand),
 }
 
 #[derive(Debug, Args)]
@@ -377,6 +380,7 @@ async fn run(cli: Cli) -> Result<(), HarnessError> {
         })) => {
             run_coding_fixture(&data_dir, &workspace, &path, &find, &replace, approve, json).await
         }
+        Some(Command::Tasks(command)) => delegation_cli::run(command).await,
         None => Ok(()),
     }
 }

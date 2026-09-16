@@ -2,7 +2,7 @@
 
 [English](P5_MULTI_AGENT.en.md) | Tiếng Việt
 
-Runbook triển khai; trạng thái: **chưa bắt đầu**. Dự toán: 8–12 ngày công. Target files, Rust tests và lệnh `ha` dưới đây là output tương lai, trừ khi checkout thật đã có. Riêng tài liệu này không là bằng chứng hoàn tất.
+Runbook triển khai; trạng thái: **đã triển khai local, nghiệm thu còn chờ CI remote**. Dự toán: 8–12 ngày công. Target files, Rust tests và lệnh `ha` dưới đây là output tương lai, trừ khi checkout thật đã có. Riêng tài liệu này không là bằng chứng hoàn tất.
 
 ## 1. Kết quả và điều kiện vào phase
 

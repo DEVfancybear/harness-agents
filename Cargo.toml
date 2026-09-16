@@ -9,6 +9,7 @@ members = [
     "crates/harness-runtime",
     "crates/harness-tools",
     "crates/harness-memory",
+    "crates/harness-orchestrator",
 ]
 resolver = "2"
 

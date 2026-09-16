@@ -215,6 +215,7 @@ fn p0_f07_phase_gate_self_test_exercises_negative_controls() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One registry contract across all accepted phases.
 fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
     let root = repository_root();
     let registry: Value = serde_json::from_str(
@@ -262,6 +263,7 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
                     && case["phase"] != "P2"
                     && case["phase"] != "P3"
                     && case["phase"] != "P4"
+                    && case["phase"] != "P5"
             })
             .all(|case| { case["readiness"] == "not_implemented" && case["required"] == false })
     );
@@ -294,6 +296,7 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
     );
     assert!(ci.contains("scripts/Verify-Phase.ps1 -Phase P0"));
     assert!(ci.contains("scripts/Verify-Phase.ps1 -Phase P4"));
+    assert!(ci.contains("scripts/Verify-Phase.ps1 -Phase P5"));
     let p4_cases = future_cases
         .iter()
         .filter(|case| case["phase"] == "P4")
@@ -304,5 +307,33 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
             .iter()
             .all(|case| case["readiness"] == "implemented" && case["required"] == true)
     );
+    // P5 owns two continuity cases; its seven steps and its strengthening cases
+    // must all be real, required and named.
+    let p5_cases = future_cases
+        .iter()
+        .filter(|case| case["phase"] == "P5")
+        .collect::<Vec<_>>();
+    assert_eq!(p5_cases.len(), 2);
+    assert!(
+        p5_cases
+            .iter()
+            .all(|case| { case["readiness"] == "implemented" && case["required"] == true })
+    );
+    let p5_steps = cases
+        .iter()
+        .filter(|case| {
+            case["phase"] == "P5" && case["id"].as_str().is_some_and(|id| id.starts_with("P5-S"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(p5_steps.len(), 7);
+    assert!(p5_steps.iter().all(|case| {
+        case["readiness"] == "implemented"
+            && case["required"] == true
+            && case["target"] == "phase_p5"
+            && !case["test_names"]
+                .as_array()
+                .expect("test names")
+                .is_empty()
+    }));
     assert!(!ci.contains("secrets."));
 }

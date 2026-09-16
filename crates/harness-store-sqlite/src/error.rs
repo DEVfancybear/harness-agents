@@ -28,3 +28,9 @@ impl StoreError {
         HarnessError::new(self.code, self.message)
     }
 }
+
+impl From<HarnessError> for StoreError {
+    fn from(error: HarnessError) -> Self {
+        Self::new(error.code(), error.to_string())
+    }
+}

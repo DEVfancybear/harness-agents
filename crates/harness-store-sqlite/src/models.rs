@@ -27,6 +27,8 @@ pub const RUNTIME_SCHEMA_VERSION: i64 = 1;
 pub const TOOLS_SCHEMA_VERSION: i64 = 1;
 /// Additive P4 memory tables retain all earlier schema revisions.
 pub const MEMORY_SCHEMA_VERSION: i64 = 1;
+/// Additive P5 delegation tables retain all earlier schema revisions.
+pub const DELEGATION_SCHEMA_VERSION: i64 = 1;
 
 /// All durable paths owned by a local harness data directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,6 +77,7 @@ pub enum StoreFaultPoint {
     BeforeToolIntentCommit,
     BeforeToolSettlementCommit,
     BeforeMemorySettlementCommit,
+    BeforeDelegationDeliveryCommit,
 }
 
 /// A one-shot, deterministic fault injector for component tests.
@@ -579,5 +582,110 @@ pub struct StoredExtractionLeaseRecord {
     pub job: StoredExtractionJobRecord,
     pub source_events: Vec<EventEnvelope>,
     pub owner: String,
+    pub generation: u64,
+}
+
+/// One durable delegation task node, including its host-authored brief.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredTaskNodeRecord {
+    pub task_id: TaskId,
+    pub parent_task_id: Option<TaskId>,
+    pub role: String,
+    pub status: String,
+    pub revision: u64,
+    pub depth: u32,
+    pub depends_on: Vec<TaskId>,
+    pub brief_json: Value,
+    pub node_json: Value,
+}
+
+/// The single durable owner of a task, fenced by ownership generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskOwnerRecord {
+    pub task_id: TaskId,
+    pub owner_run_id: AgentRunId,
+    pub owner_session_id: SessionId,
+    pub role: String,
+    pub generation: u64,
+    pub lease_revision: u64,
+}
+
+/// A task state transition together with the durable parent message it makes
+/// visible. Both commit inside one transaction.
+#[derive(Clone, Debug)]
+pub struct DeliveryCommit {
+    pub task_transition: StoredTaskNodeRecord,
+    pub result: Option<StoredDelegatedResultRecord>,
+    pub delivery: ParentDeliveryRecord,
+    pub usage: Option<BudgetUsageRecord>,
+}
+
+/// The durable worker report.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredDelegatedResultRecord {
+    pub result_id: String,
+    pub task_id: TaskId,
+    pub worker_run_id: AgentRunId,
+    pub outcome: String,
+    pub base_revision: String,
+    pub result_revision: String,
+    pub artifact_refs: Vec<String>,
+    pub report_json: Value,
+    pub result_hash: ContentHash,
+}
+
+/// A durable parent message. `message_id` is the logical delivery identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParentDeliveryRecord {
+    pub message_id: String,
+    pub sender_task_id: TaskId,
+    pub recipient_task_id: TaskId,
+    pub recipient_session_id: SessionId,
+    pub result_id: Option<String>,
+    pub payload_hash: ContentHash,
+    pub payload: Value,
+    pub state: String,
+    pub consumed_by: Option<String>,
+}
+
+/// Observed usage charged against a delegation budget. The charged task is
+/// implied by the write that carried it, so this stays a plain value record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BudgetUsageRecord {
+    pub model_requests: u32,
+    pub retries: u32,
+    pub cost_units: u64,
+}
+
+/// A host-issued memory binding for one delegated worker. The binding pins the
+/// exact asset version that was injected, so a later revision is detectable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryBindingRow {
+    pub binding_id: String,
+    pub task_id: TaskId,
+    pub profile_id: AgentProfileId,
+    pub memory_asset_id: MemoryAssetId,
+    pub version: u64,
+    pub injection_mode: String,
+    pub priority: i64,
+    pub actions: Vec<String>,
+    pub revision: u64,
+}
+
+/// A host-owned isolated worker workspace row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorktreeRecordRow {
+    pub worktree_id: String,
+    pub task_id: TaskId,
+    pub run_id: AgentRunId,
+    pub project_id: ProjectId,
+    pub base_commit: String,
+    pub base_branch: String,
+    pub branch: String,
+    pub path: String,
+    pub write_scope: Vec<String>,
+    pub state: String,
+    pub input_fingerprint: ContentHash,
+    pub result_fingerprint: Option<ContentHash>,
     pub generation: u64,
 }

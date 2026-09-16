@@ -6,7 +6,7 @@
 
 Các case IDs C01–C30, K01–K14 giữ nguyên định nghĩa trong [memory contract](../MEMORY_AND_CONTINUITY.vi.md) và [plugin contract](../PLUGIN_ARCHITECTURE.vi.md). Bảng này gán **một phase phụ trách bằng chứng component đầu tiên** cho mỗi case, không thay thế điều kiện gốc. P0 dựng fixture/test registry; không được nhận đã chạy 44 runtime cases.
 
-“Củng cố” nghĩa là chạy lại bằng component downstream hoặc tích hợp đầy đủ hơn. P1 dùng controlled receipts và synthetic principals khi chưa có process tool/agent thật; P3/P5 phải bổ sung chứng minh thật ở boundary đó. P7 chạy toàn bộ 44 cases trên runtime tích hợp. P8 chạy lại các regressions đó và thêm sáu ca Web. Mọi case trong bảng hiện **chưa triển khai**.
+“Củng cố” nghĩa là chạy lại bằng component downstream hoặc tích hợp đầy đủ hơn. P1 dùng controlled receipts và synthetic principals khi chưa có process tool/agent thật; P3/P5 phải bổ sung chứng minh thật ở boundary đó. P7 chạy toàn bộ 44 cases trên runtime tích hợp. P8 chạy lại các regressions đó và thêm sáu ca Web. Case chỉ được coi là đã triển khai khi phase sở hữu có evidence gắn source; xem cặp evidence của từng phase.
 
 Primary ownership được khai báo trong [manifest](manifest.json); step triển khai cụ thể nằm ở [runbooks từng phase](README.vi.md). Một case có thể cần nhiều test functions và fault windows. Không ép một function chứa tất cả rồi bỏ qua một nửa điều kiện.
 

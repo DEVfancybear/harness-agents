@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 [CmdletBinding()]
 param(
-    [ValidateSet('P0', 'P1', 'P2', 'P3', 'P4')]
+    [ValidateSet('P0', 'P1', 'P2', 'P3', 'P4', 'P5')]
     [string] $Phase = 'P0',
     [string] $RepositoryRoot = (Join-Path $PSScriptRoot '..'),
     [switch] $SelfTest,
@@ -50,6 +50,33 @@ function Get-DiscoveredTestNames {
     return @($names | Sort-Object)
 }
 
+function Get-TargetTestEntries {
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]] $Tests,
+        [string] $DefaultTarget = ''
+    )
+
+    # An entry may be plain ("name", proven by the case's own target) or
+    # qualified ("phase_p5::name", proven by a later acceptance target).
+    $entries = [System.Collections.Generic.List[object]]::new()
+    foreach ($test in $Tests) {
+        $separator = $test.IndexOf('::')
+        if ($separator -gt 0) {
+            $entries.Add([pscustomobject]@{
+                Target = $test.Substring(0, $separator)
+                ShortName = $test.Substring($separator + 2)
+                Qualified = $test
+            })
+        } else {
+            $entries.Add([pscustomobject]@{
+                Target = $DefaultTarget
+                ShortName = $test
+                Qualified = $test
+            })
+        }
+    }
+    return @($entries)
+}
 function Assert-RequiredTestDiscovery {
     param(
         [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]] $Discovered,
@@ -233,7 +260,7 @@ foreach ($case in $phaseCases) {
     }
 }
 
-$activePhases = @('P0', 'P1', 'P2', 'P3', 'P4')
+$activePhases = @('P0', 'P1', 'P2', 'P3', 'P4', 'P5')
 $activeCases = @($registry.cases | Where-Object { $_.phase -in $activePhases })
 foreach ($activeCase in $activeCases) {
     if ($activeCase.readiness -cne 'implemented' -or $activeCase.required -ne $true) {
@@ -277,6 +304,7 @@ try {
         'P2' { @('P0', 'P1') }
         'P3' { @('P0', 'P1', 'P2') }
         'P4' { @('P0', 'P1', 'P2', 'P3') }
+        'P5' { @('P0', 'P1', 'P2', 'P3', 'P4') }
         default { @() }
     }
     foreach ($predecessorPhase in $predecessorPhases) {
@@ -285,24 +313,32 @@ try {
         $predecessorTestFile = "phase_$($predecessorPhase.ToLowerInvariant())"
         $predecessorDiscovery = Invoke-CheckedCommand -Name "predecessor-$predecessorPhase-test-discovery" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $predecessorTestFile, '--locked', '--', '--list')
         $predecessorDiscovered = Get-DiscoveredTestNames -Output $predecessorDiscovery.Output
-        Assert-RequiredTestDiscovery -Discovered $predecessorDiscovered -Required $predecessorTests
-        foreach ($testName in $predecessorTests) {
+        $predecessorLocal = @($predecessorTests | Where-Object { $_ -notmatch '::' })
+        Assert-RequiredTestDiscovery -Discovered $predecessorDiscovered -Required $predecessorLocal
+        foreach ($testName in $predecessorLocal) {
             $result = Invoke-CheckedCommand -Name "predecessor-$predecessorPhase-test:$testName" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $predecessorTestFile, '--locked', $testName, '--', '--exact')
             Assert-RequiredTestResult -TestName $testName -Output $result.Output
+        }
+        # A case may also be proven by a test in a later acceptance target. Such
+        # entries are qualified with their target and run here as regressions.
+        foreach ($entry in (Get-TargetTestEntries -Tests $predecessorTests -DefaultTarget $predecessorTestFile)) {
+            $result = Invoke-CheckedCommand -Name "predecessor-$predecessorPhase-test:$($entry.Qualified)" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $entry.Target, '--locked', $entry.ShortName, '--', '--exact')
+            Assert-RequiredTestResult -TestName $entry.ShortName -Output $result.Output
         }
         $results.Add([pscustomobject]@{ name = "predecessor-$predecessorPhase-regression"; result = 'passed'; count = $predecessorTests.Count })
         if (-not $Json) { Write-Output "GATE_STEP_OK: predecessor-$predecessorPhase-regression ($($predecessorTests.Count) tests)" }
     }
 
+    $phaseEntries = @(Get-TargetTestEntries -Tests $requiredTests -DefaultTarget $phaseTestFile)
     $discovery = Invoke-CheckedCommand -Name 'phase-test-discovery' -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $phaseTestFile, '--locked', '--', '--list')
     $discoveredTests = Get-DiscoveredTestNames -Output $discovery.Output
-    Assert-RequiredTestDiscovery -Discovered $discoveredTests -Required $requiredTests
+    Assert-RequiredTestDiscovery -Discovered $discoveredTests -Required @($phaseEntries | Where-Object { $_.Target -ceq $phaseTestFile } | ForEach-Object { $_.ShortName })
     $results.Add([pscustomobject]@{ name = 'phase-test-discovery'; result = 'passed'; tests = $discoveredTests })
     if (-not $Json) { Write-Output "GATE_STEP_OK: phase-test-discovery ($($discoveredTests.Count) tests)" }
 
-    foreach ($testName in $requiredTests) {
-        $result = Invoke-CheckedCommand -Name "required-test:$testName" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $phaseTestFile, '--locked', $testName, '--', '--exact')
-        Assert-RequiredTestResult -TestName $testName -Output $result.Output
+    foreach ($entry in $phaseEntries) {
+        $result = Invoke-CheckedCommand -Name "required-test:$($entry.Qualified)" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $entry.Target, '--locked', $entry.ShortName, '--', '--exact')
+        Assert-RequiredTestResult -TestName $entry.ShortName -Output $result.Output
     }
     $results.Add([pscustomobject]@{ name = 'required-tests'; result = 'passed'; count = $requiredTests.Count })
     if (-not $Json) { Write-Output "GATE_STEP_OK: required-tests ($($requiredTests.Count) tests)" }

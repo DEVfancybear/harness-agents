@@ -30,6 +30,7 @@ use crate::{
     ToolTaskUpdateCommit, WriterOpenOptions,
 };
 
+pub mod delegation;
 mod memory;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -202,6 +203,10 @@ impl SqliteStore {
             let _ = FileExt::unlock(&lock_file);
             return Err(error);
         }
+        if let Err(error) = delegation::ensure_delegation_schema(&pool).await {
+            let _ = FileExt::unlock(&lock_file);
+            return Err(error);
+        }
         let fence = match acquire_fence(&pool, options.host_id).await {
             Ok(fence) => fence,
             Err(error) => {
@@ -241,6 +246,12 @@ impl SqliteStore {
     #[must_use]
     pub fn paths(&self) -> &StorePaths {
         &self.paths
+    }
+
+    /// Access the test-only fault plan. It never alters production behaviour
+    /// unless a test explicitly armed a point.
+    pub(crate) fn fault_plan_ref(&self) -> &StoreFaultPlan {
+        &self.fault_plan
     }
 
     pub fn fence(&self) -> Result<HostFence, StoreError> {
