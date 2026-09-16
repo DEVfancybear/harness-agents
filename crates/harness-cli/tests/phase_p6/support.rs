@@ -55,16 +55,35 @@ impl FixtureMode {
 /// Path to the compiled fixture plugin.
 #[must_use]
 pub fn fixture_plugin() -> PathBuf {
-    binary("p6_fixture_plugin")
+    binary(
+        "p6_fixture_plugin",
+        option_env!("CARGO_BIN_EXE_p6_fixture_plugin"),
+    )
 }
 
 /// Path to the compiled MCP fixture server.
 #[must_use]
 pub fn fixture_mcp_server() -> PathBuf {
-    binary("p6_fixture_mcp_server")
+    binary(
+        "p6_fixture_mcp_server",
+        option_env!("CARGO_BIN_EXE_p6_fixture_mcp_server"),
+    )
 }
 
-fn binary(name: &str) -> PathBuf {
+/// Resolve a fixture executable.
+///
+/// The fixtures are binaries of the `harness-cli` crate, so the compile-time
+/// environment variables resolve the real artifact instead of a path guess.
+fn binary(name: &str, exported: Option<&str>) -> PathBuf {
+    if let Some(path) = exported {
+        let candidate = PathBuf::from(path);
+        assert!(
+            candidate.is_file(),
+            "compiled fixture binary missing at {}",
+            candidate.display()
+        );
+        return candidate;
+    }
     let mut path = std::env::current_exe().expect("test binary path");
     path.pop();
     if path.ends_with("deps") {
@@ -165,18 +184,7 @@ pub fn run_cli(arguments: &[&str]) -> Output {
 }
 
 fn binary_ha() -> PathBuf {
-    let mut path = std::env::current_exe().expect("test binary path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    let candidate = path.join(format!("ha{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        candidate.is_file(),
-        "compiled ha binary missing at {}",
-        candidate.display()
-    );
-    candidate
+    binary("ha", option_env!("CARGO_BIN_EXE_ha"))
 }
 
 /// Write a manifest JSON file into a temporary directory.

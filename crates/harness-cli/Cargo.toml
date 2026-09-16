@@ -22,7 +22,11 @@ harness-memory = { path = "../harness-memory" }
 harness-orchestrator = { path = "../harness-orchestrator" }
 harness-extensions = { path = "../harness-extensions" }
 harness-kernel = { path = "../harness-kernel" }
+rmcp = { version = "=3.4.0", default-features = false, features = ["client", "server", "macros", "schemars", "transport-child-process", "transport-io"] }
+schemars.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 toml.workspace = true
 tokio.workspace = true
 
@@ -41,3 +45,13 @@ tokio.workspace = true
 
 [lints]
 workspace = true
+# P6 fixture executables. They live beside the acceptance target that starts
+# them, so `CARGO_BIN_EXE_*` resolves the real compiled binary instead of a
+# path guess.
+[[bin]]
+name = "p6_fixture_plugin"
+path = "src/bin/p6_fixture_plugin.rs"
+
+[[bin]]
+name = "p6_fixture_mcp_server"
+path = "src/bin/p6_fixture_mcp_server.rs"

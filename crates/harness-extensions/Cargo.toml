@@ -6,14 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "p6_fixture_plugin"
-path = "src/bin/p6_fixture_plugin.rs"
-
-[[bin]]
-name = "p6_fixture_mcp_server"
-path = "src/bin/p6_fixture_mcp_server.rs"
-
 [dependencies]
 harness-kernel = { path = "../harness-kernel" }
 harness-providers = { path = "../harness-providers" }
