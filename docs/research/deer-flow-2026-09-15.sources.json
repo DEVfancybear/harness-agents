@@ -1,0 +1,254 @@
+{
+  "schema_version": 1,
+  "research_dates": [
+    "2026-09-14",
+    "2026-09-15"
+  ],
+  "repository": "https://github.com/bytedance/deer-flow",
+  "revision": "6469833886487a71c25d17b6b543ecab9b0defca",
+  "purpose": "New greenfield Harness Agents product and architecture plan",
+  "method": "Two-pass documentation and selected source inspection; direct file fallback because graph MCP was unavailable",
+  "upstream_runtime_executed": false,
+  "upstream_tests_executed": false,
+  "live_model_benchmarks_executed": false,
+  "source_hash_basis": "SHA-256 of complete files in the cloned checkout; hashes identify snapshots, not read coverage",
+  "evidence_paths": [
+    {
+      "path": "backend/app/scheduler/service.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/app/scheduler/service.py",
+      "sha256": "121aba4e2f725fcd2315f78c25b32fe28e26af935f07c57b3c6fe953d7c2bed4",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/docs/AUTH_DESIGN.md",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/docs/AUTH_DESIGN.md",
+      "sha256": "d7ed3edd74da57f98f7af8a6b8ef4de2cdf1545bb2e8e8efa908a882459cf3f1",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/docs/checkpoint-retention-contract.md",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/docs/checkpoint-retention-contract.md",
+      "sha256": "ee141b00fa6cc92aa92da8f90a1539e7afc6158c74986b85c28db9222c6ec217",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/docs/LOOP_DETECTION.md",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/docs/LOOP_DETECTION.md",
+      "sha256": "60ebd9012e423220041f1836683b17a384e93af1c84ae32bc3b9300457b83a7f",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/docs/RUN_EVENT_STREAM.md",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/docs/RUN_EVENT_STREAM.md",
+      "sha256": "5315adb2dcf137eedb2c9a176f9da36bece86a884d9008cdf2f0ca4b18b5265d",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/docs/summarization.md",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/docs/summarization.md",
+      "sha256": "2a675358327221f8f6d8eaa8a0200e122cabbb75705b9ca491f24a6f83e66708",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/docs/THREAD_LIFECYCLE.md",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/docs/THREAD_LIFECYCLE.md",
+      "sha256": "7f098cc64fd04e0c569d425ce0585bc60aeee467bf8afac2781d50d6f98ed7f4",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/extension-api/pyproject.toml",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/extension-api/pyproject.toml",
+      "sha256": "016692e97dfbd0c5315869642526aad691a3f370e6b47120fe74c5b8a299cbc8",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/agents/lead_agent/agent.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/agents/lead_agent/agent.py",
+      "sha256": "4c452f068d18b469f353213f49d3289a2b5401a54d24301918ad47c72365c7b9",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/queue.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/queue.py",
+      "sha256": "a0aa4897687b1eff97cc656cf154d1794d76bbd68e97c09b4fe20bc365ea39a2",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/agents/memory/manager.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/agents/memory/manager.py",
+      "sha256": "b85e0aa0c6fecdee479ec55004e0e733a934babb5ef8046cafe02b978d542772",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/agents/middlewares/durable_context_middleware.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/agents/middlewares/durable_context_middleware.py",
+      "sha256": "cf37b6d48e81b1f4c8c9a9c1a12a874d893e423e13a771c17d988c19dde9bdfd",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/agents/middlewares/terminal_response_middleware.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/agents/middlewares/terminal_response_middleware.py",
+      "sha256": "a29ef08f30e1bb2f9ddf8a56c1ceb73888be2fe1b4b42fd1cffcd827f3d8c3bf",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/agents/middlewares/token_budget_middleware.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/agents/middlewares/token_budget_middleware.py",
+      "sha256": "c3fa7bcb7ebec378a836cd7c46fd082a7e40f610e1015adb1815b12195588ee8",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/agents/middlewares/tool_output_budget_middleware.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/agents/middlewares/tool_output_budget_middleware.py",
+      "sha256": "744024c3276375445bbe1e625b21723f269d2a5f754ba52d10d4e1571ff5e261",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/agents/task_continuity/tools.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/agents/task_continuity/tools.py",
+      "sha256": "d86570525feb805a15c862a1f4032f7e204282e3fd0e65966a36dbf5e20057f4",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/config/model_config.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/config/model_config.py",
+      "sha256": "fcae619b437cb28f0c8693cf05eeae3f17513b5fd2be8d345287130867c8bc90",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/config/reload_boundary.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/config/reload_boundary.py",
+      "sha256": "cfdd8de0c5f71c71ec6240068034631c3416d587699bcae98164f3e3daa053b0",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/mcp/tasks/driver.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/mcp/tasks/driver.py",
+      "sha256": "f24b53523ad471611607e851d856e24d18a91625fba5b317310a32f6f2db0acf",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/runtime/goal.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/runtime/goal.py",
+      "sha256": "f28aecd71c8054b25472536b8dde80648ac30c9b4da540c94ef24a1ca9587bc6",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/runtime/runs/manager.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/runtime/runs/manager.py",
+      "sha256": "214c80ed97d6a480598a431bbf634574554e7ee17accf35191dd7fe6d202a5e2",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/runtime/stream_bridge/base.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/runtime/stream_bridge/base.py",
+      "sha256": "75394fed2757ae1b5ccb0df3ba288e677bf91c83e3187acf638659cb0021abc6",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/sandbox/env_policy.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/sandbox/env_policy.py",
+      "sha256": "94822be942bbbc54bb0141e24c7d36269192f81be95f1c8e9180baf7ee42a6ff",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/sandbox/sandbox_provider.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/sandbox/sandbox_provider.py",
+      "sha256": "50134433b68a72fc9651247610a63562c61f2dbc68cd618de3e30f503faff51a",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/scheduler/schedules.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/scheduler/schedules.py",
+      "sha256": "e59b8e6e212779d1284fb75c5f99f2327bbac36fa8426558a8899278a8f17b0e",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/skills/catalog.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/skills/catalog.py",
+      "sha256": "a2653c0d06ad432ecbda234d4d6a2fedda7b5a425469cf4ce28649089433728a",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/skills/permissions.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/skills/permissions.py",
+      "sha256": "ea288d3d3b73ffbcd473bfe1a5123a818d488634d6971decaaa960cb7c2a6a53",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/subagents/acceptance_checks.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/subagents/acceptance_checks.py",
+      "sha256": "eb7e2c33aeb7fb836c506eac860e93995b8831d9cfe055d727383188a94842d4",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/subagents/context_snapshot.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/subagents/context_snapshot.py",
+      "sha256": "8505329a39581c919adb2f3b3d17e5d375fd4d3d70bedab7d714fe53f7241823",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/subagents/report_contract.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/subagents/report_contract.py",
+      "sha256": "fd703de3fb400720abb9ffcb6134962302e3227cf199e9a1327f7113f0771b00",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/subagents/status_contract.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/subagents/status_contract.py",
+      "sha256": "aaf9800049c5105283917c77d1b0744ff074ad0a7a302fd685de6ec6df02d807",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/tools/builtins/tool_search.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/tools/builtins/tool_search.py",
+      "sha256": "205d9eafca26bf2e3a671f3f55792e4eb30a75f9f995ab0af34dfbc10e964da2",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/packages/harness/deerflow/uploads/manager.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/packages/harness/deerflow/uploads/manager.py",
+      "sha256": "056d49dd5a243fe0f86c8211343641c286e347f1a8f8574a30e21f8d29fa619d",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "backend/tests/test_task_continuity.py",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/backend/tests/test_task_continuity.py",
+      "sha256": "5e46fdda1dcc14a896ef9a6cfeb64fa80d9842238adb995f46b5ef29a2e49149",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "docs/ARCHITECTURE.md",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/docs/ARCHITECTURE.md",
+      "sha256": "10d2ff251e638598251456f67876af1f72a28d385132472963e20edcaec4de9b",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "docs/task-continuity.md",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/docs/task-continuity.md",
+      "sha256": "38e242b80a2134247fef0094b6663184a365705540c7ed38ae62039b371812dc",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "frontend/src/core/tasks/subtask-result.ts",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/frontend/src/core/tasks/subtask-result.ts",
+      "sha256": "2331058e65eb3a81b7b49042c7db69ae2e1011be0728d95091722fbfdf8dea7b",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    },
+    {
+      "path": "frontend/src/core/tasks/subtask-update.ts",
+      "url": "https://github.com/bytedance/deer-flow/blob/6469833886487a71c25d17b6b543ecab9b0defca/frontend/src/core/tasks/subtask-update.ts",
+      "sha256": "fae17573f3c0ceaf3b03463179530de21d89cf1f9c4e5937a49a2d69391c9077",
+      "inspection": "selected sections or relevant symbols; not exhaustive verification"
+    }
+  ],
+  "additional_official_sources": [
+    "https://sqlite.org/wal.html",
+    "https://sqlite.org/backup.html",
+    "https://tokio.rs/tokio/topics/shutdown",
+    "https://git-scm.com/docs/git-worktree",
+    "https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects",
+    "https://modelcontextprotocol.io/specification/2026-07-28",
+    "https://github.com/modelcontextprotocol/rust-sdk"
+  ]
+}
