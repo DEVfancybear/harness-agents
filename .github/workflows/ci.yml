@@ -96,3 +96,19 @@ jobs:
       - name: Run P5 gate, delegation fixtures and predecessor regressions without credentials
         shell: pwsh
         run: ./scripts/Verify-Phase.ps1 -Phase P5
+  verify-p6:
+    name: P6 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+      - name: Run P6 gate, extension fixtures and predecessor regressions without credentials
+        shell: pwsh
+        run: ./scripts/Verify-Phase.ps1 -Phase P6

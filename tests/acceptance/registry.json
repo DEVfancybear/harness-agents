@@ -123,6 +123,195 @@
       "required": true
     },
     {
+      "id": "C01",
+      "phase": "P1",
+      "target": "phase_p1",
+      "test_names": [
+        "p1_c01_child_kill_after_ack_recovers_one_input"
+      ],
+      "fixture": "crates/harness-cli/src/bin/p1_fixture_host.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C02",
+      "phase": "P1",
+      "target": "phase_p1",
+      "test_names": [
+        "p1_c02_child_kill_after_receipt_before_snapshot_folds_committed_tail"
+      ],
+      "fixture": "crates/harness-cli/src/bin/p1_fixture_host.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C15",
+      "phase": "P1",
+      "target": "phase_p1",
+      "test_names": [
+        "p1_c15_writer_competition_and_stale_fence_are_rejected",
+        "phase_p5::strengthening::p5_c15_stale_worker_generation_cannot_commit"
+      ],
+      "fixture": "crates/harness-cli/src/bin/p1_fixture_host.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C21",
+      "phase": "P1",
+      "target": "phase_p1",
+      "test_names": [
+        "p1_c21_injected_write_failure_never_acknowledges_or_advances_state"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p1.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C24",
+      "phase": "P1",
+      "target": "phase_p1",
+      "test_names": [
+        "p1_c24_task_lease_blocks_competing_session_continuation",
+        "phase_p5::strengthening::p5_c24_competing_worker_cannot_own_one_task"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p1.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "K01",
+      "phase": "P1",
+      "target": "phase_p1",
+      "test_names": [
+        "p1_k01_graph_rejects_missing_incompatible_cycle_and_duplicates_before_admission",
+        "phase_p6::p6_s06_extension_paths_preserve_predecessor_contracts"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p1.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "K02",
+      "phase": "P1",
+      "target": "phase_p1",
+      "test_names": [
+        "p1_k02_optional_extractor_absence_allows_required_composition"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p1.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "K03",
+      "phase": "P1",
+      "target": "phase_p1",
+      "test_names": [
+        "p1_k03_failed_mount_rolls_back_unpublished_resources_and_joins_them",
+        "phase_p6::p6_s06_extension_paths_preserve_predecessor_contracts"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p1.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "K04",
+      "phase": "P1",
+      "target": "phase_p1",
+      "test_names": [
+        "p1_k04_scoped_lookup_is_nearest_and_siblings_are_isolated",
+        "phase_p5::strengthening::p5_k04_worker_scope_override_is_worker_local",
+        "phase_p6::p6_s03_external_tools_cross_the_same_policy_gate"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p1.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "K05",
+      "phase": "P1",
+      "target": "phase_p1",
+      "test_names": [
+        "p1_k05_late_disposer_cannot_remove_replacement_generation",
+        "phase_p6::p6_s06_extension_paths_preserve_predecessor_contracts"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p1.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "K06",
+      "phase": "P1",
+      "target": "phase_p1",
+      "test_names": [
+        "p1_k06_provider_loss_stops_admission_drains_dependents_and_marks_unknown",
+        "phase_p5::strengthening::p5_k06_provider_loss_drains_dependent_children"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p1.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "K07",
+      "phase": "P1",
+      "target": "phase_p1",
+      "test_names": [
+        "p1_k07_racing_shutdown_is_shared_aggregates_errors_and_closes_store_last",
+        "phase_p5::strengthening::p5_k07_racing_shutdown_shares_completion_and_reports_failures"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p1.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
       "id": "P1-S01",
       "phase": "P1",
       "target": "phase_p1",
@@ -239,6 +428,128 @@
       "required": true
     },
     {
+      "id": "C04",
+      "phase": "P2",
+      "target": "phase_p2",
+      "test_names": [
+        "p2_c04_five_compactions_preserve_mandatory_state_and_corrections"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p2.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C06",
+      "phase": "P2",
+      "target": "phase_p2",
+      "test_names": [
+        "p2_c06_new_session_continuation_reuses_task_checkpoint_and_scope"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p2.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C09",
+      "phase": "P2",
+      "target": "phase_p2",
+      "test_names": [
+        "p2_c09_decision_supersession_survives_context_and_resume"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p2.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C14",
+      "phase": "P2",
+      "target": "phase_p2",
+      "test_names": [
+        "p2_c14_offline_replay_dispatches_nothing_and_matches_frozen_packet",
+        "phase_p6::p6_extension_provider_requires_an_active_capability"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p2.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C18",
+      "phase": "P2",
+      "target": "phase_p2",
+      "test_names": [
+        "p2_c18_unclassified_instruction_is_mandatory_after_compaction"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p2.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C19",
+      "phase": "P2",
+      "target": "phase_p2",
+      "test_names": [
+        "p2_c19_project_rule_with_zero_relevance_is_admitted"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p2.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "K10",
+      "phase": "P2",
+      "target": "phase_p2",
+      "test_names": [
+        "p2_k10_config_change_is_boundary_scoped_and_frozen_request_is_immutable"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p2.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "K11",
+      "phase": "P2",
+      "target": "phase_p2",
+      "test_names": [
+        "p2_k11_unknown_critical_event_blocks_resume_but_allows_offline_inspection",
+        "phase_p6::p6_s06_extension_paths_preserve_predecessor_contracts"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p2.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
       "id": "P2-S01",
       "phase": "P2",
       "target": "phase_p2",
@@ -343,6 +654,100 @@
         "p2_s07_cli_runs_resumes_continues_inspects_and_replays_offline"
       ],
       "fixture": "crates/harness-cli/tests/phase_p2.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C03",
+      "phase": "P3",
+      "target": "phase_p3",
+      "test_names": [
+        "p3_c03_unknown_side_effect_is_reconciled_without_blind_rerun",
+        "phase_p5::strengthening::p5_c03_uncertain_child_effect_is_not_completed",
+        "phase_p6::p6_s06_extension_paths_preserve_predecessor_contracts"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p3.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C10",
+      "phase": "P3",
+      "target": "phase_p3",
+      "test_names": [
+        "p3_c10_external_workspace_change_invalidates_approved_execution",
+        "phase_p5::strengthening::p5_c10_worktree_change_invalidates_branch_check"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p3.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C23",
+      "phase": "P3",
+      "target": "phase_p3",
+      "test_names": [
+        "p3_c23_project_identity_requires_explicit_reassociation",
+        "phase_p5::strengthening::p5_c23_linked_worktrees_share_project_identity"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p3.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C29",
+      "phase": "P3",
+      "target": "phase_p3",
+      "test_names": [
+        "p3_c29_secret_output_is_redacted_and_artifact_scope_is_enforced"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p3.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "K08",
+      "phase": "P3",
+      "target": "phase_p3",
+      "test_names": [
+        "p3_k08_parent_deny_cannot_be_overridden"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p3.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "K09",
+      "phase": "P3",
+      "target": "phase_p3",
+      "test_names": [
+        "p3_k09_observer_failure_cannot_rewrite_receipt"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p3.rs",
       "platforms": [
         "windows",
         "linux"
@@ -464,6 +869,174 @@
       "required": true
     },
     {
+      "id": "C05",
+      "phase": "P4",
+      "target": "phase_p4",
+      "test_names": [
+        "p4_c05_optional_extraction_failure_does_not_block_working_state_resume"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p4.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C07",
+      "phase": "P4",
+      "target": "phase_p4",
+      "test_names": [
+        "p4_c07_three_principals_publish_with_cas_no_lost_update",
+        "phase_p5::strengthening::p5_c07_three_workers_publish_without_lost_update"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p4.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C08",
+      "phase": "P4",
+      "target": "phase_p4",
+      "test_names": [
+        "p4_c08_forged_scope_cannot_search_read_or_export",
+        "phase_p5::strengthening::p5_c08_forged_child_scope_cannot_read_outside_grants",
+        "phase_p6::p6_k13_nested_extension_call_cannot_escalate_authority"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p4.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C12",
+      "phase": "P4",
+      "target": "phase_p4",
+      "test_names": [
+        "p4_c12_crash_before_settlement_keeps_job_and_cursor_atomic"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p4.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C13",
+      "phase": "P4",
+      "target": "phase_p4",
+      "test_names": [
+        "p4_c13_injected_memory_never_becomes_independent_evidence"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p4.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C16",
+      "phase": "P4",
+      "target": "phase_p4",
+      "test_names": [
+        "p4_c16_sequence_cursor_handles_same_timestamp_pages"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p4.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C17",
+      "phase": "P4",
+      "target": "phase_p4",
+      "test_names": [
+        "p4_c17_out_of_order_range_cannot_advance_contiguous_cursor"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p4.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C20",
+      "phase": "P4",
+      "target": "phase_p4",
+      "test_names": [
+        "p4_c20_revocation_invalidates_transitive_derived_context"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p4.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C22",
+      "phase": "P4",
+      "target": "phase_p4",
+      "test_names": [
+        "p4_c22_missing_changed_or_malformed_extractor_does_not_advance"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p4.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C26",
+      "phase": "P4",
+      "target": "phase_p4",
+      "test_names": [
+        "p4_c26_fts_empty_vietnamese_identifiers_and_vector_timeout_are_distinct"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p4.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C30",
+      "phase": "P4",
+      "target": "phase_p4",
+      "test_names": [
+        "p4_c30_budget_and_shutdown_pause_jobs_durably"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p4.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
       "id": "P4-S01",
       "phase": "P4",
       "target": "phase_p4",
@@ -561,6 +1134,36 @@
         "p4_s07_cli_catch_up_inspects_memory_and_resume_is_independent"
       ],
       "fixture": "crates/harness-cli/tests/phase_p4.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C11",
+      "phase": "P5",
+      "target": "phase_p5",
+      "test_names": [
+        "p5_c11_completed_child_result_survives_parent_restart"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p5.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "C25",
+      "phase": "P5",
+      "target": "phase_p5",
+      "test_names": [
+        "p5_c25_lost_parent_notification_replays_exactly_once"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p5.rs",
       "platforms": [
         "windows",
         "linux"
@@ -684,13 +1287,13 @@
       "required": true
     },
     {
-      "id": "C01",
-      "phase": "P1",
-      "target": "phase_p1",
+      "id": "K12",
+      "phase": "P6",
+      "target": "phase_p6",
       "test_names": [
-        "p1_c01_child_kill_after_ack_recovers_one_input"
+        "p6_k12_malformed_oversized_and_duplicate_frames_fail_bounded"
       ],
-      "fixture": "crates/harness-cli/src/bin/p1_fixture_host.rs",
+      "fixture": "crates/harness-cli/tests/phase_p6.rs",
       "platforms": [
         "windows",
         "linux"
@@ -699,13 +1302,13 @@
       "required": true
     },
     {
-      "id": "C02",
-      "phase": "P1",
-      "target": "phase_p1",
+      "id": "K13",
+      "phase": "P6",
+      "target": "phase_p6",
       "test_names": [
-        "p1_c02_child_kill_after_receipt_before_snapshot_folds_committed_tail"
+        "p6_k13_nested_extension_call_cannot_escalate_authority"
       ],
-      "fixture": "crates/harness-cli/src/bin/p1_fixture_host.rs",
+      "fixture": "crates/harness-cli/tests/phase_p6.rs",
       "platforms": [
         "windows",
         "linux"
@@ -714,14 +1317,13 @@
       "required": true
     },
     {
-      "id": "C03",
-      "phase": "P3",
-      "target": "phase_p3",
+      "id": "K14",
+      "phase": "P6",
+      "target": "phase_p6",
       "test_names": [
-        "p3_c03_unknown_side_effect_is_reconciled_without_blind_rerun",
-        "phase_p5::strengthening::p5_c03_uncertain_child_effect_is_not_completed"
+        "p6_k14_untrusted_profile_cannot_load_executables_or_secrets"
       ],
-      "fixture": "crates/harness-cli/tests/phase_p3.rs",
+      "fixture": "crates/harness-cli/tests/phase_p6.rs",
       "platforms": [
         "windows",
         "linux"
@@ -730,13 +1332,13 @@
       "required": true
     },
     {
-      "id": "C04",
-      "phase": "P2",
-      "target": "phase_p2",
+      "id": "P6-S01",
+      "phase": "P6",
+      "target": "phase_p6",
       "test_names": [
-        "p2_c04_five_compactions_preserve_mandatory_state_and_corrections"
+        "p6_s01_extension_trust_contracts_are_versioned"
       ],
-      "fixture": "crates/harness-cli/tests/phase_p2.rs",
+      "fixture": "crates/harness-cli/tests/phase_p6.rs",
       "platforms": [
         "windows",
         "linux"
@@ -745,13 +1347,14 @@
       "required": true
     },
     {
-      "id": "C05",
-      "phase": "P4",
-      "target": "phase_p4",
+      "id": "P6-S02",
+      "phase": "P6",
+      "target": "phase_p6",
       "test_names": [
-        "p4_c05_optional_extraction_failure_does_not_block_working_state_resume"
+        "p6_s02_bounded_stdio_transport_enforces_handshake_and_limits",
+        "p6_extension_processes_receive_a_minimal_environment"
       ],
-      "fixture": "crates/harness-cli/tests/phase_p4.rs",
+      "fixture": "crates/harness-cli/tests/phase_p6.rs",
       "platforms": [
         "windows",
         "linux"
@@ -760,13 +1363,13 @@
       "required": true
     },
     {
-      "id": "C06",
-      "phase": "P2",
-      "target": "phase_p2",
+      "id": "P6-S03",
+      "phase": "P6",
+      "target": "phase_p6",
       "test_names": [
-        "p2_c06_new_session_continuation_reuses_task_checkpoint_and_scope"
+        "p6_s03_external_tools_cross_the_same_policy_gate"
       ],
-      "fixture": "crates/harness-cli/tests/phase_p2.rs",
+      "fixture": "crates/harness-cli/tests/phase_p6.rs",
       "platforms": [
         "windows",
         "linux"
@@ -775,14 +1378,13 @@
       "required": true
     },
     {
-      "id": "C07",
-      "phase": "P4",
-      "target": "phase_p4",
+      "id": "P6-S04",
+      "phase": "P6",
+      "target": "phase_p6",
       "test_names": [
-        "p4_c07_three_principals_publish_with_cas_no_lost_update",
-        "phase_p5::strengthening::p5_c07_three_workers_publish_without_lost_update"
+        "p6_s04_mcp_client_registers_scoped_tools_and_renegotiates"
       ],
-      "fixture": "crates/harness-cli/tests/phase_p4.rs",
+      "fixture": "crates/harness-cli/tests/phase_p6.rs",
       "platforms": [
         "windows",
         "linux"
@@ -791,14 +1393,13 @@
       "required": true
     },
     {
-      "id": "C08",
-      "phase": "P4",
-      "target": "phase_p4",
+      "id": "P6-S05",
+      "phase": "P6",
+      "target": "phase_p6",
       "test_names": [
-        "p4_c08_forged_scope_cannot_search_read_or_export",
-        "phase_p5::strengthening::p5_c08_forged_child_scope_cannot_read_outside_grants"
+        "p6_s05_skills_are_versioned_data_and_compose_by_precedence"
       ],
-      "fixture": "crates/harness-cli/tests/phase_p4.rs",
+      "fixture": "crates/harness-cli/tests/phase_p6.rs",
       "platforms": [
         "windows",
         "linux"
@@ -807,13 +1408,14 @@
       "required": true
     },
     {
-      "id": "C09",
-      "phase": "P2",
-      "target": "phase_p2",
+      "id": "P6-S06",
+      "phase": "P6",
+      "target": "phase_p6",
       "test_names": [
-        "p2_c09_decision_supersession_survives_context_and_resume"
+        "p6_s06_unload_keeps_evidence_and_reload_uses_a_new_generation",
+        "p6_s06_extension_paths_preserve_predecessor_contracts"
       ],
-      "fixture": "crates/harness-cli/tests/phase_p2.rs",
+      "fixture": "crates/harness-cli/tests/phase_p6.rs",
       "platforms": [
         "windows",
         "linux"
@@ -822,257 +1424,13 @@
       "required": true
     },
     {
-      "id": "C10",
-      "phase": "P3",
-      "target": "phase_p3",
+      "id": "P6-S07",
+      "phase": "P6",
+      "target": "phase_p6",
       "test_names": [
-        "p3_c10_external_workspace_change_invalidates_approved_execution",
-        "phase_p5::strengthening::p5_c10_worktree_change_invalidates_branch_check"
+        "p6_s07_fixture_extension_installs_registers_and_unloads"
       ],
-      "fixture": "crates/harness-cli/tests/phase_p3.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C11",
-      "phase": "P5",
-      "target": "phase_p5",
-      "test_names": [
-        "p5_c11_completed_child_result_survives_parent_restart"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p5.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C12",
-      "phase": "P4",
-      "target": "phase_p4",
-      "test_names": [
-        "p4_c12_crash_before_settlement_keeps_job_and_cursor_atomic"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p4.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C13",
-      "phase": "P4",
-      "target": "phase_p4",
-      "test_names": [
-        "p4_c13_injected_memory_never_becomes_independent_evidence"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p4.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C14",
-      "phase": "P2",
-      "target": "phase_p2",
-      "test_names": [
-        "p2_c14_offline_replay_dispatches_nothing_and_matches_frozen_packet"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p2.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C15",
-      "phase": "P1",
-      "target": "phase_p1",
-      "test_names": [
-        "p1_c15_writer_competition_and_stale_fence_are_rejected",
-        "phase_p5::strengthening::p5_c15_stale_worker_generation_cannot_commit"
-      ],
-      "fixture": "crates/harness-cli/src/bin/p1_fixture_host.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C16",
-      "phase": "P4",
-      "target": "phase_p4",
-      "test_names": [
-        "p4_c16_sequence_cursor_handles_same_timestamp_pages"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p4.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C17",
-      "phase": "P4",
-      "target": "phase_p4",
-      "test_names": [
-        "p4_c17_out_of_order_range_cannot_advance_contiguous_cursor"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p4.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C18",
-      "phase": "P2",
-      "target": "phase_p2",
-      "test_names": [
-        "p2_c18_unclassified_instruction_is_mandatory_after_compaction"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p2.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C19",
-      "phase": "P2",
-      "target": "phase_p2",
-      "test_names": [
-        "p2_c19_project_rule_with_zero_relevance_is_admitted"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p2.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C20",
-      "phase": "P4",
-      "target": "phase_p4",
-      "test_names": [
-        "p4_c20_revocation_invalidates_transitive_derived_context"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p4.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C21",
-      "phase": "P1",
-      "target": "phase_p1",
-      "test_names": [
-        "p1_c21_injected_write_failure_never_acknowledges_or_advances_state"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p1.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C22",
-      "phase": "P4",
-      "target": "phase_p4",
-      "test_names": [
-        "p4_c22_missing_changed_or_malformed_extractor_does_not_advance"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p4.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C23",
-      "phase": "P3",
-      "target": "phase_p3",
-      "test_names": [
-        "p3_c23_project_identity_requires_explicit_reassociation",
-        "phase_p5::strengthening::p5_c23_linked_worktrees_share_project_identity"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p3.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C24",
-      "phase": "P1",
-      "target": "phase_p1",
-      "test_names": [
-        "p1_c24_task_lease_blocks_competing_session_continuation",
-        "phase_p5::strengthening::p5_c24_competing_worker_cannot_own_one_task"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p1.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C25",
-      "phase": "P5",
-      "target": "phase_p5",
-      "test_names": [
-        "p5_c25_lost_parent_notification_replays_exactly_once"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p5.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C26",
-      "phase": "P4",
-      "target": "phase_p4",
-      "test_names": [
-        "p4_c26_fts_empty_vietnamese_identifiers_and_vector_timeout_are_distinct"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p4.rs",
+      "fixture": "crates/harness-cli/tests/phase_p6.rs",
       "platforms": [
         "windows",
         "linux"
@@ -1097,243 +1455,6 @@
       "id": "C28",
       "phase": "P7",
       "target": "phase_p7",
-      "test_names": [],
-      "fixture": null,
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "not_implemented",
-      "required": false
-    },
-    {
-      "id": "C29",
-      "phase": "P3",
-      "target": "phase_p3",
-      "test_names": [
-        "p3_c29_secret_output_is_redacted_and_artifact_scope_is_enforced"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p3.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "C30",
-      "phase": "P4",
-      "target": "phase_p4",
-      "test_names": [
-        "p4_c30_budget_and_shutdown_pause_jobs_durably"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p4.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "K01",
-      "phase": "P1",
-      "target": "phase_p1",
-      "test_names": [
-        "p1_k01_graph_rejects_missing_incompatible_cycle_and_duplicates_before_admission"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p1.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "K02",
-      "phase": "P1",
-      "target": "phase_p1",
-      "test_names": [
-        "p1_k02_optional_extractor_absence_allows_required_composition"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p1.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "K03",
-      "phase": "P1",
-      "target": "phase_p1",
-      "test_names": [
-        "p1_k03_failed_mount_rolls_back_unpublished_resources_and_joins_them"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p1.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "K04",
-      "phase": "P1",
-      "target": "phase_p1",
-      "test_names": [
-        "p1_k04_scoped_lookup_is_nearest_and_siblings_are_isolated",
-        "phase_p5::strengthening::p5_k04_worker_scope_override_is_worker_local"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p1.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "K05",
-      "phase": "P1",
-      "target": "phase_p1",
-      "test_names": [
-        "p1_k05_late_disposer_cannot_remove_replacement_generation"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p1.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "K06",
-      "phase": "P1",
-      "target": "phase_p1",
-      "test_names": [
-        "p1_k06_provider_loss_stops_admission_drains_dependents_and_marks_unknown",
-        "phase_p5::strengthening::p5_k06_provider_loss_drains_dependent_children"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p1.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "K07",
-      "phase": "P1",
-      "target": "phase_p1",
-      "test_names": [
-        "p1_k07_racing_shutdown_is_shared_aggregates_errors_and_closes_store_last",
-        "phase_p5::strengthening::p5_k07_racing_shutdown_shares_completion_and_reports_failures"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p1.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "K08",
-      "phase": "P3",
-      "target": "phase_p3",
-      "test_names": [
-        "p3_k08_parent_deny_cannot_be_overridden"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p3.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "K09",
-      "phase": "P3",
-      "target": "phase_p3",
-      "test_names": [
-        "p3_k09_observer_failure_cannot_rewrite_receipt"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p3.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "K10",
-      "phase": "P2",
-      "target": "phase_p2",
-      "test_names": [
-        "p2_k10_config_change_is_boundary_scoped_and_frozen_request_is_immutable"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p2.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "K11",
-      "phase": "P2",
-      "target": "phase_p2",
-      "test_names": [
-        "p2_k11_unknown_critical_event_blocks_resume_but_allows_offline_inspection"
-      ],
-      "fixture": "crates/harness-cli/tests/phase_p2.rs",
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "implemented",
-      "required": true
-    },
-    {
-      "id": "K12",
-      "phase": "P6",
-      "target": "phase_p6",
-      "test_names": [],
-      "fixture": null,
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "not_implemented",
-      "required": false
-    },
-    {
-      "id": "K13",
-      "phase": "P6",
-      "target": "phase_p6",
-      "test_names": [],
-      "fixture": null,
-      "platforms": [
-        "windows",
-        "linux"
-      ],
-      "readiness": "not_implemented",
-      "required": false
-    },
-    {
-      "id": "K14",
-      "phase": "P6",
-      "target": "phase_p6",
       "test_names": [],
       "fixture": null,
       "platforms": [

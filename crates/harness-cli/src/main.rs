@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod delegation_cli;
+mod extension_cli;
 mod memory_cli;
 
 use std::{fs, path::PathBuf, process::ExitCode, sync::Arc};
@@ -97,6 +98,8 @@ enum Command {
     Code(CodingCommand),
     /// P5 delegation: coordinator/worker runs and durable task views.
     Tasks(delegation_cli::TaskCommand),
+    /// P6 external extensions: trust inspection, local registration and skills.
+    Extensions(extension_cli::ExtensionCommand),
 }
 
 #[derive(Debug, Args)]
@@ -381,6 +384,7 @@ async fn run(cli: Cli) -> Result<(), HarnessError> {
             run_coding_fixture(&data_dir, &workspace, &path, &find, &replace, approve, json).await
         }
         Some(Command::Tasks(command)) => delegation_cli::run(command).await,
+        Some(Command::Extensions(command)) => extension_cli::run(command).await,
         None => Ok(()),
     }
 }

@@ -19,5 +19,5 @@ pub use contracts::{
 };
 pub use loop_service::{CodingLoopResult, CodingLoopService};
 pub use policy::{PolicyEffect, PolicyRule, ToolPolicy};
-pub use service::{ToolExecutionService, ToolObserver};
+pub use service::{ExternalToolDispatcher, ToolExecutionService, ToolObserver};
 pub use workspace::{observe_workspace, observed_file_hash};

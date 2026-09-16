@@ -195,3 +195,13 @@ contract_id!(
     "runtime_command",
     "^runtime_command_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 );
+contract_id!(
+    ExtensionInstanceId,
+    "extension_instance",
+    "^extension_instance_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+);
+contract_id!(
+    SkillId,
+    "skill",
+    "^skill_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+);

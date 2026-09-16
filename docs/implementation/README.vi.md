@@ -22,7 +22,7 @@ Nguồn chuẩn: [plan kiến trúc](../RUST_HARNESS_PLAN.vi.md), [hợp đồng
 | P3 | [Coding tools, execution policy và receipts](P3_CODING_TOOLS.vi.md) | P2 | 7–10 | not_started |
 | P4 | [Memory tái sử dụng và extraction phục hồi được](P4_MEMORY.vi.md) | P3 | 7–10 | not_started |
 | P5 | [Giao việc, task DAG và workspace cô lập](P5_MULTI_AGENT.vi.md) | P4 | 8–12 | implemented_local_pending_ci (xem [evidence P5](../evidence/P5.vi.md)) |
-| P6 | [Skills, MCP và protocol plugin bên ngoài](P6_EXTENSIONS.vi.md) | P5 | 5–8 | not_started |
+| P6 | [Skills, MCP và protocol plugin bên ngoài](P6_EXTENSIONS.vi.md) | P5 | 5–8 | implemented_local_pending_ci (xem [evidence P6](../evidence/P6.vi.md)) |
 | P7 | [Gia cố recovery và phát hành CLI](P7_RELEASE.vi.md) | P6 | 8–11 | not_started |
 | P8 | [Web UI dùng chung host services](P8_WEB.vi.md) | P7 | 10–15 | not_started |
 

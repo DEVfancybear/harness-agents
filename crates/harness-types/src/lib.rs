@@ -25,9 +25,9 @@ pub use fixture::{ContinuationFixtureReport, verify_continuation_fixture};
 pub use hash::{ContentHash, canonical_json_bytes};
 pub use ids::{
     AgentProfileId, AgentRunId, ArtifactId, CompositionSnapshotId, ContextPacketId, EventId,
-    HostId, InputId, InstructionId, MemoryAssetId, PlanItemId, PluginInstanceId, ProjectId,
-    ProviderAttemptId, RequestId, RuntimeCommandId, ScopeId, SessionId, SnapshotId, TaskId,
-    ToolApprovalId, ToolExecutionId, ToolInvocationId,
+    ExtensionInstanceId, HostId, InputId, InstructionId, MemoryAssetId, PlanItemId,
+    PluginInstanceId, ProjectId, ProviderAttemptId, RequestId, RuntimeCommandId, ScopeId,
+    SessionId, SkillId, SnapshotId, TaskId, ToolApprovalId, ToolExecutionId, ToolInvocationId,
 };
 pub use schema::{SchemaDocument, generated_schema_documents};
 

@@ -80,6 +80,21 @@ pub enum ErrorCode {
     ResultIncomplete,
     SchedulerShutdown,
     DeliveryConflict,
+    ExtensionProtocolError,
+    ExtensionDigestMismatch,
+    ExtensionProtocolUnsupported,
+    ExtensionNotFound,
+    ExtensionUntrusted,
+    ExtensionCapabilityMismatch,
+    HostMethodDenied,
+    EnvironmentDenied,
+    SecretNotGranted,
+    FrameLimitExceeded,
+    InflightLimitExceeded,
+    DuplicateFrameId,
+    SchemaVersionMismatch,
+    SkillUnavailable,
+    ConfigTrustRequired,
 }
 
 impl ErrorCode {
@@ -159,6 +174,21 @@ impl ErrorCode {
             Self::ResultIncomplete => "result_incomplete",
             Self::SchedulerShutdown => "scheduler_shutdown",
             Self::DeliveryConflict => "delivery_conflict",
+            Self::ExtensionProtocolError => "extension_protocol_error",
+            Self::ExtensionDigestMismatch => "extension_digest_mismatch",
+            Self::ExtensionProtocolUnsupported => "extension_protocol_unsupported",
+            Self::ExtensionNotFound => "extension_not_found",
+            Self::ExtensionUntrusted => "extension_untrusted",
+            Self::ExtensionCapabilityMismatch => "extension_capability_mismatch",
+            Self::HostMethodDenied => "host_method_denied",
+            Self::EnvironmentDenied => "environment_denied",
+            Self::SecretNotGranted => "secret_not_granted",
+            Self::FrameLimitExceeded => "frame_limit_exceeded",
+            Self::InflightLimitExceeded => "inflight_limit_exceeded",
+            Self::DuplicateFrameId => "duplicate_frame_id",
+            Self::SchemaVersionMismatch => "schema_version_mismatch",
+            Self::SkillUnavailable => "skill_unavailable",
+            Self::ConfigTrustRequired => "config_trust_required",
         }
     }
 }

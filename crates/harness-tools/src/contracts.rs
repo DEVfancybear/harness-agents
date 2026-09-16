@@ -23,6 +23,8 @@ pub enum ToolKind {
     GitStatus,
     GitDiff,
     TaskUpdate,
+    /// An external extension tool, reachable only through the same policy gate.
+    ExternalTool,
 }
 
 impl ToolKind {
@@ -38,6 +40,7 @@ impl ToolKind {
             Self::GitStatus => "git_status",
             Self::GitDiff => "git_diff",
             Self::TaskUpdate => "task_update",
+            Self::ExternalTool => "external_tool",
         }
     }
 }
@@ -194,6 +197,17 @@ pub enum CodingToolAction {
     TaskUpdate {
         note: String,
     },
+    /// A tool provided by a trusted external extension. It crosses the same
+    /// gate as every built-in action, and carries the parent invocation so a
+    /// nested call stays correlated and non-escalating.
+    ExternalTool {
+        plugin_id: String,
+        tool_name: String,
+        arguments: Value,
+        /// Parent invocation when this call was produced by another tool.
+        parent_invocation_id: Option<String>,
+        timeout_ms: u64,
+    },
 }
 
 impl CodingToolAction {
@@ -209,6 +223,7 @@ impl CodingToolAction {
             Self::GitStatus => ToolKind::GitStatus,
             Self::GitDiff { .. } => ToolKind::GitDiff,
             Self::TaskUpdate { .. } => ToolKind::TaskUpdate,
+            Self::ExternalTool { .. } => ToolKind::ExternalTool,
         }
     }
 
@@ -222,7 +237,8 @@ impl CodingToolAction {
             Self::RunProcess { .. }
             | Self::RunShell { .. }
             | Self::GitStatus
-            | Self::TaskUpdate { .. } => None,
+            | Self::TaskUpdate { .. }
+            | Self::ExternalTool { .. } => None,
         }
     }
 
@@ -230,7 +246,10 @@ impl CodingToolAction {
     pub const fn has_external_side_effect(&self) -> bool {
         matches!(
             self,
-            Self::ApplyPatch { .. } | Self::RunProcess { .. } | Self::RunShell { .. }
+            Self::ApplyPatch { .. }
+                | Self::RunProcess { .. }
+                | Self::RunShell { .. }
+                | Self::ExternalTool { .. }
         )
     }
 
@@ -556,6 +575,14 @@ pub enum ToolOutput {
     },
     TaskUpdate {
         note: String,
+    },
+    /// Result of a trusted external extension tool. The payload is plugin data;
+    /// it is recorded as evidence, never interpreted as host authority.
+    ExternalTool {
+        plugin_id: String,
+        tool_name: String,
+        payload: Value,
+        inflight: u64,
     },
     Denied {
         code: String,

@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 [CmdletBinding()]
 param(
-    [ValidateSet('P0', 'P1', 'P2', 'P3', 'P4', 'P5')]
+    [ValidateSet('P0', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6')]
     [string] $Phase = 'P0',
     [string] $RepositoryRoot = (Join-Path $PSScriptRoot '..'),
     [switch] $SelfTest,
@@ -260,7 +260,7 @@ foreach ($case in $phaseCases) {
     }
 }
 
-$activePhases = @('P0', 'P1', 'P2', 'P3', 'P4', 'P5')
+$activePhases = @('P0', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6')
 $activeCases = @($registry.cases | Where-Object { $_.phase -in $activePhases })
 foreach ($activeCase in $activeCases) {
     if ($activeCase.readiness -cne 'implemented' -or $activeCase.required -ne $true) {
@@ -305,6 +305,7 @@ try {
         'P3' { @('P0', 'P1', 'P2') }
         'P4' { @('P0', 'P1', 'P2', 'P3') }
         'P5' { @('P0', 'P1', 'P2', 'P3', 'P4') }
+        'P6' { @('P0', 'P1', 'P2', 'P3', 'P4', 'P5') }
         default { @() }
     }
     foreach ($predecessorPhase in $predecessorPhases) {

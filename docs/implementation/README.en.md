@@ -22,7 +22,7 @@ Source of truth: [architecture plan](../RUST_HARNESS_PLAN.en.md), [plugin contra
 | P3 | [Coding tools, execution policy and receipts](P3_CODING_TOOLS.en.md) | P2 | 7–10 | not_started |
 | P4 | [Reusable memory and recovery-safe extraction](P4_MEMORY.en.md) | P3 | 7–10 | not_started |
 | P5 | [Delegation, task DAG and isolated workspaces](P5_MULTI_AGENT.en.md) | P4 | 8–12 | implemented_local_pending_ci (see [P5 evidence](../evidence/P5.en.md)) |
-| P6 | [Skills, MCP and external plugin protocol](P6_EXTENSIONS.en.md) | P5 | 5–8 | not_started |
+| P6 | [Skills, MCP and external plugin protocol](P6_EXTENSIONS.en.md) | P5 | 5–8 | implemented_local_pending_ci (see [P6 evidence](../evidence/P6.en.md)) |
 | P7 | [Recovery hardening and CLI release](P7_RELEASE.en.md) | P6 | 8–11 | not_started |
 | P8 | [Web UI over the same host services](P8_WEB.en.md) | P7 | 10–15 | not_started |
 

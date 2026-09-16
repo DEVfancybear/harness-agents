@@ -264,6 +264,7 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
                     && case["phase"] != "P3"
                     && case["phase"] != "P4"
                     && case["phase"] != "P5"
+                    && case["phase"] != "P6"
             })
             .all(|case| { case["readiness"] == "not_implemented" && case["required"] == false })
     );
@@ -330,6 +331,34 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
         case["readiness"] == "implemented"
             && case["required"] == true
             && case["target"] == "phase_p5"
+            && !case["test_names"]
+                .as_array()
+                .expect("test names")
+                .is_empty()
+    }));
+    // P6 owns three continuity cases and seven steps, all real and required.
+    assert!(ci.contains("scripts/Verify-Phase.ps1 -Phase P6"));
+    let p6_cases = future_cases
+        .iter()
+        .filter(|case| case["phase"] == "P6")
+        .collect::<Vec<_>>();
+    assert_eq!(p6_cases.len(), 3);
+    assert!(
+        p6_cases
+            .iter()
+            .all(|case| { case["readiness"] == "implemented" && case["required"] == true })
+    );
+    let p6_steps = cases
+        .iter()
+        .filter(|case| {
+            case["phase"] == "P6" && case["id"].as_str().is_some_and(|id| id.starts_with("P6-S"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(p6_steps.len(), 7);
+    assert!(p6_steps.iter().all(|case| {
+        case["readiness"] == "implemented"
+            && case["required"] == true
+            && case["target"] == "phase_p6"
             && !case["test_names"]
                 .as_array()
                 .expect("test names")

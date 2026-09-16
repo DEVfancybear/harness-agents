@@ -6,7 +6,7 @@ English | [Tiếng Việt](ACCEPTANCE_MAP.vi.md)
 
 C01–C30 and K01–K14 retain their definitions in the [memory contract](../MEMORY_AND_CONTINUITY.en.md) and [plugin contract](../PLUGIN_ARCHITECTURE.en.md). This table assigns **one phase responsible for the first component proof** of each case, not a replacement acceptance condition. P0 creates fixtures/test registry; it cannot claim the 44 runtime cases ran.
 
-“Strengthen” means repeat with downstream components or a more complete integration. P1 uses controlled receipts and synthetic principals before real process tools/agents exist; P3/P5 must add real proof at those boundaries. P7 runs all 44 cases against the integrated runtime. P8 repeats those regressions and adds six Web cases. Every case here is currently **not implemented**.
+“Strengthen” means repeat with downstream components or a more complete integration. P1 uses controlled receipts and synthetic principals before real process tools/agents exist; P3/P5 must add real proof at those boundaries. P7 runs all 44 cases against the integrated runtime. P8 repeats those regressions and adds six Web cases. Cases are marked implemented only where the owning phase recorded source-bound evidence; see each phase's evidence pair.
 
 Primary ownership is recorded in the [manifest](manifest.json); detailed steps are in the [phase runbooks](README.en.md). A case may need multiple test functions and fault windows. Do not force it into one function while dropping half its conditions.
 

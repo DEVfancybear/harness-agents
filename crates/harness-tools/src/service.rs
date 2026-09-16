@@ -28,6 +28,25 @@ use crate::{
     },
 };
 
+/// Dispatches an `ExternalTool` action after the gate has authorized it and the
+/// durable intent is committed. A returned error is treated exactly like any
+/// other dispatch failure: the outcome becomes uncertain, never a success.
+pub trait ExternalToolDispatcher: Send + Sync {
+    fn dispatch_external<'a>(
+        &'a self,
+        plugin_id: &'a str,
+        tool_name: &'a str,
+        arguments: &'a serde_json::Value,
+        timeout_ms: u64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ToolOutput, harness_types::HarnessError>>
+                + Send
+                + 'a,
+        >,
+    >;
+}
+
 /// An optional presentation observer. It is deliberately invoked only after a
 /// receipt commit; an error or panic can alter neither receipt nor outcome.
 pub trait ToolObserver: Send + Sync {
@@ -41,6 +60,7 @@ pub struct ToolExecutionService {
     store: Arc<SqliteStore>,
     policy: ToolPolicy,
     observer: Option<Arc<dyn ToolObserver>>,
+    external: Option<Arc<dyn ExternalToolDispatcher>>,
 }
 
 impl ToolExecutionService {
@@ -50,12 +70,21 @@ impl ToolExecutionService {
             store,
             policy: ToolPolicy::default(),
             observer: None,
+            external: None,
         }
     }
 
     #[must_use]
     pub fn with_policy(mut self, policy: ToolPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Attach the external tool dispatcher. Without one, an `ExternalTool`
+    /// action is denied rather than silently ignored.
+    #[must_use]
+    pub fn with_external(mut self, external: Arc<dyn ExternalToolDispatcher>) -> Self {
+        self.external = Some(external);
         self
     }
 
@@ -384,10 +413,30 @@ impl ToolExecutionService {
             .await
             .map_err(store_error)?;
 
-        match self
-            .dispatch(&prepared.workspace_root, &transformed, cancellation)
-            .await
-        {
+        let dispatched = match &transformed {
+            CodingToolAction::ExternalTool {
+                plugin_id,
+                tool_name,
+                arguments,
+                timeout_ms,
+                ..
+            } => match &self.external {
+                Some(external) => {
+                    external
+                        .dispatch_external(plugin_id, tool_name, arguments, *timeout_ms)
+                        .await
+                }
+                None => Err(HarnessError::new(
+                    ErrorCode::PolicyDenied,
+                    "no external tool dispatcher is configured for this host",
+                )),
+            },
+            other => {
+                self.dispatch(&prepared.workspace_root, other, cancellation)
+                    .await
+            }
+        };
+        match dispatched {
             Ok(output) => {
                 self.settle(
                     &prepared,
@@ -549,7 +598,8 @@ impl ToolExecutionService {
             CodingToolAction::RunProcess { .. }
             | CodingToolAction::RunShell { .. }
             | CodingToolAction::GitStatus
-            | CodingToolAction::TaskUpdate { .. } => {}
+            | CodingToolAction::TaskUpdate { .. }
+            | CodingToolAction::ExternalTool { .. } => {}
         }
         Ok(())
     }
@@ -653,6 +703,10 @@ impl ToolExecutionService {
         cancellation: CancellationToken,
     ) -> Result<ToolOutput, HarnessError> {
         match action {
+            CodingToolAction::ExternalTool { .. } => Err(HarnessError::new(
+                ErrorCode::PolicyDenied,
+                "external tool actions are dispatched by the configured dispatcher, not directly",
+            )),
             CodingToolAction::ReadFile { path } => {
                 let target = resolve_relative(root, path, false)?;
                 let output = read_text_output(&target)?;
