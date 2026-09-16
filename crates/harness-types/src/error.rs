@@ -95,6 +95,9 @@ pub enum ErrorCode {
     SchemaVersionMismatch,
     SkillUnavailable,
     ConfigTrustRequired,
+    BackupManifestInvalid,
+    RestoreTargetConflict,
+    RetentionRefused,
 }
 
 impl ErrorCode {
@@ -189,6 +192,9 @@ impl ErrorCode {
             Self::SchemaVersionMismatch => "schema_version_mismatch",
             Self::SkillUnavailable => "skill_unavailable",
             Self::ConfigTrustRequired => "config_trust_required",
+            Self::BackupManifestInvalid => "backup_manifest_invalid",
+            Self::RestoreTargetConflict => "restore_target_conflict",
+            Self::RetentionRefused => "retention_refused",
         }
     }
 }

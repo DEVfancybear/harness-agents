@@ -22,6 +22,7 @@ harness-memory = { path = "../harness-memory" }
 harness-orchestrator = { path = "../harness-orchestrator" }
 harness-extensions = { path = "../harness-extensions" }
 harness-kernel = { path = "../harness-kernel" }
+harness-maintenance = { path = "../harness-maintenance" }
 rmcp = { version = "=3.4.0", default-features = false, features = ["client", "server", "macros", "schemars", "transport-child-process", "transport-io"] }
 schemars.workspace = true
 serde.workspace = true
@@ -39,6 +40,7 @@ harness-tools = { path = "../harness-tools" }
 harness-memory = { path = "../harness-memory" }
 harness-orchestrator = { path = "../harness-orchestrator" }
 harness-extensions = { path = "../harness-extensions" }
+harness-maintenance = { path = "../harness-maintenance" }
 proptest.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

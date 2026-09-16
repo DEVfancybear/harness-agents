@@ -1,0 +1,26 @@
+[package]
+name = "harness-maintenance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+harness-memory = { path = "../harness-memory" }
+harness-session = { path = "../harness-session" }
+harness-store-sqlite = { path = "../harness-store-sqlite" }
+harness-types = { path = "../harness-types" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

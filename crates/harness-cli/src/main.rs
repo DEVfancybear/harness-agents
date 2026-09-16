@@ -2,6 +2,7 @@
 
 mod delegation_cli;
 mod extension_cli;
+mod maintenance_cli;
 mod memory_cli;
 
 use std::{fs, path::PathBuf, process::ExitCode, sync::Arc};
@@ -100,6 +101,8 @@ enum Command {
     Tasks(delegation_cli::TaskCommand),
     /// P6 external extensions: trust inspection, local registration and skills.
     Extensions(extension_cli::ExtensionCommand),
+    /// P7 recovery hardening: doctor, backup, restore, retention, GC and release matrix.
+    Maintenance(maintenance_cli::MaintenanceCommand),
 }
 
 #[derive(Debug, Args)]
@@ -385,6 +388,7 @@ async fn run(cli: Cli) -> Result<(), HarnessError> {
         }
         Some(Command::Tasks(command)) => delegation_cli::run(command).await,
         Some(Command::Extensions(command)) => extension_cli::run(command).await,
+        Some(Command::Maintenance(command)) => maintenance_cli::run(command).await,
         None => Ok(()),
     }
 }

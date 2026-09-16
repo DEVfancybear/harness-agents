@@ -723,6 +723,7 @@ dependencies = [
  "clap",
  "harness-extensions",
  "harness-kernel",
+ "harness-maintenance",
  "harness-memory",
  "harness-orchestrator",
  "harness-providers",
@@ -768,6 +769,23 @@ name = "harness-kernel"
 version = "0.1.0"
 dependencies = [
  "harness-types",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "harness-maintenance"
+version = "0.1.0"
+dependencies = [
+ "harness-memory",
+ "harness-session",
+ "harness-store-sqlite",
+ "harness-types",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

@@ -2,7 +2,7 @@
 
 [English](P7_RELEASE.en.md) | Tiếng Việt
 
-Runbook triển khai; trạng thái: **chưa bắt đầu**. Dự toán: 8–11 ngày công. Target files, Rust tests và lệnh `ha` dưới đây là output tương lai, trừ khi checkout thật đã có. Riêng tài liệu này không là bằng chứng hoàn tất.
+Runbook triển khai; trạng thái: **đã triển khai cục bộ, acceptance chờ CI từ xa**. Dự toán: 8–11 ngày công. Target files, Rust tests và lệnh `ha` dưới đây là output tương lai, trừ khi checkout thật đã có. Riêng tài liệu này không là bằng chứng hoàn tất.
 
 ## 1. Kết quả và điều kiện vào phase
 

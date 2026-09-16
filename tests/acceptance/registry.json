@@ -1442,27 +1442,136 @@
       "id": "C27",
       "phase": "P7",
       "target": "phase_p7",
-      "test_names": [],
-      "fixture": null,
+      "test_names": [
+        "p7_c27_restore_into_new_directory_and_refuse_active_target"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p7.rs",
       "platforms": [
         "windows",
         "linux"
       ],
-      "readiness": "not_implemented",
-      "required": false
+      "readiness": "implemented",
+      "required": true
     },
     {
       "id": "C28",
       "phase": "P7",
       "target": "phase_p7",
-      "test_names": [],
+      "test_names": [
+        "p7_c28_forget_blocks_reextraction_and_reports_survivors"
+      ],
+      "fixture": "crates/harness-cli/tests/phase_p7.rs",
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "P7-S01",
+      "phase": "P7",
+      "target": "phase_p7",
+      "test_names": [
+        "p7_s01_release_matrix_is_complete_and_honest"
+      ],
       "fixture": null,
       "platforms": [
         "windows",
         "linux"
       ],
-      "readiness": "not_implemented",
-      "required": false
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "P7-S02",
+      "phase": "P7",
+      "target": "phase_p7",
+      "test_names": [
+        "p7_s02_backup_manifest_pins_every_artifact"
+      ],
+      "fixture": null,
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "P7-S03",
+      "phase": "P7",
+      "target": "phase_p7",
+      "test_names": [
+        "p7_s03_migration_runs_on_a_copy_and_refuses_newer_writes"
+      ],
+      "fixture": null,
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "P7-S04",
+      "phase": "P7",
+      "target": "phase_p7",
+      "test_names": [
+        "p7_s04_retention_classes_are_separate_and_confirmed"
+      ],
+      "fixture": null,
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "P7-S05",
+      "phase": "P7",
+      "target": "phase_p7",
+      "test_names": [
+        "p7_s05_full_case_matrix_runs_end_to_end"
+      ],
+      "fixture": null,
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "P7-S06",
+      "phase": "P7",
+      "target": "phase_p7",
+      "test_names": [
+        "p7_s06_packaged_binary_starts_and_reports_capabilities"
+      ],
+      "fixture": null,
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
+    },
+    {
+      "id": "P7-S07",
+      "phase": "P7",
+      "target": "phase_p7",
+      "test_names": [
+        "p7_s07_operator_docs_and_release_record_are_consistent"
+      ],
+      "fixture": null,
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "readiness": "implemented",
+      "required": true
     }
   ]
 }

@@ -29,6 +29,8 @@ pub const TOOLS_SCHEMA_VERSION: i64 = 1;
 pub const MEMORY_SCHEMA_VERSION: i64 = 1;
 /// Additive P5 delegation tables retain all earlier schema revisions.
 pub const DELEGATION_SCHEMA_VERSION: i64 = 1;
+/// Additive P7 maintenance tables retain all earlier schema revisions.
+pub const MAINTENANCE_SCHEMA_VERSION: i64 = 1;
 
 /// All durable paths owned by a local harness data directory.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -688,4 +690,16 @@ pub struct WorktreeRecordRow {
     pub input_fingerprint: ContentHash,
     pub result_fingerprint: Option<ContentHash>,
     pub generation: u64,
+}
+
+/// A durable retention tombstone. It records that a source was deliberately
+/// forgotten and blocks a later extraction pass from bringing it back.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TombstoneRow {
+    pub tombstone_id: String,
+    pub source_kind: String,
+    pub source_id: String,
+    pub reason: String,
+    pub surviving_copies: Vec<String>,
+    pub created_unix_ms: u64,
 }

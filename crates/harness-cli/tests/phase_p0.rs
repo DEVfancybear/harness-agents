@@ -265,6 +265,7 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
                     && case["phase"] != "P4"
                     && case["phase"] != "P5"
                     && case["phase"] != "P6"
+                    && case["phase"] != "P7"
             })
             .all(|case| { case["readiness"] == "not_implemented" && case["required"] == false })
     );
@@ -359,6 +360,45 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
         case["readiness"] == "implemented"
             && case["required"] == true
             && case["target"] == "phase_p6"
+            && !case["test_names"]
+                .as_array()
+                .expect("test names")
+                .is_empty()
+    }));
+    // P7 is the release gate: it owns the last two continuity cases and seven
+    // steps, and it retains every earlier case as a regression.
+    assert!(ci.contains("scripts/Verify-Phase.ps1 -Phase P7"));
+    let p7_cases = future_cases
+        .iter()
+        .filter(|case| case["phase"] == "P7")
+        .collect::<Vec<_>>();
+    assert_eq!(p7_cases.len(), 2);
+    assert!(
+        p7_cases
+            .iter()
+            .all(|case| { case["readiness"] == "implemented" && case["required"] == true })
+    );
+    let p7_steps = cases
+        .iter()
+        .filter(|case| {
+            case["phase"] == "P7" && case["id"].as_str().is_some_and(|id| id.starts_with("P7-S"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(p7_steps.len(), 7);
+    assert!(p7_steps.iter().all(|case| {
+        case["readiness"] == "implemented"
+            && case["required"] == true
+            && case["target"] == "phase_p7"
+            && !case["test_names"]
+                .as_array()
+                .expect("test names")
+                .is_empty()
+    }));
+    // Every one of the 44 continuity and plugin cases now has an executable
+    // acceptance test, which is the state the release gate asserts.
+    assert!(future_cases.iter().all(|case| {
+        case["readiness"] == "implemented"
+            && case["required"] == true
             && !case["test_names"]
                 .as_array()
                 .expect("test names")

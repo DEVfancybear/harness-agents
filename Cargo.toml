@@ -11,6 +11,7 @@ members = [
     "crates/harness-memory",
     "crates/harness-orchestrator",
     "crates/harness-extensions",
+    "crates/harness-maintenance",
 ]
 resolver = "2"
 

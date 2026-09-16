@@ -31,6 +31,7 @@ use crate::{
 };
 
 pub mod delegation;
+mod maintenance;
 mod memory;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -204,6 +205,10 @@ impl SqliteStore {
             return Err(error);
         }
         if let Err(error) = delegation::ensure_delegation_schema(&pool).await {
+            let _ = FileExt::unlock(&lock_file);
+            return Err(error);
+        }
+        if let Err(error) = maintenance::ensure_maintenance_schema(&pool).await {
             let _ = FileExt::unlock(&lock_file);
             return Err(error);
         }
@@ -1336,6 +1341,12 @@ impl SqliteStore {
     }
 
     /// Flush and publish an artifact before any database reference is accepted.
+    ///
+    /// This writes and flushes the bytes and returns the record a caller commits
+    /// inside its own transaction. Use [`SqliteStore::publish_artifact_recorded`]
+    /// when no surrounding transaction exists: an artifact whose bytes are on
+    /// disk but whose row was never committed is invisible to backup and to
+    /// garbage collection.
     pub fn publish_artifact(&self, bytes: &[u8]) -> Result<PublishedArtifact, StoreError> {
         self.fence()?;
         fs::create_dir_all(&self.paths.artifact_dir).map_err(|error| {
