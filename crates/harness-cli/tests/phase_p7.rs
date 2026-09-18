@@ -226,6 +226,38 @@ fn crate_tests_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests")
 }
 
+/// Both guides document how `ha` reaches the terminal, and the installer they
+/// name really carries the surface they describe.
+fn assert_install_is_documented(root: &std::path::Path, bodies: &[(&str, String)]) {
+    for (name, text) in bodies {
+        for required in [
+            "scripts/Install-Ha.ps1",
+            "cargo install --path crates/harness-cli",
+            "ha --version",
+        ] {
+            assert!(
+                text.contains(required),
+                "{name} must document how to install `ha`: missing {required}"
+            );
+        }
+    }
+    let installer = std::fs::read_to_string(root.join("scripts/Install-Ha.ps1"))
+        .expect("the installer script exists");
+    for required in [
+        "[ValidateSet('Release', 'Debug')]",
+        "'--bin'",
+        "--locked",
+        "$UseCargoInstall",
+        "--target-dir",
+        "Join-Path $HOME '.cargo/bin'",
+    ] {
+        assert!(
+            installer.contains(required),
+            "the installer must keep its documented surface: missing {required}"
+        );
+    }
+}
+
 /// Every one of the 44 continuity and plugin cases is registered as implemented
 /// and required, and names a test that really exists in a real target.
 fn assert_case_matrix_is_complete() {
@@ -1310,6 +1342,10 @@ async fn p7_s07_operator_docs_and_release_record_are_consistent() {
         );
     }
 
+    // The guides also say how `ha` reaches the terminal, and the installer they
+    // name really exists with the surface they describe.
+    assert_install_is_documented(&root, &bodies);
+
     // The release record states the tested platforms, the unverified checks and
     // what is explicitly out of scope, and never claims an unmeasured target.
     let record = run_cli(&["maintenance", "release-matrix", "--json"]);
@@ -1348,6 +1384,150 @@ async fn p7_s07_operator_docs_and_release_record_are_consistent() {
             .unwrap_or_else(|error| panic!("{name} must exist: {error}"));
         assert!(!text.trim().is_empty(), "{name} must not be empty");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Installing the CLI on the terminal PATH
+// ---------------------------------------------------------------------------
+
+/// The first command a new operator runs must work on a directory that holds no
+/// store yet, and say so plainly instead of failing to open a database that does
+/// not exist.
+#[tokio::test]
+async fn p7_doctor_accepts_an_uninitialized_data_directory() {
+    let root = temp_root();
+    let data = root.path().join("fresh");
+    std::fs::create_dir_all(&data).expect("create an empty data directory");
+
+    // The directory holds no store, and nothing pretends otherwise.
+    assert!(
+        !harness_maintenance::store_is_initialized(&data),
+        "a fresh directory holds no store"
+    );
+
+    // The library reports an uninitialized directory as writable, not as broken.
+    let compatibility = check_store_compatibility(&data)
+        .await
+        .expect("an empty directory is a diagnosable state");
+    assert_eq!(compatibility, StoreCompatibility::Uninitialized);
+    assert!(compatibility.is_writable());
+    assert!(compatibility.inspection_allowed());
+    assert!(compatibility.describe().contains("may create one"));
+
+    // Backing up a directory with no store is still refused, so the new state did
+    // not turn an empty directory into a valid snapshot source.
+    let error = create_backup(&data, root.path().join("nothing"))
+        .await
+        .expect_err("a directory with no store cannot be backed up");
+    assert_eq!(error.code(), ErrorCode::BackupManifestInvalid);
+    assert!(
+        !harness_maintenance::store_is_initialized(&data),
+        "a refused backup must not leave a store behind"
+    );
+
+    // The packaged binary agrees, and reports the empty state instead of an error
+    // an operator cannot act on. `doctor` may create the store it diagnoses, so
+    // the uninitialized assertions above are made before it runs.
+    let doctor = run_cli(&[
+        "maintenance",
+        "doctor",
+        "--data-dir",
+        &data.to_string_lossy(),
+        "--json",
+    ]);
+    assert!(
+        doctor.status.success(),
+        "doctor must diagnose an empty directory: {doctor:?}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&doctor.stdout).expect("doctor JSON parses");
+    assert_eq!(parsed["writable"], json!(true));
+    assert_eq!(parsed["sessions"], json!(0));
+    assert_eq!(parsed["artifacts"], json!(0));
+    assert_eq!(parsed["schema_revisions"]["store"], json!(1));
+    assert!(
+        parsed["not_verified"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "an empty directory is still reported with what was not verified"
+    );
+
+    // The new state must not swallow the older distinction either: a directory
+    // that does hold a store is still reported as writable.
+    let seeded = root.path().join("seeded");
+    seed(&seeded).await;
+    let compatibility = check_store_compatibility(&seeded)
+        .await
+        .expect("compatibility");
+    assert_eq!(compatibility, StoreCompatibility::Writable);
+}
+
+/// The installer documented in the operator guide really installs a working
+/// binary, proven against a throwaway destination.
+#[test]
+fn p7_install_script_installs_a_working_binary() {
+    let root = repository_root();
+    let script = root.join("scripts/Install-Ha.ps1");
+    assert!(script.is_file(), "the installer script must exist");
+
+    let destination = tempfile::tempdir().expect("tempdir");
+    let output = std::process::Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-File",
+            &script.to_string_lossy(),
+            "-Profile",
+            "Debug",
+            "-Destination",
+            &destination.path().to_string_lossy(),
+            "-SkipBuild",
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("the installer runs");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "the installer must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Installed:"),
+        "the installer must report what it installed: {stdout}"
+    );
+
+    // The installed file is a real executable that reports its version, so the
+    // script is not merely copying a stale or empty artifact.
+    let installed = destination
+        .path()
+        .join(if cfg!(windows) { "ha.exe" } else { "ha" });
+    assert!(
+        installed.is_file(),
+        "the installer must produce the ha binary"
+    );
+    let version = std::process::Command::new(&installed)
+        .arg("--version")
+        .output()
+        .expect("the installed binary runs");
+    assert!(version.status.success(), "{version:?}");
+    let text = String::from_utf8_lossy(&version.stdout);
+    assert!(
+        text.trim().starts_with("ha "),
+        "the installed binary must report its name and version: {text}"
+    );
+    assert!(
+        text.split_whitespace()
+            .nth(1)
+            .is_some_and(|version| version.split('.').count() >= 2),
+        "the version must look like a version: {text}"
+    );
+
+    // A destination outside PATH is reported rather than silently assumed.
+    assert!(
+        stdout.contains("PATH:"),
+        "the installer must report the PATH state: {stdout}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -1548,7 +1548,8 @@
       "phase": "P7",
       "target": "phase_p7",
       "test_names": [
-        "p7_s06_packaged_binary_starts_and_reports_capabilities"
+        "p7_s06_packaged_binary_starts_and_reports_capabilities",
+        "p7_doctor_accepts_an_uninitialized_data_directory"
       ],
       "fixture": null,
       "platforms": [
@@ -1563,7 +1564,8 @@
       "phase": "P7",
       "target": "phase_p7",
       "test_names": [
-        "p7_s07_operator_docs_and_release_record_are_consistent"
+        "p7_s07_operator_docs_and_release_record_are_consistent",
+        "p7_install_script_installs_a_working_binary"
       ],
       "fixture": null,
       "platforms": [

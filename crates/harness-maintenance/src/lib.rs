@@ -23,6 +23,7 @@ pub use contracts::{
 };
 pub use migration::{
     MigrationOutcome, StoreCompatibility, check_store_compatibility, migrate_copy,
+    store_is_initialized,
 };
 pub use retention::{
     collect_garbage, default_grace_seconds, forget_source, list_tombstones, retention_summary,

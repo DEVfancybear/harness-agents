@@ -31,11 +31,16 @@ Use the [P4 SPEC](docs/specs/P4.en.md) and [restart handoff](docs/handoffs/P4.en
 Đọc [SPEC P4](docs/specs/P4.vi.md) và [bàn giao khởi động lại](docs/handoffs/P4.vi.md) cho phase hiện tại. Kế hoạch chín phase giữ CLI trước; Web là P8 tùy chọn.
 
 ```powershell
-cargo build -p harness-cli --bin ha --locked
+pwsh -NoProfile -File scripts/Install-Ha.ps1        # put `ha` on your PATH
+ha --version
 ha memory --data-dir <data-dir> --session-id <session-id> catch-up --budget 4 --extractor mock
 ha memory --data-dir <data-dir> --session-id <session-id> jobs --json
 pwsh -NoProfile -File scripts/Verify-P4Gauntlet.ps1
 ```
+
+`scripts/Install-Ha.ps1` builds the release binary and installs it into `$HOME/.cargo/bin`; add `-Profile Debug` for a fast local build or `-UseCargoInstall` to install through Cargo. See [the operator guide](docs/OPERATOR_GUIDE.en.md) / [hướng dẫn vận hành](docs/OPERATOR_GUIDE.vi.md) for both routes, the PATH notes and how to uninstall. Without installing, use `cargo build -p harness-cli --bin ha --locked` and `target/debug/ha`.
+
+`scripts/Install-Ha.ps1` build binary release rồi cài vào `$HOME/.cargo/bin`; thêm `-Profile Debug` để build nhanh khi phát triển, hoặc `-UseCargoInstall` để cài qua Cargo. Xem [hướng dẫn vận hành](docs/OPERATOR_GUIDE.vi.md) để biết cả hai đường, lưu ý về PATH và cách gỡ cài đặt. Nếu không cài, dùng `cargo build -p harness-cli --bin ha --locked` rồi chạy `target/debug/ha`.
 
 The extractor defaults to disabled. The explicit mock is a deterministic local fixture; inferred memories stay candidates until manual confirmation. See `ha memory --help` for search/read/inspect, versioned publication, summaries and invalidation. Host CLI identity options are trusted local user input and must never be populated directly from model arguments.
 

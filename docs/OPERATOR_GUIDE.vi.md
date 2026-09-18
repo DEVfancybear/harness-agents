@@ -264,3 +264,58 @@ benchmark chưa đo vẫn được nêu là chưa đo ngay cả khi mọi nền 
 | `ha maintenance gc` | Thu gom artifact không tham chiếu, không pin, đã cũ | Không bao giờ; nó báo những gì được giữ và vì sao |
 | `ha maintenance migrate-copy` | Chuyển đổi store trên một bản sao | Đích đã có dữ liệu; nguồn không có store |
 | `ha maintenance release-matrix` | Báo cáo nền tảng, capability và tính trung thực của benchmark | Không bao giờ; nó báo những gì chưa kiểm chứng |
+
+## 11. Đưa CLI vào terminal
+
+```console
+pwsh -NoProfile -File scripts/Install-Ha.ps1
+ha --version
+ha maintenance doctor --data-dir <DATA_DIR>
+```
+
+`ha` là một executable bình thường, nên "cài" nghĩa là đưa executable đó vào
+`PATH`. Repo có sẵn một script làm việc đó, theo hai đường:
+
+| Đường | Lệnh | Việc nó làm |
+| --- | --- | --- |
+| Copy (mặc định) | `scripts/Install-Ha.ps1` | Build `ha` bằng `cargo build --release -p harness-cli --bin ha --locked` rồi copy artifact đã biên dịch vào `$HOME/.cargo/bin`, thư mục mà trình cài Rust đã đặt sẵn trong `PATH` |
+| Cargo | `scripts/Install-Ha.ps1 -UseCargoInstall` | Chạy `cargo install --path crates/harness-cli --locked --root $HOME/.cargo`, để sau này `cargo uninstall harness-cli` gỡ được |
+
+Vài biến thể hữu ích:
+
+```console
+pwsh -NoProfile -File scripts/Install-Ha.ps1 -Profile Debug        # build nhanh hơn, cho vòng lặp cục bộ
+pwsh -NoProfile -File scripts/Install-Ha.ps1 -Force                # build lại kể cả khi binary có vẻ còn mới
+pwsh -NoProfile -File scripts/Install-Ha.ps1 -Destination <DIR>    # cài vào chỗ khác
+pwsh -NoProfile -File scripts/Install-Ha.ps1 -SkipBuild            # cài binary đã build sẵn
+```
+
+Những gì script **không** làm, một cách có chủ ý: không tải gì về, không publish gì
+lên package registry, và không bao giờ tự sửa `PATH` của bạn. Khi thư mục cài chưa
+có trong `PATH`, nó in ra đúng thư mục cần thêm thay vì âm thầm sửa profile. Nó cũng
+in đường dẫn đã cài và kết quả `ha --version`, để bạn biết chính xác mình sắp chạy
+binary nào.
+
+Cả hai đường đều build từ đúng cây source mà phase gate kiểm; chỉ khác cargo profile.
+Nếu bạn muốn đúng artifact mà release gate đã chạy, hãy dùng profile release mặc định.
+
+Gỡ lại:
+
+```console
+Remove-Item "$HOME/.cargo/bin/ha.exe"     # đường copy
+cargo uninstall harness-cli               # đường cargo
+```
+
+Hai điều cần biết sau khi cài:
+
+- **`ha` chạy nền trước.** Không có daemon: không có gì chạy giữa các lệnh của bạn,
+  nên backup, thu gom hay thao tác retention xảy ra đúng lúc bạn gọi và không lúc nào khác.
+- **Thư mục mới là đích hợp lệ.** `ha maintenance doctor --data-dir <DIR>` chạy được
+  trên thư mục chưa có store và báo nó là chưa khởi tạo — đúng trạng thái mà binary
+  này được phép tạo store trong đó. Nó không giả vờ rằng store đã tồn tại, và việc
+  sao lưu một thư mục như vậy vẫn bị từ chối.
+
+Build từ source vẫn dùng được cho phát triển:
+`cargo build -p harness-cli --bin ha --locked` ghi ra `target/debug/ha`, và
+`cargo run -p harness-cli --bin ha -- <args>` chạy nó mà không cài gì.
+

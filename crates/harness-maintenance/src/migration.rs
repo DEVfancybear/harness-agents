@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use harness_store_sqlite::{
     DELEGATION_SCHEMA_VERSION, MAINTENANCE_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION,
-    RUNTIME_SCHEMA_VERSION, STORE_SCHEMA_VERSION, SqliteStore, TOOLS_SCHEMA_VERSION,
+    RUNTIME_SCHEMA_VERSION, STORE_SCHEMA_VERSION, SqliteStore, StorePaths, TOOLS_SCHEMA_VERSION,
     WriterOpenOptions,
 };
 use harness_types::{ErrorCode, HostId};
@@ -19,6 +19,8 @@ use crate::contracts::MaintenanceError;
 /// Whether this binary can write a given store.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StoreCompatibility {
+    /// No store exists at the data directory yet, so this binary may create one.
+    Uninitialized,
     /// Every recorded revision is supported; writes are safe.
     Writable,
     /// The store is older and will be migrated on open, but only in a copy.
@@ -34,7 +36,7 @@ pub enum StoreCompatibility {
 impl StoreCompatibility {
     #[must_use]
     pub const fn is_writable(&self) -> bool {
-        matches!(self, Self::Writable)
+        matches!(self, Self::Uninitialized | Self::Writable)
     }
 
     /// Read-only diagnosis stays available in every case, including `TooNew`.
@@ -46,6 +48,9 @@ impl StoreCompatibility {
     #[must_use]
     pub fn describe(&self) -> String {
         match self {
+            Self::Uninitialized => {
+                "no store exists at this data directory yet; this binary may create one".to_owned()
+            }
             Self::Writable => "store schema revisions are supported".to_owned(),
             Self::NeedsMigration {
                 recorded,
@@ -73,10 +78,27 @@ pub struct MigrationOutcome {
     pub revisions: std::collections::BTreeMap<String, i64>,
 }
 
+/// Whether a data directory already holds a store.
+///
+/// This is the distinction `doctor` reports and `backup` enforces: a directory
+/// with no database is uninitialized, not broken, and there is nothing to
+/// snapshot in it yet.
+#[must_use]
+pub fn store_is_initialized(data_dir: impl AsRef<Path>) -> bool {
+    StorePaths::new(data_dir.as_ref()).database_path.is_file()
+}
+
 /// Inspect a data directory and report whether this binary may write it.
 pub async fn check_store_compatibility(
     data_dir: impl AsRef<Path>,
 ) -> Result<StoreCompatibility, MaintenanceError> {
+    // A directory that holds no database is not a broken store: it is a store
+    // that has not been created yet. Opening it read-only would fail with
+    // `read_only_store` and hide that distinction from `doctor`, which is the
+    // first command a new operator runs.
+    if !store_is_initialized(data_dir.as_ref()) {
+        return Ok(StoreCompatibility::Uninitialized);
+    }
     let store = SqliteStore::open_read_only(data_dir.as_ref()).await?;
     let revisions = store.all_schema_revisions().await?;
     store.close().await?;

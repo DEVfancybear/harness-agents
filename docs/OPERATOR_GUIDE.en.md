@@ -270,3 +270,60 @@ platform is green.
 | `ha maintenance gc` | Collect unreferenced, unpinned, old artifacts | Never; it reports what it retained and why |
 | `ha maintenance migrate-copy` | Migrate a store on a copy | The destination is occupied; the source has no store |
 | `ha maintenance release-matrix` | Report platforms, capabilities and benchmark honesty | Never; it reports what is unverified |
+
+## 11. Getting the CLI into your terminal
+
+```console
+pwsh -NoProfile -File scripts/Install-Ha.ps1
+ha --version
+ha maintenance doctor --data-dir <DATA_DIR>
+```
+
+`ha` is an ordinary executable, so installing it means putting that executable on
+your `PATH`. The repository ships one script that does it, in two routes:
+
+| Route | Command | What it does |
+| --- | --- | --- |
+| Copy (default) | `scripts/Install-Ha.ps1` | Builds `ha` with `cargo build --release -p harness-cli --bin ha --locked` and copies the compiled artifact into `$HOME/.cargo/bin`, the directory the Rust installer already put on `PATH` |
+| Cargo | `scripts/Install-Ha.ps1 -UseCargoInstall` | Runs `cargo install --path crates/harness-cli --locked --root $HOME/.cargo`, so `cargo uninstall harness-cli` can remove it later |
+
+Useful variations:
+
+```console
+pwsh -NoProfile -File scripts/Install-Ha.ps1 -Profile Debug        # faster build, for local iteration
+pwsh -NoProfile -File scripts/Install-Ha.ps1 -Force                # rebuild even if the binary looks current
+pwsh -NoProfile -File scripts/Install-Ha.ps1 -Destination <DIR>    # install somewhere else
+pwsh -NoProfile -File scripts/Install-Ha.ps1 -SkipBuild            # install the already built binary
+```
+
+What the script does **not** do, on purpose: it downloads nothing, it publishes
+nothing to a package registry, and it never edits your `PATH`. When the install
+directory is not on `PATH`, it prints the exact directory to add instead of
+changing your profile behind your back. It also prints the installed path and the
+`ha --version` output, so you can see which binary you are about to run.
+
+Both routes build from the same source tree the phase gate tests; only the cargo
+profile differs. If you want the exact artifact the release gate exercised, use
+the default release profile.
+
+Removing it again:
+
+```console
+Remove-Item "$HOME/.cargo/bin/ha.exe"     # the copy route
+cargo uninstall harness-cli               # the cargo route
+```
+
+Two things to know after installing:
+
+- **`ha` is foreground.** There is no daemon: nothing runs between your commands,
+  so a backup, a collection or a retention action happens exactly when you ask for
+  it and at no other time.
+- **A fresh directory is a valid target.** `ha maintenance doctor --data-dir <DIR>`
+  works on a directory that holds no store yet and reports it as uninitialized,
+  which is the state this binary may create a store in. It does not pretend a
+  store already exists, and backing such a directory up is still refused.
+
+Building from source stays available for development:
+`cargo build -p harness-cli --bin ha --locked` writes `target/debug/ha`, and
+`cargo run -p harness-cli --bin ha -- <args>` runs it without installing anything.
+
