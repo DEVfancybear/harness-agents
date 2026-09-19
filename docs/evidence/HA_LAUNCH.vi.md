@@ -479,9 +479,9 @@ Kết quả lệnh: `cargo test -p harness-cli --test interactive_launch --locke
 → **15 passed, 0 failed** (32.85 s).
 
 Phạm vi chính xác: ca này kill trong **lượt gọi model đầu tiên** nên không có tool nào chạy
-(headless fail closed cho mọi tool call). Nó chứng minh phần *admission/lease/replay*; phần
-*receipt đã commit rồi mới mất process* vẫn chỉ ở mức mô phỏng trung thực cho durable state
-(mục trên). Không có phần nào ở đây được gọi là "kill trong lúc tool đang chạy".
+(headless fail closed cho mọi tool call). Nó chứng minh phần *admission/lease/replay*. Phần
+*receipt đã commit rồi mới mất process* được đo riêng ở **mục 15.2** bằng một ca PTY với tool
+chạy thật. Không có phần nào ở đây được gọi là "kill trong lúc tool đang chạy".
 
 
 ## 11. Grant round 9 (publish + credential): đã chuẩn bị, chưa thực thi được
@@ -596,8 +596,9 @@ phải trong app:
 
 Bằng chứng: một lần chạy bounded `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1
 -TimeoutSeconds 300` báo `PTY_EXIT: 0` và `test result: ok. 4 passed; 0 failed` (9.03 s).
-Sau khi thêm ca I08 (mục 12.3), cùng runner đó chạy **năm** ca: `PTY_EXIT: 0`,
-`test result: ok. 5 passed; 0 failed` (11.01 s); transcript hiện có ở
+Sau khi thêm ca I08 (mục 12.3) là **năm** ca (`5 passed; 0 failed`, 11.01 s), rồi thêm ca I13
+(mục 15.2) thành **sáu** ca: `PTY_EXIT: 0`, `test result: ok. 6 passed; 0 failed` (12.61 s);
+transcript hiện có ở
 `target/pty-acceptance/pty-all.txt` là của lần chạy năm ca. Đây là bằng chứng I01/I06/I07
 trong pseudo-console thật, không phải suy luận từ scripted backend.
 
@@ -638,7 +639,7 @@ Kill process cứng vẫn **ngoài phạm vi** đúng như plan ghi, và đượ
 | Unit test binary `ha` | `cargo test -p harness-cli --bin ha --locked` | 61 passed, 0 failed (thêm 3 test I08 cho phục hồi mode) |
 | Launch/headless acceptance | `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` | 15 passed, 0 failed, gồm ca kill process thật (mục 10.1) |
 | Session/turn acceptance | `cargo test -p harness-cli --test interactive_session --locked -- --test-threads=1` | 9 passed, 0 failed |
-| PTY trong console thật | `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 300` | `PTY_EXIT: 0`, **5 passed, 0 failed** (11.01 s) cho i01/i06/i07a/i07b/i08 |
+| PTY trong console thật | `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 420` | `PTY_EXIT: 0`, **6 passed, 0 failed** (12.61 s) cho i01/i06/i07a/i07b/i08/i13 (vòng 13 chỉ có 5 ca đầu) |
 | Regression toàn CLI (serial) | `cargo test -p harness-cli --tests --locked -- --test-threads=1` | **229 passed, 0 failed, 5 ignored** (5 ca PTY; chi tiết `target/cli-tests-round13.txt`) |
 | Providers | `cargo test -p harness-providers --locked` | 3 passed, 0 failed |
 
@@ -649,14 +650,24 @@ Kill process cứng vẫn **ngoài phạm vi** đúng như plan ghi, và đượ
   `scripts/Invoke-HaPtyAcceptance.ps1`. Gate liệt kê chúng là `not_run` kèm hướng dẫn.
 - **I08 (lỗi render/backend sau khi terminal đã khởi tạo)**: chưa có ca PTY inject lỗi;
   hiện chỉ được chứng minh ở mức scripted backend (H07 G2), không phải PTY thật.
-- **H05 I13**: kill *process* thật giữa turn **đã đo** (mục 10.1). Còn lại: kill đúng lúc
-  *sau khi tool receipt đã commit* — vẫn chỉ mô phỏng trung thực cho durable state.
+- **H05 I13**: cả hai nửa đã đo trên process thật — kill giữa lượt gọi model (mục 10.1) và kill
+  sau khi tool receipt đã commit (mục 15.2, PTY + tool chạy thật).
 - **Live provider**: không chạy; không có credential/budget được cấp.
 - **User PATH / cài binary thật**: không thực hiện; không được cấp quyền.
 - **Publish release / push remote**: không thực hiện; không được cấp quyền.
 - **Linux**: chưa build/chạy; mọi kết quả trên là Windows.
 
 ## 14. Ghi chú flake môi trường (đã điều tra, không che)
+
+**Bổ sung round 16**: hai lần chạy gate liên tiếp đỏ ở hai test **khác nhau**, cả hai đều là
+loại loopback/flaky đã biết và cả hai đều xanh khi chạy riêng:
+
+- lần 1: `regression-phase_p2` → `p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized`;
+- lần 2: `acceptance-launch` → `i13_resume_continues_the_task_with_recovered_context_and_no_rerun`
+  (chạy riêng 3 lần liên tiếp: 3/3 xanh).
+
+Không có thay đổi nào của round 16 chạm vào hai test đó (round 16 chỉ sửa test PTY, docs và
+script gate). Gate được chạy lại cho tới khi xanh và kết quả cuối được ghi ở mục 12.4/15.
 
 Test `phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` thỉnh
 thoảng đỏ ở tầng connect tới fixture server loopback trong chính process test:
@@ -744,8 +755,8 @@ Chưa chứng minh / còn mở:
 ## 15. Đối chiếu acceptance I01–I20 với bằng chứng
 
 Bảng này nói rõ mỗi mục của plan được chứng minh bằng gì và ở mức nào; "một phần" nghĩa là
-phần còn thiếu được ghi đúng chứ không được tính là đạt. Sau round 15 chỉ còn **I13** (kill
-đúng lúc receipt vừa commit) và **I19** (VM sạch thật) ở mức một phần — xem mục 15.1.
+phần còn thiếu được ghi đúng chứ không được tính là đạt. Sau round 16 chỉ còn **I19** (VM
+sạch thật) ở mức một phần; I04/I09 đóng ở mục 15.1, I13 đóng ở mục 15.2.
 
 | # | Bằng chứng cụ thể | Trạng thái |
 |---|---|---|
@@ -761,7 +772,7 @@ phần còn thiếu được ghi đúng chứ không được tính là đạt. 
 | I10 | `phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` (SSE → sự kiện chuẩn hoá), `h03_text_and_terminal_events_are_rendered_before_the_run_ends` (text hiện trước khi run kết thúc) | đạt |
 | I11 | `g2_tool_results_return_to_the_model_and_the_turn_ends_with_the_answer`, `g2_a_failed_tool_call_is_reported_instead_of_ending_the_turn`, `g2_the_tool_loop_is_bounded_and_reports_which_bound_stopped_it`, `g3_the_foundation_admits_one_input_per_session_and_says_so` | đạt |
 | I12 | `h05_a_denied_gated_action_is_not_executed_and_the_model_is_told`, `h05_a_granted_gated_action_runs_once_after_the_answer`, `h05_an_expired_approval_is_a_refusal_not_a_silent_grant`, `i12_headless_turn_without_provider_configuration_fails_closed` | đạt |
-| I13 | `i13_a_hard_kill_mid_turn_leaves_one_admitted_input_and_no_claimed_success` (mục 10.1), `i13_resume_continues_the_task_with_recovered_context_and_no_rerun`, `i13_resuming_an_unknown_session_fails_without_running_anything`, `h05_a_settled_receipt_is_not_re_executed_after_the_process_state_is_lost` | **một phần**: kill process thật đo ở lượt gọi model; kill đúng lúc receipt vừa commit vẫn mô phỏng |
+| I13 | PTY `i13_a_settled_tool_receipt_survives_a_hard_kill_mid_turn` (mục 15.2: patch được duyệt chạy thật, receipt đã commit rồi mới kill cứng; tiếp tục bằng process mới → `tool_calls = 0`, file không đổi, vẫn đúng 1 receipt), `i13_a_hard_kill_mid_turn_leaves_one_admitted_input_and_no_claimed_success` (mục 10.1), `i13_resume_continues_the_task_with_recovered_context_and_no_rerun`, `i13_resuming_an_unknown_session_fails_without_running_anything`, `h05_a_settled_receipt_is_not_re_executed_after_the_process_state_is_lost` | đạt |
 | I14 | `Install-Ha.ps1 -SelfTest`: `disposable_install_replaces_and_verifies_the_artifact`, `installed_digest_matches_the_built_artifact`, `install_manifest_records_version_and_digest` | đạt trong destination tạm |
 | I15 | `Install-Ha.ps1 -SelfTest`: `merge_appends_a_missing_directory`, `merge_is_case_insensitive_and_ignores_a_trailing_separator`, `merge_drops_empty_entries_and_keeps_order`, `merge_never_folds_machine_or_process_entries_into_user_path`, `injected_writer_receives_the_merged_user_path`, `self_test_never_writes_the_real_user_path` | đạt ở mức mô phỏng; **không** ghi User PATH thật |
 | I16 | `i16_a_second_run_in_the_same_project_is_refused_while_the_first_holds_the_store`, `h02_two_terminals_in_one_project_share_a_store_and_the_second_is_busy` | đạt |
@@ -804,6 +815,26 @@ khẳng định `git_root` là `None` khi project không có Git, và header ren
 
 Kết quả: `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` →
 **17 passed, 0 failed**.
+
+### 15.2. Kill đúng lúc tool receipt đã commit, trên process thật (round 16)
+
+Ca PTY `i13_a_settled_tool_receipt_survives_a_hard_kill_mid_turn` đóng nốt nửa còn lại của I13.
+Đây là ca PTY đầu tiên **không** dùng fixture nội bộ của app mà chạy một provider HTTP thật do
+test điều khiển, nên tool được thực thi thật qua P3 gate và ghi receipt thật vào store:
+
+1. Provider (test) trả về một tool call `apply_patch` với `expected_hash` của file fixture;
+2. app render proposal `[approval] ApplyPatch: patch src/parser.rs`, test gửi `y`;
+3. tool chạy thật (file đổi nội dung), receipt commit; app gọi model lần hai — provider **giữ
+   kết nối này** thay vì trả lời, nên test biết chắc receipt đã commit trước khi kill;
+4. kill cứng process (không unwind, không flush, không đóng writer tử tế);
+5. đọc state bằng đường read-only của operator: `receipt_count = 1`;
+6. process mới `ha chat --headless --resume <session>` chạy tiếp qua provider thật: exit 0,
+   `tool_calls = 0`, file **không đổi byte nào**, và `receipt_count` vẫn đúng 1.
+
+Kết quả: `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -Filter i13` → `PTY_EXIT: 0`,
+`1 passed; 0 failed` (1.72 s). Đây là mức "kill process thật sau khi receipt đã commit" chứ
+không phải mô phỏng; ca mô phỏng ở `interactive_session` vẫn giữ như một đối chứng bổ sung cho
+durable state (drop toàn bộ in-memory + writer generation mới).
 
 **Không đạt / not_run (không được tính là đạt)**: live provider smoke (không có credential),
 publish release (không có channel và chưa được xác nhận push tag), build/chạy Linux (chỉ có

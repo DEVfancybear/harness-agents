@@ -112,7 +112,7 @@ $requiredSelectors = @(
 )
 
 $notRun = @(
-    'PTY cases i01/i06/i07a/i07b/i08: they need a real console, which a sandboxed cargo test does not have. Run scripts/Invoke-HaPtyAcceptance.ps1 - all five pass there with transcripts; this gate does not count them as passes.',
+    'PTY cases i01/i06/i07a/i07b/i08/i13: they need a real console, which a sandboxed cargo test does not have. Run scripts/Invoke-HaPtyAcceptance.ps1 - all six pass there with transcripts; this gate does not count them as passes.',
     'Live provider smoke (paid model call): no credential or budget is granted for this assignment.',
     'Linux build and run: this session only has Windows x64.',
     'Real User PATH mutation and install into the user profile: not authorized in this assignment.'

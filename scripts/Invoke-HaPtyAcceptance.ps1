@@ -8,19 +8,21 @@ transcript when the process that creates the pseudo-console owns one, and a sand
 `cargo test` does not. This helper launches the compiled test binary in a new console
 window, waits with a hard bound, and writes the result next to the transcript.
 
-Status at the time of writing (HA_LAUNCH H07, round 13): all five cases pass here -
+Status at the time of writing (HA_LAUNCH H07, round 16): all six cases pass here -
   - i01: bare `ha` opens the app, renders its header and exits 0;
   - i06: Vietnamese input, backspace and paste leave the app alive at a usable prompt;
   - i07a/i07b: Ctrl-C clears an idle prompt and cancels a running turn;
   - i08: an injected render/backend fault after initialization exits 1 with a named
-    error instead of hanging or swallowing the failure.
+    error instead of hanging or swallowing the failure;
+  - i13: an approved patch runs for real and commits its receipt, the process is then
+    killed hard, and a new process resumes without re-running the settled action.
 
-Measured in one bounded run: PTY_EXIT 0 and "5 passed; 0 failed". The cases stay
+Measured in one bounded run: PTY_EXIT 0 and "6 passed; 0 failed". The cases stay
 `#[ignore]`d because `cargo test` in a sandbox has no console; this helper is how they
 are run for evidence.
 
 .PARAMETER Filter
-Test-name filter passed to the test binary. Defaults to all five PTY cases.
+Test-name filter passed to the test binary. Defaults to all six PTY cases.
 
 .PARAMETER TimeoutSeconds
 Hard bound before the console run is killed. Defaults to 600.

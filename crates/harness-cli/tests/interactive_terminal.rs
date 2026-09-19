@@ -226,7 +226,7 @@ fn base_env(temp: &tempfile::TempDir) -> Vec<(&'static str, String)> {
     ]
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all five cases i01, i06, i07a, i07b and i08 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all six cases i01, i06, i07a, i07b, i08 and i13 pass there."]
 #[test]
 fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     let (temp, project) = sandbox();
@@ -259,7 +259,7 @@ fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all five cases i01, i06, i07a, i07b and i08 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all six cases i01, i06, i07a, i07b, i08 and i13 pass there."]
 #[test]
 fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     let (temp, project) = sandbox();
@@ -320,7 +320,7 @@ fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all five cases i01, i06, i07a, i07b and i08 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all six cases i01, i06, i07a, i07b, i08 and i13 pass there."]
 #[test]
 fn i07a_ctrl_c_clears_an_idle_prompt() {
     // One pseudo-console per test: opening a second one in the same process blocks
@@ -354,7 +354,7 @@ fn i07a_ctrl_c_clears_an_idle_prompt() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all five cases i01, i06, i07a, i07b and i08 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all six cases i01, i06, i07a, i07b, i08 and i13 pass there."]
 #[test]
 fn i07b_ctrl_c_cancels_a_running_turn() {
     let (temp, project) = sandbox();
@@ -423,7 +423,7 @@ fn i07b_ctrl_c_cancels_a_running_turn() {
     let _ = hold.join();
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all five cases i01, i06, i07a, i07b and i08 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all six cases i01, i06, i07a, i07b, i08 and i13 pass there."]
 #[test]
 fn i08_a_backend_fault_after_init_restores_the_terminal_and_is_not_swallowed() {
     // I08: inject a render/backend failure *after* the terminal is initialized and
@@ -456,5 +456,280 @@ fn i08_a_backend_fault_after_init_restores_the_terminal_and_is_not_swallowed() {
     assert!(
         transcript.contains("HA_TEST_FAIL_AFTER_MS"),
         "the reported failure is the injected one, not an unrelated error:\n{transcript}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// I13 - a settled tool receipt survives a hard kill of the real process
+// ---------------------------------------------------------------------------
+
+impl PtySession {
+    /// Kill the app the way a crash does: no unwinding, no flush, no graceful close.
+    fn kill(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+/// Environment for a turn that talks to a local fixture provider.
+fn provider_env(temp: &tempfile::TempDir, endpoint: &str) -> Vec<(&'static str, String)> {
+    let mut env = base_env(temp);
+    env.push(("HA_PROVIDER_ENDPOINT", endpoint.to_owned()));
+    env.push(("HA_PROVIDER_MODEL", "fixture-model".to_owned()));
+    env.push(("DEEPSEEK_API_KEY", "fixture-secret-value".to_owned()));
+    env
+}
+
+/// Run one non-PTY command against the same state root and parse its JSON stdout.
+fn run_cli_json(temp: &tempfile::TempDir, project: &Path, args: &[&str]) -> serde_json::Value {
+    let output = std::process::Command::new(cli_binary())
+        .args(args)
+        .current_dir(project)
+        .env("HA_HOME", ha_home(temp))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("ha runs");
+    assert!(
+        output.status.success(),
+        "ha {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("a JSON result")
+}
+
+/// The state root `base_env` hands to the app.
+fn ha_home(temp: &tempfile::TempDir) -> PathBuf {
+    temp.path().join("home")
+}
+
+/// The single per-project store the app created under `HA_HOME`.
+fn only_store(temp: &tempfile::TempDir) -> PathBuf {
+    let projects = ha_home(temp).join("data").join("projects");
+    let mut stores: Vec<PathBuf> = std::fs::read_dir(&projects)
+        .expect("the app created a per-project store")
+        .map(|entry| entry.expect("store entry").path())
+        .collect();
+    stores.sort();
+    assert_eq!(stores.len(), 1, "one store is expected: {stores:?}");
+    stores.pop().expect("one store")
+}
+
+fn read_request(socket: &mut std::net::TcpStream) -> String {
+    let mut buffer = vec![0_u8; 8192];
+    let read = socket.read(&mut buffer).expect("fixture reads");
+    buffer.truncate(read);
+    String::from_utf8_lossy(&buffer).into_owned()
+}
+
+fn write_sse(socket: &mut std::net::TcpStream, body: &str) {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    socket
+        .write_all(response.as_bytes())
+        .expect("fixture writes");
+    socket.flush().ok();
+}
+
+/// Provider script for the kill case: one gated patch request, a second call held
+/// open (the window the test kills in), then a prose answer for the continuation.
+fn patch_then_stall_endpoint(
+    expected_hash: String,
+    replacement: String,
+) -> (
+    String,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+    let address = listener.local_addr().expect("fixture address");
+    let asked = Arc::new(AtomicBool::new(false));
+    let continued = Arc::new(AtomicBool::new(false));
+    let asked_flag = Arc::clone(&asked);
+    let continued_flag = Arc::clone(&continued);
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        let arguments = serde_json::json!({
+            "path": "src/parser.rs",
+            "expected_hash": expected_hash,
+            "replacement": replacement,
+        })
+        .to_string();
+        let tool_call = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"id\":\"patch-1\",\"function\":{{\"name\":\"apply_patch\",\"arguments\":{}}}}}]}},\"finish_reason\":null}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n",
+            serde_json::Value::String(arguments)
+        );
+        // 1. The turn asks for one gated patch.
+        let (mut socket, _) = listener.accept().expect("the first call arrives");
+        let _ = read_request(&mut socket);
+        asked_flag.store(true, Ordering::SeqCst);
+        write_sse(&mut socket, &tool_call);
+        // 2. After the tool settles the app asks again: hold this call open so the
+        //    test can kill the process with the receipt already committed.
+        let (mut second, _) = listener.accept().expect("the second call arrives");
+        let _ = read_request(&mut second);
+        continued_flag.store(true, Ordering::SeqCst);
+        let _ = held.recv_timeout(Duration::from_mins(2));
+        drop(second);
+        // 3. The continuation after the kill gets a prose answer.
+        let (mut third, _) = listener.accept().expect("the continuation arrives");
+        let _ = read_request(&mut third);
+        write_sse(
+            &mut third,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"the parser is already fixed; nothing to redo\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
+    });
+    (
+        format!("http://{address}/chat/completions"),
+        asked,
+        continued,
+        release,
+        handle,
+    )
+}
+
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all six cases i01, i06, i07a, i07b, i08 and i13 pass there."]
+#[test]
+#[allow(clippy::too_many_lines)] // One kill-then-resume sequence; splitting it hides the order.
+fn i13_a_settled_tool_receipt_survives_a_hard_kill_mid_turn() {
+    // I13: the kill lands *after* a granted tool action committed its receipt and
+    // the turn already asked the model for the next step.
+    let (temp, project) = sandbox();
+    std::fs::create_dir_all(project.join("src")).expect("src dir");
+    let original = "fn parse() { todo!() }\n";
+    std::fs::write(project.join("src").join("parser.rs"), original).expect("fixture file");
+    let expected = harness_types::ContentHash::from_bytes(original.as_bytes())
+        .as_str()
+        .to_owned();
+    let replacement = "fn parse() { println!(\"fixed before the kill\"); }\n";
+    let (endpoint, _asked, continued, release, server) =
+        patch_then_stall_endpoint(expected, replacement.to_owned());
+
+    let mut session = PtySession::spawn(&project, &provider_env(&temp, &endpoint));
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+    session.send("fix the parser\r");
+    // The proposal is rendered with the contract action name, not the tool name.
+    session.wait_for("[approval] ApplyPatch", Duration::from_secs(40));
+    session.send("y\r");
+
+    // The second model call only happens after the tool settled, so waiting for it
+    // is what makes "killed with a committed receipt" a measurement, not a guess.
+    let waiting = Instant::now() + Duration::from_mins(1);
+    while !continued.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < waiting,
+            "the turn never committed the tool and continued:\n{}",
+            session.transcript()
+        );
+        assert!(
+            session.is_alive(),
+            "the app died before the kill:\n{}",
+            session.transcript()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let patched = std::fs::read_to_string(project.join("src").join("parser.rs"))
+        .expect("the granted patch wrote the file");
+    assert!(
+        patched.contains("fixed before the kill"),
+        "the approved action really ran: {patched}"
+    );
+
+    // A hard kill: no unwinding, no flush, no graceful writer shutdown.
+    session.kill();
+    // Release the held call. The fixture thread then waits for the continuation,
+    // so it must not be joined until that continuation has run.
+    let _ = release.send(());
+
+    // The durable state, read the way an operator reads it: no runtime.
+    let store = only_store(&temp);
+    let store = store.to_str().expect("the store path is UTF-8").to_owned();
+    let listed = run_cli_json(
+        &temp,
+        &project,
+        &["sessions", "list", "--data-dir", &store, "--json"],
+    );
+    let sessions = listed["sessions"].as_array().expect("sessions is an array");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "exactly one session is durable: {listed}"
+    );
+    let session_id = sessions[0]["session_id"]
+        .as_str()
+        .expect("a session id")
+        .to_owned();
+    let status = run_cli_json(
+        &temp,
+        &project,
+        &[
+            "status",
+            "--data-dir",
+            &store,
+            "--session-id",
+            &session_id,
+            "--json",
+        ],
+    );
+    assert_eq!(
+        status["recovery"]["receipt_count"],
+        serde_json::json!(1),
+        "the settled receipt survived the kill: {status}"
+    );
+
+    // A new process resumes the task. The settled action must not run again.
+    let resume = std::process::Command::new(cli_binary())
+        .args([
+            "chat",
+            "--headless",
+            "--resume",
+            &session_id,
+            "--prompt",
+            "continue after the kill",
+            "--json",
+        ])
+        .current_dir(&project)
+        .env("HA_HOME", ha_home(&temp))
+        .env("HA_PROVIDER_ENDPOINT", &endpoint)
+        .env("HA_PROVIDER_MODEL", "fixture-model")
+        .env("DEEPSEEK_API_KEY", "fixture-secret-value")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the continuation runs");
+    assert!(
+        resume.status.success(),
+        "resume failed: {}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    server.join().expect("the fixture server finishes");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&resume.stdout).expect("the continuation prints JSON");
+    assert_eq!(
+        parsed["tool_calls"],
+        serde_json::json!(0),
+        "the settled action is not re-executed: {parsed}"
+    );
+    let after = std::fs::read_to_string(project.join("src").join("parser.rs"))
+        .expect("the file after the continuation");
+    assert_eq!(after, patched, "the side effect happened exactly once");
+    let still = run_cli_json(
+        &temp,
+        &project,
+        &[
+            "status",
+            "--data-dir",
+            &store,
+            "--session-id",
+            &session_id,
+            "--json",
+        ],
+    );
+    assert_eq!(
+        still["recovery"]["receipt_count"],
+        serde_json::json!(1),
+        "no second receipt was written for the settled action: {still}"
     );
 }

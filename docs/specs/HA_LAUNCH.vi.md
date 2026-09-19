@@ -350,12 +350,15 @@ thật thay `PendingService`, và `ha chat --headless` chạy turn thật. Live 
 - Headless: `ha chat --headless --resume <session-id>` tiếp tục task của session đó, JSON có
   `resumed_from`; session lạ trả lỗi và **không** chạy gì.
 
-**Còn lại của H05 (cập nhật round 14)**: ca kill **process thật** giữa turn nay **đã có và đã
-đo** (`i13_a_hard_kill_mid_turn_leaves_one_admitted_input_and_no_claimed_success`): process bị
-kill cứng trong lúc gọi model, store đọc lại chỉ thấy **một** input đã admit (`input_count = 1`,
-`next_sequence = 2`), replay dừng ở sequence 1, `receipt_count = 0`, không snapshot; host mới lấy
-được lease và trả lời trong **session mới**. Điều **chưa** chứng minh: kill *sau khi tool receipt
-đã commit* — ca đó vẫn chỉ ở mức mô phỏng trung thực cho durable state.
+**H05 nay đã đo cả hai nhánh kill (cập nhật round 16)**:
+
+- `i13_a_hard_kill_mid_turn_leaves_one_admitted_input_and_no_claimed_success`: kill cứng trong
+  lúc gọi model; store đọc lại chỉ thấy **một** input đã admit (`input_count = 1`,
+  `next_sequence = 2`), replay dừng ở sequence 1, `receipt_count = 0`, không snapshot; host mới
+  lấy được lease và trả lời trong **session mới**;
+- `i13_a_settled_tool_receipt_survives_a_hard_kill_mid_turn` (PTY, provider HTTP thật do test
+  điều khiển): patch được duyệt chạy **thật**, receipt commit, rồi mới kill cứng; process mới
+  `--resume` chạy tiếp với `tool_calls = 0`, file không đổi byte nào và vẫn đúng **một** receipt.
 
 ### H06 — Installer và command resolution (đang triển khai)
 
@@ -464,10 +467,15 @@ Vì vậy có **hai mức bằng chứng**, ghi rõ để không đánh đồng:
   mới** (`resumed_from: null`), còn session bị kill giữ nguyên một input. Ca này không chạy
   tool (headless fail closed), nên nó chứng minh phần *admission/lease/replay*, không phải
   phần *receipt*.
-- **Receipt đã commit rồi mới mất process (mô phỏng trung thực)**: mọi handle in-memory
-  (driver, runtime, tool service, writer) bị drop và lượt kế tiếp mở **writer generation mới**
-  từ đĩa, đúng như một process mới; test khẳng định receipt đã settle không bị chạy lại và
-  context được phục hồi.
+- **Receipt đã commit rồi mới kill process thật (round 16, đã đo — PTY)**: provider HTTP do test
+  điều khiển trả về tool call `apply_patch`, người dùng duyệt `y`, tool chạy thật và receipt
+  commit, rồi provider **giữ** lời gọi kế tiếp để test kill cứng đúng lúc đó. Process mới
+  `ha chat --headless --resume` chạy tiếp qua provider thật: `tool_calls = 0`, file không đổi
+  byte nào, `receipt_count` vẫn đúng 1 — settled side effect không bị chạy lại.
+- **Mô phỏng trung thực cho durable state (đối chứng bổ sung)**: mọi handle in-memory (driver,
+  runtime, tool service, writer) bị drop và lượt kế tiếp mở **writer generation mới** từ đĩa,
+  đúng như một process mới; test khẳng định receipt đã settle không bị chạy lại và context được
+  phục hồi.
 
 ### Quyền bổ sung được cấp trong session (round 9) và trạng thái thực thi
 
