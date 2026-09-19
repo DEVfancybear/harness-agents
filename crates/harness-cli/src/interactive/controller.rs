@@ -7,9 +7,9 @@
 use harness_types::InputId;
 
 use super::bootstrap::LaunchContext;
-use super::events::{AppPhase, Key, SessionEvent};
+use super::events::{AppPhase, Key, SessionCandidate, SessionEvent};
 use super::input::{InputOutcome, LineEditor};
-use super::service::{SessionChannel, SessionPort, SubmitRequest};
+use super::service::{ApprovalDecision, SessionChannel, SessionPort, SubmitRequest};
 use super::view;
 
 /// Exit code for a normal quit.
@@ -31,6 +31,12 @@ pub enum Effect {
     Exit(u8),
 }
 
+/// One gated action waiting for the user's answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingApproval {
+    request_id: String,
+}
+
 /// Interactive app state and its transitions.
 pub struct InteractiveController {
     phase: AppPhase,
@@ -43,6 +49,9 @@ pub struct InteractiveController {
     channel: SessionChannel,
     pending_text: String,
     active_input: Option<InputId>,
+    pending_approval: Option<PendingApproval>,
+    /// Last resume listing, so a number can select from it.
+    session_candidates: Vec<SessionCandidate>,
 }
 
 impl InteractiveController {
@@ -67,6 +76,8 @@ impl InteractiveController {
             channel,
             pending_text: String::new(),
             active_input: None,
+            pending_approval: None,
+            session_candidates: Vec::new(),
         }
     }
 
@@ -147,6 +158,56 @@ impl InteractiveController {
                     let line = view::tool_line(&name, if ok { "ok" } else { "failed" });
                     self.push_line(&mut effects, line);
                 }
+                SessionEvent::ApprovalRequired {
+                    request_id,
+                    action,
+                    summary,
+                    workspace,
+                    scope,
+                } => {
+                    self.flush_stream(&mut effects);
+                    for line in
+                        view::approval_lines(&action, &summary, &workspace, &scope, &request_id)
+                    {
+                        self.push_line(&mut effects, line);
+                    }
+                    self.pending_approval = Some(PendingApproval {
+                        request_id: request_id.clone(),
+                    });
+                    self.phase = AppPhase::WaitingApproval;
+                }
+                SessionEvent::SessionsListed { sessions } => {
+                    self.flush_stream(&mut effects);
+                    if sessions.is_empty() {
+                        self.push_line(
+                            &mut effects,
+                            "no persisted sessions in this project yet".to_owned(),
+                        );
+                    } else {
+                        let header = format!("sessions in this project ({}):", sessions.len());
+                        self.push_line(&mut effects, header);
+                        for (index, candidate) in sessions.iter().enumerate() {
+                            let line = format!(
+                                "  {}. {}  {}  {}",
+                                index + 1,
+                                view::short_id(&candidate.session_id),
+                                candidate.task_id,
+                                candidate.detail
+                            );
+                            self.push_line(&mut effects, line);
+                        }
+                        self.push_line(
+                            &mut effects,
+                            "use /resume <number> to continue one of them".to_owned(),
+                        );
+                    }
+                    self.session_candidates = sessions;
+                }
+                SessionEvent::Notice { message } => {
+                    self.flush_stream(&mut effects);
+                    let line = format!("[info] {message}");
+                    self.push_line(&mut effects, line);
+                }
                 SessionEvent::RunTerminal { outcome } => {
                     self.flush_stream(&mut effects);
                     let line = view::run_line(&outcome.label());
@@ -168,6 +229,11 @@ impl InteractiveController {
     }
 
     fn submit(&mut self, text: String) -> Vec<Effect> {
+        // While a gated action waits, the next line is the answer — never a new
+        // request that would run beside the pending one.
+        if self.phase == AppPhase::WaitingApproval {
+            return self.answer(&text);
+        }
         if text.starts_with('/') {
             return self.command(&text);
         }
@@ -204,6 +270,7 @@ impl InteractiveController {
         vec![Effect::WriteLine(String::new()), Effect::RedrawPrompt]
     }
 
+    #[allow(clippy::too_many_lines)]
     fn command(&mut self, line: &str) -> Vec<Effect> {
         let mut parts = line.split_whitespace();
         let name = parts.next().unwrap_or_default();
@@ -247,31 +314,68 @@ impl InteractiveController {
                 }
             }
             "/new" => {
-                let text = if self.phase.has_active_run() {
-                    "cannot start a new session while a run is active; press Ctrl-C to cancel it first"
-                        .to_owned()
+                // A new conversation never abandons a running one: the run is
+                // settled first, exactly like Ctrl-C.
+                if self.phase.has_active_run() {
+                    self.push_line(
+                        &mut effects,
+                        "cannot start a new conversation while a run is active; press Ctrl-C to cancel it first"
+                            .to_owned(),
+                    );
                 } else {
-                    "session lifecycle (new session, checkpoint, close) arrives with HA_LAUNCH H05; this session stays open"
-                        .to_owned()
-                };
-                self.push_line(&mut effects, text);
+                    self.service.resume(None);
+                    self.session_candidates.clear();
+                    self.push_line(
+                        &mut effects,
+                        "starting a fresh conversation; the earlier chain is no longer continued"
+                            .to_owned(),
+                    );
+                }
             }
             "/model" => {
+                // The backend label names the configured model or states that setup
+                // is required; it never claims a model that was not resolved.
                 let label = self.service.label();
-                let text = format!(
-                    "model resolution arrives with HA_LAUNCH H04; current backend: {label}"
-                );
+                let text = format!("backend: {label}");
                 self.push_line(&mut effects, text);
             }
-            "/resume" => {
-                let text = match argument {
-                    Some(session) => format!(
-                        "resume of session {session} arrives with HA_LAUNCH H05; no state was changed"
-                    ),
-                    None => "usage: /resume <session-id>".to_owned(),
-                };
-                self.push_line(&mut effects, text);
-            }
+            "/resume" => match argument {
+                None => {
+                    self.service.list_sessions();
+                    self.push_line(
+                        &mut effects,
+                        "looking for persisted sessions in this project...".to_owned(),
+                    );
+                }
+                Some(selector) => {
+                    let chosen = match selector.parse::<usize>() {
+                        Ok(index) => self
+                            .session_candidates
+                            .get(index.saturating_sub(1))
+                            .map(|candidate| candidate.session_id.clone()),
+                        Err(_) => self
+                            .session_candidates
+                            .iter()
+                            .find(|candidate| candidate.session_id == selector)
+                            .map(|candidate| candidate.session_id.clone()),
+                    };
+                    match chosen {
+                        Some(session_id) => {
+                            self.service.resume(Some(session_id.clone()));
+                            let text =
+                                format!("continuing from session {}", view::short_id(&session_id));
+                            self.push_line(&mut effects, text);
+                        }
+                        None => {
+                            self.push_line(
+                                &mut effects,
+                                "that session is not in the last list; run /resume to list this project's sessions"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                }
+            },
             other => {
                 let text =
                     format!("unknown command {other}; /help lists what this revision supports");
@@ -296,7 +400,47 @@ impl InteractiveController {
         effects.push(Effect::WriteLine(line));
     }
 
+    /// Resolve the pending approval from one typed line.
+    fn answer(&mut self, line: &str) -> Vec<Effect> {
+        let Some(pending) = self.pending_approval.clone() else {
+            // No pending request: fall through to a normal submission.
+            return Vec::new();
+        };
+        let decision = match line.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" | "grant" | "/approve" => Some(ApprovalDecision::Granted),
+            "n" | "no" | "deny" | "/deny" => Some(ApprovalDecision::Denied),
+            _ => None,
+        };
+        let mut effects = Vec::new();
+        let Some(decision) = decision else {
+            self.push_line(
+                &mut effects,
+                "the request is still pending: answer y to run it once, or n to refuse".to_owned(),
+            );
+            effects.push(Effect::RedrawPrompt);
+            return effects;
+        };
+        let accepted = self.service.answer(&pending.request_id, decision);
+        self.pending_approval = None;
+        self.phase = AppPhase::Running;
+        let label = if decision == ApprovalDecision::Granted {
+            "granted"
+        } else {
+            "denied"
+        };
+        let line = if accepted {
+            format!("[approval] {label} {}", pending.request_id)
+        } else {
+            "[approval] that request is no longer pending (expired or already answered); the action was not executed"
+                .to_owned()
+        };
+        self.push_line(&mut effects, line);
+        effects.push(Effect::RedrawPrompt);
+        effects
+    }
+
     fn finish_run(&mut self) {
+        self.pending_approval = None;
         self.active_input = None;
         self.phase = if self.setup_required {
             AppPhase::SetupRequired
@@ -310,9 +454,11 @@ impl InteractiveController {
 mod tests {
     use super::{Effect, InteractiveController};
     use crate::interactive::bootstrap::{self, LaunchContext, LaunchRequest};
-    use crate::interactive::events::{AppPhase, Key, RunOutcome, SessionEvent};
+    use crate::interactive::events::{AppPhase, Key, RunOutcome, SessionCandidate, SessionEvent};
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
-    use crate::interactive::service::{FixtureService, SessionChannel, SessionPort, SubmitRequest};
+    use crate::interactive::service::{
+        ApprovalDecision, FixtureService, SessionChannel, SessionPort, SubmitRequest,
+    };
     use std::sync::{Arc, Mutex};
 
     /// Test port that records what the controller admitted.
@@ -610,27 +756,295 @@ mod tests {
         assert!(status.contains("Phase:   ready"), "{status}");
 
         let model = lines(&submit_text(&mut controller, "/model")).join("\n");
-        assert!(model.contains("H04"), "{model}");
+        assert!(model.contains("backend:"), "{model}");
         let config = lines(&submit_text(&mut controller, "/config")).join("\n");
         assert!(config.contains("Config:"), "{config}");
         let resume = lines(&submit_text(&mut controller, "/resume")).join("\n");
-        assert!(resume.contains("usage"), "{resume}");
-        let resume = lines(&submit_text(&mut controller, "/resume session_01")).join("\n");
-        assert!(resume.contains("H05"), "{resume}");
+        assert!(
+            resume.contains("looking for persisted sessions"),
+            "{resume}"
+        );
+        let resume = lines(&submit_text(&mut controller, "/resume 3")).join("\n");
+        assert!(resume.contains("not in the last list"), "{resume}");
         let unknown = lines(&submit_text(&mut controller, "/nope")).join("\n");
         assert!(unknown.contains("unknown command"), "{unknown}");
         let fresh = lines(&submit_text(&mut controller, "/new")).join("\n");
-        assert!(fresh.contains("H05"), "{fresh}");
+        assert!(fresh.contains("fresh conversation"), "{fresh}");
 
         submit_text(&mut controller, "work");
         let busy = lines(&submit_text(&mut controller, "/new")).join("\n");
-        assert!(busy.contains("cannot start a new session"), "{busy}");
+        assert!(busy.contains("cannot start a new conversation"), "{busy}");
 
         let exit = submit_text(&mut controller, "/exit");
         assert!(matches!(exit.last(), Some(Effect::Exit(_))), "{exit:?}");
         assert!(
             lines(&exit).iter().any(|line| line.contains("canceling")),
             "an active run is canceled before exit: {exit:?}"
+        );
+    }
+
+    /// Test port that records approval answers and can announce proposals.
+    #[derive(Clone)]
+    struct ApprovalPort {
+        sender: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
+        answers: Arc<Mutex<Vec<(String, ApprovalDecision)>>>,
+        accept: bool,
+    }
+
+    impl SessionPort for ApprovalPort {
+        fn label(&self) -> String {
+            "approval test port".to_owned()
+        }
+        fn submit(&mut self, request: SubmitRequest) {
+            let _ = self.sender.send(SessionEvent::Accepted {
+                input_id: request.input_id,
+            });
+        }
+        fn cancel(&mut self) {}
+        fn answer(&mut self, request_id: &str, decision: ApprovalDecision) -> bool {
+            self.answers
+                .lock()
+                .expect("answer log")
+                .push((request_id.to_owned(), decision));
+            self.accept
+        }
+    }
+
+    fn approval_event(request_id: &str) -> SessionEvent {
+        SessionEvent::ApprovalRequired {
+            request_id: request_id.to_owned(),
+            action: "ApplyPatch".to_owned(),
+            summary: "patch src/parser.rs".to_owned(),
+            workspace: "C:/work/repo".to_owned(),
+            scope: "one action, this turn only".to_owned(),
+        }
+    }
+
+    #[test]
+    fn h05_a_gated_action_is_rendered_and_answered_by_the_user() {
+        let bench = bench(true);
+        let channel = SessionChannel::new();
+        let sender = channel.sender();
+        let port = ApprovalPort {
+            sender: sender.clone(),
+            answers: Arc::new(Mutex::new(Vec::new())),
+            accept: true,
+        };
+        let answers = Arc::clone(&port.answers);
+        let mut controller = InteractiveController::new(&bench.context, Box::new(port), channel);
+        let _ = controller.boot_lines();
+
+        sender
+            .send(approval_event("approval-1-abcdef"))
+            .expect("proposal delivered");
+        let effects = controller.pump_events();
+        let rendered = lines(&effects).join("\n");
+        assert!(
+            rendered.contains("[approval] ApplyPatch: patch src/parser.rs"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("C:/work/repo"), "{rendered}");
+        assert!(
+            rendered.contains("one action, this turn only"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("approval-1-abcdef"), "{rendered}");
+        assert_eq!(controller.phase(), AppPhase::WaitingApproval);
+
+        // Any other line is not admitted as a new request while the gate waits.
+        let refused = submit_text(&mut controller, "do something else");
+        let text = lines(&refused).join("\n");
+        assert!(text.contains("still pending"), "{text}");
+        assert_eq!(controller.phase(), AppPhase::WaitingApproval);
+
+        let granted = submit_text(&mut controller, "y");
+        assert!(
+            lines(&granted).join("\n").contains("granted"),
+            "{granted:?}"
+        );
+        assert_eq!(controller.phase(), AppPhase::Running);
+        assert_eq!(
+            answers.lock().expect("answer log").as_slice(),
+            [("approval-1-abcdef".to_owned(), ApprovalDecision::Granted)]
+        );
+    }
+
+    #[test]
+    fn h05_a_denial_is_recorded_and_a_stale_request_is_reported() {
+        let bench = bench(true);
+        let channel = SessionChannel::new();
+        let sender = channel.sender();
+        let port = ApprovalPort {
+            sender: sender.clone(),
+            answers: Arc::new(Mutex::new(Vec::new())),
+            accept: true,
+        };
+        let answers = Arc::clone(&port.answers);
+        let mut controller = InteractiveController::new(&bench.context, Box::new(port), channel);
+        let _ = controller.boot_lines();
+
+        sender
+            .send(approval_event("approval-2-abcdef"))
+            .expect("proposal delivered");
+        let _ = controller.pump_events();
+        let denied = submit_text(&mut controller, "n");
+        assert!(lines(&denied).join("\n").contains("denied"), "{denied:?}");
+        assert_eq!(
+            answers.lock().expect("answer log").as_slice(),
+            [("approval-2-abcdef".to_owned(), ApprovalDecision::Denied)]
+        );
+
+        // A request that is no longer pending must say so instead of pretending.
+        let stale_channel = SessionChannel::new();
+        let stale_sender = stale_channel.sender();
+        let stale_port = ApprovalPort {
+            sender: stale_sender.clone(),
+            answers: Arc::new(Mutex::new(Vec::new())),
+            accept: false,
+        };
+        let mut stale =
+            InteractiveController::new(&bench.context, Box::new(stale_port), stale_channel);
+        let _ = stale.boot_lines();
+        stale_sender
+            .send(approval_event("approval-3-abcdef"))
+            .expect("proposal delivered");
+        let _ = stale.pump_events();
+        let answered = submit_text(&mut stale, "y");
+        let rendered = lines(&answered).join("\n");
+        assert!(rendered.contains("no longer pending"), "{rendered}");
+        assert_eq!(stale.phase(), AppPhase::Running);
+    }
+
+    /// Test port that records resume traffic.
+    struct ResumePort {
+        sender: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
+        listed: Arc<Mutex<usize>>,
+        resumed: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    impl SessionPort for ResumePort {
+        fn label(&self) -> String {
+            "resume test port".to_owned()
+        }
+        fn submit(&mut self, request: SubmitRequest) {
+            let _ = self.sender.send(SessionEvent::Accepted {
+                input_id: request.input_id,
+            });
+        }
+        fn cancel(&mut self) {}
+        fn list_sessions(&mut self) {
+            *self.listed.lock().expect("list count") += 1;
+        }
+        fn resume(&mut self, session_id: Option<String>) {
+            self.resumed.lock().expect("resume log").push(session_id);
+        }
+    }
+
+    fn candidate(session_id: &str, task_id: &str, detail: &str) -> SessionCandidate {
+        SessionCandidate {
+            session_id: session_id.to_owned(),
+            task_id: task_id.to_owned(),
+            detail: detail.to_owned(),
+        }
+    }
+
+    #[test]
+    fn h05_resume_lists_sessions_and_selects_one_by_number() {
+        let bench = bench(true);
+        let channel = SessionChannel::new();
+        let sender = channel.sender();
+        let port = ResumePort {
+            sender: sender.clone(),
+            listed: Arc::new(Mutex::new(0)),
+            resumed: Arc::new(Mutex::new(Vec::new())),
+        };
+        let listed = Arc::clone(&port.listed);
+        let resumed = Arc::clone(&port.resumed);
+        let mut controller = InteractiveController::new(&bench.context, Box::new(port), channel);
+        let _ = controller.boot_lines();
+
+        let asked = lines(&submit_text(&mut controller, "/resume")).join("\n");
+        assert!(asked.contains("looking for persisted sessions"), "{asked}");
+        assert_eq!(*listed.lock().expect("list count"), 1);
+
+        sender
+            .send(SessionEvent::SessionsListed {
+                sessions: vec![
+                    candidate(
+                        "session_0192f0aa-bbcc-7ddd-8eee-000000000001",
+                        "task_0192f0aa-bbcc-7ddd-8eee-00000000000a",
+                        "1 input(s), 4 event(s)",
+                    ),
+                    candidate(
+                        "session_0192f0aa-bbcc-7ddd-8eee-000000000002",
+                        "task_0192f0aa-bbcc-7ddd-8eee-00000000000a",
+                        "2 input(s), 9 event(s)",
+                    ),
+                ],
+            })
+            .expect("listing delivered");
+        let listing = lines(&controller.pump_events()).join("\n");
+        assert!(
+            listing.contains("sessions in this project (2)"),
+            "{listing}"
+        );
+        assert!(listing.contains("1. "), "{listing}");
+        assert!(listing.contains("2. "), "{listing}");
+        assert!(listing.contains("2 input(s), 9 event(s)"), "{listing}");
+
+        let selected = lines(&submit_text(&mut controller, "/resume 2")).join("\n");
+        assert!(selected.contains("continuing from session"), "{selected}");
+        assert_eq!(
+            resumed.lock().expect("resume log").as_slice(),
+            [Some(
+                "session_0192f0aa-bbcc-7ddd-8eee-000000000002".to_owned()
+            )]
+        );
+
+        let bogus = lines(&submit_text(&mut controller, "/resume 9")).join("\n");
+        assert!(bogus.contains("not in the last list"), "{bogus}");
+        assert_eq!(resumed.lock().expect("resume log").len(), 1);
+
+        let fresh = lines(&submit_text(&mut controller, "/new")).join("\n");
+        assert!(fresh.contains("fresh conversation"), "{fresh}");
+        let log = resumed.lock().expect("resume log");
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[1], None, "a new conversation clears the resumed chain");
+    }
+
+    #[test]
+    fn h05_an_empty_listing_and_a_notice_are_rendered_honestly() {
+        let bench = bench(true);
+        let channel = SessionChannel::new();
+        let sender = channel.sender();
+        let port = ResumePort {
+            sender: sender.clone(),
+            listed: Arc::new(Mutex::new(0)),
+            resumed: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut controller = InteractiveController::new(&bench.context, Box::new(port), channel);
+        let _ = controller.boot_lines();
+
+        sender
+            .send(SessionEvent::SessionsListed { sessions: vec![] })
+            .expect("empty listing delivered");
+        let rendered = lines(&controller.pump_events()).join("\n");
+        assert!(
+            rendered.contains("no persisted sessions in this project yet"),
+            "{rendered}"
+        );
+
+        sender
+            .send(SessionEvent::Notice {
+                message: "session session_x is not in this project's store; nothing was resumed"
+                    .to_owned(),
+            })
+            .expect("notice delivered");
+        let rendered = lines(&controller.pump_events()).join("\n");
+        assert!(rendered.contains("[info] session session_x"), "{rendered}");
+        assert!(
+            rendered.contains("nothing was resumed"),
+            "the app never claims a resume that did not happen: {rendered}"
         );
     }
 }

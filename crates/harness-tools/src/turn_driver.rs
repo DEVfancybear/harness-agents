@@ -7,7 +7,10 @@
 //! existing policy/approval/receipt gate, and a bounded number of continuation
 //! steps.
 
+use std::fmt;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,9 +18,12 @@ use harness_providers::{
     CancellationToken, MessageRole, NormalizedToolCall, ProviderMessage, ProviderStreamEvent,
 };
 use harness_runtime::{ProviderEventSink, RunRequest, RunResult, RuntimeService};
-use harness_types::HarnessError;
+use harness_types::{ErrorCode, HarnessError};
 
-use crate::{CodingToolAction, ToolExecutionService, ToolExecutionView, ToolOutput, ToolRequest};
+use crate::{
+    CodingToolAction, PreparedToolRequest, ToolExecutionService, ToolExecutionView, ToolOutput,
+    ToolRequest,
+};
 
 /// Limits that bound one user turn.
 #[derive(Clone, Copy, Debug)]
@@ -66,14 +72,66 @@ pub enum TurnStop {
     Canceled,
 }
 
-/// How tool approvals are handled inside this turn.
+/// One gated action waiting for the user's decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalProposal {
+    /// Stable id the answer must quote back.
+    pub request_id: String,
+    /// What the action is, in one line.
+    pub action: String,
+    /// The concrete target: path, command or query.
+    pub summary: String,
+    /// Directory the action would act on.
+    pub workspace: PathBuf,
+    /// How far the grant reaches.
+    pub scope: String,
+}
+
+/// The user's answer to one proposal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalAnswer {
+    /// Run this exact action once.
+    Granted,
+    /// Do not run it; the model is told the action was denied.
+    Denied,
+    /// Nobody answered in time; treated as a refusal.
+    Expired,
+}
+
+/// Asks the host to answer one proposal.
+///
+/// The driver never grants by itself: a gate that is asked must be answered by the
+/// user through the interactive app or by an explicit fixture.
+pub trait ApprovalGate: Send + Sync {
+    fn request(
+        &self,
+        proposal: ApprovalProposal,
+    ) -> Pin<Box<dyn Future<Output = ApprovalAnswer> + Send>>;
+}
+
+/// How tool approvals are handled inside this turn.
+#[derive(Clone)]
 pub enum ApprovalMode {
     /// Grant the prepared action (used by fixtures and explicit auto runs).
     Auto,
     /// Never grant a blanket approval; a gated action fails closed.
     None,
+    /// Ask the host for each gated action.
+    Ask(Arc<dyn ApprovalGate>),
 }
+
+impl fmt::Debug for ApprovalMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => formatter.write_str("Auto"),
+            Self::None => formatter.write_str("None"),
+            Self::Ask(_) => formatter.write_str("Ask(..)"),
+        }
+    }
+}
+
+/// Scope text shown with every proposal.
+const APPROVAL_SCOPE: &str = "one action, this turn only";
 
 /// Per-turn options.
 #[derive(Clone, Debug)]
@@ -224,7 +282,10 @@ impl TurnDriver {
                     name: name.clone(),
                     summary: summarize_arguments(&call.arguments),
                 });
-                match self.execute_call(&result, &call, &options).await {
+                match self
+                    .execute_call(&result, &call, &options, tool_calls)
+                    .await
+                {
                     Ok(view) => {
                         observer.observe(TurnProgress::ToolSettled {
                             name: name.clone(),
@@ -285,6 +346,7 @@ impl TurnDriver {
         result: &RunResult,
         call: &NormalizedToolCall,
         options: &TurnOptions,
+        sequence: u32,
     ) -> Result<ToolExecutionView, HarnessError> {
         let action = CodingToolAction::from_provider_call(&call.name, &call.arguments)?;
         let prepared = self
@@ -297,11 +359,82 @@ impl TurnDriver {
                 action,
             ))
             .await?;
-        let approval = match options.approvals {
+        let approval = match &options.approvals {
             ApprovalMode::Auto => Some(self.tools.approve(&prepared).await?),
             ApprovalMode::None => None,
+            ApprovalMode::Ask(gate) => {
+                let proposal = proposal_for(sequence, &prepared, &options.workspace_root);
+                let answered = gate.request(proposal).await;
+                match answered {
+                    ApprovalAnswer::Granted => Some(self.tools.approve(&prepared).await?),
+                    ApprovalAnswer::Denied => {
+                        return Err(HarnessError::new(
+                            ErrorCode::PolicyDenied,
+                            "denied by the user; the action was not executed",
+                        ));
+                    }
+                    ApprovalAnswer::Expired => {
+                        return Err(HarnessError::new(
+                            ErrorCode::ApprovalStale,
+                            "the approval request expired before an answer arrived; the action was not executed",
+                        ));
+                    }
+                }
+            }
         };
         self.tools.execute(prepared, approval).await
+    }
+}
+
+/// Build the proposal the user answers.
+fn proposal_for(
+    sequence: u32,
+    prepared: &PreparedToolRequest,
+    workspace_root: &std::path::Path,
+) -> ApprovalProposal {
+    let action = prepared.action();
+    ApprovalProposal {
+        request_id: format!(
+            "approval-{sequence}-{}",
+            short_hash(prepared.action_hash().as_str())
+        ),
+        action: format!("{:?}", action.kind()),
+        summary: summarize_action(action),
+        workspace: workspace_root.to_path_buf(),
+        scope: APPROVAL_SCOPE.to_owned(),
+    }
+}
+
+fn short_hash(hash: &str) -> String {
+    let hexadecimal = hash.strip_prefix("sha256:").unwrap_or(hash);
+    hexadecimal.chars().take(12).collect()
+}
+
+/// One-line, secret-free description of the exact action being approved.
+fn summarize_action(action: &CodingToolAction) -> String {
+    match action {
+        CodingToolAction::ReadFile { path } => format!("read {path}"),
+        CodingToolAction::ListFiles { path } => {
+            format!("list {}", path.as_deref().unwrap_or("."))
+        }
+        CodingToolAction::SearchText { query, path } => {
+            format!("search {query:?} in {}", path.as_deref().unwrap_or("."))
+        }
+        CodingToolAction::ApplyPatch { path, .. } => format!("patch {path}"),
+        CodingToolAction::RunProcess {
+            executable, args, ..
+        } => format!("run {executable} {}", args.join(" ")),
+        CodingToolAction::RunShell { command, .. } => format!("shell: {command}"),
+        CodingToolAction::GitStatus => "git status".to_owned(),
+        CodingToolAction::GitDiff { path } => {
+            format!("git diff {}", path.as_deref().unwrap_or("."))
+        }
+        CodingToolAction::TaskUpdate { note } => format!("task update: {note}"),
+        CodingToolAction::ExternalTool {
+            plugin_id,
+            tool_name,
+            ..
+        } => format!("extension {plugin_id}/{tool_name}"),
     }
 }
 

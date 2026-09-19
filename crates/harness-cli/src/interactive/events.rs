@@ -40,6 +40,8 @@ pub enum AppPhase {
     Ready,
     SetupRequired,
     Running,
+    /// A gated action is waiting for the user's answer; the run is still active.
+    WaitingApproval,
     Canceling,
     Closed,
 }
@@ -52,6 +54,7 @@ impl AppPhase {
             Self::Ready => "ready",
             Self::SetupRequired => "setup_required",
             Self::Running => "running",
+            Self::WaitingApproval => "waiting_approval",
             Self::Canceling => "canceling",
             Self::Closed => "closed",
         }
@@ -60,7 +63,10 @@ impl AppPhase {
     /// A run is active, so a second input must not be admitted.
     #[must_use]
     pub const fn has_active_run(self) -> bool {
-        matches!(self, Self::Running | Self::Canceling)
+        matches!(
+            self,
+            Self::Running | Self::WaitingApproval | Self::Canceling
+        )
     }
 }
 
@@ -83,15 +89,54 @@ impl RunOutcome {
     }
 }
 
+/// One persisted session the user can continue from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionCandidate {
+    pub session_id: String,
+    pub task_id: String,
+    /// Short, secret-free description for the list.
+    pub detail: String,
+}
+
 /// Events the controller consumes from the session port.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionEvent {
-    Accepted { input_id: InputId },
-    TextDelta { text: String },
-    ToolStarted { name: String, summary: String },
-    ToolSettled { name: String, ok: bool },
-    RunTerminal { outcome: RunOutcome },
-    RecoverableError { message: String },
+    Accepted {
+        input_id: InputId,
+    },
+    TextDelta {
+        text: String,
+    },
+    ToolStarted {
+        name: String,
+        summary: String,
+    },
+    ToolSettled {
+        name: String,
+        ok: bool,
+    },
+    /// A gated action is waiting for the user's decision.
+    ApprovalRequired {
+        request_id: String,
+        action: String,
+        summary: String,
+        workspace: String,
+        scope: String,
+    },
+    /// The answer to a resume listing.
+    SessionsListed {
+        sessions: Vec<SessionCandidate>,
+    },
+    /// Something the user should know that is not an error.
+    Notice {
+        message: String,
+    },
+    RunTerminal {
+        outcome: RunOutcome,
+    },
+    RecoverableError {
+        message: String,
+    },
 }
 
 #[cfg(test)]
@@ -104,6 +149,8 @@ mod tests {
         assert_eq!(AppPhase::SetupRequired.label(), "setup_required");
         assert!(AppPhase::Running.has_active_run());
         assert!(AppPhase::Canceling.has_active_run());
+        assert!(AppPhase::WaitingApproval.has_active_run());
+        assert_eq!(AppPhase::WaitingApproval.label(), "waiting_approval");
         assert!(!AppPhase::Ready.has_active_run());
         assert!(!AppPhase::Closed.has_active_run());
     }

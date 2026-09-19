@@ -40,6 +40,23 @@ pub fn tool_line(name: &str, detail: &str) -> String {
     }
 }
 
+/// The proposal block shown before a gated action runs.
+#[must_use]
+pub fn approval_lines(
+    action: &str,
+    summary: &str,
+    workspace: &str,
+    scope: &str,
+    request_id: &str,
+) -> Vec<String> {
+    vec![
+        format!("[approval] {action}: {summary}"),
+        format!("           workspace: {workspace}"),
+        format!("           scope: {scope} (request {request_id})"),
+        "           answer y to run it once, or n to refuse".to_owned(),
+    ]
+}
+
 #[must_use]
 pub fn run_line(label: &str) -> String {
     format!("[run] {label}")

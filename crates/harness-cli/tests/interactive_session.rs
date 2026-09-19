@@ -17,8 +17,9 @@ use harness_providers::{
 use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
 use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
 use harness_tools::{
-    ApprovalMode, ToolExecutionService, TurnDriver, TurnLimits, TurnObserver, TurnOptions,
-    TurnOutcome, TurnProgress, TurnStop, coding_tool_schemas, observe_workspace,
+    ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ToolExecutionService, TurnDriver,
+    TurnLimits, TurnObserver, TurnOptions, TurnOutcome, TurnProgress, TurnStop,
+    coding_tool_schemas, observe_workspace, observed_file_hash,
 };
 use harness_types::{HostId, InputId, ProjectId, SessionId, TaskId};
 use serde_json::json;
@@ -455,5 +456,175 @@ async fn g3_the_foundation_admits_one_input_per_session_and_says_so() {
             .to_string()
             .contains("more than one admitted input"),
         "{conflict}"
+    );
+}
+
+/// Test gate: answers from a script and records every proposal it was asked.
+struct ScriptedGate {
+    answers: Mutex<Vec<ApprovalAnswer>>,
+    proposals: Mutex<Vec<ApprovalProposal>>,
+}
+
+impl ScriptedGate {
+    fn new(answers: Vec<ApprovalAnswer>) -> Self {
+        Self {
+            answers: Mutex::new(answers),
+            proposals: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn proposals(&self) -> Vec<ApprovalProposal> {
+        self.proposals.lock().expect("proposal log").clone()
+    }
+}
+
+impl ApprovalGate for ScriptedGate {
+    fn request(
+        &self,
+        proposal: ApprovalProposal,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ApprovalAnswer> + Send>> {
+        self.proposals.lock().expect("proposal log").push(proposal);
+        let answer = {
+            let mut answers = self.answers.lock().expect("answer script");
+            if answers.is_empty() {
+                ApprovalAnswer::Denied
+            } else {
+                answers.remove(0)
+            }
+        };
+        Box::pin(async move { answer })
+    }
+}
+
+/// Provider script that asks for one patch, then answers in prose.
+fn patch_then_final(bench: &Bench) -> Vec<Vec<ProviderStreamEvent>> {
+    let expected = observed_file_hash(&bench.workspace, "src/parser.rs").expect("file hash");
+    vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                "patch-1",
+                "apply_patch",
+                json!({
+                    "path": "src/parser.rs",
+                    "expected_hash": expected.as_str(),
+                    "replacement": "fn parse() { println!(\"fixed\"); }\n",
+                })
+                .to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("done"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]
+}
+
+async fn run_with_approvals(
+    bench: &Bench,
+    provider: Arc<SequenceProvider>,
+    gate: Arc<ScriptedGate>,
+) -> TurnOutcome {
+    let store = bench.open_store().await;
+    let options = TurnOptions {
+        workspace_root: bench.workspace.clone(),
+        actor_id: "test.actor".to_owned(),
+        approvals: ApprovalMode::Ask(gate as Arc<dyn ApprovalGate>),
+        limits: TurnLimits::default(),
+    };
+    driver(&store, provider)
+        .run_turn(
+            request(&bench.workspace, "fix the parser"),
+            options,
+            Arc::new(RecordingObserver::default()) as Arc<dyn TurnObserver>,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the turn runs")
+}
+
+#[tokio::test]
+async fn h05_a_denied_gated_action_is_not_executed_and_the_model_is_told() {
+    let bench = bench();
+    let provider = Arc::new(SequenceProvider::new(patch_then_final(&bench)));
+    let gate = Arc::new(ScriptedGate::new(vec![ApprovalAnswer::Denied]));
+
+    let outcome = run_with_approvals(&bench, Arc::clone(&provider), Arc::clone(&gate)).await;
+
+    assert_eq!(outcome.stop, TurnStop::Final);
+    assert!(
+        outcome.executions.is_empty(),
+        "a denied action must not execute"
+    );
+    let file = std::fs::read_to_string(bench.workspace.join("src").join("parser.rs"))
+        .expect("fixture file");
+    assert!(file.contains("todo!"), "the file must be untouched: {file}");
+
+    let proposals = gate.proposals();
+    assert_eq!(proposals.len(), 1, "the user was asked exactly once");
+    let proposal = &proposals[0];
+    assert!(proposal.action.contains("ApplyPatch"), "{proposal:?}");
+    assert!(proposal.summary.contains("src/parser.rs"), "{proposal:?}");
+    assert_eq!(proposal.workspace, bench.workspace);
+    assert!(!proposal.scope.is_empty());
+    assert!(
+        proposal.request_id.starts_with("approval-1-"),
+        "{proposal:?}"
+    );
+
+    let seen = provider.seen();
+    assert_eq!(seen.len(), 2, "the model gets a chance to adapt");
+    assert!(
+        seen[1]
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Tool && message.content.contains("denied")),
+        "the denial must reach the model: {:?}",
+        seen[1].messages
+    );
+}
+
+#[tokio::test]
+async fn h05_a_granted_gated_action_runs_once_after_the_answer() {
+    let bench = bench();
+    let provider = Arc::new(SequenceProvider::new(patch_then_final(&bench)));
+    let gate = Arc::new(ScriptedGate::new(vec![ApprovalAnswer::Granted]));
+
+    let outcome = run_with_approvals(&bench, Arc::clone(&provider), Arc::clone(&gate)).await;
+
+    assert_eq!(outcome.stop, TurnStop::Final);
+    assert_eq!(outcome.executions.len(), 1, "the granted action runs");
+    let file = std::fs::read_to_string(bench.workspace.join("src").join("parser.rs"))
+        .expect("fixture file");
+    assert!(file.contains("fixed"), "the patch was applied: {file}");
+    assert_eq!(gate.proposals().len(), 1);
+}
+
+#[tokio::test]
+async fn h05_an_expired_approval_is_a_refusal_not_a_silent_grant() {
+    let bench = bench();
+    let provider = Arc::new(SequenceProvider::new(patch_then_final(&bench)));
+    let gate = Arc::new(ScriptedGate::new(vec![ApprovalAnswer::Expired]));
+
+    let outcome = run_with_approvals(&bench, Arc::clone(&provider), Arc::clone(&gate)).await;
+
+    assert!(
+        outcome.executions.is_empty(),
+        "an expired request must not become a grant"
+    );
+    let file = std::fs::read_to_string(bench.workspace.join("src").join("parser.rs"))
+        .expect("fixture file");
+    assert!(file.contains("todo!"), "the file must be untouched: {file}");
+    let seen = provider.seen();
+    assert!(
+        seen[1]
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Tool
+                && message.content.contains("expired")),
+        "the expiry must reach the model: {:?}",
+        seen[1].messages
     );
 }

@@ -44,14 +44,6 @@ impl TurnObserver for SilentObserver {
 /// long because it wires real components, not because it branches.
 #[allow(clippy::too_many_lines)]
 pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
-    if let Some(session) = &request.resume {
-        return Err(HarnessError::new(
-            ErrorCode::ServiceUnavailable,
-            format!(
-                "resuming session {session} in a headless turn arrives with HA_LAUNCH H05; no state was changed"
-            ),
-        ));
-    }
     let caller_dir = std::env::current_dir().map_err(|error| {
         HarnessError::new(
             ErrorCode::StorageOpenFailed,
@@ -79,6 +71,35 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         .await
         .map_err(StoreError::into_harness_error)?,
     );
+    // Resuming continues the task of the named session: the new turn runs in a
+    // fresh session linked to it, exactly like a follow-up in the interactive app.
+    let resumed_from = match &request.resume {
+        Some(session_text) => {
+            let parsed = SessionId::parse(session_text.clone()).map_err(|error| {
+                HarnessError::new(
+                    error.code(),
+                    format!("--resume needs a canonical session id: {error}"),
+                )
+            })?;
+            let task = store
+                .session_task(&parsed)
+                .await
+                .map_err(StoreError::into_harness_error)?
+                .ok_or_else(|| {
+                    HarnessError::new(
+                        ErrorCode::InvalidPayload,
+                        format!(
+                            "session {session_text} is not in this project's store; nothing was resumed"
+                        ),
+                    )
+                })?;
+            Some((parsed, task))
+        }
+        None => None,
+    };
+    let task_id = resumed_from
+        .as_ref()
+        .map_or_else(TaskId::generate, |(_, task)| task.clone());
     let observation = observe_workspace(ProjectId::generate(), &context.project.root)?;
     let capabilities = ModelCapabilities {
         provider_id: "deepseek".to_owned(),
@@ -108,7 +129,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     );
     let run_request = RunRequest::new(
         SessionId::generate(),
-        TaskId::generate(),
+        task_id,
         InputId::generate(),
         request.prompt.clone(),
         observation,
@@ -121,14 +142,29 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         approvals: ApprovalMode::None,
         limits: TurnLimits::default(),
     };
-    let outcome = driver
-        .run_turn(
-            run_request,
-            options,
-            Arc::new(SilentObserver),
-            CancellationToken::new(),
-        )
-        .await?;
+    let outcome = match &resumed_from {
+        Some((source, _)) => {
+            driver
+                .run_turn_continuing(
+                    source,
+                    run_request,
+                    options,
+                    Arc::new(SilentObserver),
+                    CancellationToken::new(),
+                )
+                .await?
+        }
+        None => {
+            driver
+                .run_turn(
+                    run_request,
+                    options,
+                    Arc::new(SilentObserver),
+                    CancellationToken::new(),
+                )
+                .await?
+        }
+    };
     let output = serde_json::json!({
         "schema_version": 1,
         "session_id": outcome.session_id,
@@ -140,6 +176,9 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         "stop": format!("{:?}", outcome.stop).to_lowercase(),
         "approvals": "none",
         "fixture": false,
+        "resumed_from": resumed_from
+            .as_ref()
+            .map(|(source, _)| source.as_str().to_owned()),
     });
 
     drop(driver);

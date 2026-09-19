@@ -527,3 +527,179 @@ fn i12_headless_turn_without_provider_configuration_fails_closed() {
         run.stderr
     );
 }
+
+/// SSE fixture that serves several requests and returns the full request bodies.
+fn sse_fixture_multi(
+    text: &'static str,
+    requests: usize,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+    let address = listener.local_addr().expect("fixture address");
+    let handle = std::thread::spawn(move || {
+        let mut bodies = Vec::new();
+        for _ in 0..requests {
+            let (mut socket, _) = listener.accept().expect("fixture accepts");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            // Read the head, then exactly the declared body.
+            let head_end = loop {
+                let read = socket.read(&mut chunk).expect("fixture reads");
+                if read == 0 {
+                    break request.len();
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&request[..head_end]).into_owned();
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            while request.len() < head_end + length {
+                let read = socket.read(&mut chunk).expect("fixture reads body");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let body = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .expect("fixture writes");
+            socket.flush().ok();
+            bodies.push(String::from_utf8_lossy(&request).into_owned());
+        }
+        bodies
+    });
+    (format!("http://{address}/chat/completions"), handle)
+}
+
+#[test]
+fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
+    let (endpoint, server) = sse_fixture_multi("fixture answer", 2);
+    let sandbox = Sandbox::new();
+    let project = sandbox.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+
+    let run_headless = |arguments: Vec<&str>| {
+        std::process::Command::new(cli_binary())
+            .args(arguments)
+            .current_dir(&project)
+            .env("HA_HOME", sandbox.path())
+            .env("HA_PROVIDER_ENDPOINT", &endpoint)
+            .env("HA_PROVIDER_MODEL", "fixture-model")
+            .env("DEEPSEEK_API_KEY", "fixture-secret-value")
+            .stdin(Stdio::null())
+            .output()
+            .expect("ha binary runs")
+    };
+
+    let first = run_headless(vec![
+        "chat",
+        "--headless",
+        "--prompt",
+        "first prompt from the test",
+        "--json",
+    ]);
+    let first = CliRun::from_output(&first);
+    assert_eq!(first.code(), 0, "stderr was: {}", first.stderr);
+    let first_json: serde_json::Value =
+        serde_json::from_str(&first.stdout).expect("first output is JSON");
+    let session_id = first_json["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let task_id = first_json["task_id"].as_str().expect("task id").to_owned();
+    assert_eq!(first_json["tool_calls"], serde_json::Value::from(0));
+    assert_eq!(first_json["resumed_from"], serde_json::Value::Null);
+
+    let second = run_headless(vec![
+        "chat",
+        "--headless",
+        "--resume",
+        &session_id,
+        "--prompt",
+        "second prompt from the test",
+        "--json",
+    ]);
+    let second = CliRun::from_output(&second);
+    assert_eq!(second.code(), 0, "stderr was: {}", second.stderr);
+    let second_json: serde_json::Value =
+        serde_json::from_str(&second.stdout).expect("second output is JSON");
+    assert_eq!(
+        second_json["resumed_from"].as_str(),
+        Some(session_id.as_str()),
+        "the turn reports what it resumed from"
+    );
+    assert_eq!(
+        second_json["task_id"].as_str(),
+        Some(task_id.as_str()),
+        "the task identity is kept across the resume"
+    );
+    assert_ne!(
+        second_json["session_id"].as_str(),
+        Some(session_id.as_str()),
+        "the follow-up owns its own session"
+    );
+    assert_eq!(second_json["tool_calls"], serde_json::Value::from(0));
+
+    let requests = server.join().expect("fixture server finishes");
+    assert_eq!(requests.len(), 2, "one provider call per turn");
+    assert!(
+        requests[1].contains("first prompt from the test"),
+        "the resumed turn must carry the recovered context: {}",
+        &requests[1][..requests[1].len().min(600)]
+    );
+    assert!(
+        requests[1].contains("second prompt from the test"),
+        "the new input is sent as well"
+    );
+}
+
+#[test]
+fn i13_resuming_an_unknown_session_fails_without_running_anything() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+
+    let output = std::process::Command::new(cli_binary())
+        .args([
+            "chat",
+            "--headless",
+            "--resume",
+            "session_0192f0aa-bbcc-7ddd-8eee-000000000001",
+            "--prompt",
+            "hello",
+            "--json",
+        ])
+        .current_dir(&project)
+        .env("HA_HOME", sandbox.path())
+        .env(
+            "HA_PROVIDER_ENDPOINT",
+            "http://127.0.0.1:1/chat/completions",
+        )
+        .env("HA_PROVIDER_MODEL", "fixture-model")
+        .env("DEEPSEEK_API_KEY", "fixture-secret-value")
+        .stdin(Stdio::null())
+        .output()
+        .expect("ha binary runs");
+    let run = CliRun::from_output(&output);
+    assert_ne!(run.code(), 0, "an unknown session must not start a run");
+    assert!(run.stdout.is_empty(), "stdout was: {}", run.stdout);
+    assert!(run.stderr.contains("nothing was resumed"), "{}", run.stderr);
+}

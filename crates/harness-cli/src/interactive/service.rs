@@ -6,8 +6,12 @@
 //! A production launch never falls back to the fixture: when provider settings
 //! are missing the service reports exactly what to set.
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use harness_providers::{
     CancellationToken, CredentialResolver, DeepSeekAdapter, ModelCapabilities, ModelProvider,
@@ -16,14 +20,16 @@ use harness_providers::{
 use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
 use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
 use harness_tools::{
-    ApprovalMode, ToolExecutionService, TurnDriver, TurnLimits, TurnObserver, TurnOptions,
-    TurnProgress, TurnStop, coding_tool_schemas, observe_workspace,
+    ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ToolExecutionService, TurnDriver,
+    TurnLimits, TurnObserver, TurnOptions, TurnProgress, TurnStop, coding_tool_schemas,
+    observe_workspace,
 };
 use harness_types::{ErrorCode, HostId, InputId, ProjectId, SessionId, TaskId};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 
 use super::bootstrap::{CREDENTIAL_VARIABLES, LaunchContext};
-use super::events::{RunOutcome, SessionEvent};
+use super::events::{RunOutcome, SessionCandidate, SessionEvent};
 use super::paths::LaunchEnvironment;
 
 /// Environment variable holding the provider endpoint.
@@ -38,12 +44,97 @@ pub struct SubmitRequest {
     pub text: String,
 }
 
+/// The user's decision on one gated action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalDecision {
+    /// Run this exact action once.
+    Granted,
+    /// Do not run it.
+    Denied,
+}
+
 /// What the controller needs from an execution backend.
 pub trait SessionPort: Send {
     /// Label shown in the header; a fixture must never look like the real thing.
     fn label(&self) -> String;
     fn submit(&mut self, request: SubmitRequest);
     fn cancel(&mut self);
+    /// Answer one pending approval request; false when the id is not pending.
+    fn answer(&mut self, _request_id: &str, _decision: ApprovalDecision) -> bool {
+        false
+    }
+    /// Ask for the resumable sessions of this project; the list arrives as an event.
+    fn list_sessions(&mut self) {}
+    /// Continue from a persisted session, or start a fresh conversation when None.
+    fn resume(&mut self, _session_id: Option<String>) {}
+}
+
+/// Asks the user for each gated action and waits for the answer.
+///
+/// The proposal travels as a session event; the answer comes back through
+/// `ChannelApprovalGate::answer`. No answer inside the timeout is an expiry,
+/// never a silent grant.
+pub struct ChannelApprovalGate {
+    sender: UnboundedSender<SessionEvent>,
+    pending: Mutex<HashMap<String, oneshot::Sender<ApprovalAnswer>>>,
+    timeout: Duration,
+}
+
+impl ChannelApprovalGate {
+    #[must_use]
+    pub fn new(sender: UnboundedSender<SessionEvent>, timeout: Duration) -> Self {
+        Self {
+            sender,
+            pending: Mutex::new(HashMap::new()),
+            timeout,
+        }
+    }
+
+    /// Answer one pending request.
+    pub fn answer(&self, request_id: &str, decision: ApprovalDecision) -> bool {
+        let pending = self
+            .pending
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(request_id));
+        match pending {
+            Some(sender) => sender
+                .send(match decision {
+                    ApprovalDecision::Granted => ApprovalAnswer::Granted,
+                    ApprovalDecision::Denied => ApprovalAnswer::Denied,
+                })
+                .is_ok(),
+            None => false,
+        }
+    }
+}
+
+impl ApprovalGate for ChannelApprovalGate {
+    fn request(
+        &self,
+        proposal: ApprovalProposal,
+    ) -> Pin<Box<dyn Future<Output = ApprovalAnswer> + Send>> {
+        let (sender, receiver) = oneshot::channel();
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.insert(proposal.request_id.clone(), sender);
+        }
+        let _ = self.sender.send(SessionEvent::ApprovalRequired {
+            request_id: proposal.request_id,
+            action: proposal.action,
+            summary: proposal.summary,
+            workspace: proposal.workspace.display().to_string(),
+            scope: proposal.scope,
+        });
+        let timeout = self.timeout;
+        Box::pin(async move {
+            match tokio::time::timeout(timeout, receiver).await {
+                Ok(Ok(answer)) => answer,
+                // The sender was dropped without an answer: refuse, never grant.
+                Ok(Err(_)) => ApprovalAnswer::Denied,
+                Err(_) => ApprovalAnswer::Expired,
+            }
+        })
+    }
 }
 
 /// Event channel shared by the port implementation and the controller.
@@ -202,8 +293,16 @@ pub struct AgentSessionService {
     environment: LaunchEnvironment,
     task_id: TaskId,
     previous_session: Arc<Mutex<Option<SessionId>>>,
+    /// Asks the user for every gated action; never grants on its own.
+    gate: Arc<ChannelApprovalGate>,
     cancellation: Option<CancellationToken>,
 }
+
+/// How long a gated action waits for the user before it expires.
+const APPROVAL_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// Upper bound on the resume list, newest first.
+const RESUME_LIST_LIMIT: usize = 20;
 
 impl AgentSessionService {
     #[must_use]
@@ -212,6 +311,7 @@ impl AgentSessionService {
         environment: LaunchEnvironment,
         sender: UnboundedSender<SessionEvent>,
     ) -> Self {
+        let gate = Arc::new(ChannelApprovalGate::new(sender.clone(), APPROVAL_TIMEOUT));
         Self {
             sender,
             store_dir: context.project_store_dir(),
@@ -219,6 +319,7 @@ impl AgentSessionService {
             environment,
             task_id: TaskId::generate(),
             previous_session: Arc::new(Mutex::new(None)),
+            gate,
             cancellation: None,
         }
     }
@@ -253,6 +354,7 @@ impl SessionPort for AgentSessionService {
         let environment = self.environment.clone();
         let task_id = self.task_id.clone();
         let previous_session = Arc::clone(&self.previous_session);
+        let gate = Arc::clone(&self.gate);
         // Every user input opens its own session; the conversation is the chain of
         // sessions linked to the same task.
         let session_id = SessionId::generate();
@@ -265,11 +367,122 @@ impl SessionPort for AgentSessionService {
                 session_id,
                 task_id,
                 previous_session,
+                gate,
                 request,
                 cancellation,
             )
             .await;
         });
+    }
+
+    fn answer(&mut self, request_id: &str, decision: ApprovalDecision) -> bool {
+        self.gate.answer(request_id, decision)
+    }
+
+    fn list_sessions(&mut self) {
+        let sender = self.sender.clone();
+        let store_dir = self.store_dir.clone();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            match SqliteStore::open_read_only(store_dir.clone()).await {
+                Ok(store) => match store.list_sessions().await {
+                    Ok(summaries) => {
+                        // Newest first, bounded: a resume list is a menu, not a dump.
+                        let mut sessions: Vec<SessionCandidate> = summaries
+                            .into_iter()
+                            .map(|summary| SessionCandidate {
+                                session_id: summary.session_id.as_str().to_owned(),
+                                task_id: summary.task_id.as_str().to_owned(),
+                                detail: format!(
+                                    "{} input(s), {} event(s)",
+                                    summary.input_count, summary.next_sequence
+                                ),
+                            })
+                            .collect();
+                        sessions.reverse();
+                        sessions.truncate(RESUME_LIST_LIMIT);
+                        let _ = sender.send(SessionEvent::SessionsListed { sessions });
+                    }
+                    Err(error) => {
+                        let _ = sender.send(SessionEvent::RecoverableError {
+                            message: format!("session list could not be read: {error}"),
+                        });
+                    }
+                },
+                Err(error) => {
+                    let _ = sender.send(SessionEvent::Notice {
+                        message: format!(
+                            "no persisted sessions in this project yet ({error}); this conversation starts fresh"
+                        ),
+                    });
+                }
+            }
+        });
+    }
+
+    fn resume(&mut self, session_id: Option<String>) {
+        match session_id {
+            None => {
+                if let Ok(mut guard) = self.previous_session.lock() {
+                    *guard = None;
+                }
+                let _ = self.sender.send(SessionEvent::Notice {
+                    message:
+                        "starting a fresh conversation; the previous chain is no longer continued"
+                            .to_owned(),
+                });
+            }
+            Some(session_id) => {
+                let sender = self.sender.clone();
+                let store_dir = self.store_dir.clone();
+                let previous = Arc::clone(&self.previous_session);
+                let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                    return;
+                };
+                handle.spawn(async move {
+                    let known = match SqliteStore::open_read_only(store_dir).await {
+                        Ok(store) => store
+                            .list_sessions()
+                            .await
+                            .is_ok_and(|summaries| {
+                                summaries
+                                    .iter()
+                                    .any(|summary| summary.session_id.as_str() == session_id)
+                            }),
+                        Err(_) => false,
+                    };
+                    if !known {
+                        let _ = sender.send(SessionEvent::Notice {
+                            message: format!(
+                                "session {session_id} is not in this project's store; nothing was resumed"
+                            ),
+                        });
+                        return;
+                    }
+                    match harness_types::SessionId::parse(session_id.clone()) {
+                        Ok(parsed) => {
+                            if let Ok(mut guard) = previous.lock() {
+                                *guard = Some(parsed);
+                            }
+                            let _ = sender.send(SessionEvent::Notice {
+                                message: format!(
+                                    "continuing from session {session_id}; the next request recovers that context"
+                                ),
+                            });
+                        }
+                        Err(_) => {
+                            let _ = sender.send(SessionEvent::Notice {
+                                message: format!(
+                                    "session {session_id} is not a valid session id; nothing was resumed"
+                                ),
+                            });
+                        }
+                    }
+                });
+            }
+        }
     }
 
     fn cancel(&mut self) {
@@ -292,6 +505,7 @@ async fn run_turn(
     session_id: SessionId,
     task_id: TaskId,
     previous_session: Arc<Mutex<Option<SessionId>>>,
+    gate: Arc<ChannelApprovalGate>,
     request: SubmitRequest,
     cancellation: CancellationToken,
 ) {
@@ -383,9 +597,9 @@ async fn run_turn(
     let options = TurnOptions {
         workspace_root,
         actor_id: "interactive.user".to_owned(),
-        // Interactive approval rendering is H05; until then a gated action fails
-        // closed instead of being granted silently.
-        approvals: ApprovalMode::None,
+        // Every gated action is rendered to the user and answered by them; nothing
+        // is granted without an explicit answer.
+        approvals: ApprovalMode::Ask(gate as Arc<dyn ApprovalGate>),
         limits: TurnLimits::default(),
     };
     let observer: Arc<dyn TurnObserver> = Arc::new(ChannelObserver {
@@ -502,13 +716,17 @@ impl SessionPort for FixtureService {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentSessionService, ENDPOINT_VARIABLE, FixtureService, MODEL_VARIABLE, SessionChannel,
-        SessionPort, SubmitRequest, resolve_provider,
+        AgentSessionService, ApprovalDecision, ApprovalGate, ApprovalProposal, ChannelApprovalGate,
+        ENDPOINT_VARIABLE, FixtureService, MODEL_VARIABLE, SessionChannel, SessionPort,
+        SubmitRequest, resolve_provider,
     };
     use crate::interactive::bootstrap::{self, LaunchRequest};
     use crate::interactive::events::{RunOutcome, SessionEvent};
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
+    use harness_tools::ApprovalAnswer;
     use harness_types::InputId;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     fn request() -> SubmitRequest {
         SubmitRequest {
@@ -561,6 +779,75 @@ mod tests {
             vec![SessionEvent::RunTerminal {
                 outcome: RunOutcome::Canceled
             }]
+        );
+    }
+
+    fn proposal(request_id: &str) -> ApprovalProposal {
+        ApprovalProposal {
+            request_id: request_id.to_owned(),
+            action: "ApplyPatch".to_owned(),
+            summary: "patch src/parser.rs".to_owned(),
+            workspace: std::path::PathBuf::from("C:/work/repo"),
+            scope: "one action, this turn only".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn h05_the_gate_expires_without_an_answer_and_never_grants_late() {
+        let mut channel = SessionChannel::new();
+        let gate = ChannelApprovalGate::new(channel.sender(), Duration::from_millis(30));
+
+        let answer = ApprovalGate::request(&gate, proposal("approval-1")).await;
+        assert_eq!(
+            answer,
+            ApprovalAnswer::Expired,
+            "no answer inside the timeout is an expiry, not a grant"
+        );
+
+        let announced = channel.drain();
+        assert!(
+            announced.iter().any(|event| matches!(
+                event,
+                SessionEvent::ApprovalRequired { request_id, action, .. }
+                    if request_id == "approval-1" && action == "ApplyPatch"
+            )),
+            "{announced:?}"
+        );
+        assert!(!gate.answer("approval-1", ApprovalDecision::Granted));
+        assert!(!gate.answer("unknown", ApprovalDecision::Denied));
+    }
+
+    #[tokio::test]
+    async fn h05_the_gate_forwards_the_users_answer() {
+        let mut channel = SessionChannel::new();
+        let gate = Arc::new(ChannelApprovalGate::new(
+            channel.sender(),
+            Duration::from_secs(5),
+        ));
+        let asking = Arc::clone(&gate);
+        let handle = tokio::spawn(async move {
+            ApprovalGate::request(asking.as_ref(), proposal("approval-2")).await
+        });
+
+        // Wait for the proposal to reach the UI before answering it.
+        let mut request_id = None;
+        for _ in 0..200 {
+            if let Some(id) = channel.drain().into_iter().find_map(|event| match event {
+                SessionEvent::ApprovalRequired { request_id, .. } => Some(request_id),
+                _ => None,
+            }) {
+                request_id = Some(id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let request_id = request_id.expect("the proposal reaches the channel");
+        assert_eq!(request_id, "approval-2");
+        assert!(gate.answer(&request_id, ApprovalDecision::Granted));
+        assert_eq!(handle.await.expect("asking task"), ApprovalAnswer::Granted);
+        assert!(
+            !gate.answer(&request_id, ApprovalDecision::Denied),
+            "a request is answered once"
         );
     }
 
