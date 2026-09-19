@@ -108,8 +108,8 @@ Không checkpoint nào được nhận "done" khi prerequisite chưa đạt.
 | ID | Nội dung | Phụ thuộc | Trạng thái |
 |---|---|---|---|
 | H01 | Entry point, dispatch, TTY detector, parser compat | — | dispatch + guard + parser xong; UI thật chờ H03 |
-| H02 | Launch context, paths/HA_HOME, config/setup state | H01 | chờ H01 pass |
-| H03 | Terminal app, controller/renderer, input loop | H02 | chờ H02 pass |
+| H02 | Launch context, paths/HA_HOME, config/setup state | H01 | context + paths + setup state xong bằng unit test; UI thật chờ H03 |
+| H03 | Terminal app, controller/renderer, input loop | H02 | việc tiếp theo |
 | H04 | G1 provider incremental, G2 tool continuation, G3 durable session | H03 + khảo sát G1–G3 | chờ H03 pass |
 | H05 | Approval, resume, lifecycle | H04 | chờ H04 pass |
 | H06 | Installer, User PATH scope, install manifest | H01–H03 | logic + test disposable; **không** ghi User PATH thật |
@@ -136,5 +136,28 @@ tiếp nhận không phải hỏi lại hội thoại.
 - Interactive app ở H01 là boot header + prompt line-mode tối thiểu ghi rõ
   `connection pending`; H03 thay bằng controller/renderer thật có raw mode.
 
+### H02 — Startup context, project và first-run config
 
+- **Provider/secret vẫn không vào file config.** Hợp đồng P0 `HarnessConfig` (chỉ
+  `schema_version` + `cli`, `deny_unknown_fields`) được giữ nguyên. H02 chỉ **kiểm
+  tra sự hiện diện** của credential qua biến môi trường `DEEPSEEK_API_KEY` hoặc
+  `HA_API_KEY`; giá trị không bao giờ được đọc vào chuỗi hiển thị hay log. Endpoint
+  và model thật là quyết định của H04; H02 không đoán URL mặc định.
+- **Store writer là lazy.** Bootstrap chỉ resolve đường dẫn; writer chỉ mở khi user
+  gửi yêu cầu đầu, nên mở app không tạo database và không khóa project. Hai terminal
+  cùng project vì vậy chỉ xung đột khi bắt đầu làm việc, và lỗi là `writer_locked`
+  có sẵn của store port (đã test trên thư mục fixture).
+- **Project identity** = `sha256` của đường dẫn project đã canonicalize; store của
+  project ở `<data>/projects/project-<16 hex đầu>`. Project lấy từ caller cwd hoặc
+  `--cwd`, không bao giờ từ thư mục cài đặt; Git root chỉ là context (đi lên theo
+  cây thư mục, không chdir).
+- **Config hỏng là lỗi typed, không fallback và không ghi đè.** Message nêu đường dẫn
+  và hướng dẫn `ha config validate`, nhưng **không** in lại text parser thô: lỗi type
+  của TOML có thể trích giá trị bị từ chối, mà giá trị đó có thể là secret người dùng
+  đặt nhầm file. Test khẳng định file giữ nguyên byte.
+- **Header in actual resolved paths**: project, Git, config (kèm origin `HA_HOME` /
+  `platform default`), data dir, store dir của project, và setup hint khi thiếu
+  config/credential. Đây là phần diagnostics mà plan mục 5 yêu cầu.
+- **UI dùng tiếng Việt** theo mockup của plan. Render tiếng Việt trên terminal thật
+  chưa được kiểm chứng ở H02; việc đó thuộc H03/H07 với PTY.
 

@@ -4,63 +4,72 @@ Tài liệu này là điểm vào cho lượt coding tiếp theo. Cập nhật s
 
 ## 1. Ranh giới hiện tại
 
-- **H01 xong** ở mức dispatch contract/parser/guard non-TTY. Bằng chứng: mục 2 của
-  [evidence HA_LAUNCH](../evidence/HA_LAUNCH.vi.md); quyết định: mục 5 của
-  [SPEC HA_LAUNCH](../specs/HA_LAUNCH.vi.md).
-- **H02–H08 chưa bắt đầu.** Không có mục nào trong bảng staging được đánh dấu xong.
-- Gõ `ha` trong terminal thật **chưa** được chứng minh: cần H03 (UI thật) và H07
-  (PTY harness). Hiện tại TTY path chỉ mở boot shell line-mode ghi rõ
-  `connection pending`; đây là hành vi có chủ đích, không phải agent đã nối.
-- `ha chat --headless` trả `service_unavailable` (exit 1). H04 thay bằng turn thật.
+- **H01 xong**: dispatch contract, parser `ha chat`, TTY detector, guard non-TTY exit 2.
+- **H02 xong**: launch context thật — paths (`HA_HOME`/platform default/explicit),
+  config non-secret + setup state, project identity + Git context, store dir theo
+  project, header in actual resolved paths.
+- **H03–H08 chưa bắt đầu.** Không mục nào trong bảng staging được đánh dấu xong.
+- Gõ `ha` trong terminal thật **chưa** được chứng minh end-to-end: hiện TTY path mở
+  boot shell line-mode (đã in header/setup state thật từ H02) nhưng chưa có raw mode,
+  editor, streaming. Việc đó là H03; bản PTY transcript là H07.
+- `ha chat --headless` vẫn trả `service_unavailable` (exit 1). H04 thay bằng turn thật.
+
+Bằng chứng: mục 2–3 của [evidence HA_LAUNCH](../evidence/HA_LAUNCH.vi.md). Quyết định:
+mục 5 của [SPEC HA_LAUNCH](../specs/HA_LAUNCH.vi.md).
 
 ## 2. Quyền: cái gì được và không được cấp
 
 Assignment này **không** nêu quyền cho: sửa User PATH thật, cài binary thật lên máy
-user, paid provider smoke, publish release, push remote. Vì vậy các việc đó không
-được thực hiện và không được tuyên bố. Prompt mẫu trong HA_LAUNCH_PROMPT mục 4 không
-tự cấp quyền (chính prompt đó nói vậy).
+user, paid provider smoke, publish release, push remote. Các việc đó không được thực
+hiện và không được tuyên bố. Prompt mẫu trong HA_LAUNCH_PROMPT mục 4 không tự cấp quyền.
 
-Được cấp: sửa source trong repo, build/test local, tạo process con trong thư mục tạm,
-cài vào `-Destination` tạm khi test installer, commit local cho checkpoint (không push).
-
-Checkpoint nào cần quyền chưa có sẽ dừng ở `blocked_on_authority`, không được mô tả
-là đã đạt:
+Được cấp: sửa source trong repo, build/test local, process con trong thư mục tạm, cài
+vào `-Destination` tạm khi test installer, commit local cho checkpoint (không push).
 
 | Checkpoint | Cần gì | Trạng thái quyền |
 |---|---|---|
 | H04 live smoke | credential + budget | **chưa cấp** → I10–I12 chỉ dùng HTTP fixture; live ghi `not_run` |
-| H06 User PATH | quyền ghi User PATH thật | **chưa cấp** → test bằng fixture trong bộ nhớ, không mutate registry |
+| H06 User PATH | quyền ghi User PATH thật | **chưa cấp** → test bằng fixture trong bộ nhớ |
 | H06/H08 cài thật | quyền cài lên máy user | **chưa cấp** → chỉ `-Destination` tạm |
 | H08 publish | quyền phát hành release | **chưa cấp** → chỉ release candidate + checksum local |
 
 ## 3. Việc tiếp theo chính xác
 
-**H02 — startup context, project và first-run config.** Prerequisite H01 đã đạt (bảng
-staging trong SPEC, mục 2 evidence). Phạm vi và thứ tự:
+**H03 — terminal app và input loop.** Prerequisite H02 đã đạt (unit test xanh, clippy
+sạch). Thứ tự đề nghị:
 
-1. `interactive/paths.rs`: resolve user config/data với `HA_HOME` override và
-   precedence đã ghi ở plan mục 5; env phải **inject được** để test hermetic.
-2. `interactive/config.rs`: load config non-secret, trạng thái `setup_required`,
-   lỗi actionable cho config hỏng (I09); không gọi provider khi launch (I05).
-3. `interactive/bootstrap.rs`: caller cwd / `--cwd`, project identity, Git root chỉ
-   cho project context (không chdir về installation dir), store/catalog theo project,
-   owner-busy khi hai terminal cùng project (I16).
-4. Thay `BootContext::resolve` tạm ở `interactive/app.rs` bằng bootstrap thật; header
-   phải hiện project/provider/setup state đúng và ghi actual resolved paths trong
-   diagnostics.
-5. Test H02: I04 (đường dẫn spaces/Unicode, no-Git), I05 (HA_HOME rỗng, offline,
-   không key), I09 (config hỏng/cwd sai/quyền), I16 (hai writer cùng project) — fixture
-   home/env hoàn toàn tách khỏi user thật.
+1. **Spike và pin thư viện terminal** trước khi viết renderer: khảo sát khả năng raw
+   mode Windows/ConPTY + Linux, chọn phiên bản cụ thể, ghi quyết định vào mục 5 SPEC.
+   Không viết API thư viện từ trí nhớ; đọc tài liệu/version thật rồi mới code.
+2. Tách `interactive/{controller,events,view,input,terminal}.rs`: state reducer
+   (booting → ready/setup_required → running → waiting_approval/question → ready,
+   canceling, closed) tách khỏi renderer; channel có backpressure; renderer coalesce
+   nhưng không drop domain receipt.
+3. Editor tối thiểu: Enter gửi một yêu cầu, backspace/history, Unicode tiếng Việt,
+   bracketed paste không tự submit nhiều dòng, resize không vỡ prompt.
+4. Slash commands `/help`, `/exit`, `/new`, `/status`, `/model`, `/config`,
+   `/resume`; `/new` không bỏ active run. Ctrl-C khi chạy: cancel + drain rồi về
+   prompt; Ctrl-C khi idle: clear input; EOF/`/exit`: thoát. RAII guard restore
+   terminal cho mọi đường thoát (không hứa restore khi process bị kill cứng).
+5. Test H03 không cần PTY: controller/reducer + editor với fixture backend (có nhãn
+   rõ `fixture`). PTY thật I01/I06/I07/I08 thuộc H07 — không được thay bằng test giả.
 
-Sau H02: H03 (terminal app thật, chọn/pin thư viện terminal sau spike Windows), rồi
-H04 (G1/G2/G3). Không nhảy sang H04–H08 trước khi H02/H03 có evidence.
+Sau H03: H04 (G1 provider incremental stream, G2 model→tool→model loop, G3 durable
+session/resume) — đây là phần lớn nhất và phải khảo sát G1–G3 trước khi refactor.
 
 ## 4. Trạng thái test ở checkpoint này
 
-- `cargo test -p harness-cli --bin ha` → 10 passed.
+- `cargo test -p harness-cli --bin ha` → 25 passed (H01 11, H02 14).
 - `cargo test -p harness-cli --test interactive_launch` → 6 passed.
-- `cargo clippy -p harness-cli --all-targets -- -D warnings` → sạch; `cargo fmt --all -- --check` → sạch.
-- Regression `cargo test -p harness-cli --tests --locked` (phase_p0..p7 + H01) → kết quả
-  ghi ở mục 2 evidence; một flake loopback của phase_p2 đã được điều tra và ghi lại ở
-  mục 4 evidence, không phải regression của H01.
-- Chưa chạy: `--workspace --all-targets` đầy đủ (H07 gate), Linux, PTY.
+- `cargo clippy -p harness-cli --all-targets -- -D warnings` và `cargo fmt --all -- --check` → sạch.
+- `cargo test -p harness-cli --tests --locked`: một lần xanh toàn bộ (161 test), một
+  lần đỏ vì flake loopback của `phase_p2` (không phải regression; chi tiết ở mục 5
+  evidence). **Không** được báo gate xanh nếu bỏ qua flake này.
+- Chưa chạy: `--workspace --all-targets` đầy đủ (H07), Linux, PTY.
+
+## 5. Gap đã biết cần đóng
+
+- Project directory **read-only** chưa có test (mới có không tồn tại và là file).
+- Provider endpoint/model chưa resolve; H04 phải chốt và ghi vào SPEC.
+- Render tiếng Việt trên terminal thật chưa kiểm chứng.
+- Migration note cho hành vi mới "bare `ha` non-TTY exit 2" phải vào operator docs ở H07.
