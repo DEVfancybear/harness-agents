@@ -40,7 +40,10 @@ fn cli_binary() -> PathBuf {
 /// One interactive session inside a real pseudo-console.
 struct PtySession {
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// All input goes through one queue: the test's keystrokes and the terminal
+    /// emulator's replies must never contend for a lock, and a slow write must not
+    /// block the reader that has to keep draining the console.
+    input: std::sync::mpsc::Sender<Vec<u8>>,
     transcript: Arc<Mutex<Vec<u8>>>,
     /// The master handle must outlive the session: dropping it closes the
     /// pseudo-console, which silently stops output and leaves the child blocked.
@@ -88,11 +91,21 @@ impl PtySession {
         let mut reader = master
             .try_clone_reader()
             .expect("the master side is readable");
-        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
-            Arc::new(Mutex::new(master.take_writer().expect("the master side is writable")));
+        let (input, queue) = std::sync::mpsc::channel::<Vec<u8>>();
+        let mut writer = master.take_writer().expect("the master side is writable");
+        std::thread::spawn(move || {
+            while let Ok(bytes) = queue.recv() {
+                if writer.write_all(&bytes).is_err() {
+                    return;
+                }
+                if writer.flush().is_err() {
+                    return;
+                }
+            }
+        });
         let transcript = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&transcript);
-        let answer_writer = Arc::clone(&writer);
+        let answer_input = input.clone();
         std::thread::spawn(move || {
             let mut chunk = [0_u8; 4096];
             while let Ok(read) = reader.read(&mut chunk) {
@@ -107,27 +120,25 @@ impl PtySession {
                     .windows(CURSOR_POSITION_QUERY.len())
                     .any(|window| window == CURSOR_POSITION_QUERY)
                 {
-                    if let Ok(mut writer) = answer_writer.lock() {
-                        let _ = writer.write_all(CURSOR_POSITION_REPORT);
-                        let _ = writer.flush();
-                    }
+                    // The queue is unbounded, so the reader never blocks here: it
+                    // must keep draining the console even when the app is not
+                    // reading input yet.
+                    let _ = answer_input.send(CURSOR_POSITION_REPORT.to_vec());
                 }
             }
         });
         Self {
             child,
-            writer,
+            input,
             transcript,
             _master: master,
         }
     }
 
     fn send(&mut self, text: &str) {
-        let mut writer = self.writer.lock().expect("writer lock");
-        writer
-            .write_all(text.as_bytes())
-            .expect("input reaches the app");
-        writer.flush().expect("input is flushed");
+        self.input
+            .send(text.as_bytes().to_vec())
+            .expect("the writer thread is alive");
     }
 
     fn transcript(&self) -> String {

@@ -109,7 +109,7 @@ $requiredSelectors = @(
 )
 
 $notRun = @(
-    'PTY transcript I01/I06/I07/I08 in a real terminal: ConPTY capture does not work in this sandbox (evidence section 8); the render loop is covered by the scripted backend and the non-TTY guard by the launch tests.',
+    'PTY cases I06/I07 in a real terminal: I01 passes through scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript saved), but I06 fails at the bracketed-paste step and I07 hangs the harness; both are measured and recorded in the evidence.',
     'Live provider smoke (paid model call): no credential or budget is granted for this assignment.',
     'Linux build and run: this session only has Windows x64.',
     'Real User PATH mutation and install into the user profile: not authorized in this assignment.'

@@ -51,8 +51,11 @@ $arguments = @('--ignored', '--test-threads=1', '--nocapture')
 if (-not [string]::IsNullOrWhiteSpace($Filter)) {
     $arguments = @($Filter) + $arguments
 }
-$stdout = Join-Path $OutputDirectory 'pty-transcript.txt'
-$stderr = Join-Path $OutputDirectory 'pty-transcript.err.txt'
+# Name the transcript after the filter: a later run must never overwrite the
+# evidence of an earlier one.
+$label = if ([string]::IsNullOrWhiteSpace($Filter)) { 'all' } else { ($Filter -replace '[^A-Za-z0-9_]', '') }
+$stdout = Join-Path $OutputDirectory "pty-$label.txt"
+$stderr = Join-Path $OutputDirectory "pty-$label.err.txt"
 
 Write-Host "Running $($candidate.Name) in a new console (bound $TimeoutSeconds s)"
 $process = Start-Process -FilePath $candidate.FullName -ArgumentList $arguments -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
