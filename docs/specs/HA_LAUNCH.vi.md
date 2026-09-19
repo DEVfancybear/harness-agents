@@ -443,3 +443,23 @@ trung thực cho durable state**: mọi handle in-memory (driver, runtime, tool 
 bị drop và lượt kế tiếp mở **writer generation mới** từ đĩa, đúng như một process mới; test
 khẳng định receipt đã settle không bị chạy lại và context được phục hồi. Ca kill process
 thật vẫn cần PTY (H07) và tiếp tục là not_run.
+
+### Quyền bổ sung được cấp trong session (round 9) và trạng thái thực thi
+
+User chọn phương án **(a): cấp quyền publish + credential để chạy smoke và phát hành
+candidate**. Đây là grant tường minh trong session, nên bảng quyền ở mục 0 được cập nhật:
+
+| Hành động | Trạng thái mới | Thực thi được chưa |
+|---|---|---|
+| Paid provider smoke | **được cấp** (có điều kiện: credential thật phải có trong env) | **chưa**: env không có `DEEPSEEK_API_KEY`/`HA_API_KEY`/`HA_PROVIDER_ENDPOINT`/`HA_PROVIDER_MODEL` |
+| Publish release candidate | **được cấp** (có điều kiện: phải có kênh xác thực) | **chưa**: `gh` không có, `GH_TOKEN`/`GITHUB_TOKEN` không set |
+| Push source lên remote | vẫn **không** được cấp riêng | không thực hiện |
+
+Đã chuẩn bị sẵn hai bước chạy được ngay khi input xuất hiện:
+
+- `scripts/Smoke-HaProvider.ps1`: một lượt live **có bound** (một turn, prompt ngắn, data
+  dir tạm), từ chối chạy nếu thiếu cấu hình (`SMOKE_NOT_RUN`, exit 2 — không thay fixture,
+  không gọi trả phí), che endpoint còn `scheme://host`, và **từ chối ghi evidence** nếu phát
+  hiện credential lọt vào output. Self test của nó kiểm chính đường từ chối + logic che.
+- `scripts/New-HaRelease.ps1 -PublishDryRun`: kiểm kênh publish, in ra **đúng** các lệnh sẽ
+  chạy (tag → push tag → `gh release create` với zip + checksum) và **không** publish gì.

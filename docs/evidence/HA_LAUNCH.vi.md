@@ -453,7 +453,40 @@ thành công việc cần tool; một flag automation-approval tường minh là
 user chốt nên chưa được thêm. Ca **kill process thật** giữa turn vẫn cần PTY (H07) và vẫn là
 not_run.
 
-## 11. Chưa xác minh (không được coi là đạt)
+
+## 11. Grant round 9 (publish + credential): đã chuẩn bị, chưa thực thi được
+
+User cấp quyền **(a)** cho live smoke và publish candidate. Hai blocker đo được tại thời
+điểm này (không phải suy đoán):
+
+| Cần | Đo được | Hệ quả |
+|---|---|---|
+| Credential cho smoke | `DEEPSEEK_API_KEY`, `HA_API_KEY`, `HA_PROVIDER_ENDPOINT`, `HA_PROVIDER_MODEL` đều **unset** trong env | không thể gọi model; smoke vẫn phải `not_run` cho tới khi có credential thật |
+| Kênh publish | `gh` **không cài**, `GH_TOKEN`/`GITHUB_TOKEN` **unset**, chưa có tag nào | không thể tạo release; không có đường publish nào để chạy |
+
+Đã làm sẵn (đều verify được ngay bây giờ, không cần hai input trên):
+
+- `scripts/Smoke-HaProvider.ps1`: `SMOKE_SELFTEST_OK`; khi thiếu cấu hình in
+  `SMOKE_NOT_RUN` kèm danh sách biến thiếu, nêu rõ "no fixture is substituted and no paid
+  call is made", và **exit 2** (đã đo). Khi có credential: chạy đúng **một** turn qua binary
+  đã build, in model + endpoint đã che (scheme://host) + exit code + response, và **từ chối
+  ghi evidence** nếu credential xuất hiện trong output.
+- `scripts/New-HaRelease.ps1 -PublishDryRun`: in channel status (`NOT available`), tag
+  `ha-v0.1.0`, và đúng các lệnh sẽ chạy (`git tag` → `git push origin <tag>` →
+  `gh release create`), rồi `exit 0` mà **không** publish gì. Candidate hiện có:
+  `target/release-candidate/ha-0.1.0-windows-x64/` + `.zip` (zip sha256
+  `899ac8e62fa2e079beecaed197369a7b23d647b0146e278d4c35f0cdccd0e97d`; digest của
+  `ha.exe` bên trong bundle là danh tính ổn định, zip đổi hash giữa các lần đóng gói).
+
+**Việc cần từ user để đi tiếp** (một trong hai, hoặc cả hai):
+
+1. Smoke: đặt `HA_PROVIDER_ENDPOINT`, `HA_PROVIDER_MODEL` và `DEEPSEEK_API_KEY`
+   (hoặc `HA_API_KEY`) rồi chạy `pwsh -NoProfile -File scripts/Smoke-HaProvider.ps1`.
+   Tôi không đọc secret từ chỗ khác và không tự tạo credential.
+2. Publish: cài `gh` **hoặc** set `GH_TOKEN` (kèm xác nhận push tag `ha-v0.1.0` lên
+   `origin`). Sau đó `-PublishDryRun` sẽ báo channel ready và bước publish thật mới chạy.
+
+## 12. Chưa xác minh (không được coi là đạt)
 
 - **I01 PTY transcript**: chưa có. Cần terminal thật/PTY harness (H07). Unit test
   dùng fixture detector chỉ chứng minh logic capability, không phải bằng chứng
@@ -464,7 +497,7 @@ not_run.
 - **Publish release / push remote**: không thực hiện; không được cấp quyền.
 - **Linux**: chưa build/chạy; mọi kết quả trên là Windows.
 
-## 12. Ghi chú flake môi trường (đã điều tra, không che)
+## 13. Ghi chú flake môi trường (đã điều tra, không che)
 
 Test `phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` thỉnh
 thoảng đỏ ở tầng connect tới fixture server loopback trong chính process test:

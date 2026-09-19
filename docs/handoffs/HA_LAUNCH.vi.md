@@ -106,6 +106,17 @@ H07 (gate `Verify-HaLaunch.ps1` + PTY harness + I01–I18), H08 (release candida
 
 ## 6. Việc tiếp theo chi tiết (H08)
 
+**Bước 0 — hai input còn thiếu (user cấp trong round 9, chưa có giá trị thật):**
+
+1. Smoke: set `HA_PROVIDER_ENDPOINT` + `HA_PROVIDER_MODEL` + `DEEPSEEK_API_KEY` (hoặc
+   `HA_API_KEY`), rồi chạy `pwsh -NoProfile -File scripts/Smoke-HaProvider.ps1` (một turn
+   có bound; script tự từ chối nếu thiếu và không thay fixture). Kết quả cần ghi vào mục 11
+   của evidence, thay dòng `not_run`.
+2. Publish: cài `gh` hoặc set `GH_TOKEN`; xác nhận việc push tag `ha-v0.1.0` lên
+   `origin`; chạy `pwsh -NoProfile -File scripts/New-HaRelease.ps1 -SkipBuild -PublishDryRun`
+   để xem channel, rồi mới publish thật và cập nhật evidence bằng URL thật (không tạo URL giả).
+
+
 1. **Build release candidate** đúng revision đã test: bundle Windows x64 và (nếu có
    toolchain) Linux x64, kèm checksum sha256 và manifest nguồn; **không** kèm fixture
    executables hay test secrets.
