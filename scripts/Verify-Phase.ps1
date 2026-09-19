@@ -289,6 +289,16 @@ $phaseTestFile = "phase_$($Phase.ToLowerInvariant())"
 $results = [System.Collections.Generic.List[object]]::new()
 Push-Location -LiteralPath $repoRoot
 try {
+    # This step intentionally keeps cargo's default parallelism. It was briefly
+    # changed to `--test-threads=1` while diagnosing a CI failure; that was the
+    # wrong lever. The real defect was a server-readiness race in the phase_p2
+    # loopback fixture, which failed under the load of a full workspace run but
+    # passed when its binary ran alone, and which serial execution only hid most
+    # of the time. The fixture now waits for its accept loop and tolerates a
+    # readiness probe. Measured with that fix: repeated full workspace runs are
+    # green in parallel, and parallel takes about half the time of serial
+    # (82 s against 166 s). Re-add the flag only with a measurement showing
+    # parallelism itself is what breaks.
     foreach ($step in @(
         @{ Name = 'format'; File = 'cargo'; Arguments = @('fmt', '--all', '--', '--check') },
         @{ Name = 'clippy'; File = 'cargo'; Arguments = @('clippy', '--workspace', '--all-targets', '--locked', '--', '-D', 'warnings') },

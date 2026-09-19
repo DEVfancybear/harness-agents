@@ -183,34 +183,54 @@ async fn p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized() {
         .await
         .expect("fixture listener");
     let address = listener.local_addr().expect("fixture address");
+    // Hardening for a loopback flake that is NOT fully explained: under the load of
+    // a full workspace run this test intermittently gets
+    // `provider_protocol ... error sending request for url (http://127.0.0.1:PORT/...)`
+    // while the same binary is green when run alone. Two measures, matching what the
+    // launch-suite fixture already does:
+    //   1. the task signals once it is scheduled, so the client does not race the
+    //      gap between `bind` (socket in listen) and the first `accept` poll;
+    //   2. a connection that closes without sending a request head is discarded and
+    //      accept continues, so a readiness probe cannot consume the single
+    //      response this fixture serves.
+    // Measured: this substantially reduces the failures but does NOT eliminate
+    // them, and `--jobs 1` does not help either, so server readiness is not the
+    // whole cause. Do not read a green run here as proof the flake is gone.
+    let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        let (mut socket, _peer) = listener.accept().await.expect("fixture accepts");
-        let mut request_bytes = Vec::new();
-        let mut chunk = [0_u8; 1024];
+        let _ = ready_sender.send(());
         loop {
-            let read = socket.read(&mut chunk).await.expect("fixture reads");
-            if read == 0 {
-                break;
+            let (mut socket, _peer) = listener.accept().await.expect("fixture accepts");
+            let mut request_bytes = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = socket.read(&mut chunk).await.expect("fixture reads");
+                if read == 0 {
+                    break;
+                }
+                request_bytes.extend_from_slice(&chunk[..read]);
+                if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
             }
-            request_bytes.extend_from_slice(&chunk[..read]);
-            if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
+            if request_bytes.is_empty() {
+                continue;
             }
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("fixture writes");
+            return request_bytes;
         }
-        let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
-            "data: [DONE]\n\n"
-        );
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        socket
-            .write_all(response.as_bytes())
-            .await
-            .expect("fixture writes");
-        request_bytes
     });
     let adapter = DeepSeekAdapter::new(
         format!("http://{address}/chat/completions"),
@@ -218,6 +238,13 @@ async fn p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized() {
         ModelCapabilities::deepseek_fixture(),
     )
     .expect("adapter config");
+    // The fixture task signals once it is scheduled; awaiting it closes the window
+    // between "port is bound" and "someone is accepting on it". The probe below
+    // confirms a plain TCP connection to this listener is accepted, which also
+    // shows a refused connection at this point is not simply "nothing listening".
+    // It sends no bytes, so the fixture discards it and keeps waiting.
+    ready_receiver.await.expect("fixture task is scheduled");
+    std::net::TcpStream::connect(address).expect("fixture accepts a readiness probe");
     let events = adapter
         .stream(provider_request(), CancellationToken::new())
         .await
