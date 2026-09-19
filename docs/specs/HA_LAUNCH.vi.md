@@ -98,8 +98,44 @@ Quyết định đã chốt ở H01:
   non-TTY chạy binary thật qua pipe — đúng thực tế, không cần PTY giả.
 - Guard non-TTY là hành vi **mới** so với revision khảo sát (trước đây bare `ha`
   thoát 0 im lặng). Migration note thuộc H07 và được ghi ở operator docs.
-- Thư viện terminal (H03) **chưa chốt** ở H01: phải spike Windows/PowerShell/Linux
-  rồi pin phiên bản cụ thể trước khi viết renderer, không viết API từ trí nhớ.
+- Thư viện terminal đã chốt ở H03: `crossterm = "=0.29.0"` (xem mục 5).
+
+### H03 — Terminal app và input loop (hoàn tất phần code)
+
+- **Chia module thật**: `events.rs` (từ vựng `Key`/`SessionEvent`/`AppPhase`/`RunOutcome`),
+  `input.rs` (editor), `service.rs` (port + staged service + fixture), `view.rs` (chuỗi
+  thuần), `controller.rs` (state reducer, **không** chạm terminal), `terminal.rs`
+  (backend thật + guard), `app.rs` (host vòng lặp render). Controller chỉ trả
+  `Effect`; host dịch effect sang lời gọi terminal, nên toàn bộ luật được unit test
+  không cần PTY.
+- **State machine**: `Booting` → `Ready`/`SetupRequired` (chuyển khi `boot_lines` thật
+  sự render header) → `Running` → `Canceling` → về `Ready`/`SetupRequired`;
+  `Closed` khi thoát. Một input chỉ được admit khi không có run active; input thứ hai
+  bị từ chối kèm hướng dẫn Ctrl-C.
+- **Bàn phím** (map từ `crossterm::event`, có test): Enter gửi, Backspace/Delete,
+  Left/Right/Home/End theo **ký tự** (không theo byte, nên tiếng Việt không vỡ), Up/Down
+  history có nhớ draft, Ctrl-C = cancel khi đang chạy / clear input khi idle, Ctrl-D
+  trên buffer rỗng = thoát, `Event::Paste` = chèn một lần (newline thành space, không
+  tự submit), `Event::Resize` = vẽ lại prompt không mất buffer.
+- **Streaming thật theo sự kiện**: `TextDelta` được flush mỗi vòng pump và **trước**
+  dòng tool/terminal, nên text hiện khi run còn đang chạy (không phải animation sau
+  khi xong).
+- **Raw mode an toàn**: `RawModeGuard` bật raw mode + bracketed paste và restore khi
+  `Drop` cho mọi đường thoát (bình thường, lỗi, unwind). Process bị kill cứng không
+  hứa restore — đúng như plan. Không dùng alternate screen.
+- **Fallback line mode**: nếu không bật được raw mode, app dùng lại **cùng controller**,
+  mỗi lần một dòng; nói rõ lý do ra stderr. Không có đường nào biến fallback thành
+  production backend giả.
+- **Fixture là opt-in tường minh**: `ha chat --fixture` dùng backend fixture **có nhãn**
+  ("fixture (no model was called)") và echo lại đúng text đã admit; fixture bị **từ chối**
+  khi đi với `--headless` vì lượt headless phải báo trạng thái backend thật. Mặc định
+  production vẫn là staged service báo `connection pending` (H04 nối thật), không tự
+  fallback mock.
+- **Giới hạn đã biết của H03**: editor một dòng (paste nhiều dòng bị đổi newline thành
+  space, chưa có multiline mode); việc Ctrl-C có được crossterm giao thành key event
+  trên Windows/ConPTY, và độ hiển thị tiếng Việt, **chưa** được chứng minh — phải kiểm
+  bằng PTY thật ở H07.
+
 
 ## 4. Trạng thái staging theo checkpoint
 
@@ -109,8 +145,8 @@ Không checkpoint nào được nhận "done" khi prerequisite chưa đạt.
 |---|---|---|---|
 | H01 | Entry point, dispatch, TTY detector, parser compat | — | dispatch + guard + parser xong; UI thật chờ H03 |
 | H02 | Launch context, paths/HA_HOME, config/setup state | H01 | context + paths + setup state xong bằng unit test; UI thật chờ H03 |
-| H03 | Terminal app, controller/renderer, input loop | H02 | việc tiếp theo |
-| H04 | G1 provider incremental, G2 tool continuation, G3 durable session | H03 + khảo sát G1–G3 | chờ H03 pass |
+| H03 | Terminal app, controller/renderer, input loop | H02 | controller/renderer/editor/terminal + fixture route xong bằng test; PTY thật thuộc H07 |
+| H04 | G1 provider incremental, G2 tool continuation, G3 durable session | H03 + khảo sát G1–G3 | việc tiếp theo |
 | H05 | Approval, resume, lifecycle | H04 | chờ H04 pass |
 | H06 | Installer, User PATH scope, install manifest | H01–H03 | logic + test disposable; **không** ghi User PATH thật |
 | H07 | Gate `Verify-HaLaunch.ps1`, PTY fixture, acceptance I01–I18 | H01–H06 | chờ |

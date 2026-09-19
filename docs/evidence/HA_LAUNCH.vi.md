@@ -1,6 +1,6 @@
 # Evidence HA_LAUNCH — track H01–H08
 
-Trạng thái: **H01 và H02 xong ở mức được ghi dưới đây; H03–H08 chưa bắt đầu.** Tài liệu này được cập
+Trạng thái: **H01–H03 xong ở mức được ghi dưới đây; H04–H08 chưa bắt đầu.** Tài liệu này được cập
 nhật lại sau mỗi checkpoint; trạng thái ở đây là trạng thái thật tại thời điểm ghi,
 không phải trạng thái dự kiến.
 
@@ -137,7 +137,72 @@ Giới hạn của H02 (không được đọc là đã đạt end-to-end):
   credential. Lượt model thật là H04.
 - Render tiếng Việt trên terminal thật chưa kiểm chứng (H03/H07).
 
-## 4. Chưa xác minh (không được coi là đạt)
+## 4. Đã xác minh cho H03
+
+| Kiểm chứng | Lệnh | Kết quả |
+|---|---|---|
+| Lint | `cargo clippy -p harness-cli --all-targets -- -D warnings` | exit 0 |
+| Unit test | `cargo test -p harness-cli --bin ha` | 50 passed, 0 failed (H01 8, H02 17, H03 25) |
+| Integration test | `cargo test -p harness-cli --test interactive_launch` | 7 passed, 0 failed |
+| Regression CLI (serial) | `cargo test -p harness-cli --tests --locked -- --test-threads=1` | 202 passed, 0 failed: P0 8, P1 21, P2 17, P3 20, P4 22, P5 27, P6 15, P7 15, unit 50, H01 integration 7 |
+
+Selector H03 phía unit:
+
+- Editor: `h03_editor_edits_vietnamese_text_by_character`,
+  `h03_editor_keeps_boundaries_and_ignores_empty_submissions`,
+  `h03_editor_submits_once_and_remembers_history`,
+  `h03_editor_paste_never_submits_multiple_commands`,
+  `h03_editor_ctrl_c_and_ctrl_d_follow_the_plan`.
+- Từ vựng/state: `h03_phase_labels_and_active_run_are_explicit`,
+  `h03_terminal_outcomes_are_labelled_for_the_transcript`.
+- Port: `h03_pending_service_accepts_then_reports_that_nothing_ran`,
+  `h03_fixture_service_is_labelled_and_streams_a_full_run`,
+  `h03_cancel_reports_a_canceled_run`.
+- View: `h03_prompt_marks_a_busy_phase_and_stays_readable`,
+  `h03_help_lists_the_commands_the_plan_requires`,
+  `h03_tool_and_run_lines_and_short_ids_are_stable`.
+- Controller: `h03_one_admission_per_message_and_a_running_run_refuses_a_second`,
+  `h03_ctrl_c_cancels_a_run_and_clears_an_idle_prompt`,
+  `h03_fixture_run_streams_text_before_tools_and_returns_to_ready`,
+  `h03_text_and_terminal_events_are_rendered_before_the_run_ends`,
+  `h03_pending_service_says_connection_pending_and_keeps_setup_state`,
+  `h03_slash_commands_are_parsed_and_staged_features_stay_honest`.
+- Terminal backend: `h03_keys_are_mapped_from_real_crossterm_events`,
+  `h03_paste_resize_and_key_release_are_handled`.
+- Host loop với scripted backend (không PTY):
+  `h03_scripted_terminal_renders_the_boot_header_and_exits_cleanly`,
+  `h03_scripted_terminal_echoes_vietnamese_input_and_reports_connection_pending`,
+  `h03_scripted_terminal_edits_with_backspace_before_submitting`,
+  `h03_resize_redraws_the_prompt_without_losing_the_buffer`,
+  `h03_fixture_run_renders_a_requested_failure_and_is_labelled`.
+- Parser: `h03_fixture_is_rejected_for_a_headless_turn`.
+- Integration: `i03_fixture_route_never_bypasses_the_terminal_or_headless_contract`.
+
+Đối chiếu acceptance, phần H03 chứng minh được:
+
+- **I06 (phần logic)**: gõ tiếng Việt theo ký tự, backspace/delete/home/end, history có
+  nhớ draft, paste một lần không tự submit, resize vẽ lại prompt không mất buffer.
+- **I07 (phần logic)**: Ctrl-C khi đang chạy gọi cancel và chuyển `Canceling`; Ctrl-C
+  khi idle clear input; Ctrl-D trên buffer rỗng thoát; `/exit` hủy run active trước khi
+  thoát.
+- **I10 (phần render)**: `TextDelta` được render **trước** khi run kết thúc và trước
+  dòng tool/terminal; test khẳng định thứ tự effect, không phải animation sau khi xong.
+- **I12 (phần admission)**: một input được admit mỗi message; input thứ hai trong lúc
+  chạy bị từ chối, không vào service.
+- **Fixture honesty**: fixture có nhãn trong header, echo đúng buffer đã admit, render
+  được cả đường failed; mặc định production vẫn báo `connection pending`, và
+  `--fixture` không bypass guard non-TTY cũng không dùng được cho headless.
+
+Chưa xác minh (không được coi là đạt):
+
+- **Raw mode/PTY thật**: I01/I06/I07/I08 ở dạng transcript terminal thật thuộc H07.
+  Cụ thể chưa chứng minh: Ctrl-C có được giao thành key event trên Windows/ConPTY,
+  tiếng Việt hiển thị đúng trên terminal thật, và guard restore terminal sau lỗi thật
+  (hiện có RAII + unit test đường thoát, chưa có test lỗi sau khi vào raw mode).
+- **Multiline editing**: chưa có; paste nhiều dòng bị đổi newline thành space.
+- **Linux**: chưa build/chạy.
+
+## 5. Chưa xác minh (không được coi là đạt)
 
 - **I01 PTY transcript**: chưa có. Cần terminal thật/PTY harness (H07). Unit test
   dùng fixture detector chỉ chứng minh logic capability, không phải bằng chứng
@@ -148,7 +213,7 @@ Giới hạn của H02 (không được đọc là đã đạt end-to-end):
 - **Publish release / push remote**: không thực hiện; không được cấp quyền.
 - **Linux**: chưa build/chạy; mọi kết quả trên là Windows.
 
-## 5. Ghi chú flake môi trường (đã điều tra, không che)
+## 6. Ghi chú flake môi trường (đã điều tra, không che)
 
 Test `phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` thỉnh
 thoảng đỏ ở tầng connect tới fixture server loopback trong chính process test:
