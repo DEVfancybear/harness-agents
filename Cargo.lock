@@ -910,6 +910,7 @@ dependencies = [
 name = "harness-runtime"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "harness-memory",
  "harness-providers",
  "harness-session",
