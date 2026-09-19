@@ -42,6 +42,9 @@ struct PtySession {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     transcript: Arc<Mutex<Vec<u8>>>,
+    /// The master handle must outlive the session: dropping it closes the
+    /// pseudo-console, which silently stops output and leaves the child blocked.
+    _master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
 impl PtySession {
@@ -69,14 +72,11 @@ impl PtySession {
             .spawn_command(command)
             .expect("the app starts inside the pseudo-console");
         drop(pair.slave);
-        let mut reader = pair
-            .master
+        let master = pair.master;
+        let mut reader = master
             .try_clone_reader()
             .expect("the master side is readable");
-        let writer = pair
-            .master
-            .take_writer()
-            .expect("the master side is writable");
+        let writer = master.take_writer().expect("the master side is writable");
         let transcript = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&transcript);
         std::thread::spawn(move || {
@@ -94,6 +94,7 @@ impl PtySession {
             child,
             writer,
             transcript,
+            _master: master,
         }
     }
 
@@ -170,7 +171,7 @@ fn base_env(temp: &tempfile::TempDir) -> Vec<(&'static str, String)> {
     ]
 }
 
-#[ignore = "ConPTY capture does not work in this sandbox: portable-pty 0.9.0 spawns the child (console hosts are created) but no output is ever readable from the master and the child never exits, so a real transcript cannot be captured here. Recorded in docs/evidence/HA_LAUNCH.vi.md section 8; the render loop is covered by the scripted backend and the non-TTY behaviour by the launch tests."]
+#[ignore = "ConPTY capture does not work in this sandbox: portable-pty 0.9.0 spawns the child (console hosts are created) but no output is ever readable from the master and the child never exits, even after keeping the master handle alive for the whole session. Recorded in docs/evidence/HA_LAUNCH.vi.md; the render loop is covered by the scripted backend and the non-TTY behaviour by the launch tests."]
 #[test]
 fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     let (temp, project) = sandbox();
@@ -197,7 +198,7 @@ fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     assert!(session.transcript().contains("bye"), "the app says goodbye");
 }
 
-#[ignore = "ConPTY capture does not work in this sandbox: portable-pty 0.9.0 spawns the child (console hosts are created) but no output is ever readable from the master and the child never exits, so a real transcript cannot be captured here. Recorded in docs/evidence/HA_LAUNCH.vi.md section 8; the render loop is covered by the scripted backend and the non-TTY behaviour by the launch tests."]
+#[ignore = "ConPTY capture does not work in this sandbox: portable-pty 0.9.0 spawns the child (console hosts are created) but no output is ever readable from the master and the child never exits, even after keeping the master handle alive for the whole session. Recorded in docs/evidence/HA_LAUNCH.vi.md; the render loop is covered by the scripted backend and the non-TTY behaviour by the launch tests."]
 #[test]
 fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     let (temp, project) = sandbox();
@@ -233,7 +234,7 @@ fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     );
 }
 
-#[ignore = "ConPTY capture does not work in this sandbox: portable-pty 0.9.0 spawns the child (console hosts are created) but no output is ever readable from the master and the child never exits, so a real transcript cannot be captured here. Recorded in docs/evidence/HA_LAUNCH.vi.md section 8; the render loop is covered by the scripted backend and the non-TTY behaviour by the launch tests."]
+#[ignore = "ConPTY capture does not work in this sandbox: portable-pty 0.9.0 spawns the child (console hosts are created) but no output is ever readable from the master and the child never exits, even after keeping the master handle alive for the whole session. Recorded in docs/evidence/HA_LAUNCH.vi.md; the render loop is covered by the scripted backend and the non-TTY behaviour by the launch tests."]
 #[test]
 fn i07_ctrl_c_clears_an_idle_prompt_and_cancels_a_running_turn() {
     let (temp, project) = sandbox();

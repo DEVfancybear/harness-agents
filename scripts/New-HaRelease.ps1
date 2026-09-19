@@ -38,7 +38,10 @@ param(
     [string] $Profile = 'Release',
     [string] $OutputDirectory = '',
     [switch] $SkipBuild,
-    [switch] $SelfTest
+    [switch] $SelfTest,
+    # Show exactly what a publication would do, including the channel status, and
+    # publish nothing.
+    [switch] $PublishDryRun
 )
 
 Set-StrictMode -Version Latest
@@ -227,6 +230,29 @@ function Invoke-ReleaseSelfTest {
     }
 }
 
+<#
+Report whether a publication could run at all, and print the exact commands.
+
+Nothing here publishes: the grant for this assignment covers preparing a candidate,
+and a real release still needs an authenticated channel that does not exist yet in
+this environment.
+#>
+function Get-PublishChannel {
+    $gh = Get-Command gh -ErrorAction SilentlyContinue
+    $token = ''
+    foreach ($name in @('GH_TOKEN', 'GITHUB_TOKEN')) {
+        if (-not [string]::IsNullOrWhiteSpace([string] [Environment]::GetEnvironmentVariable($name))) {
+            $token = $name
+            break
+        }
+    }
+    return [pscustomobject]@{
+        GhCli = if ($gh) { [string] $gh.Source } else { '' }
+        Token = $token
+        Ready = (($null -ne $gh) -or (-not [string]::IsNullOrWhiteSpace($token)))
+    }
+}
+
 if ($SelfTest) {
     Invoke-ReleaseSelfTest
 }
@@ -268,9 +294,37 @@ if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force 
 Compress-Archive -Path (Join-Path $bundleDirectory '*') -DestinationPath $archive
 $archiveDigest = Get-FileDigest -FilePath $archive
 
+$tag = "ha-v$versionToken"
+$channel = Get-PublishChannel
+
+if ($PublishDryRun) {
+    Write-Host ''
+    Write-Host 'PUBLISH_DRY_RUN: nothing was published.'
+    Write-Host "   candidate: $archive"
+    Write-Host "   sha256:    $archiveDigest"
+    Write-Host "   tag:       $tag"
+    if ($channel.Ready) {
+        Write-Host "   channel:   ready"
+    }
+    else {
+        Write-Host '   channel:   NOT available - install gh or set GH_TOKEN; no publication is possible here.'
+    }
+    Write-Host '   commands a publication would run:'
+    Write-Host ('     git tag -a ' + $tag + ' -m "ha ' + $versionToken + '"')
+    Write-Host ('     git push origin ' + $tag)
+    Write-Host ('     gh release create ' + $tag + ' "' + $archive + '" --title "ha ' + $versionToken + '" --notes-file <release-notes.md>')
+    Write-Host '     (upload checksums.txt next to the archive; verify the download digest matches)'
+    exit 0
+}
+
 Write-Host ''
 Write-Host "Candidate:  $bundleDirectory"
 Write-Host "Archive:    $archive"
 Write-Host "SHA-256:    $archiveDigest"
 Write-Host "Contents:   $($result.Files -join ', ')"
-Write-Host 'Published:  no - publishing a release is not authorized in this assignment.'
+if ($channel.Ready) {
+    Write-Host 'Published:  no - this run only prepares a candidate. Run with -PublishDryRun to see the publication commands.'
+}
+else {
+    Write-Host 'Published:  no - publishing needs an authenticated channel (gh or GH_TOKEN), which is not available here.'
+}
