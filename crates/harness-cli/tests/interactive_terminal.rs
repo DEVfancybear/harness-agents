@@ -40,12 +40,21 @@ fn cli_binary() -> PathBuf {
 /// One interactive session inside a real pseudo-console.
 struct PtySession {
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     transcript: Arc<Mutex<Vec<u8>>>,
     /// The master handle must outlive the session: dropping it closes the
     /// pseudo-console, which silently stops output and leaves the child blocked.
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
+
+/// Terminal emulator duties the harness must perform.
+///
+/// ConPTY asks the host terminal for the cursor position with ESC[6n once the app
+/// switches its console into virtual-terminal input mode, and the app blocks until
+/// the report arrives. A real terminal answers; a bare pipe does not, which is why
+/// this reply is required for any transcript to appear at all.
+const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
+const CURSOR_POSITION_REPORT: &[u8] = b"\x1b[1;1R";
 
 impl PtySession {
     fn spawn(cwd: &Path, env: &[(&str, String)]) -> Self {
@@ -60,13 +69,16 @@ impl PtySession {
             .expect("a pseudo-console can be opened");
         let mut command = CommandBuilder::new(cli_binary());
         command.cwd(cwd);
+        // Never inherit a credential from the developer's shell: the tests decide
+        // whether the app is configured. This runs before the explicit environment
+        // so a test that wants a credential can still set one.
+        command.env_remove("DEEPSEEK_API_KEY");
+        command.env_remove("HA_API_KEY");
+        command.env_remove("HA_PROVIDER_ENDPOINT");
+        command.env_remove("HA_PROVIDER_MODEL");
         for (name, value) in env {
             command.env(name, value);
         }
-        // Never inherit a credential from the developer's shell: the tests decide
-        // whether the app is configured.
-        command.env_remove("DEEPSEEK_API_KEY");
-        command.env_remove("HA_API_KEY");
         let child = pair
             .slave
             .spawn_command(command)
@@ -76,17 +88,29 @@ impl PtySession {
         let mut reader = master
             .try_clone_reader()
             .expect("the master side is readable");
-        let writer = master.take_writer().expect("the master side is writable");
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(master.take_writer().expect("the master side is writable")));
         let transcript = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&transcript);
+        let answer_writer = Arc::clone(&writer);
         std::thread::spawn(move || {
             let mut chunk = [0_u8; 4096];
             while let Ok(read) = reader.read(&mut chunk) {
                 if read == 0 {
                     break;
                 }
+                let bytes = &chunk[..read];
                 if let Ok(mut buffer) = sink.lock() {
-                    buffer.extend_from_slice(&chunk[..read]);
+                    buffer.extend_from_slice(bytes);
+                }
+                if bytes
+                    .windows(CURSOR_POSITION_QUERY.len())
+                    .any(|window| window == CURSOR_POSITION_QUERY)
+                {
+                    if let Ok(mut writer) = answer_writer.lock() {
+                        let _ = writer.write_all(CURSOR_POSITION_REPORT);
+                        let _ = writer.flush();
+                    }
                 }
             }
         });
@@ -99,10 +123,11 @@ impl PtySession {
     }
 
     fn send(&mut self, text: &str) {
-        self.writer
+        let mut writer = self.writer.lock().expect("writer lock");
+        writer
             .write_all(text.as_bytes())
             .expect("input reaches the app");
-        self.writer.flush().expect("input is flushed");
+        writer.flush().expect("input is flushed");
     }
 
     fn transcript(&self) -> String {
@@ -171,7 +196,7 @@ fn base_env(temp: &tempfile::TempDir) -> Vec<(&'static str, String)> {
     ]
 }
 
-#[ignore = "ConPTY capture does not work in this sandbox: portable-pty 0.9.0 spawns the child (console hosts are created) but no output is ever readable from the master and the child never exits, even after keeping the master handle alive for the whole session. Recorded in docs/evidence/HA_LAUNCH.vi.md; the render loop is covered by the scripted backend and the non-TTY behaviour by the launch tests."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console) or any terminal. State at H07: i01 passes there; i06 fails on the bracketed-paste expectation and i07 hangs the harness - both recorded in docs/evidence/HA_LAUNCH.vi.md."]
 #[test]
 fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     let (temp, project) = sandbox();
@@ -195,10 +220,16 @@ fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     session.send("/exit\r");
     let status = session.wait_exit(Duration::from_secs(20));
     assert_eq!(status, Some(0), "transcript:\n{}", session.transcript());
-    assert!(session.transcript().contains("bye"), "the app says goodbye");
+    // The shell must get its prompt back: the app leaves the cursor on a fresh
+    // line instead of parking it inside its own prompt.
+    let transcript = session.transcript();
+    assert!(
+        transcript.ends_with("\r\n") || transcript.ends_with('\n'),
+        "the app restores the terminal before exiting: {transcript:?}"
+    );
 }
 
-#[ignore = "ConPTY capture does not work in this sandbox: portable-pty 0.9.0 spawns the child (console hosts are created) but no output is ever readable from the master and the child never exits, even after keeping the master handle alive for the whole session. Recorded in docs/evidence/HA_LAUNCH.vi.md; the render loop is covered by the scripted backend and the non-TTY behaviour by the launch tests."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console) or any terminal. State at H07: i01 passes there; i06 fails on the bracketed-paste expectation and i07 hangs the harness - both recorded in docs/evidence/HA_LAUNCH.vi.md."]
 #[test]
 fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     let (temp, project) = sandbox();
@@ -234,7 +265,7 @@ fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     );
 }
 
-#[ignore = "ConPTY capture does not work in this sandbox: portable-pty 0.9.0 spawns the child (console hosts are created) but no output is ever readable from the master and the child never exits, even after keeping the master handle alive for the whole session. Recorded in docs/evidence/HA_LAUNCH.vi.md; the render loop is covered by the scripted backend and the non-TTY behaviour by the launch tests."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console) or any terminal. State at H07: i01 passes there; i06 fails on the bracketed-paste expectation and i07 hangs the harness - both recorded in docs/evidence/HA_LAUNCH.vi.md."]
 #[test]
 fn i07_ctrl_c_clears_an_idle_prompt_and_cancels_a_running_turn() {
     let (temp, project) = sandbox();
