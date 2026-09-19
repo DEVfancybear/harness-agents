@@ -18,8 +18,9 @@ Tài liệu này là điểm vào cho lượt coding tiếp theo. Cập nhật s
   credential/budget).
 - **H05 xong phần code**: approval gate thật (render + answer, deny/expiry không thực thi),
   `/resume` liệt kê/chọn session của project, `/new` không bỏ chạy ngầm, và headless
-  `--resume <session-id>` tiếp tục task với context phục hồi. Còn **một ca test**: hard kill
-  giữa turn sau khi receipt đã commit.
+  `--resume <session-id>` tiếp tục task với context phục hồi. Ca kill *process* thật giữa turn
+  **đã có và đã đo** (round 14): store chỉ thấy một input đã admit, không receipt, host mới tiếp
+  quản trong session mới. Còn lại: kill đúng lúc *sau khi tool receipt đã commit* — vẫn mô phỏng.
 - **H06 xong phần code**: installer dùng artifact Cargo báo + digest + manifest, thay thế có
   staging/rollback, phân loại lỗi khóa file, User PATH merge tách biệt có test, cảnh báo
   shadowing; `-SelfTest` 14 check xanh. **Không** ghi User PATH thật và không cài vào vị
@@ -76,9 +77,12 @@ Chi tiết từng bước ở mục 6; nhắc lại: H08 **không** được pub
    số/id, resume = đặt nguồn hội thoại rồi tiếp tục bằng `continue_task_streaming`.
 3. ~~`/new`/`/exit` khi có run active~~ **đã xong**: `/new` từ chối khi đang chạy,
    `/exit` cancel + đóng writer trước khi thoát.
-4. **Đã làm phần lớn**: ca gián đoạn với durable state thật (drop toàn bộ in-memory,
-   writer generation mới) chứng minh receipt đã settle không bị chạy lại. **Còn lại**: kill
-   *process* thật giữa turn — cần PTY (H07) và vẫn not_run.
+4. **Đã xong hai mức**: (a) kill *process* thật giữa turn — process `ha chat --headless` bị kill
+   cứng trong lúc gọi model, store đọc lại chỉ thấy một input đã admit, replay dừng ở input,
+   `receipt_count = 0`, host mới trả lời trong session mới; (b) ca gián đoạn với durable state
+   thật (drop toàn bộ in-memory, writer generation mới) chứng minh receipt đã settle không bị
+   chạy lại. **Còn lại**: kill đúng lúc receipt vừa commit nhưng process chưa thoát — cần một
+   tool chạy được, mà headless thì fail closed.
    Lưu ý contract: P3 yêu cầu approval cho **mọi** action không bị deny, nên headless fail
    closed cho mọi tool call; muốn automation chạy tool phải có flag approval tường minh do
    user chốt (xem SPEC).
@@ -94,7 +98,7 @@ H07 (gate `Verify-HaLaunch.ps1` + PTY harness + I01–I18), H08 (release candida
 ## 4. Trạng thái test ở checkpoint này
 
 - `cargo test -p harness-cli --bin ha` → 61 passed (gồm 3 unit test I08 cho phục hồi mode).
-- `cargo test -p harness-cli --test interactive_launch` → 14 passed.
+- `cargo test -p harness-cli --test interactive_launch` → 15 passed (thêm ca kill process thật).
 - `cargo test -p harness-cli --test interactive_session` → 9 passed.
 - `cargo test -p harness-cli --test interactive_terminal` → 5 ignored (cần console thật; chạy
   bằng runner, `5 passed`).
@@ -107,17 +111,26 @@ H07 (gate `Verify-HaLaunch.ps1` + PTY harness + I01–I18), H08 (release candida
   release self test, docs).
 - Năm ca PTY: `scripts/Invoke-HaPtyAcceptance.ps1` → `PTY_EXIT: 0`, `5 passed; 0 failed`
   (console thật; `cargo test` trong sandbox vẫn `#[ignore]` năm ca này).
-- Chưa chạy: Linux, live provider smoke, publish, VM sạch thật, kill process cứng giữa turn.
+- Chưa chạy: Linux (chỉ có target `x86_64-pc-windows-msvc`), live provider smoke, publish, VM
+  sạch thật, kill đúng lúc receipt vừa commit.
 
 ## 5. Gap đã biết cần đóng
 
-- Kill *process* cứng giữa turn (H05 I13): hiện chỉ mô phỏng bằng mất state in-memory + writer
-  generation mới; I01/I06/I07/I08 đã xanh trong console thật (mục 12.2–12.3 evidence).
+- Kill *process* thật giữa turn (H05 I13): đã đo (mục 10.1 evidence). Còn lại là kill đúng lúc
+  receipt vừa commit; I01/I06/I07/I08 đã xanh trong console thật (mục 12.2–12.3 evidence).
 - Multiline editing trong editor.
 - Project directory read-only chưa có test.
 - Provider endpoint/model resolution (H04) và credential resolver ngoài env var.
-- Kill *process* thật giữa turn rồi để host khác tiếp quản (H05 I13): hiện chỉ mô phỏng
-  bằng mất state in-memory + writer generation mới.
+- Kill đúng lúc tool receipt vừa commit (H05 I13): cần đường chạy tool không tương tác —
+  headless hiện fail closed cho mọi tool call, nên ca này vẫn ở mức mô phỏng.
+
+Bảng đối chiếu acceptance I01–I20 (mục 15 evidence) chỉ ra bốn mục **một phần**, đây là các
+gap còn lại theo đúng thứ tự ưu tiên:
+
+1. **I19**: chưa có VM/máy sạch thật; hiện chỉ mô phỏng PATH tối giản trong thư mục tạm.
+2. **I13**: kill đúng lúc receipt vừa commit (xem trên).
+3. **I04**: chưa chạy *binary đã cài* từ path Unicode + thư mục không có Git.
+4. **I09**: chưa có ca riêng cho data directory không có quyền ghi.
 
 ## 6. Việc tiếp theo chi tiết (H08)
 
@@ -150,6 +163,7 @@ tương ứng trong gate. Bốn ca vẫn `#[ignore]` vì `cargo test` trong sand
    mô phỏng bằng PATH tối thiểu + thư mục tạm, phải ghi rõ là mô phỏng, không phải VM thật.
 4. **Publish: KHÔNG được cấp quyền.** Bàn giao candidate + checksum, ghi rõ "download route
    chưa public", không tạo URL giả.
-5. **PTY**: nếu có môi trường có console thật (không phải sandbox này), chạy
-   `cargo test -p harness-cli --test interactive_terminal -- --ignored --test-threads=1` để
-   lấy transcript I01/I06/I07 và đóng nốt ca hard-kill của H05; ngược lại giữ not_run.
+5. **PTY**: đã chạy trên console thật ở round 13 (không phải sandbox):
+   `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1` → `PTY_EXIT: 0`, 5 passed, 0 failed.
+   Kill process thật giữa turn đã có ở dạng test process (round 14, mục 10.1 evidence); ca
+   hard-kill đúng lúc receipt vừa commit thì cần đường chạy tool không tương tác.

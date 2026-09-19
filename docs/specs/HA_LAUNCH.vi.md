@@ -345,8 +345,12 @@ thật thay `PendingService`, và `ha chat --headless` chạy turn thật. Live 
 - Headless: `ha chat --headless --resume <session-id>` tiếp tục task của session đó, JSON có
   `resumed_from`; session lạ trả lỗi và **không** chạy gì.
 
-**Còn lại của H05**: test hard-kill *giữa* lúc tool receipt đã commit (I13 nhánh kill thật)
-— hiện đã chứng minh resume/continuation bằng process thật nhưng chưa có ca kill giữa turn.
+**Còn lại của H05 (cập nhật round 14)**: ca kill **process thật** giữa turn nay **đã có và đã
+đo** (`i13_a_hard_kill_mid_turn_leaves_one_admitted_input_and_no_claimed_success`): process bị
+kill cứng trong lúc gọi model, store đọc lại chỉ thấy **một** input đã admit (`input_count = 1`,
+`next_sequence = 2`), replay dừng ở sequence 1, `receipt_count = 0`, không snapshot; host mới lấy
+được lease và trả lời trong **session mới**. Điều **chưa** chứng minh: kill *sau khi tool receipt
+đã commit* — ca đó vẫn chỉ ở mức mô phỏng trung thực cho durable state.
 
 ### H06 — Installer và command resolution (đang triển khai)
 
@@ -444,11 +448,21 @@ blanket grant", nhưng hệ quả là headless hiện **không thể** hoàn th�
 Muốn automation chạy được tool thì phải có một flag approval tường minh (ví dụ
 `--allow-actions`) — đây là thay đổi contract cần user chốt, nên **chưa** tự thêm.
 
-Vì vậy ca "hard kill giữa turn sau khi receipt đã commit" được chứng minh ở mức **mô phỏng
-trung thực cho durable state**: mọi handle in-memory (driver, runtime, tool service, writer)
-bị drop và lượt kế tiếp mở **writer generation mới** từ đĩa, đúng như một process mới; test
-khẳng định receipt đã settle không bị chạy lại và context được phục hồi. Ca kill process
-thật vẫn cần PTY (H07) và tiếp tục là not_run.
+Vì vậy có **hai mức bằng chứng**, ghi rõ để không đánh đồng:
+
+- **Kill process thật giữa turn (round 14, đã đo)**: process `ha chat --headless` bị kill cứng
+  trong lúc request đầu tiên còn đang bay tới provider (endpoint accept rồi không trả lời).
+  Store sau đó — đọc bằng đúng đường read-only của operator (`ha sessions list`, `ha status`) —
+  cho thấy input đã được admit đúng một lần (`input_count = 1`, `next_sequence = 2`), replay
+  dừng ở sequence 1, `receipt_count = 0` và không có snapshot: **không có thành công nào bị
+  claim**. Host mới mở được writer generation mới và hoàn thành lượt của nó trong **session
+  mới** (`resumed_from: null`), còn session bị kill giữ nguyên một input. Ca này không chạy
+  tool (headless fail closed), nên nó chứng minh phần *admission/lease/replay*, không phải
+  phần *receipt*.
+- **Receipt đã commit rồi mới mất process (mô phỏng trung thực)**: mọi handle in-memory
+  (driver, runtime, tool service, writer) bị drop và lượt kế tiếp mở **writer generation mới**
+  từ đĩa, đúng như một process mới; test khẳng định receipt đã settle không bị chạy lại và
+  context được phục hồi.
 
 ### Quyền bổ sung được cấp trong session (round 9) và trạng thái thực thi
 

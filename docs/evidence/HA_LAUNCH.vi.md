@@ -1,6 +1,6 @@
 # Evidence HA_LAUNCH — track H01–H08
 
-Trạng thái: **H01–H08 xong phần code** (H05 còn ca hard-kill giữa turn; H07 thiếu transcript PTY thật vì ConPTY không chạy trong sandbox; H08 không publish và chỉ mô phỏng máy sạch). Không có live provider smoke. H05 còn ca hard-kill giữa turn; H06 không ghi User PATH thật vì không được cấp quyền. H04/H05 chưa có live provider smoke vì không được cấp quyền. Tài liệu này được cập
+Trạng thái: **H01–H08 xong phần code**. H05: đã có ca kill *process* thật giữa turn (đo phần admission/lease/replay); phần kill *sau khi tool receipt đã commit* vẫn chỉ ở mức mô phỏng trung thực cho durable state. H07: transcript PTY thật cho I01/I06/I07/I08 đã xanh qua runner console (không tính tự động trong gate vì sandbox không có console). H08: bundle candidate + installer + uninstall, **không publish**, máy sạch chỉ mô phỏng. H06: **không** ghi User PATH thật và không cài vào máy user (không được cấp quyền). H04/H05: **không** có live provider smoke (không được cấp credential/budget). Tài liệu này được cập
 nhật lại sau mỗi checkpoint; trạng thái ở đây là trạng thái thật tại thời điểm ghi,
 không phải trạng thái dự kiến.
 
@@ -292,12 +292,14 @@ Selector H05 mới: `h05_a_denied_gated_action_is_not_executed_and_the_model_is_
   trước** — tức context được phục hồi thật, không phải bắt đầu lại. Resume id lạ fail và
   không chạy gì.
 
-Chưa chứng minh (còn lại của H05/H07):
+Còn lại của H05/H07 (ghi đúng mức đã đạt):
 
-- **Hard kill giữa turn sau khi receipt đã commit** rồi mở lại resume: chưa có ca test
-  riêng (cần kill process thật giữa lúc tool đã settle). Cơ chế continuation/recovery đã
-  được chứng minh, nhưng nhánh kill thì chưa.
-- PTY/terminal thật cho I07/I08 vẫn thuộc H07.
+- **Kill process thật giữa turn**: **đã đo** ở round 14 (mục 10.1) — input admit một lần,
+  không receipt, replay dừng ở input, host mới tiếp quản trong session mới.
+- **Kill sau khi tool receipt đã commit**: vẫn chỉ mô phỏng trung thực cho durable state
+  (drop toàn bộ in-memory + mở writer generation mới). Chưa có ca kill process thật ở đúng
+  thời điểm đó, vì cần một tool chạy được mà đường headless thì fail closed.
+- PTY/terminal thật cho I07/I08: **đã xanh** (mục 12.2–12.3) qua runner console.
 - Live provider smoke: **not_run**.
 
 
@@ -422,9 +424,9 @@ thiểu (chỉ thư mục cài + `System32`, `toolchainOnMinimalPath=False`):
 
 | Kiểm chứng | Lệnh | Kết quả |
 |---|---|---|
-| Launch acceptance (đã thêm I09/I16) | `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` | 14 passed, 0 failed |
+| Launch acceptance (đã thêm I09/I16 và kill process thật) | `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` | 15 passed, 0 failed |
 | Session acceptance (đã thêm ca gián đoạn) | `cargo test -p harness-cli --test interactive_session --locked -- --test-threads=1` | 9 passed, 0 failed |
-| Gate runtime với 9 selector bắt buộc | `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json` | `"passed": true`, `"failures": []` |
+| Gate runtime với 10 selector bắt buộc | `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json` | `"passed": true`, `"failures": []` |
 | Lint toàn workspace | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
 
 Selector mới: `i09_a_corrupt_configuration_stops_the_run_with_an_actionable_error`,
@@ -450,8 +452,36 @@ Selector mới: `i09_a_corrupt_configuration_stops_the_run_with_an_actionable_er
 không bị deny, nên đường headless (không có người để hỏi) **fail closed cho mọi tool call**.
 Đó là hành vi đúng theo "không blanket grant", nhưng nghĩa là headless hiện không thể hoàn
 thành công việc cần tool; một flag automation-approval tường minh là quyết định contract cần
-user chốt nên chưa được thêm. Ca **kill process thật** giữa turn vẫn cần PTY (H07) và vẫn là
-not_run.
+user chốt nên chưa được thêm.
+
+### 10.1. Kill process thật giữa turn (round 14)
+
+I13 nhánh kill **process thật** nay có ca riêng:
+`i13_a_hard_kill_mid_turn_leaves_one_admitted_input_and_no_claimed_success` (nằm trong
+`interactive_launch`, đã thành selector bắt buộc của gate).
+
+Cách đo: một process `ha chat --headless` thật chạy với `HA_PROVIDER_ENDPOINT` trỏ tới endpoint
+loopback **accept rồi không bao giờ trả lời**; test chờ tới khi provider thấy kết nối (tức input
+đã được admit và writer đã mở), rồi kill cứng process — không unwind, không flush, không đóng
+writer tử tế. Sau đó state durable được đọc bằng **đúng đường read-only của operator**
+(`ha sessions list --json`, `ha status --session-id ... --json`), không dựng runtime.
+
+| Đo được | Kết quả |
+|---|---|
+| Input đã admit | `input_count = 1`, `next_sequence = 2` — admit đúng một lần, và session đã tiêu thụ sequence nên không thể admit lại chính input đó |
+| Thành công bị claim | không: `recovery.receipt_count = 0`, `latest_snapshot_sequence = null` |
+| Replay | dừng ở `replayed_through_sequence = 1` (chỉ có input) |
+| Host mới | mở được writer generation mới, chạy lượt của nó trong **session mới** (`resumed_from: null`, `stop: "final"`) |
+| Session bị kill sau đó | vẫn `input_count = 1`, vẫn `receipt_count = 0` — không bị "hoàn thành hộ" |
+| Đối chứng dương | session hoàn thành của lượt sau có `replayed_through_sequence = 2`, `next_sequence = 3`, nên "replay dừng ở 1" ở trên thật sự nghĩa là "không ghi gì thêm" |
+
+Kết quả lệnh: `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1`
+→ **15 passed, 0 failed** (32.85 s).
+
+Phạm vi chính xác: ca này kill trong **lượt gọi model đầu tiên** nên không có tool nào chạy
+(headless fail closed cho mọi tool call). Nó chứng minh phần *admission/lease/replay*; phần
+*receipt đã commit rồi mới mất process* vẫn chỉ ở mức mô phỏng trung thực cho durable state
+(mục trên). Không có phần nào ở đây được gọi là "kill trong lúc tool đang chạy".
 
 
 ## 11. Grant round 9 (publish + credential): đã chuẩn bị, chưa thực thi được
@@ -525,24 +555,24 @@ lưu transcript theo tên filter (`pty-<filter>.txt`) để lần chạy sau kh�
 của lần trước (lần này transcript i06 đã bị lần chạy i07 ghi đè trước khi kịp đọc).
 
 
-### 12.1. Ket qua PTY sau khi sua (round 12)
+### 12.1. Kết quả PTY sau khi sửa (round 12)
 
-Ba loi that da tim ra va sua trong test/harness (khong phai trong app):
+Ba lỗi thật đã tìm ra và sửa trong test/harness (không phải trong app):
 
-1. Chi mot pseudo-console moi process tren host nay: mo cai thu hai (du cai dau da dong)
-   thi BLOCK -> tach i07 thanh hai test mot-session (i07a, i07b).
-2. ConPTY khong forward bracketed-paste markers: newline trong paste toi nhu Enter va phan
-   dau bi submit nhu mot request. Khong sua duoc trong app; test nay khang dinh dieu app
-   phai lam: van song va prompt con dung duoc sau paste.
-3. Loi chuoi input cua chinh test: ky tu marker con trong buffer nen /exit bi noi thanh
-   z/exit va submit nhu REQUEST thay vi command -> test nay clear buffer bang Ctrl-C truoc
-   khi gui /exit.
+1. Chỉ một pseudo-console mỗi process trên host này: mở cái thứ hai (dù cái đầu đã đóng)
+   thì BLOCK → tách i07 thành hai test một-session (i07a, i07b).
+2. `ConPTY` không forward bracketed-paste markers: newline trong paste tới như Enter và phần
+   đầu bị submit như một request. Không sửa được trong app; test này khẳng định điều app
+   phải làm: vẫn sống và prompt còn dùng được sau paste.
+3. Lỗi chuỗi input của chính test: ký tự marker còn trong buffer nên `/exit` bị nối thành
+   `z/exit` và submit như REQUEST thay vì command → test này clear buffer bằng Ctrl-C trước
+   khi gửi `/exit`.
 
-| Ca | Ket qua trong console that (transcript luu o target/pty-acceptance/) |
+| Ca | Kết quả trong console thật (transcript lưu ở `target/pty-acceptance/`) |
 |---|---|
-| I01 bare ha mo app | ok - header/prompt render, process song, /exit thoat 0 |
-| I06 go tieng Viet + backspace + paste | ok - transcript cho thay "> sua loi parser" tung ky tu, backspace dung; paste tren console nay submit phan dau nhu mot request, app van song va prompt dung duoc |
-| I07a Ctrl-C khi idle | ok - "> typo" -> Ctrl-C -> "> z" (buffer da clear, khong co "> typoz") |
+| I01 bare `ha` mở app | ok — header/prompt render, process sống, `/exit` thoát 0 |
+| I06 gõ tiếng Việt + backspace + paste | ok — transcript cho thấy "> sua loi parser" từng ký tự, backspace đúng; paste trên console này submit phần đầu như một request, app vẫn sống và prompt dùng được |
+| I07a Ctrl-C khi idle | ok — "> typo" → Ctrl-C → "> z" (buffer đã clear, không có "> typoz") |
 | I07b Ctrl-C khi đang chạy | ok — xem 12.2 |
 
 Hai nguyên nhân còn lại của i07b được tìm ra ở round 13 và đều nằm trong **test**, không
@@ -606,7 +636,7 @@ Kill process cứng vẫn **ngoài phạm vi** đúng như plan ghi, và đượ
 |---|---|---|
 | Gate đầy đủ của track | `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json` | `"passed": true`, `"failures": []` (format, clippy `-D warnings`, 9 selector bắt buộc, unit + acceptance + P0–P7 serial, installer self test, release self test, docs) |
 | Unit test binary `ha` | `cargo test -p harness-cli --bin ha --locked` | 61 passed, 0 failed (thêm 3 test I08 cho phục hồi mode) |
-| Launch/headless acceptance | `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` | 14 passed, 0 failed |
+| Launch/headless acceptance | `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` | 15 passed, 0 failed, gồm ca kill process thật (mục 10.1) |
 | Session/turn acceptance | `cargo test -p harness-cli --test interactive_session --locked -- --test-threads=1` | 9 passed, 0 failed |
 | PTY trong console thật | `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 300` | `PTY_EXIT: 0`, **5 passed, 0 failed** (11.01 s) cho i01/i06/i07a/i07b/i08 |
 | Regression toàn CLI (serial) | `cargo test -p harness-cli --tests --locked -- --test-threads=1` | **229 passed, 0 failed, 5 ignored** (5 ca PTY; chi tiết `target/cli-tests-round13.txt`) |
@@ -619,8 +649,8 @@ Kill process cứng vẫn **ngoài phạm vi** đúng như plan ghi, và đượ
   `scripts/Invoke-HaPtyAcceptance.ps1`. Gate liệt kê chúng là `not_run` kèm hướng dẫn.
 - **I08 (lỗi render/backend sau khi terminal đã khởi tạo)**: chưa có ca PTY inject lỗi;
   hiện chỉ được chứng minh ở mức scripted backend (H07 G2), không phải PTY thật.
-- **H05 I13 nhánh kill thật**: mới mô phỏng bằng mất state in-memory + writer generation mới;
-  chưa kill process thật giữa turn rồi để host khác tiếp quản.
+- **H05 I13**: kill *process* thật giữa turn **đã đo** (mục 10.1). Còn lại: kill đúng lúc
+  *sau khi tool receipt đã commit* — vẫn chỉ mô phỏng trung thực cho durable state.
 - **Live provider**: không chạy; không có credential/budget được cấp.
 - **User PATH / cài binary thật**: không thực hiện; không được cấp quyền.
 - **Publish release / push remote**: không thực hiện; không được cấp quyền.
@@ -708,4 +738,38 @@ Chưa chứng minh / còn mở:
   SPEC); hiện dùng chuỗi session cùng task.
 - `ProjectId` trong một phiên vẫn sinh mới; identity bền theo project hiện là thư mục
   store (`project-<hash>`). Nối registry project là việc của H05.
-- **I13** (hard kill rồi `/resume`) và lifecycle cancel/close đầy đủ thuộc H05.
+- **I13** (hard kill rồi `/resume`): nay đã có ca kill process thật (mục 10.1) cộng với ca
+  mô phỏng receipt-đã-commit; lifecycle cancel/close có test ở `interactive_session`.
+
+## 15. Đối chiếu acceptance I01–I20 với bằng chứng
+
+Bảng này nói rõ mỗi mục của plan được chứng minh bằng gì và ở mức nào; "một phần" nghĩa là
+phần còn thiếu được ghi đúng chứ không được tính là đạt.
+
+| # | Bằng chứng cụ thể | Trạng thái |
+|---|---|---|
+| I01 | PTY `i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly` (console thật, mục 12.2) + guard `i01_chat_without_a_terminal_uses_the_same_guard` | đạt |
+| I02 | `i02_help_and_version_stay_fast_paths_that_write_nothing`, `i02_existing_subcommands_keep_their_dispatch_and_output`, `i02_unknown_options_and_missing_arguments_remain_parser_errors` | đạt |
+| I03 | `i03_bare_launch_without_a_terminal_exits_two_with_instructions`, `i03_headless_turn_runs_through_the_real_adapter_and_keeps_the_key_out_of_output`, `i03_headless_rejects_the_headless_only_flags_and_keeps_stdout_plain`, `i03_fixture_route_never_bypasses_the_terminal_or_headless_contract` | đạt |
+| I04 | `h02_project_identity_follows_the_caller_directory_with_spaces_and_unicode`, `h02_relative_cwd_resolves_from_the_caller_and_git_root_comes_from_the_project_tree`, sandbox PTY dùng thư mục "project with spaces" | **một phần**: chưa chạy *binary đã cài* từ path Unicode không có Git |
+| I05 | `h02_empty_home_without_credentials_opens_setup_state_and_writes_nothing`, `h04_an_unconfigured_provider_is_reported_and_the_setup_state_is_kept`, header PTY i01 ("setup required") | đạt |
+| I06 | PTY `i06_pty_keeps_vietnamese_input_and_paste_intact` + `h03_editor_edits_vietnamese_text_by_character`, `h03_keys_are_mapped_from_real_crossterm_events` | đạt (console thật) |
+| I07 | PTY `i07a_ctrl_c_clears_an_idle_prompt`, `i07b_ctrl_c_cancels_a_running_turn` + `h03_ctrl_c_cancels_a_run_and_clears_an_idle_prompt` | đạt (console thật) |
+| I08 | PTY `i08_a_backend_fault_after_init_restores_the_terminal_and_is_not_swallowed` + ba unit test `h07_i08_*` (mục 12.3) | đạt |
+| I09 | `i09_a_corrupt_configuration_stops_the_run_with_an_actionable_error`, `i09_an_invalid_project_directory_stops_the_run_with_an_actionable_error`, `h02_corrupt_configuration_is_actionable_and_never_replaced_by_defaults` | **một phần**: "data dir không có quyền" chưa có ca riêng |
+| I10 | `phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` (SSE → sự kiện chuẩn hoá), `h03_text_and_terminal_events_are_rendered_before_the_run_ends` (text hiện trước khi run kết thúc) | đạt |
+| I11 | `g2_tool_results_return_to_the_model_and_the_turn_ends_with_the_answer`, `g2_a_failed_tool_call_is_reported_instead_of_ending_the_turn`, `g2_the_tool_loop_is_bounded_and_reports_which_bound_stopped_it`, `g3_the_foundation_admits_one_input_per_session_and_says_so` | đạt |
+| I12 | `h05_a_denied_gated_action_is_not_executed_and_the_model_is_told`, `h05_a_granted_gated_action_runs_once_after_the_answer`, `h05_an_expired_approval_is_a_refusal_not_a_silent_grant`, `i12_headless_turn_without_provider_configuration_fails_closed` | đạt |
+| I13 | `i13_a_hard_kill_mid_turn_leaves_one_admitted_input_and_no_claimed_success` (mục 10.1), `i13_resume_continues_the_task_with_recovered_context_and_no_rerun`, `i13_resuming_an_unknown_session_fails_without_running_anything`, `h05_a_settled_receipt_is_not_re_executed_after_the_process_state_is_lost` | **một phần**: kill process thật đo ở lượt gọi model; kill đúng lúc receipt vừa commit vẫn mô phỏng |
+| I14 | `Install-Ha.ps1 -SelfTest`: `disposable_install_replaces_and_verifies_the_artifact`, `installed_digest_matches_the_built_artifact`, `install_manifest_records_version_and_digest` | đạt trong destination tạm |
+| I15 | `Install-Ha.ps1 -SelfTest`: `merge_appends_a_missing_directory`, `merge_is_case_insensitive_and_ignores_a_trailing_separator`, `merge_drops_empty_entries_and_keeps_order`, `merge_never_folds_machine_or_process_entries_into_user_path`, `injected_writer_receives_the_merged_user_path`, `self_test_never_writes_the_real_user_path` | đạt ở mức mô phỏng; **không** ghi User PATH thật |
+| I16 | `i16_a_second_run_in_the_same_project_is_refused_while_the_first_holds_the_store`, `h02_two_terminals_in_one_project_share_a_store_and_the_second_is_busy` | đạt |
+| I17 | `Install-Ha.ps1 -SelfTest`: `shadowing_command_is_found_before_the_owned_binary`, `shadowing_command_is_never_deleted` | đạt |
+| I18 | `Install-Ha.ps1 -SelfTest`: `update_keeps_the_binary_usable`, `locked_executable_is_reported_as_in_use`, `a_failed_replacement_leaves_the_previous_binary_usable`; `New-HaRelease.ps1 -SelfTest`: `bundle_manifest_digest_mismatch`, `bundle_must_not_claim_publication`, `unexpected_file_was_not_rejected` | đạt |
+| I19 | `Install-Ha.ps1 -FromBundle` + `bundle_install_uses_the_verified_executable`, `a_tampered_bundle_is_refused`; bundle `ha-0.1.0-windows-x64` kèm `checksums.txt` | **một phần**: PATH tối giản disposable, **không** có VM sạch thật |
+| I20 | `uninstall_removes_only_owned_files`, `uninstall_keeps_user_data`, rồi cài lại từ bundle | đạt (disposable) |
+
+**Không đạt / not_run (không được tính là đạt)**: live provider smoke (không có credential),
+publish release (không có channel và chưa được xác nhận push tag), build/chạy Linux (chỉ có
+target `x86_64-pc-windows-msvc`: `rustup target list --installed` xác nhận), ghi User PATH thật
+và cài lên máy user (không được cấp quyền), VM sạch thật cho I19.

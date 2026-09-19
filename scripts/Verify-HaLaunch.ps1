@@ -100,6 +100,7 @@ $requiredSelectors = @(
     @{ Target = 'interactive_launch'; Selector = 'i03_bare_launch_without_a_terminal_exits_two_with_instructions' },
     @{ Target = 'interactive_launch'; Selector = 'i03_headless_turn_runs_through_the_real_adapter_and_keeps_the_key_out_of_output' },
     @{ Target = 'interactive_launch'; Selector = 'i13_resume_continues_the_task_with_recovered_context_and_no_rerun' },
+    @{ Target = 'interactive_launch'; Selector = 'i13_a_hard_kill_mid_turn_leaves_one_admitted_input_and_no_claimed_success' },
     @{ Target = 'interactive_launch'; Selector = 'i09_a_corrupt_configuration_stops_the_run_with_an_actionable_error' },
     @{ Target = 'interactive_launch'; Selector = 'i16_a_second_run_in_the_same_project_is_refused_while_the_first_holds_the_store' },
     @{ Target = 'interactive_session'; Selector = 'h05_a_settled_receipt_is_not_re_executed_after_the_process_state_is_lost' },

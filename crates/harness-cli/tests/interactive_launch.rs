@@ -891,3 +891,284 @@ fn hanging_endpoint() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) 
         handle,
     )
 }
+
+// ---------------------------------------------------------------------------
+// H05 I13 - a hard kill of the real process in the middle of a turn
+// ---------------------------------------------------------------------------
+
+/// A provider that accepts the request and then never answers. The stop channel
+/// releases the socket, so the test never waits out a long hold.
+fn stalling_endpoint() -> (
+    String,
+    Arc<AtomicBool>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stalling listener");
+    let address = listener.local_addr().expect("stalling address");
+    let accepted = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&accepted);
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        if let Ok((connection, _)) = listener.accept() {
+            flag.store(true, Ordering::SeqCst);
+            // Hold the socket open without answering until the test releases it.
+            let _ = held.recv_timeout(Duration::from_mins(1));
+            drop(connection);
+        }
+    });
+    (
+        format!("http://{address}/chat/completions"),
+        accepted,
+        release,
+        handle,
+    )
+}
+
+/// The single per-project store the app created under `HA_HOME`.
+fn only_project_store(sandbox: &Sandbox) -> PathBuf {
+    let projects = sandbox.path().join("data").join("projects");
+    let mut stores: Vec<PathBuf> = std::fs::read_dir(&projects)
+        .expect("the app created a per-project store")
+        .map(|entry| entry.expect("project store entry").path())
+        .collect();
+    stores.sort();
+    assert_eq!(stores.len(), 1, "one project store is expected: {stores:?}");
+    stores.pop().expect("one store")
+}
+
+/// Read-only operator view: durable sessions, no runtime.
+fn session_list(sandbox: &Sandbox, store: &Path) -> serde_json::Value {
+    let store = store.to_string_lossy().into_owned();
+    let run = sandbox.run(&["sessions", "list", "--data-dir", store.as_str(), "--json"]);
+    assert_eq!(run.code(), 0, "session list failed: {}", run.stderr);
+    serde_json::from_str(&run.stdout).expect("session list prints JSON")
+}
+
+/// Read-only recovery view of one session, which is where a claimed success
+/// would have to show up as a receipt.
+fn session_status(sandbox: &Sandbox, store: &Path, session: &str) -> serde_json::Value {
+    let store = store.to_string_lossy().into_owned();
+    let run = sandbox.run(&[
+        "status",
+        "--data-dir",
+        store.as_str(),
+        "--session-id",
+        session,
+        "--json",
+    ]);
+    assert_eq!(run.code(), 0, "status failed: {}", run.stderr);
+    serde_json::from_str(&run.stdout).expect("status prints JSON")
+}
+
+#[test]
+fn i13_a_hard_kill_mid_turn_leaves_one_admitted_input_and_no_claimed_success() {
+    // The kill scenario is repeated only for the known loopback wobble, which is
+    // this sandbox refusing a fresh loopback connection: that is a transport
+    // failure before the turn started, not a result about the kill. Anything else
+    // fails on the first attempt.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match hard_kill_scenario() {
+            Ok(()) => break,
+            Err(stderr) if stderr.contains(LOOPBACK_WOBBLE) && attempt < 4 => {
+                eprintln!("attempt {attempt} hit the known loopback wobble: {stderr}");
+            }
+            Err(stderr) => panic!("the killed run never reached the provider: {stderr}"),
+        }
+    }
+}
+
+/// One kill-then-inspect run in its own sandbox. `Err` carries the child stderr
+/// when the process ended before the provider ever saw it; every durable
+/// invariant is asserted here, where a failure is a real failure.
+#[allow(clippy::too_many_lines)] // One kill-then-inspect sequence; splitting hides the order.
+fn hard_kill_scenario() -> Result<(), String> {
+    let (endpoint, accepted, release, hold) = stalling_endpoint();
+    let sandbox = Sandbox::new();
+    let project = sandbox.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+
+    let mut doomed = std::process::Command::new(cli_binary())
+        .args([
+            "chat",
+            "--headless",
+            "--prompt",
+            "patch the parser",
+            "--json",
+        ])
+        .current_dir(&project)
+        .env("HA_HOME", sandbox.path())
+        .env("HA_PROVIDER_ENDPOINT", &endpoint)
+        .env("HA_PROVIDER_MODEL", "fixture-model")
+        .env("DEEPSEEK_API_KEY", "fixture-secret-value")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the doomed run starts");
+
+    // The turn must be in flight before the kill: the provider only sees the
+    // request after the input was admitted and the writer was taken.
+    let deadline = Instant::now() + Duration::from_mins(1);
+    loop {
+        if accepted.load(Ordering::SeqCst) {
+            break;
+        }
+        if doomed.try_wait().expect("wait on the doomed run").is_some() {
+            let mut stderr = String::new();
+            if let Some(mut pipe) = doomed.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            let _ = release.send(());
+            hold.join().expect("the stalling endpoint ends");
+            return Err(stderr);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the doomed run never reached the provider"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // A hard kill: the process dies with no unwinding, no flush and no graceful
+    // writer shutdown. This is the case a simulated drop cannot prove.
+    doomed.kill().expect("the run is killed");
+    let status = doomed.wait().expect("the killed run is reaped");
+    assert!(!status.success(), "a killed run must not report success");
+    let _ = release.send(());
+    hold.join().expect("the stalling endpoint ends");
+
+    // What a new host finds, read the way an operator reads it: no runtime.
+    let store = only_project_store(&sandbox);
+    let listed = session_list(&sandbox, &store);
+    let sessions = listed["sessions"]
+        .as_array()
+        .expect("sessions is an array")
+        .clone();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "exactly one session is durable: {listed}"
+    );
+    let session_id = sessions[0]["session_id"]
+        .as_str()
+        .expect("a session id")
+        .to_owned();
+    assert_eq!(
+        sessions[0]["input_count"],
+        serde_json::json!(1),
+        "the interrupted input was admitted exactly once: {listed}"
+    );
+    assert_eq!(
+        sessions[0]["next_sequence"],
+        serde_json::json!(2),
+        "the session consumed the sequence, so it cannot admit that input again: {listed}"
+    );
+    let recovered = session_status(&sandbox, &store, &session_id);
+    assert_eq!(
+        recovered["recovery"]["receipt_count"],
+        serde_json::json!(0),
+        "a killed turn claims no success: {recovered}"
+    );
+    assert_eq!(
+        recovered["recovery"]["replayed_through_sequence"],
+        serde_json::json!(1),
+        "replay stops at the admitted input, so nothing was recorded beyond it: {recovered}"
+    );
+    assert_eq!(
+        recovered["latest_snapshot_sequence"],
+        serde_json::Value::Null,
+        "the killed turn left no snapshot: {recovered}"
+    );
+
+    // A new host takes the store over and answers a second request in a new
+    // session. The killed session keeps its single admitted input.
+    let follow_up = follow_up_turn(&sandbox, &project).expect("the new host answers");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&follow_up.stdout).expect("headless output is JSON");
+    let new_session = parsed["session_id"].as_str().expect("a session id");
+    assert_ne!(
+        new_session, session_id,
+        "the follow-up is a new session, not a replay of the killed input"
+    );
+    assert_eq!(
+        parsed["stop"],
+        serde_json::json!("final"),
+        "the new host finishes its own turn: {parsed}"
+    );
+    assert_eq!(
+        parsed["resumed_from"],
+        serde_json::Value::Null,
+        "the follow-up does not claim to have resumed the killed input: {parsed}"
+    );
+    // Positive control for the assertions above: a turn that did answer moves
+    // replay one sequence further, so "replayed through 1" above really means
+    // "nothing beyond the input was recorded".
+    let new_status = session_status(&sandbox, &store, new_session);
+    assert_eq!(
+        new_status["recovery"]["replayed_through_sequence"],
+        serde_json::json!(2),
+        "a completed turn records one more sequence than its input: {new_status}"
+    );
+    assert_eq!(
+        new_status["next_sequence"],
+        serde_json::json!(3),
+        "the completed session advanced past its answer: {new_status}"
+    );
+    let after = session_list(&sandbox, &store);
+    let killed = after["sessions"]
+        .as_array()
+        .expect("sessions is an array")
+        .iter()
+        .find(|entry| entry["session_id"] == serde_json::json!(session_id))
+        .cloned()
+        .expect("the killed session is still listed");
+    assert_eq!(
+        killed["input_count"],
+        serde_json::json!(1),
+        "the follow-up did not admit anything into the killed session: {after}"
+    );
+    let still = session_status(&sandbox, &store, &session_id);
+    assert_eq!(
+        still["recovery"]["receipt_count"],
+        serde_json::json!(0),
+        "the killed turn is still unclaimed after the new host ran: {still}"
+    );
+    Ok(())
+}
+
+/// One successful headless turn with a fresh one-shot fixture, retried only on
+/// the known loopback wobble.
+fn follow_up_turn(sandbox: &Sandbox, project: &Path) -> Result<CliRun, String> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let (endpoint, server) = sse_fixture("handled in a new session");
+        let run = run_headless_raw(
+            sandbox,
+            project,
+            &[
+                "chat",
+                "--headless",
+                "--prompt",
+                "continue after the kill",
+                "--json",
+            ],
+            Some((&endpoint, "fixture-model", "fixture-secret-value")),
+        );
+        let _ = server.join().expect("fixture server finishes");
+        if run.code() == 0 {
+            return Ok(run);
+        }
+        if run.stderr.contains(LOOPBACK_WOBBLE) && attempt < 3 {
+            eprintln!(
+                "attempt {attempt} hit the known loopback wobble: {}",
+                run.stderr
+            );
+            continue;
+        }
+        return Err(run.stderr);
+    }
+}
