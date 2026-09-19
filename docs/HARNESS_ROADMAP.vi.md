@@ -8,6 +8,8 @@
 
 ## 1. Cách dùng và phạm vi dự toán
 
+**Ưu tiên trải nghiệm khởi động:** [track H01–H08](HA_LAUNCH_PLAN.vi.md) xử lý yêu cầu gõ `ha` để mở CLI tương tác, trên binary/CLI hiện tại. Track H độc lập với M0–M12 và có [prompt riêng](HA_LAUNCH_PROMPT.vi.md); không bắt chờ workspace vnext hay toàn roadmap mới. Đây là plan bổ sung, chưa là runtime đã hoàn thành.
+
 Đây là roadmap **thiết kế mới**, không tính phần code cũ đã làm được bao nhiêu, không yêu cầu vá/review các phase cũ. Work items là output tương lai; không đánh dấu hoàn thành chỉ vì implementation cũ có tên tương tự.
 
 Giả định một developer có kinh nghiệm Rust, model qua API, Windows/Linux, một local user và một writable host. Ngày công gồm code + integration tests + docs/handoff, chưa có số liệu velocity thực tế. Các công việc compatibility/live-provider cần re-estimate sau prototype.

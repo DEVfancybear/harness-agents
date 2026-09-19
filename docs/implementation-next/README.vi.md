@@ -6,6 +6,8 @@
 
 ## 1. DeepSeek phải đọc gì và làm đến đâu
 
+**Ngoại lệ cho assignment khởi động `ha`:** khi user giao [HA_LAUNCH H01–H08](../HA_LAUNCH_PLAN.vi.md), dùng [prompt H](../HA_LAUNCH_PROMPT.vi.md) và sửa CLI hiện tại; không áp default `vnext/`/`ha-next` của bộ M. Chỉ feature startup này được override; các assignments M vẫn theo sổ tay bên dưới.
+
 Đây là bộ hướng dẫn coding, tách khỏi runbooks P0–P8 cũ. Mỗi lượt chỉ nhận **một milestone hoặc một work item**; mặc định bắt đầu M0-01, không đọc xong rồi triển khai toàn M0–M12. Bộ này không yêu cầu model nhớ toàn bộ cuộc trò chuyện: quyết định phải nằm trong SPEC/ADR, trạng thái đang làm phải nằm trong handoff.
 
 Thứ tự đọc tối thiểu:
