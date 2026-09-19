@@ -170,7 +170,11 @@ foreach ($requirement in $requiredSelectors) {
 if ((Invoke-GateStep -Name 'unit-interactive' -File 'cargo' -Arguments @('test', '-p', 'harness-cli', '--bin', 'ha', '--locked')) -ne 0) { $failures.Add('unit-interactive') }
 if ((Invoke-GateStep -Name 'acceptance-launch' -File 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', 'interactive_launch', '--locked', '--', '--test-threads=1')) -ne 0) { $failures.Add('acceptance-launch') }
 if ((Invoke-GateStep -Name 'acceptance-session' -File 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', 'interactive_session', '--locked', '--', '--test-threads=1')) -ne 0) { $failures.Add('acceptance-session') }
-if ((Invoke-GateStep -Name 'providers-streaming' -File 'cargo' -Arguments @('test', '-p', 'harness-providers', '--locked')) -ne 0) { $failures.Add('providers-streaming') }
+# Serial like every other suite: the streaming fixture binds a loopback port inside the
+# test process, and this environment refuses the first connection when tests run in
+# parallel (evidence section 14; measured red again in rounds 20 and 21, and 3/3 green
+# with --test-threads=1 on the same binary).
+if ((Invoke-GateStep -Name 'providers-streaming' -File 'cargo' -Arguments @('test', '-p', 'harness-providers', '--locked', '--', '--test-threads=1')) -ne 0) { $failures.Add('providers-streaming') }
 
 foreach ($phase in @('phase_p0', 'phase_p1', 'phase_p2', 'phase_p3', 'phase_p4', 'phase_p5', 'phase_p6', 'phase_p7')) {
     if ((Invoke-GateStep -Name "regression-$phase" -File 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $phase, '--locked', '--', '--test-threads=1')) -ne 0) { $failures.Add("regression-$phase") }
