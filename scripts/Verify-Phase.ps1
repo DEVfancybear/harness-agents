@@ -289,16 +289,18 @@ $phaseTestFile = "phase_$($Phase.ToLowerInvariant())"
 $results = [System.Collections.Generic.List[object]]::new()
 Push-Location -LiteralPath $repoRoot
 try {
-    # This step intentionally keeps cargo's default parallelism. It was briefly
-    # changed to `--test-threads=1` while diagnosing a CI failure; that was the
-    # wrong lever. The real defect was a server-readiness race in the phase_p2
-    # loopback fixture, which failed under the load of a full workspace run but
-    # passed when its binary ran alone, and which serial execution only hid most
-    # of the time. The fixture now waits for its accept loop and tolerates a
-    # readiness probe. Measured with that fix: repeated full workspace runs are
-    # green in parallel, and parallel takes about half the time of serial
-    # (82 s against 166 s). Re-add the flag only with a measurement showing
-    # parallelism itself is what breaks.
+    # This step keeps cargo's default parallelism. It was changed to fully
+    # serialised (`--jobs 1` plus `--test-threads=1`) while investigating CI
+    # failures, and that was reverted on measurement, not on preference:
+    #   - serialised: green in 3 of 3 direct runs, but it pushed this gate to
+    #     862 s, past the 10-minute job timeout CI gives P0, and the gate still
+    #     went red once on the same revision while the identical cargo command run
+    #     by hand passed;
+    #   - parallel: the failing suites bind a loopback fixture and are green
+    #     whenever their own binary runs alone, so the instability is in this
+    #     machine's handling of many concurrent loopback connections.
+    # Serialising therefore bought no guarantee for a large time cost. Do not add
+    # either flag without a measurement showing parallelism itself is the cause.
     foreach ($step in @(
         @{ Name = 'format'; File = 'cargo'; Arguments = @('fmt', '--all', '--', '--check') },
         @{ Name = 'clippy'; File = 'cargo'; Arguments = @('clippy', '--workspace', '--all-targets', '--locked', '--', '-D', 'warnings') },
