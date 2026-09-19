@@ -146,7 +146,7 @@ Không checkpoint nào được nhận "done" khi prerequisite chưa đạt.
 | H01 | Entry point, dispatch, TTY detector, parser compat | — | dispatch + guard + parser xong; UI thật chờ H03 |
 | H02 | Launch context, paths/HA_HOME, config/setup state | H01 | context + paths + setup state xong bằng unit test; UI thật chờ H03 |
 | H03 | Terminal app, controller/renderer, input loop | H02 | controller/renderer/editor/terminal + fixture route xong bằng test; PTY thật thuộc H07 |
-| H04 | G1 provider incremental, G2 tool continuation, G3 durable session | H03 + khảo sát G1–G3 | **đang làm**: khảo sát G1–G3 xong, G1 xong (additive, có test barrier); G2/G3 + service thật còn lại |
+| H04 | G1 provider incremental, G2 tool continuation, G3 durable session | H03 + khảo sát G1–G3 | **đang làm**: khảo sát xong, G1 xong, G2 xong (TurnDriver bounded có test); G3 + service thật + headless còn lại |
 | H05 | Approval, resume, lifecycle | H04 | chờ H04 pass |
 | H06 | Installer, User PATH scope, install manifest | H01–H03 | logic + test disposable; **không** ghi User PATH thật |
 | H07 | Gate `Verify-HaLaunch.ps1`, PTY fixture, acceptance I01–I18 | H01–H06 | chờ |
@@ -248,3 +248,23 @@ tiếp nhận không phải hỏi lại hội thoại.
 hiện có), G3 (lifecycle session/resume trong service), nối `interactive/service.rs`
 thật thay `PendingService`, và `ha chat --headless` chạy turn thật. Live smoke ghi
 `not_run` vì chưa được cấp credential/budget.
+
+**Quyết định G2 (đã hoàn tất trong checkpoint này)**:
+
+- Runtime có thêm `run_streaming` (đẩy event qua `ProviderEventSink`) và `continue_run`
+  (tiếp tục một input **đã admit**, không admit input thứ hai). `run`/`run_with_cancellation`
+  giữ nguyên chữ ký, chỉ chuyển sang `run_inner` với cờ `admit_input`.
+- `stream_events` trở thành phương thức **có default** của `ModelProvider`: mặc định bridge
+  từ kết quả buffered (giữ compat cho implementor cũ), `MockProvider` và `DeepSeekAdapter`
+  override để phát từng event. Nhờ vậy runtime stream được qua `dyn ModelProvider`.
+- `TurnDriver` (trong `harness-tools`, giữ đúng chiều phụ thuộc tools→runtime/providers)
+  chạy vòng **bounded** model→tool→model: một admission cho user message, mỗi tool call đi
+  qua gate `prepare/approve/execute` hiện có, kết quả tool (hoặc lỗi tool) được đưa lại
+  model dưới dạng `ProviderMessage` role `Tool`, và bound là `max_steps`/`max_tool_calls`/
+  `deadline` với lý do dừng được báo tường minh (`TurnStop`).
+- Tiến trình được báo qua `TurnObserver` (TextDelta/ToolStarted/ToolSettled/StepStarted)
+  để tầng service map sang `SessionEvent`; driver **không** biết gì về UI.
+- Quyết định provider resolution (cho bước nối service ở phần còn lại của H04): endpoint
+  và model lấy từ `HA_PROVIDER_ENDPOINT`/`HA_PROVIDER_MODEL`, credential từ
+  `DEEPSEEK_API_KEY` hoặc `HA_API_KEY`. **Không** đoán URL mặc định; thiếu cấu hình thì
+  báo lỗi actionable, không fallback mock.

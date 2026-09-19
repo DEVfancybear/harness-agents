@@ -1,6 +1,6 @@
 # Evidence HA_LAUNCH — track H01–H08
 
-Trạng thái: **H01–H03 xong; H04 đang làm (G1 xong, G2/G3 chưa); H05–H08 chưa bắt đầu.** Tài liệu này được cập
+Trạng thái: **H01–H03 xong; H04 đang làm (G1 và G2 xong, G3 + service thật chưa); H05–H08 chưa bắt đầu.** Tài liệu này được cập
 nhật lại sau mỗi checkpoint; trạng thái ở đây là trạng thái thật tại thời điểm ghi,
 không phải trạng thái dự kiến.
 
@@ -202,15 +202,16 @@ Chưa xác minh (không được coi là đạt):
 - **Multiline editing**: chưa có; paste nhiều dòng bị đổi newline thành space.
 - **Linux**: chưa build/chạy.
 
-## 5. H04 — tiến độ từng phần (G1 xong, G2/G3 còn lại)
+## 5. H04 — tiến độ từng phần (G1 và G2 xong, G3 còn lại)
 
 H04 **chưa** hoàn tất. Ghi lại đúng phần đã xác minh để không bị đọc thành đã xong.
+
+### 5.1. G1 — provider stream tăng dần
 
 | Kiểm chứng G1 | Lệnh | Kết quả |
 |---|---|---|
 | Unit/integration của provider | `cargo test -p harness-providers` | 3 passed, 0 failed |
 | Regression P2 (provider cũ) | `cargo test -p harness-cli --test phase_p2 --locked -- --test-threads=1` | 17 passed, 0 failed |
-| Lint toàn workspace | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
 
 Selector G1: `g1_mock_stream_matches_the_buffered_boundary_event_for_event`,
 `g1_cancellation_before_dispatch_reports_a_canceled_call`,
@@ -218,18 +219,40 @@ Selector G1: `g1_mock_stream_matches_the_buffered_boundary_event_for_event`,
 
 Đã chứng minh:
 
-- **Boundary tăng dần là additive**: `StreamingModelProvider` + `ProviderEventStream` nằm
-  cạnh `ModelProvider` cũ; test so từng event giữa hai boundary và khẳng định P2 không
-  đổi (17/17 regression xanh).
+- **Boundary tăng dần là additive**: `stream_events` là phương thức có default trên
+  `ModelProvider` (mặc định bridge từ kết quả buffered), `MockProvider` và
+  `DeepSeekAdapter` override; P2 regression 17/17 xanh nên call site cũ không đổi.
 - **I10 (lõi)**: qua `DeepSeekAdapter` thật với fixture HTTP giữ body mở, client nhận
-  `TextDelta` **trước khi** server gửi phần còn lại. Đây là bằng chứng "text hiện trước
-  complete", không phải animation sau khi response xong.
-- **Cancellation**: hủy trước dispatch trả lỗi typed `provider_canceled`, không trả
-  stream rỗng giả thành công.
+  `TextDelta` **trước khi** server gửi phần còn lại.
+- **Cancellation**: hủy trước dispatch trả lỗi typed `provider_canceled`.
 
-Chưa chứng minh (thuộc phần còn lại của H04): vòng lặp model→tool→model (G2), lifecycle
-resume/canceled (G3), service thật thay `PendingService`, headless turn thật, và
-I11/I12 end-to-end. Live provider smoke: **not_run** (không có credential/budget được cấp).
+### 5.2. G2 — vòng lặp model→tool→model có bound
+
+| Kiểm chứng G2 | Lệnh | Kết quả |
+|---|---|---|
+| Acceptance turn loop | `cargo test -p harness-cli --test interactive_session --locked` | 3 passed, 0 failed |
+| Regression toàn CLI (serial) | `cargo test -p harness-cli --tests --locked -- --test-threads=1` | 205 passed, 0 failed |
+| Lint toàn workspace | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+
+Selector G2: `g2_tool_results_return_to_the_model_and_the_turn_ends_with_the_answer`,
+`g2_a_failed_tool_call_is_reported_instead_of_ending_the_turn`,
+`g2_the_tool_loop_is_bounded_and_reports_which_bound_stopped_it`.
+
+Đã chứng minh, trên store thật + workspace thật + tool gate thật (không mock gate):
+
+- **Tool result quay lại model**: provider call thứ hai nhận `ProviderMessage` role
+  `Tool` chứa kết quả `search_text`, và lượt đó kết thúc bằng câu trả lời cuối
+  (`TurnStop::Final`).
+- **Fail→fix**: tool call sai tên được báo lại cho model dưới dạng message lỗi và vòng
+  lặp **tiếp tục** (2 provider call), không kết thúc turn — đây là hành vi mà I11 cần.
+- **Bound**: provider luôn đòi thêm tool call thì vòng lặp dừng ở `TurnStop::StepLimit`
+  với `max_steps=2` và số provider call không vượt bound.
+- **Một admission cho mỗi user message**: `continue_run` không admit input mới; runtime
+  kiểm tra rằng input identity được giữ nguyên.
+
+Chưa chứng minh (thuộc phần còn lại của H04): lifecycle resume/canceled (G3), service
+thật thay `PendingService`, headless turn thật, và I12. Live provider smoke:
+**not_run** (không có credential/budget được cấp).
 
 ## 6. Chưa xác minh (không được coi là đạt)
 

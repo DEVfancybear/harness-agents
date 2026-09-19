@@ -10,9 +10,9 @@ Tài liệu này là điểm vào cho lượt coding tiếp theo. Cập nhật s
 - **H03 xong phần code**: terminal app thật với `crossterm = "=0.29.0"` — controller
   state machine tách renderer, editor Unicode/history/paste, Ctrl-C/Ctrl-D, raw mode
   có RAII guard, fallback line mode, fixture opt-in có nhãn.
-- **H04 đang làm**: khảo sát G1–G3 đã ghi vào SPEC, **G1 xong** (boundary stream tăng
-  dần additive + test barrier chứng minh text hiện trước complete). G2/G3, service thật
-  và headless turn còn lại.
+- **H04 đang làm**: khảo sát G1–G3 xong, **G1 xong** (stream tăng dần + test barrier),
+  **G2 xong** (TurnDriver bounded model→tool→model, tool result quay lại model, fail→fix,
+  bound báo lý do dừng). Còn lại: G3, service thật thay `PendingService`, headless turn.
 - **H05–H08 chưa bắt đầu.**
 - **Chưa có gì được chứng minh trên terminal thật/PTY**: I01/I06/I07/I08 transcript
   thuộc H07. Hiện tại UI mới được chứng minh qua scripted backend + unit test.
@@ -43,8 +43,11 @@ local, process con trong thư mục tạm, cài vào `-Destination` tạm, commi
 2. ~~G1 stream tăng dần~~ **đã xong**: `crates/harness-providers/src/streaming.rs`
    (`StreamingModelProvider`, `ProviderEventStream`, `collect_events`) + test barrier.
    Khi nối runtime, dùng boundary này thay vì đọc `Vec` rồi chia nhỏ.
-3. **G2**: `TurnDriver` bounded model→tool→model, dùng policy/approval/receipt gate có
-   sẵn; I11 với temp repo thật (tool fail→fix→pass), một admission mỗi message.
+3. ~~G2~~ **đã xong**: `harness-tools/src/turn_driver.rs` (`TurnDriver`, `TurnLimits`,
+   `TurnObserver`, `TurnStop`) + runtime `run_streaming`/`continue_run`; test ở
+   `crates/harness-cli/tests/interactive_session.rs` (3 ca). Khi nối service, map
+   `TurnProgress` → `SessionEvent` và truyền `ApprovalMode::None` cho đường tương tác
+   (approval thật là H05).
 4. **G3**: nối store/session theo project, resume/replay đúng task; I12 (approval
    grant/deny/expiry + auth failure không fallback mock, không lộ key).
 5. **Nối `interactive/service.rs`** thật thay `PendingService` (giữ nguyên port và
