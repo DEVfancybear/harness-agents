@@ -447,6 +447,16 @@ slash command, approval y/n, yêu cầu cấu hình provider, và danh sách "ch
   ("this installer only removes files it recorded").
 - `-FromBundle` với `-UseCargoInstall` bị từ chối vì xung đột ý định.
 
+**Đường máy sạch (round 17, vẫn chỉ là mô phỏng — không có VM thật)**: `Install-Ha.ps1 -SelfTest`
+chạy **artifact đã cài** trong một môi trường **dựng lại** bằng `ProcessStartInfo`: PATH chỉ gồm
+thư mục cài + `System32` + `SystemRoot`, đã xoá `CARGO_HOME`/`CARGO_TARGET_DIR`/`RUSTUP_HOME`/
+`RUSTC`/`RUSTFLAGS`/`GIT_*`/`NODE_PATH`/`npm_config_prefix` và mọi biến credential, còn
+`HOME`/`USERPROFILE`/`APPDATA`/`LOCALAPPDATA`/`HA_HOME` trỏ vào thư mục tạm. Ba check bắt buộc:
+`--version` (exit 0, đúng định dạng, và PATH dựng lại không chứa toolchain), `chat --help` (có
+`--headless`/`--resume`/`--fixture`), và bare `ha` không terminal (exit **2** kèm hướng dẫn).
+Self test nay có **22** check. Điều này chứng minh artifact không cần toolchain/config/credential;
+nó **không** chứng minh một máy sạch thật, nên I19 vẫn ở mức "một phần".
+
 **Phát hiện về approval ở headless (quan trọng)**:
 
 `ToolPolicy` của P3 ghi rõ: *"It always requires an explicit approval for an action that

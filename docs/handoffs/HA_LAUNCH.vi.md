@@ -23,7 +23,7 @@ Tài liệu này là điểm vào cho lượt coding tiếp theo. Cập nhật s
   quản trong session mới. Còn lại: kill đúng lúc *sau khi tool receipt đã commit* — vẫn mô phỏng.
 - **H06 xong phần code**: installer dùng artifact Cargo báo + digest + manifest, thay thế có
   staging/rollback, phân loại lỗi khóa file, User PATH merge tách biệt có test, cảnh báo
-  shadowing; `-SelfTest` 14 check xanh. **Không** ghi User PATH thật và không cài vào vị
+  shadowing; `-SelfTest` 22 check xanh. **Không** ghi User PATH thật và không cài vào vị
   trí thật của user (không được cấp quyền).
 - **H07 xong phần gate + docs**: `scripts/Verify-HaLaunch.ps1` chạy xanh toàn bộ
   (format, clippy `-D warnings`, discovery selector bắt buộc, unit + acceptance + regression

@@ -708,6 +708,61 @@ function Add-SelfTestResult {
     }
 }
 
+# A reconstructed environment for the clean-machine claim: only the install
+# directory and System32 are on PATH, no Rust/Git/Node toolchain is visible, and
+# every user location points into a disposable directory.
+# ---------------------------------------------------------------------------
+
+function New-MinimalToolchainEnvironment {
+    param([string] $InstallRoot, [string] $ProbeHome)
+    $systemRoot = [string] $env:SystemRoot
+    if ([string]::IsNullOrWhiteSpace($systemRoot)) { $systemRoot = 'C:\Windows' }
+    $entries = @($InstallRoot, (Join-Path $systemRoot 'System32'), $systemRoot)
+    [pscustomobject]@{
+        Path         = ($entries -join [System.IO.Path]::PathSeparator)
+        Home         = $ProbeHome
+        UserProfile  = $ProbeHome
+        AppData      = Join-Path $ProbeHome 'AppData/Roaming'
+        LocalAppData = Join-Path $ProbeHome 'AppData/Local'
+        HaHome       = Join-Path $ProbeHome 'home'
+    }
+}
+
+function Invoke-MinimalEnvironmentProbe {
+    param([string] $Executable, [string] $InstallRoot, [string] $ProbeHome, [string[]] $Arguments)
+    $environment = New-MinimalToolchainEnvironment -InstallRoot $InstallRoot -ProbeHome $ProbeHome
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Executable
+    foreach ($argument in $Arguments) { [void] $startInfo.ArgumentList.Add($argument) }
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.WorkingDirectory = $ProbeHome
+    # A clean logon carries no build toolchain: remove every trace before PATH is
+    # overridden, so this check cannot pass because the sandbox leaked one.
+    $toolchain = @('CARGO_HOME', 'CARGO_TARGET_DIR', 'RUSTUP_HOME', 'RUSTC', 'RUSTFLAGS',
+        'GIT_DIR', 'GIT_EXEC_PATH', 'GIT_CONFIG_GLOBAL', 'NODE_PATH', 'npm_config_prefix', 'NPM_CONFIG_PREFIX')
+    foreach ($name in $toolchain) { [void] $startInfo.EnvironmentVariables.Remove($name) }
+    $credentials = @('DEEPSEEK_API_KEY', 'HA_API_KEY', 'HA_PROVIDER_ENDPOINT', 'HA_PROVIDER_MODEL')
+    foreach ($name in $credentials) { [void] $startInfo.EnvironmentVariables.Remove($name) }
+    $startInfo.EnvironmentVariables['PATH'] = $environment.Path
+    $startInfo.EnvironmentVariables['HOME'] = $environment.Home
+    $startInfo.EnvironmentVariables['USERPROFILE'] = $environment.UserProfile
+    $startInfo.EnvironmentVariables['APPDATA'] = $environment.AppData
+    $startInfo.EnvironmentVariables['LOCALAPPDATA'] = $environment.LocalAppData
+    $startInfo.EnvironmentVariables['HA_HOME'] = $environment.HaHome
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    [pscustomobject]@{
+        ExitCode = $process.ExitCode
+        Stdout   = [string] $stdout.Result
+        Stderr   = [string] $stderr.Result
+        Path     = $environment.Path
+    }
+}
+
 function Invoke-SelfTest {
     $separator = [System.IO.Path]::PathSeparator
     $realUserPath = [string] [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -803,6 +858,21 @@ function Invoke-SelfTest {
             Write-InstallManifest @manifestArguments
             $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
             Add-SelfTestResult 'install_manifest_records_version_and_digest' (($manifest.version -eq $installedVersion.Trim()) -and ($manifest.sha256 -eq $installedDigest) -and ($manifest.owned_files.Count -eq 2)) "manifest $($manifest | ConvertTo-Json -Compress)"
+
+            # The clean-machine claim: the installed artifact must work with no
+            # build toolchain, no user configuration and no credential.
+            $probeHome = Join-Path $installRoot 'probe-home'
+            New-Item -ItemType Directory -Path $probeHome -Force | Out-Null
+            $versionProbe = Invoke-MinimalEnvironmentProbe -Executable $target -InstallRoot $installRoot -ProbeHome $probeHome -Arguments @('--version')
+            $toolchainFree = -not ($versionProbe.Path -match '(?i)cargo|rustup|node|git')
+            Add-SelfTestResult 'installed_binary_reports_its_version_without_a_toolchain' (($versionProbe.ExitCode -eq 0) -and ($versionProbe.Stdout -match '^ha \d+\.\d+\.\d+') -and $toolchainFree) "exit $($versionProbe.ExitCode); PATH $($versionProbe.Path); out $($versionProbe.Stdout.Trim())"
+
+            # The launch flags are documented where the operator looks for them.
+            $helpProbe = Invoke-MinimalEnvironmentProbe -Executable $target -InstallRoot $installRoot -ProbeHome $probeHome -Arguments @('chat', '--help')
+            Add-SelfTestResult 'installed_binary_help_lists_the_launch_contract' (($helpProbe.ExitCode -eq 0) -and ($helpProbe.Stdout.Contains('--headless')) -and ($helpProbe.Stdout.Contains('--resume')) -and ($helpProbe.Stdout.Contains('--fixture'))) "exit $($helpProbe.ExitCode); out $($helpProbe.Stdout.Length) bytes"
+
+            $guardProbe = Invoke-MinimalEnvironmentProbe -Executable $target -InstallRoot $installRoot -ProbeHome $probeHome -Arguments @()
+            Add-SelfTestResult 'installed_binary_guards_a_non_terminal_launch' (($guardProbe.ExitCode -eq 2) -and ($guardProbe.Stderr.Contains('ha chat --headless --prompt'))) "exit $($guardProbe.ExitCode); err $($guardProbe.Stderr.Trim())"
 
             $second = Install-VerifiedBinary -SourceBinary $artifact -TargetBinary $target
             Add-SelfTestResult 'update_keeps_the_binary_usable' ($second.Ok -and (Test-Path -LiteralPath $target -PathType Leaf)) "$($second.Kind): $($second.Detail)"

@@ -768,7 +768,7 @@ sạch thật) ở mức một phần; I04/I09 đóng ở mục 15.1, I13 đóng
 | I06 | PTY `i06_pty_keeps_vietnamese_input_and_paste_intact` + `h03_editor_edits_vietnamese_text_by_character`, `h03_keys_are_mapped_from_real_crossterm_events` | đạt (console thật) |
 | I07 | PTY `i07a_ctrl_c_clears_an_idle_prompt`, `i07b_ctrl_c_cancels_a_running_turn` + `h03_ctrl_c_cancels_a_run_and_clears_an_idle_prompt` | đạt (console thật) |
 | I08 | PTY `i08_a_backend_fault_after_init_restores_the_terminal_and_is_not_swallowed` + ba unit test `h07_i08_*` (mục 12.3) | đạt |
-| I09 | `i09_a_corrupt_configuration_stops_the_run_with_an_actionable_error`, `i09_an_invalid_project_directory_stops_the_run_with_an_actionable_error`, `i09_a_data_root_that_cannot_be_created_names_the_path_and_writes_nothing` (round 15: data root không dùng được → exit ≠ 0, stderr nêu **đường dẫn**, giữ mã `storage_open_failed`, không tạo state), `h02_corrupt_configuration_is_actionable_and_never_replaced_by_defaults` | đạt |
+| I09 | `i09_a_corrupt_configuration_stops_the_run_with_an_actionable_error`, `i09_an_invalid_project_directory_stops_the_run_with_an_actionable_error`, `i09_a_data_root_that_cannot_be_created_names_the_path_and_writes_nothing` (round 15: data root không dùng được → exit ≠ 0, stderr nêu **đường dẫn**, giữ mã `storage_open_failed`, không tạo state), `i09_a_data_directory_without_write_permission_names_the_path_and_writes_nothing` (round 17: **ACL thật** từ chối quyền ghi của user hiện tại trên data root), `h02_corrupt_configuration_is_actionable_and_never_replaced_by_defaults` | đạt |
 | I10 | `phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` (SSE → sự kiện chuẩn hoá), `h03_text_and_terminal_events_are_rendered_before_the_run_ends` (text hiện trước khi run kết thúc) | đạt |
 | I11 | `g2_tool_results_return_to_the_model_and_the_turn_ends_with_the_answer`, `g2_a_failed_tool_call_is_reported_instead_of_ending_the_turn`, `g2_the_tool_loop_is_bounded_and_reports_which_bound_stopped_it`, `g3_the_foundation_admits_one_input_per_session_and_says_so` | đạt |
 | I12 | `h05_a_denied_gated_action_is_not_executed_and_the_model_is_told`, `h05_a_granted_gated_action_runs_once_after_the_answer`, `h05_an_expired_approval_is_a_refusal_not_a_silent_grant`, `i12_headless_turn_without_provider_configuration_fails_closed` | đạt |
@@ -778,7 +778,7 @@ sạch thật) ở mức một phần; I04/I09 đóng ở mục 15.1, I13 đóng
 | I16 | `i16_a_second_run_in_the_same_project_is_refused_while_the_first_holds_the_store`, `h02_two_terminals_in_one_project_share_a_store_and_the_second_is_busy` | đạt |
 | I17 | `Install-Ha.ps1 -SelfTest`: `shadowing_command_is_found_before_the_owned_binary`, `shadowing_command_is_never_deleted` | đạt |
 | I18 | `Install-Ha.ps1 -SelfTest`: `update_keeps_the_binary_usable`, `locked_executable_is_reported_as_in_use`, `a_failed_replacement_leaves_the_previous_binary_usable`; `New-HaRelease.ps1 -SelfTest`: `bundle_manifest_digest_mismatch`, `bundle_must_not_claim_publication`, `unexpected_file_was_not_rejected` | đạt |
-| I19 | `Install-Ha.ps1 -FromBundle` + `bundle_install_uses_the_verified_executable`, `a_tampered_bundle_is_refused`; bundle `ha-0.1.0-windows-x64` kèm `checksums.txt` | **một phần**: PATH tối giản disposable, **không** có VM sạch thật |
+| I19 | `Install-Ha.ps1 -FromBundle` + `bundle_install_uses_the_verified_executable`, `a_tampered_bundle_is_refused`; bundle `ha-0.1.0-windows-x64` kèm `checksums.txt` | **một phần**: round 17 thêm ba check chạy **artifact đã cài** trong môi trường tái tạo (`installed_binary_reports_its_version_without_a_toolchain`, `installed_binary_help_lists_the_launch_contract`, `installed_binary_guards_a_non_terminal_launch`: PATH chỉ có thư mục cài + System32, đã xoá `CARGO_HOME`/`RUSTUP_HOME`/`GIT_*`/`NODE_*`, HOME/APPDATA/HA_HOME trỏ vào thư mục tạm); **không** có VM sạch thật |
 | I20 | `uninstall_removes_only_owned_files`, `uninstall_keeps_user_data`, rồi cài lại từ bundle | đạt (disposable) |
 
 ### 15.1. Hai mục "một phần" được đóng ở round 15 (I04, I09)
@@ -814,7 +814,7 @@ khẳng định `git_root` là `None` khi project không có Git, và header ren
 "not a Git repository, Git features unavailable").
 
 Kết quả: `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` →
-**17 passed, 0 failed**.
+**18 passed, 0 failed** (17 ở round 15, thêm ca ACL ở round 17 — xem mục 15.3).
 
 ### 15.2. Kill đúng lúc tool receipt đã commit, trên process thật (round 16)
 
@@ -835,6 +835,33 @@ Kết quả: `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -Filter i
 `1 passed; 0 failed` (1.72 s). Đây là mức "kill process thật sau khi receipt đã commit" chứ
 không phải mô phỏng; ca mô phỏng ở `interactive_session` vẫn giữ như một đối chứng bổ sung cho
 durable state (drop toàn bộ in-memory + writer generation mới).
+
+### 15.3. Round 17: I09 bằng ACL thật, và I19 với môi trường tái tạo
+
+**I09 — permission thật, không chỉ "root không dùng được".**
+`i09_a_data_directory_without_write_permission_names_the_path_and_writes_nothing` tạo data root
+rồi **từ chối quyền ghi của chính user hiện tại bằng ACL** (`icacls <dir> /deny "<user>:(OI)(CI)(W)"`).
+Ca test tự kiểm chứng điều kiện tiên quyết (`fs::create_dir` trong thư mục đó phải **thất bại**),
+nên nó không thể pass giả khi ACL không có tác dụng; sau đó app phải: exit ≠ 0, stdout rỗng,
+stderr nêu `cannot open the project store at` + đường dẫn đã resolve + mã `storage_open_failed`,
+và **không** tạo `projects/` trong root bị từ chối. Guard `DeniedWrite` gỡ ACL khi drop (kể cả
+khi assert panic) và test khẳng định quyền ghi đã trở lại.
+
+**I19 — artifact đã cài trong môi trường tái tạo.** `Install-Ha.ps1 -SelfTest` nay chạy binary
+đã cài bằng một `ProcessStartInfo` với môi trường dựng lại: PATH **chỉ** gồm thư mục cài +
+`System32` + `SystemRoot`, đã xoá `CARGO_HOME`, `CARGO_TARGET_DIR`, `RUSTUP_HOME`, `RUSTC`,
+`RUSTFLAGS`, `GIT_*`, `NODE_PATH`, `npm_config_prefix` cùng mọi biến credential, và
+`HOME`/`USERPROFILE`/`APPDATA`/`LOCALAPPDATA`/`HA_HOME` đều trỏ vào thư mục tạm disposable. Ba
+check mới (tổng self test nay **22** check):
+
+| Check | Kỳ vọng |
+|---|---|
+| `installed_binary_reports_its_version_without_a_toolchain` | `--version` exit 0, in `ha <semver>`, và PATH dựng lại **không** chứa `cargo`/`rustup`/`node`/`git` (điều kiện này nằm trong chính biểu thức pass) |
+| `installed_binary_help_lists_the_launch_contract` | `chat --help` exit 0 và có `--headless`, `--resume`, `--fixture` |
+| `installed_binary_guards_a_non_terminal_launch` | bare `ha` không có terminal: exit **2** và stderr nêu `ha chat --headless --prompt` |
+
+Đây vẫn **không** phải VM sạch: nó chứng minh artifact đã cài chạy được mà không cần toolchain,
+không cần config, không cần credential — nhưng vẫn trên chính máy này, nên I19 giữ mức "một phần".
 
 **Không đạt / not_run (không được tính là đạt)**: live provider smoke (không có credential),
 publish release (không có channel và chưa được xác nhận push tag), build/chạy Linux (chỉ có

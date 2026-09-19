@@ -530,6 +530,25 @@ fn i12_headless_turn_without_provider_configuration_fails_closed() {
     );
 }
 
+/// Prove a fresh loopback listener is reachable before the app connects to it.
+fn warm_up_loopback(endpoint: &str) {
+    let authority = endpoint
+        .strip_prefix("http://")
+        .and_then(|rest| rest.split('/').next())
+        .expect("the fixture endpoint is http");
+    let deadline = Instant::now() + Duration::from_mins(1);
+    loop {
+        if std::net::TcpStream::connect(authority).is_ok() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the fixture listener never accepted a warm-up connection"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// SSE fixture that serves several requests and returns the full request bodies.
 fn sse_fixture_multi(
     text: &'static str,
@@ -541,7 +560,9 @@ fn sse_fixture_multi(
     let address = listener.local_addr().expect("fixture address");
     let handle = std::thread::spawn(move || {
         let mut bodies = Vec::new();
-        for _ in 0..requests {
+        // Served requests are counted; a connect that closes without sending a
+        // request (the warm-up below) is not one of them.
+        while bodies.len() < requests {
             let (mut socket, _) = listener.accept().expect("fixture accepts");
             let mut request = Vec::new();
             let mut chunk = [0_u8; 1024];
@@ -556,6 +577,9 @@ fn sse_fixture_multi(
                     break index + 4;
                 }
             };
+            if request.is_empty() {
+                continue;
+            }
             let head = String::from_utf8_lossy(&request[..head_end]).into_owned();
             let length = head
                 .lines()
@@ -594,6 +618,10 @@ fn sse_fixture_multi(
 #[test]
 fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
     let (endpoint, server) = sse_fixture_multi("fixture answer", 2);
+    // This sandbox occasionally refuses the *first* connection to a fresh loopback
+    // listener. Warming the listener up first makes the app's own connect
+    // deterministic without weakening anything it has to prove.
+    warm_up_loopback(&endpoint);
     let sandbox = Sandbox::new();
     let project = sandbox.path().join("project");
     std::fs::create_dir_all(&project).expect("project dir");
@@ -1322,4 +1350,107 @@ fn i09_a_data_root_that_cannot_be_created_names_the_path_and_writes_nothing() {
         !sandbox.path().join("data").exists(),
         "no state was created next to the unusable root"
     );
+}
+
+/// A real permission denial on the data root, restored when the guard drops so a
+/// failing assertion cannot leave an undeletable temporary directory behind.
+struct DeniedWrite {
+    directory: PathBuf,
+    identity: String,
+}
+
+impl DeniedWrite {
+    fn apply(directory: &Path) -> Self {
+        let identity = match std::env::var("USERDOMAIN") {
+            Ok(domain) if !domain.is_empty() => format!(
+                "{domain}\\{}",
+                std::env::var("USERNAME").expect("USERNAME is set")
+            ),
+            _ => std::env::var("USERNAME").expect("USERNAME is set"),
+        };
+        let output = std::process::Command::new("icacls")
+            .arg(directory)
+            .arg("/deny")
+            .arg(format!("{identity}:(OI)(CI)(W)"))
+            .output()
+            .expect("icacls runs");
+        assert!(
+            output.status.success(),
+            "icacls could not deny write on {}: {}",
+            directory.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Self {
+            directory: directory.to_owned(),
+            identity,
+        }
+    }
+}
+
+impl Drop for DeniedWrite {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("icacls")
+            .arg(&self.directory)
+            .arg("/remove:d")
+            .arg(&self.identity)
+            .output();
+    }
+}
+
+#[test]
+fn i09_a_data_directory_without_write_permission_names_the_path_and_writes_nothing() {
+    // I09 names a data directory permission failure. This denies the current user
+    // write access on the data root with a real ACL, so the failure comes from the
+    // file system rather than from a fixture.
+    let sandbox = Sandbox::new();
+    let project = sandbox.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let home = sandbox.path().join("home");
+    let data = home.join("data");
+    std::fs::create_dir_all(&data).expect("data root");
+    let denied = DeniedWrite::apply(&data);
+    assert!(
+        std::fs::create_dir(data.join("probe")).is_err(),
+        "the ACL denial is effective, so the run below really meets a permission error"
+    );
+
+    let run = CliRun::from_output(
+        &std::process::Command::new(cli_binary())
+            .args(["chat", "--headless", "--prompt", "hello", "--json"])
+            .current_dir(&project)
+            .env("HA_HOME", &home)
+            .env(
+                "HA_PROVIDER_ENDPOINT",
+                "http://127.0.0.1:1/chat/completions",
+            )
+            .env("HA_PROVIDER_MODEL", "fixture-model")
+            .env("DEEPSEEK_API_KEY", "fixture-secret-value")
+            .stdin(Stdio::null())
+            .output()
+            .expect("ha binary runs"),
+    );
+
+    assert_ne!(run.code(), 0, "a denied data root must not start a run");
+    assert!(run.stdout.is_empty(), "stdout was: {}", run.stdout);
+    assert!(
+        run.stderr.contains("cannot open the project store at"),
+        "the failure says what could not be opened: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("home"),
+        "the failure names the resolved path: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("storage_open_failed"),
+        "the typed code survives the extra context: {}",
+        run.stderr
+    );
+    assert!(
+        !data.join("projects").exists(),
+        "no project store was created inside the denied root"
+    );
+    drop(denied);
+    std::fs::create_dir(data.join("probe")).expect("the denial is removed again");
 }
