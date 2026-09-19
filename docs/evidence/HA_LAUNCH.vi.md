@@ -647,7 +647,7 @@ Kill process cứng vẫn **ngoài phạm vi** đúng như plan ghi, và đượ
 | Unit test binary `ha` | `cargo test -p harness-cli --bin ha --locked` | 61 passed, 0 failed (thêm 3 test I08 cho phục hồi mode) |
 | Launch/headless acceptance | `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` | 15 passed, 0 failed, gồm ca kill process thật (mục 10.1) |
 | Session/turn acceptance | `cargo test -p harness-cli --test interactive_session --locked -- --test-threads=1` | 9 passed, 0 failed |
-| PTY trong console thật | `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 420` | `PTY_EXIT: 0`, **6 passed, 0 failed** (12.61 s) cho i01/i06/i07a/i07b/i08/i13 (vòng 13 chỉ có 5 ca đầu) |
+| PTY trong console thật | `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 420` | `PTY_EXIT: 0`, **7 passed, 0 failed** cho i01/i05/i06/i07a/i07b/i08/i13 (vòng 13 có 5 ca, vòng 16 thêm i13, vòng 19 thêm i05) |
 | Regression toàn CLI (serial) | `cargo test -p harness-cli --tests --locked -- --test-threads=1` | **229 passed, 0 failed, 5 ignored** (5 ca PTY; chi tiết `target/cli-tests-round13.txt`) |
 | Providers | `cargo test -p harness-providers --locked` | 3 passed, 0 failed |
 
@@ -774,7 +774,7 @@ sạch thật) ở mức một phần; I04/I09 đóng ở mục 15.1, I13 đóng
 | I04 | `i04_the_binary_installed_under_a_unicode_path_follows_the_caller_directory` (bản cài dưới path có dấu + spaces, hai caller directory không Git → hai store riêng, thư mục cài không thành project), `h02_project_identity_follows_the_caller_directory_with_spaces_and_unicode`, `h02_relative_cwd_resolves_from_the_caller_and_git_root_comes_from_the_project_tree` (Git root theo project tree, no-Git trả `None`) | đạt |
 | I05 | `h02_empty_home_without_credentials_opens_setup_state_and_writes_nothing`, `h04_an_unconfigured_provider_is_reported_and_the_setup_state_is_kept`, header PTY i01 ("setup required") | đạt |
 | I06 | PTY `i06_pty_keeps_vietnamese_input_and_paste_intact` + `h03_editor_edits_vietnamese_text_by_character`, `h03_keys_are_mapped_from_real_crossterm_events` | đạt (console thật) |
-| I07 | PTY `i07a_ctrl_c_clears_an_idle_prompt`, `i07b_ctrl_c_cancels_a_running_turn` + `h03_ctrl_c_cancels_a_run_and_clears_an_idle_prompt` | đạt (console thật) |
+| I07 | PTY `i07a_ctrl_c_clears_an_idle_prompt`, `i07b_ctrl_c_cancels_a_running_turn`, `i05_exit_during_an_active_run_releases_the_store_for_the_next_host` (round 19: `/exit` giữa lúc run đang chạy → cancel, thoát 0, và host kế tiếp mở được writer) + `h03_ctrl_c_cancels_a_run_and_clears_an_idle_prompt` | đạt (console thật) |
 | I08 | PTY `i08_a_backend_fault_after_init_restores_the_terminal_and_is_not_swallowed` + ba unit test `h07_i08_*` (mục 12.3) | đạt |
 | I09 | `i09_a_corrupt_configuration_stops_the_run_with_an_actionable_error`, `i09_an_invalid_project_directory_stops_the_run_with_an_actionable_error`, `i09_a_data_root_that_cannot_be_created_names_the_path_and_writes_nothing` (round 15: data root không dùng được → exit ≠ 0, stderr nêu **đường dẫn**, giữ mã `storage_open_failed`, không tạo state), `i09_a_data_directory_without_write_permission_names_the_path_and_writes_nothing` (round 17: **ACL thật** từ chối quyền ghi của user hiện tại trên data root), `h02_corrupt_configuration_is_actionable_and_never_replaced_by_defaults` | đạt |
 | I10 | `phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` (SSE → sự kiện chuẩn hoá), `h03_text_and_terminal_events_are_rendered_before_the_run_ends` (text hiện trước khi run kết thúc) | đạt |
@@ -873,6 +873,23 @@ Sáu check mới (tổng self test nay **25** check):
 
 Đây vẫn **không** phải VM sạch: nó chứng minh artifact đã cài chạy được mà không cần toolchain,
 không cần config, không cần credential — nhưng vẫn trên chính máy này, nên I19 giữ mức "một phần".
+
+### 15.4. Round 19: `/exit` giữa lúc run đang chạy, end-to-end
+
+H05 mục 3 đòi `/exit` xử lý công việc đang chạy **và** trả lại quyền sở hữu terminal/store.
+Controller đã có test cho phần cancel; round 19 thêm ca PTY
+`i05_exit_during_an_active_run_releases_the_store_for_the_next_host`:
+
+1. app chạy một turn tới provider loopback **accept rồi không trả lời** (turn đang thật sự chạy);
+2. gửi `/exit` — **không** Ctrl-C trước;
+3. transcript có `canceling the active run before exit` và app thoát **0**;
+4. quyền sở hữu store được trả lại: `ha sessions list` đọc được đúng một session, và một
+   **process host mới** (`chat --headless`) mở được writer, chạy turn của nó và trả về đúng
+   response của fixture — tức writer lease đã được nhả chứ không kẹt.
+
+Đây là bằng chứng end-to-end cho vế "restore store ownership" mà trước đó chỉ có ở mức
+controller/unit. Cùng runner chạy **bảy** ca: `PTY_EXIT: 0`, `7 passed; 0 failed` (13.73 s,
+transcript `target/pty-acceptance/pty-all.txt`).
 
 **Không đạt / not_run (không được tính là đạt)**: live provider smoke (không có credential),
 publish release (không có channel và chưa được xác nhận push tag), build/chạy Linux (chỉ có

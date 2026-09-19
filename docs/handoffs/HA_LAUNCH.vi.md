@@ -34,10 +34,10 @@ việc tiếp theo) ở **mục 16 của evidence**: [evidence HA_LAUNCH](../evi
   **not_run**. Operator guide (vi + en) đã có mục 12 với bảng migration cho hành vi
   non-TTY exit 2.
 - **PTY thật (round 13): I01/I06/I07 đã xanh.** Một lần chạy bounded
-  `scripts/Invoke-HaPtyAcceptance.ps1` báo `PTY_EXIT: 0`, `6 passed; 0 failed` trong 12.61 s
-  (i01, i06, i07a, i07b, i08, i13; transcript `target/pty-acceptance/pty-all.txt`). Điều kiện đo được:
+  `scripts/Invoke-HaPtyAcceptance.ps1` báo `PTY_EXIT: 0`, `7 passed; 0 failed` trong 13.73 s
+  (i01, i05, i06, i07a, i07b, i08, i13; transcript `target/pty-acceptance/pty-all.txt`). Điều kiện đo được:
   ConPTY chỉ hoạt động khi process tạo pseudo-console **sở hữu một console**, mà `cargo test`
-  trong sandbox thì không — nên sáu ca vẫn `#[ignore]` và phải chạy bằng runner đó; gate
+  trong sandbox thì không — nên bảy ca vẫn `#[ignore]` và phải chạy bằng runner đó; gate
   liệt kê chúng là `not_run` kèm hướng dẫn, không tính là pass tự động.
 - **H08 xong phần code**: bundle candidate + checksum + manifest (`published:false`), installer
   `-FromBundle` (verify trước khi cài) và `-Uninstall` (chỉ xóa file sở hữu, giữ user data),
@@ -103,8 +103,8 @@ H07 (gate `Verify-HaLaunch.ps1` + PTY harness + I01–I18), H08 (release candida
 - `cargo test -p harness-cli --bin ha` → 61 passed (gồm 3 unit test I08 cho phục hồi mode).
 - `cargo test -p harness-cli --test interactive_launch` → 17 passed (kill process thật, I04, I09).
 - `cargo test -p harness-cli --test interactive_session` → 9 passed.
-- `cargo test -p harness-cli --test interactive_terminal` → 6 ignored (cần console thật; chạy
-  bằng runner, `6 passed`).
+- `cargo test -p harness-cli --test interactive_terminal` → 7 ignored (cần console thật; chạy
+  bằng runner, `7 passed`).
 - `cargo test -p harness-providers` → 3 passed.
 - `cargo test -p harness-cli --tests --locked -- --test-threads=1` → **229 passed, 0 failed,
   5 ignored** (5 ignored là các ca PTY; chi tiết trong `target/cli-tests-round13.txt`).
@@ -112,8 +112,8 @@ H07 (gate `Verify-HaLaunch.ps1` + PTY harness + I01–I18), H08 (release candida
 - `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1` → `"passed": true`, `failures: []`
   (format, clippy, discovery selector, unit + acceptance + P0–P7 serial, installer self test,
   release self test, docs).
-- Sáu ca PTY: `scripts/Invoke-HaPtyAcceptance.ps1` → `PTY_EXIT: 0`, `6 passed; 0 failed`
-  (console thật; `cargo test` trong sandbox vẫn `#[ignore]` sáu ca này).
+- Bảy ca PTY: `scripts/Invoke-HaPtyAcceptance.ps1` → `PTY_EXIT: 0`, `7 passed; 0 failed`
+  (console thật; `cargo test` trong sandbox vẫn `#[ignore]` bảy ca này).
 - Chưa chạy: Linux (chỉ có target `x86_64-pc-windows-msvc`), live provider smoke, publish, VM
   sạch thật, kill đúng lúc receipt vừa commit.
 
@@ -169,6 +169,6 @@ tương ứng trong gate. Bốn ca vẫn `#[ignore]` vì `cargo test` trong sand
 4. **Publish: KHÔNG được cấp quyền.** Bàn giao candidate + checksum, ghi rõ "download route
    chưa public", không tạo URL giả.
 5. **PTY**: đã chạy trên console thật ở round 13 (không phải sandbox):
-   `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1` → `PTY_EXIT: 0`, 6 passed, 0 failed.
+   `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1` → `PTY_EXIT: 0`, 7 passed, 0 failed.
    Kill process thật giữa turn đã có ở dạng test process (round 14, mục 10.1 evidence); ca
    hard-kill đúng lúc receipt vừa commit thì cần đường chạy tool không tương tác.

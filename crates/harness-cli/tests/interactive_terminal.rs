@@ -226,7 +226,7 @@ fn base_env(temp: &tempfile::TempDir) -> Vec<(&'static str, String)> {
     ]
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all six cases i01, i06, i07a, i07b, i08 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all seven cases i01, i05, i06, i07a, i07b, i08 and i13 pass there."]
 #[test]
 fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     let (temp, project) = sandbox();
@@ -259,7 +259,7 @@ fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all six cases i01, i06, i07a, i07b, i08 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all seven cases i01, i05, i06, i07a, i07b, i08 and i13 pass there."]
 #[test]
 fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     let (temp, project) = sandbox();
@@ -320,7 +320,7 @@ fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all six cases i01, i06, i07a, i07b, i08 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all seven cases i01, i05, i06, i07a, i07b, i08 and i13 pass there."]
 #[test]
 fn i07a_ctrl_c_clears_an_idle_prompt() {
     // One pseudo-console per test: opening a second one in the same process blocks
@@ -354,7 +354,7 @@ fn i07a_ctrl_c_clears_an_idle_prompt() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all six cases i01, i06, i07a, i07b, i08 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all seven cases i01, i05, i06, i07a, i07b, i08 and i13 pass there."]
 #[test]
 fn i07b_ctrl_c_cancels_a_running_turn() {
     let (temp, project) = sandbox();
@@ -423,7 +423,7 @@ fn i07b_ctrl_c_cancels_a_running_turn() {
     let _ = hold.join();
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all six cases i01, i06, i07a, i07b, i08 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all seven cases i01, i05, i06, i07a, i07b, i08 and i13 pass there."]
 #[test]
 fn i08_a_backend_fault_after_init_restores_the_terminal_and_is_not_swallowed() {
     // I08: inject a render/backend failure *after* the terminal is initialized and
@@ -513,6 +513,26 @@ fn only_store(temp: &tempfile::TempDir) -> PathBuf {
     stores.pop().expect("one store")
 }
 
+/// Prove a loopback listener is reachable before a fresh process connects to it:
+/// this sandbox occasionally refuses the first connection to a new port.
+fn warm_up_loopback(endpoint: &str) {
+    let authority = endpoint
+        .strip_prefix("http://")
+        .and_then(|rest| rest.split('/').next())
+        .expect("the fixture endpoint is http");
+    let deadline = Instant::now() + Duration::from_mins(1);
+    loop {
+        if std::net::TcpStream::connect(authority).is_ok() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the fixture listener never accepted a warm-up connection"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn read_request(socket: &mut std::net::TcpStream) -> String {
     let mut buffer = vec![0_u8; 8192];
     let read = socket.read(&mut buffer).expect("fixture reads");
@@ -574,13 +594,19 @@ fn patch_then_stall_endpoint(
         continued_flag.store(true, Ordering::SeqCst);
         let _ = held.recv_timeout(Duration::from_mins(2));
         drop(second);
-        // 3. The continuation after the kill gets a prose answer.
-        let (mut third, _) = listener.accept().expect("the continuation arrives");
-        let _ = read_request(&mut third);
-        write_sse(
-            &mut third,
-            "data: {\"choices\":[{\"delta\":{\"content\":\"the parser is already fixed; nothing to redo\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
-        );
+        // 3. The continuation after the kill gets a prose answer. A warm-up connect
+        //    that sends no request is not that call.
+        loop {
+            let (mut third, _) = listener.accept().expect("the continuation arrives");
+            if read_request(&mut third).is_empty() {
+                continue;
+            }
+            write_sse(
+                &mut third,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"the parser is already fixed; nothing to redo\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            );
+            break;
+        }
     });
     (
         format!("http://{address}/chat/completions"),
@@ -591,7 +617,7 @@ fn patch_then_stall_endpoint(
     )
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all six cases i01, i06, i07a, i07b, i08 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all seven cases i01, i05, i06, i07a, i07b, i08 and i13 pass there."]
 #[test]
 #[allow(clippy::too_many_lines)] // One kill-then-resume sequence; splitting it hides the order.
 fn i13_a_settled_tool_receipt_survives_a_hard_kill_mid_turn() {
@@ -681,6 +707,7 @@ fn i13_a_settled_tool_receipt_survives_a_hard_kill_mid_turn() {
     );
 
     // A new process resumes the task. The settled action must not run again.
+    warm_up_loopback(&endpoint);
     let resume = std::process::Command::new(cli_binary())
         .args([
             "chat",
@@ -732,4 +759,142 @@ fn i13_a_settled_tool_receipt_survives_a_hard_kill_mid_turn() {
         serde_json::json!(1),
         "no second receipt was written for the settled action: {still}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// I07 - /exit while a run is still active
+// ---------------------------------------------------------------------------
+
+/// Provider that accepts the request and never answers, with a stop channel so the
+/// test does not wait out the hold.
+fn stalling_provider() -> (
+    String,
+    Arc<AtomicBool>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stalling listener");
+    listener
+        .set_nonblocking(true)
+        .expect("the stalling listener is non-blocking");
+    let address = listener.local_addr().expect("stalling address");
+    let contacted = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&contacted);
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        // A blocking accept() would hang the test whenever the app never reaches
+        // the provider, which is exactly what this case must be able to report.
+        let deadline = Instant::now() + Duration::from_mins(1);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((connection, _)) => {
+                    flag.store(true, Ordering::SeqCst);
+                    let _ = held.recv_timeout(Duration::from_mins(1));
+                    drop(connection);
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    (
+        format!("http://{address}/chat/completions"),
+        contacted,
+        release,
+        handle,
+    )
+}
+
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all seven cases i01, i05, i06, i07a, i07b, i08 and i13 pass there."]
+#[test]
+fn i05_exit_during_an_active_run_releases_the_store_for_the_next_host() {
+    // H05: /exit must handle an active run (cancel, cleanup) and restore terminal
+    // and store ownership. The proof for ownership is that the next host can write.
+    let (temp, project) = sandbox();
+    let (endpoint, contacted, release, server) = stalling_provider();
+    let mut session = PtySession::spawn(&project, &provider_env(&temp, &endpoint));
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+
+    session.send("hold the turn open\r");
+    session.wait_for("[run] accepted", Duration::from_secs(20));
+    let waiting = Instant::now() + Duration::from_secs(30);
+    while !contacted.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < waiting,
+            "the turn never reached the provider:\n{}",
+            session.transcript()
+        );
+        assert!(session.is_alive(), "the app is still running the turn");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // No Ctrl-C first: exit while the run is active.
+    session.send("/exit\r");
+    let status = session.wait_exit(Duration::from_secs(40));
+    let transcript = session.transcript();
+    assert_eq!(status, Some(0), "the app exits cleanly:\n{transcript}");
+    assert!(
+        transcript.contains("canceling the active run before exit"),
+        "the exit says it canceled the active run:\n{transcript}"
+    );
+    let _ = release.send(());
+    server.join().expect("the stalling provider ends");
+
+    // Store ownership is restored: a new host can take the writer and write.
+    let store = only_store(&temp);
+    let store = store.to_str().expect("the store path is UTF-8").to_owned();
+    let listed = run_cli_json(
+        &temp,
+        &project,
+        &["sessions", "list", "--data-dir", &store, "--json"],
+    );
+    assert_eq!(
+        listed["sessions"].as_array().expect("an array").len(),
+        1,
+        "the canceled run left one durable session: {listed}"
+    );
+
+    let (answer_endpoint, answer_server) = sse_answer("the store is free again");
+    let follow_up = std::process::Command::new(cli_binary())
+        .args(["chat", "--headless", "--prompt", "after the exit", "--json"])
+        .current_dir(&project)
+        .env("HA_HOME", ha_home(&temp))
+        .env("HA_PROVIDER_ENDPOINT", &answer_endpoint)
+        .env("HA_PROVIDER_MODEL", "fixture-model")
+        .env("DEEPSEEK_API_KEY", "fixture-secret-value")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the next host runs");
+    answer_server.join().expect("the answer fixture finishes");
+    assert!(
+        follow_up.status.success(),
+        "the next host took the store: {}",
+        String::from_utf8_lossy(&follow_up.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&follow_up.stdout).expect("the next host prints JSON");
+    assert_eq!(
+        parsed["response"],
+        serde_json::json!("the store is free again"),
+        "the next host completed its own turn: {parsed}"
+    );
+}
+
+/// One-shot SSE provider that answers one request with plain text.
+fn sse_answer(text: &str) -> (String, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("answer listener");
+    let address = listener.local_addr().expect("answer address");
+    let text = text.to_owned();
+    let handle = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("the answer call arrives");
+        let _ = read_request(&mut socket);
+        let body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+        );
+        write_sse(&mut socket, &body);
+    });
+    (format!("http://{address}/chat/completions"), handle)
 }

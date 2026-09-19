@@ -349,6 +349,9 @@ thật thay `PendingService`, và `ha chat --headless` chạy turn thật. Live 
   không bỏ chạy ngầm.
 - Headless: `ha chat --headless --resume <session-id>` tiếp tục task của session đó, JSON có
   `resumed_from`; session lạ trả lỗi và **không** chạy gì.
+- **`/exit` khi run đang chạy (round 19)**: cancel rồi thoát 0, và **store ownership được trả
+  lại** — chứng minh bằng ca PTY `i05_exit_during_an_active_run_releases_the_store_for_the_next_host`:
+  sau khi thoát, một process host mới mở được writer và chạy turn của nó (mục 15.4 evidence).
 
 **H05 nay đã đo cả hai nhánh kill (cập nhật round 16)**:
 
