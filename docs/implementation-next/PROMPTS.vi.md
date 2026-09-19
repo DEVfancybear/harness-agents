@@ -8,11 +8,12 @@
 Hãy triển khai M0-01 của kế hoạch mới Harness Agents, chưa làm work item khác.
 Đọc quy định repo áp dụng, docs/implementation-next/README.vi.md,
 CONTRACTS.vi.md và M0.vi.md trong cùng thư mục. Mục tiêu/kiến trúc ở
-docs/HARNESS_MASTER_PLAN.vi.md; roadmap cũ P0–P8 không là acceptance mới.
-Default code mới trong vnext/ với Cargo workspace riêng, không xóa hay rewrite
-code/data cũ. Nếu môi trường có implementation mới rồi, kiểm tra đúng contract
-và tiếp tục phần còn thiếu, không scaffold đè.
-Viết SPEC ngắn rồi implement identities/state transitions/errors và tests của
+docs/HARNESS_MASTER_PLAN.vi.md và INTEGRATION_MAP.vi.md.
+Dùng source hiện tại, root Cargo workspace và binary ha duy nhất cho mọi M/H.
+Đối chiếu source/tests/evidence P/H với contracts M; lập gap inventory theo từng
+requirement: reuse_verified/adapt/missing/incompatible. Ghi symbol/callers/tests,
+chỉ sửa hoặc bổ sung phần thiếu và nối vào luồng ha hiện có; không scaffold lại.
+Viết SPEC ngắn rồi bổ sung/refactor identities/state transitions/errors và tests của
 M0-01. Tự quyết các chi tiết thường lệ theo defaults; ghi khác biệt vào SPEC.
 Không nhận task completed chỉ vì run completed, không tạo production stub-success.
 Chạy tests thực sự, báo test count và source revision/digest; nếu chưa có full
@@ -33,8 +34,9 @@ acceptance cases được dẫn và evidence/handoff của dependency closure.
 Verify prerequisites theo source/test thật; nếu thiếu prerequisite ngoài scope,
 ghi chính xác khoảng trống, không giả lập thành completed để đi tiếp.
 Viết SPEC rồi thực hiện theo work-item order. Dùng actual path map trong SPEC,
-giữ public contracts/authority/durability đã chấp nhận. Không rewrite code cũ
-ngoài vnext/ hoặc mở rộng tính năng chưa giao.
+giữ public contracts/authority/durability đã chấp nhận. Sửa source hiện tại,
+reuse services/tests theo INTEGRATION_MAP; không tạo workspace, CLI hoặc engine
+thứ hai. Không mở rộng tính năng chưa giao hoặc ghi đè thay đổi không liên quan.
 Thêm integration tests chạy component thật và targeted fault injection;
 chỉ mock external model/network boundaries phù hợp. Đừng mock implementation
 đang cần chứng minh. Gate có exact discovery; zero/ignored required tests là fail.
@@ -45,7 +47,7 @@ chạy. Không nhận accepted khi còn required verification thiếu. Dừng tr
 ## 3. Tiếp tục sau khi hết context
 
 ```text
-Tiếp tục assignment đang ghi trong vnext/docs/handoffs/CURRENT.vi.md.
+Tiếp tục assignment đang ghi trong docs/handoffs/CURRENT.vi.md.
 Trước edits, đối chiếu Git status/source revision, SPEC, evidence và runbook.
 Đừng chỉ tin summary; inspect files/symbols/tests của work item đang dở.
 Giữ nguyên decisions đã chốt nếu không có bằng chứng mâu thuẫn. Không lặp paid

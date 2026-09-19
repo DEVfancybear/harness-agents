@@ -2,9 +2,11 @@
 
 **Planning only · 19/09/2026.** [Sổ tay](README.vi.md) · [Contracts](CONTRACTS.vi.md) · [Manifest](manifest.json)
 
+**Cách áp dụng vào source hiện tại:** tên test dự kiến dưới đây là canonical IDs để mapping, không bắt đổi tên hoặc nhân đôi test đã có. Registry ánh xạ A-case tới exact test selectors/assertions hiện tại; chỉ tạo test mới cho coverage còn thiếu. Mỗi case phải chứng minh cùng đường chạy `ha`/services/store theo [bản đồ tích hợp](INTEGRATION_MAP.vi.md), không nghiệm thu implementation song song. Status planned trong tài liệu không reset bằng chứng P/H.
+
 ## 1. Tổ chức fixtures và test oracles
 
-Các tên tests dưới đây là **tên dự kiến**, chưa có test executable. Khi coding, dùng exact names hoặc cập nhật runtime registry và SPEC cùng change. Không nhận docs kiểm tra tên case là runtime acceptance.
+Các tên tests dưới đây là **tên dự kiến**; tài liệu không xác nhận test đó đã tồn tại hay chạy. Khi coding, ưu tiên mapping exact tests hiện có; thêm tên mới cho assertions còn thiếu và cập nhật runtime registry/SPEC cùng change. Không nhận docs kiểm tra tên case là runtime acceptance.
 
 Mỗi case dùng disposable root có ownership marker, isolated data dir, injected deterministic clock/IDs khi cần. Crash test chạy component trong child process: test parent chờ named barrier, hard kill ở boundary cần kiểm tra, reopen ở process mới, assert persisted state và external effects. Simulated exception trong cùng process không thay crash test vì destructors/cleanup có thể che bug.
 

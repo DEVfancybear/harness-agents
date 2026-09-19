@@ -8,7 +8,7 @@
 
 ## 1. Định hướng và những quyết định chính
 
-Xây **coding-agent harness cá nhân bằng Rust**, sử dụng qua CLI trước, có thể tiếp tục công việc qua nhiều phiên, giao việc cho agent con, và mở rộng thành Web/daemon khi cần. Đây là bản thiết kế mới theo mục tiêu sản phẩm; **không lấy code cũ hay phase cũ làm ràng buộc, không phải danh sách vá implementation hiện tại**.
+Xây **coding-agent harness cá nhân bằng Rust**, sử dụng qua CLI trước, có thể tiếp tục công việc qua nhiều phiên, giao việc cho agent con, và mở rộng thành Web/daemon khi cần. Đây là bản thiết kế mới theo mục tiêu sản phẩm; **áp dụng bằng cách nâng cấp source hiện tại, một root Cargo workspace và một CLI `ha`**. Code đã có là nền tảng để reuse/refactor; contracts mới xác định phần còn thiếu cần bổ sung. Không dựng một sản phẩm hoặc agent engine song song.
 
 DeerFlow cung cấp nhiều cơ chế đáng học: một runtime dùng chung cho các giao diện; context/skills nạp có chọn lọc; source history sau compaction; task delegation; sandbox lifecycle; run events; tác vụ dài và lịch chạy. Ta chọn các cơ chế này, thiết kế lại bằng Rust và thu hẹp phạm vi phù hợp sản phẩm cá nhân. [Nguồn D01–D18](research/DEERFLOW_RESEARCH_2026-09-15.md).
 
@@ -129,23 +129,25 @@ flowchart TB
     EVENTS --> WEB
 ```
 
-Đề xuất logical modules; có thể gộp crate ở giai đoạn đầu nếu không mất boundary:
+Các ranh giới dưới đây ánh xạ vào crates/modules hiện tại; xem [bản đồ tích hợp](implementation-next/INTEGRATION_MAP.vi.md). Không tạo crate khác chỉ để khớp tên conceptual trong plan:
 
 | Module | Sở hữu | Không được sở hữu |
 |---|---|---|
-| `harness-contracts` | IDs, messages/events, schemas, error vocabulary | SQL, network, policy business |
-| `harness-core` | Task/run state, invariants, decision/acceptance logic | UI hay concrete DB/provider |
-| `harness-store` | SQLite transactions/migrations, queues, projections, artifact metadata | Tự suy verdict từ chat |
-| `harness-runtime` | Actors, TurnDriver, retries, budgets, cancellation, provider/tool ports | HTTP/UI framework |
-| `harness-context` | Packet compile, history, compaction, contributor admission | Ghi memory/policy ngoài transaction owner |
+| `harness-types` | IDs, messages/events, schemas, error vocabulary | SQL, network, policy business |
+| `harness-types` / `harness-session` | Task/run state, invariants, decision/acceptance logic | UI hay concrete DB/provider |
+| `harness-store-sqlite` | SQLite transactions/migrations, queues, projections, artifact metadata | Tự suy verdict từ chat |
+| `harness-runtime` + `harness-tools::turn_driver` hiện tại | Actors, TurnDriver, retries, budgets, cancellation, provider/tool ports | HTTP/UI framework |
+| `harness-session::context` | Packet compile, history, compaction, contributor admission | Ghi memory/policy ngoài transaction owner |
 | `harness-providers` | Adapter/model capability registry, wire protocol/stream normalization | Quyền chạy tool |
 | `harness-tools` | Tool descriptors, validators, policy gates, results/receipts | Input trực tiếp không qua host |
-| `harness-execution` | Process/filesystem/Git adapters, sandbox lifecycle | Task acceptance từ exit code đơn lẻ |
+| `harness-tools::{process,workspace}` | Process/filesystem/Git adapters, sandbox lifecycle | Task acceptance từ exit code đơn lẻ |
 | `harness-memory` | Assets/retrieval/extraction/provenance/invalidation | Điều phối task qua semantic search |
 | `harness-orchestrator` | DAG, agent scheduling, worktrees, integration | Agent engine khác với runtime |
-| `harness-extensions` | Kernel lifecycle, skills, MCP, process protocol | Tắt durability hoặc final policy gates |
-| `harness-app` | Composition root và application commands/queries | Implementation riêng cho mỗi giao diện |
-| `harness-cli`, `harness-api`, `harness-daemon` | Presentation/transport/process lifecycle | SQL mutation hoặc business loop tự viết lại |
+| `harness-kernel` / `harness-extensions` | Kernel lifecycle, skills, MCP, process protocol | Tắt durability hoặc final policy gates |
+| `harness-cli` composition/services | Composition root và application commands/queries | Implementation riêng cho mỗi giao diện |
+| `harness-cli`; API/daemon modules ở M10/M11 trong root workspace | Presentation/transport/process lifecycle | SQL mutation hoặc business loop tự viết lại |
+
+Backup/restore/retention tiếp tục ở `harness-maintenance`, phối hợp `harness-store-sqlite`; không viết subsystem data lifecycle trùng.
 
 Core dùng ports, implementations được inject tại composition root. Dependency tests cấm core/runtime import CLI/API. Không tạo vòng runtime ↔ tools; interface thuộc tầng thấp hơn. Không dùng Rust dynamic-library ABI làm plugin protocol v1. DeerFlow cũng tách harness/app/extension API; đây là pattern nên học. [D01, D19](research/DEERFLOW_RESEARCH_2026-09-15.md).
 
@@ -396,8 +398,8 @@ Không có review tĩnh nào chứng minh “không còn mọi thiếu sót”. 
 
 ## 19. Quan hệ với tài liệu cũ và cách bắt đầu
 
-Đối với **phát triển tương lai**, dùng master plan này và roadmap mới làm baseline. Các tài liệu P0–P8 và evidence cũ giữ lại như hồ sơ lịch sử; không cần sửa code cũ để phù hợp trước khi chốt thiết kế. Plan mới không tuyên bố migration đã chạy hoặc dữ liệu cũ bị bỏ.
+Đối với **phát triển tương lai**, dùng master plan/roadmap làm requirements để nâng cấp code đang chạy. Kiểm tra source, tests và evidence P/H ở revision hiện tại; phân loại reuse_verified/adapt/missing/incompatible và chỉ thực hiện gap. Không reset trạng thái các phase, bỏ regressions, đổi data home hoặc dựng runtime mới để tránh tích hợp. Mọi schema/config thay đổi phải xử lý compatibility ngay trong milestone sở hữu.
 
-Bước đầu là **M0: chốt contracts và acceptance nền tảng** trong roadmap. Chốt ADR về task/run/step, transaction ownership, execution authority, context provenance, plugin boundary và compatibility. Sau đó làm từng lát cắt đủ chạy/test, không triển khai toàn bộ sơ đồ trong một đợt.
+Bước đầu của track M là **M0: kiểm kê hiện trạng, chốt mapping contracts/acceptance và sửa gap nền tảng**. Track H tiếp tục tại item còn thiếu theo evidence hiện tại, không phải chờ toàn M0–M12. Chốt ADR về task/run/step, transaction ownership, execution authority, context provenance, plugin boundary và compatibility. Sau đó làm từng lát cắt đủ chạy/test, không triển khai toàn bộ sơ đồ trong một đợt.
 
 Mục tiêu đầu tiên: một agent có thể sửa fixture repository, gặp test fail, tự sửa tiếp, trả evidence đúng revision, bị kill/reopen vẫn tiếp tục mà không lặp side effect. Đây là nền tảng để skills, memory, multi-agent, Web và scheduler phát triển ổn định.

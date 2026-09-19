@@ -2,8 +2,8 @@
   "schema_version": 1,
   "status": "planning_only",
   "updated_at": "2026-09-19",
-  "workspace_root": "vnext",
-  "runtime_gate": "vnext/scripts/Verify-Milestone.ps1",
+  "workspace_root": ".",
+  "runtime_gate": "scripts/Verify-Milestone.ps1",
   "milestones": [
     {
       "id": "M0",
@@ -21,7 +21,7 @@
         },
         {
           "id": "M0-03",
-          "title": "Workspace, configuration và CLI skeleton"
+          "title": "Workspace hiện tại, configuration và CLI integration"
         },
         {
           "id": "M0-04",
@@ -769,5 +769,8 @@
       "planned_test_name": "a36_strict_confinement",
       "status": "planned"
     }
-  ]
+  ],
+  "binary": "ha",
+  "integration_mode": "in_place",
+  "integration_map": "INTEGRATION_MAP.vi.md"
 }

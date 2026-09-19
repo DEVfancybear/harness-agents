@@ -19,10 +19,12 @@ function Get-NextPlanErrors {
     param([hashtable] $Plan, [hashtable] $Docs)
     $errors = [System.Collections.Generic.List[string]]::new()
     if ($Plan.schema_version -ne 1 -or $Plan.status -cne 'planning_only' -or
-        $Plan.workspace_root -cne 'vnext' -or $Plan.runtime_gate -cne 'vnext/scripts/Verify-Milestone.ps1') {
+        $Plan.workspace_root -cne '.' -or $Plan.binary -cne 'ha' -or
+        $Plan.integration_mode -cne 'in_place' -or $Plan.integration_map -cne 'INTEGRATION_MAP.vi.md' -or
+        $Plan.runtime_gate -cne 'scripts/Verify-Milestone.ps1') {
         $errors.Add('PLAN_HEADER')
     }
-    $required = @('README.vi.md', 'CONTRACTS.vi.md', 'ACCEPTANCE.vi.md', 'PROMPTS.vi.md', 'TEMPLATES.vi.md') +
+    $required = @('README.vi.md', 'CONTRACTS.vi.md', 'ACCEPTANCE.vi.md', 'PROMPTS.vi.md', 'TEMPLATES.vi.md', 'INTEGRATION_MAP.vi.md') +
         @(0..12 | ForEach-Object { "M$_.vi.md" })
     foreach ($name in $required) {
         if (-not $Docs.ContainsKey($name)) { $errors.Add("MISSING_RUNBOOK:$name") }
@@ -84,6 +86,7 @@ function Get-NextPlanErrors {
 
     foreach ($entry in $Docs.GetEnumerator()) {
         $body = [string]$entry.Value
+        if ($body -match 'vnext[/\\]|ha-next') { $errors.Add("SPLIT_IMPLEMENTATION:$($entry.Key)") }
         if ([string]::IsNullOrWhiteSpace($body) -or $body.Contains([char]0xFFFD)) { $errors.Add("INVALID_DOCUMENT:$($entry.Key)") }
         if ([regex]::Matches($body, '(?m)^```').Count % 2 -ne 0) { $errors.Add("UNCLOSED_FENCE:$($entry.Key)") }
         foreach ($match in [regex]::Matches($body, '\[[^\]\r\n]+\]\(([^)\r\n]+)\)')) {
@@ -106,6 +109,10 @@ if ($problems.Count -gt 0) { $problems | ForEach-Object { Write-Output $_ }; exi
 
 if ($SelfTest) {
     $controls = @(
+        @{ Name = 'second-workspace'; Prefix = 'PLAN_HEADER'; Change = { param($p, $d) $p.workspace_root = 'separate-workspace' } },
+        @{ Name = 'second-cli'; Prefix = 'PLAN_HEADER'; Change = { param($p, $d) $p.binary = 'different-cli' } },
+        @{ Name = 'split-runbook'; Prefix = 'SPLIT_IMPLEMENTATION'; Change = { param($p, $d) $d['M0.vi.md'] += "`nCreate vnext/ with ha-next" } },
+        @{ Name = 'missing-integration-map'; Prefix = 'MISSING_RUNBOOK'; Change = { param($p, $d) $d.Remove('INTEGRATION_MAP.vi.md') } },
         @{ Name = 'missing-runbook'; Prefix = 'MISSING_RUNBOOK'; Change = { param($p, $d) $d.Remove('M4.vi.md') } },
         @{ Name = 'duplicate-work-item'; Prefix = 'WORK_ITEMS'; Change = { param($p, $d) $p.milestones[0].work_items[1].id = 'M0-01' } },
         @{ Name = 'wrong-dependency'; Prefix = 'DEPENDENCIES'; Change = { param($p, $d) $p.milestones[3].dependencies = @('M3') } },
@@ -126,4 +133,4 @@ if ($SelfTest) {
     }
 }
 Write-Output 'NEXT_PLAN_OK: M0-M12; 52 work items; A01-A36; ownership/dependencies/selectors/details/links validated'
-Write-Output 'Scope: planning structure only. No vnext runtime tests were executed or accepted.'
+Write-Output 'Scope: planning structure only. No application runtime tests were executed or accepted.'
