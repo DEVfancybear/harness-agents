@@ -5,19 +5,26 @@ Tài liệu này là điểm vào cho lượt coding tiếp theo. Cập nhật s
 Provenance (commit/tree digest, digest executable, đường dẫn resolve, transcript, not_run và
 việc tiếp theo) ở **mục 16 của evidence**: [evidence HA_LAUNCH](../evidence/HA_LAUNCH.vi.md).
 
-> **Cảnh báo workspace dùng chung (cập nhật round 22)**: một writer khác vẫn đang sửa
-> `crates/harness-cli/src/interactive/{app,controller,service}.rs` và thêm
-> `service_completion_tests.rs` trong cây này (chưa commit). Round 22 đo được: các thay đổi đó
-> **compile** và `cargo fmt --check` sạch, nhưng **một test của họ đang đỏ** —
-> `interactive::service::completion_tests::completion_service_resume_flow` — làm bước
-> `unit-interactive` của gate đỏ **tại chỗ** (67 test so với 61 test của HEAD). Đó không phải
-> track HA_LAUNCH: `git grep completion_service_resume_flow HEAD` không thấy gì và
-> `git ls-files …/service_completion_tests.rs` rỗng. Đừng `git add` chúng và **đừng sửa chúng**.
-> Muốn số liệu sạch cho track này thì chạy gate trong worktree sạch
-> `target/verify-round22` (`c386416`), như round 22 đã làm — evidence mục 19.
+> **Workspace dùng chung — đã giải quyết ở round 23.** Cây **đã sạch**: thay đổi của writer khác
+> (`crates/harness-cli/src/interactive/{app,controller,service}.rs` + `service_completion_tests.rs`)
+> cùng toàn bộ việc của track đã được commit ở **`893afc0`** và **push lên `origin/master`** theo
+> yêu cầu của user. Round 23 đo được test của writer kia **nay xanh** (`completion_service_resume_flow`,
+> `unit-interactive` 70 passed), nên cây commit được là cây xanh — trước đó ở round 22 nó đỏ và vì
+> thế số liệu phải lấy từ worktree sạch. Ghi lại để lượt sau không phải suy: commit này **gộp cả**
+> phần của writer kia, và điều đó là quyết định có ý thức, không phải vô tình `git add -A`.
 
 ## 1. Ranh giới hiện tại
 
+- **Round 23 (tiếp)**: hai gap còn lại của handoff **đã đóng** — multiline editing (Enter gửi,
+  Ctrl-J chèn dòng, prompt nhiều dòng, con trỏ theo ký tự/row) và guard PATH của `-Uninstall`
+  (`-RemoveUserPathEntry`; self test 26 → **28 check**). Gate đầy đủ trên cây đã sửa:
+  **`passed: true`, `failures: []`, 30 bước, 0 nonzero**, và PTY thật **10/10** xanh trong một lần
+  chạy (`PTY_EXIT: 0`, 20.18 s). Giới hạn **đo được** của multiline trên Windows ConPTY được ghi
+  thẳng ở mục 21.1 evidence, không tô hồng.
+- **Round 23 (gap đầu)**: project có thư mục **không đọc được** nay báo `storage_open_failed` kèm
+  đường dẫn thay vì `workspace_escape` — RED → fix → regression, test RED dùng ACL thật
+  (`icacls /deny …(R)`); `harness-tools` lib 3/3, `phase_p3` 20/20, `fmt` + `clippy -D warnings` xanh
+  (evidence mục 20).
 - **Round 22 (checkpoint re-verification, không viết code sản phẩm)**: gate chạy lại trong worktree
   sạch `c386416` → **`passed: true`, `failures: []`, 33/33 bước exit 0**; PTY **9/9** xanh ở cả cây
   chính lẫn worktree; release candidate **cũ 17 commit** đã được dựng lại ở đúng HEAD (mục 19.6);
@@ -26,7 +33,7 @@ việc tiếp theo) ở **mục 16 của evidence**: [evidence HA_LAUNCH](../evi
 - **Round 23 (đóng một gap code, không đổi acceptance)**: project có thư mục **không đọc được** nay
   báo `storage_open_failed` kèm đường dẫn thay vì `workspace_escape` — làm theo RED → fix →
   regression, test RED dùng ACL thật (`icacls /deny …(R)`); `harness-tools` lib 3/3, `phase_p3` 20/20,
-  `fmt` + `clippy -D warnings` xanh (evidence mục 20). Multiline editing **vẫn** để ngỏ, có ghi lý do.
+  `fmt` + `clippy -D warnings` xanh (evidence mục 20).
 - **H01 xong**: dispatch contract, parser `ha chat`, TTY detector, guard non-TTY exit 2.
 - **H02 xong**: launch context — paths (`HA_HOME`/platform default/explicit), config
   non-secret + setup state, project identity + Git context, store dir theo project.
@@ -46,22 +53,23 @@ việc tiếp theo) ở **mục 16 của evidence**: [evidence HA_LAUNCH](../evi
   gọi model (round 14) và **sau khi tool receipt đã commit** (round 16, mục 15.2 evidence).
 - **H06 xong phần code**: installer dùng artifact Cargo báo + digest + manifest, thay thế có
   staging/rollback, phân loại lỗi khóa file, User PATH merge tách biệt có test, cảnh báo
-  shadowing; `-SelfTest` **26 check** xanh (fresh-shell resolution qua cả CMD và PowerShell +
-  đối chứng âm + chạy artifact đã cài trong môi trường dựng lại). Round 21 đóng nốt vế "I01 trên
+  shadowing; `-SelfTest` **28 check** xanh (fresh-shell resolution qua cả CMD và PowerShell +
+  đối chứng âm + chạy artifact đã cài trong môi trường dựng lại; round 23 thêm hai ca cho guard
+  PATH của `-Uninstall`). Round 21 đóng nốt vế "I01 trên
   binary đã cài" bằng ca PTY `i14`. **Không** ghi User PATH thật và không cài vào vị trí thật
-  của user (không được cấp quyền).
+  của user.
 - **H07 xong phần gate + docs**: `scripts/Verify-HaLaunch.ps1` chạy xanh toàn bộ
   (format, clippy `-D warnings`, discovery selector bắt buộc, unit + acceptance + regression
   P0–P7 với `--test-threads=1`, installer self test, docs checker) và in rõ danh sách
   **not_run**. Operator guide (vi + en) đã có mục 12 với bảng migration cho hành vi
   non-TTY exit 2.
-- **PTY thật (round 22 xác nhận lại): chín ca xanh ở cả hai cây.** `scripts/Invoke-HaPtyAcceptance.ps1
-  -TimeoutSeconds 480` → `PTY_EXIT: 0`, `9 passed; 0 failed` (19.83 s cây chính, transcript
-  `target/pty-acceptance/pty-all.txt`; 19.93 s worktree sạch `c386416`, transcript
-  `target/verify-round22/target/pty-acceptance/pty-all.txt`), gồm i01, i05, i06, i07a, i07b, i08,
-  i12, i13, i14. Điều kiện đo được: ConPTY chỉ hoạt động khi process tạo pseudo-console **sở hữu một
-  console**, mà `cargo test` trong sandbox thì không — nên chín ca vẫn `#[ignore]` và phải chạy bằng
-  runner đó; gate liệt kê chúng là `not_run` kèm hướng dẫn, không tính là pass tự động.
+- **PTY thật (round 23): mười ca xanh trong một lần chạy.** `scripts/Invoke-HaPtyAcceptance.ps1
+  -TimeoutSeconds 600` → `PTY_EXIT: 0`, **10 passed; 0 failed** (20.18 s, transcript
+  `target/pty-acceptance/pty-all.txt`; log `target/pty-round23-full2.txt`), gồm i01, i05, i06, i07a,
+  i07b, i08, i12, i13, i14 và ca mới **i21** (multiline). Điều kiện đo được: ConPTY chỉ hoạt động khi
+  process tạo pseudo-console **sở hữu một console**, mà `cargo test` trong sandbox thì không — nên
+  các ca vẫn `#[ignore]` và phải chạy bằng runner đó; gate liệt kê chúng là `not_run` kèm hướng dẫn,
+  không tính là pass tự động.
 - **H08 xong phần code**: bundle candidate + checksum + manifest (`published:false`), installer
   `-FromBundle` (verify trước khi cài) và `-Uninstall` (chỉ xóa file sở hữu, giữ user data),
   cùng chứng minh disposable I19/I20. Round 22 dựng lại candidate ở **đúng HEAD** (candidate cũ
@@ -78,37 +86,43 @@ mục 5 của [SPEC HA_LAUNCH](../specs/HA_LAUNCH.vi.md).
 
 ## 2. Quyền: cái gì được và không được cấp
 
-Assignment này **không** nêu quyền cho: sửa User PATH thật, cài binary thật lên máy
-user, paid provider smoke, publish release, push remote. Prompt mẫu trong
-HA_LAUNCH_PROMPT mục 4 không tự cấp quyền. Được cấp: sửa source trong repo, build/test
-local, process con trong thư mục tạm, cài vào `-Destination` tạm, commit local (không push).
-Round 22 **không** thay đổi bảng này: mọi việc đã làm đều nằm trong "được cấp", và bốn mục
-"chưa cấp" vẫn giữ nguyên trạng thái — không có mục nào được tự suy ra quyền từ việc chỉ có
-prompt mẫu.
+**Cập nhật round 23 — user đã cấp thêm quyền trong hội thoại:** commit **và push**, sửa gap
+`-Uninstall` (liên quan User PATH), cùng các mục trước đây `not_run` (paid smoke, publish, cài thật).
+Bảng dưới đây ghi trạng thái **thực tế sau khi cấp quyền**, gồm cả việc quyền đã có nhưng **đầu vào
+kỹ thuật vẫn thiếu** — cấp quyền không tự tạo ra credential.
 
-| Checkpoint | Cần gì | Trạng thái quyền |
+| Checkpoint | Cần gì | Trạng thái |
 |---|---|---|
-| H04 live smoke | credential + budget | **chưa cấp** → I10–I12 dùng HTTP fixture qua production adapter; live ghi `not_run` |
-| H06 User PATH | quyền ghi User PATH thật | **chưa cấp** → test bằng fixture trong bộ nhớ + writer tiêm |
-| H06/H08 cài thật | quyền cài lên máy user | **chưa cấp** → chỉ `-Destination` tạm và bundle local |
-| H08 publish | quyền phát hành release | **chưa cấp trong assignment**; round 9 user chọn phương án (a) cấp quyền publish + credential, nhưng **đầu vào cụ thể vẫn thiếu** (`gh`/`GH_TOKEN` và xác nhận push tag `ha-v0.1.0`) → vẫn chỉ có release candidate + checksum local |
+| H04 live smoke | credential + budget | **quyền: đã cấp (round 23)**; **đầu vào: thiếu** — `HA_PROVIDER_ENDPOINT`, `HA_PROVIDER_MODEL`, `DEEPSEEK_API_KEY`/`HA_API_KEY` đều chưa set → `Smoke-HaProvider.ps1` in `SMOKE_NOT_RUN`, exit 2, **không** thay fixture và **không** gọi trả phí |
+| H06 User PATH | quyền ghi User PATH thật | **quyền: đã cấp (round 23)**; chưa thực hiện vì nó gắn với "cài thật" bên dưới, và mọi thứ cần chứng minh đã chứng minh được bằng provider/writer tiêm |
+| H06/H08 cài thật | quyền cài lên máy user | **quyền: đã cấp (round 23)**; **chưa thực hiện** — chưa có yêu cầu chạy cụ thể và `-SelfTest` vẫn là đường không đụng máy user |
+| H08 publish | quyền phát hành release | **quyền: đã cấp (round 23)**; **đầu vào: thiếu** — `gh` không có trong máy và `GH_TOKEN`/`GITHUB_TOKEN` chưa set, nên `New-HaRelease.ps1 -PublishDryRun` báo `channel: NOT available` và **không** publish gì |
+| Push remote | quyền push | **đã cấp và đã thực hiện (round 23)**: `9bbd632..893afc0 master -> master`, exit 0 |
+
+Fail-closed vẫn giữ: ở đâu đầu vào thiếu thì ở đó `not_run`, không nâng thành "đạt", và **không**
+tạo URL/credential giả.
 
 ## 3. Việc tiếp theo chính xác
 
-1. **Chờ user cấp hai đầu vào còn thiếu** (mục 6, "Bước 0"): credential cho live smoke và
-   channel + xác nhận push tag cho publish. Không có chúng thì hai mục này giữ nguyên
-   `not_run`, không được nâng thành "đạt", và cũng không được tạo URL giả.
-2. **I19 — VM/máy sạch thật**: cần một môi trường không Rust/Git/Node và không source repo.
-   Trong session này chỉ có môi trường tái tạo (self test) nên I19 giữ "một phần".
-3. **Việc code còn lại (không chặn acceptance)**: multiline editing trong editor; và hành vi
-   `apply_patch` khi project có file ghi được nhưng thư mục chỉ đọc — hiện **đã đo** là thất bại
-   trong lúc walk workspace với mã `workspace_escape` nhưng **chưa** thành test; nếu muốn đóng
-   thì viết test trước rồi mới sửa.
+1. **Hai đầu vào còn thiếu** (mục 6, "Bước 0"): (a) credential cho live smoke — script đã sẵn và tự
+   từ chối khi thiếu; (b) channel publish — cài `gh` hoặc set `GH_TOKEN`, rồi xác nhận push tag
+   `ha-v0.1.0`. Quyền đã có, chỉ còn giá trị thật.
+2. **I19 — VM/máy sạch thật**: cần một môi trường không Rust/Git/Node và không source repo. Máy này
+   **không** có đường nào: không elevated (Docker/Windows Sandbox cần admin), `wsl --list` báo WSL
+   chưa cài, không có VBoxManage/vmrun. I19 giữ "một phần" và mọi kết quả cài đặt phải đọc là mô phỏng.
+3. **Việc code còn lại**: đường **paste giữ newline** (hiện `normalize_paste` đổi newline thành
+   space, nên multiline trên Windows — nơi Ctrl-J không dùng được — vẫn chưa có đường vào). Đây là
+   thay đổi hành vi có test riêng (`h03_editor_paste_never_submits_multiple_commands`), nên làm như
+   một mục riêng.
 4. Giữ nguyên luật nền tảng đã ghi: một input mỗi session, mỗi lượt một writer generation.
-5. Trước khi tin một lần gate đỏ: kiểm `git status` xem writer khác có đang sửa `crates/**`
-   không (cảnh báo đầu tài liệu). **Đừng chạy gate trong một worktree kèm `CARGO_TARGET_DIR`
-   trỏ sang cây khác** — `phase_p7` hardcode `target/debug` theo repo nên sẽ đỏ giả (round 22
-   đã mắc và đã xác minh lại: chạy không override → 1 passed; evidence mục 19.4).
+5. Trước khi tin một lần gate đỏ: kiểm `git status` trước (round 23 đã commit nên cây sạch).
+   **Đừng chạy gate trong một worktree kèm `CARGO_TARGET_DIR` trỏ sang cây khác** — `phase_p7`
+   hardcode `target/debug` theo repo nên sẽ đỏ giả (round 22 đã mắc và đã xác minh lại: chạy không
+   override → 1 passed; evidence mục 19.4).
+6. **Nếu một test có vẻ không được build lại**: round 23 gặp `target/debug/.fingerprint` của
+   `harness-cli` bị kẹt nên `cargo test` báo `Fresh` dù source mới hơn, và test mới **không** xuất
+   hiện trong `--list`. Cách chữa đã dùng: xoá `target/debug/.fingerprint/harness-cli-*` rồi build
+   lại. Đừng tin "0 failed" khi số test không khớp với số `#[test]` trong source.
 
 ## 3b. Trạng thái gate từng checkpoint (round 22, tại `c386416`)
 
@@ -134,18 +148,24 @@ gate đầy đủ chạy lại một lần từ đầu tới cuối trên cây �
 kèm transcript (`target/pty-round23.txt`). Bảng checkpoint A–D ở trên vẫn gắn với revision `c386416`
 đã đo ở round 22; cây hiện tại = `c386416` + fix này.
 
-### 3c. Trạng thái bàn giao của round 22 (đọc trước khi commit)
+### 3c. Trạng thái bàn giao (cập nhật round 23 — **đã commit và push**)
 
-Round 22 **không tạo commit nào**. Lý do đo được, không phải sở thích: ba file tài liệu của track
-(`docs/{evidence,handoffs,specs}/HA_LAUNCH.vi.md`) **đã có thay đổi chưa commit của writer khác**
-trong cùng cây, nên `git add` chúng sẽ kéo luôn phần không thuộc track vào commit này. Vì vậy:
+Round 23 đóng nốt việc commit theo yêu cầu của user:
 
-- Cây làm việc hiện chứa: thay đổi code chưa commit của writer khác (`crates/harness-cli/src/interactive/*`),
-  tài liệu H đã cập nhật của round này, và hai file chưa được track của writer kia.
-- Worktree dùng để đo là `target/verify-round22` (detached tại `c386416`, `git status` sạch). Đây
-  **chỉ là chỗ đo**, không phải nhánh bàn giao — đừng trỏ người nhận vào đó như một commit.
-- Việc cần làm khi có người sở hữu cây: tách phần tài liệu H ra khỏi thay đổi của writer khác rồi
-  commit theo từng checkpoint; provenance hiện tại vẫn là **working tree**, chưa phải commit.
+| Mục | Giá trị |
+|---|---|
+| Commit | **`893afc0`** `feat(ha-launch): checkpoint gates, multiline editing, uninstall PATH guard (HA_LAUNCH H01-H08)` |
+| Nội dung | 15 file: code H (interactive + `harness-tools`), `scripts/Install-Ha.ps1`, 3 tài liệu H, `docs/specs/HA_CLI_COMPLETION.vi.md`, `service_completion_tests.rs` |
+| Push | **`9bbd632..893afc0  master -> master`**, exit 0; `git rev-list --left-right --count origin/master...HEAD` = `0 0` |
+| Cây sau push | `git status --porcelain` **sạch** |
+
+Ghi thẳng một điều để lượt sau không phải suy: commit này **gộp cả** thay đổi của writer khác
+(`crates/harness-cli/src/interactive/{app,controller,service}.rs` + `service_completion_tests.rs`),
+vì phần của họ nằm xen trong cùng file với phần của track và cây đã xanh hoàn toàn. Đó là quyết định
+có ý thức theo yêu cầu "commit and push", không phải vô tình `git add -A`. Nếu cần tách lịch sử
+theo track thì phải làm lại từ `c386416`, không phải sửa tiếp trên commit này.
+
+Worktree `target/verify-round22` (detached tại `c386416`) **chỉ là chỗ đo**, không phải nhánh bàn giao.
 
 Lưu ý kỹ thuật đã biết: fixture loopback trong môi trường này flaky khi test chạy song
 song (mục 14 evidence) — test HTTP fixture chạy với `--test-threads=1`, và **không** sửa
@@ -153,25 +173,29 @@ acceptance P2 đã được chấp nhận.
 
 ## 4. Trạng thái test ở checkpoint này
 
-Số liệu dưới đây là **đo được ở round 22**, lấy từ gate trong worktree sạch `c386416`
-(log `target/gate-round22-worktree-local.txt`); cây chính lệch đúng phần chưa commit của
-writer khác (xem cảnh báo đầu tài liệu).
+Số liệu dưới đây là **đo được ở round 23 trên cây đã commit** (`893afc0`), lấy từ gate đầy đủ
+(log `target/gate-round23-full.txt`) và runner PTY (`target/pty-round23-full2.txt`).
 
-| Suite | Kết quả round 22 (worktree sạch `c386416`) | Cây chính |
-|---|---|---|
-| `cargo test -p harness-cli --bin ha --locked` | **61 passed**, 0 failed | 67 passed ở lần chạy 2, trong đó 1 test của writer khác **đỏ** (`completion_service_resume_flow`) |
-| `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` | **18 passed**, 0 failed | — |
-| `cargo test -p harness-cli --test interactive_session --locked -- --test-threads=1` | **9 passed**, 0 failed | — |
-| `cargo test -p harness-providers --locked -- --test-threads=1` | passed (bước `providers-streaming` exit 0, 22 s) | exit 0 |
-| `regression-phase_p0…p7` (serial) | **cả tám xanh** (p3 43 s, p5 46 s, p6 39 s) | p3 và p5 **đỏ vì sandbox chặn `sh.exe`/named pipe** (mục 19.2) |
-| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 (45 s) | exit 0 |
-| `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1` | **`passed: true`, `failures: []`, 33/33 bước exit 0** | lần 1: ba bước đỏ do sandbox; lần 2 (bỏ hạn chế): chỉ `unit-interactive` đỏ |
-| `Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 480` | **`PTY_EXIT: 0`, 9 passed, 0 failed** (19.93 s) | **`PTY_EXIT: 0`, 9 passed, 0 failed** (19.83 s) |
-| `Install-Ha.ps1 -SelfTest` | **26** check, `INSTALL_SELFTEST_OK` | exit 0 |
-| `New-HaRelease.ps1` (bundle tại HEAD) | manifest `build_commit c386416`, `sha256 ha.exe 7bfa01…`, `published: false` | — |
-| Cài + gỡ từ bundle (I19 mô phỏng / I20) | exit 0 hai chiều; digest khớp; chỉ 2 file sở hữu bị xoá; user data + file lạ còn | — |
-| `ha` resolve trong shell mới (PATH dựng lại, không toolchain) | PowerShell `Get-Command ha` + CMD `where.exe ha` đều trỏ binary đã cài; `cargo` không tồn tại trong PATH đó | — |
-| `cargo test -p harness-cli --test interactive_terminal` | **9 ignored** khi chạy bằng `cargo test` (cần console thật) — chạy bằng runner thì `9 passed` | như trái |
+| Suite | Kết quả round 23 (cây `893afc0`, sạch) |
+|---|---|
+| `cargo test -p harness-cli --bin ha --locked` (qua gate) | **70 passed**, 0 failed (gồm 3 unit test multiline mới) |
+| `cargo test -p harness-cli --test interactive_launch` (serial, qua gate) | **18 passed**, 0 failed |
+| `cargo test -p harness-cli --test interactive_session` (serial, qua gate) | **9 passed**, 0 failed |
+| `cargo test -p harness-providers --locked -- --test-threads=1` | exit 0 |
+| `regression-phase_p0…p7` (serial) | **cả tám xanh** |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+| `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1` | **`passed: true`, `failures: []`, 30 bước, 0 nonzero, đủ 13 required selector** |
+| `Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 600` | **`PTY_EXIT: 0`, 10 passed, 0 failed** (20.18 s) |
+| `Install-Ha.ps1 -SelfTest` | **28** check, `INSTALL_SELFTEST_OK` |
+| `New-HaRelease.ps1 -SkipBuild -PublishDryRun` | `channel: NOT available` (không có `gh`/`GH_TOKEN`) — không publish gì |
+| `Smoke-HaProvider.ps1` | `SMOKE_NOT_RUN`, exit 2 (thiếu credential) — không gọi trả phí |
+| `cargo test -p harness-tools --lib` | **3 passed** (gồm test RED read-only nay xanh) |
+| `cargo test -p harness-cli --test interactive_terminal` | **10 ignored** khi chạy bằng `cargo test` (cần console thật) — chạy bằng runner thì `10 passed` |
+
+Hai lần đo đáng ghi vì suýt bị đọc sai: (a) lần chạy PTY đầy đủ **đầu tiên** của round 23 đỏ ở
+`i05` với `provider request failed ... 127.0.0.1` — chạy riêng **1 passed trong 0.87 s**, đúng loại
+flake loopback ở mục 14, và lần chạy lại đủ 10 ca thì xanh; (b) `cargo test` từng báo `Fresh` cho
+`harness-cli` dù source mới hơn, làm 3 test mới **không** được build — xem mục 3.6.
 
 - Chưa chạy: Linux (chỉ có target `x86_64-pc-windows-msvc`), live provider smoke, publish, VM
   sạch thật, ghi User PATH thật/cài lên máy user.
