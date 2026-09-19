@@ -18,7 +18,11 @@ Tài liệu này là điểm vào cho lượt coding tiếp theo. Cập nhật s
   `/resume` liệt kê/chọn session của project, `/new` không bỏ chạy ngầm, và headless
   `--resume <session-id>` tiếp tục task với context phục hồi. Còn **một ca test**: hard kill
   giữa turn sau khi receipt đã commit.
-- **H06–H08 chưa bắt đầu.**
+- **H06 xong phần code**: installer dùng artifact Cargo báo + digest + manifest, thay thế có
+  staging/rollback, phân loại lỗi khóa file, User PATH merge tách biệt có test, cảnh báo
+  shadowing; `-SelfTest` 14 check xanh. **Không** ghi User PATH thật và không cài vào vị
+  trí thật của user (không được cấp quyền).
+- **H07–H08 chưa bắt đầu.**
 - Phát hiện nền tảng quan trọng: journal P1 chỉ cho **một input mỗi session** và task lease
   cần **generation mới** — nên "cùng phiên" = cùng task + chuỗi session nối nhau, không
   phải một session nhiều input (chi tiết + test ở mục 5.3 evidence và mục 5 SPEC).
@@ -43,7 +47,7 @@ local, process con trong thư mục tạm, cài vào `-Destination` tạm, commi
 | H06/H08 cài thật | quyền cài lên máy user | **chưa cấp** → chỉ `-Destination` tạm |
 | H08 publish | quyền phát hành release | **chưa cấp** → chỉ release candidate + checksum local |
 
-## 3. Việc tiếp theo chính xác
+## 3. Việc tiếp theo chính xác\n\n**H07 — gate \`Verify-HaLaunch.ps1\`, PTY harness và acceptance I01–I18.**
 
 **Đóng nốt H05 (ca hard-kill), rồi H06 — installer và command resolution.**
 Prerequisite H05 đã đạt phần code.

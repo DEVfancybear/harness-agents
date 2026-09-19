@@ -148,7 +148,7 @@ Không checkpoint nào được nhận "done" khi prerequisite chưa đạt.
 | H03 | Terminal app, controller/renderer, input loop | H02 | controller/renderer/editor/terminal + fixture route xong bằng test; PTY thật thuộc H07 |
 | H04 | G1 provider incremental, G2 tool continuation, G3 durable session | H03 + khảo sát G1–G3 | **xong phần code**: G1/G2/G3 + service thật + headless, regression 211 test xanh; live smoke `not_run`; multi-input/session là gap nền tảng đã ghi |
 | H05 | Approval, resume, lifecycle | H04 | **đang làm**: approval gate + resume list/select + `/new` + headless `--resume` xong và có test; còn test hard-kill giữa turn |
-| H06 | Installer, User PATH scope, install manifest | H01–H03 | chờ H05 (không ghi User PATH thật) |
+| H06 | Installer, User PATH scope, install manifest | H01–H03 | **đang làm**: artifact identity + manifest + rollback + PATH scope + self test xong; ghi User PATH thật không được cấp quyền |
 | H07 | Gate `Verify-HaLaunch.ps1`, PTY fixture, acceptance I01–I18 | H01–H06 | chờ |
 | H08 | Release candidate, clean-machine route | H07 | chờ |
 
@@ -346,3 +346,33 @@ thật thay `PendingService`, và `ha chat --headless` chạy turn thật. Live 
 
 **Còn lại của H05**: test hard-kill *giữa* lúc tool receipt đã commit (I13 nhánh kill thật)
 — hiện đã chứng minh resume/continuation bằng process thật nhưng chưa có ca kill giữa turn.
+
+### H06 — Installer và command resolution (đang triển khai)
+
+`scripts/Install-Ha.ps1` được viết lại quanh ba bảo đảm, mỗi bảo đảm có test:
+
+- **Artifact identity thật**: đường copy dùng chính đường dẫn Cargo báo qua
+  `cargo build --message-format=json` (không đoán path, không so mtime source), và bản
+  được cài phải khớp **digest** và chạy được `--version` trước khi thay thế. Manifest
+  `ha.install.json` ghi version, sha256, source, build commit, profile và danh sách file
+  sở hữu — đây là cơ sở cho update/uninstall chỉ đụng file của mình.
+- **Thay thế có rollback**: copy sang file staging **giữ đuôi thực thi**, verify, mới
+  `Move-Item` vào chỗ; file cũ được giữ làm backup và khôi phục nếu bước cuối fail. Lỗi
+  được phân loại (`in_use` cho sharing violation, `access_denied` cho quyền, `other`,
+  `staged_verification`) thay vì gọi mọi lỗi là "file in use"; **không** kill process nào.
+- **User PATH tách biệt**: chỉ `-ModifyUserPath` mới sửa, và chỉ sửa **User** PATH
+  (append một lần, so khớp case-insensitive, bỏ entry rỗng, giữ nguyên thứ tự entry khác);
+  **không** bao giờ ghi Machine PATH hay PATH tổng hợp của process. `-NoModifyPath` và
+  xung đột hai switch bị từ chối. Khi không sửa, script in đường dẫn chính xác để thêm tay
+  và cảnh báo "terminal mới mới thấy; shell hiện tại giữ PATH kế thừa".
+- **Không xóa command lạ**: `ha` khác đứng trước trên PATH chỉ bị cảnh báo (kèm đường dẫn),
+  không bị xóa/thay.
+- **Self test trong script**: `-SelfTest` chạy 14 check — luật merge PATH (kể cả negative
+  control Machine/process không lọt vào User PATH), writer tiêm nhận đúng giá trị, phát
+  hiện shadowing không xóa file, cài vào thư mục tạm + digest + manifest, update, file bị
+  khóa, rollback giữ binary cũ chạy được, và khẳng định **không** ghi User PATH thật.
+
+**Quyền**: ghi User PATH thật và cài vào vị trí thật của user **không** được cấp trong
+assignment này. Vì vậy đường ghi registry thật không được chạy; nó được chứng minh bằng
+writer tiêm (`-UserPathWriter`) và bằng việc so User PATH trước/sau. Mọi lần cài thật
+trong bằng chứng đều vào thư mục tạm.

@@ -1,6 +1,6 @@
 # Evidence HA_LAUNCH — track H01–H08
 
-Trạng thái: **H01–H04 xong phần code; H05 xong phần code (còn ca hard-kill giữa turn); H06–H08 chưa bắt đầu.** H04/H05 chưa có live provider smoke vì không được cấp quyền. Tài liệu này được cập
+Trạng thái: **H01–H06 xong phần code (H05 còn ca hard-kill giữa turn; H06 không ghi User PATH thật vì không được cấp quyền); H07–H08 chưa bắt đầu.** H04/H05 chưa có live provider smoke vì không được cấp quyền. Tài liệu này được cập
 nhật lại sau mỗi checkpoint; trạng thái ở đây là trạng thái thật tại thời điểm ghi,
 không phải trạng thái dự kiến.
 
@@ -300,7 +300,55 @@ Chưa chứng minh (còn lại của H05/H07):
 - PTY/terminal thật cho I07/I08 vẫn thuộc H07.
 - Live provider smoke: **not_run**.
 
-## 7. Chưa xác minh (không được coi là đạt)
+
+## 7. H06 — installer và command resolution
+
+| Kiểm chứng | Lệnh | Kết quả |
+|---|---|---|
+| Self test của installer | `pwsh -NoProfile -File scripts/Install-Ha.ps1 -SelfTest` | 14 check OK, exit 0 |
+| Cài vào thư mục tạm (copy route) | `pwsh -NoProfile -File scripts/Install-Ha.ps1 -Destination <temp> -SkipBuild -Profile Debug` | exit 0, manifest khớp digest |
+| Command resolution | `Get-Command ha -CommandType Application`, `where.exe ha` trong shell con với PATH có kiểm soát | resolve đúng binary đã cài, từ cwd ngoài repo có dấu cách |
+| Binary đã cài chạy được | `ha --version`; `ha chat --fixture` qua pipe | `ha 0.1.0`; non-TTY exit 2 (giữ nguyên guard của H01) |
+| Shadowing | fake `ha.cmd` đứng trước trên PATH | có WARNING, file lạ **vẫn còn** |
+| PATH merge qua writer tiêm | `-ModifyUserPath` + provider/writer tiêm, chạy hai lần | lần 1 append đúng một lần; lần 2 không ghi gì (writerCalls=1, không nhân bản) |
+| User PATH thật | so trước/sau mọi lần chạy trên | **không đổi** |
+| Cargo route | `-UseCargoInstall -Destination <temp> -Profile Debug` | exit 0, binary + manifest trong temp root |
+
+Check trong self test: `merge_appends_a_missing_directory`,
+`merge_is_case_insensitive_and_ignores_a_trailing_separator`,
+`merge_drops_empty_entries_and_keeps_order`,
+`merge_never_folds_machine_or_process_entries_into_user_path`,
+`injected_writer_receives_the_merged_user_path`,
+`shadowing_command_is_found_before_the_owned_binary`,
+`shadowing_command_is_never_deleted`,
+`disposable_install_replaces_and_verifies_the_artifact`,
+`installed_digest_matches_the_built_artifact`,
+`install_manifest_records_version_and_digest`, `update_keeps_the_binary_usable`,
+`locked_executable_is_reported_as_in_use`,
+`a_failed_replacement_leaves_the_previous_binary_usable`,
+`self_test_never_writes_the_real_user_path`.
+
+Đã chứng minh:
+
+- **I14**: binary cài vào đích tạm được shell resolve đúng (cả `Get-Command` và
+  `where.exe`) từ cwd unrelated có dấu cách, digest khớp manifest, và chạy được.
+- **I15**: entry được append đúng một lần vào **User** PATH, không nhân bản ở lần chạy
+  sau; negative control khẳng định entry của Machine/process không bao giờ lọt vào giá trị
+  ghi; User PATH thật không bị đụng.
+- **I17**: `ha` lạ đứng trước bị báo, không bị xóa.
+- **I18**: file bị khóa được phân loại `in_use` (không phải "mọi lỗi là file in use") và
+  binary cũ vẫn chạy được sau lần thay thế thất bại — tức có rollback thật.
+
+Chưa chạy (không được cấp quyền, ghi rõ thay vì mặc định đạt):
+
+- **Ghi User PATH thật** qua registry và **cài vào vị trí thật của user**: không thực hiện.
+  Đường ghi được chứng minh bằng writer tiêm + so User PATH trước/sau.
+- **I01 trên binary đã cài trong PTY**: thuộc H07 (hiện mới chứng minh từ chối non-TTY và
+  `--version`/`--help` trên binary đã cài).
+- Gate `Verify-HaLaunch.ps1`: H07 phải gọi `Install-Ha.ps1 -SelfTest` và lặp lại các ca
+  cài tạm này.
+
+## 8. Chưa xác minh (không được coi là đạt)
 
 - **I01 PTY transcript**: chưa có. Cần terminal thật/PTY harness (H07). Unit test
   dùng fixture detector chỉ chứng minh logic capability, không phải bằng chứng
@@ -311,7 +359,7 @@ Chưa chứng minh (còn lại của H05/H07):
 - **Publish release / push remote**: không thực hiện; không được cấp quyền.
 - **Linux**: chưa build/chạy; mọi kết quả trên là Windows.
 
-## 8. Ghi chú flake môi trường (đã điều tra, không che)
+## 9. Ghi chú flake môi trường (đã điều tra, không che)
 
 Test `phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` thỉnh
 thoảng đỏ ở tầng connect tới fixture server loopback trong chính process test:
