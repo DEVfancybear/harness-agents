@@ -55,10 +55,11 @@ local, process con trong thư mục tạm, cài vào `-Destination` tạm, commi
 | H06/H08 cài thật | quyền cài lên máy user | **chưa cấp** → chỉ `-Destination` tạm |
 | H08 publish | quyền phát hành release | **chưa cấp** → chỉ release candidate + checksum local |
 
-## 3. Việc tiếp theo chính xác\n\n**H07 — gate \`Verify-HaLaunch.ps1\`, PTY harness và acceptance I01–I18.**
+## 3. Việc tiếp theo chính xác
 
-**Đóng nốt H05 (ca hard-kill), rồi H06 — installer và command resolution.**
-Prerequisite H05 đã đạt phần code.
+**H08 — prebuilt release và clean-machine install (chưa publish).** H07 đã có gate xanh; phần transcript PTY còn chặn bởi môi trường (xem mục 5 và mục 6).
+
+Chi tiết từng bước ở mục 6; nhắc lại: H08 **không** được publish vì assignment không cấp quyền.
 
 1. ~~Approval thật~~ **đã xong**: driver `ApprovalGate` + `ChannelApprovalGate` (event +
    oneshot, timeout 5 phút), controller render/answer y/n, deny/expiry fail closed kèm tool
