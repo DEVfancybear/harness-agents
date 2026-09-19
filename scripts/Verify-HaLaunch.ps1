@@ -102,6 +102,8 @@ $requiredSelectors = @(
     @{ Target = 'interactive_launch'; Selector = 'i13_resume_continues_the_task_with_recovered_context_and_no_rerun' },
     @{ Target = 'interactive_launch'; Selector = 'i13_a_hard_kill_mid_turn_leaves_one_admitted_input_and_no_claimed_success' },
     @{ Target = 'interactive_launch'; Selector = 'i09_a_corrupt_configuration_stops_the_run_with_an_actionable_error' },
+    @{ Target = 'interactive_launch'; Selector = 'i09_a_data_root_that_cannot_be_created_names_the_path_and_writes_nothing' },
+    @{ Target = 'interactive_launch'; Selector = 'i04_the_binary_installed_under_a_unicode_path_follows_the_caller_directory' },
     @{ Target = 'interactive_launch'; Selector = 'i16_a_second_run_in_the_same_project_is_refused_while_the_first_holds_the_store' },
     @{ Target = 'interactive_session'; Selector = 'h05_a_settled_receipt_is_not_re_executed_after_the_process_state_is_lost' },
     @{ Target = 'interactive_session'; Selector = 'g2_tool_results_return_to_the_model_and_the_turn_ends_with_the_answer' },

@@ -98,7 +98,7 @@ H07 (gate `Verify-HaLaunch.ps1` + PTY harness + I01–I18), H08 (release candida
 ## 4. Trạng thái test ở checkpoint này
 
 - `cargo test -p harness-cli --bin ha` → 61 passed (gồm 3 unit test I08 cho phục hồi mode).
-- `cargo test -p harness-cli --test interactive_launch` → 15 passed (thêm ca kill process thật).
+- `cargo test -p harness-cli --test interactive_launch` → 17 passed (kill process thật, I04, I09).
 - `cargo test -p harness-cli --test interactive_session` → 9 passed.
 - `cargo test -p harness-cli --test interactive_terminal` → 5 ignored (cần console thật; chạy
   bằng runner, `5 passed`).
@@ -124,13 +124,15 @@ H07 (gate `Verify-HaLaunch.ps1` + PTY harness + I01–I18), H08 (release candida
 - Kill đúng lúc tool receipt vừa commit (H05 I13): cần đường chạy tool không tương tác —
   headless hiện fail closed cho mọi tool call, nên ca này vẫn ở mức mô phỏng.
 
-Bảng đối chiếu acceptance I01–I20 (mục 15 evidence) chỉ ra bốn mục **một phần**, đây là các
-gap còn lại theo đúng thứ tự ưu tiên:
+Bảng đối chiếu acceptance I01–I20 (mục 15 evidence) sau round 15 chỉ còn **hai mục một phần**:
 
 1. **I19**: chưa có VM/máy sạch thật; hiện chỉ mô phỏng PATH tối giản trong thư mục tạm.
-2. **I13**: kill đúng lúc receipt vừa commit (xem trên).
-3. **I04**: chưa chạy *binary đã cài* từ path Unicode + thư mục không có Git.
-4. **I09**: chưa có ca riêng cho data directory không có quyền ghi.
+2. **I13**: kill đúng lúc tool receipt vừa commit (xem trên) — cần đường chạy tool không tương
+   tác, mà headless hiện fail closed cho mọi tool call.
+
+Round 15 đã đóng I04 (bản cài dưới path Unicode + hai caller directory không Git → hai store)
+và I09 (data root không dùng được → lỗi nêu đường dẫn, giữ mã `storage_open_failed`, không tạo
+state); cả hai nay là selector bắt buộc của gate (12 selector).
 
 ## 6. Việc tiếp theo chi tiết (H08)
 

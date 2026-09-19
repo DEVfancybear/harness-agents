@@ -289,6 +289,11 @@ thật thay `PendingService`, và `ha chat --headless` chạy turn thật. Live 
   `fixture: false`), log ra stderr, **không** bật raw mode, và resolve provider **trước
   khi** mở store nên cấu hình thiếu không tạo state.
 - `--resume` trong headless trả lỗi typed "arrives with H05" thay vì bỏ qua im lặng.
+- **Lỗi mở store ở headless (round 15)**: khi data root không dùng được, thông báo nêu
+  **đường dẫn store đã resolve** và giữ nguyên mã lỗi, ví dụ
+  `storage_open_failed: cannot open the project store at <HA_HOME>/data/projects/<key>: cannot create data directory: ...`.
+  Trước đó thông báo chỉ có phần lỗi hệ thống nên không cho biết path nào hỏng; hành vi mới
+  khớp với thông báo mà service interactive đã có, và có test riêng (I09, xem evidence mục 15.1).
 - `PendingService` (staged "connection pending") được **xóa** vì runtime đã nối thật;
   fixture vẫn chỉ là opt-in `--fixture` có nhãn.
 - **Gap đã biết**: `ProjectId` bên trong một phiên vẫn sinh mới mỗi phiên; identity bền

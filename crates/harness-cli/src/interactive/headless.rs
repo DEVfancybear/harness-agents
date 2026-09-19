@@ -63,13 +63,24 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     let config = resolve_provider(&environment)
         .map_err(|message| HarnessError::new(ErrorCode::ServiceUnavailable, message))?;
 
+    // Name the directory that could not be opened: an operator has to know which
+    // path failed, and the typed code must survive the extra context.
+    let store_dir = context.project_store_dir();
     let store = Arc::new(
         SqliteStore::open_writer(WriterOpenOptions::new(
-            context.project_store_dir(),
+            store_dir.clone(),
             HostId::generate(),
         ))
         .await
-        .map_err(StoreError::into_harness_error)?,
+        .map_err(|error| {
+            HarnessError::new(
+                error.code(),
+                format!(
+                    "cannot open the project store at {}: {error}",
+                    store_dir.display()
+                ),
+            )
+        })?,
     );
     // Resuming continues the task of the named session: the new turn runs in a
     // fresh session linked to it, exactly like a follow-up in the interactive app.

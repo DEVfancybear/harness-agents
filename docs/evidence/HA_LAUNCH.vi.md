@@ -426,7 +426,7 @@ thiểu (chỉ thư mục cài + `System32`, `toolchainOnMinimalPath=False`):
 |---|---|---|
 | Launch acceptance (đã thêm I09/I16 và kill process thật) | `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` | 15 passed, 0 failed |
 | Session acceptance (đã thêm ca gián đoạn) | `cargo test -p harness-cli --test interactive_session --locked -- --test-threads=1` | 9 passed, 0 failed |
-| Gate runtime với 10 selector bắt buộc | `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json` | `"passed": true`, `"failures": []` |
+| Gate runtime với 12 selector bắt buộc (round 15) | `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json` | `"passed": true`, `"failures": []` |
 | Lint toàn workspace | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
 
 Selector mới: `i09_a_corrupt_configuration_stops_the_run_with_an_actionable_error`,
@@ -744,19 +744,20 @@ Chưa chứng minh / còn mở:
 ## 15. Đối chiếu acceptance I01–I20 với bằng chứng
 
 Bảng này nói rõ mỗi mục của plan được chứng minh bằng gì và ở mức nào; "một phần" nghĩa là
-phần còn thiếu được ghi đúng chứ không được tính là đạt.
+phần còn thiếu được ghi đúng chứ không được tính là đạt. Sau round 15 chỉ còn **I13** (kill
+đúng lúc receipt vừa commit) và **I19** (VM sạch thật) ở mức một phần — xem mục 15.1.
 
 | # | Bằng chứng cụ thể | Trạng thái |
 |---|---|---|
 | I01 | PTY `i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly` (console thật, mục 12.2) + guard `i01_chat_without_a_terminal_uses_the_same_guard` | đạt |
 | I02 | `i02_help_and_version_stay_fast_paths_that_write_nothing`, `i02_existing_subcommands_keep_their_dispatch_and_output`, `i02_unknown_options_and_missing_arguments_remain_parser_errors` | đạt |
 | I03 | `i03_bare_launch_without_a_terminal_exits_two_with_instructions`, `i03_headless_turn_runs_through_the_real_adapter_and_keeps_the_key_out_of_output`, `i03_headless_rejects_the_headless_only_flags_and_keeps_stdout_plain`, `i03_fixture_route_never_bypasses_the_terminal_or_headless_contract` | đạt |
-| I04 | `h02_project_identity_follows_the_caller_directory_with_spaces_and_unicode`, `h02_relative_cwd_resolves_from_the_caller_and_git_root_comes_from_the_project_tree`, sandbox PTY dùng thư mục "project with spaces" | **một phần**: chưa chạy *binary đã cài* từ path Unicode không có Git |
+| I04 | `i04_the_binary_installed_under_a_unicode_path_follows_the_caller_directory` (bản cài dưới path có dấu + spaces, hai caller directory không Git → hai store riêng, thư mục cài không thành project), `h02_project_identity_follows_the_caller_directory_with_spaces_and_unicode`, `h02_relative_cwd_resolves_from_the_caller_and_git_root_comes_from_the_project_tree` (Git root theo project tree, no-Git trả `None`) | đạt |
 | I05 | `h02_empty_home_without_credentials_opens_setup_state_and_writes_nothing`, `h04_an_unconfigured_provider_is_reported_and_the_setup_state_is_kept`, header PTY i01 ("setup required") | đạt |
 | I06 | PTY `i06_pty_keeps_vietnamese_input_and_paste_intact` + `h03_editor_edits_vietnamese_text_by_character`, `h03_keys_are_mapped_from_real_crossterm_events` | đạt (console thật) |
 | I07 | PTY `i07a_ctrl_c_clears_an_idle_prompt`, `i07b_ctrl_c_cancels_a_running_turn` + `h03_ctrl_c_cancels_a_run_and_clears_an_idle_prompt` | đạt (console thật) |
 | I08 | PTY `i08_a_backend_fault_after_init_restores_the_terminal_and_is_not_swallowed` + ba unit test `h07_i08_*` (mục 12.3) | đạt |
-| I09 | `i09_a_corrupt_configuration_stops_the_run_with_an_actionable_error`, `i09_an_invalid_project_directory_stops_the_run_with_an_actionable_error`, `h02_corrupt_configuration_is_actionable_and_never_replaced_by_defaults` | **một phần**: "data dir không có quyền" chưa có ca riêng |
+| I09 | `i09_a_corrupt_configuration_stops_the_run_with_an_actionable_error`, `i09_an_invalid_project_directory_stops_the_run_with_an_actionable_error`, `i09_a_data_root_that_cannot_be_created_names_the_path_and_writes_nothing` (round 15: data root không dùng được → exit ≠ 0, stderr nêu **đường dẫn**, giữ mã `storage_open_failed`, không tạo state), `h02_corrupt_configuration_is_actionable_and_never_replaced_by_defaults` | đạt |
 | I10 | `phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` (SSE → sự kiện chuẩn hoá), `h03_text_and_terminal_events_are_rendered_before_the_run_ends` (text hiện trước khi run kết thúc) | đạt |
 | I11 | `g2_tool_results_return_to_the_model_and_the_turn_ends_with_the_answer`, `g2_a_failed_tool_call_is_reported_instead_of_ending_the_turn`, `g2_the_tool_loop_is_bounded_and_reports_which_bound_stopped_it`, `g3_the_foundation_admits_one_input_per_session_and_says_so` | đạt |
 | I12 | `h05_a_denied_gated_action_is_not_executed_and_the_model_is_told`, `h05_a_granted_gated_action_runs_once_after_the_answer`, `h05_an_expired_approval_is_a_refusal_not_a_silent_grant`, `i12_headless_turn_without_provider_configuration_fails_closed` | đạt |
@@ -768,6 +769,41 @@ phần còn thiếu được ghi đúng chứ không được tính là đạt.
 | I18 | `Install-Ha.ps1 -SelfTest`: `update_keeps_the_binary_usable`, `locked_executable_is_reported_as_in_use`, `a_failed_replacement_leaves_the_previous_binary_usable`; `New-HaRelease.ps1 -SelfTest`: `bundle_manifest_digest_mismatch`, `bundle_must_not_claim_publication`, `unexpected_file_was_not_rejected` | đạt |
 | I19 | `Install-Ha.ps1 -FromBundle` + `bundle_install_uses_the_verified_executable`, `a_tampered_bundle_is_refused`; bundle `ha-0.1.0-windows-x64` kèm `checksums.txt` | **một phần**: PATH tối giản disposable, **không** có VM sạch thật |
 | I20 | `uninstall_removes_only_owned_files`, `uninstall_keeps_user_data`, rồi cài lại từ bundle | đạt (disposable) |
+
+### 15.1. Hai mục "một phần" được đóng ở round 15 (I04, I09)
+
+**I09 — data root không dùng được.** Trước round này, đường headless trả lỗi thô của store:
+
+```text
+storage_open_failed: cannot create data directory: Cannot create a file when that file already exists. (os error 183)
+```
+
+Nó **không nêu đường dẫn nào** hỏng, nên người vận hành không biết là `HA_HOME`, data dir hay
+thư mục project. `crates/harness-cli/src/interactive/headless.rs` nay bọc lỗi mở store kèm
+đường dẫn đã resolve, **giữ nguyên mã lỗi** (giống thông báo mà service interactive đã có):
+
+```text
+storage_open_failed: cannot open the project store at <HA_HOME>/data/projects/<key>: cannot create data directory: ...
+```
+
+Ca `i09_a_data_root_that_cannot_be_created_names_the_path_and_writes_nothing` khoá hành vi này:
+`HA_HOME` là một **file** nên `<HA_HOME>/data` không thể tạo; kỳ vọng đo được: exit ≠ 0, stdout
+rỗng, stderr có "cannot open the project store at" + tên data root + mã `storage_open_failed`,
+file fixture vẫn là file và **không** có thư mục `data` nào được tạo cạnh nó (không fallback im
+lặng sang chỗ khác).
+
+**I04 — binary đã cài, path Unicode, không Git.**
+`i04_the_binary_installed_under_a_unicode_path_follows_the_caller_directory` copy artifact ra
+`bản cài đặt/` (có dấu và khoảng trắng, ngoài build tree), chạy một lượt headless thật từ hai
+caller directory có dấu và không có `.git`; cả hai lượt exit 0 với response của fixture, và
+`<HA_HOME>/data/projects` có **đúng hai** store — tức identity theo caller cwd, không theo chỗ
+cài và không theo repo Harness; thư mục cài chỉ chứa đúng binary. Phần "Git unavailable" được
+chứng minh ở unit test (`h02_relative_cwd_resolves_from_the_caller_and_git_root_comes_from_the_project_tree`
+khẳng định `git_root` là `None` khi project không có Git, và header render
+"not a Git repository, Git features unavailable").
+
+Kết quả: `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` →
+**17 passed, 0 failed**.
 
 **Không đạt / not_run (không được tính là đạt)**: live provider smoke (không có credential),
 publish release (không có channel và chưa được xác nhận push tag), build/chạy Linux (chỉ có

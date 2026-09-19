@@ -1172,3 +1172,154 @@ fn follow_up_turn(sandbox: &Sandbox, project: &Path) -> Result<CliRun, String> {
         return Err(run.stderr);
     }
 }
+
+// ---------------------------------------------------------------------------
+// I04 / I09 - an installed copy from a Unicode path, and an unusable data root
+// ---------------------------------------------------------------------------
+
+#[test]
+fn i04_the_binary_installed_under_a_unicode_path_follows_the_caller_directory() {
+    let sandbox = Sandbox::new();
+    // An installed copy outside the build tree, under a path with spaces and
+    // Vietnamese characters: this is the artifact an end user runs, not the
+    // cargo output path.
+    let install = sandbox.path().join("bản cài đặt");
+    std::fs::create_dir_all(&install).expect("install dir");
+    let installed = install.join(format!("ha{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(cli_binary(), &installed).expect("the artifact is installed");
+
+    for name in ["dự án một", "dự án hai"] {
+        let caller = sandbox.path().join(name);
+        std::fs::create_dir_all(&caller).expect("caller dir");
+        assert!(
+            !caller.join(".git").exists(),
+            "the caller directory is not a Git repository"
+        );
+
+        let mut attempt = 0;
+        let run = loop {
+            attempt += 1;
+            let (endpoint, server) = sse_fixture("the installed binary answers");
+            let output = std::process::Command::new(&installed)
+                .args(["chat", "--headless", "--prompt", "hello", "--json"])
+                .current_dir(&caller)
+                .env("HA_HOME", sandbox.path())
+                .env("HA_PROVIDER_ENDPOINT", &endpoint)
+                .env("HA_PROVIDER_MODEL", "fixture-model")
+                .env("DEEPSEEK_API_KEY", "fixture-secret-value")
+                .stdin(Stdio::null())
+                .output()
+                .expect("the installed binary runs");
+            let run = CliRun::from_output(&output);
+            let _ = server.join().expect("fixture server finishes");
+            if run.code() == 0 || !run.stderr.contains(LOOPBACK_WOBBLE) || attempt >= 3 {
+                break run;
+            }
+            eprintln!(
+                "attempt {attempt} hit the known loopback wobble: {}",
+                run.stderr
+            );
+        };
+        assert_eq!(
+            run.code(),
+            0,
+            "the installed binary completes a turn from {}: {}",
+            caller.display(),
+            run.stderr
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&run.stdout).expect("headless output is JSON");
+        assert_eq!(
+            parsed["response"],
+            serde_json::json!("the installed binary answers")
+        );
+        assert_eq!(parsed["fixture"], serde_json::json!(false));
+    }
+
+    // The project store follows the caller directory - not the install path and
+    // not the build tree - so two caller directories own two stores.
+    let projects = sandbox.path().join("data").join("projects");
+    let mut stores: Vec<String> = std::fs::read_dir(&projects)
+        .expect("the app created per-project stores")
+        .map(|entry| {
+            entry
+                .expect("store entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    stores.sort();
+    assert_eq!(
+        stores.len(),
+        2,
+        "one store per caller directory: {stores:?}"
+    );
+    let installed_files: Vec<String> = std::fs::read_dir(&install)
+        .expect("install dir readable")
+        .map(|entry| {
+            entry
+                .expect("install entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(
+        installed_files.len(),
+        1,
+        "the install directory only holds the binary: {installed_files:?}"
+    );
+}
+
+#[test]
+fn i09_a_data_root_that_cannot_be_created_names_the_path_and_writes_nothing() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    // `HA_HOME` is a regular file here, so `<HA_HOME>/data` cannot be created.
+    // The run must stop with an actionable error instead of silently falling back
+    // to another location or starting without durable state.
+    let home = sandbox.path().join("home-is-a-file");
+    std::fs::write(&home, "not a directory").expect("fixture file");
+
+    let mut command = std::process::Command::new(cli_binary());
+    let run = CliRun::from_output(
+        &command
+            .args(["chat", "--headless", "--prompt", "hello", "--json"])
+            .current_dir(&project)
+            .env("HA_HOME", &home)
+            .env(
+                "HA_PROVIDER_ENDPOINT",
+                "http://127.0.0.1:1/chat/completions",
+            )
+            .env("HA_PROVIDER_MODEL", "fixture-model")
+            .env("DEEPSEEK_API_KEY", "fixture-secret-value")
+            .stdin(Stdio::null())
+            .output()
+            .expect("ha binary runs"),
+    );
+
+    assert_ne!(run.code(), 0, "an unusable data root must not start a run");
+    assert!(run.stdout.is_empty(), "stdout was: {}", run.stdout);
+    assert!(
+        run.stderr.contains("cannot open the project store at"),
+        "the failure says what could not be opened: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("home-is-a-file"),
+        "the failure names the unusable root: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("storage_open_failed"),
+        "the typed code survives the extra context: {}",
+        run.stderr
+    );
+    assert!(home.is_file(), "the data root was not replaced by defaults");
+    assert!(
+        !sandbox.path().join("data").exists(),
+        "no state was created next to the unusable root"
+    );
+}
