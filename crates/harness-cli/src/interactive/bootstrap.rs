@@ -247,7 +247,7 @@ fn displayable(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{CREDENTIAL_VARIABLES, LaunchRequest, ProviderState, resolve};
+    use super::{CREDENTIAL_VARIABLES, LaunchRequest, ProviderState, displayable, resolve};
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
     use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
     use harness_types::{ErrorCode, HostId};
@@ -256,6 +256,14 @@ mod tests {
         temp: tempfile::TempDir,
         home: std::path::PathBuf,
         project: std::path::PathBuf,
+        /// The project path exactly as `resolve` will report it.
+        ///
+        /// `resolve` canonicalises the caller directory and drops the Windows
+        /// verbatim prefix. Comparing that against the raw `tempdir()` path only
+        /// works where the two spellings happen to agree: on a Windows runner the
+        /// temp path keeps an 8.3 short component (`RUNNER~1`), so the raw path and
+        /// the canonical one differ as strings while naming the same directory.
+        canonical_project: std::path::PathBuf,
     }
 
     impl Fixture {
@@ -266,10 +274,13 @@ mod tests {
             let project = temp.path().join(project_name);
             std::fs::create_dir_all(&home).expect("fixture home");
             std::fs::create_dir_all(&project).expect("fixture project");
+            let canonical_project =
+                displayable(&std::fs::canonicalize(&project).expect("canonical project"));
             Self {
                 temp,
                 home,
                 project,
+                canonical_project,
             }
         }
 
@@ -300,7 +311,7 @@ mod tests {
         let environment = fixture.environment(&[]);
         let context = resolve(fixture.request(&environment)).expect("context resolves");
 
-        assert_eq!(context.project.root, fixture.project);
+        assert_eq!(context.project.root, fixture.canonical_project);
         assert!(context.project.key.starts_with("project-"));
         assert!(context.project.digest.as_str().starts_with("sha256:"));
         assert_eq!(context.caller_dir, fixture.project);
@@ -355,8 +366,13 @@ mod tests {
             ..fixture.request(&environment)
         })
         .expect("relative cwd resolves");
-        assert_eq!(context.project.root, nested);
-        assert_eq!(context.git_root.as_deref(), Some(fixture.project.as_path()));
+        // Same canonical form as `resolve` reports, for the reason in `Fixture`.
+        let canonical_nested = displayable(&std::fs::canonicalize(&nested).expect("canonical"));
+        assert_eq!(context.project.root, canonical_nested);
+        assert_eq!(
+            context.git_root.as_deref(),
+            Some(fixture.canonical_project.as_path())
+        );
         assert!(context.header_lines().join("\n").contains("repository at"));
 
         let plain = fixture.temp.path().join("no-git-project");
