@@ -9,6 +9,8 @@ use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Resolve the compiled ha executable this crate produced.
@@ -702,4 +704,190 @@ fn i13_resuming_an_unknown_session_fails_without_running_anything() {
     assert_ne!(run.code(), 0, "an unknown session must not start a run");
     assert!(run.stdout.is_empty(), "stdout was: {}", run.stdout);
     assert!(run.stderr.contains("nothing was resumed"), "{}", run.stderr);
+}
+
+// ---------------------------------------------------------------------------
+// I09 / I16 - startup and ownership failures, observed through real processes
+// ---------------------------------------------------------------------------
+
+/// Run the binary with a controlled environment and return the captured result.
+fn run_headless_raw(
+    sandbox: &Sandbox,
+    project: &Path,
+    arguments: &[&str],
+    provider: Option<(&str, &str, &str)>,
+) -> CliRun {
+    let mut command = std::process::Command::new(cli_binary());
+    command
+        .args(arguments)
+        .current_dir(project)
+        .env("HA_HOME", sandbox.path())
+        .stdin(Stdio::null());
+    if let Some((endpoint, model, key)) = provider {
+        command
+            .env("HA_PROVIDER_ENDPOINT", endpoint)
+            .env("HA_PROVIDER_MODEL", model)
+            .env("DEEPSEEK_API_KEY", key);
+    } else {
+        command.env_remove("HA_PROVIDER_ENDPOINT");
+        command.env_remove("HA_PROVIDER_MODEL");
+        command.env_remove("DEEPSEEK_API_KEY");
+        command.env_remove("HA_API_KEY");
+    }
+    CliRun::from_output(&command.output().expect("ha binary runs"))
+}
+
+#[test]
+fn i09_a_corrupt_configuration_stops_the_run_with_an_actionable_error() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::write(
+        sandbox.path().join("config.toml"),
+        "schema_version = \"not-a-number\"\n",
+    )
+    .expect("fixture config");
+
+    let run = run_headless_raw(
+        &sandbox,
+        &project,
+        &["chat", "--headless", "--prompt", "hello", "--json"],
+        Some((
+            "http://127.0.0.1:1/chat/completions",
+            "fixture-model",
+            "fixture-key",
+        )),
+    );
+    assert_ne!(
+        run.code(),
+        0,
+        "a corrupt configuration must not start a run"
+    );
+    assert!(run.stdout.is_empty(), "stdout was: {}", run.stdout);
+    assert!(run.stderr.contains("config"), "{}", run.stderr);
+    assert!(run.stderr.contains("config.toml"), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("ha config validate"),
+        "the error points at the command that explains it: {}",
+        run.stderr
+    );
+    // The rejected value is never echoed back into the terminal.
+    assert!(!run.stderr.contains("not-a-number"), "{}", run.stderr);
+}
+
+#[test]
+fn i09_an_invalid_project_directory_stops_the_run_with_an_actionable_error() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let missing = project.join("does-not-exist");
+
+    let run = run_headless_raw(
+        &sandbox,
+        &project,
+        &[
+            "chat",
+            "--headless",
+            "--cwd",
+            missing.to_str().expect("utf-8 path"),
+            "--prompt",
+            "hello",
+            "--json",
+        ],
+        Some((
+            "http://127.0.0.1:1/chat/completions",
+            "fixture-model",
+            "fixture-key",
+        )),
+    );
+    assert_ne!(run.code(), 0, "a missing project must not start a run");
+    assert!(run.stderr.contains("does-not-exist"), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("cannot be opened"),
+        "the message says what failed: {}",
+        run.stderr
+    );
+}
+
+#[test]
+fn i16_a_second_run_in_the_same_project_is_refused_while_the_first_holds_the_store() {
+    let (endpoint, accepted, hold) = hanging_endpoint();
+    let sandbox = Sandbox::new();
+    let project = sandbox.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+
+    let mut first = std::process::Command::new(cli_binary())
+        .args([
+            "chat",
+            "--headless",
+            "--prompt",
+            "hold the store open",
+            "--json",
+        ])
+        .current_dir(&project)
+        .env("HA_HOME", sandbox.path())
+        .env("HA_PROVIDER_ENDPOINT", &endpoint)
+        .env("HA_PROVIDER_MODEL", "fixture-model")
+        .env("DEEPSEEK_API_KEY", "fixture-secret-value")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("first run starts");
+
+    // Wait until the first run really owns the project store: it only reaches the
+    // provider after the writer was opened.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !accepted.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "the first run never reached the provider"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let second = run_headless_raw(
+        &sandbox,
+        &project,
+        &["chat", "--headless", "--prompt", "second writer", "--json"],
+        Some((&endpoint, "fixture-model", "fixture-secret-value")),
+    );
+
+    let _ = first.kill();
+    let _ = first.wait();
+    let _ = hold.join();
+
+    assert_ne!(second.code(), 0, "the second writer must be refused");
+    assert!(second.stdout.is_empty(), "stdout was: {}", second.stdout);
+    assert!(
+        second.stderr.contains("another writable host"),
+        "the refusal names the real owner conflict: {}",
+        second.stderr
+    );
+    assert!(
+        second.stderr.contains("writer_locked"),
+        "the refusal keeps its typed code: {}",
+        second.stderr
+    );
+}
+
+/// A provider endpoint that accepts one connection, reports that it did, and then
+/// never answers, so the caller keeps the turn (and the store writer) open.
+fn hanging_endpoint() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("hanging listener");
+    let address = listener.local_addr().expect("hanging address");
+    let accepted = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&accepted);
+    let handle = std::thread::spawn(move || {
+        if let Ok((connection, _)) = listener.accept() {
+            flag.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_secs(30));
+            drop(connection);
+        }
+    });
+    (
+        format!("http://{address}/chat/completions"),
+        accepted,
+        handle,
+    )
 }

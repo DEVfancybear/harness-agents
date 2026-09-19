@@ -628,3 +628,105 @@ async fn h05_an_expired_approval_is_a_refusal_not_a_silent_grant() {
         seen[1].messages
     );
 }
+
+#[tokio::test]
+async fn h05_a_settled_receipt_is_not_re_executed_after_the_process_state_is_lost() {
+    // A hard kill is simulated faithfully for durable state: every in-memory handle
+    // (driver, runtime, tool service, store writer) is dropped and the next turn
+    // opens a new writer generation from disk, exactly like a fresh process.
+    let bench = bench();
+    let provider = Arc::new(SequenceProvider::new(patch_then_final(&bench)));
+
+    let first_store = bench.open_store().await;
+    let gate = Arc::new(ScriptedGate::new(vec![ApprovalAnswer::Granted]));
+    let session_id = SessionId::generate();
+    let task_id = TaskId::generate();
+    let first_options = TurnOptions {
+        workspace_root: bench.workspace.clone(),
+        actor_id: "test.actor".to_owned(),
+        approvals: ApprovalMode::Ask(gate as Arc<dyn ApprovalGate>),
+        limits: TurnLimits::default(),
+    };
+    let first = driver(&first_store, Arc::clone(&provider))
+        .run_turn(
+            request_for(&bench.workspace, &session_id, &task_id, "patch the parser"),
+            first_options,
+            Arc::new(RecordingObserver::default()) as Arc<dyn TurnObserver>,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the first turn runs");
+    assert_eq!(first.executions.len(), 1, "the granted patch executed once");
+    let patched = std::fs::read_to_string(bench.workspace.join("src").join("parser.rs"))
+        .expect("patched file");
+    assert!(patched.contains("fixed"), "{patched}");
+    close_store(first_store).await;
+
+    // The settled receipt is on disk; the process state is gone.
+    let reader = SqliteStore::open_read_only(&bench.data_dir)
+        .await
+        .expect("read-only store opens");
+    let receipts = reader
+        .load_receipts(&session_id)
+        .await
+        .expect("receipts load");
+    assert_eq!(receipts.len(), 1, "exactly one settled receipt is durable");
+    drop(reader);
+
+    // A fresh writer generation continues the conversation with a text-only answer.
+    let second_store = bench.open_store().await;
+    let follow_up_provider = Arc::new(SequenceProvider::new(vec![vec![
+        ProviderStreamEvent::started(),
+        ProviderStreamEvent::text("the parser is already fixed; nothing to redo"),
+        ProviderStreamEvent::completed("stop"),
+    ]]));
+    let second = driver(&second_store, Arc::clone(&follow_up_provider))
+        .run_turn_continuing(
+            &session_id,
+            request_for(
+                &bench.workspace,
+                &SessionId::generate(),
+                &task_id,
+                "continue after the interruption",
+            ),
+            options(&bench.workspace, TurnLimits::default()),
+            Arc::new(RecordingObserver::default()) as Arc<dyn TurnObserver>,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the resumed turn runs");
+    close_store(second_store).await;
+
+    assert_eq!(second.stop, TurnStop::Final);
+    assert_eq!(
+        second.tool_calls, 0,
+        "the resumed turn must not re-run the settled action"
+    );
+    assert!(second.executions.is_empty());
+    let after = std::fs::read_to_string(bench.workspace.join("src").join("parser.rs"))
+        .expect("file after resume");
+    assert_eq!(after, patched, "the side effect happened exactly once");
+
+    // The recovered context is real: the resumed request carries the previous turn.
+    let seen = follow_up_provider.seen();
+    assert_eq!(seen.len(), 1);
+    let packet = seen[0]
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        packet.contains("parser") || packet.contains("patch"),
+        "the continuation carries the previous turn's context: {packet}"
+    );
+
+    let reader = SqliteStore::open_read_only(&bench.data_dir)
+        .await
+        .expect("read-only store reopens");
+    let receipts = reader
+        .load_receipts(&session_id)
+        .await
+        .expect("receipts still load");
+    assert_eq!(receipts.len(), 1, "no second receipt was written");
+}
