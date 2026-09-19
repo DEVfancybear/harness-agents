@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::struct_excessive_bools, reason = "one flag per launch mode")]
 
 mod delegation_cli;
 mod extension_cli;
@@ -130,6 +131,12 @@ struct ChatArgs {
     /// Emit a versioned JSON result; only valid with --headless.
     #[arg(long, requires = "headless")]
     json: bool,
+    /// Draw the app with the plain renderer instead of the TUI.
+    ///
+    /// The same renderer the app falls back to when the console is too small, is
+    /// not a real terminal, or `HA_UI=plain` is set.
+    #[arg(long, conflicts_with = "headless")]
+    plain: bool,
 }
 
 impl ChatArgs {
@@ -141,6 +148,7 @@ impl ChatArgs {
             self.headless,
             self.prompt.clone(),
             self.json,
+            self.plain,
         )
     }
 }
@@ -322,6 +330,7 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
                 cwd: None,
                 resume: None,
                 fixture: false,
+                plain: interactive::plain_requested_from_environment(),
             })
             .await
         }

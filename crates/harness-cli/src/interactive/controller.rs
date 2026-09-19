@@ -1,13 +1,24 @@
 //! State reducer for the interactive app.
 //!
-//! The controller owns the phase, the transcript and the compiled effects. It
-//! never touches a terminal, so every rule below is unit tested without a PTY;
-//! the host translates effects into terminal calls.
+//! The controller owns the phase, the history, the editor and the compiled
+//! effects. It never touches a terminal, so every rule below is unit tested
+//! without a PTY; the host translates effects into terminal calls.
+//!
+//! T02 changed the output type, not the rules: effects now carry a typed
+//! [`HistoryItem`] (or raw stream text) instead of a pre-rendered string, and
+//! [`InteractiveController::ui_state`] exposes the snapshot the TUI viewport
+//! draws. The plain renderer still prints [`view::plain_lines`] of the same item,
+//! which is required to reproduce the pre-T02 transcript exactly.
+
+use std::time::{Duration, Instant};
 
 use harness_types::InputId;
 
 use super::bootstrap::LaunchContext;
-use super::events::{AppPhase, Key, SessionCandidate, SessionEvent};
+use super::events::{
+    AppPhase, HistoryItem, Key, Modal, RunOutcome, SessionCandidate, SessionEvent, ToolState,
+    UiState,
+};
 use super::input::{InputOutcome, LineEditor};
 use super::service::{ApprovalDecision, SessionChannel, SessionPort, SubmitRequest};
 use super::view;
@@ -15,26 +26,58 @@ use super::view;
 /// Exit code for a normal quit.
 pub const EXIT_SUCCESS: u8 = 0;
 
+/// Default step and tool-call bounds, so the status bar can show `step 2/8` and
+/// `tools 2/16` before the first event arrives.
+///
+/// These mirror `TurnLimits::default()` in `harness-tools`; the real service
+/// reports the limits it actually uses through `SessionPort::limits`.
+pub const DEFAULT_MAX_STEPS: u32 = 8;
+pub const DEFAULT_MAX_TOOL_CALLS: u32 = 16;
+
+/// How long the approval panel has before the gate refuses the request.
+pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_mins(5);
+
 /// One thing the host must do after a controller step.
 ///
 /// The exit code is a plain number so effects stay comparable in tests; the host
 /// maps it to a process exit code.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Effect {
-    /// Append one complete line.
-    WriteLine(String),
-    /// Append text exactly as given, for incremental output.
-    WritePartial(String),
-    /// Reprint the prompt with the current buffer.
-    RedrawPrompt,
+    /// Add one entry to the scrollback.
+    History(HistoryItem),
+    /// Append stream text exactly as given, for incremental output.
+    Stream(String),
+    /// Repaint the viewport (the composer, the live block and the status bar).
+    Redraw,
     /// Leave the app with this exit code.
     Exit(u8),
+}
+
+/// The step and tool-call bounds the status bar shows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TurnBounds {
+    pub max_steps: u32,
+    pub max_tool_calls: u32,
+}
+
+impl Default for TurnBounds {
+    fn default() -> Self {
+        Self {
+            max_steps: DEFAULT_MAX_STEPS,
+            max_tool_calls: DEFAULT_MAX_TOOL_CALLS,
+        }
+    }
 }
 
 /// One gated action waiting for the user's answer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingApproval {
     request_id: String,
+    action: String,
+    summary: String,
+    workspace: String,
+    scope: String,
+    expires_at: Instant,
 }
 
 /// Interactive app state and its transitions.
@@ -43,26 +86,53 @@ pub struct InteractiveController {
     setup_required: bool,
     header: Vec<String>,
     setup_hint: Option<String>,
+    /// The committed plain transcript, byte for byte what the old controller
+    /// pushed. Kept as text so U20 can be asserted without a renderer.
     transcript: Vec<String>,
     editor: LineEditor,
     service: Box<dyn SessionPort>,
     channel: SessionChannel,
+    /// Model text that has not been printed yet.
     pending_text: String,
-    active_input: Option<InputId>,
+    /// Number of line breaks in `pending_text`. It is maintained as deltas
+    /// arrive, so the common streaming path does not rescan an ever-growing
+    /// buffer on every token.
+    pending_newlines: usize,
     pending_approval: Option<PendingApproval>,
     /// Last resume listing, so a number can select from it.
     session_candidates: Vec<SessionCandidate>,
+    /// The plain renderer prints slash-command output; the TUI opens an overlay.
+    plain: bool,
+    /// The tool card that is still open, so it settles in place.
+    open_tool: Option<(String, String)>,
+    // Progress accounting for the status bar.
+    steps: u32,
+    tool_calls: u32,
+    bounds: TurnBounds,
+    run_started_at: Option<Instant>,
+    last_run_elapsed: Duration,
+    last_request: Option<String>,
+    /// Why the host is not using the TUI, when it fell back to plain.
+    fallback_reason: Option<String>,
+    /// Tick counter, so the spinner animates and an idle loop stays still.
+    tick: u64,
 }
 
 impl InteractiveController {
+    /// Build the controller for one launch.
+    ///
+    /// `plain` selects how slash-command output is delivered: the plain renderer
+    /// prints it as history lines, the TUI opens it as a modal overlay.
     #[must_use]
     pub fn new(
         context: &LaunchContext,
         service: Box<dyn SessionPort>,
         channel: SessionChannel,
+        plain: bool,
     ) -> Self {
         let mut header = context.header_lines();
         header.push(format!("Service: {}", service.label()));
+        let bounds = service.limits();
         Self {
             // The app boots before it can render; boot_lines performs the
             // transition once the header has actually been produced.
@@ -75,10 +145,28 @@ impl InteractiveController {
             service,
             channel,
             pending_text: String::new(),
-            active_input: None,
+            pending_newlines: 0,
             pending_approval: None,
             session_candidates: Vec::new(),
+            plain,
+            open_tool: None,
+            steps: 0,
+            tool_calls: 0,
+            bounds,
+            run_started_at: None,
+            last_run_elapsed: Duration::ZERO,
+            last_request: None,
+            fallback_reason: None,
+            tick: 0,
         }
+    }
+
+    /// Record why the host is using the plain renderer instead of the TUI.
+    ///
+    /// The reason is shown once, on stderr, by the host; keeping it here makes it
+    /// inspectable from a unit test and visible in the status bar.
+    pub fn set_fallback_reason(&mut self, reason: impl Into<String>) {
+        self.fallback_reason = Some(reason.into());
     }
 
     #[cfg(test)]
@@ -87,6 +175,7 @@ impl InteractiveController {
         self.phase
     }
 
+    /// The committed transcript, exactly as the plain renderer printed it.
     #[cfg(test)]
     #[must_use]
     pub fn transcript(&self) -> &[String] {
@@ -116,6 +205,61 @@ impl InteractiveController {
         self.service.resume(Some(session_id.to_owned()))
     }
 
+    /// The snapshot the TUI viewport draws.
+    #[must_use]
+    pub fn ui_state(&self) -> UiState {
+        UiState {
+            phase: self.phase,
+            setup_required: self.setup_required,
+            setup_hint: self.setup_hint.clone(),
+            header: self.header.clone(),
+            buffer: self.editor.buffer().to_owned(),
+            cursor: self.editor.cursor(),
+            live_text: self.pending_text.clone(),
+            open_tool: self.open_tool.clone(),
+            modal: self.modal(),
+            last_request: self.last_request.clone(),
+            run_started_at: self.run_started_at,
+            last_run_elapsed: self.last_run_elapsed,
+            steps: self.steps,
+            max_steps: self.bounds.max_steps,
+            tool_calls: self.tool_calls,
+            max_tool_calls: self.bounds.max_tool_calls,
+            completion: self.completion(),
+            fallback_reason: self.fallback_reason.clone(),
+            tick: self.tick,
+        }
+    }
+
+    /// The modal panel for the current state, if any.
+    fn modal(&self) -> Option<Modal> {
+        if let Some(pending) = &self.pending_approval {
+            return Some(Modal::Approval {
+                request_id: pending.request_id.clone(),
+                action: pending.action.clone(),
+                summary: pending.summary.clone(),
+                workspace: pending.workspace.clone(),
+                scope: pending.scope.clone(),
+                expires_at: pending.expires_at,
+            });
+        }
+        if let Some(picker) = self.editor.picker() {
+            return Some(Modal::Picker {
+                items: picker.items().to_vec(),
+                selected: picker.selected(),
+            });
+        }
+        self.editor.overlay().map(|overlay| Modal::Overlay {
+            title: overlay.title.clone(),
+            lines: overlay.lines.clone(),
+        })
+    }
+
+    /// Slash commands that complete the current buffer.
+    fn completion(&self) -> Vec<&'static str> {
+        self.editor.suggestions().to_vec()
+    }
+
     /// Everything the host prints once, before the first prompt.
     ///
     /// Rendering the boot header is the transition out of the booting phase, so
@@ -137,9 +281,52 @@ impl InteractiveController {
 
     /// Apply one key.
     pub fn handle_key(&mut self, key: Key) -> Vec<Effect> {
+        if key == Key::Redraw {
+            return vec![Effect::Redraw];
+        }
+        // A modal owns the keyboard while it is open: Escape closes it, and the
+        // picker takes the arrows, Enter and Escape.
+        if self.pending_approval.is_some() {
+            match key {
+                Key::EndOfInput => return self.command("/exit"),
+                Key::Esc => return Vec::new(),
+                // In the TUI the panel says `y chạy · n từ chối`, so a single y or
+                // n answers immediately; anything else is typed and answered with
+                // Enter, which is what plain mode has always done.
+                Key::Char('y' | 'Y') if !self.plain => return self.answer("y"),
+                Key::Char('n' | 'N') if !self.plain => return self.answer("n"),
+                Key::Char(character) => return self.handle_key(Key::Paste(character.to_string())),
+                _ => {}
+            }
+        } else if self.editor.picker().is_some() {
+            match key {
+                Key::Up => {
+                    self.editor.move_picker(-1);
+                    return vec![Effect::Redraw];
+                }
+                Key::Down => {
+                    self.editor.move_picker(1);
+                    return vec![Effect::Redraw];
+                }
+                Key::Esc => {
+                    self.editor.close_picker();
+                    return vec![Effect::Redraw];
+                }
+                Key::Enter => {
+                    let chosen = self.selected_candidate();
+                    self.editor.close_picker();
+                    return match chosen {
+                        Some(session_id) => self.continue_session(&session_id),
+                        None => vec![Effect::Redraw],
+                    };
+                }
+                Key::EndOfInput => return self.command("/exit"),
+                _ => {}
+            }
+        }
         match self.editor.handle(key) {
             InputOutcome::Unchanged => Vec::new(),
-            InputOutcome::Redraw => vec![Effect::RedrawPrompt],
+            InputOutcome::Redraw | InputOutcome::CompleteSuggestion => vec![Effect::Redraw],
             InputOutcome::Exit => self.command("/exit"),
             InputOutcome::Interrupt => self.interrupt(),
             InputOutcome::Submit(text) => self.submit(text),
@@ -153,98 +340,214 @@ impl InteractiveController {
         if events.is_empty() {
             return effects;
         }
-        let text_only = events
-            .iter()
-            .all(|event| matches!(event, SessionEvent::TextDelta { .. }));
         for event in events {
-            match event {
-                SessionEvent::Accepted { input_id } => {
-                    self.flush_stream(&mut effects);
-                    let line =
-                        view::run_line(&format!("accepted {}", view::short_id(input_id.as_str())));
-                    self.push_line(&mut effects, line);
+            self.apply_event(event, &mut effects);
+        }
+        // Plain output is an append-only transcript, so it consumes every delta.
+        // The TUI keeps the newest rows in its live block and only moves overflow
+        // into scrollback. Boundary events still call `flush_stream` explicitly
+        // to preserve assistant/tool/run ordering.
+        if self.plain {
+            self.flush_stream(&mut effects);
+        } else {
+            self.flush_stream_overflow(&mut effects);
+        }
+        effects.push(Effect::Redraw);
+        effects
+    }
+
+    /// Time-driven repaint: the spinner, the elapsed clock and the approval
+    /// countdown.
+    ///
+    /// It never changes the phase: a tick that mutated state could expire an
+    /// approval the gate is still waiting on. The gate owns expiry, and reports
+    /// it as `ApprovalExpired`. An idle app returns no effect at all, which is
+    /// how acceptance U06 proves the idle loop does not redraw.
+    #[allow(dead_code, reason = "T05 wires the tick into the render loop")]
+    pub fn tick(&mut self) -> Vec<Effect> {
+        if self.phase.has_active_run() || self.pending_approval.is_some() {
+            self.tick = self.tick.saturating_add(1);
+            vec![Effect::Redraw]
+        } else {
+            Vec::new()
+        }
+    }
+
+    #[allow(clippy::too_many_lines, reason = "one arm per session event")]
+    fn apply_event(&mut self, event: SessionEvent, effects: &mut Vec<Effect>) {
+        match event {
+            SessionEvent::Accepted { input_id } => {
+                self.flush_stream(effects);
+                self.push_history(
+                    effects,
+                    HistoryItem::RunAccepted {
+                        input_id: input_id.as_str().to_owned(),
+                    },
+                );
+            }
+            SessionEvent::TextDelta { text } => {
+                self.pending_newlines = self
+                    .pending_newlines
+                    .saturating_add(text.bytes().filter(|byte| *byte == b'\n').count());
+                self.pending_text.push_str(&text);
+            }
+            SessionEvent::StepStarted { step } => {
+                self.steps = step;
+            }
+            SessionEvent::ToolStarted { name, summary } => {
+                self.flush_stream(effects);
+                self.tool_calls = self.tool_calls.saturating_add(1);
+                self.open_tool = Some((name.clone(), summary.clone()));
+                if self.plain {
+                    self.push_history(
+                        effects,
+                        HistoryItem::Tool {
+                            name,
+                            summary,
+                            state: ToolState::Started,
+                        },
+                    );
                 }
-                SessionEvent::TextDelta { text } => self.pending_text.push_str(&text),
-                SessionEvent::ToolStarted { name, summary } => {
-                    self.flush_stream(&mut effects);
-                    let line = view::tool_line(&name, &summary);
-                    self.push_line(&mut effects, line);
-                }
-                SessionEvent::ToolSettled { name, ok } => {
-                    self.flush_stream(&mut effects);
-                    let line = view::tool_line(&name, if ok { "ok" } else { "failed" });
-                    self.push_line(&mut effects, line);
-                }
-                SessionEvent::ApprovalRequired {
+            }
+            SessionEvent::ToolSettled { name, ok, elapsed } => {
+                self.flush_stream(effects);
+                let summary = self
+                    .open_tool
+                    .take()
+                    .filter(|(open_name, _)| open_name == &name)
+                    .map_or_else(String::new, |(_, summary)| summary);
+                let state = if ok {
+                    ToolState::Ok { elapsed }
+                } else {
+                    ToolState::Failed { elapsed }
+                };
+                self.push_history(
+                    effects,
+                    HistoryItem::Tool {
+                        name,
+                        // In the TUI this is the same card moving from the live
+                        // region into scrollback. Plain mode already printed the
+                        // summary on the Started row, so its settled row remains
+                        // byte-identical to H03.
+                        summary: if self.plain { String::new() } else { summary },
+                        state,
+                    },
+                );
+            }
+            SessionEvent::ApprovalRequired {
+                request_id,
+                action,
+                summary,
+                workspace,
+                scope,
+                expires_at,
+            } => {
+                self.flush_stream(effects);
+                self.push_history(
+                    effects,
+                    HistoryItem::Approval {
+                        action: action.clone(),
+                        summary: summary.clone(),
+                        workspace: workspace.clone(),
+                        scope: scope.clone(),
+                        request_id: request_id.clone(),
+                    },
+                );
+                self.pending_approval = Some(PendingApproval {
                     request_id,
                     action,
                     summary,
                     workspace,
                     scope,
-                } => {
-                    self.flush_stream(&mut effects);
-                    for line in
-                        view::approval_lines(&action, &summary, &workspace, &scope, &request_id)
-                    {
-                        self.push_line(&mut effects, line);
+                    expires_at,
+                });
+                self.phase = AppPhase::WaitingApproval;
+            }
+            SessionEvent::ApprovalExpired { request_id } => {
+                self.flush_stream(effects);
+                let matches_pending = self
+                    .pending_approval
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_id == request_id);
+                if matches_pending {
+                    self.pending_approval = None;
+                    if self.phase == AppPhase::WaitingApproval {
+                        self.phase = AppPhase::Running;
                     }
-                    self.pending_approval = Some(PendingApproval {
-                        request_id: request_id.clone(),
-                    });
-                    self.phase = AppPhase::WaitingApproval;
                 }
-                SessionEvent::SessionsListed { sessions } => {
-                    self.flush_stream(&mut effects);
-                    if sessions.is_empty() {
-                        self.push_line(
-                            &mut effects,
-                            "no persisted sessions in this project yet".to_owned(),
-                        );
-                    } else {
-                        let header = format!("sessions in this project ({}):", sessions.len());
-                        self.push_line(&mut effects, header);
-                        for (index, candidate) in sessions.iter().enumerate() {
-                            let line = format!(
-                                "  {}. {}  {}  {}",
-                                index + 1,
-                                candidate.session_id,
-                                candidate.task_id,
-                                candidate.detail
-                            );
-                            self.push_line(&mut effects, line);
-                        }
-                        self.push_line(
-                            &mut effects,
-                            "use /resume <number> to continue one of them".to_owned(),
-                        );
+                self.push_history(
+                    effects,
+                    HistoryItem::ApprovalResolution {
+                        label: "expired".to_owned(),
+                        request_id,
+                    },
+                );
+            }
+            SessionEvent::SessionsListed { sessions } => {
+                self.flush_stream(effects);
+                if sessions.is_empty() {
+                    self.push_history(
+                        effects,
+                        HistoryItem::Notice {
+                            message: "no persisted sessions in this project yet".to_owned(),
+                        },
+                    );
+                } else {
+                    let mut lines = vec![format!("sessions in this project ({}):", sessions.len())];
+                    for (index, candidate) in sessions.iter().enumerate() {
+                        lines.push(format!(
+                            "  {}. {}  {}  {}",
+                            index + 1,
+                            candidate.session_id,
+                            candidate.task_id,
+                            candidate.detail
+                        ));
                     }
-                    self.session_candidates = sessions;
+                    if self.plain {
+                        lines.push("use /resume <number> to continue one of them".to_owned());
+                    }
+                    let items: Vec<String> = sessions
+                        .iter()
+                        .map(|candidate| {
+                            format!(
+                                "{}  {}  {}",
+                                candidate.session_id, candidate.task_id, candidate.detail
+                            )
+                        })
+                        .collect();
+                    self.push_history(effects, HistoryItem::Sessions { lines });
+                    // The TUI opens a picker instead of asking for a number.
+                    if !self.plain {
+                        self.editor.open_picker(items);
+                    }
                 }
-                SessionEvent::Notice { message } => {
-                    self.flush_stream(&mut effects);
-                    let line = format!("[info] {message}");
-                    self.push_line(&mut effects, line);
-                }
-                SessionEvent::RunTerminal { outcome } => {
-                    self.flush_stream(&mut effects);
-                    let line = view::run_line(&outcome.label());
-                    self.push_line(&mut effects, line);
-                    self.finish_run();
-                }
-                SessionEvent::RecoverableError { message } => {
-                    self.flush_stream(&mut effects);
-                    let line = format!("[error] {message}");
-                    self.push_line(&mut effects, line);
-                    self.finish_run();
-                }
+                self.session_candidates = sessions;
+            }
+            SessionEvent::Notice { message } => {
+                self.flush_stream(effects);
+                self.push_history(effects, HistoryItem::Notice { message });
+            }
+            SessionEvent::RunTerminal { outcome } => {
+                self.flush_stream(effects);
+                self.settle_run(Some(outcome.clone()));
+                self.push_history(
+                    effects,
+                    HistoryItem::Run {
+                        outcome,
+                        steps: self.steps,
+                        tool_calls: self.tool_calls,
+                        elapsed: self.last_run_elapsed,
+                    },
+                );
+                self.finish_run();
+            }
+            SessionEvent::RecoverableError { message } => {
+                self.flush_stream(effects);
+                self.settle_run(None);
+                self.push_history(effects, HistoryItem::Error { message });
+                self.finish_run();
             }
         }
-        // Text that arrived in this cycle is shown now, not after the run ends.
-        self.flush_stream(&mut effects);
-        if !text_only {
-            effects.push(Effect::RedrawPrompt);
-        }
-        effects
     }
 
     fn submit(&mut self, text: String) -> Vec<Effect> {
@@ -261,22 +564,47 @@ impl InteractiveController {
         }
         if self.phase.has_active_run() {
             return vec![
-                Effect::WriteLine(
-                    "a run is already active; wait for it or press Ctrl-C to cancel".to_owned(),
-                ),
-                Effect::RedrawPrompt,
+                Effect::History(HistoryItem::Notice {
+                    message: "a run is already active; wait for it or press Ctrl-C to cancel"
+                        .to_owned(),
+                }),
+                Effect::Redraw,
             ];
         }
         let input_id = InputId::generate();
-        let echo = format!("> {text}");
-        self.pending_text.clear();
-        self.active_input = Some(input_id.clone());
-        self.phase = AppPhase::Running;
-        self.service.submit(SubmitRequest { input_id, text });
+        self.fresh_run(Instant::now(), Some(text.clone()));
+        self.service.submit(SubmitRequest {
+            input_id,
+            text: text.clone(),
+        });
         let mut effects = Vec::new();
-        self.push_line(&mut effects, echo);
-        effects.push(Effect::RedrawPrompt);
+        self.push_history(&mut effects, HistoryItem::User { text });
+        effects.push(Effect::Redraw);
         effects
+    }
+
+    /// Start the accounting for a new turn.
+    fn fresh_run(&mut self, now: Instant, request: Option<String>) {
+        self.pending_text.clear();
+        self.pending_newlines = 0;
+        self.open_tool = None;
+        self.steps = 0;
+        self.tool_calls = 0;
+        self.last_run_elapsed = Duration::ZERO;
+        self.run_started_at = Some(now);
+        if request.is_some() {
+            self.last_request = request;
+        }
+        self.phase = AppPhase::Running;
+    }
+
+    /// Close the accounting for a finished turn.
+    fn settle_run(&mut self, _outcome: Option<RunOutcome>) {
+        self.last_run_elapsed = self
+            .run_started_at
+            .take()
+            .map_or(Duration::ZERO, |started| started.elapsed());
+        self.open_tool = None;
     }
 
     fn interrupt(&mut self) -> Vec<Effect> {
@@ -284,12 +612,19 @@ impl InteractiveController {
             self.service.cancel();
             self.phase = AppPhase::Canceling;
             return vec![
-                Effect::WriteLine("^C canceling the active run...".to_owned()),
-                Effect::RedrawPrompt,
+                Effect::History(HistoryItem::Notice {
+                    message: "^C canceling the active run...".to_owned(),
+                }),
+                Effect::Redraw,
             ];
         }
         self.editor.clear();
-        vec![Effect::WriteLine(String::new()), Effect::RedrawPrompt]
+        vec![
+            Effect::History(HistoryItem::Message {
+                text: String::new(),
+            }),
+            Effect::Redraw,
+        ]
     }
 
     #[allow(clippy::too_many_lines)]
@@ -302,9 +637,11 @@ impl InteractiveController {
             "/exit" | "/quit" => {
                 if self.phase.has_active_run() {
                     self.service.cancel();
-                    self.push_line(
+                    self.push_history(
                         &mut effects,
-                        "^C canceling the active run before exit".to_owned(),
+                        HistoryItem::Notice {
+                            message: "^C canceling the active run before exit".to_owned(),
+                        },
                     );
                 }
                 self.phase = AppPhase::Closed;
@@ -312,47 +649,47 @@ impl InteractiveController {
                 return effects;
             }
             "/help" => {
-                for help in view::help_lines() {
-                    self.push_line(&mut effects, help);
-                }
+                self.reference("/help", view::help_lines(), &mut effects);
             }
             "/status" => {
-                let header = self.header.clone();
-                for line in header {
-                    self.push_line(&mut effects, line);
-                }
-                let phase = format!("Phase:   {}", self.phase.label());
-                self.push_line(&mut effects, phase);
+                let mut lines = self.header.clone();
+                lines.push(format!("Phase:   {}", self.phase.label()));
+                self.reference("/status", lines, &mut effects);
             }
             "/config" => {
-                let selected: Vec<String> = self
+                let lines: Vec<String> = self
                     .header
                     .iter()
                     .filter(|line| line.starts_with("Config:") || line.starts_with("Data:"))
                     .cloned()
                     .collect();
-                for line in selected {
-                    self.push_line(&mut effects, line);
-                }
+                self.reference("/config", lines, &mut effects);
             }
             "/new" => {
                 // A new conversation never abandons a running one: the run is
                 // settled first, exactly like Ctrl-C.
                 if self.phase.has_active_run() {
-                    self.push_line(
+                    self.push_history(
                         &mut effects,
-                        "cannot start a new conversation while a run is active; press Ctrl-C to cancel it first"
-                            .to_owned(),
+                        HistoryItem::Notice {
+                            message: "cannot start a new conversation while a run is active; press Ctrl-C to cancel it first"
+                                .to_owned(),
+                        },
                     );
+                } else if let Err(error) = self.service.resume(None) {
+                    return vec![
+                        Effect::History(HistoryItem::Error { message: error }),
+                        Effect::Redraw,
+                    ];
                 } else {
-                    if let Err(error) = self.service.resume(None) {
-                        return vec![Effect::WriteLine(error), Effect::RedrawPrompt];
-                    }
                     self.session_candidates.clear();
-                    self.push_line(
+                    self.editor.close_picker();
+                    self.push_history(
                         &mut effects,
-                        "starting a fresh conversation; the earlier chain is no longer continued"
-                            .to_owned(),
+                        HistoryItem::Notice {
+                            message: "starting a fresh conversation; the earlier chain is no longer continued"
+                                .to_owned(),
+                        },
                     );
                 }
             }
@@ -360,22 +697,26 @@ impl InteractiveController {
                 // The backend label names the configured model or states that setup
                 // is required; it never claims a model that was not resolved.
                 let label = self.service.label();
-                let text = format!("backend: {label}");
-                self.push_line(&mut effects, text);
+                self.reference("/model", vec![format!("backend: {label}")], &mut effects);
             }
             "/resume" if self.phase.has_active_run() => {
-                self.push_line(
+                self.push_history(
                     &mut effects,
-                    "cannot change or list sessions while a run is active; cancel it first"
-                        .to_owned(),
+                    HistoryItem::Notice {
+                        message:
+                            "cannot change or list sessions while a run is active; cancel it first"
+                                .to_owned(),
+                    },
                 );
             }
             "/resume" => match argument {
                 None => {
                     self.service.list_sessions();
-                    self.push_line(
+                    self.push_history(
                         &mut effects,
-                        "looking for persisted sessions in this project...".to_owned(),
+                        HistoryItem::Notice {
+                            message: "looking for persisted sessions in this project...".to_owned(),
+                        },
                     );
                 }
                 Some(selector) => {
@@ -392,31 +733,73 @@ impl InteractiveController {
                     };
                     match chosen {
                         Some(session_id) => {
-                            if let Err(error) = self.service.resume(Some(session_id.clone())) {
-                                return vec![Effect::WriteLine(error), Effect::RedrawPrompt];
-                            }
-                            let text =
-                                format!("continuing from session {}", view::short_id(&session_id));
-                            self.push_line(&mut effects, text);
+                            effects.extend(self.continue_session(&session_id));
                         }
                         None => {
-                            self.push_line(
+                            self.push_history(
                                 &mut effects,
-                                "that session is not in the last list; run /resume to list this project's sessions"
-                                    .to_owned(),
+                                HistoryItem::Notice {
+                                    message: "that session is not in the last list; run /resume to list this project's sessions"
+                                        .to_owned(),
+                                },
                             );
                         }
                     }
                 }
             },
             other => {
-                let text =
-                    format!("unknown command {other}; /help lists what this revision supports");
-                self.push_line(&mut effects, text);
+                self.push_history(
+                    &mut effects,
+                    HistoryItem::Notice {
+                        message: format!(
+                            "unknown command {other}; /help lists what this revision supports"
+                        ),
+                    },
+                );
             }
         }
-        effects.push(Effect::RedrawPrompt);
+        effects.push(Effect::Redraw);
         effects
+    }
+
+    /// Deliver reference output: as an overlay in the TUI, as history in plain
+    /// mode.
+    fn reference(&mut self, title: &str, lines: Vec<String>, effects: &mut Vec<Effect>) {
+        if self.plain {
+            for text in lines {
+                self.push_history(effects, HistoryItem::Message { text });
+            }
+            return;
+        }
+        self.editor.open_overlay(title, lines);
+    }
+
+    /// Continue from one session id, reporting the outcome like the pre-T02 code.
+    fn continue_session(&mut self, session_id: &str) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        if let Err(error) = self.service.resume(Some(session_id.to_owned())) {
+            return vec![
+                Effect::History(HistoryItem::Error { message: error }),
+                Effect::Redraw,
+            ];
+        }
+        self.push_history(
+            &mut effects,
+            HistoryItem::Notice {
+                message: format!("continuing from session {}", view::short_id(session_id)),
+            },
+        );
+        effects.push(Effect::Redraw);
+        effects
+    }
+
+    /// The session the picker currently highlights.
+    fn selected_candidate(&self) -> Option<String> {
+        let picker = self.editor.picker()?;
+        let selected = picker.selected();
+        self.session_candidates
+            .get(selected)
+            .map(|candidate| candidate.session_id.clone())
     }
 
     fn flush_stream(&mut self, effects: &mut Vec<Effect>) {
@@ -424,13 +807,44 @@ impl InteractiveController {
             return;
         }
         let text = std::mem::take(&mut self.pending_text);
-        self.transcript.push(text.clone());
-        effects.push(Effect::WritePartial(text));
+        self.pending_newlines = 0;
+        // One effect, two renderers: plain mode appends the text exactly as it
+        // arrives (that is what makes the transcript byte-identical), and the TUI
+        // commits it to the scrollback through the history renderer.
+        effects.push(Effect::Stream(text.clone()));
+        self.transcript.push(text);
     }
 
-    fn push_line(&mut self, effects: &mut Vec<Effect>, line: String) {
-        self.transcript.push(line.clone());
-        effects.push(Effect::WriteLine(line));
+    /// Keep a bounded live block without rescanning it for every token.
+    ///
+    /// Width-dependent wrapping stays in the renderer. Here we commit only
+    /// complete logical lines, leaving at most eight in the viewport; no partial
+    /// line can jump into scrollback while the model is still writing it.
+    fn flush_stream_overflow(&mut self, effects: &mut Vec<Effect>) {
+        const LIVE_LINES: usize = 8;
+        let line_count = self.pending_newlines.saturating_add(1);
+        if line_count <= LIVE_LINES {
+            return;
+        }
+        let overflow = line_count - LIVE_LINES;
+        let Some(cut) = self
+            .pending_text
+            .match_indices('\n')
+            .nth(overflow - 1)
+            .map(|(index, _)| index + 1)
+        else {
+            return;
+        };
+        let tail = self.pending_text.split_off(cut);
+        let committed = std::mem::replace(&mut self.pending_text, tail);
+        self.pending_newlines = self.pending_newlines.saturating_sub(overflow);
+        effects.push(Effect::Stream(committed.clone()));
+        self.transcript.push(committed);
+    }
+
+    fn push_history(&mut self, effects: &mut Vec<Effect>, item: HistoryItem) {
+        self.transcript.extend(view::plain_lines(&item));
+        effects.push(Effect::History(item));
     }
 
     /// Resolve the pending approval from one typed line.
@@ -446,11 +860,15 @@ impl InteractiveController {
         };
         let mut effects = Vec::new();
         let Some(decision) = decision else {
-            self.push_line(
+            self.push_history(
                 &mut effects,
-                "the request is still pending: answer y to run it once, or n to refuse".to_owned(),
+                HistoryItem::Notice {
+                    message:
+                        "the request is still pending: answer y to run it once, or n to refuse"
+                            .to_owned(),
+                },
             );
-            effects.push(Effect::RedrawPrompt);
+            effects.push(Effect::Redraw);
             return effects;
         };
         let accepted = self.service.answer(&pending.request_id, decision);
@@ -461,20 +879,30 @@ impl InteractiveController {
         } else {
             "denied"
         };
-        let line = if accepted {
-            format!("[approval] {label} {}", pending.request_id)
+        if accepted {
+            self.push_history(
+                &mut effects,
+                HistoryItem::ApprovalResolution {
+                    label: label.to_owned(),
+                    request_id: pending.request_id,
+                },
+            );
         } else {
-            "[approval] that request is no longer pending (expired or already answered); the action was not executed"
-                .to_owned()
-        };
-        self.push_line(&mut effects, line);
-        effects.push(Effect::RedrawPrompt);
+            self.push_history(
+                &mut effects,
+                HistoryItem::Notice {
+                    message: "[approval] that request is no longer pending (expired or already answered); the action was not executed"
+                        .to_owned(),
+                },
+            );
+        }
+        effects.push(Effect::Redraw);
         effects
     }
 
     fn finish_run(&mut self) {
         self.pending_approval = None;
-        self.active_input = None;
+        self.open_tool = None;
         self.phase = if self.setup_required {
             AppPhase::SetupRequired
         } else {
@@ -485,98 +913,141 @@ impl InteractiveController {
 
 #[cfg(test)]
 mod tests {
-    use super::{Effect, InteractiveController};
+    use super::{EXIT_SUCCESS, Effect, InteractiveController, TurnBounds};
     use crate::interactive::bootstrap::{self, LaunchContext, LaunchRequest};
-    use crate::interactive::events::{AppPhase, Key, RunOutcome, SessionCandidate, SessionEvent};
+    use crate::interactive::events::{
+        AppPhase, HistoryItem, Key, Modal, RunOutcome, SessionCandidate, SessionEvent, ToolState,
+    };
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
     use crate::interactive::service::{
         ApprovalDecision, FixtureService, SessionChannel, SessionPort, SubmitRequest,
     };
+    use crate::interactive::view;
+    use harness_types::InputId;
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     /// Test port that records what the controller admitted.
     #[derive(Clone, Default)]
     struct RecordingPort {
-        submitted: Arc<Mutex<Vec<String>>>,
-        cancels: Arc<Mutex<usize>>,
+        submissions: Arc<Mutex<Vec<String>>>,
+        cancels: Arc<Mutex<u32>>,
+        answers: Arc<Mutex<Vec<(String, ApprovalDecision)>>>,
+        resumes: Arc<Mutex<Vec<Option<String>>>>,
+        limits: TurnBounds,
     }
 
     impl SessionPort for RecordingPort {
         fn label(&self) -> String {
-            "recording test port".to_owned()
+            "recording port".to_owned()
         }
+
         fn submit(&mut self, request: SubmitRequest) {
-            self.submitted
+            self.submissions
                 .lock()
-                .expect("submission lock")
+                .expect("submission log")
                 .push(request.text);
         }
+
         fn cancel(&mut self) {
-            *self.cancels.lock().expect("cancel lock") += 1;
+            *self.cancels.lock().expect("cancel log") += 1;
+        }
+
+        fn answer(&mut self, request_id: &str, decision: ApprovalDecision) -> bool {
+            self.answers
+                .lock()
+                .expect("answer log")
+                .push((request_id.to_owned(), decision));
+            true
+        }
+
+        fn resume(&mut self, session_id: Option<String>) -> Result<(), String> {
+            self.resumes.lock().expect("resume log").push(session_id);
+            Ok(())
+        }
+
+        fn limits(&self) -> TurnBounds {
+            self.limits
         }
     }
 
-    /// Test port that accepts and then reports a setup failure, the way the real
-    /// service does when the provider environment is incomplete.
-    struct SetupFailingPort {
-        sender: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
-    }
-
-    impl SessionPort for SetupFailingPort {
-        fn label(&self) -> String {
-            "setup required (no provider configured)".to_owned()
-        }
-        fn submit(&mut self, request: SubmitRequest) {
-            let _ = self.sender.send(SessionEvent::Accepted {
-                input_id: request.input_id,
-            });
-            let _ = self.sender.send(SessionEvent::RecoverableError {
-                message: "provider setup is incomplete: set HA_PROVIDER_ENDPOINT, HA_PROVIDER_MODEL, DEEPSEEK_API_KEY. Nothing was sent and no fixture answer was substituted.".to_owned(),
-            });
-        }
-        fn cancel(&mut self) {}
-    }
-
-    /// Test port that ignores everything; the test drives the channel itself.
-    struct SilentPort;
-
-    impl SessionPort for SilentPort {
-        fn label(&self) -> String {
-            "silent test port".to_owned()
-        }
-        fn submit(&mut self, _request: SubmitRequest) {}
-        fn cancel(&mut self) {}
-    }
-
-    struct Bench {
-        _temp: tempfile::TempDir,
-        context: LaunchContext,
-    }
-
-    fn bench(configured: bool) -> Bench {
+    /// Fixture home and project, never the developer profile.
+    ///
+    /// `configured` writes the config file and a credential, which is what makes
+    /// a launch ready instead of `setup_required`; the flag is read straight from
+    /// the environment pairs, so no test depends on the developer's shell.
+    fn context(configured: bool) -> (tempfile::TempDir, LaunchContext) {
         let temp = tempfile::tempdir().expect("temp root");
         let home = temp.path().join("home");
         let project = temp.path().join("project");
         std::fs::create_dir_all(&home).expect("fixture home");
         std::fs::create_dir_all(&project).expect("fixture project");
+        let mut pairs = vec![("HA_HOME", home.to_string_lossy().into_owned())];
         if configured {
             std::fs::write(home.join("config.toml"), "schema_version = 1\n")
                 .expect("fixture config");
+            pairs.push(("DEEPSEEK_API_KEY", "fixture-secret".to_owned()));
         }
         let context = bootstrap::resolve(LaunchRequest {
             cwd: None,
             caller_dir: project,
             platform: HostPlatform::current(),
-            environment: LaunchEnvironment::from_pairs([
-                ("HA_HOME", home.to_string_lossy().into_owned()),
-                ("DEEPSEEK_API_KEY", "fixture-secret".to_owned()),
-            ]),
+            environment: LaunchEnvironment::from_pairs(pairs),
             explicit_data_dir: None,
         })
         .expect("context resolves");
+        (temp, context)
+    }
+
+    struct Bench {
+        controller: InteractiveController,
+        events: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
+        port: RecordingPort,
+        _temp: tempfile::TempDir,
+    }
+
+    fn bench(configured: bool) -> Bench {
+        bench_with(configured, RecordingPort::default(), true)
+    }
+
+    /// The same bench with the TUI renderer selected, so the modal key handling
+    /// (immediate y/n) is exercised instead of the plain line answers.
+    fn tui_bench(configured: bool) -> Bench {
+        bench_with(configured, RecordingPort::default(), false)
+    }
+
+    fn bench_with(configured: bool, port: RecordingPort, plain: bool) -> Bench {
+        let (temp, context) = context(configured);
+        let channel = SessionChannel::new();
+        let events = channel.sender();
+        let controller =
+            InteractiveController::new(&context, Box::new(port.clone()), channel, plain);
         Bench {
+            controller,
+            events,
+            port,
             _temp: temp,
-            context,
+        }
+    }
+
+    /// A bench whose events come from the fixture service, so streaming and tool
+    /// cards are produced by the same code the app uses.
+    fn fixture_bench(configured: bool) -> Bench {
+        let (temp, context) = context(configured);
+        let channel = SessionChannel::new();
+        let events = channel.sender();
+        let port = RecordingPort::default();
+        let controller = InteractiveController::new(
+            &context,
+            Box::new(FixtureService::new(events.clone())),
+            channel,
+            true,
+        );
+        Bench {
+            controller,
+            events,
+            port,
+            _temp: temp,
         }
     }
 
@@ -587,570 +1058,1106 @@ mod tests {
         controller.handle_key(Key::Enter)
     }
 
-    fn lines(effects: &[Effect]) -> Vec<String> {
+    /// The plain lines of one effect batch: exactly what the plain renderer
+    /// writes, and exactly what the pre-T02 `WriteLine`/`WritePartial` pair wrote.
+    ///
+    /// Stream chunks are appended with no separator, because that is what
+    /// `Effect::WritePartial` did; a history line that follows starts on its own
+    /// row.
+    fn effects_to_plain(effects: &[Effect]) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        let mut streaming = false;
+        for effect in effects {
+            match effect {
+                Effect::History(item) => {
+                    streaming = false;
+                    lines.extend(view::plain_lines(item));
+                }
+                Effect::Stream(text) => {
+                    if streaming {
+                        if let Some(last) = lines.last_mut() {
+                            last.push_str(text);
+                        }
+                    } else {
+                        lines.push(text.clone());
+                    }
+                    streaming = true;
+                }
+                Effect::Redraw | Effect::Exit(_) => {}
+            }
+        }
+        lines
+    }
+
+    fn history_items(effects: &[Effect]) -> Vec<HistoryItem> {
         effects
             .iter()
             .filter_map(|effect| match effect {
-                Effect::WriteLine(line) => Some(line.clone()),
+                Effect::History(item) => Some(item.clone()),
                 _ => None,
             })
             .collect()
     }
 
-    #[test]
-    fn completion_exit_commands_and_eof_cancel_during_approval() {
-        for command in [Some("/exit"), Some("/quit"), None] {
-            let bench = bench(true);
-            let port = RecordingPort::default();
-            let recorded = port.clone();
-            let channel = SessionChannel::new();
-            let sender = channel.sender();
-            let mut controller =
-                InteractiveController::new(&bench.context, Box::new(port), channel);
-            let _ = controller.boot_lines();
-            let _ = submit_text(&mut controller, "do work");
-            sender
-                .send(approval_event("pending-exit"))
-                .expect("approval");
-            let _ = controller.pump_events();
-            let effects = match command {
-                Some(command) => submit_text(&mut controller, command),
-                None => controller.handle_key(Key::EndOfInput),
-            };
-            assert!(
-                effects.contains(&Effect::Exit(0)),
-                "{command:?}: {effects:?}"
-            );
-            assert_eq!(
-                *recorded.cancels.lock().expect("cancel log"),
-                1,
-                "{command:?}"
-            );
-            assert_eq!(recorded.submitted.lock().expect("requests").len(), 1);
-        }
-    }
-
-    #[test]
-    fn completion_resume_zero_and_active_switch_are_rejected() {
-        let bench = bench(true);
-        let channel = SessionChannel::new();
-        let sender = channel.sender();
-        let resumed = Arc::new(Mutex::new(Vec::new()));
-        let listed = Arc::new(Mutex::new(0));
-        let port = ResumePort {
-            sender: sender.clone(),
-            listed: Arc::clone(&listed),
-            resumed: Arc::clone(&resumed),
-        };
-        let mut controller = InteractiveController::new(&bench.context, Box::new(port), channel);
-        let _ = controller.boot_lines();
-        sender
-            .send(SessionEvent::SessionsListed {
-                sessions: vec![candidate(
-                    "session_0192f0aa-bbcc-7ddd-8eee-000000000001",
-                    "task-a",
-                    "source",
-                )],
-            })
-            .expect("listing");
-        let _ = controller.pump_events();
-        let _ = submit_text(&mut controller, "/resume 0");
-        assert!(
-            resumed.lock().expect("resumed").is_empty(),
-            "zero is not session one"
-        );
-        let _ = submit_text(&mut controller, "active request");
-        let _ = submit_text(&mut controller, "/resume 1");
-        let _ = submit_text(&mut controller, "/resume");
-        assert!(
-            resumed.lock().expect("resumed").is_empty(),
-            "an active run keeps its source"
-        );
-        assert_eq!(*listed.lock().expect("listed"), 0);
-    }
-
-    #[test]
-    fn h03_one_admission_per_message_and_a_running_run_refuses_a_second() {
-        let bench = bench(true);
-        let port = RecordingPort::default();
-        let recorded = port.clone();
-        let mut controller =
-            InteractiveController::new(&bench.context, Box::new(port), SessionChannel::new());
-        assert_eq!(controller.phase(), AppPhase::Booting);
-        let _ = controller.boot_lines();
-        assert_eq!(controller.phase(), AppPhase::Ready);
-
-        let effects = submit_text(&mut controller, "first request");
-        assert!(lines(&effects).iter().any(|line| line == "> first request"));
-        assert_eq!(controller.phase(), AppPhase::Running);
-        assert_eq!(recorded.submitted.lock().expect("lock").len(), 1);
-
-        let refusal = submit_text(&mut controller, "second request");
-        assert!(
-            lines(&refusal)
-                .iter()
-                .any(|line| line.contains("already active")),
-            "{refusal:?}"
-        );
-        assert_eq!(
-            recorded.submitted.lock().expect("lock").len(),
-            1,
-            "a second input must not be admitted while a run is active"
-        );
-    }
-
-    #[test]
-    fn h03_ctrl_c_cancels_a_run_and_clears_an_idle_prompt() {
-        let bench = bench(true);
-        let port = RecordingPort::default();
-        let recorded = port.clone();
-        let mut controller =
-            InteractiveController::new(&bench.context, Box::new(port), SessionChannel::new());
-
-        submit_text(&mut controller, "long task");
-        let effects = controller.handle_key(Key::Interrupt);
-        assert!(
-            lines(&effects)
-                .iter()
-                .any(|line| line.contains("canceling")),
-            "{effects:?}"
-        );
-        assert_eq!(controller.phase(), AppPhase::Canceling);
-        assert_eq!(*recorded.cancels.lock().expect("lock"), 1);
-
-        let mut idle = InteractiveController::new(
-            &bench.context,
-            Box::new(RecordingPort::default()),
-            SessionChannel::new(),
-        );
-        let _ = idle.boot_lines();
-        for character in "typo".chars() {
-            let _ = idle.handle_key(Key::Char(character));
-        }
-        assert!(idle.prompt().ends_with("typo"));
-        assert_eq!(idle.phase(), AppPhase::Ready);
-        let cleared = idle.handle_key(Key::Interrupt);
-        assert_eq!(idle.prompt(), "> ", "an idle Ctrl-C clears the input");
-        assert!(lines(&cleared).iter().any(String::is_empty));
-    }
-
-    #[test]
-    fn h03_fixture_run_streams_text_before_tools_and_returns_to_ready() {
-        let bench = bench(true);
-        let channel = SessionChannel::new();
-        let service = FixtureService::new(channel.sender());
-        let mut controller = InteractiveController::new(&bench.context, Box::new(service), channel);
-        let _ = controller.boot_lines();
-
-        submit_text(&mut controller, "fix the parser");
-        let effects = controller.pump_events();
-        assert_eq!(
-            effects.last(),
-            Some(&Effect::RedrawPrompt),
-            "the prompt is reprinted after output"
-        );
-        let streamed: String = effects
-            .iter()
-            .filter_map(|effect| match effect {
-                Effect::WritePartial(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            streamed,
-            "fixture answer for: fix the parser (no model was called)"
-        );
-        assert!(
-            effects
-                .iter()
-                .position(|effect| matches!(effect, Effect::WritePartial(_)))
-                .expect("streamed text")
-                < effects
-                    .iter()
-                    .position(|effect| matches!(effect, Effect::WriteLine(line) if line.starts_with("[tool]")))
-                    .expect("tool line"),
-            "text must be rendered before the tool lines"
-        );
-
-        let transcript = controller.transcript().join("\n");
-        assert!(
-            transcript.contains("[tool] search_text failed"),
-            "{transcript}"
-        );
-        assert!(transcript.contains("[tool] apply_patch ok"), "{transcript}");
-        assert!(transcript.contains("[run] done"), "{transcript}");
-        assert_eq!(controller.phase(), AppPhase::Ready);
-    }
-
-    #[test]
-    fn h03_text_and_terminal_events_are_rendered_before_the_run_ends() {
-        let bench = bench(true);
-        let channel = SessionChannel::new();
-        let sender = channel.sender();
-        let mut controller =
-            InteractiveController::new(&bench.context, Box::new(SilentPort), channel);
-        let _ = controller.boot_lines();
-
-        submit_text(&mut controller, "stream please");
-        sender
-            .send(SessionEvent::TextDelta {
-                text: "partial answer".to_owned(),
-            })
-            .expect("delta is delivered");
-        let effects = controller.pump_events();
-        assert_eq!(
-            effects.first(),
-            Some(&Effect::WritePartial("partial answer".to_owned()))
-        );
-        assert_eq!(
-            controller.phase(),
-            AppPhase::Running,
-            "text must be visible while the run is still active"
-        );
-
-        sender
-            .send(SessionEvent::RunTerminal {
-                outcome: RunOutcome::Done,
-            })
-            .expect("terminal event is delivered");
-        let effects = controller.pump_events();
-        assert!(lines(&effects).iter().any(|line| line == "[run] done"));
-        assert_eq!(controller.phase(), AppPhase::Ready);
-    }
-
-    #[test]
-    fn h04_an_unconfigured_provider_is_reported_and_the_setup_state_is_kept() {
-        let bench = bench(false);
-        let channel = SessionChannel::new();
-        let service = SetupFailingPort {
-            sender: channel.sender(),
-        };
-        let mut controller = InteractiveController::new(&bench.context, Box::new(service), channel);
-        let _ = controller.boot_lines();
-        assert_eq!(controller.phase(), AppPhase::SetupRequired);
-
-        submit_text(&mut controller, "do work");
-        let effects = controller.pump_events();
-        let rendered = lines(&effects).join("\n");
-        assert!(
-            rendered.contains("provider setup is incomplete"),
-            "{rendered}"
-        );
-        assert_eq!(
-            controller.phase(),
-            AppPhase::SetupRequired,
-            "the setup state is not lost by a failed turn"
-        );
-    }
-
-    #[test]
-    fn h03_slash_commands_are_parsed_and_staged_features_stay_honest() {
-        let bench = bench(true);
-        let mut controller = InteractiveController::new(
-            &bench.context,
-            Box::new(RecordingPort::default()),
-            SessionChannel::new(),
-        );
-        let _ = controller.boot_lines();
-
-        let help = lines(&submit_text(&mut controller, "/help")).join("\n");
-        assert!(help.contains("/status") && help.contains("/exit"), "{help}");
-
-        let status = lines(&submit_text(&mut controller, "/status")).join("\n");
-        assert!(status.contains("Project:"), "{status}");
-        assert!(status.contains("Phase:   ready"), "{status}");
-
-        let model = lines(&submit_text(&mut controller, "/model")).join("\n");
-        assert!(model.contains("backend:"), "{model}");
-        let config = lines(&submit_text(&mut controller, "/config")).join("\n");
-        assert!(config.contains("Config:"), "{config}");
-        let resume = lines(&submit_text(&mut controller, "/resume")).join("\n");
-        assert!(
-            resume.contains("looking for persisted sessions"),
-            "{resume}"
-        );
-        let resume = lines(&submit_text(&mut controller, "/resume 3")).join("\n");
-        assert!(resume.contains("not in the last list"), "{resume}");
-        let unknown = lines(&submit_text(&mut controller, "/nope")).join("\n");
-        assert!(unknown.contains("unknown command"), "{unknown}");
-        let fresh = lines(&submit_text(&mut controller, "/new")).join("\n");
-        assert!(fresh.contains("fresh conversation"), "{fresh}");
-
-        submit_text(&mut controller, "work");
-        let busy = lines(&submit_text(&mut controller, "/new")).join("\n");
-        assert!(busy.contains("cannot start a new conversation"), "{busy}");
-
-        let exit = submit_text(&mut controller, "/exit");
-        assert!(matches!(exit.last(), Some(Effect::Exit(_))), "{exit:?}");
-        assert!(
-            lines(&exit).iter().any(|line| line.contains("canceling")),
-            "an active run is canceled before exit: {exit:?}"
-        );
-    }
-
-    /// Test port that records approval answers and can announce proposals.
-    #[derive(Clone)]
-    struct ApprovalPort {
-        sender: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
-        answers: Arc<Mutex<Vec<(String, ApprovalDecision)>>>,
-        accept: bool,
-    }
-
-    impl SessionPort for ApprovalPort {
-        fn label(&self) -> String {
-            "approval test port".to_owned()
-        }
-        fn submit(&mut self, request: SubmitRequest) {
-            let _ = self.sender.send(SessionEvent::Accepted {
-                input_id: request.input_id,
-            });
-        }
-        fn cancel(&mut self) {}
-        fn answer(&mut self, request_id: &str, decision: ApprovalDecision) -> bool {
-            self.answers
-                .lock()
-                .expect("answer log")
-                .push((request_id.to_owned(), decision));
-            self.accept
-        }
+    fn input_id(text: &str) -> InputId {
+        InputId::parse(text).expect("canonical input id")
     }
 
     fn approval_event(request_id: &str) -> SessionEvent {
         SessionEvent::ApprovalRequired {
             request_id: request_id.to_owned(),
-            action: "ApplyPatch".to_owned(),
-            summary: "patch src/parser.rs".to_owned(),
-            workspace: "C:/work/repo".to_owned(),
-            scope: "one action, this turn only".to_owned(),
+            action: "apply_patch".to_owned(),
+            summary: "path=src/parser.rs".to_owned(),
+            workspace: "C:/work/project".to_owned(),
+            scope: "once".to_owned(),
+            expires_at: Instant::now() + Duration::from_mins(5),
         }
+    }
+
+    #[test]
+    fn h03_one_admission_per_message_and_a_running_run_refuses_a_second() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let effects = submit_text(&mut harness.controller, "first request");
+        assert_eq!(
+            effects_to_plain(&effects),
+            vec!["> first request".to_owned()],
+            "the echo is the only line the submission itself adds: {effects:#?}"
+        );
+        assert_eq!(harness.controller.phase(), AppPhase::Running);
+        assert_eq!(
+            harness
+                .port
+                .submissions
+                .lock()
+                .expect("submissions")
+                .as_slice(),
+            ["first request"]
+        );
+
+        let effects = submit_text(&mut harness.controller, "second request");
+        let plain = effects_to_plain(&effects).join("\n");
+        assert!(plain.contains("a run is already active"), "{plain}");
+        assert_eq!(
+            harness.port.submissions.lock().expect("submissions").len(),
+            1,
+            "a second input is never admitted while a run is active"
+        );
+    }
+
+    #[test]
+    fn h03_fixture_run_streams_text_before_tools_and_returns_to_ready() {
+        let mut harness = fixture_bench(true);
+        let _ = harness.controller.boot_lines();
+        let mut plain = effects_to_plain(&submit_text(&mut harness.controller, "sửa lỗi parser"));
+        plain.extend(effects_to_plain(&harness.controller.pump_events()));
+        let joined = plain.join("\n");
+        assert!(joined.contains("> sửa lỗi parser"), "{joined}");
+        assert!(joined.contains("[run] accepted "), "{joined}");
+        assert!(
+            joined.contains("fixture answer for: sửa lỗi parser"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("[tool] search_text pattern=parser"),
+            "{joined}"
+        );
+        assert!(joined.contains("[tool] search_text failed"), "{joined}");
+        assert!(
+            joined.contains("[tool] apply_patch path=src/parser.rs"),
+            "{joined}"
+        );
+        assert!(joined.contains("[tool] apply_patch ok"), "{joined}");
+        assert!(joined.contains("[run] done"), "{joined}");
+        assert_eq!(harness.controller.phase(), AppPhase::Ready);
+
+        // Order: the streamed answer is committed before the first tool row,
+        // exactly like flush_stream did before T02.
+        let answer = joined.find("fixture answer").expect("answer present");
+        let tool = joined.find("[tool] search_text").expect("tool present");
+        assert!(
+            answer < tool,
+            "text flushes before the tool line:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn t02_step_started_updates_the_counter() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        assert_eq!(harness.controller.ui_state().steps, 0);
+        harness
+            .events
+            .send(SessionEvent::StepStarted { step: 3 })
+            .expect("step event");
+        let _ = harness.controller.pump_events();
+        assert_eq!(
+            harness.controller.ui_state().steps,
+            3,
+            "the status bar counts the step the driver reported"
+        );
+        assert_eq!(
+            harness.controller.ui_state().max_steps,
+            TurnBounds::default().max_steps
+        );
+    }
+
+    /// Temporary probe while wiring T02; removed before the checkpoint.
+    #[test]
+    fn t02_probe_bench_context_shape() {
+        let (temp, configured) = context(true);
+        eprintln!(
+            "configured: config_file={} exists={} first_run={} setup_required={} provider={:?}",
+            configured.paths.config_file.display(),
+            configured.paths.config_file.exists(),
+            configured.config.is_first_run(),
+            configured.setup_required,
+            configured.provider
+        );
+        let (temp2, unconfigured) = context(false);
+        eprintln!(
+            "unconfigured: config_file={} exists={} first_run={} setup_required={} provider={:?}",
+            unconfigured.paths.config_file.display(),
+            unconfigured.paths.config_file.exists(),
+            unconfigured.config.is_first_run(),
+            unconfigured.setup_required,
+            unconfigured.provider
+        );
+        drop(temp);
+        drop(temp2);
+    }
+
+    #[test]
+    fn t02_expired_approval_closes_the_modal_and_never_grants() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        harness
+            .events
+            .send(approval_event("req-7"))
+            .expect("approval event");
+        let _ = harness.controller.pump_events();
+        assert_eq!(harness.controller.phase(), AppPhase::WaitingApproval);
+        assert!(
+            harness.controller.ui_state().modal.is_some(),
+            "the panel is open"
+        );
+
+        harness
+            .events
+            .send(SessionEvent::ApprovalExpired {
+                request_id: "req-7".to_owned(),
+            })
+            .expect("expiry event");
+        let effects = harness.controller.pump_events();
+        let items = history_items(&effects);
+        assert!(
+            items.iter().any(|item| matches!(
+                item,
+                HistoryItem::ApprovalResolution { label, request_id }
+                    if label == "expired" && request_id == "req-7"
+            )),
+            "the expiry is recorded: {items:#?}"
+        );
+        assert_eq!(
+            harness.controller.phase(),
+            AppPhase::Running,
+            "the run continues; the gate refused the action"
+        );
+        assert!(
+            harness.controller.ui_state().modal.is_none(),
+            "the panel closes on expiry instead of waiting for the run to end"
+        );
+        assert!(
+            harness.port.answers.lock().expect("answers").is_empty(),
+            "an expiry never answers the request"
+        );
+    }
+
+    #[test]
+    fn t02_a_settled_tool_card_reports_the_measured_duration() {
+        let mut harness = bench_with(true, RecordingPort::default(), true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "fix it");
+        harness
+            .events
+            .send(SessionEvent::ToolStarted {
+                name: "apply_patch".to_owned(),
+                summary: "path=a.rs".to_owned(),
+            })
+            .expect("started");
+        harness
+            .events
+            .send(SessionEvent::ToolSettled {
+                name: "apply_patch".to_owned(),
+                ok: false,
+                elapsed: Duration::from_millis(3100),
+            })
+            .expect("settled");
+        let effects = harness.controller.pump_events();
+        let items = history_items(&effects);
+        let settled = items.iter().rev().find_map(|item| match item {
+            HistoryItem::Tool { name, state, .. } if name == "apply_patch" => Some(*state),
+            _ => None,
+        });
+        assert_eq!(
+            settled,
+            Some(ToolState::Failed {
+                elapsed: Duration::from_millis(3100)
+            }),
+            "the card carries the duration the service measured"
+        );
+        assert!(
+            harness.controller.ui_state().open_tool.is_none(),
+            "the open card closes when it settles"
+        );
+    }
+
+    #[test]
+    fn t02_the_run_row_carries_steps_tools_and_elapsed() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "go");
+        harness
+            .events
+            .send(SessionEvent::StepStarted { step: 2 })
+            .expect("step");
+        harness
+            .events
+            .send(SessionEvent::ToolStarted {
+                name: "read_file".to_owned(),
+                summary: "path=a.rs".to_owned(),
+            })
+            .expect("tool");
+        harness
+            .events
+            .send(SessionEvent::ToolSettled {
+                name: "read_file".to_owned(),
+                ok: true,
+                elapsed: Duration::from_millis(12),
+            })
+            .expect("settled");
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("terminal");
+        let effects = harness.controller.pump_events();
+        let (steps, tool_calls) = history_items(&effects)
+            .into_iter()
+            .find_map(|item| match item {
+                HistoryItem::Run {
+                    steps, tool_calls, ..
+                } => Some((steps, tool_calls)),
+                _ => None,
+            })
+            .expect("a run row");
+        assert_eq!(steps, 2, "steps came from StepStarted");
+        assert_eq!(tool_calls, 1, "tool calls are counted from the tool events");
+        assert_eq!(harness.controller.phase(), AppPhase::Ready);
+    }
+
+    #[test]
+    fn h03_ctrl_c_cancels_a_run_and_clears_an_idle_prompt() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "work");
+        let effects = harness.controller.handle_key(Key::Interrupt);
+        assert_eq!(harness.controller.phase(), AppPhase::Canceling);
+        assert_eq!(*harness.port.cancels.lock().expect("cancels"), 1);
+        assert!(
+            effects_to_plain(&effects)
+                .join("\n")
+                .contains("^C canceling"),
+            "{effects:#?}"
+        );
+
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Canceled,
+            })
+            .expect("terminal");
+        let _ = harness.controller.pump_events();
+        assert_eq!(harness.controller.phase(), AppPhase::Ready);
+
+        let _ = submit_text(&mut harness.controller, "typo");
+        // Settle the run first: Ctrl-C while a run is active cancels the run, it
+        // does not clear the buffer.
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Canceled,
+            })
+            .expect("terminal");
+        let _ = harness.controller.pump_events();
+        assert_eq!(harness.controller.phase(), AppPhase::Ready);
+        let effects = harness.controller.handle_key(Key::Interrupt);
+        assert_eq!(
+            harness.controller.prompt(),
+            "> ",
+            "an idle Ctrl-C clears the buffer"
+        );
+        assert_eq!(effects_to_plain(&effects), vec![String::new()]);
     }
 
     #[test]
     fn h05_a_gated_action_is_rendered_and_answered_by_the_user() {
-        let bench = bench(true);
-        let channel = SessionChannel::new();
-        let sender = channel.sender();
-        let port = ApprovalPort {
-            sender: sender.clone(),
-            answers: Arc::new(Mutex::new(Vec::new())),
-            accept: true,
-        };
-        let answers = Arc::clone(&port.answers);
-        let mut controller = InteractiveController::new(&bench.context, Box::new(port), channel);
-        let _ = controller.boot_lines();
-
-        sender
-            .send(approval_event("approval-1-abcdef"))
-            .expect("proposal delivered");
-        let effects = controller.pump_events();
-        let rendered = lines(&effects).join("\n");
-        assert!(
-            rendered.contains("[approval] ApplyPatch: patch src/parser.rs"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("C:/work/repo"), "{rendered}");
-        assert!(
-            rendered.contains("one action, this turn only"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("approval-1-abcdef"), "{rendered}");
-        assert_eq!(controller.phase(), AppPhase::WaitingApproval);
-
-        // Any other line is not admitted as a new request while the gate waits.
-        let refused = submit_text(&mut controller, "do something else");
-        let text = lines(&refused).join("\n");
-        assert!(text.contains("still pending"), "{text}");
-        assert_eq!(controller.phase(), AppPhase::WaitingApproval);
-
-        let granted = submit_text(&mut controller, "y");
-        assert!(
-            lines(&granted).join("\n").contains("granted"),
-            "{granted:?}"
-        );
-        assert_eq!(controller.phase(), AppPhase::Running);
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        harness
+            .events
+            .send(approval_event("req-1"))
+            .expect("approval");
+        let effects = harness.controller.pump_events();
         assert_eq!(
-            answers.lock().expect("answer log").as_slice(),
-            [("approval-1-abcdef".to_owned(), ApprovalDecision::Granted)]
+            effects_to_plain(&effects),
+            view::approval_lines(
+                "apply_patch",
+                "path=src/parser.rs",
+                "C:/work/project",
+                "once",
+                "req-1"
+            ),
+            "plain mode prints the same four lines as before T02"
         );
+        assert_eq!(harness.controller.phase(), AppPhase::WaitingApproval);
+
+        let effects = submit_text(&mut harness.controller, "y");
+        assert_eq!(
+            harness.port.answers.lock().expect("answers").as_slice(),
+            [("req-1".to_owned(), ApprovalDecision::Granted)]
+        );
+        assert!(
+            effects_to_plain(&effects)
+                .join("\n")
+                .contains("[approval] granted req-1"),
+            "{effects:#?}"
+        );
+        assert_eq!(harness.controller.phase(), AppPhase::Running);
+        assert!(harness.controller.ui_state().modal.is_none());
     }
 
     #[test]
-    fn h05_a_denial_is_recorded_and_a_stale_request_is_reported() {
-        let bench = bench(true);
-        let channel = SessionChannel::new();
-        let sender = channel.sender();
-        let port = ApprovalPort {
-            sender: sender.clone(),
-            answers: Arc::new(Mutex::new(Vec::new())),
-            accept: true,
-        };
-        let answers = Arc::clone(&port.answers);
-        let mut controller = InteractiveController::new(&bench.context, Box::new(port), channel);
-        let _ = controller.boot_lines();
+    fn h05_a_denial_and_an_unknown_answer_are_handled() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        harness
+            .events
+            .send(approval_event("req-2"))
+            .expect("approval");
+        let _ = harness.controller.pump_events();
 
-        sender
-            .send(approval_event("approval-2-abcdef"))
-            .expect("proposal delivered");
-        let _ = controller.pump_events();
-        let denied = submit_text(&mut controller, "n");
-        assert!(lines(&denied).join("\n").contains("denied"), "{denied:?}");
+        let effects = submit_text(&mut harness.controller, "maybe");
+        let plain = effects_to_plain(&effects).join("\n");
+        assert!(plain.contains("request is still pending"), "{plain}");
+        assert_eq!(harness.controller.phase(), AppPhase::WaitingApproval);
+        assert!(harness.port.answers.lock().expect("answers").is_empty());
+
+        let effects = submit_text(&mut harness.controller, "n");
         assert_eq!(
-            answers.lock().expect("answer log").as_slice(),
-            [("approval-2-abcdef".to_owned(), ApprovalDecision::Denied)]
+            harness.port.answers.lock().expect("answers").as_slice(),
+            [("req-2".to_owned(), ApprovalDecision::Denied)]
         );
-
-        // A request that is no longer pending must say so instead of pretending.
-        let stale_channel = SessionChannel::new();
-        let stale_sender = stale_channel.sender();
-        let stale_port = ApprovalPort {
-            sender: stale_sender.clone(),
-            answers: Arc::new(Mutex::new(Vec::new())),
-            accept: false,
-        };
-        let mut stale =
-            InteractiveController::new(&bench.context, Box::new(stale_port), stale_channel);
-        let _ = stale.boot_lines();
-        stale_sender
-            .send(approval_event("approval-3-abcdef"))
-            .expect("proposal delivered");
-        let _ = stale.pump_events();
-        let answered = submit_text(&mut stale, "y");
-        let rendered = lines(&answered).join("\n");
-        assert!(rendered.contains("no longer pending"), "{rendered}");
-        assert_eq!(stale.phase(), AppPhase::Running);
-    }
-
-    /// Test port that records resume traffic.
-    struct ResumePort {
-        sender: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
-        listed: Arc<Mutex<usize>>,
-        resumed: Arc<Mutex<Vec<Option<String>>>>,
-    }
-
-    impl SessionPort for ResumePort {
-        fn label(&self) -> String {
-            "resume test port".to_owned()
-        }
-        fn submit(&mut self, request: SubmitRequest) {
-            let _ = self.sender.send(SessionEvent::Accepted {
-                input_id: request.input_id,
-            });
-        }
-        fn cancel(&mut self) {}
-        fn list_sessions(&mut self) {
-            *self.listed.lock().expect("list count") += 1;
-        }
-        fn resume(&mut self, session_id: Option<String>) -> Result<(), String> {
-            self.resumed.lock().expect("resume log").push(session_id);
-            Ok(())
-        }
-    }
-
-    fn candidate(session_id: &str, task_id: &str, detail: &str) -> SessionCandidate {
-        SessionCandidate {
-            session_id: session_id.to_owned(),
-            task_id: task_id.to_owned(),
-            detail: detail.to_owned(),
-        }
+        assert!(
+            effects_to_plain(&effects)
+                .join("\n")
+                .contains("[approval] denied req-2"),
+            "{effects:#?}"
+        );
     }
 
     #[test]
     fn h05_resume_lists_sessions_and_selects_one_by_number() {
-        let bench = bench(true);
-        let channel = SessionChannel::new();
-        let sender = channel.sender();
-        let port = ResumePort {
-            sender: sender.clone(),
-            listed: Arc::new(Mutex::new(0)),
-            resumed: Arc::new(Mutex::new(Vec::new())),
-        };
-        let listed = Arc::clone(&port.listed);
-        let resumed = Arc::clone(&port.resumed);
-        let mut controller = InteractiveController::new(&bench.context, Box::new(port), channel);
-        let _ = controller.boot_lines();
-
-        let asked = lines(&submit_text(&mut controller, "/resume")).join("\n");
-        assert!(asked.contains("looking for persisted sessions"), "{asked}");
-        assert_eq!(*listed.lock().expect("list count"), 1);
-
-        sender
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        harness
+            .events
             .send(SessionEvent::SessionsListed {
                 sessions: vec![
-                    candidate(
-                        "session_0192f0aa-bbcc-7ddd-8eee-000000000001",
-                        "task_0192f0aa-bbcc-7ddd-8eee-00000000000a",
-                        "1 input(s), 4 event(s)",
-                    ),
-                    candidate(
-                        "session_0192f0aa-bbcc-7ddd-8eee-000000000002",
-                        "task_0192f0aa-bbcc-7ddd-8eee-00000000000a",
-                        "2 input(s), 9 event(s)",
-                    ),
+                    SessionCandidate {
+                        session_id: "session_a".to_owned(),
+                        task_id: "task_1".to_owned(),
+                        detail: "1 input(s), 2 event(s)".to_owned(),
+                    },
+                    SessionCandidate {
+                        session_id: "session_b".to_owned(),
+                        task_id: "task_1".to_owned(),
+                        detail: "2 input(s), 4 event(s)".to_owned(),
+                    },
                 ],
             })
-            .expect("listing delivered");
-        let listing = lines(&controller.pump_events()).join("\n");
+            .expect("listing");
+        let listing = harness.controller.pump_events();
+        let listing_plain = effects_to_plain(&listing).join("\n");
         assert!(
-            listing.contains("sessions in this project (2)"),
-            "{listing}"
+            listing_plain.contains("sessions in this project (2):"),
+            "{listing_plain}"
         );
-        assert!(listing.contains("1. "), "{listing}");
-        assert!(listing.contains("2. "), "{listing}");
-        assert!(listing.contains("2 input(s), 9 event(s)"), "{listing}");
+        assert!(listing_plain.contains("1. session_a"), "{listing_plain}");
+        assert!(
+            listing_plain.contains("use /resume <number> to continue one of them"),
+            "plain mode still tells the user how to pick one: {listing_plain}"
+        );
 
-        let selected = lines(&submit_text(&mut controller, "/resume 2")).join("\n");
-        assert!(selected.contains("continuing from session"), "{selected}");
+        let effects = submit_text(&mut harness.controller, "/resume 2");
         assert_eq!(
-            resumed.lock().expect("resume log").as_slice(),
-            [Some(
-                "session_0192f0aa-bbcc-7ddd-8eee-000000000002".to_owned()
-            )]
+            harness.port.resumes.lock().expect("resumes").as_slice(),
+            [Some("session_b".to_owned())]
         );
-
-        let bogus = lines(&submit_text(&mut controller, "/resume 9")).join("\n");
-        assert!(bogus.contains("not in the last list"), "{bogus}");
-        assert_eq!(resumed.lock().expect("resume log").len(), 1);
-
-        let fresh = lines(&submit_text(&mut controller, "/new")).join("\n");
-        assert!(fresh.contains("fresh conversation"), "{fresh}");
-        let log = resumed.lock().expect("resume log");
-        assert_eq!(log.len(), 2);
-        assert_eq!(log[1], None, "a new conversation clears the resumed chain");
+        let plain = effects_to_plain(&effects).join("\n");
+        assert!(
+            plain.contains("continuing from session"),
+            "the resume is reported: {plain:?}"
+        );
+        assert!(
+            plain.contains("ssion_b"),
+            "and it names the chosen session: {plain:?}"
+        );
     }
 
     #[test]
     fn h05_an_empty_listing_and_a_notice_are_rendered_honestly() {
-        let bench = bench(true);
-        let channel = SessionChannel::new();
-        let sender = channel.sender();
-        let port = ResumePort {
-            sender: sender.clone(),
-            listed: Arc::new(Mutex::new(0)),
-            resumed: Arc::new(Mutex::new(Vec::new())),
-        };
-        let mut controller = InteractiveController::new(&bench.context, Box::new(port), channel);
-        let _ = controller.boot_lines();
-
-        sender
-            .send(SessionEvent::SessionsListed { sessions: vec![] })
-            .expect("empty listing delivered");
-        let rendered = lines(&controller.pump_events()).join("\n");
-        assert!(
-            rendered.contains("no persisted sessions in this project yet"),
-            "{rendered}"
-        );
-
-        sender
-            .send(SessionEvent::Notice {
-                message: "session session_x is not in this project's store; nothing was resumed"
-                    .to_owned(),
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        harness
+            .events
+            .send(SessionEvent::SessionsListed {
+                sessions: Vec::new(),
             })
-            .expect("notice delivered");
-        let rendered = lines(&controller.pump_events()).join("\n");
-        assert!(rendered.contains("[info] session session_x"), "{rendered}");
+            .expect("empty listing");
+        harness
+            .events
+            .send(SessionEvent::Notice {
+                message: "hello".to_owned(),
+            })
+            .expect("notice");
+        let effects = harness.controller.pump_events();
+        let plain = effects_to_plain(&effects).join("\n");
         assert!(
-            rendered.contains("nothing was resumed"),
-            "the app never claims a resume that did not happen: {rendered}"
+            plain.contains("no persisted sessions in this project yet"),
+            "{plain}"
         );
+        assert!(plain.contains("[info] hello"), "{plain}");
+    }
+
+    #[test]
+    fn h03_slash_commands_are_parsed_and_staged_features_stay_honest() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+
+        let help = effects_to_plain(&submit_text(&mut harness.controller, "/help")).join("\n");
+        assert!(help.contains("/resume"), "{help}");
+        assert!(help.contains("Ctrl-D"), "{help}");
+
+        let status = effects_to_plain(&submit_text(&mut harness.controller, "/status")).join("\n");
+        assert!(status.contains("Phase:"), "{status}");
+
+        let model = effects_to_plain(&submit_text(&mut harness.controller, "/model")).join("\n");
+        assert!(model.contains("backend: "), "{model}");
+
+        let unknown = effects_to_plain(&submit_text(&mut harness.controller, "/nope")).join("\n");
+        assert!(unknown.contains("unknown command"), "{unknown}");
+
+        let resume =
+            effects_to_plain(&submit_text(&mut harness.controller, "/resume 9")).join("\n");
+        assert!(resume.contains("not in the last list"), "{resume}");
+
+        let exit = submit_text(&mut harness.controller, "/exit");
+        assert!(exit.contains(&Effect::Exit(EXIT_SUCCESS)), "{exit:#?}");
+        assert_eq!(harness.controller.phase(), AppPhase::Closed);
+    }
+
+    #[test]
+    fn completion_typing_the_answer_still_works_while_the_panel_is_open() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "work");
+        harness
+            .events
+            .send(approval_event("req-3"))
+            .expect("approval");
+        let _ = harness.controller.pump_events();
+
+        // The TUI panel says `y chạy · n từ chối`, so n answers immediately and
+        // the character never lands in the composer buffer.
+        let _ = harness.controller.handle_key(Key::Char('n'));
+        let state = harness.controller.ui_state();
+        assert!(
+            state.buffer.is_empty(),
+            "the character must not reach the composer: {:?}",
+            state.buffer
+        );
+        assert_eq!(
+            harness.port.answers.lock().expect("answers").as_slice(),
+            [("req-3".to_owned(), ApprovalDecision::Denied)]
+        );
+    }
+
+    #[test]
+    fn t06_y_key_grants_exactly_the_pending_request() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "work");
+        harness
+            .events
+            .send(approval_event("req-8"))
+            .expect("approval");
+        let _ = harness.controller.pump_events();
+
+        let effects = harness.controller.handle_key(Key::Char('y'));
+        eprintln!(
+            "after y: answers={:?} effects={effects:#?}",
+            harness.port.answers.lock().expect("answers")
+        );
+        assert_eq!(
+            harness.port.answers.lock().expect("answers").as_slice(),
+            [("req-8".to_owned(), ApprovalDecision::Granted)],
+            "y grants exactly the pending request"
+        );
+        assert!(
+            effects_to_plain(&effects)
+                .join("\n")
+                .contains("[approval] granted req-8"),
+            "{effects:#?}"
+        );
+        assert!(
+            harness.controller.ui_state().modal.is_none(),
+            "the panel closed"
+        );
+        assert_eq!(harness.controller.phase(), AppPhase::Running);
+    }
+
+    #[test]
+    fn t06_escape_closes_the_panel_without_answering() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "work");
+        harness
+            .events
+            .send(approval_event("req-9"))
+            .expect("approval");
+        let _ = harness.controller.pump_events();
+
+        let effects = harness.controller.handle_key(Key::Esc);
+        assert!(effects.is_empty(), "Escape only dismisses: {effects:#?}");
+        assert!(
+            harness.port.answers.lock().expect("answers").is_empty(),
+            "Escape never answers a gated action"
+        );
+        assert_eq!(
+            harness.controller.phase(),
+            AppPhase::WaitingApproval,
+            "the request is still pending"
+        );
+    }
+
+    #[test]
+    fn t06_help_overlay_is_not_written_to_history() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let transcript_before = harness.controller.transcript().to_vec();
+
+        let effects = submit_text(&mut harness.controller, "/help");
+        assert!(
+            history_items(&effects).is_empty(),
+            "reference output is a temporary panel in TUI mode: {effects:#?}"
+        );
+        assert_eq!(harness.controller.transcript(), transcript_before);
+        assert!(
+            matches!(
+                harness.controller.ui_state().modal,
+                Some(Modal::Overlay { ref title, .. }) if title == "/help"
+            ),
+            "the controller must expose the editor overlay to the renderer"
+        );
+
+        let effects = harness.controller.handle_key(Key::Esc);
+        assert_eq!(effects, vec![Effect::Redraw]);
+        assert!(harness.controller.ui_state().modal.is_none());
+        assert_eq!(harness.controller.transcript(), transcript_before);
+    }
+
+    fn two_sessions() -> Vec<SessionCandidate> {
+        vec![
+            SessionCandidate {
+                session_id: "session_a".to_owned(),
+                task_id: "task_1".to_owned(),
+                detail: "1 input".to_owned(),
+            },
+            SessionCandidate {
+                session_id: "session_b".to_owned(),
+                task_id: "task_1".to_owned(),
+                detail: "2 inputs".to_owned(),
+            },
+        ]
+    }
+
+    #[test]
+    fn t06_esc_closes_the_picker_without_changing_the_source() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        harness
+            .events
+            .send(SessionEvent::SessionsListed {
+                sessions: two_sessions(),
+            })
+            .expect("sessions");
+        let _ = harness.controller.pump_events();
+        assert!(matches!(
+            harness.controller.ui_state().modal,
+            Some(Modal::Picker { .. })
+        ));
+
+        let effects = harness.controller.handle_key(Key::Esc);
+        assert_eq!(effects, vec![Effect::Redraw]);
+        assert!(harness.controller.ui_state().modal.is_none());
+        assert!(harness.port.resumes.lock().expect("resumes").is_empty());
+    }
+
+    #[test]
+    fn t06_picker_enter_resumes_the_highlighted_session() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        harness
+            .events
+            .send(SessionEvent::SessionsListed {
+                sessions: two_sessions(),
+            })
+            .expect("sessions");
+        let _ = harness.controller.pump_events();
+        let _ = harness.controller.handle_key(Key::Down);
+        let effects = harness.controller.handle_key(Key::Enter);
+
+        assert_eq!(
+            harness.port.resumes.lock().expect("resumes").as_slice(),
+            [Some("session_b".to_owned())]
+        );
+        assert!(harness.controller.ui_state().modal.is_none());
+        assert!(
+            effects_to_plain(&effects)
+                .join("\n")
+                .contains("continuing from session")
+        );
+    }
+
+    #[test]
+    fn t04_stream_text_shows_in_the_live_block_before_run_terminal() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "work");
+        harness
+            .events
+            .send(SessionEvent::TextDelta {
+                text: "partial answer".to_owned(),
+            })
+            .expect("delta");
+        let effects = harness.controller.pump_events();
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Stream(_))),
+            "a partial line stays in the live viewport: {effects:#?}"
+        );
+        assert_eq!(harness.controller.ui_state().live_text, "partial answer");
+
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("terminal");
+        let effects = harness.controller.pump_events();
+        assert!(matches!(effects.first(), Some(Effect::Stream(text)) if text == "partial answer"));
+        assert!(harness.controller.ui_state().live_text.is_empty());
+    }
+
+    #[test]
+    fn t04_tool_card_settles_in_place_with_duration() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "work");
+        harness
+            .events
+            .send(SessionEvent::ToolStarted {
+                name: "read_file".to_owned(),
+                summary: "path=a.rs".to_owned(),
+            })
+            .expect("started");
+        let started = harness.controller.pump_events();
+        assert!(
+            !history_items(&started)
+                .iter()
+                .any(|item| matches!(item, HistoryItem::Tool { .. })),
+            "a running card belongs to the live viewport"
+        );
+        assert_eq!(
+            harness.controller.ui_state().open_tool,
+            Some(("read_file".to_owned(), "path=a.rs".to_owned()))
+        );
+
+        harness
+            .events
+            .send(SessionEvent::ToolSettled {
+                name: "read_file".to_owned(),
+                ok: true,
+                elapsed: Duration::from_millis(12),
+            })
+            .expect("settled");
+        let settled = harness.controller.pump_events();
+        let cards: Vec<_> = history_items(&settled)
+            .into_iter()
+            .filter(|item| matches!(item, HistoryItem::Tool { .. }))
+            .collect();
+        assert_eq!(cards.len(), 1, "settling creates one final card");
+        assert!(matches!(
+            &cards[0],
+            HistoryItem::Tool { name, summary, state: ToolState::Ok { elapsed } }
+                if name == "read_file" && summary == "path=a.rs" && *elapsed == Duration::from_millis(12)
+        ));
+        assert!(harness.controller.ui_state().open_tool.is_none());
+    }
+
+    #[test]
+    fn t04_long_stream_commits_overflow_lines_in_order() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "work");
+        let text = (0..10)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        harness
+            .events
+            .send(SessionEvent::TextDelta { text })
+            .expect("delta");
+        let effects = harness.controller.pump_events();
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::Stream(text)) if text == "line 0\nline 1\n"
+        ));
+        assert_eq!(
+            harness.controller.ui_state().live_text,
+            (2..10)
+                .map(|index| format!("line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn t04_history_order_is_user_tool_assistant_run() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let mut effects = submit_text(&mut harness.controller, "work");
+        harness
+            .events
+            .send(SessionEvent::TextDelta {
+                text: "before tool".to_owned(),
+            })
+            .expect("text");
+        harness
+            .events
+            .send(SessionEvent::ToolStarted {
+                name: "read_file".to_owned(),
+                summary: "path=a.rs".to_owned(),
+            })
+            .expect("start");
+        harness
+            .events
+            .send(SessionEvent::ToolSettled {
+                name: "read_file".to_owned(),
+                ok: true,
+                elapsed: Duration::from_millis(1),
+            })
+            .expect("settle");
+        harness
+            .events
+            .send(SessionEvent::TextDelta {
+                text: "after tool".to_owned(),
+            })
+            .expect("text");
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("terminal");
+        effects.extend(harness.controller.pump_events());
+
+        let order: Vec<&str> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::History(HistoryItem::User { .. }) => Some("user"),
+                Effect::Stream(_) => Some("assistant"),
+                Effect::History(HistoryItem::Tool { .. }) => Some("tool"),
+                Effect::History(HistoryItem::Run { .. }) => Some("run"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, ["user", "assistant", "tool", "assistant", "run"]);
+    }
+
+    #[test]
+    fn completion_resume_zero_and_active_switch_are_rejected() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let effects = submit_text(&mut harness.controller, "/resume 0");
+        assert!(
+            effects_to_plain(&effects)
+                .join("\n")
+                .contains("not in the last list"),
+            "{effects:#?}"
+        );
+        assert!(harness.port.resumes.lock().expect("resumes").is_empty());
+
+        let _ = submit_text(&mut harness.controller, "work");
+        let effects = submit_text(&mut harness.controller, "/resume");
+        assert!(
+            effects_to_plain(&effects)
+                .join("\n")
+                .contains("cannot change or list sessions"),
+            "{effects:#?}"
+        );
+    }
+
+    #[test]
+    fn completion_exit_commands_and_eof_cancel_during_approval() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "work");
+        harness
+            .events
+            .send(approval_event("req-5"))
+            .expect("approval");
+        let _ = harness.controller.pump_events();
+
+        let effects = harness.controller.handle_key(Key::EndOfInput);
+        assert!(
+            effects.contains(&Effect::Exit(EXIT_SUCCESS)),
+            "Ctrl-D while the panel is open cancels and exits 0: {effects:#?}"
+        );
+        assert_eq!(*harness.port.cancels.lock().expect("cancels"), 1);
+        assert_eq!(harness.controller.phase(), AppPhase::Closed);
+    }
+
+    #[test]
+    fn h04_an_unconfigured_provider_keeps_the_setup_state() {
+        let mut harness = bench(false);
+        let boot = harness.controller.boot_lines().join("\n");
+        assert!(boot.contains("Harness Agents"), "{boot}");
+        assert!(harness.controller.ui_state().setup_required);
+
+        let mut configured = fixture_bench(true);
+        let boot = configured.controller.boot_lines().join("\n");
+        assert!(boot.contains("fixture (no model was called)"), "{boot}");
+        assert_eq!(configured.controller.phase(), AppPhase::Ready);
+    }
+
+    #[test]
+    fn h05_a_stale_approval_answer_is_not_claimed() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        harness
+            .events
+            .send(approval_event("req-4"))
+            .expect("approval");
+        let _ = harness.controller.pump_events();
+        // Expire it behind the controller's back. The panel closes and the run is
+        // active again, so a late "y" is a normal submission and the second-input
+        // guard refuses it: it never reaches the gate as an answer.
+        harness
+            .events
+            .send(SessionEvent::ApprovalExpired {
+                request_id: "req-4".to_owned(),
+            })
+            .expect("expiry");
+        let _ = harness.controller.pump_events();
+        let effects = submit_text(&mut harness.controller, "y");
+        let plain = effects_to_plain(&effects).join("\n");
+        assert!(
+            plain.contains("a run is already active"),
+            "a late answer is refused as a second input, not sent to the gate: {effects:#?}"
+        );
+        assert!(
+            harness.port.answers.lock().expect("answers").is_empty(),
+            "the gate is never told about a request that already expired"
+        );
+    }
+
+    #[test]
+    fn t02_eof_and_exit_keep_the_h05_rules() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let effects = harness.controller.handle_key(Key::EndOfInput);
+        assert!(
+            effects.contains(&Effect::Exit(EXIT_SUCCESS)),
+            "{effects:#?}"
+        );
+
+        let mut cancelling = bench(true);
+        let _ = cancelling.controller.boot_lines();
+        let _ = submit_text(&mut cancelling.controller, "work");
+        let effects = cancelling.controller.handle_key(Key::EndOfInput);
+        assert!(
+            effects.contains(&Effect::Exit(EXIT_SUCCESS)),
+            "Ctrl-D during a run cancels and exits 0: {effects:#?}"
+        );
+        assert_eq!(*cancelling.port.cancels.lock().expect("cancels"), 1);
+    }
+
+    #[test]
+    fn t02_an_accepted_event_keeps_the_accepted_line() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        harness
+            .events
+            .send(SessionEvent::Accepted {
+                input_id: input_id("input_0192f0aa-bbcc-7ddd-8eee-ffff00001111"),
+            })
+            .expect("accepted");
+        let effects = harness.controller.pump_events();
+        assert_eq!(
+            effects_to_plain(&effects),
+            vec!["[run] accepted ...00001111".to_owned()],
+            "{effects:#?}"
+        );
+    }
+
+    /// U20: every plain line the controller produces is the exact string the
+    /// pre-T02 controller pushed with `Effect::WriteLine`/`WritePartial`.
+    ///
+    /// The expected strings come from the pre-T02 source (`view::tool_line`,
+    /// `view::approval_lines`, `view::run_line`, `format!("> {text}")`, …), so a
+    /// wording or ordering change fails here instead of silently changing what a
+    /// plain-mode user sees.
+    #[test]
+    fn t02_plain_transcript_is_byte_identical_to_h03() {
+        let items = vec![
+            HistoryItem::User {
+                text: "sửa lỗi parser".to_owned(),
+            },
+            HistoryItem::RunAccepted {
+                input_id: "input_0192f0aa-bbcc-7ddd-8eee-ffff00001111".to_owned(),
+            },
+            HistoryItem::Tool {
+                name: "search_text".to_owned(),
+                summary: "pattern=parser".to_owned(),
+                state: ToolState::Started,
+            },
+            HistoryItem::Tool {
+                name: "search_text".to_owned(),
+                summary: String::new(),
+                state: ToolState::Failed {
+                    elapsed: Duration::from_millis(3100),
+                },
+            },
+            HistoryItem::Tool {
+                name: "apply_patch".to_owned(),
+                summary: String::new(),
+                state: ToolState::Ok {
+                    elapsed: Duration::from_millis(12),
+                },
+            },
+            HistoryItem::Approval {
+                action: "apply_patch".to_owned(),
+                summary: "path=src/parser.rs".to_owned(),
+                workspace: "C:/work/project".to_owned(),
+                scope: "once".to_owned(),
+                request_id: "req-1".to_owned(),
+            },
+            HistoryItem::ApprovalResolution {
+                label: "granted".to_owned(),
+                request_id: "req-1".to_owned(),
+            },
+            HistoryItem::Notice {
+                message: "hello".to_owned(),
+            },
+            HistoryItem::Error {
+                message: "boom".to_owned(),
+            },
+            HistoryItem::Message {
+                text: "/help            list these commands".to_owned(),
+            },
+            HistoryItem::Run {
+                outcome: RunOutcome::Done,
+                steps: 3,
+                tool_calls: 2,
+                elapsed: Duration::from_millis(14_200),
+            },
+            HistoryItem::Run {
+                outcome: RunOutcome::Failed("provider unreachable".to_owned()),
+                steps: 0,
+                tool_calls: 0,
+                elapsed: Duration::ZERO,
+            },
+        ];
+        let plain: Vec<String> = items.iter().flat_map(view::plain_lines).collect();
+        assert_eq!(
+            plain,
+            vec![
+                "> sửa lỗi parser".to_owned(),
+                "[run] accepted ...00001111".to_owned(),
+                "[tool] search_text pattern=parser".to_owned(),
+                "[tool] search_text failed".to_owned(),
+                "[tool] apply_patch ok".to_owned(),
+                "[approval] apply_patch: path=src/parser.rs".to_owned(),
+                "           workspace: C:/work/project".to_owned(),
+                "           scope: once (request req-1)".to_owned(),
+                "           answer y to run it once, or n to refuse".to_owned(),
+                "[approval] granted req-1".to_owned(),
+                "[info] hello".to_owned(),
+                "[error] boom".to_owned(),
+                "/help            list these commands".to_owned(),
+                "[run] done".to_owned(),
+                "[run] failed: provider unreachable".to_owned(),
+            ]
+        );
+    }
+
+    /// The scripted scenario end to end: reading the transcript the controller
+    /// recorded must give the same lines the renderer received.
+    #[test]
+    fn t02_the_recorded_transcript_is_what_the_plain_renderer_printed() {
+        let mut harness = fixture_bench(true);
+        let boot = harness.controller.boot_lines();
+        let mut printed = boot.clone();
+        printed.extend(effects_to_plain(&submit_text(
+            &mut harness.controller,
+            "sửa lỗi parser",
+        )));
+        printed.extend(effects_to_plain(&harness.controller.pump_events()));
+        printed.extend(effects_to_plain(&submit_text(
+            &mut harness.controller,
+            "/help",
+        )));
+        printed.extend(effects_to_plain(&submit_text(
+            &mut harness.controller,
+            "please fail",
+        )));
+        printed.extend(effects_to_plain(&harness.controller.pump_events()));
+
+        let recorded = harness.controller.transcript();
+        assert_eq!(
+            &printed[printed.len() - recorded.len()..],
+            recorded,
+            "the recorded transcript is exactly the tail the renderer printed"
+        );
+
+        let joined = recorded.join("\n");
+        for landmark in [
+            "> sửa lỗi parser",
+            "fixture answer for: sửa lỗi parser (no model was called)",
+            "[tool] search_text pattern=parser",
+            "[tool] apply_patch ok",
+            "[run] done",
+            "> please fail",
+            "[run] failed: fixture failure requested by the prompt",
+        ] {
+            assert!(
+                joined.contains(landmark),
+                "missing {landmark:?} in:\n{joined}"
+            );
+        }
     }
 }

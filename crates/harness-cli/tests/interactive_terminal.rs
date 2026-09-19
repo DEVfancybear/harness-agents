@@ -48,7 +48,7 @@ struct PtySession {
     transcript: Arc<Mutex<Vec<u8>>>,
     /// The master handle must outlive the session: dropping it closes the
     /// pseudo-console, which silently stops output and leaves the child blocked.
-    _master: Box<dyn portable_pty::MasterPty + Send>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
 /// Terminal emulator duties the harness must perform.
@@ -65,6 +65,25 @@ impl PtySession {
         Self::spawn_executable(&cli_binary(), cwd, env, &[])
     }
 
+    /// Spawn the build-tree binary with extra arguments and environment pairs.
+    ///
+    /// Used by cases that need a flag or a diagnostic variable the other cases do
+    /// not set, without changing how every case launches the app. The T08 cases
+    /// for the TUI use it as well.
+    #[allow(dead_code, reason = "T08 adds TUI PTY cases that pass arguments")]
+    fn spawn_process(
+        cwd: &Path,
+        env: &[(&str, String)],
+        arguments: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Self {
+        let mut pairs: Vec<(&str, String)> = env.to_vec();
+        for (name, value) in extra_env {
+            pairs.push((name, (*value).to_owned()));
+        }
+        Self::spawn_command(&cli_binary(), cwd, &pairs, &[], arguments)
+    }
+
     /// Spawn any `ha` executable: the build-tree binary by default, an installed
     /// artifact when a test must prove the copy a user actually gets.
     ///
@@ -75,6 +94,17 @@ impl PtySession {
         cwd: &Path,
         env: &[(&str, String)],
         remove: &[&str],
+    ) -> Self {
+        Self::spawn_command(binary, cwd, env, remove, &[])
+    }
+
+    /// Spawn with explicit arguments.
+    fn spawn_command(
+        binary: &Path,
+        cwd: &Path,
+        env: &[(&str, String)],
+        remove: &[&str],
+        arguments: &[&str],
     ) -> Self {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -87,6 +117,9 @@ impl PtySession {
             .expect("a pseudo-console can be opened");
         let mut command = CommandBuilder::new(binary);
         command.cwd(cwd);
+        for argument in arguments {
+            command.arg(*argument);
+        }
         // Never inherit a credential from the developer's shell: the tests decide
         // whether the app is configured. This runs before the explicit environment
         // so a test that wants a credential can still set one.
@@ -94,6 +127,8 @@ impl PtySession {
         command.env_remove("HA_API_KEY");
         command.env_remove("HA_PROVIDER_ENDPOINT");
         command.env_remove("HA_PROVIDER_MODEL");
+        command.env_remove("HA_UI");
+        command.env_remove("NO_COLOR");
         for name in remove {
             command.env_remove(*name);
         }
@@ -149,14 +184,31 @@ impl PtySession {
             child,
             input,
             transcript,
-            _master: master,
+            master,
         }
     }
 
     fn send(&mut self, text: &str) {
+        self.await_console();
         self.input
             .send(text.as_bytes().to_vec())
             .expect("the writer thread is alive");
+    }
+
+    /// Wait until the child has painted something.
+    ///
+    /// A keystroke written before the app owns the console is lost on this
+    /// `ConPTY`, which made the cases flaky; every case therefore types only after
+    /// the first paint has arrived.
+    fn await_console(&self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if !self.transcript().is_empty() {
+                return;
+            }
+            assert!(Instant::now() <= deadline, "the app never painted anything");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn transcript(&self) -> String {
@@ -216,11 +268,152 @@ impl PtySession {
     fn is_alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
+
+    fn resize(&mut self, columns: u16, rows: u16) {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols: columns,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("the pseudo-console resizes");
+    }
 }
 
 impl Drop for PtySession {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        // `portable_pty::Child::kill` is asynchronous on ConPTY. Reap the child
+        // before the test binary exits, otherwise a failed case can keep ha.exe
+        // locked and make the next cargo build fail with Access denied.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Keep the transcript of every case: when an assertion fails the panic
+        // message carries the text, but the raw bytes are what a reader needs to
+        // see which escape sequence landed where.
+        if let Ok(mut buffer) = self.transcript.lock() {
+            let name = std::env::var("HA_PTY_TRANSCRIPT_DIR")
+                .unwrap_or_else(|_| "target/pty-transcripts".to_owned());
+            let _ = std::fs::create_dir_all(&name);
+            let thread = std::thread::current();
+            let label = thread
+                .name()
+                .unwrap_or("pty")
+                .rsplit("::")
+                .next()
+                .unwrap_or("pty")
+                .to_owned();
+            let _ = std::fs::write(format!("{name}/{label}.txt"), buffer.as_slice());
+            buffer.clear();
+        }
+    }
+}
+
+/// The transcript with escape sequences removed and whitespace runs collapsed.
+///
+/// A PTY transcript is not a screen: the console's echo of the user's keystrokes
+/// and the app's cursor moves arrive in whatever order `ConPTY` produced them, and a
+/// per-keystroke repaint puts cursor moves inside a typed word. Assertions about
+/// what the user could read therefore compare against this view - it keeps every
+/// printable character in order - while assertions about the app's own output
+/// (the echo lines, the run landmarks) use the raw transcript.
+fn normalized(transcript: &str) -> String {
+    let mut out = String::with_capacity(transcript.len());
+    let mut characters = transcript.chars().peekable();
+    let mut in_space = false;
+    while let Some(character) = characters.next() {
+        if character == '\u{1b}' {
+            match characters.peek() {
+                Some('[') => {
+                    characters.next();
+                    // CSI: consume until a final byte in @..~
+                    for next in characters.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    characters.next();
+                    // OSC: consume until BEL or ST
+                    while let Some(next) = characters.next() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if next == '\u{1b}' {
+                            let _ = characters.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if character.is_whitespace() {
+            if !in_space {
+                out.push(' ');
+                in_space = true;
+            }
+            continue;
+        }
+        if character.is_control() {
+            continue;
+        }
+        in_space = false;
+        out.push(character);
+    }
+    out
+}
+
+/// Whether the transcript contains an SGR foreground/background colour.
+/// Cursor movement and resets are allowed under `NO_COLOR`; palette selection is
+/// not.
+fn has_color_sgr(transcript: &str) -> bool {
+    let bytes = transcript.as_bytes();
+    let mut index = 0;
+    while index + 2 < bytes.len() {
+        if bytes[index] != 0x1b || bytes[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        let start = index + 2;
+        let Some(end_offset) = bytes[start..].iter().position(|byte| *byte == b'm') else {
+            return false;
+        };
+        let end = start + end_offset;
+        let parameters = String::from_utf8_lossy(&bytes[start..end]);
+        if parameters
+            .split(';')
+            .filter_map(|part| part.parse::<u16>().ok())
+            .any(|value| matches!(value, 30..=37 | 40..=47 | 90..=107 | 38 | 48))
+        {
+            return true;
+        }
+        index = end + 1;
+    }
+    false
+}
+
+/// Wait until the normalized transcript contains the needle.
+fn wait_for_normalized(session: &PtySession, needle: &str, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let seen = normalized(&session.transcript());
+        if seen.contains(needle) {
+            return seen;
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "timed out waiting for {needle:?} in the normalized transcript; saw:\n{seen}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -240,6 +433,10 @@ fn base_env(temp: &tempfile::TempDir) -> Vec<(&'static str, String)> {
         ),
         ("HA_PROVIDER_ENDPOINT", String::new()),
         ("HA_PROVIDER_MODEL", String::new()),
+        // The Codex host can itself run with TERM=dumb. A real pseudo-console is
+        // capable of cursor positioning, so the default acceptance route must
+        // state that capability instead of silently measuring the plain fallback.
+        ("TERM", "xterm-256color".to_owned()),
     ]
 }
 
@@ -274,6 +471,139 @@ fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
         transcript.ends_with("\r\n") || transcript.ends_with('\n'),
         "the app restores the terminal before exiting: {transcript:?}"
     );
+}
+
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn t01_tui_opens_with_status_and_composer() {
+    let (temp, project) = sandbox();
+    let mut session = PtySession::spawn(&project, &base_env(&temp));
+    let transcript = session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
+    assert!(
+        !transcript.contains("using the plain renderer"),
+        "{transcript}"
+    );
+    let screen = normalized(&transcript);
+    assert!(screen.contains("setup required"), "status row: {screen}");
+    assert!(screen.contains("> Nhập yêu cầu"), "composer: {screen}");
+    session.send("/exit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+}
+
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn t03_pty_paste_keeps_newlines() {
+    let (temp, project) = sandbox();
+    let mut session =
+        PtySession::spawn_process(&project, &base_env(&temp), &["chat", "--fixture"], &[]);
+    session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
+    let accepted_before = session.transcript().matches("[run] accepted").count();
+
+    session.send("\u{1b}[200~first line\r\nsecond line\u{1b}[201~");
+    std::thread::sleep(Duration::from_millis(500));
+    if session.transcript().matches("[run] accepted").count() != accepted_before {
+        // Measured limitation of this ConPTY: it strips the bracket markers and
+        // turns the embedded newline into Enter before crossterm can emit Paste.
+        // Keep this as an explicit capability result; the event-level T03 test is
+        // the oracle on terminals that actually deliver a Paste event.
+        eprintln!("T03_PTY_PASTE_UNAVAILABLE: ConPTY stripped bracketed-paste markers");
+        assert!(
+            session.is_alive(),
+            "the unsupported paste must not crash the app"
+        );
+        session.send("\u{3}/exit\r");
+        assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+        return;
+    }
+    session.send("\r");
+    session.wait_for("fixture answer for: first line", Duration::from_secs(30));
+    session.wait_for("second line", Duration::from_secs(30));
+    assert_eq!(
+        session.transcript().matches("[run] accepted").count(),
+        accepted_before + 1,
+        "the multiline paste is admitted as one message"
+    );
+    session.wait_for("[run] done", Duration::from_secs(30));
+    session.send("/exit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+}
+
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn t06_pty_approval_y_key() {
+    let (temp, project) = sandbox();
+    let mut session =
+        PtySession::spawn_process(&project, &base_env(&temp), &["chat", "--fixture"], &[]);
+    session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
+    session.send("request approval fixture\r");
+    session.wait_for("[approval] fixture_action", Duration::from_secs(30));
+    // ConPTY can buffer a lone printable byte even while the child is in raw
+    // mode. Submit the answer with CR so the test observes the same input path
+    // as a user pressing `y` followed by Enter on affected Windows hosts.
+    session.send("y\r");
+    wait_for_normalized(
+        &session,
+        "[approval] granted fixture-approval-1",
+        Duration::from_secs(30),
+    );
+    session.wait_for("[tool] fixture_action", Duration::from_secs(30));
+    session.wait_for("[run] done", Duration::from_secs(30));
+    session.send("/exit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+}
+
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn t07_pty_plain_flag() {
+    let (temp, project) = sandbox();
+    let mut session =
+        PtySession::spawn_process(&project, &base_env(&temp), &["chat", "--plain"], &[]);
+    let transcript = session.wait_for("using the plain renderer", Duration::from_secs(30));
+    assert!(
+        transcript.contains("plain renderer requested"),
+        "{transcript}"
+    );
+    session.send("/exit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+}
+
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn t07_pty_no_color() {
+    let (temp, project) = sandbox();
+    let mut session =
+        PtySession::spawn_process(&project, &base_env(&temp), &[], &[("NO_COLOR", "1")]);
+    session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
+    session.send("/exit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+    let transcript = session.transcript();
+    assert!(
+        !has_color_sgr(&transcript),
+        "NO_COLOR may retain cursor control but not palette SGR: {transcript:?}"
+    );
+}
+
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn t07_pty_resize_keeps_the_draft() {
+    let (temp, project) = sandbox();
+    let mut session =
+        PtySession::spawn_process(&project, &base_env(&temp), &["chat", "--fixture"], &[]);
+    session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
+    session.send("draft resize");
+    // Raw PTY bytes interleave cursor moves inside a typed word. The submitted
+    // history row below is the reliable oracle that resize preserved the draft.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(session.is_alive(), "typing keeps the TUI alive");
+    session.resize(72, 20);
+    session.send(" survives\r");
+    session.wait_for("> draft resize survives", Duration::from_secs(30));
+    session.wait_for(
+        "fixture answer for: draft resize survives",
+        Duration::from_secs(30),
+    );
+    session.send("/exit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
 }
 
 /// I14 (interactive half): the artifact a user installs, not the build-tree binary.
@@ -389,20 +719,27 @@ fn i14_the_installed_artifact_opens_the_app_in_a_real_terminal() {
 #[test]
 fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     let (temp, project) = sandbox();
-    let mut session = PtySession::spawn(&project, &base_env(&temp));
+    let mut session =
+        PtySession::spawn_process(&project, &base_env(&temp), &["chat", "--fixture"], &[]);
     session.wait_for("Harness Agents", Duration::from_secs(30));
 
     session.send("sửa lỗi parser");
-    session.wait_for("sửa lỗi parser", Duration::from_secs(15));
-    session.send("\u{7f}");
-    session.send("!");
-    session.wait_for("sửa lỗi parse!", Duration::from_secs(15));
-    assert!(session.is_alive(), "editing keeps the app alive");
+    // Raw PTY bytes are a repaint log rather than a screen, so submit the draft
+    // and use the fixture echo as the oracle for what the editor actually held.
+    // BS is the byte ConPTY reports for the Backspace virtual key; DEL is the
+    // forward-delete key and correctly does nothing at the end of this draft.
+    session.send("\u{8}!\r");
+    session.wait_for(
+        "fixture answer for: sửa lỗi parse!",
+        Duration::from_secs(30),
+    );
+    session.wait_for("[run] done", Duration::from_secs(30));
 
     // A paste must never turn into several submitted commands. Whether the console
     // forwards the bracketed-paste markers is the console's choice: this ConPTY
     // build does not, and then the newline inside the paste arrives as Enter. Both
     // outcomes are asserted, so the test measures the app instead of the terminal.
+    let accepted_before_paste = session.transcript().matches("[run] accepted").count();
     session.send("\u{1b}[200~multi\r\nline\u{1b}[201~");
     let pasted = session.wait_for_any(&["multi line", "multi"], Duration::from_secs(15));
     let transcript = session.transcript();
@@ -410,8 +747,9 @@ fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
         panic!("the pasted text never reached the prompt:\n{transcript}");
     };
     if transcript.contains("multi line") {
-        assert!(
-            !transcript.contains("[run] accepted"),
+        assert_eq!(
+            transcript.matches("[run] accepted").count(),
+            accepted_before_paste,
             "a bracketed paste must not submit a request:\n{transcript}"
         );
     } else {
@@ -424,9 +762,8 @@ fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
             session.is_alive(),
             "the app survives a console without bracketed paste:\n{transcript}"
         );
-        session.send("\u{3}");
-        session.send("ok");
-        session.wait_for("> ok", Duration::from_secs(15));
+        session.send("\u{3}ok\r");
+        session.wait_for("fixture answer for: ok", Duration::from_secs(30));
         assert!(
             session.is_alive(),
             "the prompt is still usable after a paste"
@@ -450,7 +787,8 @@ fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
 #[test]
 fn i21_pty_survives_a_multiline_draft_and_keeps_the_prompt_usable() {
     let (temp, project) = sandbox();
-    let mut session = PtySession::spawn(&project, &base_env(&temp));
+    let mut session =
+        PtySession::spawn_process(&project, &base_env(&temp), &["chat", "--fixture"], &[]);
     session.wait_for("Harness Agents", Duration::from_secs(30));
 
     // What this console does with a line break was measured, not assumed:
@@ -459,10 +797,10 @@ fn i21_pty_survives_a_multiline_draft_and_keeps_the_prompt_usable() {
     // this ConPTY build, exactly like the bracketed paste in i06). Both outcomes
     // are asserted, so the test measures the app rather than the terminal.
     session.send("dòng một");
-    session.wait_for("> dòng một", Duration::from_secs(15));
+    std::thread::sleep(Duration::from_millis(250));
     session.send("\n");
     session.send("dòng hai");
-    session.wait_for("dòng hai", Duration::from_secs(15));
+    std::thread::sleep(Duration::from_millis(250));
 
     let transcript = session.transcript();
     let inserted_break = !transcript.contains("[run] accepted");
@@ -483,8 +821,16 @@ fn i21_pty_survives_a_multiline_draft_and_keeps_the_prompt_usable() {
         session.is_alive(),
         "the app stays alive through a multi-row draft:\n{transcript}"
     );
-    session.send("\u{3}");
-    session.wait_for_any(&["> "], Duration::from_secs(10));
+    if inserted_break {
+        // Submitting the draft makes the in-memory editor state observable through
+        // both the committed history row and the fixture service response.
+        session.send("\r");
+        session.wait_for("> dòng một", Duration::from_secs(30));
+        session.wait_for("fixture answer for: dòng một", Duration::from_secs(30));
+        session.wait_for("[run] done", Duration::from_secs(30));
+    } else {
+        session.send("\u{3}");
+    }
     session.send("/exit\r");
     assert_eq!(
         session.wait_exit(Duration::from_secs(20)),
@@ -504,10 +850,10 @@ fn i07a_ctrl_c_clears_an_idle_prompt() {
     session.wait_for("Harness Agents", Duration::from_secs(30));
 
     session.send("typo");
-    session.wait_for("> typo", Duration::from_secs(15));
+    wait_for_normalized(&session, "typo", Duration::from_secs(15));
     session.send("\u{3}");
     session.send("z");
-    session.wait_for("> z", Duration::from_secs(15));
+    wait_for_normalized(&session, "z", Duration::from_secs(15));
     assert!(
         !session.transcript().contains("> typoz"),
         "an idle Ctrl-C clears the buffer:\n{}",
@@ -518,7 +864,7 @@ fn i07a_ctrl_c_clears_an_idle_prompt() {
     // Clear the marker character first: "/exit" appended to it would be submitted
     // as a request instead of a command.
     session.send("\u{3}");
-    session.wait_for_any(&["> "], Duration::from_secs(10));
+    wait_for_normalized(&session, ">", Duration::from_secs(10));
     session.send("/exit\r");
     assert_eq!(
         session.wait_exit(Duration::from_secs(20)),
@@ -709,9 +1055,23 @@ fn warm_up_loopback(endpoint: &str) {
 
 fn read_request(socket: &mut std::net::TcpStream) -> String {
     let mut buffer = vec![0_u8; 8192];
-    let read = socket.read(&mut buffer).expect("fixture reads");
+    let Ok(read) = socket.read(&mut buffer) else {
+        return String::new();
+    };
     buffer.truncate(read);
     String::from_utf8_lossy(&buffer).into_owned()
+}
+
+/// Accept the next actual HTTP request, ignoring reachability probes that connect
+/// and close without sending bytes. A probe must never consume one scripted model
+/// response and shift the fixture protocol by one call.
+fn accept_request(listener: &std::net::TcpListener) -> std::net::TcpStream {
+    loop {
+        let (mut socket, _) = listener.accept().expect("the model call arrives");
+        if !read_request(&mut socket).is_empty() {
+            return socket;
+        }
+    }
 }
 
 fn write_sse(socket: &mut std::net::TcpStream, body: &str) {
@@ -757,30 +1117,22 @@ fn patch_then_stall_endpoint(
             serde_json::Value::String(arguments)
         );
         // 1. The turn asks for one gated patch.
-        let (mut socket, _) = listener.accept().expect("the first call arrives");
-        let _ = read_request(&mut socket);
+        let mut socket = accept_request(&listener);
         asked_flag.store(true, Ordering::SeqCst);
         write_sse(&mut socket, &tool_call);
         // 2. After the tool settles the app asks again: hold this call open so the
         //    test can kill the process with the receipt already committed.
-        let (mut second, _) = listener.accept().expect("the second call arrives");
-        let _ = read_request(&mut second);
+        let second = accept_request(&listener);
         continued_flag.store(true, Ordering::SeqCst);
         let _ = held.recv_timeout(Duration::from_mins(2));
         drop(second);
         // 3. The continuation after the kill gets a prose answer. A warm-up connect
         //    that sends no request is not that call.
-        loop {
-            let (mut third, _) = listener.accept().expect("the continuation arrives");
-            if read_request(&mut third).is_empty() {
-                continue;
-            }
-            write_sse(
-                &mut third,
-                "data: {\"choices\":[{\"delta\":{\"content\":\"the parser is already fixed; nothing to redo\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
-            );
-            break;
-        }
+        let mut third = accept_request(&listener);
+        write_sse(
+            &mut third,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"the parser is already fixed; nothing to redo\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
     });
     (
         format!("http://{address}/chat/completions"),
@@ -807,6 +1159,7 @@ fn i13_a_settled_tool_receipt_survives_a_hard_kill_mid_turn() {
     let replacement = "fn parse() { println!(\"fixed before the kill\"); }\n";
     let (endpoint, _asked, continued, release, server) =
         patch_then_stall_endpoint(expected, replacement.to_owned());
+    warm_up_loopback(&endpoint);
 
     let mut session = PtySession::spawn(&project, &provider_env(&temp, &endpoint));
     session.wait_for("Harness Agents", Duration::from_secs(30));
@@ -984,6 +1337,7 @@ fn stalling_provider() -> (
 
 #[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
 #[test]
+#[allow(clippy::too_many_lines)] // One kill-then-reopen sequence; splitting it hides the order.
 fn i05_exit_during_an_active_run_releases_the_store_for_the_next_host() {
     // H05: /exit must handle an active run (cancel, cleanup) and restore terminal
     // and store ownership. The proof for ownership is that the next host can write.
@@ -1031,25 +1385,65 @@ fn i05_exit_during_an_active_run_releases_the_store_for_the_next_host() {
         "the canceled run left one durable session: {listed}"
     );
 
-    let (answer_endpoint, answer_server) = sse_answer("the store is free again");
-    let follow_up = std::process::Command::new(cli_binary())
+    let (answer_endpoint, answer_contacted, answer_server) = sse_answer("the store is free again");
+    warm_up_loopback(&answer_endpoint);
+    let mut follow_up = std::process::Command::new(cli_binary())
         .args(["chat", "--headless", "--prompt", "after the exit", "--json"])
         .current_dir(&project)
         .env("HA_HOME", ha_home(&temp))
         .env("HA_PROVIDER_ENDPOINT", &answer_endpoint)
         .env("HA_PROVIDER_MODEL", "fixture-model")
         .env("DEEPSEEK_API_KEY", "fixture-secret-value")
+        .env("HA_TEST_TRACE_HEADLESS", "1")
         .stdin(std::process::Stdio::null())
-        .output()
-        .expect("the next host runs");
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the next host starts");
+    let follow_up_deadline = Instant::now() + Duration::from_secs(30);
+    let follow_up_status = loop {
+        if let Some(status) = follow_up.try_wait().expect("next host status") {
+            break status;
+        }
+        if Instant::now() >= follow_up_deadline {
+            let _ = follow_up.kill();
+            let _ = follow_up.wait();
+            let mut stderr = String::new();
+            follow_up
+                .stderr
+                .take()
+                .expect("timed out host stderr")
+                .read_to_string(&mut stderr)
+                .expect("timed out host stderr read");
+            panic!(
+                "the next host exceeded its bound (provider_contacted={}): {stderr}",
+                answer_contacted.load(Ordering::SeqCst),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut follow_up_stdout = Vec::new();
+    follow_up
+        .stdout
+        .take()
+        .expect("next host stdout")
+        .read_to_end(&mut follow_up_stdout)
+        .expect("next host stdout read");
+    let mut follow_up_stderr = Vec::new();
+    follow_up
+        .stderr
+        .take()
+        .expect("next host stderr")
+        .read_to_end(&mut follow_up_stderr)
+        .expect("next host stderr read");
     answer_server.join().expect("the answer fixture finishes");
     assert!(
-        follow_up.status.success(),
+        follow_up_status.success(),
         "the next host took the store: {}",
-        String::from_utf8_lossy(&follow_up.stderr)
+        String::from_utf8_lossy(&follow_up_stderr)
     );
     let parsed: serde_json::Value =
-        serde_json::from_slice(&follow_up.stdout).expect("the next host prints JSON");
+        serde_json::from_slice(&follow_up_stdout).expect("the next host prints JSON");
     assert_eq!(
         parsed["response"],
         serde_json::json!("the store is free again"),
@@ -1058,19 +1452,51 @@ fn i05_exit_during_an_active_run_releases_the_store_for_the_next_host() {
 }
 
 /// One-shot SSE provider that answers one request with plain text.
-fn sse_answer(text: &str) -> (String, std::thread::JoinHandle<()>) {
+fn sse_answer(text: &str) -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("answer listener");
+    listener
+        .set_nonblocking(true)
+        .expect("the answer listener is non-blocking");
     let address = listener.local_addr().expect("answer address");
     let text = text.to_owned();
+    let contacted = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&contacted);
     let handle = std::thread::spawn(move || {
-        let (mut socket, _) = listener.accept().expect("the answer call arrives");
-        let _ = read_request(&mut socket);
+        let deadline = Instant::now() + Duration::from_secs(35);
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    socket
+                        .set_nonblocking(false)
+                        .expect("an accepted answer socket can block for its request");
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .expect("the answer socket read is bounded");
+                    if !read_request(&mut socket).is_empty() {
+                        break socket;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the answer provider was not contacted before its deadline"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("the answer provider failed: {error}"),
+            }
+        };
+        flag.store(true, Ordering::SeqCst);
         let body = format!(
             "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
         );
         write_sse(&mut socket, &body);
     });
-    (format!("http://{address}/chat/completions"), handle)
+    (
+        format!("http://{address}/chat/completions"),
+        contacted,
+        handle,
+    )
 }
 
 // ---------------------------------------------------------------------------

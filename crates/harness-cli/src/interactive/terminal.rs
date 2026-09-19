@@ -27,6 +27,8 @@ pub trait TerminalBackend {
     /// Wait up to the timeout for input, reporting whether a key is ready.
     fn poll_key(&mut self, timeout: Duration) -> io::Result<bool>;
     fn read_key(&mut self) -> io::Result<Key>;
+    /// Current console size, used to decide whether the TUI fits.
+    fn size(&self) -> io::Result<(u16, u16)>;
 }
 
 /// Real terminal backed by crossterm.
@@ -38,7 +40,7 @@ pub struct CrosstermBackend;
 /// milliseconds have passed since the first write. The seam exists only in debug
 /// builds, so a shipped binary can never be told to fail this way.
 #[cfg(debug_assertions)]
-fn injected_fault() -> io::Result<()> {
+pub(crate) fn injected_fault() -> io::Result<()> {
     use std::sync::OnceLock;
     use std::time::Instant;
 
@@ -58,7 +60,7 @@ fn injected_fault() -> io::Result<()> {
 }
 
 #[cfg(not(debug_assertions))]
-fn injected_fault() -> io::Result<()> {
+pub(crate) fn injected_fault() -> io::Result<()> {
     Ok(())
 }
 
@@ -94,6 +96,11 @@ impl TerminalBackend for CrosstermBackend {
 
     fn read_key(&mut self) -> io::Result<Key> {
         Ok(map_event(event::read()?))
+    }
+
+    fn size(&self) -> io::Result<(u16, u16)> {
+        let (columns, rows) = terminal::size()?;
+        Ok((columns, rows))
     }
 }
 
@@ -134,6 +141,23 @@ impl ModeControl for SystemModes {
 pub struct RawModeGuard {
     modes: Box<dyn ModeControl>,
     active: bool,
+}
+
+/// Restore terminal modes before Rust prints a panic report.
+///
+/// Panic hooks run before stack unwinding, so relying on `RawModeGuard::drop`
+/// alone leaves the report written while the console is still raw. Installation
+/// is process-wide and idempotent; ordinary error returns still use RAII.
+pub fn install_panic_hook() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |information| {
+            let _ = execute!(io::stdout(), event::DisableBracketedPaste, cursor::Show);
+            let _ = terminal::disable_raw_mode();
+            default(information);
+        }));
+    });
 }
 
 impl RawModeGuard {
@@ -182,17 +206,29 @@ fn map_key(key: KeyEvent) -> Key {
     match key.code {
         KeyCode::Char('c') if control => Key::Interrupt,
         KeyCode::Char('d') if control => Key::EndOfInput,
-        // Ctrl-J is a line feed, which every terminal reports distinctly from
-        // Enter, so it is the multiline key the plan requires to be a real,
-        // tested combination rather than a guessed one.
+        KeyCode::Char('a') if control => Key::LineStart,
+        KeyCode::Char('e') if control => Key::LineEnd,
+        KeyCode::Char('u') if control => Key::EraseToLineStart,
+        KeyCode::Char('w') if control => Key::EraseWord,
+        KeyCode::Char('l') if control => Key::Redraw,
+        // Ctrl-J is a line feed. Measured on this ConPTY (HA_TUI T01): the
+        // console reports it as Enter with the CONTROL modifier, not as
+        // Ctrl+Char('j'), so both spellings are accepted as the multiline key.
+        // Alt+Enter is the second multiline key; it arrives as Enter with ALT,
+        // also measured, so it never collides with a plain Enter.
+        KeyCode::Enter if control || key.modifiers.contains(KeyModifiers::ALT) => Key::Newline,
         KeyCode::Char('j') if control => Key::Newline,
         KeyCode::Char(character) => Key::Char(character),
         KeyCode::Backspace => Key::Backspace,
         KeyCode::Delete => Key::Delete,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::Esc => Key::Esc,
         KeyCode::Left => Key::Left,
         KeyCode::Right => Key::Right,
         KeyCode::Up => Key::Up,
         KeyCode::Down => Key::Down,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
         KeyCode::Home => Key::Home,
         KeyCode::End => Key::End,
         KeyCode::Enter => Key::Enter,
@@ -205,13 +241,21 @@ fn map_key(key: KeyEvent) -> Key {
 /// When the script is exhausted it reports Ctrl-D, so a test that leaves an empty
 /// prompt ends the loop instead of hanging.
 #[cfg(test)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ScriptedBackend {
     keys: std::collections::VecDeque<Key>,
     output: String,
     writes: Vec<String>,
     cleared_lines: usize,
     moved_up: u32,
+    size: (u16, u16),
+}
+
+#[cfg(test)]
+impl Default for ScriptedBackend {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
 }
 
 #[cfg(test)]
@@ -224,7 +268,18 @@ impl ScriptedBackend {
             writes: Vec::new(),
             cleared_lines: 0,
             moved_up: 0,
+            // A console large enough for the TUI, so a test that wants the plain
+            // renderer has to ask for it instead of relying on a small default.
+            size: (110, 30),
         }
+    }
+
+    /// Report a different console size, for the fallback tests.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn with_size(mut self, columns: u16, rows: u16) -> Self {
+        self.size = (columns, rows);
+        self
     }
 
     #[must_use]
@@ -281,6 +336,10 @@ impl TerminalBackend for ScriptedBackend {
     fn read_key(&mut self) -> io::Result<Key> {
         Ok(self.keys.pop_front().unwrap_or(Key::EndOfInput))
     }
+
+    fn size(&self) -> io::Result<(u16, u16)> {
+        Ok(self.size)
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +359,28 @@ mod tests {
             Key::EndOfInput
         );
         assert_eq!(
+            map_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Key::LineStart
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            Key::LineEnd
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            Key::EraseToLineStart
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+            Key::EraseWord
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            Key::Redraw
+        );
+        assert_eq!(map_key(key(KeyCode::Tab, KeyModifiers::NONE)), Key::Tab);
+        assert_eq!(map_key(key(KeyCode::Esc, KeyModifiers::NONE)), Key::Esc);
+        assert_eq!(
             map_key(key(KeyCode::Char('a'), KeyModifiers::NONE)),
             Key::Char('a')
         );
@@ -316,6 +397,34 @@ mod tests {
         assert_eq!(
             map_key(key(KeyCode::F(5), KeyModifiers::NONE)),
             Key::Unknown
+        );
+    }
+
+    /// T01 measured this console: a line feed arrives as `Enter + CONTROL` and
+    /// Alt+Enter as `Enter + ALT`. Both are the multiline key, and neither may
+    /// turn into a submit.
+    #[test]
+    fn t01_line_feed_and_alt_enter_are_the_multiline_key_on_this_console() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        assert_eq!(
+            map_key(key(KeyCode::Enter, KeyModifiers::CONTROL)),
+            Key::Newline,
+            "Ctrl-J was measured as Enter+CONTROL on this ConPTY"
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Enter, KeyModifiers::ALT)),
+            Key::Newline,
+            "Alt+Enter was measured as Enter+ALT"
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            Key::Newline,
+            "the Char('j') spelling stays accepted for terminals that send it"
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Key::Enter,
+            "a plain Enter still submits"
         );
     }
 

@@ -42,6 +42,14 @@ uuid = { version = "=1.26.1", features = ["serde", "v7"] }
 ignore = "=0.4.25"
 process-wrap = { version = "=10.0.0", default-features = false, features = ["tokio1", "job-object", "process-session", "kill-on-drop"] }
 unicode-normalization = "=0.1.25"
+# HA_TUI T01 decision D1: the inline-viewport TUI is drawn with ratatui, pinned
+# exactly. `crossterm_0_29` is enabled on purpose: ratatui's crossterm backend
+# would otherwise pull its own crossterm and the lockfile would carry two.
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "crossterm_0_29", "layout-cache", "underline-color"] }
+# Width of a rendered cell, used after NFC so Vietnamese text cannot shift the
+# cursor. Pinned to the version ratatui 0.30.2 itself resolves, so the lockfile
+# keeps exactly one copy.
+unicode-width = "=0.2.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

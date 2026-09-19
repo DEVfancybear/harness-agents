@@ -10,11 +10,29 @@ repository.workspace = true
 name = "ha"
 path = "src/main.rs"
 
+[features]
+# T01 measurement switch: builds the TUI against ratatui's `scrolling-regions`
+# path so `insert_before` can be compared byte-for-byte against the default path.
+# The plan requires the decision to be measured, not assumed; the measurement and
+# its verdict are recorded in docs/specs/HA_TUI.vi.md.
+#
+# The name is deliberately the same as ratatui-core's feature: the extra
+# `Backend` trait methods that `scrolling-regions` introduces are gated on that
+# crate's feature, so `#[cfg(feature = "scrolling-regions")]` in this crate can
+# only be correct if the two are enabled together, which this mapping does.
+scrolling-regions = ["ratatui/scrolling-regions"]
+
 [dependencies]
 clap.workspace = true
 # Pinned in the HA_LAUNCH H03 spike; default features cover raw mode, key events
 # and bracketed paste on Windows and Unix.
 crossterm = "=0.29.0"
+# HA_TUI T01/D1: the inline-viewport TUI. Pinned exactly, with the crossterm 0.29
+# backend feature so this crate and the TUI share one crossterm version.
+ratatui.workspace = true
+# HA_TUI T01/D1: cell width after NFC, so Vietnamese text cannot shift the cursor.
+unicode-width.workspace = true
+unicode-normalization.workspace = true
 harness-types = { path = "../harness-types" }
 harness-providers = { path = "../harness-providers" }
 harness-session = { path = "../harness-session" }

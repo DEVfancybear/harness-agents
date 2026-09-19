@@ -3,6 +3,11 @@
 //! Cursor movement is counted in characters, never bytes, so Vietnamese and other
 //! multi-byte input cannot be split in the middle of a character. The editor owns
 //! no terminal state: the host decides how to render or redraw.
+//!
+//! T03 extends the H03 editor instead of replacing it: paste keeps its line
+//! breaks, the control keys a terminal actually reports are understood, and the
+//! editor also owns the two small modal states (session picker, reference
+//! overlay) so the controller keeps one source of focus.
 
 use super::events::Key;
 
@@ -17,11 +22,39 @@ pub enum InputOutcome {
     Interrupt,
     /// Ctrl-D was pressed on an empty prompt.
     Exit,
+    /// Tab completed the buffer; the host only has to repaint.
+    CompleteSuggestion,
     /// The key changed nothing.
     Unchanged,
 }
 
-/// Single-line prompt editor with history.
+/// The session picker, owned by the editor so focus has one owner.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Picker {
+    items: Vec<String>,
+    selected: usize,
+}
+
+impl Picker {
+    #[must_use]
+    pub fn items(&self) -> &[String] {
+        &self.items
+    }
+
+    #[must_use]
+    pub const fn selected(&self) -> usize {
+        self.selected
+    }
+}
+
+/// A reference overlay (`/help`, `/status`, `/config`, `/model`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Overlay {
+    pub title: String,
+    pub lines: Vec<String>,
+}
+
+/// Prompt editor with history, completion and the two modal panels.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LineEditor {
     buffer: String,
@@ -29,6 +62,10 @@ pub struct LineEditor {
     history: Vec<String>,
     history_index: Option<usize>,
     draft: String,
+    /// Slash commands matching the buffer right now; Tab accepts the only one.
+    suggestion: Vec<&'static str>,
+    picker: Option<Picker>,
+    overlay: Option<Overlay>,
 }
 
 impl LineEditor {
@@ -57,20 +94,82 @@ impl LineEditor {
         &self.history
     }
 
+    #[must_use]
+    pub fn picker(&self) -> Option<&Picker> {
+        self.picker.as_ref()
+    }
+
+    /// The reference overlay, when one is open.
+    #[allow(dead_code, reason = "T06 draws the overlay from this accessor")]
+    #[must_use]
+    pub fn overlay(&self) -> Option<&Overlay> {
+        self.overlay.as_ref()
+    }
+
+    /// The completion candidates matching the current buffer.
+    #[allow(dead_code, reason = "T03 shows the candidates in the composer hint")]
+    #[must_use]
+    pub fn suggestions(&self) -> &[&'static str] {
+        &self.suggestion
+    }
+
+    /// Open the session picker with one label per candidate.
+    pub fn open_picker(&mut self, items: Vec<String>) {
+        self.picker = Some(Picker { items, selected: 0 });
+    }
+
+    pub fn close_picker(&mut self) {
+        self.picker = None;
+    }
+
+    /// Move the picker highlight, saturating at both ends.
+    pub fn move_picker(&mut self, delta: i32) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let last = picker.items.len().saturating_sub(1);
+        let next = if delta.is_negative() {
+            picker
+                .selected
+                .saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            picker
+                .selected
+                .saturating_add(delta.unsigned_abs() as usize)
+        };
+        picker.selected = next.min(last);
+    }
+
+    pub fn open_overlay(&mut self, title: &str, lines: Vec<String>) {
+        self.overlay = Some(Overlay {
+            title: title.to_owned(),
+            lines,
+        });
+    }
+
+    /// Close the reference overlay.
+    #[allow(dead_code, reason = "T06 closes the overlay from the controller")]
+    pub fn close_overlay(&mut self) {
+        self.overlay = None;
+    }
+
     /// Drop the current input without touching the history.
     pub fn clear(&mut self) {
         self.buffer.clear();
         self.cursor = 0;
         self.history_index = None;
         self.draft.clear();
+        self.suggestion.clear();
     }
 
     /// Apply one key.
+    #[allow(clippy::too_many_lines, reason = "one arm per key, in key order")]
     #[must_use]
     pub fn handle(&mut self, key: Key) -> InputOutcome {
         match key {
             Key::Char(character) if !character.is_control() => {
                 self.insert(&character.to_string());
+                self.refresh_suggestion();
                 InputOutcome::Redraw
             }
             Key::Newline => {
@@ -80,10 +179,12 @@ impl LineEditor {
                     return InputOutcome::Unchanged;
                 }
                 self.insert("\n");
+                self.suggestion.clear();
                 InputOutcome::Redraw
             }
             Key::Paste(text) => {
                 self.insert(&normalize_paste(&text));
+                self.refresh_suggestion();
                 InputOutcome::Redraw
             }
             Key::Backspace => {
@@ -91,6 +192,7 @@ impl LineEditor {
                     return InputOutcome::Unchanged;
                 }
                 self.remove_before();
+                self.refresh_suggestion();
                 InputOutcome::Redraw
             }
             Key::Delete => {
@@ -98,6 +200,7 @@ impl LineEditor {
                     return InputOutcome::Unchanged;
                 }
                 self.remove_at();
+                self.refresh_suggestion();
                 InputOutcome::Redraw
             }
             Key::Left => {
@@ -105,6 +208,12 @@ impl LineEditor {
                     return InputOutcome::Unchanged;
                 }
                 self.cursor -= 1;
+                // A line break belongs to the row above it, so stepping left from
+                // the first character of a row lands at the end of that row
+                // instead of on the break itself.
+                if self.buffer.chars().nth(self.cursor) == Some('\n') {
+                    self.cursor -= 1;
+                }
                 InputOutcome::Redraw
             }
             Key::Right => {
@@ -114,16 +223,87 @@ impl LineEditor {
                 self.cursor += 1;
                 InputOutcome::Redraw
             }
-            Key::Home => {
-                self.cursor = 0;
+            Key::Home | Key::LineStart => {
+                if self.buffer.contains('\n') && key == Key::LineStart {
+                    self.cursor = self.line_start();
+                } else {
+                    self.cursor = 0;
+                }
                 InputOutcome::Redraw
             }
-            Key::End => {
-                self.cursor = self.char_len();
+            Key::End | Key::LineEnd => {
+                if self.buffer.contains('\n') && key == Key::LineEnd {
+                    self.cursor = self.line_end();
+                } else {
+                    self.cursor = self.char_len();
+                }
                 InputOutcome::Redraw
             }
-            Key::Up => self.recall(true),
-            Key::Down => self.recall(false),
+            Key::EraseToLineStart => {
+                let start = self.line_start();
+                if start == self.cursor {
+                    return InputOutcome::Unchanged;
+                }
+                let (from, to) = (self.byte_offset(start), self.byte_offset(self.cursor));
+                self.buffer.replace_range(from..to, "");
+                self.cursor = start;
+                self.refresh_suggestion();
+                InputOutcome::Redraw
+            }
+            Key::EraseWord => {
+                if self.cursor == 0 {
+                    return InputOutcome::Unchanged;
+                }
+                let target = self.word_start();
+                if target == self.cursor {
+                    return InputOutcome::Unchanged;
+                }
+                let (from, to) = (self.byte_offset(target), self.byte_offset(self.cursor));
+                self.buffer.replace_range(from..to, "");
+                self.cursor = target;
+                self.refresh_suggestion();
+                InputOutcome::Redraw
+            }
+            Key::Tab => {
+                if let Some(only) = self.unique_suggestion() {
+                    self.buffer = only.to_owned();
+                    self.cursor = self.char_len();
+                    self.suggestion.clear();
+                    return InputOutcome::CompleteSuggestion;
+                }
+                InputOutcome::Unchanged
+            }
+            Key::Esc => {
+                // Escape never cancels a run; it dismisses what the editor showed
+                // on its own behalf.
+                if self.overlay.is_some() {
+                    self.overlay = None;
+                    return InputOutcome::Redraw;
+                }
+                if !self.suggestion.is_empty() {
+                    self.suggestion.clear();
+                    return InputOutcome::Redraw;
+                }
+                InputOutcome::Unchanged
+            }
+            Key::Up => {
+                if self.buffer.contains('\n')
+                    && let Some(previous) = self.row_start_before_cursor()
+                {
+                    self.cursor = previous;
+                    return InputOutcome::Redraw;
+                }
+                self.recall(true)
+            }
+            Key::Down => {
+                if self.buffer.contains('\n')
+                    && let Some(next) = self.row_start_after_cursor()
+                {
+                    self.cursor = next;
+                    return InputOutcome::Redraw;
+                }
+                self.recall(false)
+            }
             Key::Enter => self.submit(),
             Key::Interrupt => InputOutcome::Interrupt,
             Key::EndOfInput => {
@@ -133,9 +313,14 @@ impl LineEditor {
                     InputOutcome::Unchanged
                 }
             }
-            // Control characters are not typed text; Resize only needs a redraw of
-            // the prompt that the host already performs on its own.
-            Key::Char(_) | Key::Resize { .. } | Key::Unknown => InputOutcome::Unchanged,
+            // Control characters are not typed text; Resize and the repaint key
+            // only need the redraw the host already performs on its own.
+            Key::Char(_)
+            | Key::PageUp
+            | Key::PageDown
+            | Key::Redraw
+            | Key::Resize { .. }
+            | Key::Unknown => InputOutcome::Unchanged,
         }
     }
 
@@ -150,6 +335,7 @@ impl LineEditor {
         self.cursor = 0;
         self.history_index = None;
         self.draft.clear();
+        self.suggestion.clear();
         InputOutcome::Submit(submitted)
     }
 
@@ -182,6 +368,24 @@ impl LineEditor {
         InputOutcome::Redraw
     }
 
+    /// The commands the buffer could still become.
+    fn refresh_suggestion(&mut self) {
+        if !self.buffer.starts_with('/') || self.buffer.contains(char::is_whitespace) {
+            self.suggestion.clear();
+            return;
+        }
+        self.suggestion = completions(&self.buffer);
+    }
+
+    /// The one command Tab may accept: exactly one candidate, and it is longer
+    /// than what is typed.
+    fn unique_suggestion(&self) -> Option<&'static str> {
+        match self.suggestion.as_slice() {
+            [only] if *only != self.buffer => Some(only),
+            _ => None,
+        }
+    }
+
     fn char_len(&self) -> usize {
         self.buffer.chars().count()
     }
@@ -211,21 +415,140 @@ impl LineEditor {
         let end = self.byte_offset(self.cursor + 1);
         self.buffer.replace_range(start..end, "");
     }
+
+    /// Character index of the start of the row the cursor is on.
+    fn line_start(&self) -> usize {
+        self.buffer
+            .chars()
+            .take(self.cursor)
+            .enumerate()
+            .filter(|(_, character)| *character == '\n')
+            .map(|(index, _)| index + 1)
+            .last()
+            .unwrap_or(0)
+    }
+
+    /// Character index of the end of the row the cursor is on.
+    fn line_end(&self) -> usize {
+        self.buffer
+            .chars()
+            .enumerate()
+            .skip(self.cursor)
+            .find(|(_, character)| *character == '\n')
+            .map_or_else(|| self.char_len(), |(index, _)| index)
+    }
+
+    /// Character index where the word before the cursor starts.
+    ///
+    /// Whitespace immediately before the cursor is skipped first, then the word
+    /// itself: that is what Ctrl-W deletes in a shell, and a line break counts as
+    /// whitespace.
+    fn word_start(&self) -> usize {
+        let offset = self.byte_offset(self.cursor);
+        let mut characters = self.buffer[..offset].chars().rev().peekable();
+        let mut index = self.cursor;
+        while characters
+            .next_if(|character| character.is_whitespace())
+            .is_some()
+        {
+            index -= 1;
+        }
+        while characters
+            .next_if(|character| !character.is_whitespace())
+            .is_some()
+        {
+            index -= 1;
+        }
+        index
+    }
+
+    /// Cursor cell at the start of the previous row, when there is one.
+    fn row_start_before_cursor(&self) -> Option<usize> {
+        let previous_break = self
+            .buffer
+            .chars()
+            .take(self.cursor)
+            .enumerate()
+            .filter_map(|(index, character)| (character == '\n').then_some(index))
+            .last()?;
+        let column = self.cursor - previous_break - 1;
+        let row_start = self
+            .buffer
+            .chars()
+            .take(previous_break)
+            .enumerate()
+            .filter_map(|(index, character)| (character == '\n').then_some(index))
+            .last()
+            .map_or(0, |index| index + 1);
+        let row_len = previous_break - row_start;
+        Some(row_start + column.min(row_len))
+    }
+
+    /// Cursor cell at the start of the next row, when there is one.
+    fn row_start_after_cursor(&self) -> Option<usize> {
+        let break_ahead = self
+            .buffer
+            .chars()
+            .enumerate()
+            .skip(self.cursor)
+            .find(|(_, character)| *character == '\n')
+            .map(|(index, _)| index)?;
+        let row_start = self.line_start();
+        let column = self.cursor - row_start;
+        let next_start = break_ahead + 1;
+        let next_len = self
+            .buffer
+            .chars()
+            .enumerate()
+            .skip(next_start)
+            .find(|(_, character)| *character == '\n')
+            .map_or(self.char_len() - next_start, |(index, _)| {
+                index - next_start
+            });
+        Some(next_start + column.min(next_len))
+    }
 }
 
-/// Pasted text keeps its content but loses line breaks: a paste must never turn
-/// into several submitted commands, and the single-line prompt must not break.
-fn normalize_paste(text: &str) -> String {
-    text.replace("\r\n", " ")
-        .replace(['\r', '\n'], " ")
-        .chars()
-        .filter(|character| !character.is_control())
+/// Slash commands this revision understands, in help order.
+pub const SLASH_COMMANDS: [&str; 7] = [
+    "/help", "/status", "/new", "/model", "/config", "/resume", "/exit",
+];
+
+/// Commands whose name starts with `prefix`.
+#[must_use]
+pub fn completions(prefix: &str) -> Vec<&'static str> {
+    SLASH_COMMANDS
+        .iter()
+        .copied()
+        .filter(|command| command.starts_with(prefix))
         .collect()
+}
+
+/// Pasted text keeps its content **and** its line breaks.
+///
+/// A paste is one message: the newlines are preserved so a pasted code block
+/// stays one request, and carriage returns are normalized so a Windows paste does
+/// not introduce `\r` into the buffer. Other control characters are dropped.
+fn normalize_paste(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' => {
+                let _ = characters.next_if_eq(&'\n');
+                normalized.push('\n');
+            }
+            '\n' => normalized.push('\n'),
+            other if !other.is_control() => normalized.push(other),
+            _ => {}
+        }
+    }
+    normalized
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{InputOutcome, LineEditor};
+    use super::{InputOutcome, LineEditor, completions};
     use crate::interactive::events::Key;
 
     fn type_text(editor: &mut LineEditor, text: &str) {
@@ -339,19 +662,6 @@ mod tests {
     }
 
     #[test]
-    fn h03_editor_paste_never_submits_multiple_commands() {
-        let mut editor = LineEditor::new();
-        let outcome = editor.handle(Key::Paste("fix the parser\nrm -rf /\r\n:q".to_owned()));
-        assert_eq!(outcome, InputOutcome::Redraw, "paste must not submit");
-        assert_eq!(editor.buffer(), "fix the parser rm -rf / :q");
-        assert!(editor.history().is_empty());
-
-        let control = editor.handle(Key::Paste("keep\ttext\u{7}".to_owned()));
-        assert_eq!(control, InputOutcome::Redraw);
-        assert!(editor.buffer().contains("keeptext"), "{}", editor.buffer());
-    }
-
-    #[test]
     fn h03_editor_ctrl_c_and_ctrl_d_follow_the_plan() {
         let mut editor = LineEditor::new();
         assert_eq!(editor.handle(Key::EndOfInput), InputOutcome::Exit);
@@ -368,5 +678,186 @@ mod tests {
         editor.clear();
         assert_eq!(editor.buffer(), "");
         assert_eq!(editor.handle(Key::EndOfInput), InputOutcome::Exit);
+    }
+
+    /// T03 contract change: a paste keeps its line breaks.
+    ///
+    /// The H03 contract flattened them because the prompt was one line. The T03
+    /// composer is multi-row, so a pasted code block stays one message **with**
+    /// its newlines - still exactly one submit, which is the part that must never
+    /// change. Recorded in `docs/specs/HA_TUI.vi.md`.
+    #[test]
+    fn t03_paste_keeps_newlines_and_submits_once() {
+        let mut editor = LineEditor::new();
+        let outcome = editor.handle(Key::Paste("fix the parser\nrm -rf /\r\n:q".to_owned()));
+        assert_eq!(outcome, InputOutcome::Redraw, "paste must not submit");
+        assert_eq!(
+            editor.buffer(),
+            "fix the parser\nrm -rf /\n:q",
+            "newlines are preserved and \\r\\n is normalized"
+        );
+        assert!(editor.history().is_empty());
+
+        let control = editor.handle(Key::Paste("keep\ttext\u{7}".to_owned()));
+        assert_eq!(control, InputOutcome::Redraw);
+        assert!(editor.buffer().contains("keeptext"), "{}", editor.buffer());
+
+        // One paste of several lines is still exactly one submission.
+        assert_eq!(
+            editor.handle(Key::Enter),
+            InputOutcome::Submit("fix the parser\nrm -rf /\n:qkeeptext".to_owned())
+        );
+        assert_eq!(editor.history().len(), 1, "one message, one history entry");
+    }
+
+    #[test]
+    fn t03_ctrl_u_w_a_e_and_home_end_move_within_the_row() {
+        let mut editor = LineEditor::new();
+        type_text(&mut editor, "one two");
+        assert_eq!(editor.handle(Key::LineStart), InputOutcome::Redraw);
+        assert_eq!(editor.cursor(), 0);
+        assert_eq!(editor.handle(Key::LineEnd), InputOutcome::Redraw);
+        assert_eq!(editor.cursor(), 7);
+
+        // Ctrl-W deletes the word before the cursor, then the space before it.
+        assert_eq!(editor.handle(Key::EraseWord), InputOutcome::Redraw);
+        assert_eq!(editor.buffer(), "one ");
+        assert_eq!(editor.handle(Key::EraseWord), InputOutcome::Redraw);
+        assert_eq!(editor.buffer(), "");
+        assert_eq!(editor.handle(Key::EraseWord), InputOutcome::Unchanged);
+
+        type_text(&mut editor, "abcdef");
+        assert_eq!(editor.cursor(), 6);
+        let _ = editor.handle(Key::Left);
+        let _ = editor.handle(Key::Left);
+        assert_eq!(editor.cursor(), 4, "two steps left from the end");
+        assert_eq!(editor.handle(Key::EraseToLineStart), InputOutcome::Redraw);
+        assert_eq!(editor.buffer(), "ef", "Ctrl-U erases to the row start");
+        assert_eq!(editor.cursor(), 0);
+
+        // With two rows, Ctrl-U and Ctrl-A act on the row the cursor is on.
+        let mut multiline = LineEditor::new();
+        type_text(&mut multiline, "row one");
+        let _ = multiline.handle(Key::Newline);
+        type_text(&mut multiline, "row two");
+        assert_eq!(multiline.cursor(), 15);
+        assert_eq!(multiline.handle(Key::LineStart), InputOutcome::Redraw);
+        assert_eq!(multiline.cursor(), 8, "the start of the second row");
+        assert_eq!(
+            multiline.handle(Key::EraseToLineStart),
+            InputOutcome::Unchanged,
+            "there is nothing before the cursor on its own row"
+        );
+
+        // One step left lands at the end of the row above, not on the break, so
+        // Ctrl-U still acts on the row the cursor started on.
+        let _ = multiline.handle(Key::Left);
+        assert_eq!(
+            multiline.cursor(),
+            6,
+            "the last character of the row above, never the break itself"
+        );
+        assert_eq!(
+            multiline.handle(Key::EraseToLineStart),
+            InputOutcome::Redraw
+        );
+        assert_eq!(
+            multiline.buffer(),
+            "e\nrow two",
+            "everything before the cursor is erased, and the second row is untouched"
+        );
+    }
+
+    #[test]
+    fn t03_up_and_down_move_rows_before_history() {
+        let mut editor = LineEditor::new();
+        type_text(&mut editor, "first");
+        let _ = editor.handle(Key::Enter);
+        type_text(&mut editor, "ab");
+        let _ = editor.handle(Key::Newline);
+        type_text(&mut editor, "cdef");
+
+        // Multi-row buffer: Up moves to the previous row instead of the history.
+        assert_eq!(editor.handle(Key::Up), InputOutcome::Redraw);
+        assert_eq!(editor.cursor(), 2, "same column on the previous row");
+        assert_eq!(
+            editor.buffer(),
+            "ab\ncdef",
+            "the buffer is unchanged by row movement"
+        );
+        assert_eq!(editor.handle(Key::Down), InputOutcome::Redraw);
+        assert_eq!(editor.cursor(), 5, "down returns to the same column");
+
+        // Single-row buffer: Up recalls history.
+        let mut single = LineEditor::new();
+        type_text(&mut single, "remembered");
+        let _ = single.handle(Key::Enter);
+        type_text(&mut single, "draft");
+        assert_eq!(single.handle(Key::Up), InputOutcome::Redraw);
+        assert_eq!(single.buffer(), "remembered");
+        assert_eq!(single.handle(Key::Down), InputOutcome::Redraw);
+        assert_eq!(single.buffer(), "draft");
+    }
+
+    #[test]
+    fn t03_tab_completes_only_a_unique_slash_command() {
+        let mut editor = LineEditor::new();
+        type_text(&mut editor, "/re");
+        assert_eq!(editor.suggestions(), ["/resume"]);
+        assert_eq!(
+            editor.handle(Key::Tab),
+            InputOutcome::CompleteSuggestion,
+            "Tab accepts the only candidate"
+        );
+        assert_eq!(editor.buffer(), "/resume");
+
+        // With two candidates Tab does nothing and the hint stays visible.
+        let mut ambiguous = LineEditor::new();
+        type_text(&mut ambiguous, "/");
+        assert_eq!(ambiguous.suggestions().len(), super::SLASH_COMMANDS.len());
+        assert_eq!(ambiguous.handle(Key::Tab), InputOutcome::Unchanged);
+        assert_eq!(ambiguous.buffer(), "/");
+
+        // Escape clears the suggestion instead of completing it.
+        let mut escaping = LineEditor::new();
+        type_text(&mut escaping, "/re");
+        assert_eq!(escaping.handle(Key::Esc), InputOutcome::Redraw);
+        assert!(escaping.suggestions().is_empty());
+        assert_eq!(escaping.buffer(), "/re");
+    }
+
+    #[test]
+    fn t03_escape_closes_an_overlay_before_clearing_a_suggestion() {
+        let mut editor = LineEditor::new();
+        type_text(&mut editor, "/he");
+        editor.open_overlay("/help", vec!["/help  list".to_owned()]);
+        assert!(editor.overlay().is_some());
+        assert_eq!(editor.handle(Key::Esc), InputOutcome::Redraw);
+        assert!(editor.overlay().is_none(), "the overlay closes first");
+        assert_eq!(editor.buffer(), "/he", "and the draft survives");
+    }
+
+    #[test]
+    fn t03_the_picker_clamps_at_both_ends() {
+        let mut editor = LineEditor::new();
+        editor.open_picker(vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(editor.picker().expect("picker").selected(), 0);
+        editor.move_picker(1);
+        assert_eq!(editor.picker().expect("picker").selected(), 1);
+        editor.move_picker(5);
+        assert_eq!(editor.picker().expect("picker").selected(), 1, "clamped");
+        editor.move_picker(-9);
+        assert_eq!(editor.picker().expect("picker").selected(), 0, "clamped");
+        editor.close_picker();
+        assert!(editor.picker().is_none());
+    }
+
+    #[test]
+    fn t03_completions_are_prefix_matches_in_help_order() {
+        assert_eq!(completions("/"), super::SLASH_COMMANDS.to_vec());
+        assert_eq!(completions("/re"), ["/resume"]);
+        assert_eq!(completions("/c"), ["/config"]);
+        assert!(completions("/zzz").is_empty());
+        assert!(completions("hello").is_empty());
     }
 }

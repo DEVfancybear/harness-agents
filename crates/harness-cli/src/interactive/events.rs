@@ -1,13 +1,25 @@
-//! Interactive event vocabulary for `HA_LAUNCH` H03.
+//! Interactive event vocabulary for `HA_LAUNCH` H03 and `HA_TUI` T02.
 //!
 //! Terminal input is normalized into the Key enum so the editor, the controller
 //! and their tests never depend on a terminal library type. Backend work is
 //! normalized into `SessionEvent`; H04 replaces the staged producer of those
 //! events with the application service and this vocabulary stays.
+//!
+//! T02 adds the second half of the vocabulary: `HistoryItem` is what the
+//! controller emits instead of a bare string, `UiState` is the snapshot the TUI
+//! viewport draws, and `Modal` is the temporary panel that replaces the live
+//! block. The plain renderer keeps working from `HistoryItem::plain_lines()`,
+//! which is required to reproduce the pre-T02 strings exactly.
+
+use std::time::{Duration, Instant};
 
 use harness_types::InputId;
 
 /// One normalized terminal input event.
+///
+/// The T03 key set is defined here in T02 so the vocabulary is complete in one
+/// place; the editor starts consuming the new variants in T03.
+#[allow(dead_code, reason = "T03 consumes the composer keys")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Key {
     Char(char),
@@ -19,12 +31,31 @@ pub enum Key {
     End,
     Up,
     Down,
+    /// Ctrl-A: start of the current line.
+    LineStart,
+    /// Ctrl-E: end of the current line.
+    LineEnd,
+    /// Ctrl-U: erase to the start of the current line.
+    EraseToLineStart,
+    /// Ctrl-W: erase one word before the cursor.
+    EraseWord,
+    /// Tab: complete a slash command.
+    Tab,
+    /// Escape: dismiss a suggestion or close a modal. Never cancels a run.
+    Esc,
+    /// Ctrl-L: repaint the viewport without touching the scrollback.
+    Redraw,
+    PageUp,
+    PageDown,
     Enter,
-    /// Ctrl-J: insert a line break instead of submitting.
+    /// Ctrl-J or Alt+Enter: insert a line break instead of submitting.
     ///
     /// A combination the terminal reports distinctly is required here: on Windows
     /// a console cannot tell Shift+Enter from Enter, so the plan's "keys that are
     /// actually tested" rule means Ctrl-J is the documented multiline key.
+    /// Measured in `HA_TUI` T01 on this console: a line feed arrives as
+    /// `Enter + CONTROL` and Alt+Enter as `Enter + ALT`, so both reach this
+    /// variant and neither is mistaken for a submit.
     Newline,
     /// Ctrl-C: cancel an active run, or clear an idle prompt.
     Interrupt,
@@ -104,6 +135,153 @@ pub struct SessionCandidate {
     pub detail: String,
 }
 
+/// How far one tool call has got.
+///
+/// A settled card carries the duration it took, so the TUI can show
+/// `ok 12ms` / `failed 3.1s` and the plain writer can keep its old two lines.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolState {
+    /// The card is open; nothing has settled yet.
+    Started,
+    Ok {
+        elapsed: Duration,
+    },
+    Failed {
+        elapsed: Duration,
+    },
+}
+
+impl ToolState {
+    /// Whether the card has settled.
+    #[allow(dead_code, reason = "T04 decides whether a card is updated in place")]
+    #[must_use]
+    pub const fn is_settled(self) -> bool {
+        !matches!(self, Self::Started)
+    }
+}
+
+/// One entry of the conversation history.
+///
+/// The controller emits these instead of pre-rendered strings, so the TUI can
+/// style a user turn differently from a tool card while the plain renderer keeps
+/// printing exactly what it printed before T02.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HistoryItem {
+    /// The one-time header printed at startup.
+    ///
+    /// The boot header is pushed as `Message` rows in T02; T04 renders the banner
+    /// with its own styling.
+    #[allow(dead_code, reason = "T04 styles the banner")]
+    Banner { lines: Vec<String> },
+    /// A submitted user request, stored without the prompt marker.
+    User { text: String },
+    /// Model text for one turn.
+    ///
+    /// Streaming text is committed from the live block in T04; until then it goes
+    /// to the scrollback through `Effect::Stream`.
+    #[allow(dead_code, reason = "T04 commits streamed text as an item")]
+    Assistant { text: String },
+    /// A tool card: started, then settled with a duration.
+    Tool {
+        name: String,
+        summary: String,
+        state: ToolState,
+    },
+    /// The end-of-turn summary line.
+    Run {
+        outcome: RunOutcome,
+        steps: u32,
+        tool_calls: u32,
+        elapsed: Duration,
+    },
+    /// The store admitted one input; the plain line is `[run] accepted <id>`.
+    RunAccepted { input_id: String },
+    /// A failure the user has to know about.
+    Error { message: String },
+    /// A line printed exactly as given, with no prefix.
+    ///
+    /// Slash-command reference output (`/help`, `/status`, `/model`) uses this in
+    /// plain mode, because the pre-T02 renderer printed those lines verbatim.
+    Message { text: String },
+    /// Something worth knowing that is not a failure; the plain line is
+    /// `[info] <message>`.
+    Notice { message: String },
+    /// One gated action, recorded when the user answered it.
+    Approval {
+        action: String,
+        summary: String,
+        workspace: String,
+        scope: String,
+        request_id: String,
+    },
+    /// How one approval ended, recorded after the answer.
+    ApprovalResolution { label: String, request_id: String },
+    /// The session list, as plain lines.
+    Sessions { lines: Vec<String> },
+}
+
+/// One temporary panel that replaces the live block instead of joining the
+/// scrollback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Modal {
+    /// A gated action waiting for the user's answer.
+    Approval {
+        request_id: String,
+        action: String,
+        summary: String,
+        workspace: String,
+        scope: String,
+        /// When the pending request expires, so the panel can count down.
+        expires_at: Instant,
+    },
+    /// The session picker opened by `/resume` with no argument.
+    Picker { items: Vec<String>, selected: usize },
+    /// `/help`, `/status`, `/config` and `/model` output.
+    ///
+    /// Built by the controller in T06; until then the plain renderer is the one
+    /// that prints reference output.
+    #[allow(dead_code, reason = "T06 opens the overlay; T02 only defines it")]
+    Overlay { title: String, lines: Vec<String> },
+}
+
+/// The controller state the TUI viewport draws.
+///
+/// Pure data: the renderer never reaches back into the controller, so a frame is
+/// a function of this snapshot plus the theme.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UiState {
+    pub phase: AppPhase,
+    pub setup_required: bool,
+    /// Exact actionable text resolved by bootstrap; the status bar must not
+    /// invent a provider-specific substitute.
+    pub setup_hint: Option<String>,
+    pub header: Vec<String>,
+    /// The composer buffer and where the cursor sits inside it, counted in
+    /// characters.
+    pub buffer: String,
+    pub cursor: usize,
+    /// Model text that has not been committed to the scrollback yet.
+    pub live_text: String,
+    /// The open tool card, if any: it updates in place until it settles.
+    pub open_tool: Option<(String, String)>,
+    pub modal: Option<Modal>,
+    /// The last submitted request, so the status bar can name it.
+    pub last_request: Option<String>,
+    /// When the active run started, for the elapsed clock.
+    pub run_started_at: Option<Instant>,
+    /// When the last run ended, for the `[run]` summary line.
+    pub last_run_elapsed: Duration,
+    pub steps: u32,
+    pub max_steps: u32,
+    pub tool_calls: u32,
+    pub max_tool_calls: u32,
+    pub completion: Vec<&'static str>,
+    /// Why the TUI is not in use, when the host fell back to the plain renderer.
+    pub fallback_reason: Option<String>,
+    /// How many ticks have passed, so the spinner animates without wall clock.
+    pub tick: u64,
+}
+
 /// Events the controller consumes from the session port.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionEvent {
@@ -113,6 +291,10 @@ pub enum SessionEvent {
     TextDelta {
         text: String,
     },
+    /// A model step started; the status bar counts these.
+    StepStarted {
+        step: u32,
+    },
     ToolStarted {
         name: String,
         summary: String,
@@ -120,6 +302,10 @@ pub enum SessionEvent {
     ToolSettled {
         name: String,
         ok: bool,
+        /// Measured by the producer that observed both boundaries. Carrying the
+        /// value on the event avoids a second name-based lookup that races when
+        /// the same tool is called more than once.
+        elapsed: Duration,
     },
     /// A gated action is waiting for the user's decision.
     ApprovalRequired {
@@ -128,6 +314,14 @@ pub enum SessionEvent {
         summary: String,
         workspace: String,
         scope: String,
+        /// When the gate stops waiting, so the panel can count down from the real
+        /// deadline instead of a second hard-coded timeout.
+        expires_at: Instant,
+    },
+    /// Nobody answered the pending request in time: the gate refused it and the
+    /// action was not executed.
+    ApprovalExpired {
+        request_id: String,
     },
     /// The answer to a resume listing.
     SessionsListed {
@@ -149,6 +343,7 @@ pub enum SessionEvent {
 mod tests {
     use super::{AppPhase, RunOutcome, SessionEvent};
     use harness_types::InputId;
+    use std::time::Duration;
 
     #[test]
     fn h03_phase_labels_and_active_run_are_explicit() {
@@ -184,6 +379,7 @@ mod tests {
             SessionEvent::ToolSettled {
                 name: "read_file".to_owned(),
                 ok: true,
+                elapsed: Duration::from_millis(12),
             },
             SessionEvent::RunTerminal {
                 outcome: RunOutcome::Done,

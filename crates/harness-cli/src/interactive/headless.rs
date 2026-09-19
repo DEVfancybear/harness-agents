@@ -38,12 +38,22 @@ impl TurnObserver for SilentObserver {
     fn observe(&self, _progress: TurnProgress) {}
 }
 
+/// Debug-only acceptance trace for a child that is killed at a hard deadline.
+/// Normal users never see it, and release artifacts do not contain the switch.
+fn acceptance_trace(stage: &str) {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("HA_TEST_TRACE_HEADLESS").is_some() {
+        eprintln!("HA_HEADLESS_PHASE {stage}");
+    }
+}
+
 /// Run one headless turn.
 ///
 /// The body is a linear sequence: resolve, run exactly one turn, shut down. It is
 /// long because it wires real components, not because it branches.
 #[allow(clippy::too_many_lines)]
 pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
+    acceptance_trace("start");
     let caller_dir = std::env::current_dir().map_err(|error| {
         HarnessError::new(
             ErrorCode::StorageOpenFailed,
@@ -58,6 +68,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         environment: environment.clone(),
         explicit_data_dir: None,
     })?;
+    acceptance_trace("bootstrap_resolved");
     // Resolve the provider before opening anything: an unconfigured environment
     // must fail fast with instructions and must not create state.
     let config = resolve_provider(&environment)
@@ -82,6 +93,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
             )
         })?,
     );
+    acceptance_trace("writer_opened");
     // Resuming continues the task of the named session: the new turn runs in a
     // fresh session linked to it, exactly like a follow-up in the interactive app.
     let resumed_from = match &request.resume {
@@ -112,6 +124,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         .as_ref()
         .map_or_else(TaskId::generate, |(_, task)| task.clone());
     let observation = observe_workspace(ProjectId::generate(), &context.project.root)?;
+    acceptance_trace("workspace_observed");
     let capabilities = ModelCapabilities {
         provider_id: "deepseek".to_owned(),
         model: config.model.clone(),
@@ -176,6 +189,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
                 .await?
         }
     };
+    acceptance_trace("turn_finished");
     let output = serde_json::json!({
         "schema_version": 1,
         "session_id": outcome.session_id,
@@ -204,6 +218,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         .close()
         .await
         .map_err(StoreError::into_harness_error)?;
+    acceptance_trace("writer_closed");
 
     if request.json {
         println!("{output}");

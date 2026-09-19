@@ -112,8 +112,15 @@ $requiredSelectors = @(
     @{ Target = 'interactive_session'; Selector = 'g3_a_second_input_in_the_same_session_carries_real_context' }
 )
 
+$requiredTuiSelectors = @(
+    'interactive::controller::tests::t02_plain_transcript_is_byte_identical_to_h03',
+    'interactive::input::tests::t03_paste_keeps_newlines_and_submits_once',
+    'interactive::controller::tests::t04_history_order_is_user_tool_assistant_run',
+    'interactive::controller::tests::t06_y_key_grants_exactly_the_pending_request'
+)
+
 $notRun = @(
-    'PTY cases i01/i05/i06/i07a/i07b/i08/i12/i13/i14: they need a real console, which a sandboxed cargo test does not have. Run scripts/Invoke-HaPtyAcceptance.ps1 - all nine pass there with transcripts; this gate does not count them as passes.',
+    'PTY cases need a real console, which a sandboxed cargo test does not have. Run scripts/Invoke-HaPtyAcceptance.ps1 and keep its transcripts; this gate does not count them as passes.',
     'Live provider smoke (paid model call): no credential or budget is granted for this assignment.',
     'Linux build and run: this session only has Windows x64.',
     'Real User PATH mutation and install into the user profile: not authorized in this assignment.'
@@ -129,6 +136,7 @@ function Invoke-GateSelfTest {
     if ($parsed.Count -ne 2) { $failures.Add('discovery parsing did not find both sample tests') }
     if (-not ($parsed -contains 'interactive_launch::i03_thing')) { $failures.Add('discovery parsing dropped a selector') }
     if ($requiredSelectors.Count -lt 6) { $failures.Add('the required selector list shrank unexpectedly') }
+    if ($requiredTuiSelectors.Count -lt 4) { $failures.Add('the required TUI selector list shrank unexpectedly') }
     foreach ($item in $requiredSelectors) {
         if ([string]::IsNullOrWhiteSpace($item.Selector) -or [string]::IsNullOrWhiteSpace($item.Target)) {
             $failures.Add('a required selector entry is incomplete')
@@ -167,6 +175,20 @@ foreach ($requirement in $requiredSelectors) {
     }
 }
 
+$tuiDiscovery = @('test', '-p', 'harness-cli', '--bin', 'ha', '--locked', '--', '--list')
+foreach ($selector in $requiredTuiSelectors) {
+    try {
+        $count = Assert-Selector -File 'cargo' -DiscoveryArguments $tuiDiscovery -Selector $selector
+        Write-Host "== discovery ha TUI: $count tests, selector present: $selector"
+        $script:Steps.Add([pscustomobject]@{ Name = "discovery:$selector"; ExitCode = 0; Seconds = 0; Detail = "$count discovered" })
+    }
+    catch {
+        Write-Host "   FAILED: $($_.Exception.Message)"
+        $failures.Add("discovery:$selector")
+        $script:Steps.Add([pscustomobject]@{ Name = "discovery:$selector"; ExitCode = 1; Seconds = 0; Detail = $_.Exception.Message })
+    }
+}
+
 if ((Invoke-GateStep -Name 'unit-interactive' -File 'cargo' -Arguments @('test', '-p', 'harness-cli', '--bin', 'ha', '--locked')) -ne 0) { $failures.Add('unit-interactive') }
 if ((Invoke-GateStep -Name 'acceptance-launch' -File 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', 'interactive_launch', '--locked', '--', '--test-threads=1')) -ne 0) { $failures.Add('acceptance-launch') }
 if ((Invoke-GateStep -Name 'acceptance-session' -File 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', 'interactive_session', '--locked', '--', '--test-threads=1')) -ne 0) { $failures.Add('acceptance-session') }
@@ -191,6 +213,7 @@ $report = [pscustomobject]@{
     steps          = @($script:Steps)
     not_run        = $notRun
     required_tests = @($requiredSelectors | ForEach-Object { "$($_.Target)::$($_.Selector)" })
+    required_tui_tests = @($requiredTuiSelectors)
 }
 
 if ($Json) {
@@ -211,4 +234,3 @@ else {
 
 if ($failures.Count -gt 0) { exit 1 }
 exit 0
-

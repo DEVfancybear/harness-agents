@@ -11,7 +11,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use harness_providers::{
     CancellationToken, CredentialResolver, DeepSeekAdapter, ModelCapabilities, ModelProvider,
@@ -29,6 +29,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use super::bootstrap::{CREDENTIAL_VARIABLES, LaunchContext};
+use super::controller::{DEFAULT_APPROVAL_TIMEOUT, TurnBounds};
 use super::events::{RunOutcome, SessionCandidate, SessionEvent};
 use super::paths::LaunchEnvironment;
 
@@ -77,13 +78,20 @@ pub trait SessionPort: Send {
             Ok(())
         }
     }
+    /// The step and tool-call bounds this backend enforces, so the status bar can
+    /// show `step k/max` without the UI knowing the driver's type.
+    fn limits(&self) -> TurnBounds {
+        TurnBounds::default()
+    }
 }
 
 /// Asks the user for each gated action and waits for the answer.
 ///
 /// The proposal travels as a session event; the answer comes back through
 /// `ChannelApprovalGate::answer`. No answer inside the timeout is an expiry,
-/// never a silent grant.
+/// never a silent grant, and an expiry is **announced** as
+/// `SessionEvent::ApprovalExpired` before the driver is told, so the panel closes
+/// instead of waiting for the run to end.
 pub struct ChannelApprovalGate {
     sender: UnboundedSender<SessionEvent>,
     pending: Mutex<HashMap<String, oneshot::Sender<ApprovalAnswer>>>,
@@ -129,19 +137,29 @@ impl ApprovalGate for ChannelApprovalGate {
             pending.insert(proposal.request_id.clone(), sender);
         }
         let _ = self.sender.send(SessionEvent::ApprovalRequired {
-            request_id: proposal.request_id,
+            request_id: proposal.request_id.clone(),
             action: proposal.action,
             summary: proposal.summary,
             workspace: proposal.workspace.display().to_string(),
             scope: proposal.scope,
+            // The deadline travels with the proposal: the panel counts down to
+            // the gate's real timeout instead of hard-coding a second one.
+            expires_at: Instant::now() + self.timeout,
         });
         let timeout = self.timeout;
+        let request_id = proposal.request_id;
+        let sender = self.sender.clone();
         Box::pin(async move {
             match tokio::time::timeout(timeout, receiver).await {
                 Ok(Ok(answer)) => answer,
                 // The sender was dropped without an answer: refuse, never grant.
                 Ok(Err(_)) => ApprovalAnswer::Denied,
-                Err(_) => ApprovalAnswer::Expired,
+                Err(_) => {
+                    // Tell the UI first: the panel must close even though the
+                    // driver only learns about the expiry when it resumes.
+                    let _ = sender.send(SessionEvent::ApprovalExpired { request_id });
+                    ApprovalAnswer::Expired
+                }
             }
         })
     }
@@ -272,19 +290,34 @@ impl CredentialResolver for EnvironmentCredential {
 /// Maps turn progress onto the UI vocabulary.
 struct ChannelObserver {
     sender: UnboundedSender<SessionEvent>,
+    /// Calls are executed serially by the turn driver. Keeping the current
+    /// boundary here makes duration delivery O(1) and avoids a process-lifetime
+    /// map keyed by a non-unique tool name.
+    tool_started: Mutex<Option<(String, Instant)>>,
 }
 
 impl TurnObserver for ChannelObserver {
     fn observe(&self, progress: TurnProgress) {
         let event = match progress {
             TurnProgress::TextDelta(text) => SessionEvent::TextDelta { text },
+            // Step boundaries are what the status bar counts (`step 2/8`).
+            TurnProgress::StepStarted { step } => SessionEvent::StepStarted { step },
             TurnProgress::ToolStarted { name, summary } => {
+                if let Ok(mut started) = self.tool_started.lock() {
+                    *started = Some((name.clone(), Instant::now()));
+                }
                 SessionEvent::ToolStarted { name, summary }
             }
-            TurnProgress::ToolSettled { name, ok } => SessionEvent::ToolSettled { name, ok },
-            // Step boundaries are internal accounting, not something the user
-            // needs to see on every turn.
-            TurnProgress::StepStarted { .. } => return,
+            TurnProgress::ToolSettled { name, ok } => {
+                let elapsed = self
+                    .tool_started
+                    .lock()
+                    .ok()
+                    .and_then(|mut started| started.take())
+                    .filter(|(started_name, _)| started_name == &name)
+                    .map_or(Duration::ZERO, |(_, started)| started.elapsed());
+                SessionEvent::ToolSettled { name, ok, elapsed }
+            }
         };
         let _ = self.sender.send(event);
     }
@@ -306,10 +339,12 @@ pub struct AgentSessionService {
     /// Asks the user for every gated action; never grants on its own.
     gate: Arc<ChannelApprovalGate>,
     cancellation: Option<CancellationToken>,
+    /// The limits this service hands to the driver, reported to the UI.
+    limits: TurnLimits,
 }
 
 /// How long a gated action waits for the user before it expires.
-const APPROVAL_TIMEOUT: Duration = Duration::from_mins(5);
+const APPROVAL_TIMEOUT: Duration = DEFAULT_APPROVAL_TIMEOUT;
 
 /// Upper bound on the resume list, newest first.
 const RESUME_LIST_LIMIT: usize = 20;
@@ -331,6 +366,7 @@ impl AgentSessionService {
             previous_session: Arc::new(Mutex::new(None)),
             gate,
             cancellation: None,
+            limits: TurnLimits::default(),
         }
     }
 
@@ -365,6 +401,7 @@ impl SessionPort for AgentSessionService {
         let task_id = self.task_id.clone();
         let previous_session = Arc::clone(&self.previous_session);
         let gate = Arc::clone(&self.gate);
+        let limits = self.limits;
         // Every user input opens its own session; the conversation is the chain of
         // sessions linked to the same task.
         let session_id = SessionId::generate();
@@ -378,6 +415,7 @@ impl SessionPort for AgentSessionService {
                 task_id,
                 previous_session,
                 gate,
+                limits,
                 request,
                 cancellation,
             )
@@ -387,6 +425,13 @@ impl SessionPort for AgentSessionService {
 
     fn answer(&mut self, request_id: &str, decision: ApprovalDecision) -> bool {
         self.gate.answer(request_id, decision)
+    }
+
+    fn limits(&self) -> TurnBounds {
+        TurnBounds {
+            max_steps: self.limits.max_steps,
+            max_tool_calls: self.limits.max_tool_calls,
+        }
     }
 
     fn list_sessions(&mut self) {
@@ -471,6 +516,7 @@ async fn run_turn(
     task_id: TaskId,
     previous_session: Arc<Mutex<Option<SessionId>>>,
     gate: Arc<ChannelApprovalGate>,
+    limits: TurnLimits,
     request: SubmitRequest,
     cancellation: CancellationToken,
 ) {
@@ -594,10 +640,11 @@ async fn run_turn(
         // Every gated action is rendered to the user and answered by them; nothing
         // is granted without an explicit answer.
         approvals: ApprovalMode::Ask(gate as Arc<dyn ApprovalGate>),
-        limits: TurnLimits::default(),
+        limits,
     };
     let observer: Arc<dyn TurnObserver> = Arc::new(ChannelObserver {
         sender: sender.clone(),
+        tool_started: Mutex::new(None),
     });
 
     // A follow-up turn continues the previous session; the first turn starts one.
@@ -644,12 +691,31 @@ async fn run_turn(
 #[derive(Debug)]
 pub struct FixtureService {
     sender: UnboundedSender<SessionEvent>,
+    pending_approval: Arc<Mutex<Option<String>>>,
 }
 
 impl FixtureService {
     #[must_use]
     pub fn new(sender: UnboundedSender<SessionEvent>) -> Self {
-        Self { sender }
+        Self {
+            sender,
+            pending_approval: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// One deterministic tool call: started, measured, then settled.
+    fn run_fixture_tool(&self, name: &str, summary: &str, ok: bool) {
+        let started = Instant::now();
+        let _ = self.sender.send(SessionEvent::ToolStarted {
+            name: name.to_owned(),
+            summary: summary.to_owned(),
+        });
+        let elapsed = started.elapsed();
+        let _ = self.sender.send(SessionEvent::ToolSettled {
+            name: name.to_owned(),
+            ok,
+            elapsed,
+        });
     }
 }
 
@@ -665,6 +731,22 @@ impl SessionPort for FixtureService {
         send(SessionEvent::Accepted {
             input_id: request.input_id,
         });
+        send(SessionEvent::StepStarted { step: 1 });
+        if request.text == "request approval fixture" {
+            let request_id = "fixture-approval-1".to_owned();
+            if let Ok(mut pending) = self.pending_approval.lock() {
+                *pending = Some(request_id.clone());
+            }
+            send(SessionEvent::ApprovalRequired {
+                request_id,
+                action: "fixture_action".to_owned(),
+                summary: "prove the terminal approval path".to_owned(),
+                workspace: "fixture workspace (no mutation)".to_owned(),
+                scope: "once".to_owned(),
+                expires_at: Instant::now() + DEFAULT_APPROVAL_TIMEOUT,
+            });
+            return;
+        }
         // Echoing the admitted text makes the transcript prove exactly which
         // buffer was submitted, which is what the editor tests assert on.
         send(SessionEvent::TextDelta {
@@ -673,22 +755,8 @@ impl SessionPort for FixtureService {
         send(SessionEvent::TextDelta {
             text: " (no model was called)".to_owned(),
         });
-        send(SessionEvent::ToolStarted {
-            name: "search_text".to_owned(),
-            summary: "pattern=parser".to_owned(),
-        });
-        send(SessionEvent::ToolSettled {
-            name: "search_text".to_owned(),
-            ok: false,
-        });
-        send(SessionEvent::ToolStarted {
-            name: "apply_patch".to_owned(),
-            summary: "path=src/parser.rs".to_owned(),
-        });
-        send(SessionEvent::ToolSettled {
-            name: "apply_patch".to_owned(),
-            ok: true,
-        });
+        self.run_fixture_tool("search_text", "pattern=parser", false);
+        self.run_fixture_tool("apply_patch", "path=src/parser.rs", true);
         // A request that asks for a failure exercises the failure rendering
         // deterministically, without pretending a model produced it.
         let outcome = if request.text.contains("fail") {
@@ -703,6 +771,28 @@ impl SessionPort for FixtureService {
         let _ = self.sender.send(SessionEvent::RunTerminal {
             outcome: RunOutcome::Canceled,
         });
+    }
+
+    fn answer(&mut self, request_id: &str, decision: ApprovalDecision) -> bool {
+        let accepted = self
+            .pending_approval
+            .lock()
+            .ok()
+            .and_then(|mut pending| {
+                (pending.as_deref() == Some(request_id)).then(|| pending.take())
+            })
+            .flatten()
+            .is_some();
+        if !accepted {
+            return false;
+        }
+        if decision == ApprovalDecision::Granted {
+            self.run_fixture_tool("fixture_action", "no mutation", true);
+        }
+        let _ = self.sender.send(SessionEvent::RunTerminal {
+            outcome: RunOutcome::Done,
+        });
+        true
     }
 }
 

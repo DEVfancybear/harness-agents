@@ -18,6 +18,7 @@ use super::events::Key;
 use super::paths::{HostPlatform, LaunchEnvironment};
 use super::service::{AgentSessionService, FixtureService, SessionChannel, SessionPort};
 use super::terminal::{CrosstermBackend, RawModeGuard, TerminalBackend};
+use super::view;
 
 /// Validated interactive launch request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,13 +27,49 @@ pub struct AppLaunch {
     pub resume: Option<String>,
     /// Explicit opt-in to the labelled fixture backend.
     pub fixture: bool,
+    /// Force the plain renderer instead of the TUI (`--plain` or `HA_UI=plain`).
+    pub plain: bool,
 }
 
 /// How long the render loop waits for a key before draining session events.
-const KEY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const KEY_POLL_INTERVAL: Duration = super::tui::POLL_INTERVAL;
+
+/// The smallest console the TUI renderer accepts.
+///
+/// Below this the viewport cannot hold a composer, a live block and a status row,
+/// so the host falls back to the plain renderer and says why.
+const TUI_MIN_COLUMNS: u16 = 60;
+const TUI_MIN_ROWS: u16 = 10;
+
+/// Why the TUI renderer is not in use, or `None` when it is.
+///
+/// The decision is a pure function of the request and the environment so it can
+/// be unit tested without a terminal, and so the reason can be printed verbatim.
+#[must_use]
+pub fn tui_fallback_reason(
+    plain: bool,
+    environment: &LaunchEnvironment,
+    columns: u16,
+    rows: u16,
+) -> Option<String> {
+    if plain {
+        return Some("plain renderer requested (--plain or HA_UI=plain)".to_owned());
+    }
+    let term = environment.value("TERM").unwrap_or_default();
+    if term == "dumb" {
+        return Some("TERM=dumb: this terminal cannot position the cursor".to_owned());
+    }
+    if columns < TUI_MIN_COLUMNS || rows < TUI_MIN_ROWS {
+        return Some(format!(
+            "the console is {columns}x{rows}; the TUI needs at least {TUI_MIN_COLUMNS}x{TUI_MIN_ROWS}"
+        ));
+    }
+    None
+}
 
 /// Run the interactive app until the user exits.
 pub async fn run(launch: AppLaunch) -> Result<ExitCode, HarnessError> {
+    super::terminal::install_panic_hook();
     // The environment is read once and injected everywhere, so the same code path
     // is unit tested against a fixture environment.
     let environment = LaunchEnvironment::capture();
@@ -40,7 +77,7 @@ pub async fn run(launch: AppLaunch) -> Result<ExitCode, HarnessError> {
     let source = launch.resume.as_deref();
     match RawModeGuard::enter() {
         Ok(guard) => {
-            let code = run_terminal(&context, &environment, guard, source, launch.fixture)?;
+            let code = run_terminal(&context, &environment, guard, source, &launch)?;
             Ok(ExitCode::from(code))
         }
         Err(error) => {
@@ -78,11 +115,20 @@ fn run_terminal(
     environment: &LaunchEnvironment,
     _guard: RawModeGuard,
     notice: Option<&str>,
-    fixture: bool,
+    launch: &AppLaunch,
 ) -> Result<u8, HarnessError> {
     let mut backend = CrosstermBackend;
-    let mut controller = controller_for(context, environment, fixture);
-    run_loop(&mut backend, &mut controller, notice)
+    let size = backend.size().unwrap_or((TUI_MIN_COLUMNS, TUI_MIN_ROWS));
+    let fallback = tui_fallback_reason(launch.plain, environment, size.0, size.1);
+    // The plain renderer is the pre-T02 host and stays authoritative: the TUI is
+    // chosen only when the console can hold it, and every refusal says why.
+    let mut controller = controller_for(context, environment, launch.fixture, fallback.is_some());
+    if let Some(reason) = &fallback {
+        eprintln!("ha: using the plain renderer because {reason}");
+        controller.set_fallback_reason(reason.clone());
+        return run_loop(&mut backend, &mut controller, notice);
+    }
+    super::tui::run(backend, &mut controller, notice)
 }
 
 /// Build the controller.
@@ -95,6 +141,7 @@ fn controller_for(
     context: &LaunchContext,
     environment: &LaunchEnvironment,
     fixture: bool,
+    plain: bool,
 ) -> InteractiveController {
     let channel = SessionChannel::new();
     let service: Box<dyn SessionPort> = if fixture {
@@ -106,7 +153,7 @@ fn controller_for(
             channel.sender(),
         ))
     };
-    InteractiveController::new(context, service, channel)
+    InteractiveController::new(context, service, channel, plain)
 }
 
 /// Whether the cursor sits at the start of a line, so partial output is never
@@ -186,29 +233,31 @@ fn step(
     let mut exit = None;
     for effect in effects {
         match effect {
-            Effect::WriteLine(line) => {
+            Effect::History(item) => {
                 clear_prompt(backend, cursor)?;
                 if !cursor.at_line_start {
                     backend
                         .write("\r\n")
                         .map_err(|error| terminal_error(&error))?;
                 }
-                backend
-                    .write(&line)
-                    .map_err(|error| terminal_error(&error))?;
-                backend
-                    .write("\r\n")
-                    .map_err(|error| terminal_error(&error))?;
+                for line in view::plain_lines(&item) {
+                    backend
+                        .write(&line)
+                        .map_err(|error| terminal_error(&error))?;
+                    backend
+                        .write("\r\n")
+                        .map_err(|error| terminal_error(&error))?;
+                }
                 cursor.at_line_start = true;
             }
-            Effect::WritePartial(text) => {
+            Effect::Stream(text) => {
                 clear_prompt(backend, cursor)?;
                 backend
                     .write(&text)
                     .map_err(|error| terminal_error(&error))?;
                 cursor.at_line_start = false;
             }
-            Effect::RedrawPrompt => redraw = true,
+            Effect::Redraw => redraw = true,
             Effect::Exit(code) => exit = Some(code),
         }
     }
@@ -338,7 +387,7 @@ async fn run_line_mode(
     notice: Option<&str>,
     fixture: bool,
 ) -> Result<ExitCode, HarnessError> {
-    let mut controller = controller_for(context, environment, fixture);
+    let mut controller = controller_for(context, environment, fixture, true);
     if let Some(source) = notice {
         controller
             .resume_source(source)
@@ -422,13 +471,15 @@ fn render_line_mode(
     let mut redraw = false;
     for effect in effects {
         match effect {
-            Effect::WriteLine(line) => {
-                writeln!(output, "{line}").map_err(|error| io_error(&error))?;
+            Effect::History(item) => {
+                for line in view::plain_lines(&item) {
+                    writeln!(output, "{line}").map_err(|error| io_error(&error))?;
+                }
             }
-            Effect::WritePartial(text) => {
+            Effect::Stream(text) => {
                 write!(output, "{text}").map_err(|error| io_error(&error))?;
             }
-            Effect::RedrawPrompt => redraw = true,
+            Effect::Redraw => redraw = true,
             Effect::Exit(code) => exit = Some(code),
         }
     }
@@ -456,7 +507,7 @@ mod tests {
     use crate::interactive::events::Key;
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
     use crate::interactive::service::{FixtureService, SessionChannel, SessionPort};
-    use crate::interactive::terminal::ScriptedBackend;
+    use crate::interactive::terminal::{ScriptedBackend, TerminalBackend};
 
     /// Fixture home and project, never the developer profile.
     fn context(configured: bool) -> (tempfile::TempDir, LaunchContext) {
@@ -494,7 +545,7 @@ mod tests {
     #[test]
     fn completion_typing_redraws_without_a_new_line_per_key() {
         let (_temp, context) = context(true);
-        let mut controller = controller_for(&context, &environment(&[]), true);
+        let mut controller = controller_for(&context, &environment(&[]), true, true);
         let mut cursor = super::RenderCursor::default();
         let mut backend = ScriptedBackend::new(Vec::new());
         super::draw_prompt(&mut backend, &controller, &mut cursor).expect("prompt");
@@ -538,6 +589,7 @@ mod tests {
             &context,
             Box::new(Port(Arc::clone(&log))),
             SessionChannel::new(),
+            true,
         );
         let mut backend = ScriptedBackend::new(vec![Key::EndOfInput]);
         let source = "session_0192f0aa-bbcc-7ddd-8eee-000000000001";
@@ -572,6 +624,7 @@ mod tests {
             &context,
             Box::new(FixtureService::new(events.clone())),
             channel,
+            true,
         );
         let _ = controller.boot_lines();
         let buffer = Arc::new(Mutex::new(Vec::new()));
@@ -612,12 +665,50 @@ mod tests {
         );
     }
 
+    /// T07: the renderer choice is decided from the console size and the
+    /// environment, so it can be tested without a terminal. The TUI is the
+    /// default; every refusal names its reason.
+    #[test]
+    fn t07_the_renderer_choice_is_explainable() {
+        let term = environment(&[("TERM", "xterm-256color")]);
+        assert_eq!(
+            super::tui_fallback_reason(false, &term, 110, 30),
+            None,
+            "a normal console gets the TUI"
+        );
+        assert!(
+            super::tui_fallback_reason(true, &term, 110, 30)
+                .expect("plain was requested")
+                .contains("--plain")
+        );
+        assert!(
+            super::tui_fallback_reason(false, &term, 40, 30)
+                .expect("narrow console")
+                .contains("40x30")
+        );
+        assert!(
+            super::tui_fallback_reason(false, &term, 110, 6)
+                .expect("short console")
+                .contains("at least")
+        );
+        let dumb = environment(&[("TERM", "dumb")]);
+        assert!(
+            super::tui_fallback_reason(false, &dumb, 110, 30)
+                .expect("dumb terminal")
+                .contains("TERM=dumb")
+        );
+
+        // The scripted backend reports whatever size the test asks for.
+        let small = ScriptedBackend::new(Vec::new()).with_size(40, 8);
+        assert_eq!(small.size().expect("size"), (40, 8));
+    }
+
     #[test]
     fn h03_scripted_terminal_renders_the_boot_header_and_exits_cleanly() {
         let (_temp, context) = context(false);
         let mut backend = ScriptedBackend::new(vec![Key::EndOfInput]);
         let environment = environment(&[]);
-        let mut controller = controller_for(&context, &environment, false);
+        let mut controller = controller_for(&context, &environment, false, true);
         let code = run_loop(&mut backend, &mut controller, None).expect("loop runs");
         assert_eq!(code, 0);
 
@@ -642,7 +733,7 @@ mod tests {
         keys.push(Key::Enter);
         keys.push(Key::EndOfInput);
         let mut backend = ScriptedBackend::new(keys);
-        let mut controller = controller_for(&context, &environment(&[]), true);
+        let mut controller = controller_for(&context, &environment(&[]), true, true);
         let code = run_loop(&mut backend, &mut controller, None).expect("loop runs");
         assert_eq!(code, 0);
 
@@ -670,7 +761,7 @@ mod tests {
         keys.push(Key::Enter);
         keys.push(Key::EndOfInput);
         let mut backend = ScriptedBackend::new(keys);
-        let mut controller = controller_for(&context, &environment(&[]), true);
+        let mut controller = controller_for(&context, &environment(&[]), true, true);
         let code = run_loop(&mut backend, &mut controller, None).expect("loop runs");
         assert_eq!(code, 0);
 
@@ -695,7 +786,7 @@ mod tests {
         keys.push(Key::Enter);
         keys.push(Key::EndOfInput);
         let mut backend = ScriptedBackend::new(keys);
-        let mut controller = controller_for(&context, &environment(&[]), true);
+        let mut controller = controller_for(&context, &environment(&[]), true, true);
         let code = run_loop(&mut backend, &mut controller, None).expect("loop runs");
         assert_eq!(code, 0);
 
@@ -733,7 +824,7 @@ mod tests {
         keys.push(Key::Enter);
         keys.push(Key::EndOfInput);
         let mut backend = ScriptedBackend::new(keys);
-        let mut controller = controller_for(&context, &environment(&[]), true);
+        let mut controller = controller_for(&context, &environment(&[]), true, true);
         let code = run_loop(&mut backend, &mut controller, None).expect("loop runs");
         assert_eq!(code, 0);
         assert!(backend.output().contains("> hi"), "{}", backend.output());
@@ -745,7 +836,7 @@ mod tests {
         let (_temp, context) = context(true);
         let channel = SessionChannel::new();
         let service: Box<dyn SessionPort> = Box::new(FixtureService::new(channel.sender()));
-        let mut controller = InteractiveController::new(&context, service, channel);
+        let mut controller = InteractiveController::new(&context, service, channel, true);
         let boot = controller.boot_lines().join("\n");
         assert!(boot.contains("fixture (no model was called)"), "{boot}");
 

@@ -1,6 +1,67 @@
 //! Rendering helpers: pure string production with no terminal state.
 
-use super::events::AppPhase;
+use std::time::Duration;
+
+use super::events::{AppPhase, HistoryItem, ToolState};
+
+/// The plain lines one history item must produce.
+///
+/// This is the compatibility contract of the T02 refactor: for the same scripted
+/// scenario it must return exactly the strings the pre-T02 controller pushed with
+/// `Effect::WriteLine`/`WritePartial`, so the plain transcript stays
+/// byte-identical (acceptance U20) and every existing assertion keeps its
+/// meaning. Each arm therefore calls the very same helper the old code called.
+#[must_use]
+pub fn plain_lines(item: &HistoryItem) -> Vec<String> {
+    match item {
+        HistoryItem::Banner { lines } | HistoryItem::Sessions { lines } => lines.clone(),
+        HistoryItem::User { text } => vec![format!("> {text}")],
+        HistoryItem::Assistant { text } | HistoryItem::Message { text } => vec![text.clone()],
+        HistoryItem::Tool {
+            name,
+            summary,
+            state,
+        } => match state {
+            ToolState::Started => vec![tool_line(name, summary)],
+            ToolState::Ok { .. } => vec![tool_line(name, "ok")],
+            ToolState::Failed { .. } => vec![tool_line(name, "failed")],
+        },
+        HistoryItem::Run { outcome, .. } => vec![run_line(&outcome.label())],
+        HistoryItem::RunAccepted { input_id } => {
+            vec![run_line(&format!("accepted {}", short_id(input_id)))]
+        }
+        HistoryItem::Error { message } => vec![format!("[error] {message}")],
+        HistoryItem::Notice { message } => vec![format!("[info] {message}")],
+        HistoryItem::Approval {
+            action,
+            summary,
+            workspace,
+            scope,
+            request_id,
+        } => approval_lines(action, summary, workspace, scope, request_id),
+        HistoryItem::ApprovalResolution { label, request_id } => {
+            vec![format!("[approval] {label} {request_id}")]
+        }
+    }
+}
+
+/// A short duration label: milliseconds under a second, one decimal above it.
+#[must_use]
+pub fn seconds_label(elapsed: Duration) -> String {
+    let millis = elapsed.as_millis();
+    if millis < 1000 {
+        format!("{millis}ms")
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    }
+}
+
+/// `mm:ss` for the status bar clock.
+#[must_use]
+pub fn clock_label(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
 
 /// The prompt marker shows the phase, so a busy prompt never looks idle.
 #[must_use]

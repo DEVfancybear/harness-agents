@@ -16,6 +16,7 @@ pub mod input;
 pub mod paths;
 pub mod service;
 pub mod terminal;
+pub mod tui;
 pub mod view;
 
 use std::path::PathBuf;
@@ -58,6 +59,11 @@ pub enum LaunchMode {
         /// Explicit opt-in to the labelled fixture backend; never a default and
         /// never a silent production fallback.
         fixture: bool,
+        /// Force the plain renderer instead of the TUI.
+        ///
+        /// Set by `ha chat --plain` or by `HA_UI=plain`; the TUI is the default on
+        /// a console that can hold it.
+        plain: bool,
     },
     /// Run exactly one turn without a terminal.
     Headless {
@@ -73,6 +79,7 @@ pub enum LaunchMode {
 /// Clap already enforces the flag conflicts, so this is the typed backstop that
 /// keeps the contract testable without spawning a process, and that keeps a
 /// missing prompt from ever being treated as free text.
+#[allow(clippy::fn_params_excessive_bools, reason = "one flag per launch mode")]
 pub fn mode_from_args(
     cwd: Option<PathBuf>,
     resume: Option<String>,
@@ -80,6 +87,7 @@ pub fn mode_from_args(
     headless: bool,
     prompt: Option<String>,
     json: bool,
+    plain: bool,
 ) -> Result<LaunchMode, UsageError> {
     if !headless {
         if prompt.is_some() {
@@ -96,11 +104,19 @@ pub fn mode_from_args(
             cwd,
             resume,
             fixture,
+            // Clap already rejects `--plain --headless`; the typed backstop keeps
+            // a headless run from ever being routed through the TUI.
+            plain,
         });
     }
     if fixture {
         return Err(UsageError::new(
             "--fixture is only valid for the interactive app; a headless turn must report the real backend state",
+        ));
+    }
+    if plain {
+        return Err(UsageError::new(
+            "--plain is only valid for the interactive app; a headless turn never draws a viewport",
         ));
     }
     let Some(prompt) = prompt else {
@@ -117,6 +133,24 @@ pub fn mode_from_args(
         cwd,
         resume,
     })
+}
+
+/// Environment variable that selects the renderer explicitly.
+pub const UI_VARIABLE: &str = "HA_UI";
+
+/// Whether the environment asks for the plain renderer.
+///
+/// Only the exact value `plain` counts: an unknown `HA_UI` value is not a silent
+/// opt-in to anything, and the TUI stays the default.
+#[must_use]
+pub fn plain_requested(ui: Option<&str>) -> bool {
+    matches!(ui, Some(value) if value.eq_ignore_ascii_case("plain"))
+}
+
+/// Read [`UI_VARIABLE`] from the process environment.
+#[must_use]
+pub fn plain_requested_from_environment() -> bool {
+    plain_requested(std::env::var(UI_VARIABLE).ok().as_deref())
 }
 
 /// Run one launch request. Usage problems return exit code 2; real failures
@@ -141,7 +175,17 @@ pub async fn launch(mode: LaunchMode) -> Result<ExitCode, HarnessError> {
             cwd,
             resume,
             fixture,
-        } => launch_interactive_with(&detector::SystemTerminalDetector, cwd, resume, fixture).await,
+            plain,
+        } => {
+            launch_interactive_with(
+                &detector::SystemTerminalDetector,
+                cwd,
+                resume,
+                fixture,
+                plain,
+            )
+            .await
+        }
     }
 }
 
@@ -151,6 +195,7 @@ pub async fn launch_interactive_with(
     cwd: Option<PathBuf>,
     resume: Option<String>,
     fixture: bool,
+    plain: bool,
 ) -> Result<ExitCode, HarnessError> {
     let capability = detector.capability();
     if !capability.is_interactive() {
@@ -161,6 +206,7 @@ pub async fn launch_interactive_with(
         cwd,
         resume,
         fixture,
+        plain,
     })
     .await
 }
@@ -185,11 +231,13 @@ mod tests {
     #[test]
     fn h01_mode_from_args_accepts_bare_and_optioned_interactive_launch() {
         assert_eq!(
-            mode_from_args(None, None, false, false, None, false).expect("bare launch is valid"),
+            mode_from_args(None, None, false, false, None, false, false)
+                .expect("bare launch is valid"),
             LaunchMode::Interactive {
                 cwd: None,
                 resume: None,
-                fixture: false
+                fixture: false,
+                plain: false,
             }
         );
         assert_eq!(
@@ -199,39 +247,73 @@ mod tests {
                 true,
                 false,
                 None,
-                false
+                false,
+                true
             )
             .expect("interactive launch with options is valid"),
             LaunchMode::Interactive {
                 cwd: Some(PathBuf::from("C:/work/project")),
                 resume: Some("session_1".to_owned()),
-                fixture: true
+                fixture: true,
+                plain: true,
             }
         );
     }
 
     #[test]
+    fn t07_plain_is_rejected_for_a_headless_turn() {
+        let error = mode_from_args(None, None, false, true, Some("hi".to_owned()), false, true)
+            .expect_err("a headless turn never draws a viewport");
+        assert!(error.to_string().contains("--plain is only valid"));
+    }
+
+    #[test]
+    fn t07_plain_requested_only_honours_the_exact_value() {
+        assert!(super::plain_requested(Some("plain")));
+        assert!(super::plain_requested(Some("PLAIN")));
+        assert!(!super::plain_requested(Some("tui")));
+        assert!(!super::plain_requested(Some("")));
+        assert!(!super::plain_requested(None));
+    }
+
+    #[test]
     fn h01_mode_from_args_requires_prompt_for_headless() {
-        let error = mode_from_args(None, None, false, true, None, false)
+        let error = mode_from_args(None, None, false, true, None, false, false)
             .expect_err("headless needs a prompt");
         assert!(error.to_string().contains("--headless requires --prompt"));
 
-        let error = mode_from_args(None, None, false, true, Some("   ".to_owned()), false)
-            .expect_err("blank prompt is rejected");
+        let error = mode_from_args(
+            None,
+            None,
+            false,
+            true,
+            Some("   ".to_owned()),
+            false,
+            false,
+        )
+        .expect_err("blank prompt is rejected");
         assert!(error.to_string().contains("must not be empty"));
     }
 
     #[test]
     fn h01_mode_from_args_rejects_headless_only_flags_without_headless() {
-        let error = mode_from_args(None, None, false, false, Some("hello".to_owned()), false)
-            .expect_err("prompt without headless is rejected");
+        let error = mode_from_args(
+            None,
+            None,
+            false,
+            false,
+            Some("hello".to_owned()),
+            false,
+            false,
+        )
+        .expect_err("prompt without headless is rejected");
         assert!(
             error
                 .to_string()
                 .contains("--prompt is only valid with --headless")
         );
 
-        let error = mode_from_args(None, None, false, false, None, true)
+        let error = mode_from_args(None, None, false, false, None, true, false)
             .expect_err("json without headless is rejected");
         assert!(
             error
@@ -249,6 +331,7 @@ mod tests {
             true,
             Some("fix the parser".to_owned()),
             false,
+            false,
         )
         .expect_err("a headless turn must not silently use the fixture");
         assert!(error.to_string().contains("--fixture is only valid"));
@@ -263,6 +346,7 @@ mod tests {
             true,
             Some("fix the parser".to_owned()),
             true,
+            false,
         )
         .expect("headless launch is valid");
         assert_eq!(
