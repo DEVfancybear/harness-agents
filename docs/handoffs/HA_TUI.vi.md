@@ -1,6 +1,6 @@
 # Handoff HA_TUI — nâng `ha` thành TUI terminal (T01–T08)
 
-Cập nhật: **sau CP-A (T01–T02)**. SPEC: [specs/HA_TUI.vi.md](../specs/HA_TUI.vi.md) ·
+Cập nhật: **sau CP-D (T01–T08) — track T xong về code, gate và tài liệu**. SPEC: [specs/HA_TUI.vi.md](../specs/HA_TUI.vi.md) ·
 Evidence: [evidence/HA_TUI.vi.md](../evidence/HA_TUI.vi.md) ·
 Plan: [HA_TUI_PLAN.vi.md](../HA_TUI_PLAN.vi.md).
 
@@ -52,6 +52,31 @@ Phạm vi lượt này: **cả track T01–T08**, dừng báo cáo ở mỗi che
 - `map_key` được sửa theo số đo: `Enter + CONTROL` (Ctrl-J) và `Enter + ALT` (Alt+Enter)
   → `Key::Newline`; test `t01_line_feed_and_alt_enter_are_the_multiline_key_on_this_console`.
 
+### T03–T07 (đóng)
+
+- **T03 composer**: paste giữ newline (đổi hợp đồng có chủ ý, test cũ cập nhật theo);
+  Ctrl-U/W/A/E; ↑↓ theo hàng khi nhiều dòng; Tab hoàn thành slash command duy nhất;
+  wrap theo cell sau NFC và **một** hàm wrap dùng chung cho chiều cao ô lẫn con trỏ.
+- **T04 history/live block**: `Effect::Stream` → `HistoryItem::Assistant` theo đúng thứ tự
+  `flush_stream`; tool card settle tại chỗ kèm thời lượng; overflow commit theo thứ tự;
+  markdown-lite không thêm dependency và không nuốt ký tự.
+- **T05 status bar**: spinner/step/tools/elapsed/model/session/hint; giới hạn lấy từ
+  `SessionPort::limits()`; **không** vẽ lại khi rảnh (đo: 3 poll → 1 draw).
+- **T06 approval/picker/overlay**: panel đếm ngược theo `expires_at` từ event, `y`/`n` trả
+  lời ngay; picker ↑↓/Enter/Esc; overlay không ghi history; `Esc` không bao giờ huỷ lượt.
+- **T07 fallback/phục hồi**: probe renderer là hàm thuần (`--plain`, `HA_UI=plain`,
+  console < 60×10, `TERM=dumb`) với lý do ra stderr; resize giữ draft; panic hook phục hồi
+  terminal mà không đổi hành vi I08; thoát để con trỏ ở dòng mới; `NO_COLOR` không SGR màu.
+
+### T08 — gate, PTY, docs (đóng)
+
+- Gate có `$requiredTuiSelectors` (4 selector T), in trong `required_tui_tests`, và self
+  test canh danh sách không được ngắn đi.
+- PTY runner có **16 ca** (10 ca H cũ trên TUI mặc định + 6 ca T) và lưu transcript từng ca.
+- Operator guide **vi + en** mục 12.1–12.3: bảng phím, plain fallback có lý do, giới hạn
+  Windows đo được (Shift+Enter không phân biệt được; kill cứng không phục hồi được).
+- README trỏ tới plan/SPEC/evidence/handoff của track T.
+
 ### T02 — view model và refactor controller (đóng)
 
 - `events.rs`: `HistoryItem`, `ToolState`, `UiState`, `Modal`, `Key` mới,
@@ -70,7 +95,23 @@ Phạm vi lượt này: **cả track T01–T08**, dừng báo cáo ở mỗi che
   + thoát vẽ frame trắng), `layout.rs`, `theme.rs`, `history.rs`, `markdown.rs`,
   `widgets/{composer,status,approval,picker,help}.rs`.
 
-## 4. Việc đang dở và ranh giới cuối cùng thành công
+## 4. Trạng thái hiện tại (CP-D)
+
+- **T01–T08 xong.** Không còn việc dở trong track T.
+- Bằng chứng cuối: `cargo test -p harness-cli --bin ha --locked` → **133 passed, 0 failed**;
+  `cargo clippy --workspace --all-targets --locked -- -D warnings` sạch;
+  `Verify-HaLaunch.ps1 -Json` → `passed: true, failures: []`;
+  `Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 900` → `PTY_EXIT: 0`, **16 passed; 0 failed**
+  trong một lần chạy (22.32 s); `Verify-Docs.ps1 -SelfTest` → `DOCS_OK`.
+- Không đạt (ghi thẳng, xem evidence mục 8): **paid smoke chưa chạy vì môi trường không có
+  credential**, **chưa cài lên máy user**, chưa build/chạy Linux, chưa đo conhost cũ riêng.
+- Còn một điểm tên test lệch plan: plan gọi U06 là `t05_status_reflects_phase_steps_tools_and_elapsed`
+  và U05 là `t04_tool_card_settles_in_place_with_duration`; trong cây hiện có
+  `t05_a_running_status_reports_spinner_steps_tools_and_the_clock` (status widget) +
+  `t05_idle_poll_does_not_redraw` (vòng lặp) và `t04_tool_card_settles_in_place_with_duration`.
+  Nội dung acceptance được phủ; tên khác plan nên **không** đưa vào `required_tui_tests`.
+
+## 4b. Lịch sử: việc đang dở ở CP-A (đã xong ở CP-D)
 
 - CP-A **đã xong về code và số đo**. T03+ **chưa bắt đầu**.
 - Trạng thái cuối: `cargo test -p harness-cli --bin ha --locked` → **127 passed, 0 failed**;
@@ -153,23 +194,42 @@ Phạm vi lượt này: **cả track T01–T08**, dừng báo cáo ở mỗi che
    100 ms khi có run), test `t05_idle_loop_does_not_redraw` bằng số lần `draw`.
 7. **T06/T07/T08** theo plan, rồi CP-B → CP-C → CP-D.
 
+## 8b. Gate CP-D — các lần chạy thật
+
+| Lần | Kết quả | Ca đỏ | Xử lý |
+|---|---|---|---|
+| 1 | `passed: true`, `failures: []` | — | lần được nhận |
+| 2 | `passed: false` | `regression-phase_p2` | chạy riêng: **17 passed, 0 failed** |
+| 3 | `passed: false` | `providers-streaming` | chạy riêng: **3 passed, 0 failed** |
+
+Hai lần đỏ đều là **flake loopback đã biết** (plan mục 8 và evidence HA_LAUNCH mục 22):
+suite xanh khi chạy riêng trên cùng binary, không có thay đổi code giữa các lần. Không sửa
+test để xanh. PTY trong cùng khoảng thời gian: `PTY_EXIT: 0`, **16 passed; 0 failed**.
+
 ## 9. Next action chính xác
 
+Track T không còn việc code. Việc còn lại **chỉ** là ba điều kiện môi trường ở mục 8 của
+evidence, theo thứ tự:
+
+1. **Paid provider smoke** (cần credential — quyền đã có):
+   ```text
+   $env:DEEPSEEK_API_KEY = '<key>'
+   pwsh -NoProfile -File scripts/Smoke-HaProvider.ps1
+   ```
+   Kỳ vọng: provider thật trả lời, kết quả ghi vào evidence mục 8.
+2. **Cài thật lên máy user** (quyền đã có) — chạy `scripts/Install-Ha.ps1` theo hướng dẫn
+   operator guide mục 11, rồi chạy lại PTY `i14` để chứng minh bản cài mở TUI.
+3. **Linux**: build + gate trên một máy Linux (hiện chỉ có Windows x64).
+
+Sau **bất kỳ** thay đổi nào, chạy lại:
+
 ```text
+cargo test -p harness-cli --bin ha --locked
 pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json
-```
-
-Kỳ vọng: `passed: true`, `failures: []`. Nếu đỏ ở `docs`, kiểm tra link trong
-`docs/specs/HA_TUI.vi.md` (mọi link `../…` phải trỏ tới file đã tồn tại).
-
-Sau đó:
-
-```text
 pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 900
 ```
 
-Kỳ vọng: `PTY_EXIT: 0` và "10 passed; 0 failed" **trên TUI mặc định** (lần chạy trước
-diễn ra trước khi TUI được nối vào `app::run`).
+Kỳ vọng: `133 passed`; `passed: true, failures: []`; `PTY_EXIT: 0` với **16** ca xanh.
 
 ## 10. Blocked on
 

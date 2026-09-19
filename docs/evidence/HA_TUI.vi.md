@@ -1,119 +1,128 @@
 # Evidence HA_TUI — TUI terminal cho `ha`
 
-Trạng thái: **CP-A (T01–T02) verified_local**. Theo template
+Trạng thái: **T01–T08 implemented_verified (CP-D)**. Theo template
 [implementation-next/TEMPLATES.vi.md](../implementation-next/TEMPLATES.vi.md) mục 2.
-Quyết định và hợp đồng nằm ở [SPEC HA_TUI](../specs/HA_TUI.vi.md); plan ở
+Quyết định và hợp đồng ở [SPEC HA_TUI](../specs/HA_TUI.vi.md); plan ở
 [HA_TUI_PLAN.vi.md](../HA_TUI_PLAN.vi.md); handoff ở
 [handoffs/HA_TUI.vi.md](../handoffs/HA_TUI.vi.md).
 
 ## 1. Work items covered
 
-| Item | Trạng thái | Ghi chú |
+| Item | Trạng thái | Bằng chứng chính |
 |---|---|---|
-| T01 — spike và quyết định | **implemented_verified** | Bốn câu hỏi đo có số; POC đã xoá |
-| T02 — view model và refactor controller | **implemented_verified** | Plain transcript byte-identical; event mới có producer thật |
-| T03–T08 | chưa bắt đầu | CP-A chỉ gồm T01–T02 |
+| T01 — spike và quyết định | implemented_verified | SPEC mục 2 (a–g) + `t01_*` |
+| T02 — view model, refactor controller | implemented_verified | `t02_*` (U20 byte-identical) |
+| T03 — composer | implemented_verified | `t03_*`, PTY `i06`/`i21`/`t03_pty_paste_keeps_newlines` |
+| T04 — history và live block | implemented_verified | `t04_*` |
+| T05 — status bar | implemented_verified | `t05_*` (rảnh: 3 poll, **1** draw) |
+| T06 — approval, picker, overlay | implemented_verified | `t06_*`, PTY `t06_pty_approval_y_key` |
+| T07 — fallback, phục hồi, NO_COLOR | implemented_verified | `t07_*`, PTY `t07_pty_*`, `i08` |
+| T08 — gate, PTY, docs | implemented_verified | gate có `required_tui_tests`; 16 ca PTY; guide vi/en mục 12 |
 
 ## 2. Tested source
 
-- Base commit: `c97c7dd` (`docs(ha-tui): plan the TUI track T01-T08 and the DeepSeek prompts`), nhánh `master`.
-- Working tree **không sạch** khi bắt đầu: `crates/harness-cli/tests/phase_p2.rs` và
-  `scripts/Verify-Phase.ps1` sửa dở từ việc đo flake loopback của track H. Hai thay
-  đổi này **được giữ nguyên** và đi cùng commit T01 (không thuộc track T).
-- Digest của cây nguồn: `git status --porcelain` + `git diff --stat` ghi ở mục 7.
-- Lockfile: `Cargo.lock` cập nhật trong cùng commit; diff chỉ **thêm** package, không
-  package nào đang dùng bị đổi version.
+- Nhánh `master`. Commit CP-A: `b0ba93f`; commit CP-D: xem handoff mục 2.
+- Cây nguồn sạch khi đo (kiểm bằng `git status --porcelain`).
+- Lockfile: `ratatui 0.30.2`, `ratatui-core 0.1.2`, `ratatui-crossterm 0.1.2`,
+  `ratatui-widgets 0.3.2`, `unicode-width 0.2.2`, `crossterm 0.29.0` — **một bản mỗi loại**.
 
 ## 3. Môi trường
 
 | Mục | Giá trị |
 |---|---|
-| OS | Windows 11 (`Windows_NT`), x64, console thật là Windows Terminal (`WT_SESSION` set) |
-| Toolchain | `rustc 1.97.1`, `cargo 1.97.1`, `pwsh 7` |
-| crossterm | `0.29.0` — **một bản duy nhất** trong cây dependency |
-| ratatui | `0.30.2` (MIT), `ratatui-core 0.1.2`, `ratatui-crossterm 0.1.2`, `ratatui-widgets 0.3.2` |
-| unicode-width | `0.2.2` — một bản, dùng chung với `ratatui-core` |
-| Fixture version | `FixtureService` trong `crates/harness-cli/src/interactive/service.rs` |
+| OS | Windows 11 x64; console thật là Windows Terminal (`WT_SESSION` set) |
+| Toolchain | `rustc 1.97.1`, `cargo 1.97.1`, `pwsh 7.6.6` |
+| crossterm | `0.29.0` — một bản duy nhất (`cargo tree -p harness-cli -i crossterm`) |
+| ratatui | `0.30.2` (MIT), MSRV 1.88 |
+| Fixture | `FixtureService` (có nhãn) + HTTP/SSE fixture qua adapter thật |
 
-## 4. Commands thực sự đã chạy (CP-A)
+## 4. Commands thực sự đã chạy (CP-D)
 
 ```text
-cargo tree -p harness-cli -i crossterm           -> một bản 0.29.0
-cargo tree -p harness-cli -i unicode-width       -> một bản 0.2.2
-cargo build -p harness-cli --locked              -> ok
-cargo test -p harness-cli --bin ha --locked      -> 124 passed; 0 failed
-cargo test -p harness-cli --test interactive_session --locked -- --test-threads=1
-                                                 -> 9 passed; 0 failed
-cargo clippy --workspace --all-targets --locked -- -D warnings   -> ok
-cargo fmt --all -- --check                       -> ok
+cargo fmt --all -- --check                                     -> ok
+cargo clippy --workspace --all-targets --locked -- -D warnings -> ok
+cargo test -p harness-cli --bin ha --locked                    -> 133 passed; 0 failed
+pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json        -> passed: true, failures: []
 pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 900
-                                                 -> PTY_EXIT: 0, "10 passed; 0 failed" (24.07 s)
-pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json
-                                                 -> passed: true, failures: [] (sau khi có docs HA_TUI)
+                                                               -> PTY_EXIT: 0, "16 passed; 0 failed" (22.32 s)
+pwsh -NoProfile -File scripts/Verify-Docs.ps1 -SelfTest        -> DOCS_OK: 121 files, 15 language pairs
+cargo tree -p harness-cli -i crossterm                         -> một bản 0.29.0
+cargo tree -p harness-cli -i unicode-width                     -> một bản 0.2.2
 ```
 
-Số test đơn vị của binary `ha`: **70 trước T01** → **124 sau T02**. Không test nào bị
-xoá; các test cũ đổi assertion sang `plain_lines`/`effects_to_plain` theo plan T02.
+Số test đơn vị của binary `ha`: **70 trước T01 → 133 sau T08**. Không test nào bị xoá;
+test cũ đổi assertion sang `plain_lines`/`effects_to_plain` theo plan T02, và đúng **một**
+test đổi hợp đồng có chủ ý (paste giữ newline, T03 — ghi ở SPEC).
 
-## 5. Acceptance đã có test
+## 5. Acceptance (U01–U20) — test tương ứng
 
-| ID | Test | Kết quả |
+| ID | Test / ca | Kết quả |
 |---|---|---|
-| U20 (plain byte-identical) | `t02_plain_lines_are_byte_identical_to_the_pre_t02_writer` | pass — so từng chuỗi với writer trước T02 |
-| U20 (transcript khớp renderer) | `t02_the_recorded_transcript_is_what_the_plain_renderer_printed` | pass |
-| U07 (hết hạn đóng panel, không grant) | `t02_expired_approval_closes_the_modal_and_never_grants` | pass |
-| U06 (đếm step) | `t02_step_started_updates_the_counter` | pass |
-| U05 (thời lượng tool) | `t02_a_settled_tool_card_reports_the_measured_duration` | pass |
-| T01-a (chiều cao viewport) | `t01_*` trong spike (đã xoá) + `t02_viewport_height_is_bounded_for_any_console` | pass |
-| T01-b (TestBackend inline) | `t01_test_backend_supports_an_inline_viewport_and_insert_before` (spike, đã xoá) | pass lúc đo |
-| T01-c (Alt+Enter/Ctrl-J/paste) | ca PTY `t01_probe_key_delivery_measures_alt_enter_ctrl_j_and_paste` (spike) | pass lúc đo |
-| T01-e (thứ tự insert_before) | `t01_insert_before_emits_the_rows_in_order_and_clears_the_viewport` (spike) | pass lúc đo |
+| U01 | PTY `t01_tui_opens_with_status_and_composer` | pass |
+| U02 | `t03_vietnamese_text_is_measured_in_cells_after_nfc`, `t03_wrapping_places_the_cursor_on_the_right_row_and_column`, PTY `i06` | pass |
+| U03 | `t03_paste_keeps_newlines_and_submits_once`, PTY `t03_pty_paste_keeps_newlines`, `i21` | pass |
+| U04 | `t04_stream_text_shows_in_the_live_block_before_run_terminal`, `t04_history_order_is_user_tool_assistant_run` | pass |
+| U05 | `t04_tool_card_settles_in_place_with_duration`, `t02_a_settled_tool_card_reports_the_measured_duration` | pass |
+| U06 | `t05_a_running_status_reports_spinner_steps_tools_and_the_clock`, `t05_idle_poll_does_not_redraw` | pass |
+| U07 | `t06_y_key_grants_exactly_the_pending_request`, `t02_expired_approval_closes_the_modal_and_never_grants`, `interactive_session::h05_*` | pass |
+| U08 | `t06_picker_enter_resumes_the_highlighted_session`, `t06_esc_closes_the_picker_without_changing_the_source` | pass |
+| U09 | `t06_help_overlay_is_not_written_to_history` | pass |
+| U10 | `t03_tab_completes_only_a_unique_slash_command` | pass |
+| U11 | PTY `t07_pty_resize_keeps_the_draft` | pass |
+| U12 | `t07_the_renderer_choice_is_explainable`, `t07_plain_requested_only_honours_the_exact_value`, PTY `t07_pty_plain_flag` | pass |
+| U13 | PTY `t07_pty_no_color` | pass |
+| U14 | PTY `i05`, `i07a`, `i07b` trên TUI mặc định | pass |
+| U15 | PTY `i08` + phục hồi terminal khi thoát | pass |
+| U16 | `interactive_launch` i03 (headless, không ANSI) | pass |
+| U17 | PTY `i14` (artifact staged, **không** cài lên máy user) | pass |
+| U18 | `interactive_launch` i02/i04/i16 | pass |
+| U19 | PTY `i13` | pass |
+| U20 | `t02_plain_transcript_is_byte_identical_to_h03`, `t02_the_recorded_transcript_is_what_the_plain_renderer_printed` | pass |
 
 ## 6. Negative controls
 
-| Bất biến | Cách phá | Kết quả mong đợi | Đã kiểm |
-|---|---|---|---|
-| Approval không bao giờ được cấp khi hết hạn | bỏ `SessionEvent::ApprovalExpired` khỏi gate | `t02_expired_approval_closes_the_modal_and_never_grants` đỏ | có (test đọc modal + log answer) |
-| Plain mode không được lệch | đổi một nhãn trong `plain_lines` | `t02_plain_lines_are_byte_identical_to_the_pre_t02_writer` đỏ | có (so chuỗi nguyên văn) |
-| `TOOL` card phải có thời lượng thật | trả `Duration::ZERO` từ service | test `t02_a_settled_tool_card...` đỏ | có |
-| Một crossterm duy nhất | bỏ feature `crossterm_0_29` | `cargo tree -i crossterm` ra hai bản | có (đo trước/sau) |
-| Gate không tự giảm coverage | xoá một selector bắt buộc | `Verify-HaLaunch.ps1 -SelfTest` đỏ | có (self test có sẵn) |
-
-## 7. Artifacts và bằng chứng thô
-
-| Đường dẫn | Nội dung | Ghi chú |
+| Bất biến | Cách phá | Test sẽ đỏ |
 |---|---|---|
-| `target/verification/t01-pty-insert-before.txt` | transcript thô `insert_before` (conhost) | dùng `scripts/Read-HaTranscript.mjs` để đọc |
-| `target/verification/t01-pty-interactive.txt` | transcript thô spike tương tác | nt |
-| `target/verification/t01-pty-keys.txt` | bàn phím: Enter / Alt+Enter / Ctrl-J / paste | nt |
-| `target/verification/t01-windows-terminal.png` | chụp Windows Terminal | ảnh, không commit |
-| `target/pty-acceptance/pty-all.txt` | 10 ca PTY cũ | nt |
+| Approval không bao giờ được cấp khi hết hạn | bỏ `SessionEvent::ApprovalExpired` | `t02_expired_approval_closes_the_modal_and_never_grants` |
+| Plain mode không được lệch | đổi một nhãn trong `plain_lines` | `t02_plain_transcript_is_byte_identical_to_h03` |
+| Tool card phải có thời lượng thật | trả `Duration::ZERO` | `t02_a_settled_tool_card_reports_the_measured_duration` |
+| Rảnh thì không vẽ lại | cho `tick()` trả `Redraw` khi rảnh | `t05_idle_poll_does_not_redraw` |
+| Một crossterm duy nhất | bỏ feature `crossterm_0_29` | `cargo tree -i crossterm` ra hai bản |
+| Gate không tự giảm coverage | xoá một selector T | `Verify-HaLaunch.ps1 -SelfTest` đỏ |
+| Không SGR màu khi `NO_COLOR` | bỏ `Theme::plain()` | PTY `t07_pty_no_color` |
+| Paste không được thành nhiều lệnh | cho `normalize_paste` trả về nguyên văn có `\n` rồi submit từng dòng | `t03_paste_keeps_newlines_and_submits_once` |
 
-`target/` nằm trong ignore rule, nên bằng chứng ở đây là **số đo tái lập được**, không
-phải file được commit:
+## 7. Artifacts
 
-```text
-git status --porcelain            # cây nguồn của lượt đo
-pwsh -NoProfile -File scripts/Read-HaTranscript.mjs <transcript>   # đọc transcript
-```
+| Đường dẫn | Nội dung |
+|---|---|
+| `target/pty-acceptance/pty-all.txt` | kết quả 16 ca PTY trong một lần chạy |
+| `target/pty-transcripts/*.txt` | transcript thô của **từng** ca (đọc khi đỏ) |
+| `target/verification/gate-final.json` | báo cáo JSON của gate |
+| `scripts/Read-HaTranscript.mjs` | đọc transcript thành màn hình (áp escape sequence) |
+
+`target/` nằm trong ignore rule: bằng chứng ở đây là **số đo tái lập được**, không phải
+file được commit. Mọi lệnh ở mục 4 tái lập được từ commit CP-D.
 
 ## 8. Remaining limitations / not_run
 
 - **Linux**: chưa build/chạy; phiên này chỉ có Windows x64.
-- **Paid smoke**: **được cấp quyền** trong assignment nhưng CP-A không cần: T01/T02
-  chưa chạm provider thật. Sẽ chạy ở CP-C/CP-D và ghi lại ở đây.
-- **Cài thật lên máy user**: **được cấp quyền**; chưa chạy ở CP-A (thuộc U17/T08).
-- **Windows Terminal / conhost cũ**: đo trên Windows Terminal (ảnh) và ConPTY của repo;
-  conhost "cũ" (không phải WT) chưa đo riêng.
-- **Shift+Enter**: không phân biệt được trên Windows — vẫn không hứa, không ghi vào help.
-- **`scrolling-regions`**: chạy được trên ConPTY nhưng **bị loại** (xem SPEC T01-d).
-- **POC T01**: đã xoá cùng cờ `--tui-spike`; test `t01_*` của spike không còn trong cây.
+- **Paid provider smoke: chưa chạy** — quyền đã được cấp nhưng **không có credential**
+  trong môi trường (`DEEPSEEK_API_KEY` và `HA_API_KEY` đều rỗng). Đây là `not_run` vì thiếu
+  đầu vào, không phải thiếu quyền: ai có key chỉ cần chạy
+  `pwsh -NoProfile -File scripts/Smoke-HaProvider.ps1`.
+- **Cài thật lên máy user: chưa chạy.** U17 chứng minh artifact đã staged mở được app,
+  nhưng `Install-Ha.ps1` chưa ghi User PATH thật trong lượt này.
+- **conhost cũ** (không phải Windows Terminal): chưa đo riêng; đã đo trên Windows Terminal
+  và trên ConPTY của repo.
+- **Shift+Enter**: không phân biệt được trên Windows — không hứa, không ghi vào help.
+- **`scrolling-regions`**: chạy được nhưng bị loại có lý do (SPEC T01-d).
+- **Flake loopback đã biết**: `i13` từng đỏ một lần trong ba lần chạy PTY ở CP-A và xanh
+  khi chạy riêng; lần chạy CP-D xanh 16/16. Cùng loại flake đã ghi ở evidence HA_LAUNCH.
 
 ## 9. Gate
 
-- `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json` → `passed: true`, `failures: []`.
+- `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json` → `passed: true`, `failures: []`,
+  `required_tests` 13 selector H + `required_tui_tests` 4 selector T.
 - `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 900` →
-  `PTY_EXIT: 0`, "10 passed; 0 failed".
-
-Gate chưa có selector cho track T (đó là T08). Ở CP-A gate vẫn là gate H, đúng như
-plan mục 8 quy định.
+  `PTY_EXIT: 0`, "16 passed; 0 failed" trong **một** lần chạy.

@@ -220,6 +220,80 @@ Hai sửa đã áp trong harness: `PtySession::send` chờ app vẽ xong trướ
 transcript được lưu lại cho mọi ca để đọc khi đỏ. Việc còn lại của T07 là làm harness
 hết flake **trước** khi thêm ca PTY mới của T08 — không được nới assertion để xanh.
 
+## 3c. Quyết định T03–T08 (ghi khi làm, không suy đoán)
+
+### T03 — composer
+
+- **Đổi hợp đồng có chủ ý:** `normalize_paste` **giữ newline** (`\r\n` → `\n`, các ký
+  tự điều khiển khác vẫn bị loại). Trước T03 paste bị ép thành một dòng vì prompt chỉ có
+  một dòng; composer nhiều dòng làm lý do đó hết hiệu lực. Bất biến không đổi: **một paste
+  = một submit**. Test cũ `h03_editor_paste_never_submits_multiple_commands` được cập nhật
+  để assert đúng chuỗi có `\n`, không nới lỏng.
+- **Wrap theo cell sau NFC:** `layout::plan` gọi `composer::wrap_with_prefix` **một lần**
+  mỗi frame và cả chiều cao ô lẫn vị trí con trỏ đều đọc từ kết quả đó, nên ô được vẽ và ô
+  được chừa chỗ không thể lệch nhau (test `t03_layout_uses_the_same_wrap_for_rows_and_cursor`).
+- `←` từ đầu một hàng đi tới **ký tự cuối của hàng trên**, không đứng trên ký tự xuống
+  dòng — nếu không, `Ctrl-U` sẽ xoá nhầm hàng. Đây là hành vi đã đo và có test.
+
+### T04 — history và live block
+
+- `Effect::Stream` được renderer chuyển thành `HistoryItem::Assistant` ngay khi flush, nên
+  thứ tự trong scrollback vẫn là user → (assistant/tool xen kẽ) → `[run]`, đúng như
+  `flush_stream` trước T02.
+- Tool card settle **tại chỗ**: item `Tool{state: Started}` và item `Tool{state: Ok|Failed}`
+  là hai item, và renderer cập nhật card khi nó còn trong viewport (test
+  `t04_tool_card_settles_in_place_with_duration`).
+- Khi text stream vượt ngân sách hàng, các dòng hoàn chỉnh cũ nhất được commit thành
+  `HistoryItem::Assistant` theo đúng thứ tự (test `t04_long_stream_commits_overflow_lines_in_order`).
+- `markdown.rs` là markdown-lite **không thêm dependency**: fence + nhãn ngôn ngữ, inline
+  code, heading, bullet; text không nhận dạng được in nguyên văn (test
+  `t04_markdown_rendering_keeps_every_visible_character`).
+
+### T05 — status bar
+
+- Spinner/elapsed/đếm ngược chỉ được vẽ khi `controller.tick()` trả effect, tức chỉ khi có
+  lượt đang chạy hoặc có panel đang chờ. Vòng lặp **không** vẽ lại khi rảnh: đo bằng số lần
+  `draw` trên renderer đếm được (`t05_idle_poll_does_not_redraw`: 3 lần poll, **1** lần vẽ).
+- Giới hạn `step k/max` và `tools n/max` lấy từ `SessionPort::limits()`, mặc định khớp
+  `TurnLimits::default()` (8 bước, 16 tool) — không hard-code lần thứ hai trong UI.
+- Thanh trạng thái **cắt** nhãn model cho vừa bề rộng thay vì bỏ nó: console hẹp vẫn phải
+  nói đang dùng model nào (`t05_the_bar_never_exceeds_the_console_width`).
+
+### T06 — approval, picker, overlay
+
+- Panel phê duyệt đọc `expires_at` **từ event** (gate phát kèm hạn thật), nên không có
+  timeout thứ hai trong UI; `y`/`n` trả lời ngay trong TUI, gõ chữ rồi Enter vẫn dùng được
+  như trước.
+- `Esc` đóng panel/picker/overlay và **không** bao giờ trả lời hay huỷ lượt.
+- Overlay (`/help`, `/status`, `/config`, `/model`) không ghi vào history khi đóng; plain
+  mode vẫn in dòng như cũ.
+
+### T07 — fallback, phục hồi, NO_COLOR
+
+- Probe quyết định renderer là hàm thuần (`tui_fallback_reason`) nên test được không cần
+  terminal: `--plain`, `HA_UI=plain`, console < 60×10, `TERM=dumb`; mọi lý do in ra stderr.
+- Panic hook được bọc quanh toàn bộ vòng lặp sống của app (`install_panic_hook`), phục hồi
+  terminal rồi mới để panic nổi lên; lỗi backend (I08) **không** phải panic và vẫn exit 1.
+- Thoát: vẽ frame trắng, xoá vùng viewport, để con trỏ ở cột 0 dòng mới, giữ scrollback.
+- `NO_COLOR`/`TERM=dumb` → `Theme::plain()`: không SGR màu, vẫn có khung; ca PTY
+  `t07_pty_no_color` quét transcript thật.
+
+### T08 — gate, PTY, docs
+
+- Gate có **selector T bắt buộc** (`$requiredTuiSelectors`, 4 selector) và in chúng trong
+  `required_tui_tests` của báo cáo JSON; self test canh danh sách này không được ngắn đi.
+- PTY runner có **16 ca**: 10 ca H cũ trên TUI mặc định + 6 ca T
+  (`t01_tui_opens_with_status_and_composer`, `t03_pty_paste_keeps_newlines`,
+  `t06_pty_approval_y_key`, `t07_pty_resize_keeps_the_draft`, `t07_pty_plain_flag`,
+  `t07_pty_no_color`).
+- Harness PTY (đo được, ghi lại vì nó từng làm CP-A flake): transcript thô của ConPTY **đảo
+  thứ tự** echo của console và escape sequence của app, và mỗi lần vẽ lại chỉ gửi các cell
+  thay đổi nên một từ đang gõ có thể bị cắt bởi `MoveTo`. Vì vậy:
+  1. `PtySession::send` chờ app vẽ xong trước khi gõ;
+  2. assertion về chữ người dùng gõ so trên transcript **chuẩn hoá** (`normalized()`), còn
+     assertion về output của app (echo, `[run]`, `[tool]`) so trên transcript thô;
+  3. mọi ca lưu transcript vào `target/pty-transcripts/` để đọc khi đỏ.
+
 ## 4. Kiến trúc chốt cho T02–T08
 
 Theo plan mục 4, với hai điều chỉnh đã đo:

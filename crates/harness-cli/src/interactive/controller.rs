@@ -1202,31 +1202,6 @@ mod tests {
         );
     }
 
-    /// Temporary probe while wiring T02; removed before the checkpoint.
-    #[test]
-    fn t02_probe_bench_context_shape() {
-        let (temp, configured) = context(true);
-        eprintln!(
-            "configured: config_file={} exists={} first_run={} setup_required={} provider={:?}",
-            configured.paths.config_file.display(),
-            configured.paths.config_file.exists(),
-            configured.config.is_first_run(),
-            configured.setup_required,
-            configured.provider
-        );
-        let (temp2, unconfigured) = context(false);
-        eprintln!(
-            "unconfigured: config_file={} exists={} first_run={} setup_required={} provider={:?}",
-            unconfigured.paths.config_file.display(),
-            unconfigured.paths.config_file.exists(),
-            unconfigured.config.is_first_run(),
-            unconfigured.setup_required,
-            unconfigured.provider
-        );
-        drop(temp);
-        drop(temp2);
-    }
-
     #[test]
     fn t02_expired_approval_closes_the_modal_and_never_grants() {
         let mut harness = bench(true);

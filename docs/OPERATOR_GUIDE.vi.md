@@ -383,6 +383,74 @@ credential (`DEEPSEEK_API_KEY` hoặc `HA_API_KEY`). Thiếu cấu hình thì �
 hiện setup state và nói rõ còn thiếu biến nào — nó **không** gọi model và **không** trả
 câu trả lời giả.
 
+### 12.1. Giao diện TUI (track HA_TUI)
+
+Từ track HA_TUI, ứng dụng tương tác vẽ **inline viewport** ở đáy màn hình: hội thoại vẫn
+chảy vào scrollback của terminal (cuộn bằng chính terminal), còn đáy màn hình là vùng cố
+định gồm ô soạn thảo, thanh trạng thái và panel tạm. Đây **không** phải app full-screen.
+
+```text
+Harness Agents 0.1.0
+Project: C:\work\my-project    Provider: deepseek-chat via https://api.deepseek.com
+Session: new    Mode: trusted host
+
+> Sửa lỗi parser và chạy tests
+● [tool] read_file path=src/parser.rs  ok 12ms
+[run] done
+──────────────────────────────────────────────────────────
+ Vì vậy tôi sẽ sửa như sau:          ← vùng đang stream
+┌ Enter gửi · Ctrl-J xuống dòng · /help ─────────────────┐
+> _                                  ← ô soạn thảo (1..8 dòng)
+ ⠹ running · step 2/8 · tools 2/16 · 00:07 · Ctrl-C hủy
+```
+
+Bàn phím (chỉ những phím đã đo trên console thật):
+
+| Phím | Việc nó làm |
+| --- | --- |
+| `Enter` | Gửi yêu cầu (không gửi buffer rỗng) |
+| `Ctrl-J` | Xuống dòng trong ô soạn thảo |
+| `Alt+Enter` | Xuống dòng (đo được trên ConPTY của Windows Terminal; xem giới hạn bên dưới) |
+| Dán nhiều dòng | Giữ nguyên newline, **không** gửi; cả khối là **một** yêu cầu khi bạn Enter |
+| `↑` / `↓` | Buffer một dòng: lịch sử; buffer nhiều dòng: di chuyển theo hàng |
+| `←` `→` `Home` `End` | Di chuyển theo ký tự |
+| `Ctrl-A` / `Ctrl-E` | Đầu / cuối dòng hiện tại |
+| `Ctrl-U` / `Ctrl-W` | Xoá tới đầu dòng / xoá một từ |
+| `Tab` | Hoàn thành slash command khi chỉ có một gợi ý (`/re` → `/resume`) |
+| `Esc` | Đóng panel/overlay hoặc xoá gợi ý; **không** huỷ lượt đang chạy |
+| `Ctrl-C` | Đang chạy: huỷ lượt · đang rảnh: xoá buffer |
+| `Ctrl-D` | Buffer rỗng: thoát |
+| `Ctrl-L` | Vẽ lại vùng đáy, không xoá scrollback |
+| `y` / `n` | Trả lời panel phê duyệt (hoặc gõ `yes`/`no` rồi Enter) |
+
+Khi một action cần phê duyệt, panel hiện action, workspace, scope và **đếm ngược** tới
+hạn của gate; hết hạn thì action **không** chạy và panel tự đóng.
+
+### 12.2. Khi nào ứng dụng dùng giao diện đơn giản (plain)
+
+TUI là mặc định. Ứng dụng rơi về **plain mode** (chính giao diện cũ: dòng chữ nối tiếp
+trên prompt `> `) khi một trong các điều sau đúng, và **luôn in lý do ra stderr**:
+
+| Điều kiện | Ví dụ |
+| --- | --- |
+| Bạn yêu cầu | `ha chat --plain` hoặc `HA_UI=plain` |
+| Terminal quá nhỏ | nhỏ hơn 60 cột × 10 hàng |
+| Terminal không định vị được con trỏ | `TERM=dumb` |
+| Raw mode không bật được | ứng dụng in lý do rồi dùng chế độ nhập theo dòng |
+
+`--plain` xung đột với `--headless` (clap từ chối, exit 2): một lượt headless không bao
+giờ vẽ viewport.
+
+### 12.3. Giới hạn trên Windows (đã đo)
+
+- **Shift+Enter không phân biệt được với Enter** trên console Windows, nên nó **không**
+  được ghi vào help và không phải đường xuống dòng. Dùng `Ctrl-J` (đường chính thức) hoặc
+  `Alt+Enter`.
+- Con trỏ terminal là do ứng dụng đặt; sau khi thoát ứng dụng để con trỏ ở cột 0 trên dòng
+  mới, và hội thoại vẫn còn trong scrollback.
+- Bị kill cứng (Task Manager, mất điện) thì terminal **không** được phục hồi — đó là giới
+  hạn đã biết của mọi ứng dụng terminal, không phải lỗi của `ha`.
+
 **Chưa được kiểm chứng trên máy này:** transcript PTY thật (ConPTY không hoạt động trong
 môi trường sandbox đang dùng — xem mục 8 của `docs/evidence/HA_LAUNCH.vi.md`) và live
 provider smoke (không có credential/budget được cấp). Đừng coi hai điều đó là đã đạt.

@@ -1,6 +1,6 @@
 # Harness Agents
 
-**Plan: nâng `ha` thành TUI terminal (track T01–T08) — 19/09/2026:** [Feature plan HA_TUI](docs/HA_TUI_PLAN.vi.md) và [prompt giao DeepSeek](docs/HA_TUI_PROMPT.vi.md). Inline viewport kiểu Codex trên app tương tác hiện có (ratatui + crossterm đã pin), plain mode giữ làm fallback; planning only, chưa có code T.
+**TUI terminal cho `ha` (track T01–T08) — 20/09/2026:** [Feature plan HA_TUI](docs/HA_TUI_PLAN.vi.md), [SPEC triển khai](docs/specs/HA_TUI.vi.md), [evidence](docs/evidence/HA_TUI.vi.md) và [handoff](docs/handoffs/HA_TUI.vi.md). `ha` vẽ inline viewport kiểu Codex/Claude Code ở đáy màn hình (ô soạn thảo nhiều dòng, thanh trạng thái, panel approval/picker/help) và giữ hội thoại trong scrollback của terminal; ratatui + crossterm đã pin, plain mode vẫn là fallback có lý do ra stderr. Số đo quyết định (chiều cao viewport, Alt+Enter, `scrolling-regions`) ở mục 2 của SPEC.
 
 **Plan: gõ `ha` để mở CLI tương tác:** [Feature plan H01–H08](docs/HA_LAUNCH_PLAN.vi.md) và [prompt giao DeepSeek](docs/HA_LAUNCH_PROMPT.vi.md). Phân biệt cài/PATH với interactive startup; triển khai feature này trên CLI hiện tại, chưa phải tính năng đã hoàn thành.
 

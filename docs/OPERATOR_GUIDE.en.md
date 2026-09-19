@@ -372,6 +372,52 @@ counts as a refusal. A real model call needs `HA_PROVIDER_ENDPOINT`, `HA_PROVIDE
 and a credential (`DEEPSEEK_API_KEY` or `HA_API_KEY`); without them the app still opens
 in setup state and says what is missing, and it never fabricates an answer.
 
+### 12.1. The TUI (HA_TUI track)
+
+The interactive app draws an **inline viewport** at the bottom of the console: the
+conversation still flows into the terminal's own scrollback (scroll it with the terminal),
+while the bottom of the screen is a fixed area holding the composer, the status bar and the
+temporary panels. It is **not** a full-screen app.
+
+Bàn phím / keys (only the combinations measured on a real console):
+
+| Key | What it does |
+| --- | --- |
+| `Enter` | Submit the request (an empty buffer is not submitted) |
+| `Ctrl-J` | Insert a line break in the composer |
+| `Alt+Enter` | Insert a line break (measured on this Windows Terminal's ConPTY; see the limits below) |
+| Multi-line paste | Keeps its newlines and never submits; the whole block is **one** request |
+| `↑` / `↓` | Single-line buffer: history; multi-line buffer: move by row |
+| `←` `→` `Home` `End` | Move by character |
+| `Ctrl-A` / `Ctrl-E` | Start / end of the current row |
+| `Ctrl-U` / `Ctrl-W` | Erase to the row start / erase one word |
+| `Tab` | Complete a slash command when there is exactly one candidate |
+| `Esc` | Close a panel or clear a suggestion; it never cancels a running turn |
+| `Ctrl-C` | Running: cancel the turn · idle: clear the buffer |
+| `Ctrl-D` | Empty buffer: leave |
+| `Ctrl-L` | Repaint the bottom area without clearing the scrollback |
+| `y` / `n` | Answer the approval panel (or type `yes`/`no` and press Enter) |
+
+The approval panel shows the action, workspace, scope and a **countdown** to the gate's
+deadline; when it expires the action does **not** run and the panel closes.
+
+### 12.2. When the app uses the plain interface
+
+The TUI is the default. The app falls back to **plain mode** (the previous interface: plain
+lines above a `> ` prompt) when any of these holds, and it always prints the reason to
+stderr: `ha chat --plain` or `HA_UI=plain`; a console smaller than 60 columns by 10 rows;
+`TERM=dumb`; or raw mode refusing to start (which selects line input instead).
+`--plain` conflicts with `--headless` (clap rejects it, exit 2).
+
+### 12.3. Windows limits (measured)
+
+- **Shift+Enter is indistinguishable from Enter** on a Windows console, so it is not
+  documented as a key and is not a way to add a line. Use `Ctrl-J` or `Alt+Enter`.
+- On exit the app leaves the cursor at column zero of a fresh line and the conversation
+  stays in the scrollback.
+- A hard kill (Task Manager, power loss) cannot restore the terminal; that is a known limit
+  of every terminal application, not a defect of `ha`.
+
 **Not verified on this machine:** the real PTY transcript (ConPTY does not work in the
 sandbox in use — see section 8 of `docs/evidence/HA_LAUNCH.vi.md`) and the live provider
 smoke (no credential or budget is granted).
