@@ -417,7 +417,43 @@ thiểu (chỉ thư mục cài + `System32`, `toolchainOnMinimalPath=False`):
 - **Linux x64 bundle**: không có host/toolchain Linux ở đây, nên chỉ công bố Windows x64.
 - **Ghi User PATH thật**: vẫn không thực hiện; đường ghi chỉ được chứng minh bằng writer tiêm.
 
-## 10. Chưa xác minh (không được coi là đạt)
+
+## 10. Bổ sung acceptance bằng process thật (I09/I16) và ca gián đoạn của H05
+
+| Kiểm chứng | Lệnh | Kết quả |
+|---|---|---|
+| Launch acceptance (đã thêm I09/I16) | `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` | 14 passed, 0 failed |
+| Session acceptance (đã thêm ca gián đoạn) | `cargo test -p harness-cli --test interactive_session --locked -- --test-threads=1` | 9 passed, 0 failed |
+| Gate runtime với 9 selector bắt buộc | `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json` | `"passed": true`, `"failures": []` |
+| Lint toàn workspace | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+
+Selector mới: `i09_a_corrupt_configuration_stops_the_run_with_an_actionable_error`,
+`i09_an_invalid_project_directory_stops_the_run_with_an_actionable_error`,
+`i16_a_second_run_in_the_same_project_is_refused_while_the_first_holds_the_store`,
+`h05_a_settled_receipt_is_not_re_executed_after_the_process_state_is_lost`.
+
+Đã chứng minh:
+
+- **I09**: config hỏng và `--cwd` không tồn tại đều **dừng trước khi chạy** (exit ≠ 0,
+  stdout rỗng), thông báo nêu đúng đường dẫn và hướng dẫn `ha config validate`, và **không**
+  in lại giá trị bị từ chối.
+- **I16**: khi process thứ nhất đang giữ store của project (đã xác nhận nó tới được provider,
+  tức writer đã mở), process thứ hai bị từ chối với `writer_locked` / "another writable
+  host" — không có hai writer cùng ghi một store.
+- **H05 (gián đoạn)**: sau khi receipt đã settle và **toàn bộ state in-memory bị drop**
+  (mô phỏng kill trung thực cho durable state: writer generation mới mở từ đĩa), lượt tiếp
+  theo qua `continue_task_streaming`: `tool_calls = 0`, side effect trên file **không đổi
+  byte nào**, số receipt trong store vẫn **đúng 1**, và request gửi provider mang context
+  của lượt trước.
+
+**Phát hiện mới (ghi vào SPEC)**: `ToolPolicy` của P3 yêu cầu approval cho **mọi** action
+không bị deny, nên đường headless (không có người để hỏi) **fail closed cho mọi tool call**.
+Đó là hành vi đúng theo "không blanket grant", nhưng nghĩa là headless hiện không thể hoàn
+thành công việc cần tool; một flag automation-approval tường minh là quyết định contract cần
+user chốt nên chưa được thêm. Ca **kill process thật** giữa turn vẫn cần PTY (H07) và vẫn là
+not_run.
+
+## 11. Chưa xác minh (không được coi là đạt)
 
 - **I01 PTY transcript**: chưa có. Cần terminal thật/PTY harness (H07). Unit test
   dùng fixture detector chỉ chứng minh logic capability, không phải bằng chứng
@@ -428,7 +464,7 @@ thiểu (chỉ thư mục cài + `System32`, `toolchainOnMinimalPath=False`):
 - **Publish release / push remote**: không thực hiện; không được cấp quyền.
 - **Linux**: chưa build/chạy; mọi kết quả trên là Windows.
 
-## 11. Ghi chú flake môi trường (đã điều tra, không che)
+## 12. Ghi chú flake môi trường (đã điều tra, không che)
 
 Test `phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` thỉnh
 thoảng đỏ ở tầng connect tới fixture server loopback trong chính process test:

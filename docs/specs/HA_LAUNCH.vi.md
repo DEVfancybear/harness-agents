@@ -428,3 +428,18 @@ slash command, approval y/n, yêu cầu cấu hình provider, và danh sách "ch
   nó đã thêm; **không** đụng config/session data của user; từ chối khi không có manifest
   ("this installer only removes files it recorded").
 - `-FromBundle` với `-UseCargoInstall` bị từ chối vì xung đột ý định.
+
+**Phát hiện về approval ở headless (quan trọng)**:
+
+`ToolPolicy` của P3 ghi rõ: *"It always requires an explicit approval for an action that
+is not denied"*. Nghĩa là **mọi** tool call (kể cả đọc) đều cần một approval grant; đường
+headless không có người để hỏi nên **mọi tool call fail closed** — đúng thiết kế "không
+blanket grant", nhưng hệ quả là headless hiện **không thể** hoàn thành công việc cần tool.
+Muốn automation chạy được tool thì phải có một flag approval tường minh (ví dụ
+`--allow-actions`) — đây là thay đổi contract cần user chốt, nên **chưa** tự thêm.
+
+Vì vậy ca "hard kill giữa turn sau khi receipt đã commit" được chứng minh ở mức **mô phỏng
+trung thực cho durable state**: mọi handle in-memory (driver, runtime, tool service, writer)
+bị drop và lượt kế tiếp mở **writer generation mới** từ đĩa, đúng như một process mới; test
+khẳng định receipt đã settle không bị chạy lại và context được phục hồi. Ca kill process
+thật vẫn cần PTY (H07) và tiếp tục là not_run.

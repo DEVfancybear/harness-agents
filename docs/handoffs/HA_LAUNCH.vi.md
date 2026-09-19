@@ -70,9 +70,12 @@ Chi tiết từng bước ở mục 6; nhắc lại: H08 **không** được pub
    số/id, resume = đặt nguồn hội thoại rồi tiếp tục bằng `continue_task_streaming`.
 3. ~~`/new`/`/exit` khi có run active~~ **đã xong**: `/new` từ chối khi đang chạy,
    `/exit` cancel + đóng writer trước khi thoát.
-4. **Còn lại**: ca **hard kill giữa turn sau khi receipt đã commit** rồi mở lại resume
-   (I13 nhánh kill) — cần process thật bị kill giữa lúc tool đã settle, và kiểm tra không
-   rerun side effect. Nếu làm cùng PTY harness của H07 thì ghi chung một ca.
+4. **Đã làm phần lớn**: ca gián đoạn với durable state thật (drop toàn bộ in-memory,
+   writer generation mới) chứng minh receipt đã settle không bị chạy lại. **Còn lại**: kill
+   *process* thật giữa turn — cần PTY (H07) và vẫn not_run.
+   Lưu ý contract: P3 yêu cầu approval cho **mọi** action không bị deny, nên headless fail
+   closed cho mọi tool call; muốn automation chạy tool phải có flag approval tường minh do
+   user chốt (xem SPEC).
 5. Giữ nguyên luật nền tảng đã ghi: một input mỗi session, mỗi lượt một writer generation.
 
 Lưu ý kỹ thuật đã biết: fixture loopback trong môi trường này flaky khi test chạy song
