@@ -888,6 +888,17 @@ function Invoke-SelfTest {
                 New-Item -ItemType Directory -Path $emptyBin -Force | Out-Null
                 $absentProbe = Invoke-MinimalEnvironmentProbe -Executable $shell -InstallRoot $emptyBin -ProbeHome $probeHome -Arguments @('/c', 'where ha')
                 Add-SelfTestResult 'fresh_shell_without_the_install_directory_does_not_resolve_ha' ($absentProbe.ExitCode -ne 0) "exit $($absentProbe.ExitCode); out $($absentProbe.Stdout.Trim())"
+
+                # H07 asks for PowerShell and CMD resolution, not just one shell.
+                $pwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+                if ([string]::IsNullOrWhiteSpace($pwshPath)) {
+                    Add-SelfTestSkip 'powershell_fresh_shell_resolves_ha_to_the_installed_binary' 'pwsh is not on PATH'
+                }
+                else {
+                    $pwshProbe = Invoke-MinimalEnvironmentProbe -Executable $pwshPath -InstallRoot $installRoot -ProbeHome $probeHome -Arguments @('-NoProfile', '-Command', '(Get-Command ha).Source')
+                    $resolvedByPwsh = $pwshProbe.Stdout -match [regex]::Escape($target)
+                    Add-SelfTestResult 'powershell_fresh_shell_resolves_ha_to_the_installed_binary' (($pwshProbe.ExitCode -eq 0) -and $resolvedByPwsh) "exit $($pwshProbe.ExitCode); out $($pwshProbe.Stdout.Trim())"
+                }
             }
             else {
                 Add-SelfTestResult 'fresh_shell_resolves_ha_to_the_installed_binary' $false "no cmd.exe at $shell"

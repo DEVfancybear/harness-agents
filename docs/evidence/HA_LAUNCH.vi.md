@@ -307,7 +307,7 @@ Còn lại của H05/H07 (ghi đúng mức đã đạt):
 
 | Kiểm chứng | Lệnh | Kết quả |
 |---|---|---|
-| Self test của installer | `pwsh -NoProfile -File scripts/Install-Ha.ps1 -SelfTest` | **25 check OK**, exit 0 (round 17–18 bổ sung các check môi trường sạch; xem mục 15.3) |
+| Self test của installer | `pwsh -NoProfile -File scripts/Install-Ha.ps1 -SelfTest` | **26 check OK**, exit 0 (round 17–20 bổ sung các check môi trường sạch và fresh-shell; xem mục 15.3, 15.5) |
 | Cài vào thư mục tạm (copy route) | `pwsh -NoProfile -File scripts/Install-Ha.ps1 -Destination <temp> -SkipBuild -Profile Debug` | exit 0, manifest khớp digest |
 | Command resolution | `Get-Command ha -CommandType Application`, `where.exe ha` trong shell con với PATH có kiểm soát | resolve đúng binary đã cài, từ cwd ngoài repo có dấu cách |
 | Binary đã cài chạy được | `ha --version`; `ha chat --fixture` qua pipe | `ha 0.1.0`; non-TTY exit 2 (giữ nguyên guard của H01) |
@@ -336,7 +336,8 @@ Check trong self test: `merge_appends_a_missing_directory`,
 `installed_binary_guards_a_non_terminal_launch`,
 `fresh_shell_resolves_ha_to_the_installed_binary`,
 `fresh_shell_runs_ha_by_name_without_a_toolchain`,
-`fresh_shell_without_the_install_directory_does_not_resolve_ha`.
+`fresh_shell_without_the_install_directory_does_not_resolve_ha`,
+`powershell_fresh_shell_resolves_ha_to_the_installed_binary`.
 
 Đã chứng minh:
 
@@ -647,7 +648,7 @@ Kill process cứng vẫn **ngoài phạm vi** đúng như plan ghi, và đượ
 | Unit test binary `ha` | `cargo test -p harness-cli --bin ha --locked` | 61 passed, 0 failed (thêm 3 test I08 cho phục hồi mode) |
 | Launch/headless acceptance | `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` | 15 passed, 0 failed, gồm ca kill process thật (mục 10.1) |
 | Session/turn acceptance | `cargo test -p harness-cli --test interactive_session --locked -- --test-threads=1` | 9 passed, 0 failed |
-| PTY trong console thật | `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 420` | `PTY_EXIT: 0`, **7 passed, 0 failed** cho i01/i05/i06/i07a/i07b/i08/i13 (vòng 13 có 5 ca, vòng 16 thêm i13, vòng 19 thêm i05) |
+| PTY trong console thật | `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 480` | `PTY_EXIT: 0`, **8 passed, 0 failed** cho i01/i05/i06/i07a/i07b/i08/i12/i13 (vòng 13 có 5 ca; vòng 16 thêm i13; vòng 19 thêm i05; vòng 20 thêm i12) |
 | Regression toàn CLI (serial) | `cargo test -p harness-cli --tests --locked -- --test-threads=1` | **229 passed, 0 failed, 5 ignored** (5 ca PTY; chi tiết `target/cli-tests-round13.txt`) |
 | Providers | `cargo test -p harness-providers --locked` | 3 passed, 0 failed |
 
@@ -666,6 +667,12 @@ Kill process cứng vẫn **ngoài phạm vi** đúng như plan ghi, và đượ
 - **Linux**: chưa build/chạy; mọi kết quả trên là Windows.
 
 ## 14. Ghi chú flake môi trường (đã điều tra, không che)
+
+**Bổ sung round 20**: lần chạy gate đầu của round 20 đỏ ở `providers-streaming` →
+`streaming::tests::g1_adapter_delivers_text_before_the_response_completes` (fixture loopback
+trong `harness-providers`); chạy riêng `cargo test -p harness-providers --locked --lib` **3/3
+xanh**. Round 20 chỉ đổi `scripts/Install-Ha.ps1`, test PTY và tài liệu — không chạm
+`harness-providers`.
 
 **Bổ sung round 16**: hai lần chạy gate liên tiếp đỏ ở hai test **khác nhau**, cả hai đều là
 loại loopback/flaky đã biết và cả hai đều xanh khi chạy riêng:
@@ -779,7 +786,7 @@ sạch thật) ở mức một phần; I04/I09 đóng ở mục 15.1, I13 đóng
 | I09 | `i09_a_corrupt_configuration_stops_the_run_with_an_actionable_error`, `i09_an_invalid_project_directory_stops_the_run_with_an_actionable_error`, `i09_a_data_root_that_cannot_be_created_names_the_path_and_writes_nothing` (round 15: data root không dùng được → exit ≠ 0, stderr nêu **đường dẫn**, giữ mã `storage_open_failed`, không tạo state), `i09_a_data_directory_without_write_permission_names_the_path_and_writes_nothing` (round 17: **ACL thật** từ chối quyền ghi của user hiện tại trên data root), `h02_corrupt_configuration_is_actionable_and_never_replaced_by_defaults` | đạt |
 | I10 | `phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` (SSE → sự kiện chuẩn hoá), `h03_text_and_terminal_events_are_rendered_before_the_run_ends` (text hiện trước khi run kết thúc) | đạt |
 | I11 | `g2_tool_results_return_to_the_model_and_the_turn_ends_with_the_answer`, `g2_a_failed_tool_call_is_reported_instead_of_ending_the_turn`, `g2_the_tool_loop_is_bounded_and_reports_which_bound_stopped_it`, `g3_the_foundation_admits_one_input_per_session_and_says_so` | đạt |
-| I12 | `h05_a_denied_gated_action_is_not_executed_and_the_model_is_told`, `h05_a_granted_gated_action_runs_once_after_the_answer`, `h05_an_expired_approval_is_a_refusal_not_a_silent_grant`, `i12_headless_turn_without_provider_configuration_fails_closed` | đạt |
+| I12 | `h05_a_denied_gated_action_is_not_executed_and_the_model_is_told`, `h05_a_granted_gated_action_runs_once_after_the_answer`, `h05_an_expired_approval_is_a_refusal_not_a_silent_grant`, `i12_headless_turn_without_provider_configuration_fails_closed`, PTY `i12_a_prompt_with_an_unreachable_provider_is_reported_and_the_app_stays_alive` (round 20: provider được cấu hình nhưng không ai trả lời → `[run] failed` nêu URL, app vẫn sống, không có câu trả lời giả) | đạt |
 | I13 | PTY `i13_a_settled_tool_receipt_survives_a_hard_kill_mid_turn` (mục 15.2: patch được duyệt chạy thật, receipt đã commit rồi mới kill cứng; tiếp tục bằng process mới → `tool_calls = 0`, file không đổi, vẫn đúng 1 receipt), `i13_a_hard_kill_mid_turn_leaves_one_admitted_input_and_no_claimed_success` (mục 10.1), `i13_resume_continues_the_task_with_recovered_context_and_no_rerun`, `i13_resuming_an_unknown_session_fails_without_running_anything`, `h05_a_settled_receipt_is_not_re_executed_after_the_process_state_is_lost` | đạt |
 | I14 | `Install-Ha.ps1 -SelfTest`: `disposable_install_replaces_and_verifies_the_artifact`, `installed_digest_matches_the_built_artifact`, `install_manifest_records_version_and_digest` | đạt trong destination tạm |
 | I15 | `Install-Ha.ps1 -SelfTest`: `merge_appends_a_missing_directory`, `merge_is_case_insensitive_and_ignores_a_trailing_separator`, `merge_drops_empty_entries_and_keeps_order`, `merge_never_folds_machine_or_process_entries_into_user_path`, `injected_writer_receives_the_merged_user_path`, `self_test_never_writes_the_real_user_path` | đạt ở mức mô phỏng; **không** ghi User PATH thật |
@@ -890,6 +897,27 @@ Controller đã có test cho phần cancel; round 19 thêm ca PTY
 Đây là bằng chứng end-to-end cho vế "restore store ownership" mà trước đó chỉ có ở mức
 controller/unit. Cùng runner chạy **bảy** ca: `PTY_EXIT: 0`, `7 passed; 0 failed` (13.73 s,
 transcript `target/pty-acceptance/pty-all.txt`).
+
+### 15.5. Round 20: PowerShell fresh resolution và đường offline của app
+
+**H06/H07 "PowerShell/CMD fresh command resolution"** — trước round này chỉ có CMD. Self test
+nay thêm `powershell_fresh_shell_resolves_ha_to_the_installed_binary`: chạy
+`pwsh -NoProfile -Command "(Get-Command ha).Source"` **trong môi trường dựng lại** (PATH chỉ có
+thư mục cài + System32 + SystemRoot) và khẳng định exit 0 cùng đường dẫn resolve đúng binary đã
+cài. Self test nay **26 check**.
+
+**H07 "config missing/offline paths" — vế offline ở app tương tác.** Ca PTY
+`i12_a_prompt_with_an_unreachable_provider_is_reported_and_the_app_stays_alive` bind một cổng
+loopback rồi đóng nó ngay (địa chỉ chắc chắn không ai trả lời) và cấu hình app trỏ vào đó:
+
+- gửi một prompt → transcript có `[run] failed: provider_protocol: ... error sending request for
+  url (http://127.0.0.1:<port>/chat/completions)`, tức lỗi nêu **đúng URL** đã gọi;
+- app **vẫn sống** ở prompt sau lỗi (không thoát, không treo);
+- **không** có câu trả lời giả: transcript không chứa "fixture answer" hay "no model was called";
+- `/exit` sau đó thoát **0**.
+
+Cùng runner chạy **tám** ca: `PTY_EXIT: 0`, `8 passed; 0 failed` (19.88 s, transcript
+`target/pty-acceptance/pty-all.txt`).
 
 **Không đạt / not_run (không được tính là đạt)**: live provider smoke (không có credential),
 publish release (không có channel và chưa được xác nhận push tag), build/chạy Linux (chỉ có

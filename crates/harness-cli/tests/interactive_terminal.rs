@@ -226,7 +226,7 @@ fn base_env(temp: &tempfile::TempDir) -> Vec<(&'static str, String)> {
     ]
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all seven cases i01, i05, i06, i07a, i07b, i08 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all eight cases i01, i05, i06, i07a, i07b, i08, i12 and i13 pass there."]
 #[test]
 fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     let (temp, project) = sandbox();
@@ -259,7 +259,7 @@ fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all seven cases i01, i05, i06, i07a, i07b, i08 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all eight cases i01, i05, i06, i07a, i07b, i08, i12 and i13 pass there."]
 #[test]
 fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     let (temp, project) = sandbox();
@@ -320,7 +320,7 @@ fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all seven cases i01, i05, i06, i07a, i07b, i08 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all eight cases i01, i05, i06, i07a, i07b, i08, i12 and i13 pass there."]
 #[test]
 fn i07a_ctrl_c_clears_an_idle_prompt() {
     // One pseudo-console per test: opening a second one in the same process blocks
@@ -354,7 +354,7 @@ fn i07a_ctrl_c_clears_an_idle_prompt() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all seven cases i01, i05, i06, i07a, i07b, i08 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all eight cases i01, i05, i06, i07a, i07b, i08, i12 and i13 pass there."]
 #[test]
 fn i07b_ctrl_c_cancels_a_running_turn() {
     let (temp, project) = sandbox();
@@ -423,7 +423,7 @@ fn i07b_ctrl_c_cancels_a_running_turn() {
     let _ = hold.join();
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all seven cases i01, i05, i06, i07a, i07b, i08 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all eight cases i01, i05, i06, i07a, i07b, i08, i12 and i13 pass there."]
 #[test]
 fn i08_a_backend_fault_after_init_restores_the_terminal_and_is_not_swallowed() {
     // I08: inject a render/backend failure *after* the terminal is initialized and
@@ -617,7 +617,7 @@ fn patch_then_stall_endpoint(
     )
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all seven cases i01, i05, i06, i07a, i07b, i08 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all eight cases i01, i05, i06, i07a, i07b, i08, i12 and i13 pass there."]
 #[test]
 #[allow(clippy::too_many_lines)] // One kill-then-resume sequence; splitting it hides the order.
 fn i13_a_settled_tool_receipt_survives_a_hard_kill_mid_turn() {
@@ -808,7 +808,7 @@ fn stalling_provider() -> (
     )
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all seven cases i01, i05, i06, i07a, i07b, i08 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all eight cases i01, i05, i06, i07a, i07b, i08, i12 and i13 pass there."]
 #[test]
 fn i05_exit_during_an_active_run_releases_the_store_for_the_next_host() {
     // H05: /exit must handle an active run (cancel, cleanup) and restore terminal
@@ -897,4 +897,47 @@ fn sse_answer(text: &str) -> (String, std::thread::JoinHandle<()>) {
         write_sse(&mut socket, &body);
     });
     (format!("http://{address}/chat/completions"), handle)
+}
+
+// ---------------------------------------------------------------------------
+// I12 - a configured but unreachable provider (the offline path)
+// ---------------------------------------------------------------------------
+
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all eight cases i01, i05, i06, i07a, i07b, i08, i12 and i13 pass there."]
+#[test]
+fn i12_a_prompt_with_an_unreachable_provider_is_reported_and_the_app_stays_alive() {
+    // The offline path: the environment is configured, but nothing answers. The app
+    // must report the failure, stay usable, and never fabricate an answer.
+    let (temp, project) = sandbox();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe listener");
+    let address = probe.local_addr().expect("probe address");
+    drop(probe);
+    let endpoint = format!("http://{address}/chat/completions");
+
+    let mut session = PtySession::spawn(&project, &provider_env(&temp, &endpoint));
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+    session.send("hello\r");
+
+    // A failed turn is rendered as a run failure naming the provider error.
+    let transcript = session.wait_for("[run] failed", Duration::from_secs(40));
+    assert!(
+        transcript.contains(&address.to_string()),
+        "the failure names the endpoint that was called:\n{transcript}"
+    );
+    assert!(
+        session.is_alive(),
+        "the app survives an unreachable provider:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("fixture answer") && !transcript.contains("no model was called"),
+        "an unreachable provider never turns into a fixture answer:\n{transcript}"
+    );
+
+    session.send("/exit\r");
+    assert_eq!(
+        session.wait_exit(Duration::from_secs(20)),
+        Some(0),
+        "transcript:\n{}",
+        session.transcript()
+    );
 }
