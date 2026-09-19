@@ -1,114 +1,52 @@
-//! Minimal interactive boot shell for `HA_LAUNCH` H01/H02.
+//! Interactive entrypoint host for `HA_LAUNCH` H01-H03.
 //!
-//! H01 must prove that a bare `ha` dispatch reaches a live interactive process
-//! that reads input and only exits when the user exits. H02 replaces the
-//! placeholder context with the resolved launch context. The real terminal app —
-//! raw mode, line editor, streaming renderer — is H03, and the agent service is
-//! H04, so text input is still not sent anywhere and the header says so.
+//! The host owns the terminal: it renders controller effects, feeds normalized
+//! keys back, and restores the terminal through the raw-mode guard. The rules
+//! live in the controller and are unit tested without a terminal; the very same
+//! render loop runs against the scripted backend in tests.
 
-use std::fmt::Write as _;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use harness_types::{ErrorCode, HarnessError};
 
 use super::bootstrap::{self, LaunchContext, LaunchRequest};
+use super::controller::{Effect, InteractiveController};
+use super::events::Key;
 use super::paths::{HostPlatform, LaunchEnvironment};
+use super::service::{FixtureService, PendingService, SessionChannel, SessionPort};
+use super::terminal::{CrosstermBackend, RawModeGuard, TerminalBackend};
 
 /// Validated interactive launch request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppLaunch {
     pub cwd: Option<PathBuf>,
     pub resume: Option<String>,
+    /// Explicit opt-in to the labelled fixture backend.
+    pub fixture: bool,
 }
 
-/// Input events delivered by the prompt reader thread.
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum InputEvent {
-    Line(String),
-    EndOfInput,
-    ReadFailed(String),
-}
+/// How long the render loop waits for a key before draining session events.
+const KEY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Run the interactive shell until the user exits.
+/// Run the interactive app until the user exits.
 pub async fn run(launch: AppLaunch) -> Result<ExitCode, HarnessError> {
     let context = resolve_context(&launch)?;
-    let mut output = std::io::stdout();
-    render_boot(&mut output, &context, launch.resume.as_deref())?;
-
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<InputEvent>(16);
-    std::thread::spawn(move || {
-        use std::io::BufRead;
-
-        let stdin = std::io::stdin();
-        let mut handle = stdin.lock();
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match handle.read_line(&mut line) {
-                Ok(0) => {
-                    let _ = sender.blocking_send(InputEvent::EndOfInput);
-                    return;
-                }
-                Ok(_) => {
-                    let event = InputEvent::Line(line.trim_end_matches(['\r', '\n']).to_owned());
-                    if sender.blocking_send(event).is_err() {
-                        return;
-                    }
-                }
-                Err(error) => {
-                    let _ = sender.blocking_send(InputEvent::ReadFailed(error.to_string()));
-                    return;
-                }
-            }
-        }
+    let notice = launch.resume.as_deref().map(|session| {
+        format!("resume {session} requested; session recovery arrives with HA_LAUNCH H05")
     });
-
-    while let Some(event) = receiver.recv().await {
-        match event {
-            InputEvent::Line(line) => {
-                match LineAction::parse(&line) {
-                    LineAction::Exit => {
-                        writeln!(output, "bye").map_err(|error| write_failed(&error))?;
-                        return Ok(ExitCode::SUCCESS);
-                    }
-                    LineAction::Help => {
-                        write!(output, "{}", help_text()).map_err(|error| write_failed(&error))?;
-                    }
-                    LineAction::Status => render_status(&mut output, &context)?,
-                    LineAction::Empty => {}
-                    LineAction::Prompt => {
-                        writeln!(
-                            output,
-                            "connection pending: no application service is wired in this revision (HA_LAUNCH H04), so nothing was sent."
-                        )
-                        .map_err(|error| write_failed(&error))?;
-                    }
-                    LineAction::Unknown(command) => {
-                        writeln!(
-                            output,
-                            "unknown command {command}; /help lists what this revision supports."
-                        )
-                        .map_err(|error| write_failed(&error))?;
-                    }
-                }
-                write!(output, "> ").map_err(|error| write_failed(&error))?;
-                output.flush().map_err(|error| write_failed(&error))?;
-            }
-            InputEvent::EndOfInput => {
-                writeln!(output, "bye").map_err(|error| write_failed(&error))?;
-                return Ok(ExitCode::SUCCESS);
-            }
-            InputEvent::ReadFailed(message) => {
-                return Err(HarnessError::new(
-                    ErrorCode::ConfigReadError,
-                    format!("interactive input could not be read: {message}"),
-                ));
-            }
+    match RawModeGuard::enter() {
+        Ok(guard) => {
+            let code = run_terminal(&context, guard, notice.as_deref(), launch.fixture)?;
+            Ok(ExitCode::from(code))
+        }
+        Err(error) => {
+            eprintln!("ha: raw mode is unavailable ({error}); using plain line input");
+            run_line_mode(&context, notice.as_deref(), launch.fixture).await
         }
     }
-    Ok(ExitCode::SUCCESS)
 }
 
 /// Resolve the launch context from the real environment.
@@ -131,82 +69,265 @@ fn resolve_context(launch: &AppLaunch) -> Result<LaunchContext, HarnessError> {
     })
 }
 
-fn render_boot(
-    output: &mut impl Write,
+fn run_terminal(
     context: &LaunchContext,
-    resume: Option<&str>,
+    _guard: RawModeGuard,
+    notice: Option<&str>,
+    fixture: bool,
+) -> Result<u8, HarnessError> {
+    let mut backend = CrosstermBackend;
+    let mut controller = controller_for(context, fixture);
+    run_loop(&mut backend, &mut controller, notice)
+}
+
+/// Build the controller.
+///
+/// Without the explicit fixture opt-in the backend is the staged service that
+/// reports the connection is pending: a production launch never silently falls
+/// back to a fixture or a mock.
+fn controller_for(context: &LaunchContext, fixture: bool) -> InteractiveController {
+    let channel = SessionChannel::new();
+    let service: Box<dyn SessionPort> = if fixture {
+        Box::new(FixtureService::new(channel.sender()))
+    } else {
+        Box::new(PendingService::new(channel.sender()))
+    };
+    InteractiveController::new(context, service, channel)
+}
+
+/// Whether the cursor sits at the start of a line, so partial output is never
+/// overwritten by the next prompt.
+#[derive(Clone, Copy, Debug, Default)]
+struct RenderCursor {
+    at_line_start: bool,
+}
+
+/// Render loop shared by the real terminal and the scripted test backend.
+fn run_loop(
+    backend: &mut impl TerminalBackend,
+    controller: &mut InteractiveController,
+    notice: Option<&str>,
+) -> Result<u8, HarnessError> {
+    let mut cursor = RenderCursor {
+        at_line_start: true,
+    };
+    let mut boot = String::new();
+    for line in controller.boot_lines() {
+        boot.push_str(&line);
+        boot.push_str("\r\n");
+    }
+    if let Some(notice) = notice {
+        boot.push_str(notice);
+        boot.push_str("\r\n");
+    }
+    backend
+        .write(&boot)
+        .map_err(|error| terminal_error(&error))?;
+    draw_prompt(backend, controller, &mut cursor)?;
+    loop {
+        if backend
+            .poll_key(KEY_POLL_INTERVAL)
+            .map_err(|error| terminal_error(&error))?
+        {
+            let key = backend.read_key().map_err(|error| terminal_error(&error))?;
+            if matches!(key, Key::Resize { .. }) {
+                // A resize must not corrupt the prompt: redraw it in place and
+                // keep waiting for real input.
+                draw_prompt(backend, controller, &mut cursor)?;
+            } else {
+                let effects = controller.handle_key(key);
+                if step(backend, controller, effects, &mut cursor)? {
+                    return Ok(exit_code(&mut cursor));
+                }
+            }
+        }
+        let effects = controller.pump_events();
+        if step(backend, controller, effects, &mut cursor)? {
+            return Ok(exit_code(&mut cursor));
+        }
+    }
+}
+
+/// Apply one batch of effects; the returned flag means the app must exit.
+fn step(
+    backend: &mut impl TerminalBackend,
+    controller: &InteractiveController,
+    effects: Vec<Effect>,
+    cursor: &mut RenderCursor,
+) -> Result<bool, HarnessError> {
+    let mut redraw = false;
+    let mut exit = None;
+    for effect in effects {
+        match effect {
+            Effect::WriteLine(line) => {
+                if !cursor.at_line_start {
+                    backend
+                        .write("\r\n")
+                        .map_err(|error| terminal_error(&error))?;
+                }
+                backend
+                    .write(&line)
+                    .map_err(|error| terminal_error(&error))?;
+                backend
+                    .write("\r\n")
+                    .map_err(|error| terminal_error(&error))?;
+                cursor.at_line_start = true;
+            }
+            Effect::WritePartial(text) => {
+                backend
+                    .write(&text)
+                    .map_err(|error| terminal_error(&error))?;
+                cursor.at_line_start = false;
+            }
+            Effect::RedrawPrompt => redraw = true,
+            Effect::Exit(code) => exit = Some(code),
+        }
+    }
+    backend.flush().map_err(|error| terminal_error(&error))?;
+    if let Some(code) = exit {
+        exit_cleanup(backend, cursor)?;
+        return Ok(code == 0);
+    }
+    if redraw {
+        draw_prompt(backend, controller, cursor)?;
+    }
+    Ok(false)
+}
+
+fn exit_code(cursor: &mut RenderCursor) -> u8 {
+    cursor.at_line_start = true;
+    0
+}
+
+/// Leave the prompt line cleanly before the shell prompt returns.
+fn exit_cleanup(
+    backend: &mut impl TerminalBackend,
+    cursor: &mut RenderCursor,
 ) -> Result<(), HarnessError> {
-    let mut text = String::from("\n");
-    for line in context.header_lines() {
-        text.push_str(&line);
-        text.push('\n');
+    if !cursor.at_line_start {
+        backend
+            .write("\r\n")
+            .map_err(|error| terminal_error(&error))?;
     }
-    let session = resume.map_or_else(
-        || "new".to_owned(),
-        |session| format!("resume {session} (pending H05)"),
-    );
-    let _ = writeln!(text, "Session: {session}    Mode: trusted host");
-    if let Some(hint) = context.setup_hint() {
-        text.push_str(&hint);
-        text.push('\n');
-    }
-    text.push_str("\nNhập yêu cầu. /help trợ giúp · /status chẩn đoán · /exit thoát\n> ");
-    output
-        .write_all(text.as_bytes())
-        .and_then(|()| output.flush())
-        .map_err(|error| write_failed(&error))
+    backend.flush().map_err(|error| terminal_error(&error))
 }
 
-fn render_status(output: &mut impl Write, context: &LaunchContext) -> Result<(), HarnessError> {
-    let mut text = String::new();
-    for line in context.header_lines() {
-        text.push_str(&line);
-        text.push('\n');
+fn draw_prompt(
+    backend: &mut impl TerminalBackend,
+    controller: &InteractiveController,
+    cursor: &mut RenderCursor,
+) -> Result<(), HarnessError> {
+    if !cursor.at_line_start {
+        backend
+            .write("\r\n")
+            .map_err(|error| terminal_error(&error))?;
     }
-    let _ = writeln!(text, "Identity: {}", context.project.digest.as_str());
-    let _ = writeln!(text, "Caller:   {}", context.caller_dir.display());
-    output
-        .write_all(text.as_bytes())
-        .map_err(|error| write_failed(&error))
+    backend
+        .clear_line()
+        .map_err(|error| terminal_error(&error))?;
+    backend
+        .write(&controller.prompt())
+        .map_err(|error| terminal_error(&error))?;
+    backend.flush().map_err(|error| terminal_error(&error))?;
+    cursor.at_line_start = false;
+    Ok(())
 }
 
-/// What a submitted line means before H03 replaces this parser.
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum LineAction {
-    Empty,
-    Exit,
-    Help,
-    Status,
-    Prompt,
-    Unknown(String),
+fn terminal_error(error: &std::io::Error) -> HarnessError {
+    HarnessError::new(
+        ErrorCode::StorageWriteFailed,
+        format!("terminal input/output failed: {error}"),
+    )
 }
 
-impl LineAction {
-    fn parse(line: &str) -> Self {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return Self::Empty;
+/// Line-mode fallback used when raw mode cannot be enabled.
+///
+/// It drives the same controller one submitted line at a time, so the rules and
+/// the staged backend stay identical between the two modes.
+async fn run_line_mode(
+    context: &LaunchContext,
+    notice: Option<&str>,
+    fixture: bool,
+) -> Result<ExitCode, HarnessError> {
+    let mut controller = controller_for(context, fixture);
+    let mut output = std::io::stdout();
+    for line in controller.boot_lines() {
+        writeln!(output, "{line}").map_err(|error| io_error(&error))?;
+    }
+    if let Some(notice) = notice {
+        writeln!(output, "{notice}").map_err(|error| io_error(&error))?;
+    }
+    write!(output, "{}", controller.prompt()).map_err(|error| io_error(&error))?;
+    output.flush().map_err(|error| io_error(&error))?;
+
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Option<String>>(16);
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match handle.read_line(&mut line) {
+                Ok(0) | Err(_) => {
+                    let _ = sender.blocking_send(None);
+                    return;
+                }
+                Ok(_) => {
+                    let text = line.trim_end_matches(['\r', '\n']).to_owned();
+                    if sender.blocking_send(Some(text)).is_err() {
+                        return;
+                    }
+                }
+            }
         }
-        let Some(command) = trimmed.strip_prefix('/') else {
-            return Self::Prompt;
+    });
+
+    while let Some(line) = receiver.recv().await {
+        let Some(line) = line else {
+            writeln!(output, "bye").map_err(|error| io_error(&error))?;
+            return Ok(ExitCode::SUCCESS);
         };
-        let mut parts = command.split_whitespace();
-        let name = parts.next().unwrap_or_default();
-        let arguments = parts.next();
-        match (name, arguments) {
-            ("exit" | "quit", None) => Self::Exit,
-            ("help", None) => Self::Help,
-            ("status", None) => Self::Status,
-            _ => Self::Unknown(format!("/{}", command.trim())),
+        for character in line.chars() {
+            let _ = controller.handle_key(Key::Char(character));
+        }
+        if let Some(code) = render_line_mode(&mut controller, &mut output)? {
+            return Ok(ExitCode::from(code));
         }
     }
+    Ok(ExitCode::SUCCESS)
 }
 
-fn help_text() -> &'static str {
-    "commands: /help, /status, /exit. The full set (/new, /model, /config, /resume) arrives with HA_LAUNCH H03/H05.\n"
+fn render_line_mode(
+    controller: &mut InteractiveController,
+    output: &mut impl Write,
+) -> Result<Option<u8>, HarnessError> {
+    let mut effects = controller.handle_key(Key::Enter);
+    effects.extend(controller.pump_events());
+    let mut exit = None;
+    for effect in effects {
+        match effect {
+            Effect::WriteLine(line) => {
+                writeln!(output, "{line}").map_err(|error| io_error(&error))?;
+            }
+            Effect::WritePartial(text) => {
+                write!(output, "{text}").map_err(|error| io_error(&error))?;
+            }
+            Effect::RedrawPrompt => {}
+            Effect::Exit(code) => exit = Some(code),
+        }
+    }
+    if exit.is_none() {
+        write!(output, "{}", controller.prompt()).map_err(|error| io_error(&error))?;
+    } else {
+        writeln!(output).map_err(|error| io_error(&error))?;
+    }
+    output.flush().map_err(|error| io_error(&error))?;
+    Ok(exit)
 }
 
-fn write_failed(error: &std::io::Error) -> HarnessError {
+fn io_error(error: &std::io::Error) -> HarnessError {
     HarnessError::new(
         ErrorCode::StorageWriteFailed,
         format!("interactive output could not be written: {error}"),
@@ -215,61 +336,148 @@ fn write_failed(error: &std::io::Error) -> HarnessError {
 
 #[cfg(test)]
 mod tests {
-    use super::{LineAction, render_boot};
-    use crate::interactive::bootstrap::{self, LaunchRequest};
+    use super::{controller_for, run_loop};
+    use crate::interactive::bootstrap::{self, LaunchContext, LaunchRequest};
+    use crate::interactive::controller::InteractiveController;
+    use crate::interactive::events::Key;
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
+    use crate::interactive::service::{FixtureService, SessionChannel, SessionPort};
+    use crate::interactive::terminal::ScriptedBackend;
 
-    #[test]
-    fn h01_line_action_parses_slash_commands_without_treating_text_as_commands() {
-        assert_eq!(LineAction::parse("   "), LineAction::Empty);
-        assert_eq!(LineAction::parse("/exit"), LineAction::Exit);
-        assert_eq!(LineAction::parse("  /quit  "), LineAction::Exit);
-        assert_eq!(LineAction::parse("/help"), LineAction::Help);
-        assert_eq!(LineAction::parse("/status"), LineAction::Status);
-        assert_eq!(
-            LineAction::parse("fix the parser"),
-            LineAction::Prompt,
-            "free text is never a command"
-        );
-        assert_eq!(
-            LineAction::parse("rm -rf /"),
-            LineAction::Prompt,
-            "input is not a shell command"
-        );
-        assert!(matches!(
-            LineAction::parse("/model gpt"),
-            LineAction::Unknown(_)
-        ));
-    }
-
-    #[test]
-    fn h02_boot_render_uses_the_resolved_context_and_keeps_the_prompt_alive() {
+    /// Fixture home and project, never the developer profile.
+    fn context(configured: bool) -> (tempfile::TempDir, LaunchContext) {
         let temp = tempfile::tempdir().expect("temp root");
         let home = temp.path().join("home");
-        let project = temp.path().join("project with spaces");
+        let project = temp.path().join("project");
         std::fs::create_dir_all(&home).expect("fixture home");
         std::fs::create_dir_all(&project).expect("fixture project");
+        if configured {
+            std::fs::write(home.join("config.toml"), "schema_version = 1\n")
+                .expect("fixture config");
+        }
         let context = bootstrap::resolve(LaunchRequest {
             cwd: None,
-            caller_dir: project.clone(),
+            caller_dir: project,
             platform: HostPlatform::current(),
-            environment: LaunchEnvironment::from_pairs([(
-                "HA_HOME",
-                home.to_string_lossy().into_owned(),
-            )]),
+            environment: LaunchEnvironment::from_pairs([
+                ("HA_HOME", home.to_string_lossy().into_owned()),
+                ("DEEPSEEK_API_KEY", "fixture-secret".to_owned()),
+            ]),
             explicit_data_dir: None,
         })
         .expect("context resolves");
+        (temp, context)
+    }
 
-        let mut buffer = Vec::new();
-        render_boot(&mut buffer, &context, Some("session_01")).expect("boot render");
-        let text = String::from_utf8(buffer).expect("boot output is UTF-8");
+    fn keys_of(text: &str) -> Vec<Key> {
+        text.chars().map(Key::Char).collect()
+    }
 
-        assert!(text.contains("Harness Agents"), "{text}");
-        assert!(text.contains(&project.display().to_string()), "{text}");
-        assert!(text.contains("setup required"), "{text}");
-        assert!(text.contains("resume session_01 (pending H05)"), "{text}");
-        assert!(text.contains("HA_HOME"), "{text}");
-        assert!(text.ends_with("> "), "the prompt stays open: {text:?}");
+    #[test]
+    fn h03_scripted_terminal_renders_the_boot_header_and_exits_cleanly() {
+        let (_temp, context) = context(false);
+        let mut backend = ScriptedBackend::new(vec![Key::EndOfInput]);
+        let mut controller = controller_for(&context, false);
+        let code = run_loop(&mut backend, &mut controller, None).expect("loop runs");
+        assert_eq!(code, 0);
+
+        let output = backend.output();
+        assert!(output.contains("Harness Agents"), "{output}");
+        assert!(output.contains("setup required"), "{output}");
+        assert!(output.contains("not connected (H04)"), "{output}");
+        assert!(output.contains("> "), "the prompt is drawn: {output}");
+        assert!(
+            backend.cleared_lines() > 0,
+            "the prompt line is redrawn rather than duplicated"
+        );
+    }
+
+    #[test]
+    fn h03_scripted_terminal_echoes_vietnamese_input_and_reports_connection_pending() {
+        let (_temp, context) = context(true);
+        let mut keys = keys_of("sửa lỗi parser");
+        keys.push(Key::Enter);
+        keys.push(Key::EndOfInput);
+        let mut backend = ScriptedBackend::new(keys);
+        let mut controller = controller_for(&context, false);
+        let code = run_loop(&mut backend, &mut controller, None).expect("loop runs");
+        assert_eq!(code, 0);
+
+        let output = backend.output();
+        assert!(output.contains("> sửa lỗi parser"), "{output}");
+        assert!(output.contains("connection pending"), "{output}");
+        assert!(
+            backend
+                .writes()
+                .iter()
+                .any(|write| write.starts_with("[run] accepted ")),
+            "the run reports its admitted input id: {output}"
+        );
+    }
+
+    #[test]
+    fn h03_scripted_terminal_edits_with_backspace_before_submitting() {
+        let (_temp, context) = context(true);
+        let mut keys = keys_of("abx");
+        keys.push(Key::Backspace);
+        keys.push(Key::Char('c'));
+        keys.push(Key::Enter);
+        keys.push(Key::EndOfInput);
+        let mut backend = ScriptedBackend::new(keys);
+        let mut controller = controller_for(&context, true);
+        let code = run_loop(&mut backend, &mut controller, None).expect("loop runs");
+        assert_eq!(code, 0);
+
+        let output = backend.output();
+        assert!(
+            output.contains("fixture answer for: abc"),
+            "exactly the edited buffer reached the backend: {output}"
+        );
+        assert!(
+            !output.contains("fixture answer for: abx"),
+            "the erased character never reached the backend: {output}"
+        );
+        assert!(output.contains("fixture (no model was called)"));
+    }
+
+    #[test]
+    fn h03_resize_redraws_the_prompt_without_losing_the_buffer() {
+        let (_temp, context) = context(true);
+        let mut keys = keys_of("hi");
+        keys.push(Key::Resize {
+            columns: 120,
+            rows: 40,
+        });
+        keys.push(Key::Enter);
+        keys.push(Key::EndOfInput);
+        let mut backend = ScriptedBackend::new(keys);
+        let mut controller = controller_for(&context, false);
+        let code = run_loop(&mut backend, &mut controller, None).expect("loop runs");
+        assert_eq!(code, 0);
+        assert!(backend.output().contains("> hi"), "{}", backend.output());
+        assert!(backend.cleared_lines() >= 3, "every redraw clears the line");
+    }
+
+    #[test]
+    fn h03_fixture_run_renders_a_requested_failure_and_is_labelled() {
+        let (_temp, context) = context(true);
+        let channel = SessionChannel::new();
+        let service: Box<dyn SessionPort> = Box::new(FixtureService::new(channel.sender()));
+        let mut controller = InteractiveController::new(&context, service, channel);
+        let boot = controller.boot_lines().join("\n");
+        assert!(boot.contains("fixture (no model was called)"), "{boot}");
+
+        let mut keys = keys_of("please fail");
+        keys.push(Key::Enter);
+        keys.push(Key::EndOfInput);
+        let mut backend = ScriptedBackend::new(keys);
+        let code = run_loop(&mut backend, &mut controller, None).expect("loop runs");
+        assert_eq!(code, 0);
+        let output = backend.output();
+        assert!(output.contains("[tool] search_text failed"), "{output}");
+        assert!(
+            output.contains("[run] failed: fixture failure requested by the prompt"),
+            "{output}"
+        );
     }
 }

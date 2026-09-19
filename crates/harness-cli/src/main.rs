@@ -117,6 +117,10 @@ struct ChatArgs {
     /// Resume one persisted session inside the interactive app.
     #[arg(long)]
     resume: Option<String>,
+    /// Use the labelled local fixture backend instead of a model; no provider is
+    /// called and the header says so.
+    #[arg(long)]
+    fixture: bool,
     /// Run exactly one turn without a terminal and print the result to stdout.
     #[arg(long, requires = "prompt")]
     headless: bool,
@@ -133,6 +137,7 @@ impl ChatArgs {
         interactive::mode_from_args(
             self.cwd.clone(),
             self.resume.clone(),
+            self.fixture,
             self.headless,
             self.prompt.clone(),
             self.json,
@@ -316,6 +321,7 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
             interactive::launch(interactive::LaunchMode::Interactive {
                 cwd: None,
                 resume: None,
+                fixture: false,
             })
             .await
         }

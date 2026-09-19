@@ -12,6 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+# Pinned in the HA_LAUNCH H03 spike; default features cover raw mode, key events
+# and bracketed paste on Windows and Unix.
+crossterm = "=0.29.0"
 harness-types = { path = "../harness-types" }
 harness-providers = { path = "../harness-providers" }
 harness-session = { path = "../harness-session" }

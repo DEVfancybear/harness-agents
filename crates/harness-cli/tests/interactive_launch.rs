@@ -243,6 +243,49 @@ fn i02_help_and_version_stay_fast_paths_that_write_nothing() {
 }
 
 #[test]
+fn i03_fixture_route_never_bypasses_the_terminal_or_headless_contract() {
+    let sandbox = Sandbox::new();
+
+    // The fixture backend is an explicit opt-in for the interactive app only; it
+    // must not make a piped launch succeed.
+    let piped = sandbox.run(&["chat", "--fixture"]);
+    assert_eq!(piped.code(), 2, "stderr was: {}", piped.stderr);
+    assert!(
+        piped.stderr.contains("no interactive terminal"),
+        "{}",
+        piped.stderr
+    );
+
+    // A single headless turn must report the real backend state, never a fixture.
+    let headless = sandbox.run(&[
+        "chat",
+        "--headless",
+        "--prompt",
+        "hello",
+        "--fixture",
+        "--json",
+    ]);
+    assert_eq!(headless.code(), 2, "stdout was: {}", headless.stdout);
+    assert!(
+        headless.stderr.contains("--fixture is only valid"),
+        "{}",
+        headless.stderr
+    );
+
+    // The flag is documented where the operator looks for it.
+    let help = sandbox.run(&["chat", "--help"]);
+    assert_eq!(help.code(), 0, "stderr was: {}", help.stderr);
+    assert!(help.stdout.contains("--fixture"), "{}", help.stdout);
+    assert!(help.stdout.contains("--headless"), "{}", help.stdout);
+
+    assert!(
+        sandbox.state_entries().is_empty(),
+        "refused launches wrote state: {:?}",
+        sandbox.state_entries()
+    );
+}
+
+#[test]
 fn i02_existing_subcommands_keep_their_dispatch_and_output() {
     let sandbox = Sandbox::new();
     let config = repository_fixture("tests/fixtures/p0/config/valid.toml");

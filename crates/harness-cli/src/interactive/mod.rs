@@ -8,9 +8,15 @@
 pub mod app;
 pub mod bootstrap;
 pub mod config;
+pub mod controller;
 pub mod detector;
+pub mod events;
 pub mod headless;
+pub mod input;
 pub mod paths;
+pub mod service;
+pub mod terminal;
+pub mod view;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -49,6 +55,9 @@ pub enum LaunchMode {
     Interactive {
         cwd: Option<PathBuf>,
         resume: Option<String>,
+        /// Explicit opt-in to the labelled fixture backend; never a default and
+        /// never a silent production fallback.
+        fixture: bool,
     },
     /// Run exactly one turn without a terminal.
     Headless {
@@ -67,6 +76,7 @@ pub enum LaunchMode {
 pub fn mode_from_args(
     cwd: Option<PathBuf>,
     resume: Option<String>,
+    fixture: bool,
     headless: bool,
     prompt: Option<String>,
     json: bool,
@@ -82,7 +92,16 @@ pub fn mode_from_args(
                 "--json is only valid with --headless; run ha chat --headless --prompt <text> --json",
             ));
         }
-        return Ok(LaunchMode::Interactive { cwd, resume });
+        return Ok(LaunchMode::Interactive {
+            cwd,
+            resume,
+            fixture,
+        });
+    }
+    if fixture {
+        return Err(UsageError::new(
+            "--fixture is only valid for the interactive app; a headless turn must report the real backend state",
+        ));
     }
     let Some(prompt) = prompt else {
         return Err(UsageError::new(
@@ -115,9 +134,11 @@ pub async fn launch(mode: LaunchMode) -> Result<ExitCode, HarnessError> {
             cwd,
             resume,
         }),
-        LaunchMode::Interactive { cwd, resume } => {
-            launch_interactive_with(&detector::SystemTerminalDetector, cwd, resume).await
-        }
+        LaunchMode::Interactive {
+            cwd,
+            resume,
+            fixture,
+        } => launch_interactive_with(&detector::SystemTerminalDetector, cwd, resume, fixture).await,
     }
 }
 
@@ -126,13 +147,19 @@ pub async fn launch_interactive_with(
     detector: &dyn detector::TerminalDetector,
     cwd: Option<PathBuf>,
     resume: Option<String>,
+    fixture: bool,
 ) -> Result<ExitCode, HarnessError> {
     let capability = detector.capability();
     if !capability.is_interactive() {
         eprint!("{}", non_terminal_guidance(capability));
         return Ok(ExitCode::from(USAGE_EXIT_CODE));
     }
-    app::run(app::AppLaunch { cwd, resume }).await
+    app::run(app::AppLaunch {
+        cwd,
+        resume,
+        fixture,
+    })
+    .await
 }
 
 /// Guidance printed to stderr when the interactive app cannot own a terminal.
@@ -155,16 +182,18 @@ mod tests {
     #[test]
     fn h01_mode_from_args_accepts_bare_and_optioned_interactive_launch() {
         assert_eq!(
-            mode_from_args(None, None, false, None, false).expect("bare launch is valid"),
+            mode_from_args(None, None, false, false, None, false).expect("bare launch is valid"),
             LaunchMode::Interactive {
                 cwd: None,
-                resume: None
+                resume: None,
+                fixture: false
             }
         );
         assert_eq!(
             mode_from_args(
                 Some(PathBuf::from("C:/work/project")),
                 Some("session_1".to_owned()),
+                true,
                 false,
                 None,
                 false
@@ -172,25 +201,26 @@ mod tests {
             .expect("interactive launch with options is valid"),
             LaunchMode::Interactive {
                 cwd: Some(PathBuf::from("C:/work/project")),
-                resume: Some("session_1".to_owned())
+                resume: Some("session_1".to_owned()),
+                fixture: true
             }
         );
     }
 
     #[test]
     fn h01_mode_from_args_requires_prompt_for_headless() {
-        let error =
-            mode_from_args(None, None, true, None, false).expect_err("headless needs a prompt");
+        let error = mode_from_args(None, None, false, true, None, false)
+            .expect_err("headless needs a prompt");
         assert!(error.to_string().contains("--headless requires --prompt"));
 
-        let error = mode_from_args(None, None, true, Some("   ".to_owned()), false)
+        let error = mode_from_args(None, None, false, true, Some("   ".to_owned()), false)
             .expect_err("blank prompt is rejected");
         assert!(error.to_string().contains("must not be empty"));
     }
 
     #[test]
     fn h01_mode_from_args_rejects_headless_only_flags_without_headless() {
-        let error = mode_from_args(None, None, false, Some("hello".to_owned()), false)
+        let error = mode_from_args(None, None, false, false, Some("hello".to_owned()), false)
             .expect_err("prompt without headless is rejected");
         assert!(
             error
@@ -198,7 +228,7 @@ mod tests {
                 .contains("--prompt is only valid with --headless")
         );
 
-        let error = mode_from_args(None, None, false, None, true)
+        let error = mode_from_args(None, None, false, false, None, true)
             .expect_err("json without headless is rejected");
         assert!(
             error
@@ -208,9 +238,30 @@ mod tests {
     }
 
     #[test]
+    fn h03_fixture_is_rejected_for_a_headless_turn() {
+        let error = mode_from_args(
+            None,
+            None,
+            true,
+            true,
+            Some("fix the parser".to_owned()),
+            false,
+        )
+        .expect_err("a headless turn must not silently use the fixture");
+        assert!(error.to_string().contains("--fixture is only valid"));
+    }
+
+    #[test]
     fn h01_headless_mode_carries_prompt_and_json_flag() {
-        let mode = mode_from_args(None, None, true, Some("fix the parser".to_owned()), true)
-            .expect("headless launch is valid");
+        let mode = mode_from_args(
+            None,
+            None,
+            false,
+            true,
+            Some("fix the parser".to_owned()),
+            true,
+        )
+        .expect("headless launch is valid");
         assert_eq!(
             mode,
             LaunchMode::Headless {
