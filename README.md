@@ -1,5 +1,7 @@
 # Harness Agents
 
+**Plan: nâng `ha` thành TUI terminal (track T01–T08) — 19/09/2026:** [Feature plan HA_TUI](docs/HA_TUI_PLAN.vi.md) và [prompt giao DeepSeek](docs/HA_TUI_PROMPT.vi.md). Inline viewport kiểu Codex trên app tương tác hiện có (ratatui + crossterm đã pin), plain mode giữ làm fallback; planning only, chưa có code T.
+
 **Plan: gõ `ha` để mở CLI tương tác:** [Feature plan H01–H08](docs/HA_LAUNCH_PLAN.vi.md) và [prompt giao DeepSeek](docs/HA_LAUNCH_PROMPT.vi.md). Phân biệt cài/PATH với interactive startup; triển khai feature này trên CLI hiện tại, chưa phải tính năng đã hoàn thành.
 
 **Coding handoff / Giao DeepSeek code — 19/09/2026:** Read the [implementation pack](docs/implementation-next/README.vi.md) and use the [ready-to-copy M0-01 prompt](docs/implementation-next/PROMPTS.vi.md). Includes M0–M12 runbooks, concrete contracts, acceptance oracles and restart handoffs. / Bộ hướng dẫn chi tiết để DeepSeek code từng phần, bắt đầu M0-01; chưa triển khai runtime mới.
