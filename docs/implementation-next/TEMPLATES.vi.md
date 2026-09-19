@@ -4,13 +4,17 @@
 
 ## 1. SPEC trước khi code
 
-Tạo `vnext/docs/specs/Mn.vi.md` (hoặc work item cụ thể) khi milestone được giao, không tạo mọi SPEC trước. Đây là template, không bằng chứng implementation:
+Tạo `docs/specs/Mn.vi.md` (hoặc work item cụ thể) khi milestone được giao, không tạo mọi SPEC trước. Đây là template, không bằng chứng implementation:
 
 ```text
 Assignment: M?-?? ; source/base revision: ... ; working tree changes: ...
 Goal / non-goals:
 Prerequisites + evidence revisions + verification performed:
-Logical module -> actual path map:
+Logical module -> existing symbol/path -> callers -> tests:
+Requirement inventory: reuse_verified / adapt / missing / incompatible + evidence:
+CLI integration: entrypoint -> application service -> existing runtime/tool/store:
+Existing P/H regressions to preserve; new assertions required:
+Compatibility: previous config/data/JSON fixture + migration/recovery behavior:
 Contract versions / schemas / migrations touched:
 ADR decisions, defaults overridden and reasons:
 Invariants / failure modes / rollback or compatibility behavior:
@@ -24,7 +28,7 @@ Authority already granted (network, paid smoke, commit/push etc.):
 
 ## 2. Evidence sau verification
 
-Tạo `vnext/docs/evidence/Mn.vi.md`. Khi chưa commit, dùng base commit + reproducible tracked/untracked source manifest/hash, không ghi HEAD như thể toàn diff đã nằm trong commit. Nếu test revision khác final revision, rerun hoặc ghi chính xác docs-only delta và lý do.
+Tạo `docs/evidence/Mn.vi.md`. Khi chưa commit, dùng base commit + reproducible tracked/untracked source manifest/hash, không ghi HEAD như thể toàn diff đã nằm trong commit. Nếu test revision khác final revision, rerun hoặc ghi chính xác docs-only delta và lý do.
 
 ```text
 Milestone/work items covered:
@@ -42,11 +46,11 @@ Remaining limitations: platform not run, paid smoke not run, unsupported feature
 Required gates not run -> milestone cannot be accepted
 ```
 
-Logs đặt trong `vnext/.artifacts/verification/` có ignore rule, chia sẻ redacted selected evidence; docs không link tới file bị ignore mà reviewer không thể lấy. Artifact manifest có commands để tái tạo. Không commit credentials/generated runtime databases.
+Logs đặt trong `target/verification/` có ignore rule, chia sẻ redacted selected evidence; docs không link tới file bị ignore mà reviewer không thể lấy. Artifact manifest có commands để tái tạo. Không commit credentials/generated runtime databases.
 
 ## 3. Handoff khi hết context hoặc dừng
 
-Tạo/cập nhật `vnext/docs/handoffs/CURRENT.vi.md`, link milestone-specific handoff nếu cần. File này không thay store state của sản phẩm.
+Tạo/cập nhật `docs/handoffs/CURRENT.vi.md`, link milestone-specific handoff nếu cần. File này không thay store state của sản phẩm.
 
 ```text
 Current assignment and latest user constraints:

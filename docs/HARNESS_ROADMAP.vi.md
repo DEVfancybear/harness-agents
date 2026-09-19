@@ -4,13 +4,13 @@
 
 [Master plan](HARNESS_MASTER_PLAN.vi.md) · [English overview](HARNESS_MASTER_PLAN.en.md) · [Nguồn nghiên cứu](research/DEERFLOW_RESEARCH_2026-09-15.md)
 
-**Bổ sung 19/09/2026:** dùng [sổ tay coding cho DeepSeek](implementation-next/README.vi.md) để triển khai roadmap này: runbook M0–M12, contracts cụ thể, 36 acceptance specifications có test oracle, prompt giao việc và mẫu handoff. IDs/ước lượng của roadmap giữ nguyên; bộ mới phân rã cách thực hiện, không nhận runtime đã được triển khai. Default code mới trong workspace độc lập `vnext/` để tránh đụng code/data cũ.
+**Bổ sung 19/09/2026:** dùng [sổ tay coding cho DeepSeek](implementation-next/README.vi.md) để triển khai roadmap này: runbook M0–M12, contracts cụ thể, 36 acceptance specifications có test oracle, prompt giao việc và mẫu handoff. IDs/ước lượng của roadmap giữ nguyên; bộ mới phân rã cách thực hiện, không nhận runtime đã được triển khai. Mọi M/H sửa source trong root workspace và cùng binary `ha`; bắt đầu bằng [bản đồ tích hợp](implementation-next/INTEGRATION_MAP.vi.md).
 
 ## 1. Cách dùng và phạm vi dự toán
 
-**Ưu tiên trải nghiệm khởi động:** [track H01–H08](HA_LAUNCH_PLAN.vi.md) xử lý yêu cầu gõ `ha` để mở CLI tương tác, trên binary/CLI hiện tại. Track H độc lập với M0–M12 và có [prompt riêng](HA_LAUNCH_PROMPT.vi.md); không bắt chờ workspace vnext hay toàn roadmap mới. Đây là plan bổ sung, chưa là runtime đã hoàn thành.
+**Ưu tiên trải nghiệm khởi động:** [track H01–H08](HA_LAUNCH_PLAN.vi.md) xử lý yêu cầu gõ `ha` để mở CLI tương tác, trên binary/CLI hiện tại. Track H có [prompt riêng](HA_LAUNCH_PROMPT.vi.md) và là lát cắt ưu tiên của cùng sản phẩm; không phải ngoại lệ kiến trúc. Các phần H đã triển khai được đối chiếu/test và reuse ở M2/M3/M4/M9; không bắt làm lại hoặc chờ toàn roadmap. Đọc evidence H hiện tại để biết trạng thái, không suy từ ngày lập plan.
 
-Đây là roadmap **thiết kế mới**, không tính phần code cũ đã làm được bao nhiêu, không yêu cầu vá/review các phase cũ. Work items là output tương lai; không đánh dấu hoàn thành chỉ vì implementation cũ có tên tương tự.
+Đây là roadmap **nâng cấp code hiện tại**. IDs M mô tả yêu cầu/coverage cần đối chiếu, không tuyên bố source chưa có tính năng tương ứng. Trước mỗi assignment phải phân loại từng requirement reuse_verified/adapt/missing/incompatible; giữ P/H regressions, bổ sung test cho gap và nối vào luồng `ha` hiện tại. Nhãn planned của tài liệu không reset tiến độ implementation.
 
 Giả định một developer có kinh nghiệm Rust, model qua API, Windows/Linux, một local user và một writable host. Ngày công gồm code + integration tests + docs/handoff, chưa có số liệu velocity thực tế. Các công việc compatibility/live-provider cần re-estimate sau prototype.
 
@@ -20,13 +20,13 @@ Ba mốc có giá trị sử dụng:
 - **M0–M9:** CLI v1 có skills/MCP, reusable memory và nhiều agent, đủ release theo profile tin cậy đã công bố.
 - **M10–M12:** Web, daemon/scheduler và strict backend là nhánh mở rộng có điều kiện, không bắt buộc chờ nhau.
 
-Không tự quy đổi “nhiều agents” thành số ngày chia cho số agent. Không cộng dự toán này vào roadmap P0–P8 cũ.
+Các số ngày dưới đây là dự toán phạm vi đầy đủ ban đầu, chỉ giữ làm tham khảo. Sau inventory phải tính lại effort còn thiếu; không cộng lại phần P/H đã có. Không quy đổi số agents thành hệ số chia ngày.
 
 ## 2. Milestones, dependencies và điều kiện nghiệm thu
 
 | Mốc | Phụ thuộc | Đầu ra | Ngày công | Exit gate |
 |---|---|---|---:|---|
-| M0 Contracts và executable skeleton | — | IDs/domain state/ports, ADR, schemas, acceptance registry, CLI skeleton | 3–5 | Contracts validate/round-trip; boundaries không vòng; fixture gate chạy thật |
+| M0 Baseline và contracts tích hợp | — | Source/test inventory, gaps IDs/state/ports, ADR/schema, CLI và registry hiện tại | 3–5 | Contracts validate/round-trip; boundaries không vòng; fixture gate chạy thật |
 | M1 Durable store và recovery | M0 | Journal/inbox/projections/fence/artifacts/checkpoints | 7–10 | Crash tại ACK/receipt/checkpoint không mất committed work; read-only replay không dispatch |
 | M2 Provider protocol và stream | M0 | Typed messages, mock + DeepSeek adapter, capability/config model, stream decoder | 5–8 | Multi-tool chunk conformance; partial/error/cancel; secrets ngoài records |
 | M3 TurnDriver và application service | M1, M2 | Run/step/attempt, bounded loop, questions/approvals ports, budget, goal/stop logic | 6–9 | Multi-step với fixture tools; admit input một lần; mọi path terminal/recoverable đúng |
@@ -46,7 +46,7 @@ M2 có thể phát triển độc lập sau M0 về mặt dependencies, nhưng r
 
 ## 3. Work items để giao thành PR
 
-Mỗi milestone có bốn work items theo thứ tự. Các targets dưới đây là logical modules trong master plan, không ép giữ file layout/code hiện tại. Integration owner của milestone chịu trách nhiệm ghép các modules và kiểm chứng trên revision cuối.
+Mỗi milestone có bốn work items theo thứ tự. Các targets dưới đây là logical modules được ánh xạ vào source hiện tại qua bản đồ tích hợp. Reuse trước; refactor có mục tiêu và cập nhật callers/tests khi contracts cần thay đổi. Integration owner của milestone chịu trách nhiệm ghép các modules và kiểm chứng trên revision cuối.
 
 ### 3.1. M0 — Contracts và ranh giới
 
@@ -54,7 +54,7 @@ Mỗi milestone có bốn work items theo thứ tự. Các targets dưới đây
 |---|---|---|---|
 | M0-01 | Chốt product profiles, identities, task/session/run/step/invocation states, error taxonomy | contracts/core + ADR | State transition invalid bị reject; phân biệt run completed và task satisfied |
 | M0-02 | Định nghĩa ports store/provider/tool/execution/context, event envelope và schemas | contracts + dependency rules | Serialization/version fixtures; core không import app/UI/SQL |
-| M0-03 | CLI skeleton/config schema strict, composition root, fixture driver | app/CLI + test harness | Config invalid/unknown field fail rõ; `--json`/exit codes có contract |
+| M0-03 | Kiểm tra/mở rộng CLI config hiện tại, composition root và fixture driver | app/CLI + test harness | Config invalid/unknown field fail rõ; `--json`/exit codes có contract |
 | M0-04 | Acceptance registry, failpoint interface, data samples không secrets | tests/docs | Gate chạy đúng test count; trạng thái planned khác accepted |
 
 ### 3.2. M1 — Durable execution data
@@ -264,7 +264,7 @@ Không cần tạo 11 ADR rỗng ở M0. M0 chốt ranh giới và danh mục; o
 
 ## 7. Nhịp giao việc, nghiệm thu và quản lý thay đổi
 
-Mỗi assignment gồm milestone/work-item IDs, scope, non-goals, contracts, target modules, dependencies, acceptance cases và ngân sách. Implementer bắt đầu bằng SPEC ngắn; mỗi PR chỉ nên có một thay đổi hành vi kiểm chứng được. Khi reuse code cũ trong tương lai, kiểm tra theo contracts mới thay vì mặc định được miễn nghiệm thu.
+Mỗi assignment gồm milestone/work-item IDs, scope, non-goals, contracts, target modules, dependencies, acceptance cases và ngân sách. Implementer bắt đầu bằng SPEC ngắn; mỗi PR chỉ nên có một thay đổi hành vi kiểm chứng được. Bắt buộc khảo sát/reuse code hiện tại và kiểm tra theo contracts; ghi test nào đã đủ, assertion nào còn thiếu để không viết lại subsystem.
 
 Gate milestone: format/lint/type/build; required tests với discovery count; predecessor regressions; schema/backward-compat; docs/source links; review invariants; evidence/handoff. Tính accepted từ evidence ở revision cuối, không từ việc sửa status JSON. Runtime verification không bị thay bằng docs verification.
 
@@ -275,9 +275,10 @@ Prompt giao bước đầu:
 ```text
 Triển khai M0 của kế hoạch mới tại docs/HARNESS_MASTER_PLAN.vi.md
 và docs/HARNESS_ROADMAP.vi.md. Chỉ xử lý M0-01..M0-04.
-Lấy contracts/product goals mới làm chuẩn; không yêu cầu giữ kiến trúc code cũ.
+Đọc INTEGRATION_MAP, khảo sát code/tests hiện tại, chỉ patch gaps theo contracts.
+Giữ root workspace và binary ha; không tạo codebase/runtime/CLI thứ hai.
 Giữ nguyên dữ liệu/thay đổi không liên quan. Chốt SPEC và ADR nền tảng,
-tạo skeleton tối thiểu cùng schema/state/boundary tests và acceptance registry.
+nối chức năng vào modules hiện tại; mở rộng schema/state/boundary tests và registry.
 Không triển khai trước M1–M12. Bàn giao source revision, commands/results,
 limitations và next action. Commit/push/release theo quyền trong assignment.
 ```

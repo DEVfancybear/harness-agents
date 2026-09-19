@@ -8,7 +8,7 @@ Nguồn chính là repository công khai [bytedance/deer-flow](https://github.co
 
 Lượt một đọc architecture/docs và các đường source: lead assembly, context/compaction/history, provider/runtime, skills/deferred tools, subagents/acceptance, sandbox, memory và event projections. Lượt hai mở rộng: goals/continuations, thread lineage, stream gaps, scheduled occurrences, long-running MCP tasks, upload handling, credentials/environment, auth, config reload và checkpoint retention.
 
-Theo yêu cầu cập nhật, kết quả cuối là **bản thiết kế tổng thể mới**. Code cũ của Harness không được dùng để xác định thứ tự sửa lỗi hoặc giới hạn kiến trúc. Bản draft phân tích khoảng trống implementation cũ đã được thay bằng master plan/roadmap mới.
+Kết quả nghiên cứu là requirements/kiến trúc mục tiêu để **nâng cấp Harness hiện tại**. Hiệu chỉnh phạm vi ngày 19/09/2026: áp dụng các cơ chế đã chọn vào cùng root workspace và CLI `ha`; kiểm kê code/tests hiện tại để reuse/refactor/bổ sung gap, không tạo sản phẩm song song. Đây là chỉnh cách áp dụng nghiên cứu, không phải một lượt khảo sát upstream mới.
 
 Phương pháp: đọc tài liệu và source/snippets liên quan, đối chiếu contract với call sites và test tiêu biểu. Graph MCP không có callable tools trong phiên; dùng source search trực tiếp. Không chạy DeerFlow server, không chạy toàn bộ test suite upstream và không đo live-model benchmark. Đây không phải line-by-line security audit hay cam kết không còn mọi lỗi.
 

@@ -1,14 +1,14 @@
 # Sổ tay triển khai cho DeepSeek — kế hoạch mới M0–M12
 
-**19/09/2026 · Chỉ đặc tả triển khai, chưa có runtime mới.**
+**19/09/2026 · Kế hoạch nâng cấp source hiện tại; một workspace, một CLI `ha`.**
 
 [Master plan](../HARNESS_MASTER_PLAN.vi.md) · [Roadmap](../HARNESS_ROADMAP.vi.md) · [Contracts](CONTRACTS.vi.md) · [Acceptance chi tiết](ACCEPTANCE.vi.md) · [Prompt giao việc](PROMPTS.vi.md) · [Mẫu SPEC/evidence/handoff](TEMPLATES.vi.md) · [Manifest máy đọc](manifest.json)
 
 ## 1. DeepSeek phải đọc gì và làm đến đâu
 
-**Ngoại lệ cho assignment khởi động `ha`:** khi user giao [HA_LAUNCH H01–H08](../HA_LAUNCH_PLAN.vi.md), dùng [prompt H](../HA_LAUNCH_PROMPT.vi.md) và sửa CLI hiện tại; không áp default `vnext/`/`ha-next` của bộ M. Chỉ feature startup này được override; các assignments M vẫn theo sổ tay bên dưới.
+**Áp dụng cho mọi assignment M và H:** sửa và tích hợp vào source hiện tại, dùng root Cargo workspace và binary `ha`. Tên thư mục `implementation-next` chỉ đặt tên cho bộ tài liệu cho bước phát triển tiếp theo. [HA_LAUNCH H01–H08](../HA_LAUNCH_PLAN.vi.md) và [prompt H](../HA_LAUNCH_PROMPT.vi.md) tuân theo cùng nguyên tắc, không có ngoại lệ tạo codebase hoặc CLI thứ hai.
 
-Đây là bộ hướng dẫn coding, tách khỏi runbooks P0–P8 cũ. Mỗi lượt chỉ nhận **một milestone hoặc một work item**; mặc định bắt đầu M0-01, không đọc xong rồi triển khai toàn M0–M12. Bộ này không yêu cầu model nhớ toàn bộ cuộc trò chuyện: quyết định phải nằm trong SPEC/ADR, trạng thái đang làm phải nằm trong handoff.
+Đây là bộ hướng dẫn nâng cấp project đang có. Runbooks/evidence P0–P8 và H là căn cứ kiểm tra implementation hiện tại; M0–M12 bổ sung yêu cầu và acceptance, không reset thành quả đã làm. Mỗi lượt chỉ nhận **một milestone hoặc một work item**; mặc định bắt đầu M0-01, không đọc xong rồi triển khai toàn M0–M12. Bộ này không yêu cầu model nhớ toàn bộ cuộc trò chuyện: quyết định phải nằm trong SPEC/ADR, trạng thái đang làm phải nằm trong handoff.
 
 Thứ tự đọc tối thiểu:
 
@@ -19,45 +19,36 @@ Thứ tự đọc tối thiểu:
 
 Thứ tự thẩm quyền: yêu cầu mới nhất của user → master plan → contracts/roadmap → runbook → SPEC implementation. Nếu user đã cho phép một thay đổi, không hỏi lại vì câu hướng dẫn chung. Routine implementation choices có default ở đây; tự quyết và ghi SPEC. Chỉ cần làm rõ khi yêu cầu mâu thuẫn thực sự, credentials không có, hoặc action ngoài phạm vi được giao.
 
-## 2. Quyết định đường dẫn để bắt đầu mà không mắc vào code cũ
+## 2. Một workspace hiện tại, một CLI `ha`
 
-Default triển khai mới trong **`vnext/`**, một Cargo workspace độc lập có `[workspace]` riêng, lockfile/toolchain riêng; data directory fixture/runtime riêng. Binary trong thời gian phát triển tên **`ha-next`**. Không sửa members của workspace cũ, không xóa code cũ, không migrate data cũ ngầm. Đây là vùng code mới, không phải worktree mới hoặc repo mới.
+Mọi thay đổi nằm trong root `Cargo.toml`, dùng chung `Cargo.lock`, toolchain và các crate `harness-*` hiện có. Entry point sản phẩm vẫn là `crates/harness-cli/src/main.rs`, binary `ha`. Thêm module/refactor code đang có khi cần; không tạo workspace lồng, binary sản phẩm khác hoặc một runtime chạy song song.
 
-M0 chỉ tạo contracts/core/app/CLI/testkit tối thiểu và placeholder ports cần dùng. Các crates còn lại chỉ tạo khi milestone sở hữu cần; không tạo 14 crates rỗng. M0 ghi `layout-map` trong SPEC để ánh xạ logical modules sang actual paths. Rename/gộp module được phép nếu cùng boundary và cập nhật map, imports, gate commands, docs trong cùng change. Default paths trong runbooks tránh DeepSeek tự chọn cấu trúc khác ở mỗi lượt.
+Đọc [bản đồ tích hợp](INTEGRATION_MAP.vi.md) trước khi sửa. Bảng dưới ánh xạ **logical shorthand** của runbooks; tên file là mục tiêu cần đối chiếu, không là lệnh tạo bản sao nếu symbol đã nằm ở file khác.
 
-Trong câu trên, “placeholder ports” nghĩa declarations của typed interfaces, **không phải methods trả success giả**. M0-01 được phép bootstrap `vnext/Cargo.toml` và contracts/core manifests tối thiểu để chạy reducer tests ngay; M0-03 hoàn thiện workspace config/CLI/testkit, không đợi tới M0-03 mới có test chạy được.
-
-```text
-vnext/
-  Cargo.toml, Cargo.lock, rust-toolchain.toml
-  crates/{contracts,core,app,cli,testkit}/...
-  crates/{store,providers,runtime,tools,execution,context}/...  # tạo theo mốc
-  crates/{extensions,memory,orchestrator}/...                # tạo sau
-  tests/fixtures/<milestone>/...
-  tests/acceptance/registry.json
-  schemas/...
-  scripts/Verify-Milestone.ps1                               # M0 tạo
-  docs/{specs,adr,evidence,handoffs}/...
-```
-
-Giai đoạn M9 mới quyết định cutover tên `ha`/workspace chính, installation path và import dữ liệu qua ADR/migration có backup. Không gắn việc cutover vào M0. User có thể giao vị trí khác; ghi override trong SPEC trước edits và giữ data isolation.
-
-Quy ước shorthand trong dòng **Files/ownership** của runbook:
-
-| Shorthand | Default actual path |
+| Shorthand | Owner hiện tại / đường dẫn cần kiểm tra |
 |---|---|
-| `contracts/x.rs`, `core/x.rs`, `runtime/x.rs`, `store/x.rs`, ... | `vnext/crates/<module>/src/x.rs` |
-| `store/migrations`, `store/memory_schema.rs` | SQL files ở `vnext/crates/store/migrations/`; schema runner ở `vnext/crates/store/src/memory_schema.rs` |
-| `cli/x.rs`, `api/x.rs`, `daemon/x.rs`, `testkit/x.rs` | `vnext/crates/<module>/src/x.rs`, tạo crate đúng milestone |
-| `schemas`, `tests/fixtures`, `scripts`, `docs` | Thư mục cùng tên dưới `vnext/` |
-| `web/...` | `vnext/web/...`, chỉ tạo tại M10 |
-| `crates/...`, `Cargo.toml`, `rust-toolchain.toml` | Relative trực tiếp với `vnext/` |
+| `contracts/*` | `crates/harness-types/src/` |
+| `core/*`, `context/*` | `crates/harness-session/src/`; trạng thái run/acceptance đối chiếu thêm types/runtime |
+| `store/*` | `crates/harness-store-sqlite/src/`, migrations trong crate này |
+| `providers/*`, `runtime/*` | `crates/harness-providers/src/`, `crates/harness-runtime/src/` |
+| `tools/*`, `execution/*` | `crates/harness-tools/src/`; TurnDriver hiện ở crate này phải được tái sử dụng |
+| `extensions/*` | `crates/harness-extensions/src/`; kernel lifecycle thuộc `crates/harness-kernel/src/` |
+| `memory/*`, `orchestrator/*` | `crates/harness-memory/src/`, `crates/harness-orchestrator/src/` |
+| Backup/restore/retention | `crates/harness-maintenance/src/`, phối hợp store hiện tại |
+| `app/*`, `cli/*` | Composition/controllers trong `crates/harness-cli/src/`, gọi services hiện có; không nhét business loop vào renderer |
+| `testkit/*` | Helpers/fixtures của test suites hiện tại; chỉ tách shared helper khi có consumer thật |
+| `api/*`, `daemon/*`, `web/*` | Chỉ thêm ở M10/M11 khi được giao, trong cùng repo/workspace, dùng chung runtime/services |
+| `schemas`, `tests`, `scripts`, `docs` | Thư mục tại root repository; giữ các registry/gate/evidence hiện có |
 
-Đừng tạo đồng thời `vnext/store` và `vnext/crates/store` vì đọc shorthand như path literal. Integration acceptance targets mặc định ở `vnext/crates/cli/tests/milestone_mn.rs` (package `ha-next-cli`, hoặc application integration-test package được SPEC chốt khi dependencies tăng); reusable fixtures ở `ha-next-testkit`. Gate phải gọi exact package/target thực có trong runtime registry, không giả file top-level `vnext/tests` tự được Cargo discover.
+M0 là kiểm kê và chuẩn hóa contracts trên code đang có. Mỗi requirement phải ghi `reuse_verified / adapt / missing / incompatible`, source symbol, tests đã có, khoảng trống và hành động. Không tự scaffold lại types/store/runtime. Crate nội bộ mới chỉ được tạo trong root workspace khi SPEC chứng minh boundary cần tách và không tạo engine mới.
+
+Integration tests ưu tiên mở rộng target hiện tại. Khi cần target M riêng, dùng `crates/harness-cli/tests/milestone_mn.rs` (package `harness-cli`). Tái sử dụng acceptance registry `tests/acceptance/registry.json`; nếu schema hiện tại không chứa mapping M, thêm `tests/acceptance/milestones.json` tham chiếu cùng test selectors, không tạo verdict authority cạnh tranh.
+
+Data directory/session/store hiện tại phải tiếp tục được hỗ trợ. Schema thay đổi qua migrations versioned, fixture dữ liệu phiên bản trước và recovery khi migration lỗi. Không âm thầm reset database hoặc đổi data home để tránh xử lý compatibility. Fixture tests dùng temp directory riêng; điều này không tạo runtime sản phẩm riêng.
 
 ## 3. Chu trình một assignment
 
-1. **Inventory:** xác minh branch/revision/status; liệt kê files được sửa; xác minh predecessor gate, không tin mỗi dòng “completed” trong handoff.
+1. **Inventory:** xác minh branch/revision/status; liệt kê files được sửa và thay đổi của người dùng cần giữ; đối chiếu source/test với requirement qua bản đồ tích hợp; xác minh predecessor gate, không tin mỗi dòng “completed” trong handoff.
 2. **SPEC:** ghi goal/non-goals, contracts, failure modes, paths, cases và commands. Chỉ cần ADR đã đến hạn trong runbook.
 3. **Executable example:** tạo fixture nhỏ có input/expected output hoặc invariant có thể chứng minh fail khi implementation sai. Không tạo fixture expected bằng chính function đang test.
 4. **Implement một lát cắt:** đi theo thứ tự work items; contracts/schema → storage/adapter → orchestration → CLI → tests. Không thêm TODO-success/no-op vào production path.
@@ -79,7 +70,7 @@ Không tự spawn agents, gọi paid APIs, commit/push/publish hay tạo automat
 | M10 Web độc lập M11 daemon | M10 có host lifecycle của API process; chưa hứa task sống sau API exit. M11 mới thêm client attach/detach và long-lived daemon |
 | M12 chỉ phụ thuộc M4 | Implement strict backend bằng ExecutionBackend port; không import M8/M10/M11; ghép lại regression tại mốc release sử dụng |
 
-Không cần ghép code cũ để thỏa prerequisites mới. Reuse có thể thực hiện khi contract/test mới chứng minh behavior, và chỉ trong scope được giao.
+Phải nối vào code hiện tại để đáp ứng prerequisites. Reuse behavior đã có bằng test phù hợp; bổ sung assertion nếu contract mới rộng hơn. Không coi nhãn phase đã pass là đủ, cũng không bắt viết lại một tính năng chỉ vì nó chưa mang ID M.
 
 ## 5. Gate chạy được và cách tính accepted
 
@@ -90,19 +81,19 @@ pwsh -NoProfile -File scripts/Verify-NextPlan.ps1 -SelfTest
 pwsh -NoProfile -File scripts/Verify-Docs.ps1 -SelfTest
 ```
 
-**Interface gate runtime tương lai — M0 phải tạo trước khi dùng:**
+**Interface gate runtime tương lai — M0 mở rộng gate hiện có hoặc tạo wrapper dùng chung runner trước khi dùng:**
 
 ```powershell
-pwsh -NoProfile -File vnext/scripts/Verify-Milestone.ps1 -Milestone M0
+pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M0
 # Ví dụ sau M4; gate tự lấy dependency closure từ runtime registry:
-pwsh -NoProfile -File vnext/scripts/Verify-Milestone.ps1 -Milestone M4
+pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M4
 ```
 
-Gate runtime dùng manifest-path `vnext/Cargo.toml`, locked dependencies, fmt/clippy/build/test, schema fixtures và test discovery. Từng test suite thực thi trong Rust integration target có tên ổn định, ví dụ `milestone_m4`; registry ghi exact test names. `cargo test <filter>` exit 0 nhưng chạy 0 tests là **gate failure**. Ignored/skipped case bắt buộc không được tính pass; trường hợp OS-specific ghi platform requirement và phải có evidence từ OS tương ứng trước milestone acceptance đa nền tảng.
+Gate runtime kế thừa `scripts/Verify-Phase.ps1` và các regressions hiện có, dùng manifest-path `Cargo.toml`, locked dependencies, fmt/clippy/build/test, schema fixtures và test discovery. Từng test suite thực thi trong Rust integration target có tên ổn định, ví dụ `milestone_m4`; registry ghi exact test names. `cargo test <filter>` exit 0 nhưng chạy 0 tests là **gate failure**. Ignored/skipped case bắt buộc không được tính pass; trường hợp OS-specific ghi platform requirement và phải có evidence từ OS tương ứng trước milestone acceptance đa nền tảng.
 
 M0/M1/M2 bổ sung contract/integration tests nội bộ dù chưa có A-case bao hết. A01–A36 là acceptance liên tầng, không thay toàn bộ unit/integration test. Mỗi runbook có regressions và adversarial checks riêng.
 
-Trạng thái implementation: planned → in_progress → implemented_unverified → verified_local → accepted; blocked là trạng thái cần ghi reason/next action, không có nghĩa completed. `accepted` cần đủ required platform gates + evidence + tất cả cases đến hạn. Reviewer/user có thể nghiệm thu; implementer không chỉ sửa một cờ status để tự nghiệm thu. Manifest trong bộ tài liệu luôn `planning_only`; execution state nằm ở `vnext/`.
+Trạng thái implementation: planned → in_progress → implemented_unverified → verified_local → accepted; blocked là trạng thái cần ghi reason/next action, không có nghĩa completed. `accepted` cần đủ required platform gates + evidence + tất cả cases đến hạn. Reviewer/user có thể nghiệm thu; implementer không chỉ sửa một cờ status để tự nghiệm thu. Manifest trong bộ tài liệu luôn `planning_only`; implementation evidence/handoff nằm trong `docs/evidence/` và `docs/handoffs/`; runtime state vẫn dùng store hiện tại.
 
 ## 6. Danh mục runbooks và dependencies
 

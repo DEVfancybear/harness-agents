@@ -10,12 +10,14 @@ Mục tiêu: mở terminal ở thư mục bất kỳ, gõ ha không tham số th
 hiện đúng project/cấu hình, có ô nhập và giữ process sống tới khi user thoát.
 
 Đọc quy định repo, Git status, plan H và các file source được plan dẫn.
-Đây là feature trên CLI hiện tại crates/harness-cli và binary ha; không tạo vnext/
-hoặc ha-next, không đợi triển khai roadmap M0–M12. Scope H override default
-vnext của implementation pack chỉ cho feature khởi động này.
+Mọi feature H/M dùng source hiện tại, root workspace và binary ha duy nhất.
+Đọc docs/implementation-next/INTEGRATION_MAP.vi.md; kiểm tra SPEC/evidence/handoff H
+và source HEAD trước khi sửa. Reuse phần đã đạt, chỉ implement/refactor gaps;
+không tạo CLI/engine thứ hai hoặc đợi toàn M0–M12.
 
-Tạo docs/specs/HA_LAUNCH.vi.md. Xác minh no-arg dispatch (revision khảo sát đang
-None => Ok(())), help/version fast paths, TTY detection và commands compatibility.
+Cập nhật docs/specs/HA_LAUNCH.vi.md, giữ tiến độ/decisions đã có. Xác minh no-arg
+dispatch ở HEAD, help/version fast paths, TTY detection và commands compatibility.
+None => Ok(()) chỉ là baseline cũ, không được giả định source hiện tại còn như vậy.
 Implement bootstrap/config/project resolution và InteractiveController tách renderer.
 Thiếu key vẫn mở setup UI và thoát được; không tự gọi API khi launch, không pretend
 mock response là model thật. Fixture service cho tests phải có label rõ.

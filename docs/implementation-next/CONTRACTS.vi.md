@@ -42,7 +42,7 @@ recover_readonly(session_id) -> RecoveryView
 
 Duplicate cùng ID + payload hash trả kết quả cũ; cùng ID khác payload reject, không overwrite. Claim phải conditional update/unique transaction, không read-then-write race. Receipt immutable; correction/reconciliation là event mới tham chiếu receipt cũ. `outcome_unknown` không đồng nghĩa failed/no side effect.
 
-Core tables M1: metadata/migrations, ownership, projects/workspaces, tasks/sessions, inputs, events, projections/checkpoints, commands/inbox/outbox, artifact metadata/references. Minimum unique constraints: `(session_id, seq)`, event ID, `(scope,input_id)`, delivery dedupe key. Các table run/step có thể được M3 thêm; public IDs/types tồn tại từ M0.
+M1 kiểm kê schema/constraints/migration runner hiện có trước; tái sử dụng tables và chỉ thêm migration cho gap. Logical core tables cần đối chiếu: metadata/migrations, ownership, projects/workspaces, tasks/sessions, inputs, events, projections/checkpoints, commands/inbox/outbox, artifact metadata/references. Minimum unique constraints: `(session_id, seq)`, event ID, `(scope,input_id)`, delivery dedupe key. Các table run/step có thể được M3 thêm; public IDs/types tồn tại từ M0.
 
 M3 migrations thêm runs/steps/attempts/frozen_requests/questions/budget_reservations. M4 thêm approvals/intents/receipts. M5 thêm history index/lineage/notes. M7 thêm assets/versions/bindings/dependencies/extraction jobs/dispositions. M8 thêm DAG/children/workspace leases. Không dùng một giant mutable JSON blob thay constraint fields cần query/unique/CAS.
 
@@ -121,10 +121,10 @@ Child TaskBrief có source snapshot/criteria/file scopes/budget/grants. Parent w
 
 ## 9. CLI và compatibility default
 
-CLI JSON envelope: `schema_version`, `command`, `request_id`, `status`, `data`, `error?`; stdout machine-readable, progress/log stderr. Human-readable mặc định. Exit codes đề xuất M0 chốt: 0 command succeeded (không đồng nghĩa task accepted), 2 invalid usage/config, 3 waiting/input/action required ở non-interactive, 4 execution failed, 5 ownership/conflict, 130 user cancel. JSON có task acceptance/run status tách biệt.
+CLI JSON envelope: `schema_version`, `command`, `request_id`, `status`, `data`, `error?`; stdout machine-readable, progress/log stderr. Human-readable mặc định. Exit codes mục tiêu dưới đây phải được M0 đối chiếu với CLI đang dùng; giữ semantics hiện có hoặc thêm versioned interface, không đổi âm thầm: 0 command succeeded (không đồng nghĩa task accepted), 2 invalid usage/config, 3 waiting/input/action required ở non-interactive, 4 execution failed, 5 ownership/conflict, 130 user cancel. JSON có task acceptance/run status tách biệt.
 
-Unimplemented commands không xuất hiện như tính năng hoạt động. `--mock`/fixture profile explicit; live default chỉ khi config provider hợp lệ và user đã chọn. Data directory mới có marker/version; reject legacy directory nếu chưa có importer. M9 migration/import support là assignment riêng, không xóa data không nhận diện.
+Unimplemented commands không xuất hiện như tính năng hoạt động. `--mock`/fixture profile explicit; live default chỉ khi config provider hợp lệ và user đã chọn. Giữ config/data directory và các sessions hiện được hỗ trợ. Mọi thay đổi schema/config/JSON/exit code cần fixture backward compatibility và migration versioned trong chính milestone làm thay đổi; không dồn compatibility đến M9. Unknown/newer format báo lỗi rõ và không ghi đè. M9 mở rộng backup/restore/retention, không là lúc đầu tiên nối dữ liệu hiện tại.
 
 ## 10. Những quyết định phải chốt ở đúng mốc
 
-M0 pin Rust/toolchain/test interface theo môi trường thực có; M1 chọn SQLite binding/locking và durability pragmas; M2 kiểm tra DeepSeek docs chính thức/capabilities/endpoints lúc coding; M4 chọn OS process/path primitives; M6 pin MCP SDK/spec compatibility; M10 chốt Web stack; M12 chọn backend sau capability spike. Không cần hỏi user cho những lựa chọn kỹ thuật thường lệ phù hợp defaults; ghi ADR và fixture proof. Không bịa API hoặc hardcode model pricing từ tài liệu cũ.
+M0 giữ toolchain/dependencies đã pin trừ khi có gap được chứng minh; M1 kiểm tra SQLite binding/locking và durability pragmas hiện tại; M2 kiểm tra DeepSeek docs chính thức/capabilities/endpoints lúc coding; M4 chọn OS process/path primitives; M6 pin MCP SDK/spec compatibility; M10 chốt Web stack; M12 chọn backend sau capability spike. Không cần hỏi user cho những lựa chọn kỹ thuật thường lệ phù hợp defaults; ghi ADR và fixture proof. Không bịa API hoặc hardcode model pricing từ tài liệu cũ.

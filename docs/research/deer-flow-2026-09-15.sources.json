@@ -6,7 +6,7 @@
   ],
   "repository": "https://github.com/bytedance/deer-flow",
   "revision": "6469833886487a71c25d17b6b543ecab9b0defca",
-  "purpose": "New greenfield Harness Agents product and architecture plan",
+  "purpose": "Incremental architecture and feature plan for the existing Harness Agents codebase",
   "method": "Two-pass documentation and selected source inspection; direct file fallback because graph MCP was unavailable",
   "upstream_runtime_executed": false,
   "upstream_tests_executed": false,

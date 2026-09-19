@@ -32,9 +32,9 @@ Kết quả, diff và kiểm chứng ...
 
 ## 2. Căn cứ source: thiếu hai lớp khác nhau
 
-Khảo sát tại revision `547f0bb69acb62449ecf829ca38bff714ac404be`. Chưa build/cài/chạy provider trong lượt lập plan này. Graph MCP không có tools callable nên đã đọc source trực tiếp.
+**Baseline lịch sử**, khảo sát tại revision `547f0bb69acb62449ecf829ca38bff714ac404be`; bảng này không mô tả HEAD hiện tại. Source H đã phát triển sau đó: trước mỗi assignment phải đọc SPEC/evidence/handoff H đang có, inspect interactive modules/TurnDriver/tests và chỉ xử lý gap. Không ghi đè các tài liệu H đang được cập nhật. Chưa build/cài/chạy provider trong lượt lập plan này. Graph MCP không có tools callable nên đã đọc source trực tiếp.
 
-| Căn cứ | Hành vi source hiện tại | Khoảng trống cần giải quyết |
+| Căn cứ | Hành vi ở revision khảo sát | Khoảng trống ghi nhận lúc khảo sát |
 |---|---|---|
 | [CLI main](../crates/harness-cli/src/main.rs), `run`, match `None` | `None => Ok(())` | Gõ `ha` không tham số thoát ngay, chưa khởi động interactive app |
 | [Cargo CLI](../crates/harness-cli/Cargo.toml) | Đã có binary tên `ha` | Không cần đổi tên binary hoặc tạo shell alias để giải quyết no-arg launch |
@@ -49,9 +49,9 @@ Việc terminal không tìm thấy `ha` là lỗi **command resolution/PATH**. V
 
 ## 3. Quan hệ với plan M0–M12: ưu tiên feature trên CLI hiện tại
 
-**Track H này triển khai trên CLI hiện tại**, chủ yếu `crates/harness-cli`, installer và các ports runtime cần nối. Không bắt DeepSeek tạo `vnext/`, đổi sang `ha-next`, hoặc đợi hết M0–M12 mới giải quyết yêu cầu. Đây là override có phạm vi cho trải nghiệm khởi động `ha`; các assignment kiến trúc mới khác vẫn theo plan M.
+**Mọi track H và M triển khai trên source hiện tại**, chung root workspace, binary `ha`, runtime và store. H ưu tiên trải nghiệm khởi động, chủ yếu `crates/harness-cli`, installer và services cần nối; không phải ngoại lệ của một kế hoạch viết sản phẩm khác. Xem [bản đồ tích hợp](implementation-next/INTEGRATION_MAP.vi.md).
 
-Không chạy cả hai engine cùng lúc. `InteractiveController` gọi application service/adapter; khi runtime vnext sẵn sàng, chỉ thay implementation của port sau compatibility checks. Không sao chép business loop vào renderer. Các commands cũ `run`, `resume`, `memory`, `tasks`, `extensions`, `maintenance` giữ semantics/parser/JSON hiện có; đừng âm thầm biến `ha run` từ fixture thành live API trong feature này.
+`InteractiveController` gọi service hiện có, nối `AgentSessionService`/`TurnDriver` qua ports. M2/M3/M4 mở rộng chính đường chạy này với regression checks; không viết hoặc thay sang engine thứ hai. Không sao chép business loop vào renderer. Các commands cũ `run`, `resume`, `memory`, `tasks`, `extensions`, `maintenance` giữ semantics/parser/JSON hiện có; đừng âm thầm biến `ha run` từ fixture thành live API trong feature này.
 
 Ưu tiên đạt ba mốc tách biệt:
 

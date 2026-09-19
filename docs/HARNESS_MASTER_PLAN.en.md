@@ -4,7 +4,7 @@
 
 [Detailed Vietnamese master plan](HARNESS_MASTER_PLAN.vi.md) · [Implementation roadmap](HARNESS_ROADMAP.vi.md) · [DeerFlow research and sources](research/DEERFLOW_RESEARCH_2026-09-15.md)
 
-**Implementation guidance added 2026-09-19:** the [DeepSeek coding pack](implementation-next/README.vi.md) provides 13 milestone runbooks, concrete contracts, setup/trigger/oracle acceptance specifications, assignment prompts and restart handoff templates. It defaults new implementation to an isolated `vnext/` Cargo workspace. These are planning artifacts, not completed runtime features.
+**Implementation guidance added 2026-09-19:** the [DeepSeek coding pack](implementation-next/README.vi.md) provides 13 milestone runbooks, concrete contracts, setup/trigger/oracle acceptance specifications, assignment prompts and restart handoff templates. Every M/H assignment upgrades the existing root Cargo workspace and the single `ha` CLI; use the [integration map](implementation-next/INTEGRATION_MAP.vi.md). These are planning artifacts, not completed runtime features.
 
 This is an English overview of the new plan. The Vietnamese master plan and roadmap contain the complete subsystem contracts, work items, coverage matrix and acceptance scenarios.
 
@@ -12,7 +12,7 @@ This is an English overview of the new plan. The Vietnamese master plan and road
 
 Design a personal Rust coding-agent harness with CLI-first delivery, durable task continuity, optional reusable memory and bounded multi-agent delegation. Web, daemon scheduling and strict execution backends are later milestones with explicit prerequisites.
 
-Per the updated request, this plan is independent of existing code and old implementation phases. It is not a repair backlog. For future development, use this plan and its new roadmap as the design baseline; preserve older P0–P8 documents as historical material. No runtime implementation, data migration or phase acceptance is implied by publishing these documents.
+This plan defines requirements for upgrading the existing codebase. Inspect and reuse current P/H implementations and tests, adapt incompatible behavior, and add missing capabilities to the same `ha` execution path. No second workspace, product CLI or agent engine is planned. Publishing these documents does not accept runtime features or reset previously completed phases.
 
 Research inspected selected DeerFlow documentation/source paths in two passes on September 14–15 at commit `6469833886487a71c25d17b6b543ecab9b0defca`. The second pass added goals, lineage, streaming gaps, scheduling, remote task handles, upload handling, secrets, auth and retention. No upstream runtime benchmark or full test suite was executed. This is bounded architecture research, not an exhaustive security audit.
 
@@ -35,7 +35,7 @@ The initial coding journey must handle read → edit → failing test → correc
 
 ## 3. Architecture and invariants
 
-Logical modules are contracts, core domain, store, runtime, context, providers, tools, execution, memory, orchestrator, extensions, application composition and CLI/API/daemon adapters. Start with fewer crates if boundaries remain enforced. Core/runtime depend on ports, not UI frameworks or concrete transport/storage implementations.
+Logical modules are contracts, core domain, store, runtime, context, providers, tools, execution, memory, orchestrator, extensions, application composition and CLI/API/daemon adapters. Map these responsibilities onto the current harness-types/session/store-sqlite/runtime/tools/kernel/providers/extensions/memory/orchestrator/maintenance/cli crates. Additional internal crates require a justified boundary within the same root workspace. Core/runtime depend on ports, not UI frameworks or concrete transport/storage implementations.
 
 Task, session, run, turn, step, provider attempt and tool invocation have separate identities and state machines. Run completion is distinct from task acceptance. Explicit stop reasons cover limits, errors, missing input, external waits and unknown outcomes.
 
@@ -80,7 +80,7 @@ Backup/restore must cover a consistent database snapshot and reachable artifacts
 
 | Milestone | Scope | Person-days |
 |---|---|---:|
-| M0 | Contracts, ADR boundaries, schemas and executable skeleton | 3–5 |
+| M0 | Existing-code inventory, contract gaps, integration and acceptance mapping | 3–5 |
 | M1 | Durable store, artifacts, checkpoints and recovery | 7–10 |
 | M2 | Provider messages, capabilities and incremental streaming | 5–8 |
 | M3 | TurnDriver, input/approval, limits and goal outcomes | 6–9 |
@@ -94,7 +94,7 @@ Backup/restore must cover a consistent database snapshot and reachable artifacts
 | M11, optional | Daemon, schedules and external-task workers | 8–12 |
 | M12, conditional | One strict execution backend | 8–12 |
 
-M0–M9 totals **63–95 person-days**, approximately **79–119 with 25% contingency**. M0–M5 provides the initial single-agent coding/continuity slice in **36–54 person-days** before contingency. Optional M10–M12 together add **26–39 person-days**. These are greenfield estimates, not additional time on top of the old roadmap or automatic-agent deadlines.
+M0–M9 totals **63–95 person-days**, approximately **79–119 with 25% contingency**. M0–M5 provides the initial single-agent coding/continuity slice in **36–54 person-days** before contingency. Optional M10–M12 together add **26–39 person-days**. These original full-capability estimates are historical sizing references, not remaining effort. Re-estimate only the verified gaps after the current source/test inventory; do not add completed P/H work again.
 
 M2 depends on M0; M3 joins M1 and M2. M4–M9 proceed sequentially. M10/M11 depend on M9 and can be selected independently. M12 depends on M4 and must move before any release that promises untrusted-code confinement.
 
@@ -106,4 +106,4 @@ Acceptance exercises real storage, drivers, tools and process fixtures with dete
 
 Measure task acceptance, false completion, source recall, total cost, latency, storage growth, recovery/cancellation and integration effort. Compare single-agent, memory and multi-agent variants on the same tasks. Do not claim token savings or production success rates before measuring a baseline.
 
-Start with **M0-01..M0-04** only: define domain contracts, ports, the smallest executable skeleton and the acceptance registry. Do not scaffold the entire architecture or treat older code with matching names as accepted automatically. Every milestone requires revision-bound evidence and a handoff before proceeding.
+Start with **M0-01** unless a different item is assigned: map existing symbols/callers/tests to requirements, then patch the contract gaps in place. M0-02..M0-04 extend ports, current CLI composition and the existing acceptance runner. Reuse evidence that proves the required behavior; names alone are insufficient. Every milestone requires revision-bound evidence and a handoff before proceeding.
