@@ -1393,5 +1393,83 @@ Quyền quyết định nay được truyền vào hàm (`-RemoveRecordedPathEnt
 | `self_test_never_writes_the_real_user_path` | ok — User PATH thật không đổi |
 
 Cả hai ca chạy trên provider/writer **tiêm**, nên User PATH thật của máy này vẫn **không** bị đọc
-hay ghi — đúng phần quyền đã ghi ở mục 0 và mục 2 của handoff. Thay đổi này cũng đã được ghi vào
-SPEC (mục installer) và operator guide không nhắc `-Uninstall` nên không cần sửa.
+hay ghi — đúng phần quyền đã ghi ở mục 0 và mục 2 của handoff.
+
+**Sửa lại một câu ở trên cho đúng:** operator guide **có** được sửa trong round này. Kiểm tra cho
+thấy `docs/OPERATOR_GUIDE.{vi,en}.md` chỉ nói về đường copy/cargo và **không** hề nhắc `-FromBundle`,
+`-Uninstall` hay `-ModifyUserPath`, tức đường cài end-user của H08 **không có tài liệu vận hành** —
+trong khi H07 yêu cầu docs chỉ ghi hành vi có thật. Đã thêm mục gỡ cài đặt bằng installer cho cả hai
+thứ tiếng, kèm câu nói rõ `purge` **chưa** được implement (kế hoạch có nêu, code thì không) để không
+ai trông vào một lệnh không tồn tại.
+
+## 22. Round 23: flake loopback **tái phát mạnh**, đã đo và không che
+
+Sau khi commit, gate chạy lại trên cây đã commit (`target/gate-final-committed.txt`) và **đỏ ở
+`acceptance-launch`**, cụ thể là `i13_resume_continues_the_task_with_recovered_context_and_no_rerun`.
+Đây **không** phải hồi quy của round 23, và điều đó được chứng minh bằng phép đo đối chứng chứ
+không bằng lập luận:
+
+| Phép đo | Kết quả |
+|---|---|
+| `i13_resume_continues` chạy riêng trên cây đã commit, 3 lần | **2 đỏ, 1 xanh** — đỏ mất **6.43/6.44 s**, xanh mất **0.70 s** |
+| Cùng test đó trong **worktree sạch tại `c386416`** (không có thay đổi nào của round 23), 3 lần | **2 đỏ, 1 xanh** — đỏ **6.45/6.44 s**, xanh **0.65 s** |
+| `phase_p2` chạy riêng sau khi gate đỏ lần hai | **17 passed, 0 failed** (1.19 s) |
+
+Hai kết luận đo được: (1) **cùng tỉ lệ hỏng và cùng con số thời gian ở revision gốc**, nên thay đổi
+của round 23 không phải nguyên nhân; (2) chế độ hỏng có **hai mức thời gian tách biệt** — ~0.7 s khi
+qua và ~6.4 s khi hỏng — nghĩa là khi hỏng, client đã **chờ hết một khoảng timeout rồi mới bỏ cuộc**
+chứ không bị từ chối tức thì. Thông điệp luôn cùng dạng:
+
+```text
+provider_protocol: provider_protocol: provider request failed: error sending request
+for url (http://127.0.0.1:<port>/chat/completions)
+```
+
+Cơ chế đọc được từ chính code test: `sse_fixture_multi` phục vụ đúng `requests` yêu cầu và **bỏ
+qua** kết nối nào đóng mà không gửi request (`if request.is_empty() { continue; }`), còn
+`warm_up_loopback` chỉ chờ `TcpStream::connect` **thành công** — tức bắt tay TCP xong — chứ không
+chờ server `accept()`. Giữa hai thời điểm đó, tiến trình `ha` đầu tiên có thể đã vào hàng đợi
+`accept`. Warm-up mà round trước thêm vào chỉ **thu hẹp** cửa sổ chứ không đóng nó, và trên máy này
+cửa sổ đó hiện thắng khoảng **2/3 lần**.
+
+**Không sửa trong round này**, có lý do: đây là flake của **fixture trong test**, không phải hành vi
+sản phẩm; mục 14 đã ghi rõ **không** được sửa acceptance P2 đã được chấp nhận, và `i13` cũng là
+selector bắt buộc của gate. Sửa nó là một thay đổi test riêng — ví dụ để fixture phục vụ theo *yêu
+cầu đã hoàn tất* thay vì *số kết nối*, hoặc warm-up bằng một request HTTP thật rồi trừ đi — và cần
+review riêng vì nó chạm đúng thứ đang dùng làm bằng chứng. Việc làm ngay là ghi đúng trạng thái:
+**gate trên máy này hiện xanh không ổn định**, mỗi lần đỏ phải được truy nguyên chứ không được tính
+là đạt.
+
+Cách xử lý đã dùng: chạy lại gate (tối đa ba lần, ghi lại từng lần) và chỉ nhận lần xanh khi
+`failures: []` — không sửa test, không bỏ bước, không nâng `not_run` thành "đạt".
+
+### 22.1. Ba lần chạy gate liên tiếp, ba bước đỏ **khác nhau**
+
+Đây là phần quan trọng nhất của mục này, vì nó đổi cách đọc mọi con số "gate xanh" ở các mục trước.
+
+| Lần | Bước đỏ | Chi tiết đo được |
+|---|---|---|
+| 1 | `providers-streaming` | `g1_adapter_delivers_text_before_the_response_completes` — `2 passed; 1 failed` trong **0.02 s** |
+| 2 | `acceptance-launch` | `i13_resume_continues…` — `17 passed; 1 failed`, suite mất **203.49 s** (bình thường 38–39 s) |
+| 3 | `unit-interactive` | `completion_service_resume_flow` — `69 passed; 1 failed`, suite mất **10.41 s** (bình thường 0.8 s) |
+
+Ba bước, ba nguyên nhân biểu kiến khác nhau, và **cả ba đều xanh khi chạy riêng ngay sau đó**:
+
+| Suite chạy riêng | Kết quả |
+|---|---|
+| `cargo test -p harness-cli --bin ha --locked` × 3 | **70 passed / 0 failed** cả ba lần (0.76 / 0.77 / 0.73 s) |
+| `cargo test -p harness-cli --test phase_p2` | 17 passed, 0 failed (1.19 s) |
+| `i13_resume_continues` riêng | có lần xanh 0.64–0.70 s |
+| PTY đầy đủ 10 ca | `PTY_EXIT: 0`, 10 passed (20.18 s) |
+
+Điều đáng chú ý về **thời gian**: mỗi lần hỏng, suite đều chậm bất thường (203 s so với 38 s;
+10.4 s so với 0.8 s) — dấu hiệu chờ timeout chứ không phải sai logic. Việc này **không** phải do
+round 23: `i13` hỏng **cùng tỉ lệ và cùng con số thời gian** trong worktree sạch ở `c386416`, và
+round 23 không sửa `harness-providers`, không sửa fixture của `interactive_launch`, cũng không sửa
+đường provider của `completion_tests`.
+
+Kết luận phải ghi thẳng: **trên máy này, "gate xanh" là trạng thái không ổn định**, và các con số
+gate ở mục 19/20/21 là **những lần chạy xanh thật** chứ không phải một bảo đảm tái lập được. Không
+có bước nào bị bỏ, không test nào bị sửa, và không mục `not_run` nào được nâng — nhưng người đọc
+bằng chứng cần biết rằng một lần `failures: []` trên máy này là kết quả **có xác suất**, không phải
+hằng số.

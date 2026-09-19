@@ -320,6 +320,21 @@ Remove-Item "$HOME/.cargo/bin/ha.exe"     # đường copy
 cargo uninstall harness-cli               # đường cargo
 ```
 
+Nếu bạn cài từ **bundle release** (`-FromBundle <dir>`, đường end-user), nên gỡ bằng
+chính installer để nó chỉ xóa thứ nó đã ghi:
+
+```console
+pwsh -NoProfile -File scripts/Install-Ha.ps1 -Uninstall -Destination <DIR>
+pwsh -NoProfile -File scripts/Install-Ha.ps1 -Uninstall -Destination <DIR> -RemoveUserPathEntry
+```
+
+- Lệnh đầu gỡ **đúng các file trong manifest** và **giữ nguyên** entry `PATH` mà lần cài đã
+  thêm (nó in ra entry đó kèm cách gỡ). Lệnh thứ hai xóa luôn entry — cần cờ riêng vì lần
+  cài cũng cần `-ModifyUserPath` mới được ghi vào User PATH.
+- Cả hai đều **không** đụng config và session data của bạn. Hiện **chưa** có lệnh nào xóa dữ
+  liệu người dùng: kế hoạch có nêu một đường `purge` riêng kèm kiểm tra path containment và
+  xác nhận, nhưng nó **chưa** được implement, nên đừng trông vào nó.
+
 Hai điều cần biết sau khi cài:
 
 - **`ha` chạy nền trước.** Không có daemon: không có gì chạy giữa các lệnh của bạn,

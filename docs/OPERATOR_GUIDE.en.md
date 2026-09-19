@@ -313,6 +313,22 @@ Remove-Item "$HOME/.cargo/bin/ha.exe"     # the copy route
 cargo uninstall harness-cli               # the cargo route
 ```
 
+If you installed from a **release bundle** (`-FromBundle <dir>`, the end-user route), remove
+it with the installer itself so only what it recorded is deleted:
+
+```console
+pwsh -NoProfile -File scripts/Install-Ha.ps1 -Uninstall -Destination <DIR>
+pwsh -NoProfile -File scripts/Install-Ha.ps1 -Uninstall -Destination <DIR> -RemoveUserPathEntry
+```
+
+- The first command removes **exactly the files in the manifest** and **leaves the `PATH`
+  entry** the install added (it prints that entry and how to remove it). The second one
+  removes the entry too: it needs its own switch because installing also needed
+  `-ModifyUserPath` before writing to the User PATH.
+- Neither touches your config or session data. There is currently **no** command that deletes
+  user data: the plan describes a separate `purge` route with path containment and
+  confirmation, but it is **not** implemented, so do not count on it.
+
 Two things to know after installing:
 
 - **`ha` is foreground.** There is no daemon: nothing runs between your commands,

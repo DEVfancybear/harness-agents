@@ -197,6 +197,28 @@ Hai lần đo đáng ghi vì suýt bị đọc sai: (a) lần chạy PTY đầy 
 flake loopback ở mục 14, và lần chạy lại đủ 10 ca thì xanh; (b) `cargo test` từng báo `Fresh` cho
 `harness-cli` dù source mới hơn, làm 3 test mới **không** được build — xem mục 3.6.
 
+### 4b. Flake loopback hiện **nặng** — đọc trước khi tin một lần gate đỏ
+
+Sau khi commit, gate đỏ ở `acceptance-launch::i13_resume_continues…`, rồi lần sau đỏ ở
+`regression-phase_p2`. Cả hai đã được truy nguyên bằng đo đối chứng, **không** phải hồi quy:
+
+| Phép đo | Kết quả |
+|---|---|
+| `i13_resume_continues` riêng, cây đã commit, 3 lần | 2 đỏ (6.43/6.44 s) / 1 xanh (0.70 s) |
+| Cùng test trong worktree sạch `c386416`, 3 lần | 2 đỏ (6.45/6.44 s) / 1 xanh (0.65 s) |
+| `phase_p2` riêng sau khi gate đỏ | 17 passed, 0 failed (1.19 s) |
+
+Tỉ lệ hỏng và con số thời gian **giống nhau ở revision gốc**, nên không phải do round 23. Chế độ
+hỏng có hai mức thời gian tách biệt sẽ (~0.7 s) và hỏng (~6.4 s), tức client chờ hết timeout rồi bỏ
+cuộc. Xem mục 22 evidence để có cơ chế đầy đủ và lý do **không** sửa test trong round này.
+
+Hệ quả thực hành: gate trên máy này **xanh không ổn định**. Ba lần chạy liên tiếp cho **ba bước đỏ
+khác nhau** (`providers-streaming`, `acceptance-launch`, `unit-interactive`), và mỗi lần suite hỏng
+đều chậm bất thường — 203 s so với 38 s, 10.4 s so với 0.8 s — tức chờ timeout. Cả ba suite đó
+**xanh khi chạy riêng** ngay sau đó (`--bin ha` 3/3 lần 70 passed; `phase_p2` 17 passed; `i13` riêng
+có lần xanh 0.64 s). Đừng kết luận "track hỏng" từ một lần đỏ, và cũng **đừng** bỏ qua: chạy lại,
+ghi lại từng lần, chỉ nhận trạng thái xanh khi `failures: []`, và **không** sửa test để làm nó xanh.
+
 - Chưa chạy: Linux (chỉ có target `x86_64-pc-windows-msvc`), live provider smoke, publish, VM
   sạch thật, ghi User PATH thật/cài lên máy user.
 
