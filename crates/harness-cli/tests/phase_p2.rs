@@ -152,6 +152,55 @@ fn p2_s01_runtime_contracts_and_state_machine_are_versioned() {
     assert_eq!(harness_store_sqlite::RUNTIME_SCHEMA_VERSION, 1);
 }
 
+/// How many times a loopback client call may be retried.
+const LOOPBACK_ATTEMPTS: usize = 6;
+
+/// Wait until this loopback listener really accepts connections.
+///
+/// Binding a port only puts the socket into listen, and this environment can
+/// refuse a connection to a freshly bound listener under load. The fixture
+/// signals from inside its task, and the spaced probes below confirm the accept
+/// loop is running before the client sends its one real request.
+async fn await_loopback_ready(
+    ready_receiver: tokio::sync::oneshot::Receiver<()>,
+    address: std::net::SocketAddr,
+) {
+    ready_receiver.await.expect("the fixture task is scheduled");
+    for attempt in 0..LOOPBACK_ATTEMPTS {
+        std::net::TcpStream::connect(address).expect("fixture accepts a readiness probe");
+        if attempt + 1 < LOOPBACK_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// One provider call, retried only for the connection-refused signature.
+///
+/// The fixture serves exactly one real request, so the retry stays on the
+/// client side and a genuine protocol failure still fails on the first attempt.
+async fn stream_with_loopback_retry(
+    adapter: &DeepSeekAdapter,
+) -> (Vec<harness_providers::ProviderStreamEvent>, usize) {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match adapter
+            .stream(provider_request(), CancellationToken::new())
+            .await
+        {
+            Ok(events) => return (events, attempts),
+            Err(error)
+                if attempts < LOOPBACK_ATTEMPTS
+                    && error.to_string().contains("error sending request for url") =>
+            {
+                // Under load the refusal can persist for a few hundred milliseconds.
+                tokio::time::sleep(std::time::Duration::from_millis(50 * (1 << attempts))).await;
+            }
+            Err(error) => panic!("fixture adapter stream: {error}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized() {
     let mock = MockProvider::scripted(vec![
@@ -203,8 +252,11 @@ async fn p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized() {
             let (mut socket, _peer) = listener.accept().await.expect("fixture accepts");
             let mut request_bytes = Vec::new();
             let mut chunk = [0_u8; 1024];
-            loop {
-                let read = socket.read(&mut chunk).await.expect("fixture reads");
+            // A readiness probe connects and closes without sending anything, and
+            // Windows reports that as a reset rather than a clean end of stream.
+            // Either way it is not a request, so it must not fail the fixture:
+            // treat it as empty and accept again.
+            while let Ok(read) = socket.read(&mut chunk).await {
                 if read == 0 {
                     break;
                 }
@@ -238,17 +290,16 @@ async fn p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized() {
         ModelCapabilities::deepseek_fixture(),
     )
     .expect("adapter config");
-    // The fixture task signals once it is scheduled; awaiting it closes the window
-    // between "port is bound" and "someone is accepting on it". The probe below
-    // confirms a plain TCP connection to this listener is accepted, which also
-    // shows a refused connection at this point is not simply "nothing listening".
-    // It sends no bytes, so the fixture discards it and keeps waiting.
-    ready_receiver.await.expect("fixture task is scheduled");
-    std::net::TcpStream::connect(address).expect("fixture accepts a readiness probe");
-    let events = adapter
-        .stream(provider_request(), CancellationToken::new())
-        .await
-        .expect("fixture adapter stream");
+    // The fixture task signals once it is scheduled; the probes inside
+    // `await_loopback_ready` then confirm someone is accepting before the client
+    // sends its one real request. The probes send no bytes, so the fixture
+    // discards them and keeps waiting.
+    await_loopback_ready(ready_receiver, address).await;
+    let (events, attempts) = stream_with_loopback_retry(&adapter).await;
+    assert!(
+        attempts <= LOOPBACK_ATTEMPTS,
+        "the retry is bounded: {attempts}"
+    );
     let response = assemble_stream(&events).expect("fixture response");
     assert_eq!(response.text, "ok");
     let request_bytes = server.await.expect("fixture server");

@@ -389,7 +389,9 @@ fn sse_fixture(text: &'static str) -> (String, std::thread::JoinHandle<String>) 
     let handle = std::thread::spawn(move || {
         let (mut socket, _) = listener.accept().expect("fixture accepts");
         let mut request = vec![0_u8; 8192];
-        let read = socket.read(&mut request).expect("fixture reads");
+        // A readiness probe connects and closes without sending a request, and
+        // Windows reports that as a reset rather than a clean end of stream.
+        let read = socket.read(&mut request).unwrap_or(0);
         request.truncate(read);
         let body = format!(
             "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
@@ -567,8 +569,13 @@ fn sse_fixture_multi(
             let mut request = Vec::new();
             let mut chunk = [0_u8; 1024];
             // Read the head, then exactly the declared body.
+            // A readiness probe connects and closes without sending a request, and
+            // Windows reports that as a reset rather than a clean end of stream.
+            // Neither is a request, so the fixture accepts again.
             let head_end = loop {
-                let read = socket.read(&mut chunk).expect("fixture reads");
+                let Ok(read) = socket.read(&mut chunk) else {
+                    break request.len();
+                };
                 if read == 0 {
                     break request.len();
                 }
@@ -590,7 +597,9 @@ fn sse_fixture_multi(
                 })
                 .unwrap_or(0);
             while request.len() < head_end + length {
-                let read = socket.read(&mut chunk).expect("fixture reads body");
+                let Ok(read) = socket.read(&mut chunk) else {
+                    break;
+                };
                 if read == 0 {
                     break;
                 }
@@ -638,15 +647,34 @@ fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
             .output()
             .expect("ha binary runs")
     };
+    // The warm-up above makes the first connect deterministic, but a later turn can
+    // still meet the same doubt, so every turn retries only on that signature. A
+    // genuine failure returns immediately.
+    let run_turn = |arguments: Vec<&str>| {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let run = CliRun::from_output(&run_headless(arguments.clone()));
+            if run.code() == 0 || !run.stderr.contains(LOOPBACK_WOBBLE) || attempt >= 6 {
+                return run;
+            }
+            // Under load this environment can refuse loopback connections for a few
+            // hundred milliseconds, so back off instead of retrying immediately.
+            std::thread::sleep(std::time::Duration::from_millis(50 * (1 << attempt)));
+            eprintln!(
+                "attempt {attempt} hit the known loopback wobble: {}",
+                run.stderr
+            );
+        }
+    };
 
-    let first = run_headless(vec![
+    let first = run_turn(vec![
         "chat",
         "--headless",
         "--prompt",
         "first prompt from the test",
         "--json",
     ]);
-    let first = CliRun::from_output(&first);
     assert_eq!(first.code(), 0, "stderr was: {}", first.stderr);
     let first_json: serde_json::Value =
         serde_json::from_str(&first.stdout).expect("first output is JSON");
@@ -658,7 +686,7 @@ fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
     assert_eq!(first_json["tool_calls"], serde_json::Value::from(0));
     assert_eq!(first_json["resumed_from"], serde_json::Value::Null);
 
-    let second = run_headless(vec![
+    let second = run_turn(vec![
         "chat",
         "--headless",
         "--resume",
@@ -667,7 +695,6 @@ fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
         "second prompt from the test",
         "--json",
     ]);
-    let second = CliRun::from_output(&second);
     assert_eq!(second.code(), 0, "stderr was: {}", second.stderr);
     let second_json: serde_json::Value =
         serde_json::from_str(&second.stdout).expect("second output is JSON");

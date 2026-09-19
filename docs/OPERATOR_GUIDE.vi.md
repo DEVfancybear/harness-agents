@@ -383,6 +383,20 @@ credential (`DEEPSEEK_API_KEY` hoặc `HA_API_KEY`). Thiếu cấu hình thì �
 hiện setup state và nói rõ còn thiếu biến nào — nó **không** gọi model và **không** trả
 câu trả lời giả.
 
+Đặt credential cho phiên làm việc hiện tại:
+
+```powershell
+$env:DEEPSEEK_API_KEY = '<key-của-bạn>'      # hoặc $env:HA_API_KEY
+$env:HA_PROVIDER_MODEL = 'deepseek-chat'      # tuỳ provider
+ha                                            # mở TUI; thanh trạng thái hiện model đang dùng
+```
+
+Muốn kiểm tra provider thật trước khi mở app (tốn một lượt gọi trả phí):
+
+```powershell
+pwsh -NoProfile -File scripts/Smoke-HaProvider.ps1
+```
+
 ### 12.1. Giao diện TUI (track HA_TUI)
 
 Từ track HA_TUI, ứng dụng tương tác vẽ **inline viewport** ở đáy màn hình: hội thoại vẫn

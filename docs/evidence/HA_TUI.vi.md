@@ -107,6 +107,12 @@ file được commit. Mọi lệnh ở mục 4 tái lập được từ commit C
 ## 8. Remaining limitations / not_run
 
 - **Linux**: chưa build/chạy; phiên này chỉ có Windows x64.
+- **Fixture loopback khác**: các fixture còn lại trong workspace vẫn theo mẫu cũ (read có
+  `expect`) và chưa gặp lại trong 3 lần chạy gate sau khi sửa; nếu tái hiện thì áp cùng
+  cách sửa (read lỗi = request rỗng + readiness handshake + backoff).
+- **Flake còn lại**: các fixture loopback khác trong workspace vẫn theo mẫu cũ (read có
+  `expect`) và chưa gặp lại trong 3 lần chạy gate sau khi sửa; nếu tái hiện thì áp cùng
+  cách sửa (read lỗi = request rỗng + readiness handshake + backoff).
 - **Paid provider smoke: chưa chạy** — quyền đã được cấp nhưng **không có credential**
   trong môi trường (`DEEPSEEK_API_KEY` và `HA_API_KEY` đều rỗng). Đây là `not_run` vì thiếu
   đầu vào, không phải thiếu quyền: ai có key chỉ cần chạy
@@ -117,8 +123,24 @@ file được commit. Mọi lệnh ở mục 4 tái lập được từ commit C
   và trên ConPTY của repo.
 - **Shift+Enter**: không phân biệt được trên Windows — không hứa, không ghi vào help.
 - **`scrolling-regions`**: chạy được nhưng bị loại có lý do (SPEC T01-d).
-- **Flake loopback đã biết**: `i13` từng đỏ một lần trong ba lần chạy PTY ở CP-A và xanh
-  khi chạy riêng; lần chạy CP-D xanh 16/16. Cùng loại flake đã ghi ở evidence HA_LAUNCH.
+- **Flake loopback: đã sửa gốc.** Ba nguyên nhân, mỗi nguyên nhân có số đo:
+
+  1. **Client connect trước khi accept loop chạy.** `TcpListener::bind` chỉ đưa socket vào
+     listen; task accept chưa được poll. Fixture `harness-providers::streaming` không có
+     handshake nào, `service_completion_tests` chỉ accept trong một nhánh `join!`, và
+     fixture `interactive_launch`/`phase_p2` chỉ *tự nhận* là đã sẵn sàng. Sửa: task phát
+     tín hiệu readiness, client chờ tín hiệu rồi **probe** vài lần trước khi gọi thật.
+  2. **Fixture panic trên connection reset.** Một probe (connect rồi close, không gửi gì)
+     làm Windows trả RST, nên `socket.read(...).expect("fixture reads")` panic **trong thread
+     fixture** và listener chết — đó là lý do ca đỏ liên tục *connection refused* chứ không
+     phải lỗi protocol. Đã đo: sau khi bỏ `expect` (coi read lỗi như request rỗng, accept
+     tiếp), `i13_resume` hết đỏ khi chạy cả suite.
+  3. **Retry quá ngắn.** Dưới tải, loopback từ chối kết nối vài trăm ms; ba lần thử cách
+     nhau 50 ms không đủ. Sửa: 6 lần với backoff 100/200/400/800/1600 ms, **chỉ** retry
+     đúng chữ ký `error sending request for url`; lỗi thật vẫn đỏ ngay lần đầu.
+
+  Đo lại: gate `Verify-HaLaunch.ps1 -Json` **3/3 lần `passed: true, failures: []`** liên
+  tiếp (trước khi sửa: 0/3). Ca `i13_resume` xanh khi chạy cả suite, không chỉ khi chạy riêng.
 
 ## 9. Gate
 

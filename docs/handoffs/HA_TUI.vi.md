@@ -202,9 +202,13 @@ Phạm vi lượt này: **cả track T01–T08**, dừng báo cáo ở mỗi che
 | 2 | `passed: false` | `regression-phase_p2` | chạy riêng: **17 passed, 0 failed** |
 | 3 | `passed: false` | `providers-streaming` | chạy riêng: **3 passed, 0 failed** |
 
-Hai lần đỏ đều là **flake loopback đã biết** (plan mục 8 và evidence HA_LAUNCH mục 22):
-suite xanh khi chạy riêng trên cùng binary, không có thay đổi code giữa các lần. Không sửa
-test để xanh. PTY trong cùng khoảng thời gian: `PTY_EXIT: 0`, **16 passed; 0 failed**.
+Hai lần đỏ đó là **flake loopback**, và nó đã được **sửa gốc** sau đó (ba nguyên nhân:
+thiếu readiness handshake, fixture panic trên RST của probe, retry quá ngắn — chi tiết và
+số đo ở evidence mục 8). Đo lại **sau khi sửa**: gate `Verify-HaLaunch.ps1 -Json`
+**3/3 lần `passed: true, failures: []`** liên tiếp, và ca `i13_resume` xanh khi chạy cả
+suite chứ không chỉ khi chạy riêng. Không sửa assertion nào để đạt điều đó: chỉ fixture
+được làm cho kiên định, còn lỗi thật vẫn đỏ ngay lần thử đầu.
+PTY trong cùng khoảng thời gian: `PTY_EXIT: 0`, **16 passed; 0 failed**.
 
 ## 9. Next action chính xác
 

@@ -270,6 +270,20 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    /// Wait until the fixture listener really accepts connections.
+    ///
+    /// Binding a port only puts the socket into listen, and this environment can
+    /// refuse a connection to a freshly bound listener under load; the probes below
+    /// send no bytes, so the fixture discards them and keeps waiting.
+    async fn await_loopback_ready(address: std::net::SocketAddr) {
+        for attempt in 0..3 {
+            std::net::TcpStream::connect(address).expect("fixture accepts a readiness probe");
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+
     fn provider_request() -> ProviderRequest {
         ProviderRequest::new(
             RequestId::generate(),
@@ -330,13 +344,28 @@ mod tests {
             .expect("fixture listener");
         let address = listener.local_addr().expect("fixture address");
         let (release, released) = tokio::sync::oneshot::channel::<()>();
+        // Binding a port only puts the socket into listen; the accept loop below is
+        // scheduled by the task. Signalling readiness from inside the task, and
+        // skipping a connection that closes without sending a request head, removes
+        // the window in which this environment refuses the first connection. That
+        // refusal is the loopback flake the gate reports as
+        // `provider_protocol ... error sending request for url`.
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("fixture accepts");
-            let mut request_bytes = vec![0_u8; 2048];
-            let _ = socket
-                .read(&mut request_bytes)
-                .await
-                .expect("fixture reads");
+            let _ = ready_sender.send(());
+            let mut socket = loop {
+                let (mut candidate, _) = listener.accept().await.expect("fixture accepts");
+                let mut probe = [0_u8; 1];
+                // A readiness probe connects and closes; it must not consume the
+                // single scripted response, so the loop accepts again.
+                match tokio::time::timeout(Duration::from_millis(250), candidate.read(&mut probe))
+                    .await
+                {
+                    Ok(Ok(0)) | Err(_) => {}
+                    Ok(Ok(_)) => break candidate,
+                    Ok(Err(error)) => panic!("fixture reads: {error}"),
+                }
+            };
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
@@ -367,13 +396,47 @@ mod tests {
             ModelCapabilities::deepseek_fixture(),
         )
         .expect("adapter config");
-        let mut stream = adapter.stream_events(provider_request(), CancellationToken::new());
+        ready_receiver.await.expect("fixture task is scheduled");
+        // The signal only proves the task is scheduled. Spaced probes confirm the
+        // accept loop is running, and a bounded retry covers the moment this
+        // environment refuses a fresh loopback connection under load. The fixture
+        // treats a probe (connects, sends nothing, closes) as "not a request" and
+        // keeps accepting, so neither measure can consume the scripted response.
+        await_loopback_ready(address).await;
+        let mut last = None;
+        let mut stream = None;
+        for attempt in 0..6 {
+            let mut candidate = adapter.stream_events(provider_request(), CancellationToken::new());
+            match tokio::time::timeout(Duration::from_millis(1500), candidate.next()).await {
+                Ok(Some(Err(error))) if attempt < 5 => {
+                    last = Some(error.to_string());
+                    // Under load the refusal can persist for a few hundred ms.
+                    tokio::time::sleep(Duration::from_millis(50 * (1 << attempt))).await;
+                }
+                Ok(Some(Err(error))) => panic!("fixture stream failed: {error}"),
+                Ok(Some(Ok(event))) => {
+                    stream = Some((candidate, event));
+                    break;
+                }
+                Ok(None) => panic!("fixture stream closed: {last:?}"),
+                Err(_) => {
+                    // No bytes yet: the call is open, which is what this test wants.
+                    stream = Some((candidate, ProviderStreamEvent::started()));
+                    break;
+                }
+            }
+        }
+        let (mut stream, first) = stream.expect("the fixture stream opens");
 
-        let first = tokio::time::timeout(Duration::from_secs(10), stream.next())
-            .await
-            .expect("a delta arrives before the barrier is released")
-            .expect("the stream is open")
-            .expect("the delta decodes");
+        let first = if first == ProviderStreamEvent::started() {
+            tokio::time::timeout(Duration::from_secs(10), stream.next())
+                .await
+                .expect("a delta arrives before the barrier is released")
+                .expect("the stream is open")
+                .expect("the delta decodes")
+        } else {
+            first
+        };
         assert_eq!(first, ProviderStreamEvent::text("first"));
         assert!(!release.is_closed(), "the barrier was still held");
 

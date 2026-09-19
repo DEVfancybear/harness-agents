@@ -372,6 +372,20 @@ counts as a refusal. A real model call needs `HA_PROVIDER_ENDPOINT`, `HA_PROVIDE
 and a credential (`DEEPSEEK_API_KEY` or `HA_API_KEY`); without them the app still opens
 in setup state and says what is missing, and it never fabricates an answer.
 
+Setting the credential for the current shell:
+
+```powershell
+$env:DEEPSEEK_API_KEY = '<your key>'         # or $env:HA_API_KEY
+$env:HA_PROVIDER_MODEL = 'deepseek-chat'      # provider dependent
+ha                                            # opens the TUI; the status bar names the model
+```
+
+To check the real provider before opening the app (costs one paid call):
+
+```powershell
+pwsh -NoProfile -File scripts/Smoke-HaProvider.ps1
+```
+
 ### 12.1. The TUI (HA_TUI track)
 
 The interactive app draws an **inline viewport** at the bottom of the console: the

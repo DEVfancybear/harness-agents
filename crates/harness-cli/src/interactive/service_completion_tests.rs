@@ -181,8 +181,17 @@ async fn resume_flow() {
         input_id: InputId::generate(),
         text: "continue source".to_owned(),
     });
-    let provider = async {
-        let (mut socket, _) = listener
+    // The accept loop must be listening before the service connects: this
+    // environment refuses a connection to a fresh loopback listener that nobody is
+    // accepting on yet, which is the flake the gate reports for this case. The
+    // listener is shared so the failure-mode assertion below can still prove that an
+    // unknown source calls no provider at all.
+    let listener = std::sync::Arc::new(listener);
+    let fixture_listener = std::sync::Arc::clone(&listener);
+    let (listening, is_listening) = tokio::sync::oneshot::channel::<()>();
+    let provider = tokio::spawn(async move {
+        let _ = listening.send(());
+        let (mut socket, _) = fixture_listener
             .accept()
             .await
             .expect("production adapter connects");
@@ -197,9 +206,13 @@ async fn resume_flow() {
             .await
             .expect("response");
         request
-    };
+    });
     let (request, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::join!(provider, terminal(&mut channel))
+        is_listening.await.expect("the fixture is listening");
+        tokio::join!(
+            async { provider.await.expect("fixture task") },
+            terminal(&mut channel)
+        )
     })
     .await
     .expect("bounded resumed turn");
