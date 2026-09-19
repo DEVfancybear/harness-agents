@@ -6,8 +6,11 @@
 //! provider, a store writer or a network call.
 
 pub mod app;
+pub mod bootstrap;
+pub mod config;
 pub mod detector;
 pub mod headless;
+pub mod paths;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
