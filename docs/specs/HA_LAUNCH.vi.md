@@ -149,8 +149,8 @@ Không checkpoint nào được nhận "done" khi prerequisite chưa đạt.
 | H04 | G1 provider incremental, G2 tool continuation, G3 durable session | H03 + khảo sát G1–G3 | **xong phần code**: G1/G2/G3 + service thật + headless, regression 211 test xanh; live smoke `not_run`; multi-input/session là gap nền tảng đã ghi |
 | H05 | Approval, resume, lifecycle | H04 | **đang làm**: approval gate + resume list/select + `/new` + headless `--resume` xong và có test; còn test hard-kill giữa turn |
 | H06 | Installer, User PATH scope, install manifest | H01–H03 | **đang làm**: artifact identity + manifest + rollback + PATH scope + self test xong; ghi User PATH thật không được cấp quyền |
-| H07 | Gate `Verify-HaLaunch.ps1`, PTY fixture, acceptance I01–I18 | H01–H06 | chờ |
-| H08 | Release candidate, clean-machine route | H07 | chờ |
+| H07 | Gate `Verify-HaLaunch.ps1`, PTY fixture, acceptance I01–I18 | H01–H06 | **đang làm**: gate + operator docs + migration note xong; transcript PTY thật bị chặn bởi ConPTY trong sandbox (not_run, có lý do đo được) |
+| H08 | Release candidate, clean-machine route | H07 | việc tiếp theo (không publish) |
 
 Bảng này được cập nhật lại ở mỗi checkpoint cùng evidence/handoff; trạng thái
 "chờ" không được đổi thành "xong" chỉ vì code đã viết mà chưa có test chạy.
@@ -376,3 +376,33 @@ thật thay `PendingService`, và `ha chat --headless` chạy turn thật. Live 
 assignment này. Vì vậy đường ghi registry thật không được chạy; nó được chứng minh bằng
 writer tiêm (`-UserPathWriter`) và bằng việc so User PATH trước/sau. Mọi lần cài thật
 trong bằng chứng đều vào thư mục tạm.
+
+### H07 — Gate và acceptance (đang triển khai)
+
+Đã tạo `scripts/Verify-HaLaunch.ps1` — gate runtime của track, chạy tuần tự:
+
+1. `cargo fmt --all -- --check` và `cargo clippy --workspace --all-targets --locked -- -D warnings`;
+2. **discovery chính xác selector**: gate liệt kê test của từng target và **fail** nếu một
+   selector bắt buộc biến mất (`gate_required_test_ignored`) hoặc target không có test nào
+   (`gate_test_discovery_empty`) — nên không thể "giảm coverage mà vẫn xanh";
+3. unit test của binary `ha`, acceptance `interactive_launch`, `interactive_session`,
+   provider streaming, và regression P0–P7 — tất cả với `--test-threads=1` vì fixture
+   loopback của môi trường này chập khi chạy song song (mục 9 evidence);
+4. installer self test và docs checker.
+
+Gate in rõ **not_run** và không tính chúng là pass: transcript PTY thật (I01/I06/I07/I08),
+live provider smoke, Linux, và mọi thao tác thật lên PATH/profile của user.
+
+**Trạng thái PTY (blocker của môi trường)**: `portable-pty = "=0.9.0"` đã được thêm làm
+dev-dependency và `crates/harness-cli/tests/interactive_terminal.rs` chứa harness thật
+(openpty → spawn → đọc transcript → gửi phím → chờ exit) cùng ba ca I01/I06/I07. Trong
+sandbox này ConPTY **spawn được process nhưng không đọc được byte nào từ master và process
+con không thoát** (đã thử cả `cmd.exe /c echo` để loại trừ lỗi của `ha`), nên ba ca đó
+được đánh dấu `#[ignore]` kèm lý do đo được, và gate báo not_run. Đây là giới hạn môi
+trường, không phải bằng chứng đạt; render loop hiện được chứng minh bằng scripted backend
+(H03) và guard non-TTY bằng launch test.
+
+Operator docs đã cập nhật **chỉ với hành vi có thật**: mục 11 nói rõ installer mới
+(artifact/digest/manifest/rollback/User PATH tách biệt/shadowing) và mục 12 mới mô tả
+entrypoint tương tác, bảng migration cho hành vi non-TTY exit 2, các option `chat`,
+slash command, approval y/n, yêu cầu cấu hình provider, và danh sách "chưa kiểm chứng".

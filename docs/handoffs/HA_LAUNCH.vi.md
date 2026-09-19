@@ -22,7 +22,15 @@ Tài liệu này là điểm vào cho lượt coding tiếp theo. Cập nhật s
   staging/rollback, phân loại lỗi khóa file, User PATH merge tách biệt có test, cảnh báo
   shadowing; `-SelfTest` 14 check xanh. **Không** ghi User PATH thật và không cài vào vị
   trí thật của user (không được cấp quyền).
-- **H07–H08 chưa bắt đầu.**
+- **H07 xong phần gate + docs**: `scripts/Verify-HaLaunch.ps1` chạy xanh toàn bộ
+  (format, clippy `-D warnings`, discovery selector bắt buộc, unit + acceptance + regression
+  P0–P7 với `--test-threads=1`, installer self test, docs checker) và in rõ danh sách
+  **not_run**. Operator guide (vi + en) đã có mục 12 với bảng migration cho hành vi
+  non-TTY exit 2.
+- **Chặn bởi môi trường**: transcript PTY thật (I01/I06/I07/I08) — ConPTY trong sandbox
+  spawn được process nhưng không đọc được output; harness đã viết và được `#[ignore]`
+  kèm lý do. **Không** được coi là đã đạt.
+- **H08 chưa bắt đầu.**
 - Phát hiện nền tảng quan trọng: journal P1 chỉ cho **một input mỗi session** và task lease
   cần **generation mới** — nên "cùng phiên" = cùng task + chuỗi session nối nhau, không
   phải một session nhiều input (chi tiết + test ở mục 5.3 evidence và mục 5 SPEC).
@@ -89,3 +97,18 @@ H07 (gate `Verify-HaLaunch.ps1` + PTY harness + I01–I18), H08 (release candida
 - Project directory read-only chưa có test.
 - Provider endpoint/model resolution (H04) và credential resolver ngoài env var.
 - Migration note cho hành vi mới "bare `ha` non-TTY exit 2" (H07, operator docs).
+
+## 6. Việc tiếp theo chi tiết (H08)
+
+1. **Build release candidate** đúng revision đã test: bundle Windows x64 và (nếu có
+   toolchain) Linux x64, kèm checksum sha256 và manifest nguồn; **không** kèm fixture
+   executables hay test secrets.
+2. **Installer end-user** dùng artifact candidate: staging → verify checksum → cài vào user
+   bin (trong test: thư mục tạm) → ghi manifest → update/uninstall chỉ đụng file sở hữu.
+3. **Clean-machine route**: máy/VM không có Rust/Git/Node — trong session này chỉ có thể
+   mô phỏng bằng PATH tối thiểu + thư mục tạm, phải ghi rõ là mô phỏng, không phải VM thật.
+4. **Publish: KHÔNG được cấp quyền.** Bàn giao candidate + checksum, ghi rõ "download route
+   chưa public", không tạo URL giả.
+5. **PTY**: nếu có môi trường có console thật (không phải sandbox này), chạy
+   `cargo test -p harness-cli --test interactive_terminal -- --ignored --test-threads=1` để
+   lấy transcript I01/I06/I07 và đóng nốt ca hard-kill của H05; ngược lại giữ not_run.

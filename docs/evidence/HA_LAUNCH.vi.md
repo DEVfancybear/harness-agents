@@ -1,6 +1,6 @@
 # Evidence HA_LAUNCH — track H01–H08
 
-Trạng thái: **H01–H06 xong phần code (H05 còn ca hard-kill giữa turn; H06 không ghi User PATH thật vì không được cấp quyền); H07–H08 chưa bắt đầu.** H04/H05 chưa có live provider smoke vì không được cấp quyền. Tài liệu này được cập
+Trạng thái: **H01–H06 xong phần code; H07 có gate + operator docs + migration note (transcript PTY thật bị chặn bởi ConPTY trong sandbox); H08 chưa bắt đầu.** H05 còn ca hard-kill giữa turn; H06 không ghi User PATH thật vì không được cấp quyền. H04/H05 chưa có live provider smoke vì không được cấp quyền. Tài liệu này được cập
 nhật lại sau mỗi checkpoint; trạng thái ở đây là trạng thái thật tại thời điểm ghi,
 không phải trạng thái dự kiến.
 
@@ -348,7 +348,42 @@ Chưa chạy (không được cấp quyền, ghi rõ thay vì mặc định đ�
 - Gate `Verify-HaLaunch.ps1`: H07 phải gọi `Install-Ha.ps1 -SelfTest` và lặp lại các ca
   cài tạm này.
 
-## 8. Chưa xác minh (không được coi là đạt)
+
+## 8. H07 — gate và operator docs
+
+| Kiểm chứng | Lệnh | Kết quả |
+|---|---|---|
+| Gate runtime của track | `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1` | xem verdict bên dưới |
+| Self test của gate | `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -SelfTest` | `GATE_SELFTEST_OK`, exit 0 |
+| Operator docs | `pwsh -NoProfile -File scripts/Verify-Docs.ps1 -SelfTest` | DOCS_OK, 114 file |
+
+Gate chạy và **xanh** cho: format, clippy (`-D warnings`), discovery selector bắt buộc
+(6 selector trên hai target), unit test binary `ha`, acceptance `interactive_launch`
+(11 test), `interactive_session` (8 test), provider streaming (3 test), regression
+P0–P7 (tất cả với `--test-threads=1`), installer self test và docs checker.
+
+Gate in rõ **not_run** và không tính là pass: transcript PTY thật, live provider smoke,
+Linux, và mọi thao tác thật lên PATH/profile của user.
+
+Đã chứng minh ở H07:
+
+- **Gate có thể fail thật**: trong lần chạy đầu, clippy bắt 2 lỗi trong file test PTY mới
+  và gate báo `GATE_FAILED: clippy` (exit 1) — tức gate không phải hình thức.
+- **Discovery chống mất coverage**: gate liệt kê test của từng target và fail nếu selector
+  bắt buộc biến mất; self test của gate kiểm chính bộ parse này.
+- **Migration note cho hành vi mới**: bare `ha` non-TTY giờ exit 2 kèm hướng dẫn; mục 12
+  của operator guide (vi + en) ghi bảng tình huống, option `chat`, slash command, approval
+  y/n, yêu cầu cấu hình provider, và danh sách chưa kiểm chứng.
+
+**Blocker của môi trường (ghi rõ, không tính là đạt)**: harness PTY thật đã viết
+(`portable-pty = "=0.9.0"` + `crates/harness-cli/tests/interactive_terminal.rs` với ba ca
+I01/I06/I07), nhưng trong sandbox này ConPTY **spawn được process mà không đọc được byte
+nào từ master và process con không thoát** — đã loại trừ lỗi của `ha` bằng cách thử
+`cmd.exe /c echo`: cùng hiện tượng. Ba ca được `#[ignore]` kèm lý do và gate báo not_run.
+Vì vậy I01/I06/I07/I08 ở dạng transcript terminal thật **chưa** đạt; render loop đang được
+chứng minh bằng scripted backend (H03) và guard non-TTY bằng launch test.
+
+## 9. Chưa xác minh (không được coi là đạt)
 
 - **I01 PTY transcript**: chưa có. Cần terminal thật/PTY harness (H07). Unit test
   dùng fixture detector chỉ chứng minh logic capability, không phải bằng chứng
@@ -359,7 +394,7 @@ Chưa chạy (không được cấp quyền, ghi rõ thay vì mặc định đ�
 - **Publish release / push remote**: không thực hiện; không được cấp quyền.
 - **Linux**: chưa build/chạy; mọi kết quả trên là Windows.
 
-## 9. Ghi chú flake môi trường (đã điều tra, không che)
+## 10. Ghi chú flake môi trường (đã điều tra, không che)
 
 Test `phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` thỉnh
 thoảng đỏ ở tầng connect tới fixture server loopback trong chính process test:

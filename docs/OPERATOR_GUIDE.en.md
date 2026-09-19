@@ -327,3 +327,35 @@ Building from source stays available for development:
 `cargo build -p harness-cli --bin ha --locked` writes `target/debug/ha`, and
 `cargo run -p harness-cli --bin ha -- <args>` runs it without installing anything.
 
+
+## 12. Starting the interactive app with `ha`
+
+Typing bare `ha` in a terminal opens the interactive app instead of exiting: the header
+shows the project, the provider and the setup state, then the prompt appears.
+
+**Behaviour change worth knowing (migration):** bare `ha` used to exit 0 silently. It now:
+
+| Situation | Behaviour |
+| --- | --- |
+| `ha` in a real terminal | Opens the app; exits only on `/exit`, Ctrl-D on an empty line, or Ctrl-C while waiting |
+| `ha` with redirected stdin/stdout (pipe, CI, script) | Does **not** wait for input: prints short guidance on stderr and exits with code **2** |
+| `ha --help`, `ha --version`, the existing subcommands | Unchanged; the app is not started |
+
+| Command | What it does |
+| --- | --- |
+| `ha chat` | Same entrypoint as bare `ha` |
+| `ha chat --cwd <path>` | Opens that project instead of the current directory |
+| `ha chat --resume <session-id>` | Continues from a persisted session (the app also has `/resume`) |
+| `ha chat --headless --prompt "<text>" [--json]` | One turn without a terminal; result on stdout, logs on stderr |
+| `ha chat --fixture` | Labelled fixture backend for trying the UI; no model is called |
+
+Inside the app: `/help`, `/status`, `/config`, `/model`, `/new`, `/resume [number|id]`,
+`/exit`. A gated action prints the action, working directory and scope, then waits for
+`y` (run it once) or `n` (refuse); there is no implicit approval and no answer in time
+counts as a refusal. A real model call needs `HA_PROVIDER_ENDPOINT`, `HA_PROVIDER_MODEL`
+and a credential (`DEEPSEEK_API_KEY` or `HA_API_KEY`); without them the app still opens
+in setup state and says what is missing, and it never fabricates an answer.
+
+**Not verified on this machine:** the real PTY transcript (ConPTY does not work in the
+sandbox in use — see section 8 of `docs/evidence/HA_LAUNCH.vi.md`) and the live provider
+smoke (no credential or budget is granted).

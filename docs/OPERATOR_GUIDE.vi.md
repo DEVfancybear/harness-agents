@@ -291,10 +291,24 @@ pwsh -NoProfile -File scripts/Install-Ha.ps1 -SkipBuild            # cài binary
 ```
 
 Những gì script **không** làm, một cách có chủ ý: không tải gì về, không publish gì
-lên package registry, và không bao giờ tự sửa `PATH` của bạn. Khi thư mục cài chưa
-có trong `PATH`, nó in ra đúng thư mục cần thêm thay vì âm thầm sửa profile. Nó cũng
-in đường dẫn đã cài và kết quả `ha --version`, để bạn biết chính xác mình sắp chạy
-binary nào.
+lên package registry, và không tự sửa `PATH` của bạn trừ khi bạn yêu cầu rõ bằng
+`-ModifyUserPath`. Khi thư mục cài chưa có trong `PATH`, nó in ra đúng thư mục cần
+thêm thay vì âm thầm sửa profile; khi bạn truyền `-ModifyUserPath`, nó chỉ sửa
+**User PATH** (thêm một lần, không nhân bản, giữ nguyên các entry khác và không bao giờ
+ghi Machine PATH hay PATH tổng hợp của process) và nói rõ terminal mới mới thấy thay đổi.
+
+Từ bản này script còn:
+
+- cài **đúng artifact Cargo báo**, kiểm tra digest và `--version` của bản staged trước
+  khi thay thế, giữ file cũ làm backup để rollback nếu bước cuối thất bại;
+- ghi manifest `ha.install.json` cạnh binary (version, sha256, source, build commit,
+  danh sách file sở hữu) để update/uninstall chỉ đụng file của mình;
+- phân loại lỗi khi thay thế: file đang chạy là `in_use` (đóng app rồi chạy lại — script
+  **không** kill process nào), thiếu quyền là `access_denied`;
+- cảnh báo nếu một `ha` khác đứng trước trên `PATH`; nó **không** xóa command đó.
+
+Chạy `pwsh -NoProfile -File scripts/Install-Ha.ps1 -SelfTest` để tự kiểm chứng các luật
+trên mà không cài vào đâu thật.
 
 Cả hai đường đều build từ đúng cây source mà phase gate kiểm; chỉ khác cargo profile.
 Nếu bạn muốn đúng artifact mà release gate đã chạy, hãy dùng profile release mặc định.
@@ -319,3 +333,41 @@ Build từ source vẫn dùng được cho phát triển:
 `cargo build -p harness-cli --bin ha --locked` ghi ra `target/debug/ha`, và
 `cargo run -p harness-cli --bin ha -- <args>` chạy nó mà không cài gì.
 
+
+## 12. Khởi động tương tác bằng `ha`
+
+Từ track HA_LAUNCH, gõ `ha` không tham số trong một terminal sẽ mở ứng dụng tương tác
+thay vì thoát ngay: header hiện project, provider và setup state, sau đó là ô nhập.
+
+**Thay đổi hành vi cần biết (migration):** trước đây `ha` không tham số thoát với mã 0
+một cách im lặng. Bây giờ:
+
+| Tình huống | Hành vi |
+| --- | --- |
+| `ha` trong terminal thật | Mở ứng dụng; chỉ thoát khi bạn gõ `/exit`, Ctrl-D trên dòng rỗng, hoặc Ctrl-C khi đang chờ |
+| `ha` khi stdin/stdout không phải terminal (pipe, CI, script) | **Không** treo chờ nhập: in hướng dẫn ngắn ra stderr và thoát với mã **2** |
+| `ha --help`, `ha --version`, các subcommand cũ | Giữ nguyên như trước, không khởi động ứng dụng |
+
+Lệnh và option của entrypoint tương tác:
+
+| Lệnh | Việc nó làm |
+| --- | --- |
+| `ha chat` | Cùng entrypoint với `ha` không tham số |
+| `ha chat --cwd <path>` | Mở project ở path đó thay vì thư mục đang đứng |
+| `ha chat --resume <session-id>` | Tiếp tục từ một session đã lưu (đường tương tác dùng `/resume`) |
+| `ha chat --headless --prompt "<text>" [--json]` | Chạy đúng một lượt không cần terminal; kết quả ra stdout, log ra stderr |
+| `ha chat --fixture` | Dùng backend fixture **có nhãn** để thử giao diện; không gọi model nào |
+
+Trong ứng dụng: `/help`, `/status`, `/config`, `/model`, `/new`, `/resume [số|id]`,
+`/exit`. Khi một action cần phê duyệt, ứng dụng in action, thư mục và scope thật rồi chờ
+bạn trả lời `y` (chạy một lần) hoặc `n` (từ chối); không có phê duyệt ngầm, hết thời gian
+chờ được tính là từ chối.
+
+Cần cấu hình để gọi model thật: `HA_PROVIDER_ENDPOINT`, `HA_PROVIDER_MODEL` và một
+credential (`DEEPSEEK_API_KEY` hoặc `HA_API_KEY`). Thiếu cấu hình thì ứng dụng vẫn mở,
+hiện setup state và nói rõ còn thiếu biến nào — nó **không** gọi model và **không** trả
+câu trả lời giả.
+
+**Chưa được kiểm chứng trên máy này:** transcript PTY thật (ConPTY không hoạt động trong
+môi trường sandbox đang dùng — xem mục 8 của `docs/evidence/HA_LAUNCH.vi.md`) và live
+provider smoke (không có credential/budget được cấp). Đừng coi hai điều đó là đã đạt.
