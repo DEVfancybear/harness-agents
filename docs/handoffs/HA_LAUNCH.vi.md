@@ -15,6 +15,13 @@ việc tiếp theo) ở **mục 16 của evidence**: [evidence HA_LAUNCH](../evi
 
 ## 1. Ranh giới hiện tại
 
+- **Round 24 — CI đã XANH 12/12 job.** Trước đó mọi commit từ `9bbd632` đều đỏ. Nguyên nhân thật
+  (đọc từ log CI sau khi user cài `gh`) là **test không portable**, không phải flake loopback như
+  tôi kết luận sai ở round 23: (a) tempdir trên runner Windows giữ tên 8.3 nên so raw-vs-canonical
+  sai; (b) Linux dừng ở `config_read_error` còn Windows ở `storage_open_failed` cho cùng một root
+  hỏng; (c) fixture ACL (`icacls`+`USERNAME`) là Windows-only, gồm cả test read-denial trong
+  `harness-tools`. Sửa ở `01a7bee` + `ed22df4`; run `35459853068` → **12/12 success**. Chi tiết:
+  mục 23 evidence.
 - **Round 23 (tiếp)**: hai gap còn lại của handoff **đã đóng** — multiline editing (Enter gửi,
   Ctrl-J chèn dòng, prompt nhiều dòng, con trỏ theo ký tự/row) và guard PATH của `-Uninstall`
   (`-RemoveUserPathEntry`; self test 26 → **28 check**). Gate đầy đủ trên cây đã sửa:

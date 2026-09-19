@@ -1473,3 +1473,54 @@ gate ở mục 19/20/21 là **những lần chạy xanh thật** chứ không ph
 có bước nào bị bỏ, không test nào bị sửa, và không mục `not_run` nào được nâng — nhưng người đọc
 bằng chứng cần biết rằng một lần `failures: []` trên máy này là kết quả **có xác suất**, không phải
 hằng số.
+
+## 23. CI đỏ 12/12 job: nguyên nhân thật là test không portable, không phải flake
+
+Mục này sửa lại một kết luận sai ở mục 22. Sau khi có `gh` (user cài, đăng nhập sẵn), log thật của
+CI đọc được và cho thấy 12 job đỏ vì **ba lỗi tất định theo platform** trong chính test của track H —
+không phải flake loopback. Việc tôi suy ra "flake" từ đo local là **sai**, và ghi lại đây để không ai
+lặp lại cách suy đó.
+
+Log lấy bằng: `gh run view <id> --log-failed --repo DEVfancybear/harness-agents`.
+
+| Job | Test | Lỗi thật trong log |
+|---|---|---|
+| windows | `h02_project_identity_follows_the_caller_directory_with_spaces_and_unicode` | `left: C:\Users\runneradmin\…` vs `right: C:\Users\RUNNER~1\…` |
+| windows | `h02_relative_cwd_resolves_from_the_caller_and_git_root_comes_from_the_project_tree` | cùng dạng `RUNNER~1` |
+| windows | `h02_…` (assertion header) | header in path canonical, test so path raw |
+| ubuntu | `i09_a_data_directory_without_write_permission_names_the_path_and_writes_nothing` | `USERNAME is set: NotPresent` |
+| ubuntu | `i09_a_data_root_that_cannot_be_created_names_the_path_and_writes_nothing` | `config_read_error: … Not a directory (os error 20)` |
+| ubuntu | `workspace::tests::review_unreadable_directory_…` | `USERNAME is set: NotPresent` — test ACL **tôi thêm ở round 23** |
+
+Ba nguyên nhân, ba bản chất khác nhau:
+
+1. **Tên 8.3 trên Windows runner.** `resolve` canonicalize caller directory rồi bỏ prefix `\\?\`
+   (`displayable`). Tempdir trên runner Windows giữ thành phần tên ngắn (`RUNNER~1`), nên đường dẫn
+   raw và đường dẫn canonical **khác chuỗi nhưng cùng thư mục**. Test so raw với canonical nên chỉ
+   đúng trên máy này. Sửa: fixture expose dạng canonical mà `resolve` báo (`canonical_project`) và
+   mọi assertion so cùng dạng.
+2. **Thứ tự lỗi khác nhau giữa hai OS.** Với `HA_HOME` là một file, Linux đọc `config.toml` **bên
+   trong** root hỏng trước nên dừng bằng `config_read_error`; Windows dừng ở store với
+   `storage_open_failed`. Test khẳng định thứ tự của một platform. Sửa: khẳng định **hợp đồng** —
+   exit ≠ 0, stdout rỗng, có mã lỗi có kiểu, và **nêu đúng đường dẫn** hỏng — chấp nhận cả hai mã.
+3. **Fixture chỉ chạy được trên Windows.** `icacls` + `USERNAME` là Windows-only theo bản chất, cả ở
+   `interactive_launch.rs` **và** ở test read-denial tôi thêm trong `harness-tools`. Sửa: skip có
+   thông báo nêu lý do trên platform khác, thay vì panic.
+
+**Kết quả sau khi sửa** (commit `01a7bee` và `ed22df4`):
+
+```text
+gh run view 35459853068 --json jobs
+success  P0 P3 P4 P5 P6 P7 (ubuntu-latest)
+success  P0 P3 P4 P5 P6 P7 (windows-latest)
+```
+
+**12/12 job xanh.** Hai điều cần rút ra, và cả hai đều ngược với kết luận cũ ở mục 22:
+
+- Flake loopback **không** phải nguyên nhân CI đỏ. Nó có thật trên máy này (mục 22 đo được), nhưng
+  trên runner GitHub không xuất hiện, nên mọi thời gian tôi dành để "sửa flake" không đụng tới
+  nguyên nhân thật. Việc đúng lẽ ra phải làm từ đầu là **đọc log**, và tôi chỉ đọc được sau khi
+  `gh` có mặt.
+- Bài học về test: bộ H được viết và kiểm **chỉ trên một máy Windows**, nên nó âm thầm phụ thuộc
+  vào tên đường dẫn ngắn không tồn tại, vào thứ tự lỗi của Windows, và vào `icacls`. Từ đây, test
+  mới của track phải nêu rõ platform và skip có lý do, không được giả định môi trường.
