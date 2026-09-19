@@ -37,23 +37,15 @@ pub async fn run(launch: AppLaunch) -> Result<ExitCode, HarnessError> {
     // is unit tested against a fixture environment.
     let environment = LaunchEnvironment::capture();
     let context = resolve_context(&launch, &environment)?;
-    let notice = launch.resume.as_deref().map(|session| {
-        format!("resume {session} requested; session recovery arrives with HA_LAUNCH H05")
-    });
+    let source = launch.resume.as_deref();
     match RawModeGuard::enter() {
         Ok(guard) => {
-            let code = run_terminal(
-                &context,
-                &environment,
-                guard,
-                notice.as_deref(),
-                launch.fixture,
-            )?;
+            let code = run_terminal(&context, &environment, guard, source, launch.fixture)?;
             Ok(ExitCode::from(code))
         }
         Err(error) => {
             eprintln!("ha: raw mode is unavailable ({error}); using plain line input");
-            run_line_mode(&context, &environment, notice.as_deref(), launch.fixture).await
+            run_line_mode(&context, &environment, source, launch.fixture).await
         }
     }
 }
@@ -122,6 +114,10 @@ fn controller_for(
 #[derive(Clone, Copy, Debug, Default)]
 struct RenderCursor {
     at_line_start: bool,
+    prompt_visible: bool,
+    /// How many rows the visible prompt spans, so a multi-row prompt can be
+    /// erased before the next write instead of leaving continuation rows behind.
+    prompt_rows: u16,
 }
 
 /// Render loop shared by the real terminal and the scripted test backend.
@@ -132,14 +128,23 @@ fn run_loop(
 ) -> Result<u8, HarnessError> {
     let mut cursor = RenderCursor {
         at_line_start: true,
+        prompt_visible: false,
+        prompt_rows: 0,
     };
+    if let Some(source) = notice {
+        controller
+            .resume_source(source)
+            .map_err(|message| HarnessError::new(ErrorCode::InvalidPayload, message))?;
+    }
     let mut boot = String::new();
     for line in controller.boot_lines() {
         boot.push_str(&line);
         boot.push_str("\r\n");
     }
     if let Some(notice) = notice {
+        boot.push_str("Selected session ");
         boot.push_str(notice);
+        boot.push_str("; the next request verifies and recovers its context.");
         boot.push_str("\r\n");
     }
     backend
@@ -182,6 +187,7 @@ fn step(
     for effect in effects {
         match effect {
             Effect::WriteLine(line) => {
+                clear_prompt(backend, cursor)?;
                 if !cursor.at_line_start {
                     backend
                         .write("\r\n")
@@ -196,6 +202,7 @@ fn step(
                 cursor.at_line_start = true;
             }
             Effect::WritePartial(text) => {
+                clear_prompt(backend, cursor)?;
                 backend
                     .write(&text)
                     .map_err(|error| terminal_error(&error))?;
@@ -239,20 +246,79 @@ fn draw_prompt(
     controller: &InteractiveController,
     cursor: &mut RenderCursor,
 ) -> Result<(), HarnessError> {
-    if !cursor.at_line_start {
+    if !cursor.at_line_start && !cursor.prompt_visible {
         backend
             .write("\r\n")
             .map_err(|error| terminal_error(&error))?;
     }
-    backend
-        .clear_line()
-        .map_err(|error| terminal_error(&error))?;
-    backend
-        .write(&controller.prompt())
-        .map_err(|error| terminal_error(&error))?;
+    // Erase the prompt that is already on screen first: a multi-row prompt must
+    // not leave its continuation rows behind when it shrinks or grows.
+    erase_prompt(backend, cursor)?;
+    let lines = controller.prompt_lines();
+    for (index, line) in lines.iter().enumerate() {
+        backend
+            .write(line)
+            .map_err(|error| terminal_error(&error))?;
+        if index + 1 < lines.len() {
+            backend
+                .write("\r\n")
+                .map_err(|error| terminal_error(&error))?;
+        }
+    }
+    backend.flush().map_err(|error| terminal_error(&error))?;
+    // Leave the cursor where the next character would be typed, which may be a
+    // continuation row rather than the end of the prompt.
+    let (row, column) = controller.prompt_cursor_cell();
+    let back = (lines.len().saturating_sub(1)).saturating_sub(row);
+    if back > 0 {
+        backend
+            .move_up(u16::try_from(back).unwrap_or(u16::MAX))
+            .map_err(|error| terminal_error(&error))?;
+    }
+    if column > 0 {
+        backend
+            .write(&format!("\r\u{1b}[{column}C"))
+            .map_err(|error| terminal_error(&error))?;
+    }
     backend.flush().map_err(|error| terminal_error(&error))?;
     cursor.at_line_start = false;
+    cursor.prompt_visible = true;
+    cursor.prompt_rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     Ok(())
+}
+
+/// Remove the visible prompt, returning the cursor to its first row.
+///
+/// A single-row prompt is always cleared, even when nothing was drawn yet, because
+/// that is what keeps a stale shell line from surviving under the first prompt.
+fn erase_prompt(
+    backend: &mut impl TerminalBackend,
+    cursor: &mut RenderCursor,
+) -> Result<(), HarnessError> {
+    let rows = if cursor.prompt_visible {
+        cursor.prompt_rows.max(1)
+    } else {
+        1
+    };
+    for row in 0..rows {
+        if row > 0 {
+            backend.move_up(1).map_err(|error| terminal_error(&error))?;
+        }
+        backend
+            .clear_line()
+            .map_err(|error| terminal_error(&error))?;
+    }
+    cursor.prompt_visible = false;
+    cursor.at_line_start = true;
+    cursor.prompt_rows = 0;
+    Ok(())
+}
+
+fn clear_prompt(
+    backend: &mut impl TerminalBackend,
+    cursor: &mut RenderCursor,
+) -> Result<(), HarnessError> {
+    erase_prompt(backend, cursor)
 }
 
 fn terminal_error(error: &std::io::Error) -> HarnessError {
@@ -273,6 +339,11 @@ async fn run_line_mode(
     fixture: bool,
 ) -> Result<ExitCode, HarnessError> {
     let mut controller = controller_for(context, environment, fixture);
+    if let Some(source) = notice {
+        controller
+            .resume_source(source)
+            .map_err(|message| HarnessError::new(ErrorCode::InvalidPayload, message))?;
+    }
     let mut output = std::io::stdout();
     for line in controller.boot_lines() {
         writeln!(output, "{line}").map_err(|error| io_error(&error))?;
@@ -307,28 +378,48 @@ async fn run_line_mode(
         }
     });
 
-    while let Some(line) = receiver.recv().await {
-        let Some(line) = line else {
-            writeln!(output, "bye").map_err(|error| io_error(&error))?;
-            return Ok(ExitCode::SUCCESS);
+    run_line_input(&mut controller, &mut output, &mut receiver).await
+}
+
+async fn run_line_input(
+    controller: &mut InteractiveController,
+    output: &mut impl Write,
+    receiver: &mut tokio::sync::mpsc::Receiver<Option<String>>,
+) -> Result<ExitCode, HarnessError> {
+    let mut ticks = tokio::time::interval(KEY_POLL_INTERVAL);
+    loop {
+        let effects = tokio::select! {
+            line = receiver.recv() => match line.flatten() {
+                Some(line) => {
+                    for character in line.chars() {
+                        let _ = controller.handle_key(Key::Char(character));
+                    }
+                    controller.handle_key(Key::Enter)
+                }
+                None => {
+                    // Line input has no partial editor buffer. EOF follows
+                    // the same cancel/exit route as an explicit quit.
+                    controller.handle_key(Key::EndOfInput)
+                }
+            },
+            _ = ticks.tick() => controller.pump_events(),
         };
-        for character in line.chars() {
-            let _ = controller.handle_key(Key::Char(character));
-        }
-        if let Some(code) = render_line_mode(&mut controller, &mut output)? {
+        if let Some(code) = render_line_mode(controller, output, effects)? {
             return Ok(ExitCode::from(code));
         }
     }
-    Ok(ExitCode::SUCCESS)
 }
 
 fn render_line_mode(
     controller: &mut InteractiveController,
     output: &mut impl Write,
+    effects: Vec<Effect>,
 ) -> Result<Option<u8>, HarnessError> {
-    let mut effects = controller.handle_key(Key::Enter);
-    effects.extend(controller.pump_events());
+    if effects.is_empty() {
+        return Ok(None);
+    }
     let mut exit = None;
+    let mut redraw = false;
     for effect in effects {
         match effect {
             Effect::WriteLine(line) => {
@@ -337,13 +428,13 @@ fn render_line_mode(
             Effect::WritePartial(text) => {
                 write!(output, "{text}").map_err(|error| io_error(&error))?;
             }
-            Effect::RedrawPrompt => {}
+            Effect::RedrawPrompt => redraw = true,
             Effect::Exit(code) => exit = Some(code),
         }
     }
-    if exit.is_none() {
+    if exit.is_none() && redraw {
         write!(output, "{}", controller.prompt()).map_err(|error| io_error(&error))?;
-    } else {
+    } else if exit.is_some() {
         writeln!(output).map_err(|error| io_error(&error))?;
     }
     output.flush().map_err(|error| io_error(&error))?;
@@ -398,6 +489,127 @@ mod tests {
 
     fn environment(pairs: &[(&str, &str)]) -> LaunchEnvironment {
         LaunchEnvironment::from_pairs(pairs.iter().map(|(name, value)| (*name, *value)))
+    }
+
+    #[test]
+    fn completion_typing_redraws_without_a_new_line_per_key() {
+        let (_temp, context) = context(true);
+        let mut controller = controller_for(&context, &environment(&[]), true);
+        let mut cursor = super::RenderCursor::default();
+        let mut backend = ScriptedBackend::new(Vec::new());
+        super::draw_prompt(&mut backend, &controller, &mut cursor).expect("prompt");
+        let before = backend.writes().len();
+        for key in [
+            Key::Char('s'),
+            Key::Char('ử'),
+            Key::Char('a'),
+            Key::Backspace,
+        ] {
+            let effects = controller.handle_key(key);
+            assert!(!super::step(&mut backend, &controller, effects, &mut cursor).expect("redraw"));
+        }
+        assert!(
+            !backend.writes()[before..]
+                .iter()
+                .any(|part| part.contains('\n')),
+            "redraws must stay on the prompt line: {:?}",
+            backend.writes()
+        );
+    }
+
+    #[test]
+    fn completion_launch_resume_is_delivered_to_the_session_port() {
+        use std::sync::{Arc, Mutex};
+        struct Port(Arc<Mutex<Vec<Option<String>>>>);
+        impl SessionPort for Port {
+            fn label(&self) -> String {
+                "resume test".to_owned()
+            }
+            fn submit(&mut self, _: crate::interactive::service::SubmitRequest) {}
+            fn cancel(&mut self) {}
+            fn resume(&mut self, source: Option<String>) -> Result<(), String> {
+                self.0.lock().expect("resume log").push(source);
+                Ok(())
+            }
+        }
+        let (_temp, context) = context(true);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut controller = InteractiveController::new(
+            &context,
+            Box::new(Port(Arc::clone(&log))),
+            SessionChannel::new(),
+        );
+        let mut backend = ScriptedBackend::new(vec![Key::EndOfInput]);
+        let source = "session_0192f0aa-bbcc-7ddd-8eee-000000000001";
+        assert_eq!(
+            run_loop(&mut backend, &mut controller, Some(source)).expect("launch"),
+            0
+        );
+        assert_eq!(
+            *log.lock().expect("resume log"),
+            vec![Some(source.to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_line_mode_streams_before_the_next_input_line() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Output(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("output").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (_temp, context) = context(true);
+        let channel = SessionChannel::new();
+        let events = channel.sender();
+        let mut controller = InteractiveController::new(
+            &context,
+            Box::new(FixtureService::new(events.clone())),
+            channel,
+        );
+        let _ = controller.boot_lines();
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let mut output = Output(Arc::clone(&buffer));
+        let (input, mut receiver) = tokio::sync::mpsc::channel(2);
+        let producer = async {
+            events
+                .send(crate::interactive::events::SessionEvent::TextDelta {
+                    text: "late response".to_owned(),
+                })
+                .expect("response");
+            let observed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if String::from_utf8_lossy(&buffer.lock().expect("output"))
+                        .contains("late response")
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+            input
+                .send(Some("/exit".to_owned()))
+                .await
+                .expect("exit line");
+            observed
+        };
+        let (result, observed) = tokio::join!(
+            super::run_line_input(&mut controller, &mut output, &mut receiver),
+            producer
+        );
+        assert_eq!(result.expect("line mode"), std::process::ExitCode::SUCCESS);
+        assert!(
+            observed,
+            "output must arrive while stdin remains idle and open"
+        );
     }
 
     #[test]
@@ -472,6 +684,42 @@ mod tests {
             "the erased character never reached the backend: {output}"
         );
         assert!(output.contains("fixture (no model was called)"));
+    }
+
+    #[test]
+    fn h03_a_multiline_draft_submits_once_and_erases_its_extra_rows() {
+        let (_temp, context) = context(true);
+        let mut keys = keys_of("first line");
+        keys.push(Key::Newline);
+        keys.extend(keys_of("second line"));
+        keys.push(Key::Enter);
+        keys.push(Key::EndOfInput);
+        let mut backend = ScriptedBackend::new(keys);
+        let mut controller = controller_for(&context, &environment(&[]), true);
+        let code = run_loop(&mut backend, &mut controller, None).expect("loop runs");
+        assert_eq!(code, 0);
+
+        let output = backend.output();
+        // Both rows were drawn, and the continuation row carries no marker.
+        assert!(output.contains("> first line"), "{output}");
+        assert!(output.contains("second line"), "{output}");
+        assert!(
+            !output.contains("> second line"),
+            "only the first row carries the marker: {output}"
+        );
+
+        // The whole draft reached the backend as ONE request, not one per row.
+        assert!(
+            output.contains("fixture answer for: first line\nsecond line"),
+            "the rows were submitted as a single message: {output}"
+        );
+
+        // Growing to two rows and then erasing for the response moved the cursor
+        // up, so a continuation row was never left behind on screen.
+        assert!(
+            backend.moved_up() > 0,
+            "a multi-row prompt must be erased by moving up: {output}"
+        );
     }
 
     #[test]

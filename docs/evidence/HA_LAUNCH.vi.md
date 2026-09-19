@@ -354,10 +354,14 @@ Chưa chạy (không được cấp quyền, ghi rõ thay vì mặc định đ�
 
 - **Ghi User PATH thật** qua registry và **cài vào vị trí thật của user**: không thực hiện.
   Đường ghi được chứng minh bằng writer tiêm + so User PATH trước/sau.
-- **I01 trên binary đã cài trong PTY**: thuộc H07 (hiện mới chứng minh từ chối non-TTY và
-  `--version`/`--help` trên binary đã cài).
-- Gate `Verify-HaLaunch.ps1`: H07 phải gọi `Install-Ha.ps1 -SelfTest` và lặp lại các ca
-  cài tạm này.
+
+Đã đóng ở round 21 (trước đây nằm trong danh sách "chưa chạy"):
+
+- **I01 trên binary đã cài trong PTY**: ca
+  `i14_the_installed_artifact_opens_the_app_in_a_real_terminal` chạy **artifact đã cài** trong
+  pseudo-console thật, từ project ngoài thư mục cài (mục 18).
+- **Gate gọi installer self test**: `Verify-HaLaunch.ps1` chạy `Install-Ha.ps1 -SelfTest` như
+  một bước bắt buộc và lặp lại các ca cài tạm.
 
 
 ## 8. H07 — gate và operator docs
@@ -654,19 +658,33 @@ Kill process cứng vẫn **ngoài phạm vi** đúng như plan ghi, và đượ
 
 ## 13. Chưa xác minh (không được coi là đạt)
 
-- **I01/I06/I07 PTY**: đã có transcript thật trong pseudo-console (mục 12.2), nhưng không
-  tự động trong gate: `cargo test` trong sandbox không có console nên phải chạy
-  `scripts/Invoke-HaPtyAcceptance.ps1`. Gate liệt kê chúng là `not_run` kèm hướng dẫn.
-- **I08 (lỗi render/backend sau khi terminal đã khởi tạo)**: chưa có ca PTY inject lỗi;
-  hiện chỉ được chứng minh ở mức scripted backend (H07 G2), không phải PTY thật.
-- **H05 I13**: cả hai nửa đã đo trên process thật — kill giữa lượt gọi model (mục 10.1) và kill
-  sau khi tool receipt đã commit (mục 15.2, PTY + tool chạy thật).
-- **Live provider**: không chạy; không có credential/budget được cấp.
-- **User PATH / cài binary thật**: không thực hiện; không được cấp quyền.
-- **Publish release / push remote**: không thực hiện; không được cấp quyền.
+Danh sách này chỉ còn những mục **thực sự** chưa đo. Round 21 dọn lại vì nó còn giữ ba dòng đã
+lỗi thời từ round 10–13 (PTY I01/I06/I07, ca PTY I08, và hai nửa của H05 I13 — cả ba nay đã có
+bằng chứng, xem mục 12.2, 12.3, 15.2 và 18).
+
+- **Live provider**: không chạy; không có credential/budget được cấp (mục 11).
+- **User PATH / cài binary thật**: không thực hiện; không được cấp quyền. Đường ghi được chứng
+  minh bằng writer tiêm (mục 7), không phải bằng cách sửa registry của user.
+- **Publish release / push remote**: không thực hiện; không được cấp quyền (mục 9, 11).
 - **Linux**: chưa build/chạy; mọi kết quả trên là Windows.
+- **I19 — VM sạch thật**: chỉ có môi trường tái tạo trong self test (mục 15.3), không có VM.
+
+Đã đóng (trước đây nằm trong danh sách này): **I01/I06/I07/I08/I12/I13/I14 PTY** đều có ca trong
+pseudo-console thật và chạy được bằng `scripts/Invoke-HaPtyAcceptance.ps1`; gate liệt kê chín ca
+này là `not_run` kèm hướng dẫn vì `cargo test` trong sandbox không có console (mục 12.2, 12.3,
+15.2, 15.4, 15.5, 18).
 
 ## 14. Ghi chú flake môi trường (đã điều tra, không che)
+
+**Bổ sung round 21**: gate đỏ ở đúng **một** bước — `providers-streaming` →
+`streaming::tests::g1_adapter_delivers_text_before_the_response_completes` — và đó là bước **duy
+nhất** trong gate còn chạy test song song (`cargo test -p harness-providers --locked`, thiếu
+`--test-threads=1`), dù chính mục này đã kết luận từ trước rằng fixture loopback phải chạy tuần
+tự trong môi trường này. Đo lại trên **cùng binary**:
+`cargo test -p harness-providers --locked -- --test-threads=1` → **3 passed; 0 failed** (exit 0).
+Vì vậy round 21 sửa **gate**, không sửa test: bước `providers-streaming` nay truyền
+`-- --test-threads=1` như mọi suite khác, kèm comment nêu lý do. Không đổi acceptance P2 và không
+đổi test nào của `harness-providers`.
 
 **Bổ sung round 20**: lần chạy gate đầu của round 20 đỏ ở `providers-streaming` →
 `streaming::tests::g1_adapter_delivers_text_before_the_response_completes` (fixture loopback
@@ -771,7 +789,8 @@ Chưa chứng minh / còn mở:
 
 Bảng này nói rõ mỗi mục của plan được chứng minh bằng gì và ở mức nào; "một phần" nghĩa là
 phần còn thiếu được ghi đúng chứ không được tính là đạt. Sau round 16 chỉ còn **I19** (VM
-sạch thật) ở mức một phần; I04/I09 đóng ở mục 15.1, I13 đóng ở mục 15.2.
+sạch thật) ở mức một phần; I04/I09 đóng ở mục 15.1, I13 đóng ở mục 15.2. Round 21
+đóng nốt vế "I01 trên binary đã cài" của I14 (mục 18).
 
 | # | Bằng chứng cụ thể | Trạng thái |
 |---|---|---|
@@ -788,7 +807,7 @@ sạch thật) ở mức một phần; I04/I09 đóng ở mục 15.1, I13 đóng
 | I11 | `g2_tool_results_return_to_the_model_and_the_turn_ends_with_the_answer`, `g2_a_failed_tool_call_is_reported_instead_of_ending_the_turn`, `g2_the_tool_loop_is_bounded_and_reports_which_bound_stopped_it`, `g3_the_foundation_admits_one_input_per_session_and_says_so` | đạt |
 | I12 | `h05_a_denied_gated_action_is_not_executed_and_the_model_is_told`, `h05_a_granted_gated_action_runs_once_after_the_answer`, `h05_an_expired_approval_is_a_refusal_not_a_silent_grant`, `i12_headless_turn_without_provider_configuration_fails_closed`, PTY `i12_a_prompt_with_an_unreachable_provider_is_reported_and_the_app_stays_alive` (round 20: provider được cấu hình nhưng không ai trả lời → `[run] failed` nêu URL, app vẫn sống, không có câu trả lời giả) | đạt |
 | I13 | PTY `i13_a_settled_tool_receipt_survives_a_hard_kill_mid_turn` (mục 15.2: patch được duyệt chạy thật, receipt đã commit rồi mới kill cứng; tiếp tục bằng process mới → `tool_calls = 0`, file không đổi, vẫn đúng 1 receipt), `i13_a_hard_kill_mid_turn_leaves_one_admitted_input_and_no_claimed_success` (mục 10.1), `i13_resume_continues_the_task_with_recovered_context_and_no_rerun`, `i13_resuming_an_unknown_session_fails_without_running_anything`, `h05_a_settled_receipt_is_not_re_executed_after_the_process_state_is_lost` | đạt |
-| I14 | `Install-Ha.ps1 -SelfTest`: `disposable_install_replaces_and_verifies_the_artifact`, `installed_digest_matches_the_built_artifact`, `install_manifest_records_version_and_digest` | đạt trong destination tạm |
+| I14 | `Install-Ha.ps1 -SelfTest`: `disposable_install_replaces_and_verifies_the_artifact`, `installed_digest_matches_the_built_artifact`, `install_manifest_records_version_and_digest`; PTY round 21: `i14_the_installed_artifact_opens_the_app_in_a_real_terminal` (chính I01, nhưng chạy trên **binary đã cài**, mục 18) | đạt trong destination tạm **và** console thật |
 | I15 | `Install-Ha.ps1 -SelfTest`: `merge_appends_a_missing_directory`, `merge_is_case_insensitive_and_ignores_a_trailing_separator`, `merge_drops_empty_entries_and_keeps_order`, `merge_never_folds_machine_or_process_entries_into_user_path`, `injected_writer_receives_the_merged_user_path`, `self_test_never_writes_the_real_user_path` | đạt ở mức mô phỏng; **không** ghi User PATH thật |
 | I16 | `i16_a_second_run_in_the_same_project_is_refused_while_the_first_holds_the_store`, `h02_two_terminals_in_one_project_share_a_store_and_the_second_is_busy` | đạt |
 | I17 | `Install-Ha.ps1 -SelfTest`: `shadowing_command_is_found_before_the_owned_binary`, `shadowing_command_is_never_deleted` | đạt |
@@ -928,13 +947,15 @@ và cài lên máy user (không được cấp quyền), VM sạch thật cho I1
 
 | Mục | Giá trị đo được |
 |---|---|
-| Commit code được đo | `ebad2997e3a6bbdaf937041c5bc1a9e5e8b12a62`, tree `c8718a526dee1f52de788906953580127637f1d2`. Round 18 chỉ đổi `scripts/Install-Ha.ps1` và tài liệu (không đổi `crates/**/src`), nên digest executable bên dưới vẫn đúng cho cây này; commit của round 18 xem `git log -1` |
-| Executable dùng cho acceptance | `target/debug/ha.exe`, `ha 0.1.0`, sha256 `23fd5424b187c0ae229aa6efef9d4b6abcc3df053e00cdbb245c185e5afd6747`, 25 682 944 byte |
-| Release candidate | `target/release-candidate/ha-0.1.0-windows-x64/` + `ha-0.1.0-windows-x64.zip` (digest zip ở mục 9); `published: false` |
+| Commit code được đo | `c386416e9b529dcace078afa0c48ed8343c63353`, tree `75fa028ce8ba572c87634f1c384a711142bd3bf5` (round 21: `596e46a` thêm ca PTY `i14` + cập nhật runner/gate docs, `c386416` cho bước streaming chạy tuần tự). Round 21 **không** đổi `crates/**/src`, nên executable là bản dựng từ cùng source với round 18 |
+| Executable dùng cho acceptance | `target/debug/ha.exe`, `ha 0.1.0`. Digest **phụ thuộc thư mục build** (đường dẫn nhúng trong binary), nên chỉ so trong cùng một cây: cây chính (round 18) sha256 `23fd5424b187c0ae229aa6efef9d4b6abcc3df053e00cdbb245c185e5afd6747`, 25 682 944 byte; worktree sạch `ha-verify-round20` ở `c386416` sha256 `3f5ec0a6e4bfba680e25994078cb0d53d64e28f76455ed9ce7109a88affadced`, 25 725 440 byte |
+| Release candidate | `target/release-candidate/ha-0.1.0-windows-x64/` + `ha-0.1.0-windows-x64.zip`; **round 22 dựng lại ở HEAD**: `build_commit c386416`, `sha256 ha.exe = 7bfa0133c7e696e5b37fe3611afdeef8cba710257fcc0a430bd9aa91ffc6d64b`, `published: false` (candidate cũ dựng ở `1eceeef` đã bị thay; xem mục 19.6) |
 | Đường dẫn đã resolve (ví dụ) | store per-project: `<HA_HOME>/data/projects/project-<hash>` (mục 10.1, 15.2); cài đặt disposable: `%TEMP%/ha-install-<guid>` (self test); bundle: `target/release-candidate/...` |
-| TTY transcript | `target/pty-acceptance/pty-all.txt` — **8 ca** i01/i05/i06/i07a/i07b/i08/i12/i13 (mục 12.2, 15.2, 15.4, 15.5) |
+| TTY transcript | `target/pty-acceptance/pty-all.txt` — **9 ca** i01/i05/i06/i07a/i07b/i08/i12/i13/i14 (mục 12.2, 15.2, 15.4, 15.5, 18); round 22 chạy lại xanh ở **cả hai cây**: 9 passed / 0 failed trong 19.83 s (cây chính) và 19.93 s (worktree sạch `c386416`, transcript `target/verify-round22/target/pty-acceptance/pty-all.txt`) |
 | OS đã chạy | Windows 11 x64; `rustup target list --installed` chỉ có `x86_64-pc-windows-msvc` |
-| Test automation đã chạy | gate `Verify-HaLaunch.ps1` (`passed: true`, 13 selector), installer self test **26** check, docs checker |
+| Test automation đã chạy | gate `Verify-HaLaunch.ps1` (`passed: true`, 13 selector, `failures: []`, **33/33 bước exit 0**) — round 21: hai lần xanh (tại chỗ + worktree `c386416`); **round 22: xác nhận lại trong worktree sạch `target/verify-round22` ở `c386416`**, kèm hai lần đỏ đã truy nguyên nguyên nhân (giới hạn sandbox ở mục 19.2 và file chưa commit của writer khác ở mục 19.3); installer self test **26** check; docs checker; PTY suite **9** ca |
+| not_run | live provider smoke, publish, Linux, VM sạch thật, ghi User PATH/cài lên máy user (mục 13, 15) — round 22 không đổi danh sách này |
+| Việc tiếp theo thực tế | cần user cấp credential/budget cho smoke, hoặc channel + xác nhận push tag `ha-v0.1.0` cho publish; nếu không có, track dừng ở đúng mức đã đo và không có mục nào được nâng thành "đạt" |
 
 ## 17. Round 20: xác minh trong worktree riêng (workspace bị ghi song song)
 
@@ -969,5 +990,408 @@ Ghi chú flake của round 20 (đã đo trước khi cây bị sửa dở): lầ
 `acceptance-launch` + `providers-streaming` + `regression-phase_p2`; `cargo test -p harness-providers
 --locked --lib` chạy riêng **3/3 xanh**. Đây đúng loại loopback flake đã ghi ở mục 14, và worktree
 sạch ở trên là lần chạy không có writer khác tranh chấp.
-| not_run | live provider smoke, publish, Linux, VM sạch thật, ghi User PATH/cài lên máy user (mục 13, 15) |
-| Việc tiếp theo thực tế | cần user cấp credential/budget cho smoke, hoặc channel + xác nhận push tag `ha-v0.1.0` cho publish; nếu không có, track dừng ở đúng mức đã đo và không có mục nào được nâng thành "đạt" |
+
+## 18. Round 21: artifact đã cài mở app trong console thật (I14)
+
+Plan H06 nói thẳng: "tuyệt đối không chỉ kiểm tra absolute path `--version`", và oracle I14 đòi
+"resolved executable path/digest đúng **và I01 pass trên installed executable**". Self test của
+installer đã có nửa digest; nửa còn lại — chạy chính **artifact đã cài** trong terminal thật —
+chưa từng được đo: mọi ca PTY trước đó chạy `target/debug/ha.exe` trong build tree.
+
+Ca mới `i14_the_installed_artifact_opens_the_app_in_a_real_terminal`:
+
+1. copy `target/debug/ha.exe` (đường Cargo báo) vào một thư mục cài **có dấu và khoảng trắng**
+   (`<temp>/bản cài đặt`);
+2. dựng lại môi trường: `PATH` chỉ còn thư mục cài + `%SystemRoot%\System32` + `%SystemRoot%`,
+   và `APPDATA`/`LOCALAPPDATA`/`USERPROFILE`/`HOME`/`CARGO_HOME`/`RUSTUP_HOME` bị xoá khỏi
+   process con — không toolchain, không profile của user, không state thật;
+3. chạy binary đã cài trong pseudo-console thật, cwd là một project **ngoài** thư mục cài và
+   không có `.git`;
+4. khẳng định trên transcript: header `Harness Agents 0.1.0`, prompt tiếng Việt, dòng
+   `Project: <caller project>`, `Data: <HA_HOME>/data [HA_HOME]` và
+   `Store: <HA_HOME>/data/projects` — tức identity theo caller cwd và state theo `HA_HOME`,
+   không theo thư mục cài;
+5. `/exit` → exit **0**, terminal được trả lại (transcript kết thúc bằng xuống dòng), và thư mục
+   cài sau khi chạy vẫn **chỉ có** đúng file `ha.exe`.
+
+Điều đáng ghi lại: ConPTY tự đặt tiêu đề cửa sổ bằng đường dẫn executable, nên transcript có
+chứa chuỗi `<temp>\bản cài đặt\ha.exe` — đó là **bằng chứng process được chạy đúng là bản đã
+cài**, không phải build-tree binary. Vì tiêu đề luôn có đường dẫn đó, assertion "thư mục cài
+không xuất hiện trong transcript" là sai; thứ được khẳng định là **state** không nằm ở đó
+(dòng `Data:`/`Store:` trỏ về `HA_HOME`, và thư mục cài không sinh file mới).
+
+Store per-project **chưa** được tạo lúc boot: app chỉ mở store khi request đầu tiên được
+dispatch, nên lần đo đầu của ca này đỏ ở `only_store` (`NotFound`). Đó là hành vi thật, không
+phải lỗi mới; ca được sửa để khẳng định đúng thứ boot tạo ra (đường dẫn đã resolve trong
+header), còn việc store được tạo thì đã có ca headless I04/I09 và PTY i13/i05 chứng minh.
+
+Kết quả đo (console thật, một lần chạy có bound):
+
+```text
+pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 480
+PTY_EXIT: 0
+test i14_the_installed_artifact_opens_the_app_in_a_real_terminal ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.51s
+```
+
+Suite PTY nay **chín** ca; `scripts/Verify-HaLaunch.ps1` và header của
+`scripts/Invoke-HaPtyAcceptance.ps1` được cập nhật theo (vẫn là `not_run` trong gate với lý do
+sandbox không có console, kèm hướng dẫn chạy).
+
+**Transcript đo được của chính ca này** (lần đo đầu, đường dẫn tạm rút gọn bằng `<temp>`; dòng đầu
+là tiêu đề cửa sổ do ConPTY tự đặt, tức bằng chứng process chạy đúng bản đã cài):
+
+```text
+]0;<temp>\bản cài đặt\ha.exe
+Harness Agents 0.1.0
+Project: <temp>\project with spaces    Provider: setup required
+Session: new    Mode: trusted host
+Git:     not a Git repository, Git features unavailable
+Config:  first run, defaults (<temp>\home\config.toml) [HA_HOME]
+Data:    <temp>\home\data [HA_HOME]
+Store:   <temp>\home\data\projects\project-<hash>
+Service: setup required (no provider configured)
+Nhập yêu cầu. /help trợ giúp · /status chẩn đoán · /exit thoát
+>
+```
+
+**Kết quả đo của round 21**
+
+| Phép đo | Kết quả |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0 (cả cây chính lẫn worktree) |
+| PTY suite (console thật, bound 480 s) | `PTY_EXIT: 0`, **9 passed, 0 failed** — 20.51 s (cây chính), 20.43 s (worktree) |
+| `Install-Ha.ps1 -SelfTest` | **26** check OK, `INSTALL_SELFTEST_OK` |
+| `Verify-Docs.ps1` | `DOCS_EXIT: 0` |
+| Gate lần 1 (cây chính) | **đỏ**: `providers-streaming`, bước duy nhất còn chạy song song — sửa ở `c386416` (mục 14) |
+| Gate lần 2 (cây chính, tại chỗ) | `GATE_EXIT: 0`, `passed: true`, `failures: []` |
+| Gate trong worktree sạch `c386416` | `GATE_EXIT: 0`, `passed: true`, `failures: []` — hai lần chạy liên tiếp (log `target/gate-verify-21.txt`, `target/gate-verify-21-c.txt`) |
+
+**Xác minh trong worktree sạch.** Cây chính vẫn có thay đổi chưa commit của writer khác
+(`crates/harness-cli/src/interactive/{app,controller,service}.rs` và `service_completion_tests.rs`),
+nên commit của track được xác minh lại ở worktree `C:\Users\duong\Downloads\ha-verify-round20` tại
+đúng `c386416` (`git status --porcelain` = **0** dòng). Bằng chứng worktree thật sự sạch: bước
+`unit-interactive` báo **61** test, trong khi lần chạy tại chỗ báo **67** vì cộng thêm module chưa
+commit của writer kia.
+
+Một điều phải ghi thẳng: lần chạy gate **đầu tiên** trong worktree trả về `passed: false`, nhưng
+**tên bước đỏ không được ghi lại** vì lệnh của tôi lọc output chỉ giữ dòng `"passed"`/`"failures"`.
+Đó là lỗi đo của tôi, không phải bằng chứng về sản phẩm, và không được phép suy ra "bước X hỏng" từ
+một lần đỏ không tên. Tally đo được của round 21: **5 lần chạy gate, 2 đỏ, 3 xanh**; lần đỏ có tên
+là `providers-streaming` (đã sửa nguyên nhân), lần kia không tên và cùng loại flake loopback ở mục 14.
+Sau khi sửa, ba lần chạy liên tiếp (một tại chỗ, hai trong worktree) đều `failures: []`.
+
+## 19. Round 22: gate lại từng checkpoint tại `c386416` và đóng vế revision của artifact H08
+
+Round này **không viết code sản phẩm**. Việc được giao là chạy lại chuỗi checkpoint theo dependency
+và chỉ ghi nhận cái đo được. Ba phát hiện có giá trị nằm ở mục 19.2, 19.4 và 19.6.
+
+### 19.1. Trạng thái đo được lúc bắt đầu
+
+| Mục | Giá trị |
+|---|---|
+| HEAD | `c386416e9b529dcace078afa0c48ed8343c63353`, nhánh `master`, **ahead 4** so với `origin/master` |
+| Cây chính | vẫn có thay đổi **chưa commit của writer khác**: `crates/harness-cli/src/interactive/{app,controller,service}.rs` + `service_completion_tests.rs` (untracked) |
+| Tài liệu H | `docs/{evidence,handoffs,specs}/HA_LAUNCH.vi.md` cũng đang được sửa dở trong cây |
+
+Ba lần chạy gate độc lập trong round này:
+
+| Lần | Môi trường | Kết quả | Bước đỏ |
+|---|---|---|---|
+| 1 | cây chính, sandbox `workspace-write` | `passed: false` | `acceptance-launch`, `regression-phase_p3`, `regression-phase_p5` |
+| 2 | cây chính, bỏ hạn chế sandbox | `passed: false` | **chỉ** `unit-interactive` |
+| 3 | worktree sạch `c386416`, target riêng | **`passed: true`, `failures: []`** | — |
+
+Log: `target/gate-round22.json.txt`, `target/gate-round22-fullaccess.txt`,
+`target/gate-round22-worktree-local.txt`.
+
+### 19.2. Ba bước đỏ ở lần 1 là **giới hạn sandbox**, không phải lỗi sản phẩm
+
+Không suy đoán: hai phép đo trực tiếp tách nguyên nhân.
+
+| Bước | Thông điệp thật | Nguyên nhân đo được |
+|---|---|---|
+| `acceptance-launch` → `i09_a_data_directory_without_write_permission_names_the_path_and_writes_nothing` | `panicked at crates\harness-cli\tests\interactive_launch.rs:1377` = assert trên `output.status.success()` của `icacls` | `icacls <dir> /deny <user>:(OI)(CI)(W)` → **exit 5**, "Access is denied": sandbox từ chối đổi ACL, nên test không dựng được tiền đề "data root bị từ chối ghi" |
+| `regression-phase_p3` → `p3_c23_project_identity_requires_explicit_reassociation` | `sh.exe: *** fatal error - couldn't create signal pipe, Win32 error 5` | git gọi `C:\Program Files\Git\usr\bin\sh.exe`; named pipe bị chặn |
+| `regression-phase_p5` (6 test worktree) | `git clone --local --no-hardlinks … failed: … couldn't create signal pipe, Win32 error 5` | cùng nguyên nhân trên |
+
+Đối chứng âm để chắc chắn git không hỏng vì lý do khác: `git init` + `git commit` + `git worktree add`
+trong thư mục tạm đều **exit 0**; chỉ `sh.exe` là không spawn được. Và ở lần chạy 2 (bỏ hạn chế),
+đúng ba bước đó **xanh**: `acceptance-launch` 35 s, `regression-phase_p3` 43 s, `regression-phase_p5`
+46 s. Vậy chúng là hệ quả của môi trường chạy, không phải regression của H01–H08.
+
+### 19.3. Bước đỏ ở lần 2 là **file chưa commit của writer khác**
+
+Lần 2 chỉ còn `unit-interactive` đỏ ở
+`interactive::service::completion_tests::completion_service_resume_flow`. Đây không phải code của
+track H:
+
+- `git grep completion_service_resume_flow HEAD` → **không có** trong HEAD;
+- `git ls-files crates/harness-cli/src/interactive/service_completion_tests.rs` → **rỗng** (untracked);
+- cùng bước đó trong worktree sạch báo **61 passed, 0 failed**, còn cây chính báo **67 test** — đúng
+  bằng số test của module chưa commit.
+
+### 19.4. Checkpoint A/B/C xanh trong worktree sạch `c386416`
+
+`git worktree add --detach target/verify-round22 c386416` → `git status --porcelain` = **0** dòng,
+rồi chạy gate tại chỗ (target riêng):
+
+```text
+pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json
+GATE_EXIT: 0
+passed: true
+failures: []
+required_tests: 13
+```
+
+Cả **33 bước đều exit 0**: `format`, `clippy`, 13 discovery selector, `unit-interactive` (61 test),
+`acceptance-launch` (18 test), `acceptance-session` (9 test), `providers-streaming`,
+`regression-phase_p0…p7`, `installer-selftest` (26 check), `release-selftest`, `docs`.
+
+**Một cái bẫy đo đã gặp và phải ghi lại.** Lần chạy gate đầu trong worktree đỏ ở
+`regression-phase_p7::p7_install_script_installs_a_working_binary` — nhưng nguyên nhân là **cách tôi
+đo**: tôi trỏ `CARGO_TARGET_DIR` về `target` của cây chính để tái dùng cache, còn test P7 lại tìm
+artifact ở `target/debug` **tương đối theo repo**, nên không thấy binary. Chạy lại **không** override
+(`cargo test -p harness-cli --test phase_p7 -- --test-threads=1 p7_install_script_installs_a_working_binary`)
+→ **1 passed**. Đây là điều kiện dễ tái diễn: **đừng chạy gate trong worktree kèm `CARGO_TARGET_DIR`
+trỏ sang cây khác**, nếu không `phase_p7` sẽ đỏ giả. Test P7 vẫn hardcode `target/debug`;
+việc đó **không** bị sửa trong round này (không thuộc phạm vi được giao và đang được một track khác sở hữu).
+
+### 19.5. PTY thật: chín ca xanh ở **cả hai** cây trong round này
+
+| Cây | Lệnh | Kết quả |
+|---|---|---|
+| cây chính | `scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 480` | `PTY_EXIT: 0`, **9 passed, 0 failed**, 19.83 s — transcript `target/pty-acceptance/pty-all.txt` |
+| worktree sạch `c386416` | cùng lệnh | `PTY_EXIT: 0`, **9 passed, 0 failed**, 19.93 s — transcript `target/verify-round22/target/pty-acceptance/pty-all.txt` |
+
+Chín ca: i01, i05, i06, i07a, i07b, i08, i12, i13, i14. Vì vậy toàn bộ acceptance cần console thật
+(I01/I05/I06/I07/I08/I12/I13/I14) có bằng chứng ở **đúng revision đang bàn giao**, không mượn kết quả
+của round trước.
+
+### 19.6. H08: revision của artifact **không khớp** revision đã test — đã đóng
+
+Đây là phát hiện thật của round này. Candidate đang nằm trong cây được dựng ở commit
+`1eceeefb781d25b08e62368a5b47fa708f800b3d`, trong khi HEAD là `c386416` — candidate **cũ 17 commit**,
+và trong khoảng đó `crates/harness-cli/src/interactive/headless.rs` **có đổi 13 dòng**. Nghĩa là
+artifact đang được coi là "release candidate" **không** phải bản dựng từ revision đã test: đúng lỗi
+mà mục 8.1 của plan cấm ("đừng chỉ so mtime … để khẳng định binary đúng phiên bản").
+
+Đã sửa bằng cách dựng lại và đóng gói lại ở HEAD (`scripts/New-HaRelease.ps1`), rồi kiểm lại manifest:
+
+| Trường | Giá trị đo được |
+|---|---|
+| `build_commit` | `c386416e9b529dcace078afa0c48ed8343c63353` (**= HEAD**) |
+| `version` / `target` | `ha 0.1.0` / `x86_64-pc-windows-msvc` |
+| `sha256` (ha.exe) | `7bfa0133c7e696e5b37fe3611afdeef8cba710257fcc0a430bd9aa91ffc6d64b` |
+| `published` | `false` |
+| bundle | `target/release-candidate/ha-0.1.0-windows-x64/` (3 file: `ha.exe`, `ha.release.json`, `checksums.txt`) + `.zip` |
+
+Độ tin cậy của digest: xoá `target/release/ha.exe` rồi dựng lại hai lần liên tiếp đều cho **đúng
+cùng digest `7bfa01…`**, và `checksums.txt` khớp digest của cả `ha.exe` lẫn manifest. Không có
+fixture executable hay test secret nào trong bundle (`Assert-BundleContents` chỉ cho đúng 3 tên file).
+
+### 19.7. Đường cài end-user đầu-cuối (I19 một phần, I20) — đo trên candidate **mới**
+
+| Bước | Lệnh | Kết quả đo được |
+|---|---|---|
+| Cài từ bundle đã verify vào thư mục tạm | `Install-Ha.ps1 -FromBundle target\release-candidate\ha-0.1.0-windows-x64 -Destination <temp> -NoModifyPath` | exit 0; `Installed/SHA-256` khớp `7bfa01…`; `ha.install.json` ghi `build_commit c386416`, `source` = bundle, `owned_files` = 2 file, `added_path_entry: null` |
+| Không ghi User PATH | `-NoModifyPath` | installer in `PATH: … is NOT on the persisted User PATH` + hướng dẫn thủ công; `added_path_entry` để `null` |
+| Gỡ cài đặt | `Install-Ha.ps1 -Uninstall -Destination <temp>` | exit 0; xoá **đúng 2 file sở hữu**; `unrelated-note.txt` (không sở hữu) **còn**; user data `config.toml` **còn**; in `PATH: no PATH entry was recorded` |
+| `ha` resolve trong shell mới | `PATH` dựng lại chỉ còn `<install>;System32;SystemRoot`, đã xoá `CARGO_HOME`/`RUSTUP_HOME` | **PowerShell**: `Get-Command ha` → `<install>\ha.exe`, `ha --version` → `ha 0.1.0`; **CMD**: `where.exe ha` → cùng đường dẫn, `ha --version` → `ha 0.1.0` |
+| Chứng minh "không cần toolchain" | `where.exe cargo` trong đúng PATH tối giản đó | **không tìm thấy** (exit 1) — artifact chạy được mà không có Rust |
+| Guard non-TTY của chính artifact đóng gói | `<bundle>\ha.exe` với stdio bị pipe | exit **2** + hướng dẫn `ha chat --headless --prompt …`; stdout rỗng |
+
+Đây vẫn **không** phải VM sạch: cùng máy, cùng user, chỉ dựng lại `PATH`/env của tiến trình con.
+I19 giữ nguyên mức **"một phần"** cho tới khi có máy/VM thật không toolchain.
+
+### 19.8. Việc tiếp theo của round 22
+
+1. **I19**: vẫn cần một VM/máy sạch thật (không Rust/Git/Node, không source repo) — trong session
+   này không có, và mọi kết quả ở mục 19.7 phải được đọc là **mô phỏng**.
+2. **Hai input còn thiếu của H08** (mục 11 và mục 6 handoff): credential/budget cho live smoke, và
+   channel + xác nhận push tag cho publish. Không có thì hai mục giữ `not_run`, không nâng thành "đạt".
+3. **Quyền**: round này **không** được cấp — và không tự suy — quyền ghi User PATH thật, cài binary
+   lên máy user, gọi model trả phí hay publish release. Ba việc đó vẫn chưa thực hiện.
+4. **Gap code đã biết, chưa sửa**: multiline editing; `apply_patch` trên project có thư mục chỉ đọc
+   (đo được `workspace_escape` trong lúc walk, chưa có test khoá hành vi); đường xoá PATH entry khi
+   `-Uninstall` chưa có guard tường minh như đường cài (xem 19.9); `phase_p7` hardcode `target/debug`.
+
+### 19.9. Hai quan sát code **chưa sửa** (ghi để không mất, không claim là đã đóng)
+
+1. **`Install-Ha.ps1 -Uninstall` xoá PATH entry không cần cờ tường minh.** Đường **cài** chỉ ghi User
+   PATH khi có `-ModifyUserPath` (mục 8.3 plan), nhưng đường **gỡ** xoá entry đã ghi mà không có cờ
+   tương đương: `Invoke-Uninstall` gọi `Remove-UserPathEntry` rồi `SetEnvironmentVariable(...,'User')`
+   chỉ dựa vào `manifest.added_path_entry`. Self test hiện chỉ chạy ca `AddedPathEntry = ''`, nên
+   nhánh xoá thật **chưa** được phủ. Với assignment **không** cấp quyền ghi User PATH, round này
+   **không** sửa; nếu sửa thì nên theo hướng yêu cầu cờ tường minh + thêm ca self test có entry thật.
+2. **`walk_files` gán `WorkspaceEscape` cho lỗi quyền khi walk** (`crates/harness-tools/src/workspace.rs`):
+   lỗi `ignore::Error` và `symlink_metadata` đều bị map thành `workspace_escape`, nên một thư mục chỉ
+   đọc trong project sẽ báo "thoát workspace" thay vì "không đọc được". Đây đúng là hành vi đã đo ở
+   mục 5 gap của handoff. **Đã đóng ở round 23** — xem mục 20.
+
+## 20. Round 23: đóng gap `apply_patch` trên project có thư mục không đọc được
+
+Gap này nằm trong danh sách "đã đo nhưng chưa có test khoá hành vi" từ các round trước: một project
+có file ghi được nhưng **thư mục không đọc được** làm `apply_patch` thất bại với mã
+`workspace_escape` trong lúc walk workspace. Mã đó sai bản chất — walk **không** thoát workspace, nó
+chỉ không mở được một thư mục **bên trong** workspace — và nó khiến người vận hành đi tìm sai nguyên
+nhân (path traversal) trong khi vấn đề là quyền đọc.
+
+Làm theo đúng thứ tự RED → fix → regression.
+
+**RED trước.** Test mới
+`workspace::tests::review_unreadable_directory_is_reported_as_a_read_failure_with_the_path` dựng một
+project có `visible.txt` đọc được và thư mục con `locked/` bị **ACL thật** từ chối quyền đọc
+(`icacls <dir> /deny <user>:(OI)(CI)(R)`, có guard `Drop` gỡ ACL nên assertion đỏ cũng không để lại
+cây tạm không xoá được). Chạy trước khi sửa:
+
+```text
+test workspace::tests::review_unreadable_directory_is_reported_as_a_read_failure_with_the_path ... FAILED
+assertion `left == right` failed: a permission failure is not a workspace escape:
+  workspace_escape: workspace walk failed: …\locked: IO error for operation on …\locked:
+  Access is denied. (os error 5)
+  left: WorkspaceEscape
+ right: StorageOpenFailed
+```
+
+Đây là **đo được**, không phải suy luận: mã hiện tại là `WorkspaceEscape` và thông điệp còn **có**
+đường dẫn, nên vế "nêu đường dẫn" vốn đã đúng — vế sai là **mã lỗi**.
+
+**Fix.** `walk_files` nay phân loại lỗi qua hai helper thay vì map mọi thứ thành `WorkspaceEscape`:
+
+| Đường lỗi | Trước | Sau |
+|---|---|---|
+| Walker báo lỗi và `ignore::Error::io_error()` là `PermissionDenied` | `workspace_escape` | `storage_open_failed` + `cannot read workspace directory <path>: <error>` |
+| `symlink_metadata` trả `PermissionDenied` | `workspace_escape` | `storage_open_failed` + cùng dạng thông điệp |
+| Lỗi walker khác (không xác định được bản chất) | `workspace_escape` | **giữ nguyên** `workspace_escape` |
+| `strip_prefix` thất bại (thoát root thật) | `workspace_escape` | **giữ nguyên** — đây mới đúng là escape |
+
+Chọn `StorageOpenFailed` vì nó là mã đã dùng cho "không mở được" ở tầng store (ví dụ đường I09
+"data root không dùng được"), nên thông điệp nhất quán với phần còn lại của CLI. Đường dẫn được lấy
+từ `ignore::Error::WithPath` khi có, thay vì để thông điệp mất vị trí.
+
+**Kiểm chứng sau fix.**
+
+| Phép đo | Lệnh | Kết quả |
+|---|---|---|
+| Test RED nay xanh | `cargo test -p harness-tools --lib --locked -- --test-threads=1` | **3 passed, 0 failed** |
+| Regression sở hữu mã workspace | `cargo test -p harness-cli --test phase_p3 --locked -- --test-threads=1` | **20 passed, 0 failed** (39.25 s) |
+| Định dạng | `cargo fmt --all -- --check` | exit 0 |
+| Lint toàn workspace | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+
+Hai assertion `WorkspaceEscape` sẵn có trong `phase_p3` (`../outside/outside.txt` và
+`symlink` escape) vẫn xanh — tức nhánh escape **không** bị nới lỏng bởi thay đổi này.
+
+**Phạm vi còn lại:** `search_text` và `list_files` dùng chung `walk_files` nên cũng hết bị báo sai
+mã; `workspace_fingerprint` cũng vậy, nghĩa là **approval gate** trên project có thư mục không đọc
+được nay báo đúng bản chất.
+
+**Gate đầy đủ trên cây đã sửa (cùng round).** Sau khi ghi tài liệu, gate được chạy lại **một lần từ
+đầu tới cuối trên cây chính đã chứa fix này** (không chỉ chạy riêng các bước bị ảnh hưởng):
+
+```text
+pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json
+GATE_EXIT: 0
+passed: true
+failures: []
+steps: 30, nonzero: 0
+required_tests: 13
+```
+
+Log `target/gate-round23.txt`. Các bước then chốt: `format` exit 0, `clippy` exit 0,
+`unit-interactive` exit 0, `acceptance-launch` exit 0 (35 s), `acceptance-session` exit 0 (8 s),
+`regression-phase_p3` exit 0 (39 s), `installer-selftest` exit 0, `docs` exit 0. PTY suite chạy lại
+sau fix: `PTY_EXIT: 0`, **9 passed, 0 failed** trong 19.94 s (`target/pty-round23.txt`).
+
+Lưu ý về con số bước: 30 bước ở lần chạy này so với 33 ở lần worktree round 22. Phần chênh lệch nằm
+ở các bước `discovery:*`: `Assert-Selector` chạy `--list` cho **từng** selector nên cùng một target
+được liệt kê nhiều lần. Cả hai lần đều **0 bước nonzero, `failures: []`, và đủ 13 required selector**,
+nên không có bước nào bị bỏ: đây là khác biệt về cách đếm của gate, không phải coverage giảm.
+Gate cũng **không** chạy `cargo test -p harness-tools` như một bước riêng, nên test RED mới được ghi
+nhận bằng lần chạy riêng ở bảng trên.
+
+## 21. Round 23 (tiếp): multiline editing và guard PATH của `-Uninstall`
+
+Hai việc còn lại của handoff được giao tiếp trong cùng lượt này. Cả hai đều **không** nâng mục
+`not_run` nào thành "đạt".
+
+### 21.1. Multiline editing — đã implement, kèm một giới hạn console **đo được**
+
+**Hợp đồng.** Enter vẫn **gửi** yêu cầu; **Ctrl-J** (line feed) chèn dòng mới. Buffer nhiều dòng là
+**một** yêu cầu: nó vào history như một entry và chỉ được admit một lần, đúng luật "một input mỗi
+session" của P1. Dòng nối tiếp **không** mang marker `> `.
+
+| Thay đổi | File |
+|---|---|
+| `Key::Newline` + tài liệu lý do phải là phím console báo **tách biệt** | `src/interactive/events.rs` |
+| `LineEditor` nhận `Key::Newline`: chèn `\n`; từ chối khi buffer rỗng hoặc đã kết thúc bằng `\n` | `src/interactive/input.rs` |
+| `prompt_lines()` (chia theo `\n`, chỉ dòng đầu có marker) và `cursor_cell()` (row/column theo **ký tự**, cột dòng đầu tính cả marker) | `src/interactive/view.rs` |
+| `TerminalBackend::move_up` + `MoveUp` của crossterm; `draw_prompt` vẽ nhiều dòng rồi đặt con trỏ đúng (row, column); `erase_prompt` xoá **mọi** row của prompt cũ trước khi vẽ lại | `src/interactive/terminal.rs`, `src/interactive/app.rs` |
+| `map_key`: `Ctrl-J` → `Key::Newline` | `src/interactive/terminal.rs` |
+| Hằng số/method mới cho host: `prompt_lines()`, `prompt_cursor_cell()` | `src/interactive/controller.rs` |
+
+**Một regression do chính tôi gây ra và đã sửa trong lúc làm.** Bản `erase_prompt` đầu tiên chỉ xoá
+khi `prompt_visible == true`, tức bỏ mất hành vi "luôn `clear_line` trước khi vẽ prompt đầu tiên".
+Test `h03_scripted_terminal_renders_the_boot_header_and_exits_cleanly` bắt được ngay
+(`backend.cleared_lines() > 0` đỏ), và `erase_prompt` nay luôn xoá ít nhất một row. Đây là lý do
+gate chạy **sau** khi sửa, không phải trước.
+
+**Giới hạn console — đo được, không suy đoán.** Trên ConPTY của máy này, gửi một line feed thô
+(`\n`) tới app **không** tới dưới dạng `KeyCode::Char('j') + CONTROL`: console chuyển nó thành
+**Enter** và yêu cầu bị gửi đi. Transcript của ca PTY mới ghi đúng chuỗi đó:
+
+```text
+> dòng một
+[run] accepted ...93338542
+[error] provider setup is incomplete: …
+> dòng hai
+```
+
+Đây cùng loại giới hạn mà ca `i06` đã ghi cho bracketed paste ("console without bracketed paste").
+Vì vậy ca PTY mới **không** khẳng định Ctrl-J chèn dòng: nó khẳng định cái đo được — app sống sót,
+prompt còn dùng được, `/exit` thoát 0 — và in rõ nhánh nào đã xảy ra:
+
+```text
+test i21_pty_survives_a_multiline_draft_and_keeps_the_prompt_usable ... ok
+i21: this console reports the line-feed key as Enter; asserting the app survives it
+```
+
+Hệ quả cho người dùng Windows: Ctrl-J **không** dùng được như phím multiline trên console này, và
+cách còn lại là paste. Paste hiện vẫn đổi newline thành space (`normalize_paste`), và round này
+**không** đổi hành vi đó — sửa nó là thay đổi hành vi có test riêng (`h03_editor_paste_never_submits_multiple_commands`),
+nên phải làm như một mục riêng chứ không gộp vào đây. Ghi thẳng: multiline **đã có trong editor và
+đã được kiểm ở tầng controller/renderer**, nhưng **chưa** chứng minh được đường phím trên Windows
+ConPTY.
+
+**Kiểm chứng multiline.**
+
+| Phép đo | Lệnh | Kết quả |
+|---|---|---|
+| Toàn bộ unit test của binary (gồm 3 test mới) | `cargo test -p harness-cli --bin ha --locked` | **70 passed, 0 failed** |
+| Test mới: editor | `h03_editor_accepts_multiline_input_on_the_newline_key` | ok |
+| Test mới: view | `h03_a_multiline_draft_is_one_prompt_with_rows_and_a_cursor_cell` | ok |
+| Test mới: render loop | `h03_a_multiline_draft_submits_once_and_erases_its_extra_rows` | ok |
+| PTY thật | `Invoke-HaPtyAcceptance.ps1 -Filter i21` | `PTY_EXIT: 0`, **1 passed** |
+
+### 21.2. `-Uninstall` chỉ gỡ PATH entry khi có cờ tường minh
+
+Đường **cài** phải có `-ModifyUserPath` mới ghi User PATH; đường **gỡ** trước đây xoá entry đã ghi
+**không** cần cờ nào. Nay có `-RemoveUserPathEntry`, và khi thiếu cờ thì installer **in ra** rằng
+entry vẫn còn kèm cách gỡ, thay vì tự quyết.
+
+Một chi tiết dễ sai đã lộ ra và được sửa: `Invoke-Uninstall` **không** đọc được switch của
+script scope, vì self test gọi hàm này mà khối `param` cấp cao nhất chưa từng chạy — nên
+`$RemoveUserPathEntry` luôn `false` trong self test và nhánh xoá **không thể** được chứng minh.
+Quyền quyết định nay được truyền vào hàm (`-RemoveRecordedPathEntry`), call site thật truyền
+`-RemoveRecordedPathEntry:$RemoveUserPathEntry`.
+
+| Phép đo | Kết quả |
+|---|---|
+| `Install-Ha.ps1 -SelfTest` | **28 check OK** (trước round này: 26), `INSTALL_SELFTEST_OK`, exit 0 |
+| `uninstall_keeps_the_recorded_path_entry_without_the_switch` | ok — không ghi gì (`writes=0`), entry vẫn còn |
+| `uninstall_removes_the_path_entry_with_the_switch` | ok — ghi **đúng 1 lần**, giá trị gửi writer không còn entry và vẫn giữ `C:\user\a` |
+| `self_test_never_writes_the_real_user_path` | ok — User PATH thật không đổi |
+
+Cả hai ca chạy trên provider/writer **tiêm**, nên User PATH thật của máy này vẫn **không** bị đọc
+hay ghi — đúng phần quyền đã ghi ở mục 0 và mục 2 của handoff. Thay đổi này cũng đã được ghi vào
+SPEC (mục installer) và operator guide không nhắc `-Uninstall` nên không cần sửa.

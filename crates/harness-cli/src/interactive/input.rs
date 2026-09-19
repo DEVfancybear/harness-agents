@@ -42,7 +42,10 @@ impl LineEditor {
         &self.buffer
     }
 
-    #[cfg(test)]
+    /// Cursor position counted in characters from the start of the buffer.
+    ///
+    /// The renderer needs it to place the terminal cursor inside a multi-line
+    /// prompt; it is never a byte offset.
     #[must_use]
     pub const fn cursor(&self) -> usize {
         self.cursor
@@ -68,6 +71,15 @@ impl LineEditor {
         match key {
             Key::Char(character) if !character.is_control() => {
                 self.insert(&character.to_string());
+                InputOutcome::Redraw
+            }
+            Key::Newline => {
+                // A line break on an empty buffer is not a request, and a second
+                // one right after the first adds nothing: keep the prompt usable.
+                if self.buffer.is_empty() || self.buffer.ends_with('\n') {
+                    return InputOutcome::Unchanged;
+                }
+                self.insert("\n");
                 InputOutcome::Redraw
             }
             Key::Paste(text) => {
@@ -256,6 +268,45 @@ mod tests {
         type_text(&mut editor, "   ");
         assert_eq!(editor.handle(Key::Enter), InputOutcome::Unchanged);
         assert!(editor.history().is_empty(), "blank input is not a request");
+    }
+
+    #[test]
+    fn h03_editor_accepts_multiline_input_on_the_newline_key() {
+        let mut editor = LineEditor::new();
+        // A line break before any text would be a blank request.
+        assert_eq!(editor.handle(Key::Newline), InputOutcome::Unchanged);
+        assert_eq!(editor.buffer(), "");
+
+        type_text(&mut editor, "first line");
+        assert_eq!(editor.handle(Key::Newline), InputOutcome::Redraw);
+        assert_eq!(editor.buffer(), "first line\n");
+        // Two breaks in a row add nothing.
+        assert_eq!(editor.handle(Key::Newline), InputOutcome::Unchanged);
+
+        type_text(&mut editor, "second line");
+        assert_eq!(editor.buffer(), "first line\nsecond line");
+        assert_eq!(editor.cursor(), "first line\nsecond line".chars().count());
+
+        // Enter still submits the whole message, and it is one history entry.
+        assert_eq!(
+            editor.handle(Key::Enter),
+            InputOutcome::Submit("first line\nsecond line".to_owned())
+        );
+        assert_eq!(editor.history(), ["first line\nsecond line".to_owned()]);
+
+        // Cursor movement stays character-based across a line break: two steps
+        // left from the end of "ab\ncd" sits after 'c', so the break is ahead and
+        // Backspace joins the two rows back into one.
+        type_text(&mut editor, "ab");
+        assert_eq!(editor.handle(Key::Newline), InputOutcome::Redraw);
+        type_text(&mut editor, "cd");
+        assert_eq!(editor.buffer(), "ab\ncd");
+        assert_eq!(editor.cursor(), 5);
+        assert_eq!(editor.handle(Key::Left), InputOutcome::Redraw);
+        assert_eq!(editor.handle(Key::Left), InputOutcome::Redraw);
+        assert_eq!(editor.cursor(), 3);
+        assert_eq!(editor.handle(Key::Backspace), InputOutcome::Redraw);
+        assert_eq!(editor.buffer(), "abcd");
     }
 
     #[test]

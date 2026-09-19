@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     path::{Component, Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -430,6 +430,46 @@ pub(crate) fn redact_text(text: &str) -> String {
         .collect()
 }
 
+/// Classify a failure to open or inspect a directory during the walk.
+///
+/// A path this process is not allowed to read is a **read failure** and must say
+/// so, naming the path: reporting `workspace_escape` for it tells an operator the
+/// walk tried to leave the workspace when it only could not look inside. The
+/// escape code stays reserved for a walk that really left the root, and for any
+/// other walker failure whose nature is not established here.
+fn deny_read_error(path: &Path, error: &(dyn std::fmt::Display + 'static)) -> HarnessError {
+    HarnessError::new(
+        ErrorCode::StorageOpenFailed,
+        format!(
+            "cannot read workspace directory {}: {error}",
+            path.display()
+        ),
+    )
+}
+
+fn walk_failure(path: &Path, error: &ignore::Error) -> HarnessError {
+    if error
+        .io_error()
+        .is_some_and(|io_error| io_error.kind() == ErrorKind::PermissionDenied)
+    {
+        return deny_read_error(path, error);
+    }
+    HarnessError::new(
+        ErrorCode::WorkspaceEscape,
+        format!("workspace walk failed: {error}"),
+    )
+}
+
+fn entry_failure(path: &Path, error: &std::io::Error) -> HarnessError {
+    if error.kind() == ErrorKind::PermissionDenied {
+        return deny_read_error(path, error);
+    }
+    HarnessError::new(
+        ErrorCode::WorkspaceEscape,
+        format!("cannot inspect workspace walk entry: {error}"),
+    )
+}
+
 fn walk_files(root: &Path) -> Result<Vec<WalkFile>, HarnessError> {
     let mut files = Vec::new();
     let walker = WalkBuilder::new(root)
@@ -442,22 +482,26 @@ fn walk_files(root: &Path) -> Result<Vec<WalkFile>, HarnessError> {
         .parents(true)
         .build();
     for item in walker {
-        let item = item.map_err(|error| {
-            HarnessError::new(
-                ErrorCode::WorkspaceEscape,
-                format!("workspace walk failed: {error}"),
-            )
-        })?;
+        let item = match item {
+            Ok(item) => item,
+            Err(error) => {
+                // The walker wraps the failing path in its own error types, so
+                // recover the location instead of leaving the message anonymous.
+                let path = match &error {
+                    ignore::Error::WithPath { path, .. } => path.clone(),
+                    _ => root.to_owned(),
+                };
+                return Err(walk_failure(&path, &error));
+            }
+        };
         let path = item.path();
         if path == root {
             continue;
         }
-        let metadata = fs::symlink_metadata(path).map_err(|error| {
-            HarnessError::new(
-                ErrorCode::WorkspaceEscape,
-                format!("cannot inspect workspace walk entry: {error}"),
-            )
-        })?;
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => return Err(entry_failure(path, &error)),
+        };
         if is_link_or_reparse(path)? || !metadata.is_file() {
             continue;
         }
@@ -725,5 +769,80 @@ mod tests {
         let output = result.unwrap();
         assert!(output.truncated);
         assert_eq!(output.text, prefix);
+    }
+
+    /// Restores the ACL of a denied directory when the test ends, so a failing
+    /// assertion cannot leave an unreadable temporary tree behind.
+    struct DeniedRead {
+        directory: PathBuf,
+        identity: String,
+    }
+
+    impl DeniedRead {
+        fn apply(directory: &Path) -> Self {
+            let identity = match std::env::var("USERDOMAIN") {
+                Ok(domain) if !domain.is_empty() => format!(
+                    "{domain}\\{}",
+                    std::env::var("USERNAME").expect("USERNAME is set")
+                ),
+                _ => std::env::var("USERNAME").expect("USERNAME is set"),
+            };
+            let output = std::process::Command::new("icacls")
+                .arg(directory)
+                .arg("/deny")
+                .arg(format!("{identity}:(OI)(CI)(R)"))
+                .output()
+                .expect("icacls runs");
+            assert!(
+                output.status.success(),
+                "icacls could not deny read on {}: {}",
+                directory.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Self {
+                directory: directory.to_owned(),
+                identity,
+            }
+        }
+    }
+
+    impl Drop for DeniedRead {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("icacls")
+                .arg(&self.directory)
+                .arg("/remove:d")
+                .arg(&self.identity)
+                .output();
+        }
+    }
+
+    /// A directory the process may not read is a read failure, not an escape
+    /// attempt: an operator reading the error must not be told the walk left
+    /// the workspace when it merely could not open a directory inside it.
+    #[test]
+    fn review_unreadable_directory_is_reported_as_a_read_failure_with_the_path() {
+        let root =
+            std::env::temp_dir().join(format!("walk-{}", harness_types::InputId::generate()));
+        let locked = root.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(root.join("visible.txt"), "readable").unwrap();
+        fs::write(locked.join("hidden.txt"), "inside a locked directory").unwrap();
+
+        let denial = DeniedRead::apply(&locked);
+        let result = walk_files(&root);
+        let error = result.expect_err("an unreadable directory must not be skipped silently");
+        drop(denial);
+
+        assert_eq!(
+            error.code(),
+            ErrorCode::StorageOpenFailed,
+            "a permission failure is not a workspace escape: {error}"
+        );
+        assert!(
+            error.to_string().contains("locked"),
+            "the failure must name the directory that could not be read: {error}"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }

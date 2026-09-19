@@ -19,6 +19,10 @@ pub trait TerminalBackend {
     fn write(&mut self, text: &str) -> io::Result<()>;
     /// Erase the current line and return the cursor to column zero.
     fn clear_line(&mut self) -> io::Result<()>;
+    /// Move the cursor up `rows` lines without changing the column.
+    ///
+    /// Only needed to erase a prompt that spans more than one row.
+    fn move_up(&mut self, rows: u16) -> io::Result<()>;
     fn flush(&mut self) -> io::Result<()>;
     /// Wait up to the timeout for input, reporting whether a key is ready.
     fn poll_key(&mut self, timeout: Duration) -> io::Result<bool>;
@@ -70,6 +74,13 @@ impl TerminalBackend for CrosstermBackend {
             Clear(ClearType::CurrentLine),
             cursor::MoveToColumn(0)
         )
+    }
+
+    fn move_up(&mut self, rows: u16) -> io::Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        execute!(io::stdout(), cursor::MoveUp(rows))
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -171,6 +182,10 @@ fn map_key(key: KeyEvent) -> Key {
     match key.code {
         KeyCode::Char('c') if control => Key::Interrupt,
         KeyCode::Char('d') if control => Key::EndOfInput,
+        // Ctrl-J is a line feed, which every terminal reports distinctly from
+        // Enter, so it is the multiline key the plan requires to be a real,
+        // tested combination rather than a guessed one.
+        KeyCode::Char('j') if control => Key::Newline,
         KeyCode::Char(character) => Key::Char(character),
         KeyCode::Backspace => Key::Backspace,
         KeyCode::Delete => Key::Delete,
@@ -196,6 +211,7 @@ pub struct ScriptedBackend {
     output: String,
     writes: Vec<String>,
     cleared_lines: usize,
+    moved_up: u32,
 }
 
 #[cfg(test)]
@@ -207,6 +223,7 @@ impl ScriptedBackend {
             output: String::new(),
             writes: Vec::new(),
             cleared_lines: 0,
+            moved_up: 0,
         }
     }
 
@@ -226,6 +243,13 @@ impl ScriptedBackend {
     pub const fn cleared_lines(&self) -> usize {
         self.cleared_lines
     }
+
+    /// Total rows the render loop moved the cursor up, so a test can prove a
+    /// multi-row prompt was erased rather than left on screen.
+    #[must_use]
+    pub const fn moved_up(&self) -> u32 {
+        self.moved_up
+    }
 }
 
 #[cfg(test)]
@@ -238,6 +262,11 @@ impl TerminalBackend for ScriptedBackend {
 
     fn clear_line(&mut self) -> io::Result<()> {
         self.cleared_lines += 1;
+        Ok(())
+    }
+
+    fn move_up(&mut self, rows: u16) -> io::Result<()> {
+        self.moved_up += u32::from(rows);
         Ok(())
     }
 

@@ -32,6 +32,10 @@ use super::bootstrap::{CREDENTIAL_VARIABLES, LaunchContext};
 use super::events::{RunOutcome, SessionCandidate, SessionEvent};
 use super::paths::LaunchEnvironment;
 
+#[cfg(test)]
+#[path = "service_completion_tests.rs"]
+mod completion_tests;
+
 /// Environment variable holding the provider endpoint.
 pub const ENDPOINT_VARIABLE: &str = "HA_PROVIDER_ENDPOINT";
 /// Environment variable holding the model name.
@@ -66,7 +70,13 @@ pub trait SessionPort: Send {
     /// Ask for the resumable sessions of this project; the list arrives as an event.
     fn list_sessions(&mut self) {}
     /// Continue from a persisted session, or start a fresh conversation when None.
-    fn resume(&mut self, _session_id: Option<String>) {}
+    fn resume(&mut self, session_id: Option<String>) -> Result<(), String> {
+        if session_id.is_some() {
+            Err("this backend does not support persisted sessions".to_owned())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Asks the user for each gated action and waits for the answer.
@@ -422,67 +432,22 @@ impl SessionPort for AgentSessionService {
         });
     }
 
-    fn resume(&mut self, session_id: Option<String>) {
-        match session_id {
-            None => {
-                if let Ok(mut guard) = self.previous_session.lock() {
-                    *guard = None;
-                }
-                let _ = self.sender.send(SessionEvent::Notice {
-                    message:
-                        "starting a fresh conversation; the previous chain is no longer continued"
-                            .to_owned(),
-                });
-            }
-            Some(session_id) => {
-                let sender = self.sender.clone();
-                let store_dir = self.store_dir.clone();
-                let previous = Arc::clone(&self.previous_session);
-                let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                    return;
-                };
-                handle.spawn(async move {
-                    let known = match SqliteStore::open_read_only(store_dir).await {
-                        Ok(store) => store
-                            .list_sessions()
-                            .await
-                            .is_ok_and(|summaries| {
-                                summaries
-                                    .iter()
-                                    .any(|summary| summary.session_id.as_str() == session_id)
-                            }),
-                        Err(_) => false,
-                    };
-                    if !known {
-                        let _ = sender.send(SessionEvent::Notice {
-                            message: format!(
-                                "session {session_id} is not in this project's store; nothing was resumed"
-                            ),
-                        });
-                        return;
-                    }
-                    match harness_types::SessionId::parse(session_id.clone()) {
-                        Ok(parsed) => {
-                            if let Ok(mut guard) = previous.lock() {
-                                *guard = Some(parsed);
-                            }
-                            let _ = sender.send(SessionEvent::Notice {
-                                message: format!(
-                                    "continuing from session {session_id}; the next request recovers that context"
-                                ),
-                            });
-                        }
-                        Err(_) => {
-                            let _ = sender.send(SessionEvent::Notice {
-                                message: format!(
-                                    "session {session_id} is not a valid session id; nothing was resumed"
-                                ),
-                            });
-                        }
-                    }
-                });
-            }
+    fn resume(&mut self, session_id: Option<String>) -> Result<(), String> {
+        let source = session_id
+            .map(SessionId::parse)
+            .transpose()
+            .map_err(|error| format!("resume needs a canonical session id: {error}"))?;
+        let mut previous = self
+            .previous_session
+            .lock()
+            .map_err(|_| "conversation state is unavailable; nothing was resumed".to_owned())?;
+        // Selection is synchronous: submit cannot overtake a background lookup.
+        // The turn validates ownership in this project's store before dispatch.
+        if source.is_none() {
+            self.task_id = TaskId::generate();
         }
+        *previous = source;
+        Ok(())
     }
 
     fn cancel(&mut self) {
@@ -540,6 +505,35 @@ async fn run_turn(
             });
             return;
         }
+    };
+
+    let source = if let Ok(previous) = previous_session.lock() {
+        previous.clone()
+    } else {
+        send(SessionEvent::RecoverableError {
+            message: "conversation state is unavailable".to_owned(),
+        });
+        return;
+    };
+    let task_id = match &source {
+        Some(source) => match store.session_task(source).await {
+            Ok(Some(task)) => task,
+            result => {
+                let message = match result {
+                    Ok(None) => format!(
+                        "session {source} is not in this project's store; nothing was resumed"
+                    ),
+                    Err(error) => format!("session could not be recovered: {error}"),
+                    Ok(Some(_)) => unreachable!(),
+                };
+                if let Ok(store) = Arc::try_unwrap(store) {
+                    let _ = store.close().await;
+                }
+                send(SessionEvent::RecoverableError { message });
+                return;
+            }
+        },
+        None => task_id,
     };
 
     let capabilities = ModelCapabilities {
@@ -607,7 +601,6 @@ async fn run_turn(
     });
 
     // A follow-up turn continues the previous session; the first turn starts one.
-    let source = previous_session.lock().ok().and_then(|guard| guard.clone());
     let outcome = match &source {
         Some(source) => {
             driver

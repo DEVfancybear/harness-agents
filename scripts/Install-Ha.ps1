@@ -55,6 +55,12 @@ written through the same code path the tests exercise with an injected writer.
 Never touch PATH, even with `-ModifyUserPath`. Both together are rejected so the
 intent cannot be ambiguous.
 
+.PARAMETER RemoveUserPathEntry
+Allow `-Uninstall` to delete the PATH entry this installer recorded. Uninstalling
+without it removes only the owned files and reports that the recorded PATH entry is
+still there, so removing persisted user environment state is never a side effect of
+a different request. It has no effect outside `-Uninstall`.
+
 .PARAMETER SelfTest
 Run the PATH/merge/identity/rollback checks against in-memory and disposable
 state and exit: no PATH entry and no real install location is touched. Negative
@@ -89,6 +95,9 @@ param(
     [string] $FromBundle = '',
     # Remove exactly what this installer recorded, keeping user data.
     [switch] $Uninstall,
+    # Required for -Uninstall to delete the recorded PATH entry: install takes an
+    # explicit switch to write user environment state, so removal takes one too.
+    [switch] $RemoveUserPathEntry,
     # Test hooks. When supplied, nothing real is read or written: the caller owns
     # the state, which is how the persisted PATH path is proven without touching
     # the developer's registry.
@@ -377,7 +386,18 @@ Uninstall: remove exactly the files this installer recorded, and only the PATH
 entry it added. User configuration and session data are never removed here.
 #>
 function Invoke-Uninstall {
-    param([string] $InstallDirectory = '')
+    param(
+        [string] $InstallDirectory = '',
+        # Passed in rather than read from the script scope: the self test reaches
+        # this function without the top-level parameter block ever running, so a
+        # script-scoped switch would silently be false there and the removal branch
+        # could never be proven.
+        [switch] $RemoveRecordedPathEntry,
+        # Forwarded so a test can prove the PATH half with an injected provider and
+        # writer instead of the developer's real registry.
+        [scriptblock] $UserPathProvider = $null,
+        [scriptblock] $UserPathWriter = $null
+    )
     if ([string]::IsNullOrWhiteSpace($InstallDirectory)) {
         $InstallDirectory = (Resolve-InstallTargets).InstallDirectory
     }
@@ -399,7 +419,15 @@ function Invoke-Uninstall {
     }
     $pathMessage = 'PATH:      no PATH entry was recorded for this install'
     $recorded = [string] $manifest.added_path_entry
-    if (-not [string]::IsNullOrEmpty($recorded)) {
+    if (-not [string]::IsNullOrEmpty($recorded) -and -not $RemoveRecordedPathEntry) {
+        # Installing needs -ModifyUserPath to touch User PATH, so uninstalling must
+        # need its own explicit switch before it deletes what that install added.
+        # The omission is reported, never silently resolved in either direction.
+        $pathMessage = "PATH:      $recorded stays on the persisted User PATH; pass -RemoveUserPathEntry to remove it"
+    }
+    elseif (-not [string]::IsNullOrEmpty($recorded)) {
+        # The forwarded provider is what makes this branch provable in the self
+        # test; in a real uninstall it is empty and the User scope is read.
         $userPath = Get-PathValue -Provider $UserPathProvider -Scope 'User'
         $result = Remove-UserPathEntry -UserPath $userPath -Entry $recorded
         if ($result.Removed) {
@@ -545,7 +573,7 @@ function Invoke-Install {
         throw '-ModifyUserPath and -NoModifyPath contradict each other; pass at most one.'
     }
     if ($Uninstall) {
-        Invoke-Uninstall
+        Invoke-Uninstall -RemoveRecordedPathEntry:$RemoveUserPathEntry
         return
     }
     if (-not [string]::IsNullOrWhiteSpace($FromBundle) -and $UseCargoInstall) {
@@ -992,6 +1020,39 @@ function Invoke-SelfTest {
             Write-InstallManifest @bundleManifestArguments
             Invoke-Uninstall -InstallDirectory $bundleInstallDirectory | Out-Null
             Add-SelfTestResult 'uninstall_removes_only_owned_files' ((-not (Test-Path -LiteralPath $bundleTarget)) -and (-not (Test-Path -LiteralPath (Join-Path $bundleInstallDirectory $manifestName))) -and (Test-Path -LiteralPath $foreignFile -PathType Leaf))
+
+            # Removing a recorded PATH entry is user-environment state, so it needs
+            # its own explicit switch. Both halves are proven against an injected
+            # writer: the real User PATH is never read or written here.
+            $installDirectoryText = $bundleInstallDirectory
+            $staleManifest = @{
+                ManifestPath   = (Join-Path $bundleInstallDirectory $manifestName)
+                Version        = 'selftest'
+                Digest         = $bundleResult.Digest
+                Commit         = 'selftest'
+                OwnedFiles     = @($bundleTarget, (Join-Path $bundleInstallDirectory $manifestName))
+                AddedPathEntry = $installDirectoryText
+                Source         = $bundleRoot
+            }
+            $simulated = "C:\user\a;$installDirectoryText"
+            $keptPaths = [System.Collections.Generic.List[string]]::new()
+            $keepProvider = { $simulated }.GetNewClosure()
+            $keepWriter = { param([string] $Value) $keptPaths.Add($Value) }.GetNewClosure()
+            Write-InstallManifest @staleManifest
+            Invoke-Uninstall -InstallDirectory $bundleInstallDirectory -UserPathProvider $keepProvider -UserPathWriter $keepWriter | Out-Null
+            # No switch: the entry must survive and nothing may be written.
+            $kept = (Get-PathValue -Provider $keepProvider -Scope 'User')
+            Add-SelfTestResult 'uninstall_keeps_the_recorded_path_entry_without_the_switch' (($keptPaths.Count -eq 0) -and $kept.Contains($installDirectoryText)) "writes=$($keptPaths.Count) path='$kept'"
+
+            $removedPaths = [System.Collections.Generic.List[string]]::new()
+            $removeProvider = { $simulated }.GetNewClosure()
+            $removeWriter = { param([string] $Value) $removedPaths.Add($Value) }.GetNewClosure()
+            Write-InstallManifest @staleManifest
+            Invoke-Uninstall -InstallDirectory $bundleInstallDirectory -RemoveRecordedPathEntry -UserPathProvider $removeProvider -UserPathWriter $removeWriter | Out-Null
+            # The provider is a constant in this fixture, so the proof is what the
+            # installer handed the writer: the merged value with the entry gone.
+            $written = if ($removedPaths.Count -eq 1) { $removedPaths[0] } else { '' }
+            Add-SelfTestResult 'uninstall_removes_the_path_entry_with_the_switch' (($removedPaths.Count -eq 1) -and (-not $written.Contains($installDirectoryText)) -and $written.Contains('C:\user\a')) "writes=$($removedPaths.Count) written='$written'"
 
             $dataDirectory = Join-Path $installRoot 'user-data'
             New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null

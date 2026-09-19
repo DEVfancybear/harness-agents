@@ -99,6 +99,23 @@ impl InteractiveController {
         view::prompt_line(self.phase, self.editor.buffer())
     }
 
+    /// The prompt as terminal rows: a multi-line draft is one prompt, not several.
+    #[must_use]
+    pub fn prompt_lines(&self) -> Vec<String> {
+        view::prompt_lines(self.phase, self.editor.buffer())
+    }
+
+    /// Row and column for the terminal cursor inside the current prompt.
+    #[must_use]
+    pub fn prompt_cursor_cell(&self) -> (usize, usize) {
+        view::cursor_cell(self.phase, self.editor.buffer(), self.editor.cursor())
+    }
+
+    /// Select a startup source before accepting the first user message.
+    pub fn resume_source(&mut self, session_id: &str) -> Result<(), String> {
+        self.service.resume(Some(session_id.to_owned()))
+    }
+
     /// Everything the host prints once, before the first prompt.
     ///
     /// Rendering the boot header is the transition out of the booting phase, so
@@ -123,10 +140,7 @@ impl InteractiveController {
         match self.editor.handle(key) {
             InputOutcome::Unchanged => Vec::new(),
             InputOutcome::Redraw => vec![Effect::RedrawPrompt],
-            InputOutcome::Exit => {
-                self.phase = AppPhase::Closed;
-                vec![Effect::Exit(EXIT_SUCCESS)]
-            }
+            InputOutcome::Exit => self.command("/exit"),
             InputOutcome::Interrupt => self.interrupt(),
             InputOutcome::Submit(text) => self.submit(text),
         }
@@ -139,6 +153,9 @@ impl InteractiveController {
         if events.is_empty() {
             return effects;
         }
+        let text_only = events
+            .iter()
+            .all(|event| matches!(event, SessionEvent::TextDelta { .. }));
         for event in events {
             match event {
                 SessionEvent::Accepted { input_id } => {
@@ -190,7 +207,7 @@ impl InteractiveController {
                             let line = format!(
                                 "  {}. {}  {}  {}",
                                 index + 1,
-                                view::short_id(&candidate.session_id),
+                                candidate.session_id,
                                 candidate.task_id,
                                 candidate.detail
                             );
@@ -224,11 +241,16 @@ impl InteractiveController {
         }
         // Text that arrived in this cycle is shown now, not after the run ends.
         self.flush_stream(&mut effects);
-        effects.push(Effect::RedrawPrompt);
+        if !text_only {
+            effects.push(Effect::RedrawPrompt);
+        }
         effects
     }
 
     fn submit(&mut self, text: String) -> Vec<Effect> {
+        if matches!(text.split_whitespace().next(), Some("/exit" | "/quit")) {
+            return self.command(&text);
+        }
         // While a gated action waits, the next line is the answer — never a new
         // request that would run beside the pending one.
         if self.phase == AppPhase::WaitingApproval {
@@ -323,7 +345,9 @@ impl InteractiveController {
                             .to_owned(),
                     );
                 } else {
-                    self.service.resume(None);
+                    if let Err(error) = self.service.resume(None) {
+                        return vec![Effect::WriteLine(error), Effect::RedrawPrompt];
+                    }
                     self.session_candidates.clear();
                     self.push_line(
                         &mut effects,
@@ -339,6 +363,13 @@ impl InteractiveController {
                 let text = format!("backend: {label}");
                 self.push_line(&mut effects, text);
             }
+            "/resume" if self.phase.has_active_run() => {
+                self.push_line(
+                    &mut effects,
+                    "cannot change or list sessions while a run is active; cancel it first"
+                        .to_owned(),
+                );
+            }
             "/resume" => match argument {
                 None => {
                     self.service.list_sessions();
@@ -349,9 +380,9 @@ impl InteractiveController {
                 }
                 Some(selector) => {
                     let chosen = match selector.parse::<usize>() {
-                        Ok(index) => self
-                            .session_candidates
-                            .get(index.saturating_sub(1))
+                        Ok(index) => index
+                            .checked_sub(1)
+                            .and_then(|index| self.session_candidates.get(index))
                             .map(|candidate| candidate.session_id.clone()),
                         Err(_) => self
                             .session_candidates
@@ -361,7 +392,9 @@ impl InteractiveController {
                     };
                     match chosen {
                         Some(session_id) => {
-                            self.service.resume(Some(session_id.clone()));
+                            if let Err(error) = self.service.resume(Some(session_id.clone())) {
+                                return vec![Effect::WriteLine(error), Effect::RedrawPrompt];
+                            }
                             let text =
                                 format!("continuing from session {}", view::short_id(&session_id));
                             self.push_line(&mut effects, text);
@@ -562,6 +595,78 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn completion_exit_commands_and_eof_cancel_during_approval() {
+        for command in [Some("/exit"), Some("/quit"), None] {
+            let bench = bench(true);
+            let port = RecordingPort::default();
+            let recorded = port.clone();
+            let channel = SessionChannel::new();
+            let sender = channel.sender();
+            let mut controller =
+                InteractiveController::new(&bench.context, Box::new(port), channel);
+            let _ = controller.boot_lines();
+            let _ = submit_text(&mut controller, "do work");
+            sender
+                .send(approval_event("pending-exit"))
+                .expect("approval");
+            let _ = controller.pump_events();
+            let effects = match command {
+                Some(command) => submit_text(&mut controller, command),
+                None => controller.handle_key(Key::EndOfInput),
+            };
+            assert!(
+                effects.contains(&Effect::Exit(0)),
+                "{command:?}: {effects:?}"
+            );
+            assert_eq!(
+                *recorded.cancels.lock().expect("cancel log"),
+                1,
+                "{command:?}"
+            );
+            assert_eq!(recorded.submitted.lock().expect("requests").len(), 1);
+        }
+    }
+
+    #[test]
+    fn completion_resume_zero_and_active_switch_are_rejected() {
+        let bench = bench(true);
+        let channel = SessionChannel::new();
+        let sender = channel.sender();
+        let resumed = Arc::new(Mutex::new(Vec::new()));
+        let listed = Arc::new(Mutex::new(0));
+        let port = ResumePort {
+            sender: sender.clone(),
+            listed: Arc::clone(&listed),
+            resumed: Arc::clone(&resumed),
+        };
+        let mut controller = InteractiveController::new(&bench.context, Box::new(port), channel);
+        let _ = controller.boot_lines();
+        sender
+            .send(SessionEvent::SessionsListed {
+                sessions: vec![candidate(
+                    "session_0192f0aa-bbcc-7ddd-8eee-000000000001",
+                    "task-a",
+                    "source",
+                )],
+            })
+            .expect("listing");
+        let _ = controller.pump_events();
+        let _ = submit_text(&mut controller, "/resume 0");
+        assert!(
+            resumed.lock().expect("resumed").is_empty(),
+            "zero is not session one"
+        );
+        let _ = submit_text(&mut controller, "active request");
+        let _ = submit_text(&mut controller, "/resume 1");
+        let _ = submit_text(&mut controller, "/resume");
+        assert!(
+            resumed.lock().expect("resumed").is_empty(),
+            "an active run keeps its source"
+        );
+        assert_eq!(*listed.lock().expect("listed"), 0);
     }
 
     #[test]
@@ -935,8 +1040,9 @@ mod tests {
         fn list_sessions(&mut self) {
             *self.listed.lock().expect("list count") += 1;
         }
-        fn resume(&mut self, session_id: Option<String>) {
+        fn resume(&mut self, session_id: Option<String>) -> Result<(), String> {
             self.resumed.lock().expect("resume log").push(session_id);
+            Ok(())
         }
     }
 

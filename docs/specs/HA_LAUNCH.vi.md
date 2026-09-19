@@ -148,10 +148,10 @@ Không checkpoint nào được nhận "done" khi prerequisite chưa đạt.
 | H02 | Launch context, paths/HA_HOME, config/setup state | H01 | context + paths + setup state xong bằng unit test; UI thật chờ H03 |
 | H03 | Terminal app, controller/renderer, input loop | H02 | controller/renderer/editor/terminal + fixture route xong bằng test; PTY thật thuộc H07 |
 | H04 | G1 provider incremental, G2 tool continuation, G3 durable session | H03 + khảo sát G1–G3 | **xong phần code**: G1/G2/G3 + service thật + headless, regression 211 test xanh; live smoke `not_run`; multi-input/session là gap nền tảng đã ghi |
-| H05 | Approval, resume, lifecycle | H04 | **đang làm**: approval gate + resume list/select + `/new` + headless `--resume` xong và có test; còn test hard-kill giữa turn |
-| H06 | Installer, User PATH scope, install manifest | H01–H03 | **đang làm**: artifact identity + manifest + rollback + PATH scope + self test xong; ghi User PATH thật không được cấp quyền |
-| H07 | Gate `Verify-HaLaunch.ps1`, PTY fixture, acceptance I01–I18 | H01–H06 | **xong phần code**: gate + operator docs + migration note xong; transcript PTY thật cho I01/I06/I07/I08 **đã xanh** qua runner console thật (`5 passed`, không tính tự động trong gate vì sandbox không có console); kill process cứng vẫn ngoài phạm vi |
-| H08 | Release candidate, clean-machine route | H07 | **đang làm**: bundle + checksum + installer từ bundle + uninstall xong và có test disposable; **không publish** (không được cấp quyền) |
+| H05 | Approval, resume, lifecycle | H04 | **xong phần code**: approval gate + resume list/select + `/new` + headless `--resume` xong và có test; cả hai nửa hard-kill (giữa lượt gọi model và sau khi receipt đã commit) đã đo trên process thật (mục 10.1/15.2 evidence) |
+| H06 | Installer, User PATH scope, install manifest | H01–H03 | **xong phần code**: artifact identity + manifest + rollback + PATH scope + self test **26 check** (gồm fresh-shell resolution CMD/PowerShell và chạy artifact đã cài trong môi trường dựng lại) + PTY `i14` (I01 trên binary đã cài); ghi User PATH thật không được cấp quyền |
+| H07 | Gate `Verify-HaLaunch.ps1`, PTY fixture, acceptance I01–I18 | H01–H06 | **xong phần code**: gate + operator docs + migration note xong; **chín** ca PTY thật (I01/I05/I06/I07a/I07b/I08/I12/I13/I14) xanh qua runner console thật, không tính tự động trong gate vì sandbox không có console; Linux/live smoke/publish vẫn `not_run` |
+| H08 | Release candidate, clean-machine route | H07 | **xong phần code**: bundle + checksum + installer từ bundle + uninstall xong và có test disposable; round 22 **dựng lại candidate ở đúng HEAD** (`build_commit c386416`, `sha256 ha.exe 7bfa01…`) sau khi phát hiện candidate cũ dựng ở `1eceeef` — cũ 17 commit (evidence mục 19.6) — và chạy đường cài/gỡ đầu-cuối trên candidate mới (mục 19.7); **không publish** (không được cấp quyền), **I19 vẫn "một phần"** vì không có VM sạch thật |
 
 Bảng này được cập nhật lại ở mỗi checkpoint cùng evidence/handoff; trạng thái
 "chờ" không được đổi thành "xong" chỉ vì code đã viết mà chưa có test chạy.
@@ -383,7 +383,7 @@ thật thay `PendingService`, và `ha chat --headless` chạy turn thật. Live 
   và cảnh báo "terminal mới mới thấy; shell hiện tại giữ PATH kế thừa".
 - **Không xóa command lạ**: `ha` khác đứng trước trên PATH chỉ bị cảnh báo (kèm đường dẫn),
   không bị xóa/thay.
-- **Self test trong script**: `-SelfTest` chạy 14 check — luật merge PATH (kể cả negative
+- **Self test trong script**: `-SelfTest` chạy **26 check** (round 17–21 mở rộng từ 14) — luật merge PATH (kể cả negative
   control Machine/process không lọt vào User PATH), writer tiêm nhận đúng giá trị, phát
   hiện shadowing không xóa file, cài vào thư mục tạm + digest + manifest, update, file bị
   khóa, rollback giữ binary cũ chạy được, và khẳng định **không** ghi User PATH thật.
@@ -406,22 +406,29 @@ trong bằng chứng đều vào thư mục tạm.
    loopback của môi trường này chập khi chạy song song (mục 9 evidence);
 4. installer self test và docs checker.
 
-Gate in rõ **not_run** và không tính chúng là pass: transcript PTY thật (I01/I06/I07/I08 —
-chạy được bằng runner console, xem dưới), live provider smoke, Linux, và mọi thao tác thật
-lên PATH/profile của user.
+Gate in rõ **not_run** và không tính chúng là pass: chín ca PTY thật (i01/i05/i06/i07a/i07b/i08/
+i12/i13/i14 — chạy được bằng runner console, xem dưới), live provider smoke, Linux, và mọi thao
+tác thật lên PATH/profile của user.
 
-**Trạng thái PTY (round 13: đã xanh trong console thật)**: `portable-pty = "=0.9.0"` là
+**Trạng thái PTY (round 21: chín ca xanh trong console thật)**: `portable-pty = "=0.9.0"` là
 dev-dependency và `crates/harness-cli/tests/interactive_terminal.rs` chứa harness thật
-(openpty → spawn → đọc transcript → gửi phím → chờ exit) với bốn ca i01, i06, i07a, i07b.
-Điều kiện môi trường đo được: ConPTY chỉ chạy khi process tạo pseudo-console **sở hữu một
-console**, mà `cargo test` trong sandbox thì không — nên các ca này `#[ignore]` và được chạy
-bằng `scripts/Invoke-HaPtyAcceptance.ps1` (mở console mới, bound cứng, lưu transcript).
-Lần chạy round 13 báo `PTY_EXIT: 0` và `4 passed; 0 failed` (9.03 s) cho I01/I06/I07, và sau
-khi thêm ca I08 (fault seam chỉ có ở debug build + unit test phục hồi mode) là
-`5 passed; 0 failed` (11.01 s, transcript `target/pty-acceptance/pty-all.txt`) — transcript
-thật, không phải suy luận từ scripted backend. Gate vẫn liệt kê **năm** ca PTY là not_run kèm
-hướng dẫn chạy (sandbox không có console), không tính pass tự động; kill process cứng vẫn
-ngoài phạm vi như plan ghi.
+(openpty → spawn → đọc transcript → gửi phím → chờ exit) với **chín** ca: i01, i05, i06, i07a,
+i07b, i08, i12, i13, i14. Điều kiện môi trường đo được: ConPTY chỉ chạy khi process tạo
+pseudo-console **sở hữu một console**, mà `cargo test` trong sandbox thì không — nên các ca này
+`#[ignore]` và được chạy bằng `scripts/Invoke-HaPtyAcceptance.ps1` (mở console mới, bound cứng,
+lưu transcript). Lần chạy round 21 báo `PTY_EXIT: 0` và `9 passed; 0 failed` (20.51 s,
+transcript `target/pty-acceptance/pty-all.txt`) — transcript thật, không phải suy luận từ
+scripted backend. Gate vẫn liệt kê **chín** ca PTY là not_run kèm hướng dẫn chạy (sandbox không
+có console), không tính pass tự động.
+
+Quyết định của round 21: harness có thêm `PtySession::spawn_executable(binary, cwd, env, remove)`
+để một ca chọn **executable** và **xoá bớt biến kế thừa**, thay vì luôn chạy
+`CARGO_BIN_EXE_ha` với môi trường của developer. `spawn` cũ giữ nguyên chữ ký và gọi lại hàm
+này. Nhờ đó I14 đo được đúng thứ plan đòi: **artifact đã cài** (không phải binary trong build
+tree) mở app trong terminal thật, với PATH và profile đã dựng lại. Ghi chú đo được: ConPTY tự
+đặt tiêu đề cửa sổ bằng đường dẫn executable nên transcript luôn chứa đường dẫn thư mục cài;
+assertion đúng là **state** không nằm ở đó (`Data:`/`Store:` trỏ về `HA_HOME`), không phải
+"đường dẫn cài không xuất hiện".
 
 Operator docs đã cập nhật **chỉ với hành vi có thật**: mục 11 nói rõ installer mới
 (artifact/digest/manifest/rollback/User PATH tách biệt/shadowing) và mục 12 mới mô tả
@@ -448,6 +455,12 @@ slash command, approval y/n, yêu cầu cấu hình provider, và danh sách "ch
 - `-Uninstall`: chỉ xóa file do chính installer ghi trong manifest, chỉ gỡ entry PATH mà
   nó đã thêm; **không** đụng config/session data của user; từ chối khi không có manifest
   ("this installer only removes files it recorded").
+- `-Uninstall` **chỉ gỡ entry PATH khi có `-RemoveUserPathEntry`** (round 23). Đường cài cần
+  `-ModifyUserPath` mới ghi User PATH, nên đường gỡ cần cờ riêng trước khi xoá thứ mà lần cài
+  đã thêm; thiếu cờ thì installer **in rõ** entry vẫn còn và cách gỡ, chứ không tự quyết theo
+  hướng nào. Hai ca self test khoá cả hai nửa: `uninstall_keeps_the_recorded_path_entry_without_the_switch`
+  và `uninstall_removes_the_path_entry_with_the_switch` (chạy trên provider/writer tiêm, không
+  đụng User PATH thật).
 - `-FromBundle` với `-UseCargoInstall` bị từ chối vì xung đột ý định.
 
 **Đường máy sạch (round 17, vẫn chỉ là mô phỏng — không có VM thật)**: `Install-Ha.ps1 -SelfTest`
@@ -518,3 +531,18 @@ candidate**. Đây là grant tường minh trong session, nên bảng quyền �
   hiện credential lọt vào output. Self test của nó kiểm chính đường từ chối + logic che.
 - `scripts/New-HaRelease.ps1 -PublishDryRun`: kiểm kênh publish, in ra **đúng** các lệnh sẽ
   chạy (tag → push tag → `gh release create` với zip + checksum) và **không** publish gì.
+
+### Round 22: hai quy tắc đo được chốt thêm
+
+1. **Artifact phải khớp revision đã test.** Candidate H08 từng nằm ở `1eceeef` trong khi HEAD là
+   `c386416`, và `crates/harness-cli/src/interactive/headless.rs` có đổi trong khoảng đó — tức
+   nhãn "release candidate" khi đó **không** chứng minh được nguồn. Từ round này, manifest của
+   candidate phải có `build_commit` **bằng HEAD lúc đo**; nếu khác thì phải dựng lại trước khi
+   dùng nó làm bằng chứng cài đặt (mục 8.1 plan cấm suy phiên bản từ mtime).
+2. **Gate trong worktree phải dùng `target` riêng.** `phase_p7::p7_install_script_installs_a_working_binary`
+   tìm artifact ở `target/debug` **tương đối theo repo**; trỏ `CARGO_TARGET_DIR` sang cây khác làm
+   bước này đỏ **giả** (đã đo: đỏ khi override, `1 passed` khi không). Đây là giới hạn của test
+   hiện có, không phải lỗi sản phẩm, và **không** được sửa trong round 22 vì test thuộc track khác.
+3. **Quyền không tự suy.** Round 22 giữ nguyên bảng quyền ở mục 0: assignment không nêu quyền cho
+   sửa User PATH thật, cài binary lên máy user, paid smoke hay publish — nên bốn việc đó vẫn
+   `not_run`, kể cả khi round 9 có grant điều kiện mà **đầu vào cụ thể vẫn thiếu**.

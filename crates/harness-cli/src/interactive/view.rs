@@ -16,6 +16,50 @@ pub fn prompt_line(phase: AppPhase, buffer: &str) -> String {
     format!("{}{buffer}", prompt_prefix(phase))
 }
 
+/// The prompt as the rows a terminal must draw.
+///
+/// A buffer containing line breaks is one message, so it is drawn as one prompt
+/// spanning several rows: the marker only precedes the first row, and every later
+/// row is plain continuation text. Returning rows instead of one string keeps the
+/// host responsible for terminals, and keeps this function pure.
+#[must_use]
+pub fn prompt_lines(phase: AppPhase, buffer: &str) -> Vec<String> {
+    let prefix = prompt_prefix(phase);
+    let mut lines: Vec<String> = Vec::new();
+    for (index, segment) in buffer.split('\n').enumerate() {
+        if index == 0 {
+            lines.push(format!("{prefix}{segment}"));
+        } else {
+            lines.push(segment.to_owned());
+        }
+    }
+    lines
+}
+
+/// Where the terminal cursor belongs inside a multi-line prompt.
+///
+/// `cursor` counts characters from the start of the buffer, never bytes, so a
+/// Vietnamese character moves the cursor by one cell. The column of the first row
+/// accounts for the prompt marker; continuation rows start at column zero.
+#[must_use]
+pub fn cursor_cell(phase: AppPhase, buffer: &str, cursor: usize) -> (usize, usize) {
+    let prefix_width = prompt_prefix(phase).chars().count();
+    let mut row = 0;
+    let mut column = prefix_width;
+    for (index, character) in buffer.chars().enumerate() {
+        if index == cursor {
+            break;
+        }
+        if character == '\n' {
+            row += 1;
+            column = 0;
+        } else {
+            column += 1;
+        }
+    }
+    (row, column)
+}
+
 #[must_use]
 pub fn help_lines() -> Vec<String> {
     vec![
@@ -72,7 +116,10 @@ pub fn short_id(id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{help_lines, prompt_line, prompt_prefix, run_line, short_id, tool_line};
+    use super::{
+        cursor_cell, help_lines, prompt_line, prompt_lines, prompt_prefix, run_line, short_id,
+        tool_line,
+    };
     use crate::interactive::events::AppPhase;
 
     #[test]
@@ -82,6 +129,44 @@ mod tests {
         assert_eq!(prompt_prefix(AppPhase::Running), ".. ");
         assert_eq!(prompt_prefix(AppPhase::Canceling), ".. ");
         assert_eq!(prompt_line(AppPhase::Ready, "sửa lỗi"), "> sửa lỗi");
+    }
+
+    #[test]
+    fn h03_a_multiline_draft_is_one_prompt_with_rows_and_a_cursor_cell() {
+        let buffer = "first line\nsecond\nthird";
+        assert_eq!(
+            prompt_lines(AppPhase::Ready, buffer),
+            vec![
+                "> first line".to_owned(),
+                "second".to_owned(),
+                "third".to_owned()
+            ],
+            "only the first row carries the marker"
+        );
+
+        // The marker is two cells wide, so cursor 0 sits after "> ".
+        assert_eq!(cursor_cell(AppPhase::Ready, buffer, 0), (0, 2));
+        assert_eq!(cursor_cell(AppPhase::Ready, buffer, 5), (0, 7));
+        // The break itself belongs to the end of the first row.
+        assert_eq!(cursor_cell(AppPhase::Ready, buffer, 10), (0, 12));
+        // The first character after the break starts row 1 at column 0.
+        assert_eq!(cursor_cell(AppPhase::Ready, buffer, 11), (1, 0));
+        assert_eq!(cursor_cell(AppPhase::Ready, buffer, 17), (1, 6));
+        assert_eq!(cursor_cell(AppPhase::Ready, buffer, 18), (2, 0));
+        assert_eq!(cursor_cell(AppPhase::Ready, buffer, 23), (2, 5));
+
+        // The busy marker is ".. " (three cells) while the ready marker is "> "
+        // (two), so the cursor column follows the marker actually in use.
+        assert_eq!(cursor_cell(AppPhase::Running, "x", 0), (0, 3));
+        assert_eq!(prompt_prefix(AppPhase::Running).chars().count(), 3);
+        assert_eq!(prompt_prefix(AppPhase::Ready).chars().count(), 2);
+
+        // A single-line prompt stays exactly as it was.
+        assert_eq!(prompt_lines(AppPhase::Ready, ""), vec!["> ".to_owned()]);
+        assert_eq!(
+            prompt_lines(AppPhase::Ready, "one line"),
+            vec!["> one line".to_owned()]
+        );
     }
 
     #[test]

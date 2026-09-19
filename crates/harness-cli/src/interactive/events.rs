@@ -20,6 +20,12 @@ pub enum Key {
     Up,
     Down,
     Enter,
+    /// Ctrl-J: insert a line break instead of submitting.
+    ///
+    /// A combination the terminal reports distinctly is required here: on Windows
+    /// a console cannot tell Shift+Enter from Enter, so the plan's "keys that are
+    /// actually tested" rule means Ctrl-J is the documented multiline key.
+    Newline,
     /// Ctrl-C: cancel an active run, or clear an idle prompt.
     Interrupt,
     /// Ctrl-D on an empty prompt: leave the app.
