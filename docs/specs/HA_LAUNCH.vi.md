@@ -161,3 +161,25 @@ tiếp nhận không phải hỏi lại hội thoại.
 - **UI dùng tiếng Việt** theo mockup của plan. Render tiếng Việt trên terminal thật
   chưa được kiểm chứng ở H02; việc đó thuộc H03/H07 với PTY.
 
+### H03 — Terminal app và input loop
+
+- **Thư viện terminal đã chốt: `crossterm` pin `=0.29.0`** (style pin exact của repo).
+  Khảo sát thật, không viết API từ trí nhớ: `cargo search crossterm` trả 0.29.0 là bản
+  mới nhất trên registry; docs.rs 0.29.0 (`all.html` + trang feature) xác nhận các item
+  cần dùng đều tồn tại — `terminal::enable_raw_mode`, `terminal::disable_raw_mode`,
+  `terminal::is_raw_mode_enabled`, `terminal::size`, `terminal::{Clear, ClearType,
+  EnterAlternateScreen, LeaveAlternateScreen}`, `cursor::{Hide, Show, MoveTo}`,
+  `event::{read, poll, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+  EnableBracketedPaste, DisableBracketedPaste}`, macro `execute!`/`queue!`, trait `tty::IsTty`.
+- **Feature**: bản 0.29.0 bật mặc định `events`, `bracketed-paste`, `windows` — đúng
+  thứ H03 cần cho raw mode + key event + ConPTY. Không bật thêm feature nào; đặc biệt
+  **không** bật `use-dev-tty` (mở `/dev/tty` là quyết định riêng) và không cần
+  `event-stream` vì event được đọc trong reader thread riêng.
+- **Không dùng ratatui/full-screen TUI**: plan yêu cầu app terminal tối thiểu với prompt
+  editor + streaming output; alternate screen chỉ dùng nếu thật cần.
+- Detector TTY của H01 vẫn là điều kiện tiên quyết: raw mode chỉ được bật sau khi
+  detector nói stdin/stdout là terminal.
+- Thêm dependency sẽ cập nhật `Cargo.lock`; mọi lệnh gate dùng `--locked` nên lock phải
+  được cập nhật trong cùng checkpoint.
+
+
