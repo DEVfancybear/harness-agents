@@ -23,6 +23,9 @@ use serde_json::{Value, json};
 use thiserror::Error;
 pub use tokio_util::sync::CancellationToken;
 
+mod streaming;
+pub use streaming::{ProviderEventStream, StreamingModelProvider, collect_events};
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
     pub provider_id: String,
