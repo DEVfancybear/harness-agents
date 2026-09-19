@@ -150,7 +150,7 @@ Không checkpoint nào được nhận "done" khi prerequisite chưa đạt.
 | H05 | Approval, resume, lifecycle | H04 | **đang làm**: approval gate + resume list/select + `/new` + headless `--resume` xong và có test; còn test hard-kill giữa turn |
 | H06 | Installer, User PATH scope, install manifest | H01–H03 | **đang làm**: artifact identity + manifest + rollback + PATH scope + self test xong; ghi User PATH thật không được cấp quyền |
 | H07 | Gate `Verify-HaLaunch.ps1`, PTY fixture, acceptance I01–I18 | H01–H06 | **đang làm**: gate + operator docs + migration note xong; transcript PTY thật bị chặn bởi ConPTY trong sandbox (not_run, có lý do đo được) |
-| H08 | Release candidate, clean-machine route | H07 | việc tiếp theo (không publish) |
+| H08 | Release candidate, clean-machine route | H07 | **đang làm**: bundle + checksum + installer từ bundle + uninstall xong và có test disposable; **không publish** (không được cấp quyền) |
 
 Bảng này được cập nhật lại ở mỗi checkpoint cùng evidence/handoff; trạng thái
 "chờ" không được đổi thành "xong" chỉ vì code đã viết mà chưa có test chạy.
@@ -406,3 +406,25 @@ Operator docs đã cập nhật **chỉ với hành vi có thật**: mục 11 n�
 (artifact/digest/manifest/rollback/User PATH tách biệt/shadowing) và mục 12 mới mô tả
 entrypoint tương tác, bảng migration cho hành vi non-TTY exit 2, các option `chat`,
 slash command, approval y/n, yêu cầu cấu hình provider, và danh sách "chưa kiểm chứng".
+
+### H08 — Prebuilt release và clean-machine install (đang triển khai)
+
+**Không publish** (assignment không cấp quyền). Đã tạo `scripts/New-HaRelease.ps1`:
+
+- Build đúng revision đã test, lấy executable **Cargo báo**; đóng gói bundle chỉ gồm
+  `ha` + `ha.release.json` (version, target, rustc, build commit, sha256, `published:false`)
+  + `checksums.txt` (mọi file trừ chính nó). **Không** kèm fixture executable, test secret
+  hay build cache — và có negative control: thêm một file lạ (ví dụ
+  `p6_fixture_plugin.exe`) thì checker **fail**.
+- Xuất ra `target/release-candidate/ha-<version>-<platform>-x64/` + file zip cùng tên,
+  in sha256 của zip. Script nói rõ `Published: no` — không tạo URL giả.
+
+**Installer end-user** (bổ sung vào `scripts/Install-Ha.ps1`):
+
+- `-FromBundle <dir>`: verify `ha.release.json` + toàn bộ `checksums.txt` **trước khi**
+  stage; bundle bị sửa một byte bị từ chối với mã lỗi `bundle_checksum_mismatch`; manifest
+  cài đặt ghi `source` = đường dẫn bundle.
+- `-Uninstall`: chỉ xóa file do chính installer ghi trong manifest, chỉ gỡ entry PATH mà
+  nó đã thêm; **không** đụng config/session data của user; từ chối khi không có manifest
+  ("this installer only removes files it recorded").
+- `-FromBundle` với `-UseCargoInstall` bị từ chối vì xung đột ý định.

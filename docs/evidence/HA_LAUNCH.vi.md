@@ -1,6 +1,6 @@
 # Evidence HA_LAUNCH — track H01–H08
 
-Trạng thái: **H01–H06 xong phần code; H07 có gate + operator docs + migration note (transcript PTY thật bị chặn bởi ConPTY trong sandbox); H08 chưa bắt đầu.** H05 còn ca hard-kill giữa turn; H06 không ghi User PATH thật vì không được cấp quyền. H04/H05 chưa có live provider smoke vì không được cấp quyền. Tài liệu này được cập
+Trạng thái: **H01–H08 xong phần code** (H05 còn ca hard-kill giữa turn; H07 thiếu transcript PTY thật vì ConPTY không chạy trong sandbox; H08 không publish và chỉ mô phỏng máy sạch). Không có live provider smoke. H05 còn ca hard-kill giữa turn; H06 không ghi User PATH thật vì không được cấp quyền. H04/H05 chưa có live provider smoke vì không được cấp quyền. Tài liệu này được cập
 nhật lại sau mỗi checkpoint; trạng thái ở đây là trạng thái thật tại thời điểm ghi,
 không phải trạng thái dự kiến.
 
@@ -383,7 +383,41 @@ nào từ master và process con không thoát** — đã loại trừ lỗi c�
 Vì vậy I01/I06/I07/I08 ở dạng transcript terminal thật **chưa** đạt; render loop đang được
 chứng minh bằng scripted backend (H03) và guard non-TTY bằng launch test.
 
-## 9. Chưa xác minh (không được coi là đạt)
+
+## 9. H08 — release candidate và clean-machine install (không publish)
+
+| Kiểm chứng | Lệnh | Kết quả |
+|---|---|---|
+| Self test packaging | `pwsh -NoProfile -File scripts/New-HaRelease.ps1 -SelfTest` | `RELEASE_SELFTEST_OK` (bundle contents, manifest digest, negative control file lạ) |
+| Build candidate | `pwsh -NoProfile -File scripts/New-HaRelease.ps1 -SkipBuild` | bundle `ha-0.1.0-windows-x64` gồm `ha.exe`, `ha.release.json`, `checksums.txt`; zip sha256 `3d5b476e825ebb378a3ac10570a9f9222f7d99c784cfa2c3390e2cf5c9b7ae9a`; `published: false` |
+| Gate runtime (đã thêm bước release) | `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json` | `"passed": true`, `"failures": []` |
+| Installer self test mở rộng | `pwsh -NoProfile -File scripts/Install-Ha.ps1 -SelfTest` | 18 check OK (thêm bundle install, bundle bị sửa bị từ chối, uninstall chỉ xóa file sở hữu, user data được giữ) |
+
+**I19 (máy sạch — mô phỏng)**: cài từ bundle vào thư mục tạm, sau đó chạy với PATH tối
+thiểu (chỉ thư mục cài + `System32`, `toolchainOnMinimalPath=False`):
+
+- `ha --version` → `ha 0.1.0` (không cần Rust/Git/Node, không cần source repo);
+- bare `ha` không có terminal → exit **2** kèm hướng dẫn (đúng hành vi mới, migration note
+  đã ghi ở operator guide mục 12);
+- `ha init --data-dir <temp>` tạo store thật → `userDataCreated=True`.
+
+**I20 (update rồi uninstall)**: update từ cùng bundle → `stillRuns=True`; uninstall →
+
+- `Removed:` đúng hai file sở hữu (`ha.exe`, `ha.install.json`);
+- `foreignFileKept=True` (file lạ cạnh binary không bị xóa);
+- `userDataKept=True` (config/store của user còn nguyên);
+- `PATH:` báo không có entry nào do lần cài này thêm;
+- reinstall sau uninstall → `reinstalledRuns=True`.
+
+**Chưa chạy (ghi rõ, không tính là đạt)**:
+
+- **Publish release**: không được cấp quyền → không publish, không URL, không tag.
+- **VM/máy sạch thật** (I19/I20 trên máy không có build toolchain thực sự): chỉ **mô phỏng**
+  bằng PATH tối thiểu + thư mục tạm; chưa có VM trong session này.
+- **Linux x64 bundle**: không có host/toolchain Linux ở đây, nên chỉ công bố Windows x64.
+- **Ghi User PATH thật**: vẫn không thực hiện; đường ghi chỉ được chứng minh bằng writer tiêm.
+
+## 10. Chưa xác minh (không được coi là đạt)
 
 - **I01 PTY transcript**: chưa có. Cần terminal thật/PTY harness (H07). Unit test
   dùng fixture detector chỉ chứng minh logic capability, không phải bằng chứng
@@ -394,7 +428,7 @@ chứng minh bằng scripted backend (H03) và guard non-TTY bằng launch test.
 - **Publish release / push remote**: không thực hiện; không được cấp quyền.
 - **Linux**: chưa build/chạy; mọi kết quả trên là Windows.
 
-## 10. Ghi chú flake môi trường (đã điều tra, không che)
+## 11. Ghi chú flake môi trường (đã điều tra, không che)
 
 Test `phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` thỉnh
 thoảng đỏ ở tầng connect tới fixture server loopback trong chính process test:

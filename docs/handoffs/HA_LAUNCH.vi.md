@@ -30,7 +30,9 @@ Tài liệu này là điểm vào cho lượt coding tiếp theo. Cập nhật s
 - **Chặn bởi môi trường**: transcript PTY thật (I01/I06/I07/I08) — ConPTY trong sandbox
   spawn được process nhưng không đọc được output; harness đã viết và được `#[ignore]`
   kèm lý do. **Không** được coi là đã đạt.
-- **H08 chưa bắt đầu.**
+- **H08 xong phần code**: bundle candidate + checksum + manifest (`published:false`), installer
+  `-FromBundle` (verify trước khi cài) và `-Uninstall` (chỉ xóa file sở hữu, giữ user data),
+  cùng chứng minh disposable I19/I20. **Không publish** và chưa có VM sạch thật.
 - Phát hiện nền tảng quan trọng: journal P1 chỉ cho **một input mỗi session** và task lease
   cần **generation mới** — nên "cùng phiên" = cùng task + chuỗi session nối nhau, không
   phải một session nhiều input (chi tiết + test ở mục 5.3 evidence và mục 5 SPEC).
