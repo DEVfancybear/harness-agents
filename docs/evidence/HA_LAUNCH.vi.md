@@ -1,6 +1,6 @@
 # Evidence HA_LAUNCH — track H01–H08
 
-Trạng thái: **H01–H03 xong ở mức được ghi dưới đây; H04–H08 chưa bắt đầu.** Tài liệu này được cập
+Trạng thái: **H01–H03 xong; H04 đang làm (G1 xong, G2/G3 chưa); H05–H08 chưa bắt đầu.** Tài liệu này được cập
 nhật lại sau mỗi checkpoint; trạng thái ở đây là trạng thái thật tại thời điểm ghi,
 không phải trạng thái dự kiến.
 
@@ -202,7 +202,36 @@ Chưa xác minh (không được coi là đạt):
 - **Multiline editing**: chưa có; paste nhiều dòng bị đổi newline thành space.
 - **Linux**: chưa build/chạy.
 
-## 5. Chưa xác minh (không được coi là đạt)
+## 5. H04 — tiến độ từng phần (G1 xong, G2/G3 còn lại)
+
+H04 **chưa** hoàn tất. Ghi lại đúng phần đã xác minh để không bị đọc thành đã xong.
+
+| Kiểm chứng G1 | Lệnh | Kết quả |
+|---|---|---|
+| Unit/integration của provider | `cargo test -p harness-providers` | 3 passed, 0 failed |
+| Regression P2 (provider cũ) | `cargo test -p harness-cli --test phase_p2 --locked -- --test-threads=1` | 17 passed, 0 failed |
+| Lint toàn workspace | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+
+Selector G1: `g1_mock_stream_matches_the_buffered_boundary_event_for_event`,
+`g1_cancellation_before_dispatch_reports_a_canceled_call`,
+`g1_adapter_delivers_text_before_the_response_completes`.
+
+Đã chứng minh:
+
+- **Boundary tăng dần là additive**: `StreamingModelProvider` + `ProviderEventStream` nằm
+  cạnh `ModelProvider` cũ; test so từng event giữa hai boundary và khẳng định P2 không
+  đổi (17/17 regression xanh).
+- **I10 (lõi)**: qua `DeepSeekAdapter` thật với fixture HTTP giữ body mở, client nhận
+  `TextDelta` **trước khi** server gửi phần còn lại. Đây là bằng chứng "text hiện trước
+  complete", không phải animation sau khi response xong.
+- **Cancellation**: hủy trước dispatch trả lỗi typed `provider_canceled`, không trả
+  stream rỗng giả thành công.
+
+Chưa chứng minh (thuộc phần còn lại của H04): vòng lặp model→tool→model (G2), lifecycle
+resume/canceled (G3), service thật thay `PendingService`, headless turn thật, và
+I11/I12 end-to-end. Live provider smoke: **not_run** (không có credential/budget được cấp).
+
+## 6. Chưa xác minh (không được coi là đạt)
 
 - **I01 PTY transcript**: chưa có. Cần terminal thật/PTY harness (H07). Unit test
   dùng fixture detector chỉ chứng minh logic capability, không phải bằng chứng
@@ -213,7 +242,7 @@ Chưa xác minh (không được coi là đạt):
 - **Publish release / push remote**: không thực hiện; không được cấp quyền.
 - **Linux**: chưa build/chạy; mọi kết quả trên là Windows.
 
-## 6. Ghi chú flake môi trường (đã điều tra, không che)
+## 7. Ghi chú flake môi trường (đã điều tra, không che)
 
 Test `phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` thỉnh
 thoảng đỏ ở tầng connect tới fixture server loopback trong chính process test:

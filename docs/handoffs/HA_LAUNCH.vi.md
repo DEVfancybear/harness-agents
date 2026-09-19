@@ -10,7 +10,10 @@ Tài liệu này là điểm vào cho lượt coding tiếp theo. Cập nhật s
 - **H03 xong phần code**: terminal app thật với `crossterm = "=0.29.0"` — controller
   state machine tách renderer, editor Unicode/history/paste, Ctrl-C/Ctrl-D, raw mode
   có RAII guard, fallback line mode, fixture opt-in có nhãn.
-- **H04–H08 chưa bắt đầu.** Bảng staging trong SPEC vẫn ghi H04 là "việc tiếp theo".
+- **H04 đang làm**: khảo sát G1–G3 đã ghi vào SPEC, **G1 xong** (boundary stream tăng
+  dần additive + test barrier chứng minh text hiện trước complete). G2/G3, service thật
+  và headless turn còn lại.
+- **H05–H08 chưa bắt đầu.**
 - **Chưa có gì được chứng minh trên terminal thật/PTY**: I01/I06/I07/I08 transcript
   thuộc H07. Hiện tại UI mới được chứng minh qua scripted backend + unit test.
 - `ha chat --headless` vẫn trả `service_unavailable` (exit 1). H04 thay bằng turn thật.
@@ -36,17 +39,10 @@ local, process con trong thư mục tạm, cài vào `-Destination` tạm, commi
 
 **H04 — application service và agent execution thật.** Prerequisite H03 đã đạt.
 
-1. **Khảo sát G1–G3 trước khi refactor** và ghi kết quả vào SPEC + evidence:
-   - G1: `ModelProvider::stream` hiện trả `Vec<ProviderStreamEvent>` sau khi thu hết
-     (`crates/harness-providers/src/lib.rs`), tức chưa có event tăng dần.
-   - G2: `CodingLoopService` chạy một provider response rồi thực thi tool, **chưa** gửi
-     tool result trở lại model (`crates/harness-tools/src/loop_service.rs`).
-   - G3: `SessionService`/`SqliteStore` đã có admit/receipt/recover; cần định nghĩa
-     lifecycle resume/canceled/error cho interactive.
-2. **G1 tối thiểu, additive**: thêm API stream tăng dần bên cạnh `ModelProvider` hiện
-   có (giữ nguyên tests/compat), implement cho `MockProvider` và `DeepSeekAdapter`;
-   fixture HTTP server local (tokio `TcpListener`, không cần dependency mới) chạy qua
-   production adapter để test I10 — text phải hiện trước terminal barrier.
+1. ~~Khảo sát G1–G3~~ **đã xong** (bảng gate ở mục 5 SPEC).
+2. ~~G1 stream tăng dần~~ **đã xong**: `crates/harness-providers/src/streaming.rs`
+   (`StreamingModelProvider`, `ProviderEventStream`, `collect_events`) + test barrier.
+   Khi nối runtime, dùng boundary này thay vì đọc `Vec` rồi chia nhỏ.
 3. **G2**: `TurnDriver` bounded model→tool→model, dùng policy/approval/receipt gate có
    sẵn; I11 với temp repo thật (tool fail→fix→pass), một admission mỗi message.
 4. **G3**: nối store/session theo project, resume/replay đúng task; I12 (approval

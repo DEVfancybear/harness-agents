@@ -146,7 +146,7 @@ Không checkpoint nào được nhận "done" khi prerequisite chưa đạt.
 | H01 | Entry point, dispatch, TTY detector, parser compat | — | dispatch + guard + parser xong; UI thật chờ H03 |
 | H02 | Launch context, paths/HA_HOME, config/setup state | H01 | context + paths + setup state xong bằng unit test; UI thật chờ H03 |
 | H03 | Terminal app, controller/renderer, input loop | H02 | controller/renderer/editor/terminal + fixture route xong bằng test; PTY thật thuộc H07 |
-| H04 | G1 provider incremental, G2 tool continuation, G3 durable session | H03 + khảo sát G1–G3 | việc tiếp theo |
+| H04 | G1 provider incremental, G2 tool continuation, G3 durable session | H03 + khảo sát G1–G3 | **đang làm**: khảo sát G1–G3 xong, G1 xong (additive, có test barrier); G2/G3 + service thật còn lại |
 | H05 | Approval, resume, lifecycle | H04 | chờ H04 pass |
 | H06 | Installer, User PATH scope, install manifest | H01–H03 | logic + test disposable; **không** ghi User PATH thật |
 | H07 | Gate `Verify-HaLaunch.ps1`, PTY fixture, acceptance I01–I18 | H01–H06 | chờ |
@@ -218,4 +218,33 @@ tiếp nhận không phải hỏi lại hội thoại.
 - Thêm dependency sẽ cập nhật `Cargo.lock`; mọi lệnh gate dùng `--locked` nên lock phải
   được cập nhật trong cùng checkpoint.
 
+### H04 — Application service và agent execution thật (đang triển khai)
 
+**Khảo sát G1–G3 tại revision hiện tại** (đọc source thật, không suy đoán):
+
+| Gate | Hiện trạng source | Khoảng trống |
+|---|---|---|
+| G1 provider tăng dần | `ModelProvider::stream` trả `ProviderFuture` = `Vec<ProviderStreamEvent>` sau khi đã đọc hết byte stream; `assemble_stream` gộp text/tool delta thành một response | Không có event tăng dần cho caller → text không thể hiện trước khi xong |
+| G2 tool continuation | `RuntimeService::run_with_cancellation` admit input rồi gọi provider **một lần**; `CodingLoopService::run_once` thực thi tool call sau đó nhưng **không** gửi tool result trở lại model | Thiếu vòng lặp model→tool→model có bound |
+| G3 durable session | `SessionService::{admit_input, record_synthetic_receipt, recover}` + `SqliteStore` (writer lock/fence, journal, receipt, snapshot) đã có | Chưa có lifecycle interactive (resume/canceled/error) và chưa nối vào service |
+
+**Quyết định G1 (đã hoàn tất trong checkpoint này)**:
+
+- Thêm **boundary additive** `StreamingModelProvider` + `ProviderEventStream` trong
+  `crates/harness-providers/src/streaming.rs`; `ModelProvider`, call sites và test P2
+  **không đổi**. `collect_events` là cầu nối về dạng buffered cho caller cũ, và có
+  test khẳng định hai boundary trả cùng tập event.
+- Truyền event qua **bounded channel** (4 cho mock, 16 cho adapter) + `poll_fn`, nên
+  consumer chậm sẽ tạo backpressure thay vì buffer vô hạn.
+- `DeepSeekAdapter` decode SSE và **forward từng event ngay khi decode**, không đợi hết
+  body; `MockProvider` phát script theo từng event (có delay/cancel).
+- Cancellation được kiểm tra trước dispatch, trong lúc chờ response và trong lúc đọc
+  stream; lỗi trả về là `provider_canceled` typed.
+- **Bằng chứng tăng dần (lõi I10)**: test dựng fixture HTTP thật, gửi delta đầu rồi
+  **giữ body mở**; client phải nhận được `TextDelta` trong lúc barrier còn giữ. Đây là
+  thứ boundary buffered không thể vượt qua.
+
+**Còn lại của H04**: G2 (TurnDriver bounded model→tool→model dùng policy/approval/receipt
+hiện có), G3 (lifecycle session/resume trong service), nối `interactive/service.rs`
+thật thay `PendingService`, và `ha chat --headless` chạy turn thật. Live smoke ghi
+`not_run` vì chưa được cấp credential/budget.
