@@ -35,6 +35,9 @@ toml.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# Pinned in the HA_LAUNCH H07 spike: real ConPTY on Windows and a real pty on
+# Unix, so the no-arg launch is proven in a terminal instead of a pipe.
+portable-pty = "=0.9.0"
 sqlx.workspace = true
 harness-kernel = { path = "../harness-kernel" }
 harness-session = { path = "../harness-session" }

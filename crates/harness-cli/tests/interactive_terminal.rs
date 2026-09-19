@@ -1,0 +1,294 @@
+//! `HA_LAUNCH` H07 PTY acceptance: the interactive app in a real terminal.
+//!
+//! This file is the only place that proves the no-arg launch owns a terminal:
+//! `Command::output()` creates pipes, which is exactly the non-interactive case.
+//! Every test below spawns the compiled binary inside a real pseudo-console and
+//! reads the transcript it produces.
+
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+/// Resolve the compiled `ha` executable this crate produced.
+fn cli_binary() -> PathBuf {
+    if let Some(path) = option_env!("CARGO_BIN_EXE_ha") {
+        let candidate = PathBuf::from(path);
+        assert!(
+            candidate.is_file(),
+            "compiled ha binary missing at {}",
+            candidate.display()
+        );
+        return candidate;
+    }
+    let mut path = std::env::current_exe().expect("test binary path");
+    path.pop();
+    if path.ends_with("deps") {
+        path.pop();
+    }
+    let candidate = path.join(format!("ha{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        candidate.is_file(),
+        "compiled ha binary missing at {}",
+        candidate.display()
+    );
+    candidate
+}
+
+/// One interactive session inside a real pseudo-console.
+struct PtySession {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Box<dyn Write + Send>,
+    transcript: Arc<Mutex<Vec<u8>>>,
+}
+
+impl PtySession {
+    fn spawn(cwd: &Path, env: &[(&str, String)]) -> Self {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 30,
+                cols: 110,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("a pseudo-console can be opened");
+        let mut command = CommandBuilder::new(cli_binary());
+        command.cwd(cwd);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        // Never inherit a credential from the developer's shell: the tests decide
+        // whether the app is configured.
+        command.env_remove("DEEPSEEK_API_KEY");
+        command.env_remove("HA_API_KEY");
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .expect("the app starts inside the pseudo-console");
+        drop(pair.slave);
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .expect("the master side is readable");
+        let writer = pair
+            .master
+            .take_writer()
+            .expect("the master side is writable");
+        let transcript = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&transcript);
+        std::thread::spawn(move || {
+            let mut chunk = [0_u8; 4096];
+            while let Ok(read) = reader.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                if let Ok(mut buffer) = sink.lock() {
+                    buffer.extend_from_slice(&chunk[..read]);
+                }
+            }
+        });
+        Self {
+            child,
+            writer,
+            transcript,
+        }
+    }
+
+    fn send(&mut self, text: &str) {
+        self.writer
+            .write_all(text.as_bytes())
+            .expect("input reaches the app");
+        self.writer.flush().expect("input is flushed");
+    }
+
+    fn transcript(&self) -> String {
+        let buffer = self.transcript.lock().expect("transcript lock").clone();
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
+    /// Wait until the transcript contains the needle, returning what was seen.
+    fn wait_for(&self, needle: &str, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let text = self.transcript();
+            if text.contains(needle) {
+                return text;
+            }
+            assert!(
+                Instant::now() <= deadline,
+                "timed out waiting for {needle:?}; transcript was:\n{text}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn wait_exit(&mut self, timeout: Duration) -> Option<u32> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return status.exit_code().into(),
+                Ok(None) => {}
+                Err(error) => panic!("waiting for the app failed: {error}"),
+            }
+            if Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+/// Isolated state root for one session.
+fn sandbox() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("temp root");
+    let project = temp.path().join("project with spaces");
+    std::fs::create_dir_all(&project).expect("project dir");
+    (temp, project)
+}
+
+fn base_env(temp: &tempfile::TempDir) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "HA_HOME",
+            temp.path().join("home").to_string_lossy().into_owned(),
+        ),
+        ("HA_PROVIDER_ENDPOINT", String::new()),
+        ("HA_PROVIDER_MODEL", String::new()),
+    ]
+}
+
+#[ignore = "ConPTY capture does not work in this sandbox: portable-pty 0.9.0 spawns the child (console hosts are created) but no output is ever readable from the master and the child never exits, so a real transcript cannot be captured here. Recorded in docs/evidence/HA_LAUNCH.vi.md section 8; the render loop is covered by the scripted backend and the non-TTY behaviour by the launch tests."]
+#[test]
+fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
+    let (temp, project) = sandbox();
+    let mut session = PtySession::spawn(&project, &base_env(&temp));
+
+    let text = session.wait_for("Harness Agents", Duration::from_secs(30));
+    assert!(session.is_alive(), "the app stays alive at the prompt");
+    assert!(
+        text.contains("Nhập yêu cầu"),
+        "the prompt is Vietnamese: {text}"
+    );
+    assert!(
+        text.contains(&project.display().to_string()),
+        "the header names the caller project: {text}"
+    );
+    assert!(
+        text.contains("setup required"),
+        "an unconfigured provider is stated, not hidden: {text}"
+    );
+
+    session.send("/exit\r");
+    let status = session.wait_exit(Duration::from_secs(20));
+    assert_eq!(status, Some(0), "transcript:\n{}", session.transcript());
+    assert!(session.transcript().contains("bye"), "the app says goodbye");
+}
+
+#[ignore = "ConPTY capture does not work in this sandbox: portable-pty 0.9.0 spawns the child (console hosts are created) but no output is ever readable from the master and the child never exits, so a real transcript cannot be captured here. Recorded in docs/evidence/HA_LAUNCH.vi.md section 8; the render loop is covered by the scripted backend and the non-TTY behaviour by the launch tests."]
+#[test]
+fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
+    let (temp, project) = sandbox();
+    let mut session = PtySession::spawn(&project, &base_env(&temp));
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+
+    session.send("sửa lỗi parser");
+    session.wait_for("sửa lỗi parser", Duration::from_secs(15));
+    session.send("\u{7f}");
+    session.send("!");
+    session.wait_for("sửa lỗi parse!", Duration::from_secs(15));
+    assert!(session.is_alive(), "editing keeps the app alive");
+
+    // A bracketed paste arrives as one insertion; it must never become several
+    // submitted lines.
+    session.send("\u{1b}[200~multi\r\nline\u{1b}[201~");
+    session.wait_for("multi line", Duration::from_secs(15));
+    assert!(
+        !session.transcript().contains("[run] accepted"),
+        "a paste must not submit a request:\n{}",
+        session.transcript()
+    );
+    assert!(session.is_alive());
+
+    session.send("\r");
+    session.wait_for("[run] accepted", Duration::from_secs(25));
+    session.send("/exit\r");
+    assert_eq!(
+        session.wait_exit(Duration::from_secs(20)),
+        Some(0),
+        "transcript:\n{}",
+        session.transcript()
+    );
+}
+
+#[ignore = "ConPTY capture does not work in this sandbox: portable-pty 0.9.0 spawns the child (console hosts are created) but no output is ever readable from the master and the child never exits, so a real transcript cannot be captured here. Recorded in docs/evidence/HA_LAUNCH.vi.md section 8; the render loop is covered by the scripted backend and the non-TTY behaviour by the launch tests."]
+#[test]
+fn i07_ctrl_c_clears_an_idle_prompt_and_cancels_a_running_turn() {
+    let (temp, project) = sandbox();
+    let mut session = PtySession::spawn(&project, &base_env(&temp));
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+
+    // Idle: Ctrl-C clears whatever was typed.
+    session.send("typo");
+    session.wait_for("> typo", Duration::from_secs(15));
+    session.send("\u{3}");
+    session.send("z");
+    session.wait_for("> z", Duration::from_secs(15));
+    assert!(
+        !session.transcript().contains("> typoz"),
+        "an idle Ctrl-C clears the buffer:\n{}",
+        session.transcript()
+    );
+    assert!(session.is_alive());
+
+    // Running: the provider accepts the connection and never answers, so the turn
+    // stays active until Ctrl-C cancels it.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("hanging endpoint");
+    let address = listener.local_addr().expect("hanging address");
+    let hold = std::thread::spawn(move || {
+        if let Ok((connection, _)) = listener.accept() {
+            std::thread::sleep(Duration::from_secs(10));
+            drop(connection);
+        }
+    });
+    let mut running_env = base_env(&temp);
+    running_env.push((
+        "HA_PROVIDER_ENDPOINT",
+        format!("http://{address}/chat/completions"),
+    ));
+    running_env.push(("HA_PROVIDER_MODEL", "fixture-model".to_owned()));
+    running_env.push(("DEEPSEEK_API_KEY", "fixture-secret-value".to_owned()));
+    let mut running = PtySession::spawn(&project, &running_env);
+    running.wait_for("Harness Agents", Duration::from_secs(30));
+
+    running.send("hold the turn open\r");
+    running.wait_for("[run] accepted", Duration::from_secs(20));
+    running.send("\u{3}");
+    running.wait_for("canceling", Duration::from_secs(20));
+    running.wait_for("[run]", Duration::from_secs(30));
+    running.send("/exit\r");
+    assert_eq!(
+        running.wait_exit(Duration::from_secs(20)),
+        Some(0),
+        "transcript:\n{}",
+        running.transcript()
+    );
+    let text = running.transcript();
+    assert!(
+        !text.contains("fixture-secret-value"),
+        "the credential never reaches the screen"
+    );
+    let _ = hold.join();
+}
