@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+futures-util.workspace = true
 harness-providers = { path = "../harness-providers" }
 harness-session = { path = "../harness-session" }
 harness-store-sqlite = { path = "../harness-store-sqlite" }

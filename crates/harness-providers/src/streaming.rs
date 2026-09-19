@@ -16,27 +16,37 @@ use harness_types::ErrorCode;
 use tokio::sync::mpsc;
 
 use crate::{
-    CancellationToken, DeepSeekAdapter, MockProvider, ModelCapabilities, ModelProvider,
-    ProviderError, ProviderRequest, ProviderStreamEvent, SseDecoder,
+    CancellationToken, DeepSeekAdapter, MockProvider, ProviderError, ProviderFuture,
+    ProviderRequest, ProviderStreamEvent, SseDecoder,
 };
 
 /// Incremental event stream from one provider call.
 pub type ProviderEventStream =
     Pin<Box<dyn Stream<Item = Result<ProviderStreamEvent, ProviderError>> + Send>>;
 
-/// A provider that reports events while the response is still arriving.
-pub trait StreamingModelProvider: Send + Sync {
-    fn capabilities(&self) -> ModelCapabilities;
-
-    /// Start one call and return its event stream.
-    ///
-    /// Implementations must not wait for the response to finish: the first text
-    /// delta is delivered as soon as it is decoded.
-    fn stream_events(
-        &self,
-        request: ProviderRequest,
-        cancellation: CancellationToken,
-    ) -> ProviderEventStream;
+/// Bridge a buffered future into the incremental shape.
+///
+/// This is the default for a provider that can only answer in one piece: the
+/// events arrive together instead of progressively, which callers can detect.
+pub(crate) fn bridge_buffered(future: ProviderFuture) -> ProviderEventStream {
+    let (sender, mut receiver) = mpsc::channel::<Result<ProviderStreamEvent, ProviderError>>(16);
+    tokio::spawn(async move {
+        match future.await {
+            Ok(events) => {
+                for event in events {
+                    if sender.send(Ok(event)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = sender.send(Err(error)).await;
+            }
+        }
+    });
+    Box::pin(futures_util::stream::poll_fn(move |context| {
+        receiver.poll_recv(context)
+    }))
 }
 
 /// Collect an incremental stream into the buffered shape P2 callers expect.
@@ -50,19 +60,16 @@ pub async fn collect_events(
     Ok(events)
 }
 
-impl StreamingModelProvider for MockProvider {
-    fn capabilities(&self) -> ModelCapabilities {
-        <Self as ModelProvider>::capabilities(self)
-    }
-
-    fn stream_events(
-        &self,
-        request: ProviderRequest,
-        cancellation: CancellationToken,
-    ) -> ProviderEventStream {
-        let script = Arc::clone(&self.script);
-        let calls = Arc::clone(&self.calls);
-        let delay_ms = self.delay_ms;
+/// Incremental implementation for the deterministic mock provider.
+pub(crate) fn mock_stream(
+    provider: &MockProvider,
+    request: ProviderRequest,
+    cancellation: CancellationToken,
+) -> ProviderEventStream {
+    {
+        let script = Arc::clone(&provider.script);
+        let calls = Arc::clone(&provider.calls);
+        let delay_ms = provider.delay_ms;
         // Bounded channel: the consumer applies backpressure instead of letting a
         // long script buffer without limit.
         let (sender, mut receiver) = mpsc::channel::<Result<ProviderStreamEvent, ProviderError>>(4);
@@ -114,22 +121,20 @@ impl StreamingModelProvider for MockProvider {
     }
 }
 
-impl StreamingModelProvider for DeepSeekAdapter {
-    fn capabilities(&self) -> ModelCapabilities {
-        <Self as ModelProvider>::capabilities(self)
-    }
-
-    // The transport loop is deliberately linear: request, decode, forward. It is
-    // long but has no branching business logic.
-    #[allow(clippy::too_many_lines)]
-    fn stream_events(
-        &self,
-        request: ProviderRequest,
-        cancellation: CancellationToken,
-    ) -> ProviderEventStream {
-        let endpoint = self.endpoint.clone();
-        let credentials = Arc::clone(&self.credentials);
-        let client = self.client.clone();
+/// Incremental implementation for the `DeepSeek` adapter.
+///
+/// The transport loop is deliberately linear: request, decode, forward. It is
+/// long but has no branching business logic.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn adapter_stream(
+    provider: &DeepSeekAdapter,
+    request: ProviderRequest,
+    cancellation: CancellationToken,
+) -> ProviderEventStream {
+    {
+        let endpoint = provider.endpoint.clone();
+        let credentials = Arc::clone(&provider.credentials);
+        let client = provider.client.clone();
         let (sender, mut receiver) =
             mpsc::channel::<Result<ProviderStreamEvent, ProviderError>>(16);
         tokio::spawn(async move {
@@ -252,7 +257,7 @@ impl StreamingModelProvider for DeepSeekAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamingModelProvider, collect_events};
+    use super::collect_events;
     use crate::{
         CancellationToken, DeepSeekAdapter, MessageRole, MockProvider, ModelCapabilities,
         ModelProvider, ProviderMessage, ProviderRequest, ProviderStreamEvent,

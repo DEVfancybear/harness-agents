@@ -24,7 +24,7 @@ use thiserror::Error;
 pub use tokio_util::sync::CancellationToken;
 
 mod streaming;
-pub use streaming::{ProviderEventStream, StreamingModelProvider, collect_events};
+pub use streaming::{ProviderEventStream, collect_events};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
@@ -245,6 +245,19 @@ pub type ProviderFuture =
 pub trait ModelProvider: Send + Sync {
     fn capabilities(&self) -> ModelCapabilities;
     fn stream(&self, request: ProviderRequest, cancellation: CancellationToken) -> ProviderFuture;
+
+    /// Incremental view of one call.
+    ///
+    /// The default forwards the buffered result once, so an implementor that can
+    /// only answer in one piece still works. Providers that decode a transport
+    /// stream override this and deliver each event as it arrives.
+    fn stream_events(
+        &self,
+        request: ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> ProviderEventStream {
+        streaming::bridge_buffered(self.stream(request, cancellation))
+    }
 }
 
 #[derive(Clone)]
@@ -320,6 +333,14 @@ impl ModelProvider for MockProvider {
             Ok(result)
         })
     }
+
+    fn stream_events(
+        &self,
+        request: ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> ProviderEventStream {
+        streaming::mock_stream(self, request, cancellation)
+    }
 }
 
 pub trait CredentialResolver: Send + Sync {
@@ -378,6 +399,14 @@ impl ModelProvider for DeepSeekAdapter {
     fn capabilities(&self) -> ModelCapabilities {
         self.capabilities.clone()
     }
+    fn stream_events(
+        &self,
+        request: ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> ProviderEventStream {
+        streaming::adapter_stream(self, request, cancellation)
+    }
+
     fn stream(&self, request: ProviderRequest, cancellation: CancellationToken) -> ProviderFuture {
         let endpoint = self.endpoint.clone();
         let credentials = Arc::clone(&self.credentials);

@@ -11,6 +11,7 @@ mod loop_service;
 mod policy;
 mod process;
 mod service;
+mod turn_driver;
 mod workspace;
 
 pub use contracts::{
@@ -20,4 +21,8 @@ pub use contracts::{
 pub use loop_service::{CodingLoopResult, CodingLoopService};
 pub use policy::{PolicyEffect, PolicyRule, ToolPolicy};
 pub use service::{ExternalToolDispatcher, ToolExecutionService, ToolObserver};
+pub use turn_driver::{
+    ApprovalMode, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnOutcome, TurnProgress,
+    TurnStop,
+};
 pub use workspace::{observe_workspace, observed_file_hash};

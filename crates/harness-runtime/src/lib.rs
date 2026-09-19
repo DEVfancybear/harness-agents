@@ -8,9 +8,10 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
 };
 
+use futures_util::StreamExt;
 use harness_providers::{
     CancellationToken, MessageRole, ModelProvider, NormalizedToolCall, ProviderError,
-    ProviderMessage, ProviderRequest, assemble_stream,
+    ProviderMessage, ProviderRequest, ProviderStreamEvent, assemble_stream,
 };
 use harness_session::{
     AdmitInputRequest, ContextBlock, ContextBuildRequest, ContextBuilder, RecoveryView,
@@ -288,6 +289,34 @@ impl SummaryProvider for FailingSummaryProvider {
     }
 }
 
+/// Receives provider events while a response is still arriving.
+///
+/// The interactive service renders text from these events, so a caller sees an
+/// answer before the run reaches its terminal state.
+pub type ProviderEventSink = Arc<dyn Fn(ProviderStreamEvent) + Send + Sync>;
+
+/// Consume an incremental provider stream, forwarding each event to the sink and
+/// returning the collected events so the durable path stays identical.
+async fn stream_with_sink(
+    provider: &dyn ModelProvider,
+    request: ProviderRequest,
+    cancellation: CancellationToken,
+    sink: ProviderEventSink,
+) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
+    let mut stream = provider.stream_events(request, cancellation);
+    let mut events = Vec::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(event) => {
+                sink(event.clone());
+                events.push(event);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(events)
+}
+
 #[derive(Clone)]
 pub struct RuntimeService {
     store: Arc<SqliteStore>,
@@ -328,11 +357,53 @@ impl RuntimeService {
             .await
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn run_with_cancellation(
         &self,
         request: RunRequest,
         cancellation: CancellationToken,
+    ) -> Result<RunResult, RuntimeError> {
+        self.run_inner(request, cancellation, None, true, Vec::new())
+            .await
+    }
+
+    /// Run one turn and forward provider events while the response is arriving.
+    ///
+    /// The sink receives decoded events; durable admission, frozen requests and
+    /// receipts are unchanged.
+    pub async fn run_streaming(
+        &self,
+        request: RunRequest,
+        cancellation: CancellationToken,
+        sink: ProviderEventSink,
+    ) -> Result<RunResult, RuntimeError> {
+        self.run_inner(request, cancellation, Some(sink), true, Vec::new())
+            .await
+    }
+
+    /// Continue an already admitted input.
+    ///
+    /// No new user input is admitted: appended messages (assistant tool calls and
+    /// their results) are added to the same conversation, so a bounded
+    /// model -> tool -> model loop keeps one input identity per user message.
+    pub async fn continue_run(
+        &self,
+        request: RunRequest,
+        appended: Vec<ProviderMessage>,
+        cancellation: CancellationToken,
+        sink: Option<ProviderEventSink>,
+    ) -> Result<RunResult, RuntimeError> {
+        self.run_inner(request, cancellation, sink, false, appended)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_inner(
+        &self,
+        request: RunRequest,
+        cancellation: CancellationToken,
+        sink: Option<ProviderEventSink>,
+        admit_input: bool,
+        appended: Vec<ProviderMessage>,
     ) -> Result<RunResult, RuntimeError> {
         let config = self
             .config
@@ -349,23 +420,27 @@ impl RuntimeService {
             ));
         }
         let session = SessionService::new(Arc::clone(&self.store));
-        let expected_sequence = self
-            .store
-            .session_summary(&request.session_id)
-            .await?
-            .map_or(1, |summary| summary.next_sequence);
-        session
-            .admit_input(AdmitInputRequest {
-                session_id: request.session_id.clone(),
-                task_id: request.task_id.clone(),
-                input_id: request.input_id.clone(),
-                expected_sequence,
-                authority: SourceAuthority::User,
-                raw_text: request.text.clone(),
-                workspace: request.workspace.clone(),
-                initial_plan_items: Vec::new(),
-            })
-            .await?;
+        // A continuation step must not admit a second user input: the identity of
+        // the turn was fixed when the user message was admitted.
+        if admit_input {
+            let expected_sequence = self
+                .store
+                .session_summary(&request.session_id)
+                .await?
+                .map_or(1, |summary| summary.next_sequence);
+            session
+                .admit_input(AdmitInputRequest {
+                    session_id: request.session_id.clone(),
+                    task_id: request.task_id.clone(),
+                    input_id: request.input_id.clone(),
+                    expected_sequence,
+                    authority: SourceAuthority::User,
+                    raw_text: request.text.clone(),
+                    workspace: request.workspace.clone(),
+                    initial_plan_items: Vec::new(),
+                })
+                .await?;
+        }
         let agent_run_id = AgentRunId::generate();
         self.record_agent(&agent_run_id, &request, AgentState::Idle, 0)
             .await?;
@@ -433,13 +508,16 @@ impl RuntimeService {
             content: composition_content,
         };
         self.store.persist_composition_snapshot(composition).await?;
+        let mut conversation = vec![
+            ProviderMessage::new(MessageRole::System, request.system_policy.clone()),
+            ProviderMessage::new(MessageRole::User, built.packet.content.clone()),
+        ];
+        // Continuation turns carry the tool results back to the model.
+        conversation.extend(appended);
         let provider_request = ProviderRequest::new(
             harness_types::RequestId::generate(),
             capabilities.model.clone(),
-            vec![
-                ProviderMessage::new(MessageRole::System, request.system_policy.clone()),
-                ProviderMessage::new(MessageRole::User, built.packet.content.clone()),
-            ],
+            conversation,
         )
         .with_tool_schemas(request.tool_schemas.clone());
         self.store
@@ -494,10 +572,22 @@ impl RuntimeService {
                 break;
             }
             let attempt_number = attempts.max(1);
-            let result = self
-                .provider
-                .stream(provider_request.clone(), cancellation.clone())
-                .await;
+            let result = match &sink {
+                Some(sink) => {
+                    stream_with_sink(
+                        self.provider.as_ref(),
+                        provider_request.clone(),
+                        cancellation.clone(),
+                        Arc::clone(sink),
+                    )
+                    .await
+                }
+                None => {
+                    self.provider
+                        .stream(provider_request.clone(), cancellation.clone())
+                        .await
+                }
+            };
             match result {
                 Ok(events) => {
                     let assembled = assemble_stream(&events)?;
