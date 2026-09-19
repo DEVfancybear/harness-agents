@@ -1,6 +1,6 @@
 # Evidence HA_LAUNCH — track H01–H08
 
-Trạng thái: **H01–H03 xong; H04 đang làm (G1 và G2 xong, G3 + service thật chưa); H05–H08 chưa bắt đầu.** Tài liệu này được cập
+Trạng thái: **H01–H04 xong phần code (H04 chưa có live smoke vì không được cấp quyền); H05–H08 chưa bắt đầu.** Tài liệu này được cập
 nhật lại sau mỗi checkpoint; trạng thái ở đây là trạng thái thật tại thời điểm ghi,
 không phải trạng thái dự kiến.
 
@@ -202,7 +202,7 @@ Chưa xác minh (không được coi là đạt):
 - **Multiline editing**: chưa có; paste nhiều dòng bị đổi newline thành space.
 - **Linux**: chưa build/chạy.
 
-## 5. H04 — tiến độ từng phần (G1 và G2 xong, G3 còn lại)
+## 5. H04 — tiến độ từng phần (G1, G2, G3 xong; còn live smoke không được cấp quyền)
 
 H04 **chưa** hoàn tất. Ghi lại đúng phần đã xác minh để không bị đọc thành đã xong.
 
@@ -250,9 +250,7 @@ Selector G2: `g2_tool_results_return_to_the_model_and_the_turn_ends_with_the_ans
 - **Một admission cho mỗi user message**: `continue_run` không admit input mới; runtime
   kiểm tra rằng input identity được giữ nguyên.
 
-Chưa chứng minh (thuộc phần còn lại của H04): lifecycle resume/canceled (G3), service
-thật thay `PendingService`, headless turn thật, và I12. Live provider smoke:
-**not_run** (không có credential/budget được cấp).
+Xem mục 5.3 cho G3, service thật và headless turn.
 
 ## 6. Chưa xác minh (không được coi là đạt)
 
@@ -309,3 +307,42 @@ này**, không phải lỗi sản phẩm: cùng binary, cùng test, chỉ khác 
 được ghi cho H07: gate `Verify-HaLaunch.ps1` phải chạy các test bị ảnh hưởng với
 `--test-threads=1` (hoặc cơ chế tương đương có ghi chú), nếu không gate sẽ đỏ ngẫu
 nhiên và không đủ tư cách làm bằng chứng. Không sửa acceptance P2 đã được chấp nhận.
+
+### 5.3. G3 + service thật + headless turn
+
+| Kiểm chứng | Lệnh | Kết quả |
+|---|---|---|
+| Session/turn acceptance | `cargo test -p harness-cli --test interactive_session --locked -- --test-threads=1` | 5 passed, 0 failed |
+| Launch + headless end-to-end | `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` | 9 passed, 0 failed |
+| Regression toàn CLI (serial) | `cargo test -p harness-cli --tests --locked -- --test-threads=1` | **211 passed, 0 failed** |
+| Lint toàn workspace | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+
+Selector mới: `g3_a_second_input_in_the_same_session_carries_real_context`,
+`g3_the_foundation_admits_one_input_per_session_and_says_so`,
+`i03_headless_turn_runs_through_the_real_adapter_and_keeps_the_key_out_of_output`,
+`i12_headless_turn_without_provider_configuration_fails_closed`.
+
+Đã chứng minh:
+
+- **Headless end-to-end thật**: binary `ha chat --headless --prompt ... --json` chạy qua
+  production adapter tới fixture HTTP thật trong test, in JSON đúng
+  (`response`, `stop: final`, `fixture: false`, `approvals: none`), exit 0; request
+  mang `Authorization: Bearer …`; **không** stream nào chứa credential và không có ANSI.
+- **Thiếu cấu hình thì fail closed**: không set endpoint/model/key → exit khác 0, stdout
+  rỗng, stderr nêu đúng tên biến và nói rõ "no fixture answer was substituted".
+- **Chuỗi session cho hội thoại**: lượt hai chạy qua `continue_task_streaming` với cùng
+  task, session mới, packet khác lượt một và chứa input mới.
+- **Luật nền tảng được ghi bằng test**: input thứ hai trong cùng session trả
+  `idempotency_conflict` ("more than one admitted input"), nên không có đường nào âm
+  thầm ghi đè journal.
+- **Fixture không thể lọt vào production**: `PendingService` bị xóa; service thật là mặc
+  định; `--fixture` vẫn chỉ là opt-in có nhãn và bị từ chối cho headless (test H03).
+
+Chưa chứng minh / còn mở:
+
+- **Live provider smoke: not_run** — assignment không cấp credential/budget.
+- **Nhiều input trong đúng một session** không được nền tảng P1 hỗ trợ (gap đã ghi trong
+  SPEC); hiện dùng chuỗi session cùng task.
+- `ProjectId` trong một phiên vẫn sinh mới; identity bền theo project hiện là thư mục
+  store (`project-<hash>`). Nối registry project là việc của H05.
+- **I13** (hard kill rồi `/resume`) và lifecycle cancel/close đầy đủ thuộc H05.

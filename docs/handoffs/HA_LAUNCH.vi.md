@@ -10,10 +10,14 @@ Tài liệu này là điểm vào cho lượt coding tiếp theo. Cập nhật s
 - **H03 xong phần code**: terminal app thật với `crossterm = "=0.29.0"` — controller
   state machine tách renderer, editor Unicode/history/paste, Ctrl-C/Ctrl-D, raw mode
   có RAII guard, fallback line mode, fixture opt-in có nhãn.
-- **H04 đang làm**: khảo sát G1–G3 xong, **G1 xong** (stream tăng dần + test barrier),
-  **G2 xong** (TurnDriver bounded model→tool→model, tool result quay lại model, fail→fix,
-  bound báo lý do dừng). Còn lại: G3, service thật thay `PendingService`, headless turn.
+- **H04 xong phần code**: G1 (stream tăng dần), G2 (TurnDriver bounded), G3 (chuỗi session
+  cùng task + continuation link), **service thật** thay `PendingService`, và **headless
+  turn thật** chạy qua production adapter. Live provider smoke **not_run** (không được cấp
+  credential/budget).
 - **H05–H08 chưa bắt đầu.**
+- Phát hiện nền tảng quan trọng: journal P1 chỉ cho **một input mỗi session** và task lease
+  cần **generation mới** — nên "cùng phiên" = cùng task + chuỗi session nối nhau, không
+  phải một session nhiều input (chi tiết + test ở mục 5.3 evidence và mục 5 SPEC).
 - **Chưa có gì được chứng minh trên terminal thật/PTY**: I01/I06/I07/I08 transcript
   thuộc H07. Hiện tại UI mới được chứng minh qua scripted backend + unit test.
 - `ha chat --headless` vẫn trả `service_unavailable` (exit 1). H04 thay bằng turn thật.
@@ -37,23 +41,21 @@ local, process con trong thư mục tạm, cài vào `-Destination` tạm, commi
 
 ## 3. Việc tiếp theo chính xác
 
-**H04 — application service và agent execution thật.** Prerequisite H03 đã đạt.
+**H05 — approval, resume và lifecycle.** Prerequisite H04 đã đạt phần code.
 
-1. ~~Khảo sát G1–G3~~ **đã xong** (bảng gate ở mục 5 SPEC).
-2. ~~G1 stream tăng dần~~ **đã xong**: `crates/harness-providers/src/streaming.rs`
-   (`StreamingModelProvider`, `ProviderEventStream`, `collect_events`) + test barrier.
-   Khi nối runtime, dùng boundary này thay vì đọc `Vec` rồi chia nhỏ.
-3. ~~G2~~ **đã xong**: `harness-tools/src/turn_driver.rs` (`TurnDriver`, `TurnLimits`,
-   `TurnObserver`, `TurnStop`) + runtime `run_streaming`/`continue_run`; test ở
-   `crates/harness-cli/tests/interactive_session.rs` (3 ca). Khi nối service, map
-   `TurnProgress` → `SessionEvent` và truyền `ApprovalMode::None` cho đường tương tác
-   (approval thật là H05).
-4. **G3**: nối store/session theo project, resume/replay đúng task; I12 (approval
-   grant/deny/expiry + auth failure không fallback mock, không lộ key).
-5. **Nối `interactive/service.rs`** thật thay `PendingService` (giữ nguyên port và
-   `SessionEvent`), và làm `ha chat --headless --prompt <text> --json` chạy một turn
-   thật, stdout JSON, log ra stderr, không bật raw mode.
-6. **Live smoke**: ghi `not_run` vì chưa được cấp credential/budget.
+1. **Render/answer approval thật**: hiện đường tương tác dùng `ApprovalMode::None` nên
+   action bị gate sẽ fail closed. H05 phải render proposal (action, cwd, scope, diff) và
+   trả answer đúng request ID qua app authority, không blanket grant; I12 (grant/deny/
+   expiry) và I16 (busy/read-only) chạy với process thật.
+2. **`/resume`**: list session theo scope rồi chọn, phục hồi state/effect thật trước khi
+   submit; dùng chuỗi session + continuation link (`continue_task_streaming`) và
+   `SessionService::recover`. Không tin in-memory history.
+3. **`/new` và `/exit` khi có run active**: cancel + drain rồi mới chuyển; restore
+   terminal/store ownership trên mọi đường thoát.
+4. **I13**: hard kill sau receipt đã commit rồi mở lại `/resume` — không rerun side effect
+   đã settle; reconcile effect chưa rõ. Test bằng process thật, không chỉ throw exception.
+5. Giữ nguyên luật nền tảng đã ghi: một input mỗi session, mỗi lượt một writer generation;
+   nếu H05 cần khác thì phải mở quyết định riêng vì đó là thay đổi nền tảng P1.
 
 Lưu ý kỹ thuật đã biết: fixture loopback trong môi trường này flaky khi test chạy song
 song (mục 6 evidence) — test HTTP fixture của H04 nên chạy với `--test-threads=1` hoặc
@@ -64,11 +66,13 @@ H07 (gate `Verify-HaLaunch.ps1` + PTY harness + I01–I18), H08 (release candida
 
 ## 4. Trạng thái test ở checkpoint này
 
-- `cargo test -p harness-cli --bin ha` → 50 passed (H01 8, H02 17, H03 25).
-- `cargo test -p harness-cli --test interactive_launch` → 7 passed.
-- `cargo clippy -p harness-cli --all-targets -- -D warnings` và `cargo fmt --all -- --check` → sạch.
-- `cargo test -p harness-cli --tests --locked -- --test-threads=1` → kết quả ghi ở mục 4 evidence.
-- Chưa chạy: `--workspace --all-targets` đầy đủ (H07), Linux, PTY thật.
+- `cargo test -p harness-cli --bin ha` → 52 passed.
+- `cargo test -p harness-cli --test interactive_launch` → 9 passed.
+- `cargo test -p harness-cli --test interactive_session` → 5 passed.
+- `cargo test -p harness-providers` → 3 passed.
+- `cargo test -p harness-cli --tests --locked -- --test-threads=1` → **211 passed, 0 failed**.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` → exit 0.
+- Chưa chạy: `--workspace --all-targets` đầy đủ (H07), Linux, PTY thật, live provider.
 
 ## 5. Gap đã biết cần đóng
 

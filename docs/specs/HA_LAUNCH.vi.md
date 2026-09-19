@@ -146,8 +146,8 @@ Không checkpoint nào được nhận "done" khi prerequisite chưa đạt.
 | H01 | Entry point, dispatch, TTY detector, parser compat | — | dispatch + guard + parser xong; UI thật chờ H03 |
 | H02 | Launch context, paths/HA_HOME, config/setup state | H01 | context + paths + setup state xong bằng unit test; UI thật chờ H03 |
 | H03 | Terminal app, controller/renderer, input loop | H02 | controller/renderer/editor/terminal + fixture route xong bằng test; PTY thật thuộc H07 |
-| H04 | G1 provider incremental, G2 tool continuation, G3 durable session | H03 + khảo sát G1–G3 | **đang làm**: khảo sát xong, G1 xong, G2 xong (TurnDriver bounded có test); G3 + service thật + headless còn lại |
-| H05 | Approval, resume, lifecycle | H04 | chờ H04 pass |
+| H04 | G1 provider incremental, G2 tool continuation, G3 durable session | H03 + khảo sát G1–G3 | **xong phần code**: G1/G2/G3 + service thật + headless, regression 211 test xanh; live smoke `not_run`; multi-input/session là gap nền tảng đã ghi |
+| H05 | Approval, resume, lifecycle | H04 | việc tiếp theo |
 | H06 | Installer, User PATH scope, install manifest | H01–H03 | logic + test disposable; **không** ghi User PATH thật |
 | H07 | Gate `Verify-HaLaunch.ps1`, PTY fixture, acceptance I01–I18 | H01–H06 | chờ |
 | H08 | Release candidate, clean-machine route | H07 | chờ |
@@ -268,3 +268,46 @@ thật thay `PendingService`, và `ha chat --headless` chạy turn thật. Live 
   và model lấy từ `HA_PROVIDER_ENDPOINT`/`HA_PROVIDER_MODEL`, credential từ
   `DEEPSEEK_API_KEY` hoặc `HA_API_KEY`. **Không** đoán URL mặc định; thiếu cấu hình thì
   báo lỗi actionable, không fallback mock.
+
+**Quyết định G3 và service thật (đã hoàn tất trong checkpoint này)**:
+
+- `AgentSessionService` (trong `interactive/service.rs`) là producer production của
+  `SessionPort`: giữ **một** `SessionId`/`TaskId` cho cả phiên app (nhiều lượt dùng
+  chung session), mở store writer **lazy theo từng lượt** tại
+  `<data>/projects/project-<key>`, chạy `TurnDriver` với `ApprovalMode::None` (một
+  action cần approval thì fail closed, không blanket grant — approval thật là H05).
+- Mỗi lượt chạy trong task riêng; `cancel()` hủy `CancellationToken` của lượt đang chạy.
+  `submit` kiểm tra có async runtime và báo lỗi typed thay vì panic nếu bị gọi sai chỗ.
+- **Provider resolution không đoán**: `HA_PROVIDER_ENDPOINT` + `HA_PROVIDER_MODEL` +
+  credential (`DEEPSEEK_API_KEY` hoặc `HA_API_KEY`). Thiếu biến nào thì thông báo nêu
+  đúng biến đó và nói rõ **không có fixture nào được thay vào**. Credential chỉ được đọc
+  tại thời điểm gọi qua `CredentialResolver`, không lưu/log/hiển thị.
+- **Headless thật**: `ha chat --headless --prompt <text> [--json]` chạy đúng một turn
+  qua cùng runtime/store/tool gate, stdout chỉ có kết quả (JSON có `schema_version`,
+  session/task/input id, response, steps, tool_calls, stop, `approvals: "none"`,
+  `fixture: false`), log ra stderr, **không** bật raw mode, và resolve provider **trước
+  khi** mở store nên cấu hình thiếu không tạo state.
+- `--resume` trong headless trả lỗi typed "arrives with H05" thay vì bỏ qua im lặng.
+- `PendingService` (staged "connection pending") được **xóa** vì runtime đã nối thật;
+  fixture vẫn chỉ là opt-in `--fixture` có nhãn.
+- **Gap đã biết**: `ProjectId` bên trong một phiên vẫn sinh mới mỗi phiên; identity bền
+  theo project hiện là **thư mục store** (`project-<hash>`). Việc nối registry project
+  (`register_project`) và resume xuyên phiên là việc của H05.
+
+**Phát hiện nền tảng P1 (quan trọng cho H05)**:
+
+- Journal đã được chấp nhận chỉ cho **một `input.admitted` mỗi session**
+  (`harness-session` `fold_event` trả `idempotency_conflict` khi có input thứ hai), và
+  task lease chỉ cho session khác tiếp quản khi **writer generation mới hơn** (hoặc cùng
+  generation nhưng khác host) — `claim_task` trong `harness-store-sqlite`.
+- Vì vậy mô hình hội thoại của app là: **một task identity + một session cho mỗi user
+  input**, nối nhau bằng continuation link (`continue_task_streaming`); mỗi lượt mở writer
+  mới (generation mới) và **release writer trước khi phát terminal event** để lượt sau
+  không đua lease.
+- Đã kiểm bằng test: input thứ hai trong cùng session bị từ chối đúng
+  `idempotency_conflict`; lượt tiếp theo qua chuỗi session chạy được và mang context thật
+  (packet của lượt hai khác lượt một và chứa input mới).
+- **Gap so với câu chữ của plan** ("giữ same session qua các lượt"): muốn nhiều input
+  trong đúng một session thì phải sửa nền tảng P1 (journal fold + lease semantics), ngoài
+  scope H04 và cần quyết định riêng. Hiện tại "cùng phiên làm việc" được biểu diễn bằng
+  chuỗi session cùng task — điều này cũng là nền cho `/resume` ở H05.
