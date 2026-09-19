@@ -29,8 +29,38 @@ pub trait TerminalBackend {
 #[derive(Debug, Default)]
 pub struct CrosstermBackend;
 
+/// Test-only fault injection for the I08 acceptance case: with
+/// `HA_TEST_FAIL_AFTER_MS` set, the real backend starts failing once that many
+/// milliseconds have passed since the first write. The seam exists only in debug
+/// builds, so a shipped binary can never be told to fail this way.
+#[cfg(debug_assertions)]
+fn injected_fault() -> io::Result<()> {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static DEADLINE: OnceLock<Option<Instant>> = OnceLock::new();
+    let deadline = DEADLINE.get_or_init(|| {
+        std::env::var("HA_TEST_FAIL_AFTER_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|millis| Instant::now() + Duration::from_millis(millis))
+    });
+    match deadline {
+        Some(deadline) if Instant::now() >= *deadline => Err(io::Error::other(
+            "injected terminal fault (HA_TEST_FAIL_AFTER_MS)",
+        )),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn injected_fault() -> io::Result<()> {
+    Ok(())
+}
+
 impl TerminalBackend for CrosstermBackend {
     fn write(&mut self, text: &str) -> io::Result<()> {
+        injected_fault()?;
         io::stdout().write_all(text.as_bytes())
     }
 
@@ -43,6 +73,7 @@ impl TerminalBackend for CrosstermBackend {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        injected_fault()?;
         io::stdout().flush()
     }
 
@@ -55,20 +86,61 @@ impl TerminalBackend for CrosstermBackend {
     }
 }
 
+/// The terminal modes the app owns. Injected so that restoration is provable in a
+/// test process, which has no console to put into raw mode, and so that the guard
+/// never depends on the real terminal being reachable at drop time.
+trait ModeControl: std::fmt::Debug {
+    fn enable(&self) -> io::Result<()>;
+    fn disable(&self);
+    fn enable_paste(&self);
+    fn disable_paste(&self);
+}
+
+/// The real terminal: raw mode plus bracketed paste.
+#[derive(Debug, Default)]
+struct SystemModes;
+
+impl ModeControl for SystemModes {
+    fn enable(&self) -> io::Result<()> {
+        terminal::enable_raw_mode()
+    }
+
+    fn disable(&self) {
+        let _ = terminal::disable_raw_mode();
+    }
+
+    fn enable_paste(&self) {
+        let _ = execute!(io::stdout(), event::EnableBracketedPaste);
+    }
+
+    fn disable_paste(&self) {
+        let _ = execute!(io::stdout(), event::DisableBracketedPaste);
+    }
+}
+
 /// Raw mode plus bracketed paste, restored when the guard is dropped.
 #[derive(Debug)]
 pub struct RawModeGuard {
+    modes: Box<dyn ModeControl>,
     active: bool,
 }
 
 impl RawModeGuard {
     /// Enter raw mode; the caller must keep the guard alive for the whole session.
     pub fn enter() -> io::Result<Self> {
-        terminal::enable_raw_mode()?;
+        Self::enter_with(Box::new(SystemModes))
+    }
+
+    /// Enter raw mode against an injected mode controller; the test seam for I08.
+    fn enter_with(modes: Box<dyn ModeControl>) -> io::Result<Self> {
+        modes.enable()?;
         // Bracketed paste is best effort: a terminal that does not support it must
         // not stop the app from starting.
-        let _ = execute!(io::stdout(), event::EnableBracketedPaste);
-        Ok(Self { active: true })
+        modes.enable_paste();
+        Ok(Self {
+            modes,
+            active: true,
+        })
     }
 }
 
@@ -77,8 +149,10 @@ impl Drop for RawModeGuard {
         if !self.active {
             return;
         }
-        let _ = execute!(io::stdout(), event::DisableBracketedPaste);
-        let _ = terminal::disable_raw_mode();
+        // Order matters: paste mode off, then raw mode, so a terminal never keeps
+        // interpreting pasted bytes as commands.
+        self.modes.disable_paste();
+        self.modes.disable();
         self.active = false;
     }
 }
@@ -237,5 +311,104 @@ mod tests {
         };
         assert_eq!(map_event(Event::Key(release)), Key::Unknown);
         assert_eq!(map_event(Event::FocusGained), Key::Unknown);
+    }
+
+    /// I08: the modes the app owns are restored on the way out, including when
+    /// the render loop unwinds instead of returning normally.
+    #[test]
+    fn h07_i08_the_guard_restores_every_mode_it_turned_on() {
+        let modes = std::sync::Arc::new(RecordingModes::default());
+        {
+            let _guard = super::RawModeGuard::enter_with(Box::new(SharedModes(
+                std::sync::Arc::clone(&modes),
+            )))
+            .expect("raw mode is entered through the seam");
+            assert_eq!(modes.events(), vec!["enable", "paste on"]);
+        }
+        assert_eq!(
+            modes.events(),
+            vec!["enable", "paste on", "paste off", "disable"],
+            "paste mode is turned off before raw mode, and both are restored"
+        );
+    }
+
+    #[test]
+    fn h07_i08_an_unwinding_failure_still_restores_the_terminal() {
+        let modes = std::sync::Arc::new(RecordingModes::default());
+        let captured = std::sync::Arc::clone(&modes);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard =
+                super::RawModeGuard::enter_with(Box::new(SharedModes(captured))).expect("raw mode");
+            panic!("the render loop failed after the terminal was initialized");
+        }));
+        assert!(unwind.is_err(), "the failure is not swallowed by the guard");
+        assert_eq!(
+            modes.events(),
+            vec!["enable", "paste on", "paste off", "disable"],
+            "an unwinding failure restores the terminal exactly like a clean exit"
+        );
+    }
+
+    #[test]
+    fn h07_i08_a_terminal_that_refuses_raw_mode_is_reported_and_not_claimed_open() {
+        let modes = std::sync::Arc::new(RecordingModes {
+            fail_enable: true,
+            ..RecordingModes::default()
+        });
+        let error =
+            super::RawModeGuard::enter_with(Box::new(SharedModes(std::sync::Arc::clone(&modes))))
+                .expect_err("a refused raw mode is an error, never a silent downgrade");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            modes.events(),
+            vec!["enable"],
+            "nothing is turned off twice"
+        );
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingModes {
+        events: std::sync::Mutex<Vec<&'static str>>,
+        fail_enable: bool,
+    }
+
+    impl RecordingModes {
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().expect("recording lock").clone()
+        }
+
+        fn record(&self, event: &'static str) {
+            self.events.lock().expect("recording lock").push(event);
+        }
+    }
+
+    struct SharedModes(std::sync::Arc<RecordingModes>);
+
+    impl std::fmt::Debug for SharedModes {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("SharedModes")
+        }
+    }
+
+    impl super::ModeControl for SharedModes {
+        fn enable(&self) -> std::io::Result<()> {
+            self.0.record("enable");
+            if self.0.fail_enable {
+                return Err(std::io::Error::other("no console"));
+            }
+            Ok(())
+        }
+
+        fn disable(&self) {
+            self.0.record("disable");
+        }
+
+        fn enable_paste(&self) {
+            self.0.record("paste on");
+        }
+
+        fn disable_paste(&self) {
+            self.0.record("paste off");
+        }
     }
 }

@@ -7,6 +7,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -52,7 +53,7 @@ struct PtySession {
 
 /// Terminal emulator duties the harness must perform.
 ///
-/// ConPTY asks the host terminal for the cursor position with ESC[6n once the app
+/// `ConPTY` asks the host terminal for the cursor position with ESC[6n once the app
 /// switches its console into virtual-terminal input mode, and the app blocks until
 /// the report arrives. A real terminal answers; a bare pipe does not, which is why
 /// this reply is required for any transcript to appear at all.
@@ -225,7 +226,7 @@ fn base_env(temp: &tempfile::TempDir) -> Vec<(&'static str, String)> {
     ]
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console) or any terminal. State at H07: i01 passes there; i06 fails on the bracketed-paste expectation and i07 hangs the harness - both recorded in docs/evidence/HA_LAUNCH.vi.md."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all five cases i01, i06, i07a, i07b and i08 pass there."]
 #[test]
 fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     let (temp, project) = sandbox();
@@ -258,7 +259,7 @@ fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console) or any terminal. State at H07: i01 passes there; i06 fails on the bracketed-paste expectation and i07 hangs the harness - both recorded in docs/evidence/HA_LAUNCH.vi.md."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all five cases i01, i06, i07a, i07b and i08 pass there."]
 #[test]
 fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     let (temp, project) = sandbox();
@@ -319,7 +320,7 @@ fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console) or any terminal. State at H07: i01 passes there; i06 fails on the bracketed-paste expectation and i07 hangs the harness - both recorded in docs/evidence/HA_LAUNCH.vi.md."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all five cases i01, i06, i07a, i07b and i08 pass there."]
 #[test]
 fn i07a_ctrl_c_clears_an_idle_prompt() {
     // One pseudo-console per test: opening a second one in the same process blocks
@@ -353,16 +354,34 @@ fn i07a_ctrl_c_clears_an_idle_prompt() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console) or any terminal. State at H07: i01 passes there; i06 fails on the bracketed-paste expectation and i07 hangs the harness - both recorded in docs/evidence/HA_LAUNCH.vi.md."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all five cases i01, i06, i07a, i07b and i08 pass there."]
 #[test]
 fn i07b_ctrl_c_cancels_a_running_turn() {
     let (temp, project) = sandbox();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("hanging endpoint");
+    listener
+        .set_nonblocking(true)
+        .expect("the fixture listener is non-blocking");
     let address = listener.local_addr().expect("hanging address");
+    // A blocking accept() here would hang the test itself whenever the app never
+    // reaches the provider, which is exactly what this case must be able to report.
+    let contacted = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&contacted);
     let hold = std::thread::spawn(move || {
-        if let Ok((connection, _)) = listener.accept() {
-            std::thread::sleep(Duration::from_secs(10));
-            drop(connection);
+        let deadline = Instant::now() + Duration::from_mins(1);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((connection, _)) => {
+                    flag.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_secs(8));
+                    drop(connection);
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(_) => return,
+            }
         }
     });
     let mut running_env = base_env(&temp);
@@ -377,6 +396,15 @@ fn i07b_ctrl_c_cancels_a_running_turn() {
 
     running.send("hold the turn open\r");
     running.wait_for("[run] accepted", Duration::from_secs(20));
+    let waiting = Instant::now() + Duration::from_secs(30);
+    while !contacted.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < waiting,
+            "the turn never reached the provider, so it is not waiting on it:\n{}",
+            running.transcript()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
     running.send("\u{3}");
     running.wait_for("canceling", Duration::from_secs(20));
     running.wait_for("[run]", Duration::from_secs(30));
@@ -393,4 +421,40 @@ fn i07b_ctrl_c_cancels_a_running_turn() {
         "the credential never reaches the screen"
     );
     let _ = hold.join();
+}
+
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all five cases i01, i06, i07a, i07b and i08 pass there."]
+#[test]
+fn i08_a_backend_fault_after_init_restores_the_terminal_and_is_not_swallowed() {
+    // I08: inject a render/backend failure *after* the terminal is initialized and
+    // raw mode is on. The fault is armed through the debug-only seam
+    // HA_TEST_FAIL_AFTER_MS, which a release binary cannot be told to honour.
+    let (temp, project) = sandbox();
+    let mut env = base_env(&temp);
+    env.push(("HA_TEST_FAIL_AFTER_MS", "1500".to_owned()));
+    let mut session = PtySession::spawn(&project, &env);
+
+    // The boot header and prompt are rendered before the deadline, so the failure
+    // really happens after initialization rather than during startup.
+    let booted = session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
+    assert!(booted.contains("Harness Agents"), "boot rendered: {booted}");
+    assert!(session.is_alive(), "the app is at the prompt, in raw mode");
+    std::thread::sleep(Duration::from_millis(1800));
+    session.send("x");
+
+    let status = session.wait_exit(Duration::from_secs(25));
+    let transcript = session.transcript();
+    assert_eq!(
+        status,
+        Some(1),
+        "a terminal failure is a runtime error, not a hang and not a success:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("terminal input/output failed"),
+        "the fatal error names itself instead of being swallowed:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("HA_TEST_FAIL_AFTER_MS"),
+        "the reported failure is the injected one, not an unrelated error:\n{transcript}"
+    );
 }

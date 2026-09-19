@@ -132,9 +132,10 @@ Quyết định đã chốt ở H01:
   production vẫn là staged service báo `connection pending` (H04 nối thật), không tự
   fallback mock.
 - **Giới hạn đã biết của H03**: editor một dòng (paste nhiều dòng bị đổi newline thành
-  space, chưa có multiline mode); việc Ctrl-C có được crossterm giao thành key event
-  trên Windows/ConPTY, và độ hiển thị tiếng Việt, **chưa** được chứng minh — phải kiểm
-  bằng PTY thật ở H07.
+  space, chưa có multiline mode). Hai điều H03 chưa chứng minh được — Ctrl-C có tới app
+  như key event trên Windows/ConPTY hay không, và tiếng Việt hiển thị/nhập ra sao — nay
+  **đã được kiểm bằng PTY thật ở H07** (mục 12.2 evidence: i06 và i07a/i07b xanh trong
+  console thật).
 
 
 ## 4. Trạng thái staging theo checkpoint
@@ -149,7 +150,7 @@ Không checkpoint nào được nhận "done" khi prerequisite chưa đạt.
 | H04 | G1 provider incremental, G2 tool continuation, G3 durable session | H03 + khảo sát G1–G3 | **xong phần code**: G1/G2/G3 + service thật + headless, regression 211 test xanh; live smoke `not_run`; multi-input/session là gap nền tảng đã ghi |
 | H05 | Approval, resume, lifecycle | H04 | **đang làm**: approval gate + resume list/select + `/new` + headless `--resume` xong và có test; còn test hard-kill giữa turn |
 | H06 | Installer, User PATH scope, install manifest | H01–H03 | **đang làm**: artifact identity + manifest + rollback + PATH scope + self test xong; ghi User PATH thật không được cấp quyền |
-| H07 | Gate `Verify-HaLaunch.ps1`, PTY fixture, acceptance I01–I18 | H01–H06 | **đang làm**: gate + operator docs + migration note xong; transcript PTY thật bị chặn bởi ConPTY trong sandbox (not_run, có lý do đo được) |
+| H07 | Gate `Verify-HaLaunch.ps1`, PTY fixture, acceptance I01–I18 | H01–H06 | **xong phần code**: gate + operator docs + migration note xong; transcript PTY thật cho I01/I06/I07/I08 **đã xanh** qua runner console thật (`5 passed`, không tính tự động trong gate vì sandbox không có console); kill process cứng vẫn ngoài phạm vi |
 | H08 | Release candidate, clean-machine route | H07 | **đang làm**: bundle + checksum + installer từ bundle + uninstall xong và có test disposable; **không publish** (không được cấp quyền) |
 
 Bảng này được cập nhật lại ở mỗi checkpoint cùng evidence/handoff; trạng thái
@@ -390,17 +391,22 @@ trong bằng chứng đều vào thư mục tạm.
    loopback của môi trường này chập khi chạy song song (mục 9 evidence);
 4. installer self test và docs checker.
 
-Gate in rõ **not_run** và không tính chúng là pass: transcript PTY thật (I01/I06/I07/I08),
-live provider smoke, Linux, và mọi thao tác thật lên PATH/profile của user.
+Gate in rõ **not_run** và không tính chúng là pass: transcript PTY thật (I01/I06/I07/I08 —
+chạy được bằng runner console, xem dưới), live provider smoke, Linux, và mọi thao tác thật
+lên PATH/profile của user.
 
-**Trạng thái PTY (blocker của môi trường)**: `portable-pty = "=0.9.0"` đã được thêm làm
+**Trạng thái PTY (round 13: đã xanh trong console thật)**: `portable-pty = "=0.9.0"` là
 dev-dependency và `crates/harness-cli/tests/interactive_terminal.rs` chứa harness thật
-(openpty → spawn → đọc transcript → gửi phím → chờ exit) cùng ba ca I01/I06/I07. Trong
-sandbox này ConPTY **spawn được process nhưng không đọc được byte nào từ master và process
-con không thoát** (đã thử cả `cmd.exe /c echo` để loại trừ lỗi của `ha`), nên ba ca đó
-được đánh dấu `#[ignore]` kèm lý do đo được, và gate báo not_run. Đây là giới hạn môi
-trường, không phải bằng chứng đạt; render loop hiện được chứng minh bằng scripted backend
-(H03) và guard non-TTY bằng launch test.
+(openpty → spawn → đọc transcript → gửi phím → chờ exit) với bốn ca i01, i06, i07a, i07b.
+Điều kiện môi trường đo được: ConPTY chỉ chạy khi process tạo pseudo-console **sở hữu một
+console**, mà `cargo test` trong sandbox thì không — nên các ca này `#[ignore]` và được chạy
+bằng `scripts/Invoke-HaPtyAcceptance.ps1` (mở console mới, bound cứng, lưu transcript).
+Lần chạy round 13 báo `PTY_EXIT: 0` và `4 passed; 0 failed` (9.03 s) cho I01/I06/I07, và sau
+khi thêm ca I08 (fault seam chỉ có ở debug build + unit test phục hồi mode) là
+`5 passed; 0 failed` (11.01 s, transcript `target/pty-acceptance/pty-all.txt`) — transcript
+thật, không phải suy luận từ scripted backend. Gate vẫn liệt kê **năm** ca PTY là not_run kèm
+hướng dẫn chạy (sandbox không có console), không tính pass tự động; kill process cứng vẫn
+ngoài phạm vi như plan ghi.
 
 Operator docs đã cập nhật **chỉ với hành vi có thật**: mục 11 nói rõ installer mới
 (artifact/digest/manifest/rollback/User PATH tách biệt/shadowing) và mục 12 mới mô tả

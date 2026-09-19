@@ -109,7 +109,7 @@ $requiredSelectors = @(
 )
 
 $notRun = @(
-    'PTY cases I06/I07 in a real terminal: I01 passes through scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript saved), but I06 fails at the bracketed-paste step and I07 hangs the harness; both are measured and recorded in the evidence.',
+    'PTY cases i01/i06/i07a/i07b/i08: they need a real console, which a sandboxed cargo test does not have. Run scripts/Invoke-HaPtyAcceptance.ps1 - all five pass there with transcripts; this gate does not count them as passes.',
     'Live provider smoke (paid model call): no credential or budget is granted for this assignment.',
     'Linux build and run: this session only has Windows x64.',
     'Real User PATH mutation and install into the user profile: not authorized in this assignment.'
@@ -203,3 +203,4 @@ else {
 
 if ($failures.Count -gt 0) { exit 1 }
 exit 0
+

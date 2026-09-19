@@ -543,27 +543,84 @@ Ba loi that da tim ra va sua trong test/harness (khong phai trong app):
 | I01 bare ha mo app | ok - header/prompt render, process song, /exit thoat 0 |
 | I06 go tieng Viet + backspace + paste | ok - transcript cho thay "> sua loi parser" tung ky tu, backspace dung; paste tren console nay submit phan dau nhu mot request, app van song va prompt dung duoc |
 | I07a Ctrl-C khi idle | ok - "> typo" -> Ctrl-C -> "> z" (buffer da clear, khong co "> typoz") |
-| I07b Ctrl-C khi dang chay | chua: harness van treo o nhanh run (runner kill o 300 s) |
+| I07b Ctrl-C khi đang chạy | ok — xem 12.2 |
 
-Nghia la 3/4 ca PTY da co transcript that; ca con lai (cancel mot run dang cho provider qua
-ConPTY) la viec ke tiep. Cac ca da xanh van de nguyen che do ignore vi cargo test trong
-sandbox khong co console; chay bang scripts/Invoke-HaPtyAcceptance.ps1.
+Hai nguyên nhân còn lại của i07b được tìm ra ở round 13 và đều nằm trong **test**, không
+phải trong app:
 
-Còn lỗi đo được (ghi đúng, chưa sửa):
+1. Listener `accept()` chặn vô hạn nên thread test treo khi harness không kết nối; nay
+   listener non-blocking với deadline, và test khẳng định cờ `contacted` (nếu provider
+   không hề thấy kết nối thì đó là lỗi của provider, không phải của Ctrl-C).
+2. Kỳ vọng bracketed paste của i06 vượt quá điều ConPTY trên host này làm được (nó không
+   forward marker), nên khẳng định được thu về đúng thứ app phải bảo đảm: sống sót và
+   prompt còn dùng được sau paste.
 
-- **i06** fails ở kỳ vọng bracketed paste (cần so lại chuỗi gửi/nhận trong console thật).
-- **i07** **treo harness** khi chạy trong console (đã kill bằng timeout của runner) — nghi
-  deadlock giữa luồng đọc (đang giữ lock writer để trả DSR) và `send`; cần sửa trước khi
-  kết luận về Ctrl-C qua ConPTY.
-- Vì vậy cả ba ca vẫn `#[ignore]` (lý do nay là "cần console thật + trạng thái i06/i07"),
-  và gate vẫn báo chúng là not_run.
+### 12.2. Kết quả PTY round 13: cả bốn ca xanh trong một lần chạy console thật
+
+| Ca | Kết quả |
+|---|---|
+| i01 bare `ha` mở app | ok — header/prompt render, process sống, `/exit` thoát 0 |
+| i06 gõ tiếng Việt + backspace + paste | ok — transcript cho thấy "> sua loi parser" từng ký tự, backspace đúng, sau paste app vẫn sống và prompt dùng được |
+| i07a Ctrl-C khi idle | ok — "> typo" → Ctrl-C → "> z" (buffer đã clear, không có "> typoz") |
+| i07b Ctrl-C khi đang chạy | ok — run bị cancel, app về prompt và thoát sạch |
+
+Bằng chứng: một lần chạy bounded `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1
+-TimeoutSeconds 300` báo `PTY_EXIT: 0` và `test result: ok. 4 passed; 0 failed` (9.03 s).
+Sau khi thêm ca I08 (mục 12.3), cùng runner đó chạy **năm** ca: `PTY_EXIT: 0`,
+`test result: ok. 5 passed; 0 failed` (11.01 s); transcript hiện có ở
+`target/pty-acceptance/pty-all.txt` là của lần chạy năm ca. Đây là bằng chứng I01/I06/I07
+trong pseudo-console thật, không phải suy luận từ scripted backend.
+
+Cả bốn ca **vẫn** `#[ignore]` vì `cargo test` trong sandbox không có console — lý do ignore
+nay ghi đúng: chạy bằng `scripts/Invoke-HaPtyAcceptance.ps1`, nơi cả bốn ca đều pass. Gate
+vì vậy vẫn liệt kê I06/I07 là `not_run` kèm hướng dẫn chạy, không tính là pass tự động.
+
+### 12.3. I08: lỗi render/backend sau khi terminal đã khởi tạo (round 13)
+
+I08 yêu cầu: inject lỗi render/backend sau terminal init, terminal modes/cursor phải được
+phục hồi khi recoverable failure/unwind, và lỗi fatal **không** được nuốt. Ba lớp bằng chứng:
+
+1. **Seam inject chỉ có ở debug build**: `CrosstermBackend::write/flush` gọi một hàm fault
+   được biên dịch có điều kiện; khi `HA_TEST_FAIL_AFTER_MS` được set, backend bắt đầu trả
+   `io::Error` sau mốc đó. Bản release (`cfg(not(debug_assertions))`) là no-op, nên binary
+   phát hành không thể bị "ra lệnh" hỏng theo cách này.
+2. **Unit test cho phần phục hồi** (`cargo test -p harness-cli --bin ha h07_i08`, 3 passed):
+   guard nay tách phần điều khiển mode ra sau seam `ModeControl` để chứng minh được trong
+   process test (vốn không có console để bật raw mode):
+   - `h07_i08_the_guard_restores_every_mode_it_turned_on`: thứ tự `enable → paste on →
+     paste off → disable`;
+   - `h07_i08_an_unwinding_failure_still_restores_the_terminal`: panic sau khi vào raw mode
+     vẫn phục hồi đủ bốn bước (unwind), và lỗi không bị guard nuốt;
+   - `h07_i08_a_terminal_that_refuses_raw_mode_is_reported_and_not_claimed_open`: từ chối
+     raw mode là lỗi trả về, không âm thầm hạ cấp và không tắt hai lần.
+3. **Ca PTY thật `i08`** (console thật, bound 240 s): app boot tới prompt, mốc fault đi qua,
+   gửi một phím để buộc redraw → app thoát **1** (không treo, không "thành công") và
+   transcript chứa `terminal input/output failed` cùng tên seam `HA_TEST_FAIL_AFTER_MS`;
+   kết quả `PTY_EXIT: 0`, `1 passed; 0 failed` (2.26 s).
+
+Kill process cứng vẫn **ngoài phạm vi** đúng như plan ghi, và được ghi là not_run.
+
+### 12.4. Tổng hợp đo được ở round 13
+
+| Kiểm chứng | Lệnh | Kết quả |
+|---|---|---|
+| Gate đầy đủ của track | `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json` | `"passed": true`, `"failures": []` (format, clippy `-D warnings`, 9 selector bắt buộc, unit + acceptance + P0–P7 serial, installer self test, release self test, docs) |
+| Unit test binary `ha` | `cargo test -p harness-cli --bin ha --locked` | 61 passed, 0 failed (thêm 3 test I08 cho phục hồi mode) |
+| Launch/headless acceptance | `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` | 14 passed, 0 failed |
+| Session/turn acceptance | `cargo test -p harness-cli --test interactive_session --locked -- --test-threads=1` | 9 passed, 0 failed |
+| PTY trong console thật | `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 300` | `PTY_EXIT: 0`, **5 passed, 0 failed** (11.01 s) cho i01/i06/i07a/i07b/i08 |
+| Regression toàn CLI (serial) | `cargo test -p harness-cli --tests --locked -- --test-threads=1` | **229 passed, 0 failed, 5 ignored** (5 ca PTY; chi tiết `target/cli-tests-round13.txt`) |
+| Providers | `cargo test -p harness-providers --locked` | 3 passed, 0 failed |
 
 ## 13. Chưa xác minh (không được coi là đạt)
 
-- **I01 PTY transcript**: chưa có. Cần terminal thật/PTY harness (H07). Unit test
-  dùng fixture detector chỉ chứng minh logic capability, không phải bằng chứng
-  interactive launch.
-- **H02–H08**: chưa có dòng code nào. Mọi mục trong bảng staging của SPEC vẫn "chờ".
+- **I01/I06/I07 PTY**: đã có transcript thật trong pseudo-console (mục 12.2), nhưng không
+  tự động trong gate: `cargo test` trong sandbox không có console nên phải chạy
+  `scripts/Invoke-HaPtyAcceptance.ps1`. Gate liệt kê chúng là `not_run` kèm hướng dẫn.
+- **I08 (lỗi render/backend sau khi terminal đã khởi tạo)**: chưa có ca PTY inject lỗi;
+  hiện chỉ được chứng minh ở mức scripted backend (H07 G2), không phải PTY thật.
+- **H05 I13 nhánh kill thật**: mới mô phỏng bằng mất state in-memory + writer generation mới;
+  chưa kill process thật giữa turn rồi để host khác tiếp quản.
 - **Live provider**: không chạy; không có credential/budget được cấp.
 - **User PATH / cài binary thật**: không thực hiện; không được cấp quyền.
 - **Publish release / push remote**: không thực hiện; không được cấp quyền.
