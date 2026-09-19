@@ -106,6 +106,12 @@ H07 (gate `Verify-HaLaunch.ps1` + PTY harness + I01–I18), H08 (release candida
 
 ## 6. Việc tiếp theo chi tiết (H08)
 
+**Bước -1 — PTY (round 10): I01 đã đạt.** Chạy
+`pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1` (bound, console mới, lưu
+transcript). Còn: sửa kỳ vọng bracketed paste của i06, và sửa deadlock nghi ngờ của i07
+(luồng đọc giữ lock writer khi trả DSR trong khi `send` cần lock đó) rồi mới kết luận về
+Ctrl-C qua ConPTY; sau đó bỏ `#[ignore]` cho các ca đã xanh.
+
 **Bước 0 — hai input còn thiếu (user cấp trong round 9, chưa có giá trị thật):**
 
 1. Smoke: set `HA_PROVIDER_ENDPOINT` + `HA_PROVIDER_MODEL` + `DEEPSEEK_API_KEY` (hoặc

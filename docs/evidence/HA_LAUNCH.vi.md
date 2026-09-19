@@ -486,7 +486,40 @@ User cấp quyền **(a)** cho live smoke và publish candidate. Hai blocker đo
 2. Publish: cài `gh` **hoặc** set `GH_TOKEN` (kèm xác nhận push tag `ha-v0.1.0` lên
    `origin`). Sau đó `-PublishDryRun` sẽ báo channel ready và bước publish thật mới chạy.
 
-## 12. Chưa xác minh (không được coi là đạt)
+
+## 12. PTY thật: I01 đạt, i06/i07 còn lỗi đo được (round 10)
+
+Phát hiện nguyên nhân gốc và sửa harness:
+
+1. **Master handle phải sống suốt session** — drop nó là đóng pseudo-console (im lặng, con
+   treo). Đã giữ trong struct.
+2. **Harness phải làm việc của terminal emulator**: ConPTY hỏi vị trí con trỏ bằng
+   `ESC[6n` khi app bật VT input mode và app **chặn** tới khi có trả lời. Harness nay trả
+   `ESC[1;1R` khi thấy query.
+3. **ConPTY cần console thật**: process tạo pseudo-console phải sở hữu một console; `cargo
+   test` trong sandbox thì không. Vì vậy có runner có bound:
+   `scripts/Invoke-HaPtyAcceptance.ps1` (mở console mới, timeout cứng, lưu transcript).
+4. **Thứ tự env trong harness**: strip credential phải chạy *trước* env của test, nếu không
+   nó xoá luôn credential mà test cố set.
+
+| Kiểm chứng | Lệnh | Kết quả |
+|---|---|---|
+| I01 trong PTY thật | `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -Filter i01_bare_launch -TimeoutSeconds 180` | `PTY_EXIT: 0`, `i01 ... ok`, transcript lưu ở `target/pty-acceptance/pty-transcript.txt` |
+
+Đã chứng minh: bare `ha` trong **pseudo-console thật** render header (project/setup state),
+giữ process sống ở prompt, nhận `/exit` và thoát **0**, trả terminal về trạng thái dùng
+được — đây là I01, không còn là suy luận từ scripted backend.
+
+Còn lỗi đo được (ghi đúng, chưa sửa):
+
+- **i06** fails ở kỳ vọng bracketed paste (cần so lại chuỗi gửi/nhận trong console thật).
+- **i07** **treo harness** khi chạy trong console (đã kill bằng timeout của runner) — nghi
+  deadlock giữa luồng đọc (đang giữ lock writer để trả DSR) và `send`; cần sửa trước khi
+  kết luận về Ctrl-C qua ConPTY.
+- Vì vậy cả ba ca vẫn `#[ignore]` (lý do nay là "cần console thật + trạng thái i06/i07"),
+  và gate vẫn báo chúng là not_run.
+
+## 13. Chưa xác minh (không được coi là đạt)
 
 - **I01 PTY transcript**: chưa có. Cần terminal thật/PTY harness (H07). Unit test
   dùng fixture detector chỉ chứng minh logic capability, không phải bằng chứng
@@ -497,7 +530,7 @@ User cấp quyền **(a)** cho live smoke và publish candidate. Hai blocker đo
 - **Publish release / push remote**: không thực hiện; không được cấp quyền.
 - **Linux**: chưa build/chạy; mọi kết quả trên là Windows.
 
-## 13. Ghi chú flake môi trường (đã điều tra, không che)
+## 14. Ghi chú flake môi trường (đã điều tra, không che)
 
 Test `phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` thỉnh
 thoảng đỏ ở tầng connect tới fixture server loopback trong chính process test:
