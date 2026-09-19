@@ -510,6 +510,20 @@ Phát hiện nguyên nhân gốc và sửa harness:
 giữ process sống ở prompt, nhận `/exit` và thoát **0**, trả terminal về trạng thái dùng
 được — đây là I01, không còn là suy luận từ scripted backend.
 
+Bổ sung sau khi sửa deadlock tiềm ẩn (round 11): input của harness nay đi qua **một writer
+thread** với queue, nên luồng đọc không bao giờ giữ lock writer (trả DSR bằng queue). Kết quả
+đo lại từng ca:
+
+| Ca | Lệnh (console thật, bound) | Kết quả |
+|---|---|---|
+| i06 | `... -Filter i06_pty -TimeoutSeconds 240` | FAILED sau 15 s tại bước paste: `timed out waiting for "multi line"` |
+| i07 | `... -Filter i07_ctrl_c -TimeoutSeconds 240` | **PTY_TIMEOUT**: harness vẫn treo, bị runner kill |
+
+Nghĩa là deadlock lock-writer **không** phải nguyên nhân (đã sửa mà vẫn treo); nghi vấn tiếp
+theo cho i07 là chỗ drop/kill session hoặc `hold.join()`, cần trace từng bước. Runner nay
+lưu transcript theo tên filter (`pty-<filter>.txt`) để lần chạy sau không ghi đè bằng chứng
+của lần trước (lần này transcript i06 đã bị lần chạy i07 ghi đè trước khi kịp đọc).
+
 Còn lỗi đo được (ghi đúng, chưa sửa):
 
 - **i06** fails ở kỳ vọng bracketed paste (cần so lại chuỗi gửi/nhận trong console thật).
