@@ -4,6 +4,8 @@
 
 [Master plan](HARNESS_MASTER_PLAN.vi.md) · [English overview](HARNESS_MASTER_PLAN.en.md) · [Nguồn nghiên cứu](research/DEERFLOW_RESEARCH_2026-09-15.md)
 
+**Bổ sung 19/09/2026:** dùng [sổ tay coding cho DeepSeek](implementation-next/README.vi.md) để triển khai roadmap này: runbook M0–M12, contracts cụ thể, 36 acceptance specifications có test oracle, prompt giao việc và mẫu handoff. IDs/ước lượng của roadmap giữ nguyên; bộ mới phân rã cách thực hiện, không nhận runtime đã được triển khai. Default code mới trong workspace độc lập `vnext/` để tránh đụng code/data cũ.
+
 ## 1. Cách dùng và phạm vi dự toán
 
 Đây là roadmap **thiết kế mới**, không tính phần code cũ đã làm được bao nhiêu, không yêu cầu vá/review các phase cũ. Work items là output tương lai; không đánh dấu hoàn thành chỉ vì implementation cũ có tên tương tự.

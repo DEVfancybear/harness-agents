@@ -4,6 +4,8 @@
 
 [Detailed Vietnamese master plan](HARNESS_MASTER_PLAN.vi.md) · [Implementation roadmap](HARNESS_ROADMAP.vi.md) · [DeerFlow research and sources](research/DEERFLOW_RESEARCH_2026-09-15.md)
 
+**Implementation guidance added 2026-09-19:** the [DeepSeek coding pack](implementation-next/README.vi.md) provides 13 milestone runbooks, concrete contracts, setup/trigger/oracle acceptance specifications, assignment prompts and restart handoff templates. It defaults new implementation to an isolated `vnext/` Cargo workspace. These are planning artifacts, not completed runtime features.
+
 This is an English overview of the new plan. The Vietnamese master plan and roadmap contain the complete subsystem contracts, work items, coverage matrix and acceptance scenarios.
 
 ## 1. Scope and authority

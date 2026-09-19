@@ -4,6 +4,8 @@
 
 [English overview](HARNESS_MASTER_PLAN.en.md) · [Nghiên cứu DeerFlow và nguồn tham chiếu](research/DEERFLOW_RESEARCH_2026-09-15.md) · [Roadmap và backlog thực hiện](HARNESS_ROADMAP.vi.md)
 
+**Hướng dẫn coding bổ sung 19/09/2026:** [Implementation pack cho DeepSeek](implementation-next/README.vi.md) cụ thể hóa contracts, paths, từng work item, test oracle và handoff. Bộ này giữ kiến trúc/mốc của master plan; chưa triển khai runtime.
+
 ## 1. Định hướng và những quyết định chính
 
 Xây **coding-agent harness cá nhân bằng Rust**, sử dụng qua CLI trước, có thể tiếp tục công việc qua nhiều phiên, giao việc cho agent con, và mở rộng thành Web/daemon khi cần. Đây là bản thiết kế mới theo mục tiêu sản phẩm; **không lấy code cũ hay phase cũ làm ràng buộc, không phải danh sách vá implementation hiện tại**.

@@ -5,12 +5,16 @@ on:
     paths:
       - '**.md'
       - 'docs/implementation/manifest.json'
+      - 'docs/implementation-next/manifest.json'
+      - 'scripts/Verify-NextPlan.ps1'
       - 'scripts/Verify-Docs.ps1'
       - '.github/workflows/docs.yml'
   pull_request:
     paths:
       - '**.md'
       - 'docs/implementation/manifest.json'
+      - 'docs/implementation-next/manifest.json'
+      - 'scripts/Verify-NextPlan.ps1'
       - 'scripts/Verify-Docs.ps1'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
@@ -32,3 +36,6 @@ jobs:
       - name: Validate bilingual documents and checker negative controls
         shell: pwsh
         run: ./scripts/Verify-Docs.ps1 -SelfTest
+      - name: Validate new implementation plan and checker negative controls
+        shell: pwsh
+        run: ./scripts/Verify-NextPlan.ps1 -SelfTest

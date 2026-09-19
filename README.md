@@ -1,5 +1,7 @@
 # Harness Agents
 
+**Coding handoff / Giao DeepSeek code — 19/09/2026:** Read the [implementation pack](docs/implementation-next/README.vi.md) and use the [ready-to-copy M0-01 prompt](docs/implementation-next/PROMPTS.vi.md). Includes M0–M12 runbooks, concrete contracts, acceptance oracles and restart handoffs. / Bộ hướng dẫn chi tiết để DeepSeek code từng phần, bắt đầu M0-01; chưa triển khai runtime mới.
+
 **New development plan / Kế hoạch phát triển mới — 15/09/2026:** Start with the [new master plan (Tiếng Việt)](docs/HARNESS_MASTER_PLAN.vi.md), [English overview](docs/HARNESS_MASTER_PLAN.en.md), [implementation roadmap](docs/HARNESS_ROADMAP.vi.md), and [DeerFlow research](docs/research/DEERFLOW_RESEARCH_2026-09-15.md). This is the design baseline for future development, independent of existing code. The P0–P8 documents and implementation status below are historical records, not the new roadmap. / Đây là baseline thiết kế cho phát triển tương lai, độc lập với code hiện có. Các tài liệu P0–P8 và trạng thái triển khai bên dưới là hồ sơ lịch sử, không phải roadmap mới.
 
 Personal coding-agent harness planned in Rust: CLI first, multiple delegated agents, Web UI later.

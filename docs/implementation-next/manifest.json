@@ -1,0 +1,773 @@
+{
+  "schema_version": 1,
+  "status": "planning_only",
+  "updated_at": "2026-09-19",
+  "workspace_root": "vnext",
+  "runtime_gate": "vnext/scripts/Verify-Milestone.ps1",
+  "milestones": [
+    {
+      "id": "M0",
+      "runbook": "M0.vi.md",
+      "dependencies": [],
+      "optional": false,
+      "work_items": [
+        {
+          "id": "M0-01",
+          "title": "Identities và state reducers"
+        },
+        {
+          "id": "M0-02",
+          "title": "Ports, envelopes và schema fixtures"
+        },
+        {
+          "id": "M0-03",
+          "title": "Workspace, configuration và CLI skeleton"
+        },
+        {
+          "id": "M0-04",
+          "title": "Acceptance registry và gate runner"
+        }
+      ],
+      "acceptance_ids": []
+    },
+    {
+      "id": "M1",
+      "runbook": "M1.vi.md",
+      "dependencies": [
+        "M0"
+      ],
+      "optional": false,
+      "work_items": [
+        {
+          "id": "M1-01",
+          "title": "Migrations và writer ownership"
+        },
+        {
+          "id": "M1-02",
+          "title": "Input, inbox và projections"
+        },
+        {
+          "id": "M1-03",
+          "title": "Artifacts, checkpoints và replay"
+        },
+        {
+          "id": "M1-04",
+          "title": "Recovery queries và CLI inspection"
+        }
+      ],
+      "acceptance_ids": [
+        "A01",
+        "A02",
+        "A05"
+      ]
+    },
+    {
+      "id": "M2",
+      "runbook": "M2.vi.md",
+      "dependencies": [
+        "M0"
+      ],
+      "optional": false,
+      "work_items": [
+        {
+          "id": "M2-01",
+          "title": "Typed messages và capability registry"
+        },
+        {
+          "id": "M2-02",
+          "title": "SSE assembler có state"
+        },
+        {
+          "id": "M2-03",
+          "title": "Transport, DeepSeek và cancellation"
+        },
+        {
+          "id": "M2-04",
+          "title": "Conformance harness và smoke recipe"
+        }
+      ],
+      "acceptance_ids": [
+        "A06",
+        "A07"
+      ]
+    },
+    {
+      "id": "M3",
+      "runbook": "M3.vi.md",
+      "dependencies": [
+        "M1",
+        "M2"
+      ],
+      "optional": false,
+      "work_items": [
+        {
+          "id": "M3-01",
+          "title": "Durable driver và minimum context"
+        },
+        {
+          "id": "M3-02",
+          "title": "Question, approval ports và steering"
+        },
+        {
+          "id": "M3-03",
+          "title": "Durable accounting và loop detection"
+        },
+        {
+          "id": "M3-04",
+          "title": "Terminal/goal evaluator và CLI run"
+        }
+      ],
+      "acceptance_ids": [
+        "A09",
+        "A10",
+        "A11"
+      ]
+    },
+    {
+      "id": "M4",
+      "runbook": "M4.vi.md",
+      "dependencies": [
+        "M3"
+      ],
+      "optional": false,
+      "work_items": [
+        {
+          "id": "M4-01",
+          "title": "Gate, approvals và receipts"
+        },
+        {
+          "id": "M4-02",
+          "title": "Filesystem và Git read/patch"
+        },
+        {
+          "id": "M4-03",
+          "title": "Process lifecycle và spool"
+        },
+        {
+          "id": "M4-04",
+          "title": "End-to-end coding và recovery"
+        }
+      ],
+      "acceptance_ids": [
+        "A03",
+        "A04",
+        "A08",
+        "A11",
+        "A13",
+        "A14",
+        "A15",
+        "A16",
+        "A17"
+      ]
+    },
+    {
+      "id": "M5",
+      "runbook": "M5.vi.md",
+      "dependencies": [
+        "M4"
+      ],
+      "optional": false,
+      "work_items": [
+        {
+          "id": "M5-01",
+          "title": "Context channels và manifest"
+        },
+        {
+          "id": "M5-02",
+          "title": "Compaction generation và CAS"
+        },
+        {
+          "id": "M5-03",
+          "title": "History index, exact reads và notes"
+        },
+        {
+          "id": "M5-04",
+          "title": "Resume/fork/rollback và workspace staleness"
+        }
+      ],
+      "acceptance_ids": [
+        "A12",
+        "A18",
+        "A19",
+        "A20",
+        "A21"
+      ]
+    },
+    {
+      "id": "M6",
+      "runbook": "M6.vi.md",
+      "dependencies": [
+        "M5"
+      ],
+      "optional": false,
+      "work_items": [
+        {
+          "id": "M6-01",
+          "title": "Local skills và activation"
+        },
+        {
+          "id": "M6-02",
+          "title": "Kernel và process protocol"
+        },
+        {
+          "id": "M6-03",
+          "title": "MCP client adapter"
+        },
+        {
+          "id": "M6-04",
+          "title": "Deferred schema và config explain"
+        }
+      ],
+      "acceptance_ids": [
+        "A22",
+        "A23",
+        "A24"
+      ]
+    },
+    {
+      "id": "M7",
+      "runbook": "M7.vi.md",
+      "dependencies": [
+        "M6"
+      ],
+      "optional": false,
+      "work_items": [
+        {
+          "id": "M7-01",
+          "title": "Assets và authority"
+        },
+        {
+          "id": "M7-02",
+          "title": "Durable extraction consumer"
+        },
+        {
+          "id": "M7-03",
+          "title": "Retrieval và invalidation"
+        },
+        {
+          "id": "M7-04",
+          "title": "CLI và quality fixtures"
+        }
+      ],
+      "acceptance_ids": [
+        "A19",
+        "A25",
+        "A26"
+      ]
+    },
+    {
+      "id": "M8",
+      "runbook": "M8.vi.md",
+      "dependencies": [
+        "M7"
+      ],
+      "optional": false,
+      "work_items": [
+        {
+          "id": "M8-01",
+          "title": "DAG, scheduling và briefs"
+        },
+        {
+          "id": "M8-02",
+          "title": "Result và parent delivery"
+        },
+        {
+          "id": "M8-03",
+          "title": "Worktree ownership và integration"
+        },
+        {
+          "id": "M8-04",
+          "title": "Evidence verifier và terminal task"
+        }
+      ],
+      "acceptance_ids": [
+        "A27",
+        "A28",
+        "A29",
+        "A30"
+      ]
+    },
+    {
+      "id": "M9",
+      "runbook": "M9.vi.md",
+      "dependencies": [
+        "M8"
+      ],
+      "optional": false,
+      "work_items": [
+        {
+          "id": "M9-01",
+          "title": "Backup, restore và retention"
+        },
+        {
+          "id": "M9-02",
+          "title": "Diagnostics và redacted observability"
+        },
+        {
+          "id": "M9-03",
+          "title": "Full gates và eval baseline"
+        },
+        {
+          "id": "M9-04",
+          "title": "Packaging và documented profile"
+        }
+      ],
+      "acceptance_ids": [
+        "A31",
+        "A32"
+      ]
+    },
+    {
+      "id": "M10",
+      "runbook": "M10.vi.md",
+      "dependencies": [
+        "M9"
+      ],
+      "optional": true,
+      "work_items": [
+        {
+          "id": "M10-01",
+          "title": "Authenticated commands/queries"
+        },
+        {
+          "id": "M10-02",
+          "title": "Events, replay và gap"
+        },
+        {
+          "id": "M10-03",
+          "title": "Task workspace UI"
+        },
+        {
+          "id": "M10-04",
+          "title": "Uploads và artifact previews"
+        }
+      ],
+      "acceptance_ids": [
+        "A33"
+      ]
+    },
+    {
+      "id": "M11",
+      "runbook": "M11.vi.md",
+      "dependencies": [
+        "M9"
+      ],
+      "optional": true,
+      "work_items": [
+        {
+          "id": "M11-01",
+          "title": "Daemon host và IPC"
+        },
+        {
+          "id": "M11-02",
+          "title": "Durable schedules/occurrences"
+        },
+        {
+          "id": "M11-03",
+          "title": "External task driver và polling"
+        },
+        {
+          "id": "M11-04",
+          "title": "Non-interactive policy và notifications"
+        }
+      ],
+      "acceptance_ids": [
+        "A34",
+        "A35"
+      ]
+    },
+    {
+      "id": "M12",
+      "runbook": "M12.vi.md",
+      "dependencies": [
+        "M4"
+      ],
+      "optional": true,
+      "work_items": [
+        {
+          "id": "M12-01",
+          "title": "Capability spike và backend selection"
+        },
+        {
+          "id": "M12-02",
+          "title": "Confinement và execution mapping"
+        },
+        {
+          "id": "M12-03",
+          "title": "Ownership leases và orphan recovery"
+        },
+        {
+          "id": "M12-04",
+          "title": "Adversarial gates và profile documentation"
+        }
+      ],
+      "acceptance_ids": [
+        "A36"
+      ]
+    }
+  ],
+  "acceptance": [
+    {
+      "id": "A01",
+      "slug": "input_ack_dedupe",
+      "owners": [
+        "M1"
+      ],
+      "completion_milestone": "M1",
+      "planned_test_name": "a01_input_ack_dedupe",
+      "status": "planned"
+    },
+    {
+      "id": "A02",
+      "slug": "owner_generation",
+      "owners": [
+        "M1"
+      ],
+      "completion_milestone": "M1",
+      "planned_test_name": "a02_owner_generation",
+      "status": "planned"
+    },
+    {
+      "id": "A03",
+      "slug": "receipt_before_checkpoint",
+      "owners": [
+        "M4"
+      ],
+      "completion_milestone": "M4",
+      "planned_test_name": "a03_receipt_before_checkpoint",
+      "status": "planned"
+    },
+    {
+      "id": "A04",
+      "slug": "effect_before_receipt",
+      "owners": [
+        "M4"
+      ],
+      "completion_milestone": "M4",
+      "planned_test_name": "a04_effect_before_receipt",
+      "status": "planned"
+    },
+    {
+      "id": "A05",
+      "slug": "checkpoint_compatibility",
+      "owners": [
+        "M1"
+      ],
+      "completion_milestone": "M1",
+      "planned_test_name": "a05_checkpoint_compatibility",
+      "status": "planned"
+    },
+    {
+      "id": "A06",
+      "slug": "sse_multicall",
+      "owners": [
+        "M2"
+      ],
+      "completion_milestone": "M2",
+      "planned_test_name": "a06_sse_multicall",
+      "status": "planned"
+    },
+    {
+      "id": "A07",
+      "slug": "provider_fail_cancel",
+      "owners": [
+        "M2"
+      ],
+      "completion_milestone": "M2",
+      "planned_test_name": "a07_provider_fail_cancel",
+      "status": "planned"
+    },
+    {
+      "id": "A08",
+      "slug": "coding_e2e",
+      "owners": [
+        "M4"
+      ],
+      "completion_milestone": "M4",
+      "planned_test_name": "a08_coding_e2e",
+      "status": "planned"
+    },
+    {
+      "id": "A09",
+      "slug": "terminal_acceptance",
+      "owners": [
+        "M3"
+      ],
+      "completion_milestone": "M3",
+      "planned_test_name": "a09_terminal_acceptance",
+      "status": "planned"
+    },
+    {
+      "id": "A10",
+      "slug": "goal_no_progress",
+      "owners": [
+        "M3"
+      ],
+      "completion_milestone": "M3",
+      "planned_test_name": "a10_goal_no_progress",
+      "status": "planned"
+    },
+    {
+      "id": "A11",
+      "slug": "human_input_grant",
+      "owners": [
+        "M3",
+        "M4"
+      ],
+      "completion_milestone": "M4",
+      "planned_test_name": "a11_human_input_grant",
+      "status": "planned"
+    },
+    {
+      "id": "A12",
+      "slug": "compaction_cas",
+      "owners": [
+        "M5"
+      ],
+      "completion_milestone": "M5",
+      "planned_test_name": "a12_compaction_cas",
+      "status": "planned"
+    },
+    {
+      "id": "A13",
+      "slug": "queued_process_cancel",
+      "owners": [
+        "M4"
+      ],
+      "completion_milestone": "M4",
+      "planned_test_name": "a13_queued_process_cancel",
+      "status": "planned"
+    },
+    {
+      "id": "A14",
+      "slug": "approval_binding",
+      "owners": [
+        "M4"
+      ],
+      "completion_milestone": "M4",
+      "planned_test_name": "a14_approval_binding",
+      "status": "planned"
+    },
+    {
+      "id": "A15",
+      "slug": "path_patch_safety",
+      "owners": [
+        "M4"
+      ],
+      "completion_milestone": "M4",
+      "planned_test_name": "a15_path_patch_safety",
+      "status": "planned"
+    },
+    {
+      "id": "A16",
+      "slug": "process_tree_env",
+      "owners": [
+        "M4"
+      ],
+      "completion_milestone": "M4",
+      "planned_test_name": "a16_process_tree_env",
+      "status": "planned"
+    },
+    {
+      "id": "A17",
+      "slug": "output_quota",
+      "owners": [
+        "M4"
+      ],
+      "completion_milestone": "M4",
+      "planned_test_name": "a17_output_quota",
+      "status": "planned"
+    },
+    {
+      "id": "A18",
+      "slug": "history_after_compaction",
+      "owners": [
+        "M5"
+      ],
+      "completion_milestone": "M5",
+      "planned_test_name": "a18_history_after_compaction",
+      "status": "planned"
+    },
+    {
+      "id": "A19",
+      "slug": "optional_services_failure",
+      "owners": [
+        "M5",
+        "M7"
+      ],
+      "completion_milestone": "M7",
+      "planned_test_name": "a19_optional_services_failure",
+      "status": "planned"
+    },
+    {
+      "id": "A20",
+      "slug": "source_scope_fork",
+      "owners": [
+        "M5"
+      ],
+      "completion_milestone": "M5",
+      "planned_test_name": "a20_source_scope_fork",
+      "status": "planned"
+    },
+    {
+      "id": "A21",
+      "slug": "rollback_effects",
+      "owners": [
+        "M5"
+      ],
+      "completion_milestone": "M5",
+      "planned_test_name": "a21_rollback_effects",
+      "status": "planned"
+    },
+    {
+      "id": "A22",
+      "slug": "skill_version",
+      "owners": [
+        "M6"
+      ],
+      "completion_milestone": "M6",
+      "planned_test_name": "a22_skill_version",
+      "status": "planned"
+    },
+    {
+      "id": "A23",
+      "slug": "extension_bounds",
+      "owners": [
+        "M6"
+      ],
+      "completion_milestone": "M6",
+      "planned_test_name": "a23_extension_bounds",
+      "status": "planned"
+    },
+    {
+      "id": "A24",
+      "slug": "catalog_revocation",
+      "owners": [
+        "M6"
+      ],
+      "completion_milestone": "M6",
+      "planned_test_name": "a24_catalog_revocation",
+      "status": "planned"
+    },
+    {
+      "id": "A25",
+      "slug": "memory_job_cas",
+      "owners": [
+        "M7"
+      ],
+      "completion_milestone": "M7",
+      "planned_test_name": "a25_memory_job_cas",
+      "status": "planned"
+    },
+    {
+      "id": "A26",
+      "slug": "memory_provenance",
+      "owners": [
+        "M7"
+      ],
+      "completion_milestone": "M7",
+      "planned_test_name": "a26_memory_provenance",
+      "status": "planned"
+    },
+    {
+      "id": "A27",
+      "slug": "child_capacity_budget",
+      "owners": [
+        "M8"
+      ],
+      "completion_milestone": "M8",
+      "planned_test_name": "a27_child_capacity_budget",
+      "status": "planned"
+    },
+    {
+      "id": "A28",
+      "slug": "child_delivery_recovery",
+      "owners": [
+        "M8"
+      ],
+      "completion_milestone": "M8",
+      "planned_test_name": "a28_child_delivery_recovery",
+      "status": "planned"
+    },
+    {
+      "id": "A29",
+      "slug": "integration_acceptance",
+      "owners": [
+        "M8"
+      ],
+      "completion_milestone": "M8",
+      "planned_test_name": "a29_integration_acceptance",
+      "status": "planned"
+    },
+    {
+      "id": "A30",
+      "slug": "dirty_workspace_preservation",
+      "owners": [
+        "M8"
+      ],
+      "completion_milestone": "M8",
+      "planned_test_name": "a30_dirty_workspace_preservation",
+      "status": "planned"
+    },
+    {
+      "id": "A31",
+      "slug": "backup_retention_restore",
+      "owners": [
+        "M9"
+      ],
+      "completion_milestone": "M9",
+      "planned_test_name": "a31_backup_retention_restore",
+      "status": "planned"
+    },
+    {
+      "id": "A32",
+      "slug": "diagnostics_isolation",
+      "owners": [
+        "M9"
+      ],
+      "completion_milestone": "M9",
+      "planned_test_name": "a32_diagnostics_isolation",
+      "status": "planned"
+    },
+    {
+      "id": "A33",
+      "slug": "web_replay_gap",
+      "owners": [
+        "M10"
+      ],
+      "completion_milestone": "M10",
+      "planned_test_name": "a33_web_replay_gap",
+      "status": "planned"
+    },
+    {
+      "id": "A34",
+      "slug": "schedule_occurrences",
+      "owners": [
+        "M11"
+      ],
+      "completion_milestone": "M11",
+      "planned_test_name": "a34_schedule_occurrences",
+      "status": "planned"
+    },
+    {
+      "id": "A35",
+      "slug": "external_task_ambiguity",
+      "owners": [
+        "M11"
+      ],
+      "completion_milestone": "M11",
+      "planned_test_name": "a35_external_task_ambiguity",
+      "status": "planned"
+    },
+    {
+      "id": "A36",
+      "slug": "strict_confinement",
+      "owners": [
+        "M12"
+      ],
+      "completion_milestone": "M12",
+      "planned_test_name": "a36_strict_confinement",
+      "status": "planned"
+    }
+  ]
+}
