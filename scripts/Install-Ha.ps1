@@ -871,6 +871,29 @@ function Invoke-SelfTest {
             $helpProbe = Invoke-MinimalEnvironmentProbe -Executable $target -InstallRoot $installRoot -ProbeHome $probeHome -Arguments @('chat', '--help')
             Add-SelfTestResult 'installed_binary_help_lists_the_launch_contract' (($helpProbe.ExitCode -eq 0) -and ($helpProbe.Stdout.Contains('--headless')) -and ($helpProbe.Stdout.Contains('--resume')) -and ($helpProbe.Stdout.Contains('--fixture'))) "exit $($helpProbe.ExitCode); out $($helpProbe.Stdout.Length) bytes"
 
+            # H06 exit criterion: a fresh shell must resolve `ha` through PATH to the
+            # installed binary. Running the absolute path is not enough.
+            $shell = Join-Path ([string] $env:SystemRoot) 'System32/cmd.exe'
+            if (Test-Path -LiteralPath $shell -PathType Leaf) {
+                $whereProbe = Invoke-MinimalEnvironmentProbe -Executable $shell -InstallRoot $installRoot -ProbeHome $probeHome -Arguments @('/c', 'where ha')
+                $resolved = @(($whereProbe.Stdout -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                Add-SelfTestResult 'fresh_shell_resolves_ha_to_the_installed_binary' (($whereProbe.ExitCode -eq 0) -and ($resolved.Count -eq 1) -and ($resolved[0].Trim() -ieq $target)) "exit $($whereProbe.ExitCode); resolved '$($resolved -join '|')'"
+
+                $shellRun = Invoke-MinimalEnvironmentProbe -Executable $shell -InstallRoot $installRoot -ProbeHome $probeHome -Arguments @('/c', 'ha --version')
+                Add-SelfTestResult 'fresh_shell_runs_ha_by_name_without_a_toolchain' (($shellRun.ExitCode -eq 0) -and ($shellRun.Stdout -match '^ha \d+\.\d+\.\d+')) "exit $($shellRun.ExitCode); out $($shellRun.Stdout.Trim())"
+
+                # Negative control: resolution must come from the install directory
+                # this installer owns, not from something already on the machine.
+                $emptyBin = Join-Path $probeHome 'empty-bin'
+                New-Item -ItemType Directory -Path $emptyBin -Force | Out-Null
+                $absentProbe = Invoke-MinimalEnvironmentProbe -Executable $shell -InstallRoot $emptyBin -ProbeHome $probeHome -Arguments @('/c', 'where ha')
+                Add-SelfTestResult 'fresh_shell_without_the_install_directory_does_not_resolve_ha' ($absentProbe.ExitCode -ne 0) "exit $($absentProbe.ExitCode); out $($absentProbe.Stdout.Trim())"
+            }
+            else {
+                Add-SelfTestResult 'fresh_shell_resolves_ha_to_the_installed_binary' $false "no cmd.exe at $shell"
+                Add-SelfTestSkip 'fresh_shell_runs_ha_by_name_without_a_toolchain' 'no cmd.exe in this environment'
+            }
+
             $guardProbe = Invoke-MinimalEnvironmentProbe -Executable $target -InstallRoot $installRoot -ProbeHome $probeHome -Arguments @()
             Add-SelfTestResult 'installed_binary_guards_a_non_terminal_launch' (($guardProbe.ExitCode -eq 2) -and ($guardProbe.Stderr.Contains('ha chat --headless --prompt'))) "exit $($guardProbe.ExitCode); err $($guardProbe.Stderr.Trim())"
 

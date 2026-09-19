@@ -307,7 +307,7 @@ Còn lại của H05/H07 (ghi đúng mức đã đạt):
 
 | Kiểm chứng | Lệnh | Kết quả |
 |---|---|---|
-| Self test của installer | `pwsh -NoProfile -File scripts/Install-Ha.ps1 -SelfTest` | 14 check OK, exit 0 |
+| Self test của installer | `pwsh -NoProfile -File scripts/Install-Ha.ps1 -SelfTest` | **25 check OK**, exit 0 (round 17–18 bổ sung các check môi trường sạch; xem mục 15.3) |
 | Cài vào thư mục tạm (copy route) | `pwsh -NoProfile -File scripts/Install-Ha.ps1 -Destination <temp> -SkipBuild -Profile Debug` | exit 0, manifest khớp digest |
 | Command resolution | `Get-Command ha -CommandType Application`, `where.exe ha` trong shell con với PATH có kiểm soát | resolve đúng binary đã cài, từ cwd ngoài repo có dấu cách |
 | Binary đã cài chạy được | `ha --version`; `ha chat --fixture` qua pipe | `ha 0.1.0`; non-TTY exit 2 (giữ nguyên guard của H01) |
@@ -328,7 +328,15 @@ Check trong self test: `merge_appends_a_missing_directory`,
 `install_manifest_records_version_and_digest`, `update_keeps_the_binary_usable`,
 `locked_executable_is_reported_as_in_use`,
 `a_failed_replacement_leaves_the_previous_binary_usable`,
-`self_test_never_writes_the_real_user_path`.
+`bundle_install_uses_the_verified_executable`, `a_tampered_bundle_is_refused`,
+`uninstall_removes_only_owned_files`, `uninstall_keeps_user_data`,
+`self_test_never_writes_the_real_user_path`,
+`installed_binary_reports_its_version_without_a_toolchain`,
+`installed_binary_help_lists_the_launch_contract`,
+`installed_binary_guards_a_non_terminal_launch`,
+`fresh_shell_resolves_ha_to_the_installed_binary`,
+`fresh_shell_runs_ha_by_name_without_a_toolchain`,
+`fresh_shell_without_the_install_directory_does_not_resolve_ha`.
 
 Đã chứng minh:
 
@@ -851,14 +859,17 @@ khi assert panic) và test khẳng định quyền ghi đã trở lại.
 đã cài bằng một `ProcessStartInfo` với môi trường dựng lại: PATH **chỉ** gồm thư mục cài +
 `System32` + `SystemRoot`, đã xoá `CARGO_HOME`, `CARGO_TARGET_DIR`, `RUSTUP_HOME`, `RUSTC`,
 `RUSTFLAGS`, `GIT_*`, `NODE_PATH`, `npm_config_prefix` cùng mọi biến credential, và
-`HOME`/`USERPROFILE`/`APPDATA`/`LOCALAPPDATA`/`HA_HOME` đều trỏ vào thư mục tạm disposable. Ba
-check mới (tổng self test nay **22** check):
+`HOME`/`USERPROFILE`/`APPDATA`/`LOCALAPPDATA`/`HA_HOME` đều trỏ vào thư mục tạm disposable.
+Sáu check mới (tổng self test nay **25** check):
 
 | Check | Kỳ vọng |
 |---|---|
 | `installed_binary_reports_its_version_without_a_toolchain` | `--version` exit 0, in `ha <semver>`, và PATH dựng lại **không** chứa `cargo`/`rustup`/`node`/`git` (điều kiện này nằm trong chính biểu thức pass) |
 | `installed_binary_help_lists_the_launch_contract` | `chat --help` exit 0 và có `--headless`, `--resume`, `--fixture` |
 | `installed_binary_guards_a_non_terminal_launch` | bare `ha` không có terminal: exit **2** và stderr nêu `ha chat --headless --prompt` |
+| `fresh_shell_resolves_ha_to_the_installed_binary` | `cmd.exe /c where ha` trong shell con với PATH dựng lại: exit 0 và **đúng một** dòng, bằng chính đường dẫn binary đã cài |
+| `fresh_shell_runs_ha_by_name_without_a_toolchain` | `cmd.exe /c ha --version` (gọi **theo tên**, không phải absolute path): exit 0, in `ha <semver>` |
+| `fresh_shell_without_the_install_directory_does_not_resolve_ha` | **đối chứng âm**: cùng shell, PATH không có thư mục cài → `where ha` thất bại, tức kết quả trên đến từ thư mục installer sở hữu chứ không từ thứ có sẵn trên máy |
 
 Đây vẫn **không** phải VM sạch: nó chứng minh artifact đã cài chạy được mà không cần toolchain,
 không cần config, không cần credential — nhưng vẫn trên chính máy này, nên I19 giữ mức "một phần".
@@ -867,3 +878,17 @@ không cần config, không cần credential — nhưng vẫn trên chính máy 
 publish release (không có channel và chưa được xác nhận push tag), build/chạy Linux (chỉ có
 target `x86_64-pc-windows-msvc`: `rustup target list --installed` xác nhận), ghi User PATH thật
 và cài lên máy user (không được cấp quyền), VM sạch thật cho I19.
+
+## 16. Provenance của checkpoint hiện tại (H07 mục 4)
+
+| Mục | Giá trị đo được |
+|---|---|
+| Commit code được đo | `ebad2997e3a6bbdaf937041c5bc1a9e5e8b12a62`, tree `c8718a526dee1f52de788906953580127637f1d2`. Round 18 chỉ đổi `scripts/Install-Ha.ps1` và tài liệu (không đổi `crates/**/src`), nên digest executable bên dưới vẫn đúng cho cây này; commit của round 18 xem `git log -1` |
+| Executable dùng cho acceptance | `target/debug/ha.exe`, `ha 0.1.0`, sha256 `23fd5424b187c0ae229aa6efef9d4b6abcc3df053e00cdbb245c185e5afd6747`, 25 682 944 byte |
+| Release candidate | `target/release-candidate/ha-0.1.0-windows-x64/` + `ha-0.1.0-windows-x64.zip` (digest zip ở mục 9); `published: false` |
+| Đường dẫn đã resolve (ví dụ) | store per-project: `<HA_HOME>/data/projects/project-<hash>` (mục 10.1, 15.2); cài đặt disposable: `%TEMP%/ha-install-<guid>` (self test); bundle: `target/release-candidate/...` |
+| TTY transcript | `target/pty-acceptance/pty-all.txt` — 6 ca i01/i06/i07a/i07b/i08/i13 (mục 12.2, 15.2) |
+| OS đã chạy | Windows 11 x64; `rustup target list --installed` chỉ có `x86_64-pc-windows-msvc` |
+| Test automation đã chạy | gate `Verify-HaLaunch.ps1` (`passed: true`, 13 selector), installer self test 25 check, docs checker |
+| not_run | live provider smoke, publish, Linux, VM sạch thật, ghi User PATH/cài lên máy user (mục 13, 15) |
+| Việc tiếp theo thực tế | cần user cấp credential/budget cho smoke, hoặc channel + xác nhận push tag `ha-v0.1.0` cho publish; nếu không có, track dừng ở đúng mức đã đo và không có mục nào được nâng thành "đạt" |

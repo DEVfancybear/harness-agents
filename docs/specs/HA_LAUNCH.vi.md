@@ -454,7 +454,12 @@ thư mục cài + `System32` + `SystemRoot`, đã xoá `CARGO_HOME`/`CARGO_TARGE
 `HOME`/`USERPROFILE`/`APPDATA`/`LOCALAPPDATA`/`HA_HOME` trỏ vào thư mục tạm. Ba check bắt buộc:
 `--version` (exit 0, đúng định dạng, và PATH dựng lại không chứa toolchain), `chat --help` (có
 `--headless`/`--resume`/`--fixture`), và bare `ha` không terminal (exit **2** kèm hướng dẫn).
-Self test nay có **22** check. Điều này chứng minh artifact không cần toolchain/config/credential;
+**Fresh shell theo đúng exit criterion của H06 (round 18)**: cùng môi trường dựng lại đó chạy
+`cmd.exe /c where ha` và `cmd.exe /c ha --version` — gọi **theo tên** chứ không phải absolute
+path — nên chứng minh shell resolve `ha` trỏ binary đã cài; kèm **đối chứng âm** (PATH không có
+thư mục cài thì `where ha` thất bại), để kết quả không thể đến từ một `ha` có sẵn trên máy.
+
+Self test nay có **25** check. Điều này chứng minh artifact không cần toolchain/config/credential;
 nó **không** chứng minh một máy sạch thật, nên I19 vẫn ở mức "một phần".
 
 **Phát hiện về approval ở headless (quan trọng)**:
