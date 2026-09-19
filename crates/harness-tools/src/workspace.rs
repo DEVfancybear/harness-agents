@@ -821,6 +821,17 @@ mod tests {
     /// the workspace when it merely could not open a directory inside it.
     #[test]
     fn review_unreadable_directory_is_reported_as_a_read_failure_with_the_path() {
+        // The denial is applied with `icacls` and the account name comes from
+        // `USERNAME`, so this case is Windows-only by construction. It is skipped
+        // rather than failed elsewhere: a skipped test that says why is more honest
+        // than one that panics on a platform the fixture cannot work on.
+        if !cfg!(windows) {
+            eprintln!(
+                "read-denial fixture needs icacls and USERNAME; skipping on {}",
+                std::env::consts::OS
+            );
+            return;
+        }
         let root =
             std::env::temp_dir().join(format!("walk-{}", harness_types::InputId::generate()));
         let locked = root.join("locked");

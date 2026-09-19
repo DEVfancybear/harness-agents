@@ -322,8 +322,11 @@ mod tests {
 
         let header = context.header_lines().join("\n");
         assert!(header.contains("Harness Agents"), "{header}");
+        // The header prints the canonical project path, so compare against the
+        // canonical spelling rather than the raw tempdir one: on a Windows runner
+        // the two differ (8.3 short component) while naming the same directory.
         assert!(
-            header.contains(&fixture.project.display().to_string()),
+            header.contains(&fixture.canonical_project.display().to_string()),
             "{header}"
         );
         assert!(header.contains("setup required"), "{header}");
