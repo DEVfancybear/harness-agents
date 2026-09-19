@@ -23,7 +23,13 @@ Phạm vi lượt này: **cả track T01–T08**, dừng báo cáo ở mỗi che
 
 ## 2. Branch / base / source digest
 
-- Nhánh `master`, base `c97c7dd` (plan T), `origin/master` cùng revision lúc bắt đầu.
+- Nhánh `master`. Base khi bắt đầu track T: `c97c7dd`; `HEAD` lúc chốt CP-A:
+  **`b0ba93f`** (`feat(ha-tui): inline-viewport TUI, typed effects and the CP-A
+  checkpoint (HA_TUI T01-T02)`), đã **push** lên `origin/master`.
+- Giữa lúc bắt đầu và lúc chốt, `origin/master` nhận thêm 5 commit của **track H**
+  (`8ea37c7`, `d7e6a2a`, `01a7bee`, `ed22df4`, `41322e3` — CI runner, gate
+  parallelism, evidence H07). Chúng đến từ một phiên làm việc khác trên **cùng
+  workspace**; xem mục 12.
 - Cây nguồn khi bắt đầu **không sạch**: `crates/harness-cli/tests/phase_p2.rs` và
   `scripts/Verify-Phase.ps1` sửa dở từ việc đo flake loopback của track H (chờ fixture
   task được schedule; giữ parallelism trong `Verify-Phase.ps1`). Hai file này đi cùng
@@ -168,6 +174,33 @@ diễn ra trước khi TUI được nối vào `app::run`).
 ## 10. Blocked on
 
 Không. Quyền commit/push, paid smoke và cài thật đã được cấp.
+
+## 12. Cảnh báo: workspace có writer song song
+
+Trong lúc track T đang chạy, **một phiên/agent khác đã và đang sửa cùng workspace**:
+
+- `HEAD` nhảy từ `c97c7dd` sang `41322e3` qua 5 commit track H mà phiên này không tạo.
+- `scripts/Verify-HaLaunch.ps1` được sửa để thêm `$requiredTuiSelectors` (4 selector T)
+  và `crates/harness-cli/src/interactive/headless.rs` được thêm `acceptance_trace` —
+  **không phải việc của phiên này**, nhưng đã nằm trong commit `b0ba93f` vì cùng cây.
+- Một số file bị sửa **trong lúc** phiên này đang làm (`tui/mod.rs`, `layout.rs`,
+  `composer.rs`, `status.rs` có `LastWriteTime` xen giữa các lần đọc của phiên này).
+- Bốn selector T trong gate trùng **đúng tên** với test của plan
+  (`t02_plain_transcript_is_byte_identical_to_h03`, `t03_paste_keeps_newlines_and_submits_once`,
+  `t04_history_order_is_user_tool_assistant_run`, `t06_y_key_grants_exactly_the_pending_request`)
+  và cả bốn hiện **có** trong `ha --list` và xanh — nên gate vẫn `passed: true`.
+
+**Hệ quả cần người giao việc quyết định:** nếu phiên kia vẫn đang chạy, hai phiên có thể
+ghi đè lên nhau (đã suýt xảy ra: một lần `controller.rs` bị ghi rỗng giữa lượt, và một
+lần file bị sửa ngoài ý muốn của phiên này). Đề nghị: **chỉ một phiên tiếp tục track T**;
+phiên còn lại nên dừng trước khi lượt sau bắt đầu T03, hoặc hai phiên chia file rõ ràng.
+
+Cách kiểm tra nhanh trước khi tiếp tục:
+
+```text
+git log --oneline -3            # HEAD phải là b0ba93f hoặc commit kế tiếp do chính bạn tạo
+git status --porcelain          # phải sạch, hoặc chỉ có thay đổi của chính bạn
+```
 
 ## 11. Không lặp lại
 
