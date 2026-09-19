@@ -2,6 +2,7 @@
 
 mod delegation_cli;
 mod extension_cli;
+mod interactive;
 mod maintenance_cli;
 mod memory_cli;
 
@@ -33,6 +34,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Open the interactive Harness app; the same entrypoint as bare ha.
+    Chat(ChatArgs),
     /// Search, inspect and maintain scoped reusable memory.
     Memory(memory_cli::MemoryCommand),
     /// Initialize a local P1 `SQLite` data directory and inspectable built-in metadata.
@@ -103,6 +106,38 @@ enum Command {
     Extensions(extension_cli::ExtensionCommand),
     /// P7 recovery hardening: doctor, backup, restore, retention, GC and release matrix.
     Maintenance(maintenance_cli::MaintenanceCommand),
+}
+
+/// Options for the interactive entrypoint (`HA_LAUNCH` H01).
+#[derive(Debug, Args)]
+struct ChatArgs {
+    /// Open the project at this path instead of the caller working directory.
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// Resume one persisted session inside the interactive app.
+    #[arg(long)]
+    resume: Option<String>,
+    /// Run exactly one turn without a terminal and print the result to stdout.
+    #[arg(long, requires = "prompt")]
+    headless: bool,
+    /// Prompt text for the single headless turn.
+    #[arg(long, requires = "headless")]
+    prompt: Option<String>,
+    /// Emit a versioned JSON result; only valid with --headless.
+    #[arg(long, requires = "headless")]
+    json: bool,
+}
+
+impl ChatArgs {
+    fn mode(&self) -> Result<interactive::LaunchMode, interactive::UsageError> {
+        interactive::mode_from_args(
+            self.cwd.clone(),
+            self.resume.clone(),
+            self.headless,
+            self.prompt.clone(),
+            self.json,
+        )
+    }
 }
 
 #[derive(Debug, Args)]
@@ -264,7 +299,7 @@ enum PluginsSubcommand {
 #[tokio::main]
 async fn main() -> ExitCode {
     match run(Cli::parse()).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("{error}");
             ExitCode::from(1)
@@ -272,8 +307,37 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Route the launch contract added by `HA_LAUNCH` H01, then fall back to the
+/// unchanged legacy dispatch for every existing subcommand.
+async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
+    let Cli { command } = cli;
+    match command {
+        None => {
+            interactive::launch(interactive::LaunchMode::Interactive {
+                cwd: None,
+                resume: None,
+            })
+            .await
+        }
+        Some(Command::Chat(args)) => match args.mode() {
+            Ok(mode) => interactive::launch(mode).await,
+            Err(usage) => {
+                eprintln!("{usage}");
+                Ok(ExitCode::from(interactive::USAGE_EXIT_CODE))
+            }
+        },
+        Some(command) => {
+            legacy_run(Cli {
+                command: Some(command),
+            })
+            .await?;
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
-async fn run(cli: Cli) -> Result<(), HarnessError> {
+async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
     match cli.command {
         Some(Command::Memory(command)) => memory_cli::run(command).await,
         Some(Command::Init { data_dir, json }) => init_store(&data_dir, json).await,
@@ -389,6 +453,12 @@ async fn run(cli: Cli) -> Result<(), HarnessError> {
         Some(Command::Tasks(command)) => delegation_cli::run(command).await,
         Some(Command::Extensions(command)) => extension_cli::run(command).await,
         Some(Command::Maintenance(command)) => maintenance_cli::run(command).await,
+        // The interactive entrypoint is routed by run() before legacy dispatch;
+        // reaching this arm would mean the launch contract was bypassed.
+        Some(Command::Chat(_)) => Err(HarnessError::new(
+            ErrorCode::InvalidStateTransition,
+            "interactive chat must be routed by run()",
+        )),
         None => Ok(()),
     }
 }
