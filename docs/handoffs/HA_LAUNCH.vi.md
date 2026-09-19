@@ -5,6 +5,13 @@ Tài liệu này là điểm vào cho lượt coding tiếp theo. Cập nhật s
 Provenance (commit/tree digest, digest executable, đường dẫn resolve, transcript, not_run và
 việc tiếp theo) ở **mục 16 của evidence**: [evidence HA_LAUNCH](../evidence/HA_LAUNCH.vi.md).
 
+> **Cảnh báo workspace dùng chung (round 20)**: một writer khác đang sửa dở
+> `crates/harness-cli/src/interactive/{app,controller,service}.rs` trong cây này, nên tại thời điểm
+> ghi, `cargo fmt --check` và `cargo test` **đỏ vì các thay đổi chưa commit đó** (E0053/E0308) —
+> không phải do track HA_LAUNCH. Commit của track (`2ee006d`) đã được xác minh trong một worktree
+> sạch: gate `passed: true`, PTY 8/8, self test 26 check, docs OK (evidence mục 17). Trước khi tin
+> một lần chạy gate đỏ, hãy kiểm `git status` xem có ai đang sửa `crates/**` không.
+
 ## 1. Ranh giới hiện tại
 
 - **H01 xong**: dispatch contract, parser `ha chat`, TTY detector, guard non-TTY exit 2.

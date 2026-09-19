@@ -932,8 +932,42 @@ và cài lên máy user (không được cấp quyền), VM sạch thật cho I1
 | Executable dùng cho acceptance | `target/debug/ha.exe`, `ha 0.1.0`, sha256 `23fd5424b187c0ae229aa6efef9d4b6abcc3df053e00cdbb245c185e5afd6747`, 25 682 944 byte |
 | Release candidate | `target/release-candidate/ha-0.1.0-windows-x64/` + `ha-0.1.0-windows-x64.zip` (digest zip ở mục 9); `published: false` |
 | Đường dẫn đã resolve (ví dụ) | store per-project: `<HA_HOME>/data/projects/project-<hash>` (mục 10.1, 15.2); cài đặt disposable: `%TEMP%/ha-install-<guid>` (self test); bundle: `target/release-candidate/...` |
-| TTY transcript | `target/pty-acceptance/pty-all.txt` — 6 ca i01/i06/i07a/i07b/i08/i13 (mục 12.2, 15.2) |
+| TTY transcript | `target/pty-acceptance/pty-all.txt` — **8 ca** i01/i05/i06/i07a/i07b/i08/i12/i13 (mục 12.2, 15.2, 15.4, 15.5) |
 | OS đã chạy | Windows 11 x64; `rustup target list --installed` chỉ có `x86_64-pc-windows-msvc` |
-| Test automation đã chạy | gate `Verify-HaLaunch.ps1` (`passed: true`, 13 selector), installer self test 25 check, docs checker |
+| Test automation đã chạy | gate `Verify-HaLaunch.ps1` (`passed: true`, 13 selector), installer self test **26** check, docs checker |
+
+## 17. Round 20: xác minh trong worktree riêng (workspace bị ghi song song)
+
+Trong round 20, **một writer khác đang sửa dở** `crates/harness-cli/src/interactive/{app,controller,service}.rs`
+trong cùng workspace: `cargo fmt --all -- --check` báo diff và `cargo test` báo `E0053`/`E0308`, nên gate
+**không thể** chạy xanh tại chỗ (mọi bước đỏ, kể cả `format` và `discovery`). Đó là thay đổi chưa commit
+của writer kia, không phải của track này — tôi không `git add` và không sửa chúng.
+
+Để vẫn có kết quả xác minh trung thực cho commit của mình, tôi tạo một **git worktree sạch** ở đúng
+commit `2ee006d` và chạy toàn bộ phép đo ở đó:
+
+```powershell
+git worktree add --detach C:\Users\duong\Downloads\ha-verify-round20 2ee006d
+cd C:\Users\duong\Downloads\ha-verify-round20
+cargo fmt --all -- --check                     # exit 0
+pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 480   # PTY_EXIT 0, 8 passed
+pwsh -NoProfile -File scripts/Install-Ha.ps1 -SelfTest                         # 26 check OK
+pwsh -NoProfile -File scripts/Verify-Docs.ps1                                  # DOCS_EXIT 0
+pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json                        # passed: true, failures: []
+```
+
+| Phép đo trong worktree `2ee006d` | Kết quả |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0 |
+| PTY suite (console thật) | `PTY_EXIT: 0`, **8 passed, 0 failed** (20.43 s) |
+| Installer self test | **26** check OK, `INSTALL_SELFTEST_OK` |
+| Docs checker | `DOCS_EXIT: 0` |
+| Gate đầy đủ | `GATE_EXIT: 0`, `passed: true`, `failures: []` |
+
+Ghi chú flake của round 20 (đã đo trước khi cây bị sửa dở): lần chạy gate đầu đỏ ở
+`providers-streaming::g1_adapter_delivers_text_before_the_response_completes`, lần thứ hai đỏ ở
+`acceptance-launch` + `providers-streaming` + `regression-phase_p2`; `cargo test -p harness-providers
+--locked --lib` chạy riêng **3/3 xanh**. Đây đúng loại loopback flake đã ghi ở mục 14, và worktree
+sạch ở trên là lần chạy không có writer khác tranh chấp.
 | not_run | live provider smoke, publish, Linux, VM sạch thật, ghi User PATH/cài lên máy user (mục 13, 15) |
 | Việc tiếp theo thực tế | cần user cấp credential/budget cho smoke, hoặc channel + xác nhận push tag `ha-v0.1.0` cho publish; nếu không có, track dừng ở đúng mức đã đo và không có mục nào được nâng thành "đạt" |
