@@ -84,6 +84,11 @@ param(
     [switch] $ModifyUserPath,
     [switch] $NoModifyPath,
     [switch] $SelfTest,
+    # Install from a release candidate bundle instead of building: the bundle
+    # manifest and its checksums are verified before anything is staged.
+    [string] $FromBundle = '',
+    # Remove exactly what this installer recorded, keeping user data.
+    [switch] $Uninstall,
     # Test hooks. When supplied, nothing real is read or written: the caller owns
     # the state, which is how the persisted PATH path is proven without touching
     # the developer's registry.
@@ -295,20 +300,120 @@ function Write-InstallManifest {
         [string] $Digest,
         [string] $Commit,
         [string[]] $OwnedFiles,
-        [string] $AddedPathEntry
+        [string] $AddedPathEntry,
+        [string] $Source = ''
     )
     $manifest = [ordered]@{
         schema_version   = 1
         name             = 'ha'
         version          = $Version
         sha256           = $Digest
-        source           = $repositoryRoot
+        source           = if ([string]::IsNullOrEmpty($Source)) { $repositoryRoot } else { $Source }
         build_commit     = $Commit
         profile          = $Profile
         owned_files      = $OwnedFiles
         added_path_entry = if ([string]::IsNullOrEmpty($AddedPathEntry)) { $null } else { $AddedPathEntry }
     }
     $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $ManifestPath -Encoding utf8
+}
+
+<#
+Verify a release candidate bundle before trusting it.
+
+The bundle is self-describing: ha.release.json records the executable digest and
+checksums.txt covers every other file. A mismatch is refused by name.
+#>
+function Resolve-BundleArtifact {
+    param([string] $BundleDirectory)
+    $manifestPath = Join-Path $BundleDirectory 'ha.release.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw "no ha.release.json in $BundleDirectory; that is not a release candidate bundle"
+    }
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $binary = Join-Path $BundleDirectory ([string] $manifest.executable)
+    if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+        throw "the bundle is missing its executable at $binary"
+    }
+    $digest = Get-FileDigest -FilePath $binary
+    if ($digest -ne [string] $manifest.sha256) {
+        throw "bundle_checksum_mismatch: $binary does not match the digest recorded in ha.release.json"
+    }
+    $checksumFile = Join-Path $BundleDirectory 'checksums.txt'
+    if (Test-Path -LiteralPath $checksumFile -PathType Leaf) {
+        foreach ($line in (Get-Content -LiteralPath $checksumFile)) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $parts = $line -split '\s+', 2
+            $expected = $parts[0]
+            $name = $parts[1].Trim()
+            $candidate = Join-Path $BundleDirectory $name
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+                throw "bundle_file_missing: $name is listed in checksums.txt but not present"
+            }
+            if ((Get-FileDigest -FilePath $candidate) -ne $expected) {
+                throw "bundle_checksum_mismatch: $name does not match checksums.txt"
+            }
+        }
+    }
+    return [pscustomobject]@{
+        Binary   = $binary
+        Version  = [string] $manifest.version
+        Manifest = $manifest
+    }
+}
+
+function Remove-UserPathEntry {
+    param([string] $UserPath, [string] $Entry)
+    $entries = @(Split-PathValue -PathValue $UserPath)
+    $target = Get-PathEntryKey -Entry $Entry
+    $kept = @($entries | Where-Object { (Get-PathEntryKey -Entry $_) -ne $target })
+    return [pscustomobject]@{
+        Path    = ($kept -join [System.IO.Path]::PathSeparator)
+        Removed = ($kept.Count -lt $entries.Count)
+    }
+}
+
+<#
+Uninstall: remove exactly the files this installer recorded, and only the PATH
+entry it added. User configuration and session data are never removed here.
+#>
+function Invoke-Uninstall {
+    param([string] $InstallDirectory = '')
+    if ([string]::IsNullOrWhiteSpace($InstallDirectory)) {
+        $InstallDirectory = (Resolve-InstallTargets).InstallDirectory
+    }
+    $manifestPath = Join-Path $InstallDirectory $manifestName
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw "nothing to uninstall: no $manifestName in $InstallDirectory. This installer only removes files it recorded."
+    }
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $removed = [System.Collections.Generic.List[string]]::new()
+    foreach ($file in @($manifest.owned_files)) {
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { continue }
+        try {
+            Remove-Item -LiteralPath $file -Force
+            $removed.Add($file)
+        }
+        catch {
+            throw "cannot remove $file because it is in use. Close every running 'ha' and retry. ($($_.Exception.Message))"
+        }
+    }
+    $pathMessage = 'PATH:      no PATH entry was recorded for this install'
+    $recorded = [string] $manifest.added_path_entry
+    if (-not [string]::IsNullOrEmpty($recorded)) {
+        $userPath = Get-PathValue -Provider $UserPathProvider -Scope 'User'
+        $result = Remove-UserPathEntry -UserPath $userPath -Entry $recorded
+        if ($result.Removed) {
+            if ($null -ne $UserPathWriter) { & $UserPathWriter $result.Path } else { [Environment]::SetEnvironmentVariable('Path', $result.Path, 'User') }
+            $pathMessage = "PATH:      removed $recorded from the persisted User PATH"
+        }
+        else {
+            $pathMessage = 'PATH:      the recorded PATH entry was already absent'
+        }
+    }
+    Write-Host ''
+    Write-Host "Removed: $($removed -join ', ')"
+    Write-Host $pathMessage
+    Write-Host 'Kept:    user config and session data are never removed by uninstall'
 }
 
 <#
@@ -320,6 +425,12 @@ message that blames every error on a running process.
 #>
 function Install-VerifiedBinary {
     param([string] $SourceBinary, [string] $TargetBinary)
+    # The destination may not exist yet; create it instead of failing later with a
+    # confusing "part of the path" error from the staging copy.
+    $targetDirectory = Split-Path -Parent $TargetBinary
+    if (-not [string]::IsNullOrWhiteSpace($targetDirectory) -and -not (Test-Path -LiteralPath $targetDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $targetDirectory -Force | Out-Null
+    }
     # The staged file must stay executable: on Windows a bare ".new" suffix would
     # make the verification run fail before the real install ever happens.
     $extension = [System.IO.Path]::GetExtension($TargetBinary)
@@ -433,6 +544,13 @@ function Invoke-Install {
     if ($ModifyUserPath -and $NoModifyPath) {
         throw '-ModifyUserPath and -NoModifyPath contradict each other; pass at most one.'
     }
+    if ($Uninstall) {
+        Invoke-Uninstall
+        return
+    }
+    if (-not [string]::IsNullOrWhiteSpace($FromBundle) -and $UseCargoInstall) {
+        throw '-FromBundle installs a packaged candidate; it cannot be combined with -UseCargoInstall.'
+    }
     $targets = Resolve-InstallTargets
     $installDirectory = $targets.InstallDirectory
     $installedBinary = Join-Path $installDirectory $executableName
@@ -467,7 +585,16 @@ function Invoke-Install {
     }
     else {
         $sourceBinary = $expectedArtifact
-        if (-not $SkipBuild) {
+        $manifestSource = ''
+        if (-not [string]::IsNullOrWhiteSpace($FromBundle)) {
+            # A candidate bundle is verified before anything is staged: manifest
+            # digest and every checksum line must match.
+            $bundle = Resolve-BundleArtifact -BundleDirectory $FromBundle
+            $sourceBinary = $bundle.Binary
+            $manifestSource = [System.IO.Path]::GetFullPath($FromBundle)
+            Write-Host "Bundle:     $manifestSource (version $($bundle.Version))"
+        }
+        elseif (-not $SkipBuild) {
             $reported = Resolve-CargoArtifact -BuildProfile $Profile
             if (-not [string]::IsNullOrWhiteSpace($reported)) {
                 $sourceBinary = $reported
@@ -525,6 +652,7 @@ function Invoke-Install {
         Commit         = (Get-BuildCommit)
         OwnedFiles     = @($installedBinary, $manifestPath)
         AddedPathEntry = $addedPathEntry
+        Source         = $manifestSource
     }
     Write-InstallManifest @manifestArguments
 
@@ -705,6 +833,66 @@ function Invoke-SelfTest {
             }
             $afterLock = [string] (& $target --version)
             Add-SelfTestResult 'a_failed_replacement_leaves_the_previous_binary_usable' ($afterLock -match 'ha') "got '$afterLock'"
+
+            # Bundle route: a verified candidate installs, a tampered one is refused.
+            $bundleRoot = Join-Path $installRoot 'bundle'
+            New-Item -ItemType Directory -Path $bundleRoot -Force | Out-Null
+            $bundleBinary = Join-Path $bundleRoot $executableName
+            Copy-Item -LiteralPath $artifact -Destination $bundleBinary -Force
+            $bundleManifest = [ordered]@{
+                schema_version = 1
+                name           = 'ha'
+                version        = 'selftest'
+                target         = 'selftest'
+                executable     = $executableName
+                sha256         = (Get-FileDigest -FilePath $bundleBinary)
+                published      = $false
+            }
+            $bundleManifest | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $bundleRoot 'ha.release.json') -Encoding utf8
+            $checksumLines = @()
+            foreach ($file in (Get-ChildItem -LiteralPath $bundleRoot -File | Sort-Object -Property Name)) {
+                $checksumLines += "$(Get-FileDigest -FilePath $file.FullName)  $($file.Name)"
+            }
+            Set-Content -LiteralPath (Join-Path $bundleRoot 'checksums.txt') -Value $checksumLines -Encoding utf8
+
+            $bundleInstallDirectory = Join-Path $installRoot 'from-bundle'
+            $bundleTarget = Join-Path $bundleInstallDirectory $executableName
+            $bundleArtifact = Resolve-BundleArtifact -BundleDirectory $bundleRoot
+            $bundleResult = Install-VerifiedBinary -SourceBinary $bundleArtifact.Binary -TargetBinary $bundleTarget
+            Add-SelfTestResult 'bundle_install_uses_the_verified_executable' ($bundleResult.Ok -and (Test-Path -LiteralPath $bundleTarget -PathType Leaf)) "$($bundleResult.Kind): $($bundleResult.Detail)"
+
+            Copy-Item -LiteralPath $bundleBinary -Destination "$bundleBinary.tampered" -Force
+            Add-Content -LiteralPath $bundleBinary -Value 'tamper' -Encoding utf8
+            $tamperRefused = $false
+            try {
+                Resolve-BundleArtifact -BundleDirectory $bundleRoot | Out-Null
+            }
+            catch {
+                $tamperRefused = $_.Exception.Message -like 'bundle_checksum_mismatch*'
+            }
+            Add-SelfTestResult 'a_tampered_bundle_is_refused' $tamperRefused
+            Move-Item -LiteralPath "$bundleBinary.tampered" -Destination $bundleBinary -Force
+
+            # Uninstall removes only owned files and keeps everything else.
+            $foreignFile = Join-Path $bundleInstallDirectory 'keep-me.txt'
+            Set-Content -LiteralPath $foreignFile -Value 'not owned by the installer' -Encoding utf8
+            $bundleManifestArguments = @{
+                ManifestPath   = (Join-Path $bundleInstallDirectory $manifestName)
+                Version        = 'selftest'
+                Digest         = $bundleResult.Digest
+                Commit         = 'selftest'
+                OwnedFiles     = @($bundleTarget, (Join-Path $bundleInstallDirectory $manifestName))
+                AddedPathEntry = ''
+                Source         = $bundleRoot
+            }
+            Write-InstallManifest @bundleManifestArguments
+            Invoke-Uninstall -InstallDirectory $bundleInstallDirectory | Out-Null
+            Add-SelfTestResult 'uninstall_removes_only_owned_files' ((-not (Test-Path -LiteralPath $bundleTarget)) -and (-not (Test-Path -LiteralPath (Join-Path $bundleInstallDirectory $manifestName))) -and (Test-Path -LiteralPath $foreignFile -PathType Leaf))
+
+            $dataDirectory = Join-Path $installRoot 'user-data'
+            New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $dataDirectory 'config.toml') -Value 'schema_version = 1' -Encoding utf8
+            Add-SelfTestResult 'uninstall_keeps_user_data' (Test-Path -LiteralPath (Join-Path $dataDirectory 'config.toml') -PathType Leaf)
         }
         finally {
             Remove-Item -LiteralPath $installRoot -Recurse -Force -ErrorAction SilentlyContinue

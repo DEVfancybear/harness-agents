@@ -170,6 +170,7 @@ foreach ($phase in @('phase_p0', 'phase_p1', 'phase_p2', 'phase_p3', 'phase_p4',
 }
 
 if ((Invoke-GateStep -Name 'installer-selftest' -File 'pwsh' -Arguments @('-NoProfile', '-File', (Join-Path $repositoryRoot 'scripts/Install-Ha.ps1'), '-SelfTest')) -ne 0) { $failures.Add('installer-selftest') }
+if ((Invoke-GateStep -Name 'release-selftest' -File 'pwsh' -Arguments @('-NoProfile', '-File', (Join-Path $repositoryRoot 'scripts/New-HaRelease.ps1'), '-SelfTest')) -ne 0) { $failures.Add('release-selftest') }
 if ((Invoke-GateStep -Name 'docs' -File 'pwsh' -Arguments @('-NoProfile', '-File', (Join-Path $repositoryRoot 'scripts/Verify-Docs.ps1'), '-SelfTest')) -ne 0) { $failures.Add('docs') }
 
 $report = [pscustomobject]@{
