@@ -62,6 +62,20 @@ const CURSOR_POSITION_REPORT: &[u8] = b"\x1b[1;1R";
 
 impl PtySession {
     fn spawn(cwd: &Path, env: &[(&str, String)]) -> Self {
+        Self::spawn_executable(&cli_binary(), cwd, env, &[])
+    }
+
+    /// Spawn any `ha` executable: the build-tree binary by default, an installed
+    /// artifact when a test must prove the copy a user actually gets.
+    ///
+    /// `remove` names extra inherited variables to drop, so a case can rebuild the
+    /// environment instead of measuring the developer's shell.
+    fn spawn_executable(
+        binary: &Path,
+        cwd: &Path,
+        env: &[(&str, String)],
+        remove: &[&str],
+    ) -> Self {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -71,7 +85,7 @@ impl PtySession {
                 pixel_height: 0,
             })
             .expect("a pseudo-console can be opened");
-        let mut command = CommandBuilder::new(cli_binary());
+        let mut command = CommandBuilder::new(binary);
         command.cwd(cwd);
         // Never inherit a credential from the developer's shell: the tests decide
         // whether the app is configured. This runs before the explicit environment
@@ -80,6 +94,9 @@ impl PtySession {
         command.env_remove("HA_API_KEY");
         command.env_remove("HA_PROVIDER_ENDPOINT");
         command.env_remove("HA_PROVIDER_MODEL");
+        for name in remove {
+            command.env_remove(*name);
+        }
         for (name, value) in env {
             command.env(name, value);
         }
@@ -226,7 +243,7 @@ fn base_env(temp: &tempfile::TempDir) -> Vec<(&'static str, String)> {
     ]
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all eight cases i01, i05, i06, i07a, i07b, i08, i12 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all nine cases i01, i05, i06, i07a, i07b, i08, i12, i13 and i14 pass there."]
 #[test]
 fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     let (temp, project) = sandbox();
@@ -259,7 +276,116 @@ fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all eight cases i01, i05, i06, i07a, i07b, i08, i12 and i13 pass there."]
+/// I14 (interactive half): the artifact a user installs, not the build-tree binary.
+///
+/// The installer self test proves the installed digest matches the built artifact;
+/// this case proves the installed copy itself opens the app. It is staged under a
+/// path with spaces and Vietnamese diacritics, started from a project directory
+/// that is neither the install directory nor a Git repository, with PATH and the
+/// profile variables rebuilt so no toolchain or developer state is reachable.
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all nine cases i01, i05, i06, i07a, i07b, i08, i12, i13 and i14 pass there."]
+#[test]
+fn i14_the_installed_artifact_opens_the_app_in_a_real_terminal() {
+    let (temp, project) = sandbox();
+    let install = temp.path().join("bản cài đặt");
+    std::fs::create_dir_all(&install).expect("install directory");
+    let installed = install.join(format!("ha{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(cli_binary(), &installed)
+        .expect("the installed copy comes from the built artifact");
+    assert!(
+        installed.is_file(),
+        "installed artifact at {}",
+        installed.display()
+    );
+
+    // A rebuilt environment: the install directory is the only place on PATH that
+    // could resolve the command, and the developer profile and toolchain variables
+    // are gone, so nothing here can fall back to the machine that built it.
+    let system_root = std::env::var("SystemRoot").expect("Windows sets SystemRoot");
+    let mut env = base_env(&temp);
+    env.push((
+        "PATH",
+        format!(
+            "{};{system_root}\\System32;{system_root}",
+            install.display()
+        ),
+    ));
+    env.push(("SystemRoot", system_root.clone()));
+    env.push((
+        "SystemDrive",
+        system_root.chars().take(2).collect::<String>(),
+    ));
+    let remove = [
+        "APPDATA",
+        "LOCALAPPDATA",
+        "USERPROFILE",
+        "HOME",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+    ];
+
+    let mut session = PtySession::spawn_executable(&installed, &project, &env, &remove);
+    let text = session.wait_for("Harness Agents", Duration::from_secs(30));
+    assert!(
+        session.is_alive(),
+        "the installed app stays alive at the prompt"
+    );
+    assert!(
+        text.contains("Nhập yêu cầu"),
+        "the prompt is Vietnamese: {text}"
+    );
+    assert!(
+        text.contains(&format!("Project: {}", project.display())),
+        "the header names the caller project: {text}"
+    );
+    // The state root is the caller's HA_HOME, not anything next to the binary. The
+    // store itself is created on the first request, so boot only resolves the path.
+    let data_root = ha_home(&temp).join("data");
+    assert!(
+        text.contains(&format!("Data:    {} [HA_HOME]", data_root.display())),
+        "the header reports the caller's data root with its origin: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "Store:   {}",
+            data_root.join("projects").display()
+        )),
+        "the store is scoped to the caller project under HA_HOME: {text}"
+    );
+
+    session.send("/exit\r");
+    assert_eq!(
+        session.wait_exit(Duration::from_secs(20)),
+        Some(0),
+        "transcript:\n{}",
+        session.transcript()
+    );
+    let transcript = session.transcript();
+    assert!(
+        transcript.ends_with("\r\n") || transcript.ends_with('\n'),
+        "the installed app restores the terminal before exiting: {transcript:?}"
+    );
+    // Read the install directory the way an operator would: it must still hold the
+    // artifact and nothing the app wrote while it ran.
+    let mut staged: Vec<String> = std::fs::read_dir(&install)
+        .expect("the install directory is readable")
+        .map(|entry| {
+            entry
+                .expect("install entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    staged.sort();
+    assert_eq!(
+        staged.len(),
+        1,
+        "the install directory holds only the artifact: {staged:?}"
+    );
+}
+
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all nine cases i01, i05, i06, i07a, i07b, i08, i12, i13 and i14 pass there."]
 #[test]
 fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     let (temp, project) = sandbox();
@@ -320,7 +446,7 @@ fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all eight cases i01, i05, i06, i07a, i07b, i08, i12 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all nine cases i01, i05, i06, i07a, i07b, i08, i12, i13 and i14 pass there."]
 #[test]
 fn i07a_ctrl_c_clears_an_idle_prompt() {
     // One pseudo-console per test: opening a second one in the same process blocks
@@ -354,7 +480,7 @@ fn i07a_ctrl_c_clears_an_idle_prompt() {
     );
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all eight cases i01, i05, i06, i07a, i07b, i08, i12 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all nine cases i01, i05, i06, i07a, i07b, i08, i12, i13 and i14 pass there."]
 #[test]
 fn i07b_ctrl_c_cancels_a_running_turn() {
     let (temp, project) = sandbox();
@@ -423,7 +549,7 @@ fn i07b_ctrl_c_cancels_a_running_turn() {
     let _ = hold.join();
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all eight cases i01, i05, i06, i07a, i07b, i08, i12 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all nine cases i01, i05, i06, i07a, i07b, i08, i12, i13 and i14 pass there."]
 #[test]
 fn i08_a_backend_fault_after_init_restores_the_terminal_and_is_not_swallowed() {
     // I08: inject a render/backend failure *after* the terminal is initialized and
@@ -617,7 +743,7 @@ fn patch_then_stall_endpoint(
     )
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all eight cases i01, i05, i06, i07a, i07b, i08, i12 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all nine cases i01, i05, i06, i07a, i07b, i08, i12, i13 and i14 pass there."]
 #[test]
 #[allow(clippy::too_many_lines)] // One kill-then-resume sequence; splitting it hides the order.
 fn i13_a_settled_tool_receipt_survives_a_hard_kill_mid_turn() {
@@ -808,7 +934,7 @@ fn stalling_provider() -> (
     )
 }
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all eight cases i01, i05, i06, i07a, i07b, i08, i12 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all nine cases i01, i05, i06, i07a, i07b, i08, i12, i13 and i14 pass there."]
 #[test]
 fn i05_exit_during_an_active_run_releases_the_store_for_the_next_host() {
     // H05: /exit must handle an active run (cancel, cleanup) and restore terminal
@@ -903,7 +1029,7 @@ fn sse_answer(text: &str) -> (String, std::thread::JoinHandle<()>) {
 // I12 - a configured but unreachable provider (the offline path)
 // ---------------------------------------------------------------------------
 
-#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all eight cases i01, i05, i06, i07a, i07b, i08, i12 and i13 pass there."]
+#[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all nine cases i01, i05, i06, i07a, i07b, i08, i12, i13 and i14 pass there."]
 #[test]
 fn i12_a_prompt_with_an_unreachable_provider_is_reported_and_the_app_stays_alive() {
     // The offline path: the environment is configured, but nothing answers. The app

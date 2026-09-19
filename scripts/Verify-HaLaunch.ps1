@@ -13,7 +13,7 @@ regressions P0-P7, the installer self test and the documentation checker with it
 negative controls.
 
 Items the gate deliberately reports as NOT RUN instead of counting them as passes:
-the PTY transcript cases (I01/I06/I07/I08 in a real terminal), the live provider
+the PTY transcript cases (I01/I06/I07/I08/I14 in a real terminal), the live provider
 smoke, Linux, and any real mutation of the user's PATH or profile.
 
 A required selector that disappeared fails the gate instead of silently reducing
@@ -113,7 +113,7 @@ $requiredSelectors = @(
 )
 
 $notRun = @(
-    'PTY cases i01/i05/i06/i07a/i07b/i08/i12/i13: they need a real console, which a sandboxed cargo test does not have. Run scripts/Invoke-HaPtyAcceptance.ps1 - all eight pass there with transcripts; this gate does not count them as passes.',
+    'PTY cases i01/i05/i06/i07a/i07b/i08/i12/i13/i14: they need a real console, which a sandboxed cargo test does not have. Run scripts/Invoke-HaPtyAcceptance.ps1 - all nine pass there with transcripts; this gate does not count them as passes.',
     'Live provider smoke (paid model call): no credential or budget is granted for this assignment.',
     'Linux build and run: this session only has Windows x64.',
     'Real User PATH mutation and install into the user profile: not authorized in this assignment.'
