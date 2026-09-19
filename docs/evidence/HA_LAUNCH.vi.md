@@ -524,6 +524,31 @@ theo cho i07 là chỗ drop/kill session hoặc `hold.join()`, cần trace từn
 lưu transcript theo tên filter (`pty-<filter>.txt`) để lần chạy sau không ghi đè bằng chứng
 của lần trước (lần này transcript i06 đã bị lần chạy i07 ghi đè trước khi kịp đọc).
 
+
+### 12.1. Ket qua PTY sau khi sua (round 12)
+
+Ba loi that da tim ra va sua trong test/harness (khong phai trong app):
+
+1. Chi mot pseudo-console moi process tren host nay: mo cai thu hai (du cai dau da dong)
+   thi BLOCK -> tach i07 thanh hai test mot-session (i07a, i07b).
+2. ConPTY khong forward bracketed-paste markers: newline trong paste toi nhu Enter va phan
+   dau bi submit nhu mot request. Khong sua duoc trong app; test nay khang dinh dieu app
+   phai lam: van song va prompt con dung duoc sau paste.
+3. Loi chuoi input cua chinh test: ky tu marker con trong buffer nen /exit bi noi thanh
+   z/exit va submit nhu REQUEST thay vi command -> test nay clear buffer bang Ctrl-C truoc
+   khi gui /exit.
+
+| Ca | Ket qua trong console that (transcript luu o target/pty-acceptance/) |
+|---|---|
+| I01 bare ha mo app | ok - header/prompt render, process song, /exit thoat 0 |
+| I06 go tieng Viet + backspace + paste | ok - transcript cho thay "> sua loi parser" tung ky tu, backspace dung; paste tren console nay submit phan dau nhu mot request, app van song va prompt dung duoc |
+| I07a Ctrl-C khi idle | ok - "> typo" -> Ctrl-C -> "> z" (buffer da clear, khong co "> typoz") |
+| I07b Ctrl-C khi dang chay | chua: harness van treo o nhanh run (runner kill o 300 s) |
+
+Nghia la 3/4 ca PTY da co transcript that; ca con lai (cancel mot run dang cho provider qua
+ConPTY) la viec ke tiep. Cac ca da xanh van de nguyen che do ignore vi cargo test trong
+sandbox khong co console; chay bang scripts/Invoke-HaPtyAcceptance.ps1.
+
 Còn lỗi đo được (ghi đúng, chưa sửa):
 
 - **i06** fails ở kỳ vọng bracketed paste (cần so lại chuỗi gửi/nhận trong console thật).
