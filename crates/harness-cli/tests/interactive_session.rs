@@ -89,10 +89,29 @@ impl TurnObserver for RecordingObserver {
 struct Bench {
     _temp: tempfile::TempDir,
     workspace: std::path::PathBuf,
-    store: Arc<SqliteStore>,
+    data_dir: std::path::PathBuf,
 }
 
-async fn bench() -> Bench {
+impl Bench {
+    /// Open a store writer.
+    ///
+    /// Each open acquires a new writer generation, and a turn owns its writer for
+    /// the duration of the turn — exactly how the application service behaves. A
+    /// follow-up turn therefore runs on a newer generation, which is what the
+    /// accepted task-lease rule requires.
+    async fn open_store(&self) -> Arc<SqliteStore> {
+        Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                self.data_dir.clone(),
+                HostId::generate(),
+            ))
+            .await
+            .expect("store opens"),
+        )
+    }
+}
+
+fn bench() -> Bench {
     let temp = tempfile::tempdir().expect("temp root");
     let workspace = temp.path().join("repo with spaces");
     std::fs::create_dir_all(workspace.join("src")).expect("workspace");
@@ -101,18 +120,11 @@ async fn bench() -> Bench {
         "fn parse() { todo!() }\n",
     )
     .expect("fixture file");
-    let store = Arc::new(
-        SqliteStore::open_writer(WriterOpenOptions::new(
-            temp.path().join("data"),
-            HostId::generate(),
-        ))
-        .await
-        .expect("store opens"),
-    );
+    let data_dir = temp.path().join("data");
     Bench {
         _temp: temp,
         workspace,
-        store,
+        data_dir,
     }
 }
 
@@ -138,13 +150,22 @@ fn request(workspace: &std::path::Path, text: &str) -> RunRequest {
     .with_tool_schemas(coding_tool_schemas())
 }
 
-fn driver(bench: &Bench, provider: Arc<SequenceProvider>) -> TurnDriver {
+fn driver(store: &Arc<SqliteStore>, provider: Arc<SequenceProvider>) -> TurnDriver {
     let runtime = Arc::new(RuntimeService::new(
-        Arc::clone(&bench.store),
+        Arc::clone(store),
         provider,
         RuntimeConfig::default(),
     ));
-    TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&bench.store)))
+    TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(store)))
+}
+
+/// Release the writer so the next turn can acquire a newer generation.
+async fn close_store(store: Arc<SqliteStore>) {
+    Arc::try_unwrap(store)
+        .expect("the turn released its store handles")
+        .close()
+        .await
+        .expect("store closes");
 }
 
 async fn run(
@@ -153,7 +174,8 @@ async fn run(
     limits: TurnLimits,
 ) -> (TurnOutcome, Arc<RecordingObserver>) {
     let observer = Arc::new(RecordingObserver::default());
-    let outcome = driver(bench, provider)
+    let store = bench.open_store().await;
+    let outcome = driver(&store, provider)
         .run_turn(
             request(&bench.workspace, "find the todo and tell me about it"),
             options(&bench.workspace, limits),
@@ -167,7 +189,7 @@ async fn run(
 
 #[tokio::test]
 async fn g2_tool_results_return_to_the_model_and_the_turn_ends_with_the_answer() {
-    let bench = bench().await;
+    let bench = bench();
     let provider = Arc::new(SequenceProvider::new(vec![
         vec![
             ProviderStreamEvent::started(),
@@ -230,7 +252,7 @@ async fn g2_tool_results_return_to_the_model_and_the_turn_ends_with_the_answer()
 
 #[tokio::test]
 async fn g2_a_failed_tool_call_is_reported_instead_of_ending_the_turn() {
-    let bench = bench().await;
+    let bench = bench();
     let provider = Arc::new(SequenceProvider::new(vec![
         vec![
             ProviderStreamEvent::started(),
@@ -267,7 +289,7 @@ async fn g2_a_failed_tool_call_is_reported_instead_of_ending_the_turn() {
 
 #[tokio::test]
 async fn g2_the_tool_loop_is_bounded_and_reports_which_bound_stopped_it() {
-    let bench = bench().await;
+    let bench = bench();
     // The provider always asks for another tool call: without a bound this would
     // loop forever.
     let provider = Arc::new(SequenceProvider::new(vec![vec![
@@ -292,5 +314,146 @@ async fn g2_the_tool_loop_is_bounded_and_reports_which_bound_stopped_it() {
         provider.seen().len() <= limits.max_steps as usize + 1,
         "the loop must stop at the step bound: {} calls",
         provider.seen().len()
+    );
+}
+
+/// Build one request that belongs to an existing session and task.
+fn request_for(
+    workspace: &std::path::Path,
+    session_id: &SessionId,
+    task_id: &TaskId,
+    text: &str,
+) -> RunRequest {
+    let observation =
+        observe_workspace(ProjectId::generate(), workspace).expect("workspace observation");
+    RunRequest::new(
+        session_id.clone(),
+        task_id.clone(),
+        InputId::generate(),
+        text,
+        observation,
+    )
+    .with_tool_schemas(coding_tool_schemas())
+}
+
+#[tokio::test]
+async fn g3_a_second_input_in_the_same_session_carries_real_context() {
+    let bench = bench();
+    let provider = Arc::new(SequenceProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("first answer"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("second answer"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let task_id = TaskId::generate();
+
+    let first_store = bench.open_store().await;
+    let first = driver(&first_store, Arc::clone(&provider))
+        .run_turn(
+            request_for(
+                &bench.workspace,
+                &SessionId::generate(),
+                &task_id,
+                "first user message",
+            ),
+            options(&bench.workspace, TurnLimits::default()),
+            Arc::new(RecordingObserver::default()) as Arc<dyn TurnObserver>,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the first turn runs");
+    assert_eq!(first.stop, TurnStop::Final);
+    assert_eq!(first.final_text, "first answer");
+    close_store(first_store).await;
+
+    // The accepted P1 journal admits one user input per session, so the follow-up
+    // is a new session linked to its predecessor and sharing the task identity.
+    let second_store = bench.open_store().await;
+    let second = driver(&second_store, Arc::clone(&provider))
+        .run_turn_continuing(
+            &first.session_id,
+            request_for(
+                &bench.workspace,
+                &SessionId::generate(),
+                &task_id,
+                "second user message",
+            ),
+            options(&bench.workspace, TurnLimits::default()),
+            Arc::new(RecordingObserver::default()) as Arc<dyn TurnObserver>,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the continuation turn runs");
+    close_store(second_store).await;
+    assert_eq!(second.stop, TurnStop::Final);
+    assert_eq!(second.final_text, "second answer");
+    assert_eq!(second.task_id, first.task_id, "the task identity is kept");
+    assert_ne!(
+        second.session_id, first.session_id,
+        "each user input owns its session in the accepted journal model"
+    );
+
+    let seen = provider.seen();
+    assert_eq!(seen.len(), 2, "one provider call per input");
+    let second_packet = &seen[1].messages[1].content;
+    assert!(
+        second_packet.contains("second user message"),
+        "the new input reaches the model: {second_packet}"
+    );
+    assert_ne!(
+        &seen[0].messages[1].content, second_packet,
+        "the second turn must rebuild context from the session journal, not start empty"
+    );
+}
+
+#[tokio::test]
+async fn g3_the_foundation_admits_one_input_per_session_and_says_so() {
+    let bench = bench();
+    let provider = Arc::new(SequenceProvider::new(vec![vec![
+        ProviderStreamEvent::started(),
+        ProviderStreamEvent::text("only answer"),
+        ProviderStreamEvent::completed("stop"),
+    ]]));
+    let store = bench.open_store().await;
+    let driver = driver(&store, Arc::clone(&provider));
+    let session_id = SessionId::generate();
+    let task_id = TaskId::generate();
+
+    driver
+        .run_turn(
+            request_for(&bench.workspace, &session_id, &task_id, "first message"),
+            options(&bench.workspace, TurnLimits::default()),
+            Arc::new(RecordingObserver::default()) as Arc<dyn TurnObserver>,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the first turn runs");
+
+    // A second admission in the same session is refused by the accepted journal:
+    // this is exactly why the conversation uses a linked-session chain instead.
+    let conflict = driver
+        .run_turn(
+            request_for(&bench.workspace, &session_id, &task_id, "second message"),
+            options(&bench.workspace, TurnLimits::default()),
+            Arc::new(RecordingObserver::default()) as Arc<dyn TurnObserver>,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("one input per session is the accepted foundation rule");
+    assert_eq!(
+        conflict.code(),
+        harness_types::ErrorCode::IdempotencyConflict
+    );
+    assert!(
+        conflict
+            .to_string()
+            .contains("more than one admitted input"),
+        "{conflict}"
     );
 }

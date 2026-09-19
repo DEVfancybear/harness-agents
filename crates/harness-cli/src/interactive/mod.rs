@@ -128,12 +128,15 @@ pub async fn launch(mode: LaunchMode) -> Result<ExitCode, HarnessError> {
             json,
             cwd,
             resume,
-        } => headless::run(headless::HeadlessRequest {
-            prompt,
-            json,
-            cwd,
-            resume,
-        }),
+        } => {
+            headless::run(headless::HeadlessRequest {
+                prompt,
+                json,
+                cwd,
+                resume,
+            })
+            .await
+        }
         LaunchMode::Interactive {
             cwd,
             resume,

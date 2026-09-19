@@ -16,7 +16,7 @@ use super::bootstrap::{self, LaunchContext, LaunchRequest};
 use super::controller::{Effect, InteractiveController};
 use super::events::Key;
 use super::paths::{HostPlatform, LaunchEnvironment};
-use super::service::{FixtureService, PendingService, SessionChannel, SessionPort};
+use super::service::{AgentSessionService, FixtureService, SessionChannel, SessionPort};
 use super::terminal::{CrosstermBackend, RawModeGuard, TerminalBackend};
 
 /// Validated interactive launch request.
@@ -33,18 +33,27 @@ const KEY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Run the interactive app until the user exits.
 pub async fn run(launch: AppLaunch) -> Result<ExitCode, HarnessError> {
-    let context = resolve_context(&launch)?;
+    // The environment is read once and injected everywhere, so the same code path
+    // is unit tested against a fixture environment.
+    let environment = LaunchEnvironment::capture();
+    let context = resolve_context(&launch, &environment)?;
     let notice = launch.resume.as_deref().map(|session| {
         format!("resume {session} requested; session recovery arrives with HA_LAUNCH H05")
     });
     match RawModeGuard::enter() {
         Ok(guard) => {
-            let code = run_terminal(&context, guard, notice.as_deref(), launch.fixture)?;
+            let code = run_terminal(
+                &context,
+                &environment,
+                guard,
+                notice.as_deref(),
+                launch.fixture,
+            )?;
             Ok(ExitCode::from(code))
         }
         Err(error) => {
             eprintln!("ha: raw mode is unavailable ({error}); using plain line input");
-            run_line_mode(&context, notice.as_deref(), launch.fixture).await
+            run_line_mode(&context, &environment, notice.as_deref(), launch.fixture).await
         }
     }
 }
@@ -53,7 +62,10 @@ pub async fn run(launch: AppLaunch) -> Result<ExitCode, HarnessError> {
 ///
 /// The platform and environment are injected into the resolver, so the same code
 /// path is unit tested with a fixture home instead of the developer profile.
-fn resolve_context(launch: &AppLaunch) -> Result<LaunchContext, HarnessError> {
+fn resolve_context(
+    launch: &AppLaunch,
+    environment: &LaunchEnvironment,
+) -> Result<LaunchContext, HarnessError> {
     let caller_dir = std::env::current_dir().map_err(|error| {
         HarnessError::new(
             ErrorCode::StorageOpenFailed,
@@ -64,33 +76,43 @@ fn resolve_context(launch: &AppLaunch) -> Result<LaunchContext, HarnessError> {
         cwd: launch.cwd.clone(),
         caller_dir,
         platform: HostPlatform::current(),
-        environment: LaunchEnvironment::capture(),
+        environment: environment.clone(),
         explicit_data_dir: None,
     })
 }
 
 fn run_terminal(
     context: &LaunchContext,
+    environment: &LaunchEnvironment,
     _guard: RawModeGuard,
     notice: Option<&str>,
     fixture: bool,
 ) -> Result<u8, HarnessError> {
     let mut backend = CrosstermBackend;
-    let mut controller = controller_for(context, fixture);
+    let mut controller = controller_for(context, environment, fixture);
     run_loop(&mut backend, &mut controller, notice)
 }
 
 /// Build the controller.
 ///
-/// Without the explicit fixture opt-in the backend is the staged service that
-/// reports the connection is pending: a production launch never silently falls
-/// back to a fixture or a mock.
-fn controller_for(context: &LaunchContext, fixture: bool) -> InteractiveController {
+/// Without the explicit fixture opt-in the backend is the real application
+/// service. An unconfigured provider is reported as a setup error naming the
+/// variables to set: a production launch never silently falls back to a fixture
+/// or a mock.
+fn controller_for(
+    context: &LaunchContext,
+    environment: &LaunchEnvironment,
+    fixture: bool,
+) -> InteractiveController {
     let channel = SessionChannel::new();
     let service: Box<dyn SessionPort> = if fixture {
         Box::new(FixtureService::new(channel.sender()))
     } else {
-        Box::new(PendingService::new(channel.sender()))
+        Box::new(AgentSessionService::new(
+            context,
+            environment.clone(),
+            channel.sender(),
+        ))
     };
     InteractiveController::new(context, service, channel)
 }
@@ -246,10 +268,11 @@ fn terminal_error(error: &std::io::Error) -> HarnessError {
 /// the staged backend stay identical between the two modes.
 async fn run_line_mode(
     context: &LaunchContext,
+    environment: &LaunchEnvironment,
     notice: Option<&str>,
     fixture: bool,
 ) -> Result<ExitCode, HarnessError> {
-    let mut controller = controller_for(context, fixture);
+    let mut controller = controller_for(context, environment, fixture);
     let mut output = std::io::stdout();
     for line in controller.boot_lines() {
         writeln!(output, "{line}").map_err(|error| io_error(&error))?;
@@ -373,18 +396,26 @@ mod tests {
         text.chars().map(Key::Char).collect()
     }
 
+    fn environment(pairs: &[(&str, &str)]) -> LaunchEnvironment {
+        LaunchEnvironment::from_pairs(pairs.iter().map(|(name, value)| (*name, *value)))
+    }
+
     #[test]
     fn h03_scripted_terminal_renders_the_boot_header_and_exits_cleanly() {
         let (_temp, context) = context(false);
         let mut backend = ScriptedBackend::new(vec![Key::EndOfInput]);
-        let mut controller = controller_for(&context, false);
+        let environment = environment(&[]);
+        let mut controller = controller_for(&context, &environment, false);
         let code = run_loop(&mut backend, &mut controller, None).expect("loop runs");
         assert_eq!(code, 0);
 
         let output = backend.output();
         assert!(output.contains("Harness Agents"), "{output}");
         assert!(output.contains("setup required"), "{output}");
-        assert!(output.contains("not connected (H04)"), "{output}");
+        assert!(
+            output.contains("setup required (no provider configured)"),
+            "an unconfigured provider is stated, not hidden: {output}"
+        );
         assert!(output.contains("> "), "the prompt is drawn: {output}");
         assert!(
             backend.cleared_lines() > 0,
@@ -399,13 +430,16 @@ mod tests {
         keys.push(Key::Enter);
         keys.push(Key::EndOfInput);
         let mut backend = ScriptedBackend::new(keys);
-        let mut controller = controller_for(&context, false);
+        let mut controller = controller_for(&context, &environment(&[]), true);
         let code = run_loop(&mut backend, &mut controller, None).expect("loop runs");
         assert_eq!(code, 0);
 
         let output = backend.output();
         assert!(output.contains("> sửa lỗi parser"), "{output}");
-        assert!(output.contains("connection pending"), "{output}");
+        assert!(
+            output.contains("fixture answer for: sửa lỗi parser"),
+            "{output}"
+        );
         assert!(
             backend
                 .writes()
@@ -424,7 +458,7 @@ mod tests {
         keys.push(Key::Enter);
         keys.push(Key::EndOfInput);
         let mut backend = ScriptedBackend::new(keys);
-        let mut controller = controller_for(&context, true);
+        let mut controller = controller_for(&context, &environment(&[]), true);
         let code = run_loop(&mut backend, &mut controller, None).expect("loop runs");
         assert_eq!(code, 0);
 
@@ -451,7 +485,7 @@ mod tests {
         keys.push(Key::Enter);
         keys.push(Key::EndOfInput);
         let mut backend = ScriptedBackend::new(keys);
-        let mut controller = controller_for(&context, false);
+        let mut controller = controller_for(&context, &environment(&[]), true);
         let code = run_loop(&mut backend, &mut controller, None).expect("loop runs");
         assert_eq!(code, 0);
         assert!(backend.output().contains("> hi"), "{}", backend.output());

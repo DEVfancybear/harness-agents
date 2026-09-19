@@ -833,6 +833,44 @@ impl RuntimeService {
         })
     }
 
+    /// Continue a task in a new session, forwarding provider events as they arrive.
+    ///
+    /// The accepted P1 journal admits exactly one user input per session, so a
+    /// follow-up turn is a new session linked to its predecessor. This entry point
+    /// keeps the link, the continuation context and the incremental stream.
+    pub async fn continue_task_streaming(
+        &self,
+        source_session_id: &SessionId,
+        request: RunRequest,
+        cancellation: CancellationToken,
+        sink: ProviderEventSink,
+    ) -> Result<RunResult, RuntimeError> {
+        let source_task = self
+            .store
+            .session_task(source_session_id)
+            .await?
+            .ok_or_else(|| {
+                RuntimeError::new(ErrorCode::InvalidPayload, "source session does not exist")
+            })?;
+        if source_task != request.task_id {
+            return Err(RuntimeError::new(
+                ErrorCode::IdempotencyConflict,
+                "continuation task does not match source session",
+            ));
+        }
+        let request =
+            if let Some(packet) = self.store.latest_context_packet(source_session_id).await? {
+                request.with_continuation_context(packet.packet.content)
+            } else {
+                request
+            };
+        let result = self.run_streaming(request, cancellation, sink).await?;
+        self.store
+            .record_continuation_link(source_session_id, &result.session_id, &result.task_id)
+            .await?;
+        Ok(result)
+    }
+
     pub async fn continue_task(
         &self,
         source_session_id: &SessionId,

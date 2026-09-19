@@ -373,3 +373,157 @@ fn i03_headless_rejects_the_headless_only_flags_and_keeps_stdout_plain() {
         "a refused headless turn wrote state"
     );
 }
+
+// ---------------------------------------------------------------------------
+// I03/I12 - a headless turn through the real adapter
+// ---------------------------------------------------------------------------
+
+/// One-shot SSE fixture server on a real socket.
+fn sse_fixture(text: &'static str) -> (String, std::thread::JoinHandle<String>) {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+    let address = listener.local_addr().expect("fixture address");
+    let handle = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("fixture accepts");
+        let mut request = vec![0_u8; 8192];
+        let read = socket.read(&mut request).expect("fixture reads");
+        request.truncate(read);
+        let body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket
+            .write_all(response.as_bytes())
+            .expect("fixture writes");
+        socket.flush().ok();
+        String::from_utf8_lossy(&request).into_owned()
+    });
+    (format!("http://{address}/chat/completions"), handle)
+}
+
+/// Transport failures this sandbox is known to produce intermittently: a
+/// freshly started loopback listener refuses a connection for a few seconds.
+/// The retry below is keyed on that exact signature only, so a real failure
+/// still fails on the first attempt.
+const LOOPBACK_WOBBLE: &str = "error sending request for url";
+
+fn attempt_headless_turn() -> Result<(CliRun, String), String> {
+    let (endpoint, server) = sse_fixture("fixture says hello");
+    let sandbox = Sandbox::new();
+    let project = sandbox.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+
+    let output = std::process::Command::new(cli_binary())
+        .args([
+            "chat",
+            "--headless",
+            "--prompt",
+            "hello from the headless test",
+            "--json",
+        ])
+        .current_dir(&project)
+        .env("HA_HOME", sandbox.path())
+        .env("HA_PROVIDER_ENDPOINT", &endpoint)
+        .env("HA_PROVIDER_MODEL", "fixture-model")
+        .env("DEEPSEEK_API_KEY", "fixture-secret-value")
+        .stdin(Stdio::null())
+        .output()
+        .expect("ha binary runs");
+    let run = CliRun::from_output(&output);
+    let request = server.join().expect("fixture server finishes");
+    if run.code() != 0 && run.stderr.contains(LOOPBACK_WOBBLE) {
+        return Err(run.stderr);
+    }
+    Ok((run, request))
+}
+
+#[test]
+fn i03_headless_turn_runs_through_the_real_adapter_and_keeps_the_key_out_of_output() {
+    let mut attempt = 0;
+    let (run, request) = loop {
+        attempt += 1;
+        match attempt_headless_turn() {
+            Ok(success) => break success,
+            Err(wobble) if attempt < 3 => {
+                eprintln!("attempt {attempt} hit the known loopback wobble: {wobble}");
+            }
+            Err(wobble) => panic!("loopback fixture never became reachable: {wobble}"),
+        }
+    };
+
+    assert_eq!(run.code(), 0, "stderr was: {}", run.stderr);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&run.stdout).expect("headless output is JSON");
+    assert_eq!(
+        parsed["response"],
+        serde_json::Value::String("fixture says hello".to_owned())
+    );
+    assert_eq!(parsed["fixture"], serde_json::Value::Bool(false));
+    assert_eq!(
+        parsed["stop"],
+        serde_json::Value::String("final".to_owned())
+    );
+    assert_eq!(
+        parsed["approvals"],
+        serde_json::Value::String("none".to_owned())
+    );
+
+    assert!(
+        request.contains("Bearer fixture-secret-value"),
+        "the adapter must authenticate: {request}"
+    );
+    for stream in [&run.stdout, &run.stderr] {
+        assert!(
+            !stream.contains("fixture-secret-value"),
+            "the credential must never be printed: {stream}"
+        );
+        assert!(
+            !stream.contains(char::from(27)),
+            "redirected output must stay free of terminal control sequences"
+        );
+    }
+}
+
+#[test]
+fn i12_headless_turn_without_provider_configuration_fails_closed() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+
+    let output = std::process::Command::new(cli_binary())
+        .args(["chat", "--headless", "--prompt", "hello", "--json"])
+        .current_dir(&project)
+        .env("HA_HOME", sandbox.path())
+        .env_remove("HA_PROVIDER_ENDPOINT")
+        .env_remove("HA_PROVIDER_MODEL")
+        .env_remove("DEEPSEEK_API_KEY")
+        .env_remove("HA_API_KEY")
+        .stdin(Stdio::null())
+        .output()
+        .expect("ha binary runs");
+    let run = CliRun::from_output(&output);
+
+    assert_ne!(
+        run.code(),
+        0,
+        "an unconfigured provider must not report success"
+    );
+    assert!(run.stdout.is_empty(), "stdout was: {}", run.stdout);
+    assert!(run.stderr.contains("service_unavailable"), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("HA_PROVIDER_ENDPOINT"),
+        "{}",
+        run.stderr
+    );
+    assert!(run.stderr.contains("DEEPSEEK_API_KEY"), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("no fixture answer was substituted"),
+        "the failure must state that nothing was faked: {}",
+        run.stderr
+    );
+}

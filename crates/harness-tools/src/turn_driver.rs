@@ -121,6 +121,44 @@ impl TurnDriver {
         observer: Arc<dyn TurnObserver>,
         cancellation: CancellationToken,
     ) -> Result<TurnOutcome, HarnessError> {
+        self.run_turn_inner(None, request, options, observer, cancellation)
+            .await
+    }
+
+    /// Run one user turn that continues a previous session.
+    ///
+    /// The accepted journal admits one user input per session, so a follow-up turn
+    /// opens a new session that is linked to its predecessor and inherits its
+    /// context packet. The task identity stays the same across the conversation.
+    pub async fn run_turn_continuing(
+        &self,
+        source_session_id: &harness_types::SessionId,
+        request: RunRequest,
+        options: TurnOptions,
+        observer: Arc<dyn TurnObserver>,
+        cancellation: CancellationToken,
+    ) -> Result<TurnOutcome, HarnessError> {
+        self.run_turn_inner(
+            Some(source_session_id),
+            request,
+            options,
+            observer,
+            cancellation,
+        )
+        .await
+    }
+
+    // One linear pass per step with an explicit bound check between them; the
+    // length is the wiring, not hidden branching logic.
+    #[allow(clippy::too_many_lines)]
+    async fn run_turn_inner(
+        &self,
+        source_session_id: Option<&harness_types::SessionId>,
+        request: RunRequest,
+        options: TurnOptions,
+        observer: Arc<dyn TurnObserver>,
+        cancellation: CancellationToken,
+    ) -> Result<TurnOutcome, HarnessError> {
         let started = Instant::now();
         let session_id = request.session_id.clone();
         let task_id = request.task_id.clone();
@@ -129,11 +167,25 @@ impl TurnDriver {
         let mut tool_calls = 0_u32;
         let mut steps = 0_u32;
 
-        let mut result = self
-            .runtime
-            .run_streaming(request.clone(), cancellation.clone(), sink_for(&observer))
-            .await
-            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+        let first_step = match source_session_id {
+            Some(source) => {
+                self.runtime
+                    .continue_task_streaming(
+                        source,
+                        request.clone(),
+                        cancellation.clone(),
+                        sink_for(&observer),
+                    )
+                    .await
+            }
+            None => {
+                self.runtime
+                    .run_streaming(request.clone(), cancellation.clone(), sink_for(&observer))
+                    .await
+            }
+        };
+        let mut result =
+            first_step.map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
 
         // The loop yields why it stopped, so no bound can silently fall through.
         let stop = loop {

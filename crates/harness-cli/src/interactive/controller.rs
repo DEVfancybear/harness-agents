@@ -312,9 +312,7 @@ mod tests {
     use crate::interactive::bootstrap::{self, LaunchContext, LaunchRequest};
     use crate::interactive::events::{AppPhase, Key, RunOutcome, SessionEvent};
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
-    use crate::interactive::service::{
-        FixtureService, PendingService, SessionChannel, SessionPort, SubmitRequest,
-    };
+    use crate::interactive::service::{FixtureService, SessionChannel, SessionPort, SubmitRequest};
     use std::sync::{Arc, Mutex};
 
     /// Test port that records what the controller admitted.
@@ -337,6 +335,27 @@ mod tests {
         fn cancel(&mut self) {
             *self.cancels.lock().expect("cancel lock") += 1;
         }
+    }
+
+    /// Test port that accepts and then reports a setup failure, the way the real
+    /// service does when the provider environment is incomplete.
+    struct SetupFailingPort {
+        sender: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
+    }
+
+    impl SessionPort for SetupFailingPort {
+        fn label(&self) -> String {
+            "setup required (no provider configured)".to_owned()
+        }
+        fn submit(&mut self, request: SubmitRequest) {
+            let _ = self.sender.send(SessionEvent::Accepted {
+                input_id: request.input_id,
+            });
+            let _ = self.sender.send(SessionEvent::RecoverableError {
+                message: "provider setup is incomplete: set HA_PROVIDER_ENDPOINT, HA_PROVIDER_MODEL, DEEPSEEK_API_KEY. Nothing was sent and no fixture answer was substituted.".to_owned(),
+            });
+        }
+        fn cancel(&mut self) {}
     }
 
     /// Test port that ignores everything; the test drives the channel itself.
@@ -549,10 +568,12 @@ mod tests {
     }
 
     #[test]
-    fn h03_pending_service_says_connection_pending_and_keeps_setup_state() {
+    fn h04_an_unconfigured_provider_is_reported_and_the_setup_state_is_kept() {
         let bench = bench(false);
         let channel = SessionChannel::new();
-        let service = PendingService::new(channel.sender());
+        let service = SetupFailingPort {
+            sender: channel.sender(),
+        };
         let mut controller = InteractiveController::new(&bench.context, Box::new(service), channel);
         let _ = controller.boot_lines();
         assert_eq!(controller.phase(), AppPhase::SetupRequired);
@@ -560,7 +581,10 @@ mod tests {
         submit_text(&mut controller, "do work");
         let effects = controller.pump_events();
         let rendered = lines(&effects).join("\n");
-        assert!(rendered.contains("connection pending"), "{rendered}");
+        assert!(
+            rendered.contains("provider setup is incomplete"),
+            "{rendered}"
+        );
         assert_eq!(
             controller.phase(),
             AppPhase::SetupRequired,
