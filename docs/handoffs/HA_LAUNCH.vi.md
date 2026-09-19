@@ -14,7 +14,11 @@ Tài liệu này là điểm vào cho lượt coding tiếp theo. Cập nhật s
   cùng task + continuation link), **service thật** thay `PendingService`, và **headless
   turn thật** chạy qua production adapter. Live provider smoke **not_run** (không được cấp
   credential/budget).
-- **H05–H08 chưa bắt đầu.**
+- **H05 xong phần code**: approval gate thật (render + answer, deny/expiry không thực thi),
+  `/resume` liệt kê/chọn session của project, `/new` không bỏ chạy ngầm, và headless
+  `--resume <session-id>` tiếp tục task với context phục hồi. Còn **một ca test**: hard kill
+  giữa turn sau khi receipt đã commit.
+- **H06–H08 chưa bắt đầu.**
 - Phát hiện nền tảng quan trọng: journal P1 chỉ cho **một input mỗi session** và task lease
   cần **generation mới** — nên "cùng phiên" = cùng task + chuỗi session nối nhau, không
   phải một session nhiều input (chi tiết + test ở mục 5.3 evidence và mục 5 SPEC).
@@ -41,21 +45,20 @@ local, process con trong thư mục tạm, cài vào `-Destination` tạm, commi
 
 ## 3. Việc tiếp theo chính xác
 
-**H05 — approval, resume và lifecycle.** Prerequisite H04 đã đạt phần code.
+**Đóng nốt H05 (ca hard-kill), rồi H06 — installer và command resolution.**
+Prerequisite H05 đã đạt phần code.
 
-1. **Render/answer approval thật**: hiện đường tương tác dùng `ApprovalMode::None` nên
-   action bị gate sẽ fail closed. H05 phải render proposal (action, cwd, scope, diff) và
-   trả answer đúng request ID qua app authority, không blanket grant; I12 (grant/deny/
-   expiry) và I16 (busy/read-only) chạy với process thật.
-2. **`/resume`**: list session theo scope rồi chọn, phục hồi state/effect thật trước khi
-   submit; dùng chuỗi session + continuation link (`continue_task_streaming`) và
-   `SessionService::recover`. Không tin in-memory history.
-3. **`/new` và `/exit` khi có run active**: cancel + drain rồi mới chuyển; restore
-   terminal/store ownership trên mọi đường thoát.
-4. **I13**: hard kill sau receipt đã commit rồi mở lại `/resume` — không rerun side effect
-   đã settle; reconcile effect chưa rõ. Test bằng process thật, không chỉ throw exception.
-5. Giữ nguyên luật nền tảng đã ghi: một input mỗi session, mỗi lượt một writer generation;
-   nếu H05 cần khác thì phải mở quyết định riêng vì đó là thay đổi nền tảng P1.
+1. ~~Approval thật~~ **đã xong**: driver `ApprovalGate` + `ChannelApprovalGate` (event +
+   oneshot, timeout 5 phút), controller render/answer y/n, deny/expiry fail closed kèm tool
+   message cho model.
+2. ~~`/resume`~~ **đã xong**: liệt kê session của project (read-only, tối đa 20), chọn theo
+   số/id, resume = đặt nguồn hội thoại rồi tiếp tục bằng `continue_task_streaming`.
+3. ~~`/new`/`/exit` khi có run active~~ **đã xong**: `/new` từ chối khi đang chạy,
+   `/exit` cancel + đóng writer trước khi thoát.
+4. **Còn lại**: ca **hard kill giữa turn sau khi receipt đã commit** rồi mở lại resume
+   (I13 nhánh kill) — cần process thật bị kill giữa lúc tool đã settle, và kiểm tra không
+   rerun side effect. Nếu làm cùng PTY harness của H07 thì ghi chung một ca.
+5. Giữ nguyên luật nền tảng đã ghi: một input mỗi session, mỗi lượt một writer generation.
 
 Lưu ý kỹ thuật đã biết: fixture loopback trong môi trường này flaky khi test chạy song
 song (mục 6 evidence) — test HTTP fixture của H04 nên chạy với `--test-threads=1` hoặc

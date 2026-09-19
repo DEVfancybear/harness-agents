@@ -147,8 +147,8 @@ Không checkpoint nào được nhận "done" khi prerequisite chưa đạt.
 | H02 | Launch context, paths/HA_HOME, config/setup state | H01 | context + paths + setup state xong bằng unit test; UI thật chờ H03 |
 | H03 | Terminal app, controller/renderer, input loop | H02 | controller/renderer/editor/terminal + fixture route xong bằng test; PTY thật thuộc H07 |
 | H04 | G1 provider incremental, G2 tool continuation, G3 durable session | H03 + khảo sát G1–G3 | **xong phần code**: G1/G2/G3 + service thật + headless, regression 211 test xanh; live smoke `not_run`; multi-input/session là gap nền tảng đã ghi |
-| H05 | Approval, resume, lifecycle | H04 | việc tiếp theo |
-| H06 | Installer, User PATH scope, install manifest | H01–H03 | logic + test disposable; **không** ghi User PATH thật |
+| H05 | Approval, resume, lifecycle | H04 | **đang làm**: approval gate + resume list/select + `/new` + headless `--resume` xong và có test; còn test hard-kill giữa turn |
+| H06 | Installer, User PATH scope, install manifest | H01–H03 | chờ H05 (không ghi User PATH thật) |
 | H07 | Gate `Verify-HaLaunch.ps1`, PTY fixture, acceptance I01–I18 | H01–H06 | chờ |
 | H08 | Release candidate, clean-machine route | H07 | chờ |
 
@@ -311,3 +311,38 @@ thật thay `PendingService`, và `ha chat --headless` chạy turn thật. Live 
   trong đúng một session thì phải sửa nền tảng P1 (journal fold + lease semantics), ngoài
   scope H04 và cần quyết định riêng. Hiện tại "cùng phiên làm việc" được biểu diễn bằng
   chuỗi session cùng task — điều này cũng là nền cho `/resume` ở H05.
+
+### H05 — Approval, resume và lifecycle (đang triển khai)
+
+**Quyết định approval**:
+
+- Driver có port `ApprovalGate` + `ApprovalProposal`/`ApprovalAnswer`; `ApprovalMode` có
+  thêm biến thể `Ask(gate)`. Driver **không bao giờ tự grant**: không có câu trả lời thì
+  action không chạy.
+- Đường tương tác dùng `ChannelApprovalGate`: gửi `SessionEvent::ApprovalRequired` (kèm
+  request id, action, summary, workspace, scope) rồi chờ `oneshot` với timeout 5 phút;
+  hết hạn = `ApprovalAnswer::Expired` (**không** phải grant). `SessionPort::answer` trả
+  `false` cho id không còn pending, và UI nói rõ "no longer pending … not executed".
+- Controller render proposal (action, workspace, scope, request id) và nhận câu trả lời
+  `y/yes/grant` hoặc `n/no/deny` (kèm `/approve`/`/deny`). Khi đang chờ, một dòng khác
+  **không** được admit như request mới; phase là `waiting_approval` và vẫn tính là run
+  active nên Ctrl-C hủy được.
+- Denied/expired trả lỗi typed (`policy_denied`/`approval_stale`) → driver gửi lại cho
+  model dưới dạng tool message để nó tự điều chỉnh, nhưng **không** thực thi action.
+
+**Quyết định resume/lifecycle**:
+
+- `SessionPort` có `list_sessions`/`resume`; service đọc store ở chế độ read-only, liệt kê
+  tối đa 20 session mới nhất của **project hiện tại** (không vượt scope) và phát
+  `SessionsListed`; `/resume <số|id>` chọn từ danh sách vừa liệt kê, id lạ thì nói rõ chứ
+  không đoán.
+- Resume = đặt nguồn hội thoại thành session đó; lượt kế tiếp chạy
+  `continue_task_streaming` nên **context được phục hồi từ packet đã lưu** và task identity
+  giữ nguyên.
+- `/new` khi idle bắt đầu hội thoại mới (xóa chuỗi); khi có run active thì **từ chối**,
+  không bỏ chạy ngầm.
+- Headless: `ha chat --headless --resume <session-id>` tiếp tục task của session đó, JSON có
+  `resumed_from`; session lạ trả lỗi và **không** chạy gì.
+
+**Còn lại của H05**: test hard-kill *giữa* lúc tool receipt đã commit (I13 nhánh kill thật)
+— hiện đã chứng minh resume/continuation bằng process thật nhưng chưa có ca kill giữa turn.

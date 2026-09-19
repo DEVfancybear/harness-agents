@@ -1,6 +1,6 @@
 # Evidence HA_LAUNCH — track H01–H08
 
-Trạng thái: **H01–H04 xong phần code (H04 chưa có live smoke vì không được cấp quyền); H05–H08 chưa bắt đầu.** Tài liệu này được cập
+Trạng thái: **H01–H04 xong phần code; H05 xong phần code (còn ca hard-kill giữa turn); H06–H08 chưa bắt đầu.** H04/H05 chưa có live provider smoke vì không được cấp quyền. Tài liệu này được cập
 nhật lại sau mỗi checkpoint; trạng thái ở đây là trạng thái thật tại thời điểm ghi,
 không phải trạng thái dự kiến.
 
@@ -252,7 +252,55 @@ Selector G2: `g2_tool_results_return_to_the_model_and_the_turn_ends_with_the_ans
 
 Xem mục 5.3 cho G3, service thật và headless turn.
 
-## 6. Chưa xác minh (không được coi là đạt)
+
+## 6. H05 — approval, resume và lifecycle (phần code xong)
+
+| Kiểm chứng | Lệnh | Kết quả |
+|---|---|---|
+| Unit test (bin ha) | `cargo test -p harness-cli --bin ha --locked` | 58 passed, 0 failed |
+| Launch + resume end-to-end | `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` | 11 passed, 0 failed |
+| Session/turn acceptance | `cargo test -p harness-cli --test interactive_session --locked -- --test-threads=1` | 8 passed, 0 failed |
+| Regression toàn CLI (serial) | `cargo test -p harness-cli --tests --locked -- --test-threads=1` | **222 passed, 0 failed** (P0 8, P1 21, P2 17, P3 20, P4 22, P5 27, P6 15, P7 15, unit 58, launch 11, session 8) |
+| Lint toàn workspace | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+
+Selector H05 mới: `h05_a_denied_gated_action_is_not_executed_and_the_model_is_told`,
+`h05_a_granted_gated_action_runs_once_after_the_answer`,
+`h05_an_expired_approval_is_a_refusal_not_a_silent_grant`,
+`h05_the_gate_expires_without_an_answer_and_never_grants_late`,
+`h05_the_gate_forwards_the_users_answer`,
+`h05_a_gated_action_is_rendered_and_answered_by_the_user`,
+`h05_a_denial_is_recorded_and_a_stale_request_is_reported`,
+`h05_resume_lists_sessions_and_selects_one_by_number`,
+`h05_an_empty_listing_and_a_notice_are_rendered_honestly`,
+`i13_resume_continues_the_task_with_recovered_context_and_no_rerun`,
+`i13_resuming_an_unknown_session_fails_without_running_anything`.
+
+Đã chứng minh:
+
+- **I12 (approval)**: action bị gate chỉ chạy sau câu trả lời của user. Deny và expiry đều
+  **không** thực thi (file fixture không đổi byte nào) và được báo lại cho model dưới dạng
+  tool message; grant thì chạy đúng một lần. Gate hết hạn trả `Expired`, không bao giờ
+  thành grant; id đã trả lời/không tồn tại trả `false` và UI nói rõ "not executed".
+- **UI approval**: proposal hiện action/workspace/scope/request id; khi đang chờ, dòng khác
+  không được admit thành request mới; trả lời y/n đổi phase đúng.
+- **Resume**: `/resume` liệt kê session của **project hiện tại** (tối đa 20, mới nhất
+  trước); `/resume <số|id>` chọn; id lạ bị từ chối tường minh; `/new` khi idle mở hội
+  thoại mới và khi có run active thì từ chối.
+- **I13 (continuation + recovery bằng process thật)**: hai lần chạy binary thật
+  (`ha chat --headless ...` rồi `--resume <session>`) cho thấy lượt sau giữ nguyên task,
+  dùng session mới, báo `resumed_from`, **và request gửi provider có chứa prompt của lượt
+  trước** — tức context được phục hồi thật, không phải bắt đầu lại. Resume id lạ fail và
+  không chạy gì.
+
+Chưa chứng minh (còn lại của H05/H07):
+
+- **Hard kill giữa turn sau khi receipt đã commit** rồi mở lại resume: chưa có ca test
+  riêng (cần kill process thật giữa lúc tool đã settle). Cơ chế continuation/recovery đã
+  được chứng minh, nhưng nhánh kill thì chưa.
+- PTY/terminal thật cho I07/I08 vẫn thuộc H07.
+- Live provider smoke: **not_run**.
+
+## 7. Chưa xác minh (không được coi là đạt)
 
 - **I01 PTY transcript**: chưa có. Cần terminal thật/PTY harness (H07). Unit test
   dùng fixture detector chỉ chứng minh logic capability, không phải bằng chứng
@@ -263,7 +311,7 @@ Xem mục 5.3 cho G3, service thật và headless turn.
 - **Publish release / push remote**: không thực hiện; không được cấp quyền.
 - **Linux**: chưa build/chạy; mọi kết quả trên là Windows.
 
-## 7. Ghi chú flake môi trường (đã điều tra, không che)
+## 8. Ghi chú flake môi trường (đã điều tra, không che)
 
 Test `phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` thỉnh
 thoảng đỏ ở tầng connect tới fixture server loopback trong chính process test:
