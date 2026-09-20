@@ -581,19 +581,51 @@ Nguồn của mục này là **hai ảnh chụp TUI đang chạy** do người g
 ### 13.2. Số đo
 
 ```text
-cargo test -p harness-cli --bin ha --locked                    -> 187 passed; 0 failed
+cargo test -p harness-cli --bin ha --locked                    -> 188 passed; 0 failed
+cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1
+                                                               -> 18 passed; 0 failed (3 lần liên tiếp)
 cargo clippy --workspace --all-targets --locked -- -D warnings -> sạch
 cargo fmt --all -- --check                                     -> sạch
 pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json        -> passed: true, failures: [] (lần chạy đầu)
 pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1       -> PTY_EXIT: 0, 16 passed; 0 failed (22.85 s)
+pwsh -NoProfile -File scripts/Install-Ha.ps1                   -> INSTALL_EXIT 0 (release)
+  C:\Users\duong\.cargo\bin\ha.exe SHA-256
+    59c3b88025483bd41ed3e91f20ef6dc434a8a32401e2166250c6ab67062a2c18
+  PTY i14 trên artifact mới cài                                -> PTY_EXIT: 0, ca xanh
+paid smoke qua binary đã cài (prompt buộc markdown)             -> SMOKE_EXIT: 0 after 2 s,
+                                                                  SMOKE_STOP: final, độ dài 710
 ```
 
-Hai lần đỏ PTY giữa lượt, ghi lại đầy đủ:
+Ba lần đỏ gặp trong lượt, ghi lại đầy đủ:
 
 | Lần | Ca đỏ | Đọc được gì | Phân loại |
 |---|---|---|---|
-| 1 | `t07_pty_plain_flag` | Cây **chưa build được**: `Modal` chưa được import trong `composer.rs` (lỗi E0433 của chính lượt này) | Lỗi thật của lượt này — đã sửa, xanh ở lần chạy sau |
+| 1 | `t07_pty_plain_flag` | Cây **chưa build được**: `Modal` chưa được import trong `composer.rs` (lỗi E0433 của chính lượt này) | Lỗi thật của lượt này — đã sửa |
 | 2 | `i14_the_installed_artifact_opens_the_app_in_a_real_terminal` | Assert cuối `transcript.ends_with("\r\n")` (`interactive_terminal.rs:694`); chạy **một mình** ca đó cho `PTY_EXIT: 0` | Flake console: lần đọc cuối của PTY giành với lúc tiến trình thoát. **Không** nới assertion |
+| 3 | `i13_resume_continues_the_task_with_recovered_context_and_no_rerun` (trong gate) | `error sending request for url (http://127.0.0.1:59208/chat/completions)`, ca chạy 40.77 s; chạy **một mình** xanh **4/4** | Flake loopback dưới tải — xem 13.2b |
+
+### 13.2b. Flake loopback thứ ba: `i13_resume_...` — đã sửa
+
+Đây là **cùng một họ** với ba flake loopback đã sửa trước đó (mục 12.2 và SPEC 3e.4): máy này thỉnh
+thoảng từ chối một kết nối tới listener **đã** bind và đang accept, khi cả workspace chạy nặng.
+
+Khác biệt so với ba lần trước: `i13` chạy `ha chat --headless --resume` như một **tiến trình thật**,
+nên bậc thử lại trong `harness-providers` (chỉ có trong tiến trình test) **không** che được nó.
+Fixture `sse_fixture_multi` thì đã đúng: nó đếm "request thật" và bỏ qua probe, nên **không** bị
+tiêu mất response.
+
+Sửa: bậc thử lại đặt ở phía test, đúng cách `phase_p2` đã làm.
+
+```text
+const LOOPBACK_ATTEMPTS: usize = 10;   // backoff 50 ms × 2^min(attempt, 6)
+điều kiện thử lại: code() != 0 && stderr chứa "error sending request for url"
+```
+
+Hệ quả phải kiểm: một lỗi **thật** (protocol, 4xx, JSON hỏng) không khớp chữ ký đó nên vẫn đỏ ngay
+lần đầu; oracle `requests.len() == 2` của ca vẫn nguyên vẹn vì fixture chỉ đếm request thật.
+
+Số đo: **3/3** lần chạy liên tiếp cả `interactive_launch` xanh (34.07 s / 34.49 s / 34.73 s), sau đó
+gate `failures: []`. Trước khi sửa: 1 đỏ trong 2 lần chạy gate.
 
 ### 13.3. **Không** được chứng minh (đọc kỹ trước khi báo cáo)
 
@@ -602,8 +634,14 @@ Hai lần đỏ PTY giữa lượt, ghi lại đầy đủ:
   qua `ScriptedRenderer` ở **100×30** và đếm `path=src/parser.rs` xuất hiện **đúng một** lần, đồng
   thời khẳng định live block nhường vùng trên cho panel. Đây là **khung hình của `TestBackend`**,
   không phải của ConPTY — nhưng nó là **cùng một** hàm `draw_state` mà đường TUI thật gọi.
-- **Chưa đo trên console thật với `**` trong câu trả lời của model thật.** Ca PTY `t06_pty_approval_y_key`
-  và `t01_tui_opens_with_status_and_composer` xanh, nhưng không ca nào bắt model trả về markdown có
-  emphasis. Việc còn lại: một lần `ha chat` thật, hỏi câu trả lời có `**đậm**`, đọc màn hình.
+- **Đường markdown thì đã có chữ thật của model làm bằng chứng.** Paid smoke ở 13.2 trả về đúng
+  `**bold**` cộng một đoạn văn dài, và test
+  `t04_a_real_answer_loses_no_marker_and_no_word` dùng **nguyên văn** câu trả lời đó ở width 72:
+  khẳng định không còn `**` trên màn hình, mọi dòng ≤ 72 cell, và mọi từ còn đủ theo thứ tự. Cái
+  **chưa** đo được là khung hình ConPTY của chính lượt chat đó — nhưng nội dung đầu vào đã là chữ
+  thật, không phải chữ tự nghĩ ra.
 - **Bề rộng wrap lấy từ `area.width` của khung**, nên hành vi ở console hẹp (< 60 cột) không được
   đo: dưới ngưỡng đó app chuyển sang plain (mục 8), nên đường wrap của TUI không chạy.
+- **Bậc thử lại của `i13` không có ca âm chứng minh nó không che lỗi thật.** Lập luận là đọc code
+  (chỉ khớp đúng chuỗi `error sending request for url`), **không** phải một ca đỏ cố ý. Đây là cùng
+  mức bằng chứng với ba flake loopback trước đó.

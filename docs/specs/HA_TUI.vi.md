@@ -671,6 +671,14 @@ tui::tests::t06_a_pending_approval_frame_holds_one_copy_of_the_proposal         
 composer::tests::t03_the_hint_names_the_keys_of_the_panel_that_is_open          -> ok
 ```
 
+### 3f.3. Chữ thật của model là đầu vào của test, không phải chữ tự nghĩ ra
+
+Một paid turn thật (prompt buộc markdown) trả về đúng `**bold**` cộng một đoạn văn dài 710 ký tự.
+Đó chính là hình dạng câu trả lời đã sinh ra cả hai lỗi trong ảnh, nên nó được đóng thành test
+`t04_a_real_answer_loses_no_marker_and_no_word`: nguyên văn câu trả lời đó, ở width **72** (console
+hẹp — nơi lỗi xuất hiện), khẳng định (a) không còn `**` trên màn hình, (b) mọi dòng ≤ 72 cell —
+tức terminal không còn gì để cắt, (c) mọi từ còn đủ và đúng thứ tự.
+
 ## 4. Kiến trúc chốt cho T02–T08
 
 Theo plan mục 4, với hai điều chỉnh đã đo:

@@ -403,4 +403,43 @@ mod tests {
         let expected: Vec<&str> = paragraph.split_whitespace().collect();
         assert_eq!(words, expected, "no word may be lost or reordered");
     }
+
+    /// The exact text a live paid turn returned on 20/09/2026, when asked to answer
+    /// with `**bold**` followed by a long line of prose. Both defects in the report
+    /// came from *this* shape of answer: the markers were printed and the prose row
+    /// was clipped by the terminal. Pinning the real bytes is what keeps the fix
+    /// honest - a synthetic one-liner would not have caught either.
+    #[test]
+    fn t04_a_real_answer_loses_no_marker_and_no_word() {
+        let answer = "**bold**\n\nThe morning light filtered through the tall windows as the team gathered around the worn wooden table, laptops open and coffee cups steaming. They had spent weeks preparing for this moment, refining every detail, testing each assumption, and questioning the parts that felt too easy. Now the room filled with a quiet energy, the kind that precedes something meaningful. Someone sketched diagrams on the whiteboard while another typed notes in rapid bursts. Outside, traffic hummed and birds crossed the pale sky, indifferent to the work happening indoors. The conversation moved between problem and possibility, and slowly a shape emerged from the noise, clear enough to follow. They agreed to begin.";
+        // A narrow console, which is where the report came from.
+        let width = 72;
+        let rendered = render(answer, width, &Theme::plain());
+        let visible = plain_text(&rendered);
+
+        assert!(
+            !visible.contains("**"),
+            "the markers must not reach the screen: {visible}"
+        );
+        assert!(
+            visible.starts_with("bold"),
+            "the emphasised word stays: {visible}"
+        );
+        for line in &rendered {
+            let cells = crate::interactive::tui::widgets::composer::display_width(&plain_text(
+                std::slice::from_ref(line),
+            ));
+            assert!(
+                cells <= usize::from(width),
+                "a prose row was left for the terminal to clip: {cells} > {width}"
+            );
+        }
+        // Every word of the answer is still readable, in order.
+        let words: Vec<&str> = visible.split_whitespace().collect();
+        let expected: Vec<&str> = answer
+            .split_whitespace()
+            .map(|word| word.trim_matches('*'))
+            .collect();
+        assert_eq!(words, expected, "the answer must survive wrapping intact");
+    }
 }

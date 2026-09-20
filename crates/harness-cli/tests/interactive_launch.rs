@@ -13,6 +13,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+/// How many times a headless turn is retried for a refused loopback connection.
+///
+/// This machine intermittently refuses a connection to a listener that is already
+/// bound and accepting, and the refusal reaches a real child process as
+/// `provider_protocol: ... error sending request for url`. The retry is keyed on that
+/// exact text only, so a genuine protocol failure still fails on the first attempt.
+const LOOPBACK_ATTEMPTS: usize = 10;
+
 /// Resolve the compiled ha executable this crate produced.
 fn cli_binary() -> PathBuf {
     if let Some(path) = option_env!("CARGO_BIN_EXE_ha") {
@@ -630,7 +638,25 @@ fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
     };
     let run_turn = |arguments: Vec<&str>| CliRun::from_output(&run_headless(arguments));
 
-    let first = run_turn(vec![
+    // A refused loopback connection is a property of this host, not of the resume
+    // contract under test, so the turn is retried for that signature alone. The
+    // fixture below keeps accepting and counts only real requests, so a retry cannot
+    // consume the scripted answer.
+    let run_turn_reliably = |arguments: Vec<&str>| {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let run = run_turn(arguments.clone());
+            let refused = run.stderr.contains("error sending request for url");
+            if run.code() == 0 || !refused || attempt >= LOOPBACK_ATTEMPTS {
+                return run;
+            }
+            // Under load the refusal can persist for a few hundred milliseconds.
+            std::thread::sleep(Duration::from_millis(50 * (1 << attempt.min(6))));
+        }
+    };
+
+    let first = run_turn_reliably(vec![
         "chat",
         "--headless",
         "--prompt",
@@ -648,7 +674,7 @@ fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
     assert_eq!(first_json["tool_calls"], serde_json::Value::from(0));
     assert_eq!(first_json["resumed_from"], serde_json::Value::Null);
 
-    let second = run_turn(vec![
+    let second = run_turn_reliably(vec![
         "chat",
         "--headless",
         "--resume",

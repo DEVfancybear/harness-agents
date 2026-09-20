@@ -630,18 +630,54 @@ qua `ScriptedRenderer`, đếm `path=src/parser.rs` xuất hiện **đúng 1** l
 ### 15.3. Số đo của lượt này
 
 ```text
-cargo test -p harness-cli --bin ha --locked              -> 187 passed; 0 failed
+cargo test -p harness-cli --bin ha --locked              -> 188 passed; 0 failed
+cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1
+                                                          -> 18 passed; 0 failed  (3 lần liên tiếp)
 cargo clippy --workspace --all-targets --locked -- -D warnings -> sạch
 cargo fmt --all -- --check                               -> sạch
 pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json  -> passed: true, failures: []  (lần chạy đầu)
 pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -> PTY_EXIT: 0, 16 passed; 0 failed (22.85 s)
+cài thật (release, -SkipBuild không dùng):
+  pwsh -NoProfile -File scripts/Install-Ha.ps1           -> INSTALL_EXIT 0
+  C:\Users\duong\.cargo\bin\ha.exe SHA-256
+    59c3b88025483bd41ed3e91f20ef6dc434a8a32401e2166250c6ab67062a2c18
+  PTY i14 trên artifact **mới cài**: PTY_EXIT: 0, ca xanh
+paid smoke qua binary đã cài, prompt buộc markdown:
+  -> SMOKE_EXIT: 0 after 2 s · SMOKE_STOP: final · SMOKE_RESPONSE_LENGTH: 710
+     model trả về **bold** + một đoạn văn dài -> xác nhận ** là chữ model thật viết
 ```
 
-Hai lần chạy PTY giữa lượt **có đỏ**, và cả hai đều là flake console, không phải hồi quy:
+Hai lần chạy PTY giữa lượt **có đỏ**, và cả hai đều không phải hồi quy của bản sửa:
 
 | Lần | Ca đỏ | Đọc transcript | Kết luận |
 |---|---|---|---|
 | 1 | `t07_pty_plain_flag` | Lúc đó cây **chưa build được** (`Modal` chưa import trong `composer.rs`) — lỗi của chính lượt này, đã sửa | Lỗi thật, đã sửa |
-| 2 | `i14_the_installed_artifact_opens_the_app_in_a_real_terminal` | Assert cuối `transcript.ends_with("\r\n")`; chạy **một mình** ca đó `PTY_EXIT: 0` | Flake console: lần đọc cuối giành với lúc tiến trình thoát. **Không** nới assertion |
+| 2 | `i14_the_installed_artifact_opens_the_app_in_a_real_terminal` | Assert cuối `transcript.ends_with("\r\n")`; chạy **một mình** ca đó `PTY_EXIT: 0` | Flake console: lần đọc cuối của PTY giành với lúc tiến trình thoát. **Không** nới assertion |
 
-Lần chạy đủ 16 ca ngay sau đó xanh hết, và gate `failures: []` ở lần chạy đầu.
+Lần chạy đủ 16 ca ngay sau đó xanh hết, và gate lần chạy đầu sau khi vá `i13` cũng xanh.
+
+### 15.4. Flake thứ ba của loopback — `i13_resume_...` (đã sửa)
+
+Gate lần chạy **thứ hai** của lượt này đỏ ở `acceptance-launch`, ca chạy 40.77 s:
+
+```text
+provider_protocol: provider_protocol: provider_protocol: provider request failed:
+  error sending request for url (http://127.0.0.1:59208/chat/completions)
+left: 1   right: 0        (interactive_launch.rs:660)
+```
+
+Chạy **một mình** ca đó: xanh **4/4 lần liên tiếp**. Nghĩa là đỏ chỉ xuất hiện dưới tải cả suite —
+đúng họ với ba flake loopback đã sửa trước đó (SPEC 3e.4), không phải hồi quy.
+
+**Sửa, cùng cách đã dùng ở `phase_p2`:** `i13` chạy `ha chat --headless --resume` như một **tiến
+trình thật**, và tiến trình thật **không** có bậc thử lại nào; fixture `sse_fixture_multi` thì vẫn
+nhận kết nối nên **không** bị tiêu mất response. Vì vậy bậc thử lại được đặt ở phía test:
+
+- `LOOPBACK_ATTEMPTS = 10`, backoff `50 ms × 2^min(attempt, 6)` — cùng công thức đã dùng.
+- **Chỉ** thử lại khi `code() != 0` **và** stderr chứa đúng `error sending request for url`. Một
+  lỗi thật (protocol, 4xx, JSON hỏng) vẫn đỏ ngay lần đầu.
+- Fixture **không** đổi: nó đã đếm đúng "request thật" và bỏ qua probe, nên `requests.len() == 2`
+  vẫn là oracle nguyên vẹn.
+
+Số đo sau khi sửa: **3/3 lần chạy liên tiếp** cả suite `interactive_launch` xanh (34.07 s, 34.49 s,
+34.73 s), rồi gate `failures: []`.
