@@ -371,8 +371,28 @@ mod tests {
 
     /// I10 core: text must be visible while the server is still holding the
     /// response open. A buffered provider cannot pass this test.
+    ///
+    /// The body is framed with chunked transfer encoding rather than delimited by
+    /// closing the connection. Closing is what let this test fail intermittently
+    /// with `error decoding response body`: the client could not tell a finished
+    /// body from a dropped connection, so a close that arrived as a reset looked
+    /// like a truncated response. With an explicit end-of-body chunk the client
+    /// knows where the body ends and the close stops carrying meaning.
     fn sse_fixture_response_head() -> &'static [u8] {
-        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    }
+
+    /// One chunk: the size in hex, the payload, then CRLF.
+    fn chunk(payload: &[u8]) -> Vec<u8> {
+        let mut framed = format!("{:x}\r\n", payload.len()).into_bytes();
+        framed.extend_from_slice(payload);
+        framed.extend_from_slice(b"\r\n");
+        framed
+    }
+
+    /// The last chunk: zero length, then the empty trailer.
+    fn last_chunk() -> &'static [u8] {
+        b"0\r\n\r\n"
     }
 
     fn sse_fixture_first_delta() -> &'static [u8] {
@@ -399,25 +419,30 @@ mod tests {
             .await
             .expect("fixture writes the head");
         socket
-            .write_all(sse_fixture_first_delta())
+            .write_all(&chunk(sse_fixture_first_delta()))
             .await
             .expect("fixture writes the first delta");
         socket.flush().await.expect("fixture flushes");
         // Barrier: the body stays open until the client has seen the delta.
         let _ = released.await;
         socket
-            .write_all(sse_fixture_rest())
+            .write_all(&chunk(sse_fixture_rest()))
             .await
             .expect("fixture writes the rest");
+        socket
+            .write_all(last_chunk())
+            .await
+            .expect("fixture ends the body");
+        socket.flush().await.expect("fixture flushes the end");
         socket
             .shutdown()
             .await
             .expect("fixture half-closes response");
-        // Keep the accepted socket alive until reqwest consumes the final SSE
-        // bytes. Dropping both halves immediately after shutdown can surface as an
-        // intermittent `error decoding response body` on Windows.
+        // Keep the accepted socket alive a moment past the end-of-body chunk, so a
+        // close cannot race the client's last read. The body is already complete,
+        // so this is belt and braces rather than the thing that makes it correct.
         let mut trailing = [0_u8; 256];
-        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        let _ = tokio::time::timeout(Duration::from_millis(500), async {
             loop {
                 match socket.read(&mut trailing).await {
                     Ok(0) | Err(_) => break,
