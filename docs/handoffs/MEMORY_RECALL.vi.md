@@ -254,14 +254,55 @@ Review cũng **xác nhận đúng** những chỗ trông đáng ngờ mà không
 bind tham số, `covers()` khớp mirror FTS, tên field `json_extract`, OR 32 term, `relevance_for`, và
 sqlx `Drop` rollback (nên early return sau `begin_write` không rò transaction — tôi đã tự kiểm lại).
 
-### 7.7. Việc còn lại
+### 7.7. Tám phát hiện M1–M8 đã đóng — commit `eb32a4d`
 
-1. **Tám phát hiện M1–M8 ở §7.6** — chưa sửa. M4 (uỷ quyền `bind` thay vì `publish`, và load trước
-   khi kiểm) và M7 (turn record che directive) là hai chỗ tôi cho là đáng làm trước.
-2. Chưa cập nhật `docs/MEMORY_AND_CONTINUITY.vi.md`: thay đổi này mở rộng memory từ "chỉ dẫn người
-   dùng" sang "nhật ký hội thoại", tức một quyết định hợp đồng cần ghi lại.
-3. Chưa có test cho `search_terms` với term chứa `"` (M8), cho scope/authorization của
-   `find_active_memory_by_content` (M3), và cho fallback `AND` thành công (đường đó chỉ được chạy
-   trên store rỗng).
-4. `attachments.rs` của writer khác đã được họ commit (`62e3f98`); blocker mà review báo đã tự hết
+Cả tám đều đã sửa. Hai trong số đó hoá ra là **câu hỏi hợp đồng** chứ không phải bug, nên chúng được
+viết thành văn bản ở `docs/MEMORY_AND_CONTINUITY.{vi,en}.md` §19 thay vì để người đọc code sau tự
+quyết.
+
+| # | Đã sửa thế nào | Bằng chứng |
+|---|---|---|
+| M1 | `search_store` trả `Result<Option<..>>`: `Err` là từ chối và đi tiếp như từ chối, `Ok(None)` là outage, `Ok(Some)` là câu trả lời kể cả rỗng | nhánh chết đã thành nhánh sống; `search_memory` từ chối thì `recall` báo lỗi thay vì "không khớp" |
+| M2 | Revision của fallback **thay** revision của lần đọc đầu, kèm comment nói vì sao (runtime revalidate rồi drop âm thầm) | test fallback `AND` mới chạy đúng đường đó |
+| M3 | `find_active_memory_by_content` dùng đúng predicate scope + reachability của search (kể cả NULL-tolerance và grant `search`) | test mới: cùng text ở project khác phải trả `None`; bỏ predicate project thì test đỏ |
+| M4 | `append_memory_version_source` uỷ quyền bằng `publish` **trước** khi load | không còn principal bind-only chèn event vào version của người khác |
+| M5 | `prune_turns` có trần `PRUNE_PER_TURN = 8`, và lỗi prune (hoặc ngưỡng không đạt được) trả `StoredButUnpruned` thay vì "nothing was stored" | test mới: batch 1 thu hồi đúng 1, ba lần nữa chạm ngưỡng, lần thứ tư không thu hồi quá |
+| M6 | Hai nửa: `derive_l2` và `write_version` **từ chối** bản ghi lượt làm nguồn; và lượt thu hồi **pin** bản ghi đang là nguồn của asset còn sống, báo lại số pinned | test mới: một cạnh phụ thuộc cũ ⇒ `(retired, pinned) == (0, 1)`, bản ghi và asset dẫn xuất vẫn đọc được |
+| M7 | Đường từ khóa hỏi **durable memory trước**, chỉ hỏi nhật ký khi durable rỗng, và nói rõ khi nhật ký trả lời (`MemoryIndex`) | test mới: ba turn record + một directive ⇒ directive là câu trả lời; **đã kiểm ngược** bằng cách bỏ exclusion, lúc đó ba bản ghi log được inject trước directive |
+| M8 | `search_terms` normalize lại term của caller, nên `"` chỉ là ký tự | test mới với `"zebra quasar"`, `zebra*`, `NEAR(...)`, `zebra"`; bỏ normalization thì `storage_open_failed: unterminated string` |
+
+**Quyết định hợp đồng (M6, M7), ghi ở §19 của `MEMORY_AND_CONTINUITY`:**
+
+- Bản ghi lượt là **mục log**, không phải nguồn của tri thức bền: cả `summarize` lẫn semantic merge
+  từ chối nó kèm lý do, và ngưỡng retention không được phép xoá tri thức ⇒ bản ghi đang bị phụ thuộc
+  thì **pin** và được báo lại (`stored_but_unpruned`) chứ không im lặng giữ log vô hạn.
+- **Hai loại vật liệu, hai chỉ mục**: câu hỏi về chủ đề hỏi durable memory trước rồi mới tới nhật ký;
+  câu hỏi *về* cuộc hội thoại đi đường recency. Trước đây hai thứ được hỏi cùng lúc nên chỉ dẫn của
+  người dùng phải cạnh tranh với chính tiếng vọng của nó.
+
+**Bằng chứng của lượt này:**
+
+- 232 unit test (trước là 212). Tám test mới đều được **kiểm ngược**: bỏ từng fix thì test tương ứng
+  đỏ (đã chạy lại cho M3, M7, M8; M5/M6 kiểm bằng giá trị `(retired, pinned)` và `retries`).
+- `phase_p0..p7` 148/148, `interactive_launch` 18/18, `interactive_session` 13/13.
+- Gate `scripts/Verify-HaLaunch.ps1 -Json`: `failures: []` (lưu ở `target/verification/gate-m1-m8.json`).
+- `scripts/Verify-P4Mutations.ps1`: `P4_MUTATIONS_OK: 5/5 killed` — literal normalization vẫn duy nhất.
+- PTY: lần chạy đầu 16/17, `i13` đỏ vì `error sending request for url (http://127.0.0.1:55607/...)` —
+  mock provider loopback của chính test, không liên quan tới memory (transcript giữ ở
+  `target/pty-acceptance/pty-round1-i13-flake.txt`); chạy lại **17/17 xanh**.
+- Smoke trả tiền, hai lượt thật với `HA_MEMORY=on` (binary debug, project tạm):
+  lượt 1 lưu directive (`stored_disposition: stored`) + turn record; lượt 2 ở session mới
+  (`state: found`, `1 hit(s), 1 block(s) injected`, message dạng **durable** chứ không phải log) và
+  model trả lời đúng `zebra-quasar-7719`. Hai asset của probe đã được `ha memory invalidate` kèm lý do;
+  `search` sau đó trả `no_term_overlap`.
+
+### 7.8. Việc còn lại
+
+1. `docs/MEMORY_AND_CONTINUITY.{vi,en}.md` §19 và `docs/OPERATOR_GUIDE.{vi,en}.md` §12.5 đã cập nhật
+   theo hợp đồng mới (đã xong trong `eb32a4d`).
+2. Bài học còn để ngỏ, không phải lỗi: `answered:` chỉ giữ 200 ký tự, nên một câu trả lời dài chỉ
+   vào được nhật ký ở dạng trích đoạn. Nếu sau này cần trả lời câu hỏi *về nội dung* câu trả lời cũ,
+   đó là một tính năng mới (L2 từ hội thoại), không phải chỗ sửa của lượt này.
+3. `attachments.rs` của writer khác đã được họ commit (`62e3f98`); blocker mà review báo đã tự hết
    trước khi tôi kịp xử.
+4. Linux build/run vẫn chưa kiểm (phiên này chỉ có Windows x64), như mọi lượt trước.
