@@ -959,7 +959,6 @@ impl RuntimeService {
                 checkpoint_id: format!("checkpoint-{}", recovery.replayed_through_sequence),
                 through_event_seq: recovery.replayed_through_sequence,
                 recovery,
-                system_policy: request.system_policy.clone(),
                 project_rules: Vec::<ContextBlock>::new(),
                 optional_blocks: request
                     .memory

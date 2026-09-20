@@ -257,9 +257,12 @@ pub fn assemble_stream(events: &[ProviderStreamEvent]) -> Result<ProviderRespons
             ProviderStreamEvent::Started { .. } => {}
         }
     }
-    let incomplete_tool_calls = calls
-        .values()
-        .any(|call| serde_json::from_str::<Value>(&call.arguments).is_err());
+    // A call with no name or with arguments that never completed JSON cannot be
+    // executed; the flag is what lets a caller refuse the whole response instead of
+    // reporting one confusing tool failure per fragment.
+    let incomplete_tool_calls = calls.values().any(|call| {
+        call.name.trim().is_empty() || serde_json::from_str::<Value>(&call.arguments).is_err()
+    });
     Ok(ProviderResponse {
         text,
         finish_reason,
@@ -537,9 +540,20 @@ impl ModelProvider for DeepSeekAdapter {
     }
 }
 
+/// Identity a fragment gets when the stream never announced one.
+const DEFAULT_TOOL_CALL_ID: &str = "tool-call";
+
 #[derive(Default)]
 pub struct SseDecoder {
     buffer: Vec<u8>,
+    /// Call identity announced for each streamed tool-call `index`.
+    ///
+    /// The fragment that opens a call carries `id` and `function.name`; every later
+    /// fragment of the same call carries `index` and `function.arguments` only, so
+    /// the index is the only field that identifies the call for the whole stream.
+    tool_call_ids: BTreeMap<u64, String>,
+    /// Call the most recent fragment belonged to, for a stream that omits `index`.
+    last_tool_call_id: Option<String>,
 }
 
 impl SseDecoder {
@@ -587,7 +601,7 @@ impl SseDecoder {
             if data == "[DONE]" {
                 output.push(ProviderStreamEvent::completed("stop"));
             } else {
-                output.push(parse_sse_payload(&data)?);
+                output.extend(self.frame_events(&data)?);
             }
         }
         if final_chunk && !self.buffer.iter().all(u8::is_ascii_whitespace) {
@@ -600,48 +614,324 @@ impl SseDecoder {
     }
 }
 
-fn parse_sse_payload(data: &str) -> Result<ProviderStreamEvent, ProviderError> {
-    let value: Value = serde_json::from_str(data).map_err(|error| {
-        ProviderError::new(
-            ErrorCode::ProviderProtocol,
-            format!("malformed provider SSE JSON: {error}"),
-        )
-    })?;
-    let choice = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .ok_or_else(|| {
+impl SseDecoder {
+    /// Every event one SSE `data:` payload carries, in wire order.
+    ///
+    /// A frame can carry prose and tool-call fragments together, so nothing is
+    /// dropped in favour of the first match. A frame with neither is the terminal
+    /// one when it names a reason, and an empty text delta otherwise, which is what
+    /// the P2 boundary already reported for such a frame.
+    fn frame_events(&mut self, data: &str) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
+        let value: Value = serde_json::from_str(data).map_err(|error| {
             ProviderError::new(
                 ErrorCode::ProviderProtocol,
-                "provider SSE frame has no choice",
+                format!("malformed provider SSE JSON: {error}"),
             )
         })?;
-    let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
-    if let Some(content) = delta.get("content").and_then(Value::as_str) {
-        return Ok(ProviderStreamEvent::text(content));
+        let choice = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .ok_or_else(|| {
+                ProviderError::new(
+                    ErrorCode::ProviderProtocol,
+                    "provider SSE frame has no choice",
+                )
+            })?;
+        let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
+        let mut events = Vec::new();
+        if let Some(content) = delta.get("content").and_then(Value::as_str) {
+            events.push(ProviderStreamEvent::text(content));
+        }
+        if let Some(fragments) = delta.get("tool_calls").and_then(Value::as_array) {
+            for fragment in fragments {
+                events.push(self.tool_call_fragment(fragment));
+            }
+        }
+        // A terminal frame can carry the last of the answer with it, so the reason is
+        // reported in addition to that content: taking whichever came first dropped
+        // `finish_reason` from every frame that also carried prose or a fragment. A
+        // frame with neither stays what it always was — the terminal event when it
+        // names a reason, an empty text delta otherwise.
+        match choice.get("finish_reason").and_then(Value::as_str) {
+            Some(reason) => events.push(ProviderStreamEvent::completed(reason)),
+            None if events.is_empty() => events.push(ProviderStreamEvent::text("")),
+            None => {}
+        }
+        Ok(events)
     }
-    if let Some(tool) = delta
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-    {
-        let function = tool.get("function").cloned().unwrap_or_else(|| json!({}));
-        return Ok(ProviderStreamEvent::tool_delta(
-            tool.get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("tool-call"),
+
+    /// One streamed tool-call fragment, stamped with the identity of its call.
+    ///
+    /// The measured `DeepSeek` stream (OpenAI-compatible) opens a call with a frame
+    /// that carries `index`, `id` and `function.name`, and then sends one frame per
+    /// argument fragment carrying `index` and `function.arguments` only. Reading the
+    /// id off each frame therefore turned one call into two — a named call with no
+    /// arguments and an anonymous call holding them — and both were rejected by the
+    /// execution gate, at 0 ms, as `provider_protocol` and `policy_denied`. `index`
+    /// is present for the whole call, so the announced id is remembered per index
+    /// and stamped onto every later fragment.
+    fn tool_call_fragment(&mut self, fragment: &Value) -> ProviderStreamEvent {
+        let announced = fragment
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        let index = fragment.get("index").and_then(Value::as_u64);
+        let call_id = match (index, announced) {
+            (Some(index), Some(id)) => {
+                self.tool_call_ids.insert(index, id.to_owned());
+                id.to_owned()
+            }
+            // A continuation fragment: only the index says which call it belongs to.
+            (Some(index), None) => self
+                .tool_call_ids
+                .entry(index)
+                .or_insert_with(|| format!("{DEFAULT_TOOL_CALL_ID}-{index}"))
+                .clone(),
+            (None, Some(id)) => id.to_owned(),
+            // Neither field: the fragment continues the call announced most
+            // recently, and only a stream that never announced one keeps the
+            // historical placeholder, which the gate then reports as malformed.
+            (None, None) => self
+                .last_tool_call_id
+                .clone()
+                .unwrap_or_else(|| DEFAULT_TOOL_CALL_ID.to_owned()),
+        };
+        self.last_tool_call_id = Some(call_id.clone());
+        let function = fragment
+            .get("function")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        ProviderStreamEvent::tool_delta(
+            call_id,
             function.get("name").and_then(Value::as_str).unwrap_or(""),
             function
                 .get("arguments")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
-        ));
+        )
     }
-    if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-        return Ok(ProviderStreamEvent::completed(reason));
+}
+
+#[cfg(test)]
+mod sse_tool_call_tests {
+    use super::{ProviderStreamEvent, SseDecoder, assemble_stream};
+    use serde_json::json;
+
+    /// The measured wire shape of one call: this frame opens it, and the argument
+    /// fragments that follow carry `index` and `arguments` only.
+    const OPENING_FRAME: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":null,\"tool_calls\":[{\"index\":0,",
+        "\"id\":\"call_00_aDELHVxEkgZ5FfVqhk7K7693\",\"type\":\"function\",",
+        "\"function\":{\"name\":\"list_files\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n"
+    );
+
+    /// One continuation fragment, spelled the way the provider spelled it.
+    fn argument_frame(arguments: &str) -> String {
+        let payload = json!({
+            "choices": [{
+                "delta": {"tool_calls": [{"index": 0, "function": {"arguments": arguments}}]},
+                "finish_reason": null,
+            }],
+        });
+        format!("data: {payload}\n\n")
     }
-    Ok(ProviderStreamEvent::text(""))
+
+    fn tool_events(events: &[ProviderStreamEvent]) -> Vec<(&str, &str, &str)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderStreamEvent::ToolCallDelta {
+                    call_id,
+                    name,
+                    arguments,
+                } => Some((call_id.as_str(), name.as_str(), arguments.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Regression: one call fragmented over ten frames stayed one call.
+    ///
+    /// Reading the id off each frame made two calls out of this — `list_files` with
+    /// no arguments and an anonymous call holding `{"path": "."}` — and the gate
+    /// rejected both at 0 ms, which is the failure a user saw as two red tool cards.
+    /// The bytes are also fed in chunks that cut frames apart, because a real socket
+    /// does not deliver frames.
+    #[test]
+    fn sse_fragments_of_one_call_keep_one_identity() {
+        let mut wire = String::from(OPENING_FRAME);
+        for fragment in ["{", "\"", "path", "\"", ": ", "\"", ".", "\"", "}"] {
+            wire.push_str(&argument_frame(fragment));
+        }
+        let mut decoder = SseDecoder::new();
+        let mut events = Vec::new();
+        for chunk in wire.as_bytes().chunks(7) {
+            events.extend(decoder.feed(chunk).expect("frames decode"));
+        }
+        events.extend(decoder.finish().expect("the stream ends"));
+
+        let fragments = tool_events(&events);
+        assert_eq!(fragments.len(), 10, "one fragment per frame: {events:?}");
+        assert_eq!(
+            fragments[0].1, "list_files",
+            "the opening frame names the call"
+        );
+        for (call_id, _, _) in &fragments {
+            assert_eq!(
+                *call_id, "call_00_aDELHVxEkgZ5FfVqhk7K7693",
+                "every fragment must belong to the announced call: {events:?}"
+            );
+        }
+
+        let response = assemble_stream(&events).expect("normalized response");
+        assert_eq!(
+            response.tool_calls.len(),
+            1,
+            "one call, not one per fragment: {:?}",
+            response.tool_calls
+        );
+        assert_eq!(response.tool_calls[0].name, "list_files");
+        assert_eq!(response.tool_calls[0].arguments, "{\"path\": \".\"}");
+        assert!(!response.incomplete_tool_calls);
+    }
+
+    /// A frame that carries the end of the answer still reports why it ended.
+    ///
+    /// Taking the first match dropped `finish_reason` whenever the terminal frame also
+    /// carried prose or a tool fragment, so the normalized response lost the provider's
+    /// own statement about how the turn finished.
+    #[test]
+    fn sse_a_finish_reason_survives_the_content_that_rides_with_it() {
+        let mut decoder = SseDecoder::new();
+        let prose = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n";
+        let events = decoder.feed(prose.as_bytes()).expect("the frame decodes");
+        assert_eq!(
+            events,
+            vec![
+                ProviderStreamEvent::text("done"),
+                ProviderStreamEvent::completed("stop")
+            ],
+            "{events:?}"
+        );
+
+        let fragment = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_e\",",
+            "\"function\":{\"name\":\"git_status\",\"arguments\":\"{}\"}}]},",
+            "\"finish_reason\":\"tool_calls\"}]}\n\n"
+        );
+        let mut decoder = SseDecoder::new();
+        let events = decoder
+            .feed(fragment.as_bytes())
+            .expect("the frame decodes");
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[1], ProviderStreamEvent::completed("tool_calls"));
+
+        // The shape that carries only the reason keeps producing only the terminal event.
+        let mut decoder = SseDecoder::new();
+        let terminal = decoder
+            .feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+            .expect("the frame decodes");
+        assert_eq!(terminal, vec![ProviderStreamEvent::completed("stop")]);
+    }
+
+    /// Two calls opened in one frame stay separate, and a continuation finds its own.
+    #[test]
+    fn sse_parallel_calls_in_one_frame_stay_separate() {
+        let opening = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}},",
+            "{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"search_text\",\"arguments\":\"\"}}",
+            "]},\"finish_reason\":null}]}\n\n"
+        );
+        let continuation = json!({
+            "choices": [{
+                "delta": {"tool_calls": [{"index": 1, "function": {"arguments": "{\"query\":\"x\"}"}}]},
+                "finish_reason": null,
+            }],
+        });
+        let mut decoder = SseDecoder::new();
+        let mut events = decoder.feed(opening.as_bytes()).expect("the opening frame");
+        events.extend(
+            decoder
+                .feed(format!("data: {continuation}\n\n").as_bytes())
+                .expect("the continuation frame"),
+        );
+
+        let response = assemble_stream(&events).expect("normalized response");
+        assert_eq!(response.tool_calls.len(), 2, "{:?}", response.tool_calls);
+        assert_eq!(response.tool_calls[0].call_id, "call_a");
+        assert_eq!(response.tool_calls[0].name, "read_file");
+        assert_eq!(response.tool_calls[0].arguments, "{\"path\":\"a.rs\"}");
+        assert_eq!(response.tool_calls[1].call_id, "call_b");
+        assert_eq!(response.tool_calls[1].name, "search_text");
+        assert_eq!(response.tool_calls[1].arguments, "{\"query\":\"x\"}");
+        assert!(!response.incomplete_tool_calls);
+    }
+
+    /// A frame that carries prose and a fragment keeps both.
+    #[test]
+    fn sse_prose_and_a_fragment_in_one_frame_are_both_kept() {
+        let frame = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"checking\",\"tool_calls\":[",
+            "{\"index\":0,\"id\":\"call_c\",\"function\":{\"name\":\"git_status\",\"arguments\":\"{}\"}}",
+            "]},\"finish_reason\":null}]}\n\n"
+        );
+        let mut decoder = SseDecoder::new();
+        let events = decoder.feed(frame.as_bytes()).expect("the frame decodes");
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0], ProviderStreamEvent::text("checking"));
+        assert_eq!(
+            events[1],
+            ProviderStreamEvent::tool_delta("call_c", "git_status", "{}")
+        );
+    }
+
+    /// An adapter that omits `index` still keeps one call: the id opens it and the
+    /// fragments after it continue the call that was announced most recently.
+    #[test]
+    fn sse_fragments_without_an_index_continue_the_announced_call() {
+        let opening = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_d\",",
+            "\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}]}\n\n"
+        );
+        let rest = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"function\":{\"arguments\":\"\\\"a.rs\\\"}\"}}]},\"finish_reason\":null}]}\n\n"
+        );
+        let mut decoder = SseDecoder::new();
+        let mut events = decoder.feed(opening.as_bytes()).expect("the opening frame");
+        events.extend(decoder.feed(rest.as_bytes()).expect("the rest"));
+
+        let response = assemble_stream(&events).expect("normalized response");
+        assert_eq!(response.tool_calls.len(), 1, "{:?}", response.tool_calls);
+        assert_eq!(response.tool_calls[0].call_id, "call_d");
+        assert_eq!(response.tool_calls[0].arguments, "{\"path\":\"a.rs\"}");
+        assert!(!response.incomplete_tool_calls);
+    }
+
+    /// A fragment that announces nothing is still reported as a malformed call,
+    /// so a stream this decoder cannot identify never looks executable.
+    #[test]
+    fn sse_an_anonymous_fragment_is_reported_as_incomplete() {
+        let frame = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+            "{\"function\":{\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n"
+        );
+        let mut decoder = SseDecoder::new();
+        let events = decoder.feed(frame.as_bytes()).expect("the frame decodes");
+        assert_eq!(
+            tool_events(&events),
+            vec![("tool-call", "", "{}")],
+            "{events:?}"
+        );
+        let response = assemble_stream(&events).expect("normalized response");
+        assert!(
+            response.incomplete_tool_calls,
+            "a call with no name cannot be executed: {:?}",
+            response.tool_calls
+        );
+    }
 }
 
 #[cfg(test)]

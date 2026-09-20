@@ -25,7 +25,7 @@ use harness_tools::{
     TurnLimits, TurnObserver, TurnOptions, TurnProgress, TurnStop, coding_tool_schemas,
     observe_workspace,
 };
-use harness_types::{ErrorCode, HostId, InputId, ProjectId, SessionId, TaskId};
+use harness_types::{ErrorCode, HostId, InputId, SessionId, TaskId};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
@@ -33,7 +33,9 @@ use super::bootstrap::{CREDENTIAL_VARIABLES, DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL, 
 use super::controller::{DEFAULT_APPROVAL_TIMEOUT, TurnBounds};
 use super::credentials::{self, CredentialSource};
 use super::events::{RunOutcome, SessionCandidate, SessionEvent};
+use super::memory;
 use super::paths::LaunchEnvironment;
+use super::project;
 
 #[cfg(test)]
 #[path = "service_completion_tests.rs"]
@@ -796,6 +798,22 @@ async fn run_turn(
         None => task_id,
     };
 
+    // A workspace root keeps one project identity, whether or not memory is on: a
+    // generated id per turn would put every project-scoped record this turn writes
+    // out of reach of the next one.
+    let project_id = match project::resolve_project_id(&store, &workspace_root).await {
+        Ok(project_id) => project_id,
+        Err(error) => {
+            send(SessionEvent::RecoverableError {
+                message: format!("project identity is unavailable: {error}"),
+            });
+            return;
+        }
+    };
+    let memory_on = memory::memory_requested_from_environment(&environment);
+    let memory_principal = memory_on
+        .then(|| memory::principal(project_id.clone(), task_id.clone(), session_id.clone()));
+
     let capabilities = ModelCapabilities {
         provider_id: "deepseek".to_owned(),
         model: config.model.clone(),
@@ -819,7 +837,7 @@ async fn run_turn(
             }
         };
 
-    let observation = match observe_workspace(ProjectId::generate(), &workspace_root) {
+    let observation = match observe_workspace(project_id, &workspace_root) {
         Ok(observation) => observation,
         Err(error) => {
             send(SessionEvent::RecoverableError {
@@ -842,13 +860,33 @@ async fn run_turn(
         ToolExecutionService::new(Arc::clone(&store)),
     );
     let run_request = RunRequest::new(
-        session_id,
+        session_id.clone(),
         task_id,
         request.input_id.clone(),
-        request.text,
+        request.text.clone(),
         observation,
     )
     .with_tool_schemas(coding_tool_schemas());
+    // Retrieval happens before dispatch, so the packet the runtime freezes carries
+    // the exact memory versions that were read.
+    let run_request = match &memory_principal {
+        Some(principal) => match memory::recall(Arc::clone(&store), principal, &request.text).await
+        {
+            Ok(recall) => {
+                send(SessionEvent::Notice {
+                    message: recall.message,
+                });
+                run_request.with_memory(recall.contribution)
+            }
+            Err(error) => {
+                send(SessionEvent::Notice {
+                    message: format!("memory: recall skipped ({error})"),
+                });
+                run_request
+            }
+        },
+        None => run_request,
+    };
     let options = TurnOptions {
         workspace_root,
         actor_id: "interactive.user".to_owned(),
@@ -878,6 +916,21 @@ async fn run_turn(
 
     // Release the writer before announcing the terminal event: the next turn takes
     // a newer generation of the task lease, and it must not race this one.
+    // Memory is written first: it reads the admitted input back from the journal and
+    // commits its asset under the write generation this turn already holds.
+    if outcome.is_ok()
+        && let Some(principal) = &memory_principal
+    {
+        match memory::remember_input(Arc::clone(&store), principal, &session_id).await {
+            Ok(Some(asset_id)) => send(SessionEvent::Notice {
+                message: format!("memory: stored this input as {asset_id}"),
+            }),
+            Ok(None) => {}
+            Err(error) => send(SessionEvent::Notice {
+                message: format!("memory: this input was not stored ({error})"),
+            }),
+        }
+    }
     drop(driver);
     drop(runtime);
     if let Ok(store) = Arc::try_unwrap(store) {

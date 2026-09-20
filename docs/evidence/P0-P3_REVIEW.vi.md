@@ -58,12 +58,38 @@ chạy thêm docs self-test cho báo cáo cuối.
 
 - **Cao — approval:** chưa gắn invocation/session/task vào binding; grant có
   thể khớp một proposal khác nếu actor/action/workspace giống nhau và chưa dùng.
-- **Cao — SSE:** parser chỉ lấy tool delta đầu tiên, không giữ ID theo index
-  khi các chunk sau thiếu ID. Cần fixture nhiều tool và nhiều chunk.
 - **Cao — compaction:** lấy sequence CAS sau khi dựng candidate, nên có thể
   nhận candidate cũ khi tail đã thay đổi; cần CAS theo source và rebase có giới hạn.
 - **Vừa — hủy process đang đợi:** đợi mutex rồi spawn trước khi chọn nhánh
   cancellation, nên tác vụ đã hủy vẫn có thể khởi chạy trong thời gian ngắn.
+
+### Sửa sau đó: danh tính tool call trong stream (finding 2 của review này)
+
+Finding thứ hai ở trên — `parse_sse_payload` chỉ lấy tool delta đầu tiên và rơi về
+`tool-call` khi frame thiếu ID — đã được sửa trong `crates/harness-providers/src/lib.rs`.
+Decoder giờ nhớ call id đã announce cho từng `index` trong stream và đóng dấu id đó lên
+mọi fragment sau, phát **mọi** fragment mà một frame mang, giữ cả prose lẫn fragment
+trong cùng frame; call không bao giờ có tên được báo là incomplete. Năm test hồi quy:
+`sse_fragments_of_one_call_keep_one_identity` và
+`sse_parallel_calls_in_one_frame_stay_separate` đã được đo **RED** với decoder cũ trước
+khi sửa (chúng tái hiện đúng ca đã đo: một call có tên nhưng rỗng arguments và một call
+ẩn danh giữ arguments), còn
+`sse_prose_and_a_fragment_in_one_frame_are_both_kept`,
+`sse_fragments_without_an_index_continue_the_announced_call` và
+`sse_an_anonymous_fragment_is_reported_as_incomplete` là control cho hành vi mà bản sửa
+không được đổi.
+
+Đo trên cây hiện tại: `cargo test -p harness-providers --locked` pass 13 test,
+`cargo test -p harness-cli --test phase_p2 --locked` pass 17, và
+`cargo test -p harness-cli --test interactive_session --locked` pass 10 (trong đó
+`g2_a_malformed_streamed_call_is_refused_with_its_own_reason` phủ phía driver từ chối).
+Bản sửa này **không** được coi là đã kiểm chứng bằng `scripts/Verify-P0P3Review.ps1`:
+entry point đó chép file review hiện tại đè lên baseline đóng băng
+`c9bb106cce67c5f0b7e3c02fafe1484e5f69d379`, và nó không còn build được ở đó — đo được
+`error[E0004]: non-exhaustive patterns: &CodingToolAction::ExternalTool { .. } not covered`
+vì `crates/harness-tools/src/contracts.rs` (thuộc danh sách owned) đã đi trước
+`crates/harness-tools/src/service.rs` của baseline. Entry point review cần baseline mới
+(hoặc danh sách owned rộng hơn) trước khi chạy lại được.
 
 Các mục này chưa sửa trong bộ thay đổi này. Vì vậy chưa thể kết luận toàn bộ
 P0–P3 đáp ứng đầy đủ hợp đồng. Runbook vẫn ghi `not started` vì là bản kế hoạch

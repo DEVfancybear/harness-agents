@@ -952,6 +952,30 @@ impl SqliteStore {
         rows.iter().map(decode_job).collect()
     }
 
+    /// The extraction jobs of one source stream.
+    ///
+    /// A stream is the host scope a caller may act on, so it is filtered here rather
+    /// than by every caller after the whole table has already been read.
+    pub async fn list_extraction_jobs_for_stream(
+        &self,
+        stream: &SessionId,
+    ) -> Result<Vec<StoredExtractionJobRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM memory_jobs WHERE source_stream = ? ORDER BY start_sequence",
+        )
+        .bind(stream.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "list extraction jobs of one stream",
+                error,
+            )
+        })?;
+        rows.iter().map(decode_job).collect()
+    }
+
     pub async fn recover_extraction_jobs(&self) -> Result<u64, StoreError> {
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;

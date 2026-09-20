@@ -338,7 +338,10 @@ async fn run_delegation(
     let store = open_writer(data_dir).await?;
     let workspace = Arc::new(WorkspaceManager::new(data_dir.join("delegation")));
     let root = workspace_root.unwrap_or_else(|| PathBuf::from("."));
-    let project_id = ProjectId::generate();
+    // One project identity per workspace root — the same one the interactive app and the
+    // memory commands resolve. A fresh id per invocation would put every worktree,
+    // artifact and memory this run writes out of reach of the next run.
+    let project_id = crate::interactive::project::resolve_project_id(&store, &root).await?;
     let coordinator_task = TaskId::generate();
     // The coordinator session exists before any child result, so a delivery to
     // a not-yet-running parent always has a durable inbox target.

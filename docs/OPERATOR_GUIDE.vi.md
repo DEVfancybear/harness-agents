@@ -373,6 +373,12 @@ Lệnh và option của entrypoint tương tác:
 | `ha chat --headless --prompt "<text>" [--json]` | Chạy đúng một lượt không cần terminal; kết quả ra stdout, log ra stderr |
 | `ha chat --fixture` | Dùng backend fixture **có nhãn** để thử giao diện; không gọi model nào |
 
+**Thay đổi hành vi cần biết (định danh):** trước đây mỗi lượt sinh một project identity
+mới, nên mọi thứ scope theo project — artifact của tool, approval, memory — thuộc về một
+định danh mà lượt sau không gọi tên lại được. Giờ một workspace root đăng ký **một** project
+identity trong store của nó, và mọi lượt sau, trong process này hay process khác, đều resolve
+đúng định danh đó.
+
 Trong ứng dụng: `/help`, `/status`, `/key`, `/config`, `/model`, `/new`, `/resume [số|id]`,
 `/exit`. Khi một action cần phê duyệt, ứng dụng in action, thư mục và scope thật rồi chờ
 bạn trả lời `y` (chạy một lần) hoặc `n` (từ chối); không có phê duyệt ngầm, hết thời gian
@@ -565,3 +571,92 @@ thật (mask mới chỉ được canh ở tầng khung hình vẽ bằng backen
 có lượt gọi provider thật nào bằng key lưu trong app, và phép đo ACL Windows chỉ có trên **một**
 máy — một môi trường bị chặn đổi ACL sẽ rơi về mặc định profile (và `/status` nói đúng như vậy).
 Đừng coi ba điều đó là đã đạt.
+
+### 12.6. Đọc lại câu trả lời dài bằng `/more`, phím cuộn và con lăn chuột
+
+Mục này bổ sung cho 12.1 và 12.3: nó nói về hai đường đọc một câu trả lời **dài hơn vùng đáy
+màn hình**, và về con lăn chuột.
+
+**`/more` — mở lại transcript gần nhất, từ dòng đầu.** Vùng đáy chỉ giữ **phần đuôi** của câu
+trả lời đang stream, nên phần bị cắt chính là **phần đầu**. Gõ `/more` để mở lại transcript gần
+nhất trong **cùng loại panel** mà `/help` dùng, và panel **mở ở dòng đầu** — bạn không phải cuộn
+trước khi thấy thứ mình cần.
+
+| Phím (khi panel đang mở) | Việc nó làm |
+| --- | --- |
+| `PageUp` / `PageDown` | Cuộn 8 dòng một lần |
+| `Home` / `End` | Về dòng đầu / nhảy tới dòng cuối |
+| `Esc` | Đóng panel |
+
+Viền dưới của panel luôn nói bạn đang ở đâu: `còn N dòng` (còn N dòng nữa ở phía dưới),
+`dòng x/y` (đang ở dòng x trên y), `cuối` (đã tới đáy), cộng `Esc đóng`. Đóng panel **không**
+ghi gì vào hội thoại. Ở plain mode (12.2), `/more` in ra như mọi lệnh tham khảo khác.
+
+**Giới hạn phải biết:** `/more` chỉ giữ **500 dòng gần nhất** của phiên, và đếm theo **dòng
+logic** (một dòng chữ, không phải một hàng màn hình). Phiên dài hơn thế thì phần cũ nhất **chỉ
+còn trong scrollback của terminal** — cuộn terminal lên vẫn thấy, nhưng `/more` không lấy lại
+được. Đây là chủ ý: app không sao chép scrollback của terminal, nó chỉ thêm một cửa sổ đọc nhỏ.
+
+**Con lăn chuột.** App bật chế độ *alternate scroll* của terminal (`DECSET 1007`) khi khởi động
+và tắt khi thoát. Nghĩa là con lăn vẫn cuộn **scrollback của terminal** như bạn quen, và app
+**không** chiếm chuột: không có chế độ mouse-capture nào được bật. Đây là chủ ý — mouse capture
+sẽ lấy con lăn khỏi terminal **và xoá scrollback**, mà scrollback chính là nơi app đẩy toàn bộ
+hội thoại; bật nó sẽ đổi "mất phần đầu câu trả lời trong vùng đáy" lấy "mất luôn phần đầu trong
+lịch sử cuộn", tệ hơn hẳn.
+
+**Chưa được kiểm chứng trên máy này:** `/more`, phím cuộn và con lăn **chưa từng** được lái
+trong console thật ở lượt này (ConPTY cần console mà môi trường build không có). Ba test của
+feature chỉ khẳng định trên **state** của controller/editor — **không** phải terminal thật, và
+**không** có ca PTY nào gõ `/more` hay `PageUp`/`PageDown`/`Home`/`End`. Riêng `1007` là hành vi
+**phía terminal**: không test nào chứng minh được một terminal cụ thể tôn trọng nó, và nó **chưa**
+được đo trên Windows Terminal hay emulator nào khác. Đừng coi ba điều đó là đã đạt.
+
+Một chi tiết nhỏ đã đo, chưa sửa: dòng gợi ý ở viền dưới panel có ghi `↑↓` nhưng `↑`/`↓`
+**không** cuộn panel — chúng vẫn thuộc ô soạn thảo (lịch sử / di chuyển theo hàng) và vì vậy có
+thể **sửa bản nháp** đang gõ dở trong khi panel mở. Muốn cuộn panel thì dùng `PageUp`/`PageDown`
+hoặc `Home`/`End`. Ghi ở `docs/evidence/HA_TUI.vi.md` mục 12.4 cùng phần còn lại của lượt này.
+
+### 12.5. Memory trong chat (bật tường minh)
+
+Memory **mặc định tắt**. Đặt `HA_MEMORY=on` trong shell khởi động `ha`; giá trị khác, hoặc
+không đặt, giữ nguyên hành vi phía trên: không đọc memory và không lưu gì về cuộc trò chuyện.
+
+Khi bật, một lượt làm hai việc có giới hạn:
+
+- **trước khi gửi request**, text của bạn là query truy xuất; phần memory của workspace này
+  khớp được sẽ vào context mà model nhận, kèm đúng version memory của từng block;
+- **sau lượt**, text mà journal đã admit được lưu **một lần** thành asset memory đã xác nhận,
+  scope theo project. Chỉ text bạn gửi được lưu — không bao giờ lưu câu trả lời của model.
+
+Workspace root giữ **một** project identity trong store, nên memory của lần chạy trước vẫn đọc
+được ở lần chạy sau, kể cả terminal mới, session mới hay task mới. Truy xuất khớp tài liệu chứa
+**mọi** term của câu hỏi; khi không có kết quả, app thử lại bằng bốn term dài nhất, và mỗi lượt
+in ra điều đã xảy ra (`memory: 1 hit(s), 1 block(s) injected`). Lượt headless báo cùng thông tin
+đó trong kết quả `--json`, ở khoá `memory`.
+
+Cùng lượng memory đó tra được từ CLI; store của project chính là thư mục header của app in ra:
+
+```powershell
+ha memory --data-dir "$env:HA_HOME\data\projects\<project-key>" --principal local-user search "marker"
+```
+
+Extraction (`ha memory catch-up`) có thêm `--asset-scope session|project`. `session` giữ những
+gì một lượt trích ra riêng cho stream của lượt đó — đây là mặc định; `project` ghi chúng thành
+kiến thức mà mọi session sau của project đọc được. Scope là một phần của strategy, nên đổi
+scope sẽ mở một thế hệ cursor mới thay vì tái dùng thứ scope kia đã settle.
+
+Thứ extraction suy luận ra được settle ở trạng thái **candidate**, và candidate **không** tra
+được cho tới khi có người xác nhận. Xem thứ đang chờ rồi xác nhận:
+
+```powershell
+ha memory --data-dir <store> --session-id <id> candidates --limit 16   # đang chờ gì
+ha memory --data-dir <store> --session-id <id> confirm --limit 8 --confirm
+ha memory --data-dir <store> --session-id <id> search "parser"         # giờ tra được
+```
+
+`confirm` từ chối nếu thiếu `--confirm`, chỉ xác nhận candidate mà principal được phép publish,
+và bị chặn ở 64 asset mỗi lần gọi. Xác nhận tạo **version mới** — không bao giờ viết lại nội
+dung mà extractor đề xuất.
+
+Memory không bắt buộc để chạy app: khi `HA_MEMORY` không được đặt, truy xuất bị bỏ qua và không
+ghi gì.

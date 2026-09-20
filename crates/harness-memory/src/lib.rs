@@ -160,11 +160,32 @@ pub struct StoredMemoryAsset {
     pub current: StoredMemoryVersion,
 }
 
+/// Where the assets one extraction settles belong.
+///
+/// The stream a job reads and the scope its result belongs to are two different host
+/// decisions: a session's stream can yield run history or reusable project knowledge,
+/// and only the host knows which. The scope is part of the strategy, so a change of
+/// scope is a change of strategy — and callers fold it into the strategy digest, which
+/// is what keeps a cursor from being reused across two different scopes.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionScope {
+    /// Assets belong to the session whose stream produced them, and to no other.
+    #[default]
+    Session,
+    /// Assets belong to the host principal's project (or to the user when the
+    /// principal carries no project), and to no session or task: knowledge meant to
+    /// outlive the run that produced it.
+    Project,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtractionStrategy {
     pub extractor_version: String,
     pub strategy_digest: ContentHash,
     pub replay_start_sequence: Option<u64>,
+    /// Scope the settled assets are written at; see [`ExtractionScope`].
+    pub asset_scope: ExtractionScope,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -411,6 +432,110 @@ impl MemoryService {
             .await
             .map_err(to_harness_error)?;
         convert_asset(stored)
+    }
+
+    /// Candidate assets this principal may still confirm, oldest first.
+    ///
+    /// Extraction settles model inference as a candidate on purpose, so a human needs a
+    /// way to see what is waiting without copying asset ids out of a search result.
+    pub async fn list_candidates(
+        &self,
+        principal: &MemoryPrincipal,
+        limit: usize,
+    ) -> Result<Vec<StoredMemoryAsset>, HarnessError> {
+        if limit == 0 || limit > 64 {
+            return Err(HarnessError::new(
+                ErrorCode::InvalidPayload,
+                "candidate listing is bounded to 1..=64 assets",
+            ));
+        }
+        self.store
+            .list_memory_candidates(&store_principal(principal), limit)
+            .await
+            .map_err(to_harness_error)?
+            .into_iter()
+            .map(convert_asset)
+            .collect()
+    }
+
+    /// Confirm one asset version as user-approved memory.
+    ///
+    /// Confirmation is the host's act, never the model's: the content is not rewritten,
+    /// the asset keeps its scope and provenance, and the new version carries
+    /// `UserConfirmed` evidence, which is what the publication policy accepts as
+    /// publishable. `expected_version` is the version the human inspected.
+    pub async fn confirm_version(
+        &self,
+        principal: &MemoryPrincipal,
+        memory_asset_id: &MemoryAssetId,
+        expected_version: u64,
+        provenance_kind: &str,
+    ) -> Result<StoredMemoryAsset, HarnessError> {
+        let current = self
+            .read(principal, memory_asset_id)
+            .await?
+            .ok_or_else(|| HarnessError::new(ErrorCode::InvalidPayload, "asset not found"))?;
+        if current.asset.current_version != expected_version {
+            return Err(HarnessError::new(
+                ErrorCode::SequenceConflict,
+                "the asset changed since it was inspected; review it again",
+            ));
+        }
+        let record = current.current.record;
+        self.write_version(
+            principal,
+            memory_asset_id,
+            expected_version,
+            WriteMemoryVersion {
+                source_assets: Vec::new(),
+                content: current.current.content,
+                authority: SourceAuthority::User,
+                evidence: EvidenceState::UserConfirmed,
+                user_confirmed: true,
+                source_event_refs: record.source_event_refs,
+                source_file_hashes: record.source_file_hashes,
+                source_commit: record.source_commit,
+                provenance_kind: provenance_kind.to_owned(),
+                validity: Validity::Valid,
+                supersedes: Some(expected_version),
+                extractor_version: record.extractor_version,
+                strategy_digest: current.current.strategy_digest,
+            },
+        )
+        .await
+    }
+
+    /// Confirm a bounded batch of candidate assets at their current version.
+    ///
+    /// One asset that cannot be confirmed fails the batch rather than being skipped: a
+    /// caller that asked for confirmation has to learn which asset refused.
+    pub async fn confirm(
+        &self,
+        principal: &MemoryPrincipal,
+        assets: &[MemoryAssetId],
+    ) -> Result<Vec<StoredMemoryAsset>, HarnessError> {
+        if assets.is_empty() || assets.len() > 64 {
+            return Err(HarnessError::new(
+                ErrorCode::InvalidPayload,
+                "confirmation is bounded to 1..=64 assets",
+            ));
+        }
+        let mut confirmed = Vec::new();
+        for asset in assets {
+            let current = self.read(principal, asset).await?.ok_or_else(|| {
+                HarnessError::new(ErrorCode::InvalidPayload, "candidate asset not found")
+            })?;
+            confirmed.push(
+                self.confirm_version(
+                    principal,
+                    asset,
+                    current.asset.current_version,
+                    "host_confirmation",
+                )
+                .await?,
+            );
+        }
+        Ok(confirmed)
     }
 
     pub async fn read(
@@ -663,9 +788,27 @@ impl MemoryService {
             .map_err(to_harness_error)
     }
 
+    /// Every extraction job in the store, whatever stream it belongs to.
+    ///
+    /// Whole-store reporting for maintenance; a caller acting on one stream uses
+    /// [`Self::list_jobs_for`], so it never has to filter another scope's rows out.
     pub async fn list_jobs(&self) -> Result<Vec<ExtractionJob>, HarnessError> {
         self.store
             .list_extraction_jobs()
+            .await
+            .map_err(to_harness_error)?
+            .into_iter()
+            .map(convert_job)
+            .collect()
+    }
+
+    /// The extraction jobs of the one stream the host is acting on.
+    pub async fn list_jobs_for(
+        &self,
+        stream: &SessionId,
+    ) -> Result<Vec<ExtractionJob>, HarnessError> {
+        self.store
+            .list_extraction_jobs_for_stream(stream)
             .await
             .map_err(to_harness_error)?
             .into_iter()

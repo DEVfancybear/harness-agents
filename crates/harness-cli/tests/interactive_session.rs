@@ -251,6 +251,62 @@ async fn g2_tool_results_return_to_the_model_and_the_turn_ends_with_the_answer()
     ));
 }
 
+/// The policy is sent once, and the user's request reads as a request.
+///
+/// Measured before the repair: the system policy appeared twice — as the `system`
+/// message and again inside the request text — and the user's own words arrived under
+/// `[instruction:instruction-0]`, which the model read as metadata and reported as
+/// "the instruction content itself isn't shown here".
+#[tokio::test]
+async fn g3_the_provider_sees_the_policy_once_and_the_request_as_a_request() {
+    let bench = bench();
+    let provider = Arc::new(SequenceProvider::new(vec![vec![
+        ProviderStreamEvent::started(),
+        ProviderStreamEvent::text("ok"),
+        ProviderStreamEvent::completed("stop"),
+    ]]));
+
+    let (outcome, _) = run(&bench, Arc::clone(&provider), TurnLimits::default()).await;
+    assert_eq!(outcome.stop, TurnStop::Final);
+
+    let seen = provider.seen();
+    let messages = &seen[0].messages;
+    assert_eq!(messages[0].role, MessageRole::System);
+    let policy = messages[0].content.clone();
+    assert!(
+        !policy.trim().is_empty(),
+        "the system message carries the policy"
+    );
+
+    let request = &messages[1];
+    assert_eq!(request.role, MessageRole::User);
+    assert!(
+        request
+            .content
+            .contains("[user instruction]\nfind the todo and tell me about it"),
+        "the request must be labelled as the instruction it is: {}",
+        request.content
+    );
+    assert!(
+        !request.content.contains(&policy),
+        "the policy must not be repeated inside the request text: {}",
+        request.content
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.content.contains(&policy))
+            .count(),
+        1,
+        "exactly one message carries the policy: {messages:?}"
+    );
+    assert!(
+        !request.content.contains("instruction-0"),
+        "internal block ids are not sent to the model: {}",
+        request.content
+    );
+}
+
 #[tokio::test]
 async fn g2_a_failed_tool_call_is_reported_instead_of_ending_the_turn() {
     let bench = bench();
@@ -279,6 +335,66 @@ async fn g2_a_failed_tool_call_is_reported_instead_of_ending_the_turn() {
             .any(|message| message.role == MessageRole::Tool && message.content.contains("failed")),
         "the failure must be handed back to the model: {:?}",
         seen[1].messages
+    );
+    assert!(
+        observer
+            .progress()
+            .iter()
+            .any(|item| matches!(item, TurnProgress::ToolSettled { ok: false, .. }))
+    );
+}
+
+#[tokio::test]
+async fn g2_a_malformed_streamed_call_is_refused_with_its_own_reason() {
+    let bench = bench();
+    // The measured split: a decoder that loses the call identity hands back one named
+    // call with no arguments and one anonymous call holding them.
+    let provider = Arc::new(SequenceProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta("call-1", "search_text", String::new()),
+            ProviderStreamEvent::tool_delta("tool-call", "", json!({"query": "todo"}).to_string()),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("re-issued"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+
+    let (outcome, observer) = run(&bench, Arc::clone(&provider), TurnLimits::default()).await;
+
+    assert_eq!(outcome.stop, TurnStop::Final);
+    assert_eq!(outcome.tool_calls, 2, "both halves were requested");
+    assert!(
+        outcome.executions.is_empty(),
+        "neither half may reach the execution gate: {:?}",
+        outcome.executions
+    );
+    let feedback = provider.seen()[1]
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Tool)
+        .map(|message| message.content.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        feedback
+            .iter()
+            .any(|message| message.contains("the arguments are not complete JSON")),
+        "the nameless half and the argument half each keep their own reason: {feedback:?}"
+    );
+    assert!(
+        feedback
+            .iter()
+            .any(|message| message.contains("the function name is missing")),
+        "{feedback:?}"
+    );
+    assert!(
+        feedback
+            .iter()
+            .all(|message| message.contains("was not executed")),
+        "a refusal, not a policy denial: {feedback:?}"
     );
     assert!(
         observer

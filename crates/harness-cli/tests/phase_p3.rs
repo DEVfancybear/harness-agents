@@ -1457,6 +1457,59 @@ async fn p3_k09_observer_failure_cannot_rewrite_receipt() {
 }
 
 #[tokio::test]
+async fn p3_s07_cli_fixture_reuses_the_workspace_project_identity() {
+    let temp = TempDir::new().expect("temporary fixture");
+    let root = setup_workspace(&temp);
+    let data_dir = temp.path().join("cli-data");
+    let data_dir_text = data_dir.to_str().expect("data directory Unicode");
+    let root_text = root.to_str().expect("workspace Unicode");
+
+    let mut project_ids = Vec::new();
+    for replacement in ["FIXED first run", "FIXED second run"] {
+        let fixture = run_ha(&[
+            "code",
+            "fixture",
+            "--data-dir",
+            data_dir_text,
+            "--workspace",
+            root_text,
+            "--path",
+            "src/parser.txt",
+            "--find",
+            "BUG",
+            "--replace",
+            replacement,
+            "--approve",
+            "--json",
+        ]);
+        assert!(
+            fixture.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fixture.stderr)
+        );
+        let output: Value = serde_json::from_slice(&fixture.stdout).expect("fixture JSON");
+        let task_id =
+            TaskId::parse(output["task_id"].as_str().expect("task ID").to_owned()).expect("task");
+        let store = SqliteStore::open_read_only(&data_dir)
+            .await
+            .expect("fixture store opens for reading");
+        let state = store
+            .current_projection(&task_id)
+            .await
+            .expect("projection read")
+            .expect("the fixture committed a working state");
+        store.close().await.expect("reader closes");
+        project_ids.push(state.workspace.project_id);
+    }
+
+    assert_eq!(
+        project_ids[0], project_ids[1],
+        "a second fixture run on the same workspace and data directory must resolve the same \
+         project identity, not invent another one"
+    );
+}
+
+#[tokio::test]
 async fn p3_s07_cli_fixture_runs_p2_response_through_p3_tools_and_recovers_after_restart() {
     let temp = TempDir::new().expect("temporary fixture");
     let root = setup_workspace(&temp);

@@ -25,4 +25,4 @@ pub use turn_driver::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, TurnDriver, TurnLimits,
     TurnObserver, TurnOptions, TurnOutcome, TurnProgress, TurnStop,
 };
-pub use workspace::{observe_workspace, observed_file_hash};
+pub use workspace::{observe_workspace, observed_file_hash, workspace_registration};

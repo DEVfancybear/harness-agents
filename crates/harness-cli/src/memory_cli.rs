@@ -2,8 +2,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use clap::{Args, Subcommand, ValueEnum};
 use harness_memory::{
-    ExtractionOutput, ExtractionStrategy, MemoryBudget, MemoryExtractor, MemoryPrincipal,
-    MemoryService, SourceProjection, WriteMemoryVersion,
+    ExtractionOutput, ExtractionScope, ExtractionStrategy, MemoryBudget, MemoryExtractor,
+    MemoryPrincipal, MemoryService, SourceProjection, WriteMemoryVersion,
 };
 use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
 use harness_types::{
@@ -59,6 +59,21 @@ enum MemoryAction {
         #[arg(long)]
         confirm: bool,
     },
+    /// Candidate memory waiting for a human decision.
+    Candidates {
+        #[arg(long, default_value_t = 16)]
+        limit: usize,
+    },
+    /// Confirm named candidates, or the oldest ones, as user-approved memory.
+    Confirm {
+        /// Assets to confirm; empty means the oldest `--limit` candidates.
+        #[arg(long = "asset")]
+        asset: Vec<String>,
+        #[arg(long, default_value_t = 8)]
+        limit: u32,
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Propose a source-linked L2 summary from an exact L1/L2 version.
     Summarize {
         asset_id: String,
@@ -73,6 +88,12 @@ enum MemoryAction {
         budget: u32,
         #[arg(long, value_enum, default_value_t = ExtractorMode::Disabled)]
         extractor: ExtractorMode,
+        /// Where the settled assets belong. `session` keeps this run's history private
+        /// to its stream; `project` makes the knowledge readable from any later session
+        /// of the same project, which is a different scope and therefore a different
+        /// cursor generation.
+        #[arg(long, value_enum, default_value_t = AssetScopeMode::Session)]
+        asset_scope: AssetScopeMode,
         /// Explicit replay generation; a changed strategy also requires --replay-from.
         #[arg(long, default_value = "p4-journal-v1")]
         strategy: String,
@@ -85,6 +106,28 @@ enum MemoryAction {
 enum ExtractorMode {
     Disabled,
     Mock,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AssetScopeMode {
+    Session,
+    Project,
+}
+
+impl AssetScopeMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Project => "project",
+        }
+    }
+
+    fn scope(self) -> ExtractionScope {
+        match self {
+            Self::Session => ExtractionScope::Session,
+            Self::Project => ExtractionScope::Project,
+        }
+    }
 }
 
 pub async fn run(command: MemoryCommand) -> Result<(), HarnessError> {
@@ -103,6 +146,7 @@ pub async fn run(command: MemoryCommand) -> Result<(), HarnessError> {
         MemoryAction::Search { .. }
             | MemoryAction::Read { .. }
             | MemoryAction::Inspect { .. }
+            | MemoryAction::Candidates { .. }
             | MemoryAction::Jobs
     );
     let store = Arc::new(
@@ -167,6 +211,49 @@ async fn execute(
             Ok(
                 json!({"asset": asset.as_ref().map(asset_json), "versions": versions.iter().map(|version| json!({"record": version.record, "content": version.content, "strategy_digest": version.strategy_digest})).collect::<Vec<_>>()}),
             )
+        }
+        MemoryAction::Candidates { limit } => {
+            let candidates = service.list_candidates(principal, limit).await?;
+            Ok(json!({
+                "count": candidates.len(),
+                "candidates": candidates.iter().map(|candidate| json!({
+                    "asset": candidate.asset,
+                    "layer": candidate.layer,
+                    "scope": candidate.asset.scope,
+                    "version": candidate.asset.current_version,
+                    "content_preview": candidate.current.content.chars().take(240).collect::<String>(),
+                })).collect::<Vec<_>>(),
+            }))
+        }
+        MemoryAction::Confirm {
+            asset,
+            limit,
+            confirm,
+        } => {
+            if !confirm {
+                return Err(HarnessError::new(
+                    ErrorCode::PolicyDenied,
+                    "confirmation is a human act: run ha memory candidates first, then pass --confirm",
+                ));
+            }
+            let ids = if asset.is_empty() {
+                service
+                    .list_candidates(principal, usize::try_from(limit).unwrap_or(8).min(64))
+                    .await?
+                    .into_iter()
+                    .map(|candidate| candidate.asset.memory_asset_id)
+                    .collect::<Vec<_>>()
+            } else {
+                asset
+                    .iter()
+                    .map(|id| MemoryAssetId::parse(id.clone()))
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let confirmed = service.confirm(principal, &ids).await?;
+            Ok(json!({
+                "confirmed": confirmed.len(),
+                "assets": confirmed.iter().map(asset_json).collect::<Vec<_>>(),
+            }))
         }
         MemoryAction::Invalidate { asset_id, reason } => Ok(
             json!({"invalidated": service.invalidate(principal, &MemoryAssetId::parse(asset_id)?, &reason).await?}),
@@ -236,17 +323,13 @@ async fn execute(
                     "jobs requires --session-id host scope",
                 )
             })?;
-            let jobs = service
-                .list_jobs()
-                .await?
-                .into_iter()
-                .filter(|job| &job.source_stream == stream)
-                .collect::<Vec<_>>();
+            let jobs = service.list_jobs_for(stream).await?;
             Ok(json!({"jobs": jobs}))
         }
         MemoryAction::CatchUp {
             budget,
             extractor,
+            asset_scope,
             strategy,
             replay_from,
         } => {
@@ -255,8 +338,14 @@ async fn execute(
             })?;
             let strategy = ExtractionStrategy {
                 extractor_version: "mock-extractor-v1".to_owned(),
-                strategy_digest: ContentHash::from_bytes(strategy.as_bytes()),
+                // The asset scope is part of the strategy: the same stream extracted at
+                // another scope is another generation of work with its own cursor, so a
+                // scope change cannot silently reuse what the previous scope settled.
+                strategy_digest: ContentHash::from_bytes(
+                    format!("{strategy}#asset-scope={}", asset_scope.label()).as_bytes(),
+                ),
                 replay_start_sequence: replay_from,
+                asset_scope: asset_scope.scope(),
             };
             service.recover_interrupted_jobs().await?;
             let scheduled = service.schedule_backlog(stream, &strategy, 16).await?.len();
@@ -279,7 +368,7 @@ async fn execute(
             listener.abort();
             let _ = listener.await;
             Ok(
-                json!({"scheduled": scheduled, "report": result?, "contiguous_sequence": service.extraction_cursor(stream, &strategy).await?, "extractor": if matches!(extractor, ExtractorMode::Mock) { "deterministic_mock" } else { "disabled" }}),
+                json!({"scheduled": scheduled, "report": result?, "contiguous_sequence": service.extraction_cursor(stream, &strategy).await?, "extractor": if matches!(extractor, ExtractorMode::Mock) { "deterministic_mock" } else { "disabled" }, "asset_scope": asset_scope.label()}),
             )
         }
     }

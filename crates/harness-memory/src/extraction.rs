@@ -1,13 +1,22 @@
 use std::{future::Future, pin::Pin};
 
 use super::{
-    BTreeSet, ContentHash, Deserialize, ErrorCode, EventId, EvidenceState, ExtractionFailureKind,
-    ExtractionLease, HarnessError, MEMORY_CONTRACT_VERSION, MemoryAsset, MemoryAssetId,
-    MemoryAssetStatus, MemoryLayer, MemoryPrincipal, MemoryScope, MemoryService, MemoryVersion,
-    Serialize, SourceAuthority, StoredMemoryAsset, StoredMemoryAssetRecord,
-    StoredMemoryVersionRecord, Validity, convert_asset, normalize_search_text, store_lease,
-    store_principal, to_harness_error,
+    AgentProfileId, BTreeSet, ContentHash, Deserialize, ErrorCode, EventId, EvidenceState,
+    ExtractionFailureKind, ExtractionLease, ExtractionScope, HarnessError, MEMORY_CONTRACT_VERSION,
+    MemoryAsset, MemoryAssetId, MemoryAssetStatus, MemoryLayer, MemoryPrincipal, MemoryScope,
+    MemoryService, MemoryVersion, ProjectId, Serialize, SessionId, SourceAuthority,
+    StoredMemoryAsset, StoredMemoryAssetRecord, StoredMemoryVersionRecord, TaskId, Validity,
+    convert_asset, normalize_search_text, store_lease, store_principal, to_harness_error,
 };
+
+/// The scope one derived asset inherits from the source a caller named first.
+struct InheritedScope {
+    scope: MemoryScope,
+    project_id: Option<ProjectId>,
+    task_id: Option<TaskId>,
+    session_id: Option<SessionId>,
+    agent_profile_id: Option<AgentProfileId>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +55,7 @@ impl MemoryService {
         lease: &ExtractionLease,
         extractor: &dyn MemoryExtractor,
         max_output_bytes: usize,
+        asset_scope: ExtractionScope,
     ) -> Result<Vec<StoredMemoryAsset>, HarnessError> {
         for event in &lease.source_events {
             event.validate()?;
@@ -143,6 +153,7 @@ impl MemoryService {
                     MemoryLayer::L1,
                     &candidate.content,
                     candidate.source_event_refs,
+                    asset_scope,
                 );
                 record.current.record.extractor_version = Some(lease.job.extractor_version.clone());
                 record.current.strategy_digest = Some(lease.job.strategy_digest.clone());
@@ -174,6 +185,7 @@ impl MemoryService {
         }
         let mut events = BTreeSet::new();
         let mut files = Vec::new();
+        let mut inherited: Option<InheritedScope> = None;
         for source in sources {
             let asset = self
                 .read(principal, &source.memory_asset_id)
@@ -189,13 +201,32 @@ impl MemoryService {
             }
             events.extend(asset.current.record.source_event_refs);
             files.extend(asset.current.record.source_file_hashes);
+            // A summary is never wider than the evidence it summarises, so it takes the
+            // scope of the source the caller named first.
+            if inherited.is_none() {
+                inherited = Some(InheritedScope {
+                    scope: asset.asset.scope,
+                    project_id: asset.asset.project_id.clone(),
+                    task_id: asset.task_id.clone(),
+                    session_id: asset.session_id.clone(),
+                    agent_profile_id: asset.agent_profile_id.clone(),
+                });
+            }
         }
         let mut record = candidate_record(
             principal,
             MemoryLayer::L2,
             content,
             events.into_iter().collect(),
+            ExtractionScope::Session,
         );
+        if let Some(inherited) = inherited {
+            record.asset.scope = inherited.scope;
+            record.asset.project_id = inherited.project_id;
+            record.task_id = inherited.task_id;
+            record.session_id = inherited.session_id;
+            record.agent_profile_id = inherited.agent_profile_id;
+        }
         files.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         files.dedup();
         record.current.record.source_file_hashes = files;
@@ -272,10 +303,30 @@ fn candidate_record(
     layer: MemoryLayer,
     content: &str,
     sources: Vec<EventId>,
+    asset_scope: ExtractionScope,
 ) -> StoredMemoryAssetRecord {
     let id = MemoryAssetId::generate();
     let content = sanitize_memory_text(content);
     let hash = ContentHash::from_bytes(content.as_bytes());
+    // The stream a job reads authorises the extraction, but it does not decide where the
+    // result belongs: binding every asset to the source session silently made extracted
+    // knowledge unreadable from any other session.
+    let (scope, task_id, session_id) = match asset_scope {
+        ExtractionScope::Session => (
+            MemoryScope::Session,
+            principal.task_id.clone(),
+            principal.session_id.clone(),
+        ),
+        ExtractionScope::Project => (
+            if principal.project_id.is_some() {
+                MemoryScope::Project
+            } else {
+                MemoryScope::User
+            },
+            None,
+            None,
+        ),
+    };
     StoredMemoryAssetRecord {
         asset: MemoryAsset {
             schema_version: MEMORY_CONTRACT_VERSION,
@@ -288,22 +339,16 @@ fn candidate_record(
             .to_owned(),
             owner_id: principal.principal_id.clone(),
             project_id: principal.project_id.clone(),
-            scope: if principal.session_id.is_some() {
-                MemoryScope::Session
-            } else if principal.project_id.is_some() {
-                MemoryScope::Project
-            } else {
-                MemoryScope::User
-            },
+            scope,
             visibility: "scoped".to_owned(),
             status: MemoryAssetStatus::Candidate,
             current_version: 1,
             created_by: SourceAuthority::ModelProposed,
         },
         layer: layer.as_str().to_owned(),
-        task_id: principal.task_id.clone(),
+        task_id,
         agent_profile_id: principal.agent_profile_id.clone(),
-        session_id: principal.session_id.clone(),
+        session_id,
         current: StoredMemoryVersionRecord {
             record: MemoryVersion {
                 schema_version: MEMORY_CONTRACT_VERSION,

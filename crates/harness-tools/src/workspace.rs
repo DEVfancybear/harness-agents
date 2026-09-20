@@ -80,6 +80,27 @@ pub fn observe_workspace(
     ))
 }
 
+/// The registration record of one workspace root.
+///
+/// A project id is generated, never derived, so a caller that wants the same
+/// identity on the next run must register this record and read the id back. The
+/// canonical root, Git common directory and identity hash come from the same
+/// inspection the execution gate performs, so the record cannot disagree with the
+/// workspace the tools later act on — and registration never hashes workspace
+/// files, which keeps it usable while a build or an editor holds them.
+pub fn workspace_registration(
+    project_id: ProjectId,
+    root: impl AsRef<Path>,
+) -> Result<ProjectRegistrationRecord, HarnessError> {
+    let identity = inspect_identity(root.as_ref())?;
+    Ok(ProjectRegistrationRecord {
+        project_id,
+        canonical_root: identity.root_text,
+        git_common_dir: identity.git_common_dir,
+        identity_hash: identity.identity_hash,
+    })
+}
+
 /// Observe the current text content hash through the same rooted path and
 /// sensitive-path guards used by P3. This is a read-only CLI setup helper for
 /// deterministic fixtures; it is not an execution authority.
@@ -93,10 +114,20 @@ pub fn observed_file_hash(
     Ok(ContentHash::from_bytes(text.as_bytes()))
 }
 
-pub(crate) fn inspect_workspace(
-    root: &Path,
-    project_id: ProjectId,
-) -> Result<WorkspaceDescriptor, HarnessError> {
+/// The identity of one workspace root: where it is, and which project it is.
+///
+/// Identity is deliberately independent of the current revision, so it needs no
+/// file walk. Callers that only need to recognise a root again — registering and
+/// resolving a project — use this instead of hashing every workspace file.
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceIdentity {
+    pub root: PathBuf,
+    pub root_text: String,
+    pub git_common_dir: Option<String>,
+    pub identity_hash: ContentHash,
+}
+
+pub(crate) fn inspect_identity(root: &Path) -> Result<WorkspaceIdentity, HarnessError> {
     let canonical = fs::canonicalize(root).map_err(|error| {
         HarnessError::new(
             ErrorCode::WorkspaceEscape,
@@ -118,8 +149,6 @@ pub(crate) fn inspect_workspace(
     let root_text = canonical_path_text(&canonical)?;
     let git_common_dir = git_output(&canonical, ["rev-parse", "--git-common-dir"])
         .and_then(|value| canonicalize_git_path(&canonical, &value));
-    let git_head =
-        git_output(&canonical, ["rev-parse", "HEAD"]).unwrap_or_else(|| "not_git".to_owned());
     // Project identity is deliberately independent of the current revision.
     // `git_head` and all tracked/untracked file content remain in the mutable
     // workspace fingerprint, so an external commit invalidates an approval
@@ -130,14 +159,29 @@ pub(crate) fn inspect_workspace(
         "git_common_dir": git_common_dir,
     });
     let identity_hash = ContentHash::from_canonical_json(&identity_value)?;
-    let fingerprint = workspace_fingerprint(&canonical, &git_head)?;
-    Ok(WorkspaceDescriptor {
-        project_id,
+    Ok(WorkspaceIdentity {
         root: canonical,
         root_text,
         git_common_dir,
-        git_head,
         identity_hash,
+    })
+}
+
+pub(crate) fn inspect_workspace(
+    root: &Path,
+    project_id: ProjectId,
+) -> Result<WorkspaceDescriptor, HarnessError> {
+    let identity = inspect_identity(root)?;
+    let git_head =
+        git_output(&identity.root, ["rev-parse", "HEAD"]).unwrap_or_else(|| "not_git".to_owned());
+    let fingerprint = workspace_fingerprint(&identity.root, &git_head)?;
+    Ok(WorkspaceDescriptor {
+        project_id,
+        root: identity.root,
+        root_text: identity.root_text,
+        git_common_dir: identity.git_common_dir,
+        git_head,
+        identity_hash: identity.identity_hash,
         fingerprint,
     })
 }

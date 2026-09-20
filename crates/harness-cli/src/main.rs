@@ -508,7 +508,16 @@ async fn run_coding_fixture(
     approve: bool,
     json_output: bool,
 ) -> Result<(), HarnessError> {
-    let workspace_observation = observe_workspace(ProjectId::generate(), workspace)?;
+    // The fixture belongs to the same project as every other run in this data directory:
+    // the identity is resolved rather than invented, so the receipts and artifacts one
+    // invocation writes stay addressable by the next one.
+    let store = Arc::new(
+        SqliteStore::open_writer(WriterOpenOptions::new(data_dir, HostId::generate()))
+            .await
+            .map_err(store_error)?,
+    );
+    let project_id = interactive::project::resolve_project_id(&store, workspace).await?;
+    let workspace_observation = observe_workspace(project_id, workspace)?;
     let expected_hash = observed_file_hash(workspace, path)?;
     let patch_arguments = serde_json::to_string(&serde_json::json!({
         "path": path,
@@ -542,11 +551,6 @@ async fn run_coding_fixture(
         ),
         ProviderStreamEvent::completed("tool_calls"),
     ]));
-    let store = Arc::new(
-        SqliteStore::open_writer(WriterOpenOptions::new(data_dir, HostId::generate()))
-            .await
-            .map_err(store_error)?,
-    );
     let runtime = Arc::new(RuntimeService::new(
         Arc::clone(&store),
         provider,
@@ -605,6 +609,12 @@ async fn run_coding_fixture(
     Ok(())
 }
 
+/// Synthetic workspace observation for the keyless runtime demo flows.
+///
+/// These commands (`ha runtime run|continue`) start a runtime against no real
+/// workspace, so they carry a placeholder observation and its project identity is not
+/// resolvable later. A flow that acts on a real root — the interactive app, a headless
+/// turn, the delegation CLI, `ha code fixture` — resolves the durable identity instead.
 fn demo_workspace() -> WorkspaceObservation {
     WorkspaceObservation {
         project_id: ProjectId::generate(),

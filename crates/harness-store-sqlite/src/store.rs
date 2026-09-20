@@ -828,6 +828,45 @@ impl SqliteStore {
         })
     }
 
+    /// The project identity this canonical root was already registered under.
+    ///
+    /// A project id is generated, never derived, so a second process that opens
+    /// the same workspace must find the id the first one registered instead of
+    /// inventing another. Without this read the registration table could only
+    /// reject conflicts and never resolve one.
+    pub async fn registered_project(
+        &self,
+        canonical_root: &str,
+    ) -> Result<Option<ProjectId>, StoreError> {
+        if canonical_root.trim().is_empty() {
+            return Err(StoreError::new(
+                ErrorCode::ProjectIdentityConflict,
+                "project canonical root must not be empty",
+            ));
+        }
+        let row =
+            sqlx::query("SELECT project_id FROM project_registrations WHERE canonical_root = ?")
+                .bind(canonical_root)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|error| {
+                    database_error(
+                        ErrorCode::StorageOpenFailed,
+                        "read registered project",
+                        error,
+                    )
+                })?;
+        row.map(|row| {
+            ProjectId::parse(row_get::<String>(&row, "project_id")?).map_err(|error| {
+                StoreError::new(
+                    ErrorCode::ProjectIdentityConflict,
+                    format!("stored project identity is invalid: {error}"),
+                )
+            })
+        })
+        .transpose()
+    }
+
     /// Consume a bound approval and record the pre-side-effect intent in the
     /// same durable transaction.
     #[allow(clippy::too_many_lines)]
@@ -1692,6 +1731,39 @@ impl SqliteStore {
             .await
             .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "count inbox", error))?;
         to_u64(count, "inbox count")
+    }
+
+    /// The admitted user input of one session: its durable event and exact text.
+    ///
+    /// The input is admitted inside the turn, so a caller that wants to reference
+    /// what the user actually sent — rather than what the UI submitted — reads the
+    /// durable ACK here instead of guessing an event id.
+    pub async fn session_admitted_input(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<(EventId, String)>, StoreError> {
+        let row = sqlx::query(
+            "SELECT event_id, raw_text FROM inbox WHERE session_id = ?
+             ORDER BY admitted_sequence DESC LIMIT 1",
+        )
+        .bind(session_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "read admitted input", error)
+        })?;
+        row.map(|row| {
+            let event_id =
+                EventId::parse(row_get::<String>(&row, "event_id")?).map_err(|error| {
+                    StoreError::new(
+                        ErrorCode::StorageWriteFailed,
+                        format!("stored input event is invalid: {error}"),
+                    )
+                })?;
+            let text: String = row_get(&row, "raw_text")?;
+            Ok((event_id, text))
+        })
+        .transpose()
     }
 
     /// Test support performs a real database corruption after a valid snapshot

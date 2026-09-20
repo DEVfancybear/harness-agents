@@ -76,18 +76,42 @@ with failure fixtures; this repair set does not establish full P0–P3 conforman
    session and task IDs. A grant can therefore match another otherwise-identical
    prepared request before consumption. Extend durable approval identity and
    test cross-invocation/cross-task rejection, including old-record handling.
-2. **High — streamed tool calls:** `parse_sse_payload` reads only the first tool
-   delta and falls back to `tool-call` when an ID is omitted. It does not retain
-   the provider's per-index identity across frames. Add multi-call/chunk fixtures
-   before relying on this adapter for real streamed tool execution.
-3. **High — stale compaction:** `RuntimeService::compact` samples its CAS sequence
+2. **High — stale compaction:** `RuntimeService::compact` samples its CAS sequence
    after building the candidate rather than using the candidate's source sequence.
    A concurrent appended event can be accepted without rebuilding the candidate.
    Tie CAS to the source snapshot and implement the documented bounded rebase.
-4. **Medium — queued process cancellation:** the process runner acquires its
+3. **Medium — queued process cancellation:** the process runner acquires its
    host-wide mutex before checking cancellation, then spawns before selecting
    cancellation. A canceled queued operation can still briefly start a process.
    Make admission cancellation-aware and add a marker-file negative test.
+
+### Later repair: streamed tool-call identity (finding 2 of this review)
+
+The second finding above — `parse_sse_payload` reading only the first tool delta and
+falling back to `tool-call` when an ID is omitted — is repaired in
+`crates/harness-providers/src/lib.rs`. The decoder now remembers the call id announced
+for each streamed `index` and stamps it onto every later fragment, emits every fragment
+a frame carries, and keeps prose and fragments from the same frame; a call that never
+received a name is reported as incomplete. Five regression tests cover it:
+`sse_fragments_of_one_call_keep_one_identity` and
+`sse_parallel_calls_in_one_frame_stay_separate` were observed RED against the old decoder
+before the repair (they reproduce the measured split: one named call with no arguments and
+an anonymous call holding them), and `sse_prose_and_a_fragment_in_one_frame_are_both_kept`,
+`sse_fragments_without_an_index_continue_the_announced_call` and
+`sse_an_anonymous_fragment_is_reported_as_incomplete` are controls for behaviour the
+repair must not change.
+
+Measured on the current tree: `cargo test -p harness-providers --locked` passes 13 tests,
+`cargo test -p harness-cli --test phase_p2 --locked` passes 17, and
+`cargo test -p harness-cli --test interactive_session --locked` passes 10 (its
+`g2_a_malformed_streamed_call_is_refused_with_its_own_reason` covers the driver-side
+refusal). This repair is **not** claimed as verified by `scripts/Verify-P0P3Review.ps1`:
+that entry point overlays today's review-owned files onto the frozen baseline
+`c9bb106cce67c5f0b7e3c02fafe1484e5f69d379`, and it no longer builds there — measured
+`error[E0004]: non-exhaustive patterns: &CodingToolAction::ExternalTool { .. } not covered`
+because the owned `crates/harness-tools/src/contracts.rs` has moved past the baseline's
+`crates/harness-tools/src/service.rs`. The review entry point therefore needs a fresh
+baseline (or a wider owned set) before it can be re-run at all.
 
 The runbooks/handbook still say `not started`; they were retained as historical
 planning documents, consistent with their catalog role. Consult phase evidence

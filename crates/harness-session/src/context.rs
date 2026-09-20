@@ -65,7 +65,6 @@ pub struct ContextBuildRequest {
     pub checkpoint_id: String,
     pub through_event_seq: u64,
     pub recovery: RecoveryView,
-    pub system_policy: String,
     pub project_rules: Vec<ContextBlock>,
     pub optional_blocks: Vec<ContextBlock>,
     pub recent_tail: Vec<ContextBlock>,
@@ -145,11 +144,10 @@ impl ContextBuilder {
                 .cloned(),
         );
         source_manifest.extend(request.recovery.working_state.decision_refs.iter().cloned());
-        mandatory.push(ContextBlock::mandatory(
-            "system-policy",
-            ContextBlockKind::SystemPolicy,
-            request.system_policy,
-        ));
+        // The system policy is not a block here: the runtime already sends it as the
+        // conversation's system message, and repeating it inside the request text
+        // gave the model two copies of one policy and pushed its own instruction into
+        // a wall of quoted blocks.
         for mut block in request.project_rules {
             block.mandatory = true;
             mandatory.push(block);
@@ -239,7 +237,7 @@ impl ContextBuilder {
                         .any(|block| block.kind == ContextBlockKind::Memory && block.id == id)
                 })
                 .collect(),
-            rendering_version: 1,
+            rendering_version: RENDERING_VERSION,
             token_estimate: estimate_tokens(&content),
             content_hash: ContentHash::from_bytes(content.as_bytes()),
             content,
@@ -262,16 +260,29 @@ impl ContextBuilder {
     }
 }
 
-impl ContextBlockKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::SystemPolicy => "system_policy",
-            Self::ProjectRule => "project_rule",
-            Self::Instruction => "instruction",
-            Self::WorkingState => "working_state",
-            Self::RecentTail => "recent_tail",
-            Self::Memory => "memory",
-            Self::Optional => "optional",
+/// Version of the rendered packet text.
+///
+/// 2 drops the duplicated system-policy block and labels every block in words, so the
+/// user's own instruction reads as an instruction rather than as a quoted tag. A
+/// packet rendered by an older version is not comparable byte-for-byte with this one.
+pub(crate) const RENDERING_VERSION: u16 = 2;
+
+impl ContextBlock {
+    /// The words the model reads before the block's text.
+    ///
+    /// A block id is provenance for inspection, not something a model can use, and the
+    /// old `[kind:id]` header made the request itself look like metadata. Blocks whose
+    /// identity is the point — a memory version, a project rule, an optional reference —
+    /// keep it; the rest say plainly what they are.
+    fn label(&self) -> String {
+        match self.kind {
+            ContextBlockKind::SystemPolicy => "system policy".to_owned(),
+            ContextBlockKind::Instruction => "user instruction".to_owned(),
+            ContextBlockKind::WorkingState => "working state".to_owned(),
+            ContextBlockKind::RecentTail => "earlier context".to_owned(),
+            ContextBlockKind::ProjectRule => format!("project rule {}", self.id),
+            ContextBlockKind::Memory => format!("memory {}", self.id),
+            ContextBlockKind::Optional => format!("reference {}", self.id),
         }
     }
 }
@@ -281,7 +292,7 @@ fn estimate_tokens(text: &str) -> u64 {
 }
 
 fn render_block(block: &ContextBlock) -> String {
-    format!("[{}:{}]\n{}", block.kind.as_str(), block.id, block.text)
+    format!("[{}]\n{}", block.label(), block.text)
 }
 
 fn estimate_bytes(bytes: usize) -> u64 {
@@ -295,5 +306,42 @@ fn _memory_marker(id: MemoryAssetId, version: u64) -> MemoryVersionRef {
     MemoryVersionRef {
         memory_asset_id: id,
         version,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ContextBlock, ContextBlockKind, RENDERING_VERSION, render_block};
+
+    /// The measured failure: the model was sent `[instruction:instruction-0]` and told
+    /// the user its instruction "isn't shown here", because the request looked like a
+    /// quoted tag rather than the thing it had to do.
+    #[test]
+    fn a_rendered_block_names_what_it_is_instead_of_quoting_an_internal_id() {
+        let instruction = ContextBlock::mandatory(
+            "instruction-0",
+            ContextBlockKind::Instruction,
+            "sửa lỗi parser",
+        );
+        let rendered = render_block(&instruction);
+        assert_eq!(rendered, "[user instruction]\nsửa lỗi parser");
+        assert!(
+            !rendered.contains("instruction-0"),
+            "an internal id is provenance, not something the model can use: {rendered}"
+        );
+        assert_eq!(render_block(&instruction), render_block(&instruction));
+
+        // Identity that carries meaning is kept: a memory block must show the version
+        // it came from, and a project rule must stay distinguishable.
+        let memory = ContextBlock::optional(
+            "memory_asset_01a0@2",
+            ContextBlockKind::Memory,
+            "uses cargo test",
+            10,
+        );
+        assert!(render_block(&memory).contains("memory_asset_01a0@2"));
+        let rule = ContextBlock::mandatory("rule-no-api", ContextBlockKind::ProjectRule, "keep");
+        assert!(render_block(&rule).contains("project rule rule-no-api"));
+        assert_eq!(RENDERING_VERSION, 2);
     }
 }

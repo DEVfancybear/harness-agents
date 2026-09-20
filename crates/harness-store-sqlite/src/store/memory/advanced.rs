@@ -62,6 +62,70 @@ impl SqliteStore {
         })?;
         Ok((records, revision))
     }
+    /// Candidate assets of one principal that a human can still confirm, oldest first.
+    ///
+    /// Scope is filtered in SQL and authorization is re-checked per row with the
+    /// `publish` action, so a listing can never hand back a candidate the principal
+    /// would not be allowed to confirm.
+    pub async fn list_memory_candidates(
+        &self,
+        principal: &StoreMemoryPrincipal,
+        limit: usize,
+    ) -> Result<Vec<StoredMemoryAssetRecord>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "begin candidate listing",
+                error,
+            )
+        })?;
+        let rows = sqlx::query(
+            "SELECT a.memory_asset_id FROM memory_assets a
+             WHERE a.status = 'candidate'
+               AND (a.project_id IS NULL OR a.project_id = ?1)
+               AND (a.task_id IS NULL OR a.task_id = ?2)
+               AND (a.agent_profile_id IS NULL OR a.agent_profile_id = ?3)
+               AND (a.session_id IS NULL OR a.session_id = ?4)
+             ORDER BY a.created_at, a.memory_asset_id LIMIT ?5",
+        )
+        .bind(principal.project_id.as_ref().map(ToString::to_string))
+        .bind(principal.task_id.as_ref().map(ToString::to_string))
+        .bind(principal.agent_profile_id.as_ref().map(ToString::to_string))
+        .bind(principal.session_id.as_ref().map(ToString::to_string))
+        .bind(i64::try_from(limit.min(64)).unwrap_or(64))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| database_error(ErrorCode::StorageOpenFailed, "list candidates", error))?;
+        let mut records = Vec::new();
+        for row in rows {
+            let id = MemoryAssetId::parse(row.get::<String, _>("memory_asset_id"))
+                .map_err(|error| StoreError::new(error.code(), error.to_string()))?;
+            match assert_authorized(&mut tx, principal, &id, "publish").await {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.code(),
+                        ErrorCode::PolicyDenied | ErrorCode::SequenceConflict
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+            if let Some(asset) = load_asset_in_tx(&mut tx, &id).await? {
+                records.push(asset);
+            }
+        }
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "close candidate listing",
+                error,
+            )
+        })?;
+        Ok(records)
+    }
+
     pub async fn invalidate_memory(
         &self,
         principal: &StoreMemoryPrincipal,

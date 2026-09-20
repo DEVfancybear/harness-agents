@@ -104,10 +104,9 @@ impl MemoryService {
         }
         let mut report = CatchUpReport::default();
         let mut budget_exhausted = budget.max_calls == 0;
-        let jobs = self.list_jobs().await?;
+        let jobs = self.list_jobs_for(stream).await?;
         for job in jobs.into_iter().filter(|job| {
-            &job.source_stream == stream
-                && job.extractor_version == strategy.extractor_version
+            job.extractor_version == strategy.extractor_version
                 && job.strategy_digest == strategy.strategy_digest
                 && job.status != ExtractionJobStatus::Completed
         }) {
@@ -163,7 +162,7 @@ impl MemoryService {
                     self.store.fail_extraction_job(&store_lease(&lease), "paused", "shutdown").await.map_err(to_harness_error)?;
                     break;
                 },
-                result = self.extract_lease(principal, &lease, extractor, budget.max_output_bytes) => result,
+                result = self.extract_lease(principal, &lease, extractor, budget.max_output_bytes, strategy.asset_scope) => result,
             };
             match result {
                 Ok(assets) => {

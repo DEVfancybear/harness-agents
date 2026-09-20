@@ -282,6 +282,23 @@ impl TurnDriver {
                     name: name.clone(),
                     summary: summarize_arguments(&call.arguments),
                 });
+                // A call the model never named, or whose arguments never became JSON,
+                // is not an action. Rejecting it here says so in one sentence; the
+                // execution gate would otherwise answer with a policy denial that
+                // reads as if the tool itself had been refused.
+                if let Some(reason) = malformed_call(&call) {
+                    observer.observe(TurnProgress::ToolSettled {
+                        name: name.clone(),
+                        ok: false,
+                    });
+                    appended.push(ProviderMessage::new(
+                        MessageRole::Tool,
+                        format!(
+                            "tool call {name:?} was not executed: {reason}; re-issue it with a function name and complete JSON arguments"
+                        ),
+                    ));
+                    continue;
+                }
                 match self
                     .execute_call(&result, &call, &options, tool_calls)
                     .await
@@ -450,6 +467,22 @@ fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
 /// Short, non-secret summary of the requested arguments for the transcript.
 fn summarize_arguments(arguments: &str) -> String {
     truncate_text(&arguments.replace(['\n', '\r'], " "), 160)
+}
+
+/// Why a streamed call can never become an action.
+///
+/// The measured case is a stream that splits one call across frames: a decoder that
+/// loses that identity hands back a named call with no arguments and an anonymous
+/// call holding them. Neither is executable, and the model has to be told which
+/// half was wrong instead of being told the tool was denied.
+fn malformed_call(call: &NormalizedToolCall) -> Option<&'static str> {
+    if call.name.trim().is_empty() {
+        return Some("the function name is missing");
+    }
+    if serde_json::from_str::<serde_json::Value>(&call.arguments).is_err() {
+        return Some("the arguments are not complete JSON");
+    }
+    None
 }
 
 /// Render a bounded tool result as the message the model receives next.

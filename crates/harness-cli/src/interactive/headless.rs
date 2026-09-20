@@ -16,10 +16,12 @@ use harness_tools::{
     ApprovalMode, ToolExecutionService, TurnDriver, TurnLimits, TurnObserver, TurnOptions,
     TurnProgress, coding_tool_schemas, observe_workspace,
 };
-use harness_types::{ErrorCode, HarnessError, HostId, InputId, ProjectId, SessionId, TaskId};
+use harness_types::{ErrorCode, HarnessError, HostId, InputId, SessionId, TaskId};
 
 use super::bootstrap::{self, LaunchRequest};
+use super::memory;
 use super::paths::{HostPlatform, LaunchEnvironment};
+use super::project;
 use super::service::{EnvironmentCredential, resolve_provider, validate_credential_file};
 
 /// A validated single-turn headless request.
@@ -128,7 +130,20 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     let task_id = resumed_from
         .as_ref()
         .map_or_else(TaskId::generate, |(_, task)| task.clone());
-    let observation = observe_workspace(ProjectId::generate(), &context.project.root)?;
+    let session_id = SessionId::generate();
+    // One project identity per workspace root, resolved before anything scoped to the
+    // project is written; memory stays a separate opt-in on top of it.
+    let project_id = project::resolve_project_id(&store, &context.project.root).await?;
+    let memory_principal = if memory::memory_requested_from_environment(&environment) {
+        Some(memory::principal(
+            project_id.clone(),
+            task_id.clone(),
+            session_id.clone(),
+        ))
+    } else {
+        None
+    };
+    let observation = observe_workspace(project_id, &context.project.root)?;
     acceptance_trace("workspace_observed");
     let capabilities = ModelCapabilities {
         provider_id: "deepseek".to_owned(),
@@ -158,13 +173,30 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         ToolExecutionService::new(Arc::clone(&store)),
     );
     let run_request = RunRequest::new(
-        SessionId::generate(),
+        session_id.clone(),
         task_id,
         InputId::generate(),
         request.prompt.clone(),
         observation,
     )
     .with_tool_schemas(coding_tool_schemas());
+    let mut recall = None;
+    let run_request = match &memory_principal {
+        Some(principal) => {
+            match memory::recall(Arc::clone(&store), principal, &request.prompt).await {
+                Ok(found) => {
+                    let request = run_request.with_memory(found.contribution.clone());
+                    recall = Some(found);
+                    request
+                }
+                Err(error) => {
+                    eprintln!("memory: recall skipped ({error})");
+                    run_request
+                }
+            }
+        }
+        None => run_request,
+    };
     let options = TurnOptions {
         workspace_root: context.project.root.clone(),
         actor_id: "headless.user".to_owned(),
@@ -196,6 +228,28 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         }
     };
     acceptance_trace("turn_finished");
+    // Stored before the writer is released, exactly like the interactive turn: the
+    // admitted text comes back from the journal and is committed as reusable memory.
+    let stored = match &memory_principal {
+        Some(principal) => memory::remember_input(Arc::clone(&store), principal, &session_id)
+            .await
+            .map(|stored| stored.map(|asset_id| asset_id.as_str().to_owned())),
+        None => Ok(None),
+    };
+    let memory_report = match (&memory_principal, &recall, &stored) {
+        (Some(_), recall, stored) => serde_json::json!({
+            "enabled": true,
+            "recall": recall.as_ref().map(|found| serde_json::json!({
+                "state": format!("{:?}", found.state).to_lowercase(),
+                "hits": found.hits,
+                "blocks": found.blocks,
+                "message": found.message,
+            })),
+            "stored_asset_id": stored.as_ref().ok().and_then(Clone::clone),
+            "error": stored.as_ref().err().map(ToString::to_string),
+        }),
+        (None, _, _) => serde_json::json!({"enabled": false}),
+    };
     let output = serde_json::json!({
         "schema_version": 1,
         "session_id": outcome.session_id,
@@ -207,6 +261,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         "stop": format!("{:?}", outcome.stop).to_lowercase(),
         "approvals": "none",
         "fixture": false,
+        "memory": memory_report,
         "resumed_from": resumed_from
             .as_ref()
             .map(|(source, _)| source.as_str().to_owned()),

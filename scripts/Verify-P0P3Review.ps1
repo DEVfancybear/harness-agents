@@ -1,11 +1,20 @@
 #Requires -Version 7.0
 [CmdletBinding()]
-param([switch] $SkipMutations)
+param(
+    [switch] $SkipMutations,
+    # The frozen source state the review-owned files are overlaid onto. Re-baselining is
+    # a deliberate act: the owned set must be re-checked against the new baseline, because
+    # a file whose crate-mates have moved on can no longer be overlaid (measured: the
+    # owned `crates/harness-tools/src/contracts.rs` gained `CodingToolAction::ExternalTool`
+    # while the baseline's `crates/harness-tools/src/service.rs` predates it, and the gate
+    # stopped compiling).
+    [string] $Baseline = 'c9bb106cce67c5f0b7e3c02fafe1484e5f69d379'
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $repository = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
-$baseline = 'c9bb106cce67c5f0b7e3c02fafe1484e5f69d379'
+$baseline = $Baseline
 $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('harness-p0-p3-review-' + [guid]::NewGuid().ToString('N'))
 $archive = "$scratch.zip"
 $owned = @(

@@ -365,6 +365,12 @@ shows the project, the provider and the setup state, then the prompt appears.
 | `ha chat --headless --prompt "<text>" [--json]` | One turn without a terminal; result on stdout, logs on stderr |
 | `ha chat --fixture` | Labelled fixture backend for trying the UI; no model is called |
 
+**Behaviour change worth knowing (identity):** a turn used to generate a new project
+identity every time, so anything scoped to the project — tool artifacts, approvals,
+memory — belonged to an identity the next turn could not name again. A workspace root now
+registers **one** project identity in its store, and every later turn, in this process or
+a later one, resolves that same identity.
+
 Inside the app: `/help`, `/status`, `/config`, `/model`, `/new`, `/resume [number|id]`,
 `/exit`. A gated action prints the action, working directory and scope, then waits for
 `y` (run it once) or `n` (refuse); there is no implicit approval and no answer in time
@@ -448,3 +454,53 @@ stderr: `ha chat --plain` or `HA_UI=plain`; a console smaller than 60 columns by
 **Not verified on this machine:** the real PTY transcript (ConPTY does not work in the
 sandbox in use — see section 8 of `docs/evidence/HA_LAUNCH.vi.md`) and the live provider
 smoke (no credential or budget is granted).
+
+### 12.4. Chat memory (opt-in)
+
+Memory is **off unless you ask for it**. Set `HA_MEMORY=on` in the shell that launches
+`ha`; any other value, or leaving it unset, keeps the behaviour above: no memory is read
+and nothing about the conversation is stored.
+
+With it on, one turn does two bounded things:
+
+- **before the request**, your text is the retrieval query; the memory of this workspace
+  that matches is added to the context the model receives, together with the exact memory
+  version each block came from;
+- **after the turn**, the text the journal admitted is stored once as a confirmed,
+  project-scoped memory asset. Only text you sent is stored — never the model's answer.
+
+The workspace root keeps one project identity in the store, so memory written by one run
+is readable by the next one, including a new terminal, a new session or a new task.
+Retrieval matches documents that contain **every** term of the question; when that finds
+nothing the app retries with the four longest terms, and every turn prints what happened
+(`memory: 1 hit(s), 1 block(s) injected`). A headless run reports the same in its `--json`
+result under `memory`.
+
+The same memory is inspectable from the CLI. The store of the project is the directory
+the app's header shows:
+
+```powershell
+ha memory --data-dir "$env:HA_HOME\data\projects\<project-key>" --principal local-user search "marker"
+```
+
+Extraction (`ha memory catch-up`) takes `--asset-scope session|project` as well. `session`
+keeps what a run extracts private to that run's stream, which is the default; `project`
+writes it as knowledge any later session of the project can read. The scope is part of the
+strategy, so changing it starts a new cursor generation instead of reusing what the other
+scope already settled.
+
+What extraction infers is settled as a **candidate**, and a candidate is deliberately not
+retrievable until a human confirms it. Review what is waiting, then confirm:
+
+```powershell
+ha memory --data-dir <store> --session-id <id> candidates --limit 16   # what is waiting
+ha memory --data-dir <store> --session-id <id> confirm --limit 8 --confirm
+ha memory --data-dir <store> --session-id <id> search "parser"         # now retrievable
+```
+
+`confirm` refuses without `--confirm`, confirms only candidates the principal may publish,
+and is bounded to 64 assets per call. Confirmation adds a version — it never rewrites the
+content the extractor proposed.
+
+Memory is never required to run the app: with `HA_MEMORY` unset, retrieval is skipped and
+nothing is written.
