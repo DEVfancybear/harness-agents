@@ -12,14 +12,44 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use super::super::theme::Theme;
 
 /// Draw the overlay with its title in the border.
-pub fn render(frame: &mut Frame, area: Rect, title: &str, lines: &[String], theme: &Theme) {
+///
+/// `scroll` is a row offset from the top; it is clamped here because this is the
+/// only place that knows how many rows fit. The bottom border says whether there is
+/// more content and how to reach it, so a clipped panel never looks like the whole
+/// answer.
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    lines: &[String],
+    scroll: usize,
+    theme: &Theme,
+) {
+    let rows = rows(lines, theme);
+    let height = usize::from(area.height.saturating_sub(2)).max(1);
+    let max_scroll = rows.len().saturating_sub(height);
+    let offset = scroll.min(max_scroll);
+    let visible: Vec<Line<'static>> = rows.into_iter().skip(offset).take(height).collect();
+    let hint = if max_scroll == 0 {
+        " Esc đóng ".to_owned()
+    } else if offset == 0 {
+        format!(" ↑↓/PgUp/PgDn cuộn · còn {max_scroll} dòng · Esc đóng ")
+    } else if offset >= max_scroll {
+        " ↑↓/PgUp/PgDn cuộn · cuối · Esc đóng ".to_owned()
+    } else {
+        format!(
+            " ↑↓/PgUp/PgDn cuộn · dòng {}/{} · Esc đóng ",
+            offset + 1,
+            max_scroll + 1
+        )
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.border)
         .title(Span::styled(format!(" {title} "), theme.title))
-        .title_bottom(Span::styled(" Esc đóng ", theme.dim));
+        .title_bottom(Span::styled(hint, theme.dim));
     frame.render_widget(
-        Paragraph::new(rows(lines, theme))
+        Paragraph::new(visible)
             .block(block)
             .wrap(Wrap { trim: false }),
         area,

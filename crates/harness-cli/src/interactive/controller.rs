@@ -94,6 +94,9 @@ pub struct InteractiveController {
     /// The committed plain transcript, byte for byte what the old controller
     /// pushed. Kept as text so U20 can be asserted without a renderer.
     transcript: Vec<String>,
+    /// The newest lines of the same transcript, so `/more` can show them again in a
+    /// scrollable panel without the terminal's scrollback.
+    recall: Vec<String>,
     editor: LineEditor,
     service: Box<dyn SessionPort>,
     channel: SessionChannel,
@@ -150,6 +153,7 @@ impl InteractiveController {
             setup_hint: context.setup_hint(),
             context: context.clone(),
             transcript: Vec::new(),
+            recall: Vec::new(),
             editor: LineEditor::new(),
             service,
             channel,
@@ -271,6 +275,7 @@ impl InteractiveController {
         self.editor.overlay().map(|overlay| Modal::Overlay {
             title: overlay.title.clone(),
             lines: overlay.lines.clone(),
+            scroll: overlay.scroll(),
         })
     }
 
@@ -316,6 +321,22 @@ impl InteractiveController {
                 Key::Char('n' | 'N') if !self.plain => return self.answer("n"),
                 Key::Char(character) => return self.handle_key(Key::Paste(character.to_string())),
                 _ => {}
+            }
+        } else if self.editor.overlay().is_some() {
+            // An open panel owns the scroll keys: a long answer or a long help page
+            // has to be readable to its first line, and the composer is not being
+            // typed into while the panel is up. Escape still closes it, which is
+            // what acceptance U09 asserts. Arrows are left to the editor, which is
+            // what a panel opened from a draft must not steal.
+            let scrolled = match key {
+                Key::PageUp => self.editor.scroll_overlay(-8),
+                Key::PageDown => self.editor.scroll_overlay(8),
+                Key::Home => self.editor.scroll_overlay_to(false),
+                Key::End => self.editor.scroll_overlay_to(true),
+                _ => false,
+            };
+            if scrolled {
+                return vec![Effect::Redraw];
             }
         } else if self.editor.picker().is_some() {
             match key {
@@ -712,6 +733,12 @@ impl InteractiveController {
                     .collect();
                 self.reference("/config", lines, &mut effects);
             }
+            "/more" => {
+                // The whole point is to read what the viewport clipped, so the panel
+                // opens at the TOP: a reader who has to scroll before seeing the
+                // beginning is exactly the problem this command exists to fix.
+                self.reference("/more", self.recall_lines(), &mut effects);
+            }
             "/key" => match raw_argument {
                 Some(value) => {
                     self.editor.forget_submission(trimmed);
@@ -969,7 +996,8 @@ impl InteractiveController {
         // arrives (that is what makes the transcript byte-identical), and the TUI
         // commits it to the scrollback through the history renderer.
         effects.push(Effect::Stream(text.clone()));
-        self.transcript.push(text);
+        self.transcript.push(text.clone());
+        self.remember(text.split('\n').map(str::to_owned).collect());
     }
 
     /// Keep a bounded live block without rescanning it for every token.
@@ -996,12 +1024,42 @@ impl InteractiveController {
         let committed = std::mem::replace(&mut self.pending_text, tail);
         self.pending_newlines = self.pending_newlines.saturating_sub(overflow);
         effects.push(Effect::Stream(committed.clone()));
-        self.transcript.push(committed);
+        self.transcript.push(committed.clone());
+        self.remember(committed.split('\n').map(str::to_owned).collect());
     }
 
     fn push_history(&mut self, effects: &mut Vec<Effect>, item: HistoryItem) {
-        self.transcript.extend(view::plain_lines(&item));
+        let lines = view::plain_lines(&item);
+        self.transcript.extend(lines.clone());
+        self.remember(lines);
         effects.push(Effect::History(item));
+    }
+
+    /// Keep the newest lines for `/more`.
+    ///
+    /// The terminal's own scrollback is where everything lives, and this app does
+    /// not try to replace it. What it adds is a way to read the last answer without
+    /// leaving the app, bounded so a long session cannot grow without limit.
+    fn remember(&mut self, lines: Vec<String>) {
+        const RECALL_LINES: usize = 500;
+        self.recall.extend(lines);
+        if self.recall.len() > RECALL_LINES {
+            let excess = self.recall.len() - RECALL_LINES;
+            self.recall.drain(..excess);
+        }
+    }
+
+    /// The text `/more` shows: the recent transcript, newest last.
+    fn recall_lines(&self) -> Vec<String> {
+        let mut lines = self.recall.clone();
+        // Text still streaming is part of the answer the user is reading.
+        if !self.pending_text.is_empty() {
+            lines.extend(self.pending_text.split('\n').map(str::to_owned));
+        }
+        if lines.is_empty() {
+            lines.push("(nothing has been shown yet)".to_owned());
+        }
+        lines
     }
 
     /// Resolve the pending approval from one typed line.
@@ -2115,6 +2173,106 @@ mod tests {
                 .join("\n")
                 .contains("continuing from session")
         );
+    }
+
+    /// K04: `/more` reopens what the live viewport clipped, from its first line.
+    ///
+    /// The live block keeps only a bounded tail, so a long answer scrolls its own
+    /// opening out of the viewport. The panel is the way back to it without leaving
+    /// the app, and it must open at the top: a reader who has to scroll before seeing
+    /// the beginning is the problem, not the fix.
+    #[test]
+    fn k04_more_opens_the_recent_transcript_from_its_first_line_and_scrolls() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "a long question");
+        for index in 0..20 {
+            let _ = harness.events.send(SessionEvent::TextDelta {
+                text: format!("answer line {index}\n"),
+            });
+            let _ = harness.controller.pump_events();
+        }
+        let _ = harness.events.send(SessionEvent::RunTerminal {
+            outcome: RunOutcome::Done,
+        });
+        let _ = harness.controller.pump_events();
+
+        let effects = submit_text(&mut harness.controller, "/more");
+        let Some(Modal::Overlay {
+            title,
+            lines,
+            scroll,
+        }) = harness.controller.ui_state().modal
+        else {
+            panic!("the TUI opens a panel, not history: {effects:#?}");
+        };
+        assert_eq!(title, "/more");
+        assert_eq!(scroll, 0, "the panel opens at the top");
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("answer line 0"),
+            "the clipped opening is missing from the panel: {joined}"
+        );
+        assert!(
+            joined.contains("answer line 19"),
+            "the panel must hold the whole answer: {joined}"
+        );
+
+        // Scrolling moves the panel, not the transcript.
+        let before = harness.controller.transcript().len();
+        let _ = harness.controller.handle_key(Key::PageDown);
+        let Some(Modal::Overlay { scroll, .. }) = harness.controller.ui_state().modal else {
+            panic!("the panel stays open while scrolling");
+        };
+        assert_eq!(scroll, 8, "PageDown moves one page");
+        let _ = harness.controller.handle_key(Key::End);
+        let Some(Modal::Overlay { scroll, .. }) = harness.controller.ui_state().modal else {
+            panic!("the panel stays open at the end");
+        };
+        assert!(scroll > 8, "End jumps to the bottom: {scroll}");
+        let _ = harness.controller.handle_key(Key::Home);
+        let Some(Modal::Overlay { scroll, .. }) = harness.controller.ui_state().modal else {
+            panic!("the panel stays open at the top");
+        };
+        assert_eq!(scroll, 0, "Home returns to the top");
+        assert_eq!(
+            harness.controller.transcript().len(),
+            before,
+            "scrolling a panel must not write history"
+        );
+        // Escape still closes it, which is what acceptance U09 asserts.
+        let _ = harness.controller.handle_key(Key::Esc);
+        assert!(
+            harness.controller.ui_state().modal.is_none(),
+            "Escape closes the panel"
+        );
+    }
+
+    /// A scrolling overlay keeps the help text verbatim and never clips the top.
+    #[test]
+    fn k04_a_long_overlay_is_readable_from_its_first_row() {
+        let lines: Vec<String> = (0..40).map(|index| format!("row {index}")).collect();
+        let mut editor = crate::interactive::input::LineEditor::new();
+        editor.open_overlay("test", lines);
+        assert_eq!(
+            editor.overlay().expect("overlay").scroll(),
+            0,
+            "an overlay opens at the top"
+        );
+        assert!(editor.scroll_overlay(5));
+        assert_eq!(editor.overlay().expect("overlay").scroll(), 5);
+        assert!(editor.scroll_overlay(-99));
+        assert_eq!(
+            editor.overlay().expect("overlay").scroll(),
+            0,
+            "scrolling up past the top saturates instead of wrapping"
+        );
+        assert!(editor.scroll_overlay_to(true));
+        assert!(
+            editor.overlay().expect("overlay").scroll() > 30,
+            "End asks for the bottom"
+        );
+        assert!(!crate::interactive::input::LineEditor::new().scroll_overlay(5));
     }
 
     #[test]

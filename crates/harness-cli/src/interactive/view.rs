@@ -132,6 +132,8 @@ pub fn help_lines() -> Vec<String> {
          typed; it is removed from recall history afterwards"
             .to_owned(),
         "/new             start a new session when nothing is running".to_owned(),
+        "/more            reopen the recent transcript in a scrollable panel (PgUp/PgDn, Home/End)"
+            .to_owned(),
         "/model           show which model the next run would use".to_owned(),
         "/config          show the resolved configuration and data files".to_owned(),
         "/resume <id>     resume a persisted session".to_owned(),

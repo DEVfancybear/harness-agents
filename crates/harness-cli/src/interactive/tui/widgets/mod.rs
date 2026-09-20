@@ -46,8 +46,12 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
             Some(crate::interactive::events::Modal::Picker { items, selected }) => {
                 picker::render(frame, area, items, *selected, theme);
             }
-            Some(crate::interactive::events::Modal::Overlay { title, lines }) => {
-                help::render(frame, area, title, lines, theme);
+            Some(crate::interactive::events::Modal::Overlay {
+                title,
+                lines,
+                scroll,
+            }) => {
+                help::render(frame, area, title, lines, *scroll, theme);
             }
             None => {}
         }

@@ -236,12 +236,16 @@ pub enum Modal {
     },
     /// The session picker opened by `/resume` with no argument.
     Picker { items: Vec<String>, selected: usize },
-    /// `/help`, `/status`, `/config` and `/model` output.
+    /// `/help`, `/status`, `/config`, `/model` and `/more` output.
     ///
-    /// Built by the controller in T06; until then the plain renderer is the one
-    /// that prints reference output.
-    #[allow(dead_code, reason = "T06 opens the overlay; T02 only defines it")]
-    Overlay { title: String, lines: Vec<String> },
+    /// `scroll` is the row offset from the top, so a panel holding more than it can
+    /// show is readable instead of clipped. It is clamped by the renderer, which is
+    /// the only place that knows how many rows fit.
+    Overlay {
+        title: String,
+        lines: Vec<String>,
+        scroll: usize,
+    },
 }
 
 /// The controller state the TUI viewport draws.

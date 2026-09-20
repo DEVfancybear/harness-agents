@@ -50,11 +50,47 @@ impl Picker {
     }
 }
 
-/// A reference overlay (`/help`, `/status`, `/config`, `/model`).
+/// A reference overlay (`/help`, `/status`, `/config`, `/model`, `/more`).
+///
+/// `scroll` counts rows from the top of the content. The renderer clamps it against
+/// the rows that actually fit, so a panel longer than the viewport is readable
+/// rather than clipped at the fold.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Overlay {
     pub title: String,
     pub lines: Vec<String>,
+    scroll: usize,
+}
+
+impl Overlay {
+    /// The row offset from the top.
+    #[must_use]
+    pub const fn scroll(&self) -> usize {
+        self.scroll
+    }
+
+    /// Move the view by `delta` rows, saturating at the top.
+    pub fn scroll_by(&mut self, delta: i32) {
+        self.scroll = if delta.is_negative() {
+            self.scroll.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.scroll.saturating_add(delta.unsigned_abs() as usize)
+        };
+    }
+
+    /// Back to the top, for `Home`.
+    pub fn scroll_home(&mut self) {
+        self.scroll = 0;
+    }
+
+    /// The bottom that the renderer will clamp to, for `End`.
+    ///
+    /// It cannot know the viewport height here, so it asks for more than any
+    /// terminal can show and lets the renderer clamp; that keeps the offset a
+    /// property of the content rather than of one frame's geometry.
+    pub fn scroll_end(&mut self) {
+        self.scroll = usize::MAX / 2;
+    }
 }
 
 /// Prompt editor with history, completion and the two modal panels.
@@ -158,7 +194,33 @@ impl LineEditor {
         self.overlay = Some(Overlay {
             title: title.to_owned(),
             lines,
+            scroll: 0,
         });
+    }
+
+    /// Scroll the open overlay; a no-op when none is open.
+    ///
+    /// Returns whether anything could have changed, so the caller only repaints a
+    /// panel that is actually there.
+    pub fn scroll_overlay(&mut self, delta: i32) -> bool {
+        let Some(overlay) = self.overlay.as_mut() else {
+            return false;
+        };
+        overlay.scroll_by(delta);
+        true
+    }
+
+    /// Jump the open overlay to its top or bottom.
+    pub fn scroll_overlay_to(&mut self, end: bool) -> bool {
+        let Some(overlay) = self.overlay.as_mut() else {
+            return false;
+        };
+        if end {
+            overlay.scroll_end();
+        } else {
+            overlay.scroll_home();
+        }
+        true
     }
 
     /// Close the reference overlay.
@@ -605,8 +667,8 @@ impl LineEditor {
 }
 
 /// Slash commands this revision understands, in help order.
-pub const SLASH_COMMANDS: [&str; 8] = [
-    "/help", "/status", "/key", "/new", "/model", "/config", "/resume", "/exit",
+pub const SLASH_COMMANDS: [&str; 9] = [
+    "/help", "/status", "/key", "/more", "/new", "/model", "/config", "/resume", "/exit",
 ];
 
 /// Commands whose name starts with `prefix`.
