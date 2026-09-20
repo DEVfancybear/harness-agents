@@ -102,6 +102,15 @@ pub trait SessionPort: Send {
     fn provider_problem(&self) -> Option<String> {
         None
     }
+    /// The project identity this workspace is scoped to, for `/status`.
+    ///
+    /// Memory is scoped by this id, and the app otherwise never shows it: the
+    /// projects directory is named after a digest, so an operator who wants to
+    /// inspect what a turn stored has nothing to pass to `ha memory`. This is the
+    /// missing link, answered on demand because resolving it needs the store.
+    fn project_id(&mut self) -> Option<String> {
+        None
+    }
     /// Save a key so this session and the next launch can use it.
     ///
     /// The file is the source of truth because the credential resolver re-reads it
@@ -539,6 +548,12 @@ pub struct AgentSessionService {
     cancellation: Option<CancellationToken>,
     /// The limits this service hands to the driver, reported to the UI.
     limits: TurnLimits,
+    /// The project identity, once `/status` has asked for it.
+    ///
+    /// Cached because resolving it opens the project store, and only an explicit
+    /// request should pay for that: the app deliberately opens no store until the
+    /// first turn arrives.
+    project_id: Arc<Mutex<Option<String>>>,
 }
 
 /// How long a gated action waits for the user before it expires.
@@ -566,7 +581,43 @@ impl AgentSessionService {
             gate,
             cancellation: None,
             limits: TurnLimits::default(),
+            project_id: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Resolve the project identity by opening this project's store read-only.
+    ///
+    /// Read-only is what keeps `/status` from becoming a second writer: it needs the
+    /// identity the first turn registered, not write authority over it.
+    fn resolve_project_id(&self) -> Option<String> {
+        if let Ok(cache) = self.project_id.lock()
+            && let Some(known) = cache.as_ref()
+        {
+            return Some(known.clone());
+        }
+        let store_dir = self.store_dir.clone();
+        let workspace_root = self.workspace_root.clone();
+        let resolved = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            runtime.block_on(async move {
+                let store = SqliteStore::open_read_only(store_dir).await.ok()?;
+                let id = crate::interactive::project::resolve_project_id(&store, &workspace_root)
+                    .await
+                    .ok()?;
+                let _ = store.close().await;
+                Some(id.as_str().to_owned())
+            })
+        })
+        .join()
+        .ok()
+        .flatten()?;
+        if let Ok(mut cache) = self.project_id.lock() {
+            *cache = Some(resolved.clone());
+        }
+        Some(resolved)
     }
 
     fn configured(&self) -> Result<ProviderConfig, String> {
@@ -641,6 +692,10 @@ impl SessionPort for AgentSessionService {
 
     fn provider_problem(&self) -> Option<String> {
         self.configured().err()
+    }
+
+    fn project_id(&mut self) -> Option<String> {
+        self.resolve_project_id()
     }
 
     fn save_credential(&mut self, key: &str) -> Result<CredentialSource, String> {
@@ -1121,6 +1176,7 @@ mod tests {
     use crate::interactive::credentials::{self, CredentialSource, Protection};
     use crate::interactive::events::{RunOutcome, SessionEvent};
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
+    use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
     use harness_tools::ApprovalAnswer;
     use harness_types::InputId;
     use std::path::PathBuf;
@@ -1223,6 +1279,64 @@ mod tests {
             workspace: std::path::PathBuf::from("C:/work/repo"),
             scope: "one action, this turn only".to_owned(),
         }
+    }
+
+    /// K05: `/status` can name the project scope memory is keyed by.
+    ///
+    /// The app shows this id nowhere else, and memory is scoped by it, so without
+    /// this line an operator has nothing to pass to `ha memory --project-id`. It also
+    /// has to stay honest before the first turn: no store means no identity yet, and
+    /// inventing one would point later lookups at the wrong place.
+    #[tokio::test]
+    async fn k05_status_names_the_project_scope_once_the_store_exists() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&home).expect("fixture home");
+        std::fs::create_dir_all(&project).expect("fixture project");
+        let environment =
+            LaunchEnvironment::from_pairs([("HA_HOME", home.to_string_lossy().into_owned())]);
+        let context = bootstrap::resolve(LaunchRequest {
+            cwd: None,
+            caller_dir: project.clone(),
+            platform: HostPlatform::current(),
+            environment: environment.clone(),
+            explicit_data_dir: None,
+        })
+        .expect("context resolves");
+        let channel = SessionChannel::new();
+        let mut service = AgentSessionService::new(&context, environment, channel.sender());
+
+        assert_eq!(
+            service.project_id(),
+            None,
+            "no store yet means the workspace has no registered identity"
+        );
+
+        // Register it the way a first turn does, then ask again.
+        let store = SqliteStore::open_writer(WriterOpenOptions::new(
+            context.project_store_dir(),
+            harness_types::HostId::generate(),
+        ))
+        .await
+        .expect("store opens");
+        let registered =
+            crate::interactive::project::resolve_project_id(&store, &context.project.root)
+                .await
+                .expect("the root registers");
+        store.close().await.expect("store closes");
+
+        let reported = service.project_id().expect("the id is reported");
+        assert_eq!(reported, registered.as_str());
+        assert!(
+            reported.starts_with("project_"),
+            "the reported id must be the id the CLI accepts: {reported}"
+        );
+        assert_eq!(
+            service.project_id().as_deref(),
+            Some(registered.as_str()),
+            "a second ask answers from the cache"
+        );
     }
 
     #[tokio::test]

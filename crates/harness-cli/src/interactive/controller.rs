@@ -717,6 +717,16 @@ impl InteractiveController {
             "/status" => {
                 let mut lines = self.header.clone();
                 lines.push(format!("Phase:   {}", self.phase.label()));
+                // The project id is what memory is scoped by, and the app shows it
+                // nowhere else: the projects directory is named after a digest, so
+                // without this line there is nothing to hand to `ha memory --project-id`.
+                lines.push(match self.service.project_id() {
+                    Some(id) => format!("Project: {id} (memory scope for this workspace)"),
+                    None => {
+                        "Project: not registered yet; the first turn in this workspace creates it"
+                            .to_owned()
+                    }
+                });
                 // The provider facts answer "what is this app actually using?":
                 // which credential variable holds the key (never its value), whether
                 // the endpoint and the model came from the environment or from the
@@ -2272,6 +2282,68 @@ mod tests {
             harness.controller.ui_state().modal.is_none(),
             "Escape closes the panel"
         );
+    }
+
+    /// `/status` shows the project id, because memory is scoped by it and the app
+    /// shows it nowhere else.
+    #[test]
+    fn k05_status_reports_the_project_scope_and_says_so_when_there_is_none() {
+        struct ScopePort {
+            recorded: RecordingPort,
+            scope: Option<String>,
+        }
+
+        impl SessionPort for ScopePort {
+            fn label(&self) -> String {
+                self.recorded.label()
+            }
+            fn submit(&mut self, request: SubmitRequest) {
+                self.recorded.submit(request);
+            }
+            fn cancel(&mut self) {
+                self.recorded.cancel();
+            }
+            fn answer(&mut self, request_id: &str, decision: ApprovalDecision) -> bool {
+                self.recorded.answer(request_id, decision)
+            }
+            fn resume(&mut self, session_id: Option<String>) -> Result<(), String> {
+                self.recorded.resume(session_id)
+            }
+            fn limits(&self) -> TurnBounds {
+                self.recorded.limits()
+            }
+            fn project_id(&mut self) -> Option<String> {
+                self.scope.clone()
+            }
+        }
+
+        for (scope, expected) in [
+            (
+                Some("project_01a0bde9-575d-7640-96ff-f94721ad22a1".to_owned()),
+                "Project: project_01a0bde9-575d-7640-96ff-f94721ad22a1",
+            ),
+            (None, "Project: not registered yet"),
+        ] {
+            let (temp, context) = context(true);
+            let channel = SessionChannel::new();
+            let mut controller = InteractiveController::new(
+                &context,
+                Box::new(ScopePort {
+                    recorded: RecordingPort::default(),
+                    scope,
+                }),
+                channel,
+                true,
+            );
+            controller.boot_lines();
+            let effects = submit_text(&mut controller, "/status");
+            let text = effects_to_plain(&effects).join("\n");
+            assert!(
+                text.contains(expected),
+                "the panel must say what memory is scoped by: {text}"
+            );
+            drop(temp);
+        }
     }
 
     /// A scrolling overlay keeps the help text verbatim and never clips the top.
