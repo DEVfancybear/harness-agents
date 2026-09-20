@@ -1090,10 +1090,18 @@ async fn run_turn(
         && let Some(principal) = &memory_principal
     {
         match memory::remember_input(Arc::clone(&store), principal, &session_id).await {
-            Ok(Some(asset_id)) => send(SessionEvent::Notice {
+            Ok(memory::RememberOutcome::Stored(asset_id)) => send(SessionEvent::Notice {
                 message: format!("memory: stored this input as {asset_id}"),
             }),
-            Ok(None) => {}
+            Ok(memory::RememberOutcome::Duplicate(asset_id)) => send(SessionEvent::Notice {
+                message: format!("memory: this input was already remembered as {asset_id}"),
+            }),
+            // Said out loud, not swallowed: a reader who is not told that an input was
+            // skipped cannot tell the feature from a bug.
+            Ok(memory::RememberOutcome::NotKnowledge { reason }) => send(SessionEvent::Notice {
+                message: format!("memory: not stored ({reason})"),
+            }),
+            Ok(memory::RememberOutcome::NothingAdmitted) => {}
             Err(error) => send(SessionEvent::Notice {
                 message: format!("memory: this input was not stored ({error})"),
             }),
@@ -1117,9 +1125,12 @@ async fn run_turn(
             match outcome.stop {
                 TurnStop::Final => RunOutcome::Done,
                 TurnStop::Canceled => RunOutcome::Canceled,
-                TurnStop::StepLimit => RunOutcome::Failed("step limit reached".to_owned()),
-                TurnStop::ToolLimit => RunOutcome::Failed("tool-call limit reached".to_owned()),
-                TurnStop::Deadline => RunOutcome::Failed("deadline reached".to_owned()),
+                // A bound is not a break: the turn stopped where the user set the limit,
+                // the work is durable, and `continue` picks it up. Saying `failed` told
+                // the user eight tool calls had been lost when none were.
+                TurnStop::StepLimit => RunOutcome::Paused("step limit reached".to_owned()),
+                TurnStop::ToolLimit => RunOutcome::Paused("tool-call limit reached".to_owned()),
+                TurnStop::Deadline => RunOutcome::Paused("deadline reached".to_owned()),
             }
         }
         Err(error) => RunOutcome::Failed(error.to_string()),

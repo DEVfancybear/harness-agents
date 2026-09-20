@@ -308,7 +308,10 @@ impl TurnDriver {
         let input_id = request.input_id.clone();
         let mut executions = Vec::new();
         let mut tool_calls = 0_u32;
-        let mut steps = 0_u32;
+        // One step is one model call, and the first call is already one: counting the
+        // dispatch again after each round of tools made `max_steps` mean about half of
+        // what it says and reported a turn that used four calls as eight steps.
+        let mut steps = 1_u32;
 
         let first_step = match source_session_id {
             Some(source) => {
@@ -332,7 +335,6 @@ impl TurnDriver {
 
         // The loop yields why it stopped, so no bound can silently fall through.
         let stop = loop {
-            steps += 1;
             if result.tool_calls.is_empty() {
                 break TurnStop::Final;
             }
@@ -342,6 +344,7 @@ impl TurnDriver {
             if started.elapsed() >= options.limits.deadline {
                 break TurnStop::Deadline;
             }
+            // The bound counts model calls, so it is checked before the next one.
             if steps >= options.limits.max_steps {
                 break TurnStop::StepLimit;
             }

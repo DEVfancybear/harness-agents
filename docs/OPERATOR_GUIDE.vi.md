@@ -661,16 +661,44 @@ Khi bật, một lượt làm hai việc có giới hạn:
   scope theo project. Chỉ text bạn gửi được lưu — không bao giờ lưu câu trả lời của model.
 
 Workspace root giữ **một** project identity trong store, nên memory của lần chạy trước vẫn đọc
-được ở lần chạy sau, kể cả terminal mới, session mới hay task mới. Truy xuất khớp tài liệu chứa
-**mọi** term của câu hỏi; khi không có kết quả, app thử lại bằng bốn term dài nhất, và mỗi lượt
-in ra điều đã xảy ra (`memory: 1 hit(s), 1 block(s) injected`). Lượt headless báo cùng thông tin
-đó trong kết quả `--json`, ở khoá `memory`.
+được ở lần chạy sau, kể cả terminal mới, session mới hay task mới.
+
+**Truy xuất hoạt động thế nào (đã đổi).** Trước đây app khớp tài liệu chứa **mọi** term của câu
+hỏi, rồi khi không có kết quả thì thử lại bằng bốn term dài nhất. Cách đó hỏng đúng ở trường hợp
+thường gặp nhất: bạn hỏi "what marker did I ask you to remember?", tài liệu viết "Remember this
+marker for later", và phép giao trượt vì những từ chỉ có trong câu hỏi. Câu trả lời nằm trong
+store mà model báo là không có.
+
+Giờ app **hợp** các term lại, rồi chỉ giữ kết quả chứa **ít nhất hai** term của câu hỏi (câu hỏi
+một term thì ngưỡng là một). Sàn hai term là chỗ quan trọng: một từ chung chung là trùng hợp từ
+vựng, không phải bằng chứng là đúng chủ đề — nếu không có sàn thì truy vấn rộng chỉ đổi "im lặng
+không tìm thấy" thành "tìm thấy thứ sai", mà cái sau tệ hơn. Nếu không ứng viên nào đủ ngưỡng, app
+quay về đúng phép giao cũ, nên câu hỏi đòi chính xác vẫn chính xác.
+
+Mỗi lượt vẫn in ra điều đã xảy ra (`memory: 1 hit(s), 1 block(s) injected`). Hai loại "rỗng" được
+nói khác nhau: `nothing matching this question yet (no term overlap)` nghĩa là có tìm nhưng không
+khớp, còn `nothing to search for in this message` nghĩa là tin nhắn không có gì để tra. Lượt
+headless báo cùng thông tin trong `--json`, ở khoá `memory`.
+
+**Cái gì được nhớ (đã đổi).** Chỉ **chỉ dẫn và khai báo** được lưu. Một **câu hỏi** thì không:
+nó là bạn đang hỏi, không phải bạn đang dặn, và trước đây mỗi câu hỏi thành một asset
+`user_instruction` đã-xác-nhận — đó là cách corpus đầy câu hỏi rồi chúng lấn át câu trả lời. Khi
+một input bị bỏ qua, app **nói ra** (`memory: not stored (a question is not an instruction)`)
+chứ không im lặng.
+
+Nói cùng một câu hai lần là **một** memory: asset cũ được giữ nguyên id, nguyên version và
+nguyên content hash, chỉ ghi thêm event nguồn. Audit không mất, và không sinh bản gần trùng để
+cạnh tranh thứ hạng với bản gốc.
 
 Cùng lượng memory đó tra được từ CLI; store của project chính là thư mục header của app in ra:
 
 ```powershell
 ha memory --data-dir "$env:HA_HOME\data\projects\<project-key>" --principal local-user search "marker"
 ```
+
+Giới hạn của truy xuất, để không phải đoán: tối đa **8** hit mỗi lượt, memory bổ sung bị chặn ở
+**800 token**, và `search --limit` nhận **1..=32**. Nội dung memory vào context như block **tuỳ
+chọn** — nó có thể bị loại khi ngân sách token chật, và nó **không bao giờ** thành block bắt buộc.
 
 Extraction (`ha memory catch-up`) có thêm `--asset-scope session|project`. `session` giữ những
 gì một lượt trích ra riêng cho stream của lượt đó — đây là mặc định; `project` ghi chúng thành

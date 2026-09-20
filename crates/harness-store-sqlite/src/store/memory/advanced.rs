@@ -254,6 +254,164 @@ impl SqliteStore {
         })?;
         Ok(affected)
     }
+    /// The active asset that already holds this exact text, if any.
+    ///
+    /// A write path uses this to avoid minting a second asset for text it has already
+    /// remembered. It looks the text up in `memory_versions` rather than through the
+    /// index: the index is for finding things by meaning, and this is an identity
+    /// question - is this the same bytes - where a ranked match would be the wrong
+    /// tool and a near-miss would be the wrong answer.
+    ///
+    /// Scope and authorization are the same predicates a search uses, so a caller
+    /// cannot discover an asset through this that it could not have searched for.
+    pub async fn find_active_memory_by_content(
+        &self,
+        principal: &StoreMemoryPrincipal,
+        normalized_content: &str,
+        project_only: bool,
+    ) -> Result<Option<MemoryAssetId>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "begin memory content lookup",
+                error,
+            )
+        })?;
+        let row = sqlx::query(
+            "SELECT a.memory_asset_id FROM memory_versions v
+             JOIN memory_assets a ON a.memory_asset_id = v.memory_asset_id
+             WHERE v.normalized_content = ?1
+               AND v.version = a.current_version
+               AND a.status = 'active'
+               AND json_extract(v.version_json, '$.validity') = 'valid'
+               AND ((?2 = 1 AND a.project_id = ?3) OR (?2 = 0 AND a.project_id IS NULL))
+               AND EXISTS (SELECT 1 FROM memory_bindings b
+                   WHERE b.memory_asset_id = a.memory_asset_id AND b.principal_id = ?4)
+             ORDER BY a.memory_asset_id LIMIT 1",
+        )
+        .bind(normalized_content)
+        .bind(i64::from(project_only))
+        .bind(principal.project_id.as_ref().map(ToString::to_string))
+        .bind(&principal.principal_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "look up memory by content",
+                error,
+            )
+        })?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "close memory content lookup",
+                error,
+            )
+        })?;
+        row.map(|row| {
+            MemoryAssetId::parse(row.get::<String, _>("memory_asset_id"))
+                .map_err(|error| StoreError::new(error.code(), error.to_string()))
+        })
+        .transpose()
+    }
+
+    /// Record one more source event on a version that already exists.
+    ///
+    /// This is what keeps the audit trail when the same text is said twice: the
+    /// asset, its version number and its content hash are all untouched, and only the
+    /// source list grows. `content_hash` covers the content, so a dependent summary
+    /// that pinned this version is still pinning the same bytes and must not be
+    /// rebuilt.
+    ///
+    /// Idempotent: recording an event the version already names is not an error and
+    /// writes nothing.
+    pub async fn append_memory_version_source(
+        &self,
+        principal: &StoreMemoryPrincipal,
+        asset_id: &MemoryAssetId,
+        event_id: &harness_types::EventId,
+    ) -> Result<bool, StoreError> {
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        let Some(mut record) = load_asset_in_tx(&mut tx, asset_id).await? else {
+            return Err(StoreError::new(
+                ErrorCode::InvalidPayload,
+                "memory asset to append to was not found",
+            ));
+        };
+        assert_authorized(&mut tx, principal, asset_id, "bind").await?;
+        if record.current.record.source_event_refs.contains(event_id) {
+            tx.commit().await.map_err(|error| {
+                database_error(
+                    ErrorCode::StorageWriteFailed,
+                    "commit unchanged memory sources",
+                    error,
+                )
+            })?;
+            return Ok(false);
+        }
+        record
+            .current
+            .record
+            .source_event_refs
+            .push(event_id.clone());
+        record.current.record.source_event_refs.sort();
+        record.current.record.source_event_refs.dedup();
+        record
+            .current
+            .record
+            .validate()
+            .map_err(|error| StoreError::new(error.code(), error.to_string()))?;
+        // The version row is rewritten in place: same version number, same content,
+        // same content hash - only `version_json` names one more source.
+        let json = serde_json::to_string(&record.current.record).map_err(|_| {
+            StoreError::new(
+                ErrorCode::InvalidPayload,
+                "memory version cannot be serialized",
+            )
+        })?;
+        sqlx::query(
+            "UPDATE memory_versions SET version_json = ? WHERE memory_asset_id = ? AND version = ?",
+        )
+        .bind(json)
+        .bind(asset_id.as_str())
+        .bind(to_i64(record.current.record.version, "memory version")?)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "append memory version source",
+                error,
+            )
+        })?;
+        super::advanced::insert_dependency(
+            &mut tx,
+            asset_id,
+            record.current.record.version,
+            "event",
+            event_id.as_str(),
+            None,
+        )
+        .await?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit appended memory source",
+                error,
+            )
+        })?;
+        Ok(true)
+    }
+
+    /// Scoped FTS search: `query` is an FTS5 MATCH expression, `limit` its row budget.
+    ///
+    /// The caller owns the query shape - `AND` for an exact ask, `OR` for recall -
+    /// and the row budget, because only the caller knows how many candidates it has
+    /// to see before it can decide which of them are relevant. What this function
+    /// owns is the part that must never depend on either: the scope, grant, binding
+    /// and lineage-validity predicates, which all precede ranking and `LIMIT`.
     pub async fn search_memory(
         &self,
         principal: &StoreMemoryPrincipal,

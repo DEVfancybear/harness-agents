@@ -162,7 +162,9 @@ pub fn run_row(
 ) -> Line<'static> {
     let style = match outcome {
         RunOutcome::Done => theme.tool_ok,
-        RunOutcome::Canceled => theme.dim,
+        // Neither a cancel nor a bound is a red line: nothing broke, and what the turn
+        // did is durable.
+        RunOutcome::Canceled | RunOutcome::Paused(_) => theme.dim,
         RunOutcome::Failed(_) => theme.tool_failed,
     };
     Line::from(vec![

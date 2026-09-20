@@ -193,8 +193,33 @@ mod tests {
         cursor_cell, help_lines, plain_lines, prompt_line, prompt_lines, prompt_prefix, run_line,
         short_id, tool_line,
     };
-    use crate::interactive::events::{AppPhase, HistoryItem, ToolState};
+    use crate::interactive::events::{AppPhase, HistoryItem, RunOutcome, ToolState};
     use std::time::Duration;
+
+    /// A bound is a pause, not a break: the measured turn printed
+    /// `[run] failed: step limit reached · 8 steps · 8 tool calls`, which reads as if the
+    /// work had been lost. It had not — every receipt was durable and the task continues.
+    #[test]
+    fn a_bounded_run_says_paused_and_a_break_still_says_failed() {
+        let run = |outcome| HistoryItem::Run {
+            outcome,
+            steps: 8,
+            tool_calls: 8,
+            elapsed: Duration::from_millis(18_300),
+        };
+        assert_eq!(
+            plain_lines(&run(RunOutcome::Paused("step limit reached".to_owned()))),
+            vec!["[run] paused: step limit reached".to_owned()]
+        );
+        assert_eq!(
+            plain_lines(&run(RunOutcome::Failed("provider unreachable".to_owned()))),
+            vec!["[run] failed: provider unreachable".to_owned()]
+        );
+        assert_eq!(
+            plain_lines(&run(RunOutcome::Done)),
+            vec!["[run] done".to_owned()]
+        );
+    }
 
     /// The measured gap: the transcript said `[tool] list_files {"path": ""} failed` and
     /// nothing else, so a reader could not tell a malformed call from a policy denial.

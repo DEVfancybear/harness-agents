@@ -111,6 +111,10 @@ impl AppPhase {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunOutcome {
     Done,
+    /// The turn stopped at a bound — steps, tool calls or the deadline — rather than
+    /// breaking. Everything it did is durable and the conversation continues, so
+    /// calling it a failure told the user their work was lost when it was not.
+    Paused(String),
     Failed(String),
     Canceled,
 }
@@ -120,6 +124,7 @@ impl RunOutcome {
     pub fn label(&self) -> String {
         match self {
             Self::Done => "done".to_owned(),
+            Self::Paused(reason) => format!("paused: {reason}"),
             Self::Failed(reason) => format!("failed: {reason}"),
             Self::Canceled => "canceled".to_owned(),
         }

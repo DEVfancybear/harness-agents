@@ -471,10 +471,35 @@ With it on, one turn does two bounded things:
 
 The workspace root keeps one project identity in the store, so memory written by one run
 is readable by the next one, including a new terminal, a new session or a new task.
-Retrieval matches documents that contain **every** term of the question; when that finds
-nothing the app retries with the four longest terms, and every turn prints what happened
-(`memory: 1 hit(s), 1 block(s) injected`). A headless run reports the same in its `--json`
-result under `memory`.
+
+**How retrieval works (changed).** It used to match documents that contained **every** term
+of the question, and retried with the four longest terms when that found nothing. That
+failed on the most ordinary case: you ask "what marker did I ask you to remember?", the
+instruction says "Remember this marker for later", and the conjunction fails on the words
+only the question has. The answer was in the store while the model reported it was not.
+
+The app now takes the **union** of the terms and keeps only the hits that contain **at
+least two** of them (one, for a one-term question). The floor is the part that matters: a
+single shared word is an accident of vocabulary rather than evidence of aboutness, and
+without it a wider query would trade a silent miss for a confident wrong answer — which is
+worse. If nothing clears the floor it falls back to the exact conjunction, so a question
+that means a specific phrase still gets one.
+
+Every turn prints what happened (`memory: 1 hit(s), 1 block(s) injected`). The two kinds of
+empty are named differently: `nothing matching this question yet (no term overlap)` means it
+searched and found nothing, `nothing to search for in this message` means the message held
+nothing to search for. A headless run reports the same in its `--json` result under
+`memory`.
+
+**What gets remembered (changed).** Only **directives and statements**. A **question** is
+not: it is you asking, not you telling, and storing each one as a confirmed
+`user_instruction` asset is how the corpus filled with questions that then outranked the
+answers. When an input is skipped the app says so (`memory: not stored (a question is not an
+instruction)`) instead of staying silent.
+
+Saying the same thing twice is **one** memory: the existing asset keeps its id, its version
+and its content hash, and the new source event is recorded on it. The audit trail survives
+and no near-duplicate is minted to compete with the original in ranking.
 
 The same memory is inspectable from the CLI. The store of the project is the directory
 the app's header shows:

@@ -262,12 +262,27 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     acceptance_trace("turn_finished");
     // Stored before the writer is released, exactly like the interactive turn: the
     // admitted text comes back from the journal and is committed as reusable memory.
-    let stored = match &memory_principal {
+    let remembered = match &memory_principal {
         Some(principal) => memory::remember_input(Arc::clone(&store), principal, &session_id)
             .await
-            .map(|stored| stored.map(|asset_id| asset_id.as_str().to_owned())),
+            .map(Some),
         None => Ok(None),
     };
+    let stored = remembered.as_ref().map(|outcome| match outcome {
+        Some(
+            memory::RememberOutcome::Stored(asset_id)
+            | memory::RememberOutcome::Duplicate(asset_id),
+        ) => Some(asset_id.as_str().to_owned()),
+        _ => None,
+    });
+    // A headless run reports what it did not keep as well: a caller scripting this
+    // reads the disposition instead of inferring it from a null.
+    let stored_disposition = remembered.as_ref().map(|outcome| match outcome {
+        Some(memory::RememberOutcome::Stored(_)) => "stored",
+        Some(memory::RememberOutcome::Duplicate(_)) => "duplicate",
+        Some(memory::RememberOutcome::NotKnowledge { reason }) => reason,
+        Some(memory::RememberOutcome::NothingAdmitted) | None => "nothing_admitted",
+    });
     let memory_report = match (&memory_principal, &recall, &stored) {
         (Some(_), recall, stored) => serde_json::json!({
             "enabled": true,
@@ -278,7 +293,8 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
                 "message": found.message,
             })),
             "stored_asset_id": stored.as_ref().ok().and_then(Clone::clone),
-            "error": stored.as_ref().err().map(ToString::to_string),
+            "stored_disposition": stored_disposition.as_ref().ok().copied(),
+            "error": remembered.as_ref().err().map(ToString::to_string),
         }),
         (None, _, _) => serde_json::json!({"enabled": false}),
     };

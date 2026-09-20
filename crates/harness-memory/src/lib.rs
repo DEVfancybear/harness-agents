@@ -21,7 +21,10 @@ use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 mod extraction;
 pub use extraction::{ExtractedCandidate, ExtractionOutput, MemoryExtractor, SourceProjection};
 mod retrieval;
-pub use retrieval::{MemoryContribution, RetrievalResult, RetrievalState, VectorAdapter};
+pub use retrieval::{
+    MAX_QUERY_BYTES, MemoryContribution, RetrievalResult, RetrievalState, VectorAdapter,
+    normalize_terms,
+};
 mod maintenance;
 pub use maintenance::{CatchUpReport, MemoryBudget};
 
@@ -555,6 +558,67 @@ impl MemoryService {
             .transpose()
     }
 
+    /// The active asset that already holds this exact text, if any.
+    ///
+    /// The identity half of deduplication, and deliberately not a search: this asks
+    /// "are these the same bytes", where a ranked match would answer "this looks
+    /// related". They are different questions and only the first one is safe to skip a
+    /// write on.
+    ///
+    /// # Errors
+    /// Fails when the principal is unusable or the store cannot answer.
+    pub async fn find_active_by_content(
+        &self,
+        principal: &MemoryPrincipal,
+        content: &str,
+        scope: MemoryScope,
+        project_id: Option<ProjectId>,
+    ) -> Result<Option<MemoryAssetId>, HarnessError> {
+        validate_principal(principal)?;
+        let store_principal = store_principal(principal);
+        // Project scope compares the project column; user scope compares for absence,
+        // so a user-scoped asset is never matched by a project-scoped lookup.
+        let project_only = scope == MemoryScope::Project;
+        let project = if project_only { project_id } else { None };
+        let found = self
+            .store
+            .find_active_memory_by_content(
+                &StoreMemoryPrincipal {
+                    project_id: project,
+                    ..store_principal
+                },
+                &normalize_search_text(content),
+                project_only,
+            )
+            .await
+            .map_err(to_harness_error)?;
+        Ok(found)
+    }
+
+    /// Record one more source event on a version that already exists.
+    ///
+    /// Used by deduplication: the same text said twice is one memory with two
+    /// sources, not two memories. The asset keeps its id, its version number and its
+    /// content hash, so nothing that depends on it needs rebuilding.
+    ///
+    /// Returns whether the source list changed - `false` when the event was already
+    /// recorded.
+    ///
+    /// # Errors
+    /// Fails when the principal may not bind the asset, or the store cannot write.
+    pub async fn append_version_source(
+        &self,
+        principal: &MemoryPrincipal,
+        memory_asset_id: &MemoryAssetId,
+        event_id: &EventId,
+    ) -> Result<bool, HarnessError> {
+        validate_principal(principal)?;
+        self.store
+            .append_memory_version_source(&store_principal(principal), memory_asset_id, event_id)
+            .await
+            .map_err(to_harness_error)
+    }
+
     pub async fn export_versions(
         &self,
         principal: &MemoryPrincipal,
@@ -1006,6 +1070,17 @@ fn parse_layer(value: &str) -> Result<MemoryLayer, HarnessError> {
             "stored memory layer is unsupported",
         )),
     }
+}
+
+/// A principal without an id cannot own or read anything.
+fn validate_principal(principal: &MemoryPrincipal) -> Result<(), HarnessError> {
+    if principal.principal_id.trim().is_empty() {
+        return Err(HarnessError::new(
+            ErrorCode::PolicyDenied,
+            "host principal is required",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_create(

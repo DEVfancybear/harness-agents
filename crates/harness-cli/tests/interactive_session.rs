@@ -434,6 +434,45 @@ async fn g2_the_tool_loop_is_bounded_and_reports_which_bound_stopped_it() {
     );
 }
 
+/// A step is one model call, so the bound means what it says.
+///
+/// Measured in a real turn: `[run] failed: step limit reached · 8 steps · 8 tool calls`
+/// after four rounds of tools, because the loop counted the dispatch again after every
+/// round — `max_steps` allowed about half of what it promised and the transcript doubled
+/// the work that happened.
+#[tokio::test]
+async fn g2_the_step_bound_counts_one_step_per_model_call() {
+    let bench = bench();
+    // The provider always asks for another tool call, so only the bound can stop it.
+    let provider = Arc::new(SequenceProvider::new(vec![vec![
+        ProviderStreamEvent::started(),
+        ProviderStreamEvent::tool_delta(
+            "call-loop",
+            "search_text",
+            json!({"query": "todo", "path": "."}).to_string(),
+        ),
+        ProviderStreamEvent::completed("tool_calls"),
+    ]]));
+
+    let limits = TurnLimits {
+        max_steps: 4,
+        max_tool_calls: 16,
+        deadline: Duration::from_mins(1),
+    };
+    let (outcome, _observer) = run(&bench, Arc::clone(&provider), limits).await;
+
+    assert_eq!(outcome.stop, TurnStop::StepLimit);
+    assert_eq!(
+        provider.seen().len(),
+        limits.max_steps as usize,
+        "the bound must allow exactly one model call per step"
+    );
+    assert_eq!(
+        outcome.steps, limits.max_steps,
+        "the reported step count must be the number of model calls that happened"
+    );
+}
+
 /// Build one request that belongs to an existing session and task.
 fn request_for(
     workspace: &std::path::Path,
