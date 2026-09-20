@@ -597,16 +597,18 @@ registration surface, and `register --confirm` is what proves a plugin starts at
 ### 12.7. Images in a message
 
 `deepseek-flash` accepts images, so a screenshot can be part of a request instead of a path the
-model tries to open with a text reader. Two ways in:
+model tries to open with a text reader. Three ways in:
 
 | How | What to do |
 | --- | --- |
 | A file you already have | Name it in your message: `what is wrong here? "C:\Users\me\shot.png"`. Dragging the file from Explorer types the same path. **Quote it if the path has spaces.** A relative path resolves against the project directory. |
+| A link to an image | Paste or drag the link itself: `what is wrong here? https://cdn.example.com/shots/broken.png`. Nothing is downloaded here — the link goes into the request and the **provider** fetches it. That needs a link the internet can reach, at most 8192 characters, for an image up to 32 MiB. If the link is private (localhost, an intranet host, a session-bound URL) the provider cannot read it and the turn fails with its download error: copy the picture to the clipboard and use `/image` instead. Only a link whose path ends in `.png`, `.jpg`, `.jpeg`, `.gif` or `.webp` is attached; an ordinary link in a sentence is left as text. |
 | A screenshot on the clipboard | `/image`. `Ctrl-V` does the same where the terminal forwards the key to the app — Windows Terminal keeps that key for its own paste, so `/image` is the way that always works. |
 
 Either way the image is attached to that turn, the clipboard case writes the pasted file into
 the data directory and inserts its quoted path into the composer, and the transcript says what
-happened (`[info] image attached: shot.png (image/png, 84 KiB)`). A candidate that cannot be
+happened (`[info] image attached: shot.png (image/png, 84 KiB)`, or
+`broken.png (image url, downloaded by the model)` for a link). A candidate that cannot be
 attached is reported with its reason instead of being skipped in silence: a file that is not
 really an image, one larger than 8 MiB, more than three in one message, or a path that names a
 place credentials live (`.ssh/`, `*.pem`, `.env`, `credentials*`) — those are never sent to a
@@ -624,4 +626,6 @@ Verified against the local SSE fixture rather than by reading the code: one head
 base64 in that block decoded to bytes identical to the file on disk (165 bytes, PNG magic intact).
 The same turn reported `"images":["shot.png (image/png, 165 B)"]` — the byte size is exact, because
 `0 KiB` next to an attached image reads like a failure — and the next turn in the same project
-still recalled the earlier turn, so attaching an image does not disturb the memory path.
+still recalled the earlier turn, so attaching an image does not disturb the memory path. A second
+turn naming `https://cdn.example.com/shots/broken.png` sent that link unchanged as the
+`image_url` value, so the link case is proven at the wire, not only in a unit test.

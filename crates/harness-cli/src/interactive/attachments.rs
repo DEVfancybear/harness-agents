@@ -1,10 +1,13 @@
 //! Images a turn can show the model.
 //!
-//! Two ways in, one shape out. A path the user typed, pasted or dragged into the
-//! terminal (`"C:\Users\me\shot.png"`) is found in the message text; a screenshot that
+//! Three ways in, one shape out. A path the user typed, pasted or dragged into the
+//! terminal (`"C:\Users\me\shot.png"`) is found in the message text; a public `http(s)`
+//! link that names an image goes in as a link, because the API downloads those itself
+//! and this app should not make a network call nobody asked for; and a screenshot that
 //! only exists as a bitmap on the clipboard is read by the app itself, because **no
 //! terminal sends a clipboard bitmap as text** — bracketed paste carries characters or
-//! nothing. Both become the same attachment, and both are bounded the same way.
+//! nothing. All three become the same attachment, and the two the app reads are bounded
+//! the same way.
 //!
 //! The API is what sets the rules this module enforces: PNG, JPEG, GIF or WebP,
 //! detected from the **bytes** rather than from a file name or a declared type, at most
@@ -17,13 +20,16 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use harness_providers::ImageAttachment;
+use harness_providers::{ImageAttachment, MAX_REMOTE_URL_CHARS};
 
 /// Longest side and byte size the API accepts, with room for the base64 expansion.
 pub const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Most images one turn may carry: three are already ~32 MiB of base64 in the body.
 pub const MAX_IMAGES: usize = 3;
+
+/// Extensions that name an image in a link, lower case for comparison.
+const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 
 /// One image ready to be attached to a message.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,10 +54,12 @@ impl Attachments {
     }
 }
 
-/// Read every image path one user message names.
+/// Read every image one user message names.
 ///
 /// A path with spaces has to be quoted, exactly as a shell would require; a bare word
-/// is still accepted, which is how a drag-and-drop lands in most terminals.
+/// is still accepted, which is how a drag-and-drop lands in most terminals. A public
+/// `http(s)` link that names an image goes in as a link: the provider downloads it, and
+/// fetching it here would mean this app made a network call the user did not ask for.
 #[must_use]
 pub fn from_message(text: &str, workspace: &Path) -> Attachments {
     let mut result = Attachments::default();
@@ -62,23 +70,82 @@ pub fn from_message(text: &str, workspace: &Path) -> Attachments {
             ));
             break;
         }
+        if let Some(url) = remote_image_url(&candidate) {
+            match remote_attachment(&url) {
+                Ok(image) => push_once(&mut result, image),
+                Err(reason) => result.notes.push(reason),
+            }
+            continue;
+        }
         let Some(path) = resolve(&candidate, workspace) else {
             continue;
         };
         match read_image_file(&path) {
-            Ok(image) => {
-                if !result
-                    .images
-                    .iter()
-                    .any(|existing| existing.source == image.source)
-                {
-                    result.images.push(image);
-                }
-            }
+            Ok(image) => push_once(&mut result, image),
             Err(reason) => result.notes.push(reason),
         }
     }
     result
+}
+
+/// Attach an image once, however many times the message names it.
+fn push_once(result: &mut Attachments, image: PreparedImage) {
+    if !result
+        .images
+        .iter()
+        .any(|existing| existing.source == image.source)
+    {
+        result.images.push(image);
+    }
+}
+
+/// The `http(s)` link in a token, when that link names an image by its extension.
+///
+/// A link whose path does not end in an image extension is left alone rather than
+/// guessed at: the API refuses a link whose bytes turn out not to be an image, and a
+/// guess would turn an ordinary link in a sentence into a failed request.
+fn remote_image_url(token: &str) -> Option<String> {
+    let trimmed = token
+        .trim()
+        .trim_matches(|character: char| matches!(character, '"' | '\'' | '.' | ',' | ';'));
+    let lowered = trimmed.to_ascii_lowercase();
+    if !(lowered.starts_with("http://") || lowered.starts_with("https://")) {
+        return None;
+    }
+    let path = lowered.split(['?', '#']).next().unwrap_or(lowered.as_str());
+    let named_an_image = IMAGE_EXTENSIONS
+        .iter()
+        .any(|extension| path.ends_with(&format!(".{extension}")));
+    named_an_image.then(|| trimmed.to_owned())
+}
+
+/// Turn a public image link into an attachment, or say why it cannot be one.
+fn remote_attachment(url: &str) -> Result<PreparedImage, String> {
+    if looks_like_credentials(url) {
+        return Err(format!(
+            "{url}: a link to a credential file is never attached to a request"
+        ));
+    }
+    let Some(attachment) = ImageAttachment::remote(url, remote_label(url)) else {
+        return Err(format!(
+            "{url}: a remote image link must be http(s) and at most {MAX_REMOTE_URL_CHARS} characters"
+        ));
+    };
+    Ok(PreparedImage {
+        attachment,
+        source: url.to_owned(),
+    })
+}
+
+/// The label for a remote image: the file the link names, and where the bytes come from.
+fn remote_label(url: &str) -> String {
+    let without_query = url.split(['?', '#']).next().unwrap_or(url);
+    let name = without_query
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(without_query);
+    format!("{name} (image url, downloaded by the model)")
 }
 
 /// Render a byte count the way a reader expects it.
@@ -152,11 +219,7 @@ fn attachment_from_bytes(
         human_size(metadata.len())
     );
     Ok(PreparedImage {
-        attachment: ImageAttachment {
-            media_type: media_type.to_owned(),
-            data_base64: BASE64.encode(bytes),
-            label,
-        },
+        attachment: ImageAttachment::inline(media_type, BASE64.encode(bytes), label),
         source: label_source.to_owned(),
     })
 }
@@ -401,8 +464,8 @@ mod tests {
         let found = from_message(&quoted, temp.path());
         assert_eq!(found.images.len(), 1, "{found:?}");
         assert!(found.notes.is_empty(), "{found:?}");
-        assert_eq!(found.images[0].attachment.media_type, "image/png");
-        assert!(found.images[0].attachment.data_base64.starts_with("iVBOR"));
+        let url = found.images[0].attachment.url();
+        assert!(url.starts_with("data:image/png;base64,iVBOR"), "{url}");
 
         let found = from_message(&format!("see {}", bare.display()), temp.path());
         assert_eq!(found.images.len(), 1, "{found:?}");
@@ -410,6 +473,64 @@ mod tests {
         // A relative path resolves against the workspace.
         let relative = from_message("look at other.png", temp.path());
         assert_eq!(relative.images.len(), 1, "{relative:?}");
+    }
+
+    /// A dragged link is an image the app never holds the bytes of.
+    #[test]
+    fn an_image_link_is_attached_as_the_link() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let message = "what is wrong here? https://example.com/shots/broken.png";
+        let found = from_message(message, temp.path());
+        assert_eq!(found.images.len(), 1, "{found:?}");
+        assert!(found.notes.is_empty(), "{found:?}");
+        assert_eq!(
+            found.images[0].attachment.url(),
+            "https://example.com/shots/broken.png"
+        );
+        assert_eq!(
+            found.images[0].attachment.label,
+            "broken.png (image url, downloaded by the model)"
+        );
+
+        // A query string is part of the link, and the extension is what decides.
+        let with_query = from_message("see https://cdn.example.com/a/b.jpg?w=800", temp.path());
+        assert_eq!(with_query.images.len(), 1, "{with_query:?}");
+        assert!(
+            with_query.images[0]
+                .attachment
+                .url()
+                .ends_with("b.jpg?w=800"),
+            "{with_query:?}"
+        );
+
+        // The same link twice is one image.
+        let twice = from_message(
+            "https://example.com/x.png and again https://example.com/x.png",
+            temp.path(),
+        );
+        assert_eq!(twice.images.len(), 1, "{twice:?}");
+
+        // An ordinary link, or a link that is not http(s), is not guessed at.
+        let page = from_message("read https://example.com/docs/page", temp.path());
+        assert!(page.images.is_empty(), "{page:?}");
+        assert!(
+            page.notes.is_empty(),
+            "an ordinary link is not a failure: {page:?}"
+        );
+        let local = from_message("see ftp://example.com/x.png", temp.path());
+        assert!(local.images.is_empty(), "{local:?}");
+
+        // A link into a credential store is refused the way the file would be, and a
+        // link that is not an image at all is left alone rather than guessed at.
+        let key = from_message("https://example.com/.ssh/photo.png", temp.path());
+        assert!(key.images.is_empty(), "{key:?}");
+        assert!(
+            key.notes.iter().any(|note| note.contains("credential")),
+            "{key:?}"
+        );
+        let pem = from_message("https://example.com/home/id_rsa.pem", temp.path());
+        assert!(pem.images.is_empty(), "{pem:?}");
+        assert!(pem.notes.is_empty(), "{pem:?}");
     }
 
     #[test]

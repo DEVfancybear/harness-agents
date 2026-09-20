@@ -70,25 +70,97 @@ pub struct ProviderMessage {
     pub attachments: Vec<ImageAttachment>,
 }
 
+/// Where the bytes of an attached image come from.
+///
+/// The API accepts both shapes in the same block position: an inline `data:` URL, and a
+/// public `http(s)` link the provider downloads itself.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ImageSource {
+    /// The bytes travel inside the request, base64 of the file without a `data:` prefix.
+    Inline {
+        /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+        media_type: String,
+        data_base64: String,
+    },
+    /// A link the provider fetches, for a picture this app never holds the bytes of.
+    Remote {
+        /// The `http(s)` URL, at most [`MAX_REMOTE_URL_CHARS`] long.
+        url: String,
+    },
+}
+
+/// Longest `http(s)` link the API accepts for a remote image.
+pub const MAX_REMOTE_URL_CHARS: usize = 8192;
+
+impl ImageSource {
+    /// A public link, when the API could fetch it at all: `http(s)`, and short enough.
+    ///
+    /// `None` is a refusal the caller turns into a reason — a link that is not fetched by
+    /// anyone must not look like an image that was attached.
+    #[must_use]
+    pub fn remote(url: impl Into<String>) -> Option<Self> {
+        let url = url.into();
+        let scheme = url.starts_with("http://") || url.starts_with("https://");
+        (scheme && url.chars().count() <= MAX_REMOTE_URL_CHARS).then_some(Self::Remote { url })
+    }
+
+    /// The `image_url.url` value: a data URL, or the link the provider downloads.
+    #[must_use]
+    pub fn url(&self) -> String {
+        match self {
+            Self::Inline {
+                media_type,
+                data_base64,
+            } => format!("data:{media_type};base64,{data_base64}"),
+            Self::Remote { url } => url.clone(),
+        }
+    }
+}
+
 /// One image carried by a user message.
 ///
 /// The API accepts PNG, JPEG, GIF and WebP, and detects the format from the bytes
-/// rather than from a file name or a declared type — so this type carries the media
-/// type the bytes really are, and the data URL is built in exactly one place.
+/// rather than from a file name or a declared type — so an inline attachment carries the
+/// media type the bytes really are, and the wire URL is built in exactly one place.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ImageAttachment {
-    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
-    pub media_type: String,
-    /// Base64 of the file, without a `data:` prefix.
-    pub data_base64: String,
+    /// Inline bytes, or a link the provider fetches.
+    pub source: ImageSource,
     /// One short line naming the image for the transcript and the packet marker.
     pub label: String,
 }
 
 impl ImageAttachment {
+    /// An image whose bytes this app read and encoded.
     #[must_use]
-    pub fn data_url(&self) -> String {
-        format!("data:{};base64,{}", self.media_type, self.data_base64)
+    pub fn inline(
+        media_type: impl Into<String>,
+        data_base64: impl Into<String>,
+        label: impl Into<String>,
+    ) -> Self {
+        Self {
+            source: ImageSource::Inline {
+                media_type: media_type.into(),
+                data_base64: data_base64.into(),
+            },
+            label: label.into(),
+        }
+    }
+
+    /// An image the provider downloads from a public link.
+    #[must_use]
+    pub fn remote(url: impl Into<String>, label: impl Into<String>) -> Option<Self> {
+        Some(Self {
+            source: ImageSource::remote(url)?,
+            label: label.into(),
+        })
+    }
+
+    /// The URL this attachment puts in the request.
+    #[must_use]
+    pub fn url(&self) -> String {
+        self.source.url()
     }
 }
 
@@ -147,7 +219,7 @@ impl ProviderMessage {
                     "type": "image_url",
                     // `auto` lets the provider pick the detail level; its own default is
                     // the same, and pinning `high` would spend tokens on every small icon.
-                    "image_url": { "url": image.data_url(), "detail": "auto" },
+                    "image_url": { "url": image.url(), "detail": "auto" },
                 }));
             }
             return json!({ "role": "user", "content": blocks });
@@ -1104,11 +1176,11 @@ mod wire_tests {
     /// message alone — any other role is refused, so the text shape is kept there.
     #[test]
     fn a_user_message_with_an_image_uses_content_blocks() {
-        let image = super::ImageAttachment {
-            media_type: "image/png".to_owned(),
-            data_base64: "iVBORw0KGgo=".to_owned(),
-            label: "shot.png (image/png, 1 KiB)".to_owned(),
-        };
+        let image = super::ImageAttachment::inline(
+            "image/png",
+            "iVBORw0KGgo=",
+            "shot.png (image/png, 1 KiB)",
+        );
         let message = super::ProviderMessage::user_with_images("what is wrong here?", vec![image]);
         let wire = message.to_wire();
         assert_eq!(wire["role"], "user");
@@ -1129,11 +1201,41 @@ mod wire_tests {
 
         // A non-user role keeps the text shape rather than a request the API refuses.
         let mut assistant = super::ProviderMessage::new(super::MessageRole::Assistant, "hello");
-        assistant.attachments.push(super::ImageAttachment {
-            media_type: "image/png".to_owned(),
-            data_base64: "iVBORw0KGgo=".to_owned(),
-            label: "shot.png".to_owned(),
-        });
+        assistant.attachments.push(super::ImageAttachment::inline(
+            "image/png",
+            "iVBORw0KGgo=",
+            "shot.png",
+        ));
         assert_eq!(assistant.to_wire()["content"], "hello");
+    }
+
+    /// A link is sent as a link: the provider downloads it, this app never fetches it.
+    #[test]
+    fn a_remote_image_link_is_sent_as_the_link_itself() {
+        let image =
+            super::ImageAttachment::remote("https://example.com/shot.png", "shot.png (image url)")
+                .expect("a public link is an attachment");
+        let message = super::ProviderMessage::user_with_images("what is here?", vec![image]);
+        let wire = message.to_wire();
+        assert_eq!(
+            wire["content"][1]["image_url"]["url"],
+            "https://example.com/shot.png"
+        );
+        assert_eq!(wire["content"][1]["image_url"]["detail"], "auto");
+
+        // Anything the API could not fetch is refused here, not at the provider.
+        assert!(super::ImageAttachment::remote("ftp://example.com/shot.png", "x").is_none());
+        assert!(super::ImageAttachment::remote("shot.png", "x").is_none());
+        assert!(
+            super::ImageAttachment::remote(
+                format!(
+                    "https://example.com/{}",
+                    "a".repeat(super::MAX_REMOTE_URL_CHARS)
+                ),
+                "x"
+            )
+            .is_none(),
+            "a link past the documented 8192 characters is refused"
+        );
     }
 }

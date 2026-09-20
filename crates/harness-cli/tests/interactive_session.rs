@@ -488,13 +488,12 @@ async fn g3_a_named_image_reaches_the_model_as_content_blocks() {
 
     let observer = Arc::new(RecordingObserver::default());
     let store = bench.open_store().await;
-    let image = harness_providers::ImageAttachment {
-        media_type: "image/png".to_owned(),
+    let image = harness_providers::ImageAttachment::inline(
+        "image/png",
         // The smallest real PNG, so the bytes are an image and not a placeholder.
-        data_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
-            .to_owned(),
-        label: "shot.png (image/png, 1 KiB)".to_owned(),
-    };
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+        "shot.png (image/png, 1 KiB)",
+    );
     let mut request = request(&bench.workspace, "what is wrong in this screenshot?");
     request.images = vec![image];
     let outcome = driver(&store, Arc::clone(&provider))

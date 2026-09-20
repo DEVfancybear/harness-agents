@@ -785,16 +785,18 @@ be blank` là call model ghép sai (model cũng được báo y hệt và thư�
 ### 12.8. Ảnh trong một yêu cầu
 
 `deepseek-flash` nhận ảnh, nên ảnh chụp màn hình có thể là một phần của yêu cầu thay vì một
-đường dẫn mà model sẽ thử mở bằng tool đọc text. Hai đường vào:
+đường dẫn mà model sẽ thử mở bằng tool đọc text. Ba đường vào:
 
 | Cách | Bạn làm gì |
 | --- | --- |
 | Ảnh đã có trên đĩa | Ghi tên nó trong tin nhắn: `chỗ này sai gì? "C:\Users\me\shot.png"`. Kéo file từ Explorer cũng ra đúng đường dẫn đó. **Nhớ quote nếu đường dẫn có dấu cách.** Đường dẫn tương đối được hiểu theo thư mục project. |
+| Link tới một ảnh | Dán hoặc kéo chính link đó: `chỗ này sai gì? https://cdn.example.com/shots/broken.png`. Ở đây **không** tải gì cả — link đi thẳng vào request và **provider** tự tải. Vì vậy link phải truy cập được từ internet, tối đa 8192 ký tự, ảnh tối đa 32 MiB. Nếu link là riêng tư (localhost, host nội bộ, URL gắn session) thì provider không đọc được và lượt đó fail kèm lỗi tải của nó: hãy copy ảnh vào clipboard rồi dùng `/image`. Chỉ link có đường dẫn kết thúc bằng `.png`, `.jpg`, `.jpeg`, `.gif` hoặc `.webp` mới được gắn; một link bình thường trong câu vẫn chỉ là text. |
 | Ảnh chụp đang trong clipboard | `/image`. `Ctrl-V` làm y hệt ở những terminal có chuyển phím cho app — Windows Terminal giữ phím đó cho paste của nó, nên `/image` là cách luôn chạy. |
 
-Cả hai đường đều gắn ảnh vào đúng lượt đó; trường hợp clipboard thì file PNG được ghi vào thư
+Cả ba đường đều gắn ảnh vào đúng lượt đó; trường hợp clipboard thì file PNG được ghi vào thư
 mục dữ liệu và đường dẫn (đã quote) được chèn vào ô soạn thảo, còn transcript nói rõ đã xảy ra
-gì (`[info] image attached: shot.png (image/png, 84 KiB)`). Ứng viên không gắn được sẽ được báo
+gì (`[info] image attached: shot.png (image/png, 84 KiB)`, hoặc
+`broken.png (image url, downloaded by the model)` với link). Ứng viên không gắn được sẽ được báo
 kèm lý do chứ không bị bỏ im lặng: file không thật sự là ảnh, file lớn hơn 8 MiB, quá ba ảnh
 trong một tin nhắn, hoặc đường dẫn trỏ vào nơi chứa credential (`.ssh/`, `*.pem`, `.env`,
 `credentials*`) — những chỗ đó **không bao giờ** được gửi tới provider.
@@ -811,4 +813,6 @@ là mảng gồm block text nêu tên ảnh rồi tới block `image_url`, và b
 đúng byte của file trên đĩa (165 byte, magic PNG còn nguyên). Cùng lượt đó báo
 `"images":["shot.png (image/png, 165 B)"]` — kích thước hiển thị theo byte chính xác, vì `0 KiB`
 bên cạnh một ảnh đã gắn đọc như thể gắn lỗi — và lượt kế tiếp trong cùng project vẫn recall được
-lượt trước, tức là gắn ảnh không làm hỏng đường memory.
+lượt trước, tức là gắn ảnh không làm hỏng đường memory. Lượt thứ hai ghi tên
+`https://cdn.example.com/shots/broken.png` đã gửi đúng link đó làm giá trị `image_url`, nên đường
+link được chứng minh ở tầng wire chứ không chỉ trong unit test.
