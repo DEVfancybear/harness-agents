@@ -60,6 +60,10 @@ pub(crate) fn injected_fault() -> io::Result<()> {
 }
 
 #[cfg(not(debug_assertions))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "release keeps the debug build's fallible signature; the write path uses `?`"
+)]
 pub(crate) fn injected_fault() -> io::Result<()> {
     Ok(())
 }

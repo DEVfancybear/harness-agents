@@ -1,6 +1,8 @@
 # Plan cho DeepSeek: nâng `ha` thành TUI terminal (track T01–T08)
 
-**19/09/2026 · Planning only · Feature track HA_TUI T01–T08. Chưa có dòng code T nào.**
+**Lập ngày 19/09/2026 · T01–T08 đã triển khai và kiểm chứng. Nội dung dưới đây là baseline
+để bảo trì/phát triển tiếp; trạng thái chạy thật nằm ở [evidence](evidence/HA_TUI.vi.md)
+và [handoff](handoffs/HA_TUI.vi.md).**
 
 [Prompt giao DeepSeek](HA_TUI_PROMPT.vi.md) · [Track khởi động H01–H08](HA_LAUNCH_PLAN.vi.md) · [SPEC HA_LAUNCH](specs/HA_LAUNCH.vi.md) · [Handoff HA_LAUNCH](handoffs/HA_LAUNCH.vi.md) · [Bản đồ tích hợp](implementation-next/INTEGRATION_MAP.vi.md) · [Templates SPEC/evidence/handoff](implementation-next/TEMPLATES.vi.md)
 

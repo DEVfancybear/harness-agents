@@ -537,6 +537,31 @@ mod tests {
         }
     }
 
+    /// K01: a masked buffer reaches the screen as a mask, never as the key.
+    ///
+    /// The controller masks at the single point it builds `UiState`, and the
+    /// composer draws whatever is in `state.buffer`. This asserts the painted frame
+    /// itself, so a renderer that reached around the state for the raw editor value
+    /// could not pass.
+    #[test]
+    fn k01_a_secret_buffer_is_painted_as_a_mask() {
+        let backend = ScriptedBackend::new(Vec::new());
+        let mut renderer = ScriptedRenderer::open(backend, 80, 24).expect("renderer opens");
+        let mut masked = state(AppPhase::Ready);
+        masked.buffer = crate::interactive::input::mask_secret(true, "sk-live-secret");
+        masked.cursor = masked.buffer.chars().count();
+        renderer.draw_state(&masked).expect("frame draws");
+        let painted = renderer.painted().join("\n");
+        assert!(
+            !painted.contains("sk-live-secret"),
+            "the key reached the screen: {painted}"
+        );
+        assert!(
+            painted.contains('\u{2022}'),
+            "the mask is what the user sees: {painted}"
+        );
+    }
+
     /// The frame carries the D5 text landmarks the PTY assertions depend on.
     #[test]
     fn t04_a_frame_paints_the_composer_marker_the_live_text_and_the_status_row() {

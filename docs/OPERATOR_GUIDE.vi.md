@@ -373,7 +373,7 @@ Lệnh và option của entrypoint tương tác:
 | `ha chat --headless --prompt "<text>" [--json]` | Chạy đúng một lượt không cần terminal; kết quả ra stdout, log ra stderr |
 | `ha chat --fixture` | Dùng backend fixture **có nhãn** để thử giao diện; không gọi model nào |
 
-Trong ứng dụng: `/help`, `/status`, `/config`, `/model`, `/new`, `/resume [số|id]`,
+Trong ứng dụng: `/help`, `/status`, `/key`, `/config`, `/model`, `/new`, `/resume [số|id]`,
 `/exit`. Khi một action cần phê duyệt, ứng dụng in action, thư mục và scope thật rồi chờ
 bạn trả lời `y` (chạy một lần) hoặc `n` (từ chối); không có phê duyệt ngầm, hết thời gian
 chờ được tính là từ chối.
@@ -401,7 +401,7 @@ là do bạn đặt hay do mặc định, và endpoint có kết nối được 
 
 ```text
 backend: deepseek-flash via https://api.deepseek.com
-Provider: credential found in DEEPSEEK_API_KEY (value hidden)
+Provider: credential from environment variable DEEPSEEK_API_KEY (value hidden)
 Provider: endpoint not set, using the default https://api.deepseek.com
 Provider: model not set, using the default deepseek-flash
 Provider: ready, would call deepseek-flash
@@ -410,7 +410,8 @@ Provider: endpoint answered a TCP connection
 
 Nếu dòng cuối là `endpoint did not answer`, lỗi nằm ở mạng/proxy. Nếu là
 `no credential; set one of ...`, key chưa được đặt **trong chính shell đang chạy `ha`**
-(biến môi trường chỉ có tác dụng với tiến trình được khởi động sau khi bạn đặt nó).
+(biến môi trường chỉ có tác dụng với tiến trình được khởi động sau khi bạn đặt nó) — hoặc
+bạn lưu key ngay trong app bằng `/key` (mục 12.4).
 
 Muốn kiểm tra provider thật trước khi mở app (tốn một lượt gọi trả phí) — cũng chỉ
 cần key:
@@ -490,3 +491,77 @@ giờ vẽ viewport.
 **Chưa được kiểm chứng trên máy này:** transcript PTY thật (ConPTY không hoạt động trong
 môi trường sandbox đang dùng — xem mục 8 của `docs/evidence/HA_LAUNCH.vi.md`) và live
 provider smoke (không có credential/budget được cấp). Đừng coi hai điều đó là đã đạt.
+
+### 12.4. Lưu API key trong app bằng `/key`
+
+Bạn **không** cần mở shell đặt biến môi trường trước khi mở `ha`: gõ `/key` ngay trong app.
+
+| Cách gõ | Việc nó làm | Riêng tư |
+| --- | --- | --- |
+| `/key` rồi Enter | Ô soạn thảo vào chế độ nhập bí mật: mỗi ký tự hiện thành `•`; Enter lưu, **Esc huỷ** | Key không vào history của app và không được vẽ lên màn hình |
+| `/key <key-của-bạn>` | Lưu ngay, không hỏi lại; chỉ nhận **một từ** | **Kém riêng tư hơn**: giá trị nằm trong history của terminal/shell — `/help` nói đúng câu này |
+
+`/key` bị từ chối khi một lượt đang chạy. Sau khi lưu, app báo đã lưu vào file nào và
+**không cần khởi động lại**: lượt gửi kế tiếp dùng key đó. Nếu chưa có `config.toml`, app
+ghi file tối thiểu (`schema_version = 1`) để cổng "setup required" được xoá; file đó
+**không** chứa key — key luôn nằm ở file riêng, có chủ ý.
+
+Key được lưu ở đâu:
+
+```text
+<data dir>\private\credentials.env
+# Windows mặc định: %LOCALAPPDATA%\HarnessAgents\data\private\credentials.env
+```
+
+Thư mục con `private\` là **cố ý**: nó tách key khỏi các project store nằm cùng data dir, để app
+siết quyền trên đúng thư mục đó mà không đụng ACL của dữ liệu khác. Nội dung file là đúng một
+dòng `DEEPSEEK_API_KEY="<key>"`. Biến `HA_CREDENTIALS_DIR` đổi **thư mục** chứa file này và được
+dùng **nguyên như bạn đặt** (app không tự thêm `private\` lần nữa) — đó cũng là cách ly file khỏi
+dữ liệu thật khi bạn muốn thử. Không cần đoán đường dẫn: `/status` và `/model` in ra nguồn kèm
+đường dẫn thật (`credential from saved file <path>`).
+
+Quyền, và app **nói thật** về quyền:
+
+- Trên Unix: file được tạo với `0600` **ngay lúc tạo** (không phải siết sau khi ghi) và thư mục
+  `0700`.
+- Trên Windows: app cắt quyền kế thừa của thư mục credential (`icacls <dir> /inheritance:r`) rồi
+  chỉ giữ **tài khoản đang dùng** và `SYSTEM`; file thừa hưởng ACL đó. Đo trước/sau trên máy này:
+  trước khi lưu, thư mục cha còn `CodexSandboxUsers:(I)(OI)(CI)(RX)` — một nhóm **không phải** bạn
+  đọc được; sau khi lưu, thư mục credential chỉ còn `NT AUTHORITY\SYSTEM` và `<DOMAIN>\<USER>`.
+- Nếu bước siết ACL **không chạy được** (ví dụ môi trường bị chặn đổi ACL: `icacls` trả
+  `Access is denied`), app **không** giả vờ: `/status` in dòng
+  `Provider: credential file protection: the profile default only: no owner-only permission could
+  be applied, so another account on this machine may be able to read the file`. Hãy đọc dòng đó
+  trước khi tin rằng key đã được siết. File tìm thấy lúc khởi động được báo là
+  `not re-measured now` — app chỉ đo lúc nó tự lưu key.
+
+**Luật ưu tiên (quan trọng):** biến môi trường `DEEPSEEK_API_KEY` hoặc `HA_API_KEY` **luôn
+thắng** file. File chỉ là phương án dự phòng khi cả hai biến đều vắng hoặc rỗng. Nếu bạn vẫn
+export biến trong shell đang chạy `ha`, `/key` lưu được file nhưng app vẫn dùng biến —
+`/status` và `/model` in ra nguồn đang thực sự được dùng (`credential from environment
+variable ...` hay `credential from saved file ...`), và không bao giờ in giá trị.
+
+Hoàn tác: xoá file.
+
+```powershell
+Remove-Item "$env:LOCALAPPDATA\HarnessAgents\data\private\credentials.env"
+```
+
+Không cần dọn gì thêm: `config.toml` không chứa key nên giữ nguyên được, và app quay lại
+trạng thái "setup required" ở lần mở kế tiếp nếu không còn biến môi trường nào. Nếu bạn từng
+đặt `HA_CREDENTIALS_DIR`, xoá file trong **thư mục đó** thay vì đường dẫn mặc định ở trên;
+`/status` in ra đường dẫn thật đang dùng.
+
+Esc **thật sự huỷ** chế độ nhập bí mật: bấm Esc thì ô trở lại bình thường, không có gì được lưu,
+và file key đã lưu trước đó **không** bị ghi đè. Ctrl-C khi rảnh chỉ xoá ô, không thoát chế độ;
+muốn thoát hẳn thì bấm Esc. Mask `•` không chỉ là thứ ô soạn thảo hiện: nó được canh bằng test ở
+cả tầng khung hình đã vẽ, nên key không có đường lên màn hình.
+
+**Chưa được kiểm chứng trên máy này:** hành vi lưu key có test đơn vị (`docs/evidence/HA_TUI.vi.md`
+mục 11) và đường CLI thật đọc **file** credential ở `private\` đã được đo end-to-end bằng binary
+release với endpoint loopback chết (evidence 11.4: app đọc file, mở store, đi tới lời gọi provider
+rồi exit 1 — không có request nào rời máy). Nhưng **chưa** có ca PTY nào lái `/key` trong console
+thật (mask mới chỉ được canh ở tầng khung hình vẽ bằng backend test, không phải ConPTY), **chưa**
+có lượt gọi provider thật nào bằng key lưu trong app, và phép đo ACL Windows chỉ có trên **một**
+máy — một môi trường bị chặn đổi ACL sẽ rơi về mặc định profile (và `/status` nói đúng như vậy).
+Đừng coi ba điều đó là đã đạt.

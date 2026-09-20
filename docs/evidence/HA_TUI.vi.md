@@ -176,3 +176,237 @@ file được commit. Mọi lệnh ở mục 4 tái lập được từ commit C
 - Gate đầy đủ sau các sửa trên: format, Clippy, **133 unit**, **18 launch acceptance**,
   **9 session acceptance**, provider streaming, P0–P7, installer, release và docs đều xanh;
   JSON trả `passed: true`, `failures: []`.
+
+## 11. Lưu API key trong app (`/key`) — đo trong lượt này
+
+Trạng thái: **implemented, unit test xanh (153 test, 0 failed trong phiên có quyền đổi ACL);
+CHƯA commit, CHƯA qua gate/PTY/paid smoke.** Mục này ghi đúng những gì đã đo, đo ở đâu, và những
+gì **không**. Quyết định và hợp đồng ở SPEC mục 3d. Mọi con số test ở đây là **số đo có ngày**,
+không phải hằng số.
+
+### 11.1. Work items
+
+| Item | Trạng thái | Bằng chứng chính |
+|---|---|---|
+| K01 — file credential, parser, secret entry, gate setup, mask ở khung hình | implemented (unit) | 11 test `k01_*` (10 chạy được trên Windows) |
+| K02 — thứ tự ưu tiên, chẩn đoán, file hỏng bị từ chối | implemented (unit) | 5 test `k02_*` |
+| K03 — thư mục `private/`, ACL Windows, nhãn `Protection` | implemented, test xanh khi môi trường cho đổi ACL | 3 test `k03_*` |
+| Esc huỷ secret entry | **đã sửa, test bấm phím thật** | `input.rs:773`–`781` + `controller.rs:1373`–`1385` |
+| Mode `0600` áp lúc **tạo** file (Unix) | **đã sửa, có test** | `k01_the_stage_file_is_created_with_restrictive_flags`, `k01_the_file_is_owner_only_on_unix` |
+| `/key <value>` được mô tả trong app | **đã sửa** | `/help` `view.rs:131`–`133`; notice `controller.rs:753`–`754` |
+| ACL Windows thật (account + SYSTEM) | **đã áp + đã đo** trên `%LOCALAPPDATA%\HarnessAgents` | 11.2; test `k03_a_saved_key_is_restricted_to_this_account_by_an_acl` |
+| Nhãn `Protection` + dòng `Provider: credential file protection: …` trong `/status` | implemented; **nhãn** có test, **dòng đã render** thì chưa | `service.rs:335`–`338`; `k03_the_protection_labels_say_they_grant`; khoảng trống ở 11.7 |
+| Mask không lên màn hình | assert ở **3 tầng**: editor, controller, khung hình đã vẽ | 3 test ở 11.5 |
+| `/key` chạy trong console thật | **not_run** | không có ca PTY nào cho `/key` |
+| Một lượt gọi provider thật bằng key lưu trong app | **not_run** | môi trường không có credential/budget |
+
+### 11.2. Tested source, phép đo ACL, và một khác biệt môi trường phải nói rõ
+
+`HEAD` = `aeaf7b7` (`feat(ha-tui): /model and /status say which provider settings are actually in
+use`). Feature `/key` **chưa có commit nào**; `crates/harness-cli/src/interactive/credentials.rs`
+vẫn **untracked**. Cây đã **ngừng đổi**; hash dưới đây là bản cuối của lượt này.
+
+| | Giá trị |
+|---|---|
+| sha256 (16 ký tự đầu, đo lại 10:51 ngày 20/09/2026 sau khi cây ngừng đổi) | `credentials.rs 247DD32D6DDBDFF8`, `service.rs 30DC718E5FBF91AA`, `controller.rs 40568110E2005CB2`, `bootstrap.rs B2FA70F70BFB3151`, `input.rs F11C299E64170B34`, `view.rs F5B31462FED96083`, `events.rs 5A84C0BC7E302E6E`, `headless.rs AA4BFE1DBBE0EE27`, `tui/mod.rs 7CD12D2953E36362` |
+| `git status --porcelain` | 8 file source dưới `interactive/` modified + `credentials.rs` untracked (cùng file docs/scripts của track trước) |
+| Unit test | **153 passed; 0 failed** — đo lúc 10:49 ngày 20/09/2026 bằng `cargo test --release -p harness-cli --bin ha --locked` trong phiên có quyền đổi ACL (bên giao việc; 3 lần liên tiếp cho riêng test ACL đều `1 passed; 0 failed`); `cargo check --release -p harness-cli --all-targets --locked` **không warning** |
+| Tổng số test | **153**, đo lúc 10:49 ngày 20/09/2026 bằng `cargo test -p harness-cli --bin ha --locked -- --list`; **18** tên khớp `k0[123]_` trên Windows (10 `k01_*` + 5 `k02_*` + 3 `k03_*`), cộng 1 test `#[cfg(unix)]` = 19 test của feature |
+| Test trong phiên soạn tài liệu này | **152 passed; 1 failed** (đo 10:49 ngày 20/09/2026, debug và release đều vậy) — cùng bản cây, khác quyền file (xem dưới); test đỏ đúng là `k03_a_saved_key_is_restricted_to_this_account_by_an_acl` |
+
+**Phép đo ACL trước/sau (giá trị của feature này), trên `%LOCALAPPDATA%\HarnessAgents`:**
+
+```text
+TRƯỚC  icacls <thư mục cha của đường dẫn credential>
+       ... DESKTOP-14QHC6K\CodexSandboxUsers:(I)(OI)(CI)(RX)     <- nhóm KHÔNG phải user đọc được
+SAU    icacls <thư mục credential của một key đã lưu>
+       NT AUTHORITY\SYSTEM:(OI)(CI)(F)
+       DESKTOP-14QHC6K\duong:(OI)(CI)(F)
+       (file credential thừa hưởng đúng hai mục này, thêm cờ (I))
+```
+
+Nghĩa là: sau khi `/key` lưu, quyền kế thừa của profile bị cắt (`/inheritance:r`) và chỉ còn tài
+khoản đang dùng cộng `SYSTEM`; app vẫn đọc và xoá được thứ nó vừa siết, `load()` vẫn trả key.
+
+**Khác biệt môi trường — đây là chỗ dễ báo sai nhất.** Cùng bản cây đó, trong **phiên soạn tài
+liệu này** (file policy `workspace-write`), bước đổi ACL **bị hệ điều hành/sandbox từ chối**:
+
+```text
+icacls <dir> /inheritance:r   -> exit 5, "Access is denied"     (đo trong phiên này, 2 lần, 2 thư mục khác nhau)
+k03_a_saved_key_is_restricted_to_this_account_by_an_acl
+  assertion `left == right` failed: the ACL step must report what it did
+    left: ProfileDefault
+   right: OwnerOnlyAcl
+```
+
+Đây **không** phải lỗi logic: `restrict_acl` trả `Protection::ProfileDefault` khi `icacls` fail,
+và `describe()` của nhãn đó nói thẳng *"no owner-only permission could be applied, so another
+account on this machine may be able to read the file"*. Tức trong môi trường bị siết, app **báo
+sự thật** thay vì hứa suông — đó là hành vi đúng và là lý do có bốn nhãn `Protection`. Hệ quả cần
+biết: **test này phụ thuộc quyền của môi trường chạy** — runner không được đổi ACL sẽ thấy nó đỏ
+(evidence 11.7 ghi là khoảng trống còn lại, không phải bằng chứng code sai).
+
+*Ghi chú lịch sử (ngắn, để đọc log cũ):* trong lượt này cây từng có hai bản trung gian — bản A
+(`149 passed; 0 failed`, chưa có `private/`/`Protection`) và bản B1 (`148 passed; 2 failed`, hai
+test cũ còn assert đường dẫn cũ). Cả hai đã bị bản cuối ở trên thay thế; đừng dùng số của chúng.
+
+### 11.3. Commands thật đã chạy
+
+```text
+# Phiên bên giao việc (có quyền đổi ACL) — số của bản cuối, đo 20/09/2026:
+cargo test --release -p harness-cli --bin ha --locked  -> 153 passed; 0 failed
+cargo test --release -p harness-cli --bin ha --locked k03_a_saved_key  -> ok, 1 passed; 0 failed (3 lần)
+cargo check --release -p harness-cli --all-targets --locked            -> không warning
+
+# Phiên soạn tài liệu này (file policy workspace-write) — cùng bản cây, đo 10:49 ngày 20/09/2026:
+cargo test -p harness-cli --bin ha --locked            -> 152 passed; 1 failed
+cargo test --release -p harness-cli --bin ha --locked  -> 152 passed; 1 failed
+                                                          (cùng một test: ProfileDefault != OwnerOnlyAcl)
+cargo test -p harness-cli --bin ha --locked -- --list  -> 153 test; 18 tên khớp k0[123]_ trên Windows
+                                                          (10 k01 + 5 k02 + 3 k03; k01_the_file_is_owner_only_on_unix KHÔNG có — cfg(unix))
+cargo build --release -p harness-cli --bin ha --locked -> dùng cho phép đo end-to-end ở 11.4
+pwsh -NoProfile -File scripts/Verify-Docs.ps1          -> DOCS_OK: 121 files, 15 language pairs
+pwsh -NoProfile -File scripts/Verify-Docs.ps1 -SelfTest -> DOCS_OK + NEGATIVE_CONTROL_OK
+cargo clippy --workspace --all-targets --locked -- -D warnings         -> CHƯA chạy
+scripts/Verify-HaLaunch.ps1 -Json / Invoke-HaPtyAcceptance.ps1        -> CHƯA chạy
+scripts/Smoke-HaProvider.ps1                                          -> CHƯA chạy
+```
+
+Bằng chứng phụ cho nhánh `ProfileDefault` (chạy tay trong phiên này, không phải suy đoán):
+
+```text
+USERDOMAIN='DESKTOP-14QHC6K'  USERNAME='duong'      (account resolve được, không phải lý do fail)
+icacls <scratch dir>                    -> exit 0 (đọc được ACL)
+icacls <scratch dir> /inheritance:r     -> exit 5, "Access is denied"   (2 thư mục khác nhau, 2 lần)
+```
+
+### 11.4. End-to-end: CLI thật đọc **file** credential ở `private/` rồi đi tới lời gọi provider
+
+Đây là phép đo chạy binary release thật (không phải unit test), chạy lại được, và **không** dùng
+`HA_CREDENTIALS_DIR` — nó kiểm luôn đường dẫn mặc định mới `<data dir>/private/`:
+
+```powershell
+# KHÔNG set DEEPSEEK_API_KEY / HA_API_KEY trong shell này
+$root = "<repo>\target\e2e-cred-check2"
+#   $root\home\data\private\credentials.env  chứa đúng: DEEPSEEK_API_KEY="sk-e2e-file-only"
+$env:HA_HOME              = "$root\home"          # KHÔNG set HA_CREDENTIALS_DIR
+$env:HA_PROVIDER_ENDPOINT = 'http://127.0.0.1:9/chat/completions'   # cổng chết, không có gì lắng nghe
+& "<repo>\target\release\ha.exe" chat --headless --prompt hello --cwd "$root\project" --json
+```
+
+Kết quả đo được (phiên soạn tài liệu này):
+
+```text
+file written at: <...>\target\e2e-cred-check2\home\data\private\credentials.env
+key env present: False/False
+EXIT: 1
+provider_protocol: provider_protocol: provider_protocol: provider request failed: error sending request for url (http://127.0.0.1:9/chat/completions)
+key value in output: False
+```
+
+Cây tạm sau lượt chạy (chứng minh store đã mở và lượt đã được nhận trước khi request thất bại):
+
+```text
+home\data\private\credentials.env
+home\data\projects\project-994371608010cd34\harness.sqlite3
+home\data\projects\project-994371608010cd34\harness.sqlite3-shm
+home\data\projects\project-994371608010cd34\harness.sqlite3-wal
+home\data\projects\project-994371608010cd34\writer.lock
+```
+
+Điều phép đo này **chứng minh**:
+
+1. Key **chỉ** đến từ file: cả `DEEPSEEK_API_KEY` lẫn `HA_API_KEY` đều vắng trong môi trường.
+2. Đường dẫn mặc định **`<data dir>/private/credentials.env`** là đúng: app tìm thấy key ở đó mà
+   không cần `HA_CREDENTIALS_DIR`.
+3. Đường CLI thật (`ha chat --headless`) đọc được file đó: nếu không, nó dừng ở
+   `no credential; set one of ...` (mã `SecretNotGranted`) chứ không đi tiếp.
+4. App đã mở store, nhận lượt và **đi tới lời gọi provider** (xem cây tạm ở trên).
+5. **Không có request nào rời máy**: endpoint là cổng loopback chết `127.0.0.1:9`.
+6. Giá trị key **không** xuất hiện trong output (`Contains('sk-e2e-file-only')` → `False`).
+
+Điều phép đo này **không** chứng minh: không có lời gọi DeepSeek thật nào (endpoint chết, không
+credential thật), nên **không** nói gì về việc key có xác thực được hay không. Nó cũng không đo
+ACL: thư mục `private/` ở đây nằm trong `target\` của workspace.
+
+### 11.5. Test nào chứng minh điều gì
+
+| Test | Điều được chứng minh | Oracle |
+|---|---|---|
+| `k01_only_the_known_variable_is_accepted` | tên biến khác bị từ chối | `load` trả `ConfigParseError`; chuỗi lỗi chứa `does not use`, **không** chứa giá trị fixture |
+| `k01_the_parser_detail_never_quotes_the_value` | giá trị không quote bị từ chối, thông điệp có path và `/key` | chuỗi lỗi không chứa `sk-secret-without-quotes` |
+| `k01_missing_and_blank_files_are_absent_not_errors` | file thiếu và giá trị rỗng là `None` | `load` trả `Ok(None)` cho cả hai |
+| `k01_round_trip_keeps_the_key_and_leaves_no_staging_file` | `save` → `load` giữ nguyên key; không còn file `*staged*` | quét `read_dir` thư mục đích |
+| `k01_a_quote_in_the_key_survives_a_round_trip` | key chứa `"` sống qua escape/unescape | `save`/`load` với `sk-with"quote` |
+| `k01_the_file_is_owner_only_on_unix` (`#[cfg(unix)]`) | mode file `0600` **và** mode thư mục `0700` sau `save` | `metadata().permissions().mode() & 0o777` cho cả hai — **không biên dịch trên Windows** |
+| `k01_the_stage_file_is_created_with_restrictive_flags` | file staging được **tạo** với mode `0600` và nội dung đúng một dòng | gọi thẳng `write_staged`, đọc mode (assertion Unix trong test chạy mọi nền tảng) |
+| `k01_key_entry_masks_saves_clears_the_gate_and_admits_the_next_message` | cả chuỗi `/key` bằng **phím thật**: prompt mask; file ghi đúng `DEEPSEEK_API_KEY="sk-controller-fixture"\n`; gate setup xoá; phase `Ready`; notice trong transcript; key không có trong transcript và không tạo submission; lượt kế tiếp được nhận thật; `/key` bị từ chối khi run đang chạy; Esc sau đó **không** ghi đè key đã lưu | `controller.editor.secret_entry()`, `controller.prompt()`, `ui_state().setup_required`, `phase()`, `transcript()`, submission log của port, đọc lại file credential |
+| `k01_a_secret_buffer_is_painted_as_a_mask` (TUI) | **khung hình đã vẽ** không chứa `sk-live-secret` và **có** chứa `•` khi `state.buffer` là buffer đã mask | vẽ bằng `ScriptedRenderer::draw_state(80×24)` rồi soi `painted()`; một renderer lấy buffer thô sẽ trượt |
+| `k02_the_credential_file_follows_the_explicit_directory` | `HA_CREDENTIALS_DIR` thắng data dir; giá trị rỗng không phải override | so `resolve_file` với path mong đợi |
+| `k02_a_source_is_described_by_name_never_by_value` | `describe()` chỉ trả tên nguồn; `is_live()` env `false` / file `true` | assert trên `CredentialSource` |
+| `k01_saving_a_key_clears_the_setup_gate_and_writes_the_minimal_config` | `config.toml` = `"schema_version = 1\n"`; `setup_required` false; header nêu `credentials.env` và **không** vẽ key | `bootstrap::credential_saved` + đọc lại file config |
+| `k01_secret_entry_masks_the_buffer_and_never_reaches_history` | mask một-ký-tự-một-mask; Enter trả `InputOutcome::Secret`; history rỗng; **`Key::Esc` thật** trả `Redraw`, thoát secret entry và không để lại gì | `display_buffer()`, `handle(Key::Enter)`, `handle(Key::Esc)`, `history()` |
+| `k02_a_saved_file_configures_the_provider_and_the_environment_still_wins` | file là nguồn credential hợp lệ; biến môi trường thắng file | `resolve_provider` với/không có `DEEPSEEK_API_KEY` |
+| `k02_a_saved_file_is_readable_and_a_corrupt_one_is_refused` | file lưu đọc được; file hỏng **dừng** launch kèm path, không lặp nội dung | `validate_credential_file` |
+| `k02_diagnostics_name_the_source_and_never_the_value` | `/status` nêu `credentials.env` + `value hidden`, không có key. **Không** phủ dòng protection mới (`service.rs:337`) | `provider_diagnostics` join |
+
+### 11.6. Negative controls
+
+| Bất biến | Cách phá | Test sẽ đỏ |
+|---|---|---|
+| Chỉ nhận đúng một tên biến | cho parser nhận mọi `NAME=` | `k01_only_the_known_variable_is_accepted` |
+| Thông điệp lỗi không rò giá trị | nhét giá trị bị từ chối vào `detail` | `k01_the_parser_detail_never_quotes_the_value`, `k02_a_saved_file_is_readable_and_a_corrupt_one_is_refused` |
+| Biến môi trường thắng file | đảo thứ tự trong `credentials::source` (stat file trước) | `k02_a_saved_file_configures_the_provider_and_the_environment_still_wins` |
+| Key không vào history | cho `LineEditor::submit` chạy nhánh history trước nhánh `secret` | `k01_secret_entry_masks_the_buffer_and_never_reaches_history` |
+| `/key` là setup trọn vẹn | bỏ `write_minimal_config` khỏi `credential_saved` | `k01_saving_a_key_clears_the_setup_gate_and_writes_the_minimal_config` |
+| Không rò key qua chẩn đoán | cho `describe()` trả cả giá trị | `k02_diagnostics_name_the_source_and_never_the_value` |
+| Esc phải huỷ secret entry | bỏ nhánh `self.secret` khỏi `Key::Esc` | `k01_secret_entry_masks_the_buffer_and_never_reaches_history` (đơn vị) + `k01_key_entry_masks_saves_clears_the_gate_and_admits_the_next_message` (controller) |
+| Không có cửa sổ file ai cũng mở được (Unix) | đổi `write_staged` sang `fs::write` + `set_permissions` sau | `k01_the_stage_file_is_created_with_restrictive_flags` (chỉ đỏ trên Unix) |
+| Esc không được ghi đè key đã lưu | cho `Key::Esc` gọi `save_key` với buffer | `k01_key_entry_masks_saves_clears_the_gate_and_admits_the_next_message` |
+| Renderer không được lách qua state để lấy buffer thô | cho composer vẽ `editor.buffer()` thay vì `state.buffer` | `k01_a_secret_buffer_is_painted_as_a_mask` |
+| ACL phải nêu đúng account + SYSTEM | bỏ `/grant:r "SYSTEM:..."` khỏi `restrict_acl` | `k03_a_saved_key_is_restricted_to_this_account_by_an_acl` (chỉ chạy/đỏ ở môi trường cho đổi ACL) |
+| Nhãn `Protection` không được nói quá | cho `ProfileDefault.describe()` trả "owner-only" | `k03_the_protection_labels_say_they_grant` |
+
+### 11.7. **Không** được chứng minh (đọc kỹ trước khi báo cáo)
+
+- **Chưa có lượt gọi DeepSeek thật nào.** Môi trường này **không** có credential/budget
+  (`DEEPSEEK_API_KEY` và `HA_API_KEY` đều rỗng), nên **không** có bằng chứng rằng một key lưu
+  bằng `/key` thật sự xác thực được với provider. Toàn bộ chuỗi "lưu → lượt kế tiếp dùng" chỉ
+  được chứng minh ở mức unit: `resolve_provider` đọc lại nguồn, `credentials::load` đọc lại
+  file — **không** có request HTTP nào được gửi.
+- **TUI chưa được lái trong console thật ở lượt này.** ConPTY cần một console mà sandbox build
+  không có, nên **không** có ca PTY nào cho `/key`: không có bằng chứng transcript thật rằng ký tự
+  `•` là thứ terminal nhận được. Mask được canh ở **ba tầng không cần console** — editor
+  (`display_buffer()`), controller (`prompt()`/`transcript()`), và **khung hình đã vẽ**
+  (`k01_a_secret_buffer_is_painted_as_a_mask`) — nhưng đó là `ScriptedRenderer`, không phải ConPTY.
+- **ACL Windows: đo trên một máy, và phụ thuộc quyền của môi trường chạy.** Phép đo trước/sau ở
+  11.2 là trên `%LOCALAPPDATA%\HarnessAgents` của **máy này**, trong phiên **có** quyền đổi ACL;
+  test `k03_a_saved_key_is_restricted_to_this_account_by_an_acl` cũng xanh ở đó. Trong phiên soạn
+  tài liệu này (policy `workspace-write`) `icacls /inheritance:r` bị từ chối (exit 5) nên `save()`
+  trả `ProfileDefault` và **cùng test đó đỏ** — nghĩa là test **phụ thuộc quyền của runner**, và
+  một CI bị siết ACL sẽ thấy nó đỏ. Thêm nữa: assertion trong test dựa vào chữ **`SYSTEM`** theo
+  tiếng Anh (chính test ghi rõ điều này), nên **chưa** kiểm chứng cho Windows bản địa hoá khác.
+- **Nhánh `icacls` thất bại không có test ép.** "Fallback trung thực" (`ProfileDefault` khi
+  `icacls` fail) được chứng minh bằng phép đo thủ công trong môi trường bị chặn ACL, **không** bằng
+  một test tiêm lỗi.
+- **Dòng protection trong `/status` chưa được test assert.** `provider_diagnostics` in
+  `Provider: credential file protection: <mô tả>` (`service.rs:335`–`338`), và **nhãn** thì có test
+  (`k03_the_protection_labels_say_they_grant`), nhưng **không** test nào assert chuỗi đã render —
+  nên một thay đổi ở dòng đó sẽ không làm test nào đỏ.
+- **Hai assertion Unix `0600`/`0700` không chạy trên máy này.** `k01_the_file_is_owner_only_on_unix`
+  là `#[cfg(unix)]` (không biên dịch, không chạy trên Windows), và assertion mode bên trong
+  `k01_the_stage_file_is_created_with_restrictive_flags` cũng nằm trong khối `#[cfg(unix)]` — trên
+  Windows test đó chỉ khẳng định nội dung file staging. Vậy "0600 lúc tạo" được canh bằng test
+  nhưng **chưa từng được đo** trong lượt này.
+- **`/key <giá-trị>` chỉ lưu token đầu tiên.** Hạn chế này **đã được ghi trong app** (`/help`
+  `view.rs:131`–`133` và notice `controller.rs:753`–`754`), nhưng vẫn là hạn chế: key chứa dấu
+  cách sẽ bị cắt.
+- Chưa commit, chưa gate, chưa PTY, chưa cài lên máy user trong lượt này; không có phép đo nào
+  trên VM sạch.
+
+Đã sửa trong lượt này (trước đây nằm trong danh sách "không đạt"): **Esc huỷ secret entry** (implement +
+test bấm phím thật ở editor và controller); **mode `0600` áp lúc tạo file staging** (Unix) thay cho
+`set_permissions` sau khi ghi; **`/key <value>` được mô tả trong `/help`**; **đường `/key` của
+controller có test end-to-end**; **file credential nằm trong `<data dir>/private/`**; **ACL Windows
+thật (account + SYSTEM) và `Protection` được `save()` trả về, `/status` in ra**; và **mask được
+assert ở cả tầng khung hình đã vẽ**.

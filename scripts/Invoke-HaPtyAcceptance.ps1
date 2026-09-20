@@ -8,28 +8,19 @@ transcript when the process that creates the pseudo-console owns one, and a sand
 `cargo test` does not. This helper launches the compiled test binary in a new console
 window, waits with a hard bound, and writes the result next to the transcript.
 
-Status at the time of writing (HA_LAUNCH H07, round 21): all nine cases pass here -
-  - i01: bare `ha` opens the app, renders its header and exits 0;
-  - i06: Vietnamese input, backspace and paste leave the app alive at a usable prompt;
-  - i07a/i07b: Ctrl-C clears an idle prompt and cancels a running turn;
-  - i08: an injected render/backend fault after initialization exits 1 with a named
-    error instead of hanging or swallowing the failure;
-  - i05: /exit during an active run cancels it, exits 0 and releases the store so the
-    next host can take the writer;
-  - i12: a configured but unreachable provider fails the turn with the endpoint named,
-    leaves the app alive and never fabricates a fixture answer;
-  - i14: the installed artifact (staged under a path with spaces and Vietnamese
-    diacritics, with PATH and the profile variables rebuilt) opens the same app from
-    a project outside the install directory;
-  - i13: an approved patch runs for real and commits its receipt, the process is then
-    killed hard, and a new process resumes without re-running the settled action.
+Status at the time of writing (HA_TUI CP-D plus the post-CP-D wiring audit): all 16
+cases pass here. Ten HA_LAUNCH cases cover bare launch, active-run exit and writer
+release, Vietnamese input, idle/running Ctrl-C, backend failure recovery, unreachable
+provider behavior, settled-receipt recovery, staged install, and a multiline draft.
+Six HA_TUI cases cover the inline viewport, multiline paste, approval by `y`, resize,
+plain fallback, and `NO_COLOR`.
 
-Measured in one bounded run: PTY_EXIT 0 and "9 passed; 0 failed" in 20.51 s. The cases stay
+Measured in one bounded run: PTY_EXIT 0 and "16 passed; 0 failed" in 21.98 s. The cases stay
 `#[ignore]`d because `cargo test` in a sandbox has no console; this helper is how they
 are run for evidence.
 
 .PARAMETER Filter
-Test-name filter passed to the test binary. Defaults to all nine PTY cases.
+Test-name filter passed to the test binary. Defaults to all 16 PTY cases.
 
 .PARAMETER TimeoutSeconds
 Hard bound before the console run is killed. Defaults to 600.

@@ -13,6 +13,8 @@
 
 use std::time::{Duration, Instant};
 
+use super::credentials::CredentialSource;
+
 use harness_types::InputId;
 
 /// One normalized terminal input event.
@@ -287,6 +289,14 @@ pub struct UiState {
 pub enum SessionEvent {
     Accepted {
         input_id: InputId,
+    },
+    /// A credential was saved and is now the active source.
+    ///
+    /// It carries the *name* of the source, never the key: this event crosses the
+    /// same channels as every other one, so putting the value here would leak it
+    /// into a journal or a transcript.
+    ProviderConfigured {
+        source: CredentialSource,
     },
     TextDelta {
         text: String,

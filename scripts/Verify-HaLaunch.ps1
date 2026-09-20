@@ -13,8 +13,8 @@ regressions P0-P7, the installer self test and the documentation checker with it
 negative controls.
 
 Items the gate deliberately reports as NOT RUN instead of counting them as passes:
-the PTY transcript cases (I01/I06/I07/I08/I14 in a real terminal), the live provider
-smoke, Linux, and any real mutation of the user's PATH or profile.
+the 16 PTY transcript cases in a real terminal, the live provider smoke, Linux, and
+any real mutation of the user's PATH or profile.
 
 A required selector that disappeared fails the gate instead of silently reducing
 coverage.
@@ -41,6 +41,23 @@ $ErrorActionPreference = 'Stop'
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $script:Steps = [System.Collections.Generic.List[object]]::new()
 
+function Invoke-NativeCapture {
+    param([string] $File, [string[]] $Arguments)
+    # Windows PowerShell 5.1 wraps native stderr as NativeCommandError. Cargo writes
+    # normal progress to stderr, so capture each record as text and judge the command
+    # by LASTEXITCODE.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = (& $File @Arguments 2>&1 | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
+        $exit = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    return [pscustomobject]@{ Output = $output; ExitCode = $exit }
+}
+
 function Invoke-GateStep {
     param(
         [string] $Name,
@@ -50,8 +67,9 @@ function Invoke-GateStep {
     Write-Host "== $Name"
     Write-Host "   $File $($Arguments -join ' ')"
     $start = Get-Date
-    $output = & $File @Arguments 2>&1 | Out-String
-    $exit = $LASTEXITCODE
+    $result = Invoke-NativeCapture -File $File -Arguments $Arguments
+    $output = $result.Output
+    $exit = $result.ExitCode
     $elapsed = [int] ((Get-Date) - $start).TotalSeconds
     $tail = ($output -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 3) -join ' | '
     $script:Steps.Add([pscustomobject]@{
@@ -71,12 +89,12 @@ function Invoke-GateStep {
 
 function Get-DiscoveredTests {
     param([string] $File, [string[]] $Arguments)
-    $output = & $File @Arguments 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) {
+    $result = Invoke-NativeCapture -File $File -Arguments $Arguments
+    if ($result.ExitCode -ne 0) {
         throw "test discovery failed for $File $($Arguments -join ' ')"
     }
     $names = [System.Collections.Generic.List[string]]::new()
-    foreach ($line in ($output -split "`r?`n")) {
+    foreach ($line in ($result.Output -split "`r?`n")) {
         if ($line -match '^([A-Za-z0-9_:]+): test$') {
             $names.Add($Matches[1])
         }

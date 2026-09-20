@@ -274,6 +274,9 @@ hết flake **trước** khi thêm ca PTY mới của T08 — không được n�
   terminal: `--plain`, `HA_UI=plain`, console < 60×10, `TERM=dumb`; mọi lý do in ra stderr.
 - Panic hook được bọc quanh toàn bộ vòng lặp sống của app (`install_panic_hook`), phục hồi
   terminal rồi mới để panic nổi lên; lỗi backend (I08) **không** phải panic và vẫn exit 1.
+- Khi `/exit` hoặc Ctrl-D đến trong lúc run còn active, controller yêu cầu cancel nhưng
+  **chưa phát `Exit` ngay**. Nó chỉ thoát sau `RunTerminal`/`RecoverableError`, để worker đóng
+  run và nhả SQLite writer; PTY `i05` chứng minh host kế tiếp mở cùng workspace được.
 - Thoát: vẽ frame trắng, xoá vùng viewport, để con trỏ ở cột 0 dòng mới, giữ scrollback.
 - `NO_COLOR`/`TERM=dumb` → `Theme::plain()`: không SGR màu, vẫn có khung; ca PTY
   `t07_pty_no_color` quét transcript thật.
@@ -293,6 +296,236 @@ hết flake **trước** khi thêm ca PTY mới của T08 — không được n�
   2. assertion về chữ người dùng gõ so trên transcript **chuẩn hoá** (`normalized()`), còn
      assertion về output của app (echo, `[run]`, `[tool]`) so trên transcript thô;
   3. mọi ca lưu transcript vào `target/pty-transcripts/` để đọc khi đỏ.
+
+## 3d. Lưu API key trong app — `/key` (sau CP-D, chưa commit)
+
+Lượt này thêm đường **tự lưu credential** để người dùng không phải mở shell đặt biến môi
+trường trước khi mở `ha`. Đây là việc **ngoài** track T01–T08: plan HA_TUI không có item nào
+cho việc nhập key (handoff mục 13). Nguồn: `crates/harness-cli/src/interactive/credentials.rs`
+(mới) + `bootstrap.rs`, `controller.rs`, `events.rs`, `headless.rs`, `input.rs`, `service.rs`,
+`view.rs`. Không thêm dependency nào, `Cargo.toml`/`Cargo.lock` không đổi.
+
+### 3d.1. Credential là file riêng — **cố ý** không nằm trong `config.toml`
+
+**Quyết định:** key không được ghi vào `config.toml` nghiêm ngặt, và sẽ không bao giờ. Ba lý do:
+
+1. `config.toml` là file **non-secret** theo hợp đồng (`config.rs:1`) và schema P0 chỉ nhận
+   `schema_version`; thêm một trường secret vào đó là đổi contract P0.
+2. Parser TOML **có thể trích giá trị nó từ chối** trong thông điệp lỗi — chính `config.rs:83`
+   ghi lý do đó — nên key nằm trong file strict sẽ có đường rò ra log.
+3. Một file riêng siết được quyền riêng và hoàn tác được riêng: xoá `credentials.env` là xong,
+   không phải sửa file config.
+
+`save()` vì vậy chỉ ghi thêm `config.toml` **tối thiểu** (`schema_version = 1`) và **chỉ khi
+file chưa tồn tại** (mục 3d.6).
+
+### 3d.2. Đường dẫn, định dạng, parser
+
+| Mục | Giá trị |
+|---|---|
+| Tên file | `credentials.env` (`credentials::CREDENTIAL_FILE_NAME`) |
+| Thư mục | `HA_CREDENTIALS_DIR` nếu có (biến chứa **thư mục**, dùng **nguyên như đã cho**, không lồng thêm; giá trị rỗng không tính là override), ngược lại `<data dir>/private` (`CREDENTIAL_DIRECTORY_NAME = "private"`, `credentials.rs:54`) |
+| Data dir | `--data-dir` > `HA_HOME/data` > platform (`paths.rs:145`) |
+| Windows | `%LOCALAPPDATA%\HarnessAgents\data\private\credentials.env` |
+| Linux | `$XDG_DATA_HOME/harness-agents/private/credentials.env` |
+| Nội dung | đúng một dòng `DEEPSEEK_API_KEY="<key>"` |
+| Biến được nhận | chỉ `DEEPSEEK_API_KEY`; tên khác bị từ chối chứ không được hiểu một nửa |
+
+**Quyết định: file nằm trong thư mục con `private/`.** Data root còn chứa project store mà module
+này **không** sở hữu, nên siết quyền ở chính data root sẽ đổi ACL của những thư mục không thuộc
+nó; một thư mục con riêng thì siết được mà không đụng ai (`credentials.rs:48`–`54`). Override
+`HA_CREDENTIALS_DIR` vì vậy cũng được dùng nguyên trạng — không tự thêm `private/` lần nữa
+(assert bằng `k03_the_credential_directory_is_a_dedicated_subdirectory`).
+
+Parser `credentials::parse` (`credentials.rs:170`) chấp nhận dòng trống và dòng bắt đầu `#`,
+rồi đúng một dòng `NAME=value` với `NAME` là biến đã biết và giá trị được quote bằng `"` hoặc
+`'`. Nó **từ chối**: dòng không có `=`; tên biến khác (`it names a variable this app does not
+use`); khai hai lần (`the variable is set twice`); giá trị không quote. `\` và `"` được escape
+khi ghi và hoàn nguyên khi đọc, nên key chứa `"` sống qua round trip.
+
+Thông điệp lỗi của `load` nêu **path** và bước tiếp theo (`/key` hoặc xoá file) và **không**
+lặp lại nội dung file — kể cả khi lỗi đến từ parser, vì chi tiết parser có thể trích giá trị bị
+từ chối. File **thiếu** hoặc giá trị **rỗng/toàn khoảng trắng** là `Ok(None)`: không phải lỗi,
+và không cấp credential.
+
+`validate_credential_file` (`service.rs:296`, dùng ở đường headless) kiểm thêm rằng nguồn mà
+`credentials::source` báo và file mà resolver đọc là **cùng một path**, và file đó đọc được —
+để một override lệch không tạo ra trạng thái "nhận ở đây rồi hỏng ở lần gọi đầu".
+
+### 3d.3. Thứ tự ưu tiên — biến môi trường **luôn** thắng file
+
+`credentials::source` (`credentials.rs:113`) là nơi duy nhất quyết định nguồn: nó hỏi
+`DEEPSEEK_API_KEY` rồi `HA_API_KEY` (đúng thứ tự `CREDENTIAL_VARIABLES`) và **chỉ khi cả hai
+đều vắng hoặc rỗng** mới `stat` file. Hệ quả phải nói rõ: file là **fallback**; nếu biến vẫn
+được export trong shell đang chạy `ha`, `/key` ghi được file nhưng lượt kế tiếp **vẫn dùng
+biến**.
+
+`CredentialSource` chỉ mang **tên** nguồn — `Environment { variable }` hoặc `File { path }` —
+và `describe()` trả `environment variable <TÊN>` hoặc `saved file <path>` (`credentials.rs:59`).
+Không biến thể nào mang giá trị, nên header, `/status`, `/model` và
+`SessionEvent::ProviderConfigured { source }` (`events.rs:298`) không có đường rò.
+
+### 3d.4. Thứ tự siết quyền trong `save()` — 0600 lúc **tạo** file, ACL thật trên Windows
+
+`credentials::save` làm tuần tự:
+
+1. `create_dir_all(thư mục)` — lỗi là `StorageOpenFailed` có path.
+2. `restrict_directory(thư mục)`: Unix `0700`; ngoài Unix không đặt mode.
+3. `restrict_acl(thư mục, <DOMAIN>\<USER>)`: **chỉ trên Windows** — gọi `icacls <dir>
+   /inheritance:r` rồi `icacls <dir> /grant:r "<account>:(OI)(CI)F" /grant:r "SYSTEM:(OI)(CI)F"`
+   (`credentials.rs:355`–`385`). File credential **thừa hưởng** ACL của thư mục. Shell ra
+   `icacls` là chủ ý: cách còn lại là gọi API bảo mật Win32, mà crate này không có `unsafe`.
+4. `write_staged` **tạo** file staging `.credentials.env.staged` bằng
+   `OpenOptions::new().write(true).create(true).truncate(true)` cộng `mode(0o600)` trên Unix
+   (`std::os::unix::fs::OpenOptionsExt`), ghi nội dung rồi `sync_all()` (`credentials.rs:393`).
+5. `rename` staging → đích: người đọc không thấy file viết dở.
+6. `restrict_file(path)`: gọi thêm một lần, cho file cũ có trước bản này.
+7. `save()` **trả về** `Protection` — đúng thứ nó vừa áp, không phải thứ nó hy vọng.
+
+**Unix:** mode `0600` được kernel áp **lúc tạo file**, không phải `set_permissions` sau khi ghi,
+nên câu "the key is never in a file that anyone else can open, not even for the instant between
+creating and tightening it" (`credentials.rs:12`–`18`) **đúng**, và được canh bằng
+`k01_the_stage_file_is_created_with_restrictive_flags` (mode file staging) cùng
+`k01_the_file_is_owner_only_on_unix` (`0600` file + `0700` thư mục).
+
+**Windows:** ACL owner-only **có** được áp, qua `icacls`. Đo trước/sau trên
+`%LOCALAPPDATA%\HarnessAgents` (bên giao việc đo, xem evidence 11.2): **trước** thư mục cha có
+`DESKTOP-14QHC6K\CodexSandboxUsers:(I)(OI)(CI)(RX)` — một nhóm không phải người dùng đọc được
+key; **sau** khi lưu key, thư mục credential chỉ còn `NT AUTHORITY\SYSTEM:(OI)(CI)(F)` và
+`DESKTOP-14QHC6K\duong:(OI)(CI)(F)`, file thừa hưởng đúng hai mục đó với cờ `(I)`.
+
+**Khi bước ACL bị từ chối, app nói thật.** `restrict_acl` trả `Protection::ProfileDefault` nếu
+`icacls` fail (hoặc không resolve được account), và `Protection::describe()` in ra nguyên văn
+*"the profile default only: no owner-only permission could be applied, so another account on this
+machine may be able to read the file"*. Đo được: trong một môi trường bị chặn đổi ACL,
+`icacls <dir> /inheritance:r` trả **exit 5 `Access is denied`**, `save()` trả `ProfileDefault`, và
+test `k03_a_saved_key_is_restricted_to_this_account_by_an_acl` (assertion `OwnerOnlyAcl`) **đỏ** —
+đúng như thiết kế: môi trường bị siết thì được **báo sự thật**, không được cấp một lời hứa suông.
+Không có test nào **ép** nhánh fail đó (evidence mục 11.7).
+
+**Bốn nhãn `Protection`** (`credentials.rs:58`–`87`) là hợp đồng trung thực, không phải trang trí:
+
+| Nhãn | Nghĩa | Nguồn |
+|---|---|---|
+| `OwnerOnly` | Unix `0600`/`0700` do app áp | `restrict_acl` nhánh unix |
+| `OwnerOnlyAcl` | ACL do app áp (account này + SYSTEM) | `icacls` chạy thành công |
+| `ProfileDefault` | **Không** áp được gì; câu mô tả nói thẳng là tài khoản khác **có thể** đọc được | `icacls` fail/không có account |
+| `NotReverified` | File tìm thấy lúc khởi động: app đã đặt nó khi lưu key, nhưng **lần chạy này không đo lại** | `credentials::source` |
+
+`CredentialSource::File { path, protection }` mang nhãn này; `/status` in thêm dòng
+`Provider: credential file protection: <mô tả>` (`service.rs:337`), còn `describe()` của nguồn
+vẫn chỉ là tên file.
+
+### 3d.5. Lệnh `/key`
+
+| Dạng | Hành vi |
+|---|---|
+| `/key` | Composer vào **secret entry**: buffer mask `•` mỗi ký tự (`SECRET_MASK`, `input.rs:78`), không completion, không picker; Enter lưu, giá trị **không** vào history |
+| `/key <giá-trị>` | Lưu trực tiếp; chỉ **token đầu tiên** của phần còn lại được dùng (`argument` cắt theo whitespace, `controller.rs:692`); `/help` nói rõ dạng này **kém riêng tư hơn** và chỉ nhận một từ |
+| `/key` khi run đang chạy | Từ chối kèm notice "cannot enter an API key while a run is active" |
+| `/key` với giá trị rỗng | Notice "no key was entered; nothing was saved" |
+
+Giá trị không có đường tới màn hình: cả plain lẫn TUI đều đọc
+`InteractiveController::display_buffer()` (`controller.rs:217`), và `UiState::buffer` được set
+từ chính hàm đó (`controller.rs:234`) — TUI vẽ `state.buffer`. `InputOutcome::Secret` là đường
+duy nhất mang giá trị ra khỏi editor, và `LineEditor::submit` trả nó **trước** khi chạm history
+(`input.rs:402`–`407`).
+
+Dạng có tham số **đã được mô tả trong app** (sửa của lượt này): `/help` có dòng thứ hai
+(`view.rs:131`–`133`) — *"save it in one line: less private, because the value stays in this
+terminal's history, and it takes one word, so use /key alone when in doubt"* — và notice sau
+`/key` trần cũng nói cùng điều đó (`controller.rs:753`–`754`). Giới hạn một-token vì vậy là
+**hạn chế đã biết và đã ghi**, không còn là điều chỉ tài liệu ngoài repo biết.
+
+**Esc huỷ secret entry — đã sửa.** `Key::Esc` của editor nay có nhánh `self.secret` gọi
+`cancel_secret()` rồi trả `InputOutcome::Redraw` (`input.rs:351`–`368`). Hai test canh đúng
+đường bấm phím thật, không gọi hàm trực tiếp: `k01_secret_entry_masks_the_buffer_and_never_reaches_history`
+bấm `Key::Esc` (`input.rs:773`–`781`) và
+`k01_key_entry_masks_saves_clears_the_gate_and_admits_the_next_message` khẳng định sau Esc thì
+prompt trở lại bình thường và **file key đã lưu không bị ghi đè** (`controller.rs:1373`–`1385`).
+Ctrl-C khi rảnh vẫn chỉ gọi `editor.clear()` (`controller.rs:672`), tức xoá buffer mà giữ nguyên
+secret mode — nay không còn là đường cụt vì Esc đã thoát được.
+
+`/help` liệt kê `/key` và cả dạng `/key <value>` (`view.rs:129`–`133`) — 9 dòng cho 8 lệnh;
+`SLASH_COMMANDS` vẫn **8** phần tử (`input.rs:596`).
+
+### 3d.6. Lưu xong thì **không cần restart** — cơ chế
+
+`controller::save_key` (`controller.rs:878`) làm bốn việc trong cùng một bước:
+
+1. `AgentSessionService::save_credential` ghi file rồi trả
+   `SessionEvent::ProviderConfigured { source }` (`service.rs:634`) — event chỉ mang nguồn.
+   Ghi lỗi trả `SessionEvent::RecoverableError` và **không** ghi file dở.
+2. `LaunchContext::credential_saved(source)` (`bootstrap.rs:170`) đọc config; nếu file **chưa
+   tồn tại** thì ghi `schema_version = 1\n` bằng `write_minimal_config`, rồi `config::load` lại.
+   File config **hỏng** không bị ghi đè: nó trả đúng lỗi của lần load bình thường.
+3. Context mới là `ProviderState::CredentialPresent` với `setup_required = false`
+   (`bootstrap.rs:188`), nên gate setup được xoá; controller đổi phase
+   `SetupRequired | Booting → Ready` và vẽ lại header (`controller.rs:899`–`908`).
+4. Lượt kế tiếp chạy `resolve_provider` **mỗi lượt** (`service.rs:740`) và dựng
+   `EnvironmentCredential` mới; resolver đọc file **lúc gọi** (`credentials::load` trong
+   `resolve`, `service.rs:444`), nên key vừa lưu có hiệu lực ngay trong phiên đang chạy. Nhánh
+   biến môi trường thì ngược lại: `CredentialSource::is_live()` trả `false` cho environment và
+   `true` cho file (`credentials.rs:76`).
+
+`submit` hỏi `provider_problem()` **lúc gửi** chứ không lúc boot (`controller.rs:619`), nên một
+"setup required" cũ không chặn được yêu cầu mà app đã phục vụ được.
+
+`/status` và `/model` in `provider_diagnostics`: dòng đầu là
+`Provider: credential from <nguồn> (value hidden)` (`service.rs:331`); khi nguồn là **file**, có
+thêm dòng `Provider: credential file protection: <mô tả>` (`service.rs:337`) lấy từ nhãn
+`Protection` — file tìm thấy lúc khởi động là `NotReverified` ("not re-measured now"), vì đo lại
+ACL trên mỗi lần render là shell ra `icacls`. Các dòng sau nói endpoint và model đến từ biến hay
+từ mặc định, và endpoint có trả lời TCP không (kiểm tra kết nối, không gửi request, không cần
+credential).
+
+### 3d.7. Test canh hợp đồng (tên thật, chạy trên cây nguồn này)
+
+| Test | Điều nó khẳng định |
+|---|---|
+| `k01_only_the_known_variable_is_accepted` | tên biến khác bị từ chối; thông điệp không lặp nội dung file |
+| `k01_the_parser_detail_never_quotes_the_value` | giá trị không quote bị từ chối; thông điệp có path và `/key`, **không** có key |
+| `k01_missing_and_blank_files_are_absent_not_errors` | file thiếu và giá trị rỗng là `None`, không phải lỗi |
+| `k01_round_trip_keeps_the_key_and_leaves_no_staging_file` | round trip giữ key; không còn file `.staged` |
+| `k01_a_quote_in_the_key_survives_a_round_trip` | key chứa `"` sống qua escape/unescape |
+| `k01_the_file_is_owner_only_on_unix` (`#[cfg(unix)]`) | mode file `0600` **và** mode thư mục `0700` — **không** được biên dịch trên Windows |
+| `k01_the_stage_file_is_created_with_restrictive_flags` | `write_staged` tạo file staging với mode `0600` (assertion Unix trong một test chạy được mọi nền tảng) và nội dung đúng một dòng |
+| `k01_key_entry_masks_saves_clears_the_gate_and_admits_the_next_message` | cả chuỗi `/key` bằng phím thật: prompt mask, file ghi đúng dòng `DEEPSEEK_API_KEY="..."`, gate setup xoá, phase `Ready`, notice trong transcript, key **không** có trong transcript, lượt kế tiếp được nhận thật, `/key` bị từ chối khi run đang chạy, và Esc sau đó không ghi đè key đã lưu |
+| `k02_the_credential_file_follows_the_explicit_directory` | `HA_CREDENTIALS_DIR` thắng; giá trị rỗng không phải override |
+| `k02_a_source_is_described_by_name_never_by_value` | `describe()` chỉ trả tên; `is_live()`: file `true`, env `false` |
+| `k01_saving_a_key_clears_the_setup_gate_and_writes_the_minimal_config` | `schema_version = 1\n`; gate xoá; header nêu nguồn và không vẽ key |
+| `k01_secret_entry_masks_the_buffer_and_never_reaches_history` | mask một-ký-tự-một-mask; Enter trả `Secret`; history rỗng; **bấm `Key::Esc` thật** thì thoát secret entry và không để lại gì |
+| `k02_a_saved_file_configures_the_provider_and_the_environment_still_wins` | file là nguồn hợp lệ; biến môi trường thắng file |
+| `k02_a_saved_file_is_readable_and_a_corrupt_one_is_refused` | file hỏng bị từ chối kèm path, không lặp nội dung |
+| `k02_diagnostics_name_the_source_and_never_the_value` | `/status` nêu `credentials.env` + `value hidden`, không có key |
+| `k03_the_credential_directory_is_a_dedicated_subdirectory` | thư mục mặc định là `<data dir>/private`; `HA_CREDENTIALS_DIR` được dùng **nguyên trạng**, không lồng thêm `private/` |
+| `k03_a_saved_key_is_restricted_to_this_account_by_an_acl` (`#[cfg(windows)]`) | `save()` trả `OwnerOnlyAcl`; `icacls` đọc lại cho thấy ACL nêu đúng `<DOMAIN>\<USER>` và `SYSTEM`, **không** còn `CodexSandboxUsers`/`S-1-15-3-`; app vẫn `load()` được key vừa siết. Assertion trên chữ `SYSTEM` là **tiếng Anh** — ghi rõ trong test, không hứa cho Windows bản địa hoá khác |
+| `k03_the_protection_labels_say_they_grant` | bốn nhãn `Protection` nói đúng thứ chúng cấp: `OwnerOnly` → `0600`, `OwnerOnlyAcl` → `SYSTEM`, `ProfileDefault` → "may be able to read", `NotReverified` → "not re-measured" |
+| `k01_a_secret_buffer_is_painted_as_a_mask` (TUI) | **khung hình đã vẽ** (`ScriptedRenderer::draw_state`) với `state.buffer = mask_secret(true, "sk-live-secret")` **không** chứa key và **có** chứa `•` — nên một renderer lách qua state để lấy buffer thô sẽ không qua được |
+
+**Số test, ghi kèm ngày đo:** binary `ha` có **153 test**, đo lúc 10:49 ngày 20/09/2026 bằng
+`cargo test -p harness-cli --bin ha --locked -- --list`; trong đó **18** tên khớp `k0[123]_` biên
+dịch trên Windows (10 `k01_*` + 5 `k02_*` + 3 `k03_*`), cộng `k01_the_file_is_owner_only_on_unix`
+(`#[cfg(unix)]`) là **19 test của feature**. Đây là **số đo có ngày**, không phải hằng số: lần sau
+thêm test thì con số này đổi.
+
+Chạy đầy đủ: `cargo test --release -p harness-cli --bin ha --locked` cho **153 passed; 0 failed**
+trong phiên có quyền đổi ACL (bên giao việc, 20/09/2026); trong phiên soạn tài liệu này (file
+policy `workspace-write`) cùng bản cây cho **152 passed; 1 failed**, và test đỏ đúng là
+`k03_a_saved_key_is_restricted_to_this_account_by_an_acl` vì `icacls` bị từ chối — chi tiết và cách
+đọc kết quả ở evidence 11.2/11.7.
+
+Đảm bảo "key không lên màn hình" nay được assert ở **ba tầng**, không chỉ một: editor
+(`k01_secret_entry_masks_the_buffer_and_never_reaches_history`), controller
+(`k01_key_entry_masks_saves_clears_the_gate_and_admits_the_next_message`: prompt đã mask, key không
+có trong transcript), và **khung hình đã vẽ** (`k01_a_secret_buffer_is_painted_as_a_mask`).
+
+Điều các test **không** phủ: một lượt gọi provider thật (`not_run` vì môi trường không có
+credential — evidence mục 11), một ca PTY cho `/key` (ConPTY cần console mà sandbox build không
+có), và **nhánh `icacls` thất bại** — không test nào **ép** `restrict_acl` trả `ProfileDefault`,
+nên "fallback trung thực" được chứng minh bằng phép đo thủ công trong môi trường bị chặn ACL
+(evidence 11.2/11.3), không bằng test. Đường controller `save_key`, hành vi Esc, đường dẫn
+`private/`, bước ACL Windows và mask ở tầng khung hình **đã** được phủ.
 
 ## 4. Kiến trúc chốt cho T02–T08
 

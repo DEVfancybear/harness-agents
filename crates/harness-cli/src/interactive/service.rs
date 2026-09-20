@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::ToSocketAddrs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,6 +31,7 @@ use tokio::sync::oneshot;
 
 use super::bootstrap::{CREDENTIAL_VARIABLES, DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL, LaunchContext};
 use super::controller::{DEFAULT_APPROVAL_TIMEOUT, TurnBounds};
+use super::credentials::{self, CredentialSource};
 use super::events::{RunOutcome, SessionCandidate, SessionEvent};
 use super::paths::LaunchEnvironment;
 
@@ -89,6 +90,22 @@ pub trait SessionPort: Send {
     /// environment or from the defaults, and whether the endpoint answers.
     fn provider_diagnostics(&self) -> Vec<String> {
         Vec::new()
+    }
+    /// Why a real dispatch is impossible right now, or `None` when it is possible.
+    ///
+    /// The controller asks this before submitting a turn, so the answer is always
+    /// evaluated against the *current* credential: after `/key` saves one, this
+    /// turns `None` and the very next message reaches the provider.
+    fn provider_problem(&self) -> Option<String> {
+        None
+    }
+    /// Save a key so this session and the next launch can use it.
+    ///
+    /// The file is the source of truth because the credential resolver re-reads it
+    /// at call time; nothing has to restart for the next turn to use it. The
+    /// returned event carries the source *name*, never the value.
+    fn save_credential(&mut self, _key: &str) -> Option<SessionEvent> {
+        None
     }
 }
 
@@ -212,36 +229,48 @@ impl Default for SessionChannel {
 pub struct ProviderConfig {
     pub endpoint: String,
     pub model: String,
-    pub credential_variable: String,
+    /// Name of the source that holds the key; never the key.
+    pub credential: CredentialSource,
 }
 
-/// Resolve provider settings from the environment.
+impl ProviderConfig {
+    /// The environment variable the credential resolver should probe first.
+    ///
+    /// When the active source is the saved file there is no variable to name, so
+    /// the resolver is bound to the primary variable anyway: it stays empty in the
+    /// environment and the resolver falls through to the file, which is exactly
+    /// the ordered pair of sources the resolver implements.
+    #[must_use]
+    pub fn credential_variable(&self) -> String {
+        match &self.credential {
+            CredentialSource::Environment { variable } => variable.clone(),
+            CredentialSource::File { .. } => CREDENTIAL_VARIABLES[0].to_owned(),
+        }
+    }
+}
+
+/// Resolve provider settings without touching the filesystem.
 ///
 /// The credential is mandatory and is **never** substituted: without it the error
 /// names what to set, and no fixture answer is produced. The endpoint and the model
 /// fall back to `DeepSeek`'s documented values, so one `DEEPSEEK_API_KEY` is a complete
 /// setup; an explicit variable still overrides either one, which is what another
 /// provider or another model needs.
-pub fn resolve_provider(environment: &LaunchEnvironment) -> Result<ProviderConfig, String> {
+pub fn resolve_provider(
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+) -> Result<ProviderConfig, String> {
     let explicit_endpoint = environment
         .value(ENDPOINT_VARIABLE)
         .filter(|value| !value.is_empty());
     let explicit_model = environment
         .value(MODEL_VARIABLE)
         .filter(|value| !value.is_empty());
-    let credential = CREDENTIAL_VARIABLES
-        .iter()
-        .find(|name| {
-            environment
-                .value(name)
-                .is_some_and(|value| !value.is_empty())
-        })
-        .copied();
 
-    let Some(credential_variable) = credential else {
+    let Some(credential) = credentials::source(environment, data_dir) else {
         return Err(format!(
-            "provider setup is incomplete: set {} (API key). Nothing was sent and no fixture answer was substituted.",
-            CREDENTIAL_VARIABLES.join(" or ")
+            "provider setup is incomplete: set {} or save the key in the app with /key (API key). Nothing was sent and no fixture answer was substituted.",
+            credentials::CREDENTIAL_VARIABLES.join(" or ")
         ));
     };
     Ok(ProviderConfig {
@@ -253,8 +282,41 @@ pub fn resolve_provider(environment: &LaunchEnvironment) -> Result<ProviderConfi
             || DEEPSEEK_MODEL.to_owned(),
             |value| value.to_string_lossy().into_owned(),
         ),
-        credential_variable: credential_variable.to_owned(),
+        credential,
     })
+}
+
+/// Check that a key the app is about to trust can really be read.
+///
+/// Two things have to agree: the source the environment resolves to, and the file
+/// the credential resolver reads at call time. They are the same path by
+/// construction, and this proves it for the launch at hand — if an override makes
+/// them disagree, the key would be accepted here and then fail on the first call,
+/// which is exactly the confusing state this check exists to prevent.
+pub fn validate_credential_file(
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+) -> Result<(), String> {
+    let Some(CredentialSource::File { path, .. }) = credentials::source(environment, data_dir)
+    else {
+        return Ok(());
+    };
+    let resolver_path = credentials::resolve_file(environment, data_dir);
+    if resolver_path != path {
+        return Err(format!(
+            "the credential source {} and the file the resolver reads {} disagree; nothing was sent",
+            path.display(),
+            resolver_path.display()
+        ));
+    }
+    match credentials::load(&path) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(format!(
+            "the credential file {} holds no key; save it in the app with /key",
+            path.display()
+        )),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// One line per provider fact, for `/status`.
@@ -263,18 +325,23 @@ pub fn resolve_provider(environment: &LaunchEnvironment) -> Result<ProviderConfi
 /// where from, which endpoint and model will be used and why, and is that endpoint
 /// answering. The credential **value** never appears.
 #[must_use]
-pub fn provider_diagnostics(environment: &LaunchEnvironment) -> Vec<String> {
+pub fn provider_diagnostics(environment: &LaunchEnvironment, data_dir: &Path) -> Vec<String> {
     let mut lines = Vec::new();
-    match CREDENTIAL_VARIABLES.iter().find(|name| {
-        environment
-            .value(name)
-            .is_some_and(|value| !value.is_empty())
-    }) {
-        Some(name) => lines.push(format!(
-            "Provider: credential found in {name} (value hidden)"
-        )),
+    match credentials::source(environment, data_dir) {
+        Some(source) => {
+            lines.push(format!(
+                "Provider: credential from {} (value hidden)",
+                source.describe()
+            ));
+            if let Some(protection) = source.protection() {
+                lines.push(format!(
+                    "Provider: credential file protection: {}",
+                    protection.describe()
+                ));
+            }
+        }
         None => lines.push(format!(
-            "Provider: no credential; set one of {}",
+            "Provider: no credential; set one of {} or save it with /key",
             CREDENTIAL_VARIABLES.join(", ")
         )),
     }
@@ -302,7 +369,7 @@ pub fn provider_diagnostics(environment: &LaunchEnvironment) -> Vec<String> {
             "Provider: model not set, using the default {DEEPSEEK_MODEL}"
         )),
     }
-    match resolve_provider(environment) {
+    match resolve_provider(environment, data_dir) {
         Ok(config) => {
             lines.push(format!("Provider: ready, would call {}", config.model));
             lines.push(match endpoint_reachability(&config.endpoint) {
@@ -353,29 +420,60 @@ fn endpoint_reachability(endpoint: &str) -> Result<(), String> {
 
 /// Reads the credential when a call is made; the value is never stored, logged
 /// or rendered anywhere in the app.
+///
+/// Two ordered sources, and the order is the whole contract: the environment
+/// variable wins, the file saved by `/key` is the fallback. The file is re-read
+/// on every call, which is why saving a key takes effect in a running app
+/// without a restart.
 pub struct EnvironmentCredential {
     variable: String,
+    data_dir: PathBuf,
+    environment: LaunchEnvironment,
 }
 
 impl EnvironmentCredential {
-    /// Bind the resolver to one environment variable name.
+    /// Bind the resolver to one environment variable name and one data root.
     #[must_use]
-    pub fn new(variable: impl Into<String>) -> Self {
+    pub fn new(variable: impl Into<String>, data_dir: PathBuf) -> Self {
         Self {
             variable: variable.into(),
+            data_dir,
+            environment: LaunchEnvironment::capture(),
         }
+    }
+
+    /// The file this launch falls back to when the variable is absent.
+    #[must_use]
+    pub fn file(&self) -> PathBuf {
+        credentials::resolve_file(&self.environment, &self.data_dir)
     }
 }
 
 impl CredentialResolver for EnvironmentCredential {
     fn resolve(&self) -> Result<String, ProviderError> {
-        match std::env::var(&self.variable) {
-            Ok(value) if !value.trim().is_empty() => Ok(value),
-            _ => Err(ProviderError::new(
+        if let Some(value) = self
+            .environment
+            .value(&self.variable)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(value.to_string_lossy().into_owned());
+        }
+        let path = self.file();
+        match credentials::load(&path) {
+            Ok(Some(value)) => Ok(value),
+            Err(error) => Err(ProviderError::new(
                 ErrorCode::SecretNotGranted,
                 format!(
-                    "credential {} is not present in the environment",
+                    "credential {} is not present in the environment and the saved file cannot be used: {error}",
                     self.variable
+                ),
+            )),
+            Ok(None) => Err(ProviderError::new(
+                ErrorCode::SecretNotGranted,
+                format!(
+                    "credential {} is not present in the environment and {} holds no key; save it in the app with /key",
+                    self.variable,
+                    path.display()
                 ),
             )),
         }
@@ -427,6 +525,8 @@ impl TurnObserver for ChannelObserver {
 pub struct AgentSessionService {
     sender: UnboundedSender<SessionEvent>,
     store_dir: PathBuf,
+    /// Root that owns the credential file `/key` writes.
+    data_dir: PathBuf,
     workspace_root: PathBuf,
     environment: LaunchEnvironment,
     task_id: TaskId,
@@ -455,6 +555,7 @@ impl AgentSessionService {
         Self {
             sender,
             store_dir: context.project_store_dir(),
+            data_dir: context.paths.data_dir.clone(),
             workspace_root: context.project.root.clone(),
             environment,
             task_id: TaskId::generate(),
@@ -466,7 +567,7 @@ impl AgentSessionService {
     }
 
     fn configured(&self) -> Result<ProviderConfig, String> {
-        resolve_provider(&self.environment)
+        resolve_provider(&self.environment, &self.data_dir)
     }
 }
 
@@ -491,6 +592,7 @@ impl SessionPort for AgentSessionService {
         };
         let sender = self.sender.clone();
         let store_dir = self.store_dir.clone();
+        let data_dir = self.data_dir.clone();
         let workspace_root = self.workspace_root.clone();
         let environment = self.environment.clone();
         let task_id = self.task_id.clone();
@@ -504,6 +606,7 @@ impl SessionPort for AgentSessionService {
             run_turn(
                 sender,
                 store_dir,
+                data_dir,
                 workspace_root,
                 environment,
                 session_id,
@@ -530,7 +633,23 @@ impl SessionPort for AgentSessionService {
     }
 
     fn provider_diagnostics(&self) -> Vec<String> {
-        provider_diagnostics(&self.environment)
+        provider_diagnostics(&self.environment, &self.data_dir)
+    }
+
+    fn provider_problem(&self) -> Option<String> {
+        self.configured().err()
+    }
+
+    fn save_credential(&mut self, key: &str) -> Option<SessionEvent> {
+        let path = credentials::resolve_file(&self.environment, &self.data_dir);
+        match credentials::save(&path, key) {
+            Ok(protection) => Some(SessionEvent::ProviderConfigured {
+                source: CredentialSource::File { path, protection },
+            }),
+            Err(error) => Some(SessionEvent::RecoverableError {
+                message: format!("the key could not be saved: {error}"),
+            }),
+        }
     }
 
     fn list_sessions(&mut self) {
@@ -609,6 +728,7 @@ impl SessionPort for AgentSessionService {
 async fn run_turn(
     sender: UnboundedSender<SessionEvent>,
     store_dir: PathBuf,
+    data_dir: PathBuf,
     workspace_root: PathBuf,
     environment: LaunchEnvironment,
     session_id: SessionId,
@@ -626,7 +746,7 @@ async fn run_turn(
         input_id: request.input_id.clone(),
     });
 
-    let config = match resolve_provider(&environment) {
+    let config = match resolve_provider(&environment, &data_dir) {
         Ok(config) => config,
         Err(message) => {
             send(SessionEvent::RecoverableError { message });
@@ -689,9 +809,10 @@ async fn run_turn(
         // A real adapter: this is never presented as a fixture.
         fixture: false,
     };
-    let credentials = Arc::new(EnvironmentCredential {
-        variable: config.credential_variable.clone(),
-    });
+    let credentials = Arc::new(EnvironmentCredential::new(
+        config.credential_variable(),
+        data_dir.clone(),
+    ));
     let provider: Arc<dyn ModelProvider> =
         match DeepSeekAdapter::new(config.endpoint.clone(), credentials, capabilities) {
             Ok(adapter) => Arc::new(adapter),
@@ -903,15 +1024,19 @@ impl SessionPort for FixtureService {
 mod tests {
     use super::{
         AgentSessionService, ApprovalDecision, ApprovalGate, ApprovalProposal, ChannelApprovalGate,
-        DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL, ENDPOINT_VARIABLE, FixtureService, MODEL_VARIABLE,
-        SessionChannel, SessionPort, SubmitRequest, provider_diagnostics, resolve_provider,
+        DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL, ENDPOINT_VARIABLE, EnvironmentCredential,
+        FixtureService, MODEL_VARIABLE, SessionChannel, SessionPort, SubmitRequest,
+        provider_diagnostics, resolve_provider, validate_credential_file,
     };
     use crate::interactive::bootstrap::{self, LaunchRequest};
+    use crate::interactive::credentials::{self, CredentialSource, Protection};
     use crate::interactive::events::{RunOutcome, SessionEvent};
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
     use harness_tools::ApprovalAnswer;
     use harness_types::InputId;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     fn request() -> SubmitRequest {
@@ -923,6 +1048,39 @@ mod tests {
 
     fn environment(pairs: &[(&str, &str)]) -> LaunchEnvironment {
         LaunchEnvironment::from_pairs(pairs.iter().map(|(name, value)| (*name, *value)))
+    }
+
+    /// A credential directory that belongs to one test only.
+    ///
+    /// These cases must never read or write the credential file of the account
+    /// running them, so the directory is `HA_CREDENTIALS_DIR` under a temporary
+    /// root. The per-test counter matters: tests in one binary run in parallel, and
+    /// a directory keyed only by the process id let two cases overwrite each
+    /// other's file. It is deliberately not cleaned up so a failing assertion can
+    /// still be inspected afterwards.
+    fn scoped_credentials() -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "ha-service-credential-tests-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::create_dir_all(&directory);
+        directory
+    }
+
+    /// Environment plus a directory reserved for this test's credential file.
+    fn credential_environment(pairs: &[(&str, &str)]) -> (LaunchEnvironment, PathBuf) {
+        let directory = scoped_credentials();
+        let merged = pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .chain([(
+                credentials::CREDENTIAL_DIRECTORY_VARIABLE.to_owned(),
+                directory.to_string_lossy().into_owned(),
+            )])
+            .collect::<Vec<_>>();
+        (LaunchEnvironment::from_pairs(merged), directory)
     }
 
     #[test]
@@ -1039,9 +1197,14 @@ mod tests {
 
     #[test]
     fn h04_provider_setup_names_the_missing_credential_and_never_substitutes_a_fixture() {
-        let error = resolve_provider(&environment(&[]))
+        let (environment, data_dir) = credential_environment(&[]);
+        let error = resolve_provider(&environment, &data_dir)
             .expect_err("an empty environment is not configured");
         assert!(error.contains("DEEPSEEK_API_KEY"), "{error}");
+        assert!(
+            error.contains("/key"),
+            "the message must name the in-app way to set it: {error}"
+        );
         assert!(
             error.contains("no fixture answer"),
             "the message must say nothing was substituted: {error}"
@@ -1055,54 +1218,171 @@ mod tests {
     /// stays mandatory. Recorded in the operator guide section 12.
     #[test]
     fn t08_one_deepseek_key_is_a_complete_provider_setup() {
-        let bare = resolve_provider(&environment(&[("DEEPSEEK_API_KEY", "fixture-secret")]))
+        let (environment, data_dir) =
+            credential_environment(&[("DEEPSEEK_API_KEY", "fixture-secret")]);
+        let bare = resolve_provider(&environment, &data_dir)
             .expect("a bare DeepSeek key configures the provider");
         assert_eq!(bare.endpoint, DEEPSEEK_ENDPOINT);
         assert_eq!(bare.model, DEEPSEEK_MODEL);
-        assert_eq!(bare.credential_variable, "DEEPSEEK_API_KEY");
+        assert_eq!(
+            bare.credential,
+            CredentialSource::Environment {
+                variable: "DEEPSEEK_API_KEY".to_owned()
+            }
+        );
         assert!(
             bare.endpoint.starts_with("https://"),
             "the default is TLS: {bare:?}"
         );
 
-        let explicit = resolve_provider(&environment(&[
+        let (environment, data_dir) = credential_environment(&[
             ("DEEPSEEK_API_KEY", "fixture-secret"),
             (ENDPOINT_VARIABLE, "http://127.0.0.1:9/chat/completions"),
             (MODEL_VARIABLE, "fixture-model"),
-        ]))
-        .expect("explicit settings still resolve");
+        ]);
+        let explicit =
+            resolve_provider(&environment, &data_dir).expect("explicit settings still resolve");
         assert_eq!(explicit.endpoint, "http://127.0.0.1:9/chat/completions");
         assert_eq!(explicit.model, "fixture-model");
 
         // The alias credential works the same way.
-        let alias = resolve_provider(&environment(&[("HA_API_KEY", "fixture-secret")]))
+        let (environment, data_dir) = credential_environment(&[("HA_API_KEY", "fixture-secret")]);
+        let alias = resolve_provider(&environment, &data_dir)
             .expect("the alias credential configures the provider");
-        assert_eq!(alias.credential_variable, "HA_API_KEY");
+        assert_eq!(
+            alias.credential,
+            CredentialSource::Environment {
+                variable: "HA_API_KEY".to_owned()
+            }
+        );
         assert_eq!(alias.model, DEEPSEEK_MODEL);
     }
 
     #[test]
     fn h04_provider_setup_accepts_a_complete_environment_and_the_key_alias() {
-        let config = resolve_provider(&environment(&[
+        let (environment, data_dir) = credential_environment(&[
             (ENDPOINT_VARIABLE, "http://127.0.0.1:9/chat/completions"),
             (MODEL_VARIABLE, "fixture-model"),
             ("DEEPSEEK_API_KEY", "fixture-secret"),
-        ]))
-        .expect("a complete setup resolves");
+        ]);
+        let config = resolve_provider(&environment, &data_dir).expect("a complete setup resolves");
         assert_eq!(config.model, "fixture-model");
-        assert_eq!(config.credential_variable, "DEEPSEEK_API_KEY");
+        assert_eq!(
+            config.credential,
+            CredentialSource::Environment {
+                variable: "DEEPSEEK_API_KEY".to_owned()
+            }
+        );
         assert!(
             !config.endpoint.contains("fixture-secret"),
             "the credential never becomes part of the endpoint"
         );
 
-        let alias = resolve_provider(&environment(&[
+        let (environment, data_dir) = credential_environment(&[
             (ENDPOINT_VARIABLE, "http://127.0.0.1:9/chat/completions"),
             (MODEL_VARIABLE, "fixture-model"),
             ("HA_API_KEY", "fixture-secret"),
-        ]))
-        .expect("the alias credential resolves");
-        assert_eq!(alias.credential_variable, "HA_API_KEY");
+        ]);
+        let alias =
+            resolve_provider(&environment, &data_dir).expect("the alias credential resolves");
+        assert_eq!(
+            alias.credential,
+            CredentialSource::Environment {
+                variable: "HA_API_KEY".to_owned()
+            }
+        );
+    }
+
+    /// K02: the file `/key` writes is a real credential source, and the
+    /// environment still beats it.
+    #[test]
+    fn k02_a_saved_file_configures_the_provider_and_the_environment_still_wins() {
+        let (environment, data_dir) = credential_environment(&[]);
+        let path = credentials::resolve_file(&environment, &data_dir);
+        credentials::save(&path, "sk-from-file").expect("the key is saved");
+
+        let from_file =
+            resolve_provider(&environment, &data_dir).expect("a saved key configures the provider");
+        let CredentialSource::File {
+            path: source_path,
+            protection,
+        } = &from_file.credential
+        else {
+            panic!("a saved file must be the active source: {from_file:?}");
+        };
+        assert_eq!(
+            source_path, &path,
+            "the source must be the file this test wrote"
+        );
+        assert_eq!(
+            *protection,
+            Protection::NotReverified,
+            "a launch must not claim it re-measured the permissions"
+        );
+        assert_eq!(from_file.model, DEEPSEEK_MODEL);
+
+        let (with_variable, same_dir) =
+            credential_environment(&[("DEEPSEEK_API_KEY", "sk-from-environment")]);
+        let precedence = resolve_provider(&with_variable, &same_dir)
+            .expect("the environment and the file both resolve");
+        assert_eq!(
+            precedence.credential,
+            CredentialSource::Environment {
+                variable: "DEEPSEEK_API_KEY".to_owned()
+            },
+            "an exported variable must override the saved file"
+        );
+
+        // The parser round trip is asserted through `load` above. The resolver
+        // itself reads the process environment and cannot be pointed at this
+        // directory without mutating global state under parallel tests, so its
+        // file branch is covered where that environment is controlled.
+        let _ = EnvironmentCredential::new("DEEPSEEK_API_KEY", data_dir.clone());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// K02: the file `/key` writes is what the resolver reads, and a corrupt file
+    /// is refused instead of being treated as no credential.
+    ///
+    /// A **missing** file is not this function's business: "no credential at all"
+    /// is reported by `resolve_provider`, which is checked in its own case.
+    #[test]
+    fn k02_a_saved_file_is_readable_and_a_corrupt_one_is_refused() {
+        let (environment, data_dir) = credential_environment(&[]);
+        let path = credentials::resolve_file(&environment, &data_dir);
+        validate_credential_file(&environment, &data_dir)
+            .expect("no file is nothing to validate, not a failure");
+
+        credentials::save(&path, "sk-validated").expect("the key is saved");
+        validate_credential_file(&environment, &data_dir).expect("the saved file is readable");
+
+        std::fs::write(&path, "DEEPSEEK_API_KEY=unquoted\n").expect("fixture");
+        let error = validate_credential_file(&environment, &data_dir)
+            .expect_err("a corrupt file must stop the launch");
+        assert!(error.contains("credentials.env"), "{error}");
+        assert!(
+            !error.contains("unquoted"),
+            "the refusal must not echo the file: {error}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The credential value must not appear in any rendered diagnostic.
+    #[test]
+    fn k02_diagnostics_name_the_source_and_never_the_value() {
+        let (environment, data_dir) = credential_environment(&[]);
+        let path = credentials::resolve_file(&environment, &data_dir);
+        credentials::save(&path, "sk-must-not-be-rendered").expect("the key is saved");
+
+        let lines = provider_diagnostics(&environment, &data_dir);
+        let joined = lines.join("\n");
+        assert!(joined.contains("credentials.env"), "{joined}");
+        assert!(joined.contains("value hidden"), "{joined}");
+        assert!(
+            !joined.contains("sk-must-not-be-rendered"),
+            "a diagnostic rendered the key: {joined}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// T08 follow-up: `/status` must answer "what is this app actually using?".
@@ -1115,13 +1395,14 @@ mod tests {
     fn t08_status_diagnostics_name_the_source_of_every_provider_fact() {
         // A loopback endpoint keeps this test off the network; the reachability line
         // is asserted for its shape, never for the network being up.
-        let configured = provider_diagnostics(&environment(&[
+        let (environment, data_dir) = credential_environment(&[
             ("DEEPSEEK_API_KEY", "fixture-secret-value"),
             (ENDPOINT_VARIABLE, "http://127.0.0.1:9/chat/completions"),
-        ]));
+        ]);
+        let configured = provider_diagnostics(&environment, &data_dir);
         let joined = configured.join("\n");
         assert!(
-            joined.contains("credential found in DEEPSEEK_API_KEY"),
+            joined.contains("credential from environment variable DEEPSEEK_API_KEY"),
             "{joined}"
         );
         assert!(
@@ -1142,14 +1423,14 @@ mod tests {
             "reachability is reported either way: {joined}"
         );
 
-        let explicit = provider_diagnostics(&environment(&[
+        let (environment, data_dir) = credential_environment(&[
             ("HA_API_KEY", "fixture-secret-value"),
             (ENDPOINT_VARIABLE, "http://127.0.0.1:9/chat/completions"),
             (MODEL_VARIABLE, "fixture-model"),
-        ]))
-        .join("\n");
+        ]);
+        let explicit = provider_diagnostics(&environment, &data_dir).join("\n");
         assert!(
-            explicit.contains("credential found in HA_API_KEY"),
+            explicit.contains("credential from environment variable HA_API_KEY"),
             "{explicit}"
         );
         assert!(
@@ -1165,8 +1446,13 @@ mod tests {
             "an explicit value is never reported as defaulted: {explicit}"
         );
 
-        let empty = provider_diagnostics(&environment(&[])).join("\n");
+        let (environment, data_dir) = credential_environment(&[]);
+        let empty = provider_diagnostics(&environment, &data_dir).join("\n");
         assert!(empty.contains("no credential; set one of"), "{empty}");
+        assert!(
+            empty.contains("/key"),
+            "the empty state must name the in-app way to fix it: {empty}"
+        );
         assert!(empty.contains("not ready"), "{empty}");
     }
 

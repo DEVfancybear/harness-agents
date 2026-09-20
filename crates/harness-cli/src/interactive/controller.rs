@@ -86,6 +86,10 @@ pub struct InteractiveController {
     setup_required: bool,
     header: Vec<String>,
     setup_hint: Option<String>,
+    /// The launch context this session started from. Kept so `/key` can refresh
+    /// the provider state from the same rules the launch used, instead of writing
+    /// a second copy of them here.
+    context: LaunchContext,
     /// The committed plain transcript, byte for byte what the old controller
     /// pushed. Kept as text so U20 can be asserted without a renderer.
     transcript: Vec<String>,
@@ -143,6 +147,7 @@ impl InteractiveController {
             setup_required: context.setup_required,
             header,
             setup_hint: context.setup_hint(),
+            context: context.clone(),
             transcript: Vec::new(),
             editor: LineEditor::new(),
             service,
@@ -187,21 +192,30 @@ impl InteractiveController {
     }
 
     /// Prompt text for the current phase and buffer.
+    ///
+    /// While a secret is being entered the buffer is masked here, at the single
+    /// point every renderer reads, instead of relying on each renderer to mask it.
     #[must_use]
     pub fn prompt(&self) -> String {
-        view::prompt_line(self.phase, self.editor.buffer())
+        view::prompt_line(self.phase, &self.display_buffer())
     }
 
     /// The prompt as terminal rows: a multi-line draft is one prompt, not several.
     #[must_use]
     pub fn prompt_lines(&self) -> Vec<String> {
-        view::prompt_lines(self.phase, self.editor.buffer())
+        view::prompt_lines(self.phase, &self.display_buffer())
     }
 
     /// Row and column for the terminal cursor inside the current prompt.
     #[must_use]
     pub fn prompt_cursor_cell(&self) -> (usize, usize) {
-        view::cursor_cell(self.phase, self.editor.buffer(), self.editor.cursor())
+        view::cursor_cell(self.phase, &self.display_buffer(), self.editor.cursor())
+    }
+
+    /// The buffer as it may be rendered; masked while a secret is being typed.
+    #[must_use]
+    pub fn display_buffer(&self) -> String {
+        self.editor.display_buffer()
     }
 
     /// Select a startup source before accepting the first user message.
@@ -217,7 +231,7 @@ impl InteractiveController {
             setup_required: self.setup_required,
             setup_hint: self.setup_hint.clone(),
             header: self.header.clone(),
-            buffer: self.editor.buffer().to_owned(),
+            buffer: self.display_buffer(),
             cursor: self.editor.cursor(),
             live_text: self.pending_text.clone(),
             open_tool: self.open_tool.clone(),
@@ -334,6 +348,7 @@ impl InteractiveController {
             InputOutcome::Exit => self.command("/exit"),
             InputOutcome::Interrupt => self.interrupt(),
             InputOutcome::Submit(text) => self.submit(text),
+            InputOutcome::Secret(value) => self.save_key(&value),
         }
     }
 
@@ -380,6 +395,27 @@ impl InteractiveController {
     #[allow(clippy::too_many_lines, reason = "one arm per session event")]
     fn apply_event(&mut self, event: SessionEvent, effects: &mut Vec<Effect>) {
         match event {
+            SessionEvent::ProviderConfigured { source } => {
+                // The key value is not on this event by construction. A producer
+                // that saves a credential out of band (the headless path, a future
+                // plugin) still has to tell the UI, so the state is refreshed here
+                // as it is after `/key`.
+                match self.context.credential_saved(source) {
+                    Ok(context) => {
+                        self.setup_required = context.setup_required;
+                        self.setup_hint = context.setup_hint();
+                        self.context = context;
+                    }
+                    Err(error) => {
+                        self.push_history(
+                            effects,
+                            HistoryItem::Error {
+                                message: format!("the saved credential cannot be used: {error}"),
+                            },
+                        );
+                    }
+                }
+            }
             SessionEvent::Accepted { input_id } => {
                 self.flush_stream(effects);
                 self.push_history(
@@ -577,6 +613,15 @@ impl InteractiveController {
                 Effect::Redraw,
             ];
         }
+        // Ask the port at submission time, not at boot: the answer changes the
+        // moment `/key` saves a credential, and a stale "setup required" would
+        // refuse a request the app can now serve.
+        if let Some(problem) = self.service.provider_problem() {
+            return vec![
+                Effect::History(HistoryItem::Error { message: problem }),
+                Effect::Redraw,
+            ];
+        }
         let input_id = InputId::generate();
         self.fresh_run(Instant::now(), Some(text.clone()));
         self.service.submit(SubmitRequest {
@@ -635,9 +680,16 @@ impl InteractiveController {
 
     #[allow(clippy::too_many_lines)]
     fn command(&mut self, line: &str) -> Vec<Effect> {
-        let mut parts = line.split_whitespace();
-        let name = parts.next().unwrap_or_default();
-        let argument = parts.next();
+        // The raw remainder matters for `/key`, whose argument may contain any
+        // character. Commands that take one whitespace-delimited word keep reading
+        // `argument`, so their behavior is unchanged.
+        let trimmed = line.trim();
+        let name = trimmed.split_whitespace().next().unwrap_or_default();
+        let raw_argument = trimmed
+            .get(name.len()..)
+            .map(str::trim)
+            .filter(|rest| !rest.is_empty());
+        let argument = raw_argument.and_then(|rest| rest.split_whitespace().next());
         let mut effects = Vec::new();
         match name {
             "/exit" | "/quit" => {
@@ -680,6 +732,33 @@ impl InteractiveController {
                     .collect();
                 self.reference("/config", lines, &mut effects);
             }
+            "/key" => match argument {
+                Some(value) => return self.save_key(value),
+                None if self.phase.has_active_run() => {
+                    self.push_history(
+                        &mut effects,
+                        HistoryItem::Notice {
+                            message:
+                                "cannot enter an API key while a run is active; cancel it first"
+                                    .to_owned(),
+                        },
+                    );
+                }
+                None => {
+                    self.editor.begin_secret_entry();
+                    self.push_history(
+                        &mut effects,
+                        HistoryItem::Notice {
+                            message:
+                                "paste the API key and press Enter; it is masked, never stored in \
+                                      history, and saved to the credential file so the next launch \
+                                      starts configured. Esc cancels. /key <value> also works but \
+                                      leaves the value in this terminal's history"
+                                    .to_owned(),
+                        },
+                    );
+                }
+            },
             "/new" => {
                 // A new conversation never abandons a running one: the run is
                 // settled first, exactly like Ctrl-C.
@@ -791,6 +870,73 @@ impl InteractiveController {
             return;
         }
         self.editor.open_overlay(title, lines);
+    }
+
+    /// Save an API key entered in the app, then make it effective at once.
+    ///
+    /// The value is written to the credential file and nowhere else: it is not
+    /// pushed to history, not rendered, and not sent anywhere. The gate clears in
+    /// the same step, so the next message is dispatched for real instead of being
+    /// refused — a saved key that still needed a restart would be a trap.
+    fn save_key(&mut self, value: &str) -> Vec<Effect> {
+        let key = value.trim();
+        if key.is_empty() {
+            return vec![
+                Effect::History(HistoryItem::Notice {
+                    message: "no key was entered; nothing was saved".to_owned(),
+                }),
+                Effect::Redraw,
+            ];
+        }
+        let Some(SessionEvent::ProviderConfigured { source }) = self.service.save_credential(key)
+        else {
+            self.editor.cancel_secret();
+            return vec![
+                Effect::History(HistoryItem::Error {
+                    message: "the key could not be saved; the credential file was left unchanged"
+                        .to_owned(),
+                }),
+                Effect::Redraw,
+            ];
+        };
+        match self.context.credential_saved(source.clone()) {
+            Ok(context) => {
+                self.setup_required = context.setup_required;
+                self.setup_hint = context.setup_hint();
+                self.header = context.header_lines();
+                self.header
+                    .push(format!("Service: {}", self.service.label()));
+                self.context = context;
+                if matches!(self.phase, AppPhase::SetupRequired | AppPhase::Booting) {
+                    self.phase = AppPhase::Ready;
+                }
+                let mut effects = Vec::new();
+                self.push_history(
+                    &mut effects,
+                    HistoryItem::Notice {
+                        message: format!(
+                            "API key saved to {}; the next message uses it, and the next launch starts configured. The value is never shown, logged or kept in history.",
+                            source.describe()
+                        ),
+                    },
+                );
+                effects.push(Effect::Redraw);
+                effects
+            }
+            Err(error) => {
+                let mut effects = Vec::new();
+                self.push_history(
+                    &mut effects,
+                    HistoryItem::Error {
+                        message: format!(
+                            "the key was saved, but this session cannot use it yet: {error}"
+                        ),
+                    },
+                );
+                effects.push(Effect::Redraw);
+                effects
+            }
+        }
     }
 
     /// Continue from one session id, reporting the outcome like the pre-T02 code.
@@ -1026,6 +1172,52 @@ mod tests {
         (temp, context)
     }
 
+    /// Test port that saves a credential the way the real service does.
+    ///
+    /// The real path is `credentials::save` into the credential file the resolver
+    /// reads, so this port calls exactly that. `HA_CREDENTIALS_DIR` is deliberately
+    /// not involved: mutating the process environment is unsafe in edition 2024 and
+    /// this crate forbids `unsafe`, so the file lives under the fixture's own data
+    /// directory, which the test removes with the `TempDir`.
+    struct SavingPort {
+        recorded: RecordingPort,
+        data_dir: std::path::PathBuf,
+    }
+
+    impl SessionPort for SavingPort {
+        fn label(&self) -> String {
+            self.recorded.label()
+        }
+        fn submit(&mut self, request: SubmitRequest) {
+            self.recorded.submit(request);
+        }
+        fn cancel(&mut self) {
+            self.recorded.cancel();
+        }
+        fn answer(&mut self, request_id: &str, decision: ApprovalDecision) -> bool {
+            self.recorded.answer(request_id, decision)
+        }
+        fn resume(&mut self, session_id: Option<String>) -> Result<(), String> {
+            self.recorded.resume(session_id)
+        }
+        fn limits(&self) -> TurnBounds {
+            self.recorded.limits()
+        }
+        fn save_credential(&mut self, key: &str) -> Option<SessionEvent> {
+            let path = self
+                .data_dir
+                .join(crate::interactive::credentials::CREDENTIAL_FILE_NAME);
+            let protection = crate::interactive::credentials::save(&path, key)
+                .expect("the fixture credential directory is writable");
+            Some(SessionEvent::ProviderConfigured {
+                source: crate::interactive::credentials::CredentialSource::File {
+                    path,
+                    protection,
+                },
+            })
+        }
+    }
+
     struct Bench {
         controller: InteractiveController,
         events: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
@@ -1079,10 +1271,160 @@ mod tests {
     }
 
     fn submit_text(controller: &mut InteractiveController, text: &str) -> Vec<Effect> {
+        type_text(controller, text);
+        controller.handle_key(Key::Enter)
+    }
+
+    /// Type one line without submitting it, so a caller can inspect the prompt.
+    fn type_text(controller: &mut InteractiveController, text: &str) {
         for character in text.chars() {
             let _ = controller.handle_key(Key::Char(character));
         }
-        controller.handle_key(Key::Enter)
+    }
+
+    /// K01: the whole `/key` chain, driven by keys rather than by calling the
+    /// handler directly — editor, controller, the port that saves the file, and the
+    /// bootstrap refresh that clears the setup gate.
+    ///
+    /// Split in two because the chain has two halves: what the user sees while
+    /// typing, and what the app does once the key is submitted.
+    #[test]
+    fn k01_key_entry_masks_saves_clears_the_gate_and_admits_the_next_message() {
+        let (temp, context) = context(false);
+        assert!(context.setup_required, "the fixture starts unconfigured");
+        let channel = SessionChannel::new();
+        let events = channel.sender();
+        let recorded = RecordingPort::default();
+        let port = SavingPort {
+            recorded: recorded.clone(),
+            data_dir: context.paths.data_dir.clone(),
+        };
+        let mut controller = InteractiveController::new(&context, Box::new(port), channel, true);
+        controller.boot_lines();
+
+        assert_masked_entry_hides_the_key(&mut controller);
+        assert_submitting_the_key_opens_the_gate(&mut controller, &context, &recorded);
+        assert_escape_abandons_entry_without_overwriting(&mut controller, &events, &context);
+        drop(temp);
+    }
+
+    /// A bare `/key` opens masked entry, and the prompt shows the mask, not the key.
+    fn assert_masked_entry_hides_the_key(controller: &mut InteractiveController) {
+        submit_text(controller, "/key");
+        assert!(
+            controller.editor.secret_entry(),
+            "a bare /key starts secret entry"
+        );
+        assert!(
+            controller.ui_state().setup_required,
+            "nothing is configured until the key is submitted"
+        );
+        type_text(controller, "sk-controller-fixture");
+        let masked = controller.prompt();
+        assert!(
+            !masked.contains("sk-controller-fixture"),
+            "the prompt must mask the key: {masked}"
+        );
+        assert!(masked.contains('\u{2022}'), "the mask is visible: {masked}");
+    }
+
+    /// Submitting saves the file, clears the gate, and admits the next message.
+    fn assert_submitting_the_key_opens_the_gate(
+        controller: &mut InteractiveController,
+        context: &LaunchContext,
+        recorded: &RecordingPort,
+    ) {
+        let _ = controller.handle_key(Key::Enter);
+        let path = context
+            .paths
+            .data_dir
+            .join(crate::interactive::credentials::CREDENTIAL_FILE_NAME);
+        assert!(path.is_file(), "the key was written to {}", path.display());
+        assert!(
+            !controller.ui_state().setup_required,
+            "a saved key clears the setup gate"
+        );
+        assert_eq!(
+            controller.phase(),
+            AppPhase::Ready,
+            "the app is ready, not still in setup"
+        );
+        assert!(
+            controller
+                .transcript()
+                .join("\n")
+                .contains("API key saved to"),
+            "the user is told what happened: {:?}",
+            controller.transcript()
+        );
+        assert_eq!(
+            recorded.submissions.lock().expect("submission log").len(),
+            0,
+            "entering a key is not a request"
+        );
+        assert!(
+            !controller
+                .transcript()
+                .join("\n")
+                .contains("sk-controller-fixture"),
+            "the transcript must never carry the key"
+        );
+
+        submit_text(controller, "explain the parser");
+        assert_eq!(
+            recorded
+                .submissions
+                .lock()
+                .expect("submission log")
+                .as_slice(),
+            ["explain the parser".to_owned()],
+            "the gate is open for the next message"
+        );
+    }
+
+    /// `/key` refuses while a run is active, and Esc then abandons entry safely.
+    fn assert_escape_abandons_entry_without_overwriting(
+        controller: &mut InteractiveController,
+        events: &tokio::sync::mpsc::UnboundedSender<SessionEvent>,
+        context: &LaunchContext,
+    ) {
+        submit_text(controller, "/key");
+        assert!(
+            !controller.editor.secret_entry(),
+            "/key must not open secret entry while a run is active"
+        );
+        assert!(
+            controller
+                .transcript()
+                .join("\n")
+                .contains("cannot enter an API key while a run is active"),
+            "{:?}",
+            controller.transcript()
+        );
+        let _ = events.send(SessionEvent::RunTerminal {
+            outcome: RunOutcome::Done,
+        });
+        let _ = controller.pump_events();
+
+        submit_text(controller, "/key");
+        assert!(controller.editor.secret_entry());
+        type_text(controller, "sk-abandoned");
+        let _ = controller.handle_key(Key::Esc);
+        assert!(!controller.editor.secret_entry(), "Esc cancels entry");
+        assert_eq!(
+            controller.prompt(),
+            "> ",
+            "the prompt is a normal one again"
+        );
+        let path = context
+            .paths
+            .data_dir
+            .join(crate::interactive::credentials::CREDENTIAL_FILE_NAME);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("credential file"),
+            "DEEPSEEK_API_KEY=\"sk-controller-fixture\"\n",
+            "Esc must not overwrite the stored key"
+        );
     }
 
     /// The plain lines of one effect batch: exactly what the plain renderer

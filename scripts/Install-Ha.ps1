@@ -773,7 +773,14 @@ function Invoke-MinimalEnvironmentProbe {
     foreach ($name in $toolchain) { [void] $startInfo.EnvironmentVariables.Remove($name) }
     $credentials = @('DEEPSEEK_API_KEY', 'HA_API_KEY', 'HA_PROVIDER_ENDPOINT', 'HA_PROVIDER_MODEL')
     foreach ($name in $credentials) { [void] $startInfo.EnvironmentVariables.Remove($name) }
-    $startInfo.EnvironmentVariables['PATH'] = $environment.Path
+    # ProcessStartInfo can preserve the inherited key as `Path` while an added
+    # `PATH` becomes a second entry. Windows command lookup and where.exe do not
+    # consistently choose the same duplicate, so replace the inherited entry
+    # under the platform's canonical spelling.
+    [void] $startInfo.EnvironmentVariables.Remove('Path')
+    [void] $startInfo.EnvironmentVariables.Remove('PATH')
+    $pathKey = if ($isWindowsHost) { 'Path' } else { 'PATH' }
+    $startInfo.EnvironmentVariables[$pathKey] = $environment.Path
     $startInfo.EnvironmentVariables['HOME'] = $environment.Home
     $startInfo.EnvironmentVariables['USERPROFILE'] = $environment.UserProfile
     $startInfo.EnvironmentVariables['APPDATA'] = $environment.AppData
@@ -903,9 +910,12 @@ function Invoke-SelfTest {
             # installed binary. Running the absolute path is not enough.
             $shell = Join-Path ([string] $env:SystemRoot) 'System32/cmd.exe'
             if (Test-Path -LiteralPath $shell -PathType Leaf) {
-                $whereProbe = Invoke-MinimalEnvironmentProbe -Executable $shell -InstallRoot $installRoot -ProbeHome $probeHome -Arguments @('/c', 'where ha')
-                $resolved = @(($whereProbe.Stdout -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-                Add-SelfTestResult 'fresh_shell_resolves_ha_to_the_installed_binary' (($whereProbe.ExitCode -eq 0) -and ($resolved.Count -eq 1) -and ($resolved[0].Trim() -ieq $target)) "exit $($whereProbe.ExitCode); resolved '$($resolved -join '|')'"
+                # `%~$PATH:I` uses cmd.exe's own executable search. `where.exe`
+                # enumerates each directory and is denied by some Windows sandbox
+                # policies even though cmd can resolve and execute the same file.
+                $whereProbe = Invoke-MinimalEnvironmentProbe -Executable $shell -InstallRoot $installRoot -ProbeHome $probeHome -Arguments @('/c', 'for %I in (ha.exe) do @echo RESOLVED=%~$PATH:I')
+                $resolved = @(($whereProbe.Stdout -split "`r?`n") | Where-Object { $_.StartsWith('RESOLVED=') } | ForEach-Object { $_.Substring('RESOLVED='.Length) } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                Add-SelfTestResult 'fresh_shell_resolves_ha_to_the_installed_binary' (($whereProbe.ExitCode -eq 0) -and ($resolved.Count -eq 1) -and ($resolved[0].Trim() -ieq $target)) "exit $($whereProbe.ExitCode); resolved '$($resolved -join '|')'; err '$($whereProbe.Stderr.Trim())'"
 
                 $shellRun = Invoke-MinimalEnvironmentProbe -Executable $shell -InstallRoot $installRoot -ProbeHome $probeHome -Arguments @('/c', 'ha --version')
                 Add-SelfTestResult 'fresh_shell_runs_ha_by_name_without_a_toolchain' (($shellRun.ExitCode -eq 0) -and ($shellRun.Stdout -match '^ha \d+\.\d+\.\d+')) "exit $($shellRun.ExitCode); out $($shellRun.Stdout.Trim())"
@@ -914,8 +924,8 @@ function Invoke-SelfTest {
                 # this installer owns, not from something already on the machine.
                 $emptyBin = Join-Path $probeHome 'empty-bin'
                 New-Item -ItemType Directory -Path $emptyBin -Force | Out-Null
-                $absentProbe = Invoke-MinimalEnvironmentProbe -Executable $shell -InstallRoot $emptyBin -ProbeHome $probeHome -Arguments @('/c', 'where ha')
-                Add-SelfTestResult 'fresh_shell_without_the_install_directory_does_not_resolve_ha' ($absentProbe.ExitCode -ne 0) "exit $($absentProbe.ExitCode); out $($absentProbe.Stdout.Trim())"
+                $absentProbe = Invoke-MinimalEnvironmentProbe -Executable $shell -InstallRoot $emptyBin -ProbeHome $probeHome -Arguments @('/c', 'for %I in (ha.exe) do @echo RESOLVED=%~$PATH:I')
+                Add-SelfTestResult 'fresh_shell_without_the_install_directory_does_not_resolve_ha' ($absentProbe.Stdout.Trim() -eq 'RESOLVED=') "exit $($absentProbe.ExitCode); out $($absentProbe.Stdout.Trim())"
 
                 # H07 asks for PowerShell and CMD resolution, not just one shell.
                 $pwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue | Select-Object -First 1).Source
@@ -1080,6 +1090,3 @@ if ($SelfTest) {
 }
 
 Invoke-Install
-
-
-

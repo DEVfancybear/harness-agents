@@ -307,3 +307,145 @@ git status --porcelain          # phải sạch, hoặc chỉ có thay đổi c�
 - Không chạy lại `cargo metadata` không `--locked` để "sửa" lockfile: lockfile đã đúng,
   `cargo build --locked` xanh.
 - Không chạy lại `Invoke-HaPtyAcceptance.ps1` với filter `t01` (các ca đó thuộc POC đã xoá).
+
+## 13. `/key` — lưu API key trong app (lượt này, **chưa commit**)
+
+Trạng thái thật: **implemented trong working tree, unit test xanh (153 test, 0 failed trong phiên
+có quyền đổi ACL), chưa có commit nào.** `HEAD` vẫn là `aeaf7b7`. Hợp đồng ở SPEC mục 3d, số đo và
+`not_run` ở evidence mục 11 (11.2 ghi hash, phép đo ACL và khác biệt môi trường).
+
+### 13.1. Việc đã xong
+
+- `credentials.rs` (mới): file `credentials.env` trong **`<data dir>/private/`** (hoặc
+  `HA_CREDENTIALS_DIR`, dùng nguyên trạng), parser đúng một dòng `DEEPSEEK_API_KEY="..."` (từ chối
+  tên biến khác, khai hai lần, giá trị không quote; không lặp giá trị trong thông điệp lỗi),
+  `save()` staging rồi `rename`, `CredentialSource` chỉ mang **tên** nguồn.
+- **Siết quyền lúc tạo file**: `write_staged` mở file staging bằng `OpenOptions` + `mode(0o600)`
+  trên Unix rồi `sync_all()`, nên key không bao giờ nằm trong file ai cũng mở được, kể cả trong
+  khoảnh khắc giữa tạo và siết; thư mục `0700`.
+- **ACL Windows thật**: `restrict_acl` gọi `icacls <dir> /inheritance:r` rồi `/grant:r
+  "<USERDOMAIN>\<USERNAME>:(OI)(CI)F"` + `/grant:r "SYSTEM:(OI)(CI)F"`; file thừa hưởng ACL đó.
+  Đo trước/sau trên `%LOCALAPPDATA%\HarnessAgents`: trước có `CodexSandboxUsers:(I)(OI)(CI)(RX)`
+  (nhóm không phải user đọc được), sau chỉ còn `NT AUTHORITY\SYSTEM` + `DESKTOP-14QHC6K\duong`
+  (file thừa hưởng với cờ `(I)`).
+- **Trung thực hoá bằng kiểu**: `Protection` có bốn nhãn (`OwnerOnly`, `OwnerOnlyAcl`,
+  `ProfileDefault`, `NotReverified`); `save()` **trả về** nhãn nó vừa áp; `/status` in thêm dòng
+  `Provider: credential file protection: …`. `icacls` fail ⇒ `ProfileDefault`, với câu mô tả nói
+  thẳng là tài khoản khác **có thể** đọc được — không hứa suông.
+- `/key` (không tham số) vào secret-entry mode, buffer mask `•` mỗi ký tự, Enter lưu, giá trị
+  không vào history; **Esc huỷ** secret entry (`input.rs:351`–`368`);
+  `/key <giá-trị>` lưu trực tiếp, chỉ một token, và **đã được mô tả trong `/help`** là kém riêng
+  tư hơn vì giá trị nằm trong history của terminal.
+- Lưu xong: ghi `config.toml` tối thiểu `schema_version = 1` **chỉ khi file chưa tồn tại**,
+  reload config, xoá gate `setup_required`, đổi phase `SetupRequired | Booting → Ready`, vẽ lại
+  header; lượt kế tiếp `resolve_provider` lại nên **không cần restart**.
+- `/help` có `/key` và `/key <value>`; `SLASH_COMMANDS` **8** phần tử; `/status` + `/model` in
+  **nguồn** credential (`credential from environment variable ...` / `credential from saved
+  file ...`) và không bao giờ in giá trị; `SessionEvent::ProviderConfigured { source }` chỉ mang
+  nguồn.
+- 19 test mới cho feature (`k01_*`, `k02_*`, `k03_*`; 18 biên dịch trên Windows) — danh sách +
+  oracle ở evidence mục 11.5. Mask được assert ở **ba tầng**: editor
+  (`k01_secret_entry_masks_the_buffer_and_never_reaches_history`), controller
+  (`k01_key_entry_masks_saves_clears_the_gate_and_admits_the_next_message`) và **khung hình đã vẽ**
+  (`tui::tests::k01_a_secret_buffer_is_painted_as_a_mask`).
+- **Số test của binary `ha`: 153, đo lúc 10:49 ngày 20/09/2026** bằng
+  `cargo test -p harness-cli --bin ha --locked -- --list`; `cargo test --release -p
+  harness-cli --bin ha --locked` cho **153 passed; 0 failed** trong phiên có quyền đổi ACL (cùng
+  ngày), còn phiên soạn tài liệu này (policy `workspace-write`) cho **152 passed; 1 failed** vì
+  `icacls` bị từ chối — xem 13.5 mục 2. Đây là **số đo có ngày**, không phải hằng số.
+- Đo end-to-end bằng binary release thật, **dùng đường dẫn mặc định mới**: với
+  `HA_HOME/data/private/credentials.env` (không set `HA_CREDENTIALS_DIR`, không có biến môi trường
+  nào giữ key) và endpoint loopback chết, `ha chat --headless` đọc được file, mở store, nhận lượt
+  rồi đi tới lời gọi provider và exit 1 — chi tiết + lệnh ở evidence mục 11.4.
+
+### 13.2. File đã đụng
+
+| File | Việc |
+|---|---|
+| `crates/harness-cli/src/interactive/credentials.rs` | **mới**: file credential trong `private/`, parser, `save`, `write_staged` (tạo file `0600` trên Unix), `restrict_acl` (`icacls`), `Protection`, `source`, `resolve_file`, `CredentialSource` |
+| `crates/harness-cli/src/interactive/service.rs` | credential lấy từ `credentials::source`; `EnvironmentCredential` đọc file lúc gọi; `provider_diagnostics` (kèm dòng protection); `save_credential`; `validate_credential_file` |
+| `crates/harness-cli/src/interactive/controller.rs` | nhánh `/key`, `save_key`, phase/header sau khi lưu, `display_buffer` cho mask, notice nói `/key <value>` kém riêng tư, **test controller cho cả chuỗi `/key`** |
+| `crates/harness-cli/src/interactive/input.rs` | secret entry (`begin_secret_entry`/`take_secret`/`cancel_secret`), `SECRET_MASK`, `InputOutcome::Secret`, **nhánh `Key::Esc` huỷ secret entry** |
+| `crates/harness-cli/src/interactive/tui/mod.rs` | **test khung hình đã vẽ** cho mask (`k01_a_secret_buffer_is_painted_as_a_mask`) |
+| `crates/harness-cli/src/interactive/bootstrap.rs` | `credential_saved`, `write_minimal_config`, header nêu nguồn |
+| `crates/harness-cli/src/interactive/events.rs` | `SessionEvent::ProviderConfigured { source }` |
+| `crates/harness-cli/src/interactive/view.rs` | hai dòng `/help`: `/key` và `/key <value>` (kém riêng tư hơn, một token) |
+| `crates/harness-cli/src/interactive/headless.rs` | `validate_credential_file` trước lượt headless |
+| `crates/harness-cli/src/interactive/mod.rs` | khai báo module `credentials` |
+| `docs/specs/HA_TUI.vi.md`, `docs/evidence/HA_TUI.vi.md`, `docs/OPERATOR_GUIDE.vi.md`, `docs/handoffs/HA_TUI.vi.md` | tài liệu lượt này |
+
+Không đụng `Cargo.toml`/`Cargo.lock` (không thêm dependency) và không đụng `.rs` nào khác.
+
+### 13.3. Lệnh kiểm chứng (đúng thứ tự)
+
+```text
+git status --porcelain                 # cây đang dở; credentials.rs untracked
+cargo check -p harness-cli --all-targets --locked
+cargo test -p harness-cli --bin ha --locked
+cargo test --release -p harness-cli --bin ha --locked
+cargo test -p harness-cli --bin ha --locked -- --list | Select-String 'k0[123]_'
+cargo clippy --workspace --all-targets --locked -- -D warnings
+pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json
+pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 900
+pwsh -NoProfile -File scripts/Verify-Docs.ps1 -SelfTest
+```
+
+Kỳ vọng đo được (20/09/2026): `153 passed; 0 failed` với `cargo test --release -p harness-cli --bin
+ha --locked` **trong phiên có quyền đổi ACL**; phiên bị chặn đổi ACL (như phiên soạn tài liệu
+này) sẽ thấy **152 passed; 1 failed** ở đúng test ACL — đó là khác biệt quyền, không phải hồi quy
+(13.5 mục 2). Docs: `DOCS_OK`. Clippy, gate và PTY **chưa chạy** cho feature này.
+
+### 13.4. Plan item để đánh dấu: **không có**
+
+`docs/HA_TUI_PLAN.vi.md` chỉ có work item T01–T08, và mục 11 ghi rõ ngoài phạm vi là full-screen,
+theme tuỳ chỉnh, chuột, cuộn history trong app, i18n — **không** nhắc việc nhập key. Vậy plan
+**không** có item nào cho `/key`, nên **không** có gì để ghi "đã implement"; plan **không** được
+sửa (đúng luật của chính plan). Lưu ý tên test dùng tiền tố `k01_`/`k02_` là **cục bộ của feature
+này**, không phải case K01/K02 của P1/P6 (K01–K14 trong `PLUGIN_ARCHITECTURE.vi.md` là chuyện
+plugin, không liên quan) — đừng map nhầm khi đọc registry.
+
+### 13.5. Việc còn lại / open items
+
+1. **Cây chưa commit.** Toàn bộ feature `/key` nằm trong working tree; `credentials.rs` còn
+   **untracked**; `HEAD` vẫn `aeaf7b7`. Cây đã **ngừng đổi** ở bản cuối này (hash ở evidence
+   11.2), nhưng lượt này từng có writer song song sửa `interactive/*` (`service.rs` 1431 → 1489
+   dòng, `credentials.rs` 476 → hơn 700 dòng) — xác nhận `git status` và mtime trước khi commit.
+2. **Test ACL phụ thuộc quyền của môi trường chạy.** `k03_a_saved_key_is_restricted_to_this_account_by_an_acl`
+   **xanh** ở phiên có quyền đổi ACL (bên giao việc: `153 passed; 0 failed`), nhưng **đỏ** ở phiên
+   bị chặn (soạn tài liệu này: `152 passed; 1 failed`) vì `icacls <dir> /inheritance:r` trả
+   **exit 5 `Access is denied`** ⇒ `save()` trả `Protection::ProfileDefault`. Đó là **fallback
+   trung thực**, không phải lỗi logic — nhưng cần quyết định trước khi commit: hoặc ghi rõ yêu cầu
+   quyền cho CI, hoặc gate test theo khả năng đổi ACL. Thêm hai điều kiện đã biết: assertion dựa
+   vào chữ `SYSTEM` **tiếng Anh**, và **không** test nào ép nhánh `icacls` thất bại.
+3. **`/key <giá-trị>`**: vẫn chỉ **token đầu tiên** được lưu (key chứa dấu cách sẽ bị cắt). Hạn
+   chế này nay **đã được ghi trong app** (`/help` `view.rs:131`–`133` + notice
+   `controller.rs:753`–`754`), nên chỉ còn là hạn chế đã biết.
+4. **Chưa có ca PTY cho `/key`.** ConPTY cần console mà sandbox build không có. Mask đã được canh
+   ở ba tầng không cần console (editor, controller, khung hình đã vẽ), nhưng **chưa** có bằng
+   chứng transcript thật rằng terminal nhận đúng `•`.
+5. **Paid smoke chưa chạy**: môi trường không có credential/budget, nên chưa có lượt gọi provider
+   thật nào bằng key lưu trong app. Đường CLI thật đọc **file** credential đã được đo end-to-end
+   với endpoint loopback chết (evidence 11.4), nhưng đó không phải xác thực.
+6. **Clippy/gate/PTY chưa chạy cho feature này**: `cargo clippy --workspace --all-targets --locked
+   -- -D warnings`, `Verify-HaLaunch.ps1 -Json`, `Invoke-HaPtyAcceptance.ps1`.
+
+Đã đóng trong lượt này (không còn là open item): **Esc huỷ secret entry** (implement + test bấm
+phím thật ở editor và controller), **thứ tự siết quyền** (`write_staged` tạo file với
+`mode(0o600)` trên Unix + test mode file staging), **test controller cho cả chuỗi `/key`**
+(`k01_key_entry_masks_saves_clears_the_gate_and_admits_the_next_message`), **mô tả `/key <value>`
+trong app**, **đường dẫn `<data dir>/private/`**, **ACL Windows + `Protection` + dòng `/status`**,
+và **mask ở tầng khung hình đã vẽ** (`tui::tests::k01_a_secret_buffer_is_painted_as_a_mask`).
+
+### 13.6. Next action chính xác
+
+1. Xác nhận cây đã dừng đổi: `git status --porcelain` và mtime của
+   `crates/harness-cli/src/interactive/*.rs`; đối chiếu hash với evidence 11.2.
+2. `cargo clippy --workspace --all-targets --locked -- -D warnings` và
+   `cargo test --release -p harness-cli --bin ha --locked` → kỳ vọng `153 passed; 0 failed` trong
+   phiên có quyền đổi ACL (nếu chạy ở môi trường bị chặn ACL, đọc 13.5 mục 2 trước khi kết luận).
+3. `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json` → `passed: true, failures: []`,
+   rồi `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 900` →
+   `PTY_EXIT: 0`.
+4. Quyết định 13.5 mục 2 (yêu cầu quyền ACL cho CI / gate test theo khả năng đổi ACL) trước khi
+   commit, vì đó là điều kiện môi trường ảnh hưởng tới gate.
+5. Commit feature + docs thành một commit, rồi cập nhật lại mục 9 và 13.3 theo bản cuối cùng.

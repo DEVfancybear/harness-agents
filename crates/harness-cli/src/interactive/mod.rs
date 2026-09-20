@@ -9,6 +9,7 @@ pub mod app;
 pub mod bootstrap;
 pub mod config;
 pub mod controller;
+pub mod credentials;
 pub mod detector;
 pub mod events;
 pub mod headless;

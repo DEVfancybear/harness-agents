@@ -20,7 +20,7 @@ use harness_types::{ErrorCode, HarnessError, HostId, InputId, ProjectId, Session
 
 use super::bootstrap::{self, LaunchRequest};
 use super::paths::{HostPlatform, LaunchEnvironment};
-use super::service::{EnvironmentCredential, resolve_provider};
+use super::service::{EnvironmentCredential, resolve_provider, validate_credential_file};
 
 /// A validated single-turn headless request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,7 +40,7 @@ impl TurnObserver for SilentObserver {
 
 /// Debug-only acceptance trace for a child that is killed at a hard deadline.
 /// Normal users never see it, and release artifacts do not contain the switch.
-fn acceptance_trace(stage: &str) {
+fn acceptance_trace(#[cfg_attr(not(debug_assertions), allow(unused_variables))] stage: &str) {
     #[cfg(debug_assertions)]
     if std::env::var_os("HA_TEST_TRACE_HEADLESS").is_some() {
         eprintln!("HA_HEADLESS_PHASE {stage}");
@@ -71,8 +71,13 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     acceptance_trace("bootstrap_resolved");
     // Resolve the provider before opening anything: an unconfigured environment
     // must fail fast with instructions and must not create state.
-    let config = resolve_provider(&environment)
+    let config = resolve_provider(&environment, &context.paths.data_dir)
         .map_err(|message| HarnessError::new(ErrorCode::ServiceUnavailable, message))?;
+    // A key the app saved is read by the resolver at call time. Prove that here,
+    // before a store is opened or a turn is admitted, so a saved-but-unreadable
+    // key fails with an actionable message instead of mid-turn.
+    validate_credential_file(&environment, &context.paths.data_dir)
+        .map_err(|message| HarnessError::new(ErrorCode::SecretNotGranted, message))?;
 
     // Name the directory that could not be opened: an operator has to know which
     // path failed, and the typed code must survive the extra context.
@@ -136,7 +141,8 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         DeepSeekAdapter::new(
             config.endpoint.clone(),
             Arc::new(EnvironmentCredential::new(
-                config.credential_variable.clone(),
+                config.credential_variable(),
+                context.paths.data_dir.clone(),
             )),
             capabilities,
         )

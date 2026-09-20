@@ -10,13 +10,15 @@ use std::path::{Path, PathBuf};
 use harness_types::{ContentHash, ErrorCode, HarnessError};
 
 use super::config::{self, ConfigState};
+use super::credentials::{self, CredentialSource};
 use super::paths::{self, HostPlatform, LaunchEnvironment, PathRequest, ResolvedPaths};
 
 /// Credential variables probed for presence at launch.
 ///
 /// Only presence is checked: the value is never read, logged, stored, or placed
-/// in a command history.
-pub const CREDENTIAL_VARIABLES: [&str; 2] = ["DEEPSEEK_API_KEY", "HA_API_KEY"];
+/// in a command history. The canonical list lives in [`credentials`], which also
+/// owns the order the variables are probed in.
+pub const CREDENTIAL_VARIABLES: [&str; 2] = credentials::CREDENTIAL_VARIABLES;
 
 /// `DeepSeek`'s documented endpoint, used when the operator names no other one.
 ///
@@ -55,7 +57,28 @@ pub enum ProviderState {
     /// No credential source: the app opens a setup state and dispatches nothing.
     SetupRequired { reason: String },
     /// A credential source is present; the model is resolved on the first request.
-    CredentialPresent { variable: String },
+    ///
+    /// The source carries the *name* of where the key lives — an environment
+    /// variable or the file `/key` saved — and never the key itself.
+    CredentialPresent { source: CredentialSource },
+}
+
+impl ProviderState {
+    /// The source name for a rendered line; never the value.
+    ///
+    /// Kept as the one place that turns a state into operator-facing text, so a
+    /// future header or status line cannot invent a second spelling of it.
+    #[allow(
+        dead_code,
+        reason = "the header composes its own line; tests assert this"
+    )]
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::CredentialPresent { source } => source.describe(),
+            Self::SetupRequired { reason } => reason.clone(),
+        }
+    }
 }
 
 /// Everything the app needs to render its header and open lazily.
@@ -75,8 +98,11 @@ impl LaunchContext {
     #[must_use]
     pub fn header_lines(&self) -> Vec<String> {
         let provider = match &self.provider {
-            ProviderState::CredentialPresent { variable } => {
-                format!("credential from {variable}, model resolved on first request")
+            ProviderState::CredentialPresent { source } => {
+                format!(
+                    "credential from {}, model resolved on first request",
+                    source.describe()
+                )
             }
             ProviderState::SetupRequired { .. } => "setup required".to_owned(),
         };
@@ -121,12 +147,12 @@ impl LaunchContext {
         }
         if let ProviderState::SetupRequired { reason } = &self.provider {
             reasons.push(format!(
-                "provider {reason}; set {} to a key kept outside this repository",
+                "provider {reason}; set {} to a key kept outside this repository, or paste it here with /key",
                 CREDENTIAL_VARIABLES.join(" or ")
             ));
         }
         Some(format!(
-            "setup required: {}. Nothing is sent to a provider until this is resolved; /exit quits.",
+            "setup required: {}. Nothing is sent to a provider until this is resolved; /key saves an API key, /exit quits.",
             reasons.join("; ")
         ))
     }
@@ -136,6 +162,71 @@ impl LaunchContext {
     pub fn project_store_dir(&self) -> PathBuf {
         self.paths.project_data_dir(&self.project.key)
     }
+
+    /// The context after the app saved a usable credential.
+    ///
+    /// `/key` is a complete setup, not half of one. The credential file is not
+    /// part of the strict configuration and never will be, so the app also writes
+    /// the minimal valid configuration file when none exists — otherwise the user
+    /// pastes a working key and still faces a first-run gate.
+    ///
+    /// Only a **missing** file is written. A corrupt one is left exactly as it is:
+    /// it is never silently replaced by defaults, and this returns the error the
+    /// normal load reports so the app can say what is wrong with it.
+    pub fn credential_saved(&self, source: CredentialSource) -> Result<Self, HarnessError> {
+        let config = match std::fs::read_to_string(&self.paths.config_file) {
+            Ok(_) => config::load(&self.paths.config_file)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                write_minimal_config(&self.paths.config_file)?;
+                config::load(&self.paths.config_file)?
+            }
+            Err(error) => {
+                return Err(HarnessError::new(
+                    ErrorCode::ConfigReadError,
+                    format!(
+                        "configuration file {} could not be read: {error}",
+                        self.paths.config_file.display()
+                    ),
+                ));
+            }
+        };
+        let provider = ProviderState::CredentialPresent { source };
+        let setup_required =
+            config.is_first_run() || matches!(provider, ProviderState::SetupRequired { .. });
+        let mut updated = self.clone();
+        updated.config = config;
+        updated.provider = provider;
+        updated.setup_required = setup_required;
+        Ok(updated)
+    }
+}
+
+/// Write the smallest configuration file the strict schema accepts.
+///
+/// `schema_version` is the only required field, and every other section defaults,
+/// so this cannot disagree with the P0 contract: it writes no provider and no
+/// credential setting, which remains the point of keeping them out of this file.
+fn write_minimal_config(path: &Path) -> Result<(), HarnessError> {
+    if let Some(directory) = path.parent() {
+        std::fs::create_dir_all(directory).map_err(|error| {
+            HarnessError::new(
+                ErrorCode::StorageOpenFailed,
+                format!(
+                    "configuration directory {} could not be created: {error}",
+                    directory.display()
+                ),
+            )
+        })?;
+    }
+    std::fs::write(path, "schema_version = 1\n").map_err(|error| {
+        HarnessError::new(
+            ErrorCode::StorageOpenFailed,
+            format!(
+                "configuration file {} could not be written: {error}",
+                path.display()
+            ),
+        )
+    })
 }
 
 /// Resolve the launch context for one interactive session.
@@ -182,7 +273,7 @@ pub fn resolve(request: LaunchRequest) -> Result<LaunchContext, HarnessError> {
         explicit_data_dir: request.explicit_data_dir.as_deref(),
     })?;
     let config = config::load(&paths.config_file)?;
-    let provider = provider_state(&request.environment);
+    let provider = provider_state(&request.environment, &paths.data_dir);
     let setup_required =
         config.is_first_run() || matches!(provider, ProviderState::SetupRequired { .. });
 
@@ -208,16 +299,9 @@ fn project_key(digest: &str) -> String {
     format!("project-{short}")
 }
 
-fn provider_state(environment: &LaunchEnvironment) -> ProviderState {
-    let present = CREDENTIAL_VARIABLES.iter().find(|name| {
-        environment
-            .value(name)
-            .is_some_and(|value| !value.is_empty())
-    });
-    match present {
-        Some(variable) => ProviderState::CredentialPresent {
-            variable: (*variable).to_owned(),
-        },
+fn provider_state(environment: &LaunchEnvironment, data_dir: &Path) -> ProviderState {
+    match credentials::source(environment, data_dir) {
+        Some(source) => ProviderState::CredentialPresent { source },
         None => ProviderState::SetupRequired {
             reason: "no credential source".to_owned(),
         },
@@ -259,6 +343,7 @@ fn displayable(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{CREDENTIAL_VARIABLES, LaunchRequest, ProviderState, displayable, resolve};
+    use crate::interactive::credentials::{self, CredentialSource};
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
     use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
     use harness_types::{ErrorCode, HostId};
@@ -406,6 +491,61 @@ mod tests {
     }
 
     #[test]
+    fn k01_saving_a_key_clears_the_setup_gate_and_writes_the_minimal_config() {
+        let fixture = Fixture::new("project");
+        let environment = fixture.environment(&[]);
+        let context = resolve(fixture.request(&environment)).expect("context resolves");
+        assert!(
+            context.setup_required,
+            "no key and no config is a setup state"
+        );
+
+        let path = credentials::resolve_file(&environment, &context.paths.data_dir);
+        credentials::save(&path, "sk-bootstrap-fixture").expect("the key is saved");
+        let source = credentials::source(&environment, &context.paths.data_dir)
+            .expect("the saved file is a credential source");
+        let updated = context
+            .credential_saved(source)
+            .expect("the context accepts the saved credential");
+
+        assert!(
+            !updated.setup_required,
+            "a saved key plus a written config is a complete setup"
+        );
+        assert!(updated.setup_hint().is_none());
+        assert!(
+            updated
+                .header_lines()
+                .join("\n")
+                .contains("credentials.env"),
+            "the header names the source and never the value: {:?}",
+            updated.header_lines()
+        );
+        assert!(
+            !updated
+                .header_lines()
+                .join("\n")
+                .contains("sk-bootstrap-fixture"),
+            "the header must not render the key"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&updated.paths.config_file).expect("config file"),
+            "schema_version = 1\n",
+            "the written configuration carries no provider or credential setting"
+        );
+        // A second save is idempotent: the file already exists, so it is loaded
+        // rather than rewritten.
+        let again = updated
+            .credential_saved(CredentialSource::File {
+                path: path.clone(),
+                protection: credentials::Protection::OwnerOnly,
+            })
+            .expect("a second save still resolves");
+        assert!(!again.setup_required);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn h02_empty_home_without_credentials_opens_setup_state_and_writes_nothing() {
         let fixture = Fixture::new("project");
         let environment = fixture.environment(&[]);
@@ -451,7 +591,9 @@ mod tests {
         assert_eq!(
             context.provider,
             ProviderState::CredentialPresent {
-                variable: "DEEPSEEK_API_KEY".to_owned()
+                source: CredentialSource::Environment {
+                    variable: "DEEPSEEK_API_KEY".to_owned()
+                }
             }
         );
         assert!(!context.setup_required, "config plus credential is ready");

@@ -18,6 +18,9 @@ pub enum InputOutcome {
     Redraw,
     /// The user submitted a non-empty request.
     Submit(String),
+    /// The user submitted a secret; it must never be echoed, logged or stored in
+    /// the history, so it travels as its own outcome instead of a `Submit`.
+    Secret(String),
     /// Ctrl-C was pressed.
     Interrupt,
     /// Ctrl-D was pressed on an empty prompt.
@@ -66,7 +69,13 @@ pub struct LineEditor {
     suggestion: Vec<&'static str>,
     picker: Option<Picker>,
     overlay: Option<Overlay>,
+    /// The buffer is a secret: it is masked in every rendered form and never
+    /// becomes history. Set only by an explicit in-app request.
+    secret: bool,
 }
+
+/// The character a secret buffer is rendered with.
+pub const SECRET_MASK: char = '•';
 
 impl LineEditor {
     #[must_use]
@@ -74,6 +83,11 @@ impl LineEditor {
         Self::default()
     }
 
+    /// The raw buffer, with no masking applied.
+    ///
+    /// Production code renders through [`Self::display_buffer`]; this accessor
+    /// exists for tests that assert what was actually collected.
+    #[cfg(test)]
     #[must_use]
     pub fn buffer(&self) -> &str {
         &self.buffer
@@ -162,6 +176,66 @@ impl LineEditor {
         self.suggestion.clear();
     }
 
+    /// Start collecting a secret: one masked line, no completion, no picker.
+    ///
+    /// Called only from an explicit user request. Nothing here touches the
+    /// history, so the value cannot be recalled with the arrow keys afterwards.
+    pub fn begin_secret_entry(&mut self) {
+        self.secret = true;
+        self.picker = None;
+        self.overlay = None;
+        self.clear();
+    }
+
+    /// Whether the buffer is currently a secret.
+    ///
+    /// The controller renders through [`Self::display_buffer`], so this is the
+    /// state query rather than the value; tests assert the masking contract with it.
+    #[allow(dead_code, reason = "the controller renders the masked buffer instead")]
+    #[must_use]
+    pub const fn secret_entry(&self) -> bool {
+        self.secret
+    }
+
+    /// The buffer as it may be rendered: masked while a secret is being typed.
+    ///
+    /// Every render path goes through this, so the value has no way to reach the
+    /// screen or the scrollback while it is being entered. The cursor still moves
+    /// by one cell per character, because the mask is one character per character.
+    #[must_use]
+    pub fn display_buffer(&self) -> String {
+        mask_secret(self.secret, &self.buffer)
+    }
+
+    /// Finish secret entry, returning the collected value.
+    ///
+    /// The value is returned to the caller and dropped from the editor: it is
+    /// never pushed to history.
+    pub fn take_secret(&mut self) -> String {
+        let value = std::mem::take(&mut self.buffer);
+        self.secret = false;
+        self.cursor = 0;
+        self.suggestion.clear();
+        value
+    }
+
+    /// Leave secret entry without using the value.
+    pub fn cancel_secret(&mut self) {
+        self.secret = false;
+        self.clear();
+    }
+}
+
+/// Mask a buffer when it is a secret; one mask character per input character.
+#[must_use]
+pub fn mask_secret(secret: bool, buffer: &str) -> String {
+    if !secret {
+        return buffer.to_owned();
+    }
+    buffer.chars().map(|_| SECRET_MASK).collect()
+}
+
+impl LineEditor {
     /// Apply one key.
     #[allow(clippy::too_many_lines, reason = "one arm per key, in key order")]
     #[must_use]
@@ -275,7 +349,12 @@ impl LineEditor {
             }
             Key::Esc => {
                 // Escape never cancels a run; it dismisses what the editor showed
-                // on its own behalf.
+                // on its own behalf. Secret entry is one of those things: the app
+                // tells the user Esc cancels it, so Esc has to.
+                if self.secret {
+                    self.cancel_secret();
+                    return InputOutcome::Redraw;
+                }
                 if self.overlay.is_some() {
                     self.overlay = None;
                     return InputOutcome::Redraw;
@@ -327,6 +406,9 @@ impl LineEditor {
     fn submit(&mut self) -> InputOutcome {
         if self.buffer.trim().is_empty() {
             return InputOutcome::Unchanged;
+        }
+        if self.secret {
+            return InputOutcome::Secret(self.take_secret());
         }
         let submitted = std::mem::take(&mut self.buffer);
         if self.history.last() != Some(&submitted) {
@@ -510,8 +592,8 @@ impl LineEditor {
 }
 
 /// Slash commands this revision understands, in help order.
-pub const SLASH_COMMANDS: [&str; 7] = [
-    "/help", "/status", "/new", "/model", "/config", "/resume", "/exit",
+pub const SLASH_COMMANDS: [&str; 8] = [
+    "/help", "/status", "/key", "/new", "/model", "/config", "/resume", "/exit",
 ];
 
 /// Commands whose name starts with `prefix`.
@@ -548,7 +630,7 @@ fn normalize_paste(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputOutcome, LineEditor, completions};
+    use super::{InputOutcome, LineEditor, SECRET_MASK, completions};
     use crate::interactive::events::Key;
 
     fn type_text(editor: &mut LineEditor, text: &str) {
@@ -659,6 +741,45 @@ mod tests {
             editor.history(),
             ["first request".to_owned(), "second".to_owned()]
         );
+    }
+
+    #[test]
+    fn k01_secret_entry_masks_the_buffer_and_never_reaches_history() {
+        let mut editor = LineEditor::new();
+        editor.begin_secret_entry();
+        assert!(editor.secret_entry());
+        type_text(&mut editor, "sk-live-secret");
+        assert_eq!(
+            editor.display_buffer(),
+            SECRET_MASK
+                .to_string()
+                .repeat("sk-live-secret".chars().count()),
+            "a secret is rendered as one mask per character"
+        );
+        assert!(
+            !editor.display_buffer().contains("sk-live"),
+            "the value has no way to reach a renderer"
+        );
+        assert_eq!(
+            editor.handle(Key::Enter),
+            InputOutcome::Secret("sk-live-secret".to_owned())
+        );
+        assert!(!editor.secret_entry(), "submitting ends secret entry");
+        assert_eq!(editor.buffer(), "");
+        assert!(
+            editor.history().is_empty(),
+            "a secret is never added to the recall history"
+        );
+
+        // Escaping without submitting leaves nothing behind either. This presses the
+        // real key, because the app promises "Esc cancels" and a test that calls
+        // `cancel_secret` directly would not notice if that promise broke.
+        editor.begin_secret_entry();
+        type_text(&mut editor, "sk-abandoned");
+        assert_eq!(editor.handle(Key::Esc), InputOutcome::Redraw);
+        assert!(!editor.secret_entry(), "Esc ends secret entry");
+        assert_eq!(editor.buffer(), "");
+        assert!(editor.history().is_empty());
     }
 
     #[test]

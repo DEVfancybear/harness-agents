@@ -126,6 +126,11 @@ pub fn help_lines() -> Vec<String> {
     vec![
         "/help            list these commands".to_owned(),
         "/status          show project, config, data and provider state".to_owned(),
+        "/key             save the provider API key; the value is masked and never kept in history"
+            .to_owned(),
+        "/key <value>     save it in one line: less private, because the value stays in this \
+         terminal's history, and it takes one word, so use /key alone when in doubt"
+            .to_owned(),
         "/new             start a new session when nothing is running".to_owned(),
         "/model           show which model the next run would use".to_owned(),
         "/config          show the resolved configuration and data files".to_owned(),
