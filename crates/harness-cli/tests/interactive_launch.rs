@@ -519,12 +519,14 @@ fn i12_headless_turn_without_provider_configuration_fails_closed() {
     );
     assert!(run.stdout.is_empty(), "stdout was: {}", run.stdout);
     assert!(run.stderr.contains("service_unavailable"), "{}", run.stderr);
+    // Only the credential is demanded: the endpoint and the model fall back to
+    // DeepSeek's documented values, so an unconfigured environment means "no key".
+    assert!(run.stderr.contains("DEEPSEEK_API_KEY"), "{}", run.stderr);
     assert!(
-        run.stderr.contains("HA_PROVIDER_ENDPOINT"),
-        "{}",
+        !run.stderr.contains("HA_PROVIDER_ENDPOINT"),
+        "a missing key is the only missing input: {}",
         run.stderr
     );
-    assert!(run.stderr.contains("DEEPSEEK_API_KEY"), "{}", run.stderr);
     assert!(
         run.stderr.contains("no fixture answer was substituted"),
         "the failure must state that nothing was faked: {}",
@@ -655,12 +657,12 @@ fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
         loop {
             attempt += 1;
             let run = CliRun::from_output(&run_headless(arguments.clone()));
-            if run.code() == 0 || !run.stderr.contains(LOOPBACK_WOBBLE) || attempt >= 6 {
+            if run.code() == 0 || !run.stderr.contains(LOOPBACK_WOBBLE) || attempt >= 10 {
                 return run;
             }
             // Under load this environment can refuse loopback connections for a few
             // hundred milliseconds, so back off instead of retrying immediately.
-            std::thread::sleep(std::time::Duration::from_millis(50 * (1 << attempt)));
+            std::thread::sleep(std::time::Duration::from_millis(50 * (1 << attempt.min(6))));
             eprintln!(
                 "attempt {attempt} hit the known loopback wobble: {}",
                 run.stderr
@@ -1388,17 +1390,27 @@ struct DeniedWrite {
 
 impl DeniedWrite {
     fn apply(directory: &Path) -> Self {
-        let identity = match std::env::var("USERDOMAIN") {
-            Ok(domain) if !domain.is_empty() => format!(
-                "{domain}\\{}",
-                std::env::var("USERNAME").expect("USERNAME is set")
-            ),
-            _ => std::env::var("USERNAME").expect("USERNAME is set"),
-        };
+        // The process token is authoritative. Sandboxes and service hosts can
+        // preserve USERNAME from the interactive account while running the test
+        // under a different restricted identity.
+        let current = std::process::Command::new("whoami")
+            .output()
+            .expect("whoami runs");
+        assert!(
+            current.status.success(),
+            "whoami resolves the test identity"
+        );
+        let identity = String::from_utf8(current.stdout)
+            .expect("whoami prints UTF-8")
+            .trim()
+            .to_owned();
+        assert!(!identity.is_empty(), "whoami prints a non-empty identity");
         let output = std::process::Command::new("icacls")
             .arg(directory)
             .arg("/deny")
-            .arg(format!("{identity}:(OI)(CI)(W)"))
+            // Full deny includes AddSubdirectory/CreateFiles. The basic `(W)`
+            // mask is not sufficient on every Windows ACL inherited by Temp.
+            .arg(format!("{identity}:(OI)(CI)(F)"))
             .output()
             .expect("icacls runs");
         assert!(
@@ -1430,14 +1442,14 @@ fn i09_a_data_directory_without_write_permission_names_the_path_and_writes_nothi
     // write access on the data root with a real ACL, so the failure comes from the
     // file system rather than from a fixture.
     //
-    // The denial is applied with `icacls` and the account name comes from
-    // `USERNAME`, so this case is Windows-only by construction. It is skipped
+    // The denial is applied with `icacls` and the process identity comes from
+    // `whoami`, so this case is Windows-only by construction. It is skipped
     // rather than failed on Unix: the behaviour it proves is still covered there by
     // the read-only and unusable-root cases, and a skipped test that says why is
     // more honest than one that pretends the platform is unsupported.
     if !cfg!(windows) {
         eprintln!(
-            "i09: write-denial fixture needs icacls and USERNAME; skipping on {}",
+            "i09: write-denial fixture needs icacls and whoami; skipping on {}",
             std::env::consts::OS
         );
         return;

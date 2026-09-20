@@ -30,7 +30,9 @@ fn completion_service_resume_flow() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("isolated credential process");
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // The child spawns its own runtime and can be starved of a worker thread during
+    // a full-workspace run; the bound only has to outlast a slow machine, not a hang.
+    let deadline = Instant::now() + Duration::from_mins(2);
     let status = loop {
         if let Some(status) = child.try_wait().expect("child status") {
             break status;
@@ -207,7 +209,9 @@ async fn resume_flow() {
             .expect("response");
         request
     });
-    let (request, outcome) = tokio::time::timeout(Duration::from_secs(10), async {
+    // The bound is generous on purpose: under a full-workspace run this child can be
+    // starved of a worker thread, and a short bound turned that into a red gate.
+    let (request, outcome) = tokio::time::timeout(Duration::from_mins(1), async {
         is_listening.await.expect("the fixture is listening");
         tokio::join!(
             async { provider.await.expect("fixture task") },

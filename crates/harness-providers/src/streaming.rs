@@ -405,13 +405,13 @@ mod tests {
         await_loopback_ready(address).await;
         let mut last = None;
         let mut stream = None;
-        for attempt in 0..6 {
+        for attempt in 0..10 {
             let mut candidate = adapter.stream_events(provider_request(), CancellationToken::new());
             match tokio::time::timeout(Duration::from_millis(1500), candidate.next()).await {
                 Ok(Some(Err(error))) if attempt < 5 => {
                     last = Some(error.to_string());
                     // Under load the refusal can persist for a few hundred ms.
-                    tokio::time::sleep(Duration::from_millis(50 * (1 << attempt))).await;
+                    tokio::time::sleep(Duration::from_millis(50 * (1 << attempt.min(6)))).await;
                 }
                 Ok(Some(Err(error))) => panic!("fixture stream failed: {error}"),
                 Ok(Some(Ok(event))) => {

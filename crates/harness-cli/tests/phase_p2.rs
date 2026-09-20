@@ -153,7 +153,7 @@ fn p2_s01_runtime_contracts_and_state_machine_are_versioned() {
 }
 
 /// How many times a loopback client call may be retried.
-const LOOPBACK_ATTEMPTS: usize = 6;
+const LOOPBACK_ATTEMPTS: usize = 10;
 
 /// Wait until this loopback listener really accepts connections.
 ///
@@ -194,7 +194,10 @@ async fn stream_with_loopback_retry(
                     && error.to_string().contains("error sending request for url") =>
             {
                 // Under load the refusal can persist for a few hundred milliseconds.
-                tokio::time::sleep(std::time::Duration::from_millis(50 * (1 << attempts))).await;
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    50 * (1 << attempts.min(6)),
+                ))
+                .await;
             }
             Err(error) => panic!("fixture adapter stream: {error}"),
         }

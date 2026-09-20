@@ -372,12 +372,18 @@ counts as a refusal. A real model call needs `HA_PROVIDER_ENDPOINT`, `HA_PROVIDE
 and a credential (`DEEPSEEK_API_KEY` or `HA_API_KEY`); without them the app still opens
 in setup state and says what is missing, and it never fabricates an answer.
 
-Setting the credential for the current shell:
+**One API key is enough.** `DEEPSEEK_API_KEY` (or `HA_API_KEY`) is the whole
+credential: the endpoint and the model default to the values `DeepSeek` publishes -
+`https://api.deepseek.com` and `deepseek-flash` (see <https://api-docs.deepseek.com/>).
+Set `HA_PROVIDER_ENDPOINT` or `HA_PROVIDER_MODEL` for another provider or model; a
+variable you set always wins over the default.
 
 ```powershell
-$env:DEEPSEEK_API_KEY = '<your key>'         # or $env:HA_API_KEY
-$env:HA_PROVIDER_MODEL = 'deepseek-chat'      # provider dependent
-ha                                            # opens the TUI; the status bar names the model
+$env:DEEPSEEK_API_KEY = '<your key>'   # this line is the whole setup
+ha                                     # opens the TUI; the status bar names the model
+
+# optional, only for another model or provider:
+$env:HA_PROVIDER_MODEL = 'deepseek-v4-pro'
 ```
 
 To check the real provider before opening the app (costs one paid call):

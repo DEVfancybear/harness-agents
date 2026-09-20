@@ -28,7 +28,7 @@ use harness_types::{ErrorCode, HostId, InputId, ProjectId, SessionId, TaskId};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
-use super::bootstrap::{CREDENTIAL_VARIABLES, LaunchContext};
+use super::bootstrap::{CREDENTIAL_VARIABLES, DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL, LaunchContext};
 use super::controller::{DEFAULT_APPROVAL_TIMEOUT, TurnBounds};
 use super::events::{RunOutcome, SessionCandidate, SessionEvent};
 use super::paths::LaunchEnvironment;
@@ -210,14 +210,16 @@ pub struct ProviderConfig {
 
 /// Resolve provider settings from the environment.
 ///
-/// Nothing is guessed: no default endpoint, no default model and no fixture
-/// substitution. The error names every variable that is missing so the operator
-/// can fix the setup instead of wondering why a run produced nothing.
+/// The credential is mandatory and is **never** substituted: without it the error
+/// names what to set, and no fixture answer is produced. The endpoint and the model
+/// fall back to `DeepSeek`'s documented values, so one `DEEPSEEK_API_KEY` is a complete
+/// setup; an explicit variable still overrides either one, which is what another
+/// provider or another model needs.
 pub fn resolve_provider(environment: &LaunchEnvironment) -> Result<ProviderConfig, String> {
-    let endpoint = environment
+    let explicit_endpoint = environment
         .value(ENDPOINT_VARIABLE)
         .filter(|value| !value.is_empty());
-    let model = environment
+    let explicit_model = environment
         .value(MODEL_VARIABLE)
         .filter(|value| !value.is_empty());
     let credential = CREDENTIAL_VARIABLES
@@ -229,29 +231,21 @@ pub fn resolve_provider(environment: &LaunchEnvironment) -> Result<ProviderConfi
         })
         .copied();
 
-    let mut missing = Vec::new();
-    if endpoint.is_none() {
-        missing.push(format!("{ENDPOINT_VARIABLE} (provider endpoint URL)"));
-    }
-    if model.is_none() {
-        missing.push(format!("{MODEL_VARIABLE} (model name)"));
-    }
-    if credential.is_none() {
-        missing.push(format!("{} (API key)", CREDENTIAL_VARIABLES.join(" or ")));
-    }
-    if !missing.is_empty() {
+    let Some(credential_variable) = credential else {
         return Err(format!(
-            "provider setup is incomplete: set {}. Nothing was sent and no fixture answer was substituted.",
-            missing.join(", ")
+            "provider setup is incomplete: set {} (API key). Nothing was sent and no fixture answer was substituted.",
+            CREDENTIAL_VARIABLES.join(" or ")
         ));
-    }
-    let (Some(endpoint), Some(model), Some(credential_variable)) = (endpoint, model, credential)
-    else {
-        return Err("provider setup is incomplete".to_owned());
     };
     Ok(ProviderConfig {
-        endpoint: endpoint.to_string_lossy().into_owned(),
-        model: model.to_string_lossy().into_owned(),
+        endpoint: explicit_endpoint.map_or_else(
+            || DEEPSEEK_ENDPOINT.to_owned(),
+            |value| value.to_string_lossy().into_owned(),
+        ),
+        model: explicit_model.map_or_else(
+            || DEEPSEEK_MODEL.to_owned(),
+            |value| value.to_string_lossy().into_owned(),
+        ),
         credential_variable: credential_variable.to_owned(),
     })
 }
@@ -800,8 +794,8 @@ impl SessionPort for FixtureService {
 mod tests {
     use super::{
         AgentSessionService, ApprovalDecision, ApprovalGate, ApprovalProposal, ChannelApprovalGate,
-        ENDPOINT_VARIABLE, FixtureService, MODEL_VARIABLE, SessionChannel, SessionPort,
-        SubmitRequest, resolve_provider,
+        DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL, ENDPOINT_VARIABLE, FixtureService, MODEL_VARIABLE,
+        SessionChannel, SessionPort, SubmitRequest, resolve_provider,
     };
     use crate::interactive::bootstrap::{self, LaunchRequest};
     use crate::interactive::events::{RunOutcome, SessionEvent};
@@ -935,24 +929,47 @@ mod tests {
     }
 
     #[test]
-    fn h04_provider_setup_names_every_missing_variable_without_guessing() {
+    fn h04_provider_setup_names_the_missing_credential_and_never_substitutes_a_fixture() {
         let error = resolve_provider(&environment(&[]))
             .expect_err("an empty environment is not configured");
-        assert!(error.contains(ENDPOINT_VARIABLE), "{error}");
-        assert!(error.contains(MODEL_VARIABLE), "{error}");
         assert!(error.contains("DEEPSEEK_API_KEY"), "{error}");
         assert!(
             error.contains("no fixture answer"),
             "the message must say nothing was substituted: {error}"
         );
+    }
 
-        let partial = environment(&[(ENDPOINT_VARIABLE, "http://127.0.0.1:1/chat")]);
-        let error = resolve_provider(&partial).expect_err("a partial setup is not configured");
+    /// T-track change: one `DEEPSEEK_API_KEY` is a complete setup.
+    ///
+    /// The endpoint and the model are the values `DeepSeek` documents, so defaulting
+    /// to them is not guessing; an explicit variable still wins. The credential
+    /// stays mandatory. Recorded in the operator guide section 12.
+    #[test]
+    fn t08_one_deepseek_key_is_a_complete_provider_setup() {
+        let bare = resolve_provider(&environment(&[("DEEPSEEK_API_KEY", "fixture-secret")]))
+            .expect("a bare DeepSeek key configures the provider");
+        assert_eq!(bare.endpoint, DEEPSEEK_ENDPOINT);
+        assert_eq!(bare.model, DEEPSEEK_MODEL);
+        assert_eq!(bare.credential_variable, "DEEPSEEK_API_KEY");
         assert!(
-            !error.contains(ENDPOINT_VARIABLE),
-            "the endpoint is present: {error}"
+            bare.endpoint.starts_with("https://"),
+            "the default is TLS: {bare:?}"
         );
-        assert!(error.contains(MODEL_VARIABLE), "{error}");
+
+        let explicit = resolve_provider(&environment(&[
+            ("DEEPSEEK_API_KEY", "fixture-secret"),
+            (ENDPOINT_VARIABLE, "http://127.0.0.1:9/chat/completions"),
+            (MODEL_VARIABLE, "fixture-model"),
+        ]))
+        .expect("explicit settings still resolve");
+        assert_eq!(explicit.endpoint, "http://127.0.0.1:9/chat/completions");
+        assert_eq!(explicit.model, "fixture-model");
+
+        // The alias credential works the same way.
+        let alias = resolve_provider(&environment(&[("HA_API_KEY", "fixture-secret")]))
+            .expect("the alias credential configures the provider");
+        assert_eq!(alias.credential_variable, "HA_API_KEY");
+        assert_eq!(alias.model, DEEPSEEK_MODEL);
     }
 
     #[test]

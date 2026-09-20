@@ -18,6 +18,17 @@ use super::paths::{self, HostPlatform, LaunchEnvironment, PathRequest, ResolvedP
 /// in a command history.
 pub const CREDENTIAL_VARIABLES: [&str; 2] = ["DEEPSEEK_API_KEY", "HA_API_KEY"];
 
+/// `DeepSeek`'s documented endpoint, used when the operator names no other one.
+///
+/// Defaulting here is not guessing: these are the values the provider publishes
+/// (<https://api-docs.deepseek.com/>). A bare `DEEPSEEK_API_KEY` is therefore a
+/// complete setup, while an explicit `HA_PROVIDER_ENDPOINT` or `HA_PROVIDER_MODEL`
+/// still wins for another provider or another model.
+pub const DEEPSEEK_ENDPOINT: &str = "https://api.deepseek.com";
+
+/// The model `DeepSeek`'s documentation recommends for new callers.
+pub const DEEPSEEK_MODEL: &str = "deepseek-flash";
+
 /// Inputs for the launch context.
 #[derive(Clone, Debug)]
 pub struct LaunchRequest {

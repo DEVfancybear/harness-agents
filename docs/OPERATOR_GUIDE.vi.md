@@ -378,20 +378,25 @@ Trong ứng dụng: `/help`, `/status`, `/config`, `/model`, `/new`, `/resume [s
 bạn trả lời `y` (chạy một lần) hoặc `n` (từ chối); không có phê duyệt ngầm, hết thời gian
 chờ được tính là từ chối.
 
-Cần cấu hình để gọi model thật: `HA_PROVIDER_ENDPOINT`, `HA_PROVIDER_MODEL` và một
-credential (`DEEPSEEK_API_KEY` hoặc `HA_API_KEY`). Thiếu cấu hình thì ứng dụng vẫn mở,
-hiện setup state và nói rõ còn thiếu biến nào — nó **không** gọi model và **không** trả
-câu trả lời giả.
+**Chỉ cần một API key.** `DEEPSEEK_API_KEY` (hoặc `HA_API_KEY`) là đủ: endpoint và
+model tự lấy giá trị `DeepSeek` công bố — `https://api.deepseek.com` và
+`deepseek-flash` (xem <https://api-docs.deepseek.com/>). Đặt `HA_PROVIDER_ENDPOINT`
+hoặc `HA_PROVIDER_MODEL` khi bạn dùng provider/model khác; biến bạn đặt luôn thắng giá
+trị mặc định.
 
-Đặt credential cho phiên làm việc hiện tại:
+Thiếu **key** thì ứng dụng vẫn mở, hiện setup state và nói rõ còn thiếu biến nào — nó
+**không** gọi model và **không** trả câu trả lời giả.
 
 ```powershell
-$env:DEEPSEEK_API_KEY = '<key-của-bạn>'      # hoặc $env:HA_API_KEY
-$env:HA_PROVIDER_MODEL = 'deepseek-chat'      # tuỳ provider
-ha                                            # mở TUI; thanh trạng thái hiện model đang dùng
+$env:DEEPSEEK_API_KEY = '<key-của-bạn>'   # chỉ cần dòng này
+ha                                        # mở TUI; thanh trạng thái hiện model đang dùng
+
+# tuỳ chọn, chỉ khi dùng model/provider khác:
+$env:HA_PROVIDER_MODEL = 'deepseek-v4-pro'
 ```
 
-Muốn kiểm tra provider thật trước khi mở app (tốn một lượt gọi trả phí):
+Muốn kiểm tra provider thật trước khi mở app (tốn một lượt gọi trả phí) — cũng chỉ
+cần key:
 
 ```powershell
 pwsh -NoProfile -File scripts/Smoke-HaProvider.ps1

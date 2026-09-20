@@ -44,7 +44,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings -> ok
 cargo test -p harness-cli --bin ha --locked                    -> 133 passed; 0 failed
 pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json        -> passed: true, failures: []
 pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 900
-                                                               -> PTY_EXIT: 0, "16 passed; 0 failed" (22.32 s)
+                                                               -> PTY_EXIT: 0, "16 passed; 0 failed" (21.98 s)
 pwsh -NoProfile -File scripts/Verify-Docs.ps1 -SelfTest        -> DOCS_OK: 121 files, 15 language pairs
 cargo tree -p harness-cli -i crossterm                         -> một bản 0.29.0
 cargo tree -p harness-cli -i unicode-width                     -> một bản 0.2.2
@@ -91,6 +91,7 @@ test đổi hợp đồng có chủ ý (paste giữ newline, T03 — ghi ở SPE
 | Gate không tự giảm coverage | xoá một selector T | `Verify-HaLaunch.ps1 -SelfTest` đỏ |
 | Không SGR màu khi `NO_COLOR` | bỏ `Theme::plain()` | PTY `t07_pty_no_color` |
 | Paste không được thành nhiều lệnh | cho `normalize_paste` trả về nguyên văn có `\n` rồi submit từng dòng | `t03_paste_keeps_newlines_and_submits_once` |
+| Thoát giữa run phải nhả writer | phát `Exit` ngay sau `cancel()` thay vì chờ terminal event | PTY `i05_exit_during_an_active_run_releases_the_store_for_the_next_host` |
 
 ## 7. Artifacts
 
@@ -107,16 +108,25 @@ file được commit. Mọi lệnh ở mục 4 tái lập được từ commit C
 ## 8. Remaining limitations / not_run
 
 - **Linux**: chưa build/chạy; phiên này chỉ có Windows x64.
-- **Fixture loopback khác**: các fixture còn lại trong workspace vẫn theo mẫu cũ (read có
-  `expect`) và chưa gặp lại trong 3 lần chạy gate sau khi sửa; nếu tái hiện thì áp cùng
-  cách sửa (read lỗi = request rỗng + readiness handshake + backoff).
 - **Flake còn lại**: các fixture loopback khác trong workspace vẫn theo mẫu cũ (read có
   `expect`) và chưa gặp lại trong 3 lần chạy gate sau khi sửa; nếu tái hiện thì áp cùng
   cách sửa (read lỗi = request rỗng + readiness handshake + backoff).
+- **Flake loopback dưới tải nặng: chưa hết hẳn.** Sau khi sửa ba nguyên nhân, nâng budget
+  lên 10 lần thử (backoff tối đa 3,2 s) và nâng bound của hai ca có child process lên 2
+  phút, vẫn còn **2/6 lần chạy gate đỏ**, với **tập ca đỏ đổi giữa các lần**
+  (`providers-streaming` + `regression-phase_p2`, `acceptance-launch`,
+  `unit-interactive`). Ba ca đó xanh 6/6 khi chạy riêng trên cùng binary, nên đây là
+  loopback của môi trường từ chối kết nối theo từng đợt khi cả workspace chạy, không phải
+  lỗi logic của test hay của app. Không nới assertion nào.
+  **Đề nghị:** giữ quy tắc "chạy lại tối đa 3 lần, chỉ nhận lần `failures: []`" của plan
+  mục 8, hoặc tách ba ca phụ thuộc loopback thành suite riêng — quyết định của người giao việc.
 - **Paid provider smoke: chưa chạy** — quyền đã được cấp nhưng **không có credential**
   trong môi trường (`DEEPSEEK_API_KEY` và `HA_API_KEY` đều rỗng). Đây là `not_run` vì thiếu
-  đầu vào, không phải thiếu quyền: ai có key chỉ cần chạy
-  `pwsh -NoProfile -File scripts/Smoke-HaProvider.ps1`.
+  đầu vào, không phải thiếu quyền. **Một key là đủ**: endpoint và model mặc định theo giá
+  trị `DeepSeek` công bố (`https://api.deepseek.com`, `deepseek-flash`), nên chỉ cần
+  `$env:DEEPSEEK_API_KEY = '<key>'` rồi chạy `pwsh -NoProfile -File scripts/Smoke-HaProvider.ps1`.
+  Đây là thay đổi hành vi của T08 (trước đó smoke đòi cả `HA_PROVIDER_ENDPOINT` và
+  `HA_PROVIDER_MODEL`), có test `t08_one_deepseek_key_is_a_complete_provider_setup`.
 - **Cài thật lên máy user: chưa chạy.** U17 chứng minh artifact đã staged mở được app,
   nhưng `Install-Ha.ps1` chưa ghi User PATH thật trong lượt này.
 - **conhost cũ** (không phải Windows Terminal): chưa đo riêng; đã đo trên Windows Terminal
@@ -148,3 +158,21 @@ file được commit. Mọi lệnh ở mục 4 tái lập được từ commit C
   `required_tests` 13 selector H + `required_tui_tests` 4 selector T.
 - `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 900` →
   `PTY_EXIT: 0`, "16 passed; 0 failed" trong **một** lần chạy.
+
+## 10. Audit nối luồng thật sau CP-D (20/09/2026)
+
+- Tìm thấy lỗi lifecycle thật: `/exit` khi model đang chạy phát `Exit` ngay sau `cancel()`,
+  nên process có thể chết trước khi worker đóng run và nhả SQLite writer. Controller nay
+  giữ cờ `exit_after_run`, chuyển sang `Canceling`, rồi chỉ phát `Exit(0)` khi nhận
+  `RunTerminal` hoặc `RecoverableError`. PTY `i05` xanh **3/3** lần chạy riêng và xanh trong
+  bộ 16 ca.
+- Acceptance ACL nay lấy principal thật bằng `whoami` và deny quyền kế thừa trên đúng temp
+  directory; không còn giả định `USERDOMAIN\\USERNAME` là identity của sandbox token.
+- Installer self-test dùng cơ chế resolve PATH gốc của `cmd.exe` (`%~$PATH:I`) thay cho
+  `where.exe`, vì `where` không liệt kê được temp install root trong sandbox dù `ha.exe`
+  thực thi được.
+- Gate wrapper phân biệt stderr tiến độ của native command với failure bằng exit code; Cargo
+  ghi progress ra stderr không còn làm Windows PowerShell 5.1 dừng gate.
+- Gate đầy đủ sau các sửa trên: format, Clippy, **133 unit**, **18 launch acceptance**,
+  **9 session acceptance**, provider streaming, P0–P7, installer, release và docs đều xanh;
+  JSON trả `passed: true`, `failures: []`.

@@ -3,15 +3,18 @@
 Run one bounded live agent turn against the configured provider, or refuse.
 
 .DESCRIPTION
-This is the paid smoke that HA_LAUNCH reserves for an explicit grant. It refuses to
-run unless the environment already carries everything a real call needs:
+This is the paid smoke that HA_LAUNCH reserves for an explicit grant. It needs one
+credential:
 
-  HA_PROVIDER_ENDPOINT   provider endpoint URL
-  HA_PROVIDER_MODEL      model name
   DEEPSEEK_API_KEY or HA_API_KEY   credential (read at call time, never printed)
 
-Without them the script prints `SMOKE_NOT_RUN` and exits 2: it never substitutes a
-fixture and never fabricates a result. The budget is bounded on purpose - one turn,
+The endpoint and the model fall back to DeepSeek's documented values
+(`https://api.deepseek.com`, `deepseek-flash`), so one API key is a complete setup.
+Set `HA_PROVIDER_ENDPOINT` or `HA_PROVIDER_MODEL` to use another provider or model;
+an explicit variable always wins over the default.
+
+Without a credential the script prints `SMOKE_NOT_RUN` and exits 2: it never
+substitutes a fixture and never fabricates a result. The budget is bounded on purpose - one turn,
 a short prompt, a bounded deadline - so a smoke costs one model call, not a session.
 
 The transcript it prints contains the model, the endpoint host (never the full URL
@@ -30,7 +33,7 @@ Prove the refusal path and the redaction logic without calling anything.
 
 .EXAMPLE
 $env:DEEPSEEK_API_KEY = '...'; pwsh -NoProfile -File scripts/Smoke-HaProvider.ps1
-Run one bounded live turn.
+One key is enough: the endpoint and the model default to DeepSeek's documented ones.
 #>
 [CmdletBinding()]
 param(
@@ -45,6 +48,11 @@ $ErrorActionPreference = 'Stop'
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $executableName = if ([System.IO.Path]::DirectorySeparatorChar -eq '\') { 'ha.exe' } else { 'ha' }
 
+# The values DeepSeek documents, mirrored from the CLI's own defaults so the smoke
+# and the app agree on what "configured" means.
+$script:DeepSeekEndpoint = 'https://api.deepseek.com'
+$script:DeepSeekModel = 'deepseek-flash'
+
 function Get-SmokeConfiguration {
     $endpoint = [string] [Environment]::GetEnvironmentVariable('HA_PROVIDER_ENDPOINT')
     $model = [string] [Environment]::GetEnvironmentVariable('HA_PROVIDER_MODEL')
@@ -56,15 +64,19 @@ function Get-SmokeConfiguration {
             break
         }
     }
+    $endpointDefaulted = [string]::IsNullOrWhiteSpace($endpoint)
+    $modelDefaulted = [string]::IsNullOrWhiteSpace($model)
+    if ($endpointDefaulted) { $endpoint = $script:DeepSeekEndpoint }
+    if ($modelDefaulted) { $model = $script:DeepSeekModel }
     $missing = [System.Collections.Generic.List[string]]::new()
-    if ([string]::IsNullOrWhiteSpace($endpoint)) { $missing.Add('HA_PROVIDER_ENDPOINT') }
-    if ([string]::IsNullOrWhiteSpace($model)) { $missing.Add('HA_PROVIDER_MODEL') }
     if ([string]::IsNullOrWhiteSpace($credentialName)) { $missing.Add('DEEPSEEK_API_KEY or HA_API_KEY') }
     return [pscustomobject]@{
-        Endpoint       = $endpoint
-        Model          = $model
-        CredentialName = $credentialName
-        Missing        = @($missing)
+        Endpoint         = $endpoint
+        Model            = $model
+        CredentialName   = $credentialName
+        EndpointDefaulted = $endpointDefaulted
+        ModelDefaulted   = $modelDefaulted
+        Missing          = @($missing)
     }
 }
 
@@ -92,7 +104,23 @@ function Invoke-SmokeSelfTest {
     }
     try {
         $configuration = Get-SmokeConfiguration
-        if ($configuration.Missing.Count -ne 3) { $failures.Add("expected three missing inputs, got $($configuration.Missing.Count)") }
+        if ($configuration.Missing.Count -ne 1) { $failures.Add("expected one missing input, got $($configuration.Missing.Count)") }
+        if (-not $configuration.EndpointDefaulted) { $failures.Add('the endpoint should default when it is unset') }
+        if (-not $configuration.ModelDefaulted) { $failures.Add('the model should default when it is unset') }
+        if ($configuration.Endpoint -ne $script:DeepSeekEndpoint) { $failures.Add("default endpoint was '$($configuration.Endpoint)'") }
+        if ($configuration.Model -ne $script:DeepSeekModel) { $failures.Add("default model was '$($configuration.Model)'") }
+
+        [Environment]::SetEnvironmentVariable('DEEPSEEK_API_KEY', 'selftest-secret')
+        $configured = Get-SmokeConfiguration
+        if ($configured.Missing.Count -ne 0) { $failures.Add('one credential must be a complete setup') }
+        if ($configured.CredentialName -ne 'DEEPSEEK_API_KEY') { $failures.Add("credential name was '$($configured.CredentialName)'") }
+        [Environment]::SetEnvironmentVariable('HA_PROVIDER_MODEL', 'explicit-model')
+        $explicit = Get-SmokeConfiguration
+        if ($explicit.Model -ne 'explicit-model') { $failures.Add('an explicit model must win over the default') }
+        if ($explicit.ModelDefaulted) { $failures.Add('an explicit model must not be reported as defaulted') }
+        [Environment]::SetEnvironmentVariable('HA_PROVIDER_MODEL', $null)
+        [Environment]::SetEnvironmentVariable('DEEPSEEK_API_KEY', $null)
+
         $redacted = Get-RedactedEndpoint 'https://api.example.invalid/v1/chat?token=secret-value'
         if ($redacted -ne 'https://api.example.invalid') { $failures.Add("redaction produced '$redacted'") }
         if ($redacted.Contains('secret-value')) { $failures.Add('redaction leaked a query token') }
@@ -136,8 +164,10 @@ if ([string]::IsNullOrWhiteSpace($DataDirectory)) {
 }
 
 Write-Host 'SMOKE_START: one bounded live turn'
-Write-Host "   model:    $($configuration.Model)"
-Write-Host "   endpoint: $(Get-RedactedEndpoint -Endpoint $configuration.Endpoint)"
+$modelNote = if ($configuration.ModelDefaulted) { ' (DeepSeek default)' } else { '' }
+$endpointNote = if ($configuration.EndpointDefaulted) { ' (DeepSeek default)' } else { '' }
+Write-Host "   model:    $($configuration.Model)$modelNote"
+Write-Host "   endpoint: $(Get-RedactedEndpoint -Endpoint $configuration.Endpoint)$endpointNote"
 Write-Host "   credential: from $($configuration.CredentialName) (value never printed)"
 Write-Host "   data dir: $DataDirectory (throwaway)"
 

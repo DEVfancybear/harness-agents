@@ -102,7 +102,11 @@ Phạm vi lượt này: **cả track T01–T08**, dừng báo cáo ở mỗi che
   `cargo clippy --workspace --all-targets --locked -- -D warnings` sạch;
   `Verify-HaLaunch.ps1 -Json` → `passed: true, failures: []`;
   `Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 900` → `PTY_EXIT: 0`, **16 passed; 0 failed**
-  trong một lần chạy (22.32 s); `Verify-Docs.ps1 -SelfTest` → `DOCS_OK`.
+  trong một lần chạy (21.98 s); `Verify-Docs.ps1 -SelfTest` → `DOCS_OK`.
+- Audit nối luồng thật sau CP-D đã sửa `/exit` giữa run: controller chờ terminal event trước
+  khi thoát để service nhả SQLite writer; `i05` xanh 3/3 riêng và xanh trong bộ PTY đầy đủ.
+  Cùng audit đã làm ổn định oracle ACL, self-test PATH của installer và capture stderr của
+  gate trên Windows PowerShell 5.1.
 - Không đạt (ghi thẳng, xem evidence mục 8): **paid smoke chưa chạy vì môi trường không có
   credential**, **chưa cài lên máy user**, chưa build/chạy Linux, chưa đo conhost cũ riêng.
 - Còn một điểm tên test lệch plan: plan gọi U06 là `t05_status_reflects_phase_steps_tools_and_elapsed`
@@ -134,7 +138,7 @@ Phạm vi lượt này: **cả track T01–T08**, dừng báo cáo ở mỗi che
 |---|---|
 | `Cargo.toml`, `crates/harness-cli/Cargo.toml`, `Cargo.lock` | D1: pin ratatui/unicode-width; feature `scrolling-regions` (mặc định tắt) |
 | `crates/harness-cli/src/interactive/events.rs` | T02 vocabulary |
-| `crates/harness-cli/src/interactive/controller.rs` | T02 reducer + test T02 |
+| `crates/harness-cli/src/interactive/controller.rs` | T02 reducer; active exit chờ run terminal event để nhả writer |
 | `crates/harness-cli/src/interactive/view.rs` | `plain_lines`, `seconds_label`, `clock_label` |
 | `crates/harness-cli/src/interactive/input.rs` | T03 editor: paste giữ newline, Ctrl-U/W/A/E, ↑↓ theo hàng, Tab, picker/overlay |
 | `crates/harness-cli/src/interactive/service.rs` | StepStarted, thời lượng tool, `ApprovalExpired`, `limits` |
@@ -212,7 +216,7 @@ PTY trong cùng khoảng thời gian: `PTY_EXIT: 0`, **16 passed; 0 failed**.
 
 ## 9. Next action chính xác
 
-Track T không còn việc code. Việc còn lại **chỉ** là ba điều kiện môi trường ở mục 8 của
+Track T và audit nối luồng thật không còn việc code cục bộ. Việc còn lại **chỉ** là ba điều kiện môi trường ở mục 8 của
 evidence, theo thứ tự:
 
 1. **Paid provider smoke** (cần credential — quyền đã có):
@@ -234,6 +238,36 @@ pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 900
 ```
 
 Kỳ vọng: `133 passed`; `passed: true, failures: []`; `PTY_EXIT: 0` với **16** ca xanh.
+
+## 9b. Một key là đủ (thay đổi T08)
+
+Từ lượt này, `DEEPSEEK_API_KEY` (hoặc `HA_API_KEY`) là **toàn bộ** cấu hình provider:
+endpoint và model mặc định theo giá trị `DeepSeek` công bố
+(<https://api-docs.deepseek.com/> → `https://api.deepseek.com`, `deepseek-flash`), biến
+do người dùng đặt luôn thắng. Smoke cũng theo cùng quy tắc, nên chạy paid smoke chỉ cần:
+
+```powershell
+$env:DEEPSEEK_API_KEY = '<key>'
+pwsh -NoProfile -File scripts/Smoke-HaProvider.ps1
+```
+
+Test canh hợp đồng mới: `t08_one_deepseek_key_is_a_complete_provider_setup` (Rust) và
+self test của smoke (đường mặc định + đường override).
+
+## 9b. Một key là đủ (thay đổi T08)
+
+`DEEPSEEK_API_KEY` (hoặc `HA_API_KEY`) là **toàn bộ** cấu hình provider: endpoint và model
+mặc định theo giá trị `DeepSeek` công bố (<https://api-docs.deepseek.com/> →
+`https://api.deepseek.com`, `deepseek-flash`), biến do người dùng đặt luôn thắng. Smoke
+theo cùng quy tắc, nên chạy paid smoke chỉ cần:
+
+```powershell
+$env:DEEPSEEK_API_KEY = '<key>'
+pwsh -NoProfile -File scripts/Smoke-HaProvider.ps1
+```
+
+Test canh hợp đồng mới: `t08_one_deepseek_key_is_a_complete_provider_setup` và self test
+của smoke (đường mặc định + đường override).
 
 ## 10. Blocked on
 
