@@ -772,8 +772,9 @@ Không có lần đỏ nào trong lượt này. Gate xanh **lần chạy đầu*
 
 Memory trong chat được sửa ở một luồng riêng, không thuộc T01–T08, nên số đo của nó nằm ở
 [handoff memory](MEMORY_RECALL.vi.md) chứ không ở đây. Trạng thái tại lúc viết: commit `eb32a4d` đã
-đóng cả tám phát hiện M1–M8 của lần review đối kháng (§7.7 của handoff đó), và mở rộng memory từ
-"chỉ dẫn người dùng" sang "nhật ký hội thoại" — quyết định hợp đồng ghi ở §19 của
-`docs/MEMORY_AND_CONTINUITY.vi.md`. Hai chỗ giao với lượt này: `HA_MEMORY=on` là điều kiện để thấy
-bất kỳ dòng `memory:` nào trong transcript, và gate phê duyệt ở §16 không đổi vì memory không đi
-qua `ApprovalGate`.
+đóng cả tám phát hiện M1–M8 của lần review đối kháng (§7.7 của handoff đó), `d881e4f` đóng nốt việc
+còn lại — bản ghi lượt giữ đủ câu trả lời thay vì 200 ký tự đầu, và ngân sách memory được chia đều
+thay vì khối dài nuốt hết (§7.9) — và memory được mở rộng từ "chỉ dẫn người dùng" sang "nhật ký hội
+thoại", quyết định hợp đồng ghi ở §19 của `docs/MEMORY_AND_CONTINUITY.vi.md`. Hai chỗ giao với lượt
+này: `HA_MEMORY=on` là điều kiện để thấy bất kỳ dòng `memory:` nào trong transcript, và gate phê
+duyệt ở §16 không đổi vì memory không đi qua `ApprovalGate`.
