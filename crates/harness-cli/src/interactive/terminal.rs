@@ -116,6 +116,8 @@ trait ModeControl: std::fmt::Debug {
     fn disable(&self);
     fn enable_paste(&self);
     fn disable_paste(&self);
+    fn enable_alternate_scroll(&self);
+    fn disable_alternate_scroll(&self);
 }
 
 /// The real terminal: raw mode plus bracketed paste.
@@ -138,6 +140,22 @@ impl ModeControl for SystemModes {
     fn disable_paste(&self) {
         let _ = execute!(io::stdout(), event::DisableBracketedPaste);
     }
+
+    /// Ask the terminal to turn a mouse wheel into cursor keys (DECSET 1007).
+    ///
+    /// This is deliberately **not** mouse capture (`1000`/`1002`/`1006`). Capture
+    /// would take the wheel away from the terminal, and the terminal's own
+    /// scrollback is where this app puts everything it commits - turning that off
+    /// would trade one way of losing the top of a long answer for another. With
+    /// alternate scroll on, the wheel keeps scrolling the scrollback and the app
+    /// needs no mouse protocol at all.
+    fn enable_alternate_scroll(&self) {
+        let _ = execute!(io::stdout(), crossterm::style::Print("\u{1b}[?1007h"));
+    }
+
+    fn disable_alternate_scroll(&self) {
+        let _ = execute!(io::stdout(), crossterm::style::Print("\u{1b}[?1007l"));
+    }
 }
 
 /// Raw mode plus bracketed paste, restored when the guard is dropped.
@@ -157,7 +175,12 @@ pub fn install_panic_hook() {
     INSTALL.call_once(|| {
         let default = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |information| {
-            let _ = execute!(io::stdout(), event::DisableBracketedPaste, cursor::Show);
+            let _ = execute!(
+                io::stdout(),
+                event::DisableBracketedPaste,
+                crossterm::style::Print("\u{1b}[?1007l"),
+                cursor::Show
+            );
             let _ = terminal::disable_raw_mode();
             default(information);
         }));
@@ -176,6 +199,7 @@ impl RawModeGuard {
         // Bracketed paste is best effort: a terminal that does not support it must
         // not stop the app from starting.
         modes.enable_paste();
+        modes.enable_alternate_scroll();
         Ok(Self {
             modes,
             active: true,
@@ -188,9 +212,10 @@ impl Drop for RawModeGuard {
         if !self.active {
             return;
         }
-        // Order matters: paste mode off, then raw mode, so a terminal never keeps
-        // interpreting pasted bytes as commands.
+        // Order matters: the modes that change what a key means go off first, then
+        // raw mode, so a terminal never keeps interpreting pasted bytes as commands.
         self.modes.disable_paste();
+        self.modes.disable_alternate_scroll();
         self.modes.disable();
         self.active = false;
     }
@@ -465,12 +490,22 @@ mod tests {
                 std::sync::Arc::clone(&modes),
             )))
             .expect("raw mode is entered through the seam");
-            assert_eq!(modes.events(), vec!["enable", "paste on"]);
+            assert_eq!(
+                modes.events(),
+                vec!["enable", "paste on", "alternate scroll on"]
+            );
         }
         assert_eq!(
             modes.events(),
-            vec!["enable", "paste on", "paste off", "disable"],
-            "paste mode is turned off before raw mode, and both are restored"
+            vec![
+                "enable",
+                "paste on",
+                "alternate scroll on",
+                "paste off",
+                "alternate scroll off",
+                "disable"
+            ],
+            "the modes that change what a key means go off first, then raw mode"
         );
     }
 
@@ -486,7 +521,14 @@ mod tests {
         assert!(unwind.is_err(), "the failure is not swallowed by the guard");
         assert_eq!(
             modes.events(),
-            vec!["enable", "paste on", "paste off", "disable"],
+            vec![
+                "enable",
+                "paste on",
+                "alternate scroll on",
+                "paste off",
+                "alternate scroll off",
+                "disable"
+            ],
             "an unwinding failure restores the terminal exactly like a clean exit"
         );
     }
@@ -551,6 +593,14 @@ mod tests {
 
         fn disable_paste(&self) {
             self.0.record("paste off");
+        }
+
+        fn enable_alternate_scroll(&self) {
+            self.0.record("alternate scroll on");
+        }
+
+        fn disable_alternate_scroll(&self) {
+            self.0.record("alternate scroll off");
         }
     }
 }
