@@ -139,6 +139,93 @@ pub fn mode_from_args(
     })
 }
 
+/// The data root a launch would use for this environment.
+///
+/// Shared by the interactive launch and by the `ha memory` commands, so the store a
+/// chat turn wrote is the store those commands read without anyone repeating the
+/// path. It applies the same rule the launch does: `HA_HOME/data` when `HA_HOME` is
+/// set, otherwise the platform default (`%LOCALAPPDATA%\HarnessAgents\data` on
+/// Windows).
+///
+/// # Errors
+/// Fails when the platform provides no data directory and the environment names no
+/// `HA_HOME`, which is the same condition that stops a launch.
+pub fn default_data_dir(environment: &paths::LaunchEnvironment) -> Result<PathBuf, HarnessError> {
+    if let Some(home) = environment
+        .value("HA_HOME")
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(PathBuf::from(home).join("data"));
+    }
+    paths::resolve(&paths::PathRequest {
+        platform: paths::HostPlatform::current(),
+        environment,
+        explicit_data_dir: None,
+    })
+    .map(|resolved| resolved.data_dir)
+}
+
+/// The identity and store a workspace root resolves to.
+pub struct ResolvedProject {
+    pub id: harness_types::ProjectId,
+    /// The directory that holds this project's store.
+    ///
+    /// The `ha memory` commands take this as `--data-dir`, not the data root: they
+    /// open the project store directly. Resolving the identity without also handing
+    /// back the store would leave the caller with an id and the wrong directory.
+    pub store_dir: PathBuf,
+}
+
+/// The project identity a workspace root is registered under.
+///
+/// The app neither shows this id nor offers a way to look it up, and a
+/// project-scoped read without it returns nothing at all. This resolves the identity
+/// the chat registered for that root, which is what lets `ha memory --cwd` inspect
+/// what a turn stored.
+///
+/// The store directory is derived by running the launch's own resolution rather than
+/// re-deriving the key here: the key hashes a *displayable* path (the Windows
+/// `\\?\` verbatim prefix removed), so a second, look-alike implementation produced
+/// a different directory for the same root. Measured: that mistake pointed the lookup
+/// at a store the chat never wrote.
+///
+/// # Errors
+/// Fails when the root cannot be resolved or its store cannot be opened: an
+/// unregistered root has no identity yet, and saying so is better than inventing one.
+pub async fn registered_project(root: &std::path::Path) -> Result<ResolvedProject, HarnessError> {
+    let environment = paths::LaunchEnvironment::capture();
+    let context = bootstrap::resolve(bootstrap::LaunchRequest {
+        cwd: Some(root.to_path_buf()),
+        caller_dir: std::env::current_dir().map_err(|error| {
+            HarnessError::new(
+                harness_types::ErrorCode::StorageOpenFailed,
+                format!("the current directory could not be resolved: {error}"),
+            )
+        })?,
+        platform: paths::HostPlatform::current(),
+        environment,
+        explicit_data_dir: None,
+    })?;
+    let store_dir = context.project_store_dir();
+    let store = harness_store_sqlite::SqliteStore::open_read_only(store_dir.clone())
+        .await
+        .map_err(|error| {
+            HarnessError::new(
+                error.code(),
+                format!(
+                    "no project is registered for {}: {error}",
+                    context.project.root.display()
+                ),
+            )
+        })?;
+    let id = project::resolve_project_id(&store, &context.project.root).await?;
+    store
+        .close()
+        .await
+        .map_err(|error| HarnessError::new(error.code(), format!("store close failed: {error}")))?;
+    Ok(ResolvedProject { id, store_dir })
+}
+
 /// Environment variable that selects the renderer explicitly.
 pub const UI_VARIABLE: &str = "HA_UI";
 
@@ -229,7 +316,9 @@ pub fn non_terminal_guidance(capability: detector::TerminalCapability) -> String
 #[cfg(test)]
 mod tests {
     use super::{LaunchMode, USAGE_EXIT_CODE, mode_from_args, non_terminal_guidance};
+    use crate::interactive::bootstrap;
     use crate::interactive::detector::TerminalCapability;
+    use crate::interactive::paths::{self, LaunchEnvironment};
     use std::path::PathBuf;
 
     #[test]
@@ -371,5 +460,49 @@ mod tests {
         assert!(guidance.contains("stdout tty: false"));
         assert!(guidance.contains("ha chat --headless --prompt"));
         assert_eq!(USAGE_EXIT_CODE, 2);
+    }
+
+    /// K05: the key a launch computes must not depend on how the root was named.
+    ///
+    /// `ha memory --cwd <root>` looks the store up by this key, so if a chat that
+    /// started *in* the directory and a command that *names* the directory disagree,
+    /// the lookup opens a store the chat never wrote. That is exactly the bug this
+    /// guards: it was written once with a second, look-alike key derivation and the
+    /// measured result was "no project is registered" for a root that had just been
+    /// written.
+    #[test]
+    fn k05_a_root_names_the_same_project_either_way_it_is_reached() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).expect("workspace");
+        let environment = LaunchEnvironment::from_pairs([(
+            "HA_HOME",
+            temp.path().join("home").to_string_lossy().into_owned(),
+        )]);
+        let base = |cwd: Option<std::path::PathBuf>, caller: std::path::PathBuf| {
+            bootstrap::resolve(bootstrap::LaunchRequest {
+                cwd,
+                caller_dir: caller,
+                platform: paths::HostPlatform::current(),
+                environment: environment.clone(),
+                explicit_data_dir: None,
+            })
+            .expect("context resolves")
+        };
+        let named = base(Some(root.clone()), temp.path().to_path_buf());
+        let started_in = base(None, root.clone());
+        assert_eq!(
+            named.project.key, started_in.project.key,
+            "naming a directory and starting in it must resolve one project"
+        );
+        assert_eq!(named.project_store_dir(), started_in.project_store_dir());
+        // And the temporary-directory spelling must not change it either: a canonical
+        // path and the path the caller typed are the same workspace.
+        let canonical = std::fs::canonicalize(&root).expect("canonical root");
+        let via_canonical = base(Some(canonical), temp.path().to_path_buf());
+        assert_eq!(
+            named.project.key, via_canonical.project.key,
+            "a canonical spelling must resolve the same project as the typed one"
+        );
     }
 }

@@ -311,7 +311,15 @@ enum PluginsSubcommand {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match run(Cli::parse()).await {
+    // The dispatch future is large because one arm resolves a project identity before
+    // it opens a store. Boxing it in the entry point is one heap move at startup
+    // instead of boxing each arm and changing how the whole dispatch reads.
+    #[allow(
+        clippy::large_futures,
+        reason = "one boxed dispatch future at the entry point"
+    )]
+    let outcome = Box::pin(run(Cli::parse())).await;
+    match outcome {
         Ok(code) => code,
         Err(error) => {
             eprintln!("{error}");
@@ -354,7 +362,10 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
 #[allow(clippy::too_many_lines)]
 async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
     match cli.command {
-        Some(Command::Memory(command)) => memory_cli::run(command).await,
+        // Boxed: this arm now resolves a project identity before it opens a store,
+        // which grows the future past the size the other arms keep. Boxing one arm is
+        // cheaper than reshaping the dispatch.
+        Some(Command::Memory(command)) => Box::pin(memory_cli::run(command)).await,
         Some(Command::Init { data_dir, json }) => init_store(&data_dir, json).await,
         Some(Command::Config(ConfigCommand {
             command: ConfigSubcommand::Validate { config, json },

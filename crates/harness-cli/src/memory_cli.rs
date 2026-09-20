@@ -12,10 +12,22 @@ use harness_types::{
 };
 use serde_json::{Value, json};
 
+use crate::interactive::{self, paths::LaunchEnvironment};
+
 #[derive(Debug, Args)]
 pub struct MemoryCommand {
+    /// Data root to read. Defaults to the same root the interactive app uses, so a
+    /// key saved in the app can be inspected without repeating the path.
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
+    /// Workspace root whose project identity scopes the command.
+    ///
+    /// The app shows neither the project id nor a way to look it up, and a
+    /// project-scoped read without it returns nothing at all. This resolves the
+    /// identity the chat registered for that root, so an operator can inspect what a
+    /// turn stored without decoding a store filename by hand.
+    #[arg(long, global = true)]
+    cwd: Option<PathBuf>,
     /// Local host identity; never populated from extractor/model arguments.
     #[arg(long, global = true, default_value = "local-user")]
     principal: String,
@@ -131,12 +143,34 @@ impl AssetScopeMode {
 }
 
 pub async fn run(command: MemoryCommand) -> Result<(), HarnessError> {
-    let data_dir = command.data_dir.as_ref().ok_or_else(|| {
-        HarnessError::new(ErrorCode::InvalidPayload, "memory requires --data-dir")
-    })?;
+    let environment = LaunchEnvironment::capture();
+    let mut project_id = command
+        .project_id
+        .clone()
+        .map(ProjectId::parse)
+        .transpose()?;
+    // `--cwd` is the shorthand for "the project the chat registered in this
+    // workspace". It also supplies the store, because these commands open the project
+    // store directly: an id without the matching directory would look in the data
+    // root, find no database there, and report an uninitialized store.
+    let mut resolved_store = None;
+    if let Some(root) = &command.cwd {
+        let resolved = interactive::registered_project(root).await?;
+        if project_id.is_none() {
+            project_id = Some(resolved.id);
+        }
+        if command.data_dir.is_none() {
+            resolved_store = Some(resolved.store_dir);
+        }
+    }
+    let data_dir = match (&command.data_dir, resolved_store) {
+        (Some(dir), _) => dir.clone(),
+        (None, Some(store_dir)) => store_dir,
+        (None, None) => interactive::default_data_dir(&environment)?,
+    };
     let principal = MemoryPrincipal {
         principal_id: command.principal.clone(),
-        project_id: command.project_id.map(ProjectId::parse).transpose()?,
+        project_id,
         task_id: command.task_id.map(TaskId::parse).transpose()?,
         agent_profile_id: command.profile_id.map(AgentProfileId::parse).transpose()?,
         session_id: command.session_id.map(SessionId::parse).transpose()?,
@@ -149,6 +183,22 @@ pub async fn run(command: MemoryCommand) -> Result<(), HarnessError> {
             | MemoryAction::Candidates { .. }
             | MemoryAction::Jobs
     );
+    // A project-scoped read with no scope is not empty memory, it is an unasked
+    // question: the service answers `[]` and the operator concludes memory is broken.
+    // Say which flag is missing instead.
+    if read_only
+        && principal.project_id.is_none()
+        && command.cwd.is_none()
+        && matches!(
+            command.command,
+            MemoryAction::Search { .. } | MemoryAction::Candidates { .. }
+        )
+    {
+        return Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            "memory is scoped to a project: pass --cwd <workspace> to use the identity the chat registered there, or --project-id <project_uuid>",
+        ));
+    }
     let store = Arc::new(
         if read_only {
             SqliteStore::open_read_only(data_dir).await
