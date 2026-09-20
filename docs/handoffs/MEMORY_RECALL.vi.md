@@ -64,34 +64,63 @@ hỏi  : session MỚI, task MỚI, "What was the marker I asked you to remember
        -> answer: zebra-quasar-7719          (đúng; trước đó 3/3 lần trượt)
 ```
 
-## 4. Gate **chưa** xanh — hai lỗi không thuộc lượt này
+## 4. Gate đã xanh, và một lỗi thật lộ ra khi đuổi theo nó
 
-`Verify-HaLaunch.ps1 -Json` lần chạy này: `failures: ["regression-phase_p2", "regression-phase_p7"]`.
+`Verify-HaLaunch.ps1 -Json` lần chạy đầu của lượt này: `failures: ["regression-phase_p2",
+"regression-phase_p7"]`. Cả hai **không** liên quan memory, nhưng cả hai đều hoá ra là lỗi thật:
 
-- **`p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized`** — chạy **một mình thì
-  xanh**. Đúng họ flake loopback đã gặp bốn lần trước (SPEC 3e.4, handoff §15.4). Chưa vá cho ca
-  này.
-- **`p7_install_script_installs_a_working_binary`** — đỏ **ổn định**, kể cả khi chạy riêng.
-  `Install-Ha.ps1:615` đặt `$sourceBinary = $expectedArtifact` trong nhánh `-SkipBuild`, mà
-  `$expectedArtifact` trỏ vào repo staged trong temp **chưa được build**, nên dòng 638 ném
-  "The artifact is missing". `git blame` cho thấy dòng đó từ `0ed44139` (19/09) — **trước** phiên
-  này và không liên quan memory. Đây là lỗi thật của `-SkipBuild`, cần người sở hữu installer quyết.
+**`p7_install_script_installs_a_working_binary` — lỗi thật của `-SkipBuild`, đã sửa.**
+`Install-Ha.ps1` đặt `$sourceBinary = $expectedArtifact` rồi, khi có `-SkipBuild`, **không build**
+artifact đó. `$expectedArtifact` là `target/<profile>/ha` của **chính repo đang chạy script**, nên
+trên một repo chưa từng build thì thư mục đó rỗng, và installer từ chối bằng
+"The artifact is missing at … Run without -SkipBuild" — tức nói ngược lại đúng thứ người gọi vừa
+yêu cầu. `git blame` cho dòng đó: `0ed44139` (19/09), **trước** phiên này.
 
-Vì gate chưa `failures: []`, **objective chưa được coi là xong**.
+Sửa: artifact được build khi nó vắng mặt **và** không skip; khi vắng mặt **và** skip thì báo thẳng
+"repo này chưa được build" kèm lệnh cần chạy. Kèm một chi tiết dễ sót: `$sourceBinary` phải được
+gán **trước** nhánh, vì `Set-StrictMode -Version Latest` biến việc đọc biến chưa gán thành lỗi
+chứ không phải chuỗi rỗng — lần sửa đầu của tôi vấp đúng chỗ đó.
+
+**`p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` — flake loopback, và nguyên
+nhân là do `p7`.** Ca này chạy **một mình thì xanh** (0.59 s) nhưng đỏ sau 36 s trong gate, nghĩa
+là nó cạn 10 lần thử của retry ladder. Nghi vấn "đói tài nguyên" được xác nhận khi `p7` được sửa:
+`p7` gọi `Install-Ha.ps1` không có `-SkipBuild`, tức **build cả repo trong thư mục tạm** ngay
+trước `p2`. Sau khi sửa `p7`, `p2` xanh trong gate **không cần đụng vào nó**.
+
+Số đo cuối:
+
+```text
+Verify-HaLaunch.ps1 -Json  -> passed: true, failures: []
+cargo test -p harness-cli --bin ha --locked   -> 201 passed
+phase_p4                                      -> 26 passed
+Verify-P4Mutations.ps1                        -> P4_MUTATIONS_OK: 5/5 killed
+Invoke-HaPtyAcceptance.ps1                    -> PTY_EXIT 101, 15 passed; 1 failed (28.87 s)
+```
+
+**Ca PTY đỏ là flake, không phải hồi quy:** `i05_exit_during_an_active_run_releases_the_store_for_the_next_host`
+(`interactive_terminal.rs:1440`). Chạy **một mình**: `PTY_EXIT 0`, xanh trong 0.90 s. Đây là họ
+"console dưới tải" đã gặp ở `i14` và `t07` (handoff §15.3). Ca duyệt thật
+`t06_pty_approval_y_key` **xanh**, nên panel duyệt vẫn hoạt động trên ConPTY.
 
 ## 5. Việc còn lại, theo thứ tự
 
-1. **Sửa `-SkipBuild` của installer** (hoặc để người sở hữu làm): khi `-SkipBuild`, phải resolve
-   artifact từ repo **đã build**, hoặc báo lỗi nói rõ "repo này chưa build" thay vì nói artifact mất.
-2. **Vá flake `p2_s02`** theo đúng cách đã dùng cho `i13` (retry chỉ khi khớp
-   `error sending request for url`, có giới hạn).
-3. Chạy lại `Verify-HaLaunch.ps1 -Json` tới khi `failures: []`.
-4. Chạy 16 ca PTY (`Invoke-HaPtyAcceptance.ps1`) — chưa chạy trong lượt này.
-5. Cập nhật `docs/specs/P4.vi.md` §7 (mục retrieval) và `docs/evidence/P4.vi.md` với số đo của
-   lượt này — **chưa làm**.
-6. Cân nhắc: `tests/acceptance/registry.json` có nên thêm một ca cho truy hồi bằng câu tự nhiên
-   không. Đây là lỗ hổng đã để lọt cả bốn lỗi: **không ca C nào hỏi bằng câu paraphrase** — cả ba
-   test end-to-end cũ dùng query mà term có nguyên văn trong text đã lưu.
+1. ~~Chạy 16 ca PTY~~ — xong: 15/16, ca đỏ là flake console (`i05`, xanh khi chạy riêng),
+   ghi ở §4.
+2. **Cập nhật `docs/specs/P4.vi.md` §7 và `docs/evidence/P4.vi.md`** với số đo của lượt này —
+   **chưa làm**. SPEC §7 hiện chỉ nói "query có parameter, normalized Unicode/không dấu/snake/camel
+   identifiers, giới hạn hit/token/time"; nó **không** nói gì về chiến lược khớp, nên không có gì
+   phải sửa cho đúng — nhưng nên ghi lại union + sàn như một quyết định.
+3. **Thêm một ca acceptance cho truy hồi bằng câu tự nhiên.** Đây là lỗ hổng đã để lọt cả bốn lỗi:
+   **không ca C nào hỏi bằng câu paraphrase** — cả ba test end-to-end cũ dùng query mà term có
+   nguyên văn trong text đã lưu (`memory.rs:400` hỏi `"dự án dùng Rust nhé?"` cho tài liệu
+   `"dự án này dùng Rust nhé"`). Cân nhắc đăng ký vào `tests/acceptance/registry.json`.
+4. **Cân nhắc `harness-store-sqlite` chưa có test nào.** Cả cây `crates/harness-store-sqlite/src`
+   không có một `#[test]` nào; SQL mới của tôi (`find_active_memory_by_content`,
+   `append_memory_version_source`) chỉ được phủ gián tiếp qua `harness-cli`. Đã kiểm bằng
+   mutation gauntlet và test tích hợp, nhưng một unit test ở tầng store sẽ canh chặt hơn.
+5. **`-SkipBuild` giờ báo lỗi rõ hơn, nhưng chưa có test cho nhánh đó.** `p7` phủ nhánh
+   "repo chưa build + không skip". Nhánh "chưa build + skip" nên có một ca khẳng định thông báo
+   nói đúng việc cần làm.
 
 ## 6. Cảnh báo cũ vẫn đúng
 
