@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use harness_types::InputId;
 
+use super::attachments;
 use super::bootstrap::LaunchContext;
 use super::credentials::CredentialSource;
 use super::events::{
@@ -381,6 +382,13 @@ impl InteractiveController {
                 _ => {}
             }
         }
+        // A pasted screenshot: the key is handled here rather than by the editor
+        // because there is no text to insert until the clipboard has been read.
+        if key == Key::PasteImage {
+            let mut effects = Vec::new();
+            self.paste_image(&mut effects);
+            return effects;
+        }
         match self.editor.handle(key) {
             InputOutcome::Unchanged => Vec::new(),
             InputOutcome::Redraw | InputOutcome::CompleteSuggestion => vec![Effect::Redraw],
@@ -745,6 +753,9 @@ impl InteractiveController {
             "/help" => {
                 self.reference("/help", view::help_lines(), &mut effects);
             }
+            "/image" => {
+                self.paste_image(&mut effects);
+            }
             "/status" => {
                 let mut lines = self.header.clone();
                 lines.push(format!("Phase:   {}", self.phase.label()));
@@ -1074,6 +1085,51 @@ impl InteractiveController {
         self.transcript.extend(lines.clone());
         self.remember(lines);
         effects.push(Effect::History(item));
+    }
+
+    /// Take a bitmap off the clipboard and name it in the composer.
+    ///
+    /// The bytes are written next to the store and their path is inserted, quoted: from
+    /// there the ordinary message scan attaches it, so a screenshot, a drag-and-drop and
+    /// a typed path all take the same road into the request.
+    fn paste_image(&mut self, effects: &mut Vec<Effect>) {
+        let png = match attachments::clipboard_png() {
+            Ok(Some(png)) => png,
+            Ok(None) => {
+                self.push_history(
+                    effects,
+                    HistoryItem::Notice {
+                        message: "the clipboard holds no image; copy a screenshot first, or name an image file in your message"
+                            .to_owned(),
+                    },
+                );
+                return;
+            }
+            Err(reason) => {
+                self.push_history(effects, HistoryItem::Error { message: reason });
+                return;
+            }
+        };
+        let directory = self.context.paths.data_dir.join("attachments");
+        let path = match attachments::save_pasted_png(&directory, &png) {
+            Ok(path) => path,
+            Err(reason) => {
+                self.push_history(effects, HistoryItem::Error { message: reason });
+                return;
+            }
+        };
+        let quoted = format!("\"{}\" ", path.display());
+        let outcome = self.editor.handle(Key::Paste(quoted));
+        self.push_history(
+            effects,
+            HistoryItem::Notice {
+                message: format!("image ready: {}", path.display()),
+            },
+        );
+        effects.push(Effect::Redraw);
+        // The editor's own outcome is deliberately ignored beyond the redraw: the text
+        // was inserted by this call, so it cannot be a submit or an exit.
+        let _ = outcome;
     }
 
     /// Keep the newest lines for `/more`.

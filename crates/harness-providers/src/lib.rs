@@ -61,6 +61,35 @@ pub enum MessageRole {
 pub struct ProviderMessage {
     pub role: MessageRole,
     pub content: String,
+    /// Images the model is shown together with this message.
+    ///
+    /// Only a `user` message may carry them: the API accepts image blocks on that role
+    /// alone and refuses any other role. `to_wire` therefore keeps the text shape for
+    /// every other role rather than sending a request that cannot succeed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ImageAttachment>,
+}
+
+/// One image carried by a user message.
+///
+/// The API accepts PNG, JPEG, GIF and WebP, and detects the format from the bytes
+/// rather than from a file name or a declared type — so this type carries the media
+/// type the bytes really are, and the data URL is built in exactly one place.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub media_type: String,
+    /// Base64 of the file, without a `data:` prefix.
+    pub data_base64: String,
+    /// One short line naming the image for the transcript and the packet marker.
+    pub label: String,
+}
+
+impl ImageAttachment {
+    #[must_use]
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.media_type, self.data_base64)
+    }
 }
 
 impl ProviderMessage {
@@ -69,6 +98,17 @@ impl ProviderMessage {
         Self {
             role,
             content: content.into(),
+            attachments: Vec::new(),
+        }
+    }
+
+    /// A user message that shows the model one or more images.
+    #[must_use]
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
+        Self {
+            role: MessageRole::User,
+            content: content.into(),
+            attachments: images,
         }
     }
 
@@ -90,17 +130,32 @@ impl ProviderMessage {
     ///   conversation with every provider that speaks this format.
     ///
     /// The marker is explicit so a tool result can never read as something the user
-    /// said.
+    /// said. A message with images uses the block form of `content` instead of a
+    /// string, because that is the only shape the API reads images from.
     #[must_use]
     pub fn to_wire(&self) -> Value {
+        let text = match self.role {
+            MessageRole::Tool => format!("[tool result]\n{}", self.content),
+            MessageRole::System | MessageRole::User | MessageRole::Assistant => {
+                self.content.clone()
+            }
+        };
+        if !self.attachments.is_empty() && self.role == MessageRole::User {
+            let mut blocks = vec![json!({ "type": "text", "text": text })];
+            for image in &self.attachments {
+                blocks.push(json!({
+                    "type": "image_url",
+                    // `auto` lets the provider pick the detail level; its own default is
+                    // the same, and pinning `high` would spend tokens on every small icon.
+                    "image_url": { "url": image.data_url(), "detail": "auto" },
+                }));
+            }
+            return json!({ "role": "user", "content": blocks });
+        }
         match self.role {
-            MessageRole::Tool => json!({
-                "role": "user",
-                "content": format!("[tool result]\n{}", self.content),
-            }),
-            MessageRole::System => json!({ "role": "system", "content": self.content }),
-            MessageRole::User => json!({ "role": "user", "content": self.content }),
-            MessageRole::Assistant => json!({ "role": "assistant", "content": self.content }),
+            MessageRole::Tool | MessageRole::User => json!({ "role": "user", "content": text }),
+            MessageRole::System => json!({ "role": "system", "content": text }),
+            MessageRole::Assistant => json!({ "role": "assistant", "content": text }),
         }
     }
 }
@@ -1040,5 +1095,45 @@ mod wire_tests {
             thinking_disabled(),
             serde_json::json!({ "type": "disabled" })
         );
+    }
+
+    /// An image turns the message into the block shape the API reads images from.
+    ///
+    /// The docs are explicit: `content` is an array of blocks, the image is a
+    /// `data:` URL the API sniffs by content, and images are accepted in a `user`
+    /// message alone — any other role is refused, so the text shape is kept there.
+    #[test]
+    fn a_user_message_with_an_image_uses_content_blocks() {
+        let image = super::ImageAttachment {
+            media_type: "image/png".to_owned(),
+            data_base64: "iVBORw0KGgo=".to_owned(),
+            label: "shot.png (image/png, 1 KiB)".to_owned(),
+        };
+        let message = super::ProviderMessage::user_with_images("what is wrong here?", vec![image]);
+        let wire = message.to_wire();
+        assert_eq!(wire["role"], "user");
+        let blocks = wire["content"].as_array().expect("content is an array");
+        assert_eq!(blocks.len(), 2, "{wire}");
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "what is wrong here?");
+        assert_eq!(blocks[1]["type"], "image_url");
+        assert_eq!(
+            blocks[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+        assert_eq!(blocks[1]["image_url"]["detail"], "auto");
+
+        // No image: the shape every other message uses stays a plain string.
+        let plain = super::ProviderMessage::new(super::MessageRole::User, "no image");
+        assert_eq!(plain.to_wire()["content"], "no image");
+
+        // A non-user role keeps the text shape rather than a request the API refuses.
+        let mut assistant = super::ProviderMessage::new(super::MessageRole::Assistant, "hello");
+        assistant.attachments.push(super::ImageAttachment {
+            media_type: "image/png".to_owned(),
+            data_base64: "iVBORw0KGgo=".to_owned(),
+            label: "shot.png".to_owned(),
+        });
+        assert_eq!(assistant.to_wire()["content"], "hello");
     }
 }

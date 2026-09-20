@@ -804,3 +804,11 @@ bị từ chối; PNG, JPEG, GIF và WebP là những định dạng chạy đư
 tự, nên model có thể nói "ảnh chụp thứ hai". Ảnh đi theo dạng block của `content`, mà API chỉ
 nhận trong message **user**. `read_file` vẫn từ chối file binary: ảnh tới model dưới dạng
 attachment, không bao giờ là text của file.
+
+Đã kiểm chứng bằng fixture SSE local chứ không chỉ đọc code: một lượt headless ghi tên file PNG
+165 byte (`ha chat --headless --prompt "xem <file.png>" --json`) gửi message `user` với `content`
+là mảng gồm block text nêu tên ảnh rồi tới block `image_url`, và base64 trong block đó giải mã ra
+đúng byte của file trên đĩa (165 byte, magic PNG còn nguyên). Cùng lượt đó báo
+`"images":["shot.png (image/png, 165 B)"]` — kích thước hiển thị theo byte chính xác, vì `0 KiB`
+bên cạnh một ảnh đã gắn đọc như thể gắn lỗi — và lượt kế tiếp trong cùng project vẫn recall được
+lượt trước, tức là gắn ảnh không làm hỏng đường memory.

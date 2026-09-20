@@ -24,6 +24,12 @@ scrolling-regions = ["ratatui/scrolling-regions"]
 
 [dependencies]
 clap.workspace = true
+# A pasted screenshot lives in the clipboard as a bitmap, which no terminal sends
+# as text; the app reads it itself and turns it into a PNG the model can be shown.
+arboard.workspace = true
+image.workspace = true
+# Already in the tree through the HTTP client; pinned here for the one encoder call.
+base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
 # Pinned in the HA_LAUNCH H03 spike; default features cover raw mode, key events
 # and bracketed paste on Windows and Unix.
 crossterm = "=0.29.0"

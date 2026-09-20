@@ -156,6 +156,11 @@ pub struct RunRequest {
     pub continuation_context: Option<String>,
     pub tool_schemas: Vec<Value>,
     pub memory: Option<harness_memory::MemoryContribution>,
+    /// Images the model is shown with this turn's user message.
+    ///
+    /// They travel as content blocks, not as text, and the user message names them so
+    /// the model can refer to what it was shown.
+    pub images: Vec<harness_providers::ImageAttachment>,
 }
 
 impl RunRequest {
@@ -177,6 +182,7 @@ impl RunRequest {
             continuation_context: None,
             tool_schemas: Vec::new(),
             memory: None,
+            images: Vec::new(),
         }
     }
     #[must_use]
@@ -202,6 +208,33 @@ impl RunRequest {
         self.memory = Some(contribution);
         self
     }
+
+    #[must_use]
+    pub fn with_images(mut self, images: Vec<harness_providers::ImageAttachment>) -> Self {
+        self.images = images;
+        self
+    }
+}
+
+/// The line a user message carries when images ride with it.
+///
+/// One line per image, so the model can say "the second screenshot" and be understood,
+/// and so the frozen request records what was shown even where the bytes are separate.
+fn image_marker(images: &[harness_providers::ImageAttachment]) -> String {
+    let mut marker = String::from("[attached image");
+    if images.len() > 1 {
+        marker.push('s');
+    }
+    marker.push_str(": ");
+    let listed = images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| format!("{}. {}", index + 1, image.label))
+        .collect::<Vec<_>>()
+        .join("; ");
+    marker.push_str(&listed);
+    marker.push(']');
+    marker
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -508,9 +541,24 @@ impl RuntimeService {
             content: composition_content,
         };
         self.store.persist_composition_snapshot(composition).await?;
+        // An attached image is content blocks on the user message, and the same message
+        // names it: the packet is text, so without the marker the model would be looking
+        // at something it cannot refer to.
+        let user_message = if request.images.is_empty() {
+            ProviderMessage::new(MessageRole::User, built.packet.content.clone())
+        } else {
+            ProviderMessage::user_with_images(
+                format!(
+                    "{}\n\n{}",
+                    built.packet.content,
+                    image_marker(&request.images)
+                ),
+                request.images.clone(),
+            )
+        };
         let mut conversation = vec![
             ProviderMessage::new(MessageRole::System, request.system_policy.clone()),
-            ProviderMessage::new(MessageRole::User, built.packet.content.clone()),
+            user_message,
         ];
         // Continuation turns carry the tool results back to the model.
         conversation.extend(appended);

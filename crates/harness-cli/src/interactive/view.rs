@@ -141,6 +141,8 @@ pub fn help_lines() -> Vec<String> {
             .to_owned(),
         "/model           show which model the next run would use".to_owned(),
         "/config          show the resolved configuration and data files".to_owned(),
+        "/image           attach the image on the clipboard (Ctrl-V where the terminal forwards it)"
+            .to_owned(),
         "/resume <id>     resume a persisted session".to_owned(),
         "/exit            leave the app".to_owned(),
         "Ctrl-C cancels an active run or clears an idle prompt; Ctrl-D on an empty line exits."

@@ -240,6 +240,11 @@ fn map_key(key: KeyEvent) -> Key {
         KeyCode::Char('u') if control => Key::EraseToLineStart,
         KeyCode::Char('w') if control => Key::EraseWord,
         KeyCode::Char('l') if control => Key::Redraw,
+        // Ctrl-V: a clipboard bitmap is not text, so the app reads it itself. A
+        // terminal that binds Ctrl-V (Windows Terminal does) never forwards the key,
+        // which is why `/image` runs the same code — this mapping is for the ones that
+        // do forward it, and for a console without bracketed paste.
+        KeyCode::Char('v') if control => Key::PasteImage,
         // Ctrl-J is a line feed. Measured on this ConPTY (HA_TUI T01): the
         // console reports it as Enter with the CONTROL modifier, not as
         // Ctrl+Char('j'), so both spellings are accepted as the multiline key.

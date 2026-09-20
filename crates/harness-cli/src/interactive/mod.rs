@@ -6,6 +6,7 @@
 //! provider, a store writer or a network call.
 
 pub mod app;
+pub mod attachments;
 pub mod bootstrap;
 pub mod config;
 pub mod controller;

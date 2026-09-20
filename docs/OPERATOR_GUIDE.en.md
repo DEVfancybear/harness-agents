@@ -617,3 +617,11 @@ PNG, JPEG, GIF and WebP are what work. The message names the images in order, so
 refer to "the second screenshot". They travel in the block form of `content`, which the API
 accepts in a **user** message only. `read_file` still refuses binary files: an image reaches the
 model as an attachment, never as file text.
+
+Verified against the local SSE fixture rather than by reading the code: one headless turn naming a
+165-byte PNG (`ha chat --headless --prompt "look at <file.png>" --json`) sent a `user` message whose
+`content` was an array of a text block naming the image followed by an `image_url` block, and the
+base64 in that block decoded to bytes identical to the file on disk (165 bytes, PNG magic intact).
+The same turn reported `"images":["shot.png (image/png, 165 B)"]` — the byte size is exact, because
+`0 KiB` next to an attached image reads like a failure — and the next turn in the same project
+still recalled the earlier turn, so attaching an image does not disturb the memory path.

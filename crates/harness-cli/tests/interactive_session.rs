@@ -473,6 +473,69 @@ async fn g2_the_step_bound_counts_one_step_per_model_call() {
     );
 }
 
+/// An image named in the message reaches the model as content blocks.
+///
+/// The API reads images only from the block form of `content`, and only in a `user`
+/// message; the same message names the image so the model can refer to what it saw.
+#[tokio::test]
+async fn g3_a_named_image_reaches_the_model_as_content_blocks() {
+    let bench = bench();
+    let provider = Arc::new(SequenceProvider::new(vec![vec![
+        ProviderStreamEvent::started(),
+        ProviderStreamEvent::text("I can see the screenshot"),
+        ProviderStreamEvent::completed("stop"),
+    ]]));
+
+    let observer = Arc::new(RecordingObserver::default());
+    let store = bench.open_store().await;
+    let image = harness_providers::ImageAttachment {
+        media_type: "image/png".to_owned(),
+        // The smallest real PNG, so the bytes are an image and not a placeholder.
+        data_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+            .to_owned(),
+        label: "shot.png (image/png, 1 KiB)".to_owned(),
+    };
+    let mut request = request(&bench.workspace, "what is wrong in this screenshot?");
+    request.images = vec![image];
+    let outcome = driver(&store, Arc::clone(&provider))
+        .run_turn(
+            request,
+            options(&bench.workspace, TurnLimits::default()),
+            Arc::clone(&observer) as Arc<dyn TurnObserver>,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the turn runs");
+    assert_eq!(outcome.stop, TurnStop::Final);
+
+    let seen = provider.seen();
+    let user = seen[0]
+        .messages
+        .iter()
+        .find(|message| message.role == MessageRole::User)
+        .expect("the request carries a user message");
+    let wire = user.to_wire();
+    let blocks = wire["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("an image must use content blocks: {wire}"));
+    assert_eq!(blocks.len(), 2, "{wire}");
+    assert!(
+        blocks[0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("[attached image: 1. shot.png")),
+        "the message must name the image it carries: {wire}"
+    );
+    assert_eq!(blocks[1]["type"], "image_url");
+    assert!(
+        blocks[1]["image_url"]["url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("data:image/png;base64,")),
+        "{wire}"
+    );
+
+    close_store(store).await;
+}
+
 /// Build one request that belongs to an existing session and task.
 fn request_for(
     workspace: &std::path::Path,

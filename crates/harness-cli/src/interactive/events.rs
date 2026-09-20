@@ -63,6 +63,11 @@ pub enum Key {
     EndOfInput,
     /// Bracketed paste; embedded newlines must never become separate commands.
     Paste(String),
+    /// Ctrl-V: take a bitmap off the clipboard, because no terminal sends one as text.
+    ///
+    /// A terminal that binds Ctrl-V itself never forwards the key, which is why
+    /// `/image` runs the same code — the documented, terminal-independent way in.
+    PasteImage,
     Resize {
         columns: u16,
         rows: u16,

@@ -23,6 +23,13 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/DEVfancybear/harness-agents"
 
 [workspace.dependencies]
+# Clipboard images for the chat composer. `arboard` is the safe, maintained
+# clipboard crate (1Password); its `image-data` default feature is what exposes
+# `Clipboard::get_image`, and on Windows it already pulls `image` with `png`+`bmp`.
+arboard = "=3.6.1"
+# Encoding only: the API takes images as PNG/JPEG/GIF/WebP and detects the format
+# from the bytes, while the clipboard hands back raw RGBA.
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
 clap = { version = "=4.6.6", features = ["derive"] }
 fs2 = "=0.4.3"
 futures-util = "=0.3.34"
