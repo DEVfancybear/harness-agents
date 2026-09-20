@@ -562,3 +562,48 @@ minh cái terminal nhận được.
 - `1007` cũng **không** được kiểm tra trong `NO_COLOR`/`TERM=dumb` hay ở đường plain: nó chỉ được
   bật trong `RawModeGuard::enter`, tức chỉ khi renderer TUI thực sự vào raw mode — nhưng điều đó
   được suy ra từ đường code, **không** có phép đo console thật cho nó.
+
+## 13. Hai lỗi nhìn thấy trên màn hình thật — sửa trong lượt này (screenshot)
+
+Nguồn của mục này là **hai ảnh chụp TUI đang chạy** do người giao việc gửi, không phải suy luận.
+Đây là loại lỗi mà bộ test hiện có **không** bắt được: cả hai đều nằm ở khung hình vẽ ra, không nằm
+ở dữ liệu.
+
+### 13.1. Work items
+
+| Lỗi (ảnh) | Nguyên nhân đọc được từ code | Sửa | Test canh mới |
+|---|---|---|---|
+| Câu trả lời in `**Tool call:**` với đủ dấu `*` | `markdown::render` không có nhánh emphasis | `inline_spans` → `Modifier::BOLD`, bỏ marker | `t04_emphasis_markers_become_styling_instead_of_asterisks` |
+| Dòng dài bị terminal cắt ở mép, chữ mất | `render` trả một `Line`/dòng văn bản, không đo bề rộng | mọi block qua `wrap_spans(spans, width)` | `t04_long_rows_wrap_instead_of_being_clipped`, `t04_wrapping_breaks_at_spaces`, `t04_a_word_wider_than_the_row_still_wraps`, `t04_wrapping_keeps_every_word_of_a_long_paragraph` |
+| Khối `[approval] …` hiện hai lần (scrollback + panel) | `HistoryItem::Approval` được đẩy vào history **ngay khi request tới**, rồi panel vẽ lại cùng dữ liệu | TUI: panel là chỗ duy nhất; history chỉ nhận khi `self.plain` | `t06_the_open_panel_is_the_only_place_the_proposal_is_shown`, `t06_a_plain_session_still_records_the_proposal_it_cannot_panel`, `tui::tests::t06_a_pending_approval_frame_holds_one_copy_of_the_proposal` |
+| Viền composer ghi `trả lời panel ở trên`, không nói phím nào | `composer::hint` trả một câu cho mọi modal | `hint` khớp theo `state.modal` | `composer::tests::t03_the_hint_names_the_keys_of_the_panel_that_is_open` |
+
+### 13.2. Số đo
+
+```text
+cargo test -p harness-cli --bin ha --locked                    -> 187 passed; 0 failed
+cargo clippy --workspace --all-targets --locked -- -D warnings -> sạch
+cargo fmt --all -- --check                                     -> sạch
+pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json        -> passed: true, failures: [] (lần chạy đầu)
+pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1       -> PTY_EXIT: 0, 16 passed; 0 failed (22.85 s)
+```
+
+Hai lần đỏ PTY giữa lượt, ghi lại đầy đủ:
+
+| Lần | Ca đỏ | Đọc được gì | Phân loại |
+|---|---|---|---|
+| 1 | `t07_pty_plain_flag` | Cây **chưa build được**: `Modal` chưa được import trong `composer.rs` (lỗi E0433 của chính lượt này) | Lỗi thật của lượt này — đã sửa, xanh ở lần chạy sau |
+| 2 | `i14_the_installed_artifact_opens_the_app_in_a_real_terminal` | Assert cuối `transcript.ends_with("\r\n")` (`interactive_terminal.rs:694`); chạy **một mình** ca đó cho `PTY_EXIT: 0` | Flake console: lần đọc cuối của PTY giành với lúc tiến trình thoát. **Không** nới assertion |
+
+### 13.3. **Không** được chứng minh (đọc kỹ trước khi báo cáo)
+
+- **Chưa có ảnh chụp màn hình sau khi sửa.** Phép kiểm gần nhất với mắt người là
+  `tui::tests::t06_a_pending_approval_frame_holds_one_copy_of_the_proposal`: nó vẽ khung hình thật
+  qua `ScriptedRenderer` ở **100×30** và đếm `path=src/parser.rs` xuất hiện **đúng một** lần, đồng
+  thời khẳng định live block nhường vùng trên cho panel. Đây là **khung hình của `TestBackend`**,
+  không phải của ConPTY — nhưng nó là **cùng một** hàm `draw_state` mà đường TUI thật gọi.
+- **Chưa đo trên console thật với `**` trong câu trả lời của model thật.** Ca PTY `t06_pty_approval_y_key`
+  và `t01_tui_opens_with_status_and_composer` xanh, nhưng không ca nào bắt model trả về markdown có
+  emphasis. Việc còn lại: một lần `ha chat` thật, hỏi câu trả lời có `**đậm**`, đọc màn hình.
+- **Bề rộng wrap lấy từ `area.width` của khung**, nên hành vi ở console hẹp (< 60 cột) không được
+  đo: dưới ngưỡng đó app chuyển sang plain (mục 8), nên đường wrap của TUI không chạy.

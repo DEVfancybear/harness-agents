@@ -241,21 +241,6 @@ Kỳ vọng: `133 passed`; `passed: true, failures: []`; `PTY_EXIT: 0` với **1
 
 ## 9b. Một key là đủ (thay đổi T08)
 
-Từ lượt này, `DEEPSEEK_API_KEY` (hoặc `HA_API_KEY`) là **toàn bộ** cấu hình provider:
-endpoint và model mặc định theo giá trị `DeepSeek` công bố
-(<https://api-docs.deepseek.com/> → `https://api.deepseek.com`, `deepseek-flash`), biến
-do người dùng đặt luôn thắng. Smoke cũng theo cùng quy tắc, nên chạy paid smoke chỉ cần:
-
-```powershell
-$env:DEEPSEEK_API_KEY = '<key>'
-pwsh -NoProfile -File scripts/Smoke-HaProvider.ps1
-```
-
-Test canh hợp đồng mới: `t08_one_deepseek_key_is_a_complete_provider_setup` (Rust) và
-self test của smoke (đường mặc định + đường override).
-
-## 9b. Một key là đủ (thay đổi T08)
-
 `DEEPSEEK_API_KEY` (hoặc `HA_API_KEY`) là **toàn bộ** cấu hình provider: endpoint và model
 mặc định theo giá trị `DeepSeek` công bố (<https://api-docs.deepseek.com/> →
 `https://api.deepseek.com`, `deepseek-flash`), biến do người dùng đặt luôn thắng. Smoke
@@ -583,3 +568,80 @@ liên tiếp** sau khi sửa; `completion_service_resume_flow` khoảng **1 đ�
 4. Giữ nguyên hai flake đã sửa: chạy `cargo test -p harness-providers --locked` và
    `cargo test --release -p harness-cli --bin ha --locked` vài lần liên tiếp; **số mới ghi đè số
    cũ** trong evidence mục 12.2 và mục này, và **không** nới assertion nếu có lần đỏ.
+
+## 15. Hai lỗi nhìn thấy trên màn hình thật (screenshot của người giao việc)
+
+Người giao việc gửi hai ảnh chụp TUI đang chạy. Cả hai lỗi **không** test nào bắt được: chúng chỉ
+hiện ra khi nhìn khung hình vẽ thật. Nội dung trong history vẫn đúng — lỗi nằm ở renderer.
+
+### 15.1. Lỗi 1 — `**đậm**` in nguyên dấu sao, dòng dài bị cắt ở mép console
+
+**Triệu chứng (ảnh):** câu trả lời hiện `**Tool call:**` với đủ bốn dấu `*`; những dòng dài bị
+terminal cắt cụt, chữ mất hẳn chứ không xuống dòng.
+
+**Nguyên nhân (đọc code, không suy đoán):** `tui/markdown.rs::render` chỉ có nhánh cho heading,
+bullet và fence — **không** có nhánh nào cho emphasis; và nó trả về **đúng một** `Line` cho mỗi
+dòng văn bản, không đo bề rộng, nên terminal tự cắt phần vượt.
+
+**Đã sửa:**
+
+| Việc | Chỗ sửa |
+|---|---|
+| `**…**` → `Modifier::BOLD`, bỏ marker; `` ` `` giữ nguyên vì đó là ký tự model viết | `markdown.rs::inline_spans` (mới) |
+| Mọi block đi qua `wrap_spans(spans, width)`, `width` từ `area.width` | `markdown.rs::render`, `history.rs`, `composer.rs::render_live` |
+| Ngắt tại khoảng trắng, không cắt giữa từ; token không có khoảng trắng vẫn ngắt được | `markdown.rs::break_point`, `wrap_spans` |
+| Marker chưa đóng (`a ** b`) và `****` là **chữ**, in đúng một lần, đúng vị trí | `inline_spans`: nhìn trước bằng `after.find("**").filter(\|at\| *at > 0)` |
+
+Bất biến giữ nguyên: **không ký tự nào bị mất**; thứ duy nhất bị bỏ là khoảng trắng ngay tại điểm
+ngắt dòng (chính chỗ ngắt đã thay nó) và marker `**` đã thành style.
+
+**Test mới (8 ca trong `markdown.rs`, tất cả xanh):** `t04_emphasis_markers_become_styling_instead_of_asterisks`,
+`t04_markers_with_nothing_between_them_are_text`, `t04_an_unclosed_marker_is_text`,
+`t04_long_rows_wrap_instead_of_being_clipped`, `t04_wrapping_breaks_at_spaces`,
+`t04_a_word_wider_than_the_row_still_wraps`, `t04_wrapping_keeps_every_word_of_a_long_paragraph`,
+cùng ca cũ `t04_markdown_rendering_keeps_every_visible_character`.
+
+### 15.2. Lỗi 2 — panel duyệt in trùng khối proposal, gợi ý chỉ sai chỗ
+
+**Triệu chứng (ảnh):** khối `[approval] …` hiện **hai lần** — một lần trong scrollback phía trên
+viewport, một lần trong panel — nên panel trông như bản sao lỗi của transcript. Viền composer ghi
+`trả lời panel ở trên`, không nói phím nào.
+
+**Nguyên nhân:** `controller.rs` đẩy `HistoryItem::Approval` vào history **ngay khi request tới**,
+rồi `layout::plan` lại vẽ panel từ `pending_approval` — cùng dữ liệu, hai chỗ vẽ. Và
+`composer::hint` trả **một** câu cho mọi loại modal.
+
+**Đã sửa:**
+
+1. Ở TUI, panel là chỗ **duy nhất** in proposal: `push_history(HistoryItem::Approval)` chỉ chạy khi
+   `self.plain`. Chế độ plain **không** có panel nên ở đó history **vẫn** giữ khối — U20 không đổi.
+2. `composer::hint` khớp theo `state.modal`: approval → `y chạy · n từ chối`; picker →
+   `↑↓ · Enter · Esc`; overlay → `PgUp/PgDn · Home/End · Esc`. Đây cũng là câu trả lời cho open item
+   14.4 mục 3 theo hướng **giữ** `↑↓` cho picker (nơi `↑`/`↓` thật sự có tác dụng,
+   `controller.rs` xử lý picker bằng mũi tên) và **không** nhắc `↑↓` cho overlay — đúng như
+   `help.rs:33`–`37` đã ghi.
+
+**Test mới:** `controller::tests::t06_the_open_panel_is_the_only_place_the_proposal_is_shown`,
+`controller::tests::t06_a_plain_session_still_records_the_proposal_it_cannot_panel`,
+`tui::tests::t06_a_pending_approval_frame_holds_one_copy_of_the_proposal` (đọc **khung vẽ thật**
+qua `ScriptedRenderer`, đếm `path=src/parser.rs` xuất hiện **đúng 1** lần),
+`composer::tests::t03_the_hint_names_the_keys_of_the_panel_that_is_open`.
+
+### 15.3. Số đo của lượt này
+
+```text
+cargo test -p harness-cli --bin ha --locked              -> 187 passed; 0 failed
+cargo clippy --workspace --all-targets --locked -- -D warnings -> sạch
+cargo fmt --all -- --check                               -> sạch
+pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json  -> passed: true, failures: []  (lần chạy đầu)
+pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -> PTY_EXIT: 0, 16 passed; 0 failed (22.85 s)
+```
+
+Hai lần chạy PTY giữa lượt **có đỏ**, và cả hai đều là flake console, không phải hồi quy:
+
+| Lần | Ca đỏ | Đọc transcript | Kết luận |
+|---|---|---|---|
+| 1 | `t07_pty_plain_flag` | Lúc đó cây **chưa build được** (`Modal` chưa import trong `composer.rs`) — lỗi của chính lượt này, đã sửa | Lỗi thật, đã sửa |
+| 2 | `i14_the_installed_artifact_opens_the_app_in_a_real_terminal` | Assert cuối `transcript.ends_with("\r\n")`; chạy **một mình** ca đó `PTY_EXIT: 0` | Flake console: lần đọc cuối giành với lúc tiến trình thoát. **Không** nới assertion |
+
+Lần chạy đủ 16 ca ngay sau đó xanh hết, và gate `failures: []` ở lần chạy đầu.

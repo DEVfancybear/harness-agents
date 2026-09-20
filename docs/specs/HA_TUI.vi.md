@@ -612,6 +612,65 @@ Windows Terminal hay bất kỳ emulator nào trong lượt này (evidence 12.4)
 
 Không nới assertion nào: lần thử lại chỉ cứu **fixture**, còn lỗi thật vẫn đỏ ngay lần đầu.
 
+## 3f. Hai khiếm khuyết nhìn thấy trên màn hình thật (screenshot, lượt này)
+
+Hai lỗi này **không** test nào bắt được trước đó: chúng chỉ hiện ra khi nhìn khung hình vẽ thật.
+Cả hai đều là lỗi renderer, không phải lỗi dữ liệu — nội dung trong history vẫn đúng.
+
+### 3f.1. `**đậm**` in ra nguyên dấu sao, và dòng dài bị terminal cắt cụt
+
+| Điều quan sát được | Nguyên nhân | Sửa |
+|---|---|---|
+| Câu trả lời in ra `**Tool call:**` với đủ bốn dấu `*` | `markdown::render` chỉ xử lý heading/bullet/fence, **không** có nhánh nào cho emphasis: `inline_spans` chưa tồn tại | `inline_spans` biến `**…**` thành `Modifier::BOLD` và **bỏ** marker; `` ` `` vẫn giữ vì đó là ký tự model viết |
+| Dòng dài bị cắt ở mép console, chữ mất hẳn | `render` trả về **một** `Line` cho mỗi dòng văn bản, không đo bề rộng; terminal cắt phần vượt | Mọi block đi qua `wrap_spans(spans, width)`; `width` lấy từ `area.width` của khung |
+
+Quy tắc đã chốt, không đổi ngầm:
+
+1. **Không ký tự nào bị mất.** Hàm `render` là toàn phần: mọi ký tự vào ra đều có mặt, đúng thứ tự.
+   Thứ duy nhất bị bỏ là **khoảng trắng tại điểm ngắt dòng** — chính chỗ ngắt đã thay nó — và marker
+   `**` đã thành style. Test `t04_markdown_rendering_keeps_every_visible_character` giữ bất biến này.
+2. **Ngắt dòng tại khoảng trắng**, không cắt giữa từ (`break_point` trả về index **sau** khoảng trắng
+   cuối, rồi `trim_trailing_spaces` cắt nó khỏi dòng vừa xong). Một token không có khoảng trắng nào
+   (đường dẫn, URL dài) **vẫn** bị ngắt giữa từ — vì phương án còn lại là terminal cắt mất chữ.
+3. **Marker chưa đóng là chữ.** `a ** b` in ra đúng `a ** b`, không nhân đôi. `****` (không có gì ở
+   giữa) cũng là chữ. Quyết định bằng cách nhìn trước (`after.find("**").filter(|at| *at > 0)`) chứ
+   **không** bằng cờ trạng thái — cờ chỉ có thể gắn marker vào cuối dòng, sai vị trí.
+4. **Dòng không bao giờ được in thừa khoảng trắng**, kể cả dòng cuối: `trim_trailing_spaces` chạy cả
+   ở nhánh kết thúc.
+
+Test canh (chạy trên cây nguồn này, `crates/harness-cli/src/interactive/tui/markdown.rs`):
+
+```text
+t04_markdown_rendering_keeps_every_visible_character   -> ok
+t04_emphasis_markers_become_styling_instead_of_asterisks -> ok  (**Tool call:** -> "Tool call:")
+t04_an_unclosed_marker_is_text                          -> ok  (a ** b ` c -> nguyên văn)
+t04_markers_with_nothing_between_them_are_text           -> ok  (a **** b -> nguyên văn)
+t04_long_rows_wrap_instead_of_being_clipped             -> ok  (mọi dòng <= width)
+t04_wrapping_breaks_at_spaces                           -> ok  ("alpha beta" / "gamma delta")
+t04_a_word_wider_than_the_row_still_wraps               -> ok  (25 ký tự / width 10 -> 3 dòng)
+t04_wrapping_keeps_every_word_of_a_long_paragraph        -> ok  (không mất, không đổi thứ tự từ)
+```
+
+### 3f.2. Panel duyệt in trùng khối proposal, và gợi ý chỉ sai chỗ
+
+| Điều quan sát được | Nguyên nhân | Sửa |
+|---|---|---|
+| Khối `[approval] …` hiện **hai lần**: một lần trong scrollback phía trên, một lần trong panel | `controller.rs` đẩy `HistoryItem::Approval` vào history **ngay khi request tới**, rồi `layout::plan` lại vẽ panel từ `pending_approval` — cùng một dữ liệu, hai chỗ vẽ | Ở TUI, panel là chỗ **duy nhất** in proposal: `push_history` chỉ chạy khi `self.plain`. Chế độ plain **không** có panel nên ở đó history vẫn giữ khối (U20) |
+| Viền composer ghi `trả lời panel ở trên` — không nói phím nào, và panel không "ở trên" theo nghĩa người đọc hiểu | `composer::hint` trả **một** câu cho mọi loại modal | `hint` khớp theo `state.modal`: approval → `y chạy · n từ chối`, picker → `↑↓ · Enter · Esc`, overlay → `PgUp/PgDn · Home/End · Esc` |
+
+Hệ quả đã kiểm: `i14`/`t06_pty_approval_y_key` vẫn thấy `[approval] granted fixture-approval-1` trong
+transcript (dòng resolution **không** đổi), và mốc D5 `[approval] ` vẫn còn trên màn hình vì panel tự
+in nó ở dòng đầu.
+
+Test canh:
+
+```text
+controller::tests::t06_the_open_panel_is_the_only_place_the_proposal_is_shown   -> ok (TUI: history rỗng)
+controller::tests::t06_a_plain_session_still_records_the_proposal_it_cannot_panel -> ok (plain: có khối)
+tui::tests::t06_a_pending_approval_frame_holds_one_copy_of_the_proposal         -> ok (khung vẽ thật: 1 lần)
+composer::tests::t03_the_hint_names_the_keys_of_the_panel_that_is_open          -> ok
+```
+
 ## 4. Kiến trúc chốt cho T02–T08
 
 Theo plan mục 4, với hai điều chỉnh đã đo:
