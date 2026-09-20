@@ -61,7 +61,8 @@ fn memory_asset_of(
     match remembered {
         Ok(Some(
             memory::RememberOutcome::Stored(asset_id)
-            | memory::RememberOutcome::Duplicate(asset_id),
+            | memory::RememberOutcome::Duplicate(asset_id)
+            | memory::RememberOutcome::StoredButUnpruned { asset_id, .. },
         )) => Some(asset_id.as_str().to_owned()),
         _ => None,
     }
@@ -73,6 +74,9 @@ fn memory_disposition_of(
 ) -> &'static str {
     match remembered {
         Ok(Some(memory::RememberOutcome::Stored(_))) => "stored",
+        // Distinct from `stored` because the caller's next question is about the store, not
+        // about this turn: a log that could not be trimmed keeps growing.
+        Ok(Some(memory::RememberOutcome::StoredButUnpruned { .. })) => "stored_but_unpruned",
         Ok(Some(memory::RememberOutcome::Duplicate(_))) => "duplicate",
         Ok(Some(memory::RememberOutcome::NotKnowledge { reason })) => reason,
         Ok(Some(memory::RememberOutcome::NothingAdmitted) | None) => "nothing_admitted",

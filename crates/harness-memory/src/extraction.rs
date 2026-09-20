@@ -6,7 +6,8 @@ use super::{
     MemoryAsset, MemoryAssetId, MemoryAssetStatus, MemoryLayer, MemoryPrincipal, MemoryScope,
     MemoryService, MemoryVersion, ProjectId, Serialize, SessionId, SourceAuthority,
     StoredMemoryAsset, StoredMemoryAssetRecord, StoredMemoryVersionRecord, TaskId, Validity,
-    convert_asset, normalize_search_text, store_lease, store_principal, to_harness_error,
+    convert_asset, ensure_source_is_durable, normalize_search_text, store_lease, store_principal,
+    to_harness_error,
 };
 
 /// The scope one derived asset inherits from the source a caller named first.
@@ -199,6 +200,11 @@ impl MemoryService {
                     "L2 source version changed",
                 ));
             }
+            // A turn record is a log entry with a retention cap, so it is the one asset
+            // that is guaranteed to be retired eventually - and a derived memory dies with
+            // its source. Refusing here is the difference between a clear answer now and a
+            // summary that disappears two hundred turns later with no explanation.
+            ensure_source_is_durable(&asset)?;
             events.extend(asset.current.record.source_event_refs);
             files.extend(asset.current.record.source_file_hashes);
             // A summary is never wider than the evidence it summarises, so it takes the

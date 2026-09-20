@@ -389,3 +389,40 @@ Fixture minh họa, không gọi model thật:
 7. Sửa B, integrate, chạy lại tests trên final revision, chốt task rồi đề xuất bài học project để trích xuất nền.
 
 Gate P1/P2 bằng durable reconstruction, P3 bằng tool evidence thật, P4 bằng extraction/retrieval degradation, P5 bằng cross-agent ownership/delivery, P7 bằng backup/migration/retention. C01–C30 và plugin K01–K14 chỉ là acceptance specifications cho đến khi có executable tests và kết quả mới chạy.
+
+## 19. Nhật ký hội thoại: hợp đồng đã triển khai
+
+Mục này ghi lại một quyết định hợp đồng đã đo, không phải thiết kế đề xuất. Trước đây memory dài hạn của chat chỉ nhận "chỉ dẫn người dùng": input không phải câu hỏi được lưu thành asset `user_instruction`, còn câu trả lời của model thì không được lưu ở đâu cả. Hệ quả đo được: mở phiên mới hỏi "session trước tôi hỏi bạn những gì?" thì agent trả lời rằng nó không có bản ghi nào, trong khi dữ liệu vẫn nằm trong store. Memory đã được mở rộng thành **nhật ký hội thoại**, và điều đó kéo theo các ràng buộc dưới đây.
+
+### 19.1. Hai loại vật liệu, hai chỉ mục
+
+Store giữ hai loại vật liệu trả lời hai câu hỏi khác nhau:
+
+| Loại | Trả lời | Ví dụ | Vòng đời |
+|---|---|---|---|
+| Durable memory | "tôi biết gì" | chỉ dẫn người dùng, quan sát runtime, L2 tổng hợp | không hết hạn |
+| Nhật ký hội thoại | "ta đã nói gì" | một asset cho mỗi lượt: `asked:`, `session:`, `answered:` | tối đa 200 bản ghi mỗi project |
+
+Bản ghi lượt chứa nguyên văn input, nên nó và chỉ dẫn ghi cùng input đó trùng nhau gần hết - và bản ghi còn chứa thêm một phần câu trả lời. Nếu hỏi cả hai trong một lần tìm, chỉ dẫn của người dùng phải cạnh tranh với chính tiếng vọng của nó, và kết quả do một tie-break bm25 quyết định. Đo được: khối được inject cho đúng từ ngữ của chỉ dẫn có lúc là bản ghi lượt, tức chỉ dẫn của người dùng đến model trong dạng "thứ mà người dùng đã được trích dẫn là đã nói" thay vì một chỉ dẫn, và nó sẽ hết hạn ở ngưỡng retention.
+
+Vì vậy đường tìm kiếm theo từ khóa hỏi **durable memory trước**, và chỉ hỏi nhật ký khi durable memory không có gì cho truy vấn đó. Khi nhật ký trả lời, transcript nói rõ điều đó, vì bản ghi chỉ là trích đoạn của điều đã được nói. Câu hỏi *về* cuộc hội thoại ("session trước tôi hỏi bạn những gì?") đi đường riêng: đọc nhật ký theo thứ tự mới nhất trước, không theo độ trùng từ khóa.
+
+### 19.2. Ràng buộc về bằng chứng và ngưỡng lưu
+
+- Một lượt là chuyện đã xảy ra: runtime quan sát câu hỏi đến và câu trả lời đi ra, nên bản ghi mang `RuntimeObserved` + `VerifiedObservation` và ở trạng thái `Active`. Ghi nó thành `candidate` làm cả tính năng vô hình, vì `candidate` không được inject.
+- `answered:` chỉ giữ tối đa 200 ký tự và là **trích đoạn output của model**, không phải sự thật đã kiểm chứng. Heading của khối memory nói thẳng điều này, để một câu trả lời không bị đọc như tri thức đã xác minh rồi cứng lại thành durable knowledge.
+- Đầu vào trông như mang credential thì lượt đó không được ghi, thay vì ghi một bản ghi đã bị redact nội dung chính.
+- Ngưỡng 200 bản ghi mỗi project chỉ áp cho asset do chính đường này ghi (`provenance_kind = session_turn`). Chỉ dẫn người dùng không phải mục log và không bao giờ bị ngưỡng log thu hồi.
+- Một lượt chỉ thu hồi tối đa 8 bản ghi quá ngưỡng, để công việc trên đường trả lời không tỉ lệ với độ dài log.
+
+### 19.3. Nhật ký không phải nguồn của tri thức bền
+
+Bản ghi lượt là asset duy nhất chắc chắn sẽ bị thu hồi, và memory dẫn xuất chết theo nguồn của nó qua transitive invalidation. Vì vậy:
+
+- Không đường nào được nhận bản ghi lượt làm source: cả `derive_l2` (summarize) lẫn `write_version` với `source_assets` (semantic merge) từ chối bằng `InvalidPayload` kèm lý do. Từ chối lúc chọn nguồn rõ ràng hơn nhiều so với một bản summary biến mất hai trăm lượt sau mà không có sự kiện nào giải thích.
+- Lượt thu hồi cũng không động vào bản ghi đang là nguồn của một asset còn sống: bản ghi đó bị **pin** và được báo lại. Store ghi trước quy tắc này vẫn còn cạnh phụ thuộc, nên đây là lưới an toàn cho dữ liệu cũ, không phải đường chính.
+- Ghi chú: nếu chỉ dẫn thay đổi thì bản ghi lượt cũ vẫn giữ nguyên văn điều đã nói tại thời điểm đó. Đó là điều đúng cho một bản ghi, và là lý do đường từ khóa không lấy nhật ký làm câu trả lời.
+
+### 19.4. Hệ quả cho acceptance
+
+C30 và bộ nghiệm thu chống quên ở mục 12 phải đọc theo hợp đồng này: "không quên" nghĩa là câu hỏi về quá khứ được trả lời từ nhật ký, còn câu hỏi về chủ đề được trả lời từ durable memory. Một chương trình chỉ kiểm tra durable memory sẽ bỏ sót nửa còn lại, và một chương trình chỉ kiểm tra nhật ký sẽ coi bản ghi là tri thức - hai lỗi khác nhau, cần hai assertion khác nhau.

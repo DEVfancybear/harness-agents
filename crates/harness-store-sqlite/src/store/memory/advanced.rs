@@ -268,7 +268,6 @@ impl SqliteStore {
         &self,
         principal: &StoreMemoryPrincipal,
         normalized_content: &str,
-        project_only: bool,
     ) -> Result<Option<MemoryAssetId>, StoreError> {
         let mut tx = self.pool.begin().await.map_err(|error| {
             database_error(
@@ -284,14 +283,31 @@ impl SqliteStore {
                AND v.version = a.current_version
                AND a.status = 'active'
                AND json_extract(v.version_json, '$.validity') = 'valid'
-               AND ((?2 = 1 AND a.project_id = ?3) OR (?2 = 0 AND a.project_id IS NULL))
+               -- The same scope predicates a search applies, including the ones that
+               -- tolerate a NULL column: search accepts a user-scoped asset from a
+               -- project principal, and a lookup that did not would mint a duplicate of
+               -- something the principal can already read.
+               AND (a.project_id IS NULL OR a.project_id = ?2)
+               AND (a.task_id IS NULL OR a.task_id = ?3)
+               AND (a.agent_profile_id IS NULL OR a.agent_profile_id = ?4)
+               AND (a.session_id IS NULL OR a.session_id = ?5)
+               -- And the same reachability rule: owner or an active grant that allows
+               -- searching. Requiring only a binding let a bind-only or revoked grant
+               -- make this report someone else's asset and store nothing.
+               AND (a.owner_id = ?6 OR EXISTS (SELECT 1 FROM memory_grants g,
+                        json_each(g.actions_json) action
+                        WHERE g.memory_asset_id = a.memory_asset_id AND g.principal_id = ?6
+                          AND g.active = 1 AND (g.project_id IS NULL OR g.project_id = ?2)
+                          AND action.value = 'search'))
                AND EXISTS (SELECT 1 FROM memory_bindings b
-                   WHERE b.memory_asset_id = a.memory_asset_id AND b.principal_id = ?4)
+                   WHERE b.memory_asset_id = a.memory_asset_id AND b.principal_id = ?6)
              ORDER BY a.memory_asset_id LIMIT 1",
         )
         .bind(normalized_content)
-        .bind(i64::from(project_only))
         .bind(principal.project_id.as_ref().map(ToString::to_string))
+        .bind(principal.task_id.as_ref().map(ToString::to_string))
+        .bind(principal.agent_profile_id.as_ref().map(ToString::to_string))
+        .bind(principal.session_id.as_ref().map(ToString::to_string))
         .bind(&principal.principal_id)
         .fetch_optional(&mut *tx)
         .await
@@ -334,13 +350,19 @@ impl SqliteStore {
     ) -> Result<bool, StoreError> {
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;
+        // Authorize before reading, like every other write path in this file, so an
+        // unauthorized caller does not get a read and cannot tell a missing id from a
+        // forbidden one. The action is `publish`, not `bind`: this edits the provenance
+        // of an existing version, and provenance is what the evidence rests on. A
+        // principal that may bind an asset to itself was previously able to append
+        // arbitrary event references to someone else's version.
+        assert_authorized(&mut tx, principal, asset_id, "publish").await?;
         let Some(mut record) = load_asset_in_tx(&mut tx, asset_id).await? else {
             return Err(StoreError::new(
                 ErrorCode::InvalidPayload,
                 "memory asset to append to was not found",
             ));
         };
-        assert_authorized(&mut tx, principal, asset_id, "bind").await?;
         if record.current.record.source_event_refs.contains(event_id) {
             tx.commit().await.map_err(|error| {
                 database_error(
@@ -479,12 +501,18 @@ impl SqliteStore {
     ///
     /// Scoped to one provenance kind on purpose: this is a retention rule for the log
     /// this code writes, and it must not be able to retire an asset the user authored.
+    ///
+    /// The answer is `(retirable, pinned)`. A record that another live asset was derived
+    /// from is *pinned*: it looks like a log entry but it is load-bearing, and retiring it
+    /// would take the derived asset down with it through transitive invalidation. A
+    /// retention cap for a log must never be able to delete knowledge, so pinned records
+    /// are reported instead of retired, and the caller can say the cap was not reached.
     pub async fn turn_records_over_limit(
         &self,
         principal: &StoreMemoryPrincipal,
         provenance_kind: &str,
         keep: usize,
-    ) -> Result<Vec<MemoryAssetId>, StoreError> {
+    ) -> Result<(Vec<MemoryAssetId>, usize), StoreError> {
         let mut tx = self.pool.begin().await.map_err(|error| {
             database_error(
                 ErrorCode::StorageOpenFailed,
@@ -494,7 +522,16 @@ impl SqliteStore {
         })?;
         let keep = i64::try_from(keep).unwrap_or(i64::MAX);
         let rows = sqlx::query(
-            "SELECT v.memory_asset_id FROM memory_versions v
+            "SELECT v.memory_asset_id,
+                    EXISTS (
+                        SELECT 1 FROM memory_dependencies d
+                        JOIN memory_assets dependent
+                          ON dependent.memory_asset_id = d.derived_asset_id
+                        WHERE d.source_kind = 'asset'
+                          AND d.source_id = v.memory_asset_id
+                          AND dependent.status IN ('active', 'candidate')
+                    ) AS pinned
+             FROM memory_versions v
              JOIN memory_assets a ON a.memory_asset_id = v.memory_asset_id
              WHERE v.version = a.current_version
                AND a.status IN ('active', 'candidate')
@@ -525,12 +562,18 @@ impl SqliteStore {
                 error,
             )
         })?;
-        rows.into_iter()
-            .map(|row| {
-                MemoryAssetId::parse(row.get::<String, _>("memory_asset_id"))
-                    .map_err(|error| StoreError::new(error.code(), error.to_string()))
-            })
-            .collect()
+        let mut retirable = Vec::new();
+        let mut pinned = 0usize;
+        for row in rows {
+            let id = MemoryAssetId::parse(row.get::<String, _>("memory_asset_id"))
+                .map_err(|error| StoreError::new(error.code(), error.to_string()))?;
+            if row.get::<i64, _>("pinned") == 0 {
+                retirable.push(id);
+            } else {
+                pinned += 1;
+            }
+        }
+        Ok((retirable, pinned))
     }
 
     /// Scoped FTS search: `query` is an FTS5 MATCH expression, `limit` its row budget.
@@ -540,11 +583,18 @@ impl SqliteStore {
     /// to see before it can decide which of them are relevant. What this function
     /// owns is the part that must never depend on either: the scope, grant, binding
     /// and lineage-validity predicates, which all precede ranking and `LIMIT`.
+    ///
+    /// `exclude_provenance` drops one provenance kind before ranking, so the caller's row
+    /// budget is spent on the material it asked for. Filtering after this returns would
+    /// not do: a crowded kind would fill the budget and the row the caller wanted would
+    /// never be fetched. `None` searches everything the principal may read, and the
+    /// comparison is `IS NOT` so a row with no kind recorded is not silently dropped.
     pub async fn search_memory(
         &self,
         principal: &StoreMemoryPrincipal,
         query: &str,
         limit: usize,
+        exclude_provenance: Option<&str>,
     ) -> Result<(Vec<StoredMemoryAssetRecord>, u64), StoreError> {
         let mut tx = self.pool.begin().await.map_err(|error| {
             database_error(
@@ -574,6 +624,7 @@ impl SqliteStore {
              JOIN memory_versions v ON v.memory_asset_id = a.memory_asset_id AND v.version = a.current_version
              JOIN allowed permission ON permission.id = a.memory_asset_id AND permission.searchable = 1
              WHERE memory_fts MATCH ?1 AND a.status = 'active' AND json_extract(v.version_json, '$.validity') = 'valid'
+               AND (?8 IS NULL OR json_extract(v.version_json, '$.provenance_kind') IS NOT ?8)
                AND EXISTS (SELECT 1 FROM memory_bindings b WHERE b.memory_asset_id = a.memory_asset_id AND b.principal_id = ?6)
                AND NOT EXISTS (SELECT 1 FROM lineage l LEFT JOIN allowed p ON p.id = l.id
                    LEFT JOIN memory_assets s ON s.memory_asset_id = l.id
@@ -584,6 +635,7 @@ impl SqliteStore {
             .bind(principal.task_id.as_ref().map(ToString::to_string)).bind(principal.agent_profile_id.as_ref().map(ToString::to_string))
             .bind(principal.session_id.as_ref().map(ToString::to_string)).bind(&principal.principal_id)
             .bind(i64::try_from(limit.min(32)).unwrap_or(32))
+            .bind(exclude_provenance)
             .fetch_all(&mut *tx).await
             .map_err(|error| database_error(ErrorCode::StorageOpenFailed, "scoped FTS search", error))?;
         let mut hits = Vec::new();

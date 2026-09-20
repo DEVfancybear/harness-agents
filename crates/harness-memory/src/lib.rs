@@ -24,8 +24,8 @@ pub use extraction::{
 };
 mod retrieval;
 pub use retrieval::{
-    MAX_QUERY_BYTES, MemoryContribution, RetrievalResult, RetrievalState, VectorAdapter,
-    normalize_terms,
+    MAX_QUERY_BYTES, MemoryContribution, MemoryIndex, RetrievalResult, RetrievalState,
+    VectorAdapter, normalize_terms,
 };
 mod maintenance;
 pub use maintenance::{CatchUpReport, MemoryBudget};
@@ -53,6 +53,30 @@ pub const TURN_PROVENANCE_KIND: &str = "session_turn";
 /// verified it.
 pub const MEMORY_BLOCK_HEADING: &str = "Memory from earlier turns - use it to answer. It records what was asked and said; \
      treat a quoted reply as something that was said, not as a verified fact.";
+
+/// Refuse a log entry as the source of durable memory.
+///
+/// A turn record carries a retention cap, so it is the one asset that is guaranteed to be
+/// retired eventually - and a memory built on another dies with it, through transitive
+/// invalidation. Refusing at the moment the source is named is the difference between a
+/// clear answer now and a summary that disappears two hundred turns later with nothing to
+/// explain it.
+///
+/// Both places that accept a source call this: [`MemoryService::write_version`] when a
+/// caller names merge sources, and [`MemoryService::derive_l2`] when a caller summarises.
+/// It is deliberately not the only defence: pruning refuses to retire a record that a live
+/// asset depends on, because a store written before this rule existed still holds those
+/// edges.
+pub fn ensure_source_is_durable(asset: &StoredMemoryAsset) -> Result<(), HarnessError> {
+    if asset.current.record.provenance_kind != TURN_PROVENANCE_KIND {
+        return Ok(());
+    }
+    Err(HarnessError::new(
+        ErrorCode::InvalidPayload,
+        "a conversation turn is a log entry that expires and cannot be a source; \
+         summarize the session or a durable asset instead",
+    ))
+}
 
 #[cfg(test)]
 mod properties {
@@ -386,6 +410,7 @@ impl MemoryService {
                 .ok_or_else(|| {
                     HarnessError::new(ErrorCode::InvalidPayload, "merge source missing")
                 })?;
+            ensure_source_is_durable(&asset)?;
             request
                 .source_event_refs
                 .extend(asset.current.record.source_event_refs);
@@ -589,30 +614,24 @@ impl MemoryService {
     /// related". They are different questions and only the first one is safe to skip a
     /// write on.
     ///
+    /// Reachability is the search rule, not a weaker one: an asset counts only when the
+    /// principal owns it or holds an active `search` grant for it. Matching on a binding
+    /// alone would let a bind-only or revoked grant make this report an asset the
+    /// principal may not read, and the caller would then store nothing.
+    ///
     /// # Errors
     /// Fails when the principal is unusable or the store cannot answer.
     pub async fn find_active_by_content(
         &self,
         principal: &MemoryPrincipal,
         content: &str,
-        scope: MemoryScope,
-        project_id: Option<ProjectId>,
     ) -> Result<Option<MemoryAssetId>, HarnessError> {
         validate_principal(principal)?;
-        let store_principal = store_principal(principal);
-        // Project scope compares the project column; user scope compares for absence,
-        // so a user-scoped asset is never matched by a project-scoped lookup.
-        let project_only = scope == MemoryScope::Project;
-        let project = if project_only { project_id } else { None };
         let found = self
             .store
             .find_active_memory_by_content(
-                &StoreMemoryPrincipal {
-                    project_id: project,
-                    ..store_principal
-                },
+                &store_principal(principal),
                 &normalize_search_text(content),
-                project_only,
             )
             .await
             .map_err(to_harness_error)?;
@@ -643,11 +662,16 @@ impl MemoryService {
             .map_err(to_harness_error)
     }
 
-    /// Turn records past the cap, oldest first.
+    /// Turn records past the cap, oldest first, and how many of them are pinned.
     ///
     /// A retention rule for the conversation log: the caller retires what this returns
     /// through [`MemoryService::invalidate`], so the removal goes through the same
     /// authorization and lineage machinery as any other invalidation.
+    ///
+    /// A pinned record is one another live asset was derived from. It is over the cap and
+    /// it stays: invalidating it would take the derived asset with it, and a log limit
+    /// must never be able to delete knowledge. The count is returned rather than dropped
+    /// so the caller can report a log that is over its cap for a reason.
     ///
     /// # Errors
     /// Fails when the principal is unusable or the store cannot answer.
@@ -656,7 +680,7 @@ impl MemoryService {
         principal: &MemoryPrincipal,
         project_id: Option<&ProjectId>,
         keep: usize,
-    ) -> Result<Vec<MemoryAssetId>, HarnessError> {
+    ) -> Result<(Vec<MemoryAssetId>, usize), HarnessError> {
         validate_principal(principal)?;
         let store_principal = StoreMemoryPrincipal {
             project_id: project_id.cloned(),

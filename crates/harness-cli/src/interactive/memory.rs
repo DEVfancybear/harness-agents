@@ -19,8 +19,8 @@
 use std::sync::Arc;
 
 use harness_memory::{
-    CreateMemoryAsset, EvidenceState, MemoryContribution, MemoryLayer, MemoryPrincipal,
-    MemoryService, RetrievalState, normalize_terms, sanitize_memory_text,
+    CreateMemoryAsset, EvidenceState, MemoryContribution, MemoryIndex, MemoryLayer,
+    MemoryPrincipal, MemoryService, RetrievalState, normalize_terms, sanitize_memory_text,
 };
 use harness_store_sqlite::{SqliteStore, StoreError};
 use harness_types::{
@@ -64,6 +64,13 @@ const TURN_ANSWER_CHARS: usize = 200;
 /// least useful and are retired first. Only turn records are pruned: a directive the
 /// user typed is not a log entry and never expires.
 const TURN_MEMORY_LIMIT: usize = 200;
+
+/// How many over-cap turn records one turn retires.
+///
+/// Pruning runs on the path that just admitted a turn, so an unbounded sweep would let a
+/// large log delay the answer it belongs to. The cap is reached over a few turns instead
+/// of in one, which is the only cost of bounding the work.
+const PRUNE_PER_TURN: usize = 8;
 
 /// Marks an asset as a record of one conversation turn.
 ///
@@ -132,21 +139,37 @@ pub async fn recall(
     // term with the turn record it is asking about, so the overlap floor - which exists
     // to keep unrelated notes out - rejected it. Recentness is what that question is
     // actually about.
-    let result = if asks_about_history(text) {
-        service
-            .recent_turns(principal, principal.project_id.as_ref(), RECALL_HITS)
-            .await?
+    //
+    // Everything else is asked of durable memory first and of the log only if durable
+    // memory holds nothing. The log quotes the input it recorded, so asking both at once
+    // let a turn record shadow the very directive it recorded, and the block that reached
+    // the model framed the user's instruction as something they were quoted saying.
+    let (index, result) = if asks_about_history(text) {
+        (
+            MemoryIndex::Log,
+            service
+                .recent_turns(principal, principal.project_id.as_ref(), RECALL_HITS)
+                .await?,
+        )
     } else {
         let terms = normalize_terms(text);
         service
-            .search_terms(principal, &terms, RECALL_HITS, None)
+            .search_durable_before_log(principal, &terms, RECALL_HITS, None)
             .await?
     };
     let contribution = service.contribute(principal, &result, CONTRIBUTION_TOKENS);
     let hits = result.hits.len();
     let blocks = contribution.blocks.len();
     let message = match result.state {
-        RetrievalState::Found => format!("memory: {hits} hit(s), {blocks} block(s) injected"),
+        RetrievalState::Found => match index {
+            MemoryIndex::Durable => format!("memory: {hits} hit(s), {blocks} block(s) injected"),
+            // Said out loud, because a log entry is an excerpt of what was said and is
+            // retired at the retention cap: the reader should know which one answered.
+            MemoryIndex::Log => format!(
+                "memory: {hits} hit(s), {blocks} block(s) injected from the conversation log, \
+                 not from durable memory"
+            ),
+        },
         RetrievalState::Empty => match result.detail.as_deref() {
             // Two different empties, and the difference is what tells a reader
             // whether to rephrase or to stop asking.
@@ -182,6 +205,18 @@ pub async fn recall(
 pub enum RememberOutcome {
     /// A new asset holds this input.
     Stored(MemoryAssetId),
+    /// The turn was recorded, but the sweep that keeps the log bounded failed.
+    ///
+    /// This is not an error: the turn is durable and recall can read it. It is also not
+    /// an ordinary success, because the log is now over its cap and will keep growing
+    /// until a sweep works. Reporting it as either one would hide a store that needs
+    /// attention.
+    StoredButUnpruned {
+        /// The turn record that was written.
+        asset_id: MemoryAssetId,
+        /// What the failed sweep said, in words the transcript can print.
+        reason: String,
+    },
     /// An asset already held this text; the new source event was recorded on it.
     Duplicate(MemoryAssetId),
     /// This input is not the kind of thing memory keeps. The reason is reported.
@@ -325,10 +360,7 @@ pub async fn remember_input(
     // such an input minted another asset, which is the duplication this path exists to
     // stop.
     let storable = sanitize_memory_text(&text);
-    if let Some(existing) = service
-        .find_active_by_content(principal, &storable, scope, project_id.clone())
-        .await?
-    {
+    if let Some(existing) = service.find_active_by_content(principal, &storable).await? {
         service
             .append_version_source(principal, &existing, &event_id)
             .await?;
@@ -455,33 +487,76 @@ pub async fn remember_turn(
         )
         .await?;
     let id = asset.asset.memory_asset_id.clone();
-    prune_turns(&service, principal, prune_scope.as_ref(), TURN_MEMORY_LIMIT).await?;
-    Ok(RememberOutcome::Stored(id))
+    // The record is durable by now, so a sweep that fails does not undo the turn and must
+    // not be reported as if the turn had failed. It is still reported: a log over its cap
+    // is a fact the operator can act on, and swallowing it here is how the cap silently
+    // stopped applying before.
+    match prune_turns(
+        &service,
+        principal,
+        prune_scope.as_ref(),
+        TURN_MEMORY_LIMIT,
+        PRUNE_PER_TURN,
+    )
+    .await
+    {
+        Ok(sweep) if sweep.pinned == 0 => Ok(RememberOutcome::Stored(id)),
+        Ok(sweep) => Ok(RememberOutcome::StoredButUnpruned {
+            asset_id: id,
+            reason: format!(
+                "retired {} record(s); {} over-cap record(s) are the source of another memory \
+                 and cannot be retired without taking it down too",
+                sweep.retired, sweep.pinned
+            ),
+        }),
+        Err(error) => Ok(RememberOutcome::StoredButUnpruned {
+            asset_id: id,
+            reason: error.to_string(),
+        }),
+    }
 }
 
-/// Retire the oldest turn records past the cap.
+/// What one retention sweep found and did.
+///
+/// `pinned` is not a failure: those records are over the cap and are load-bearing, because
+/// another live asset was derived from them. It is carried out of the sweep so the caller
+/// can report it - a cap that quietly stops applying is how the log grew without bound
+/// before, and a cap that quietly deletes knowledge would be worse.
+struct RetentionSweep {
+    /// How many over-cap records were retired this sweep.
+    retired: usize,
+    /// How many over-cap records are sources of another live asset and stayed.
+    pinned: usize,
+}
+
+/// Retire the oldest turn records past the cap, at most `batch` of them.
 ///
 /// Only assets this code wrote as turn records are eligible, so a directive is never
 /// pruned by a log limit. A retirement that fails is reported: silently keeping an
 /// unbounded log would be worse than an error.
 ///
-/// `keep` is a parameter rather than the constant directly so a test can reach the
-/// boundary without writing two hundred turns.
+/// `keep` and `batch` are parameters rather than the constants directly so a test can
+/// reach the boundary without writing two hundred turns.
 async fn prune_turns(
     service: &MemoryService,
     principal: &MemoryPrincipal,
     project_id: Option<&ProjectId>,
     keep: usize,
-) -> Result<(), HarnessError> {
-    let excess = service
+    batch: usize,
+) -> Result<RetentionSweep, HarnessError> {
+    let (mut excess, pinned) = service
         .turn_records_over_limit(principal, project_id, keep)
         .await?;
+    // Bounded work: the oldest go first, and whatever is left over the cap is retired by
+    // the turns that follow.
+    excess.truncate(batch);
+    let retired = excess.len();
     for id in excess {
         service
             .invalidate(principal, &id, "turn record retired past the retention cap")
             .await?;
     }
-    Ok(())
+    Ok(RetentionSweep { retired, pinned })
 }
 
 /// Shorten text to at most `limit` characters, counting characters rather than bytes.
@@ -496,13 +571,16 @@ fn clip(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MEMORY_VARIABLE, RetrievalState, asks_about_history, memory_requested,
+        MEMORY_VARIABLE, RECALL_HITS, RetrievalState, asks_about_history, memory_requested,
         memory_requested_from_environment, principal, prune_turns, recall, remember_input,
         remember_turn,
     };
     use crate::interactive::paths::LaunchEnvironment;
     use crate::interactive::project::resolve_project_id;
-    use harness_memory::{MemoryPrincipal, MemoryService, normalize_terms};
+    use harness_memory::{
+        CreateMemoryAsset, EvidenceState, MemoryIndex, MemoryLayer, MemoryPrincipal, MemoryService,
+        normalize_terms,
+    };
     use harness_providers::MockProvider;
     use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
     use harness_session::{AdmitInputRequest, SessionService};
@@ -839,7 +917,7 @@ mod tests {
             };
             turn_ids.push(id);
             let service = MemoryService::new(Arc::clone(&fixture.store));
-            prune_turns(&service, &owner, Some(&project_id), 2)
+            prune_turns(&service, &owner, Some(&project_id), 2, 8)
                 .await
                 .expect("pruning runs");
         }
@@ -882,6 +960,83 @@ mod tests {
                 .any(|hit| hit.current.content.contains("Always run cargo test")),
             "a retention cap for the log must not expire what the user asked to keep"
         );
+    }
+
+    /// One turn retires a bounded number of records, not the whole backlog.
+    ///
+    /// Pruning runs on the path that answers a turn, so an unbounded sweep turns a long
+    /// log into a long wait before the answer the user is waiting for. The cap is reached
+    /// over the turns that follow - but only if the sweep really does progress, which is
+    /// the other half of this test.
+    #[tokio::test]
+    async fn memory_one_sweep_retires_a_bounded_batch_and_still_reaches_the_cap() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+        let service = MemoryService::new(Arc::clone(&fixture.store));
+
+        // Six turns, kept two at a time, retired one per sweep.
+        let mut owner = None;
+        for index in 0..6 {
+            let task_id = TaskId::generate();
+            let session = SessionId::generate();
+            admit(
+                &fixture,
+                &project_id,
+                &session,
+                &task_id,
+                &format!("question number {index}"),
+            )
+            .await;
+            let turn_owner = principal(project_id.clone(), task_id, session.clone());
+            remember_turn(
+                Arc::clone(&fixture.store),
+                &turn_owner,
+                &session,
+                &format!("answer number {index}"),
+            )
+            .await
+            .expect("remember_turn runs");
+            owner = Some(turn_owner);
+        }
+        let owner = owner.expect("six turns ran");
+        let reader = principal(
+            project_id.clone(),
+            TaskId::generate(),
+            SessionId::generate(),
+        );
+        let count = async || {
+            service
+                .recent_turns(&reader, Some(&project_id), 32)
+                .await
+                .expect("recent turns")
+                .hits
+                .len()
+        };
+        assert_eq!(count().await, 6, "all six turns are recorded to begin with");
+
+        prune_turns(&service, &owner, Some(&project_id), 2, 1)
+            .await
+            .expect("pruning runs");
+        assert_eq!(
+            count().await,
+            5,
+            "one sweep retires one record when the batch is one - work on the answer path \
+             must not scale with the length of the log"
+        );
+
+        // Repeated sweeps converge on the cap rather than stalling above it.
+        for _ in 0..3 {
+            prune_turns(&service, &owner, Some(&project_id), 2, 1)
+                .await
+                .expect("pruning runs");
+        }
+        assert_eq!(count().await, 2, "the sweeps reach the cap");
+        prune_turns(&service, &owner, Some(&project_id), 2, 1)
+            .await
+            .expect("pruning runs");
+        assert_eq!(count().await, 2, "and never retire past it");
     }
 
     /// An ordinary question must not drag the whole conversation into context.
@@ -1112,6 +1267,534 @@ mod tests {
         assert!(
             terms.len() > 4,
             "keeping only the four longest terms is the behaviour that failed"
+        );
+    }
+
+    /// A turn record that another memory was built on is pinned, not retired.
+    ///
+    /// The retention cap exists for a log. A record something else derives from is no
+    /// longer only a log entry: retiring it invalidates the derived asset too, one hop
+    /// later, with nothing in the transcript to connect the two. This is the legacy case -
+    /// the edge is written straight into the store the way a build without the guard would
+    /// have written it - because that is exactly the data the sweep still has to survive.
+    #[tokio::test]
+    async fn memory_a_turn_record_another_memory_depends_on_is_not_retired() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+        let service = MemoryService::new(Arc::clone(&fixture.store));
+
+        let mut turn_ids = Vec::new();
+        let mut owner = None;
+        for index in 0..3 {
+            let task_id = TaskId::generate();
+            let session = SessionId::generate();
+            admit(
+                &fixture,
+                &project_id,
+                &session,
+                &task_id,
+                &format!("question number {index}"),
+            )
+            .await;
+            let turn_owner = principal(project_id.clone(), task_id, session.clone());
+            let outcome = remember_turn(
+                Arc::clone(&fixture.store),
+                &turn_owner,
+                &session,
+                &format!("answer number {index}"),
+            )
+            .await
+            .expect("remember_turn runs");
+            turn_ids.push(match outcome {
+                super::RememberOutcome::Stored(id) => id,
+                other => panic!("a turn is recorded: {other:?}"),
+            });
+            owner = Some(turn_owner);
+        }
+        let owner = owner.expect("three turns ran");
+
+        // A live asset that names the oldest turn as its source.
+        let derived = service
+            .create_asset(
+                &owner,
+                CreateMemoryAsset {
+                    kind: "project_fact".to_owned(),
+                    scope: super::MemoryScope::Project,
+                    layer: MemoryLayer::L1,
+                    project_id: Some(project_id.clone()),
+                    task_id: None,
+                    agent_profile_id: None,
+                    session_id: None,
+                    visibility: "scoped".to_owned(),
+                    content: "a summary built on the oldest turn".to_owned(),
+                    authority: SourceAuthority::RuntimeObserved,
+                    evidence: EvidenceState::VerifiedObservation,
+                    user_confirmed: false,
+                    source_event_refs: Vec::new(),
+                    source_file_hashes: Vec::new(),
+                    source_commit: Some("legacy-edge-fixture".to_owned()),
+                    provenance_kind: "runtime_observation".to_owned(),
+                },
+            )
+            .await
+            .expect("derived asset is written");
+        let edge = link_dependency(
+            &fixture.store,
+            derived.asset.memory_asset_id.as_str(),
+            turn_ids[0].as_str(),
+        )
+        .await;
+        assert!(edge, "the legacy dependency edge is written");
+
+        let sweep = prune_turns(&service, &owner, Some(&project_id), 2, 8)
+            .await
+            .expect("pruning runs");
+        assert_eq!(
+            (sweep.retired, sweep.pinned),
+            (0, 1),
+            "the oldest record is over the cap and pinned: retiring it would take the \
+             derived asset down with it"
+        );
+
+        // The pinned record is still readable, and so is what was built on it.
+        let reader = principal(
+            project_id.clone(),
+            TaskId::generate(),
+            SessionId::generate(),
+        );
+        let recent = service
+            .recent_turns(&reader, Some(&project_id), 8)
+            .await
+            .expect("recent turns");
+        assert!(
+            recent
+                .hits
+                .iter()
+                .any(|hit| hit.current.content.contains("question number 0")),
+            "the pinned record stays: {:#?}",
+            recent.hits.len()
+        );
+        assert!(
+            service
+                .read(&reader, &derived.asset.memory_asset_id)
+                .await
+                .expect("read runs")
+                .is_some(),
+            "the asset built on it must not be retired by a log limit"
+        );
+    }
+
+    /// Nothing durable may be built on a turn record, and the refusal says why.
+    ///
+    /// A turn record is the one asset guaranteed to expire. Accepting it as a source is
+    /// how a summary becomes a memory that disappears two hundred turns later with no
+    /// event that explains the loss.
+    #[tokio::test]
+    async fn memory_a_turn_record_cannot_become_a_source_of_durable_memory() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+        let task_id = TaskId::generate();
+        let session = SessionId::generate();
+        admit(
+            &fixture,
+            &project_id,
+            &session,
+            &task_id,
+            "question number 0",
+        )
+        .await;
+        let owner = principal(project_id.clone(), task_id, session.clone());
+        let service = MemoryService::new(Arc::clone(&fixture.store));
+        let turn = remember_turn(
+            Arc::clone(&fixture.store),
+            &owner,
+            &session,
+            "answer number 0",
+        )
+        .await
+        .expect("remember_turn runs");
+        let turn_id = match turn {
+            super::RememberOutcome::Stored(id) => id,
+            other => panic!("a turn is recorded: {other:?}"),
+        };
+
+        let error = service
+            .derive_l2(
+                &owner,
+                &[harness_types::MemoryVersionRef {
+                    memory_asset_id: turn_id.clone(),
+                    version: 1,
+                }],
+                "a summary of one turn",
+            )
+            .await
+            .expect_err("a log entry is not a durable source");
+        assert!(
+            error.to_string().contains("log entry that expires"),
+            "the refusal explains itself: {error}"
+        );
+    }
+
+    /// Write one legacy dependency row straight into the store.
+    ///
+    /// Returns false when the store is not reachable, so a test can fail on the fact rather
+    /// than on a panic inside a helper.
+    async fn link_dependency(store: &SqliteStore, derived: &str, source: &str) -> bool {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&store.paths().database_path)
+            .create_if_missing(false);
+        let Ok(pool) = sqlx::SqlitePool::connect_with(options).await else {
+            return false;
+        };
+        let written = sqlx::query(
+            "INSERT INTO memory_dependencies(derived_asset_id, derived_version, source_kind, \
+             source_id, source_version) VALUES (?, 1, 'asset', ?, 1)",
+        )
+        .bind(derived)
+        .bind(source)
+        .execute(&pool)
+        .await
+        .is_ok();
+        pool.close().await;
+        written
+    }
+
+    /// A directive is never displaced by the log entry of the turn that recorded it.
+    ///
+    /// The turn record holds the input verbatim plus part of the answer, so it overlaps the
+    /// directive almost completely. Asked as one index, the two compete on a bm25
+    /// tie-break, and the block that reached the model was sometimes the log entry - the
+    /// user's instruction arriving framed as something they were quoted saying, and
+    /// expiring at the retention cap. The knowledge path asks durable memory first now, so
+    /// the answer is the directive or it is nothing.
+    #[tokio::test]
+    async fn memory_a_directive_is_not_shadowed_by_its_own_turn_record() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+        let said = "Always run cargo test before you commit";
+
+        // Three identical directive turns. The directive collapses to one asset; the log
+        // keeps one record per turn, which is what makes the shadowing plain.
+        for _ in 0..3 {
+            let task_id = TaskId::generate();
+            let session = SessionId::generate();
+            admit(&fixture, &project_id, &session, &task_id, said).await;
+            let owner = principal(project_id.clone(), task_id.clone(), session.clone());
+            remember_input(Arc::clone(&fixture.store), &owner, &session)
+                .await
+                .expect("remember runs");
+            remember_turn(
+                Arc::clone(&fixture.store),
+                &owner,
+                &session,
+                "Understood, I will run cargo test before committing.",
+            )
+            .await
+            .expect("remember_turn runs");
+        }
+
+        let later = principal(
+            project_id.clone(),
+            TaskId::generate(),
+            SessionId::generate(),
+        );
+        let recalled = recall(
+            Arc::clone(&fixture.store),
+            &later,
+            "Do I need to run cargo test before I commit?",
+        )
+        .await
+        .expect("recall runs");
+        assert_eq!(
+            recalled.state,
+            RetrievalState::Found,
+            "the directive is in the store: {}",
+            recalled.message
+        );
+        let injected = recalled
+            .contribution
+            .blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            injected.contains("Always run cargo test"),
+            "the instruction must reach the model: {injected}"
+        );
+        assert!(
+            !injected.contains("asked:"),
+            "a turn record quotes the instruction back; injected as the answer it frames the \
+             user's own instruction as something they were quoted saying: {injected}"
+        );
+        assert!(
+            !recalled.message.contains("conversation log"),
+            "durable memory answered, so the log was not consulted: {}",
+            recalled.message
+        );
+    }
+
+    /// When durable memory holds nothing, the log still answers the question.
+    ///
+    /// The knowledge path asks durable memory first, and the point of asking the log second
+    /// is that an answer which was given and never promoted to knowledge is still reachable.
+    /// Without the fallback, keeping the log out of the first query would have traded a
+    /// shadow for a silence.
+    #[tokio::test]
+    async fn memory_the_log_answers_when_durable_memory_holds_nothing() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+        let task_id = TaskId::generate();
+        let session = SessionId::generate();
+        // A question, so nothing durable is written for it: the log record and its answer
+        // are the only material that mentions the marker.
+        let asked = "Which marker identifies the zebra release?";
+        admit(&fixture, &project_id, &session, &task_id, asked).await;
+        let owner = principal(project_id.clone(), task_id, session.clone());
+        let outcome = remember_input(Arc::clone(&fixture.store), &owner, &session)
+            .await
+            .expect("remember runs");
+        assert!(
+            matches!(outcome, super::RememberOutcome::NotKnowledge { .. }),
+            "a question is not stored as knowledge: {outcome:?}"
+        );
+        remember_turn(
+            Arc::clone(&fixture.store),
+            &owner,
+            &session,
+            "The zebra release is identified by marker zebra-quasar-7719.",
+        )
+        .await
+        .expect("remember_turn runs");
+
+        let later = principal(
+            project_id.clone(),
+            TaskId::generate(),
+            SessionId::generate(),
+        );
+        let service = MemoryService::new(Arc::clone(&fixture.store));
+        let terms = normalize_terms("what marker identifies the zebra release");
+        let (index, result) = service
+            .search_durable_before_log(&later, &terms, RECALL_HITS, None)
+            .await
+            .expect("search runs");
+        assert_eq!(
+            index,
+            MemoryIndex::Log,
+            "nothing durable holds these words, so the log answered: {:#?}",
+            result.detail
+        );
+        assert_eq!(result.state, RetrievalState::Found);
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.current.content.contains("zebra-quasar-7719")),
+            "the answer the model gave is still reachable by keyword"
+        );
+    }
+
+    /// Deduplication never reaches across a project boundary.
+    ///
+    /// "The same bytes" is only a safe reason to skip a write if the asset the caller found
+    /// is one the caller could have written. Read without the search rule, the lookup saw
+    /// every project's assets, so a principal in one project could have its input silently
+    /// folded into another project's memory - the second project's asset, the second
+    /// project's scope, and nothing stored where the user actually is.
+    #[tokio::test]
+    async fn memory_deduplication_is_scoped_to_what_the_principal_can_search() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+        let said = "Always run cargo test before you commit";
+        let task_id = TaskId::generate();
+        let session = SessionId::generate();
+        admit(&fixture, &project_id, &session, &task_id, said).await;
+        let owner = principal(project_id.clone(), task_id, session.clone());
+        let stored = remember_input(Arc::clone(&fixture.store), &owner, &session)
+            .await
+            .expect("remember runs")
+            .expect_stored();
+
+        let service = MemoryService::new(Arc::clone(&fixture.store));
+        assert_eq!(
+            service
+                .find_active_by_content(&owner, said)
+                .await
+                .expect("lookup runs"),
+            Some(stored.clone()),
+            "the project that holds it must still see it, or nothing would ever deduplicate"
+        );
+
+        // Another project, with the same words. A project identity is what the launch
+        // resolves, so this is what a second workspace looks like.
+        let elsewhere = MemoryPrincipal {
+            project_id: Some(ProjectId::generate()),
+            ..owner.clone()
+        };
+        assert_eq!(
+            service
+                .find_active_by_content(&elsewhere, said)
+                .await
+                .expect("lookup runs"),
+            None,
+            "an asset in another project is not this project's memory"
+        );
+    }
+
+    /// A caller's own terms cannot turn into FTS5 syntax.
+    ///
+    /// The store takes a MATCH expression, and a term is quoted to keep it from becoming
+    /// one. A term that already carries a quote defeats that: the expression stops parsing
+    /// and the whole query is reported as an index failure. Terms now pass through the same
+    /// normalization the indexed mirror does, so a quote is only a character.
+    #[tokio::test]
+    async fn memory_a_term_with_a_quote_is_a_term_and_not_syntax() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+        let task_id = TaskId::generate();
+        let session = SessionId::generate();
+        admit(
+            &fixture,
+            &project_id,
+            &session,
+            &task_id,
+            "Remember this marker for later: zebra-quasar-7719",
+        )
+        .await;
+        let owner = principal(project_id.clone(), task_id, session.clone());
+        remember_input(Arc::clone(&fixture.store), &owner, &session)
+            .await
+            .expect("remember runs")
+            .expect_stored();
+
+        let service = MemoryService::new(Arc::clone(&fixture.store));
+        // Exactly what a JSON or shell caller passes through: a quoted phrase, and an
+        // operator that would mean something to FTS5.
+        for term in [
+            "\"zebra quasar\"",
+            "zebra*",
+            "NEAR(zebra quasar)",
+            "zebra\"",
+        ] {
+            let result = service
+                .search_terms(&owner, &[term.to_owned()], 8, None)
+                .await
+                .unwrap_or_else(|error| panic!("{term} must be a term, not syntax: {error}"));
+            assert_ne!(
+                result.state,
+                RetrievalState::Error,
+                "{term} was reported as an index outage: {:?}",
+                result.detail
+            );
+        }
+    }
+
+    /// The conjunction is still asked when the wider union has nothing to trust.
+    ///
+    /// The union is wide, so its candidate window can fill with documents that share one
+    /// term - here, thirty-three long documents repeating `alpha` - and hide the one
+    /// document that holds every term. The overlap floor rejects all of them, and the
+    /// fallback is what keeps the exact ask from being answered with silence.
+    #[tokio::test]
+    async fn memory_the_exact_ask_still_answers_when_the_union_window_is_crowded() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+        let owner = principal(
+            project_id.clone(),
+            TaskId::generate(),
+            SessionId::generate(),
+        );
+        let service = MemoryService::new(Arc::clone(&fixture.store));
+        let long = "alpha ".repeat(40);
+        for index in 0..33 {
+            service
+                .create_asset(
+                    &owner,
+                    CreateMemoryAsset {
+                        kind: "project_fact".to_owned(),
+                        scope: super::MemoryScope::Project,
+                        layer: MemoryLayer::L1,
+                        project_id: Some(project_id.clone()),
+                        task_id: None,
+                        agent_profile_id: None,
+                        session_id: None,
+                        visibility: "scoped".to_owned(),
+                        content: format!("{long}{index}"),
+                        authority: SourceAuthority::RuntimeObserved,
+                        evidence: EvidenceState::VerifiedObservation,
+                        user_confirmed: false,
+                        source_event_refs: Vec::new(),
+                        source_file_hashes: Vec::new(),
+                        source_commit: Some("crowded-window-fixture".to_owned()),
+                        provenance_kind: "runtime_observation".to_owned(),
+                    },
+                )
+                .await
+                .expect("crowding asset is written");
+        }
+        service
+            .create_asset(
+                &owner,
+                CreateMemoryAsset {
+                    kind: "project_fact".to_owned(),
+                    scope: super::MemoryScope::Project,
+                    layer: MemoryLayer::L1,
+                    project_id: Some(project_id.clone()),
+                    task_id: None,
+                    agent_profile_id: None,
+                    session_id: None,
+                    visibility: "scoped".to_owned(),
+                    content: "alpha beta".to_owned(),
+                    authority: SourceAuthority::RuntimeObserved,
+                    evidence: EvidenceState::VerifiedObservation,
+                    user_confirmed: false,
+                    source_event_refs: Vec::new(),
+                    source_file_hashes: Vec::new(),
+                    source_commit: Some("crowded-window-fixture".to_owned()),
+                    provenance_kind: "runtime_observation".to_owned(),
+                },
+            )
+            .await
+            .expect("the exact asset is written");
+
+        let result = service
+            .search_terms(&owner, &["alpha".to_owned(), "beta".to_owned()], 8, None)
+            .await
+            .expect("search runs");
+        assert_eq!(
+            result.state,
+            RetrievalState::Found,
+            "the one document holding both terms is the answer: {:?}",
+            result.detail
+        );
+        assert_eq!(
+            result.hits.len(),
+            1,
+            "and it is the only hit: {:#?}",
+            result
+                .hits
+                .iter()
+                .map(|hit| hit.current.content.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            result.hits[0].current.content.contains("beta"),
+            "the union window could not reach it, so the conjunction answered: {}",
+            result.hits[0].current.content
         );
     }
 

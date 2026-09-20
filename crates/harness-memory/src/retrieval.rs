@@ -1,7 +1,7 @@
 use super::{
     ErrorCode, HarnessError, InjectionMode, MEMORY_BLOCK_HEADING, MemoryBinding, MemoryPrincipal,
-    MemoryService, Serialize, StoredMemoryAsset, convert_asset, normalize_search_text,
-    store_principal, to_harness_error,
+    MemoryService, Serialize, StoredMemoryAsset, TURN_PROVENANCE_KIND, convert_asset,
+    normalize_search_text, store_principal, to_harness_error,
 };
 use harness_session::{ContextBlock, ContextBlockKind};
 use harness_types::{ContentHash, MemoryVersionRef};
@@ -14,6 +14,19 @@ pub enum RetrievalState {
     Empty,
     Degraded,
     Error,
+}
+
+/// Which of the store's two kinds of material answered a query.
+///
+/// Reported rather than assumed, because the two are not equivalent: durable memory is
+/// what someone chose to keep, and the conversation log is an excerpt of what was said.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryIndex {
+    /// What was published, extracted or asked to be kept.
+    Durable,
+    /// The conversation log: what was asked and answered.
+    Log,
 }
 
 #[derive(Clone, Debug)]
@@ -136,6 +149,22 @@ impl MemoryService {
         limit: usize,
         vector: Option<&dyn VectorAdapter>,
     ) -> Result<RetrievalResult, HarnessError> {
+        self.search_terms_in(principal, terms, limit, vector, None)
+            .await
+    }
+
+    /// Search, leaving one provenance kind out of the index.
+    ///
+    /// See [`MemoryService::search_durable_before_log`] for why a caller would want that;
+    /// this is the mechanism, and `exclude_provenance` is a kind, not a filter language.
+    async fn search_terms_in(
+        &self,
+        principal: &MemoryPrincipal,
+        terms: &[String],
+        limit: usize,
+        vector: Option<&dyn VectorAdapter>,
+        exclude_provenance: Option<&str>,
+    ) -> Result<RetrievalResult, HarnessError> {
         if principal.principal_id.trim().is_empty() {
             return Err(HarnessError::new(
                 ErrorCode::PolicyDenied,
@@ -148,12 +177,21 @@ impl MemoryService {
                 "memory search exceeds query/hit limits",
             ));
         }
-        let mut terms = terms.to_vec();
+        // Normalize and deduplicate here rather than trusting the caller. `normalize_terms`
+        // strips every non-alphanumeric character, so a term that arrived with a quote, a
+        // wildcard or an operator in it cannot reach the MATCH expression: an unbalanced
+        // quote made the whole query a syntax error, which the store reported as an index
+        // outage. A caller that passes raw user words also gets the diacritic folding the
+        // indexed mirror uses, instead of silently zero hits.
+        let mut normalized = Vec::with_capacity(terms.len());
+        for term in terms {
+            normalized.extend(normalize_terms(term));
+        }
+        let mut terms = normalized;
         terms.retain(|term| !term.is_empty());
         let mut seen = std::collections::HashSet::new();
         terms.retain(|term| seen.insert(term.clone()));
-        terms.truncate(MAX_QUERY_TERMS);
-        // The same byte budget the boundary always enforced, now measured on the
+        terms.truncate(MAX_QUERY_TERMS); // The same byte budget the boundary always enforced, now measured on the
         // terms that will actually be sent rather than on the caller's raw text.
         if terms.iter().map(String::len).sum::<usize>() > MAX_QUERY_BYTES {
             return Err(HarnessError::new(
@@ -175,9 +213,14 @@ impl MemoryService {
         let floor = MIN_TERM_OVERLAP.min(terms.len());
         let candidates = limit.saturating_mul(CANDIDATE_FACTOR).min(MAX_CANDIDATES);
         let outcome = self
-            .search_store(principal, &match_any(&terms), candidates)
-            .await;
-        let Some((records, revision)) = outcome else {
+            .search_store(
+                principal,
+                &match_any(&terms),
+                candidates,
+                exclude_provenance,
+            )
+            .await?;
+        let Some((records, mut revision)) = outcome else {
             return Ok(Self::unavailable());
         };
         let mut records = keep_relevant(records, &terms, floor);
@@ -185,13 +228,19 @@ impl MemoryService {
             // Nothing overlapped enough to trust. Fall back to the exact
             // conjunction: a caller asking for a specific phrase means it, and that
             // query can still match a document sharing every term.
+            //
+            // The fallback's revision replaces the first one. The runtime revalidates a
+            // contribution against it before dispatch, so returning rows read at one
+            // revision with the number from another makes the whole contribution be
+            // dropped in silence - which is the defect this path was written to fix.
             let outcome = self
-                .search_store(principal, &match_all(&terms), limit)
-                .await;
-            let Some((found, _)) = outcome else {
+                .search_store(principal, &match_all(&terms), limit, exclude_provenance)
+                .await?;
+            let Some((found, fallback_revision)) = outcome else {
                 return Ok(Self::unavailable());
             };
             records = found;
+            revision = fallback_revision;
         }
         // Breadth first, then the store's own ranking. A stable sort is what keeps
         // bm25 as the tie-break instead of replacing it.
@@ -209,30 +258,80 @@ impl MemoryService {
         Ok(self.finish(hits, revision, vector, detail).await)
     }
 
+    /// Answer from durable memory, and from the conversation log only if it is silent.
+    ///
+    /// The store holds two kinds of material. Durable memory is what someone chose to keep:
+    /// the user's own instructions, what the runtime observed, what an extraction published.
+    /// The conversation log is what was said, turn by turn, and it quotes the input it
+    /// recorded - so a directive and the log entry of the turn that carried it overlap
+    /// almost completely, and the log entry is not the weaker match: it holds the directive
+    /// plus part of the answer.
+    ///
+    /// Searching both at once therefore makes the user's instruction compete with its own
+    /// echo, decided by a bm25 tie-break. Measured: with a directive and its turn record
+    /// both present, the block injected for the directive's own words was sometimes the log
+    /// entry, which reaches the model framed as something the user was quoted saying rather
+    /// than as an instruction, and which expires at the retention cap.
+    ///
+    /// So the two are asked in order, not together. Durable memory first: if it holds
+    /// anything for this query, that is the answer, and no log entry can displace it. The
+    /// log is the fallback for what durable memory never captured - an answer that was given
+    /// and never promoted to knowledge - and when it answers, the caller is told, because a
+    /// log entry is an excerpt of what was said and not a verified fact.
+    ///
+    /// An outage is not a silence: a search that failed to run is returned as it is rather
+    /// than retried against the other index, which lives in the same table and would fail
+    /// the same way.
+    ///
+    /// # Errors
+    /// Fails when the query is unusable or the store refuses it.
+    pub async fn search_durable_before_log(
+        &self,
+        principal: &MemoryPrincipal,
+        terms: &[String],
+        limit: usize,
+        vector: Option<&dyn VectorAdapter>,
+    ) -> Result<(MemoryIndex, RetrievalResult), HarnessError> {
+        let durable = self
+            .search_terms_in(principal, terms, limit, vector, Some(TURN_PROVENANCE_KIND))
+            .await?;
+        if durable.state != RetrievalState::Empty {
+            return Ok((MemoryIndex::Durable, durable));
+        }
+        let log = self
+            .search_terms_in(principal, terms, limit, vector, None)
+            .await?;
+        Ok((MemoryIndex::Log, log))
+    }
+
     /// Run one MATCH expression under the store timeout.
     ///
-    /// `None` means the index could not answer at all - which is a different thing
-    /// from answering with no rows, and the caller reports it as such.
+    /// Three outcomes, not two. `Err` is a refusal and travels as one - flattening it
+    /// made an authorization failure indistinguishable from an empty answer, which is
+    /// why the caller used to report `no_term_overlap` for a query that was denied.
+    /// `Ok(None)` is an index that did not answer, which is an outage. `Ok(Some(..))` is
+    /// an answer, including an empty one.
     async fn search_store(
         &self,
         principal: &MemoryPrincipal,
         expression: &str,
         limit: usize,
-    ) -> Option<(Vec<super::StoredMemoryAssetRecord>, u64)> {
+        exclude_provenance: Option<&str>,
+    ) -> Result<Option<(Vec<super::StoredMemoryAssetRecord>, u64)>, HarnessError> {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            self.store
-                .search_memory(&store_principal(principal), expression, limit),
+            self.store.search_memory(
+                &store_principal(principal),
+                expression,
+                limit,
+                exclude_provenance,
+            ),
         )
         .await;
         match result {
-            Ok(Ok(found)) => Some(found),
-            Ok(Err(error)) if error.code() == ErrorCode::PolicyDenied => {
-                // Authorization is not an outage: keep it an error, not a retryable
-                // "unavailable", so a scope bug cannot look like a flaky index.
-                Some((Vec::new(), 0))
-            }
-            _ => None,
+            Ok(Ok(found)) => Ok(Some(found)),
+            Ok(Err(error)) => Err(to_harness_error(error)),
+            Err(_) => Ok(None),
         }
     }
 

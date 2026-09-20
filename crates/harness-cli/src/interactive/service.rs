@@ -882,6 +882,13 @@ fn report_memory(
         Ok(memory::RememberOutcome::Stored(asset_id)) => send(SessionEvent::Notice {
             message: format!("memory: remembered as {asset_id}"),
         }),
+        Ok(memory::RememberOutcome::StoredButUnpruned { asset_id, reason }) => {
+            send(SessionEvent::Notice {
+                message: format!(
+                    "memory: remembered as {asset_id}, but the turn log was not trimmed ({reason})"
+                ),
+            });
+        }
         Ok(memory::RememberOutcome::Duplicate(asset_id)) => send(SessionEvent::Notice {
             message: format!("memory: already remembered as {asset_id}"),
         }),

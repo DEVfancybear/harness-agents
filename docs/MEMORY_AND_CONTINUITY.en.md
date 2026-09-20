@@ -389,3 +389,40 @@ Example fixture, without a real model call:
 7. Fix B, integrate, rerun tests on the final revision, settle the task, then asynchronously propose a reusable project lesson.
 
 Gate P1/P2 on durable reconstruction, P3 on actual tool evidence, P4 on extraction/retrieval degradation, P5 on cross-agent ownership/delivery, and P7 on backup/migration/retention. C01–C30 and plugin K01–K14 are acceptance specifications only until executable tests and fresh results exist.
+
+## 19. Conversation log: the contract as implemented
+
+This section records a contract decision that was measured, not a proposed design. Long-term chat memory used to accept only "user directives": an input that was not a question was stored as a `user_instruction` asset, and the model's answer was not stored anywhere. The measured consequence: in a new session, "what did I ask you in the previous session?" was answered with "I have no record of that", while the data sat in the store. Memory has been widened into a **conversation log**, and that carries the constraints below.
+
+### 19.1. Two kinds of material, two indexes
+
+The store holds two kinds of material that answer two different questions:
+
+| Kind | Answers | Examples | Lifetime |
+|---|---|---|---|
+| Durable memory | "what do I know" | user instructions, runtime observations, derived L2 | does not expire |
+| Conversation log | "what did we say" | one asset per turn: `asked:`, `session:`, `answered:` | at most 200 records per project |
+
+A turn record contains the input verbatim, so it and the directive that stored the same input overlap almost completely - and the record also holds part of the answer. Asking both in one search makes the user's instruction compete with its own echo, decided by a bm25 tie-break. Measured: the block injected for the directive's own words was sometimes the turn record, so the user's instruction reached the model framed as something they were quoted saying rather than as an instruction, and it expires at the retention cap.
+
+The keyword search therefore asks **durable memory first**, and asks the log only when durable memory holds nothing for that query. When the log answers, the transcript says so, because a record is an excerpt of what was said. A question *about* the conversation ("what did I ask you in the previous session?") takes its own path: it reads the log newest first, not by term overlap.
+
+### 19.2. Evidence and retention constraints
+
+- A turn happened: the runtime observed the question arrive and the answer go out, so the record carries `RuntimeObserved` + `VerifiedObservation` and is `Active`. Recording it as a `candidate` made the whole feature invisible, because a candidate is not injectable.
+- `answered:` keeps at most 200 characters and is an **excerpt of model output**, not a verified fact. The memory block's heading says so outright, so a reply is not read as verified knowledge and hardened into durable memory.
+- An input that looks like it carries a credential is not recorded at all, rather than recorded with its substance redacted away.
+- The 200-record cap applies only to assets this path wrote (`provenance_kind = session_turn`). A user directive is not a log entry and is never retired by a log limit.
+- One turn retires at most 8 over-cap records, so work on the answer path does not scale with the length of the log.
+
+### 19.3. The log is not a source of durable knowledge
+
+A turn record is the one asset guaranteed to be retired, and derived memory dies with its source through transitive invalidation. Therefore:
+
+- No path may accept a turn record as a source: both `derive_l2` (summarize) and `write_version` with `source_assets` (semantic merge) refuse it with `InvalidPayload` and a reason. Refusing when the source is chosen is far clearer than a summary that disappears two hundred turns later with no event to explain it.
+- The retention sweep also leaves alone a record that is the source of a live asset: that record is **pinned** and reported. A store written before this rule still holds such edges, so this is a safety net for legacy data, not the main path.
+- Note: if a directive changes, an older turn record still holds what was said at the time. That is correct for a record, and it is why the keyword path does not use the log as its answer.
+
+### 19.4. Consequence for acceptance
+
+C30 and the anti-forgetting acceptance suite in section 12 read under this contract: "does not forget" means a question about the past is answered from the log, while a question about a subject is answered from durable memory. A suite that checks only durable memory misses half of it, and a suite that checks only the log mistakes a record for knowledge - two different defects, needing two different assertions.

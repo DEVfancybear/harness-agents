@@ -658,7 +658,8 @@ Khi bật, một lượt làm hai việc có giới hạn:
 - **trước khi gửi request**, text của bạn là query truy xuất; phần memory của workspace này
   khớp được sẽ vào context mà model nhận, kèm đúng version memory của từng block;
 - **sau lượt**, text mà journal đã admit được lưu **một lần** thành asset memory đã xác nhận,
-  scope theo project. Chỉ text bạn gửi được lưu — không bao giờ lưu câu trả lời của model.
+  scope theo project; và **một bản ghi cho lượt đó** được ghi vào nhật ký hội thoại (xem
+  "Cái gì được nhớ" bên dưới — nhật ký có giữ một trích đoạn câu trả lời của model).
 
 Workspace root giữ **một** project identity trong store, nên memory của lần chạy trước vẫn đọc
 được ở lần chạy sau, kể cả terminal mới, session mới hay task mới.
@@ -675,16 +676,43 @@ vựng, không phải bằng chứng là đúng chủ đề — nếu không có
 không tìm thấy" thành "tìm thấy thứ sai", mà cái sau tệ hơn. Nếu không ứng viên nào đủ ngưỡng, app
 quay về đúng phép giao cũ, nên câu hỏi đòi chính xác vẫn chính xác.
 
+**Hai loại vật liệu, hỏi theo thứ tự.** Store giữ **durable memory** (điều bạn dặn, điều runtime
+quan sát, L2 tổng hợp — không hết hạn) và **nhật ký hội thoại** (mỗi lượt một bản ghi). Bản ghi
+lượt chứa nguyên văn input của bạn, nên nó và chỉ dẫn ghi cùng input đó trùng nhau gần hết, và nó
+còn chứa thêm một phần câu trả lời. Vì vậy app hỏi **durable memory trước**; chỉ khi durable
+memory không có gì cho câu hỏi đó thì mới hỏi nhật ký. Trước đây hai thứ được hỏi cùng lúc, và đo
+được rằng khối được inject cho đúng từ ngữ của chỉ dẫn có lúc là **bản ghi lượt** — chỉ dẫn của
+bạn đến model trong dạng "thứ bạn đã được trích dẫn là đã nói" thay vì một chỉ dẫn. Khi nhật ký là
+thứ trả lời, transcript nói rõ: `... injected from the conversation log, not from durable memory`.
+
 Mỗi lượt vẫn in ra điều đã xảy ra (`memory: 1 hit(s), 1 block(s) injected`). Hai loại "rỗng" được
 nói khác nhau: `nothing matching this question yet (no term overlap)` nghĩa là có tìm nhưng không
 khớp, còn `nothing to search for in this message` nghĩa là tin nhắn không có gì để tra. Lượt
 headless báo cùng thông tin trong `--json`, ở khoá `memory`.
 
-**Cái gì được nhớ (đã đổi).** Chỉ **chỉ dẫn và khai báo** được lưu. Một **câu hỏi** thì không:
-nó là bạn đang hỏi, không phải bạn đang dặn, và trước đây mỗi câu hỏi thành một asset
-`user_instruction` đã-xác-nhận — đó là cách corpus đầy câu hỏi rồi chúng lấn át câu trả lời. Khi
-một input bị bỏ qua, app **nói ra** (`memory: not stored (a question is not an instruction)`)
-chứ không im lặng.
+**Cái gì được nhớ (đã đổi).** Hai thứ khác nhau được ghi, và chúng không thay thế nhau:
+
+- **Durable memory**: chỉ **chỉ dẫn và khai báo**. Một **câu hỏi** thì không: nó là bạn đang hỏi,
+  không phải bạn đang dặn, và trước đây mỗi câu hỏi thành một asset `user_instruction`
+  đã-xác-nhận — đó là cách corpus đầy câu hỏi rồi chúng lấn át câu trả lời. Khi một input bị bỏ
+  qua, app **nói ra** (`memory: not stored (a question is not an instruction)`) chứ không im lặng.
+- **Nhật ký hội thoại**: **mọi** lượt, kể cả lượt chỉ có câu hỏi. Mỗi bản ghi giữ
+  `asked:` (nguyên văn input, tối đa 200 ký tự), `session:` và `answered:` (trích đoạn tối đa 200
+  ký tự câu trả lời của model). Đây là thứ trả lời câu hỏi *về* cuộc hội thoại — "session trước
+  tôi hỏi bạn những gì?" — và câu đó đi đường riêng: đọc nhật ký theo thứ tự mới nhất trước, không
+  theo độ trùng từ khóa.
+
+Ba điều cần biết về nhật ký, vì chúng là giới hạn thật chứ không phải chi tiết nội bộ:
+
+- `answered:` là **trích đoạn output của model**, không phải sự thật đã kiểm chứng. Heading của
+  khối memory nói thẳng điều đó, để một câu trả lời không bị đọc như tri thức đã xác minh.
+- Mỗi project giữ tối đa **200** bản ghi, cũ nhất bị thu hồi trước, và mỗi lượt chỉ thu hồi tối
+  đa **8** bản ghi để không làm chậm câu trả lời. Chỉ dẫn bạn dặn **không** phải mục log nên không
+  bao giờ bị ngưỡng này thu hồi.
+- **Không gì bền được dựng trên một bản ghi lượt.** `ha memory summarize` và semantic merge từ
+  chối lấy bản ghi lượt làm nguồn, kèm lý do: bản ghi sẽ hết hạn, và memory dẫn xuất chết theo
+  nguồn của nó. Bản ghi đang là nguồn của một asset còn sống cũng không bị thu hồi, và app báo
+  `stored_but_unpruned` khi ngưỡng không đạt được vì lý do đó.
 
 Nói cùng một câu hai lần là **một** memory: asset cũ được giữ nguyên id, nguyên version và
 nguyên content hash, chỉ ghi thêm event nguồn. Audit không mất, và không sinh bản gần trùng để

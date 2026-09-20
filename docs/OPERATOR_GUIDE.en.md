@@ -514,7 +514,9 @@ With it on, one turn does two bounded things:
   that matches is added to the context the model receives, together with the exact memory
   version each block came from;
 - **after the turn**, the text the journal admitted is stored once as a confirmed,
-  project-scoped memory asset. Only text you sent is stored — never the model's answer.
+  project-scoped memory asset, and **one record of that turn** is written to the
+  conversation log (see "What gets remembered" below — the log keeps an excerpt of the
+  model's answer).
 
 The workspace root keeps one project identity in the store, so memory written by one run
 is readable by the next one, including a new terminal, a new session or a new task.
@@ -532,17 +534,50 @@ without it a wider query would trade a silent miss for a confident wrong answer 
 worse. If nothing clears the floor it falls back to the exact conjunction, so a question
 that means a specific phrase still gets one.
 
+**Two kinds of material, asked in order.** The store holds **durable memory** (what you
+asked to keep, what the runtime observed, derived L2 — it does not expire) and the
+**conversation log** (one record per turn). A turn record contains your input verbatim, so
+it and the directive that stored the same input overlap almost completely, and the record
+also holds part of the answer. The app therefore asks **durable memory first**; it asks the
+log only when durable memory holds nothing for that question. The two used to be asked
+together, and it was measured that the block injected for a directive's own words was
+sometimes the **turn record** — your instruction arriving framed as something you were
+quoted saying rather than as an instruction. When the log is what answered, the transcript
+says so: `... injected from the conversation log, not from durable memory`.
+
 Every turn prints what happened (`memory: 1 hit(s), 1 block(s) injected`). The two kinds of
 empty are named differently: `nothing matching this question yet (no term overlap)` means it
 searched and found nothing, `nothing to search for in this message` means the message held
 nothing to search for. A headless run reports the same in its `--json` result under
 `memory`.
 
-**What gets remembered (changed).** Only **directives and statements**. A **question** is
-not: it is you asking, not you telling, and storing each one as a confirmed
-`user_instruction` asset is how the corpus filled with questions that then outranked the
-answers. When an input is skipped the app says so (`memory: not stored (a question is not an
-instruction)`) instead of staying silent.
+**What gets remembered (changed).** Two different things are written, and neither replaces
+the other:
+
+- **Durable memory**: only **directives and statements**. A **question** is not: it is you
+  asking, not you telling, and storing each one as a confirmed `user_instruction` asset is
+  how the corpus filled with questions that then outranked the answers. When an input is
+  skipped the app says so (`memory: not stored (a question is not an instruction)`) instead
+  of staying silent.
+- **The conversation log**: **every** turn, including one that was only a question. Each
+  record keeps `asked:` (your input verbatim, at most 200 characters), `session:`, and
+  `answered:` (at most 200 characters of the model's answer). This is what answers a
+  question *about* the conversation — "what did I ask you in the previous session?" — and
+  that question takes its own path: the log is read newest first, not by term overlap.
+
+Three things to know about the log, because they are real limits rather than internal
+detail:
+
+- `answered:` is an **excerpt of model output**, not a verified fact. The memory block's
+  heading says so outright, so a reply is not read as verified knowledge.
+- Each project keeps at most **200** records, oldest retired first, and one turn retires at
+  most **8** of them so an answer is never delayed by a long log. A directive you gave is
+  **not** a log entry and is never retired by this cap.
+- **Nothing durable is built on a turn record.** `ha memory summarize` and semantic merge
+  refuse a turn record as a source, with the reason: the record will expire and derived
+  memory dies with its source. A record that is already the source of a live asset is not
+  retired either, and the app reports `stored_but_unpruned` when the cap cannot be reached
+  for that reason.
 
 Saying the same thing twice is **one** memory: the existing asset keeps its id, its version
 and its content hash, and the new source event is recorded on it. The audit trail survives
