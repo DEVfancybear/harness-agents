@@ -380,9 +380,36 @@ fn i03_headless_rejects_the_headless_only_flags_and_keeps_stdout_plain() {
 // I03/I12 - a headless turn through the real adapter
 // ---------------------------------------------------------------------------
 
+/// Finish a fixture response without racing the client's last read on Windows.
+///
+/// Dropping the accepted socket immediately after `flush` can turn the close into
+/// a reset. The provider then reports a transport error even though the fixture
+/// counted the request, and a bounded multi-request fixture has already closed its
+/// listener before the retry. Half-close the response and keep the read side alive
+/// until the client acknowledges the close (or a short fixture-only timeout).
+fn finish_fixture_response(socket: &mut std::net::TcpStream, response: &[u8]) {
+    use std::io::{Read, Write};
+
+    socket.write_all(response).expect("fixture writes");
+    socket.flush().expect("fixture flushes");
+    socket
+        .shutdown(std::net::Shutdown::Write)
+        .expect("fixture half-closes the response");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("fixture sets its close timeout");
+    let mut trailing = [0_u8; 256];
+    loop {
+        match socket.read(&mut trailing) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+}
+
 /// One-shot SSE fixture server on a real socket.
 fn sse_fixture(text: &'static str) -> (String, std::thread::JoinHandle<String>) {
-    use std::io::{Read, Write};
+    use std::io::Read;
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
     let address = listener.local_addr().expect("fixture address");
@@ -401,22 +428,13 @@ fn sse_fixture(text: &'static str) -> (String, std::thread::JoinHandle<String>) 
             body.len(),
             body
         );
-        socket
-            .write_all(response.as_bytes())
-            .expect("fixture writes");
-        socket.flush().ok();
+        finish_fixture_response(&mut socket, response.as_bytes());
         String::from_utf8_lossy(&request).into_owned()
     });
     (format!("http://{address}/chat/completions"), handle)
 }
 
-/// Transport failures this sandbox is known to produce intermittently: a
-/// freshly started loopback listener refuses a connection for a few seconds.
-/// The retry below is keyed on that exact signature only, so a real failure
-/// still fails on the first attempt.
-const LOOPBACK_WOBBLE: &str = "error sending request for url";
-
-fn attempt_headless_turn() -> Result<(CliRun, String), String> {
+fn attempt_headless_turn() -> (CliRun, String) {
     let (endpoint, server) = sse_fixture("fixture says hello");
     let sandbox = Sandbox::new();
     let project = sandbox.path().join("project");
@@ -440,25 +458,12 @@ fn attempt_headless_turn() -> Result<(CliRun, String), String> {
         .expect("ha binary runs");
     let run = CliRun::from_output(&output);
     let request = server.join().expect("fixture server finishes");
-    if run.code() != 0 && run.stderr.contains(LOOPBACK_WOBBLE) {
-        return Err(run.stderr);
-    }
-    Ok((run, request))
+    (run, request)
 }
 
 #[test]
 fn i03_headless_turn_runs_through_the_real_adapter_and_keeps_the_key_out_of_output() {
-    let mut attempt = 0;
-    let (run, request) = loop {
-        attempt += 1;
-        match attempt_headless_turn() {
-            Ok(success) => break success,
-            Err(wobble) if attempt < 3 => {
-                eprintln!("attempt {attempt} hit the known loopback wobble: {wobble}");
-            }
-            Err(wobble) => panic!("loopback fixture never became reachable: {wobble}"),
-        }
-    };
+    let (run, request) = attempt_headless_turn();
 
     assert_eq!(run.code(), 0, "stderr was: {}", run.stderr);
     let parsed: serde_json::Value =
@@ -534,31 +539,12 @@ fn i12_headless_turn_without_provider_configuration_fails_closed() {
     );
 }
 
-/// Prove a fresh loopback listener is reachable before the app connects to it.
-fn warm_up_loopback(endpoint: &str) {
-    let authority = endpoint
-        .strip_prefix("http://")
-        .and_then(|rest| rest.split('/').next())
-        .expect("the fixture endpoint is http");
-    let deadline = Instant::now() + Duration::from_mins(1);
-    loop {
-        if std::net::TcpStream::connect(authority).is_ok() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the fixture listener never accepted a warm-up connection"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 /// SSE fixture that serves several requests and returns the full request bodies.
 fn sse_fixture_multi(
     text: &'static str,
     requests: usize,
 ) -> (String, std::thread::JoinHandle<Vec<String>>) {
-    use std::io::{Read, Write};
+    use std::io::Read;
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
     let address = listener.local_addr().expect("fixture address");
@@ -615,10 +601,7 @@ fn sse_fixture_multi(
                 body.len(),
                 body
             );
-            socket
-                .write_all(response.as_bytes())
-                .expect("fixture writes");
-            socket.flush().ok();
+            finish_fixture_response(&mut socket, response.as_bytes());
             bodies.push(String::from_utf8_lossy(&request).into_owned());
         }
         bodies
@@ -629,10 +612,6 @@ fn sse_fixture_multi(
 #[test]
 fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
     let (endpoint, server) = sse_fixture_multi("fixture answer", 2);
-    // This sandbox occasionally refuses the *first* connection to a fresh loopback
-    // listener. Warming the listener up first makes the app's own connect
-    // deterministic without weakening anything it has to prove.
-    warm_up_loopback(&endpoint);
     let sandbox = Sandbox::new();
     let project = sandbox.path().join("project");
     std::fs::create_dir_all(&project).expect("project dir");
@@ -649,26 +628,7 @@ fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
             .output()
             .expect("ha binary runs")
     };
-    // The warm-up above makes the first connect deterministic, but a later turn can
-    // still meet the same doubt, so every turn retries only on that signature. A
-    // genuine failure returns immediately.
-    let run_turn = |arguments: Vec<&str>| {
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let run = CliRun::from_output(&run_headless(arguments.clone()));
-            if run.code() == 0 || !run.stderr.contains(LOOPBACK_WOBBLE) || attempt >= 10 {
-                return run;
-            }
-            // Under load this environment can refuse loopback connections for a few
-            // hundred milliseconds, so back off instead of retrying immediately.
-            std::thread::sleep(std::time::Duration::from_millis(50 * (1 << attempt.min(6))));
-            eprintln!(
-                "attempt {attempt} hit the known loopback wobble: {}",
-                run.stderr
-            );
-        }
-    };
+    let run_turn = |arguments: Vec<&str>| CliRun::from_output(&run_headless(arguments));
 
     let first = run_turn(vec![
         "chat",
@@ -1020,21 +980,8 @@ fn session_status(sandbox: &Sandbox, store: &Path, session: &str) -> serde_json:
 
 #[test]
 fn i13_a_hard_kill_mid_turn_leaves_one_admitted_input_and_no_claimed_success() {
-    // The kill scenario is repeated only for the known loopback wobble, which is
-    // this sandbox refusing a fresh loopback connection: that is a transport
-    // failure before the turn started, not a result about the kill. Anything else
-    // fails on the first attempt.
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        match hard_kill_scenario() {
-            Ok(()) => break,
-            Err(stderr) if stderr.contains(LOOPBACK_WOBBLE) && attempt < 4 => {
-                eprintln!("attempt {attempt} hit the known loopback wobble: {stderr}");
-            }
-            Err(stderr) => panic!("the killed run never reached the provider: {stderr}"),
-        }
-    }
+    hard_kill_scenario()
+        .unwrap_or_else(|stderr| panic!("the killed run never reached the provider: {stderr}"));
 }
 
 /// One kill-then-inspect run in its own sandbox. `Err` carries the child stderr
@@ -1196,37 +1143,26 @@ fn hard_kill_scenario() -> Result<(), String> {
     Ok(())
 }
 
-/// One successful headless turn with a fresh one-shot fixture, retried only on
-/// the known loopback wobble.
+/// One successful headless turn with a fresh one-shot fixture.
 fn follow_up_turn(sandbox: &Sandbox, project: &Path) -> Result<CliRun, String> {
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        let (endpoint, server) = sse_fixture("handled in a new session");
-        let run = run_headless_raw(
-            sandbox,
-            project,
-            &[
-                "chat",
-                "--headless",
-                "--prompt",
-                "continue after the kill",
-                "--json",
-            ],
-            Some((&endpoint, "fixture-model", "fixture-secret-value")),
-        );
-        let _ = server.join().expect("fixture server finishes");
-        if run.code() == 0 {
-            return Ok(run);
-        }
-        if run.stderr.contains(LOOPBACK_WOBBLE) && attempt < 3 {
-            eprintln!(
-                "attempt {attempt} hit the known loopback wobble: {}",
-                run.stderr
-            );
-            continue;
-        }
-        return Err(run.stderr);
+    let (endpoint, server) = sse_fixture("handled in a new session");
+    let run = run_headless_raw(
+        sandbox,
+        project,
+        &[
+            "chat",
+            "--headless",
+            "--prompt",
+            "continue after the kill",
+            "--json",
+        ],
+        Some((&endpoint, "fixture-model", "fixture-secret-value")),
+    );
+    let _ = server.join().expect("fixture server finishes");
+    if run.code() == 0 {
+        Ok(run)
+    } else {
+        Err(run.stderr)
     }
 }
 
@@ -1253,30 +1189,19 @@ fn i04_the_binary_installed_under_a_unicode_path_follows_the_caller_directory() 
             "the caller directory is not a Git repository"
         );
 
-        let mut attempt = 0;
-        let run = loop {
-            attempt += 1;
-            let (endpoint, server) = sse_fixture("the installed binary answers");
-            let output = std::process::Command::new(&installed)
-                .args(["chat", "--headless", "--prompt", "hello", "--json"])
-                .current_dir(&caller)
-                .env("HA_HOME", sandbox.path())
-                .env("HA_PROVIDER_ENDPOINT", &endpoint)
-                .env("HA_PROVIDER_MODEL", "fixture-model")
-                .env("DEEPSEEK_API_KEY", "fixture-secret-value")
-                .stdin(Stdio::null())
-                .output()
-                .expect("the installed binary runs");
-            let run = CliRun::from_output(&output);
-            let _ = server.join().expect("fixture server finishes");
-            if run.code() == 0 || !run.stderr.contains(LOOPBACK_WOBBLE) || attempt >= 3 {
-                break run;
-            }
-            eprintln!(
-                "attempt {attempt} hit the known loopback wobble: {}",
-                run.stderr
-            );
-        };
+        let (endpoint, server) = sse_fixture("the installed binary answers");
+        let output = std::process::Command::new(&installed)
+            .args(["chat", "--headless", "--prompt", "hello", "--json"])
+            .current_dir(&caller)
+            .env("HA_HOME", sandbox.path())
+            .env("HA_PROVIDER_ENDPOINT", &endpoint)
+            .env("HA_PROVIDER_MODEL", "fixture-model")
+            .env("DEEPSEEK_API_KEY", "fixture-secret-value")
+            .stdin(Stdio::null())
+            .output()
+            .expect("the installed binary runs");
+        let run = CliRun::from_output(&output);
+        let _ = server.join().expect("fixture server finishes");
         assert_eq!(
             run.code(),
             0,

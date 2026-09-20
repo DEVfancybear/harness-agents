@@ -176,6 +176,19 @@ impl LineEditor {
         self.suggestion.clear();
     }
 
+    /// Remove a just-submitted command when it carried a secret inline.
+    ///
+    /// Normal submissions enter recall history in [`Self::submit`] before the
+    /// controller knows which command they name. `/key <value>` is the exception:
+    /// the command remains supported, but Up must never reveal it again.
+    pub fn forget_submission(&mut self, submitted: &str) {
+        if self.history.last().is_some_and(|entry| entry == submitted) {
+            self.history.pop();
+        }
+        self.history_index = None;
+        self.draft.clear();
+    }
+
     /// Start collecting a secret: one masked line, no completion, no picker.
     ///
     /// Called only from an explicit user request. Nothing here touches the

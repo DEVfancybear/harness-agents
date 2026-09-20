@@ -103,9 +103,9 @@ pub trait SessionPort: Send {
     ///
     /// The file is the source of truth because the credential resolver re-reads it
     /// at call time; nothing has to restart for the next turn to use it. The
-    /// returned event carries the source *name*, never the value.
-    fn save_credential(&mut self, _key: &str) -> Option<SessionEvent> {
-        None
+    /// returned source carries the source *name*, never the value.
+    fn save_credential(&mut self, _key: &str) -> Result<CredentialSource, String> {
+        Err("this backend cannot save a provider credential".to_owned())
     }
 }
 
@@ -640,16 +640,11 @@ impl SessionPort for AgentSessionService {
         self.configured().err()
     }
 
-    fn save_credential(&mut self, key: &str) -> Option<SessionEvent> {
+    fn save_credential(&mut self, key: &str) -> Result<CredentialSource, String> {
         let path = credentials::resolve_file(&self.environment, &self.data_dir);
-        match credentials::save(&path, key) {
-            Ok(protection) => Some(SessionEvent::ProviderConfigured {
-                source: CredentialSource::File { path, protection },
-            }),
-            Err(error) => Some(SessionEvent::RecoverableError {
-                message: format!("the key could not be saved: {error}"),
-            }),
-        }
+        credentials::save(&path, key)
+            .map(|protection| CredentialSource::File { path, protection })
+            .map_err(|error| format!("the key could not be saved: {error}"))
     }
 
     fn list_sessions(&mut self) {

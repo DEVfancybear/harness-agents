@@ -291,6 +291,33 @@ mod tests {
         panic!("fixture listener at {address} refused every readiness probe");
     }
 
+    /// Accept connections until one sends a request head.
+    ///
+    /// A readiness probe connects and closes without sending anything, and it must
+    /// not consume the single scripted response, so the loop accepts again. A reset
+    /// is the same kind of probe: the client dropped the connection before sending a
+    /// head. Failing on either was measured as `fixture reads: ...` on this host,
+    /// which is a probe artifact rather than the behavior under test.
+    ///
+    /// The pattern nesting is real and cannot be unnested: `timeout(read)` yields
+    /// `Result<Result<usize>>`, so the two `Err` levels mean different things and
+    /// only this arm treats them alike.
+    #[allow(
+        clippy::unnested_or_patterns,
+        reason = "timeout over a read is genuinely a nested Result"
+    )]
+    async fn accept_the_request(listener: TcpListener) -> tokio::net::TcpStream {
+        loop {
+            let (mut candidate, _) = listener.accept().await.expect("fixture accepts");
+            let mut probe = [0_u8; 1];
+            match tokio::time::timeout(Duration::from_millis(250), candidate.read(&mut probe)).await
+            {
+                Ok(Ok(count)) if count > 0 => return candidate,
+                Err(_) | Ok(Err(_)) | Ok(Ok(_)) => {}
+            }
+        }
+    }
+
     fn provider_request() -> ProviderRequest {
         ProviderRequest::new(
             RequestId::generate(),
@@ -360,22 +387,7 @@ mod tests {
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let _ = ready_sender.send(());
-            let mut socket = loop {
-                let (mut candidate, _) = listener.accept().await.expect("fixture accepts");
-                let mut probe = [0_u8; 1];
-                // A readiness probe connects and closes; it must not consume the
-                // single scripted response, so the loop accepts again. A reset is
-                // the same kind of probe: the client dropped the connection before
-                // sending a head. Failing on it was measured as `fixture reads: ...`
-                // on this host, which is a probe artifact, not the behavior under
-                // test.
-                match tokio::time::timeout(Duration::from_millis(250), candidate.read(&mut probe))
-                    .await
-                {
-                    Ok(Ok(0)) | Err(_) | Ok(Err(_)) => {}
-                    Ok(Ok(_)) => break candidate,
-                }
-            };
+            let mut socket = accept_the_request(listener).await;
             socket
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use harness_types::InputId;
 
 use super::bootstrap::LaunchContext;
+use super::credentials::CredentialSource;
 use super::events::{
     AppPhase, HistoryItem, Key, Modal, RunOutcome, SessionCandidate, SessionEvent, ToolState,
     UiState,
@@ -395,27 +396,6 @@ impl InteractiveController {
     #[allow(clippy::too_many_lines, reason = "one arm per session event")]
     fn apply_event(&mut self, event: SessionEvent, effects: &mut Vec<Effect>) {
         match event {
-            SessionEvent::ProviderConfigured { source } => {
-                // The key value is not on this event by construction. A producer
-                // that saves a credential out of band (the headless path, a future
-                // plugin) still has to tell the UI, so the state is refreshed here
-                // as it is after `/key`.
-                match self.context.credential_saved(source) {
-                    Ok(context) => {
-                        self.setup_required = context.setup_required;
-                        self.setup_hint = context.setup_hint();
-                        self.context = context;
-                    }
-                    Err(error) => {
-                        self.push_history(
-                            effects,
-                            HistoryItem::Error {
-                                message: format!("the saved credential cannot be used: {error}"),
-                            },
-                        );
-                    }
-                }
-            }
             SessionEvent::Accepted { input_id } => {
                 self.flush_stream(effects);
                 self.push_history(
@@ -732,8 +712,11 @@ impl InteractiveController {
                     .collect();
                 self.reference("/config", lines, &mut effects);
             }
-            "/key" => match argument {
-                Some(value) => return self.save_key(value),
+            "/key" => match raw_argument {
+                Some(value) => {
+                    self.editor.forget_submission(trimmed);
+                    return self.save_key(value);
+                }
                 None if self.phase.has_active_run() => {
                     self.push_history(
                         &mut effects,
@@ -753,7 +736,7 @@ impl InteractiveController {
                                 "paste the API key and press Enter; it is masked, never stored in \
                                       history, and saved to the credential file so the next launch \
                                       starts configured. Esc cancels. /key <value> also works but \
-                                      leaves the value in this terminal's history"
+                                      shows the value while it is typed"
                                     .to_owned(),
                         },
                     );
@@ -888,28 +871,18 @@ impl InteractiveController {
                 Effect::Redraw,
             ];
         }
-        let Some(SessionEvent::ProviderConfigured { source }) = self.service.save_credential(key)
-        else {
-            self.editor.cancel_secret();
-            return vec![
-                Effect::History(HistoryItem::Error {
-                    message: "the key could not be saved; the credential file was left unchanged"
-                        .to_owned(),
-                }),
-                Effect::Redraw,
-            ];
+        let source = match self.service.save_credential(key) {
+            Ok(source) => source,
+            Err(message) => {
+                self.editor.cancel_secret();
+                return vec![
+                    Effect::History(HistoryItem::Error { message }),
+                    Effect::Redraw,
+                ];
+            }
         };
-        match self.context.credential_saved(source.clone()) {
-            Ok(context) => {
-                self.setup_required = context.setup_required;
-                self.setup_hint = context.setup_hint();
-                self.header = context.header_lines();
-                self.header
-                    .push(format!("Service: {}", self.service.label()));
-                self.context = context;
-                if matches!(self.phase, AppPhase::SetupRequired | AppPhase::Booting) {
-                    self.phase = AppPhase::Ready;
-                }
+        match self.activate_credential(source.clone()) {
+            Ok(()) => {
                 let mut effects = Vec::new();
                 self.push_history(
                     &mut effects,
@@ -937,6 +910,25 @@ impl InteractiveController {
                 effects
             }
         }
+    }
+
+    /// Refresh every controller view of provider readiness from one saved source.
+    /// Phase, setup hint and header are refreshed together so they cannot disagree.
+    fn activate_credential(&mut self, source: CredentialSource) -> Result<(), String> {
+        let context = self
+            .context
+            .credential_saved(source)
+            .map_err(|error| error.to_string())?;
+        self.setup_required = context.setup_required;
+        self.setup_hint = context.setup_hint();
+        self.header = context.header_lines();
+        self.header
+            .push(format!("Service: {}", self.service.label()));
+        self.context = context;
+        if matches!(self.phase, AppPhase::SetupRequired | AppPhase::Booting) {
+            self.phase = AppPhase::Ready;
+        }
+        Ok(())
     }
 
     /// Continue from one session id, reporting the outcome like the pre-T02 code.
@@ -1203,18 +1195,17 @@ mod tests {
         fn limits(&self) -> TurnBounds {
             self.recorded.limits()
         }
-        fn save_credential(&mut self, key: &str) -> Option<SessionEvent> {
-            let path = self
-                .data_dir
-                .join(crate::interactive::credentials::CREDENTIAL_FILE_NAME);
+        fn save_credential(
+            &mut self,
+            key: &str,
+        ) -> Result<crate::interactive::credentials::CredentialSource, String> {
+            let path = crate::interactive::credentials::resolve_file(
+                &crate::interactive::paths::LaunchEnvironment::default(),
+                &self.data_dir,
+            );
             let protection = crate::interactive::credentials::save(&path, key)
                 .expect("the fixture credential directory is writable");
-            Some(SessionEvent::ProviderConfigured {
-                source: crate::interactive::credentials::CredentialSource::File {
-                    path,
-                    protection,
-                },
-            })
+            Ok(crate::interactive::credentials::CredentialSource::File { path, protection })
         }
     }
 
@@ -1282,6 +1273,13 @@ mod tests {
         }
     }
 
+    fn saved_credential_path(context: &LaunchContext) -> std::path::PathBuf {
+        crate::interactive::credentials::resolve_file(
+            &crate::interactive::paths::LaunchEnvironment::default(),
+            &context.paths.data_dir,
+        )
+    }
+
     /// K01: the whole `/key` chain, driven by keys rather than by calling the
     /// handler directly — editor, controller, the port that saves the file, and the
     /// bootstrap refresh that clears the setup gate.
@@ -1335,10 +1333,7 @@ mod tests {
         recorded: &RecordingPort,
     ) {
         let _ = controller.handle_key(Key::Enter);
-        let path = context
-            .paths
-            .data_dir
-            .join(crate::interactive::credentials::CREDENTIAL_FILE_NAME);
+        let path = saved_credential_path(context);
         assert!(path.is_file(), "the key was written to {}", path.display());
         assert!(
             !controller.ui_state().setup_required,
@@ -1416,14 +1411,51 @@ mod tests {
             "> ",
             "the prompt is a normal one again"
         );
-        let path = context
-            .paths
-            .data_dir
-            .join(crate::interactive::credentials::CREDENTIAL_FILE_NAME);
+        let path = saved_credential_path(context);
         assert_eq!(
             std::fs::read_to_string(&path).expect("credential file"),
             "DEEPSEEK_API_KEY=\"sk-controller-fixture\"\n",
             "Esc must not overwrite the stored key"
+        );
+    }
+
+    #[test]
+    fn k01_inline_key_uses_the_full_remainder_and_is_not_recallable() {
+        let (_temp, context) = context(false);
+        let channel = SessionChannel::new();
+        let port = SavingPort {
+            recorded: RecordingPort::default(),
+            data_dir: context.paths.data_dir.clone(),
+        };
+        let mut controller = InteractiveController::new(&context, Box::new(port), channel, true);
+        controller.boot_lines();
+
+        let command = "/key sk-with an intentional space";
+        let effects = submit_text(&mut controller, command);
+        assert!(
+            effects_to_plain(&effects)
+                .join("\n")
+                .contains("API key saved"),
+            "{effects:#?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(saved_credential_path(&context)).expect("credential file"),
+            "DEEPSEEK_API_KEY=\"sk-with an intentional space\"\n"
+        );
+
+        let _ = controller.handle_key(Key::Up);
+        assert_eq!(
+            controller.prompt(),
+            "> ",
+            "Up must not recall an inline credential"
+        );
+        assert!(
+            !controller
+                .editor
+                .history()
+                .iter()
+                .any(|entry| entry == command),
+            "the inline credential must not remain in editor history"
         );
     }
 

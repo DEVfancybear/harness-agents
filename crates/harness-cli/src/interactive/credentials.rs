@@ -12,10 +12,8 @@
 //! 2. **The key is only ever written into a file nobody else can open.** On Unix
 //!    the stage file is created with mode 0600 and the directory with 0700, so the
 //!    guarantee is the same one `ssh` and `git` make for their own secrets. On
-//!    Windows this crate does not create an explicit owner-only ACL — creating one
-//!    needs an API this crate will not call — so exposure there is bounded by the
-//!    per-user profile directory the file lives in, and that is stated rather than
-//!    implied.
+//!    Windows the private directory receives an explicit ACL for the process
+//!    identity and SYSTEM before the key is staged.
 //!
 //! An unreadable or malformed file is never quietly treated as "no credential":
 //! the message names the path and a next step, and it deliberately does not echo
@@ -52,6 +50,27 @@ pub const CREDENTIAL_DIRECTORY_VARIABLE: &str = "HA_CREDENTIALS_DIR";
 /// the ACL of directories this module does not own. A dedicated subdirectory can
 /// be locked down without touching anything else.
 pub const CREDENTIAL_DIRECTORY_NAME: &str = "private";
+
+/// The Windows account of the process token, rather than the interactive account
+/// inherited through `USERNAME`/`USERDOMAIN`.
+///
+/// Sandboxes and service hosts commonly preserve the latter variables while running
+/// under a restricted identity. Granting that stale name after removing inheritance
+/// locks the running app out of the directory it just created.
+#[cfg(windows)]
+fn current_windows_account() -> Option<String> {
+    let output = std::process::Command::new("whoami").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let account = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!account.is_empty()).then_some(account)
+}
+
+#[cfg(not(windows))]
+fn current_windows_account() -> Option<String> {
+    None
+}
 
 /// How well the file is protected against other accounts on this machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -303,17 +322,9 @@ pub fn save(path: &Path, key: &str) -> Result<Protection, HarnessError> {
         )
     })?;
     restrict_directory(directory);
-    // Which account this app is allowed to name in the ACL. Windows needs it; the
-    // value is never written anywhere, only passed to the platform tool.
-    let account = std::env::var("USERDOMAIN")
-        .ok()
-        .filter(|domain| !domain.is_empty())
-        .zip(
-            std::env::var("USERNAME")
-                .ok()
-                .filter(|name| !name.is_empty()),
-        )
-        .map(|(domain, name)| format!("{domain}\\{name}"));
+    // Windows needs the process token's account. Environment variables can name
+    // the desktop user even when a sandbox executes this process as another user.
+    let account = current_windows_account();
     let protection = restrict_acl(directory, account.as_deref());
     let staging = staging_path(path);
     let contents = format!("{CREDENTIAL_FILE_VARIABLE}=\"{}\"\n", escape(key));
@@ -731,18 +742,14 @@ mod tests {
             "the ACL step must report what it did"
         );
 
-        let account = format!(
-            "{}\\{}",
-            std::env::var("USERDOMAIN").expect("USERDOMAIN"),
-            std::env::var("USERNAME").expect("USERNAME")
-        );
+        let account = super::current_windows_account().expect("whoami resolves this process");
         let acl = std::process::Command::new("icacls")
             .arg(&directory)
             .output()
             .expect("icacls runs");
         let text = String::from_utf8_lossy(&acl.stdout).into_owned();
         assert!(
-            text.contains(&account),
+            text.to_lowercase().contains(&account.to_lowercase()),
             "the ACL must name this account: {text}"
         );
         assert!(text.contains("SYSTEM"), "the ACL must keep SYSTEM: {text}");
