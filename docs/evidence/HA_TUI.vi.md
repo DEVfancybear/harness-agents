@@ -160,6 +160,26 @@ file được commit. Mọi lệnh ở mục 4 tái lập được từ commit C
   `$env:DEEPSEEK_API_KEY = '<key>'` rồi chạy `pwsh -NoProfile -File scripts/Smoke-HaProvider.ps1`.
   Đây là thay đổi hành vi của T08 (trước đó smoke đòi cả `HA_PROVIDER_ENDPOINT` và
   `HA_PROVIDER_MODEL`), có test `t08_one_deepseek_key_is_a_complete_provider_setup`.
+- **Paid provider smoke: ĐÃ CHẠY, xanh** (một lượt thật trên máy này, prompt
+  `Reply with the single word: ready`):
+
+  ```text
+  model:    deepseek-flash (DeepSeek default)
+  endpoint: https://api.deepseek.com (DeepSeek default)
+  credential: from the app's saved credential store, or none (value never printed)
+  SMOKE_EXIT: 0 after 1 s
+  SMOKE_RESPONSE_LENGTH: 5
+  SMOKE_STOP: final
+  SMOKE_RESPONSE: ready
+  SMOKE_OK: one live turn completed and was recorded without leaking the credential.
+  ```
+
+  Nghĩa là: model mặc định `deepseek-flash` **có thật và trả lời**, endpoint mặc định
+  đúng, và đường credential đã lưu hoạt động. Credential trong lượt này đến từ store của
+  app (không biến môi trường nào được đặt), nên smoke đã được sửa để **không tự từ chối**
+  khi biến môi trường trống — app là nơi quyết định, smoke chỉ chạy một turn rồi báo cáo.
+  Khi không tìm thấy credential ở đâu cả, app fail-closed với `service_unavailable` và
+  smoke thoát **2** kèm `SMOKE_NOT_RUN`, vẫn không thay thế fixture.
 - **Cài thật lên máy user: chưa chạy.** U17 chứng minh artifact đã staged mở được app,
   nhưng `Install-Ha.ps1` chưa ghi User PATH thật trong lượt này.
 - **conhost cũ** (không phải Windows Terminal): chưa đo riêng; đã đo trên Windows Terminal

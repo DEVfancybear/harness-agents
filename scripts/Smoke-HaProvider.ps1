@@ -3,18 +3,21 @@
 Run one bounded live agent turn against the configured provider, or refuse.
 
 .DESCRIPTION
-This is the paid smoke that HA_LAUNCH reserves for an explicit grant. It needs one
-credential:
+This is the paid smoke that HA_LAUNCH reserves for an explicit grant. The credential
+comes from wherever the app takes it:
 
-  DEEPSEEK_API_KEY or HA_API_KEY   credential (read at call time, never printed)
+  DEEPSEEK_API_KEY or HA_API_KEY      an environment variable
+  the saved credentials file          the app's own credential store, if one exists
 
 The endpoint and the model fall back to DeepSeek's documented values
 (`https://api.deepseek.com`, `deepseek-flash`), so one API key is a complete setup.
-Set `HA_PROVIDER_ENDPOINT` or `HA_PROVIDER_MODEL` to use another provider or model;
-an explicit variable always wins over the default.
+Set `HA_PROVIDER_ENDPOINT` or `HA_PROVIDER_MODEL` to use another provider or model.
 
-Without a credential the script prints `SMOKE_NOT_RUN` and exits 2: it never
-substitutes a fixture and never fabricates a result. The budget is bounded on purpose - one turn,
+**The app is the authority.** This script never decides that a live call is
+impossible: it asks the app for one bounded turn and reports what happened. When no
+credential can be found the app fails closed with `service_unavailable` and the
+variables to set, and this script exits 2 with `SMOKE_NOT_RUN` - still without
+substituting a fixture or fabricating a result. The budget is bounded on purpose - one turn,
 a short prompt, a bounded deadline - so a smoke costs one model call, not a session.
 
 The transcript it prints contains the model, the endpoint host (never the full URL
@@ -104,7 +107,8 @@ function Invoke-SmokeSelfTest {
     }
     try {
         $configuration = Get-SmokeConfiguration
-        if ($configuration.Missing.Count -ne 1) { $failures.Add("expected one missing input, got $($configuration.Missing.Count)") }
+        if ($configuration.Missing.Count -ne 1) { $failures.Add("an unset credential is reported once, got $($configuration.Missing.Count)") }
+        if ($configuration.CredentialName -ne '') { $failures.Add('no credential name should be found here') }
         if (-not $configuration.EndpointDefaulted) { $failures.Add('the endpoint should default when it is unset') }
         if (-not $configuration.ModelDefaulted) { $failures.Add('the model should default when it is unset') }
         if ($configuration.Endpoint -ne $script:DeepSeekEndpoint) { $failures.Add("default endpoint was '$($configuration.Endpoint)'") }
@@ -144,11 +148,8 @@ if ($SelfTest) {
 
 $configuration = Get-SmokeConfiguration
 if ($configuration.Missing.Count -gt 0) {
-    Write-Host 'SMOKE_NOT_RUN: the environment is not configured for a live call.'
-    Write-Host "   missing: $($configuration.Missing -join ', ')"
-    Write-Host '   This is deliberate: no fixture is substituted and no paid call is made.'
-    Write-Host "   Set those variables and re-run: $($MyInvocation.MyCommand.Path)"
-    exit 2
+    Write-Host "   note: no credential in the environment ($($configuration.Missing -join ', '));"
+    Write-Host '         the app will use its saved credential store if one exists.'
 }
 
 $binary = Join-Path $repositoryRoot "target/release/$executableName"
@@ -162,13 +163,24 @@ if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
 if ([string]::IsNullOrWhiteSpace($DataDirectory)) {
     $DataDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("ha-smoke-" + [guid]::NewGuid().ToString('n'))
 }
+# The app resolves --cwd with canonicalize, so the throwaway directory must exist
+# before the turn starts. Creating it here is what keeps the smoke off a real project.
+if (-not (Test-Path -LiteralPath $DataDirectory -PathType Container)) {
+    New-Item -ItemType Directory -Path $DataDirectory -Force | Out-Null
+}
 
 Write-Host 'SMOKE_START: one bounded live turn'
 $modelNote = if ($configuration.ModelDefaulted) { ' (DeepSeek default)' } else { '' }
 $endpointNote = if ($configuration.EndpointDefaulted) { ' (DeepSeek default)' } else { '' }
 Write-Host "   model:    $($configuration.Model)$modelNote"
 Write-Host "   endpoint: $(Get-RedactedEndpoint -Endpoint $configuration.Endpoint)$endpointNote"
-Write-Host "   credential: from $($configuration.CredentialName) (value never printed)"
+$credentialSource = if ([string]::IsNullOrWhiteSpace($configuration.CredentialName)) {
+    "the app's saved credential store, or none (value never printed)"
+}
+else {
+    "$($configuration.CredentialName) (value never printed)"
+}
+Write-Host "   credential: from $credentialSource"
 Write-Host "   data dir: $DataDirectory (throwaway)"
 
 $started = Get-Date
@@ -177,7 +189,13 @@ $exit = $LASTEXITCODE
 $elapsed = [int] ((Get-Date) - $started).TotalSeconds
 $transcript = $output.Trim()
 
-if ($transcript -match [regex]::Escape([string] [Environment]::GetEnvironmentVariable($configuration.CredentialName))) {
+$credentialValue = if ([string]::IsNullOrWhiteSpace($configuration.CredentialName)) {
+    ''
+}
+else {
+    [string] [Environment]::GetEnvironmentVariable($configuration.CredentialName)
+}
+if (-not [string]::IsNullOrEmpty($credentialValue) -and $transcript.Contains($credentialValue)) {
     Write-Host 'SMOKE_FAILED: the credential appeared in the output; refusing to record this run.'
     exit 1
 }
@@ -199,6 +217,13 @@ if ($exit -eq 0) {
     }
 }
 else {
+    if ($transcript.Contains('service_unavailable')) {
+        Write-Host 'SMOKE_NOT_RUN: no credential could be found for a live call.'
+        Write-Host '   The app failed closed and substituted nothing; set DEEPSEEK_API_KEY,'
+        Write-Host '   or save a key where the app keeps one, and run this again.'
+        Write-Host $transcript
+        exit 2
+    }
     Write-Host 'SMOKE_FAILED: the live turn did not succeed.'
     Write-Host $transcript
     exit 1

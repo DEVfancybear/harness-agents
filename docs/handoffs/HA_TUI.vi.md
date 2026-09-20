@@ -269,6 +269,21 @@ pwsh -NoProfile -File scripts/Smoke-HaProvider.ps1
 Test canh hợp đồng mới: `t08_one_deepseek_key_is_a_complete_provider_setup` và self test
 của smoke (đường mặc định + đường override).
 
+## 9c. Paid smoke đã chạy (CP-D)
+
+Một lượt thật, một turn, prompt `Reply with the single word: ready`:
+
+```text
+model:    deepseek-flash (DeepSeek default)   endpoint: https://api.deepseek.com (DeepSeek default)
+SMOKE_EXIT: 0 after 1 s   SMOKE_RESPONSE: ready   SMOKE_OK
+```
+
+Credential đến từ store của app (không có biến môi trường nào đặt trong lượt này). Smoke
+đã được sửa theo đúng cách đó: nó không tự quyết định "chưa cấu hình" nữa — app là nơi
+quyết định, smoke chỉ chạy một turn rồi báo cáo; khi không có credential ở đâu, app
+fail-closed và smoke thoát 2 với `SMOKE_NOT_RUN`. Còn lại của mục 8 evidence:
+**cài thật lên máy user** (chưa làm) và **Linux** (chưa có máy).
+
 ## 10. Blocked on
 
 Không. Quyền commit/push, paid smoke và cài thật đã được cấp.
