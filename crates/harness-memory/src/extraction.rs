@@ -273,7 +273,14 @@ pub(crate) fn project_sources(lease: &ExtractionLease) -> Vec<SourceProjection> 
         .collect()
 }
 
-pub(crate) fn sanitize_memory_text(text: &str) -> String {
+/// Redact the lines of a memory value that look like they carry a secret.
+///
+/// Exposed because a caller that has to compare text before storing it must compare
+/// the text that will actually be stored. `create_asset` runs this before hashing and
+/// before writing the search mirror, so a lookup keyed on the raw text can never match
+/// a redacted value: every repeat of such an input minted another asset, which is the
+/// duplication this boundary exists to prevent.
+pub fn sanitize_memory_text(text: &str) -> String {
     text.lines()
         .map(|line| {
             let lower = line.to_ascii_lowercase();

@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 mod extraction;
-pub use extraction::{ExtractedCandidate, ExtractionOutput, MemoryExtractor, SourceProjection};
+pub use extraction::{
+    ExtractedCandidate, ExtractionOutput, MemoryExtractor, SourceProjection, sanitize_memory_text,
+};
 mod retrieval;
 pub use retrieval::{
     MAX_QUERY_BYTES, MemoryContribution, RetrievalResult, RetrievalState, VectorAdapter,
@@ -44,7 +46,13 @@ pub const TURN_PROVENANCE_KIND: &str = "session_turn";
 /// history" - it read the block as provenance metadata beside the working state rather
 /// than as the answer to the question. The heading now names the material and tells the
 /// model that using it is the point.
-pub const MEMORY_BLOCK_HEADING: &str = "Memory from earlier turns - use it to answer";
+///
+/// It also says what not to do with it. A turn record quotes what an earlier reply said,
+/// and a reply is not an observation: read as established fact, one model answer would
+/// harden into durable knowledge and later turns would cite it as though the runtime had
+/// verified it.
+pub const MEMORY_BLOCK_HEADING: &str = "Memory from earlier turns - use it to answer. It records what was asked and said; \
+     treat a quoted reply as something that was said, not as a verified fact.";
 
 #[cfg(test)]
 mod properties {

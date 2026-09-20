@@ -407,6 +407,12 @@ impl SqliteStore {
 
     /// The newest turn records, newest first, with the revision they were read at.
     ///
+    /// Candidates are included on purpose. A turn record carries model output, so the
+    /// publication policy settles it as a candidate and it is deliberately absent from
+    /// the search index - the keyword path must not read it as knowledge. This path is
+    /// the conversation log, and a log that hides its unconfirmed entries would answer
+    /// "what did I ask you before?" with nothing.
+    ///
     /// The revision is part of the answer, not decoration: the runtime revalidates a
     /// contribution against it before dispatch and drops the whole thing when it does
     /// not match. Returning a placeholder here made every history contribution fail
@@ -429,7 +435,7 @@ impl SqliteStore {
             "SELECT v.memory_asset_id FROM memory_versions v
              JOIN memory_assets a ON a.memory_asset_id = v.memory_asset_id
              WHERE v.version = a.current_version
-               AND a.status = 'active'
+               AND a.status IN ('active', 'candidate')
                AND json_extract(v.version_json, '$.validity') = 'valid'
                AND a.owner_id = ?1
                AND ((?2 = 1 AND a.project_id = ?3) OR (?2 = 0 AND a.project_id IS NULL))
@@ -491,7 +497,7 @@ impl SqliteStore {
             "SELECT v.memory_asset_id FROM memory_versions v
              JOIN memory_assets a ON a.memory_asset_id = v.memory_asset_id
              WHERE v.version = a.current_version
-               AND a.status = 'active'
+               AND a.status IN ('active', 'candidate')
                AND a.owner_id = ?1
                AND ((?2 = 1 AND a.project_id = ?3) OR (?2 = 0 AND a.project_id IS NULL))
                AND json_extract(v.version_json, '$.provenance_kind') = ?4

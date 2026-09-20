@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use harness_memory::{
     CreateMemoryAsset, EvidenceState, MemoryContribution, MemoryLayer, MemoryPrincipal,
-    MemoryService, RetrievalState, normalize_terms,
+    MemoryService, RetrievalState, normalize_terms, sanitize_memory_text,
 };
 use harness_store_sqlite::{SqliteStore, StoreError};
 use harness_types::{
@@ -209,26 +209,38 @@ const INTERROGATIVE_OPENINGS: &[&str] = &[
 /// confirmed fact - which is how the corpus filled with questions that then outranked
 /// the answers.
 ///
-/// The test is deliberately narrow, and it only applies to a short input: it looks
-/// for a question mark or an interrogative opening, and anything it does not
-/// recognise stays knowledge. Dropping a real instruction is worse than keeping a
-/// question, so the default is to keep.
+/// The test is deliberately narrow, and it only applies to a short input: it looks for
+/// a question mark at the end of a short input, or a short input that opens with an
+/// interrogative *and* ends like a question. Anything else stays knowledge, because
+/// dropping a real instruction is the worse of the two mistakes.
+///
+/// `do`, `have`, `can` and their neighbours open questions and also open ordinary
+/// imperatives - "Do not force-push to main", "Have a look at the deploy script". The
+/// opening word alone therefore decides nothing; it is only ever a supporting signal
+/// beside the ending.
 fn classify_input(text: &str) -> Option<&'static str> {
     let trimmed = text.trim();
-    if trimmed.ends_with('?') || trimmed.ends_with('？') {
-        return Some("a question is not an instruction");
+    let short = trimmed.split_whitespace().count() <= MAX_QUESTION_WORDS;
+    if !short {
+        // A pasted specification can end in a question mark without being a question
+        // aimed at this assistant, and it is certainly worth keeping.
+        return None;
     }
+    let asks = trimmed.ends_with('?') || trimmed.ends_with('？');
     let opening = trimmed
         .split_whitespace()
         .next()
         .unwrap_or_default()
         .to_lowercase();
     let opening = opening.trim_end_matches(['?', '？', ',', '.', '!']);
-    // A pasted document can open with any word, so this only judges a short line: a
-    // question is short, a specification is not.
-    if trimmed.split_whitespace().count() <= MAX_QUESTION_WORDS
-        && INTERROGATIVE_OPENINGS.contains(&opening)
-    {
+    let interrogative = INTERROGATIVE_OPENINGS.contains(&opening);
+    // A question mark is decisive on its own. An interrogative opening needs the
+    // ending to agree, which is what keeps an imperative that merely starts with one of
+    // those words out of the question bucket.
+    let closes_like_a_question = ["?", "？", ".", "!", "không", "chứ", "nhỉ", "vậy"]
+        .iter()
+        .any(|ending| trimmed.to_lowercase().ends_with(ending));
+    if asks || (interrogative && closes_like_a_question) {
         return Some("a question is not an instruction");
     }
     None
@@ -307,8 +319,14 @@ pub async fn remember_input(
         None => (MemoryScope::User, None),
     };
     let service = MemoryService::new(Arc::clone(&store));
+    // The lookup key must be the text the store will hold. `create_asset` redacts
+    // credential-looking lines before it hashes and before it writes the search mirror,
+    // so a lookup of the raw text can never match a redacted value - every repeat of
+    // such an input minted another asset, which is the duplication this path exists to
+    // stop.
+    let storable = sanitize_memory_text(&text);
     if let Some(existing) = service
-        .find_active_by_content(principal, &text, scope, project_id.clone())
+        .find_active_by_content(principal, &storable, scope, project_id.clone())
         .await?
     {
         service
@@ -379,6 +397,15 @@ pub async fn remember_turn(
     if question.is_empty() {
         return Ok(RememberOutcome::NothingAdmitted);
     }
+    // The store redacts any line that looks like it carries a secret, and it does so
+    // before writing the search mirror. A record whose `asked:` line is redacted has
+    // lost the one thing it exists to keep, so it is not written at all rather than
+    // written as a stub that answers nothing.
+    if sanitize_memory_text(question) != question {
+        return Ok(RememberOutcome::NotKnowledge {
+            reason: "the question looks like it carries a credential, so the turn is not recorded",
+        });
+    }
     let (scope, project_id) = match principal.project_id.clone() {
         Some(project_id) => (MemoryScope::Project, Some(project_id)),
         None => (MemoryScope::User, None),
@@ -405,6 +432,18 @@ pub async fn remember_turn(
                 session_id: None,
                 visibility: "scoped".to_owned(),
                 content,
+                // The turn happened: the runtime observed the question arrive and the
+                // answer go out. That is what `RuntimeObserved` records, and it is also
+                // why this cannot be a candidate - a candidate is not injectable at all,
+                // so recording it as one made the whole feature invisible. Measured:
+                // `recent_turns` returned the record and `validate_memory_snapshot`
+                // refused it, and the runtime then dropped the memory in silence.
+                //
+                // What this does **not** claim is that the answer is true. `answered:` is
+                // an unverified excerpt of model output, quoted so a later turn can see
+                // what was said and never promoted to evidence of its own. The block that
+                // reaches the model says so in its heading, because a reply that is read
+                // as established fact would harden into durable knowledge.
                 authority: SourceAuthority::RuntimeObserved,
                 evidence: EvidenceState::VerifiedObservation,
                 user_confirmed: false,
@@ -416,7 +455,7 @@ pub async fn remember_turn(
         )
         .await?;
     let id = asset.asset.memory_asset_id.clone();
-    prune_turns(&service, principal, prune_scope.as_ref()).await?;
+    prune_turns(&service, principal, prune_scope.as_ref(), TURN_MEMORY_LIMIT).await?;
     Ok(RememberOutcome::Stored(id))
 }
 
@@ -425,13 +464,17 @@ pub async fn remember_turn(
 /// Only assets this code wrote as turn records are eligible, so a directive is never
 /// pruned by a log limit. A retirement that fails is reported: silently keeping an
 /// unbounded log would be worse than an error.
+///
+/// `keep` is a parameter rather than the constant directly so a test can reach the
+/// boundary without writing two hundred turns.
 async fn prune_turns(
     service: &MemoryService,
     principal: &MemoryPrincipal,
     project_id: Option<&ProjectId>,
+    keep: usize,
 ) -> Result<(), HarnessError> {
     let excess = service
-        .turn_records_over_limit(principal, project_id, TURN_MEMORY_LIMIT)
+        .turn_records_over_limit(principal, project_id, keep)
         .await?;
     for id in excess {
         service
@@ -453,8 +496,9 @@ fn clip(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MEMORY_VARIABLE, RetrievalState, memory_requested, memory_requested_from_environment,
-        principal, recall, remember_input, remember_turn,
+        MEMORY_VARIABLE, RetrievalState, asks_about_history, memory_requested,
+        memory_requested_from_environment, principal, prune_turns, recall, remember_input,
+        remember_turn,
     };
     use crate::interactive::paths::LaunchEnvironment;
     use crate::interactive::project::resolve_project_id;
@@ -694,12 +738,18 @@ mod tests {
         );
         assert_eq!(
             stored.current.record.evidence_state, "verified_observation",
-            "the runtime observed the turn; it did not confirm the claim inside it"
+            "the runtime observed the turn happen"
         );
         assert_eq!(
             stored.asset.created_by,
             SourceAuthority::RuntimeObserved,
-            "the model is not the author of record here; the runtime is"
+            "the runtime is the author of the record; the model authored only the quote"
+        );
+        assert_eq!(
+            format!("{:?}", stored.asset.status),
+            "Active",
+            "a candidate is not injectable at all: validate_memory_snapshot refuses it \
+             and the runtime then drops the memory in silence"
         );
 
         // And the history the user asks about is what a later session reads.
@@ -727,6 +777,144 @@ mod tests {
             "the revision is what dispatch revalidates against; a placeholder here \
              makes the whole contribution be dropped in silence"
         );
+    }
+
+    /// The log is bounded, and the bound never touches a directive.
+    ///
+    /// Turn records exist to answer questions about the recent past, so the oldest go
+    /// first. A directive the user typed is not a log entry: retiring it because the
+    /// conversation got long would delete knowledge the user asked to keep.
+    #[tokio::test]
+    async fn memory_the_turn_log_is_bounded_and_a_directive_is_never_retired() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+
+        // One directive, which must survive the pruning below.
+        let task_id = TaskId::generate();
+        let session = SessionId::generate();
+        admit(
+            &fixture,
+            &project_id,
+            &session,
+            &task_id,
+            "Always run cargo test before you commit",
+        )
+        .await;
+        remember_input(
+            Arc::clone(&fixture.store),
+            &principal(project_id.clone(), task_id, session.clone()),
+            &session,
+        )
+        .await
+        .expect("remember runs")
+        .expect_stored();
+
+        // Four turns, kept two at a time.
+        let mut turn_ids = Vec::new();
+        for index in 0..4 {
+            let task_id = TaskId::generate();
+            let session = SessionId::generate();
+            admit(
+                &fixture,
+                &project_id,
+                &session,
+                &task_id,
+                &format!("question number {index}"),
+            )
+            .await;
+            let owner = principal(project_id.clone(), task_id, session.clone());
+            let outcome = remember_turn(
+                Arc::clone(&fixture.store),
+                &owner,
+                &session,
+                &format!("answer number {index}"),
+            )
+            .await
+            .expect("remember_turn runs");
+            let id = match outcome {
+                super::RememberOutcome::Stored(id) => id,
+                other => panic!("a turn is recorded: {other:?}"),
+            };
+            turn_ids.push(id);
+            let service = MemoryService::new(Arc::clone(&fixture.store));
+            prune_turns(&service, &owner, Some(&project_id), 2)
+                .await
+                .expect("pruning runs");
+        }
+
+        let service = MemoryService::new(Arc::clone(&fixture.store));
+        let reader = principal(
+            project_id.clone(),
+            TaskId::generate(),
+            SessionId::generate(),
+        );
+        let recent = service
+            .recent_turns(&reader, Some(&project_id), 8)
+            .await
+            .expect("recent turns");
+        assert_eq!(
+            recent.hits.len(),
+            2,
+            "the log holds the cap, not every turn ever taken"
+        );
+        let kept = recent
+            .hits
+            .iter()
+            .map(|hit| hit.current.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            kept.contains("question number 3") && !kept.contains("question number 0"),
+            "the newest survive and the oldest retire: {kept}"
+        );
+
+        // The directive is still there, and still searchable.
+        let directive = service
+            .search(&reader, "cargo test", 8, None)
+            .await
+            .expect("search runs");
+        assert!(
+            directive
+                .hits
+                .iter()
+                .any(|hit| hit.current.content.contains("Always run cargo test")),
+            "a retention cap for the log must not expire what the user asked to keep"
+        );
+    }
+
+    /// An ordinary question must not drag the whole conversation into context.
+    ///
+    /// The recency path exists for questions about the conversation. A question about a
+    /// session *cookie*, a *previous* release, or "last time" in another sense must go
+    /// down the keyword path, or every turn would carry the recent log and bury the note
+    /// that actually answers it.
+    #[test]
+    fn only_a_question_about_the_conversation_takes_the_history_path() {
+        for asking in [
+            "session trước tôi hỏi bạn những gì?",
+            "lần trước bạn nói gì với tôi?",
+            "What did I ask you in the previous session?",
+            "what did we discuss last time?",
+        ] {
+            assert!(
+                asks_about_history(asking),
+                "{asking:?} is about the conversation"
+            );
+        }
+        for other in [
+            "how does the session cookie expire?",
+            "explain the previous release notes",
+            "what did this function do before the refactor?",
+            "sửa lỗi trong file session.rs",
+            "commit gần nhất là gì?",
+        ] {
+            assert!(
+                !asks_about_history(other),
+                "{other:?} is about a subject, not about our conversation"
+            );
+        }
     }
 
     /// A wider query must not become a licence to inject anything.
