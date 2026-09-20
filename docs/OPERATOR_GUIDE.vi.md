@@ -697,15 +697,19 @@ headless báo cùng thông tin trong `--json`, ở khoá `memory`.
   đã-xác-nhận — đó là cách corpus đầy câu hỏi rồi chúng lấn át câu trả lời. Khi một input bị bỏ
   qua, app **nói ra** (`memory: not stored (a question is not an instruction)`) chứ không im lặng.
 - **Nhật ký hội thoại**: **mọi** lượt, kể cả lượt chỉ có câu hỏi. Mỗi bản ghi giữ
-  `asked:` (nguyên văn input, tối đa 200 ký tự), `session:` và `answered:` (trích đoạn tối đa 200
-  ký tự câu trả lời của model). Đây là thứ trả lời câu hỏi *về* cuộc hội thoại — "session trước
-  tôi hỏi bạn những gì?" — và câu đó đi đường riêng: đọc nhật ký theo thứ tự mới nhất trước, không
-  theo độ trùng từ khóa.
+  `asked:` (nguyên văn input), `session:` và `answered:` (câu trả lời của model, tối đa 4000 ký tự).
+  Đây là thứ trả lời câu hỏi *về* cuộc hội thoại — "session trước tôi hỏi bạn những gì?" — và câu đó
+  đi đường riêng: đọc nhật ký theo thứ tự mới nhất trước, không theo độ trùng từ khóa. Nó cũng là
+  thứ trả lời câu hỏi *về nội dung* một câu trả lời cũ ("câu lệnh deploy bạn đưa tôi là gì?"): bản
+  ghi giữ đủ câu trả lời, không chỉ dòng đầu.
 
-Ba điều cần biết về nhật ký, vì chúng là giới hạn thật chứ không phải chi tiết nội bộ:
+Bốn điều cần biết về nhật ký, vì chúng là giới hạn thật chứ không phải chi tiết nội bộ:
 
 - `answered:` là **trích đoạn output của model**, không phải sự thật đã kiểm chứng. Heading của
   khối memory nói thẳng điều đó, để một câu trả lời không bị đọc như tri thức đã xác minh.
+- Ngân sách memory của một lượt (800 token) được **chia** cho các mục tìm thấy, và mục nào vẫn không
+  vừa thì bị cắt kèm dòng `[truncated: ...]`. Bạn thấy đúng thứ model thấy: một câu trả lời dài có
+  thể vào context ở dạng rút gọn, nhưng không bao giờ im lặng cắt.
 - Mỗi project giữ tối đa **200** bản ghi, cũ nhất bị thu hồi trước, và mỗi lượt chỉ thu hồi tối
   đa **8** bản ghi để không làm chậm câu trả lời. Chỉ dẫn bạn dặn **không** phải mục log nên không
   bao giờ bị ngưỡng này thu hồi.

@@ -410,7 +410,8 @@ Vì vậy đường tìm kiếm theo từ khóa hỏi **durable memory trước*
 ### 19.2. Ràng buộc về bằng chứng và ngưỡng lưu
 
 - Một lượt là chuyện đã xảy ra: runtime quan sát câu hỏi đến và câu trả lời đi ra, nên bản ghi mang `RuntimeObserved` + `VerifiedObservation` và ở trạng thái `Active`. Ghi nó thành `candidate` làm cả tính năng vô hình, vì `candidate` không được inject.
-- `answered:` chỉ giữ tối đa 200 ký tự và là **trích đoạn output của model**, không phải sự thật đã kiểm chứng. Heading của khối memory nói thẳng điều này, để một câu trả lời không bị đọc như tri thức đã xác minh rồi cứng lại thành durable knowledge.
+- `answered:` giữ tối đa **4000** ký tự output của model và là **trích đoạn**, không phải sự thật đã kiểm chứng. Heading của khối memory nói thẳng điều này, để một câu trả lời không bị đọc như tri thức đã xác minh rồi cứng lại thành durable knowledge. Con số này là điểm mà thêm chữ nữa cũng không thể tới được model: ngân sách memory của một lượt là 800 token, khoảng 3200 ký tự.
+- Ngân sách đó được **chia**, không phải ai nhanh chân thì lấy hết. Một khối không vừa từng bị bỏ nguyên khối, nên một memory dài che mất mọi thứ mà chính lần tìm đó tìm ra - và bản ghi hội thoại làm điều đó thành chắc chắn chứ không chỉ có thể, vì nó là câu hỏi kèm câu trả lời, mà câu trả lời thì dài hơn câu hỏi. Giờ mỗi hit được chia một phần công bằng, và khối vẫn không vừa thì bị cắt và **nói ra** (`[truncated: ...]`) thay vì biến mất: một memory dừng giữa câu mà không nói gì thì bị đọc như một memory kết thúc ở đó.
 - Đầu vào trông như mang credential thì lượt đó không được ghi, thay vì ghi một bản ghi đã bị redact nội dung chính.
 - Ngưỡng 200 bản ghi mỗi project chỉ áp cho asset do chính đường này ghi (`provenance_kind = session_turn`). Chỉ dẫn người dùng không phải mục log và không bao giờ bị ngưỡng log thu hồi.
 - Một lượt chỉ thu hồi tối đa 8 bản ghi quá ngưỡng, để công việc trên đường trả lời không tỉ lệ với độ dài log.

@@ -410,7 +410,8 @@ The keyword search therefore asks **durable memory first**, and asks the log onl
 ### 19.2. Evidence and retention constraints
 
 - A turn happened: the runtime observed the question arrive and the answer go out, so the record carries `RuntimeObserved` + `VerifiedObservation` and is `Active`. Recording it as a `candidate` made the whole feature invisible, because a candidate is not injectable.
-- `answered:` keeps at most 200 characters and is an **excerpt of model output**, not a verified fact. The memory block's heading says so outright, so a reply is not read as verified knowledge and hardened into durable memory.
+- `answered:` keeps at most **4000** characters of model output and is an **excerpt**, not a verified fact. The memory block's heading says so outright, so a reply is not read as verified knowledge and hardened into durable memory. That number is the point past which more text could not reach the model anyway: one turn's memory budget is 800 tokens, roughly 3200 characters.
+- That budget is **shared**, not raced for. A block that did not fit used to be dropped whole, so one long memory hid everything the same search found - and conversation records made that certain rather than likely, because a record is a question followed by an answer and answers are longer than questions. Each hit now gets a fair share, and a block that still does not fit is clipped and **says so** (`[truncated: ...]`) instead of vanishing: a memory that stops mid-sentence and does not say so is read as a memory that ends there.
 - An input that looks like it carries a credential is not recorded at all, rather than recorded with its substance redacted away.
 - The 200-record cap applies only to assets this path wrote (`provenance_kind = session_turn`). A user directive is not a log entry and is never retired by a log limit.
 - One turn retires at most 8 over-cap records, so work on the answer path does not scale with the length of the log.

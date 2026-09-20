@@ -560,16 +560,21 @@ the other:
   skipped the app says so (`memory: not stored (a question is not an instruction)`) instead
   of staying silent.
 - **The conversation log**: **every** turn, including one that was only a question. Each
-  record keeps `asked:` (your input verbatim, at most 200 characters), `session:`, and
-  `answered:` (at most 200 characters of the model's answer). This is what answers a
+  record keeps `asked:` (your input verbatim), `session:`, and `answered:` (the model's
+  answer, at most 4000 characters). This is what answers a
   question *about* the conversation — "what did I ask you in the previous session?" — and
-  that question takes its own path: the log is read newest first, not by term overlap.
+  that question takes its own path: the log is read newest first, not by term overlap. It is
+  also what answers a question *about the content* of an earlier answer ("what was the
+  deploy command you gave me?"): the record keeps the answer, not just its first line.
 
-Three things to know about the log, because they are real limits rather than internal
+Four things to know about the log, because they are real limits rather than internal
 detail:
 
 - `answered:` is an **excerpt of model output**, not a verified fact. The memory block's
   heading says so outright, so a reply is not read as verified knowledge.
+- One turn's memory budget (800 tokens) is **shared** among the hits, and a hit that still
+  does not fit is clipped with a `[truncated: ...]` line. You see what the model sees: a long
+  answer can reach the context shortened, but never silently cut.
 - Each project keeps at most **200** records, oldest retired first, and one turn retires at
   most **8** of them so an answer is never delayed by a long log. A directive you gave is
   **not** a log entry and is never retired by this cap.

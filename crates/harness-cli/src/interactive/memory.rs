@@ -56,7 +56,15 @@ const MAX_QUESTION_WORDS: usize = 24;
 /// The question alone cannot answer "what did I ask you before?", because the question
 /// is the half the reader already knows. A turn record carries both halves, and this
 /// bounds the one that is model output.
-const TURN_ANSWER_CHARS: usize = 200;
+///
+/// It used to bound it to 200 characters. That answered "what did I ask" and could not
+/// answer anything *about* an answer: the command, the path or the conclusion sat past
+/// the cut, and the question was answered from a record that visibly stopped
+/// mid-sentence. The bound is now the point past which more text cannot reach the model
+/// anyway - one turn's memory budget is 800 tokens, roughly 3200 characters, and a block
+/// that does not fit is clipped to its share of that budget. Keeping more would grow the
+/// store with text no turn could ever be shown.
+const TURN_ANSWER_CHARS: usize = 4000;
 
 /// How many turn records one project keeps, newest first.
 ///
@@ -1600,6 +1608,252 @@ mod tests {
                 .any(|hit| hit.current.content.contains("zebra-quasar-7719")),
             "the answer the model gave is still reachable by keyword"
         );
+    }
+
+    /// A long answer is in the log in full, not as a 200-character head.
+    ///
+    /// The record kept the first 200 characters of the model's answer, which answers "what
+    /// did I ask" and cannot answer anything *about* the answer: the command, the path or
+    /// the conclusion sits past the cut, and the model is shown a record that visibly stops
+    /// mid-sentence. The bound is now the point past which more text could not reach the
+    /// model in one turn anyway, so the question "which marker did you give me" is answered
+    /// from the answer it is asking about.
+    #[tokio::test]
+    async fn memory_a_long_answer_is_reachable_by_a_question_about_its_content() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+        let task_id = TaskId::generate();
+        let session = SessionId::generate();
+        // A question, so nothing durable is written: the record and its answer are the only
+        // material that carries the marker.
+        admit(
+            &fixture,
+            &project_id,
+            &session,
+            &task_id,
+            "How do I deploy the parser service to production?",
+        )
+        .await;
+        let owner = principal(project_id.clone(), task_id, session.clone());
+        // The marker sits far past the old 200-character cut, which is the whole point.
+        let mut answer = String::from("To deploy the parser service to production, in order:\n");
+        for step in 1..=18 {
+            let line = format!(
+                "{step}. Check the release notes and the configuration for step {step} before \
+                 continuing.\n"
+            );
+            answer.push_str(&line);
+        }
+        answer.push_str(
+            "Finally run the deploy with `cargo run --release --locked --bin ha-deploy`, and \
+             record it under deploy-marker-zebra-9911.",
+        );
+        assert!(
+            answer.chars().count() > 600,
+            "the fixture answer must be longer than the cut this test is about: {}",
+            answer.chars().count()
+        );
+        remember_turn(Arc::clone(&fixture.store), &owner, &session, &answer)
+            .await
+            .expect("remember_turn runs");
+
+        let later = principal(
+            project_id.clone(),
+            TaskId::generate(),
+            SessionId::generate(),
+        );
+        let recalled = recall(
+            Arc::clone(&fixture.store),
+            &later,
+            "Which deploy marker did you give me for the parser service?",
+        )
+        .await
+        .expect("recall runs");
+        assert_eq!(
+            recalled.state,
+            RetrievalState::Found,
+            "the answer is in the log: {}",
+            recalled.message
+        );
+        let injected = recalled
+            .contribution
+            .blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            injected.contains("deploy-marker-zebra-9911"),
+            "the end of the answer must reach the model, not just its first line: {injected}"
+        );
+        assert!(
+            !injected.contains("truncated"),
+            "this answer fits the turn budget, so nothing about it should be clipped: \
+             {injected}"
+        );
+    }
+
+    /// One long hit does not hide the other hits the same search found.
+    ///
+    /// A block that did not fit the budget used to be dropped whole, so a long memory
+    /// crowded out everything the search found beside it. Conversation records made that
+    /// certain rather than unlikely: a record is a question followed by an answer, and
+    /// answers are longer than questions. Each hit now gets a fair share, and a hit that
+    /// still does not fit is clipped and says so.
+    #[tokio::test]
+    async fn memory_a_long_hit_does_not_hide_the_hits_beside_it() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+        let owner = principal(
+            project_id.clone(),
+            TaskId::generate(),
+            SessionId::generate(),
+        );
+        let service = MemoryService::new(Arc::clone(&fixture.store));
+        // The long one repeats the shared term, which is what puts it first in bm25 and
+        // used to spend the whole budget before the others were ever considered. Its
+        // distinctive token is at the front, because a clipped block is a head: that is
+        // what "clipped" means, and its tail is what the clip marker is telling the reader
+        // about.
+        let long = format!(
+            "long-hit-head shared-term\n{}",
+            "shared-term filler sentence. ".repeat(400)
+        );
+        let mut contents = vec![
+            long,
+            "shared-term short-hit-one".to_owned(),
+            "shared-term short-hit-two".to_owned(),
+        ];
+        for content in contents.drain(..) {
+            service
+                .create_asset(
+                    &owner,
+                    CreateMemoryAsset {
+                        kind: "project_fact".to_owned(),
+                        scope: super::MemoryScope::Project,
+                        layer: MemoryLayer::L1,
+                        project_id: Some(project_id.clone()),
+                        task_id: None,
+                        agent_profile_id: None,
+                        session_id: None,
+                        visibility: "scoped".to_owned(),
+                        content,
+                        authority: SourceAuthority::RuntimeObserved,
+                        evidence: EvidenceState::VerifiedObservation,
+                        user_confirmed: false,
+                        source_event_refs: Vec::new(),
+                        source_file_hashes: Vec::new(),
+                        source_commit: Some("long-hit-fixture".to_owned()),
+                        provenance_kind: "runtime_observation".to_owned(),
+                    },
+                )
+                .await
+                .expect("fixture asset is written");
+        }
+
+        let result = service
+            .search(&owner, "shared term", 8, None)
+            .await
+            .expect("search runs");
+        assert_eq!(
+            result.hits.len(),
+            3,
+            "all three assets hold the query terms: {:#?}",
+            result.detail
+        );
+        let contribution = service.contribute(&owner, &result, 800);
+        let injected = contribution
+            .blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for marker in ["long-hit-head", "short-hit-one", "short-hit-two"] {
+            assert!(
+                injected.contains(marker),
+                "{marker} is missing from the blocks the model would read: {injected}"
+            );
+        }
+        assert!(
+            injected.contains("truncated"),
+            "the long hit was clipped, and a clipped memory says so: {injected}"
+        );
+    }
+
+    /// A question about the conversation still sees several turns, not just the newest.
+    ///
+    /// "What did I ask you before?" is a question about breadth: the answer is the list of
+    /// questions, and the newest turn is not more of an answer than the ones before it.
+    /// Storing whole answers made this the case that would break first - one long answer
+    /// could spend the whole budget and leave the model with a single turn - so the fair
+    /// share is what keeps the record's question in the message even when its answer is
+    /// longer than the budget for all eight.
+    #[tokio::test]
+    async fn memory_history_still_shows_every_recent_turn_after_long_answers() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+        for index in 0..8 {
+            let task_id = TaskId::generate();
+            let session = SessionId::generate();
+            admit(
+                &fixture,
+                &project_id,
+                &session,
+                &task_id,
+                &format!("question number {index}"),
+            )
+            .await;
+            let owner = principal(project_id.clone(), task_id, session.clone());
+            let answer = format!(
+                "Answer number {index}. {}",
+                "This paragraph is long enough that one turn cannot hold eight of them. "
+                    .repeat(12)
+            );
+            remember_turn(Arc::clone(&fixture.store), &owner, &session, &answer)
+                .await
+                .expect("remember_turn runs");
+        }
+
+        let later = principal(
+            project_id.clone(),
+            TaskId::generate(),
+            SessionId::generate(),
+        );
+        let recalled = recall(
+            Arc::clone(&fixture.store),
+            &later,
+            "session trước tôi hỏi bạn những gì?",
+        )
+        .await
+        .expect("recall runs");
+        assert_eq!(
+            recalled.state,
+            RetrievalState::Found,
+            "the log holds eight turns: {}",
+            recalled.message
+        );
+        let injected = recalled
+            .contribution
+            .blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for index in 0..8 {
+            assert!(
+                injected.contains(&format!("question number {index}")),
+                "every recent turn has to be in the message, and question number {index} is \
+                 missing (hits={}, blocks={}): {injected}",
+                recalled.hits,
+                recalled.contribution.blocks.len()
+            );
+        }
     }
 
     /// Deduplication never reaches across a project boundary.

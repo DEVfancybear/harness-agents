@@ -403,6 +403,19 @@ impl MemoryService {
             .map_err(to_harness_error)
     }
 
+    /// Render one turn's memory blocks from a retrieval result.
+    ///
+    /// The budget is shared, not raced for. A block that did not fit used to be dropped
+    /// whole, so one long hit could hide every other hit the same search found - and the
+    /// long hits are exactly the ones that carry content: a conversation record is the
+    /// user's question followed by the model's answer, and an answer is longer than a
+    /// question. Each hit is now offered a fair share of what is left, and a block that
+    /// still does not fit is clipped and says so rather than disappearing.
+    ///
+    /// The share keeps the ranking meaningful: the first hit is offered the largest share,
+    /// a hit that does not use its whole share leaves the rest for the hits after it, and
+    /// once the remaining share is too small to hold anything but the heading, the loop
+    /// stops instead of padding the context with stubs.
     pub fn contribute(
         &self,
         principal: &MemoryPrincipal,
@@ -417,23 +430,22 @@ impl MemoryService {
             revision: result.revision,
             seal: ContentHash::from_bytes(b""),
         };
+        let mut waiting =
+            u64::try_from(result.hits.len().min(MAX_CONTRIBUTED_BLOCKS)).unwrap_or(u64::MAX);
         for (rank, hit) in result.hits.iter().take(MAX_CONTRIBUTED_BLOCKS).enumerate() {
-            // The heading leads with what the material is and what to do with it, and
-            // keeps provenance as a trailing note: provenance is for audit, not for the
-            // model to weigh before deciding whether to read on.
-            let text = format!(
-                "{}\n{}\n(source: authority={:?}, validity={:?}, refs={:?})",
-                MEMORY_BLOCK_HEADING,
-                hit.current.content,
-                hit.asset.created_by,
-                hit.current.record.validity,
-                hit.current.record.source_event_refs,
-            );
-            let tokens = u64::try_from(text.len().div_ceil(4)).unwrap_or(u64::MAX);
-            if tokens > remaining {
+            let share = remaining / waiting.max(1);
+            if share < MIN_BLOCK_TOKENS {
+                break;
+            }
+            let text = render_memory_block(hit, share);
+            // The heading and the source line are fixed costs, and for a small share they
+            // are the whole block. Injecting that would spend the budget of every hit
+            // after this one to tell the model nothing, so the hit is left out instead.
+            if estimate_tokens(&text) > share {
                 continue;
             }
-            remaining -= tokens;
+            remaining = remaining.saturating_sub(estimate_tokens(&text).min(share));
+            waiting = waiting.saturating_sub(1);
             let reference = MemoryVersionRef {
                 memory_asset_id: hit.asset.memory_asset_id.clone(),
                 version: hit.asset.current_version,
@@ -480,6 +492,26 @@ const MAX_CANDIDATES: usize = 32;
 /// Upper bound on blocks one contribution may carry.
 const MAX_CONTRIBUTED_BLOCKS: usize = 8;
 
+/// The size estimate used for one rendered block.
+///
+/// Four bytes to a token, the same rough measure the rest of this crate uses when it has
+/// to bound text without a tokenizer.
+const BYTES_PER_TOKEN: u64 = 4;
+
+/// The smallest block worth injecting.
+///
+/// Every block opens with the heading that says what this material is and how to read it,
+/// and that heading is most of a small block. Below this, a block is heading and nothing
+/// else - it spends the budget and tells the model nothing.
+const MIN_BLOCK_TOKENS: u64 = 32;
+
+/// Appended to a block that was shortened to fit the turn's budget.
+///
+/// A memory that stops mid-sentence and does not say so is read as a memory that ends
+/// there, which is how a clipped answer becomes a wrong answer.
+const CLIPPED_MARKER: &str =
+    "\n[truncated: the rest of this memory did not fit this turn's budget]";
+
 /// The detail reported when a query had nothing an index could match.
 const NO_SEARCHABLE_TERMS: &str = "no_searchable_terms";
 
@@ -491,6 +523,48 @@ fn relevance_for(rank: usize) -> i32 {
     let top = i32::try_from(MAX_CONTRIBUTED_BLOCKS).unwrap_or(i32::MAX);
     let step = i32::try_from(rank).unwrap_or(i32::MAX);
     top.saturating_sub(step).max(1)
+}
+
+/// The size estimate for one rendered block.
+fn estimate_tokens(text: &str) -> u64 {
+    u64::try_from(text.len().div_ceil(4)).unwrap_or(u64::MAX)
+}
+
+/// Render one hit for injection, clipped to `share` tokens when it does not fit.
+///
+/// The heading leads with what the material is and what to do with it, and keeps
+/// provenance as a trailing note: provenance is for audit, not for the model to weigh
+/// before deciding whether to read on. A clip therefore shortens the *content* and keeps
+/// both ends: the heading is what tells the model how to read what follows, and the
+/// source line is what an auditor follows back to the version this came from.
+fn render_memory_block(hit: &StoredMemoryAsset, share: u64) -> String {
+    let head = format!("{MEMORY_BLOCK_HEADING}\n");
+    let tail = format!(
+        "\n(source: authority={:?}, validity={:?}, refs={:?})",
+        hit.asset.created_by, hit.current.record.validity, hit.current.record.source_event_refs,
+    );
+    let whole = format!("{head}{}{tail}", hit.current.content);
+    if estimate_tokens(&whole) <= share {
+        return whole;
+    }
+    let fixed = head.len() + tail.len() + CLIPPED_MARKER.len();
+    let room = usize::try_from(share.saturating_mul(BYTES_PER_TOKEN))
+        .unwrap_or(usize::MAX)
+        .saturating_sub(fixed);
+    let content = clip_chars(&hit.current.content, room);
+    format!("{head}{content}{CLIPPED_MARKER}{tail}")
+}
+
+/// The first `room` characters of `text`, never splitting one.
+fn clip_chars(text: &str, room: usize) -> String {
+    if text.len() <= room {
+        return text.to_owned();
+    }
+    let mut end = room.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
 }
 
 /// The normalized terms of one user query.

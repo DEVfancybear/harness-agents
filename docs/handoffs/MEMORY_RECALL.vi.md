@@ -300,9 +300,52 @@ quyết.
 
 1. `docs/MEMORY_AND_CONTINUITY.{vi,en}.md` §19 và `docs/OPERATOR_GUIDE.{vi,en}.md` §12.5 đã cập nhật
    theo hợp đồng mới (đã xong trong `eb32a4d`).
-2. Bài học còn để ngỏ, không phải lỗi: `answered:` chỉ giữ 200 ký tự, nên một câu trả lời dài chỉ
-   vào được nhật ký ở dạng trích đoạn. Nếu sau này cần trả lời câu hỏi *về nội dung* câu trả lời cũ,
-   đó là một tính năng mới (L2 từ hội thoại), không phải chỗ sửa của lượt này.
+2. ~~`answered:` chỉ giữ 200 ký tự~~ — xong ở §7.9.
 3. `attachments.rs` của writer khác đã được họ commit (`62e3f98`); blocker mà review báo đã tự hết
    trước khi tôi kịp xử.
-4. Linux build/run vẫn chưa kiểm (phiên này chỉ có Windows x64), như mọi lượt trước.
+4. Linux build/run vẫn chưa kiểm (phiên này chỉ có Windows x64), như mọi lượt trước — và lượt này
+   kiểm thêm một lần nữa: không có WSL, không có Docker/podman, không có `bash`, nên không có đường
+   nào chạy Linux thật tại chỗ. Đây là việc **không thể** làm trong phiên này, không phải việc bỏ sót.
+
+### 7.9. Trả lời được câu hỏi *về nội dung* câu trả lời cũ
+
+**Triệu chứng.** Bản ghi lượt giữ 200 ký tự đầu của câu trả lời. Hỏi "câu lệnh deploy bạn đưa tôi
+là gì?" thì bản ghi được tìm thấy, nhưng câu lệnh nằm sau vị trí 200 và model đọc một đoạn cắt giữa
+câu. Tôi đã ghi việc này là "không phải lỗi" ở §7.8 và đề xuất "L2 từ hội thoại" như một tính năng
+mới. Làm lại thì thấy đề xuất đó **sai hướng**: L2 là tri thức bền, mà M6 vừa chốt rằng không gì bền
+được dựng trên một bản ghi lượt (bản ghi sẽ hết hạn). Câu trả lời phải nằm trong chính bản ghi, chứ
+không phải được thăng cấp thành tri thức.
+
+**Sửa hai chỗ, và chỗ thứ hai mới là chỗ đáng nói:**
+
+1. `TURN_ANSWER_CHARS`: 200 → **4000**. Đây là điểm mà thêm chữ nữa cũng không thể tới model: ngân
+   sách memory một lượt là 800 token ≈ 3200 ký tự, mà khối không vừa thì bị cắt theo phần được chia.
+2. `contribute` **chia** ngân sách thay vì ai nhanh chân thì lấy hết. Trước đây khối không vừa bị bỏ
+   **nguyên khối** (`continue`), nên một memory dài che mất mọi thứ cùng lần tìm đó tìm ra. Bản ghi
+   hội thoại biến điều đó từ "có thể" thành "chắc chắn": bản ghi là câu hỏi + câu trả lời, mà câu trả
+   lời dài hơn câu hỏi. Giờ mỗi hit được chia `remaining / số hit còn lại`, hit nào không dùng hết
+   phần của mình thì phần dư ở lại cho các hit sau, và khối vẫn không vừa thì bị **cắt** kèm dòng
+   `[truncated: ...]` — một memory dừng giữa câu mà không nói gì thì bị đọc như một memory kết thúc ở
+   đó, và đó là cách một câu trả lời bị cắt trở thành một câu trả lời sai. Phần cố định (heading +
+   dòng `(source: ...)`) luôn được giữ: heading là thứ nói cho model biết đọc phần sau thế nào.
+
+Hệ quả đáng chú ý: đường recency ("session trước tôi hỏi bạn những gì?") **tốt hơn** trước, không
+tệ đi. Trước đây 8 bản ghi mà mỗi khối ~40 token heading thì chỉ 2–3 khối vừa; giờ mỗi bản ghi được
+~100 token, đủ cho dòng `asked:` của **cả tám** lượt.
+
+**Ba test mới, và cả ba đều kiểm ngược:**
+
+| Test | Xanh vì | Đỏ khi bỏ fix |
+|---|---|---|
+| `memory_a_long_answer_is_reachable_by_a_question_about_its_content` | marker ở cuối câu trả lời ~1300 ký tự tới được model | hạ `TURN_ANSWER_CHARS` về 200 → bản ghi dừng ở "step 2", marker mất |
+| `memory_a_long_hit_does_not_hide_the_hits_beside_it` | 3 asset (1 dài ~12 000 ký tự + 2 ngắn) đều có mặt, khối dài bị cắt kèm marker | trả lại `share = remaining` + không cắt → chỉ 2 khối, asset dài biến mất |
+| `memory_history_still_shows_every_recent_turn_after_long_answers` | 8 lượt, mỗi lượt một câu hỏi riêng, cả 8 câu đều vào message | như trên → chỉ 2 khối, "question number 0" mất |
+
+**Số đo lượt này:** 235 unit test (trước 232), `phase_p0..p7` 148/148, `interactive_launch` 18/18,
+`interactive_session` 13/13, clippy + fmt sạch, `DOCS_OK`, gate `failures: []`, PTY 17/17,
+`P4_MUTATIONS_OK 5/5`.
+
+**Một bài học về cách đo, ghi lại vì nó suýt làm tôi kết luận sai:** lần đầu tôi "kiểm ngược" bằng
+cách copy đè file đã sửa từ bản backup, và `Copy-Item` giữ nguyên mtime cũ — cargo coi file là cũ nên
+**không build lại**, và test chạy trên binary cũ. Kết quả trông như "fix không hoạt động". Từ giờ:
+sau khi khôi phục file bằng copy, chạm mtime trước khi tin kết quả test.
