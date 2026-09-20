@@ -604,6 +604,28 @@ mod tests {
         assert_eq!(found.images.len(), 1, "{found:?}");
     }
 
+    /// Reads the machine's real clipboard, so it runs only when asked for by hand:
+    ///
+    /// ```text
+    /// cargo test -p harness-cli --bin ha the_clipboard_can_be_read_by_hand -- --ignored --nocapture
+    /// ```
+    ///
+    /// Copy a screenshot first. A pasted image is the one path no test can stage for
+    /// itself — the terminal never sends a bitmap, so this prints what the app would get.
+    #[test]
+    #[ignore = "reads the machine clipboard; run by hand after copying a screenshot"]
+    fn the_clipboard_can_be_read_by_hand() {
+        match clipboard_png() {
+            Ok(Some(png)) => println!(
+                "clipboard holds {}, {} bytes",
+                sniff(&png).unwrap_or("a format this app does not attach"),
+                png.len()
+            ),
+            Ok(None) => println!("clipboard holds no image"),
+            Err(reason) => println!("clipboard could not be read: {reason}"),
+        }
+    }
+
     /// The clipboard is machine state, so this checks the shape of the answer rather
     /// than its content: no image must be an `Ok(None)`, never a hard failure.
     #[test]
