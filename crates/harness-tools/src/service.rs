@@ -1267,4 +1267,143 @@ mod tests {
             .expect("store closes");
         let _ = std::fs::remove_dir_all(temp);
     }
+
+    /// The kinds a host may auto-approve, and the three that it never may.
+    ///
+    /// Written as an exhaustive list on purpose: this predicate is the whole
+    /// definition of what "read-only" means to the approval gate, so a new
+    /// `ToolKind` cannot be added without this test failing and someone deciding
+    /// which side it belongs on.
+    #[test]
+    fn tool_kinds_classify_read_only_by_construction_not_by_name() {
+        use crate::ToolKind;
+
+        for kind in [
+            ToolKind::ReadFile,
+            ToolKind::ListFiles,
+            ToolKind::SearchText,
+            ToolKind::GitStatus,
+            ToolKind::GitDiff,
+        ] {
+            assert!(
+                kind.is_read_only(),
+                "{} only reads, so a host may stop asking for it",
+                kind.as_str()
+            );
+        }
+        for kind in [
+            ToolKind::ApplyPatch,
+            ToolKind::RunProcess,
+            ToolKind::RunShell,
+            ToolKind::TaskUpdate,
+            ToolKind::ExternalTool,
+        ] {
+            assert!(
+                !kind.is_read_only(),
+                "{} can change the world, so it must always be asked about",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// Auto-approving a read-only action skips the *question*, never the check.
+    ///
+    /// This is the test that keeps the wider grant from becoming a way to read a
+    /// credential file: a read-only kind whose path is protected is refused in
+    /// `prepare`, which runs before any proposal - and therefore before any gate -
+    /// exists. There is nothing for an "allow reads" answer to cover.
+    #[tokio::test]
+    async fn a_read_only_kind_cannot_reach_a_protected_path_through_the_gate() {
+        use crate::observe_workspace;
+        use harness_session::{AdmitInputRequest, SessionService};
+        use harness_types::SourceAuthority;
+
+        let temp = std::env::temp_dir().join(format!(
+            "harness-tools-sensitive-{}",
+            harness_types::InputId::generate()
+        ));
+        // The store lives beside the workspace, not inside it: a workspace walk that
+        // hashes the open database fails on a locked file, which is a property of the
+        // fixture and would hide the refusal this test is about.
+        let store_dir = temp.join("store");
+        let workspace = temp.join("workspace");
+        std::fs::create_dir_all(workspace.join("src")).expect("temp workspace");
+        std::fs::create_dir_all(&store_dir).expect("temp store");
+        std::fs::write(workspace.join(".env"), "API_KEY=not-a-real-secret\n").expect("env file");
+        std::fs::write(workspace.join("src").join("main.rs"), "fn main() {}\n")
+            .expect("source file");
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(store_dir, HostId::generate()))
+                .await
+                .expect("store opens"),
+        );
+        // A real admitted task, so a refusal below can only come from the path: with
+        // no admission every call fails with the same code and the test would prove
+        // nothing.
+        let session_id = SessionId::generate();
+        let task_id = TaskId::generate();
+        let project_id = ProjectId::generate();
+        SessionService::new(Arc::clone(&store))
+            .admit_input(AdmitInputRequest {
+                session_id: session_id.clone(),
+                task_id: task_id.clone(),
+                input_id: harness_types::InputId::generate(),
+                expected_sequence: 1,
+                authority: SourceAuthority::User,
+                raw_text: "read the workspace".to_owned(),
+                workspace: observe_workspace(project_id, &workspace)
+                    .expect("workspace observation"),
+                initial_plan_items: Vec::new(),
+            })
+            .await
+            .expect("fixture input is admitted");
+
+        let service = ToolExecutionService::new(Arc::clone(&store));
+        for (path, expected) in [
+            (".env", ErrorCode::SensitivePathDenied),
+            ("../outside.txt", ErrorCode::WorkspaceEscape),
+            ("src/../../outside.txt", ErrorCode::WorkspaceEscape),
+        ] {
+            let error = service
+                .prepare(ToolRequest::new(
+                    session_id.clone(),
+                    task_id.clone(),
+                    "test.actor",
+                    workspace.clone(),
+                    CodingToolAction::ReadFile {
+                        path: path.to_owned(),
+                    },
+                ))
+                .await
+                .expect_err("a protected or escaping path is refused, not offered");
+            assert_eq!(
+                error.code(),
+                expected,
+                "{path} must be refused before a proposal exists"
+            );
+        }
+
+        // The same kind on an ordinary path is still prepared, which is what proves
+        // the refusals above came from the path and not from the kind.
+        service
+            .prepare(ToolRequest::new(
+                session_id,
+                task_id,
+                "test.actor",
+                workspace.clone(),
+                CodingToolAction::ReadFile {
+                    path: "src/main.rs".to_owned(),
+                },
+            ))
+            .await
+            .expect("an ordinary read is prepared");
+
+        drop(service);
+        Arc::try_unwrap(store)
+            .expect("single owner")
+            .close()
+            .await
+            .expect("store closes");
+        let _ = std::fs::remove_dir_all(temp);
+    }
 }

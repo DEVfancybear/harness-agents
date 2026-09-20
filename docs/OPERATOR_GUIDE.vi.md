@@ -384,6 +384,37 @@ Trong ứng dụng: `/help`, `/status`, `/key`, `/config`, `/model`, `/new`, `/r
 bạn trả lời `y` (chạy một lần) hoặc `n` (từ chối); không có phê duyệt ngầm, hết thời gian
 chờ được tính là từ chối.
 
+### Phê duyệt: khi nào bị hỏi, và khi nào không
+
+Mặc định ban đầu vẫn là **hỏi mọi action**, kể cả đọc file. Nhưng panel có thêm một lựa
+chọn khi — và chỉ khi — action đó **chỉ đọc**:
+
+| Phím | Nghĩa | Hiệu lực |
+| --- | --- | --- |
+| `y` | chạy action này một lần | hết action là hết |
+| `a` | chạy action này **và** cho phép mọi thao tác chỉ-đọc trong **lượt này** | tới khi lượt kết thúc |
+| `n` | từ chối | action không chạy |
+
+`a` chỉ hiện với 5 action chỉ-đọc: `read_file`, `list_files`, `search_text`, `git_status`,
+`git_diff`. `apply_patch`, `run_process`, `run_shell`, `task_update` và tool của extension
+**luôn** hỏi từng lần, `a` không có tác dụng với chúng.
+
+Sau khi bạn bấm `a`, thanh trạng thái hiện `· reads tự động` để bạn biết cổng đang mở, và
+transcript ghi một dòng `[info] read-only, allowed for this turn: <action>` cho mỗi thao tác
+được chạy theo diện này — không có gì chạy mà không để lại dấu.
+
+Bốn điều `a` **không** làm được, kiểm bằng test:
+
+1. **Không** đọc được file trong danh sách bảo vệ: `.env`, `.env.*`, `.git`, `.harness`, và
+   tên chứa `credential`, `secret`, `password`, `private_key`, hay đuôi `.pem`/`.key`/`.p12`/
+   `.pfx`/`.clixml`. Các đường này bị từ chối **trước khi** panel tồn tại, nên không có gì để
+   `a` cho phép.
+2. **Không** ra khỏi workspace: đường dẫn tuyệt đối, `..`, và symlink/reparse point đều bị từ
+   chối trước panel.
+3. **Không** sống qua lượt sau: hết lượt là cổng đóng, kể cả khi lượt kết thúc bằng lỗi hay
+   Ctrl-C.
+4. **Không** áp cho lượt đang chạy khi bạn chưa bấm `a`: mặc định vẫn hỏi.
+
 **Chỉ cần một API key.** `DEEPSEEK_API_KEY` (hoặc `HA_API_KEY`) là đủ: endpoint và
 model tự lấy giá trị `DeepSeek` công bố — `https://api.deepseek.com` và
 `deepseek-flash` (xem <https://api-docs.deepseek.com/>). Đặt `HA_PROVIDER_ENDPOINT`
@@ -465,6 +496,7 @@ Bàn phím (chỉ những phím đã đo trên console thật):
 | `Ctrl-D` | Buffer rỗng: thoát |
 | `Ctrl-L` | Vẽ lại vùng đáy, không xoá scrollback |
 | `y` / `n` | Trả lời panel phê duyệt (hoặc gõ `yes`/`no` rồi Enter) |
+| `a` | Chỉ khi action **chỉ đọc**: chạy nó và cho phép đọc cả lượt (hoặc gõ `all` rồi Enter) |
 
 Khi một action cần phê duyệt, panel hiện action, workspace, scope và **đếm ngược** tới
 hạn của gate; hết hạn thì action **không** chạy và panel tự đóng.

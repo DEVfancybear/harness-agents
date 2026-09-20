@@ -124,6 +124,12 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
                     8,
                 );
             }
+            // An open gate is state the operator has to be able to see: after the
+            // panel closes there is nothing else on screen that says read-only
+            // actions are running without being asked about.
+            if state.reads_for_run {
+                push(Span::styled(" · reads tự động", theme.tool_ok), 18);
+            }
             push(Span::styled(" · Ctrl-C hủy".to_owned(), theme.dim), 14);
         }
         (None, AppPhase::SetupRequired) => {
@@ -195,6 +201,7 @@ mod tests {
             live_text: String::new(),
             open_tool: None,
             modal: None,
+            reads_for_run: false,
             last_request: None,
             run_started_at: None,
             last_run_elapsed: Duration::ZERO,
@@ -270,6 +277,7 @@ mod tests {
             workspace: "C:/w".to_owned(),
             scope: "once".to_owned(),
             expires_at: Instant::now() + Duration::from_mins(5),
+            read_only: false,
         });
         let text = plain_text(&[row(&state, &Theme::plain(), 200)]);
         assert!(text.contains("approval"), "{text}");

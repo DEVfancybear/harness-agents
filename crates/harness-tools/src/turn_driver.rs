@@ -100,6 +100,15 @@ pub struct ApprovalProposal {
     pub workspace: PathBuf,
     /// How far the grant reaches.
     pub scope: String,
+    /// Whether the action only reads.
+    ///
+    /// The gate uses this to decide what it may grant without asking, and the panel
+    /// uses it to decide what it offers: a host may let read-only actions through
+    /// once the user says so, but it must never extend that to a write. A request
+    /// that is read-only by kind can still have been refused outright before this
+    /// proposal existed - path containment and credential-like names are checked in
+    /// `prepare` - so this flag means "nothing is written", not "already allowed".
+    pub read_only: bool,
 }
 
 /// The user's answer to one proposal.
@@ -116,7 +125,10 @@ pub enum ApprovalAnswer {
 /// Asks the host to answer one proposal.
 ///
 /// The driver never grants by itself: a gate that is asked must be answered by the
-/// user through the interactive app or by an explicit fixture.
+/// user through the interactive app or by an explicit fixture. A gate is free to
+/// answer `Granted` without asking when `proposal.read_only` is set and the user has
+/// already allowed reads for this run - that decision belongs to the host, not here,
+/// so it stays one implementation instead of one per caller.
 pub trait ApprovalGate: Send + Sync {
     fn request(
         &self,
@@ -512,15 +524,17 @@ fn proposal_for(
     workspace_root: &std::path::Path,
 ) -> ApprovalProposal {
     let action = prepared.action();
+    let kind = action.kind();
     ApprovalProposal {
         request_id: format!(
             "approval-{sequence}-{}",
             short_hash(prepared.action_hash().as_str())
         ),
-        action: format!("{:?}", action.kind()),
+        action: format!("{kind:?}"),
         summary: summarize_action(action),
         workspace: workspace_root.to_path_buf(),
         scope: APPROVAL_SCOPE.to_owned(),
+        read_only: kind.is_read_only(),
     }
 }
 

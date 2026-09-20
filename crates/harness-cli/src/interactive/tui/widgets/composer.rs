@@ -167,6 +167,11 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
 #[must_use]
 pub fn hint(state: &UiState) -> String {
     match &state.modal {
+        // The wider grant is named only where it exists, so the hint never promises
+        // a key the panel does not offer.
+        Some(Modal::Approval {
+            read_only: true, ..
+        }) => " panel duyệt đang chờ · y chạy · a cho phép đọc cả lượt · n từ chối ".to_owned(),
         Some(Modal::Approval { .. }) => " panel duyệt đang chờ · y chạy · n từ chối ".to_owned(),
         Some(Modal::Picker { .. }) => " chọn phiên · ↑↓ · Enter · Esc đóng ".to_owned(),
         Some(Modal::Overlay { .. }) => {
@@ -224,6 +229,7 @@ mod tests {
             live_text: String::new(),
             open_tool: None,
             modal: None,
+            reads_for_run: false,
             last_request: None,
             run_started_at: None,
             last_run_elapsed: Duration::ZERO,
@@ -309,6 +315,7 @@ mod tests {
             workspace: "C:/w".to_owned(),
             scope: "once".to_owned(),
             expires_at: std::time::Instant::now(),
+            read_only: false,
         });
         let approval = hint(&asking);
         assert!(

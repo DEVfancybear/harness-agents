@@ -11,6 +11,7 @@ use std::future::Future;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -59,6 +60,14 @@ pub struct SubmitRequest {
 pub enum ApprovalDecision {
     /// Run this exact action once.
     Granted,
+    /// Run this action once, and stop asking about read-only actions until the run
+    /// ends.
+    ///
+    /// It grants the pending request as well, because a panel that offers "allow
+    /// reads" and then blocks the read in front of you would be a lie. The wider
+    /// grant is bounded twice: it never covers a mutating action, and it is dropped
+    /// when the run reaches its terminal event.
+    GrantReadsForRun,
     /// Do not run it.
     Denied,
 }
@@ -73,6 +82,14 @@ pub trait SessionPort: Send {
     fn answer(&mut self, _request_id: &str, _decision: ApprovalDecision) -> bool {
         false
     }
+    /// Allow read-only actions without asking, until the current run ends.
+    ///
+    /// Separate from `answer` because it is a property of the run rather than a
+    /// reply to one proposal: the controller grants it when the user picks the wider
+    /// option, and revokes it when the run reaches its terminal event.
+    fn approve_reads_for_run(&mut self) {}
+    /// Revoke the read-only grant, because the run it was given for is over.
+    fn revoke_reads_for_run(&mut self) {}
     /// Ask for the resumable sessions of this project; the list arrives as an event.
     fn list_sessions(&mut self) {}
     /// Continue from a persisted session, or start a fresh conversation when None.
@@ -128,10 +145,19 @@ pub trait SessionPort: Send {
 /// never a silent grant, and an expiry is **announced** as
 /// `SessionEvent::ApprovalExpired` before the driver is told, so the panel closes
 /// instead of waiting for the run to end.
+///
+/// One thing this gate *may* grant without asking: an action the proposal marks
+/// `read_only`, once the user has granted reads for the current run with
+/// [`ChannelApprovalGate::grant_reads_for_run`]. That grant is a field on this
+/// object, not on disk, and the controller clears it when the run ends - so it
+/// cannot outlive the turn it was given for. A write never qualifies: `read_only`
+/// is set from the action's kind, and every mutating kind leaves it false.
 pub struct ChannelApprovalGate {
     sender: UnboundedSender<SessionEvent>,
     pending: Mutex<HashMap<String, oneshot::Sender<ApprovalAnswer>>>,
     timeout: Duration,
+    /// Whether the user allowed read-only actions for the run now in flight.
+    reads_for_run: Arc<AtomicBool>,
 }
 
 impl ChannelApprovalGate {
@@ -141,11 +167,37 @@ impl ChannelApprovalGate {
             sender,
             pending: Mutex::new(HashMap::new()),
             timeout,
+            reads_for_run: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Allow read-only actions without asking, until the run ends.
+    ///
+    /// Idempotent, and deliberately not persisted anywhere: the only way to widen
+    /// it is another answer from the user.
+    pub fn grant_reads_for_run(&self) {
+        self.reads_for_run.store(true, Ordering::SeqCst);
+    }
+
+    /// Stop allowing read-only actions without asking.
+    ///
+    /// The controller calls this when a run reaches its terminal event, so the
+    /// grant covers one turn and never the next one.
+    pub fn clear_reads_for_run(&self) {
+        self.reads_for_run.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether read-only actions are currently allowed without asking.
+    #[must_use]
+    pub fn reads_granted_for_run(&self) -> bool {
+        self.reads_for_run.load(Ordering::SeqCst)
     }
 
     /// Answer one pending request.
     pub fn answer(&self, request_id: &str, decision: ApprovalDecision) -> bool {
+        if decision == ApprovalDecision::GrantReadsForRun {
+            self.grant_reads_for_run();
+        }
         let pending = self
             .pending
             .lock()
@@ -154,7 +206,9 @@ impl ChannelApprovalGate {
         match pending {
             Some(sender) => sender
                 .send(match decision {
-                    ApprovalDecision::Granted => ApprovalAnswer::Granted,
+                    ApprovalDecision::Granted | ApprovalDecision::GrantReadsForRun => {
+                        ApprovalAnswer::Granted
+                    }
                     ApprovalDecision::Denied => ApprovalAnswer::Denied,
                 })
                 .is_ok(),
@@ -168,6 +222,14 @@ impl ApprovalGate for ChannelApprovalGate {
         &self,
         proposal: ApprovalProposal,
     ) -> Pin<Box<dyn Future<Output = ApprovalAnswer> + Send>> {
+        // A read the user already allowed for this run never reaches the panel, so
+        // the transcript shows the turn's work rather than one block per file read.
+        if proposal.read_only && self.reads_granted_for_run() {
+            let _ = self.sender.send(SessionEvent::Notice {
+                message: format!("read-only, allowed for this turn: {}", proposal.summary),
+            });
+            return Box::pin(async { ApprovalAnswer::Granted });
+        }
         let (sender, receiver) = oneshot::channel();
         if let Ok(mut pending) = self.pending.lock() {
             pending.insert(proposal.request_id.clone(), sender);
@@ -181,6 +243,7 @@ impl ApprovalGate for ChannelApprovalGate {
             // The deadline travels with the proposal: the panel counts down to
             // the gate's real timeout instead of hard-coding a second one.
             expires_at: Instant::now() + self.timeout,
+            read_only: proposal.read_only,
         });
         let timeout = self.timeout;
         let request_id = proposal.request_id;
@@ -684,6 +747,14 @@ impl SessionPort for AgentSessionService {
         self.gate.answer(request_id, decision)
     }
 
+    fn approve_reads_for_run(&mut self) {
+        self.gate.grant_reads_for_run();
+    }
+
+    fn revoke_reads_for_run(&mut self) {
+        self.gate.clear_reads_for_run();
+    }
+
     fn limits(&self) -> TurnBounds {
         TurnBounds {
             max_steps: self.limits.max_steps,
@@ -1061,6 +1132,9 @@ async fn run_turn(
 pub struct FixtureService {
     sender: UnboundedSender<SessionEvent>,
     pending_approval: Arc<Mutex<Option<String>>>,
+    /// Mirrors the real gate's run-scoped grant, so a PTY case can drive the same
+    /// contract instead of a simplified one.
+    reads_for_run: bool,
 }
 
 impl FixtureService {
@@ -1069,6 +1143,7 @@ impl FixtureService {
         Self {
             sender,
             pending_approval: Arc::new(Mutex::new(None)),
+            reads_for_run: false,
         }
     }
 
@@ -1114,6 +1189,9 @@ impl SessionPort for FixtureService {
                 workspace: "fixture workspace (no mutation)".to_owned(),
                 scope: "once".to_owned(),
                 expires_at: Instant::now() + DEFAULT_APPROVAL_TIMEOUT,
+                // The fixture action mutates nothing, but it stands in for the gated
+                // write: the case that must never be covered by "allow reads".
+                read_only: false,
             });
             return;
         }
@@ -1156,13 +1234,24 @@ impl SessionPort for FixtureService {
         if !accepted {
             return false;
         }
-        if decision == ApprovalDecision::Granted {
+        if decision != ApprovalDecision::Denied {
+            if decision == ApprovalDecision::GrantReadsForRun {
+                self.reads_for_run = true;
+            }
             self.run_fixture_tool("fixture_action", "no mutation", true);
         }
         let _ = self.sender.send(SessionEvent::RunTerminal {
             outcome: RunOutcome::Done,
         });
         true
+    }
+
+    fn approve_reads_for_run(&mut self) {
+        self.reads_for_run = true;
+    }
+
+    fn revoke_reads_for_run(&mut self) {
+        self.reads_for_run = false;
     }
 
     fn provider_diagnostics(&self) -> Vec<String> {
@@ -1277,6 +1366,8 @@ mod tests {
         );
     }
 
+    /// A mutating action. `read_only: false` is what makes it ineligible for the
+    /// wider grant, so the tests below cannot pass by accident.
     fn proposal(request_id: &str) -> ApprovalProposal {
         ApprovalProposal {
             request_id: request_id.to_owned(),
@@ -1284,6 +1375,17 @@ mod tests {
             summary: "patch src/parser.rs".to_owned(),
             workspace: std::path::PathBuf::from("C:/work/repo"),
             scope: "one action, this turn only".to_owned(),
+            read_only: false,
+        }
+    }
+
+    /// The same proposal for a read: identical but for the flag the gate keys on.
+    fn read_proposal(request_id: &str) -> ApprovalProposal {
+        ApprovalProposal {
+            action: "ListFiles".to_owned(),
+            summary: "list .".to_owned(),
+            read_only: true,
+            ..proposal(request_id)
         }
     }
 
@@ -1368,6 +1470,139 @@ mod tests {
         );
         assert!(!gate.answer("approval-1", ApprovalDecision::Granted));
         assert!(!gate.answer("unknown", ApprovalDecision::Denied));
+    }
+
+    /// The whole point of the wider grant: a read the user already allowed is not
+    /// asked about again, and it is not asked about *silently* either - the
+    /// transcript records one line, so a reader can still see what ran.
+    #[tokio::test]
+    async fn t08_a_granted_read_is_not_asked_about_again_and_is_still_recorded() {
+        let mut channel = SessionChannel::new();
+        let gate = ChannelApprovalGate::new(channel.sender(), Duration::from_millis(30));
+        gate.grant_reads_for_run();
+
+        // The timeout is 30 ms: if this path waited for an answer at all, the test
+        // would observe an expiry instead of a grant.
+        let answer = ApprovalGate::request(&gate, read_proposal("approval-read-1")).await;
+        assert_eq!(
+            answer,
+            ApprovalAnswer::Granted,
+            "a granted read is granted without asking"
+        );
+
+        let announced = channel.drain();
+        assert!(
+            !announced.iter().any(|event| matches!(
+                event,
+                SessionEvent::ApprovalRequired { .. } | SessionEvent::ApprovalExpired { .. }
+            )),
+            "the panel must not open for a read the user already allowed: {announced:?}"
+        );
+        assert!(
+            announced.iter().any(|event| matches!(
+                event,
+                SessionEvent::Notice { message } if message.contains("read-only") && message.contains("list .")
+            )),
+            "the auto-granted read is recorded instead of being invisible: {announced:?}"
+        );
+    }
+
+    /// The grant covers reads and nothing else. This is the assertion that keeps the
+    /// fix from becoming a blanket bypass.
+    #[tokio::test]
+    async fn t08_a_granted_read_never_covers_a_mutating_action() {
+        let mut channel = SessionChannel::new();
+        let gate = ChannelApprovalGate::new(channel.sender(), Duration::from_millis(30));
+        gate.grant_reads_for_run();
+
+        let answer = ApprovalGate::request(&gate, proposal("approval-write-1")).await;
+        assert_eq!(
+            answer,
+            ApprovalAnswer::Expired,
+            "a patch still waits for an answer, so the 30 ms timeout decides it"
+        );
+        let announced = channel.drain();
+        assert!(
+            announced.iter().any(|event| matches!(
+                event,
+                SessionEvent::ApprovalRequired { request_id, .. } if request_id == "approval-write-1"
+            )),
+            "a mutating action still opens the panel: {announced:?}"
+        );
+    }
+
+    /// Before the user says so, a read keeps its panel - the grant is opt-in, not a
+    /// default.
+    #[tokio::test]
+    async fn t08_a_read_is_asked_about_until_the_user_allows_reads() {
+        let mut channel = SessionChannel::new();
+        let gate = ChannelApprovalGate::new(channel.sender(), Duration::from_millis(30));
+        assert!(
+            !gate.reads_granted_for_run(),
+            "a fresh gate has not been given anything"
+        );
+
+        let answer = ApprovalGate::request(&gate, read_proposal("approval-read-2")).await;
+        assert_eq!(answer, ApprovalAnswer::Expired);
+        let announced = channel.drain();
+        assert!(
+            announced.iter().any(|event| matches!(
+                event,
+                SessionEvent::ApprovalRequired { request_id, read_only, .. }
+                    if request_id == "approval-read-2" && *read_only
+            )),
+            "the panel opens and says the action is read-only: {announced:?}"
+        );
+    }
+
+    /// Answering the panel with `a` grants the pending action *and* opens the gate;
+    /// answering `y` does neither beyond the one action.
+    #[tokio::test]
+    async fn t08_the_wider_answer_grants_the_pending_action_and_the_run() {
+        let mut channel = SessionChannel::new();
+        let gate = Arc::new(ChannelApprovalGate::new(
+            channel.sender(),
+            Duration::from_secs(5),
+        ));
+        let asking = Arc::clone(&gate);
+        let handle = tokio::spawn(async move {
+            ApprovalGate::request(asking.as_ref(), read_proposal("approval-read-3")).await
+        });
+
+        let mut request_id = None;
+        for _ in 0..200 {
+            if let Some(id) = channel.drain().into_iter().find_map(|event| match event {
+                SessionEvent::ApprovalRequired { request_id, .. } => Some(request_id),
+                _ => None,
+            }) {
+                request_id = Some(id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let request_id = request_id.expect("the proposal reaches the channel");
+        assert!(gate.answer(&request_id, ApprovalDecision::GrantReadsForRun));
+        assert_eq!(
+            handle.await.expect("asking task"),
+            ApprovalAnswer::Granted,
+            "the action in front of the user runs; offering the grant and then blocking it would be a lie"
+        );
+        assert!(gate.reads_granted_for_run(), "and the run now allows reads");
+
+        gate.clear_reads_for_run();
+        assert!(
+            !gate.reads_granted_for_run(),
+            "clearing the grant closes the gate again"
+        );
+        let reopened = gate.clone();
+        let after = tokio::spawn(async move {
+            ApprovalGate::request(reopened.as_ref(), read_proposal("approval-read-4")).await
+        });
+        assert_eq!(
+            after.await.expect("second asking task"),
+            ApprovalAnswer::Expired,
+            "a read after the run ends waits for an answer again"
+        );
     }
 
     #[tokio::test]

@@ -645,3 +645,66 @@ gate `failures: []`. Trước khi sửa: 1 đỏ trong 2 lần chạy gate.
 - **Bậc thử lại của `i13` không có ca âm chứng minh nó không che lỗi thật.** Lập luận là đọc code
   (chỉ khớp đúng chuỗi `error sending request for url`), **không** phải một ca đỏ cố ý. Đây là cùng
   mức bằng chứng với ba flake loopback trước đó.
+
+## 14. Gate phê duyệt: đọc không hỏi, ghi vẫn hỏi (lượt này)
+
+Nguồn: người giao việc chat và gặp panel duyệt cho `ListFiles: list .`, rồi hỏi vì sao Claude
+Code và Codex CLI không hỏi như vậy. Đã tra tài liệu gốc hai bên và đọc binary trên máy, rồi
+chốt 4 mục với người giao việc **trước khi** viết code (SPEC 3g có bảng so sánh).
+
+### 14.1. Work items
+
+| # | Việc | Chỗ sửa |
+|---|---|---|
+| 1 | 5 action chỉ-đọc được miễn hỏi trong workspace | `harness-tools/src/contracts.rs` (`ToolKind::is_read_only`), `turn_driver.rs` (`ApprovalProposal::read_only`) |
+| 2 | Danh sách bảo vệ không bao giờ được miễn | **không** thêm gì: đã có sẵn ở `prepare` → `resolve_relative` → `is_sensitive_relative`; việc của lượt này là **chứng minh** nó chặn trước cổng |
+| 3 | Ghi/patch/lệnh vẫn hỏi | `is_read_only` trả `false` cho 5 kind còn lại; test liệt kê đủ 10 |
+| 4 | Panel thêm `a`, chỉ trong lượt | `ChannelApprovalGate` (`reads_for_run` + `grant`/`clear`), `ApprovalDecision::GrantReadsForRun`, `controller.rs` (phím `a`, nhãn, `finish_run` thu hồi), `tui/widgets/approval.rs` + `composer.rs` + `status.rs` + `layout.rs` |
+
+### 14.2. Số đo
+
+```text
+cargo test -p harness-cli --bin ha --locked                    -> 195 passed; 0 failed
+cargo test -p harness-tools --locked                           -> 6 passed; 0 failed
+cargo clippy --workspace --all-targets --locked -- -D warnings -> sạch
+cargo fmt --all -- --check                                     -> sạch
+pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json        -> passed: true, failures: []
+pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1       -> PTY_EXIT: 0, 16 passed; 0 failed (23.66 s)
+pwsh -NoProfile -File scripts/Verify-Docs.ps1                  -> DOCS_OK (exit 0)
+```
+
+`t06_pty_approval_y_key` xanh trong lượt này là bằng chứng **console thật** cho panel mới: nó
+gõ `request approval fixture`, đọc `[approval] fixture_action`, gửi `y`, rồi đọc
+`[approval] granted fixture-approval-1` — tức panel 7 dòng vẫn vẽ vừa viewport và đường trả lời
+không đổi.
+
+### 14.3. Test nào chứng minh điều gì
+
+| Test | Điều được chứng minh | Oracle |
+|---|---|---|
+| `tool_kinds_classify_read_only_by_construction_not_by_name` | đúng 5 kind chỉ-đọc, đúng 5 kind không; liệt kê **đủ** cả 10 nên thêm kind mới là đỏ | `ToolKind::is_read_only()` |
+| `a_read_only_kind_cannot_reach_a_protected_path_through_the_gate` | `.env` → `SensitivePathDenied`, `../outside.txt` và `src/../../outside.txt` → `WorkspaceEscape`, **tất cả trước khi proposal tồn tại**; `src/main.rs` cùng kind thì prepare được | mã lỗi của `ToolExecutionService::prepare` trên một task **đã admit** |
+| `t08_a_granted_read_is_not_asked_about_again_and_is_still_recorded` | không có `ApprovalRequired`/`ApprovalExpired`, nhưng **có** `Notice` chứa `read-only` + summary | timeout 30 ms: nếu có chờ thì đã ra `Expired` |
+| `t08_a_granted_read_never_covers_a_mutating_action` | `ApplyPatch` vẫn ra `Expired` + vẫn có `ApprovalRequired` dù cổng đang mở | cùng cổng, cùng cờ, khác `read_only` |
+| `t08_a_read_is_asked_about_until_the_user_allows_reads` | trước khi cho phép thì đọc vẫn mở panel, và event mang `read_only: true` | `reads_granted_for_run() == false` |
+| `t08_the_wider_answer_grants_the_pending_action_and_the_run` | `GrantReadsForRun` trả `Granted` cho action đang chờ **và** mở cổng; `clear` rồi thì đọc lại `Expired` | hai `oneshot` qua cổng thật |
+| `t06_the_wider_grant_is_offered_for_reads_and_not_for_writes` | modal write có `read_only: false`; bấm `a` trên write **không** gửi quyết định nào; modal read có `read_only: true` và hint có chữ `a` | `ui_state().modal`, log `answers` |
+| `t06_the_read_only_key_grants_the_action_and_the_run` | quyết định là `GrantReadsForRun`, port nhận `approve_reads_for_run`, transcript có `[approval] granted (reads allowed for this turn) req-read-1` | log của `RecordingPort` |
+| `t06_the_read_only_grant_does_not_survive_the_turn` | quanh `RunTerminal` port nhận đúng `[true, false]`, và `reads_for_run` về `false` | thứ tự lời gọi, không chỉ trạng thái cuối |
+
+### 14.4. **Không** được chứng minh (đọc kỹ trước khi báo cáo)
+
+- **Không có ca PTY nào bấm `a`.** Ca PTY duyệt dùng `y`. Đường `a` được chứng minh ở tầng
+  controller + cổng (3 test), **không** phải trên ConPTY. Việc còn lại: một lần chạy tay, hoặc
+  thêm ca PTY gõ `a`.
+- **Chưa đo panel 7 dòng ở console thấp nhất.** `PANEL_ROWS = 7` bị `modal_rows` cắt theo
+  `available`, nên ở viewport 10 hàng dòng cuối (`a ...`) có thể không hiện. Trước lượt này panel
+  là 6 hàng, nên **ngưỡng hỏng dịch lên đúng 1 hàng** — chưa đo bằng mắt ở ngưỡng đó.
+- **`reads_for_run` là trạng thái một tiến trình.** Hai cửa sổ `ha` trên cùng project có cổng
+  riêng; bấm `a` ở cửa sổ này **không** mở cổng ở cửa sổ kia. Đúng thiết kế, nhưng chưa có test
+  khẳng định nó, và cũng chưa đo hai cửa sổ thật.
+- **Không** có mục "ghi vào policy vĩnh viễn" như `[p]` của Codex. Đây là quyết định, không phải
+  thiếu sót: nó ghi ra file và cần người dùng quyết riêng.
+- **Bộ 5 kind chỉ-đọc là allowlist do tôi chọn**, không phải kết quả đo. Claude Code dùng bộ lệnh
+  shell dựng sẵn rộng hơn nhiều (`ls cat grep find git ...`); bản này chỉ có 5 action của
+  `CodingToolAction`, vì app **không** chạy lệnh shell tuỳ ý qua đường chỉ-đọc.

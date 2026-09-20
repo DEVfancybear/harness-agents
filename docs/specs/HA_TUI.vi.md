@@ -679,6 +679,83 @@ Một paid turn thật (prompt buộc markdown) trả về đúng `**bold**` c�
 hẹp — nơi lỗi xuất hiện), khẳng định (a) không còn `**` trên màn hình, (b) mọi dòng ≤ 72 cell —
 tức terminal không còn gì để cắt, (c) mọi từ còn đủ và đúng thứ tự.
 
+## 3g. Gate phê duyệt: đọc thì không hỏi, ghi thì vẫn hỏi (lượt này)
+
+### 3g.1. Vì sao đổi — và vì sao **không** phải nới gate
+
+Người giao việc chat và gặp panel duyệt cho `ListFiles: list .`. Câu hỏi đúng: Claude Code
+và Codex CLI **không** hỏi ở trường hợp đó. Đã tra tài liệu gốc của cả hai, rồi đọc thẳng
+binary trên máy này:
+
+| | Claude Code 2.1.218 | Codex CLI 0.149.0 |
+|---|---|---|
+| Cách phân loại | bảng theo **loại tool**: chỉ-đọc **không** hỏi trong working directory | **không** liệt kê tool: mặc định `sandbox = workspace-write` + `-a on-request`, nên thứ gì trong biên giới thì tự chạy |
+| Lệnh shell chỉ-đọc | bộ dựng sẵn `ls cat echo pwd head tail grep find wc which diff stat du cd` + `git` chỉ-đọc | trong biên giới sandbox |
+| Lựa chọn khi panel hiện | `Yes` / `Yes, and don't ask again` / `No` (đôi khi chỉ one-time) | `[a] Accept once` · `[s] Accept for session` · `[p] Accept and add to policy` · `[d] Decline` · `[c] Cancel turn` |
+| Mặc định trên máy này | không đặt `defaultMode` → Manual, và Manual chỉ chạy **reads** mà không hỏi | `~/.codex/config.toml` có `trust_level = "trusted"` cho workspace này |
+
+Bản của tôi trước lượt này là `ApprovalMode::Ask` cho **mọi** action (`service.rs`), không có
+khái niệm chỉ-đọc, không có bậc thẩm quyền, không có trust. Đó là **thiếu sót thiết kế**, không
+phải người dùng dùng sai.
+
+### 3g.2. Ranh giới đã chốt — 4 mục, không hơn
+
+1. **Miễn hỏi cho 5 action chỉ-đọc** trong workspace: `read_file`, `list_files`,
+   `search_text`, `git_status`, `git_diff`.
+2. **Danh sách bảo vệ không bao giờ được miễn** — điểm tựa an toàn của cả thay đổi.
+3. **Ghi / patch / chạy lệnh vẫn hỏi từng lần.**
+4. **Panel thêm lựa chọn `a`** (cho phép đọc cả lượt), giống `[s] Accept for session` của Codex
+   nhưng **chỉ** cho chỉ-đọc và **chỉ** trong một lượt. **Không** làm mục "ghi vào policy vĩnh
+   viễn" như `[p]` của Codex: nó ghi ra file và cần người dùng quyết riêng.
+
+**Điểm tựa an toàn, đọc từ code chứ không suy đoán:** `ToolExecutionService::prepare` gọi
+`validate_workspace_action` → `resolve_relative` **trước khi** một `ApprovalProposal` tồn tại.
+Hàm đó từ chối: đường dẫn tuyệt đối, `..`, symlink/reparse point, đường dẫn canonicalise ra
+ngoài root, và mọi tên khớp `is_sensitive_relative` (`.git`, `.harness`, `.env`, `.env.*`, tên
+chứa `credential`/`secret`/`password`/`private_key`, đuôi `.pem`/`.key`/`.p12`/`.pfx`/`.clixml`).
+
+Nghĩa là: một action chỉ-đọc **theo kind** vẫn có thể bị **từ chối thẳng** trước khi tới cổng.
+Miễn hỏi bỏ **câu hỏi**, không bao giờ bỏ **kiểm tra**. Đó là lý do thay đổi này an toàn để làm,
+và cũng là lý do `read_only` trong proposal nghĩa là "không ghi gì", **không** phải "đã được phép".
+
+### 3g.3. Thi hành nằm ở một chỗ duy nhất
+
+`ChannelApprovalGate` là nơi duy nhất quyết định miễn hỏi — không phải driver, không phải UI:
+
+```text
+request(proposal):
+  if proposal.read_only && reads_for_run  ->  Notice + Granted   (không mở panel)
+  else                                    ->  ApprovalRequired   (panel như cũ)
+```
+
+Hệ quả đã kiểm: **plain mode được miễn hỏi y hệt** mà không phải viết thêm dòng nào, vì hai
+renderer dùng chung một cổng. `ApprovalMode` và trait `ApprovalGate` **không** đổi hình dạng —
+`read_only` đi kèm proposal, nên chỉ đúng một chỗ dựng proposal (`proposal_for`) phải sửa.
+
+Cờ `reads_for_run` là `AtomicBool` **trên object**, không ghi ra đĩa; `finish_run()` của
+controller thu hồi nó, nên nó không sống qua lượt sau kể cả khi lượt kết thúc bằng lỗi hay
+Ctrl-C. Thanh trạng thái hiện `· reads tự động` khi cổng đang mở: nới quyền mà không nói ra là
+điều tệ nhất có thể làm ở đây.
+
+### 3g.4. Test canh ranh giới (tên thật, đã chạy)
+
+```text
+harness-tools:
+  tool_kinds_classify_read_only_by_construction_not_by_name       -> 5 chỉ-đọc, 5 không, liệt kê đủ
+  a_read_only_kind_cannot_reach_a_protected_path_through_the_gate -> .env và ../ bị TỪ CHỐI,
+                                                                     không phải được mời duyệt
+harness-cli (cổng):
+  t08_a_granted_read_is_not_asked_about_again_and_is_still_recorded -> không panel, nhưng CÓ Notice
+  t08_a_granted_read_never_covers_a_mutating_action                 -> apply_patch vẫn mở panel
+  t08_a_read_is_asked_about_until_the_user_allows_reads             -> mặc định vẫn hỏi
+  t08_the_wider_answer_grants_the_pending_action_and_the_run        -> `a` chạy action + mở cổng;
+                                                                       clear thì đóng lại
+harness-cli (controller/UI):
+  t06_the_wider_grant_is_offered_for_reads_and_not_for_writes       -> `a` trên write không có tác dụng
+  t06_the_read_only_key_grants_the_action_and_the_run               -> quyết định + nhãn transcript
+  t06_the_read_only_grant_does_not_survive_the_turn                 -> [true, false] quanh RunTerminal
+```
+
 ## 4. Kiến trúc chốt cho T02–T08
 
 Theo plan mục 4, với hai điều chỉnh đã đo:

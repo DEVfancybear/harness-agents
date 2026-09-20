@@ -524,6 +524,7 @@ mod tests {
             live_text: "đang trả lời".to_owned(),
             open_tool: None,
             modal: None,
+            reads_for_run: false,
             last_request: None,
             run_started_at: None,
             last_run_elapsed: Duration::ZERO,
@@ -598,6 +599,7 @@ mod tests {
             workspace: "C:/work/project".to_owned(),
             scope: "once".to_owned(),
             expires_at: std::time::Instant::now() + Duration::from_mins(5),
+            read_only: false,
         });
         renderer.draw_state(&asking).expect("frame draws");
         let painted = renderer.painted().join("\n");

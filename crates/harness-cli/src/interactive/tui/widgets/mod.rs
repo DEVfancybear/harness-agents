@@ -30,6 +30,7 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
                 workspace,
                 scope,
                 expires_at,
+                read_only,
             }) => approval::render(
                 frame,
                 area,
@@ -40,6 +41,7 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
                     workspace,
                     scope,
                     expires_at: *expires_at,
+                    read_only: *read_only,
                 },
                 theme,
             ),

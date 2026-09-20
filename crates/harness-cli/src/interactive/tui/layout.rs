@@ -167,7 +167,9 @@ pub fn live_rows(state: &UiState, width: u16) -> u16 {
 /// Rows a modal wants, capped by the space available.
 fn modal_rows(modal: &Modal, available: u16) -> u16 {
     let content = match modal {
-        Modal::Approval { .. } => 6,
+        // The panel owns its own height: a row added to it without raising the
+        // reservation would be clipped off the bottom of the viewport instead.
+        Modal::Approval { .. } => super::widgets::approval::PANEL_ROWS,
         Modal::Picker { items, .. } => u16::try_from(items.len() + 2).unwrap_or(u16::MAX),
         Modal::Overlay { lines, .. } => u16::try_from(lines.len() + 2).unwrap_or(u16::MAX),
     };
@@ -222,6 +224,7 @@ mod tests {
             live_text: String::new(),
             open_tool: None,
             modal: None,
+            reads_for_run: false,
             last_request: None,
             run_started_at: None,
             last_run_elapsed: Duration::ZERO,
@@ -321,6 +324,7 @@ mod tests {
             workspace: "C:/w".to_owned(),
             scope: "once".to_owned(),
             expires_at: std::time::Instant::now(),
+            read_only: false,
         });
         let outline = plan(Rect::new(0, 0, 80, 12), &state, &Theme::plain());
         assert!(outline.modal.is_some(), "the modal takes the upper region");

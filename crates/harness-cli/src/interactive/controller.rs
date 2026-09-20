@@ -79,6 +79,9 @@ struct PendingApproval {
     workspace: String,
     scope: String,
     expires_at: Instant,
+    /// Whether the action only reads, so the panel offers the wider grant only
+    /// where granting it means something.
+    read_only: bool,
 }
 
 /// Interactive app state and its transitions.
@@ -107,6 +110,12 @@ pub struct InteractiveController {
     /// buffer on every token.
     pending_newlines: usize,
     pending_approval: Option<PendingApproval>,
+    /// Whether the user allowed read-only actions for the run now in flight.
+    ///
+    /// Mirrored here so the status row can say the gate is open, and cleared by
+    /// `finish_run` so the grant covers one turn rather than the session: a new
+    /// request never inherits the last turn's permission.
+    reads_for_run: bool,
     /// Last resume listing, so a number can select from it.
     session_candidates: Vec<SessionCandidate>,
     /// The plain renderer prints slash-command output; the TUI opens an overlay.
@@ -160,6 +169,7 @@ impl InteractiveController {
             pending_text: String::new(),
             pending_newlines: 0,
             pending_approval: None,
+            reads_for_run: false,
             session_candidates: Vec::new(),
             plain,
             open_tool: None,
@@ -241,6 +251,7 @@ impl InteractiveController {
             live_text: self.pending_text.clone(),
             open_tool: self.open_tool.clone(),
             modal: self.modal(),
+            reads_for_run: self.reads_for_run,
             last_request: self.last_request.clone(),
             run_started_at: self.run_started_at,
             last_run_elapsed: self.last_run_elapsed,
@@ -264,6 +275,7 @@ impl InteractiveController {
                 workspace: pending.workspace.clone(),
                 scope: pending.scope.clone(),
                 expires_at: pending.expires_at,
+                read_only: pending.read_only,
             });
         }
         if let Some(picker) = self.editor.picker() {
@@ -316,8 +328,13 @@ impl InteractiveController {
                 Key::Esc => return Vec::new(),
                 // In the TUI the panel says `y chạy · n từ chối`, so a single y or
                 // n answers immediately; anything else is typed and answered with
-                // Enter, which is what plain mode has always done.
+                // Enter, which is what plain mode has always done. `a` is offered
+                // only for a read-only action, so the key cannot grant more than
+                // the panel said it would.
                 Key::Char('y' | 'Y') if !self.plain => return self.answer("y"),
+                Key::Char('a' | 'A') if !self.plain && self.pending_is_read_only() => {
+                    return self.answer("a");
+                }
                 Key::Char('n' | 'N') if !self.plain => return self.answer("n"),
                 Key::Char(character) => return self.handle_key(Key::Paste(character.to_string())),
                 _ => {}
@@ -487,6 +504,7 @@ impl InteractiveController {
                 workspace,
                 scope,
                 expires_at,
+                read_only,
             } => {
                 self.flush_stream(effects);
                 // The panel owns the proposal while it is open, so writing it to the
@@ -513,6 +531,7 @@ impl InteractiveController {
                     workspace,
                     scope,
                     expires_at,
+                    read_only,
                 });
                 self.phase = AppPhase::WaitingApproval;
             }
@@ -1092,6 +1111,7 @@ impl InteractiveController {
         };
         let decision = match line.trim().to_ascii_lowercase().as_str() {
             "y" | "yes" | "grant" | "/approve" => Some(ApprovalDecision::Granted),
+            "a" | "all" | "/approve-reads" => Some(ApprovalDecision::GrantReadsForRun),
             "n" | "no" | "deny" | "/deny" => Some(ApprovalDecision::Denied),
             _ => None,
         };
@@ -1100,9 +1120,13 @@ impl InteractiveController {
             self.push_history(
                 &mut effects,
                 HistoryItem::Notice {
-                    message:
+                    message: if self.reads_for_run {
                         "the request is still pending: answer y to run it once, or n to refuse"
-                            .to_owned(),
+                            .to_owned()
+                    } else {
+                        "the request is still pending: answer y to run it once, a to allow reads for this turn, or n to refuse"
+                            .to_owned()
+                    },
                 },
             );
             effects.push(Effect::Redraw);
@@ -1111,10 +1135,16 @@ impl InteractiveController {
         let accepted = self.service.answer(&pending.request_id, decision);
         self.pending_approval = None;
         self.phase = AppPhase::Running;
-        let label = if decision == ApprovalDecision::Granted {
-            "granted"
-        } else {
-            "denied"
+        if decision == ApprovalDecision::GrantReadsForRun {
+            // The grant is a property of the run, not of this one answer, so it is
+            // recorded on the port rather than carried in the decision alone.
+            self.service.approve_reads_for_run();
+            self.reads_for_run = true;
+        }
+        let label = match decision {
+            ApprovalDecision::Granted => "granted",
+            ApprovalDecision::GrantReadsForRun => "granted (reads allowed for this turn)",
+            ApprovalDecision::Denied => "denied",
         };
         if accepted {
             self.push_history(
@@ -1140,11 +1170,25 @@ impl InteractiveController {
     fn finish_run(&mut self) {
         self.pending_approval = None;
         self.open_tool = None;
+        // The read-only grant was given for this turn only. Dropping it here, on the
+        // one path every terminal event goes through, is what makes that true even
+        // when the turn ended by failing or being canceled.
+        if self.reads_for_run {
+            self.reads_for_run = false;
+            self.service.revoke_reads_for_run();
+        }
         self.phase = if self.setup_required {
             AppPhase::SetupRequired
         } else {
             AppPhase::Ready
         };
+    }
+
+    /// Whether the pending request is one the wider grant could cover.
+    fn pending_is_read_only(&self) -> bool {
+        self.pending_approval
+            .as_ref()
+            .is_some_and(|pending| pending.read_only)
     }
 
     fn finish_pending_exit(&mut self, effects: &mut Vec<Effect>) {
@@ -1179,6 +1223,9 @@ mod tests {
         cancels: Arc<Mutex<u32>>,
         answers: Arc<Mutex<Vec<(String, ApprovalDecision)>>>,
         resumes: Arc<Mutex<Vec<Option<String>>>>,
+        /// Every read-only grant the controller handed to the port, and every
+        /// revocation, so a test can assert the grant is scoped to one turn.
+        read_grants: Arc<Mutex<Vec<bool>>>,
         limits: TurnBounds,
     }
 
@@ -1204,6 +1251,14 @@ mod tests {
                 .expect("answer log")
                 .push((request_id.to_owned(), decision));
             true
+        }
+
+        fn approve_reads_for_run(&mut self) {
+            self.read_grants.lock().expect("read grant log").push(true);
+        }
+
+        fn revoke_reads_for_run(&mut self) {
+            self.read_grants.lock().expect("read grant log").push(false);
         }
 
         fn resume(&mut self, session_id: Option<String>) -> Result<(), String> {
@@ -1584,6 +1639,7 @@ mod tests {
         InputId::parse(text).expect("canonical input id")
     }
 
+    /// A gated **write**, which is the case that keeps its panel.
     fn approval_event(request_id: &str) -> SessionEvent {
         SessionEvent::ApprovalRequired {
             request_id: request_id.to_owned(),
@@ -1592,6 +1648,20 @@ mod tests {
             workspace: "C:/work/project".to_owned(),
             scope: "once".to_owned(),
             expires_at: Instant::now() + Duration::from_mins(5),
+            read_only: false,
+        }
+    }
+
+    /// The same event for a read, which is the one that offers the wider grant.
+    fn read_approval_event(request_id: &str) -> SessionEvent {
+        SessionEvent::ApprovalRequired {
+            request_id: request_id.to_owned(),
+            action: "ListFiles".to_owned(),
+            summary: "list .".to_owned(),
+            workspace: "C:/work/project".to_owned(),
+            scope: "once".to_owned(),
+            expires_at: Instant::now() + Duration::from_mins(5),
+            read_only: true,
         }
     }
 
@@ -2136,6 +2206,141 @@ mod tests {
         assert!(
             harness.controller.plain,
             "the bench has to be in plain mode for this to prove anything"
+        );
+    }
+
+    /// The wider grant is offered only where it would cover something: a write gets
+    /// the same panel it always had, and `a` is not a key that quietly means "yes".
+    #[test]
+    fn t06_the_wider_grant_is_offered_for_reads_and_not_for_writes() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "work");
+
+        harness
+            .events
+            .send(approval_event("req-write"))
+            .expect("write approval");
+        let _ = harness.controller.pump_events();
+        let write = harness.controller.ui_state().modal;
+        assert!(
+            matches!(
+                write,
+                Some(Modal::Approval {
+                    read_only: false,
+                    ..
+                })
+            ),
+            "a patch is not read-only: {write:?}"
+        );
+        // `a` typed on a write is not a decision, so it stays pending.
+        let effects = harness.controller.handle_key(Key::Char('a'));
+        assert!(
+            harness.port.answers.lock().expect("answers").is_empty(),
+            "a write must not be granted by the read-only key: {effects:#?}"
+        );
+
+        let mut reads = tui_bench(true);
+        let _ = reads.controller.boot_lines();
+        let _ = submit_text(&mut reads.controller, "work");
+        reads
+            .events
+            .send(read_approval_event("req-read"))
+            .expect("read approval");
+        let _ = reads.controller.pump_events();
+        let read = reads.controller.ui_state().modal;
+        assert!(
+            matches!(
+                read,
+                Some(Modal::Approval {
+                    read_only: true,
+                    ..
+                })
+            ),
+            "a listing is read-only: {read:?}"
+        );
+        assert!(
+            crate::interactive::tui::widgets::composer::hint(&reads.controller.ui_state())
+                .contains('a'),
+            "the hint names the key the panel offers"
+        );
+    }
+
+    /// `a` grants the action in front of the user, opens the gate for the run, and
+    /// says so in the transcript instead of widening it silently.
+    #[test]
+    fn t06_the_read_only_key_grants_the_action_and_the_run() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "work");
+        harness
+            .events
+            .send(read_approval_event("req-read-1"))
+            .expect("read approval");
+        let _ = harness.controller.pump_events();
+
+        let effects = harness.controller.handle_key(Key::Char('a'));
+        assert_eq!(
+            harness.port.answers.lock().expect("answers").as_slice(),
+            [("req-read-1".to_owned(), ApprovalDecision::GrantReadsForRun)],
+            "the answer carries the wider meaning, not a plain grant"
+        );
+        assert_eq!(
+            harness
+                .port
+                .read_grants
+                .lock()
+                .expect("read grants")
+                .as_slice(),
+            [true],
+            "the port is told to stop asking about reads"
+        );
+        assert!(
+            harness.controller.ui_state().reads_for_run,
+            "the status row has to be able to say the gate is open"
+        );
+        let plain = effects_to_plain(&effects).join("\n");
+        assert!(
+            plain.contains("[approval] granted (reads allowed for this turn) req-read-1"),
+            "the transcript records what was granted: {plain}"
+        );
+    }
+
+    /// The grant covers one turn. A run that ends - however it ends - must not leave
+    /// the next one running reads without being asked.
+    #[test]
+    fn t06_the_read_only_grant_does_not_survive_the_turn() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "work");
+        harness
+            .events
+            .send(read_approval_event("req-read-2"))
+            .expect("read approval");
+        let _ = harness.controller.pump_events();
+        let _ = harness.controller.handle_key(Key::Char('a'));
+        assert!(harness.controller.ui_state().reads_for_run);
+
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("terminal");
+        let _ = harness.controller.pump_events();
+        assert!(
+            !harness.controller.ui_state().reads_for_run,
+            "the run is over, so the gate closes"
+        );
+        assert_eq!(
+            harness
+                .port
+                .read_grants
+                .lock()
+                .expect("read grants")
+                .as_slice(),
+            [true, false],
+            "the port is told to close it again, in that order"
         );
     }
 

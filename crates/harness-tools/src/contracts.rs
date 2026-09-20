@@ -43,6 +43,26 @@ impl ToolKind {
             Self::ExternalTool => "external_tool",
         }
     }
+
+    /// Whether this action only reads.
+    ///
+    /// Reading is the one capability that cannot damage the workspace, so the host
+    /// is allowed to stop asking for it. The list is deliberately an allowlist of
+    /// five and nothing else: a kind is read-only because it was classified here,
+    /// never because its name suggests it.
+    ///
+    /// This predicate is not the whole guard. A path is checked against the
+    /// workspace root - traversal, symlinks and credential-like names - by
+    /// `ToolExecutionService::prepare` *before* any proposal exists, so a read that
+    /// is read-only by kind can still be refused outright. Auto-approving skips the
+    /// question, never the check.
+    #[must_use]
+    pub const fn is_read_only(self) -> bool {
+        matches!(
+            self,
+            Self::ReadFile | Self::ListFiles | Self::SearchText | Self::GitStatus | Self::GitDiff
+        )
+    }
 }
 
 /// The built-in provider-function names the P3 parser accepts.

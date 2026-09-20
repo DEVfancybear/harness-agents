@@ -15,6 +15,12 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use super::super::theme::Theme;
 use crate::interactive::view;
 
+/// Rows the panel needs, borders included.
+///
+/// The layout reserves exactly this, so a row added here without updating it would
+/// be clipped off the bottom of the viewport instead of wrapping into view.
+pub const PANEL_ROWS: u16 = 7;
+
 /// Everything the panel shows about one pending request.
 #[derive(Clone, Copy, Debug)]
 pub struct Proposal<'a> {
@@ -24,6 +30,10 @@ pub struct Proposal<'a> {
     pub workspace: &'a str,
     pub scope: &'a str,
     pub expires_at: Instant,
+    /// Whether the action only reads. The wider grant is offered only here, because
+    /// it can only ever cover read-only actions - offering it on a write would name
+    /// a key that does less than it says.
+    pub read_only: bool,
 }
 
 /// Draw the panel.
@@ -73,6 +83,14 @@ pub fn rows(request: &Proposal<'_>, theme: &Theme) -> Vec<Line<'static>> {
         "y chạy một lần · n từ chối · hết hạn thì không chạy".to_owned(),
         theme.dim,
     )]));
+    // The wider grant is named only when it would cover something, and it is named
+    // last so the two keys that always exist keep the position they had.
+    if request.read_only {
+        lines.push(Line::from(vec![Span::styled(
+            "a cho phép mọi thao tác chỉ-đọc trong lượt này".to_owned(),
+            theme.dim,
+        )]));
+    }
     lines
 }
 
@@ -91,6 +109,7 @@ mod tests {
             workspace: "C:/work/project",
             scope: "once",
             expires_at: Instant::now() + expires_in,
+            read_only: false,
         }
     }
 

@@ -681,3 +681,89 @@ nhận kết nối nên **không** bị tiêu mất response. Vì vậy bậc th
 
 Số đo sau khi sửa: **3/3 lần chạy liên tiếp** cả suite `interactive_launch` xanh (34.07 s, 34.49 s,
 34.73 s), rồi gate `failures: []`.
+
+## 16. Gate phê duyệt: đọc không hỏi, ghi vẫn hỏi
+
+### 16.1. Việc đã xong
+
+Người giao việc gặp panel duyệt cho `ListFiles: list .` khi chat, và hỏi đúng: Claude Code với
+Codex CLI không hỏi vậy. Đã **research trước, code sau**: tra tài liệu gốc Anthropic
+([permissions](https://code.claude.com/docs/en/permissions),
+[permission modes](https://code.claude.com/docs/en/permission-modes)) và OpenAI
+([approvals](https://mintlify.wiki/openai/codex/concepts/approvals),
+[sandboxing](https://mintlify.wiki/openai/codex/concepts/sandboxing)), rồi đọc thẳng
+`claude --help` (2.1.218), `codex --help` (0.149.0), `~/.claude/settings.json` và
+`~/.codex/config.toml` trên máy này. Bảng so sánh ở SPEC 3g.1.
+
+Chốt 4 mục với người giao việc **trước khi viết code**, rồi làm đủ 4:
+
+1. 5 action chỉ-đọc (`read_file`, `list_files`, `search_text`, `git_status`, `git_diff`) được
+   miễn hỏi trong workspace — allowlist ở `ToolKind::is_read_only`, chứ không suy từ tên.
+2. Danh sách bảo vệ **không** bị nới: `.env`, `.env.*`, `.git`, `.harness`, tên chứa
+   `credential`/`secret`/`password`/`private_key`, đuôi `.pem`/`.key`/`.p12`/`.pfx`/`.clixml`,
+   và mọi đường ra ngoài workspace — tất cả bị từ chối ở `prepare`, **trước khi** proposal tồn
+   tại. Lượt này thêm test **chứng minh** điều đó, không đổi cơ chế.
+3. Ghi/patch/lệnh vẫn hỏi từng lần; test liệt kê đủ 10 kind nên thêm kind mới là đỏ ngay.
+4. Panel có `a` = chạy action này **và** cho phép đọc cả lượt. Cờ là `AtomicBool` trên object,
+   `finish_run()` thu hồi, thanh trạng thái hiện `· reads tự động`, và mỗi lần miễn hỏi ghi một
+   dòng `[info] read-only, allowed for this turn: ...`. **Không** làm mục ghi policy vĩnh viễn.
+
+**Quyết định thiết kế quan trọng nhất:** thi hành nằm ở **một** chỗ, `ChannelApprovalGate`,
+không phải driver và không phải UI. Nhờ vậy plain mode được miễn hỏi y hệt mà không phải viết
+thêm dòng nào, và `ApprovalMode`/trait `ApprovalGate` không đổi hình dạng — chỉ một chỗ dựng
+proposal phải sửa.
+
+### 16.2. File đã đụng
+
+```text
+crates/harness-tools/src/contracts.rs                 ToolKind::is_read_only (allowlist 5)
+crates/harness-tools/src/turn_driver.rs               ApprovalProposal::read_only + doc trait
+crates/harness-tools/src/service.rs                   2 test mới (kind + đường dẫn bị chặn)
+crates/harness-cli/src/interactive/events.rs          ApprovalRequired.read_only, Modal::Approval.read_only, UiState.reads_for_run
+crates/harness-cli/src/interactive/service.rs         ApprovalDecision::GrantReadsForRun, cổng tự duyệt, grant/clear, 4 test
+crates/harness-cli/src/interactive/controller.rs      phím a, nhãn transcript, finish_run thu hồi, 3 test
+crates/harness-cli/src/interactive/tui/widgets/approval.rs  PANEL_ROWS=7 + dòng gợi ý a
+crates/harness-cli/src/interactive/tui/widgets/composer.rs  hint theo read_only
+crates/harness-cli/src/interactive/tui/widgets/status.rs    badge "reads tự động"
+crates/harness-cli/src/interactive/tui/layout.rs      modal_rows dùng PANEL_ROWS
+docs/OPERATOR_GUIDE.vi.md                             mục "Phê duyệt: khi nào bị hỏi, và khi nào không"
+docs/specs/HA_TUI.vi.md                               §3g (so sánh + ranh giới + test)
+docs/evidence/HA_TUI.vi.md                            §14 (số đo + không được chứng minh)
+```
+
+### 16.3. Số đo
+
+```text
+cargo test -p harness-cli --bin ha --locked                    -> 195 passed; 0 failed
+cargo test -p harness-tools --locked                           -> 6 passed; 0 failed
+cargo clippy --workspace --all-targets --locked -- -D warnings -> sạch
+pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json        -> passed: true, failures: []
+pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1       -> PTY_EXIT: 0, 16 passed; 0 failed
+```
+
+Không có lần đỏ nào trong lượt này. Gate xanh **lần chạy đầu**.
+
+### 16.4. Việc còn lại / open items
+
+1. **Chưa có ca PTY bấm `a`.** Đường `a` được chứng minh ở controller + cổng, chưa trên ConPTY.
+2. **Panel 7 hàng ở viewport thấp nhất chưa đo bằng mắt.** `PANEL_ROWS` bị `modal_rows` cắt theo
+   chỗ trống, nên ở 10 hàng dòng cuối có thể không hiện; ngưỡng hỏng dịch lên **1 hàng** so với
+   trước. Cần một lần lái tay trên console thật ở console thấp.
+3. **Hai cửa sổ `ha` trên cùng project có cổng riêng** — `a` ở cửa sổ này không mở cổng ở cửa sổ
+   kia. Đúng thiết kế (trạng thái một tiến trình), nhưng chưa có test và chưa đo thật.
+4. **Bộ 5 kind chỉ-đọc là allowlist tôi chọn**, hẹp hơn nhiều so với bộ lệnh shell chỉ-đọc dựng
+   sẵn của Claude Code. Muốn rộng hơn thì phải mở đường chạy shell chỉ-đọc — việc riêng, cần
+   người giao việc quyết.
+5. Open item cũ **vẫn nguyên**: paid smoke, cài thật + User PATH, Linux, conhost cũ.
+
+### 16.5. Next action chính xác
+
+1. Trên console thật: `ha chat`, hỏi một câu khiến model **đọc** file/list thư mục, xác nhận panel
+   hiện với dòng `a cho phép mọi thao tác chỉ-đọc trong lượt này`, bấm `a`, rồi xác nhận các thao
+   tác đọc sau đó **không** hỏi nữa và thanh trạng thái hiện `· reads tự động`. Lưu transcript.
+2. Trong cùng lượt đó, xác nhận một `apply_patch` (hoặc lệnh) **vẫn** hỏi, để thấy ranh giới bằng
+   mắt chứ không chỉ bằng test.
+3. Ở cùng console **thấp** (dưới ~20 hàng), mở lại panel và xem dòng `a` có bị cắt không; nếu có,
+   hoặc gộp gợi ý `a` vào dòng `y ... n ...`, hoặc cho panel biết chỗ trống thật.
+4. Nếu muốn: thêm ca PTY gõ `a` (sửa `scripts/Invoke-HaPtyAcceptance.ps1` chỉ cần nêu lại con số 16
+   thành 17) — hiện `a` chưa từng đi qua ConPTY.
