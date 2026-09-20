@@ -15,6 +15,16 @@ việc tiếp theo) ở **mục 16 của evidence**: [evidence HA_LAUNCH](../evi
 
 ## 1. Ranh giới hiện tại
 
+- **Round 25 — CI XANH 12/12 (`cb12940`).** Sau round 24, CI đỏ lại vì track TUI của writer khác:
+  lần này **clippy `-D warnings`** chặn trước khi test chạy — `unused variable` và hai variant
+  chỉ-dựng-trên-Windows trong `interactive/credentials.rs`, cùng một test barrier vượt 100 dòng trong
+  `providers/streaming.rs`. Sửa ở `cb12940` (allow đối xứng `cfg_attr(unix, …)`, và tách fixture của
+  test barrier thành helper có tên, giữ nguyên assertion). Run `cb12940` → **12/12 success**.
+  Chi tiết: mục 23.1 evidence.
+- **Một flake CÒN ĐÓ, chưa sửa:** `providers::streaming::g1_adapter_delivers_text_before_the_response_completes`
+  tự nó đỏ khoảng **1/4 lần** với `provider stream failed: error decoding response body`, và mất
+  ~165 s khi đỏ. Đã đo trên revision gốc nên **không** do round 25. Nếu CI đỏ lại kèm thông điệp đó
+  thì đây là nghi phạm đầu tiên — đọc tên test trước khi suy đoán gì khác.
 - **Round 24 — CI đã XANH 12/12 job.** Trước đó mọi commit từ `9bbd632` đều đỏ. Nguyên nhân thật
   (đọc từ log CI sau khi user cài `gh`) là **test không portable**, không phải flake loopback như
   tôi kết luận sai ở round 23: (a) tempdir trên runner Windows giữ tên 8.3 nên so raw-vs-canonical

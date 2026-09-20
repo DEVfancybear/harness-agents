@@ -1507,7 +1507,7 @@ Ba nguyên nhân, ba bản chất khác nhau:
    `interactive_launch.rs` **và** ở test read-denial tôi thêm trong `harness-tools`. Sửa: skip có
    thông báo nêu lý do trên platform khác, thay vì panic.
 
-**Kết quả sau khi sửa** (commit `01a7bee` và `ed22df4`):
+**Kết quả sau khi sửa** (commit `01a7bee` và `ed22df4`) — 12/12 job xanh:
 
 ```text
 gh run view 35459853068 --json jobs
@@ -1515,7 +1515,7 @@ success  P0 P3 P4 P5 P6 P7 (ubuntu-latest)
 success  P0 P3 P4 P5 P6 P7 (windows-latest)
 ```
 
-**12/12 job xanh.** Hai điều cần rút ra, và cả hai đều ngược với kết luận cũ ở mục 22:
+Hai điều cần rút ra, và cả hai đều ngược với kết luận cũ ở mục 22:
 
 - Flake loopback **không** phải nguyên nhân CI đỏ. Nó có thật trên máy này (mục 22 đo được), nhưng
   trên runner GitHub không xuất hiện, nên mọi thời gian tôi dành để "sửa flake" không đụng tới
@@ -1524,3 +1524,34 @@ success  P0 P3 P4 P5 P6 P7 (windows-latest)
 - Bài học về test: bộ H được viết và kiểm **chỉ trên một máy Windows**, nên nó âm thầm phụ thuộc
   vào tên đường dẫn ngắn không tồn tại, vào thứ tự lỗi của Windows, và vào `icacls`. Từ đây, test
   mới của track phải nêu rõ platform và skip có lý do, không được giả định môi trường.
+
+### 23.1. CI đỏ lại vì clippy, không phải test — và một flake có sẵn của track TUI
+
+Sau khi track TUI của writer khác lên `master`, CI đỏ lại **12/12**. Log cho thấy lần này **không**
+test nào chạy: các phase gate chạy `clippy -- -D warnings` trước, và 4 phát hiện làm bước đó đỏ, nên
+mọi bước sau không tới lượt.
+
+| File | Phát hiện | Vì sao chỉ đỏ ở CI |
+|---|---|---|
+| `interactive/credentials.rs` | `unused variable: directory` | `restrict_acl` chỉ đọc `directory` trong nhánh Windows; trên Linux tham số không ai dùng |
+| `interactive/credentials.rs` | `variants OwnerOnlyAcl and ProfileDefault are never constructed` | hai variant chỉ được dựng ở nhánh Windows |
+| `providers/streaming.rs` | `unnested or-patterns` | đã được writer kia thêm `#[allow(..., reason = ...)]` trước khi tôi xem |
+| `providers/streaming.rs` | `this function has too many lines (109/100)` | test barrier vượt ngân sách 100 dòng |
+
+Đã sửa ở commit `cb12940`: hai variant và tham số của `restrict_acl` nay có
+`cfg_attr(unix, allow(..., reason = ...))` — đúng dạng đối xứng với `cfg_attr(windows, ...)` mà
+variant Unix-only đã có sẵn; còn fixture của test barrier được tách thành helper có tên và phần
+"mở stream kèm retry" rời khỏi thân test, giữ nguyên mọi assertion. Kiểm chứng trong worktree sạch:
+`cargo clippy --workspace --all-targets --locked -- -D warnings` exit 0, `cargo fmt --all -- --check`
+sạch, `cargo test -p harness-providers --lib` 8/8 ở lần chạy xanh.
+
+Kết quả: run `cb12940` → **12/12 job success** (P0–P7 × ubuntu + windows).
+
+**Một flake CÓ SẴN, chưa sửa — ghi để lượt sau không mất thời gian đo lại.**
+`harness-providers::streaming::tests::g1_adapter_delivers_text_before_the_response_completes` tự nó
+flaky: **1 trong 4 lần đỏ**, lỗi
+`provider stream failed: error decoding response body`, và lần đỏ mất **~165 s** thay vì ~0.03 s.
+Đã đo trên **revision gốc chưa refactor** (`target/orig-check`, detached tại `9df9b32`) và nó **đỏ y
+hệt** cùng thông điệp cùng con số thời gian — nên flake này **không** do việc tách helper của tôi,
+và cũng chưa từng được sửa. Đây là ứng viên đầu tiên cần xử lý nếu CI đỏ lại kèm `error decoding
+response body`: đọc tên test trước khi kết luận bất cứ điều gì khác.
