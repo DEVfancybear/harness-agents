@@ -781,6 +781,37 @@ Mỗi yêu cầu kết thúc bằng đúng một dòng `[run]`, và bốn chữ 
 Card tool fail thì nói rõ vì sao: `failed 962ms · invalid_payload: optional tool path must not
 be blank` là call model ghép sai (model cũng được báo y hệt và thường thử lại), còn
 `failed 1.2s · policy_denied: denied by the user` là do bạn từ chối.
+**Bound không phải là ngân sách, nên app tự đi tiếp qua nó.** Bound step hay tool call để chặn
+một vòng lặp đã chạy sai; nó **không** có nghĩa task của bạn đã xong, và việc bạn phải tự gõ
+"continue" để agent của mình chạy tiếp đọc như một sự đình trệ. Khi một lượt dừng vì bound, app
+tự gửi yêu cầu kế tiếp và nói rõ trong transcript:
+
+```text
+[run] paused: step limit reached · 8 steps · 14 tool calls · 46.8s
+[info] step limit reached; continuing automatically (1 of 4) — Ctrl-C stops this
+[auto] continue: the previous turn stopped at a bound, not because the task was finished — …
+```
+
+`[auto]` đánh dấu những yêu cầu app gửi thay bạn, nên transcript vẫn tách được điều bạn hỏi với
+điều app tự làm. `Ctrl-C` tiêu luôn phần ngân sách còn lại: sau đó bound là dừng thật cho tới khi
+bạn nói tiếp. Riêng **deadline** thì không bao giờ tự tiếp — đó là thời gian thực đã trôi qua, tự
+tiếp sẽ tiêu lại đúng ngần ấy thời gian.
+
+Bốn biến môi trường chỉnh các bound, và `/status` luôn in ra giá trị đang có hiệu lực:
+
+| Biến | Mặc định | Tác dụng |
+| --- | --- | --- |
+| `HA_TURN_MAX_STEPS` | 8 | Số lần gọi model trong một lượt. |
+| `HA_TURN_MAX_TOOL_CALLS` | 16 | Số tool call trong một lượt. |
+| `HA_TURN_DEADLINE_SECONDS` | 600 | Số giây thực tế trong một lượt. |
+| `HA_TURN_CONTINUATIONS` | 4 | Số lượt app được tự tiếp sau bound step/tool call. `0` là tắt hẳn, mọi bound sẽ chờ bạn. |
+
+Với mặc định, một yêu cầu có thể tới ba mươi hai lần gọi model (8 × (1 + 4)) rồi mới dừng hẳn —
+đủ cho việc agent thật, vẫn có biên, và không bao giờ vô hạn. Ba bound chỉ nhận số nguyên dương:
+`HA_TURN_MAX_STEPS=unlimited` là gõ sai nên giữ mặc định, vì một giá trị gõ sai **không được**
+phép tháo mất tấm lưới an toàn. Lượt headless (`--headless --json`) vẫn đúng **một** lượt và
+không tự tiếp: nó báo `"stop":"step_limit"`, script muốn thêm thì gọi `--resume`.
+
 
 ### 12.8. Ảnh trong một yêu cầu
 

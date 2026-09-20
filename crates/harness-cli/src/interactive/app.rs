@@ -154,6 +154,7 @@ fn controller_for(
         ))
     };
     InteractiveController::new(context, service, channel, plain)
+        .with_continuations(super::bounds::continuations_from_environment(environment))
 }
 
 /// Whether the cursor sits at the start of a line, so partial output is never
@@ -701,6 +702,48 @@ mod tests {
         // The scripted backend reports whatever size the test asks for.
         let small = ScriptedBackend::new(Vec::new()).with_size(40, 8);
         assert_eq!(small.size().expect("size"), (40, 8));
+    }
+
+    /// The launch is where the environment reaches the controller: a budget set in the
+    /// shell has to arrive without every other layer knowing about it.
+    #[test]
+    fn h03_the_continuation_budget_comes_from_the_launch_environment() {
+        let (_temp, context) = context(false);
+        let default = controller_for(&context, &environment(&[]), true, true);
+        assert_eq!(
+            default.continuation_budget(),
+            crate::interactive::bounds::DEFAULT_CONTINUATIONS
+        );
+
+        let asked = controller_for(
+            &context,
+            &environment(&[("HA_TURN_CONTINUATIONS", "2")]),
+            true,
+            true,
+        );
+        assert_eq!(asked.continuation_budget(), 2);
+
+        // Zero is a real answer: the app stops at every bound and waits for the user,
+        // which is how it behaved before continuations existed.
+        let off = controller_for(
+            &context,
+            &environment(&[("HA_TURN_CONTINUATIONS", "0")]),
+            true,
+            true,
+        );
+        assert_eq!(off.continuation_budget(), 0);
+
+        // A value that is not a number is a typo, so the default stands.
+        let typo = controller_for(
+            &context,
+            &environment(&[("HA_TURN_CONTINUATIONS", "many")]),
+            true,
+            true,
+        );
+        assert_eq!(
+            typo.continuation_budget(),
+            crate::interactive::bounds::DEFAULT_CONTINUATIONS
+        );
     }
 
     #[test]

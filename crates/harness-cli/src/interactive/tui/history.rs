@@ -27,6 +27,9 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme) -> Vec<Line<'static
             .map(|line| Line::from(vec![Span::styled(line.clone(), theme.banner(line))]))
             .collect(),
         HistoryItem::User { text } => marker_rows("> ", text, width, theme.user, theme),
+        // The app's own continuation keeps the marker a reader can tell apart from their
+        // own words, in the same dim style the plain renderer prints `[auto] `.
+        HistoryItem::Automatic { text } => marker_rows("[auto] ", text, width, theme.dim, theme),
         HistoryItem::Assistant { text } => markdown::render(text, width, theme),
         HistoryItem::Tool {
             name,

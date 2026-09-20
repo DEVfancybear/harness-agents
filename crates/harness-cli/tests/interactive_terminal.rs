@@ -417,6 +417,30 @@ fn wait_for_normalized(session: &PtySession, needle: &str, timeout: Duration) ->
     }
 }
 
+/// Wait until the needle has been printed `count` times.
+///
+/// A second occurrence is what proves a second turn ran: waiting for the same line again
+/// would return the first one, which is already in the transcript.
+fn wait_for_occurrences(
+    session: &PtySession,
+    needle: &str,
+    count: usize,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let seen = normalized(&session.transcript());
+        if seen.matches(needle).count() >= count {
+            return seen;
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "timed out waiting for {count} x {needle:?} in the normalized transcript; saw:\n{seen}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// Isolated state root for one session.
 fn sandbox() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("temp root");
@@ -438,6 +462,127 @@ fn base_env(temp: &tempfile::TempDir) -> Vec<(&'static str, String)> {
         // state that capability instead of silently measuring the plain fallback.
         ("TERM", "xterm-256color".to_owned()),
     ]
+}
+
+/// A loopback provider that asks for one `list_files` call, every time.
+///
+/// It is how a turn reaches a bound on purpose: the harness runs the tool, calls the
+/// model again, and only the bound can end the loop.
+struct ToolCallProvider {
+    address: std::net::SocketAddr,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<AtomicBool>,
+}
+
+impl ToolCallProvider {
+    fn start() -> Self {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback provider");
+        listener
+            .set_nonblocking(true)
+            .expect("the fixture listener is non-blocking");
+        let address = listener.local_addr().expect("provider address");
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&requests);
+        let finished = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_mins(2);
+            while Instant::now() < deadline && !finished.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut connection, _)) => {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        let _ = read_http_request(&mut connection);
+                        let body = tool_call_stream();
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = connection.write_all(head.as_bytes());
+                        let _ = connection.write_all(body.as_bytes());
+                        let _ = connection.flush();
+                        let _ = connection.shutdown(std::net::Shutdown::Both);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            address,
+            requests,
+            stop,
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("http://{}/chat/completions", self.address)
+    }
+
+    fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for ToolCallProvider {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Read one HTTP request off the socket, so the reply is never written mid-request.
+fn read_http_request(connection: &mut std::net::TcpStream) -> std::io::Result<String> {
+    connection.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    let header_end = loop {
+        let read = connection.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(String::from_utf8_lossy(&buffer).into_owned());
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+    let length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    while buffer.len() < header_end + length {
+        let read = connection.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+/// One streamed `list_files` call, in the shape the decoder reads.
+fn tool_call_stream() -> String {
+    let frame = |delta: &str, finish: &str| {
+        format!("data: {{\"choices\":[{{\"delta\":{delta},\"finish_reason\":{finish}}}]}}\n\n")
+    };
+    [
+        frame("{\"role\":\"assistant\",\"content\":\"\"}", "null"),
+        frame(
+            "{\"tool_calls\":[{\"index\":0,\"id\":\"call_bound_1\",\"type\":\"function\",\
+             \"function\":{\"name\":\"list_files\",\"arguments\":\"{\\\"path\\\": \\\".\\\"}\"}}]}",
+            "null",
+        ),
+        frame("{}", "\"tool_calls\""),
+        "data: [DONE]\n\n".to_owned(),
+    ]
+    .concat()
 }
 
 #[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
@@ -1531,6 +1676,93 @@ fn i12_a_prompt_with_an_unreachable_provider_is_reported_and_the_app_stays_alive
     assert!(
         !transcript.contains("fixture answer") && !transcript.contains("no model was called"),
         "an unreachable provider never turns into a fixture answer:\n{transcript}"
+    );
+
+    session.send("/exit\r");
+    assert_eq!(
+        session.wait_exit(Duration::from_secs(20)),
+        Some(0),
+        "transcript:\n{}",
+        session.transcript()
+    );
+}
+
+/// A turn that stops at a bound continues by itself, in a real terminal.
+///
+/// The measured complaint: eight steps, tokens to spare, and the turn stopped —
+/// `[run] paused: step limit reached · 8 steps · 14 tool calls · 46.8s` — as if the task
+/// were broken. A bound stops a loop that has gone wrong, not a task that is still
+/// moving, so the app sends the next request itself, says so, and stops doing that once
+/// the budget the environment set is spent.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn g4_a_step_bound_continues_the_turn_by_itself() {
+    let (temp, project) = sandbox();
+    let provider = ToolCallProvider::start();
+    let mut env = base_env(&temp);
+    env.push(("HA_PROVIDER_ENDPOINT", provider.endpoint()));
+    env.push(("HA_PROVIDER_MODEL", "fixture-model".to_owned()));
+    env.push(("DEEPSEEK_API_KEY", "fixture-secret-value".to_owned()));
+    // Two model calls per turn and one continuation: the first turn runs the tool the
+    // model asked for and then has no step left for the round after it, and only that
+    // first pause may be continued.
+    env.push(("HA_TURN_MAX_STEPS", "2".to_owned()));
+    env.push(("HA_TURN_CONTINUATIONS", "1".to_owned()));
+    let mut session = PtySession::spawn(&project, &env);
+    session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
+
+    session.send("list the files\r");
+    // The read is gated, so the first turn needs the answer before the tool can run and
+    // the bound can be reached. Every wait counts occurrences: the same panel and the
+    // same card come back for the continuation, and matching the first one again would
+    // answer a panel that is no longer there.
+    wait_for_occurrences(&session, "[approval] ListFiles", 1, Duration::from_secs(40));
+    session.send("y\r");
+    wait_for_occurrences(
+        &session,
+        "list_files {\"path\": \".\"} ok",
+        1,
+        Duration::from_secs(40),
+    );
+
+    let continued = wait_for_normalized(
+        &session,
+        "[auto] continue: the previous turn stopped at a bound",
+        Duration::from_secs(40),
+    );
+    assert!(
+        continued.contains("[info] step limit reached; continuing automatically (1 of 1)"),
+        "the app says why it spoke:\n{continued}"
+    );
+    assert!(
+        continued.contains("[run] paused: step limit reached · 2 steps · 1 tool calls"),
+        "the pause is still on the record before the continuation:\n{continued}"
+    );
+
+    // The continuation runs, and this time the budget is spent: the pause stands.
+    wait_for_occurrences(&session, "[approval] ListFiles", 2, Duration::from_secs(40));
+    session.send("y\r");
+    wait_for_occurrences(
+        &session,
+        "list_files {\"path\": \".\"} ok",
+        2,
+        Duration::from_secs(40),
+    );
+    let paused = wait_for_occurrences(
+        &session,
+        "[run] paused: step limit reached",
+        2,
+        Duration::from_secs(40),
+    );
+    assert_eq!(
+        paused.matches("[auto] continue").count(),
+        1,
+        "the budget was one, so exactly one request was the app's own:\n{paused}"
+    );
+    assert!(
+        provider.requests() >= 4,
+        "two model calls in each of the two turns reached the provider: {} request(s)",
+        provider.requests()
     );
 
     session.send("/exit\r");

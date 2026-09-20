@@ -13,13 +13,14 @@ use harness_providers::{CancellationToken, DeepSeekAdapter, ModelCapabilities, M
 use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
 use harness_store_sqlite::{SqliteStore, StoreError, WriterOpenOptions};
 use harness_tools::{
-    ApprovalMode, ToolExecutionService, TurnDriver, TurnLimits, TurnObserver, TurnOptions,
-    TurnProgress, coding_tool_schemas, observe_workspace,
+    ApprovalMode, ToolExecutionService, TurnDriver, TurnObserver, TurnOptions, TurnProgress,
+    coding_tool_schemas, observe_workspace,
 };
 use harness_types::{ErrorCode, HarnessError, HostId, InputId, SessionId, TaskId};
 
 use super::attachments;
 use super::bootstrap::{self, LaunchRequest};
+use super::bounds;
 use super::extensions;
 use super::memory;
 use super::paths::{HostPlatform, LaunchEnvironment};
@@ -293,7 +294,10 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         actor_id: "headless.user".to_owned(),
         // There is nobody to ask: a gated action fails closed.
         approvals: ApprovalMode::None,
-        limits: TurnLimits::default(),
+        // One turn, bounded as the environment asks: a script reads `stop` in the JSON
+        // and resumes with `--resume` when it wants more, so the app never continues
+        // silently in the middle of somebody's pipeline.
+        limits: bounds::limits_from_environment(&environment),
     };
     let outcome = match &resumed_from {
         Some((source, _)) => {

@@ -16,6 +16,7 @@ use harness_types::InputId;
 
 use super::attachments;
 use super::bootstrap::LaunchContext;
+use super::bounds::{self, DEFAULT_CONTINUATIONS};
 use super::credentials::CredentialSource;
 use super::events::{
     AppPhase, HistoryItem, Key, Modal, RunOutcome, SessionCandidate, SessionEvent, ToolState,
@@ -35,6 +36,13 @@ pub const EXIT_SUCCESS: u8 = 0;
 /// reports the limits it actually uses through `SessionPort::limits`.
 pub const DEFAULT_MAX_STEPS: u32 = 8;
 pub const DEFAULT_MAX_TOOL_CALLS: u32 = 16;
+
+/// What the app sends when it continues a turn a bound stopped.
+///
+/// It says why it is speaking, because a bare `continue` makes the model guess whether
+/// the user asked something new or the last turn was cut short.
+const CONTINUATION_TEXT: &str = "continue: the previous turn stopped at a bound, not because the task was \
+     finished — pick up where it left off and complete the task";
 
 /// How long the approval panel has before the gate refuses the request.
 pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_mins(5);
@@ -127,6 +135,9 @@ pub struct InteractiveController {
     steps: u32,
     tool_calls: u32,
     bounds: TurnBounds,
+    /// Automatic continuations used since the user last spoke, and the budget for them.
+    continuations: u32,
+    max_continuations: u32,
     run_started_at: Option<Instant>,
     last_run_elapsed: Duration,
     last_request: Option<String>,
@@ -177,6 +188,8 @@ impl InteractiveController {
             steps: 0,
             tool_calls: 0,
             bounds,
+            continuations: 0,
+            max_continuations: DEFAULT_CONTINUATIONS,
             run_started_at: None,
             last_run_elapsed: Duration::ZERO,
             last_request: None,
@@ -194,10 +207,27 @@ impl InteractiveController {
         self.fallback_reason = Some(reason.into());
     }
 
+    /// Set how many times one request may be continued automatically.
+    ///
+    /// The host reads it from the environment; a budget of zero turns the app back into
+    /// one that stops at every bound and waits for the user.
+    #[must_use]
+    pub fn with_continuations(mut self, budget: u32) -> Self {
+        self.max_continuations = budget;
+        self
+    }
+
     #[cfg(test)]
     #[must_use]
     pub const fn phase(&self) -> AppPhase {
         self.phase
+    }
+
+    /// How many automatic continuations one request may use.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn continuation_budget(&self) -> u32 {
+        self.max_continuations
     }
 
     /// The committed transcript, exactly as the plain renderer printed it.
@@ -613,13 +643,16 @@ impl InteractiveController {
                 self.push_history(
                     effects,
                     HistoryItem::Run {
-                        outcome,
+                        outcome: outcome.clone(),
                         steps: self.steps,
                         tool_calls: self.tool_calls,
                         elapsed: self.last_run_elapsed,
                     },
                 );
                 self.finish_run();
+                // After `finish_run`: a continuation is a new request, and the phase has
+                // to be idle again before the service will accept one.
+                effects.extend(self.maybe_continue(&outcome));
                 self.finish_pending_exit(effects);
             }
             SessionEvent::RecoverableError { message } => {
@@ -633,6 +666,18 @@ impl InteractiveController {
     }
 
     fn submit(&mut self, text: String) -> Vec<Effect> {
+        // A request the user typed starts a fresh continuation budget: the app may carry
+        // this one on by itself when a bound stops it.
+        self.continuations = 0;
+        self.dispatch(text, false)
+    }
+
+    /// Send one request to the service.
+    ///
+    /// `automatic` marks a continuation the app started because a bound stopped the
+    /// previous turn. It does not reset the budget, which is what makes the budget a
+    /// budget rather than an infinite loop.
+    fn dispatch(&mut self, text: String, automatic: bool) -> Vec<Effect> {
         if matches!(text.split_whitespace().next(), Some("/exit" | "/quit")) {
             return self.command(&text);
         }
@@ -669,8 +714,40 @@ impl InteractiveController {
             text: text.clone(),
         });
         let mut effects = Vec::new();
-        self.push_history(&mut effects, HistoryItem::User { text });
+        let item = if automatic {
+            HistoryItem::Automatic { text }
+        } else {
+            HistoryItem::User { text }
+        };
+        self.push_history(&mut effects, item);
         effects.push(Effect::Redraw);
+        effects
+    }
+
+    /// Continue a turn a bound stopped, while the continuation budget lasts.
+    ///
+    /// The bounds exist to stop a loop that has gone wrong, not to end a task that is
+    /// still moving: a turn that stopped after eight model calls had usually not
+    /// finished, and making the user type "continue" to let their own agent keep
+    /// working reads as a stall. So the app continues by itself, says so, and stops
+    /// asking once the budget is spent — after that the pause is real.
+    fn maybe_continue(&mut self, outcome: &RunOutcome) -> Vec<Effect> {
+        let RunOutcome::Paused(reason) = outcome else {
+            return Vec::new();
+        };
+        if !reason.is_continuable() || self.continuations >= self.max_continuations {
+            return Vec::new();
+        }
+        self.continuations += 1;
+        let mut effects = vec![Effect::History(HistoryItem::Notice {
+            message: format!(
+                "{}; continuing automatically ({} of {}) — Ctrl-C stops this",
+                reason.label(),
+                self.continuations,
+                self.max_continuations
+            ),
+        })];
+        effects.extend(self.dispatch(CONTINUATION_TEXT.to_owned(), true));
         effects
     }
 
@@ -701,6 +778,9 @@ impl InteractiveController {
     fn interrupt(&mut self) -> Vec<Effect> {
         if self.phase.has_active_run() {
             self.service.cancel();
+            // Ctrl-C also means "do not start another one": the budget is spent, so the
+            // bound that ends the canceled turn is a real stop until the user speaks.
+            self.continuations = self.max_continuations;
             self.phase = AppPhase::Canceling;
             return vec![
                 Effect::History(HistoryItem::Notice {
@@ -769,6 +849,13 @@ impl InteractiveController {
                             .to_owned()
                     }
                 });
+                // What one turn may spend, and whether the app carries on by itself when
+                // a bound stops it: "paused" without this line is a mystery, and these
+                // are the numbers to raise when a long task keeps pausing.
+                lines.push(bounds::describe(
+                    &self.service.turn_limits(),
+                    self.max_continuations,
+                ));
                 // The provider facts answer "what is this app actually using?":
                 // which credential variable holds the key (never its value), whether
                 // the endpoint and the model came from the environment or from the
@@ -1258,10 +1345,11 @@ impl InteractiveController {
 
 #[cfg(test)]
 mod tests {
-    use super::{EXIT_SUCCESS, Effect, InteractiveController, TurnBounds};
+    use super::{DEFAULT_CONTINUATIONS, EXIT_SUCCESS, Effect, InteractiveController, TurnBounds};
     use crate::interactive::bootstrap::{self, LaunchContext, LaunchRequest};
     use crate::interactive::events::{
-        AppPhase, HistoryItem, Key, Modal, RunOutcome, SessionCandidate, SessionEvent, ToolState,
+        AppPhase, HistoryItem, Key, Modal, PauseReason, RunOutcome, SessionCandidate, SessionEvent,
+        ToolState,
     };
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
     use crate::interactive::service::{
@@ -3146,5 +3234,154 @@ mod tests {
                 "missing {landmark:?} in:\n{joined}"
             );
         }
+    }
+
+    /// Send the terminal event the service sends when a turn stops at a bound.
+    fn end_at(harness: &mut Bench, reason: PauseReason) -> Vec<String> {
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Paused(reason),
+            })
+            .expect("terminal event");
+        effects_to_plain(&harness.controller.pump_events())
+    }
+
+    fn submissions(harness: &Bench) -> Vec<String> {
+        harness
+            .port
+            .submissions
+            .lock()
+            .expect("submission log")
+            .clone()
+    }
+
+    /// The measured complaint: a long task ended at eight steps with tokens to spare and
+    /// the app waited for a human to type "continue". A bound stops a runaway loop, not
+    /// a task that is still moving, so the app carries on — visibly, and only while its
+    /// continuation budget lasts.
+    #[test]
+    fn a_bound_continues_the_turn_until_the_budget_is_spent() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "sửa lỗi parser");
+        assert_eq!(submissions(&harness).len(), 1);
+
+        for used in 1..=DEFAULT_CONTINUATIONS {
+            let plain = end_at(&mut harness, PauseReason::StepLimit);
+            assert!(
+                plain.iter().any(|line| line
+                    == &format!(
+                        "[info] step limit reached; continuing automatically ({used} of {DEFAULT_CONTINUATIONS}) — Ctrl-C stops this"
+                    )),
+                "continuation {used} was not announced: {plain:#?}"
+            );
+            assert!(
+                plain
+                    .iter()
+                    .any(|line| line.starts_with("[auto] continue: the previous turn stopped")),
+                "the app's own request was not marked as its own: {plain:#?}"
+            );
+            assert_eq!(
+                submissions(&harness).len(),
+                1 + used as usize,
+                "each continuation is one more request: {plain:#?}"
+            );
+        }
+
+        // The budget is spent: the next bound is the last word, and nothing is sent.
+        let plain = end_at(&mut harness, PauseReason::StepLimit);
+        assert!(
+            !plain
+                .iter()
+                .any(|line| line.contains("continuing automatically")),
+            "{plain:#?}"
+        );
+        assert_eq!(
+            submissions(&harness).len(),
+            1 + DEFAULT_CONTINUATIONS as usize
+        );
+    }
+
+    /// The budget is per request, not per session: the next thing the user types may be
+    /// continued again.
+    #[test]
+    fn a_new_request_restarts_the_continuation_budget() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "first");
+        for _ in 0..=DEFAULT_CONTINUATIONS {
+            let _ = end_at(&mut harness, PauseReason::StepLimit);
+        }
+        let spent = submissions(&harness).len();
+        assert_eq!(spent, 1 + DEFAULT_CONTINUATIONS as usize);
+
+        let _ = submit_text(&mut harness.controller, "second");
+        let plain = end_at(&mut harness, PauseReason::StepLimit);
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("continuing automatically (1 of")),
+            "a new request starts a new budget: {plain:#?}"
+        );
+        assert_eq!(submissions(&harness).len(), spent + 1 + 1);
+    }
+
+    /// The deadline is wall-clock time already spent. Continuing it by itself would spend
+    /// the same budget over and over, so that pause is a real stop.
+    #[test]
+    fn a_deadline_does_not_continue_itself() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "sửa lỗi parser");
+        let plain = end_at(&mut harness, PauseReason::Deadline);
+        assert!(
+            plain.contains(&"[run] paused: deadline reached".to_owned()),
+            "{plain:#?}"
+        );
+        assert!(
+            !plain
+                .iter()
+                .any(|line| line.contains("continuing automatically")),
+            "{plain:#?}"
+        );
+        assert_eq!(submissions(&harness).len(), 1);
+    }
+
+    /// Ctrl-C means stop. A turn that ends at a bound right after the user canceled must
+    /// not start another one behind their back.
+    #[test]
+    fn ctrl_c_stops_the_app_continuing_by_itself() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "sửa lỗi parser");
+        let _ = harness.controller.handle_key(Key::Interrupt);
+        let plain = end_at(&mut harness, PauseReason::StepLimit);
+        assert!(
+            !plain
+                .iter()
+                .any(|line| line.contains("continuing automatically")),
+            "{plain:#?}"
+        );
+        assert_eq!(submissions(&harness).len(), 1);
+    }
+
+    /// `/status` answers "why did it stop, and what do I raise?": the bounds in force are
+    /// the numbers an operator has to know to move them.
+    #[test]
+    fn status_reports_the_bounds_and_the_continuation_budget() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let plain = effects_to_plain(&submit_text(&mut harness.controller, "/status"));
+        let line = plain
+            .iter()
+            .find(|line| line.starts_with("Bounds:"))
+            .unwrap_or_else(|| panic!("no bounds line in {plain:#?}"));
+        assert!(line.contains("8 steps"), "{line}");
+        assert!(line.contains("16 tool calls"), "{line}");
+        assert!(
+            line.contains(&format!("{DEFAULT_CONTINUATIONS} automatic continuation")),
+            "{line}"
+        );
     }
 }

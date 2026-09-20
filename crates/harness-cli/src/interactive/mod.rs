@@ -8,6 +8,7 @@
 pub mod app;
 pub mod attachments;
 pub mod bootstrap;
+pub mod bounds;
 pub mod config;
 pub mod controller;
 pub mod credentials;

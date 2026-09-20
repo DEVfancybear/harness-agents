@@ -112,6 +112,39 @@ impl AppPhase {
     }
 }
 
+/// Which bound stopped a turn.
+///
+/// A bound is a safety net for a loop that has gone wrong, not the task's budget, so
+/// the app distinguishes the bounds it may carry on past from the one it may not: the
+/// deadline is a real stop, while a step or tool-call bound can be continued.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PauseReason {
+    StepLimit,
+    ToolLimit,
+    Deadline,
+}
+
+impl PauseReason {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::StepLimit => "step limit reached",
+            Self::ToolLimit => "tool-call limit reached",
+            Self::Deadline => "deadline reached",
+        }
+    }
+
+    /// Whether the app may continue this turn on its own.
+    ///
+    /// The step and tool-call bounds count work in progress; carrying on keeps the
+    /// task moving. The deadline is wall-clock time already spent, so continuing it
+    /// by itself would spend the same budget again and again.
+    #[must_use]
+    pub fn is_continuable(self) -> bool {
+        matches!(self, Self::StepLimit | Self::ToolLimit)
+    }
+}
+
 /// How one user turn ended.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunOutcome {
@@ -119,7 +152,7 @@ pub enum RunOutcome {
     /// The turn stopped at a bound — steps, tool calls or the deadline — rather than
     /// breaking. Everything it did is durable and the conversation continues, so
     /// calling it a failure told the user their work was lost when it was not.
-    Paused(String),
+    Paused(PauseReason),
     Failed(String),
     Canceled,
 }
@@ -129,7 +162,7 @@ impl RunOutcome {
     pub fn label(&self) -> String {
         match self {
             Self::Done => "done".to_owned(),
-            Self::Paused(reason) => format!("paused: {reason}"),
+            Self::Paused(reason) => format!("paused: {}", reason.label()),
             Self::Failed(reason) => format!("failed: {reason}"),
             Self::Canceled => "canceled".to_owned(),
         }
@@ -189,6 +222,11 @@ pub enum HistoryItem {
     Banner { lines: Vec<String> },
     /// A submitted user request, stored without the prompt marker.
     User { text: String },
+    /// A request the app sent by itself, to continue a turn a bound stopped.
+    ///
+    /// It is recorded apart from `User` on purpose: the reader has to be able to tell
+    /// what they asked for from what the app said next on their behalf.
+    Automatic { text: String },
     /// Model text for one turn.
     ///
     /// Streaming text is committed from the live block in T04; until then it goes

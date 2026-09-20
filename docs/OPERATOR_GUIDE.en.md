@@ -469,6 +469,38 @@ Every prompt ends with one `[run]` line, and the four words it can use mean diff
 A tool card that fails says why: `failed 962ms · invalid_payload: optional tool path must
 not be blank` is a call the model shaped wrongly (it is told the same thing and usually
 retries), while `failed 1.2s · policy_denied: denied by the user` is a refusal you made.
+**A bound is not the budget, so the app carries on past it.** A step or tool-call bound
+stops a loop that has gone wrong; it does not mean your task is finished, and being made to
+type "continue" to let your own agent keep working reads as a stall. When a turn stops that
+way the app sends the next request itself, and says so in the transcript:
+
+```text
+[run] paused: step limit reached · 8 steps · 14 tool calls · 46.8s
+[info] step limit reached; continuing automatically (1 of 4) — Ctrl-C stops this
+[auto] continue: the previous turn stopped at a bound, not because the task was finished — …
+```
+
+`[auto]` marks the requests the app made on your behalf, so the transcript still separates
+what you asked for from what it did. `Ctrl-C` spends the rest of the budget: after it, a
+bound is a real stop until you speak again. The **deadline** never continues itself — that
+is wall-clock time already spent, and continuing it would spend the same time over and over.
+
+Four variables move the bounds, and `/status` always prints the values in force:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `HA_TURN_MAX_STEPS` | 8 | Model calls in one turn. |
+| `HA_TURN_MAX_TOOL_CALLS` | 16 | Tool calls in one turn. |
+| `HA_TURN_DEADLINE_SECONDS` | 600 | Wall-clock seconds in one turn. |
+| `HA_TURN_CONTINUATIONS` | 4 | Turns the app may continue by itself after a step or tool-call bound. `0` turns that off, so every bound waits for you. |
+
+With the defaults a single request can reach thirty-two model calls (8 × (1 + 4)) before it
+stops for good — enough for real agentic work, still bounded, and never unbounded. Only a
+positive integer counts for the three bounds: `HA_TURN_MAX_STEPS=unlimited` is a typo and
+keeps the default, because a misspelled value must not remove the net. A headless turn
+(`--headless --json`) is still exactly one turn and never continues itself: it reports
+`"stop":"step_limit"`, and a script resumes with `--resume`.
+
 
 ### 12.5. Chat memory (opt-in)
 

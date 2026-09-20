@@ -32,9 +32,10 @@ use tokio::sync::oneshot;
 
 use super::attachments;
 use super::bootstrap::{CREDENTIAL_VARIABLES, DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL, LaunchContext};
+use super::bounds;
 use super::controller::{DEFAULT_APPROVAL_TIMEOUT, TurnBounds};
 use super::credentials::{self, CredentialSource};
-use super::events::{RunOutcome, SessionCandidate, SessionEvent};
+use super::events::{PauseReason, RunOutcome, SessionCandidate, SessionEvent};
 use super::extensions;
 use super::memory;
 use super::paths::LaunchEnvironment;
@@ -105,6 +106,18 @@ pub trait SessionPort: Send {
     /// show `step k/max` without the UI knowing the driver's type.
     fn limits(&self) -> TurnBounds {
         TurnBounds::default()
+    }
+    /// The full bounds one turn runs under, for `/status`.
+    ///
+    /// The default mirrors `limits()` and keeps the driver's own deadline, so a backend
+    /// that only knows the two counts still reports what a pause would mean.
+    fn turn_limits(&self) -> TurnLimits {
+        let bounds = self.limits();
+        TurnLimits {
+            max_steps: bounds.max_steps,
+            max_tool_calls: bounds.max_tool_calls,
+            deadline: TurnLimits::default().deadline,
+        }
     }
     /// Lines `/status` prints about the provider: which credential variable holds
     /// the key (never its value), whether the endpoint and the model came from the
@@ -639,6 +652,9 @@ impl AgentSessionService {
         sender: UnboundedSender<SessionEvent>,
     ) -> Self {
         let gate = Arc::new(ChannelApprovalGate::new(sender.clone(), APPROVAL_TIMEOUT));
+        // The bounds are the environment's, not a constant here: a long task needs a
+        // real way to raise them, and `/status` reports what is in force.
+        let limits = bounds::limits_from_environment(&environment);
         Self {
             sender,
             store_dir: context.project_store_dir(),
@@ -649,7 +665,7 @@ impl AgentSessionService {
             previous_session: Arc::new(Mutex::new(None)),
             gate,
             cancellation: None,
-            limits: TurnLimits::default(),
+            limits,
             project_id: Arc::new(Mutex::new(None)),
         }
     }
@@ -761,6 +777,10 @@ impl SessionPort for AgentSessionService {
             max_steps: self.limits.max_steps,
             max_tool_calls: self.limits.max_tool_calls,
         }
+    }
+
+    fn turn_limits(&self) -> TurnLimits {
+        self.limits
     }
 
     fn provider_diagnostics(&self) -> Vec<String> {
@@ -1183,10 +1203,12 @@ async fn run_turn(
                 TurnStop::Canceled => RunOutcome::Canceled,
                 // A bound is not a break: the turn stopped where the user set the limit,
                 // the work is durable, and `continue` picks it up. Saying `failed` told
-                // the user eight tool calls had been lost when none were.
-                TurnStop::StepLimit => RunOutcome::Paused("step limit reached".to_owned()),
-                TurnStop::ToolLimit => RunOutcome::Paused("tool-call limit reached".to_owned()),
-                TurnStop::Deadline => RunOutcome::Paused("deadline reached".to_owned()),
+                // the user eight tool calls had been lost when none were. The reason is
+                // typed, because the host continues a count of work by itself and treats
+                // the deadline as a real stop.
+                TurnStop::StepLimit => RunOutcome::Paused(PauseReason::StepLimit),
+                TurnStop::ToolLimit => RunOutcome::Paused(PauseReason::ToolLimit),
+                TurnStop::Deadline => RunOutcome::Paused(PauseReason::Deadline),
             }
         }
         Err(error) => RunOutcome::Failed(error.to_string()),

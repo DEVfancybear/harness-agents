@@ -16,6 +16,9 @@ pub fn plain_lines(item: &HistoryItem) -> Vec<String> {
     match item {
         HistoryItem::Banner { lines } | HistoryItem::Sessions { lines } => lines.clone(),
         HistoryItem::User { text } => vec![format!("> {text}")],
+        // An automatic continuation is marked as the app's own line: a reader must be
+        // able to tell what they asked for from what the app said on their behalf.
+        HistoryItem::Automatic { text } => vec![format!("[auto] {text}")],
         HistoryItem::Assistant { text } | HistoryItem::Message { text } => vec![text.clone()],
         HistoryItem::Tool {
             name,
@@ -195,7 +198,7 @@ mod tests {
         cursor_cell, help_lines, plain_lines, prompt_line, prompt_lines, prompt_prefix, run_line,
         short_id, tool_line,
     };
-    use crate::interactive::events::{AppPhase, HistoryItem, RunOutcome, ToolState};
+    use crate::interactive::events::{AppPhase, HistoryItem, PauseReason, RunOutcome, ToolState};
     use std::time::Duration;
 
     /// A bound is a pause, not a break: the measured turn printed
@@ -210,8 +213,12 @@ mod tests {
             elapsed: Duration::from_millis(18_300),
         };
         assert_eq!(
-            plain_lines(&run(RunOutcome::Paused("step limit reached".to_owned()))),
+            plain_lines(&run(RunOutcome::Paused(PauseReason::StepLimit))),
             vec!["[run] paused: step limit reached".to_owned()]
+        );
+        assert_eq!(
+            plain_lines(&run(RunOutcome::Paused(PauseReason::Deadline))),
+            vec!["[run] paused: deadline reached".to_owned()]
         );
         assert_eq!(
             plain_lines(&run(RunOutcome::Failed("provider unreachable".to_owned()))),
@@ -220,6 +227,19 @@ mod tests {
         assert_eq!(
             plain_lines(&run(RunOutcome::Done)),
             vec!["[run] done".to_owned()]
+        );
+    }
+
+    /// A continuation is the app's line, not the user's: `> continue` would read as
+    /// something the person typed.
+    #[test]
+    fn an_automatic_continuation_is_marked_as_the_app_speaking() {
+        let item = HistoryItem::Automatic {
+            text: "continue: the previous turn stopped at a bound".to_owned(),
+        };
+        assert_eq!(
+            plain_lines(&item),
+            vec!["[auto] continue: the previous turn stopped at a bound".to_owned()]
         );
     }
 
