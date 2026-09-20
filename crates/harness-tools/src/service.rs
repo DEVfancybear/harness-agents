@@ -125,6 +125,11 @@ impl ToolExecutionService {
                 "tool actor must not be empty",
             ));
         }
+        // The deterministic checks run first. Inspecting the workspace hashes every
+        // non-ignored file (measured: 962 ms for a `list_files` whose optional path was
+        // blank), so an action that cannot be executed must not pay for it — and must
+        // not register a project on its way to being refused either.
+        let final_action = self.policy.transform_and_validate(request.action.clone())?;
         let state = self
             .current_state(&request.session_id, &request.task_id)
             .await?;
@@ -135,7 +140,6 @@ impl ToolExecutionService {
             .await
             .map_err(store_error)?;
         Self::validate_workspace_action(&workspace.root, &request.action)?;
-        let final_action = self.policy.transform_and_validate(request.action.clone())?;
         Self::validate_workspace_action(&workspace.root, &final_action)?;
         let action_hash = final_action.canonical_hash()?;
         Ok(PreparedToolRequest {
@@ -1196,4 +1200,71 @@ fn current_unix_ms() -> Result<u64, HarnessError> {
 
 fn store_error(error: StoreError) -> HarnessError {
     error.into_harness_error()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ToolExecutionService;
+    use crate::{CodingToolAction, ToolRequest};
+    use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
+    use harness_types::{ErrorCode, HostId, ProjectId, SessionId, TaskId};
+    use std::sync::Arc;
+
+    /// A malformed action is refused by the cheap check, not by the workspace walk.
+    ///
+    /// Measured in the field: a TUI turn showed `[tool] list_files {"path": ""} failed
+    /// 962ms`, because the optional-path check ran *after* `inspect_workspace` had hashed
+    /// the whole repository. The reason is the same either way; what this pins is that
+    /// nothing expensive — and nothing durable — happens first.
+    #[tokio::test]
+    async fn a_malformed_action_is_refused_before_the_workspace_is_inspected() {
+        let temp = std::env::temp_dir().join(format!(
+            "harness-tools-prepare-{}",
+            harness_types::InputId::generate()
+        ));
+        std::fs::create_dir_all(&temp).expect("temp store directory");
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(temp.clone(), HostId::generate()))
+                .await
+                .expect("store opens"),
+        );
+        let service = ToolExecutionService::new(Arc::clone(&store));
+        let error = service
+            .prepare(ToolRequest::new(
+                SessionId::generate(),
+                TaskId::generate(),
+                "test.actor",
+                temp.clone(),
+                CodingToolAction::ListFiles {
+                    path: Some("   ".to_owned()),
+                },
+            ))
+            .await
+            .expect_err("a blank optional path is refused");
+        assert_eq!(error.code(), ErrorCode::InvalidPayload);
+        assert!(
+            error
+                .to_string()
+                .contains("optional tool path must not be blank"),
+            "the deterministic check must answer first, got: {error}"
+        );
+
+        let registration = crate::workspace_registration(ProjectId::generate(), &temp)
+            .expect("registration record");
+        assert!(
+            store
+                .registered_project(&registration.canonical_root)
+                .await
+                .expect("project read")
+                .is_none(),
+            "a refused action must not register the project"
+        );
+        drop(service);
+        Arc::try_unwrap(store)
+            .expect("single owner")
+            .close()
+            .await
+            .expect("store closes");
+        let _ = std::fs::remove_dir_all(temp);
+    }
 }

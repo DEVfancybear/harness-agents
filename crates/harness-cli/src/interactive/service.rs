@@ -513,7 +513,7 @@ impl TurnObserver for ChannelObserver {
                 }
                 SessionEvent::ToolStarted { name, summary }
             }
-            TurnProgress::ToolSettled { name, ok } => {
+            TurnProgress::ToolSettled { name, ok, detail } => {
                 let elapsed = self
                     .tool_started
                     .lock()
@@ -521,7 +521,12 @@ impl TurnObserver for ChannelObserver {
                     .and_then(|mut started| started.take())
                     .filter(|(started_name, _)| started_name == &name)
                     .map_or(Duration::ZERO, |(_, started)| started.elapsed());
-                SessionEvent::ToolSettled { name, ok, elapsed }
+                SessionEvent::ToolSettled {
+                    name,
+                    ok,
+                    elapsed,
+                    detail: detail.unwrap_or_default(),
+                }
             }
         };
         let _ = self.sender.send(event);
@@ -1079,6 +1084,7 @@ impl FixtureService {
             name: name.to_owned(),
             ok,
             elapsed,
+            detail: String::new(),
         });
     }
 }

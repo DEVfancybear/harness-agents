@@ -244,7 +244,7 @@ async fn g2_tool_results_return_to_the_model_and_the_turn_ends_with_the_answer()
         |item| matches!(item, TurnProgress::ToolStarted { name, .. } if name == "search_text")
     ));
     assert!(progress.iter().any(
-        |item| matches!(item, TurnProgress::ToolSettled { name, ok: true } if name == "search_text")
+        |item| matches!(item, TurnProgress::ToolSettled { name, ok: true, .. } if name == "search_text")
     ));
     assert!(progress.iter().any(
         |item| matches!(item, TurnProgress::TextDelta(text) if text.contains("fixture parser"))

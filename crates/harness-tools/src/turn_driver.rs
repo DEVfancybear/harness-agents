@@ -48,9 +48,23 @@ impl Default for TurnLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TurnProgress {
     TextDelta(String),
-    StepStarted { step: u32 },
-    ToolStarted { name: String, summary: String },
-    ToolSettled { name: String, ok: bool },
+    StepStarted {
+        step: u32,
+    },
+    ToolStarted {
+        name: String,
+        summary: String,
+    },
+    ToolSettled {
+        name: String,
+        ok: bool,
+        /// Why the call did not execute, for the human reading the transcript.
+        ///
+        /// The model is told the same thing in its tool result, but a card that only
+        /// says `failed 962ms` leaves the person who has to answer the next approval
+        /// unable to tell a malformed call from a policy denial.
+        detail: Option<String>,
+    },
 }
 
 /// Receives progress; the interactive service maps it to display events.
@@ -349,6 +363,7 @@ impl TurnDriver {
                     observer.observe(TurnProgress::ToolSettled {
                         name: name.clone(),
                         ok: false,
+                        detail: Some(reason.to_owned()),
                     });
                     appended.push(ProviderMessage::new(
                         MessageRole::Tool,
@@ -366,6 +381,7 @@ impl TurnDriver {
                         observer.observe(TurnProgress::ToolSettled {
                             name: name.clone(),
                             ok: true,
+                            detail: None,
                         });
                         appended.push(ProviderMessage::new(
                             MessageRole::Tool,
@@ -379,6 +395,7 @@ impl TurnDriver {
                         observer.observe(TurnProgress::ToolSettled {
                             name: name.clone(),
                             ok: false,
+                            detail: Some(error.to_string()),
                         });
                         appended.push(ProviderMessage::new(
                             MessageRole::Tool,

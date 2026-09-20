@@ -24,7 +24,12 @@ pub fn plain_lines(item: &HistoryItem) -> Vec<String> {
         } => match state {
             ToolState::Started => vec![tool_line(name, summary)],
             ToolState::Ok { .. } => vec![tool_line(name, "ok")],
-            ToolState::Failed { .. } => vec![tool_line(name, "failed")],
+            ToolState::Failed { detail, .. } if detail.trim().is_empty() => {
+                vec![tool_line(name, "failed")]
+            }
+            // The reason travels with the row: a bare `failed` told the reader nothing
+            // about whether the call was malformed, denied or stale.
+            ToolState::Failed { detail, .. } => vec![tool_line(name, &format!("failed: {detail}"))],
         },
         HistoryItem::Run { outcome, .. } => vec![run_line(&outcome.label())],
         HistoryItem::RunAccepted { input_id } => {
@@ -185,10 +190,46 @@ pub fn short_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        cursor_cell, help_lines, prompt_line, prompt_lines, prompt_prefix, run_line, short_id,
-        tool_line,
+        cursor_cell, help_lines, plain_lines, prompt_line, prompt_lines, prompt_prefix, run_line,
+        short_id, tool_line,
     };
-    use crate::interactive::events::AppPhase;
+    use crate::interactive::events::{AppPhase, HistoryItem, ToolState};
+    use std::time::Duration;
+
+    /// The measured gap: the transcript said `[tool] list_files {"path": ""} failed` and
+    /// nothing else, so a reader could not tell a malformed call from a policy denial.
+    #[test]
+    fn a_failed_tool_row_carries_the_reason_it_failed() {
+        let failed = HistoryItem::Tool {
+            name: "list_files".to_owned(),
+            summary: "path=".to_owned(),
+            state: ToolState::Failed {
+                elapsed: Duration::from_millis(962),
+                detail: "invalid_payload: optional tool path must not be blank".to_owned(),
+            },
+        };
+        assert_eq!(
+            plain_lines(&failed),
+            vec![
+                "[tool] list_files failed: invalid_payload: optional tool path must not be blank"
+                    .to_owned()
+            ]
+        );
+
+        // A producer that reports no reason keeps the old two-word line.
+        let bare = HistoryItem::Tool {
+            name: "list_files".to_owned(),
+            summary: String::new(),
+            state: ToolState::Failed {
+                elapsed: Duration::from_millis(962),
+                detail: String::new(),
+            },
+        };
+        assert_eq!(
+            plain_lines(&bare),
+            vec!["[tool] list_files failed".to_owned()]
+        );
+    }
 
     #[test]
     fn h03_prompt_marks_a_busy_phase_and_stays_readable() {

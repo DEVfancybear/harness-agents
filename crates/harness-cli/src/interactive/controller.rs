@@ -450,7 +450,12 @@ impl InteractiveController {
                     );
                 }
             }
-            SessionEvent::ToolSettled { name, ok, elapsed } => {
+            SessionEvent::ToolSettled {
+                name,
+                ok,
+                elapsed,
+                detail,
+            } => {
                 self.flush_stream(effects);
                 let summary = self
                     .open_tool
@@ -460,7 +465,7 @@ impl InteractiveController {
                 let state = if ok {
                     ToolState::Ok { elapsed }
                 } else {
-                    ToolState::Failed { elapsed }
+                    ToolState::Failed { elapsed, detail }
                 };
                 self.push_history(
                     effects,
@@ -484,16 +489,23 @@ impl InteractiveController {
                 expires_at,
             } => {
                 self.flush_stream(effects);
-                self.push_history(
-                    effects,
-                    HistoryItem::Approval {
-                        action: action.clone(),
-                        summary: summary.clone(),
-                        workspace: workspace.clone(),
-                        scope: scope.clone(),
-                        request_id: request_id.clone(),
-                    },
-                );
+                // The panel owns the proposal while it is open, so writing it to the
+                // scrollback as well would print the same block twice - once above the
+                // viewport and once in the viewport. Plain mode has no panel, so there
+                // the transcript keeps the block: `history` is what a reader of the
+                // plain transcript has instead of a panel.
+                if self.plain {
+                    self.push_history(
+                        effects,
+                        HistoryItem::Approval {
+                            action: action.clone(),
+                            summary: summary.clone(),
+                            workspace: workspace.clone(),
+                            scope: scope.clone(),
+                            request_id: request_id.clone(),
+                        },
+                    );
+                }
                 self.pending_approval = Some(PendingApproval {
                     request_id,
                     action,
@@ -1735,18 +1747,20 @@ mod tests {
                 name: "apply_patch".to_owned(),
                 ok: false,
                 elapsed: Duration::from_millis(3100),
+                detail: String::new(),
             })
             .expect("settled");
         let effects = harness.controller.pump_events();
         let items = history_items(&effects);
         let settled = items.iter().rev().find_map(|item| match item {
-            HistoryItem::Tool { name, state, .. } if name == "apply_patch" => Some(*state),
+            HistoryItem::Tool { name, state, .. } if name == "apply_patch" => Some(state.clone()),
             _ => None,
         });
         assert_eq!(
             settled,
             Some(ToolState::Failed {
-                elapsed: Duration::from_millis(3100)
+                elapsed: Duration::from_millis(3100),
+                detail: String::new(),
             }),
             "the card carries the duration the service measured"
         );
@@ -1778,6 +1792,7 @@ mod tests {
                 name: "read_file".to_owned(),
                 ok: true,
                 elapsed: Duration::from_millis(12),
+                detail: String::new(),
             })
             .expect("settled");
         harness
@@ -2070,6 +2085,58 @@ mod tests {
             "the panel closed"
         );
         assert_eq!(harness.controller.phase(), AppPhase::Running);
+    }
+
+    /// Seen on a real screen: the proposal was printed in the scrollback *and* drawn
+    /// in the panel, so the same four rows appeared twice and the panel looked like a
+    /// garbled copy of the transcript.
+    #[test]
+    fn t06_the_open_panel_is_the_only_place_the_proposal_is_shown() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "work");
+        harness
+            .events
+            .send(approval_event("req-10"))
+            .expect("approval");
+        let effects = harness.controller.pump_events();
+
+        assert!(
+            harness.controller.ui_state().modal.is_some(),
+            "the panel is open"
+        );
+        assert!(
+            history_items(&effects).is_empty(),
+            "the panel owns the proposal in the TUI: {:#?}",
+            history_items(&effects)
+        );
+    }
+
+    /// The plain transcript has no panel, so there the block has to be written to the
+    /// transcript or the reader never learns what was proposed (U20).
+    #[test]
+    fn t06_a_plain_session_still_records_the_proposal_it_cannot_panel() {
+        let mut harness = bench_with(true, RecordingPort::default(), true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "work");
+        harness
+            .events
+            .send(approval_event("req-11"))
+            .expect("approval");
+        let effects = harness.controller.pump_events();
+
+        let items = history_items(&effects);
+        assert!(
+            items.iter().any(|item| matches!(
+                item,
+                HistoryItem::Approval { request_id, .. } if request_id == "req-11"
+            )),
+            "the plain transcript keeps the block: {items:#?}"
+        );
+        assert!(
+            harness.controller.plain,
+            "the bench has to be in plain mode for this to prove anything"
+        );
     }
 
     #[test]
@@ -2434,6 +2501,7 @@ mod tests {
                 name: "read_file".to_owned(),
                 ok: true,
                 elapsed: Duration::from_millis(12),
+                detail: String::new(),
             })
             .expect("settled");
         let settled = harness.controller.pump_events();
@@ -2501,6 +2569,7 @@ mod tests {
                 name: "read_file".to_owned(),
                 ok: true,
                 elapsed: Duration::from_millis(1),
+                detail: String::new(),
             })
             .expect("settle");
         harness
@@ -2706,6 +2775,7 @@ mod tests {
                 summary: String::new(),
                 state: ToolState::Failed {
                     elapsed: Duration::from_millis(3100),
+                    detail: String::new(),
                 },
             },
             HistoryItem::Tool {

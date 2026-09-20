@@ -138,8 +138,10 @@ pub struct SessionCandidate {
 /// How far one tool call has got.
 ///
 /// A settled card carries the duration it took, so the TUI can show
-/// `ok 12ms` / `failed 3.1s` and the plain writer can keep its old two lines.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// `ok 12ms` / `failed 3.1s` and the plain writer can keep its old two lines. A
+/// failure also carries the reason, because a card that only says `failed 962ms`
+/// leaves the reader unable to tell a malformed call from a policy denial.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolState {
     /// The card is open; nothing has settled yet.
     Started,
@@ -148,6 +150,8 @@ pub enum ToolState {
     },
     Failed {
         elapsed: Duration,
+        /// Empty when the producer reported no reason.
+        detail: String,
     },
 }
 
@@ -155,7 +159,7 @@ impl ToolState {
     /// Whether the card has settled.
     #[allow(dead_code, reason = "T04 decides whether a card is updated in place")]
     #[must_use]
-    pub const fn is_settled(self) -> bool {
+    pub const fn is_settled(&self) -> bool {
         !matches!(self, Self::Started)
     }
 }
@@ -310,6 +314,8 @@ pub enum SessionEvent {
         /// value on the event avoids a second name-based lookup that races when
         /// the same tool is called more than once.
         elapsed: Duration,
+        /// Why a failed call did not execute; empty when it succeeded.
+        detail: String,
     },
     /// A gated action is waiting for the user's decision.
     ApprovalRequired {
@@ -384,6 +390,7 @@ mod tests {
                 name: "read_file".to_owned(),
                 ok: true,
                 elapsed: Duration::from_millis(12),
+                detail: String::new(),
             },
             SessionEvent::RunTerminal {
                 outcome: RunOutcome::Done,

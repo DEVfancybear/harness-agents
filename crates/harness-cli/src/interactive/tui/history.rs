@@ -27,12 +27,12 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme) -> Vec<Line<'static
             .map(|line| Line::from(vec![Span::styled(line.clone(), theme.banner(line))]))
             .collect(),
         HistoryItem::User { text } => marker_rows("> ", text, width, theme.user, theme),
-        HistoryItem::Assistant { text } => markdown::render(text, theme),
+        HistoryItem::Assistant { text } => markdown::render(text, width, theme),
         HistoryItem::Tool {
             name,
             summary,
             state,
-        } => vec![tool_card(name, summary, *state, theme)],
+        } => vec![tool_card(name, summary, state.clone(), theme)],
         HistoryItem::Run {
             outcome,
             steps,
@@ -120,15 +120,17 @@ fn marker_rows(
 /// is why the name is always present at the start of the row.
 #[must_use]
 pub fn tool_card(name: &str, summary: &str, state: ToolState, theme: &Theme) -> Line<'static> {
-    let (status, style) = match state {
-        ToolState::Started => ("…".to_owned(), theme.dim),
+    let (status, style, detail) = match state {
+        ToolState::Started => ("…".to_owned(), theme.dim, None),
         ToolState::Ok { elapsed } => (
             format!("ok {}", view::seconds_label(elapsed)),
             theme.tool_ok,
+            None,
         ),
-        ToolState::Failed { elapsed } => (
+        ToolState::Failed { elapsed, detail } => (
             format!("failed {}", view::seconds_label(elapsed)),
             theme.tool_failed,
+            (!detail.trim().is_empty()).then(|| detail.clone()),
         ),
     };
     let mut spans = vec![
@@ -141,6 +143,11 @@ pub fn tool_card(name: &str, summary: &str, state: ToolState, theme: &Theme) -> 
     }
     spans.push(Span::raw("  "));
     spans.push(Span::styled(status, style));
+    // The reason is dim like the summary: the card's colour already says it failed, and
+    // a reader has to be able to tell a malformed call from a policy denial.
+    if let Some(detail) = detail {
+        spans.push(Span::styled(format!(" · {detail}"), theme.dim));
+    }
     Line::from(spans)
 }
 
@@ -272,6 +279,7 @@ mod tests {
                 summary: String::new(),
                 state: ToolState::Failed {
                     elapsed: Duration::from_millis(3100),
+                    detail: String::new(),
                 },
             },
             80,
@@ -280,6 +288,29 @@ mod tests {
         let text = plain_text(&card);
         assert!(text.contains("[tool] apply_patch"), "{text}");
         assert!(text.contains("failed 3.1s"), "{text}");
+    }
+
+    /// The card says why it failed, next to the duration the service measured.
+    #[test]
+    fn t04_a_failed_tool_card_carries_the_reason() {
+        let card = render(
+            &HistoryItem::Tool {
+                name: "list_files".to_owned(),
+                summary: "path=".to_owned(),
+                state: ToolState::Failed {
+                    elapsed: Duration::from_millis(962),
+                    detail: "invalid_payload: optional tool path must not be blank".to_owned(),
+                },
+            },
+            120,
+            &Theme::plain(),
+        );
+        let text = plain_text(&card);
+        assert!(text.contains("failed 962ms"), "{text}");
+        assert!(
+            text.contains("invalid_payload: optional tool path must not be blank"),
+            "the reader has to be able to tell a malformed call from a denial: {text}"
+        );
     }
 
     #[test]
