@@ -582,6 +582,44 @@ mod tests {
         );
     }
 
+    /// Seen on a real screen: with the approval panel open, the viewport showed the
+    /// proposal twice - the scrollback copy and the panel - and the composer's hint
+    /// pointed at a panel it did not name. This asserts the painted frame itself.
+    #[test]
+    fn t06_a_pending_approval_frame_holds_one_copy_of_the_proposal() {
+        let backend = ScriptedBackend::new(Vec::new());
+        let mut renderer = ScriptedRenderer::open(backend, 100, 30).expect("renderer opens");
+        let mut asking = state(AppPhase::WaitingApproval);
+        asking.live_text = String::new();
+        asking.modal = Some(crate::interactive::events::Modal::Approval {
+            request_id: "req-1".to_owned(),
+            action: "apply_patch".to_owned(),
+            summary: "path=src/parser.rs".to_owned(),
+            workspace: "C:/work/project".to_owned(),
+            scope: "once".to_owned(),
+            expires_at: std::time::Instant::now() + Duration::from_mins(5),
+        });
+        renderer.draw_state(&asking).expect("frame draws");
+        let painted = renderer.painted().join("\n");
+        assert_eq!(
+            painted.matches("path=src/parser.rs").count(),
+            1,
+            "the proposal belongs in the panel, once: {painted}"
+        );
+        assert!(
+            painted.contains("workspace: C:/work/project"),
+            "the panel carries the proposal detail: {painted}"
+        );
+        assert!(
+            painted.contains("y chạy") && painted.contains("n từ chối"),
+            "the panel names its keys: {painted}"
+        );
+        assert!(
+            !painted.contains("đang trả lời"),
+            "the live block yields the upper region to the panel: {painted}"
+        );
+    }
+
     /// The whole loop runs against the scripted backend, so the TUI path itself is
     /// covered by a unit test instead of only by a console run.
     #[test]

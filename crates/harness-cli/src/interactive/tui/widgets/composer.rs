@@ -21,7 +21,7 @@ use unicode_width::UnicodeWidthChar;
 use super::super::layout::Plan;
 use super::super::markdown;
 use super::super::theme::Theme;
-use crate::interactive::events::UiState;
+use crate::interactive::events::{Modal, UiState};
 use crate::interactive::view;
 
 /// Cells one character occupies, after NFC.
@@ -160,18 +160,28 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
 }
 
 /// The short hint shown in the composer's top border.
+///
+/// The composer is not focused while a panel owns the keyboard, so the hint names
+/// the panel and the keys that close it instead of describing the composer's own
+/// keys - which would not work while the panel is up.
 #[must_use]
 pub fn hint(state: &UiState) -> String {
-    if state.modal.is_some() {
-        return " trả lời panel ở trên ".to_owned();
+    match &state.modal {
+        Some(Modal::Approval { .. }) => " panel duyệt đang chờ · y chạy · n từ chối ".to_owned(),
+        Some(Modal::Picker { .. }) => " chọn phiên · ↑↓ · Enter · Esc đóng ".to_owned(),
+        Some(Modal::Overlay { .. }) => {
+            " panel đang mở · PgUp/PgDn · Home/End · Esc đóng ".to_owned()
+        }
+        None => {
+            if state.phase.has_active_run() {
+                return " run đang chạy · Ctrl-C hủy · gõ trước rồi Enter sau ".to_owned();
+            }
+            if !state.completion.is_empty() {
+                return format!(" Tab: {} ", state.completion.join("  "));
+            }
+            " Enter gửi · Ctrl-J xuống dòng · /help ".to_owned()
+        }
     }
-    if state.phase.has_active_run() {
-        return " run đang chạy · Ctrl-C hủy · gõ trước rồi Enter sau ".to_owned();
-    }
-    if !state.completion.is_empty() {
-        return format!(" Tab: {} ", state.completion.join("  "));
-    }
-    " Enter gửi · Ctrl-J xuống dòng · /help ".to_owned()
 }
 
 /// Draw the live block: model text that has not been committed yet.
@@ -179,7 +189,7 @@ pub fn render_live(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme
     if area.height == 0 || (state.live_text.is_empty() && state.open_tool.is_none()) {
         return;
     }
-    let mut lines = markdown::render(&state.live_text, theme);
+    let mut lines = markdown::render(&state.live_text, area.width, theme);
     if state.live_text.is_empty() {
         lines.clear();
     }
@@ -199,7 +209,7 @@ pub fn render_live(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme
 #[cfg(test)]
 mod tests {
     use super::{Cell, char_width, display_width, hint, wrap};
-    use crate::interactive::events::{AppPhase, UiState};
+    use crate::interactive::events::{AppPhase, Modal, UiState};
     use crate::interactive::tui::theme::Theme;
     use std::time::Duration;
 
@@ -285,5 +295,36 @@ mod tests {
     fn t03_the_marker_style_comes_from_the_theme() {
         assert_eq!(Theme::plain().accent.fg, None);
         assert!(Theme::colored().accent.fg.is_some());
+    }
+
+    /// Seen on a real screen: the hint said "answer the panel above" whatever the panel
+    /// was, which named no key and read as if the panel were somewhere else.
+    #[test]
+    fn t03_the_hint_names_the_keys_of_the_panel_that_is_open() {
+        let mut asking = state(AppPhase::WaitingApproval);
+        asking.modal = Some(Modal::Approval {
+            request_id: "req-1".to_owned(),
+            action: "apply_patch".to_owned(),
+            summary: "path=a.rs".to_owned(),
+            workspace: "C:/w".to_owned(),
+            scope: "once".to_owned(),
+            expires_at: std::time::Instant::now(),
+        });
+        let approval = hint(&asking);
+        assert!(
+            approval.contains('y') && approval.contains('n'),
+            "{approval}"
+        );
+        assert!(
+            !approval.contains("Ctrl-J"),
+            "the composer's own keys do not work while a panel is up: {approval}"
+        );
+
+        let mut picker = state(AppPhase::Ready);
+        picker.modal = Some(Modal::Picker {
+            items: vec!["one".to_owned()],
+            selected: 0,
+        });
+        assert!(hint(&picker).contains("Esc"), "{}", hint(&picker));
     }
 }
