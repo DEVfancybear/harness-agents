@@ -660,3 +660,49 @@ dung mà extractor đề xuất.
 
 Memory không bắt buộc để chạy app: khi `HA_MEMORY` không được đặt, truy xuất bị bỏ qua và không
 ghi gì.
+
+### 12.6. Extension cục bộ trong một lượt chat (bật tường minh)
+
+Extension **mặc định tắt**. Đặt `HA_EXTENSIONS=on` trong shell khởi động `ha`; giá trị khác giữ
+đúng chín tool built-in. Khi bật, một lượt đọc mọi installation dưới `<HA_HOME>/data/extensions`
+(đổi bằng `HA_EXTENSIONS_ROOT`), chỉ start thứ đã được trust, quảng bá các tool mà installation
+khai báo, và **dừng process plugin khi lượt kết thúc** — một lượt chat không để extension chạy nền.
+
+P6 cố ý không có tool discovery: manifest chỉ khai báo capability `tools` và không nói gì về tên
+tool bên trong, nên **host quyết định thứ model được thấy**. Mỗi plugin một thư mục, gồm ba file:
+
+| File | Nội dung |
+| --- | --- |
+| `manifest.json` | manifest của extension, kèm digest mà nó pin cho executable |
+| `trust.json` | trust grant: plugin id, đúng digest đó, capability và secret được phép |
+| `installation.json` | thứ host này quảng bá: ba đường dẫn trên, và mỗi tool một mục (tên, mô tả, JSON schema tham số, timeout) |
+
+```json
+{
+  "schema_version": 1,
+  "plugin_id": "acme.notes",
+  "manifest": "manifest.json",
+  "executable": "acme-notes.exe",
+  "trust": "trust.json",
+  "tools": [
+    {
+      "name": "tool.search_notes",
+      "description": "search the local note index",
+      "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+      "timeout_ms": 10000
+    }
+  ]
+}
+```
+
+Model thấy các tool đó dưới tên `plugin__<plugin>__<tool>`; tên quảng bá được làm sạch cho wire và
+ánh xạ do host giữ, nên một tên chỉ resolve về installation mà người dùng đã trust. Tên built-in
+luôn thắng, nên extension **không thể** mạo danh `read_file`. Mọi call đi qua đúng gate như tool
+built-in — policy, rồi approval của bạn, rồi durable intent và receipt — và lượt chạy báo lại thứ
+đã nạp (`extensions: 1 plugin(s), 1 tool(s) exposed`). Lượt headless báo cùng thông tin trong khoá
+`extensions` của kết quả `--json`.
+
+Installation có executable không còn khớp digest mà grant đã pin sẽ bị từ chối kèm lý do và
+**không** được start; thư mục không có `installation.json` thì bị bỏ qua. Nhóm lệnh
+`ha extensions inspect|capabilities|register|skills` vẫn là bề mặt kiểm tra và đăng ký, và
+`register --confirm` là thứ chứng minh plugin start được.

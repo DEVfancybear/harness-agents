@@ -33,6 +33,7 @@ use super::bootstrap::{CREDENTIAL_VARIABLES, DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL, 
 use super::controller::{DEFAULT_APPROVAL_TIMEOUT, TurnBounds};
 use super::credentials::{self, CredentialSource};
 use super::events::{RunOutcome, SessionCandidate, SessionEvent};
+use super::extensions;
 use super::memory;
 use super::paths::LaunchEnvironment;
 use super::project;
@@ -855,10 +856,46 @@ async fn run_turn(
         provider,
         RuntimeConfig::default(),
     ));
-    let driver = TurnDriver::new(
-        Arc::clone(&runtime),
-        ToolExecutionService::new(Arc::clone(&store)),
-    );
+    // Local extensions are explicit opt-in, loaded for this turn and stopped when it
+    // ends: a chat turn never leaves an extension process behind.
+    let extension_root = extensions::extensions_root(&environment, &data_dir);
+    let active_extensions = if extensions::extensions_requested_from_environment(&environment) {
+        match extensions::load_active(&extension_root).await {
+            Ok(active) => {
+                send(SessionEvent::Notice {
+                    message: active.report().message(&extension_root),
+                });
+                Some(active)
+            }
+            Err(error) => {
+                send(SessionEvent::Notice {
+                    message: format!("extensions: not loaded ({error})"),
+                });
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let tools = match &active_extensions {
+        Some(active) => {
+            ToolExecutionService::new(Arc::clone(&store)).with_external(active.dispatcher())
+        }
+        None => ToolExecutionService::new(Arc::clone(&store)),
+    };
+    let driver = TurnDriver::new(Arc::clone(&runtime), tools);
+    let driver = match &active_extensions {
+        Some(active) => driver.with_external(active.tools()),
+        None => driver,
+    };
+    let tool_schemas = match &active_extensions {
+        Some(active) => {
+            let mut schemas = coding_tool_schemas();
+            schemas.extend(active.tools().schemas());
+            schemas
+        }
+        None => coding_tool_schemas(),
+    };
     let run_request = RunRequest::new(
         session_id.clone(),
         task_id,
@@ -866,7 +903,7 @@ async fn run_turn(
         request.text.clone(),
         observation,
     )
-    .with_tool_schemas(coding_tool_schemas());
+    .with_tool_schemas(tool_schemas);
     // Retrieval happens before dispatch, so the packet the runtime freezes carries
     // the exact memory versions that were read.
     let run_request = match &memory_principal {
@@ -932,6 +969,10 @@ async fn run_turn(
         }
     }
     drop(driver);
+    // Stop the extension processes this turn started, whatever the outcome was.
+    if let Some(active) = active_extensions {
+        active.shutdown().await;
+    }
     drop(runtime);
     if let Ok(store) = Arc::try_unwrap(store) {
         let _ = store.close().await;

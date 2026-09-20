@@ -12,6 +12,7 @@ pub mod controller;
 pub mod credentials;
 pub mod detector;
 pub mod events;
+pub mod extensions;
 pub mod headless;
 pub mod input;
 pub mod memory;

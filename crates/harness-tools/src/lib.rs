@@ -16,13 +16,15 @@ mod workspace;
 
 pub use contracts::{
     ApprovalGrant, CodingToolAction, IsolationMode, PreparedToolRequest, TOOL_CONTRACT_VERSION,
-    ToolCapabilities, ToolExecutionView, ToolKind, ToolOutput, ToolRequest, coding_tool_schemas,
+    ToolCapabilities, ToolExecutionView, ToolKind, ToolOutput, ToolRequest, coding_tool_names,
+    coding_tool_schemas,
 };
 pub use loop_service::{CodingLoopResult, CodingLoopService};
 pub use policy::{PolicyEffect, PolicyRule, ToolPolicy};
 pub use service::{ExternalToolDispatcher, ToolExecutionService, ToolObserver};
 pub use turn_driver::{
-    ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, TurnDriver, TurnLimits,
-    TurnObserver, TurnOptions, TurnOutcome, TurnProgress, TurnStop,
+    ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ExternalToolCatalog,
+    ExternalTools, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnOutcome, TurnProgress,
+    TurnStop,
 };
 pub use workspace::{observe_workspace, observed_file_hash, workspace_registration};

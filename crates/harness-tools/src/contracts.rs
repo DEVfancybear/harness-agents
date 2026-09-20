@@ -45,6 +45,25 @@ impl ToolKind {
     }
 }
 
+/// The built-in provider-function names the P3 parser accepts.
+///
+/// A host that also advertises external tools needs this list to keep the two
+/// namespaces apart: an extension may add a tool, never shadow a built-in one.
+#[must_use]
+pub const fn coding_tool_names() -> &'static [&'static str] {
+    &[
+        "read_file",
+        "list_files",
+        "search_text",
+        "apply_patch",
+        "run_process",
+        "run_shell",
+        "git_status",
+        "git_diff",
+        "task_update",
+    ]
+}
+
 /// Return the provider-function schemas accepted by the P3 parser. The
 /// schemas are descriptive input contracts only: every call still crosses the
 /// typed execution gate and its policy/approval checks.

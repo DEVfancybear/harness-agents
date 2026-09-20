@@ -504,3 +504,52 @@ content the extractor proposed.
 
 Memory is never required to run the app: with `HA_MEMORY` unset, retrieval is skipped and
 nothing is written.
+
+### 12.5. Local extensions in a chat turn (opt-in)
+
+Extensions are **off unless you ask for them**. Set `HA_EXTENSIONS=on` in the shell that
+launches `ha`; any other value keeps the nine built-in tools. With it on, a turn reads every
+installation under `<HA_HOME>/data/extensions` (override with `HA_EXTENSIONS_ROOT`), starts
+only what is trusted, advertises the tools those installations declare, and stops the plugin
+processes when the turn ends — a chat turn never leaves an extension running.
+
+P6 has no tool discovery on purpose: a manifest declares the `tools` capability and nothing
+about the names inside it, so **the host decides what the model may see**. One directory per
+plugin holds the three files that needs:
+
+| File | What it is |
+| --- | --- |
+| `manifest.json` | the extension manifest, including the digest it pins for its executable |
+| `trust.json` | the trust grant: plugin id, the same digest, allowed capabilities and secrets |
+| `installation.json` | what this host advertises: the three paths above, plus one entry per tool (name, description, JSON argument schema, timeout) |
+
+```json
+{
+  "schema_version": 1,
+  "plugin_id": "acme.notes",
+  "manifest": "manifest.json",
+  "executable": "acme-notes.exe",
+  "trust": "trust.json",
+  "tools": [
+    {
+      "name": "tool.search_notes",
+      "description": "search the local note index",
+      "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+      "timeout_ms": 10000
+    }
+  ]
+}
+```
+
+The model sees those tools as `plugin__<plugin>__<tool>`; the advertised name is sanitized for
+the wire and the mapping is held by the host, so a name resolves only to an installation the
+user trusted. A built-in name always wins, so an extension can never shadow `read_file`. Every
+call crosses the same gate as a built-in tool — policy, then your approval, then a durable
+intent and receipt — and the run reports what it loaded
+(`extensions: 1 plugin(s), 1 tool(s) exposed`). A headless run reports the same under
+`extensions` in its `--json` result.
+
+An installation whose executable no longer matches the digest its grant pinned is refused with
+that reason and is never started; a directory without an `installation.json` is ignored. The
+`ha extensions inspect|capabilities|register|skills` commands remain the inspection and
+registration surface, and `register --confirm` is what proves a plugin starts at all.

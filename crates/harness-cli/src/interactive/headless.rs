@@ -19,6 +19,7 @@ use harness_tools::{
 use harness_types::{ErrorCode, HarnessError, HostId, InputId, SessionId, TaskId};
 
 use super::bootstrap::{self, LaunchRequest};
+use super::extensions;
 use super::memory;
 use super::paths::{HostPlatform, LaunchEnvironment};
 use super::project;
@@ -168,10 +169,41 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         provider,
         RuntimeConfig::default(),
     ));
-    let driver = TurnDriver::new(
-        Arc::clone(&runtime),
-        ToolExecutionService::new(Arc::clone(&store)),
-    );
+    // Local extensions are opt-in, loaded for this one turn and stopped afterwards.
+    let extension_root = extensions::extensions_root(&environment, &context.paths.data_dir);
+    let active_extensions = if extensions::extensions_requested_from_environment(&environment) {
+        match extensions::load_active(&extension_root).await {
+            Ok(active) => {
+                eprintln!("{}", active.report().message(&extension_root));
+                Some(active)
+            }
+            Err(error) => {
+                eprintln!("extensions: not loaded ({error})");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let tools = match &active_extensions {
+        Some(active) => {
+            ToolExecutionService::new(Arc::clone(&store)).with_external(active.dispatcher())
+        }
+        None => ToolExecutionService::new(Arc::clone(&store)),
+    };
+    let driver = TurnDriver::new(Arc::clone(&runtime), tools);
+    let driver = match &active_extensions {
+        Some(active) => driver.with_external(active.tools()),
+        None => driver,
+    };
+    let tool_schemas = match &active_extensions {
+        Some(active) => {
+            let mut schemas = coding_tool_schemas();
+            schemas.extend(active.tools().schemas());
+            schemas
+        }
+        None => coding_tool_schemas(),
+    };
     let run_request = RunRequest::new(
         session_id.clone(),
         task_id,
@@ -179,7 +211,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         request.prompt.clone(),
         observation,
     )
-    .with_tool_schemas(coding_tool_schemas());
+    .with_tool_schemas(tool_schemas);
     let mut recall = None;
     let run_request = match &memory_principal {
         Some(principal) => {
@@ -250,6 +282,15 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         }),
         (None, _, _) => serde_json::json!({"enabled": false}),
     };
+    let extensions_report = match &active_extensions {
+        Some(active) => serde_json::json!({
+            "enabled": true,
+            "plugins": active.report().plugins,
+            "tools": active.report().tools,
+            "refused": active.report().refused,
+        }),
+        None => serde_json::json!({"enabled": false}),
+    };
     let output = serde_json::json!({
         "schema_version": 1,
         "session_id": outcome.session_id,
@@ -262,12 +303,17 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         "approvals": "none",
         "fixture": false,
         "memory": memory_report,
+        "extensions": extensions_report,
         "resumed_from": resumed_from
             .as_ref()
             .map(|(source, _)| source.as_str().to_owned()),
     });
 
     drop(driver);
+    // Stop the extension processes this turn started, before the writer is released.
+    if let Some(active) = active_extensions {
+        active.shutdown().await;
+    }
     drop(runtime);
     Arc::try_unwrap(store)
         .map_err(|_| {

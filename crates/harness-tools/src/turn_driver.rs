@@ -19,10 +19,11 @@ use harness_providers::{
 };
 use harness_runtime::{ProviderEventSink, RunRequest, RunResult, RuntimeService};
 use harness_types::{ErrorCode, HarnessError};
+use serde_json::Value;
 
 use crate::{
     CodingToolAction, PreparedToolRequest, ToolExecutionService, ToolExecutionView, ToolOutput,
-    ToolRequest,
+    ToolRequest, coding_tool_names,
 };
 
 /// Limits that bound one user turn.
@@ -155,6 +156,52 @@ pub struct TurnOutcome {
     pub stop: TurnStop,
 }
 
+/// Host-owned view of the external tools one turn may see and call.
+///
+/// The host decides what is advertised and what a name means; a plugin cannot
+/// announce itself to the model. Everything resolved here still crosses the same
+/// gate as a built-in action — policy, approval, durable intent and receipt — so
+/// this trait cannot authorize anything by itself.
+pub trait ExternalToolCatalog: Send + Sync {
+    /// Provider-function schemas for the external tools this host advertises.
+    fn schemas(&self) -> Vec<Value>;
+    /// Resolve one advertised name into an external action.
+    ///
+    /// `None` means the name is not one this host advertises, which the turn reports
+    /// as an unsupported tool rather than executing anything.
+    fn resolve(&self, name: &str, arguments: &Value) -> Option<CodingToolAction>;
+}
+
+/// A catalogue attached to a driver. Its `Debug` never prints plugin internals.
+#[derive(Clone)]
+pub struct ExternalTools(Arc<dyn ExternalToolCatalog>);
+
+impl ExternalTools {
+    #[must_use]
+    pub fn new(catalog: Arc<dyn ExternalToolCatalog>) -> Self {
+        Self(catalog)
+    }
+
+    #[must_use]
+    pub fn schemas(&self) -> Vec<Value> {
+        self.0.schemas()
+    }
+
+    #[must_use]
+    pub fn resolve(&self, name: &str, arguments: &Value) -> Option<CodingToolAction> {
+        self.0.resolve(name, arguments)
+    }
+}
+
+impl fmt::Debug for ExternalTools {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExternalTools")
+            .field("schemas", &self.schemas().len())
+            .finish()
+    }
+}
+
 /// Longest tool result text handed back to the model.
 const TOOL_RESULT_LIMIT: usize = 4000;
 
@@ -163,12 +210,24 @@ const TOOL_RESULT_LIMIT: usize = 4000;
 pub struct TurnDriver {
     runtime: Arc<RuntimeService>,
     tools: ToolExecutionService,
+    external: Option<ExternalTools>,
 }
 
 impl TurnDriver {
     #[must_use]
     pub fn new(runtime: Arc<RuntimeService>, tools: ToolExecutionService) -> Self {
-        Self { runtime, tools }
+        Self {
+            runtime,
+            tools,
+            external: None,
+        }
+    }
+
+    /// Advertise the external tools of trusted extensions to this driver.
+    #[must_use]
+    pub fn with_external(mut self, external: ExternalTools) -> Self {
+        self.external = Some(external);
+        self
     }
 
     /// Run one user turn to a final answer or a bound.
@@ -365,7 +424,7 @@ impl TurnDriver {
         options: &TurnOptions,
         sequence: u32,
     ) -> Result<ToolExecutionView, HarnessError> {
-        let action = CodingToolAction::from_provider_call(&call.name, &call.arguments)?;
+        let action = self.resolve_action(call)?;
         let prepared = self
             .tools
             .prepare(ToolRequest::new(
@@ -400,6 +459,32 @@ impl TurnDriver {
             }
         };
         self.tools.execute(prepared, approval).await
+    }
+
+    /// Resolve one streamed call into an action.
+    ///
+    /// A built-in name is resolved by the P3 parser first, so an extension can never
+    /// shadow a built-in tool with a name of its own; a name the host's catalogue does
+    /// not advertise stays the unsupported-tool denial it always was.
+    fn resolve_action(&self, call: &NormalizedToolCall) -> Result<CodingToolAction, HarnessError> {
+        if coding_tool_names().contains(&call.name.as_str()) {
+            return CodingToolAction::from_provider_call(&call.name, &call.arguments);
+        }
+        let Some(external) = &self.external else {
+            return CodingToolAction::from_provider_call(&call.name, &call.arguments);
+        };
+        let arguments: Value = serde_json::from_str(&call.arguments).map_err(|_| {
+            HarnessError::new(
+                ErrorCode::ProviderProtocol,
+                "provider tool arguments are incomplete or invalid JSON",
+            )
+        })?;
+        external.resolve(&call.name, &arguments).ok_or_else(|| {
+            HarnessError::new(
+                ErrorCode::PolicyDenied,
+                "provider requested a tool this host does not advertise",
+            )
+        })
     }
 }
 
