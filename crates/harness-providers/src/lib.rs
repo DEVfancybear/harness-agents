@@ -71,6 +71,56 @@ impl ProviderMessage {
             content: content.into(),
         }
     }
+
+    /// The message as OpenAI-compatible chat APIs accept it.
+    ///
+    /// The one shape this app can send without carrying tool-call metadata is a
+    /// plain `system`/`user`/`assistant` message. A tool result is therefore sent
+    /// as a **user** message that names the tool, which is not a stylistic choice:
+    ///
+    /// - the `tool` role requires a `tool_call_id`, and the assistant message before
+    ///   it must carry the matching `tool_calls`. Measured against the live API, a
+    ///   `tool` message without one is refused with
+    ///   `HTTP 422 ... missing field 'tool_call_id'`;
+    /// - the Chat Completions API does not support inserting tool calls
+    ///   mid-conversation at all, so replaying the structured pair is not an option
+    ///   this endpoint offers (the Anthropic and Responses APIs are the ones that
+    ///   do);
+    /// - the result text is what the model actually needs, and this keeps it in the
+    ///   conversation with every provider that speaks this format.
+    ///
+    /// The marker is explicit so a tool result can never read as something the user
+    /// said.
+    #[must_use]
+    pub fn to_wire(&self) -> Value {
+        match self.role {
+            MessageRole::Tool => json!({
+                "role": "user",
+                "content": format!("[tool result]\n{}", self.content),
+            }),
+            MessageRole::System => json!({ "role": "system", "content": self.content }),
+            MessageRole::User => json!({ "role": "user", "content": self.content }),
+            MessageRole::Assistant => json!({ "role": "assistant", "content": self.content }),
+        }
+    }
+}
+
+/// The `messages` array as the API accepts it.
+#[must_use]
+pub fn wire_messages(messages: &[ProviderMessage]) -> Vec<Value> {
+    messages.iter().map(ProviderMessage::to_wire).collect()
+}
+
+/// Thinking mode is off, deliberately.
+///
+/// The provider enables thinking mode by default, and a request that turns it on
+/// must send every assistant `reasoning_content` back on the next request —
+/// measured as `HTTP 400 The 'reasoning_content' in the thinking mode must be
+/// passed back to the API`. This app does not retain reasoning content, so it asks
+/// for the mode it can actually complete instead of failing on the second turn.
+#[must_use]
+pub fn thinking_disabled() -> Value {
+    json!({ "type": "disabled" })
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -452,7 +502,7 @@ impl ModelProvider for DeepSeekAdapter {
         let client = self.client.clone();
         Box::pin(async move {
             let token = credentials.resolve()?;
-            let mut body = json!({ "model": request.model, "messages": request.messages, "stream": true, "temperature": request.temperature });
+            let mut body = json!({ "model": request.model, "messages": wire_messages(&request.messages), "stream": true, "temperature": request.temperature, "thinking": thinking_disabled() });
             if !request.tool_schemas.is_empty()
                 && let Some(object) = body.as_object_mut()
             {
@@ -651,5 +701,54 @@ mod endpoint_tests {
             "https://gateway.internal/openai/chat"
         );
         assert_eq!(chat_completions_endpoint(""), "");
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::{MessageRole, ProviderMessage, thinking_disabled, wire_messages};
+
+    /// The measured 422: a `tool` role message without `tool_call_id`.
+    ///
+    /// The wire shape this app sends therefore never uses the `tool` role. The
+    /// result still reaches the model, marked so it cannot read as user text.
+    #[test]
+    fn a_tool_result_is_sent_as_a_marked_user_message() {
+        let messages = vec![
+            ProviderMessage::new(MessageRole::System, "be brief"),
+            ProviderMessage::new(MessageRole::User, "list the files"),
+            ProviderMessage::new(MessageRole::Assistant, "calling a tool"),
+            ProviderMessage::new(MessageRole::Tool, "tool list_files failed: denied"),
+        ];
+        let wire = wire_messages(&messages);
+        assert_eq!(wire.len(), 4);
+        assert_eq!(wire[0]["role"], "system");
+        assert_eq!(wire[1]["role"], "user");
+        assert_eq!(wire[2]["role"], "assistant");
+        assert_eq!(
+            wire[3]["role"], "user",
+            "the tool role is not sent: it needs tool_call_id and a matching tool_calls"
+        );
+        let content = wire[3]["content"].as_str().expect("content is a string");
+        assert!(
+            content.starts_with("[tool result]"),
+            "a tool result must be marked: {content}"
+        );
+        assert!(content.contains("denied"), "{content}");
+        for message in &wire {
+            assert!(
+                message.get("tool_call_id").is_none(),
+                "no message may claim a tool_call_id this app does not have: {message}"
+            );
+        }
+    }
+
+    /// Measured 400: thinking mode demands `reasoning_content` back on turn two.
+    #[test]
+    fn thinking_mode_is_disabled_explicitly() {
+        assert_eq!(
+            thinking_disabled(),
+            serde_json::json!({ "type": "disabled" })
+        );
     }
 }

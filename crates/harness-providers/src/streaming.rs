@@ -156,9 +156,10 @@ pub(crate) fn adapter_stream(
             };
             let mut body = serde_json::json!({
                 "model": request.model,
-                "messages": request.messages,
+                "messages": crate::wire_messages(&request.messages),
                 "stream": true,
                 "temperature": request.temperature,
+                "thinking": crate::thinking_disabled(),
             });
             if !request.tool_schemas.is_empty()
                 && let Some(object) = body.as_object_mut()
@@ -275,13 +276,19 @@ mod tests {
     /// Binding a port only puts the socket into listen, and this environment can
     /// refuse a connection to a freshly bound listener under load; the probes below
     /// send no bytes, so the fixture discards them and keeps waiting.
+    ///
+    /// A refused probe is retried instead of panicked on. Measured on this host:
+    /// `connect` to an already-bound listener still returns `ConnectionRefused`
+    /// while the accept loop is being scheduled, so an `expect` here failed the test
+    /// for a condition the test is not about.
     async fn await_loopback_ready(address: std::net::SocketAddr) {
-        for attempt in 0..3 {
-            std::net::TcpStream::connect(address).expect("fixture accepts a readiness probe");
-            if attempt < 2 {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+        for attempt in 0..40_u32 {
+            if std::net::TcpStream::connect(address).is_ok() {
+                return;
             }
+            tokio::time::sleep(Duration::from_millis(u64::from(attempt.min(8)) * 10 + 10)).await;
         }
+        panic!("fixture listener at {address} refused every readiness probe");
     }
 
     fn provider_request() -> ProviderRequest {
@@ -357,13 +364,16 @@ mod tests {
                 let (mut candidate, _) = listener.accept().await.expect("fixture accepts");
                 let mut probe = [0_u8; 1];
                 // A readiness probe connects and closes; it must not consume the
-                // single scripted response, so the loop accepts again.
+                // single scripted response, so the loop accepts again. A reset is
+                // the same kind of probe: the client dropped the connection before
+                // sending a head. Failing on it was measured as `fixture reads: ...`
+                // on this host, which is a probe artifact, not the behavior under
+                // test.
                 match tokio::time::timeout(Duration::from_millis(250), candidate.read(&mut probe))
                     .await
                 {
-                    Ok(Ok(0)) | Err(_) => {}
+                    Ok(Ok(0)) | Err(_) | Ok(Err(_)) => {}
                     Ok(Ok(_)) => break candidate,
-                    Ok(Err(error)) => panic!("fixture reads: {error}"),
                 }
             };
             socket
@@ -387,7 +397,23 @@ mod tests {
                 )
                 .await
                 .expect("fixture writes the rest");
-            socket.shutdown().await.ok();
+            socket
+                .shutdown()
+                .await
+                .expect("fixture half-closes response");
+            // Keep the accepted socket alive until reqwest consumes the final SSE
+            // bytes. Dropping both halves immediately after shutdown can surface as
+            // an intermittent `error decoding response body` on Windows.
+            let mut trailing = [0_u8; 256];
+            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match socket.read(&mut trailing).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            })
+            .await;
         });
 
         let adapter = DeepSeekAdapter::new(
