@@ -640,6 +640,126 @@ mod tests {
         );
     }
 
+    /// K04: a long answer keeps its END in the viewport and its start in the
+    /// scrollback.
+    ///
+    /// The report was a long reply that visibly stopped mid-sentence while the run
+    /// finished normally. The text is not lost - it arrives whole and the scrollback
+    /// keeps every line - but a viewport that grows with the answer would push its
+    /// own last lines off the screen, and that reads as truncation. This asserts the
+    /// split: the live block holds the tail and stays bounded, the scrollback holds
+    /// what scrolled out, and a burst of lines in one delta does not outrun it.
+    #[test]
+    fn k04_a_long_streamed_answer_keeps_its_end_visible_and_its_start_in_scrollback() {
+        use crate::interactive::bootstrap::{self, LaunchRequest};
+        use crate::interactive::controller::InteractiveController;
+        use crate::interactive::events::SessionEvent;
+        use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
+        use crate::interactive::service::{SessionChannel, SessionPort, SubmitRequest};
+        use std::fmt::Write as _;
+
+        /// A port that streams a paragraph in small deltas, like a real model.
+        struct LongAnswerPort {
+            sender: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
+        }
+
+        impl SessionPort for LongAnswerPort {
+            fn label(&self) -> String {
+                "long-answer fixture".to_owned()
+            }
+
+            fn cancel(&mut self) {}
+
+            fn submit(&mut self, request: SubmitRequest) {
+                let _ = self.sender.send(SessionEvent::Accepted {
+                    input_id: request.input_id,
+                });
+                let _ = self.sender.send(SessionEvent::StepStarted { step: 1 });
+                // Text is driven by the test, one delta per pump, because that is how
+                // a real stream arrives: a port that sends every delta inside `submit`
+                // delivers them as one batch, which collapses the boundary this test
+                // exists to check.
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp root");
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&project).expect("project");
+        std::fs::write(home.join("config.toml"), "schema_version = 1\n").expect("config");
+        let context = bootstrap::resolve(LaunchRequest {
+            cwd: None,
+            caller_dir: project,
+            platform: HostPlatform::current(),
+            environment: LaunchEnvironment::from_pairs([
+                ("HA_HOME", home.to_string_lossy().into_owned()),
+                ("DEEPSEEK_API_KEY", "fixture-secret".to_owned()),
+            ]),
+            explicit_data_dir: None,
+        })
+        .expect("context");
+        let channel = SessionChannel::new();
+        let events = channel.sender();
+        let port = LongAnswerPort {
+            sender: events.clone(),
+        };
+        let mut controller = InteractiveController::new(&context, Box::new(port), channel, false);
+        // Drive the controller directly: submitting and pumping is the same path the
+        // loop takes, and it leaves the viewport observable after the answer instead
+        // of after the app has closed itself.
+        controller.boot_lines();
+        let _ = controller.handle_key(Key::Char('h'));
+        let _ = controller.handle_key(Key::Char('i'));
+        let _ = controller.handle_key(Key::Enter);
+        let _ = controller.pump_events();
+
+        // One delta per pump, the way a streamed answer actually arrives.
+        for index in 0..12 {
+            let _ = events.send(SessionEvent::TextDelta {
+                text: format!("line {index} of the answer\n"),
+            });
+            let _ = controller.pump_events();
+        }
+        let _ = events.send(SessionEvent::TextDelta {
+            text: "THE-LAST-LINE-OF-THE-ANSWER".to_owned(),
+        });
+        let _ = controller.pump_events();
+
+        let state = controller.ui_state();
+        assert!(
+            state.live_text.contains("THE-LAST-LINE-OF-THE-ANSWER"),
+            "the viewport lost the end of the answer: {:?}",
+            state.live_text
+        );
+        assert!(
+            !state.live_text.contains("line 0 of the answer"),
+            "the live block must stay bounded, not grow with the answer: {:?}",
+            state.live_text
+        );
+        let transcript = controller.transcript().join("\n");
+        assert!(
+            transcript.contains("line 0 of the answer"),
+            "the earliest line was dropped instead of moving to the scrollback: {transcript}"
+        );
+
+        // A tool result or a paste arrives as several lines in ONE delta, which is
+        // the shape that can outrun a per-poll overflow decision.
+        let mut burst = String::new();
+        for index in 0..12 {
+            let _ = writeln!(burst, "burst {index} of the answer");
+        }
+        burst.push_str("BURST-LAST-LINE");
+        let _ = events.send(SessionEvent::TextDelta { text: burst });
+        let _ = controller.pump_events();
+        let state = controller.ui_state();
+        assert!(
+            state.live_text.contains("BURST-LAST-LINE"),
+            "a burst of lines pushed the end of the answer out of the viewport: {:?}",
+            state.live_text
+        );
+    }
+
     /// Poll timeouts are deliberately longer than the animation interval. If an
     /// idle tick ever starts returning a redraw effect, this catches the resulting
     /// CPU/output churn instead of relying on a visual inspection.
