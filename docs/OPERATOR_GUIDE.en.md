@@ -455,7 +455,22 @@ stderr: `ha chat --plain` or `HA_UI=plain`; a console smaller than 60 columns by
 sandbox in use — see section 8 of `docs/evidence/HA_LAUNCH.vi.md`) and the live provider
 smoke (no credential or budget is granted).
 
-### 12.4. Chat memory (opt-in)
+### 12.4. Reading the end of a turn
+
+Every prompt ends with one `[run]` line, and the four words it can use mean different things:
+
+| Line | What happened |
+| --- | --- |
+| `[run] done` | The model answered and asked for nothing more. |
+| `[run] paused: step limit reached` | The turn stopped at one of your bounds — steps, tool calls or the deadline — before the model answered. **Nothing was lost:** every tool receipt is durable, the transcript stays in scrollback, and the next prompt continues the same task. Bounds are `step 2/8` in the status bar, and a step is one model call. |
+| `[run] failed: <reason>` | Something broke: the provider was unreachable, a tool could not be prepared, or the run itself errored. The reason is printed after the colon. |
+| `[run] canceled` | You canceled it (`Ctrl-C`). |
+
+A tool card that fails says why: `failed 962ms · invalid_payload: optional tool path must
+not be blank` is a call the model shaped wrongly (it is told the same thing and usually
+retries), while `failed 1.2s · policy_denied: denied by the user` is a refusal you made.
+
+### 12.5. Chat memory (opt-in)
 
 Memory is **off unless you ask for it**. Set `HA_MEMORY=on` in the shell that launches
 `ha`; any other value, or leaving it unset, keeps the behaviour above: no memory is read
@@ -530,7 +545,7 @@ content the extractor proposed.
 Memory is never required to run the app: with `HA_MEMORY` unset, retrieval is skipped and
 nothing is written.
 
-### 12.5. Local extensions in a chat turn (opt-in)
+### 12.6. Local extensions in a chat turn (opt-in)
 
 Extensions are **off unless you ask for them**. Set `HA_EXTENSIONS=on` in the shell that
 launches `ha`; any other value keeps the nine built-in tools. With it on, a turn reads every

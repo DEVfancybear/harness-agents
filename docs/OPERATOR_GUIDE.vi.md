@@ -766,3 +766,18 @@ Installation có executable không còn khớp digest mà grant đã pin sẽ b�
 **không** được start; thư mục không có `installation.json` thì bị bỏ qua. Nhóm lệnh
 `ha extensions inspect|capabilities|register|skills` vẫn là bề mặt kiểm tra và đăng ký, và
 `register --confirm` là thứ chứng minh plugin start được.
+
+### 12.7. Đọc cuối một lượt
+
+Mỗi yêu cầu kết thúc bằng đúng một dòng `[run]`, và bốn chữ nó có thể dùng mang nghĩa khác nhau:
+
+| Dòng | Điều đã xảy ra |
+| --- | --- |
+| `[run] done` | Model đã trả lời và không hỏi thêm gì. |
+| `[run] paused: step limit reached` | Lượt dừng ở một bound bạn đặt — số step, số tool call hoặc deadline — trước khi model trả lời. **Không mất gì:** mọi receipt của tool đều bền, transcript vẫn nằm trong scrollback, và yêu cầu kế tiếp tiếp tục đúng task đó. Bound hiện ở status bar dạng `step 2/8`, và **một step là một lần gọi model**. |
+| `[run] failed: <lý do>` | Có thứ hỏng: provider không tới được, tool không chuẩn bị được, hoặc chính lượt chạy lỗi. Lý do in ngay sau dấu hai chấm. |
+| `[run] canceled` | Bạn đã huỷ (`Ctrl-C`). |
+
+Card tool fail thì nói rõ vì sao: `failed 962ms · invalid_payload: optional tool path must not
+be blank` là call model ghép sai (model cũng được báo y hệt và thường thử lại), còn
+`failed 1.2s · policy_denied: denied by the user` là do bạn từ chối.
