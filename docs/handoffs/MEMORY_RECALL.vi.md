@@ -128,3 +128,140 @@ Workspace có writer song song. Trong lượt này họ: thêm `RunOutcome::Paus
 một lúc (tôi chờ, họ tự vá), và sửa `events.rs` / `view.rs` / `tui/history.rs` /
 `tests/interactive_session.rs` / `harness-tools/src/turn_driver.rs`. Tôi **không** commit file của
 họ; commit `366b621` chỉ chứa file của tôi. Khi tôi commit, cây đã sạch phần của tôi.
+
+## 7. Nhớ cả lượt hội thoại — commit `168cbb5`
+
+### 7.1. Triệu chứng, và nó khác lỗi truy hồi thế nào
+
+Ảnh chụp một session thật: agent nói *"Tôi không có bản ghi hội thoại nào từ session khác"* trong
+khi `[info] memory:` cho thấy memory **đã được nạp**. Người giao việc kết luận đúng: **input đã load
+memory nhưng output chưa có**.
+
+Tách ra ba tầng, và tầng 3 mới là chỗ hỏng:
+
+| Tầng | Trạng thái |
+|---|---|
+| Truy hồi | đã sửa ở §1–§5 |
+| Nhét vào prompt, model dùng | **hoạt động** — chứng minh bằng một lượt lưu directive rồi hỏi lại, model trả đúng marker |
+| **Cái được lưu** | **hỏng**: store chỉ giữ input của người dùng, và chỉ khi là chỉ dẫn. Câu trả lời của agent **không bao giờ** được lưu |
+
+### 7.2. Quyết định (người giao việc giao toàn quyền)
+
+- **Một asset mỗi lượt**: `asked: <câu hỏi>`, `session: <id>`, `answered: <200 ký tự đầu>`.
+- **Active ngay, không để `candidate`** — `refresh_fts` chỉ index `Active` + `Valid`, nên candidate
+  sẽ không bao giờ được truy hồi và tính năng thành chết.
+- **Nhãn trung thực**: `RuntimeObserved` + `VerifiedObservation`, nguồn là event admission đã bền
+  vững. **Không** `UserConfirmed`, vì người dùng không xác nhận câu trả lời của model. Dòng
+  `answered:` là **trích nguyên văn** output của model, không được thăng thành bằng chứng về nội
+  dung của nó.
+- **Trần 200 bản ghi/project**, cắt cũ nhất; **chỉ** asset có `provenance_kind == "session_turn"`
+  mới bị cắt, nên directive không bao giờ hết hạn.
+- **Câu hỏi về lịch sử đi đường riêng** (`asks_about_history` → `recent_turns`): sàn overlap 2 term
+  — thứ tôi thêm để chống nhiễu — lại chặn đúng câu `"session trước tôi hỏi bạn những gì?"` vì nó
+  chỉ chia sẻ **một** term với bản ghi. Câu hỏi về *thời gian* phải trả lời bằng *thời gian*.
+
+### 7.3. Nguyên nhân gốc của "input có, output không" — và nó là lỗi của tôi
+
+`recent_turns` trả `revision: 0` trong khi store có revision riêng. `validate_memory_snapshot`
+(`advanced.rs`) so revision, và `harness-runtime/src/lib.rs:522-528` làm thế này:
+
+```rust
+if MemoryService::new(...).validate_contribution(contribution).await.is_err() {
+    request.memory = None;      // <-- bỏ TOÀN BỘ memory, không một dòng log
+}
+```
+
+Nên contribution bị **drop âm thầm** trước khi packet được dựng: `recall` báo `1 block injected`,
+mà packet không hề có block nào. Sửa: `recent_turn_records` đọc và trả revision thật, và test khẳng
+định `recent.revision > 0` kèm lý do.
+
+**Bài học đáng giữ:** một lần drop âm thầm ở tầng runtime tốn cả một lượt để tìm ra. Chỗ đó nên có
+notice.
+
+### 7.4. Số đo
+
+```text
+cargo test -p harness-cli --bin ha --locked   -> 207 passed; 1 failed (attachments.rs — không phải của lượt này)
+phase_p4                                      -> 26 passed
+cargo test -p harness-memory -p harness-store-sqlite -> xanh
+cargo clippy --workspace --all-targets --locked -- -D warnings -> sạch
+cài lại: build_commit 168cbb5, sha256 f6ed9f14...
+```
+
+End-to-end, đúng câu trong ảnh, chạy bằng **binary đã cài**:
+
+```text
+lượt 1: "Giải thích ngắn gọn memory dài hạn là gì."     -> directive=stored turn=stored
+lượt 2: "session trước tôi hỏi bạn những gì?"
+        recall: memory: 1 hit(s), 1 block(s) injected
+        trả lời: The previous session you asked: "Giải thích ngắn gọn memory dài hạn là gì."
+                 — I answered that long-term memory is the ability to store and remember
+                 information over a long period…
+```
+
+### 7.5. Vá một lỗi build không phải của lượt này
+
+`Key::PasteImage` đã được thêm vào enum và được `terminal.rs` sinh ra, nhưng **không match ở đâu**,
+nên crate không build được. `controller.rs` đọc clipboard, nên editor để buffer yên và controller sở
+hữu phím. Đã sửa để cây build lại.
+
+### 7.6. Review độc lập — ba phát hiện HIGH, và một trong số đó đổi thiết kế
+
+Tôi giao một subagent review đối kháng hai commit `366b621` + `168cbb5`. Nó tìm được ba lỗi HIGH
+**của tôi**, tất cả đều thật:
+
+**H1 — dedup không bao giờ chạy với input bị redact.** Lookup dùng text **thô**, còn `create_asset`
+redact các dòng trông như credential (`sanitize_memory_text`) **trước khi** hash và trước khi ghi
+search mirror. Nên khoá thô không bao giờ khớp giá trị đã redact: mọi lần lặp lại tạo thêm asset —
+đúng cái lỗi mà `366b621` nói đã xoá. Và vì redact theo **dòng**, một turn record có dòng `asked:`
+bị redact thì mất đúng thứ nó tồn tại để giữ.
+*Sửa:* khoá dedup là text sẽ thực sự được lưu (`sanitize_memory_text` nay public vì lý do đó), và
+lượt nào có câu hỏi bị redact thì **không ghi** turn record, báo lý do.
+
+**H2 — `classify_input` loại nhầm mệnh lệnh thường.** Danh sách interrogative chứa `do`, `have`,
+`can`, `will`, `should`… — những từ mở câu hỏi **và** mở mệnh lệnh. Nên `"Do not force-push to
+main"` và `"Have a look at the deploy script"` bị bỏ như câu hỏi, ngược lại chính doc comment hai
+dòng trên nói "bỏ sót chỉ dẫn thật là sai lầm tệ hơn". Luật `?` cũng không được chặn theo độ dài
+như comment khẳng định.
+*Sửa:* từ để hỏi chỉ tính khi **đuôi câu** đồng ý, và luật `?` chỉ áp cho input ngắn.
+
+**H3 — nhãn `VerifiedObservation` trên turn record.** Reviewer đúng: event admission chứng minh câu
+hỏi đã được nhận, **không** nói gì về câu trả lời, mà câu trả lời là output model chép nguyên văn.
+Tôi thử nhãn trung thực trước — `ModelInference` + `ModelProposed`, policy settle thành
+`candidate` — và **nó không hoạt động**: `validate_memory_snapshot` từ chối asset không `Active`, và
+runtime drop toàn bộ contribution không một dòng log. Đó là dữ kiện đáng nhớ riêng.
+*Sửa:* giữ `RuntimeObserved` + `VerifiedObservation` — đúng nghĩa "runtime quan sát lượt này đã xảy
+ra" — và **chuyển tính trung thực tới chỗ model đọc**: heading khối nay ghi rõ nó ghi lại *đã hỏi gì
+và đã nói gì*, và **một câu trả lời được trích dẫn là điều đã được nói, không phải sự thật đã kiểm**.
+
+Kèm theo: `recent_turn_records` nay nhận cả `active` và `candidate` (một log giấu mục chưa xác nhận
+thì trả lời "bạn đã hỏi gì" bằng không gì cả), và hai comment nói sai về việc code làm.
+
+**Việc còn lại từ review (chưa sửa, ghi lại thay vì im lặng):**
+
+| # | Phát hiện | Chỗ |
+|---|---|---|
+| M1 | `PolicyDenied` bị biến thành empty lành tính, và nhánh đó là code chết — không nguồn lỗi nào trong `search_memory` trả `PolicyDenied` | `retrieval.rs:230-234` |
+| M2 | Fallback `AND` trả row của snapshot này với revision của snapshot kia → contribution bị drop âm thầm (đúng loại lỗi 168cbb5 đi sửa) | `retrieval.rs:188-195` |
+| M3 | `find_active_memory_by_content` không kiểm owner/grant/task/session như search, và predicate project **ngược** với search | `advanced.rs:267-317` |
+| M4 | `append_memory_version_source` uỷ quyền bằng `bind` (đúng ra là `publish`), và **sau** khi load | `advanced.rs:337-343` |
+| M5 | `prune_turns` không có trần: lần đầu nâng cấp một store lớn sẽ chạy N transaction trong một lượt; và lỗi prune sau khi đã ghi thành công thì báo "nothing was stored" | `memory.rs:428-441` |
+| M6 | `invalidate` là bắc cầu, nên trần log có thể retire một L2 mà người dùng quan tâm (tiềm ẩn — hiện chưa có gì trỏ lên) | `advanced.rs:724-763` |
+| M7 | Mỗi directive bị chính turn record của nó **che** trong xếp hạng `covers`-trước, nên recall về directive có thể trả lời bằng câu trả lời cũ của model | `retrieval.rs:198` |
+| M8 | `search_terms` công khai, không normalize và không escape term: caller truyền term chứa `"` làm hỏng cả MATCH và bị báo thành "fts_unavailable" | `retrieval.rs:132-163` |
+
+Review cũng **xác nhận đúng** những chỗ trông đáng ngờ mà không phải lỗi: `LIMIT -1 OFFSET`, thứ tự
+bind tham số, `covers()` khớp mirror FTS, tên field `json_extract`, OR 32 term, `relevance_for`, và
+sqlx `Drop` rollback (nên early return sau `begin_write` không rò transaction — tôi đã tự kiểm lại).
+
+### 7.7. Việc còn lại
+
+1. **Tám phát hiện M1–M8 ở §7.6** — chưa sửa. M4 (uỷ quyền `bind` thay vì `publish`, và load trước
+   khi kiểm) và M7 (turn record che directive) là hai chỗ tôi cho là đáng làm trước.
+2. Chưa cập nhật `docs/MEMORY_AND_CONTINUITY.vi.md`: thay đổi này mở rộng memory từ "chỉ dẫn người
+   dùng" sang "nhật ký hội thoại", tức một quyết định hợp đồng cần ghi lại.
+3. Chưa có test cho `search_terms` với term chứa `"` (M8), cho scope/authorization của
+   `find_active_memory_by_content` (M3), và cho fallback `AND` thành công (đường đó chỉ được chạy
+   trên store rỗng).
+4. `attachments.rs` của writer khác đã được họ commit (`62e3f98`); blocker mà review báo đã tự hết
+   trước khi tôi kịp xử.
