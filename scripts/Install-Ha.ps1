@@ -612,6 +612,8 @@ function Invoke-Install {
         $digest = Get-FileDigest -FilePath $installedBinary
     }
     else {
+        # Set before the branch: StrictMode is on, so reading it unset is an error
+        # rather than an empty string.
         $sourceBinary = $expectedArtifact
         $manifestSource = ''
         if (-not [string]::IsNullOrWhiteSpace($FromBundle)) {
@@ -622,17 +624,40 @@ function Invoke-Install {
             $manifestSource = [System.IO.Path]::GetFullPath($FromBundle)
             Write-Host "Bundle:     $manifestSource (version $($bundle.Version))"
         }
-        elseif (-not $SkipBuild) {
-            $reported = Resolve-CargoArtifact -BuildProfile $Profile
-            if (-not [string]::IsNullOrWhiteSpace($reported)) {
-                $sourceBinary = $reported
-            }
-            elseif (Test-Path -LiteralPath $expectedArtifact -PathType Leaf) {
-                Write-Host "Cargo did not report an artifact; using $expectedArtifact"
-                $sourceBinary = $expectedArtifact
+        else {
+            # Build the artifact this repository owns before deciding what to install.
+            #
+            # This used to be skipped when -SkipBuild was passed, and -SkipBuild then
+            # installed `$expectedArtifact`, which is the target directory of *this*
+            # repository. On a repository that was never built, that directory holds
+            # nothing, so the installer refused with "the artifact is missing" - even
+            # though the caller had asked for the artifact this repository already has.
+            # The flag means "do not rebuild what is already here"; it cannot mean
+            # "install a file that was never produced". When the build is skipped and no
+            # artifact exists, that is a build problem and it is reported as one.
+            if (-not (Test-Path -LiteralPath $expectedArtifact -PathType Leaf)) {
+                if ($SkipBuild) {
+                    throw "-SkipBuild was passed but no built artifact exists at $expectedArtifact. Build it first (cargo build -p harness-cli --bin ha) or run without -SkipBuild."
+                }
+                $reported = Resolve-CargoArtifact -BuildProfile $Profile
+                if (-not [string]::IsNullOrWhiteSpace($reported)) {
+                    $sourceBinary = $reported
+                }
+                elseif (Test-Path -LiteralPath $expectedArtifact -PathType Leaf) {
+                    Write-Host "Cargo did not report an artifact; using $expectedArtifact"
+                    $sourceBinary = $expectedArtifact
+                }
+                else {
+                    throw "Cargo did not report a usable artifact for the ha bin."
+                }
             }
             else {
-                throw 'Cargo did not report a usable artifact for the ha bin.'
+                if (-not $SkipBuild) {
+                    $reported = Resolve-CargoArtifact -BuildProfile $Profile
+                    if (-not [string]::IsNullOrWhiteSpace($reported)) {
+                        $sourceBinary = $reported
+                    }
+                }
             }
         }
         if (-not (Test-Path -LiteralPath $sourceBinary -PathType Leaf)) {
