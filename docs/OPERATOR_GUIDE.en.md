@@ -386,6 +386,13 @@ ha                                     # opens the TUI; the status bar names the
 $env:HA_PROVIDER_MODEL = 'deepseek-v4-pro'
 ```
 
+**When the provider answers with an error, run `/model` or `/status` inside the
+app.** They print which variable the credential came from (never its value), whether the
+endpoint and the model are yours or the defaults, and whether the endpoint is reachable. If
+the last line says `endpoint did not answer`, the problem is the network or a proxy; if it
+says `no credential; set one of ...`, the key was not set **in the shell that launched
+`ha`** (an environment variable only reaches processes started after you set it).
+
 To check the real provider before opening the app (costs one paid call):
 
 ```powershell

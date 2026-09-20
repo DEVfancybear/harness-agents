@@ -116,6 +116,9 @@ pub struct InteractiveController {
     fallback_reason: Option<String>,
     /// Tick counter, so the spinner animates and an idle loop stays still.
     tick: u64,
+    /// A quit requested during a run is completed only after the service emits
+    /// its terminal event and releases the writer it owns.
+    exit_after_run: bool,
 }
 
 impl InteractiveController {
@@ -158,6 +161,7 @@ impl InteractiveController {
             last_request: None,
             fallback_reason: None,
             tick: 0,
+            exit_after_run: false,
         }
     }
 
@@ -540,12 +544,14 @@ impl InteractiveController {
                     },
                 );
                 self.finish_run();
+                self.finish_pending_exit(effects);
             }
             SessionEvent::RecoverableError { message } => {
                 self.flush_stream(effects);
                 self.settle_run(None);
                 self.push_history(effects, HistoryItem::Error { message });
                 self.finish_run();
+                self.finish_pending_exit(effects);
             }
         }
     }
@@ -637,12 +643,16 @@ impl InteractiveController {
             "/exit" | "/quit" => {
                 if self.phase.has_active_run() {
                     self.service.cancel();
+                    self.exit_after_run = true;
+                    self.phase = AppPhase::Canceling;
                     self.push_history(
                         &mut effects,
                         HistoryItem::Notice {
                             message: "^C canceling the active run before exit".to_owned(),
                         },
                     );
+                    effects.push(Effect::Redraw);
+                    return effects;
                 }
                 self.phase = AppPhase::Closed;
                 effects.push(Effect::Exit(EXIT_SUCCESS));
@@ -654,6 +664,11 @@ impl InteractiveController {
             "/status" => {
                 let mut lines = self.header.clone();
                 lines.push(format!("Phase:   {}", self.phase.label()));
+                // The provider facts answer "what is this app actually using?":
+                // which credential variable holds the key (never its value), whether
+                // the endpoint and the model came from the environment or from the
+                // defaults, and whether the endpoint is reachable at all.
+                lines.extend(self.service.provider_diagnostics());
                 self.reference("/status", lines, &mut effects);
             }
             "/config" => {
@@ -695,9 +710,13 @@ impl InteractiveController {
             }
             "/model" => {
                 // The backend label names the configured model or states that setup
-                // is required; it never claims a model that was not resolved.
+                // is required; it never claims a model that was not resolved. The
+                // provider facts follow it, so a surprising answer can be diagnosed
+                // without leaving the app.
                 let label = self.service.label();
-                self.reference("/model", vec![format!("backend: {label}")], &mut effects);
+                let mut lines = vec![format!("backend: {label}")];
+                lines.extend(self.service.provider_diagnostics());
+                self.reference("/model", lines, &mut effects);
             }
             "/resume" if self.phase.has_active_run() => {
                 self.push_history(
@@ -908,6 +927,14 @@ impl InteractiveController {
         } else {
             AppPhase::Ready
         };
+    }
+
+    fn finish_pending_exit(&mut self, effects: &mut Vec<Effect>) {
+        if self.exit_after_run {
+            self.exit_after_run = false;
+            self.phase = AppPhase::Closed;
+            effects.push(Effect::Exit(EXIT_SUCCESS));
+        }
     }
 }
 
@@ -1909,10 +1936,22 @@ mod tests {
 
         let effects = harness.controller.handle_key(Key::EndOfInput);
         assert!(
-            effects.contains(&Effect::Exit(EXIT_SUCCESS)),
-            "Ctrl-D while the panel is open cancels and exits 0: {effects:#?}"
+            !effects.contains(&Effect::Exit(EXIT_SUCCESS)),
+            "Ctrl-D must wait for service cleanup before exit: {effects:#?}"
         );
         assert_eq!(*harness.port.cancels.lock().expect("cancels"), 1);
+        assert_eq!(harness.controller.phase(), AppPhase::Canceling);
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Canceled,
+            })
+            .expect("canceled terminal event");
+        let effects = harness.controller.pump_events();
+        assert!(
+            effects.contains(&Effect::Exit(EXIT_SUCCESS)),
+            "{effects:#?}"
+        );
         assert_eq!(harness.controller.phase(), AppPhase::Closed);
     }
 
@@ -1975,10 +2014,22 @@ mod tests {
         let _ = submit_text(&mut cancelling.controller, "work");
         let effects = cancelling.controller.handle_key(Key::EndOfInput);
         assert!(
-            effects.contains(&Effect::Exit(EXIT_SUCCESS)),
-            "Ctrl-D during a run cancels and exits 0: {effects:#?}"
+            !effects.contains(&Effect::Exit(EXIT_SUCCESS)),
+            "Ctrl-D waits until cancellation releases the run: {effects:#?}"
         );
         assert_eq!(*cancelling.port.cancels.lock().expect("cancels"), 1);
+        cancelling
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Canceled,
+            })
+            .expect("canceled terminal event");
+        let effects = cancelling.controller.pump_events();
+        assert!(
+            effects.contains(&Effect::Exit(EXIT_SUCCESS)),
+            "{effects:#?}"
+        );
+        assert_eq!(cancelling.controller.phase(), AppPhase::Closed);
     }
 
     #[test]

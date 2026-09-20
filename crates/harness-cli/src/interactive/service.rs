@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -82,6 +83,12 @@ pub trait SessionPort: Send {
     /// show `step k/max` without the UI knowing the driver's type.
     fn limits(&self) -> TurnBounds {
         TurnBounds::default()
+    }
+    /// Lines `/status` prints about the provider: which credential variable holds
+    /// the key (never its value), whether the endpoint and the model came from the
+    /// environment or from the defaults, and whether the endpoint answers.
+    fn provider_diagnostics(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -248,6 +255,100 @@ pub fn resolve_provider(environment: &LaunchEnvironment) -> Result<ProviderConfi
         ),
         credential_variable: credential_variable.to_owned(),
     })
+}
+
+/// One line per provider fact, for `/status`.
+///
+/// It answers the three questions an operator actually has: is a credential set and
+/// where from, which endpoint and model will be used and why, and is that endpoint
+/// answering. The credential **value** never appears.
+#[must_use]
+pub fn provider_diagnostics(environment: &LaunchEnvironment) -> Vec<String> {
+    let mut lines = Vec::new();
+    match CREDENTIAL_VARIABLES.iter().find(|name| {
+        environment
+            .value(name)
+            .is_some_and(|value| !value.is_empty())
+    }) {
+        Some(name) => lines.push(format!(
+            "Provider: credential found in {name} (value hidden)"
+        )),
+        None => lines.push(format!(
+            "Provider: no credential; set one of {}",
+            CREDENTIAL_VARIABLES.join(", ")
+        )),
+    }
+    match environment
+        .value(ENDPOINT_VARIABLE)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => lines.push(format!(
+            "Provider: endpoint {ENDPOINT_VARIABLE}={}",
+            value.to_string_lossy()
+        )),
+        None => lines.push(format!(
+            "Provider: endpoint not set, using the default {DEEPSEEK_ENDPOINT}"
+        )),
+    }
+    match environment
+        .value(MODEL_VARIABLE)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => lines.push(format!(
+            "Provider: model {MODEL_VARIABLE}={}",
+            value.to_string_lossy()
+        )),
+        None => lines.push(format!(
+            "Provider: model not set, using the default {DEEPSEEK_MODEL}"
+        )),
+    }
+    match resolve_provider(environment) {
+        Ok(config) => {
+            lines.push(format!("Provider: ready, would call {}", config.model));
+            lines.push(match endpoint_reachability(&config.endpoint) {
+                Ok(()) => "Provider: endpoint answered a TCP connection".to_owned(),
+                Err(reason) => format!("Provider: endpoint did not answer ({reason})"),
+            });
+        }
+        Err(message) => lines.push(format!("Provider: not ready ({message})")),
+    }
+    lines
+}
+
+/// Whether a TCP connection to the endpoint's host and port succeeds.
+///
+/// A reachability check, not a call: it sends no request and needs no credential, so
+/// it can never spend money or leak a key.
+fn endpoint_reachability(endpoint: &str) -> Result<(), String> {
+    let without_scheme = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_scheme, rest)| rest);
+    let authority = without_scheme
+        .split(['/', '?'])
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "the endpoint has no host".to_owned())?;
+    let (host, port) = authority.rsplit_once(':').map_or_else(
+        || {
+            (
+                authority,
+                if endpoint.starts_with("https://") {
+                    443
+                } else {
+                    80
+                },
+            )
+        },
+        |(host, port)| (host, port.parse::<u16>().unwrap_or(443)),
+    );
+    let address = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("{host}:{port} does not resolve: {error}"))?
+        .next()
+        .ok_or_else(|| format!("{host}:{port} does not resolve"))?;
+    std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        .map(|_| ())
+        .map_err(|error| format!("{host}:{port} refused: {error}"))
 }
 
 /// Reads the credential when a call is made; the value is never stored, logged
@@ -426,6 +527,10 @@ impl SessionPort for AgentSessionService {
             max_steps: self.limits.max_steps,
             max_tool_calls: self.limits.max_tool_calls,
         }
+    }
+
+    fn provider_diagnostics(&self) -> Vec<String> {
+        provider_diagnostics(&self.environment)
     }
 
     fn list_sessions(&mut self) {
@@ -788,6 +893,10 @@ impl SessionPort for FixtureService {
         });
         true
     }
+
+    fn provider_diagnostics(&self) -> Vec<String> {
+        vec!["Provider: the labelled fixture; no model is called".to_owned()]
+    }
 }
 
 #[cfg(test)]
@@ -795,7 +904,7 @@ mod tests {
     use super::{
         AgentSessionService, ApprovalDecision, ApprovalGate, ApprovalProposal, ChannelApprovalGate,
         DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL, ENDPOINT_VARIABLE, FixtureService, MODEL_VARIABLE,
-        SessionChannel, SessionPort, SubmitRequest, resolve_provider,
+        SessionChannel, SessionPort, SubmitRequest, provider_diagnostics, resolve_provider,
     };
     use crate::interactive::bootstrap::{self, LaunchRequest};
     use crate::interactive::events::{RunOutcome, SessionEvent};
@@ -994,6 +1103,71 @@ mod tests {
         ]))
         .expect("the alias credential resolves");
         assert_eq!(alias.credential_variable, "HA_API_KEY");
+    }
+
+    /// T08 follow-up: `/status` must answer "what is this app actually using?".
+    ///
+    /// It names the credential variable (never the value), says whether the endpoint
+    /// and the model came from the environment or from the defaults, and reports
+    /// whether the endpoint answers. The reachability line is allowed to fail - a
+    /// sandbox may have no route - so the assertion is on the shape, not on success.
+    #[test]
+    fn t08_status_diagnostics_name_the_source_of_every_provider_fact() {
+        // A loopback endpoint keeps this test off the network; the reachability line
+        // is asserted for its shape, never for the network being up.
+        let configured = provider_diagnostics(&environment(&[
+            ("DEEPSEEK_API_KEY", "fixture-secret-value"),
+            (ENDPOINT_VARIABLE, "http://127.0.0.1:9/chat/completions"),
+        ]));
+        let joined = configured.join("\n");
+        assert!(
+            joined.contains("credential found in DEEPSEEK_API_KEY"),
+            "{joined}"
+        );
+        assert!(
+            !joined.contains("fixture-secret-value"),
+            "the key value must never appear: {joined}"
+        );
+        assert!(
+            joined.contains("model not set, using the default"),
+            "{joined}"
+        );
+        assert!(joined.contains(DEEPSEEK_MODEL), "{joined}");
+        assert!(
+            joined.contains("ready, would call"),
+            "a bare key is a complete setup: {joined}"
+        );
+        assert!(
+            joined.contains("endpoint answered") || joined.contains("endpoint did not answer"),
+            "reachability is reported either way: {joined}"
+        );
+
+        let explicit = provider_diagnostics(&environment(&[
+            ("HA_API_KEY", "fixture-secret-value"),
+            (ENDPOINT_VARIABLE, "http://127.0.0.1:9/chat/completions"),
+            (MODEL_VARIABLE, "fixture-model"),
+        ]))
+        .join("\n");
+        assert!(
+            explicit.contains("credential found in HA_API_KEY"),
+            "{explicit}"
+        );
+        assert!(
+            explicit.contains("endpoint HA_PROVIDER_ENDPOINT="),
+            "{explicit}"
+        );
+        assert!(
+            explicit.contains("model HA_PROVIDER_MODEL=fixture-model"),
+            "{explicit}"
+        );
+        assert!(
+            !explicit.contains("using the default"),
+            "an explicit value is never reported as defaulted: {explicit}"
+        );
+
+        let empty = provider_diagnostics(&environment(&[])).join("\n");
+        assert!(empty.contains("no credential; set one of"), "{empty}");
+        assert!(empty.contains("not ready"), "{empty}");
     }
 
     #[test]

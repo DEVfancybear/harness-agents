@@ -395,6 +395,23 @@ ha                                        # mở TUI; thanh trạng thái hiện
 $env:HA_PROVIDER_MODEL = 'deepseek-v4-pro'
 ```
 
+**Khi provider trả lỗi, gõ `/model` hoặc `/status` trong app**: hai lệnh đó in ra
+credential đang lấy từ biến nào (giá trị không bao giờ hiện), endpoint và model đang dùng
+là do bạn đặt hay do mặc định, và endpoint có kết nối được không. Ví dụ:
+
+```text
+backend: deepseek-flash via https://api.deepseek.com
+Provider: credential found in DEEPSEEK_API_KEY (value hidden)
+Provider: endpoint not set, using the default https://api.deepseek.com
+Provider: model not set, using the default deepseek-flash
+Provider: ready, would call deepseek-flash
+Provider: endpoint answered a TCP connection
+```
+
+Nếu dòng cuối là `endpoint did not answer`, lỗi nằm ở mạng/proxy. Nếu là
+`no credential; set one of ...`, key chưa được đặt **trong chính shell đang chạy `ha`**
+(biến môi trường chỉ có tác dụng với tiến trình được khởi động sau khi bạn đặt nó).
+
 Muốn kiểm tra provider thật trước khi mở app (tốn một lượt gọi trả phí) — cũng chỉ
 cần key:
 
