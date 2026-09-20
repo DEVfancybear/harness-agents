@@ -30,15 +30,20 @@ pub fn render(
     let max_scroll = rows.len().saturating_sub(height);
     let offset = scroll.min(max_scroll);
     let visible: Vec<Line<'static>> = rows.into_iter().skip(offset).take(height).collect();
+    // The keys named here are exactly the ones the controller handles for an open
+    // panel: PageUp/PageDown by a page, Home to the first row, End to the last. The
+    // arrows are deliberately absent - they belong to the editor, so a panel opened
+    // over a draft must not take them, and naming them here would advertise a key
+    // that edits the draft behind the panel instead of scrolling it.
     let hint = if max_scroll == 0 {
         " Esc đóng ".to_owned()
     } else if offset == 0 {
-        format!(" ↑↓/PgUp/PgDn cuộn · còn {max_scroll} dòng · Esc đóng ")
+        format!(" PgUp/PgDn · Home/End cuộn · còn {max_scroll} dòng · Esc đóng ")
     } else if offset >= max_scroll {
-        " ↑↓/PgUp/PgDn cuộn · cuối · Esc đóng ".to_owned()
+        " PgUp/PgDn · Home/End cuộn · cuối · Esc đóng ".to_owned()
     } else {
         format!(
-            " ↑↓/PgUp/PgDn cuộn · dòng {}/{} · Esc đóng ",
+            " PgUp/PgDn · Home/End cuộn · dòng {}/{} · Esc đóng ",
             offset + 1,
             max_scroll + 1
         )

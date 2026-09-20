@@ -2240,6 +2240,32 @@ mod tests {
             before,
             "scrolling a panel must not write history"
         );
+        // The panel advertises its keys. Every key it names must be one this
+        // controller actually handles: a hint that names a key which falls through
+        // to the editor is worse than no hint, because the user presses it and edits
+        // the draft behind the panel.
+        let frame = {
+            use crate::interactive::tui::TuiRenderer as _;
+            let backend = crate::interactive::terminal::ScriptedBackend::new(Vec::new());
+            let mut renderer = crate::interactive::tui::ScriptedRenderer::open(backend, 100, 30)
+                .expect("renderer opens");
+            renderer
+                .draw_state(&harness.controller.ui_state())
+                .expect("frame draws");
+            renderer.painted().join("\n")
+        };
+        assert!(
+            frame.contains("PgUp/PgDn"),
+            "the panel must say which keys scroll it: {frame}"
+        );
+        assert!(
+            frame.contains("Home/End"),
+            "the panel must name Home/End, which do scroll it: {frame}"
+        );
+        assert!(
+            !frame.contains('↑') && !frame.contains('↓'),
+            "the panel must not advertise the arrow keys, which the editor owns: {frame}"
+        );
         // Escape still closes it, which is what acceptance U09 asserts.
         let _ = harness.controller.handle_key(Key::Esc);
         assert!(
