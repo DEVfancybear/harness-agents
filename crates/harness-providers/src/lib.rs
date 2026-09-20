@@ -366,6 +366,45 @@ impl CredentialResolver for StaticCredentialResolver {
     }
 }
 
+/// The path a chat completion is posted to when the caller named only a base URL.
+pub const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+
+/// Make an endpoint name the chat-completions resource, whatever form it arrived in.
+///
+/// A base URL such as `https://api.deepseek.com` is what the provider documents and
+/// what an operator naturally configures, but posting to the bare host asks for `/`
+/// and the API answers **404** — which reads like a wrong model or a wrong key when
+/// it is neither. This turns every accepted spelling into the one resource path:
+///
+/// - `https://api.deepseek.com` and a trailing slash both gain `/chat/completions`;
+/// - `https://api.deepseek.com/v1` gains it after the version, so the OpenAI-style
+///   base URL works too;
+/// - an endpoint that already names the resource keeps the path it was given, and
+///   only a trailing slash is trimmed.
+///
+/// This happens once, when the adapter is built, so both call paths post to the
+/// same string.
+#[must_use]
+pub fn chat_completions_endpoint(endpoint: &str) -> String {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return trimmed.to_owned();
+    }
+    // The scheme's own `//` is not a path segment, so the path starts after it.
+    let path_start = trimmed.find("://").map_or(0, |scheme| scheme + "://".len());
+    let has_path = trimmed[path_start..].contains('/');
+    if !has_path {
+        return format!("{trimmed}{CHAT_COMPLETIONS_PATH}");
+    }
+    if trimmed.ends_with(CHAT_COMPLETIONS_PATH) {
+        return trimmed.to_owned();
+    }
+    if trimmed.ends_with("/v1") {
+        return format!("{trimmed}{CHAT_COMPLETIONS_PATH}");
+    }
+    trimmed.to_owned()
+}
+
 pub struct DeepSeekAdapter {
     endpoint: String,
     credentials: Arc<dyn CredentialResolver>,
@@ -379,7 +418,7 @@ impl DeepSeekAdapter {
         credentials: Arc<dyn CredentialResolver>,
         capabilities: ModelCapabilities,
     ) -> Result<Self, ProviderError> {
-        let endpoint = endpoint.into();
+        let endpoint = chat_completions_endpoint(&endpoint.into());
         if endpoint.trim().is_empty() {
             return Err(ProviderError::new(
                 ErrorCode::ProviderProtocol,
@@ -553,4 +592,64 @@ fn parse_sse_payload(data: &str) -> Result<ProviderStreamEvent, ProviderError> {
         return Ok(ProviderStreamEvent::completed(reason));
     }
     Ok(ProviderStreamEvent::text(""))
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::{CHAT_COMPLETIONS_PATH, chat_completions_endpoint};
+
+    /// The measured bug: a bare base URL posted to `/` and the API answered 404.
+    ///
+    /// Every spelling below is one an operator can reasonably configure, and all of
+    /// them have to name the same resource.
+    #[test]
+    fn a_base_url_gains_the_chat_completions_path() {
+        assert_eq!(
+            chat_completions_endpoint("https://api.deepseek.com"),
+            format!("https://api.deepseek.com{CHAT_COMPLETIONS_PATH}")
+        );
+        assert_eq!(
+            chat_completions_endpoint("https://api.deepseek.com/"),
+            format!("https://api.deepseek.com{CHAT_COMPLETIONS_PATH}")
+        );
+        assert_eq!(
+            chat_completions_endpoint("  https://api.deepseek.com  "),
+            format!("https://api.deepseek.com{CHAT_COMPLETIONS_PATH}")
+        );
+        // The OpenAI-style base URL, with the version segment kept.
+        assert_eq!(
+            chat_completions_endpoint("https://api.deepseek.com/v1"),
+            format!("https://api.deepseek.com/v1{CHAT_COMPLETIONS_PATH}")
+        );
+        // A bare host with no scheme is still a host, not a path.
+        assert_eq!(
+            chat_completions_endpoint("api.deepseek.com"),
+            format!("api.deepseek.com{CHAT_COMPLETIONS_PATH}")
+        );
+    }
+
+    #[test]
+    fn an_endpoint_that_already_names_the_resource_is_left_alone() {
+        for endpoint in [
+            "https://api.deepseek.com/chat/completions",
+            "https://api.deepseek.com/chat/completions/",
+            "http://127.0.0.1:9/chat/completions",
+        ] {
+            assert_eq!(
+                chat_completions_endpoint(endpoint),
+                endpoint.trim_end_matches('/'),
+                "{endpoint} must keep its own path"
+            );
+        }
+    }
+
+    /// A self-hosted path this app does not know is never guessed at.
+    #[test]
+    fn another_resource_path_is_not_replaced() {
+        assert_eq!(
+            chat_completions_endpoint("https://gateway.internal/openai/chat"),
+            "https://gateway.internal/openai/chat"
+        );
+        assert_eq!(chat_completions_endpoint(""), "");
+    }
 }
