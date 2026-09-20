@@ -505,7 +505,23 @@ function Install-VerifiedBinary {
 
     $hadExisting = Test-Path -LiteralPath $TargetBinary -PathType Leaf
     if ($hadExisting) {
+        # One backup is kept. A running app keeps its own image open, and Windows
+        # refuses to delete that file while allowing a rename: without the rename
+        # fallback, installing while `ha` is open failed with "Cannot create a file
+        # when that file already exists" and no hint about which file was in the way.
         Remove-Item -LiteralPath $backupBinary -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $backupBinary) {
+            $aside = "$TargetBinary.old.$((Get-Date).ToString('yyyyMMddHHmmss'))$extension"
+            Move-Item -LiteralPath $backupBinary -Destination $aside -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $backupBinary) {
+                Remove-Item -LiteralPath $stagingBinary -Force -ErrorAction SilentlyContinue
+                return [pscustomobject]@{
+                    Ok     = $false
+                    Kind   = 'other'
+                    Detail = "the previous backup is in use and could not be moved aside: $backupBinary (is the app still running?)"
+                }
+            }
+        }
         try {
             Move-Item -LiteralPath $TargetBinary -Destination $backupBinary -Force
         }
