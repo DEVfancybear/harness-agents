@@ -258,7 +258,7 @@ pub(crate) fn adapter_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::collect_events;
+    use super::{ProviderEventStream, collect_events};
     use crate::{
         CancellationToken, DeepSeekAdapter, MessageRole, MockProvider, ModelCapabilities,
         ModelProvider, ProviderMessage, ProviderRequest, ProviderStreamEvent,
@@ -371,75 +371,81 @@ mod tests {
 
     /// I10 core: text must be visible while the server is still holding the
     /// response open. A buffered provider cannot pass this test.
-    #[tokio::test]
-    async fn g1_adapter_delivers_text_before_the_response_completes() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("fixture listener");
-        let address = listener.local_addr().expect("fixture address");
-        let (release, released) = tokio::sync::oneshot::channel::<()>();
-        // Binding a port only puts the socket into listen; the accept loop below is
-        // scheduled by the task. Signalling readiness from inside the task, and
-        // skipping a connection that closes without sending a request head, removes
-        // the window in which this environment refuses the first connection. That
-        // refusal is the loopback flake the gate reports as
-        // `provider_protocol ... error sending request for url`.
-        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(async move {
-            let _ = ready_sender.send(());
-            let mut socket = accept_the_request(listener).await;
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .expect("fixture writes the head");
-            socket
-                .write_all(
-                    b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"},\"finish_reason\":null}]}\n\n",
-                )
-                .await
-                .expect("fixture writes the first delta");
-            socket.flush().await.expect("fixture flushes");
-            // Barrier: the body stays open until the client has seen the delta.
-            let _ = released.await;
-            socket
-                .write_all(
-                    b"data: {\"choices\":[{\"delta\":{\"content\":\" second\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
-                )
-                .await
-                .expect("fixture writes the rest");
-            socket
-                .shutdown()
-                .await
-                .expect("fixture half-closes response");
-            // Keep the accepted socket alive until reqwest consumes the final SSE
-            // bytes. Dropping both halves immediately after shutdown can surface as
-            // an intermittent `error decoding response body` on Windows.
-            let mut trailing = [0_u8; 256];
-            let _ = tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    match socket.read(&mut trailing).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
-                    }
-                }
-            })
-            .await;
-        });
+    fn sse_fixture_response_head() -> &'static [u8] {
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+    }
 
-        let adapter = DeepSeekAdapter::new(
-            format!("http://{address}/chat/completions"),
-            Arc::new(StaticCredentialResolver::new("fixture-secret")),
-            ModelCapabilities::deepseek_fixture(),
-        )
-        .expect("adapter config");
-        ready_receiver.await.expect("fixture task is scheduled");
-        // The signal only proves the task is scheduled. Spaced probes confirm the
-        // accept loop is running, and a bounded retry covers the moment this
-        // environment refuses a fresh loopback connection under load. The fixture
-        // treats a probe (connects, sends nothing, closes) as "not a request" and
-        // keeps accepting, so neither measure can consume the scripted response.
+    fn sse_fixture_first_delta() -> &'static [u8] {
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"},\"finish_reason\":null}]}\n\n"
+    }
+
+    fn sse_fixture_rest() -> &'static [u8] {
+        b"data: {\"choices\":[{\"delta\":{\"content\":\" second\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+    }
+
+    /// Serve one SSE response whose body stays open until `released` resolves.
+    ///
+    /// Kept out of the test body so the test reads as the behaviour it checks: the
+    /// fixture is a detail, and inlining it pushed the test past the line budget.
+    async fn serve_barriered_sse(
+        listener: TcpListener,
+        ready: tokio::sync::oneshot::Sender<()>,
+        released: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let _ = ready.send(());
+        let mut socket = accept_the_request(listener).await;
+        socket
+            .write_all(sse_fixture_response_head())
+            .await
+            .expect("fixture writes the head");
+        socket
+            .write_all(sse_fixture_first_delta())
+            .await
+            .expect("fixture writes the first delta");
+        socket.flush().await.expect("fixture flushes");
+        // Barrier: the body stays open until the client has seen the delta.
+        let _ = released.await;
+        socket
+            .write_all(sse_fixture_rest())
+            .await
+            .expect("fixture writes the rest");
+        socket
+            .shutdown()
+            .await
+            .expect("fixture half-closes response");
+        // Keep the accepted socket alive until reqwest consumes the final SSE
+        // bytes. Dropping both halves immediately after shutdown can surface as an
+        // intermittent `error decoding response body` on Windows.
+        let mut trailing = [0_u8; 256];
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match socket.read(&mut trailing).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+    }
+
+    /// Open the first event of a stream, retrying the loopback refusal this
+    /// environment produces under load.
+    ///
+    /// The readiness signal only proves the fixture task is scheduled. Spaced
+    /// probes confirm the accept loop is running, and a bounded retry covers the
+    /// moment a fresh loopback connection is refused. The fixture treats a probe
+    /// (connects, sends nothing, closes) as "not a request" and keeps accepting, so
+    /// neither measure can consume the scripted response.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear retry ladder; splitting it would hide which arm bounds what"
+    )]
+    async fn open_events_with_loopback_retry(
+        adapter: &DeepSeekAdapter,
+        address: std::net::SocketAddr,
+        ready: tokio::sync::oneshot::Receiver<()>,
+    ) -> (ProviderEventStream, ProviderStreamEvent) {
+        ready.await.expect("fixture task is scheduled");
         await_loopback_ready(address).await;
         let mut last = None;
         let mut stream = None;
@@ -464,7 +470,32 @@ mod tests {
                 }
             }
         }
-        let (mut stream, first) = stream.expect("the fixture stream opens");
+        stream.expect("the fixture stream opens")
+    }
+    #[tokio::test]
+    async fn g1_adapter_delivers_text_before_the_response_completes() {
+        // Binding a port only puts the socket into listen; the accept loop is
+        // scheduled by the task. Signalling readiness from inside the task, and
+        // skipping a connection that closes without sending a request head, removes
+        // the window in which this environment refuses the first connection. That
+        // refusal is the loopback flake the gate reports as
+        // `provider_protocol ... error sending request for url`.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let address = listener.local_addr().expect("fixture address");
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_barriered_sse(listener, ready_sender, released));
+
+        let adapter = DeepSeekAdapter::new(
+            format!("http://{address}/chat/completions"),
+            Arc::new(StaticCredentialResolver::new("fixture-secret")),
+            ModelCapabilities::deepseek_fixture(),
+        )
+        .expect("adapter config");
+        let (mut stream, first) =
+            open_events_with_loopback_retry(&adapter, address, ready_receiver).await;
 
         let first = if first == ProviderStreamEvent::started() {
             tokio::time::timeout(Duration::from_secs(10), stream.next())

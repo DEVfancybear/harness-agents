@@ -82,9 +82,17 @@ pub enum Protection {
     #[cfg_attr(windows, allow(dead_code, reason = "the Unix branch constructs this"))]
     OwnerOnly,
     /// An access control list restricting the file was applied by this app.
+    ///
+    /// The mirror of [`Self::OwnerOnly`]: constructed only by the Windows branch,
+    /// so it is dead code where mode bits are what protect the file.
+    #[cfg_attr(unix, allow(dead_code, reason = "the Windows branch constructs this"))]
     OwnerOnlyAcl,
     /// Only the platform default applies: the file sits in the user's own profile
     /// directory and nothing else was changed.
+    ///
+    /// Reached from the Windows branch when the account cannot be determined; on
+    /// Unix the mode-bit path reports [`Self::OwnerOnly`] instead.
+    #[cfg_attr(unix, allow(dead_code, reason = "the Windows branch returns this"))]
     ProfileDefault,
     /// A file that was found on disk. This app set it up when it saved the key, but
     /// the current launch did not measure it again, so it is not claimed.
@@ -367,6 +375,10 @@ pub fn save(path: &Path, key: &str) -> Result<Protection, HarnessError> {
 /// that could not be restricted must not be described as restricted.
 ///
 /// On Unix this is a no-op: mode bits already did the job.
+#[cfg_attr(
+    unix,
+    allow(unused_variables, reason = "only the Windows branch reads the path")
+)]
 fn restrict_acl(directory: &Path, account: Option<&str>) -> Protection {
     #[cfg(unix)]
     {
