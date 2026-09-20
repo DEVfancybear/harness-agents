@@ -446,8 +446,13 @@ prompt trở lại bình thường và **file key đã lưu không bị ghi đè
 Ctrl-C khi rảnh vẫn chỉ gọi `editor.clear()` (`controller.rs:672`), tức xoá buffer mà giữ nguyên
 secret mode — nay không còn là đường cụt vì Esc đã thoát được.
 
-`/help` liệt kê `/key` và cả dạng `/key <value>` (`view.rs:129`–`133`) — 9 dòng cho 8 lệnh;
-`SLASH_COMMANDS` vẫn **8** phần tử (`input.rs:596`).
+`/help` liệt kê `/key` và cả dạng `/key <value>` (`view.rs:129`–`133`). Lượt `/key` ghi ở đây là
+"9 dòng cho 8 lệnh" và `SLASH_COMMANDS` **8** phần tử (`input.rs:596`); sau khi thêm `/more`, con số
+đúng là `SLASH_COMMANDS` **9** phần tử (`input.rs:670`) và `view::help_lines()` **11** dòng
+(`/more` ở `view.rs:135`). Số hiện tại thuộc mục 3e.1; hai dòng dưới đây giữ nguyên như bản ghi của
+lượt `/key`:
+
+- ~~`SLASH_COMMANDS` vẫn **8** phần tử (`input.rs:596`).~~ → nay **9**, xem 3e.1.
 
 ### 3d.6. Lưu xong thì **không cần restart** — cơ chế
 
@@ -527,6 +532,86 @@ nên "fallback trung thực" được chứng minh bằng phép đo thủ công 
 (evidence 11.2/11.3), không bằng test. Đường controller `save_key`, hành vi Esc, đường dẫn
 `private/`, bước ACL Windows và mask ở tầng khung hình **đã** được phủ.
 
+## 3e. Đọc câu trả lời dài ngay trong app: `/more`, phím cuộn và con lăn chuột
+
+Ba commit sau CP-D (`1340129` `/more` + 13:36, `cce5c13` alternate scroll + 13:45, `5883d59`
+hai flake loopback + 13:58, ngày 20/09/2026) đóng đúng khoảng trống mà evidence mục 11.7 đã
+ghi: **một câu trả lời dài bị viewport cắt mất phần đầu thì không có đường đọc lại trong
+app**. Mục này ghi quyết định kèm số đo; phần chưa chứng minh nằm ở evidence mục 12.4.
+
+### 3e.1. `/more` — mở lại transcript gần nhất, **từ dòng đầu**
+
+| Mục | Hợp đồng |
+|---|---|
+| Lệnh | `/more`; vào bảng `SLASH_COMMANDS` (nay **9** phần tử, `input.rs:670`) và vào `view::help_lines()` (`view.rs:135`) |
+| Panel | Cùng loại overlay với `/help`/`/status`/`/config`/`/model` (`reference()`, `controller.rs:875`), **mở ở dòng đầu**: `open_overlay` đặt `scroll = 0` (`input.rs:193`) |
+| Nội dung | Buffer hồi tưởng **có chặn 500 dòng** trong controller (`RECALL_LINES`, `controller.rs:1044`); thêm cả `pending_text` đang stream (`recall_lines()`, `controller.rs:1053`) |
+| Ghi buffer | Đúng những điểm ghi transcript: `flush_stream` (`controller.rs:1000`), `flush_stream_overflow` (`controller.rs:1028`), `push_history` (`controller.rs:1034`) |
+| Plain mode | In các dòng như mọi lệnh tham chiếu khác, tức vào history (`reference()`, nhánh `self.plain`) |
+| History | Mở và cuộn panel **không** ghi history; `Esc` đóng panel — acceptance U09 vẫn đúng |
+
+Hai quyết định đáng ghi:
+
+1. **Mở ở dòng đầu, không mở ở cuối.** Viewport chỉ giữ đuôi câu trả lời, nên thứ người
+   dùng bị mất chính là **phần đầu**; một panel mở ở cuối bắt người đọc cuộn trước khi thấy
+   thứ họ cần — đúng cái vấn đề lệnh này sinh ra để sửa. Test
+   `k04_more_opens_the_recent_transcript_from_its_first_line_and_scrolls`
+   (`controller.rs:2185`) khẳng định `scroll == 0` và panel chứa **cả** `answer line 0` lẫn
+   `answer line 19` của một câu trả lời 20 dòng.
+2. **Buffer 500 dòng là bound, không phải cửa sổ đọc.** Nó không thay scrollback của
+   terminal (nơi app commit mọi thứ); nó chỉ đủ để đọc lại câu trả lời vừa rồi mà không phải
+   rời app, và bị chặn để một phiên dài không phình vô hạn. Hệ quả phải nói rõ: `/more`
+   **không** phải lịch sử đầy đủ — nó cắt theo dòng logic, và phiên dài hơn 500 dòng thì
+   phần cũ nhất chỉ còn trong scrollback của terminal.
+
+### 3e.2. Phím cuộn của panel — và một chỗ lời gợi ý nói rộng hơn code
+
+`PageUp`/`PageDown` cuộn 8 dòng, `Home` về dòng đầu, `End` về dòng cuối
+(`controller.rs:331`–`335`). `Overlay::scroll_by` bão hoà ở đỉnh (không quấn vòng), `scroll_end`
+đặt offset `usize::MAX / 2` và **để renderer kẹp** — vì nó là thứ duy nhất biết bao nhiêu dòng
+vừa (`help.rs:29`–`31`).
+
+Viền dưới của panel nói trạng thái cuộn (`help.rs:33`–`45`): `Esc đóng` khi vừa hết,
+`còn N dòng` ở đỉnh, `dòng x/y` ở giữa, `cuối` khi tới đáy.
+
+**Mâu thuẫn đo được, ghi lại chứ không sửa (không thuộc phạm vi tài liệu):** chuỗi gợi ý mở
+đầu bằng `↑↓/PgUp/PgDn cuộn` (`help.rs:36`, `38`, `41`), nhưng controller **không** cho `↑`/`↓`
+cuộn panel: nhánh overlay chỉ bắt `PageUp`/`PageDown`/`Home`/`End` (`controller.rs:331`–`337`),
+còn `↑`/`↓` rơi xuống editor — và ở đó chúng đổi **buffer soạn thảo** (recall history hoặc di
+chuyển theo hàng, `input.rs:443`–`460`) trong khi panel vẫn mở. Vậy hai chữ `↑↓` trong gợi ý
+mô tả một phím **không** cuộn panel, và thao tác đó còn sửa draft phía sau panel. Đây là lỗi
+chữ trong UI, không phải lỗi tài liệu: test không phủ chuỗi gợi ý nên không test nào đỏ.
+
+### 3e.3. Con lăn chuột: alternate scroll (DECSET 1007), **không** phải mouse capture
+
+App bật `ESC [ ? 1007 h` khi vào raw mode, và tắt ở **cả** `RawModeGuard::drop` lẫn panic hook
+(`terminal.rs:152`–`158`, `202`, `218`, `181`). `ModeControl` có thêm
+`enable_alternate_scroll`/`disable_alternate_scroll` (`terminal.rs:119`–`120`); thứ tự mode
+nay được assert đầy đủ trong test I08: `enable, paste on, alternate scroll on, paste off,
+alternate scroll off, disable`.
+
+**Quyết định (cố ý, không phải thiếu sót):** đây **không** phải mouse capture
+(`1000`/`1002`/`1006`). Capture lấy con lăn khỏi terminal và **xoá scrollback** — mà scrollback
+chính là nơi app commit mọi thứ nó flush (`insert_before`), nên bật capture sẽ đổi "mất phần
+đầu câu trả lời trong viewport" lấy "mất luôn phần đầu trong scrollback". Với 1007, con lăn
+vẫn cuộn scrollback của terminal, app **không** nói giao thức chuột nào, và không phím nào đổi
+nghĩa.
+
+**Ranh giới của bằng chứng:** 1007 là hành vi **phía terminal**. Không test nào chứng minh được
+một terminal cụ thể tôn trọng nó; app chỉ gửi đúng chuỗi và không làm gì khác. Chưa đo trên
+Windows Terminal hay bất kỳ emulator nào trong lượt này (evidence 12.4).
+
+### 3e.4. Hai flake loopback đã sửa (có số đo trước/sau)
+
+Đây là hai nguyên nhân **còn lại** sau ba nguyên nhân đã sửa trước đó (evidence mục 8):
+
+| Flake | Cơ chế | Sửa | Số đo |
+|---|---|---|---|
+| `providers-streaming` (SSE fixture) | Body SSE được kết thúc bằng **đóng kết nối**; client không phân biệt được "body xong" với "kết nối bị reset", nên một close tới dưới dạng RST đọc ra thành body cụt | Chunked body thật: `Transfer-Encoding: chunked` + chunk cuối `0\r\n\r\n` (`streaming.rs:381`–`396`), socket vẫn được giữ 500 ms sau chunk cuối (`streaming.rs:441`–`453`) | **0 đỏ trong 10 lần liên tiếp** `cargo test -p harness-providers --locked`; trước khi sửa khoảng **1 lần đỏ trong 8 lần chạy** |
+| `completion_service_resume_flow` | Ca chạy trong process con; dưới tải cả workspace, runtime của con bị đói worker thread trước lần connect đầu | Con chạy **tối đa hai lần**; thất bại sau lần thử lại **vẫn được báo** (`service_completion_tests.rs:20`–`43`) | **0 đỏ trong 5 lần liên tiếp** chạy cả suite; trước khi sửa khoảng **1 lần đỏ trong 3 lần chạy** |
+
+Không nới assertion nào: lần thử lại chỉ cứu **fixture**, còn lỗi thật vẫn đỏ ngay lần đầu.
+
 ## 4. Kiến trúc chốt cho T02–T08
 
 Theo plan mục 4, với hai điều chỉnh đã đo:
@@ -553,3 +638,7 @@ Theo plan mục 4, với hai điều chỉnh đã đo:
 
 Lý do: bộ assertion PTY hiện có grep theo các mốc này (i01/i05/i06/i07a/i07b/i12/i13/i21);
 đổi mốc phải ghi lý do vào SPEC này và cập nhật test có chủ ý.
+
+**Bổ sung sau CP-D (mục 3e):** đường đọc lại câu trả lời dài — `/more`, phím cuộn panel và
+alternate scroll `1007` — **không** đổi mốc chữ D5 nào, và cũng không đổi luồng
+`insert_before` → `draw`; nó chỉ thêm một panel đọc và một chuỗi mode phía terminal.

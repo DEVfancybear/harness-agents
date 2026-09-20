@@ -308,11 +308,16 @@ git status --porcelain          # phải sạch, hoặc chỉ có thay đổi c�
   `cargo build --locked` xanh.
 - Không chạy lại `Invoke-HaPtyAcceptance.ps1` với filter `t01` (các ca đó thuộc POC đã xoá).
 
-## 13. `/key` — lưu API key trong app (lượt này, **chưa commit**)
+## 13. `/key` — lưu API key trong app (lượt này, **đã commit ở `385a98f`**)
 
-Trạng thái thật: **implemented trong working tree, unit test xanh (153 test, 0 failed trong phiên
-có quyền đổi ACL), chưa có commit nào.** `HEAD` vẫn là `aeaf7b7`. Hợp đồng ở SPEC mục 3d, số đo và
+Trạng thái thật: **đã commit và push.** `/key` nằm trong commit `385a98f`; ba bản sửa tiếp theo
+(`e315b44` 404, `081d36a` 422, `9df9b32` ACL + fixture) và các lượt sau (`2e93180`, `1340129`,
+`cce5c13`, `5883d59`, `213884a`) cũng đã push. Lúc soạn mục này `HEAD` = `origin/master` =
+`213884a` (khác với `aeaf7b7` ghi trong bản gốc bên dưới). Hợp đồng ở SPEC mục 3d, số đo và
 `not_run` ở evidence mục 11 (11.2 ghi hash, phép đo ACL và khác biệt môi trường).
+
+> Phần còn lại của mục 13 giữ nguyên như bản ghi của lượt `/key`; mọi câu nói "chưa commit",
+> "untracked" hay "HEAD `aeaf7b7`" trong đó **đã cũ**, xem mục 14 để biết trạng thái hiện tại.
 
 ### 13.1. Việc đã xong
 
@@ -339,10 +344,10 @@ có quyền đổi ACL), chưa có commit nào.** `HEAD` vẫn là `aeaf7b7`. H�
 - Lưu xong: ghi `config.toml` tối thiểu `schema_version = 1` **chỉ khi file chưa tồn tại**,
   reload config, xoá gate `setup_required`, đổi phase `SetupRequired | Booting → Ready`, vẽ lại
   header; lượt kế tiếp `resolve_provider` lại nên **không cần restart**.
-- `/help` có `/key` và `/key <value>`; `SLASH_COMMANDS` **8** phần tử; `/status` + `/model` in
-  **nguồn** credential (`credential from environment variable ...` / `credential from saved
-  file ...`) và không bao giờ in giá trị; `SessionEvent::ProviderConfigured { source }` chỉ mang
-  nguồn.
+- `/help` có `/key` và `/key <value>`; `SLASH_COMMANDS` khi đó **8** phần tử (nay **9** sau `/more`,
+  xem mục 14); `/status` + `/model` in **nguồn** credential (`credential from environment variable
+  ...` / `credential from saved file ...`) và không bao giờ in giá trị;
+  `SessionEvent::ProviderConfigured { source }` chỉ mang nguồn.
 - 19 test mới cho feature (`k01_*`, `k02_*`, `k03_*`; 18 biên dịch trên Windows) — danh sách +
   oracle ở evidence mục 11.5. Mask được assert ở **ba tầng**: editor
   (`k01_secret_entry_masks_the_buffer_and_never_reaches_history`), controller
@@ -379,7 +384,7 @@ Không đụng `Cargo.toml`/`Cargo.lock` (không thêm dependency) và không đ
 ### 13.3. Lệnh kiểm chứng (đúng thứ tự)
 
 ```text
-git status --porcelain                 # cây đang dở; credentials.rs untracked
+git status --porcelain                 # cây đang dở (writer song song: memory/project)
 cargo check -p harness-cli --all-targets --locked
 cargo test -p harness-cli --bin ha --locked
 cargo test --release -p harness-cli --bin ha --locked
@@ -406,10 +411,11 @@ plugin, không liên quan) — đừng map nhầm khi đọc registry.
 
 ### 13.5. Việc còn lại / open items
 
-1. **Cây chưa commit.** Toàn bộ feature `/key` nằm trong working tree; `credentials.rs` còn
-   **untracked**; `HEAD` vẫn `aeaf7b7`. Cây đã **ngừng đổi** ở bản cuối này (hash ở evidence
-   11.2), nhưng lượt này từng có writer song song sửa `interactive/*` (`service.rs` 1431 → 1489
-   dòng, `credentials.rs` 476 → hơn 700 dòng) — xác nhận `git status` và mtime trước khi commit.
+1. ~~**Cây chưa commit.** Toàn bộ feature `/key` nằm trong working tree; `credentials.rs` còn
+   **untracked**; `HEAD` vẫn `aeaf7b7`.~~ **Đã đóng ở mục 14:** `/key` được commit ở `385a98f`,
+   `credentials.rs` đã được track, và `HEAD` = `origin/master` = `213884a` (kiểm ngày 20/09/2026).
+   Điều còn đúng từ mục này: một writer song song vẫn đang sửa `interactive/*` và các crate memory,
+   nên **luôn** xác nhận `git status` và mtime trước khi commit.
 2. **Test ACL phụ thuộc quyền của môi trường chạy.** `k03_a_saved_key_is_restricted_to_this_account_by_an_acl`
    **xanh** ở phiên có quyền đổi ACL (bên giao việc: `153 passed; 0 failed`), nhưng **đỏ** ở phiên
    bị chặn (soạn tài liệu này: `152 passed; 1 failed`) vì `icacls <dir> /inheritance:r` trả
@@ -449,3 +455,116 @@ và **mask ở tầng khung hình đã vẽ** (`tui::tests::k01_a_secret_buffer_
 4. Quyết định 13.5 mục 2 (yêu cầu quyền ACL cho CI / gate test theo khả năng đổi ACL) trước khi
    commit, vì đó là điều kiện môi trường ảnh hưởng tới gate.
 5. Commit feature + docs thành một commit, rồi cập nhật lại mục 9 và 13.3 theo bản cuối cùng.
+
+## 14. Sau CP-D: `/more`, phím cuộn, con lăn chuột và hai flake loopback (lượt này)
+
+Trạng thái: **implemented + committed + pushed**. Ba commit trên `origin/master`, đo ngày
+20/09/2026: `1340129` (`/more` + panel cuộn, 13:36) → `cce5c13` (alternate scroll `1007`, 13:45)
+→ `5883d59` (hai flake loopback, 13:58). `HEAD` = `origin/master` = `5883d59` lúc soạn mục này.
+Hợp đồng ở SPEC mục 3e; số đo, test và khoảng trống ở evidence mục 12.
+
+**Đính chính mục 13 ở trên (đã cũ, đừng đọc theo):** mục 13 và 13.5 mục 1 nói feature `/key`
+"chưa có commit nào, `credentials.rs` untracked, `HEAD` vẫn `aeaf7b7`". Điều đó **không còn
+đúng**: `/key` đã được commit ở `385a98f` và đi qua các commit sau đó; `HEAD` nay là `5883d59`.
+Mục 13 giữ nguyên như bản ghi lịch sử của lượt đó, không sửa lại.
+
+### 14.1. Việc đã xong
+
+- **`/more`** (`controller.rs`, `view.rs`, `input.rs`): mở lại transcript gần nhất trong **đúng
+  panel overlay** mà `/help` dùng, và **mở ở dòng đầu** — viewport chỉ giữ đuôi câu trả lời, nên
+  phần bị mất chính là phần đầu. Buffer hồi tưởng **chặn 500 dòng** (`RECALL_LINES`,
+  `controller.rs:1044`), ghi ở đúng ba điểm ghi transcript: `flush_stream`,
+  `flush_stream_overflow`, `push_history`; nội dung đang stream (`pending_text`) cũng được nối vào
+  khi mở panel. `SLASH_COMMANDS` nay **9** phần tử (`input.rs:670`) và `/more` có trong
+  `view::help_lines()` (`view.rs:135`). Plain mode in các dòng như mọi lệnh tham chiếu khác.
+- **Panel cuộn được** (`tui/widgets/help.rs`, `controller.rs:331`–`337`): `PageUp`/`PageDown` 8
+  dòng, `Home` về dòng đầu, `End` về dòng cuối; offset được **kẹp trong `help::render`** vì đó là
+  chỗ duy nhất biết bao nhiêu dòng vừa; viền dưới báo `còn N dòng` / `dòng x/y` / `cuối` cộng
+  `Esc đóng`. Phím cuộn **không** ghi history và `Esc` vẫn đóng panel, nên acceptance U09 vẫn đúng.
+- **Con lăn chuột = alternate scroll `DECSET 1007`** (`terminal.rs`): bật `ESC [ ? 1007 h` khi vào
+  raw mode, tắt ở `RawModeGuard::drop` **và** trong panic hook; `ModeControl` có thêm
+  `enable_alternate_scroll`/`disable_alternate_scroll`. **Cố ý không** dùng mouse capture
+  (`1000`/`1002`/`1006`): capture lấy con lăn khỏi terminal và **xoá scrollback** — mà scrollback
+  là nơi app commit mọi thứ (`insert_before`), nên capture sẽ đổi "mất phần đầu trong viewport"
+  lấy "mất luôn phần đầu trong scrollback".
+- **Hai flake loopback đã sửa gốc**: body SSE fixture nay **chunked** (`Transfer-Encoding:
+  chunked` + chunk cuối `0\r\n\r\n`, `streaming.rs:381`–`396`) thay vì được kết thúc bằng đóng kết
+  nối — trước đó client không phân biệt được body xong với kết nối bị reset; socket vẫn được giữ
+  500 ms sau chunk cuối. `completion_service_resume_flow` nay chạy con **tối đa hai lần**
+  (`service_completion_tests.rs:20`–`43`), và **thất bại sau lần thử lại vẫn được báo** — không
+  nới assertion nào.
+
+### 14.2. File đã đụng
+
+| File | Việc |
+|---|---|
+| `crates/harness-cli/src/interactive/controller.rs` | nhánh `/more`, `reference()` dùng chung, buffer `recall` + `remember()` (500 dòng), nhánh phím cuộn của overlay, **hai** trong ba test `k04_*` (`k04_more_opens_...`, `k04_a_long_overlay_is_readable_...`) |
+| `crates/harness-cli/src/interactive/view.rs` | thêm dòng `/more` vào `help_lines()` |
+| `crates/harness-cli/src/interactive/input.rs` | `SLASH_COMMANDS` lên 9; `Overlay` có `scroll`, `scroll_by`/`scroll_home`/`scroll_end`, `scroll_overlay`/`scroll_overlay_to` |
+| `crates/harness-cli/src/interactive/events.rs` | `Modal::Overlay` mang thêm `scroll` |
+| `crates/harness-cli/src/interactive/tui/widgets/help.rs` | kẹp offset theo số dòng vừa; viền dưới báo trạng thái cuộn |
+| `crates/harness-cli/src/interactive/tui/widgets/mod.rs` | truyền `scroll` xuống `help::render` |
+| `crates/harness-cli/src/interactive/terminal.rs` | `ModeControl::{enable,disable}_alternate_scroll`; bật/tắt `1007` (drop + panic hook); test I08 assert đủ thứ tự mode |
+| `crates/harness-cli/src/interactive/tui/mod.rs` | test `k04_a_long_streamed_answer_keeps_its_end_visible_and_its_start_in_scrollback` |
+| `crates/harness-providers/src/streaming.rs` | fixture SSE chunked + chunk cuối; giữ socket 500 ms |
+| `crates/harness-cli/src/interactive/service_completion_tests.rs` | `completion_service_resume_flow` chạy con tối đa 2 lần |
+| `docs/specs/HA_TUI.vi.md` (mục 3e), `docs/evidence/HA_TUI.vi.md` (mục 4b, 12), `docs/OPERATOR_GUIDE.vi.md` (mục 12.6), `docs/handoffs/HA_TUI.vi.md` (mục này) | tài liệu lượt này |
+
+Không thêm dependency nào; `Cargo.toml`/`Cargo.lock` không đổi.
+
+### 14.3. Số đo (có ngày, không phải hằng số)
+
+```text
+cargo test --release -p harness-cli --bin ha --locked      -> 163 passed; 0 failed
+                                                              (5 lần liên tiếp, cả 5 xanh; 20/09/2026)
+cargo test -p harness-providers --locked                   -> 10 lần liên tiếp xanh
+cargo clippy --workspace --all-targets --locked -- -D warnings -> sạch
+cargo fmt --all -- --check                                 -> sạch
+pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1          -> GATE_OK: every required step passed (exit 0)
+ha chat --headless --prompt "say ok"                       -> model trả lời qua binary release đã cài
+C:\Users\duong\.cargo\bin\ha.exe SHA-256
+  cae17188122301a6f5e392cce8178fd4b4c042324b943661fac4100e20dd0d37
+```
+
+Flake: `providers-streaming` khoảng **1 đỏ / 8 lần chạy** trước khi sửa → **0 đỏ trong 10 lần
+liên tiếp** sau khi sửa; `completion_service_resume_flow` khoảng **1 đỏ / 3 lần chạy** cả suite →
+**0 đỏ trong 5 lần liên tiếp**. Vì cây đang được writer khác sửa song song, `163` và `10` là **số
+đo của ngày 20/09/2026**: lần sau chạy lại lệnh rồi đọc số mới, đừng trích lại.
+
+### 14.4. Việc còn lại / open items
+
+1. **TUI, `/more`, phím cuộn và con lăn chưa từng được lái trong console thật.** ConPTY cần
+   console mà sandbox build không có; ba test `k04_*` khẳng định trên state của controller/editor,
+   **không** phải terminal. **Không** có ca PTY nào gõ `/more`, `PageUp`, `PageDown`, `Home` hay
+   `End`.
+2. **`1007` là hành vi phía terminal — không test nào chứng minh được.** Chưa đo trên Windows
+   Terminal hay emulator nào khác. Việc còn lại: một lần lái tay trên console thật (mở answer dài,
+   lăn chuột, xác nhận scrollback cuộn và không có giao thức chuột nào được gửi).
+3. **Mâu thuẫn chữ trong UI, chưa sửa (việc code, không phải việc tài liệu).** Viền dưới panel mở
+   đầu bằng `↑↓/PgUp/PgDn cuộn` (`help.rs:36`/`38`/`41`), nhưng `↑`/`↓` **không** cuộn panel:
+   `controller.rs:331`–`337` chỉ bắt `PageUp`/`PageDown`/`Home`/`End`, nên `↑`/`↓` rơi xuống editor
+   và **sửa buffer soạn thảo** (recall history / di chuyển theo hàng, `input.rs:443`–`460`) trong
+   khi panel vẫn mở; `Home`/`End` thì **có** tác dụng nhưng không được nhắc. Không test nào assert
+   chuỗi gợi ý. Hoặc bỏ `↑↓` khỏi gợi ý, hoặc cho `↑`/`↓` cuộn panel — cần người giao việc chọn.
+4. **`/more` không phải lịch sử đầy đủ**: cắt ở 500 dòng logic gần nhất; không test nào đo đúng
+   ngưỡng 500.
+5. **Một lần gate đỏ thoáng qua chưa giải thích được**: `GATE_FAILED: discovery:i13_... ,
+   discovery:i09_...` trong khi hai selector **có** trong file và lệnh discovery chạy trực tiếp trả
+   exit 0; lần chạy sau `GATE_OK` (exit 0). Ghi làm quan sát, **không** kết luận là đã sửa.
+6. **Khoảng trống cũ vẫn còn**: paid provider smoke, cài thật + User PATH, Linux, conhost cũ,
+   ACL Windows chỉ đo trên một máy (mục 8 evidence, mục 13.5).
+
+### 14.5. Next action chính xác
+
+1. Trên **console thật** (không phải sandbox build): `ha chat`, hỏi một câu trả lời dài, rồi
+   `/more` — xác nhận panel mở ở dòng đầu, `PgUp`/`PgDn`/`Home`/`End` cuộn, viền dưới đổi chữ, và
+   `Esc` đóng mà **không** ghi gì vào transcript. Đây là điều duy nhất ba test `k04_*` không chứng
+   minh được; transcript nên lưu lại như bằng chứng.
+2. Trên cùng console đó, lăn chuột khi panel đang mở và khi đang stream: scrollback phải cuộn và
+   app **không** được gửi giao thức chuột nào. Nếu terminal không tôn trọng `1007`, ghi lại đúng
+   terminal + version — đó là dữ liệu, không phải lỗi.
+3. Quyết định open item 14.4 mục 3 (bỏ `↑↓` khỏi gợi ý hay cho `↑`/`↓` cuộn panel) rồi sửa **một**
+   trong hai, kèm test assert chuỗi gợi ý.
+4. Giữ nguyên hai flake đã sửa: chạy `cargo test -p harness-providers --locked` và
+   `cargo test --release -p harness-cli --bin ha --locked` vài lần liên tiếp; **số mới ghi đè số
+   cũ** trong evidence mục 12.2 và mục này, và **không** nới assertion nếu có lần đỏ.

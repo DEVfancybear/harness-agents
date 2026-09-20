@@ -54,6 +54,31 @@ Số test đơn vị của binary `ha`: **70 trước T01 → 133 sau T08**. Kh�
 test cũ đổi assertion sang `plain_lines`/`effects_to_plain` theo plan T02, và đúng **một**
 test đổi hợp đồng có chủ ý (paste giữ newline, T03 — ghi ở SPEC).
 
+### 4b. Commands thật đã chạy cho ba commit sau CP-D (`1340129`, `cce5c13`, `5883d59`)
+
+Đo ngày **20/09/2026** (commit cuối `5883d59` lúc 13:58), trên cây sạch ở đúng ba commit đó:
+
+```text
+cargo test --release -p harness-cli --bin ha --locked   -> 163 passed; 0 failed
+                                                            (5 lần liên tiếp, cả 5 xanh)
+cargo test -p harness-providers --locked                 -> 10 lần liên tiếp xanh
+cargo clippy --workspace --all-targets --locked -- -D warnings -> sạch
+cargo fmt --all -- --check                              -> sạch
+pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1       -> GATE_OK: every required step passed, exit 0
+ha chat --headless --prompt "say ok"                    -> trả lời của model qua binary release đã cài
+```
+
+`163 passed` và `10 lần` là **số đo có ngày**, không phải hằng số: cây đang được sửa song song
+nên lần sau chạy lại phải đọc số mới, đừng trích con số này như một cam kết.
+
+Binary đã cài lúc kết thúc lượt này (đo lại 14:05 ngày 20/09/2026):
+
+```text
+C:\Users\duong\.cargo\bin\ha.exe
+SHA-256 cae17188122301a6f5e392cce8178fd4b4c042324b943661fac4100e20dd0d37
+```
+
+
 ## 5. Acceptance (U01–U20) — test tương ứng
 
 | ID | Test / ca | Kết quả |
@@ -79,6 +104,11 @@ test đổi hợp đồng có chủ ý (paste giữ newline, T03 — ghi ở SPE
 | U19 | PTY `i13` | pass |
 | U20 | `t02_plain_transcript_is_byte_identical_to_h03`, `t02_the_recorded_transcript_is_what_the_plain_renderer_printed` | pass |
 
+Ba test của lượt sau CP-D (`k04_*`, mục 12) **không** nằm trong U01–U20: chúng canh hành vi
+được thêm sau CP-D (`/more`, phím cuộn, đuôi câu trả lời dài), nên không được tính là bằng
+chứng cho acceptance nào ở bảng trên. Tên `k04_` là **cục bộ của lượt này**, không phải case K04
+của plugin (`PLUGIN_ARCHITECTURE.vi.md`).
+
 ## 6. Negative controls
 
 | Bất biến | Cách phá | Test sẽ đỏ |
@@ -92,6 +122,9 @@ test đổi hợp đồng có chủ ý (paste giữ newline, T03 — ghi ở SPE
 | Không SGR màu khi `NO_COLOR` | bỏ `Theme::plain()` | PTY `t07_pty_no_color` |
 | Paste không được thành nhiều lệnh | cho `normalize_paste` trả về nguyên văn có `\n` rồi submit từng dòng | `t03_paste_keeps_newlines_and_submits_once` |
 | Thoát giữa run phải nhả writer | phát `Exit` ngay sau `cancel()` thay vì chờ terminal event | PTY `i05_exit_during_an_active_run_releases_the_store_for_the_next_host` |
+| `/more` phải mở ở **dòng đầu** | cho `open_overlay` nhận `scroll` từ nơi gọi, hoặc mở ở đáy | `k04_more_opens_the_recent_transcript_from_its_first_line_and_scrolls` |
+| Cuộn panel không được ghi history | cho nhánh overlay của `handle_key` rơi xuống `push_history` | `k04_more_opens_the_recent_transcript_from_its_first_line_and_scrolls` (so `transcript().len()` trước/sau khi `PageDown`/`End`/`Home`) |
+| Viewport không được giữ phần đầu câu trả lời dài | bỏ `flush_stream_overflow`, cho live block lớn theo câu trả lời | `k04_a_long_streamed_answer_keeps_its_end_visible_and_its_start_in_scrollback` |
 
 ## 7. Artifacts
 
@@ -202,9 +235,14 @@ không phải hằng số.
 
 ### 11.2. Tested source, phép đo ACL, và một khác biệt môi trường phải nói rõ
 
-`HEAD` = `aeaf7b7` (`feat(ha-tui): /model and /status say which provider settings are actually in
-use`). Feature `/key` **chưa có commit nào**; `crates/harness-cli/src/interactive/credentials.rs`
-vẫn **untracked**. Cây đã **ngừng đổi**; hash dưới đây là bản cuối của lượt này.
+`HEAD` khi đo là `aeaf7b7` (`feat(ha-tui): /model and /status say which provider settings are
+actually in use`). Feature `/key` **chưa có commit nào tại thời điểm đo**;
+`crates/harness-cli/src/interactive/credentials.rs` khi đó còn **untracked**. Cây đã **ngừng đổi**
+trong lượt đo; hash dưới đây là bản cuối của lượt đó.
+
+> **Cập nhật 20/09/2026 (sau khi đo):** `/key` đã được commit ở `385a98f`, `credentials.rs` đã
+> được track, và các lượt sau nối tiếp tới `213884a` (= `origin/master` lúc ghi). Bảng dưới giữ
+> nguyên như **bản ghi của lượt đo**, không phải trạng thái hiện tại; số test hiện tại ở mục 4b/12.
 
 | | Giá trị |
 |---|---|
@@ -410,3 +448,97 @@ test bấm phím thật ở editor và controller); **mode `0600` áp lúc tạo
 controller có test end-to-end**; **file credential nằm trong `<data dir>/private/`**; **ACL Windows
 thật (account + SYSTEM) và `Protection` được `save()` trả về, `/status` in ra**; và **mask được
 assert ở cả tầng khung hình đã vẽ**.
+
+## 12. Đọc câu trả lời dài trong app — `/more`, phím cuộn, con lăn chuột, hai flake loopback
+
+Trạng thái: **implemented + committed + pushed** (`1340129`, `cce5c13`, `5883d59`, tất cả trên
+`origin/master`; `HEAD` = `origin/master` = `5883d59` tại thời điểm soạn mục này). Hợp đồng và
+quyết định ở SPEC mục 3e. Mọi con số ở đây là **số đo có ngày 20/09/2026**, không phải hằng số —
+cây nguồn đang được một writer khác sửa song song, nên lần sau phải chạy lại lệnh chứ không trích
+lại con số.
+
+### 12.1. Work items
+
+| Item | Trạng thái | Bằng chứng chính |
+|---|---|---|
+| `/more` mở lại transcript gần nhất, **từ dòng đầu** | implemented + test | `k04_more_opens_the_recent_transcript_from_its_first_line_and_scrolls`; `view.rs:135`; `SLASH_COMMANDS` 9 phần tử (`input.rs:670`) |
+| Buffer hồi tưởng có chặn **500 dòng** | implemented + test (qua `/more`) | `RECALL_LINES = 500` (`controller.rs:1044`); ghi ở ba điểm `flush_stream`/`flush_stream_overflow`/`push_history` |
+| Panel cuộn được: `PgUp`/`PgDn` 8 dòng, `Home` đầu, `End` cuối | implemented + test | `controller.rs:331`–`337`, `input.rs:73`–`93`, kẹp ở `help.rs:29`–`31`; `k04_a_long_overlay_is_readable_from_its_first_row` |
+| Viền dưới báo `còn N dòng` / `dòng x/y` / `cuối` + `Esc đóng` | implemented, **không có test assert chuỗi** | `help.rs:33`–`45` |
+| Cuộn panel **không** ghi history; `Esc` đóng (U09) | implemented + test | `k04_more_opens_...` so `transcript().len()` trước/sau |
+| `/more` trong plain mode in dòng như mọi lệnh tham chiếu | implemented (dùng chung `reference()`) | `controller.rs:875`–`883` |
+| Con lăn chuột = alternate scroll `DECSET 1007`, bật/tắt đúng chỗ | implemented + test I08 | `terminal.rs:152`–`158`, `202`, `218`, panic hook `terminal.rs:181`; thứ tự mode assert đầy đủ |
+| **Không** dùng mouse capture (`1000`/`1002`/`1006`) | quyết định có chủ ý | SPEC 3e.3 — capture lấy con lăn **và** xoá scrollback |
+| Flake SSE fixture của `providers-streaming` | **đã sửa** | chunked body + chunk cuối (`streaming.rs:381`–`396`), giữ socket 500 ms (`streaming.rs:441`–`453`) |
+| Flake `completion_service_resume_flow` | **đã sửa** | con chạy tối đa 2 lần, thất bại vẫn báo (`service_completion_tests.rs:20`–`43`) |
+| TUI/`/more`/phím cuộn/con lăn trong **console thật** | **not_run** | không có ca PTY nào cho `/more` hay phím cuộn; 1007 là hành vi phía terminal |
+| Chuỗi gợi ý viền dưới có `↑↓` nhưng `↑`/`↓` **không** cuộn panel | **mâu thuẫn đã đo, chưa sửa** | `help.rs:36`/`38`/`41` vs `controller.rs:331`–`337` (xem 12.4) |
+
+### 12.2. Số đo
+
+```text
+cargo test --release -p harness-cli --bin ha --locked      -> 163 passed; 0 failed
+                                                              (5 lần liên tiếp, cả 5 xanh; đo 20/09/2026)
+cargo test -p harness-providers --locked                   -> 10 lần liên tiếp xanh
+cargo clippy --workspace --all-targets --locked -- -D warnings -> sạch
+cargo fmt --all -- --check                                 -> sạch
+pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1          -> GATE_OK: every required step passed (exit 0)
+ha chat --headless --prompt "say ok"                       -> model trả lời qua binary release đã cài
+```
+
+Hai phép đo "trước/sau" của flake (đây là **số đo**, không phải suy đoán):
+
+| Flake | Trước | Sau |
+|---|---|---|
+| `providers-streaming` (SSE fixture) | khoảng **1 lần đỏ trong 8 lần chạy** | **0 đỏ trong 10 lần liên tiếp** |
+| `completion_service_resume_flow` | khoảng **1 lần đỏ trong 3 lần chạy** cả suite | **0 đỏ trong 5 lần liên tiếp** chạy cả suite |
+
+Binary đã cài, đo lại 14:05 ngày 20/09/2026: `C:\Users\duong\.cargo\bin\ha.exe`, SHA-256
+`cae17188122301a6f5e392cce8178fd4b4c042324b943661fac4100e20dd0d37`, 20.235.264 byte.
+
+### 12.3. Test nào chứng minh điều gì
+
+| Test | Điều được chứng minh | Oracle |
+|---|---|---|
+| `k04_more_opens_the_recent_transcript_from_its_first_line_and_scrolls` | `/more` mở **panel** (không phải history) ở `scroll == 0`; panel chứa cả `answer line 0` lẫn `answer line 19` của câu trả lời 20 dòng; `PageDown` → `scroll == 8`; `End` → `scroll > 8`; `Home` → `scroll == 0`; `transcript().len()` **không đổi** qua mọi lần cuộn; `Esc` đóng panel | `ui_state().modal` phải là `Modal::Overlay { title, lines, scroll }`; số dòng transcript trước/sau |
+| `k04_a_long_overlay_is_readable_from_its_first_row` | overlay 40 dòng mở ở 0; cuộn lên quá đỉnh **bão hoà** ở 0 (không quấn vòng); `End` xin đáy (`scroll > 30`); cuộn khi **không** có overlay trả `false` | `Overlay::scroll()` trực tiếp trên editor |
+| `k04_a_long_streamed_answer_keeps_its_end_visible_and_its_start_in_scrollback` | đuôi câu trả lời (`THE-LAST-LINE-OF-THE-ANSWER`) nằm trong `live_text`; đầu (`line 0 of the answer`) **không** còn trong live block nhưng **có** trong `transcript()`; một delta 12 dòng ("burst") không đẩy đuôi ra khỏi viewport | `ui_state().live_text` + `transcript().join("\n")` |
+
+Test **không** soi khung hình đã vẽ: cả ba khẳng định trên state của controller/editor
+(`ui_state()`, `transcript()`, `Overlay::scroll()`, `Modal::Overlay`). `ScriptedRenderer` có tồn
+tại trong `tui::tests` và được dùng ở các test khác (`tui/mod.rs:549`, `569`, `625`), nhưng
+**không** test `k04_*` nào vẽ frame — nên chúng chứng minh **state và luật cuộn**, không chứng
+minh cái terminal nhận được.
+
+### 12.4. **Không** được chứng minh (đọc kỹ trước khi báo cáo)
+
+- **TUI, `/more`, phím cuộn và con lăn chuột chưa từng được lái trong console thật trong lượt
+  này.** ConPTY cần một console mà sandbox build không có. Ba test `k04_*` khẳng định trên state
+  của controller/editor — **không** phải trên khung hình của một terminal thật. Hệ quả: "panel
+  cuộn được" được chứng minh ở tầng state, không phải bằng transcript thật.
+- **Không có ca PTY nào cho `/more` hay cho phím cuộn.** Bộ 16 ca PTY hiện có **không** ca nào gõ
+  `/more`, `PageUp`, `PageDown`, `Home` hay `End` trong panel. Nên U09 ("Esc đóng overlay không
+  ghi history") vẫn đúng theo test cũ, nhưng **đường cuộn** thì không có bằng chứng PTY.
+- **Alternate scroll (`1007`) không thể được chứng minh bằng test.** Đây là hành vi **phía
+  terminal**: app chỉ gửi `ESC [ ? 1007 h` / `ESC [ ? 1007 l` và không đọc gì về chuột. Không
+  test nào — và không phép đo nào trong lượt này — chứng minh Windows Terminal (hay bất kỳ
+  emulator nào khác) tôn trọng nó. **Chưa đo trên Windows Terminal**; chưa đo trên emulator nào.
+- **Chuỗi gợi ý viền dưới nói rộng hơn code (mâu thuẫn thật, đã đo).** Viền dưới mở đầu bằng
+  `↑↓/PgUp/PgDn cuộn` (`help.rs:36`, `38`, `41`), nhưng `↑`/`↓` **không** cuộn panel:
+  `controller.rs:331`–`337` chỉ bắt `PageUp`/`PageDown`/`Home`/`End`, nên `↑`/`↓` rơi xuống editor
+  và ở đó chúng **sửa buffer soạn thảo** (recall history / di chuyển theo hàng, `input.rs:443`–`460`)
+  trong khi panel vẫn mở. Gợi ý cũng không nói `Home`/`End` — hai phím **có** tác dụng. Không test
+  nào assert chuỗi gợi ý, nên đây là lỗi chữ trong UI không có test canh; sửa nó là việc **code**,
+  không thuộc lượt tài liệu này — ghi lại để không bị đọc thành "đã có".
+- **Buffer 500 dòng không phải lịch sử đầy đủ.** `/more` cắt theo **dòng logic** ở 500 dòng gần
+  nhất; phần cũ hơn chỉ còn trong scrollback của terminal. Không test nào đo hành vi cắt ở đúng
+  500 (test chỉ chạy 20–40 dòng).
+- **Một lần gate đỏ thoáng qua, không tái hiện.** Một lần chạy `Verify-HaLaunch.ps1` **exit 1**
+  với `GATE_FAILED: discovery:i13_... , discovery:i09_...` **trong khi** hai selector đó **có**
+  trong file và đúng lệnh discovery chạy trực tiếp trả **exit 0**; lần chạy sau cùng lệnh gate cho
+  `GATE_OK: every required step passed` (exit 0). Đây là **flake của bước discovery trong gate**,
+  không phải lỗi code của app hay của selector — ghi lại làm quan sát, **không** kết luận là đã sửa.
+- **Phép đo ACL Windows (mục 11.2) vẫn chỉ trên một máy.** Không đổi trong lượt này.
+- `1007` cũng **không** được kiểm tra trong `NO_COLOR`/`TERM=dumb` hay ở đường plain: nó chỉ được
+  bật trong `RawModeGuard::enter`, tức chỉ khi renderer TUI thực sự vào raw mode — nhưng điều đó
+  được suy ra từ đường code, **không** có phép đo console thật cho nó.
