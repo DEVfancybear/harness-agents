@@ -183,12 +183,19 @@ pub async fn run(command: MemoryCommand) -> Result<(), HarnessError> {
             | MemoryAction::Candidates { .. }
             | MemoryAction::Jobs
     );
-    // A project-scoped read with no scope is not empty memory, it is an unasked
-    // question: the service answers `[]` and the operator concludes memory is broken.
-    // Say which flag is missing instead.
+    // A read with no scope at all is not empty memory, it is an unasked question: the
+    // service answers `[]` and the operator concludes memory is broken. Say which flag
+    // is missing instead.
+    //
+    // "No scope" means none of them: a session- or task-scoped read is a deliberate
+    // narrowing, and `p4_s07` reviews candidates that way. Only the unscoped read is
+    // the accidental one this refuses.
+    let scoped = principal.project_id.is_some()
+        || principal.task_id.is_some()
+        || principal.agent_profile_id.is_some()
+        || principal.session_id.is_some();
     if read_only
-        && principal.project_id.is_none()
-        && command.cwd.is_none()
+        && !scoped
         && matches!(
             command.command,
             MemoryAction::Search { .. } | MemoryAction::Candidates { .. }
