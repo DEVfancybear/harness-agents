@@ -474,6 +474,10 @@ impl LineEditor {
             | Key::PageDown
             | Key::Redraw
             | Key::Resize { .. }
+            // Ctrl-V reaches the controller as its own key because the terminal forwards
+            // it there, and the controller reads the clipboard. Attaching an image is not
+            // an edit of the draft, so the editor leaves the buffer alone.
+            | Key::PasteImage
             | Key::Unknown => InputOutcome::Unchanged,
         }
     }
@@ -667,8 +671,8 @@ impl LineEditor {
 }
 
 /// Slash commands this revision understands, in help order.
-pub const SLASH_COMMANDS: [&str; 9] = [
-    "/help", "/status", "/key", "/more", "/new", "/model", "/config", "/resume", "/exit",
+pub const SLASH_COMMANDS: [&str; 10] = [
+    "/help", "/status", "/key", "/more", "/new", "/model", "/config", "/image", "/resume", "/exit",
 ];
 
 /// Commands whose name starts with `prefix`.

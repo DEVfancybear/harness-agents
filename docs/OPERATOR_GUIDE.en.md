@@ -593,3 +593,27 @@ An installation whose executable no longer matches the digest its grant pinned i
 that reason and is never started; a directory without an `installation.json` is ignored. The
 `ha extensions inspect|capabilities|register|skills` commands remain the inspection and
 registration surface, and `register --confirm` is what proves a plugin starts at all.
+
+### 12.7. Images in a message
+
+`deepseek-flash` accepts images, so a screenshot can be part of a request instead of a path the
+model tries to open with a text reader. Two ways in:
+
+| How | What to do |
+| --- | --- |
+| A file you already have | Name it in your message: `what is wrong here? "C:\Users\me\shot.png"`. Dragging the file from Explorer types the same path. **Quote it if the path has spaces.** A relative path resolves against the project directory. |
+| A screenshot on the clipboard | `/image`. `Ctrl-V` does the same where the terminal forwards the key to the app — Windows Terminal keeps that key for its own paste, so `/image` is the way that always works. |
+
+Either way the image is attached to that turn, the clipboard case writes the pasted file into
+the data directory and inserts its quoted path into the composer, and the transcript says what
+happened (`[info] image attached: shot.png (image/png, 84 KiB)`). A candidate that cannot be
+attached is reported with its reason instead of being skipped in silence: a file that is not
+really an image, one larger than 8 MiB, more than three in one message, or a path that names a
+place credentials live (`.ssh/`, `*.pem`, `.env`, `credentials*`) — those are never sent to a
+provider.
+
+The format comes from the bytes, not the file name, so a `.png` that is really text is refused;
+PNG, JPEG, GIF and WebP are what work. The message names the images in order, so the model can
+refer to "the second screenshot". They travel in the block form of `content`, which the API
+accepts in a **user** message only. `read_file` still refuses binary files: an image reaches the
+model as an attachment, never as file text.

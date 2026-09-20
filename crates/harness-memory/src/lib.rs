@@ -30,6 +30,22 @@ pub use maintenance::{CatchUpReport, MemoryBudget};
 
 pub const MEMORY_CONTRACT_VERSION: u16 = 1;
 
+/// The provenance kind that marks an asset as a record of one conversation turn.
+///
+/// Declared here, next to the contract, because it is a value two crates have to agree
+/// on: the host writes it, and the retention rule in this crate selects on it.
+pub const TURN_PROVENANCE_KIND: &str = "session_turn";
+
+/// The heading that opens a memory block in the context packet.
+///
+/// A block used to open with `Reusable data; authority=…`, which describes where the
+/// text came from and never says what it is. Measured: with a turn record injected, the
+/// model still answered "I don't have access to the previous session's conversation
+/// history" - it read the block as provenance metadata beside the working state rather
+/// than as the answer to the question. The heading now names the material and tells the
+/// model that using it is the point.
+pub const MEMORY_BLOCK_HEADING: &str = "Memory from earlier turns - use it to answer";
+
 #[cfg(test)]
 mod properties {
     use super::normalize_search_text;
@@ -617,6 +633,81 @@ impl MemoryService {
             .append_memory_version_source(&store_principal(principal), memory_asset_id, event_id)
             .await
             .map_err(to_harness_error)
+    }
+
+    /// Turn records past the cap, oldest first.
+    ///
+    /// A retention rule for the conversation log: the caller retires what this returns
+    /// through [`MemoryService::invalidate`], so the removal goes through the same
+    /// authorization and lineage machinery as any other invalidation.
+    ///
+    /// # Errors
+    /// Fails when the principal is unusable or the store cannot answer.
+    pub async fn turn_records_over_limit(
+        &self,
+        principal: &MemoryPrincipal,
+        project_id: Option<&ProjectId>,
+        keep: usize,
+    ) -> Result<Vec<MemoryAssetId>, HarnessError> {
+        validate_principal(principal)?;
+        let store_principal = StoreMemoryPrincipal {
+            project_id: project_id.cloned(),
+            ..store_principal(principal)
+        };
+        self.store
+            .turn_records_over_limit(&store_principal, TURN_PROVENANCE_KIND, keep)
+            .await
+            .map_err(to_harness_error)
+    }
+
+    /// The newest turn records, newest first, up to `limit`.
+    ///
+    /// A question about the conversation - "what did I ask you before?" - is a question
+    /// about *when*, not about *what*. Answering it by keyword overlap is the wrong
+    /// tool: the words in that question appear in no particular turn, and the overlap
+    /// floor that keeps unrelated notes out of the knowledge path also keeps the
+    /// history out. Recentness is the right index for it, so this is a separate read.
+    ///
+    /// # Errors
+    /// Fails when the principal is unusable or the store cannot answer.
+    pub async fn recent_turns(
+        &self,
+        principal: &MemoryPrincipal,
+        project_id: Option<&ProjectId>,
+        limit: usize,
+    ) -> Result<RetrievalResult, HarnessError> {
+        validate_principal(principal)?;
+        if limit == 0 || limit > 64 {
+            return Err(HarnessError::new(
+                ErrorCode::InvalidPayload,
+                "turn history is bounded to 1..=64 records",
+            ));
+        }
+        let store_principal = StoreMemoryPrincipal {
+            project_id: project_id.cloned(),
+            ..store_principal(principal)
+        };
+        let (records, revision) = self
+            .store
+            .recent_turn_records(&store_principal, TURN_PROVENANCE_KIND, limit)
+            .await
+            .map_err(to_harness_error)?;
+        let hits = records
+            .into_iter()
+            .map(convert_asset)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RetrievalResult {
+            state: if hits.is_empty() {
+                RetrievalState::Empty
+            } else {
+                RetrievalState::Found
+            },
+            hits,
+            detail: None,
+            // The store's revision, never a placeholder: this value is checked before
+            // dispatch and a wrong one makes the contribution be dropped in silence.
+            revision,
+        })
     }
 
     pub async fn export_versions(

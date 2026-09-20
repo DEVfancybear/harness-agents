@@ -781,3 +781,26 @@ Mỗi yêu cầu kết thúc bằng đúng một dòng `[run]`, và bốn chữ 
 Card tool fail thì nói rõ vì sao: `failed 962ms · invalid_payload: optional tool path must not
 be blank` là call model ghép sai (model cũng được báo y hệt và thường thử lại), còn
 `failed 1.2s · policy_denied: denied by the user` là do bạn từ chối.
+
+### 12.8. Ảnh trong một yêu cầu
+
+`deepseek-flash` nhận ảnh, nên ảnh chụp màn hình có thể là một phần của yêu cầu thay vì một
+đường dẫn mà model sẽ thử mở bằng tool đọc text. Hai đường vào:
+
+| Cách | Bạn làm gì |
+| --- | --- |
+| Ảnh đã có trên đĩa | Ghi tên nó trong tin nhắn: `chỗ này sai gì? "C:\Users\me\shot.png"`. Kéo file từ Explorer cũng ra đúng đường dẫn đó. **Nhớ quote nếu đường dẫn có dấu cách.** Đường dẫn tương đối được hiểu theo thư mục project. |
+| Ảnh chụp đang trong clipboard | `/image`. `Ctrl-V` làm y hệt ở những terminal có chuyển phím cho app — Windows Terminal giữ phím đó cho paste của nó, nên `/image` là cách luôn chạy. |
+
+Cả hai đường đều gắn ảnh vào đúng lượt đó; trường hợp clipboard thì file PNG được ghi vào thư
+mục dữ liệu và đường dẫn (đã quote) được chèn vào ô soạn thảo, còn transcript nói rõ đã xảy ra
+gì (`[info] image attached: shot.png (image/png, 84 KiB)`). Ứng viên không gắn được sẽ được báo
+kèm lý do chứ không bị bỏ im lặng: file không thật sự là ảnh, file lớn hơn 8 MiB, quá ba ảnh
+trong một tin nhắn, hoặc đường dẫn trỏ vào nơi chứa credential (`.ssh/`, `*.pem`, `.env`,
+`credentials*`) — những chỗ đó **không bao giờ** được gửi tới provider.
+
+Format do **nội dung file** quyết định chứ không theo đuôi, nên file `.png` mà thật ra là text sẽ
+bị từ chối; PNG, JPEG, GIF và WebP là những định dạng chạy được. Tin nhắn liệt kê ảnh theo thứ
+tự, nên model có thể nói "ảnh chụp thứ hai". Ảnh đi theo dạng block của `content`, mà API chỉ
+nhận trong message **user**. `read_file` vẫn từ chối file binary: ảnh tới model dưới dạng
+attachment, không bao giờ là text của file.

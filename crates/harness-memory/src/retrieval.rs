@@ -1,7 +1,7 @@
 use super::{
-    ErrorCode, HarnessError, InjectionMode, MemoryBinding, MemoryPrincipal, MemoryService,
-    Serialize, StoredMemoryAsset, convert_asset, normalize_search_text, store_principal,
-    to_harness_error,
+    ErrorCode, HarnessError, InjectionMode, MEMORY_BLOCK_HEADING, MemoryBinding, MemoryPrincipal,
+    MemoryService, Serialize, StoredMemoryAsset, convert_asset, normalize_search_text,
+    store_principal, to_harness_error,
 };
 use harness_session::{ContextBlock, ContextBlockKind};
 use harness_types::{ContentHash, MemoryVersionRef};
@@ -319,12 +319,16 @@ impl MemoryService {
             seal: ContentHash::from_bytes(b""),
         };
         for (rank, hit) in result.hits.iter().take(MAX_CONTRIBUTED_BLOCKS).enumerate() {
+            // The heading leads with what the material is and what to do with it, and
+            // keeps provenance as a trailing note: provenance is for audit, not for the
+            // model to weigh before deciding whether to read on.
             let text = format!(
-                "Reusable data; authority={:?}; validity={:?}; sources={:?}\n{}",
+                "{}\n{}\n(source: authority={:?}, validity={:?}, refs={:?})",
+                MEMORY_BLOCK_HEADING,
+                hit.current.content,
                 hit.asset.created_by,
                 hit.current.record.validity,
                 hit.current.record.source_event_refs,
-                hit.current.content
             );
             let tokens = u64::try_from(text.len().div_ceil(4)).unwrap_or(u64::MAX);
             if tokens > remaining {

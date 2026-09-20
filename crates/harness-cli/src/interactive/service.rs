@@ -30,6 +30,7 @@ use harness_types::{ErrorCode, HostId, InputId, SessionId, TaskId};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
+use super::attachments;
 use super::bootstrap::{CREDENTIAL_VARIABLES, DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL, LaunchContext};
 use super::controller::{DEFAULT_APPROVAL_TIMEOUT, TurnBounds};
 use super::credentials::{self, CredentialSource};
@@ -849,6 +850,31 @@ impl SessionPort for AgentSessionService {
     }
 }
 
+/// Report what one attempt to remember did, in words a reader can act on.
+///
+/// A skipped input and a stored one look the same in a transcript that stays silent,
+/// and the difference is the whole point of classifying inputs at all.
+fn report_memory(
+    send: &impl Fn(SessionEvent),
+    result: Result<memory::RememberOutcome, harness_types::HarnessError>,
+) {
+    match result {
+        Ok(memory::RememberOutcome::Stored(asset_id)) => send(SessionEvent::Notice {
+            message: format!("memory: remembered as {asset_id}"),
+        }),
+        Ok(memory::RememberOutcome::Duplicate(asset_id)) => send(SessionEvent::Notice {
+            message: format!("memory: already remembered as {asset_id}"),
+        }),
+        Ok(memory::RememberOutcome::NotKnowledge { reason }) => send(SessionEvent::Notice {
+            message: format!("memory: not stored ({reason})"),
+        }),
+        Ok(memory::RememberOutcome::NothingAdmitted) => {}
+        Err(error) => send(SessionEvent::Notice {
+            message: format!("memory: nothing was stored ({error})"),
+        }),
+    }
+}
+
 /// One turn, from admission to terminal event.
 ///
 /// Linear setup followed by one bounded turn: the length is the wiring, not
@@ -1035,6 +1061,32 @@ async fn run_turn(
         observation,
     )
     .with_tool_schemas(tool_schemas);
+    // Images the message names ride with it, so the model is shown the picture instead of
+    // being handed a path it would try to open with a text reader. A candidate that
+    // cannot be shown is said out loud: a reader who is not told why cannot tell it from
+    // a bug.
+    let attached = attachments::from_message(&request.text, &workspace_root);
+    for note in &attached.notes {
+        send(SessionEvent::Notice {
+            message: format!("image not attached ({note})"),
+        });
+    }
+    let run_request = if attached.is_empty() {
+        run_request
+    } else {
+        for image in &attached.images {
+            send(SessionEvent::Notice {
+                message: format!("image attached: {}", image.attachment.label),
+            });
+        }
+        run_request.with_images(
+            attached
+                .images
+                .into_iter()
+                .map(|image| image.attachment)
+                .collect(),
+        )
+    };
     // Retrieval happens before dispatch, so the packet the runtime freezes carries
     // the exact memory versions that were read.
     let run_request = match &memory_principal {
@@ -1086,25 +1138,29 @@ async fn run_turn(
     // a newer generation of the task lease, and it must not race this one.
     // Memory is written first: it reads the admitted input back from the journal and
     // commits its asset under the write generation this turn already holds.
-    if outcome.is_ok()
-        && let Some(principal) = &memory_principal
-    {
-        match memory::remember_input(Arc::clone(&store), principal, &session_id).await {
-            Ok(memory::RememberOutcome::Stored(asset_id)) => send(SessionEvent::Notice {
-                message: format!("memory: stored this input as {asset_id}"),
-            }),
-            Ok(memory::RememberOutcome::Duplicate(asset_id)) => send(SessionEvent::Notice {
-                message: format!("memory: this input was already remembered as {asset_id}"),
-            }),
-            // Said out loud, not swallowed: a reader who is not told that an input was
-            // skipped cannot tell the feature from a bug.
-            Ok(memory::RememberOutcome::NotKnowledge { reason }) => send(SessionEvent::Notice {
-                message: format!("memory: not stored ({reason})"),
-            }),
-            Ok(memory::RememberOutcome::NothingAdmitted) => {}
-            Err(error) => send(SessionEvent::Notice {
-                message: format!("memory: this input was not stored ({error})"),
-            }),
+    if let Some(principal) = &memory_principal {
+        // A directive is knowledge and is kept as one. A question is not knowledge, so
+        // it is not stored as a directive - but the turn itself is still worth
+        // remembering, because otherwise "what did I ask you before?" has no answer in
+        // the store. The turn record carries both halves and the session it happened in.
+        let directive = if outcome.is_ok() {
+            Some(memory::remember_input(Arc::clone(&store), principal, &session_id).await)
+        } else {
+            None
+        };
+        let answered = if outcome.is_ok() {
+            memory::remember_turn(
+                Arc::clone(&store),
+                principal,
+                &session_id,
+                outcome.as_ref().map_or("", |turn| turn.final_text.as_str()),
+            )
+            .await
+        } else {
+            Ok(memory::RememberOutcome::NothingAdmitted)
+        };
+        for result in directive.into_iter().chain(std::iter::once(answered)) {
+            report_memory(&send, result);
         }
     }
     drop(driver);

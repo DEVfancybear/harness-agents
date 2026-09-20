@@ -51,6 +51,26 @@ const RECALL_HITS: usize = 8;
 /// with "how".
 const MAX_QUESTION_WORDS: usize = 24;
 
+/// How much of the model's answer a turn record keeps, in characters.
+///
+/// The question alone cannot answer "what did I ask you before?", because the question
+/// is the half the reader already knows. A turn record carries both halves, and this
+/// bounds the one that is model output.
+const TURN_ANSWER_CHARS: usize = 200;
+
+/// How many turn records one project keeps, newest first.
+///
+/// Turn records exist to answer questions about the recent past, so the oldest are the
+/// least useful and are retired first. Only turn records are pruned: a directive the
+/// user typed is not a log entry and never expires.
+const TURN_MEMORY_LIMIT: usize = 200;
+
+/// Marks an asset as a record of one conversation turn.
+///
+/// `provenance_kind` is the field that says where an asset came from, so it is also
+/// what pruning uses to find the log entries it may retire.
+const TURN_PROVENANCE: &str = harness_memory::TURN_PROVENANCE_KIND;
+
 /// Whether the environment asks for chat memory.
 ///
 /// Only the exact value `on` counts: an unknown or misspelled value must not
@@ -107,10 +127,21 @@ pub async fn recall(
     text: &str,
 ) -> Result<Recall, HarnessError> {
     let service = MemoryService::new(store);
-    let terms = normalize_terms(text);
-    let result = service
-        .search_terms(principal, &terms, RECALL_HITS, None)
-        .await?;
+    // A question about the conversation is answered from the log, newest first, instead
+    // of by keyword overlap. Measured: "session trước tôi hỏi bạn những gì?" shares one
+    // term with the turn record it is asking about, so the overlap floor - which exists
+    // to keep unrelated notes out - rejected it. Recentness is what that question is
+    // actually about.
+    let result = if asks_about_history(text) {
+        service
+            .recent_turns(principal, principal.project_id.as_ref(), RECALL_HITS)
+            .await?
+    } else {
+        let terms = normalize_terms(text);
+        service
+            .search_terms(principal, &terms, RECALL_HITS, None)
+            .await?
+    };
     let contribution = service.contribute(principal, &result, CONTRIBUTION_TOKENS);
     let hits = result.hits.len();
     let blocks = contribution.blocks.len();
@@ -203,6 +234,40 @@ fn classify_input(text: &str) -> Option<&'static str> {
     None
 }
 
+/// Whether the message asks about the conversation itself rather than about a subject.
+///
+/// Deliberately a short, explicit phrase list and not a classifier: the cost of a false
+/// positive is low (the newest turns are injected, which is what a question about the
+/// past wants anyway) and the cost of a false negative is the answer being invisible.
+/// It must stay narrow enough that an ordinary question about, say, a session cookie
+/// does not drag the whole conversation into context.
+fn asks_about_history(text: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        "session trước",
+        "session truoc",
+        "lần trước",
+        "lan truoc",
+        "lượt trước",
+        "luot truoc",
+        "hỏi bạn những gì",
+        "hoi ban nhung gi",
+        "đã hỏi gì",
+        "da hoi gi",
+        "nói gì với bạn",
+        "noi gi voi ban",
+        "previous session",
+        "last session",
+        "last time",
+        "earlier session",
+        "what did i ask",
+        "what did we discuss",
+        "conversation history",
+        "chat history",
+    ];
+    let lowered = text.to_lowercase();
+    PHRASES.iter().any(|phrase| lowered.contains(phrase))
+}
+
 /// Store the exact admitted input of one session as reusable memory.
 ///
 /// The text comes from the durable admission rather than from the caller, so the
@@ -279,11 +344,117 @@ pub async fn remember_input(
     Ok(RememberOutcome::Stored(asset.asset.memory_asset_id))
 }
 
+/// Store one completed turn: what was asked, and the beginning of what was answered.
+///
+/// Without this, "what did I ask you in the previous session?" cannot be answered by
+/// memory at all. The store held the user's directives and never the conversation, so
+/// retrieval found the question being asked rather than any answer to it - measured on
+/// a real session, where the agent correctly reported that no earlier question content
+/// had been kept.
+///
+/// Provenance is stated exactly as far as it goes. The admission event is a durable
+/// reference for the turn: it is proof the question was really asked, which is what
+/// `VerifiedObservation` requires and what makes the asset publishable at L1. The
+/// answer line is an excerpt of the model's reply, copied from the turn in memory; the
+/// runtime did not independently confirm the claim inside it, so it is quoted as text
+/// and never promoted to evidence of its own.
+///
+/// # Errors
+/// Fails when the store cannot write. A turn that could not be recorded is reported to
+/// the caller, not swallowed.
+pub async fn remember_turn(
+    store: Arc<SqliteStore>,
+    principal: &MemoryPrincipal,
+    session_id: &SessionId,
+    answer: &str,
+) -> Result<RememberOutcome, HarnessError> {
+    let Some((input_event, question)) = store
+        .session_admitted_input(session_id)
+        .await
+        .map_err(StoreError::into_harness_error)?
+    else {
+        return Ok(RememberOutcome::NothingAdmitted);
+    };
+    let question = question.trim();
+    if question.is_empty() {
+        return Ok(RememberOutcome::NothingAdmitted);
+    }
+    let (scope, project_id) = match principal.project_id.clone() {
+        Some(project_id) => (MemoryScope::Project, Some(project_id)),
+        None => (MemoryScope::User, None),
+    };
+    let mut content = format!("asked: {question}\nsession: {session_id}");
+    let answer = answer.trim();
+    if !answer.is_empty() {
+        let answer = clip(answer, TURN_ANSWER_CHARS);
+        content.push_str("\nanswered: ");
+        content.push_str(&answer);
+    }
+    let prune_scope = project_id.clone();
+    let service = MemoryService::new(Arc::clone(&store));
+    let asset = service
+        .create_asset(
+            principal,
+            CreateMemoryAsset {
+                kind: "session_turn".to_owned(),
+                scope,
+                layer: MemoryLayer::L1,
+                project_id,
+                task_id: None,
+                agent_profile_id: None,
+                session_id: None,
+                visibility: "scoped".to_owned(),
+                content,
+                authority: SourceAuthority::RuntimeObserved,
+                evidence: EvidenceState::VerifiedObservation,
+                user_confirmed: false,
+                source_event_refs: vec![input_event],
+                source_file_hashes: Vec::new(),
+                source_commit: None,
+                provenance_kind: TURN_PROVENANCE.to_owned(),
+            },
+        )
+        .await?;
+    let id = asset.asset.memory_asset_id.clone();
+    prune_turns(&service, principal, prune_scope.as_ref()).await?;
+    Ok(RememberOutcome::Stored(id))
+}
+
+/// Retire the oldest turn records past the cap.
+///
+/// Only assets this code wrote as turn records are eligible, so a directive is never
+/// pruned by a log limit. A retirement that fails is reported: silently keeping an
+/// unbounded log would be worse than an error.
+async fn prune_turns(
+    service: &MemoryService,
+    principal: &MemoryPrincipal,
+    project_id: Option<&ProjectId>,
+) -> Result<(), HarnessError> {
+    let excess = service
+        .turn_records_over_limit(principal, project_id, TURN_MEMORY_LIMIT)
+        .await?;
+    for id in excess {
+        service
+            .invalidate(principal, &id, "turn record retired past the retention cap")
+            .await?;
+    }
+    Ok(())
+}
+
+/// Shorten text to at most `limit` characters, counting characters rather than bytes.
+fn clip(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let head: String = text.chars().take(limit).collect();
+    format!("{head}…")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         MEMORY_VARIABLE, RetrievalState, memory_requested, memory_requested_from_environment,
-        principal, recall, remember_input,
+        principal, recall, remember_input, remember_turn,
     };
     use crate::interactive::paths::LaunchEnvironment;
     use crate::interactive::project::resolve_project_id;
@@ -460,6 +631,101 @@ mod tests {
         assert_eq!(
             stored.asset.current_version, 1,
             "deduplication must not mint a version"
+        );
+    }
+
+    /// A turn record is written, is found by the history path, and carries both halves.
+    #[tokio::test]
+    async fn memory_a_previous_turn_is_recorded_and_found_by_a_later_session() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+        let task_id = TaskId::generate();
+        let first = SessionId::generate();
+        admit(
+            &fixture,
+            &project_id,
+            &first,
+            &task_id,
+            "Giải thích ngắn gọn memory dài hạn là gì.",
+        )
+        .await;
+
+        let outcome = remember_turn(
+            Arc::clone(&fixture.store),
+            &principal(project_id.clone(), task_id.clone(), first.clone()),
+            &first,
+            "Memory dài hạn lưu những gì bền vững qua các session.",
+        )
+        .await
+        .expect("remember_turn runs");
+        let asset_id = match outcome {
+            super::RememberOutcome::Stored(asset_id) => asset_id,
+            other => panic!("a turn is recorded: {other:?}"),
+        };
+
+        // The record says what was asked and what was answered, so a question about the
+        // conversation has something to answer with.
+        let service = MemoryService::new(Arc::clone(&fixture.store));
+        let stored = service
+            .read(
+                &principal(project_id.clone(), task_id.clone(), SessionId::generate()),
+                &asset_id,
+            )
+            .await
+            .expect("read runs")
+            .expect("the record exists");
+        assert!(
+            stored
+                .current
+                .content
+                .contains("asked: Giải thích ngắn gọn"),
+            "{}",
+            stored.current.content
+        );
+        assert!(
+            stored
+                .current
+                .content
+                .contains("answered: Memory dài hạn lưu"),
+            "{}",
+            stored.current.content
+        );
+        assert_eq!(
+            stored.current.record.evidence_state, "verified_observation",
+            "the runtime observed the turn; it did not confirm the claim inside it"
+        );
+        assert_eq!(
+            stored.asset.created_by,
+            SourceAuthority::RuntimeObserved,
+            "the model is not the author of record here; the runtime is"
+        );
+
+        // And the history the user asks about is what a later session reads.
+        let recent = service
+            .recent_turns(
+                &principal(project_id, task_id, SessionId::generate()),
+                Some(
+                    &resolve_project_id(&fixture.store, &fixture.workspace)
+                        .await
+                        .expect("project identity"),
+                ),
+                8,
+            )
+            .await
+            .expect("recent turns");
+        assert_eq!(recent.hits.len(), 1, "the turn is the newest record");
+        assert!(
+            recent.hits[0]
+                .current
+                .content
+                .contains("Giải thích ngắn gọn")
+        );
+        assert!(
+            recent.revision > 0,
+            "the revision is what dispatch revalidates against; a placeholder here \
+             makes the whole contribution be dropped in silence"
         );
     }
 
@@ -875,8 +1141,17 @@ mod tests {
             packet.packet.content
         );
         assert!(
-            packet.packet.content.contains("Reusable data; authority="),
-            "it must be rendered as a memory block: {}",
+            packet
+                .packet
+                .content
+                .contains(harness_memory::MEMORY_BLOCK_HEADING),
+            "it must be rendered as a memory block, under a heading that says what the \
+             material is: {}",
+            packet.packet.content
+        );
+        assert!(
+            packet.packet.content.contains("authority="),
+            "and it must keep its provenance note for audit: {}",
             packet.packet.content
         );
         assert_eq!(

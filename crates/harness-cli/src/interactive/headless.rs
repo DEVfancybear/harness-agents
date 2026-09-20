@@ -18,6 +18,7 @@ use harness_tools::{
 };
 use harness_types::{ErrorCode, HarnessError, HostId, InputId, SessionId, TaskId};
 
+use super::attachments;
 use super::bootstrap::{self, LaunchRequest};
 use super::extensions;
 use super::memory;
@@ -51,6 +52,34 @@ fn acceptance_trace(#[cfg_attr(not(debug_assertions), allow(unused_variables))] 
 }
 
 /// Run one headless turn.
+///
+/// The asset id one memory write produced, when it produced one.
+fn memory_asset_of(
+    remembered: &Result<Option<memory::RememberOutcome>, HarnessError>,
+) -> Option<String> {
+    match remembered {
+        Ok(Some(
+            memory::RememberOutcome::Stored(asset_id)
+            | memory::RememberOutcome::Duplicate(asset_id),
+        )) => Some(asset_id.as_str().to_owned()),
+        _ => None,
+    }
+}
+
+/// What one memory write did, in words a scripting caller can branch on.
+fn memory_disposition_of(
+    remembered: &Result<Option<memory::RememberOutcome>, HarnessError>,
+) -> &'static str {
+    match remembered {
+        Ok(Some(memory::RememberOutcome::Stored(_))) => "stored",
+        Ok(Some(memory::RememberOutcome::Duplicate(_))) => "duplicate",
+        Ok(Some(memory::RememberOutcome::NotKnowledge { reason })) => reason,
+        Ok(Some(memory::RememberOutcome::NothingAdmitted) | None) => "nothing_admitted",
+        Err(_) => "error",
+    }
+}
+
+/// Run one bounded headless turn and report it as JSON.
 ///
 /// The body is a linear sequence: resolve, run exactly one turn, shut down. It is
 /// long because it wires real components, not because it branches.
@@ -212,6 +241,36 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         observation,
     )
     .with_tool_schemas(tool_schemas);
+    // An image the prompt names is attached the same way it is in the app, so a scripted
+    // run can look at a screenshot too.
+    let attached = attachments::from_message(&request.prompt, &context.project.root);
+    for note in &attached.notes {
+        eprintln!("image not attached ({note})");
+    }
+    let run_request = if attached.is_empty() {
+        run_request
+    } else {
+        let labels = attached
+            .images
+            .iter()
+            .map(|image| image.attachment.label.clone())
+            .collect::<Vec<_>>();
+        for label in &labels {
+            eprintln!("image attached: {label}");
+        }
+        run_request.with_images(
+            attached
+                .images
+                .into_iter()
+                .map(|image| image.attachment)
+                .collect(),
+        )
+    };
+    let run_request_images = run_request
+        .images
+        .iter()
+        .map(|image| image.label.clone())
+        .collect::<Vec<_>>();
     let mut recall = None;
     let run_request = match &memory_principal {
         Some(principal) => {
@@ -268,21 +327,28 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
             .map(Some),
         None => Ok(None),
     };
-    let stored = remembered.as_ref().map(|outcome| match outcome {
-        Some(
-            memory::RememberOutcome::Stored(asset_id)
-            | memory::RememberOutcome::Duplicate(asset_id),
-        ) => Some(asset_id.as_str().to_owned()),
-        _ => None,
-    });
+    // And the turn itself, which is what answers "what did I ask you before?". It was
+    // missing here while the interactive path had it, so a headless session recorded no
+    // conversation at all and the history question had nothing to read.
+    let turn = match &memory_principal {
+        Some(principal) => memory::remember_turn(
+            Arc::clone(&store),
+            principal,
+            &session_id,
+            outcome.final_text.as_str(),
+        )
+        .await
+        .map(Some),
+        None => Ok(None),
+    };
+    let stored = memory_asset_of(&remembered);
+    let stored_turn = memory_asset_of(&turn);
     // A headless run reports what it did not keep as well: a caller scripting this
-    // reads the disposition instead of inferring it from a null.
-    let stored_disposition = remembered.as_ref().map(|outcome| match outcome {
-        Some(memory::RememberOutcome::Stored(_)) => "stored",
-        Some(memory::RememberOutcome::Duplicate(_)) => "duplicate",
-        Some(memory::RememberOutcome::NotKnowledge { reason }) => reason,
-        Some(memory::RememberOutcome::NothingAdmitted) | None => "nothing_admitted",
-    });
+    // reads the disposition instead of inferring it from a null. Two assets can be
+    // written per turn - a directive and a turn record - so each has its own field
+    // rather than one ambiguous id.
+    let stored_disposition = memory_disposition_of(&remembered);
+    let turn_disposition = memory_disposition_of(&turn);
     let memory_report = match (&memory_principal, &recall, &stored) {
         (Some(_), recall, stored) => serde_json::json!({
             "enabled": true,
@@ -292,9 +358,18 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
                 "blocks": found.blocks,
                 "message": found.message,
             })),
-            "stored_asset_id": stored.as_ref().ok().and_then(Clone::clone),
-            "stored_disposition": stored_disposition.as_ref().ok().copied(),
-            "error": remembered.as_ref().err().map(ToString::to_string),
+            "stored_asset_id": stored.clone(),
+            "stored_disposition": stored_disposition,
+            // The turn record is a second asset and gets its own field: one id could
+            // only ever name one of the two, and which one it named was an accident of
+            // write order.
+            "turn_asset_id": stored_turn.clone(),
+            "turn_disposition": turn_disposition,
+            "error": remembered
+                .as_ref()
+                .err()
+                .or_else(|| turn.as_ref().err())
+                .map(ToString::to_string),
         }),
         (None, _, _) => serde_json::json!({"enabled": false}),
     };
@@ -320,6 +395,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         "fixture": false,
         "memory": memory_report,
         "extensions": extensions_report,
+        "images": run_request_images,
         "resumed_from": resumed_from
             .as_ref()
             .map(|(source, _)| source.as_str().to_owned()),

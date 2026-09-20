@@ -405,6 +405,128 @@ impl SqliteStore {
         Ok(true)
     }
 
+    /// The newest turn records, newest first, with the revision they were read at.
+    ///
+    /// The revision is part of the answer, not decoration: the runtime revalidates a
+    /// contribution against it before dispatch and drops the whole thing when it does
+    /// not match. Returning a placeholder here made every history contribution fail
+    /// that check and vanish without a word.
+    pub async fn recent_turn_records(
+        &self,
+        principal: &StoreMemoryPrincipal,
+        provenance_kind: &str,
+        limit: usize,
+    ) -> Result<(Vec<StoredMemoryAssetRecord>, u64), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "begin recent turn read",
+                error,
+            )
+        })?;
+        let revision = read_revision(&mut tx).await?;
+        let rows = sqlx::query(
+            "SELECT v.memory_asset_id FROM memory_versions v
+             JOIN memory_assets a ON a.memory_asset_id = v.memory_asset_id
+             WHERE v.version = a.current_version
+               AND a.status = 'active'
+               AND json_extract(v.version_json, '$.validity') = 'valid'
+               AND a.owner_id = ?1
+               AND ((?2 = 1 AND a.project_id = ?3) OR (?2 = 0 AND a.project_id IS NULL))
+               AND json_extract(v.version_json, '$.provenance_kind') = ?4
+             ORDER BY v.created_at DESC, v.memory_asset_id DESC
+             LIMIT ?5",
+        )
+        .bind(&principal.principal_id)
+        .bind(i64::from(principal.project_id.is_some()))
+        .bind(principal.project_id.as_ref().map(ToString::to_string))
+        .bind(provenance_kind)
+        .bind(i64::try_from(limit.min(64)).unwrap_or(64))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "read recent turn records",
+                error,
+            )
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let id = MemoryAssetId::parse(row.get::<String, _>("memory_asset_id"))
+                .map_err(|error| StoreError::new(error.code(), error.to_string()))?;
+            if let Some(record) = load_asset_in_tx(&mut tx, &id).await? {
+                records.push(record);
+            }
+        }
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "close recent turn read",
+                error,
+            )
+        })?;
+        Ok((records, revision))
+    }
+
+    /// Turn records past the cap, oldest first, so a caller can retire them.
+    ///
+    /// Scoped to one provenance kind on purpose: this is a retention rule for the log
+    /// this code writes, and it must not be able to retire an asset the user authored.
+    pub async fn turn_records_over_limit(
+        &self,
+        principal: &StoreMemoryPrincipal,
+        provenance_kind: &str,
+        keep: usize,
+    ) -> Result<Vec<MemoryAssetId>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "begin turn record scan",
+                error,
+            )
+        })?;
+        let keep = i64::try_from(keep).unwrap_or(i64::MAX);
+        let rows = sqlx::query(
+            "SELECT v.memory_asset_id FROM memory_versions v
+             JOIN memory_assets a ON a.memory_asset_id = v.memory_asset_id
+             WHERE v.version = a.current_version
+               AND a.status = 'active'
+               AND a.owner_id = ?1
+               AND ((?2 = 1 AND a.project_id = ?3) OR (?2 = 0 AND a.project_id IS NULL))
+               AND json_extract(v.version_json, '$.provenance_kind') = ?4
+             ORDER BY v.created_at DESC, v.memory_asset_id DESC
+             LIMIT -1 OFFSET ?5",
+        )
+        .bind(&principal.principal_id)
+        .bind(i64::from(principal.project_id.is_some()))
+        .bind(principal.project_id.as_ref().map(ToString::to_string))
+        .bind(provenance_kind)
+        .bind(keep)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "scan turn records for retention",
+                error,
+            )
+        })?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "close turn record scan",
+                error,
+            )
+        })?;
+        rows.into_iter()
+            .map(|row| {
+                MemoryAssetId::parse(row.get::<String, _>("memory_asset_id"))
+                    .map_err(|error| StoreError::new(error.code(), error.to_string()))
+            })
+            .collect()
+    }
+
     /// Scoped FTS search: `query` is an FTS5 MATCH expression, `limit` its row budget.
     ///
     /// The caller owns the query shape - `AND` for an exact ask, `OR` for recall -
