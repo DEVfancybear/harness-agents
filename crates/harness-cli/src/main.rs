@@ -969,22 +969,56 @@ async fn show_status(data_dir: &PathBuf, session_id: &str, json: bool) -> Result
         .await
         .map_err(store_error)?
         .ok_or_else(|| HarnessError::new(ErrorCode::InvalidPayload, "session was not found"))?;
+    // Status is an inspection, not a run: a session whose journal cannot be
+    // folded is reported as blocked with its typed reason instead of failing,
+    // so an operator can still see what is durable and what is pending.
     let recovery = SessionService::new(Arc::clone(&store))
         .recover(&session_id)
-        .await
-        .map_err(store_error)?;
-    let completed = recovery
-        .working_state
-        .plan_items
-        .iter()
-        .filter(|item| item.status == harness_types::PlanItemStatus::Completed)
-        .count();
-    let pending = recovery
-        .working_state
-        .plan_items
-        .iter()
-        .filter(|item| item.status == harness_types::PlanItemStatus::Pending)
-        .count();
+        .await;
+    let (recovery_json, blocking) = match &recovery {
+        Ok(view) => {
+            let completed = view
+                .working_state
+                .plan_items
+                .iter()
+                .filter(|item| item.status == harness_types::PlanItemStatus::Completed)
+                .count();
+            let pending = view
+                .working_state
+                .plan_items
+                .iter()
+                .filter(|item| item.status == harness_types::PlanItemStatus::Pending)
+                .count();
+            (
+                serde_json::json!({
+                    "snapshot_sequence": view.snapshot_sequence,
+                    "replayed_through_sequence": view.replayed_through_sequence,
+                    "receipt_count": view.receipts.len(),
+                    "instruction_count": view.instruction_texts.len(),
+                    "completed_plan_items": completed,
+                    "pending_plan_items": pending,
+                    "snapshot_diagnostic": view.snapshot_diagnostic
+                }),
+                serde_json::json!({"blocked": false, "reason": null}),
+            )
+        }
+        Err(error) => (
+            serde_json::Value::Null,
+            serde_json::json!({"blocked": true, "reason": error.code().as_str()}),
+        ),
+    };
+    let pending_work = serde_json::json!({
+        "inbox_inputs": store.inbox_count(&session_id).await.map_err(store_error)?,
+        "pending_tool_intents": store
+            .pending_tool_intents(&session_id)
+            .await
+            .map_err(store_error)?
+            .len(),
+        "pending_runtime_commands": store
+            .pending_runtime_commands(&session_id)
+            .await
+            .map_err(store_error)?,
+    });
     let result = serde_json::json!({
         "schema_version": 1,
         "session_id": summary.session_id,
@@ -992,23 +1026,34 @@ async fn show_status(data_dir: &PathBuf, session_id: &str, json: bool) -> Result
         "next_sequence": summary.next_sequence,
         "input_count": summary.input_count,
         "latest_snapshot_sequence": summary.latest_snapshot_sequence,
-        "recovery": {
-            "snapshot_sequence": recovery.snapshot_sequence,
-            "replayed_through_sequence": recovery.replayed_through_sequence,
-            "receipt_count": recovery.receipts.len(),
-            "instruction_count": recovery.instruction_texts.len(),
-            "completed_plan_items": completed,
-            "pending_plan_items": pending,
-            "snapshot_diagnostic": recovery.snapshot_diagnostic
-        },
+        "recovery": recovery_json,
+        "pending_work": pending_work,
+        "blocking": blocking,
         "runtime": "not_available_in_p1"
     });
     if json {
         println!("{result}");
     } else {
+        match &recovery {
+            Ok(view) => {
+                println!(
+                    "session {} recovered through seq {}",
+                    session_id, view.replayed_through_sequence
+                );
+            }
+            Err(error) => {
+                println!(
+                    "session {session_id} is blocked: {} ({})",
+                    error.code(),
+                    error
+                );
+            }
+        }
         println!(
-            "session {} recovered through seq {}",
-            session_id, recovery.replayed_through_sequence
+            "pending work: {} input(s), {} tool intent(s), {} command(s)",
+            pending_work["inbox_inputs"],
+            pending_work["pending_tool_intents"],
+            pending_work["pending_runtime_commands"]
         );
         println!("runtime: not_available_in_p1");
     }

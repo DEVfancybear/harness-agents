@@ -111,14 +111,127 @@
           "required-tests"
         ]
       }
+    },
+    {
+      "id": "M1",
+      "title": "SQLite store, journal và recovery",
+      "runbook": "docs/implementation-next/M1.vi.md",
+      "prerequisites": ["M0"],
+      "status": "implemented_unverified",
+      "integration_target": "milestone_m1",
+      "work_items": [
+        {
+          "id": "M1-01",
+          "title": "Migrations và writer ownership",
+          "status": "implemented_unverified",
+          "tests": [
+            "m1_01_data_directory_marker_is_versioned",
+            "m1_01_store_schema_newer_than_host_is_refused",
+            "m1_01_writer_generation_advances_and_stale_fence_is_rejected"
+          ]
+        },
+        {
+          "id": "M1-02",
+          "title": "Input, inbox và projections",
+          "status": "verified_by_existing_suites",
+          "tests": [
+            "phase_p1::p1_s04_duplicate_id_is_idempotent_and_retains_unclassified_text",
+            "phase_p1::p1_c21_injected_write_failure_never_acknowledges_or_advances_state"
+          ]
+        },
+        {
+          "id": "M1-03",
+          "title": "Artifacts, checkpoints và replay",
+          "status": "implemented_unverified",
+          "tests": [
+            "m1_03_orphan_artifact_is_only_reachable_by_reference",
+            "m1_03_checkpoint_commit_failure_leaves_the_journal_foldable"
+          ]
+        },
+        {
+          "id": "M1-04",
+          "title": "Recovery queries và CLI inspection",
+          "status": "implemented_unverified",
+          "tests": [
+            "m1_04_status_reports_pending_work_and_blocking_reasons_without_a_provider"
+          ]
+        }
+      ],
+      "required_tests": [
+        "m1_01_data_directory_marker_is_versioned",
+        "m1_01_store_schema_newer_than_host_is_refused",
+        "m1_01_writer_generation_advances_and_stale_fence_is_rejected",
+        "m1_03_orphan_artifact_is_only_reachable_by_reference",
+        "m1_03_checkpoint_commit_failure_leaves_the_journal_foldable",
+        "m1_04_status_reports_pending_work_and_blocking_reasons_without_a_provider",
+        "phase_p1::p1_c01_child_kill_after_ack_recovers_one_input",
+        "phase_p1::p1_s04_duplicate_id_is_idempotent_and_retains_unclassified_text",
+        "phase_p1::p1_c15_writer_competition_and_stale_fence_are_rejected",
+        "phase_p1::p1_s05_artifacts_snapshots_and_corruption_fallback_are_durable",
+        "phase_p2::p2_k11_unknown_critical_event_blocks_resume_but_allows_offline_inspection"
+      ],
+      "unit_tests": [
+        {
+          "package": "harness-store-sqlite",
+          "test_name": "models::tests::data_directory_marker_accepts_the_current_format_only"
+        }
+      ],
+      "fixtures": [
+        "tests/fixtures/m1/marker/newer-format.json",
+        "tests/fixtures/m1/marker/corrupt.json"
+      ],
+      "gate": {
+        "script": "scripts/Verify-Milestone.ps1",
+        "dependency_check_bin": "dependency_check",
+        "steps": [
+          "format",
+          "clippy",
+          "workspace-tests",
+          "dependency-allowlist",
+          "unit-test-discovery",
+          "required-test-discovery",
+          "required-tests",
+          "closure-M0"
+        ]
+      }
     }
   ],
   "acceptance_cases": [
-    { "id": "A01", "owner_milestones": ["M1"], "planned_test": "a01_input_ack_dedupe", "status": "planned" },
-    { "id": "A02", "owner_milestones": ["M1"], "planned_test": "a02_owner_generation", "status": "planned" },
+    {
+      "id": "A01",
+      "owner_milestones": ["M1"],
+      "planned_test": "a01_input_ack_dedupe",
+      "status": "implemented",
+      "selectors": [
+        "phase_p1::p1_c01_child_kill_after_ack_recovers_one_input",
+        "phase_p1::p1_s04_duplicate_id_is_idempotent_and_retains_unclassified_text",
+        "phase_p1::p1_property_duplicate_input_ids_are_idempotent"
+      ]
+    },
+    {
+      "id": "A02",
+      "owner_milestones": ["M1"],
+      "planned_test": "a02_owner_generation",
+      "status": "implemented",
+      "selectors": [
+        "phase_p1::p1_c15_writer_competition_and_stale_fence_are_rejected",
+        "phase_p5::strengthening::p5_c15_stale_worker_generation_cannot_commit"
+      ]
+    },
     { "id": "A03", "owner_milestones": ["M4"], "planned_test": "a03_receipt_before_checkpoint", "status": "planned" },
     { "id": "A04", "owner_milestones": ["M4"], "planned_test": "a04_effect_before_receipt", "status": "planned" },
-    { "id": "A05", "owner_milestones": ["M1"], "planned_test": "a05_checkpoint_compatibility", "status": "planned" },
+    {
+      "id": "A05",
+      "owner_milestones": ["M1"],
+      "planned_test": "a05_checkpoint_compatibility",
+      "status": "implemented",
+      "selectors": [
+        "phase_p1::p1_s05_artifacts_snapshots_and_corruption_fallback_are_durable",
+        "phase_p2::p2_k11_unknown_critical_event_blocks_resume_but_allows_offline_inspection",
+        "milestone_m1::m1_03_orphan_artifact_is_only_reachable_by_reference",
+        "milestone_m1::m1_03_checkpoint_commit_failure_leaves_the_journal_foldable"
+      ]
+    },
     { "id": "A06", "owner_milestones": ["M2"], "planned_test": "a06_sse_multicall", "status": "planned" },
     { "id": "A07", "owner_milestones": ["M2"], "planned_test": "a07_provider_fail_cancel", "status": "planned" },
     { "id": "A08", "owner_milestones": ["M4"], "planned_test": "a08_coding_e2e", "status": "planned" },

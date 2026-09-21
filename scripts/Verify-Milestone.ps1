@@ -67,6 +67,10 @@ function Assert-RequiredTestDiscovery {
         [Parameter(Mandatory)] [string[]] $Required
     )
 
+    # A single-element array arrives as a scalar, and StrictMode forbids
+    # `.Count` on a scalar; wrap before counting.
+    $Discovered = @($Discovered)
+    $Required = @($Required)
     if ($Required.Count -eq 0) {
         throw (New-GateError -Code 'gate_configuration_error' -Message 'milestone registry has no required tests')
     }
@@ -92,6 +96,29 @@ function Assert-RequiredTestResult {
     }
     if (($Output -join "`n") -notmatch "(?m)^test\s+$escaped\s+\.\.\.\s+ok\b") {
         throw (New-GateError -Code 'gate_configuration_error' -Message "required test did not report success: $TestName")
+    }
+}
+
+function Get-TestSelector {
+    param(
+        [Parameter(Mandatory)] [string] $Selector,
+        [Parameter(Mandatory)] [string] $DefaultTarget
+    )
+
+    # A selector is either "test_name" (proven by the milestone's own target) or
+    # "target::test_name" (proven by an earlier accepted target, e.g. phase_p1).
+    $separator = $Selector.IndexOf('::')
+    if ($separator -gt 0) {
+        return [pscustomobject]@{
+            Selector = $Selector
+            Target = $Selector.Substring(0, $separator)
+            TestName = $Selector.Substring($separator + 2)
+        }
+    }
+    return [pscustomobject]@{
+        Selector = $Selector
+        Target = $DefaultTarget
+        TestName = $Selector
     }
 }
 
@@ -282,6 +309,13 @@ function Invoke-GateSelfTest {
         $registry = Read-MilestoneRegistry -Root $Root
         [void] (Resolve-Milestone -Registry $registry -MilestoneId 'M99')
     }
+    Invoke-NegativeControl -Name 'qualified-selector' -ExpectedCode 'gate_configuration_error' -Action {
+        $parsed = Get-TestSelector -Selector 'phase_p1::p1_c01_some_test' -DefaultTarget 'milestone_m1'
+        if ($parsed.Target -cne 'phase_p1' -or $parsed.TestName -cne 'p1_c01_some_test') {
+            throw (New-GateError -Code 'gate_configuration_error' -Message "selector split is wrong: $($parsed.Target) :: $($parsed.TestName)")
+        }
+        Assert-RequiredTestDiscovery -Discovered @('p1_c01_some_test') -Required @('p1_c01_other_test')
+    }
     $forbidden = Invoke-DependencyCheck -Root $Root -ExtraEdges @('harness-runtime->harness-tools')
     if ($forbidden.ExitCode -eq 0) {
         throw (New-GateError -Code 'gate_configuration_error' -Message 'dependency checker accepted a forbidden edge')
@@ -351,15 +385,25 @@ try {
     $results.Add([pscustomobject]@{ name = 'unit-tests'; result = 'passed'; count = $unitPassed })
     if (-not $Json) { Write-Output "GATE_STEP_OK: unit-tests ($unitPassed tests)" }
 
-    $discovery = Invoke-CheckedCommand -Name 'milestone-test-discovery' -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $integrationTarget, '--locked', '--', '--list')
-    $discovered = Get-DiscoveredTestNames -Output $discovery.Output
-    Assert-RequiredTestDiscovery -Discovered $discovered -Required $requiredTests
-    $results.Add([pscustomobject]@{ name = 'milestone-test-discovery'; result = 'passed'; discovered = $discovered.Count })
-    if (-not $Json) { Write-Output "GATE_STEP_OK: milestone-test-discovery ($($discovered.Count) tests)" }
+    $selectors = @($requiredTests | ForEach-Object { Get-TestSelector -Selector $_ -DefaultTarget $integrationTarget })
+    $targets = @($selectors | ForEach-Object { $_.Target } | Sort-Object -Unique)
+    $discoveredByTarget = @{}
+    foreach ($target in $targets) {
+        $targetRequired = @($selectors | Where-Object { $_.Target -ceq $target } | ForEach-Object { $_.TestName } | Sort-Object -Unique)
+        $discovery = Invoke-CheckedCommand -Name "test-discovery:$target" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $target, '--locked', '--', '--list')
+        $discoveredTarget = @(Get-DiscoveredTestNames -Output $discovery.Output)
+        Assert-RequiredTestDiscovery -Discovered $discoveredTarget -Required $targetRequired
+        $discoveredByTarget[$target] = $discoveredTarget.Count
+        if (-not $Json) { Write-Output "GATE_STEP_OK: test-discovery:$target ($($discoveredTarget.Count) tests)" }
+    }
+    $discoveredCount = 0
+    foreach ($targetCount in $discoveredByTarget.Values) { $discoveredCount += [int] $targetCount }
+    $results.Add([pscustomobject]@{ name = 'milestone-test-discovery'; result = 'passed'; discovered = $discoveredCount; targets = $targets })
+    if (-not $Json) { Write-Output "GATE_STEP_OK: milestone-test-discovery ($discoveredCount tests over $(@($targets).Count) target(s))" }
 
-    foreach ($testName in $requiredTests) {
-        $result = Invoke-CheckedCommand -Name "required-test:$testName" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $integrationTarget, '--locked', $testName, '--', '--exact')
-        Assert-RequiredTestResult -TestName $testName -Output $result.Output
+    foreach ($selector in $selectors) {
+        $result = Invoke-CheckedCommand -Name "required-test:$($selector.Selector)" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $selector.Target, '--locked', $selector.TestName, '--', '--exact')
+        Assert-RequiredTestResult -TestName $selector.TestName -Output $result.Output
     }
     $results.Add([pscustomobject]@{ name = 'required-tests'; result = 'passed'; count = $requiredTests.Count })
     if (-not $Json) { Write-Output "GATE_STEP_OK: required-tests ($($requiredTests.Count) tests)" }
@@ -374,7 +418,7 @@ try {
         }
         $entryTarget = [string] $entry.integration_target
         $entryDiscovery = Invoke-CheckedCommand -Name "closure-$closureMilestone-discovery" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $entryTarget, '--locked', '--', '--list')
-        $entryDiscovered = Get-DiscoveredTestNames -Output $entryDiscovery.Output
+        $entryDiscovered = @(Get-DiscoveredTestNames -Output $entryDiscovery.Output)
         Assert-RequiredTestDiscovery -Discovered $entryDiscovered -Required $entryTests
         foreach ($testName in $entryTests) {
             $result = Invoke-CheckedCommand -Name "closure-$closureMilestone-test:$testName" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $entryTarget, '--locked', $testName, '--', '--exact')
@@ -394,8 +438,8 @@ $summary = [ordered]@{
     result = 'passed'
     closure = $closure
     source_tree = $sourceTree
-    required_test_count = $requiredTests.Count
-    discovered_test_count = $discovered.Count
+    required_test_count = @($requiredTests).Count
+    discovered_test_count = $discoveredCount
     steps = @($results)
 }
 if ($Json) {

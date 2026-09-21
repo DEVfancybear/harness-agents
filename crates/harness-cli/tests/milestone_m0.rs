@@ -710,13 +710,20 @@ fn m0_04_milestone_registry_and_gate_self_test() {
         .collect::<Vec<_>>();
     assert_eq!(work_item_tests.len(), required.len());
 
-    // A01-A36 are registered as planned cross-layer cases with an owner.
+    // A01-A36 are registered cross-layer cases with an owner. A case is
+    // `planned` until its owner milestone implements it; an implemented case
+    // must name the exact selectors that prove it (M1 does this for A01/A02/A05).
     let cases = registry["acceptance_cases"]
         .as_array()
         .expect("acceptance cases");
     assert_eq!(cases.len(), 36);
     for case in cases {
-        assert_eq!(case["status"], "planned", "{}", case["id"]);
+        let status = case["status"].as_str().expect("status");
+        assert!(
+            matches!(status, "planned" | "implemented"),
+            "{} has an unknown status: {status}",
+            case["id"]
+        );
         assert!(
             !case["owner_milestones"]
                 .as_array()
@@ -724,6 +731,26 @@ fn m0_04_milestone_registry_and_gate_self_test() {
                 .is_empty()
         );
         assert!(case["planned_test"].as_str().is_some());
+        match status {
+            "implemented" => {
+                let selectors = case["selectors"]
+                    .as_array()
+                    .expect("implemented cases name selectors");
+                assert!(!selectors.is_empty(), "{} has no selector", case["id"]);
+                assert!(
+                    selectors.iter().all(|selector| selector
+                        .as_str()
+                        .is_some_and(|value| value.contains("::"))),
+                    "{} selectors must be qualified with their target",
+                    case["id"]
+                );
+            }
+            _ => assert!(
+                case["selectors"].is_null(),
+                "{} is planned but names selectors",
+                case["id"]
+            ),
+        }
     }
 
     // The registry of P/H cases is untouched by this file.

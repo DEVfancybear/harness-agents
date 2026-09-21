@@ -6,19 +6,27 @@ use std::{
 
 use harness_types::{
     AgentProfileId, AgentRunId, ArtifactId, CompositionSnapshotId, ContentHash, ContextPacket,
-    ContextPacketId, EventEnvelope, EventId, HostId, InputId, InstructionLedgerEntry, MemoryAsset,
-    MemoryAssetId, MemoryVersion, PluginManifest, ProjectId, ProviderAttemptId, RequestId,
-    RuntimeCommandId, SessionId, SnapshotId, TaskId, ToolApprovalId, ToolExecutionId,
+    ContextPacketId, ErrorCode, EventEnvelope, EventId, HostId, InputId, InstructionLedgerEntry,
+    MemoryAsset, MemoryAssetId, MemoryVersion, PluginManifest, ProjectId, ProviderAttemptId,
+    RequestId, RuntimeCommandId, SessionId, SnapshotId, TaskId, ToolApprovalId, ToolExecutionId,
     ToolExecutionReceipt, WorkingState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::StoreError;
 
 /// The only on-disk database schema revision implemented by P1.
 pub const STORE_SCHEMA_VERSION: i64 = 1;
 pub const DATABASE_FILE_NAME: &str = "harness.sqlite3";
 pub const ARTIFACT_DIRECTORY_NAME: &str = "artifacts";
 pub const WRITER_LOCK_FILE_NAME: &str = "writer.lock";
+/// The data directory marker: one file that names the directory and its format.
+pub const DATA_DIRECTORY_MARKER_FILE_NAME: &str = "harness-data.json";
+/// The only data directory format this host writes.
+pub const DATA_DIRECTORY_FORMAT_VERSION: u16 = 1;
+/// The marker's `kind`, so a foreign JSON file is never mistaken for one.
+pub const DATA_DIRECTORY_KIND: &str = "harness-data";
 /// Additive runtime tables retain the P1 store schema version and have their
 /// own migration marker so older P1 databases remain readable.
 pub const RUNTIME_SCHEMA_VERSION: i64 = 1;
@@ -51,6 +59,12 @@ impl StorePaths {
             writer_lock_path: data_dir.join(WRITER_LOCK_FILE_NAME),
             data_dir,
         }
+    }
+
+    /// The marker file that identifies this data directory and its format.
+    #[must_use]
+    pub fn marker_path(&self) -> PathBuf {
+        self.data_dir.join(DATA_DIRECTORY_MARKER_FILE_NAME)
     }
 
     #[must_use]
@@ -146,6 +160,61 @@ pub struct StoreDiagnostics {
     pub journal_mode: String,
     pub synchronous: i64,
     pub busy_timeout_ms: i64,
+}
+
+/// The data directory marker's durable content.
+///
+/// It is written on the first writable open and validated on every later one:
+/// a directory whose format is newer than this host supports is refused before
+/// any migration runs, and the marker is never overwritten.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataDirectoryMarker {
+    pub schema_version: u16,
+    pub kind: String,
+    pub store_schema_version: i64,
+}
+
+impl DataDirectoryMarker {
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            schema_version: DATA_DIRECTORY_FORMAT_VERSION,
+            kind: DATA_DIRECTORY_KIND.to_owned(),
+            store_schema_version: STORE_SCHEMA_VERSION,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if self.kind != DATA_DIRECTORY_KIND {
+            return Err(StoreError::new(
+                ErrorCode::MigrationFailed,
+                format!(
+                    "data directory marker is not a {DATA_DIRECTORY_KIND} marker: {}",
+                    self.kind
+                ),
+            ));
+        }
+        if self.schema_version > DATA_DIRECTORY_FORMAT_VERSION {
+            return Err(StoreError::new(
+                ErrorCode::SchemaVersionMismatch,
+                format!(
+                    "data directory format {} is newer than this host supports ({DATA_DIRECTORY_FORMAT_VERSION})",
+                    self.schema_version
+                ),
+            ));
+        }
+        if self.store_schema_version > STORE_SCHEMA_VERSION {
+            return Err(StoreError::new(
+                ErrorCode::SchemaVersionMismatch,
+                format!(
+                    "data directory store schema {} is newer than this host supports ({STORE_SCHEMA_VERSION})",
+                    self.store_schema_version
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A durable marker proving which source work produced a projection update.
@@ -702,4 +771,59 @@ pub struct TombstoneRow {
     pub reason: String,
     pub surviving_copies: Vec<String>,
     pub created_unix_ms: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DATA_DIRECTORY_FORMAT_VERSION, DATA_DIRECTORY_KIND, DataDirectoryMarker,
+        STORE_SCHEMA_VERSION,
+    };
+    use harness_types::ErrorCode;
+
+    #[test]
+    fn data_directory_marker_accepts_the_current_format_only() {
+        DataDirectoryMarker::current()
+            .validate()
+            .expect("the current marker is valid");
+
+        let newer_format = DataDirectoryMarker {
+            schema_version: DATA_DIRECTORY_FORMAT_VERSION + 1,
+            kind: DATA_DIRECTORY_KIND.to_owned(),
+            store_schema_version: STORE_SCHEMA_VERSION,
+        };
+        assert_eq!(
+            newer_format
+                .validate()
+                .expect_err("a newer format is refused")
+                .code(),
+            ErrorCode::SchemaVersionMismatch
+        );
+
+        let newer_store = DataDirectoryMarker {
+            schema_version: DATA_DIRECTORY_FORMAT_VERSION,
+            kind: DATA_DIRECTORY_KIND.to_owned(),
+            store_schema_version: STORE_SCHEMA_VERSION + 1,
+        };
+        assert_eq!(
+            newer_store
+                .validate()
+                .expect_err("a newer store schema is refused")
+                .code(),
+            ErrorCode::SchemaVersionMismatch
+        );
+
+        let foreign = DataDirectoryMarker {
+            schema_version: DATA_DIRECTORY_FORMAT_VERSION,
+            kind: "some-other-tool".to_owned(),
+            store_schema_version: STORE_SCHEMA_VERSION,
+        };
+        assert_eq!(
+            foreign
+                .validate()
+                .expect_err("a foreign marker is refused")
+                .code(),
+            ErrorCode::MigrationFailed
+        );
+    }
 }

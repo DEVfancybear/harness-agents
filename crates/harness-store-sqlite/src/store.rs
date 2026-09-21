@@ -20,13 +20,13 @@ use sqlx::{
 
 use crate::{
     AdmissionAck, AdmissionCommit, AgentStateRecord, CompositionSnapshotRecord,
-    ContextCheckpointRecord, ContextPacketRecord, ContinuationLinkRecord, FrozenRequestRecord,
-    HostFence, PersistedPluginManifest, ProjectRegistrationRecord, ProviderAttemptRecord,
-    PublishedArtifact, RUNTIME_SCHEMA_VERSION, ReceiptAck, ReceiptCommit, RuntimeCommandRecord,
-    RuntimeCommandState, STORE_SCHEMA_VERSION, SessionSummary, SnapshotRecord, SourceWorkMarker,
-    StoreDiagnostics, StoreError, StoreFaultPlan, StoreFaultPoint, StorePaths,
-    TOOLS_SCHEMA_VERSION, ToolApprovalBinding, ToolApprovalRecord, ToolApprovalState,
-    ToolIntentCommit, ToolIntentRecord, ToolIntentStatus, ToolSettlementCommit,
+    ContextCheckpointRecord, ContextPacketRecord, ContinuationLinkRecord, DataDirectoryMarker,
+    FrozenRequestRecord, HostFence, PersistedPluginManifest, ProjectRegistrationRecord,
+    ProviderAttemptRecord, PublishedArtifact, RUNTIME_SCHEMA_VERSION, ReceiptAck, ReceiptCommit,
+    RuntimeCommandRecord, RuntimeCommandState, STORE_SCHEMA_VERSION, SessionSummary,
+    SnapshotRecord, SourceWorkMarker, StoreDiagnostics, StoreError, StoreFaultPlan,
+    StoreFaultPoint, StorePaths, TOOLS_SCHEMA_VERSION, ToolApprovalBinding, ToolApprovalRecord,
+    ToolApprovalState, ToolIntentCommit, ToolIntentRecord, ToolIntentStatus, ToolSettlementCommit,
     ToolTaskUpdateCommit, WriterOpenOptions,
 };
 
@@ -187,6 +187,9 @@ impl SqliteStore {
             )
         })?;
 
+        // The marker is validated before anything else touches the directory: a
+        // data directory from a newer host must not be migrated or rewritten.
+        let marker = read_data_directory_marker(&paths)?;
         let pool = open_pool(&paths, false).await?;
         if let Err(error) = run_migrations(&pool, &options.fault_plan).await {
             let _ = FileExt::unlock(&lock_file);
@@ -209,6 +212,15 @@ impl SqliteStore {
             return Err(error);
         }
         if let Err(error) = maintenance::ensure_maintenance_schema(&pool).await {
+            let _ = FileExt::unlock(&lock_file);
+            return Err(error);
+        }
+        // A directory without a marker is a first run (or a legacy directory
+        // from before the marker existed); it gets one only after the schema it
+        // describes is real.
+        if marker.is_none()
+            && let Err(error) = write_data_directory_marker(&paths)
+        {
             let _ = FileExt::unlock(&lock_file);
             return Err(error);
         }
@@ -1724,6 +1736,31 @@ impl SqliteStore {
         .transpose()
     }
 
+    /// Runtime commands of one session that are neither completed nor canceled.
+    ///
+    /// This is read-only inspection: it never claims, retries or settles a
+    /// command, so a recovery report can list pending work without executing it.
+    pub async fn pending_runtime_commands(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<u64, StoreError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM runtime_commands
+             WHERE session_id = ? AND state IN ('pending', 'claimed')",
+        )
+        .bind(session_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "count pending commands",
+                error,
+            )
+        })?;
+        to_u64(count, "pending command count")
+    }
+
     pub async fn inbox_count(&self, session_id: &SessionId) -> Result<u64, StoreError> {
         let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM inbox WHERE session_id = ?")
             .bind(session_id.as_str())
@@ -2444,6 +2481,78 @@ async fn open_pool(paths: &StorePaths, read_only: bool) -> Result<SqlitePool, St
         .map_err(|error| {
             database_error(ErrorCode::StorageOpenFailed, "open SQLite database", error)
         })
+}
+
+/// Read and validate the data directory marker, if this directory has one.
+///
+/// `Ok(None)` means the directory predates the marker (or is new); the caller
+/// writes one after the schema it describes exists. An unreadable marker is an
+/// error, never a reason to overwrite it.
+fn read_data_directory_marker(
+    paths: &StorePaths,
+) -> Result<Option<DataDirectoryMarker>, StoreError> {
+    let marker_path = paths.marker_path();
+    let raw = match fs::read_to_string(&marker_path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(StoreError::new(
+                ErrorCode::MigrationFailed,
+                format!("data directory marker cannot be read: {error}"),
+            ));
+        }
+    };
+    let marker: DataDirectoryMarker = serde_json::from_str(&raw).map_err(|_| {
+        StoreError::new(
+            ErrorCode::MigrationFailed,
+            "data directory marker is not valid JSON for this format",
+        )
+    })?;
+    marker.validate()?;
+    Ok(Some(marker))
+}
+
+/// Write the marker for a directory that has none. It is never written over an
+/// existing file: the writer lock already excludes another host, and a marker
+/// that appeared anyway is read and validated instead.
+fn write_data_directory_marker(paths: &StorePaths) -> Result<(), StoreError> {
+    let marker = DataDirectoryMarker::current();
+    let mut rendered = serde_json::to_string_pretty(&marker).map_err(|_| {
+        StoreError::new(
+            ErrorCode::StorageWriteFailed,
+            "data directory marker cannot be serialized",
+        )
+    })?;
+    rendered.push('\n');
+    let marker_path = paths.marker_path();
+    match fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&marker_path)
+    {
+        Ok(mut file) => {
+            file.write_all(rendered.as_bytes()).map_err(|error| {
+                StoreError::new(
+                    ErrorCode::StorageWriteFailed,
+                    format!("data directory marker cannot be written: {error}"),
+                )
+            })?;
+            file.sync_all().map_err(|error| {
+                StoreError::new(
+                    ErrorCode::StorageWriteFailed,
+                    format!("data directory marker cannot be flushed: {error}"),
+                )
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another writer raced us despite the lock: validate what is there.
+            read_data_directory_marker(paths).map(|_| ())
+        }
+        Err(error) => Err(StoreError::new(
+            ErrorCode::StorageWriteFailed,
+            format!("data directory marker cannot be created: {error}"),
+        )),
+    }
 }
 
 async fn run_migrations(pool: &SqlitePool, fault_plan: &StoreFaultPlan) -> Result<(), StoreError> {
