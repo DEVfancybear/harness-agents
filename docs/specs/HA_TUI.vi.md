@@ -823,7 +823,7 @@ harness-cli (controller):
   t_a_pasted_path_is_quoted_once
 harness-cli (wire, fixture SSE thật):
   i03_a_named_file_reaches_the_model_inside_the_message
-harness-cli: 242 passed; 0 failed (cargo test -p harness-cli --bin ha)
+harness-cli: 263 passed; 0 failed; 1 ignored (cargo test -p harness-cli --bin ha --locked); lượt đó là lượt thêm file attachment, trước khi menu `/` và cổng duyệt mở rộng được gộp vào cùng cây
 ```
 
 ### 3h.4. Khiếm khuyết bắt được trong lượt này — **chưa sửa, ghi lại thay vì im lặng**
@@ -1056,13 +1056,17 @@ harness-cli (khung hình đã vẽ, tui/mod.rs):
 harness-cli (panel + viền):
   t06_every_panel_offers_the_turn_grant_and_says_how_far_it_reaches -> cả panel ghi và panel đọc;
                                                                        panel đọc vẫn ghi "· chỉ đọc"
-harness-cli: 263 passed; 1 failed; 1 ignored (cargo test -p harness-cli --bin ha --locked)
+harness-cli: 263 passed; 0 failed; 1 ignored (cargo test -p harness-cli --bin ha --locked)
 ```
 
-Con số 263/1 là **số đo có ngày** (lượt này, toolchain 1.97.1, Windows): 260 test của lượt trước,
+Con số 263 là **số đo có ngày** (lượt này, toolchain 1.97.1, Windows): 260 test của lượt trước,
 **+4** test mới (cổng, panel, khung hình, continuation), **−1** test bị xoá vì nó khẳng định đúng
-hợp đồng vừa đổi. Test đỏ vẫn là `k03_a_saved_key_is_restricted_to_this_account_by_an_acl` — đỏ
-**đúng như thiết kế** trong phiên bị từ chối `icacls` (mục 3d.4), không liên quan tới cổng duyệt.
+hợp đồng vừa đổi. Lượt đo này cũng chạy `cargo test -p harness-cli --locked` **cả suite** (263 unit,
+interactive_launch 19, interactive_session 13, phase_p0..p7 165): tất cả xanh, trừ một lần
+`p3_s04_process_output_timeout_cancel_and_descendant_cleanup_are_bounded` đỏ vì tải máy — nó khẳng
+định một tiến trình kết thúc trong 5 s, và chạy riêng thì pass 2/2 lần. Không phải hồi quy của cổng
+duyệt. `k03_a_saved_key_is_restricted_to_this_account_by_an_acl` (mục 3d.4) lượt này **pass** —
+phiên này có quyền `icacls`.
 
 ### 3j.5. `a` **không** làm gì, và ranh giới bằng chứng
 
