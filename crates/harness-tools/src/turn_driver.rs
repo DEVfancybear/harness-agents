@@ -1182,7 +1182,7 @@ fn malformed_call(call: &NormalizedToolCall) -> Option<&'static str> {
 }
 
 /// Render a bounded tool result as the message the model receives next.
-fn render_tool_output(name: &str, output: &ToolOutput) -> String {
+pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
     let body = match output {
         ToolOutput::ReadFile {
             path,

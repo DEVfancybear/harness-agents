@@ -291,6 +291,12 @@ pub struct RunRequest {
     /// They travel as content blocks, not as text, and the user message names them so
     /// the model can refer to what it was shown.
     pub images: Vec<harness_providers::ImageAttachment>,
+    /// Committed tool results recovered from an interrupted run.
+    ///
+    /// They are appended to the first step's conversation (assistant call plus
+    /// paired results) so a resumed turn sees what already executed instead of
+    /// rerunning it.
+    pub recovered_messages: Vec<ProviderMessage>,
 }
 
 impl RunRequest {
@@ -313,6 +319,7 @@ impl RunRequest {
             tool_schemas: Vec::new(),
             memory: None,
             images: Vec::new(),
+            recovered_messages: Vec::new(),
         }
     }
     #[must_use]
@@ -342,6 +349,13 @@ impl RunRequest {
     #[must_use]
     pub fn with_images(mut self, images: Vec<harness_providers::ImageAttachment>) -> Self {
         self.images = images;
+        self
+    }
+
+    /// Attach committed tool results recovered from an interrupted run.
+    #[must_use]
+    pub fn with_recovered_messages(mut self, messages: Vec<ProviderMessage>) -> Self {
+        self.recovered_messages = messages;
         self
     }
 }
@@ -763,6 +777,10 @@ impl RuntimeService {
             ProviderMessage::new(MessageRole::System, request.system_policy.clone()),
             user_message,
         ];
+        // A resumed turn replays committed tool results before this step's own
+        // appended messages, so the model sees what already executed exactly
+        // once and the pairing stays valid.
+        conversation.extend(request.recovered_messages.clone());
         // Continuation turns carry the tool results back to the model.
         conversation.extend(appended);
         // The protocol is validated before anything is frozen or dispatched: a
@@ -883,6 +901,13 @@ impl RuntimeService {
         let mut last_error = None;
         while attempts <= config.max_attempts {
             if cancellation.is_cancelled() {
+                // The reservation for this attempt exists but the attempt never
+                // dispatched: release it instead of leaving the bound charged.
+                if let Some(reservation_id) = &attempt_reservation
+                    && let Some((ledger, _)) = &self.budget
+                {
+                    ledger.release(reservation_id).await?;
+                }
                 last_error = Some(RuntimeError::new(
                     ErrorCode::ProviderCanceled,
                     "run canceled before provider dispatch",
@@ -894,6 +919,13 @@ impl RuntimeService {
                     .validate_contribution(contribution)
                     .await
             {
+                // Nothing dispatched, so the attempt's bound is released rather
+                // than settled as unknown usage.
+                if let Some(reservation_id) = &attempt_reservation
+                    && let Some((ledger, _)) = &self.budget
+                {
+                    ledger.release(reservation_id).await?;
+                }
                 last_error = Some(RuntimeError::new(
                     error.code(),
                     "memory changed after freeze; rebuild context before dispatch",
@@ -1357,12 +1389,9 @@ impl RuntimeService {
                 "continuation task does not match source session",
             ));
         }
-        let request =
-            if let Some(packet) = self.store.latest_context_packet(source_session_id).await? {
-                request.with_continuation_context(packet.packet.content)
-            } else {
-                request
-            };
+        let request = self
+            .prepare_continuation(source_session_id, request)
+            .await?;
         let result = self.run_streaming(request, cancellation, sink).await?;
         self.store
             .record_continuation_link(source_session_id, &result.session_id, &result.task_id)
@@ -1388,17 +1417,107 @@ impl RuntimeService {
                 "continuation task does not match source session",
             ));
         }
+        let request = self
+            .prepare_continuation(source_session_id, request)
+            .await?;
+        let result = self.run(request).await?;
+        self.store
+            .record_continuation_link(source_session_id, &result.session_id, &result.task_id)
+            .await?;
+        Ok(result)
+    }
+
+    /// Attach the recovered context and any committed tool results to a
+    /// continuation request.
+    async fn prepare_continuation(
+        &self,
+        source_session_id: &SessionId,
+        request: RunRequest,
+    ) -> Result<RunRequest, RuntimeError> {
         let request =
             if let Some(packet) = self.store.latest_context_packet(source_session_id).await? {
                 request.with_continuation_context(packet.packet.content)
             } else {
                 request
             };
-        let result = self.run(request).await?;
-        self.store
-            .record_continuation_link(source_session_id, &result.session_id, &result.task_id)
-            .await?;
-        Ok(result)
+        let recovered = self.recovered_messages(source_session_id).await?;
+        Ok(if recovered.is_empty() {
+            request
+        } else {
+            request.with_recovered_messages(recovered)
+        })
+    }
+
+    /// Rebuild the paired assistant call and tool results of the interrupted
+    /// step from the provider attempt and the receipt events.
+    ///
+    /// A crash between a committed receipt and the next step must not lose the
+    /// result or rerun the tool: the recovered batch is injected into the
+    /// continuation's first step. Only calls with a settled receipt are
+    /// answered; a call killed before settlement is left to the normal
+    /// reconciliation path. The assistant message is rebuilt from the attempt's
+    /// streamed events, because the step that would normally carry it was never
+    /// frozen.
+    async fn recovered_messages(
+        &self,
+        source_session_id: &SessionId,
+    ) -> Result<Vec<ProviderMessage>, RuntimeError> {
+        let views = self.store.recovered_tool_results(source_session_id).await?;
+        if views.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(frozen) = self
+            .store
+            .list_frozen_requests(source_session_id)
+            .await?
+            .pop()
+        else {
+            return Ok(Vec::new());
+        };
+        let attempts = self.store.list_provider_attempts(source_session_id).await?;
+        let Some(attempt) = attempts.iter().rfind(|attempt| {
+            attempt.request_id == frozen.request_id && attempt.state == "completed"
+        }) else {
+            return Ok(Vec::new());
+        };
+        let Ok(events) = serde_json::from_value::<Vec<ProviderStreamEvent>>(attempt.events.clone())
+        else {
+            return Ok(Vec::new());
+        };
+        let Ok(response) = harness_providers::assemble_stream(&events) else {
+            return Ok(Vec::new());
+        };
+        if response.tool_calls.is_empty() {
+            return Ok(Vec::new());
+        }
+        let calls = response
+            .tool_calls
+            .iter()
+            .map(|call| harness_providers::ProviderToolCall {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut messages = vec![ProviderMessage::assistant_with_calls(
+            response.text.clone(),
+            calls,
+        )];
+        for call in &response.tool_calls {
+            if let Some(view) = views
+                .iter()
+                .find(|view| view.call_id.as_deref() == Some(call.call_id.as_str()))
+            {
+                messages.push(ProviderMessage::tool_result(
+                    call.call_id.clone(),
+                    view.text.clone(),
+                ));
+            }
+        }
+        if messages.len() == 1 {
+            return Ok(Vec::new());
+        }
+        Ok(messages)
     }
 
     pub async fn offline_replay(

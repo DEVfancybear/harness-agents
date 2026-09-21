@@ -405,6 +405,18 @@ pub struct ToolIntentRecord {
     pub intent_sequence: u64,
 }
 
+/// One committed tool result a later step can replay after a crash.
+///
+/// The text is the same bounded, redacted view the model was given; it is
+/// recorded with the receipt event so a continuation does not have to parse the
+/// artifact or rerun the tool.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveredToolResult {
+    pub seq: u64,
+    pub call_id: Option<String>,
+    pub text: String,
+}
+
 /// Everything required to durably consume an approval and record an intent.
 #[derive(Clone, Debug)]
 pub struct ToolIntentCommit {

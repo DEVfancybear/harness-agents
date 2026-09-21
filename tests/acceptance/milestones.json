@@ -397,7 +397,9 @@
             "a11_approval_grant",
             "m4_01_descriptor_registry_is_versioned",
             "m4_01_call_id_is_bound_to_intent_and_receipt",
-            "m4_01_tools_schema_upgrade"
+            "m4_01_tools_schema_upgrade",
+            "a03_receipt_before_checkpoint",
+            "a04_effect_before_receipt"
           ]
         },
         {
@@ -424,7 +426,9 @@
         "a11_approval_grant",
         "m4_01_descriptor_registry_is_versioned",
         "m4_01_call_id_is_bound_to_intent_and_receipt",
-        "m4_01_tools_schema_upgrade"
+        "m4_01_tools_schema_upgrade",
+        "a03_receipt_before_checkpoint",
+        "a04_effect_before_receipt"
       ],
       "unit_tests": [],
       "fixtures": ["crates/harness-cli/tests/milestone_m4.rs"],
@@ -466,8 +470,20 @@
         "phase_p5::strengthening::p5_c15_stale_worker_generation_cannot_commit"
       ]
     },
-    { "id": "A03", "owner_milestones": ["M4"], "planned_test": "a03_receipt_before_checkpoint", "status": "planned" },
-    { "id": "A04", "owner_milestones": ["M4"], "planned_test": "a04_effect_before_receipt", "status": "planned" },
+    {
+      "id": "A03",
+      "owner_milestones": ["M4"],
+      "planned_test": "a03_receipt_before_checkpoint",
+      "status": "implemented",
+      "selectors": ["milestone_m4::a03_receipt_before_checkpoint"]
+    },
+    {
+      "id": "A04",
+      "owner_milestones": ["M4"],
+      "planned_test": "a04_effect_before_receipt",
+      "status": "implemented",
+      "selectors": ["milestone_m4::a04_effect_before_receipt"]
+    },
     {
       "id": "A05",
       "owner_milestones": ["M1"],

@@ -18,7 +18,7 @@ use harness_providers::{
 };
 use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
 use harness_session::{AdmitInputRequest, SessionService};
-use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
+use harness_store_sqlite::{SqliteStore, ToolIntentStatus, WriterOpenOptions};
 use harness_tools::{
     ApprovalMode, CodingToolAction, EffectClass, ToolExecutionService, ToolRequest, TurnDriver,
     TurnLimits, TurnObserver, TurnOptions, TurnProgress, coding_tool_descriptors,
@@ -35,7 +35,7 @@ use harness_types::{
 // ---------------------------------------------------------------------------
 
 struct Bench {
-    _temp: tempfile::TempDir,
+    temp: tempfile::TempDir,
     data_dir: PathBuf,
     workspace: PathBuf,
     /// One identity per fixture root: registering the same root under two
@@ -77,7 +77,7 @@ fn bench() -> Bench {
     git(&workspace, &["commit", "-m", "fixture baseline"]);
     let data_dir = temp.path().join("data");
     Bench {
-        _temp: temp,
+        temp,
         data_dir,
         workspace,
         project_id: ProjectId::generate(),
@@ -563,6 +563,238 @@ async fn m4_01_tools_schema_upgrade() {
     assert_eq!(
         view.receipt.expect("receipt").call_id.as_deref(),
         Some("call-upgrade")
+    );
+    drop(tools);
+    close(store).await;
+}
+
+// ---------------------------------------------------------------------------
+// M4-01b: crash boundaries (A03 receipt-before-checkpoint, A04 effect-before-receipt)
+// ---------------------------------------------------------------------------
+
+fn fixture_host() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_m4_fixture_host"))
+}
+
+fn wait_for_file(path: &Path, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+fn kill_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+async fn only_session(store: &Arc<SqliteStore>) -> (SessionId, TaskId) {
+    let summaries = store.list_sessions().await.expect("sessions");
+    let summary = summaries
+        .iter()
+        .max_by_key(|summary| summary.next_sequence)
+        .expect("one session exists");
+    (summary.session_id.clone(), summary.task_id.clone())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one crash scenario, told in order
+async fn a03_receipt_before_checkpoint() {
+    let bench = bench();
+    let barrier = bench.temp.path().join("a03.barrier");
+    let mut child = Command::new(fixture_host())
+        .args([
+            "--mode",
+            "receipt-barrier",
+            "--data-dir",
+            bench.data_dir.to_str().unwrap(),
+            "--workspace",
+            bench.workspace.to_str().unwrap(),
+            "--project-id",
+            bench.project_id.as_str(),
+            "--barrier",
+            barrier.to_str().unwrap(),
+        ])
+        .spawn()
+        .expect("fixture host starts");
+    assert!(
+        wait_for_file(&barrier, Duration::from_mins(1)),
+        "the fixture must settle the patch and reach the barrier"
+    );
+    // Hard kill between the receipt commit and the next step: no cleanup runs.
+    kill_child(&mut child);
+
+    let store = bench.open_store().await;
+    let (session, task) = only_session(&store).await;
+    assert_eq!(
+        file_text(&bench.workspace),
+        "FIXED parser\r\n",
+        "the patch happened exactly once"
+    );
+    let receipts = SessionService::new(Arc::clone(&store))
+        .recover(&session)
+        .await
+        .expect("recovery")
+        .receipts;
+    assert_eq!(receipts.len(), 1, "the receipt survived the crash");
+    assert_eq!(receipts[0].call_id.as_deref(), Some("call-1"));
+    assert!(
+        store
+            .pending_tool_intents(&session)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a settled intent is not pending work"
+    );
+
+    // The next turn must receive the committed tool result and must not rerun it.
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        ProviderStreamEvent::started(),
+        ProviderStreamEvent::text("continued after the crash"),
+        ProviderStreamEvent::completed("stop"),
+    ]]));
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let request = RunRequest::new(
+        SessionId::generate(),
+        task,
+        InputId::generate(),
+        "continue".to_owned(),
+        observe_workspace(bench.project_id.clone(), &bench.workspace).unwrap(),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)));
+    let outcome = driver
+        .run_turn_continuing(
+            &session,
+            request,
+            TurnOptions {
+                workspace_root: bench.workspace.clone(),
+                actor_id: "m4.test".to_owned(),
+                approvals: ApprovalMode::Auto,
+                limits: TurnLimits::default(),
+            },
+            Arc::new(SilentObserver),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("continuation runs");
+    assert_eq!(outcome.stop, harness_tools::TurnStop::Final);
+
+    let seen = provider.seen();
+    let messages = &seen.first().expect("one provider call").messages;
+    assert!(
+        messages.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.tool_calls.len() == 1
+                && message.tool_calls[0].call_id == "call-1"
+        }),
+        "the recovered assistant call is replayed: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|message| {
+            message.role == MessageRole::Tool
+                && message.tool_call_id.as_deref() == Some("call-1")
+                && message.content.contains("apply_patch")
+        }),
+        "the committed tool result is paired into the next step: {messages:?}"
+    );
+    // And the tool still did not execute twice.
+    let receipts = SessionService::new(Arc::clone(&store))
+        .recover(&session)
+        .await
+        .expect("recovery after continuation")
+        .receipts;
+    assert_eq!(receipts.len(), 1, "no second execution, no second receipt");
+    assert_eq!(file_text(&bench.workspace), "FIXED parser\r\n");
+    drop(driver);
+    close(store).await;
+}
+
+#[tokio::test]
+async fn a04_effect_before_receipt() {
+    let bench = bench();
+    let marker = bench.temp.path().join("a04.marker");
+    let mut child = Command::new(fixture_host())
+        .args([
+            "--mode",
+            "marker-process",
+            "--data-dir",
+            bench.data_dir.to_str().unwrap(),
+            "--workspace",
+            bench.workspace.to_str().unwrap(),
+            "--project-id",
+            bench.project_id.as_str(),
+            "--marker",
+            marker.to_str().unwrap(),
+        ])
+        .spawn()
+        .expect("fixture host starts");
+    assert!(
+        wait_for_file(&marker, Duration::from_mins(1)),
+        "the fixture process must write its marker"
+    );
+    // Hard kill while the side effect exists and the receipt does not.
+    kill_child(&mut child);
+
+    let store = bench.open_store().await;
+    let (session, _) = only_session(&store).await;
+    let recovered = SessionService::new(Arc::clone(&store))
+        .recover(&session)
+        .await
+        .expect("recovery");
+    assert!(
+        recovered.receipts.is_empty(),
+        "no receipt was committed before the crash"
+    );
+    let pending = store.pending_tool_intents(&session).await.unwrap();
+    assert_eq!(pending.len(), 1, "the intent is the pending handoff");
+    assert_eq!(pending[0].status, ToolIntentStatus::Recorded);
+    let marker_lines = || std::fs::read_to_string(&marker).unwrap().lines().count();
+    assert_eq!(marker_lines(), 1);
+
+    // Explicit reconciliation settles the unknown outcome without a rerun.
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let view = tools
+        .reconcile_pending(&session, &pending[0].tool_execution_id)
+        .await
+        .expect("reconcile");
+    let receipt = view.receipt.clone().expect("reconcile writes a receipt");
+    assert_eq!(receipt.outcome_state, ToolOutcomeState::OutcomeUnknown);
+    assert!(matches!(
+        view.output,
+        harness_tools::ToolOutput::OutcomeUnknown { .. }
+    ));
+    let reconciled = store
+        .tool_intent(&pending[0].tool_execution_id)
+        .await
+        .unwrap()
+        .expect("intent still exists");
+    assert_eq!(reconciled.status, ToolIntentStatus::OutcomeUnknown);
+    assert_eq!(marker_lines(), 1, "reconciliation never reruns the process");
+    assert!(
+        store
+            .pending_tool_intents(&session)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the reconciled intent is no longer pending"
+    );
+    let after = SessionService::new(Arc::clone(&store))
+        .recover(&session)
+        .await
+        .expect("recovery after reconcile");
+    assert_eq!(
+        after.receipts.len(),
+        1,
+        "reconcile writes exactly one receipt"
     );
     drop(tools);
     close(store).await;

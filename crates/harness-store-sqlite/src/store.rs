@@ -23,8 +23,8 @@ use crate::{
     ContextCheckpointRecord, ContextPacketRecord, ContinuationLinkRecord, DataDirectoryMarker,
     FrozenRequestRecord, HostFence, PersistedPluginManifest, ProjectRegistrationRecord,
     ProviderAttemptRecord, PublishedArtifact, RUNTIME_SCHEMA_VERSION, ReceiptAck, ReceiptCommit,
-    RuntimeCommandRecord, RuntimeCommandState, STORE_SCHEMA_VERSION, SessionSummary,
-    SnapshotRecord, SourceWorkMarker, StoreDiagnostics, StoreError, StoreFaultPlan,
+    RecoveredToolResult, RuntimeCommandRecord, RuntimeCommandState, STORE_SCHEMA_VERSION,
+    SessionSummary, SnapshotRecord, SourceWorkMarker, StoreDiagnostics, StoreError, StoreFaultPlan,
     StoreFaultPoint, StorePaths, TOOLS_SCHEMA_VERSION, ToolApprovalBinding, ToolApprovalRecord,
     ToolApprovalState, ToolIntentCommit, ToolIntentRecord, ToolIntentStatus, ToolSettlementCommit,
     ToolTaskUpdateCommit, WriterOpenOptions,
@@ -1292,6 +1292,61 @@ impl SqliteStore {
                 error,
             )
         })
+    }
+
+    /// Committed tool results of one session, oldest first.
+    ///
+    /// A continuation after a crash replays these as paired tool messages so the
+    /// next model step sees what was already executed instead of rerunning it.
+    pub async fn recovered_tool_results(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<RecoveredToolResult>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT sequence, event_json FROM events WHERE session_id = ? ORDER BY sequence",
+        )
+        .bind(session_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "list recovered tool results",
+                error,
+            )
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            let seq = to_u64(row_get::<i64>(&row, "sequence")?, "receipt sequence")?;
+            let event: Value = serde_json::from_str(&row_get::<String>(&row, "event_json")?)
+                .map_err(|_| {
+                    StoreError::new(
+                        ErrorCode::StorageWriteFailed,
+                        "stored receipt event is invalid",
+                    )
+                })?;
+            if event.get("event_type").and_then(Value::as_str) != Some("receipt.recorded") {
+                continue;
+            }
+            let Some(view) = event
+                .get("payload")
+                .and_then(|payload| payload.get("model_view"))
+            else {
+                continue;
+            };
+            let Some(text) = view.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            results.push(RecoveredToolResult {
+                seq,
+                call_id: view
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                text: text.to_owned(),
+            });
+        }
+        Ok(results)
     }
 
     /// Pending durable intents are the restart handoff for work that cannot be
