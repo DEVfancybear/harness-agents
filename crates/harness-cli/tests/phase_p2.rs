@@ -9,7 +9,7 @@ use harness_providers::{
     StaticCredentialResolver, assemble_stream,
 };
 use harness_runtime::{
-    AgentState, FailingSummaryProvider, RunRequest, RuntimeConfig, RuntimeService,
+    AgentState, FailingSummaryProvider, RunCommand, RunRequest, RuntimeConfig, RuntimeService,
 };
 use harness_session::{
     ContextBlock, ContextBlockKind, ContextBuildRequest, ContextBuilder, SessionService,
@@ -134,16 +134,16 @@ fn p2_s01_runtime_contracts_and_state_machine_are_versioned() {
     let config = RuntimeConfig::default();
     config.validate().expect("default runtime config is valid");
     assert_eq!(
-        AgentState::Idle.transition(AgentState::Running).unwrap(),
+        AgentState::Idle.transition(RunCommand::Start).unwrap(),
         AgentState::Running
     );
     assert_eq!(
-        AgentState::Running.transition(AgentState::Paused).unwrap(),
+        AgentState::Running.transition(RunCommand::Pause).unwrap(),
         AgentState::Paused
     );
     assert_eq!(
         AgentState::Idle
-            .transition(AgentState::Disposed)
+            .transition(RunCommand::Dispose)
             .unwrap_err()
             .code(),
         ErrorCode::InvalidStateTransition

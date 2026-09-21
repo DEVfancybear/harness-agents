@@ -99,7 +99,9 @@ fn p0_f03_contract_schemas_are_generated_from_real_types() {
         "generated schemas must retain LF in every checkout"
     );
     let documents = generated_schema_documents();
-    assert_eq!(documents.len(), 9);
+    // M0 added the serializable error report to the committed schema set; the
+    // drift check below is unchanged and covers every document.
+    assert_eq!(documents.len(), 10);
     for document in documents {
         let mut expected =
             serde_json::to_string_pretty(&document.value).expect("schema serializes");

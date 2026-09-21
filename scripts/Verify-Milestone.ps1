@@ -1,0 +1,405 @@
+#Requires -Version 7.0
+#
+# Milestone gate (M0-M12). It runs the required checks for one milestone and its
+# prerequisite closure, using the registry in tests/acceptance/milestones.json.
+#
+# The gate reuses the accepted shape of scripts/Verify-Phase.ps1: every step is a
+# checked command, required tests are proven by exact discovery and by an `ok`
+# result line, and missing, ignored or zero-test selectors exit nonzero.
+#
+# Usage:
+#   pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M0 -SelfTest
+#   pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M0
+[CmdletBinding()]
+param(
+    [string] $Milestone = 'M0',
+    [string] $RepositoryRoot = (Join-Path $PSScriptRoot '..'),
+    [switch] $SelfTest,
+    [switch] $Json
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function New-GateError {
+    param(
+        [Parameter(Mandatory)] [string] $Code,
+        [Parameter(Mandatory)] [string] $Message
+    )
+    return "$Code`: $Message"
+}
+
+function Invoke-CheckedCommand {
+    param(
+        [Parameter(Mandatory)] [string] $Name,
+        [Parameter(Mandatory)] [string] $FilePath,
+        [Parameter(Mandatory)] [string[]] $Arguments
+    )
+
+    $output = @(& $FilePath @Arguments 2>&1 | ForEach-Object { $_.ToString() })
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "$Name exited $exitCode`n$($output -join [Environment]::NewLine)")
+    }
+    return [pscustomobject]@{
+        Name = $Name
+        Arguments = $Arguments
+        Output = $output
+        ExitCode = $exitCode
+    }
+}
+
+function Get-DiscoveredTestNames {
+    param([Parameter(Mandatory)] [AllowEmptyCollection()] [AllowEmptyString()] [string[]] $Output)
+
+    $names = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($line in $Output) {
+        if ($line -match '^\s*(?<name>[A-Za-z0-9_:-]+): test$') {
+            [void] $names.Add($Matches.name)
+        }
+    }
+    return @($names | Sort-Object)
+}
+
+function Assert-RequiredTestDiscovery {
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]] $Discovered,
+        [Parameter(Mandatory)] [string[]] $Required
+    )
+
+    if ($Required.Count -eq 0) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message 'milestone registry has no required tests')
+    }
+    if ($Discovered.Count -eq 0) {
+        throw (New-GateError -Code 'gate_test_discovery_empty' -Message 'cargo test discovery returned zero tests')
+    }
+    foreach ($testName in $Required) {
+        if ($testName -notin $Discovered) {
+            throw (New-GateError -Code 'gate_configuration_error' -Message "required test was not discovered: $testName")
+        }
+    }
+}
+
+function Assert-RequiredTestResult {
+    param(
+        [Parameter(Mandatory)] [string] $TestName,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [AllowEmptyString()] [string[]] $Output
+    )
+
+    $escaped = [regex]::Escape($TestName)
+    if (($Output -join "`n") -match "(?m)^test\s+$escaped\s+\.\.\.\s+ignored\b") {
+        throw (New-GateError -Code 'gate_required_test_ignored' -Message "required test is ignored: $TestName")
+    }
+    if (($Output -join "`n") -notmatch "(?m)^test\s+$escaped\s+\.\.\.\s+ok\b") {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "required test did not report success: $TestName")
+    }
+}
+
+function Resolve-RepositoryFile {
+    param(
+        [Parameter(Mandatory)] [string] $Root,
+        [Parameter(Mandatory)] [string] $RelativePath
+    )
+
+    $candidate = [System.IO.Path]::GetFullPath((Join-Path $Root $RelativePath))
+    $relative = [System.IO.Path]::GetRelativePath($Root, $candidate)
+    if ($relative -eq '..' -or $relative.StartsWith("..$([System.IO.Path]::DirectorySeparatorChar)") -or [System.IO.Path]::IsPathRooted($relative)) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "registry path escapes repository: $RelativePath")
+    }
+    if (-not (Test-Path -LiteralPath $candidate)) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "required fixture or artifact is missing: $RelativePath")
+    }
+    return $candidate
+}
+
+function Get-SourceTreeDigest {
+    param(
+        [Parameter(Mandatory)] [string] $Root,
+        [Parameter(Mandatory)] [string] $MilestoneId
+    )
+
+    $paths = @(& git -C $Root ls-files --cached --others --exclude-standard)
+    if ($LASTEXITCODE -ne 0) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message 'git could not enumerate the source tree')
+    }
+    if ($paths.Count -eq 0) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message 'source tree enumeration returned zero files')
+    }
+    [string[]] $metadataPaths = @(
+        "docs/evidence/$MilestoneId.vi.md",
+        "docs/handoffs/CURRENT.vi.md"
+    )
+    [string[]] $normalizedPaths = @($paths | ForEach-Object { ([string] $_).Replace('\', '/') })
+    [string[]] $excludedPaths = @($normalizedPaths | Where-Object { $metadataPaths -contains $_ })
+    [string[]] $orderedPaths = @($normalizedPaths | Where-Object { $metadataPaths -notcontains $_ })
+    if ($orderedPaths.Count -eq 0) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message 'source tree has no non-metadata files to hash')
+    }
+    [System.Array]::Sort($orderedPaths, [System.StringComparer]::Ordinal)
+    [System.Array]::Sort($excludedPaths, [System.StringComparer]::Ordinal)
+
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $utf8 = [System.Text.UTF8Encoding]::new($false)
+        $fileCount = 0
+        foreach ($relativePath in $orderedPaths) {
+            if ([string]::IsNullOrWhiteSpace($relativePath)) {
+                throw (New-GateError -Code 'gate_configuration_error' -Message 'source tree contains an empty path')
+            }
+            $absolutePath = [System.IO.Path]::GetFullPath((Join-Path $Root $relativePath))
+            $relativeCheck = [System.IO.Path]::GetRelativePath($Root, $absolutePath)
+            if ($relativeCheck -eq '..' -or $relativeCheck.StartsWith("..$([System.IO.Path]::DirectorySeparatorChar)") -or
+                [System.IO.Path]::IsPathRooted($relativeCheck) -or -not (Test-Path -LiteralPath $absolutePath -PathType Leaf)) {
+                throw (New-GateError -Code 'gate_configuration_error' -Message "source tree path is unsafe or missing: $relativePath")
+            }
+            $contentHash = (Get-FileHash -LiteralPath $absolutePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $record = $relativePath.Replace('\', '/') + [char]0 + $contentHash + "`n"
+            $bytes = $utf8.GetBytes($record)
+            $buffer = [byte[]]::new($bytes.Length)
+            [void] $hasher.TransformBlock($bytes, 0, $bytes.Length, $buffer, 0)
+            $fileCount++
+        }
+        [void] $hasher.TransformFinalBlock([byte[]]::new(0), 0, 0)
+        $digest = [Convert]::ToHexString($hasher.Hash).ToLowerInvariant()
+        return [pscustomobject]@{
+            algorithm = 'sha256'
+            file_count = $fileCount
+            digest = "sha256:$digest"
+            scope = 'workspace source excluding milestone evidence and CURRENT handoff'
+            excluded_paths = $excludedPaths
+        }
+    } finally {
+        $hasher.Dispose()
+    }
+}
+
+function Invoke-NegativeControl {
+    param(
+        [Parameter(Mandatory)] [string] $Name,
+        [Parameter(Mandatory)] [string] $ExpectedCode,
+        [Parameter(Mandatory)] [scriptblock] $Action
+    )
+
+    try {
+        & $Action
+    } catch {
+        if ($_.Exception.Message.StartsWith("$ExpectedCode`:")) {
+            Write-Output "NEGATIVE_CONTROL_OK: $Name"
+            return
+        }
+        throw
+    }
+    throw "NEGATIVE_CONTROL_FAILED: $Name"
+}
+
+function Read-MilestoneRegistry {
+    param([Parameter(Mandatory)] [string] $Root)
+
+    $registryPath = Resolve-RepositoryFile -Root $Root -RelativePath 'tests/acceptance/milestones.json'
+    try {
+        $registry = Get-Content -LiteralPath $registryPath -Raw -Encoding utf8 | ConvertFrom-Json
+    } catch {
+        throw (New-GateError -Code 'gate_configuration_error' -Message 'milestone registry is not valid JSON')
+    }
+    if ($registry.schema_version -ne 1 -or $registry.registry_kind -cne 'milestone-registry') {
+        throw (New-GateError -Code 'gate_configuration_error' -Message 'milestone registry has an unsupported schema or kind')
+    }
+    return $registry
+}
+
+function Resolve-Milestone {
+    param(
+        [Parameter(Mandatory)] $Registry,
+        [Parameter(Mandatory)] [string] $MilestoneId
+    )
+
+    $milestone = @($Registry.milestones | Where-Object { $_.id -ceq $MilestoneId })
+    if ($milestone.Count -ne 1) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "unknown milestone: $MilestoneId")
+    }
+    return $milestone[0]
+}
+
+function Resolve-MilestoneClosure {
+    param(
+        [Parameter(Mandatory)] $Registry,
+        [Parameter(Mandatory)] [string] $MilestoneId
+    )
+
+    $closure = [System.Collections.Generic.List[string]]::new()
+    $pending = [System.Collections.Generic.Queue[string]]::new()
+    $pending.Enqueue($MilestoneId)
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    while ($pending.Count -gt 0) {
+        $current = $pending.Dequeue()
+        if (-not $seen.Add($current)) {
+            continue
+        }
+        $entry = Resolve-Milestone -Registry $Registry -MilestoneId $current
+        $closure.Add($current)
+        foreach ($prerequisite in @($entry.prerequisites)) {
+            $pending.Enqueue([string] $prerequisite)
+        }
+    }
+    return @($closure)
+}
+
+function Invoke-DependencyCheck {
+    param(
+        [Parameter(Mandatory)] [string] $Root,
+        [string[]] $ExtraEdges = @()
+    )
+
+    $arguments = @('run', '--quiet', '-p', 'harness-cli', '--bin', 'dependency_check', '--locked', '--', '--root', $Root)
+    foreach ($edge in $ExtraEdges) {
+        $arguments += @('--extra-edge', $edge)
+    }
+    $output = @(& cargo @arguments 2>&1 | ForEach-Object { $_.ToString() })
+    $exitCode = $LASTEXITCODE
+    return [pscustomobject]@{ ExitCode = $exitCode; Output = $output }
+}
+
+function Invoke-GateSelfTest {
+    param(
+        [Parameter(Mandatory)] [string] $Root,
+        [Parameter(Mandatory)] [string] $MilestoneId
+    )
+
+    $expectedTest = 'm0_01_retry_class_and_exit_codes_match_the_contract'
+    Invoke-NegativeControl -Name 'missing-selector' -ExpectedCode 'gate_configuration_error' -Action {
+        Assert-RequiredTestDiscovery -Discovered @('some_other_test') -Required @($expectedTest)
+    }
+    Invoke-NegativeControl -Name 'ignored-required-test' -ExpectedCode 'gate_required_test_ignored' -Action {
+        Assert-RequiredTestResult -TestName $expectedTest -Output @("test $expectedTest ... ignored")
+    }
+    Invoke-NegativeControl -Name 'command-nonzero' -ExpectedCode 'gate_configuration_error' -Action {
+        Invoke-CheckedCommand -Name 'synthetic-test' -FilePath (Join-Path $PSHOME 'pwsh') -Arguments @('-NoProfile', '-Command', 'exit 17')
+    }
+    Invoke-NegativeControl -Name 'zero-test-discovery' -ExpectedCode 'gate_test_discovery_empty' -Action {
+        Assert-RequiredTestDiscovery -Discovered @() -Required @($expectedTest)
+    }
+    Invoke-NegativeControl -Name 'unknown-milestone' -ExpectedCode 'gate_configuration_error' -Action {
+        $registry = Read-MilestoneRegistry -Root $Root
+        [void] (Resolve-Milestone -Registry $registry -MilestoneId 'M99')
+    }
+    $forbidden = Invoke-DependencyCheck -Root $Root -ExtraEdges @('harness-runtime->harness-tools')
+    if ($forbidden.ExitCode -eq 0) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message 'dependency checker accepted a forbidden edge')
+    }
+    Write-Output 'NEGATIVE_CONTROL_OK: dependency-edge'
+    Write-Output "MILESTONE_GATE_SELFTEST_OK: $MilestoneId"
+}
+
+if ($SelfTest) {
+    $selfTestRoot = (Resolve-Path -LiteralPath $RepositoryRoot).Path
+    Invoke-GateSelfTest -Root $selfTestRoot -MilestoneId $Milestone
+    exit 0
+}
+
+$repoRoot = (Resolve-Path -LiteralPath $RepositoryRoot).Path
+$registry = Read-MilestoneRegistry -Root $repoRoot
+$milestoneEntry = Resolve-Milestone -Registry $registry -MilestoneId $Milestone
+$closure = Resolve-MilestoneClosure -Registry $registry -MilestoneId $Milestone
+$integrationTarget = [string] $milestoneEntry.integration_target
+if ([string]::IsNullOrWhiteSpace($integrationTarget)) {
+    throw (New-GateError -Code 'gate_configuration_error' -Message "$Milestone has no integration target")
+}
+$requiredTests = @($milestoneEntry.required_tests | ForEach-Object { [string] $_ } | Sort-Object -Unique)
+if ($requiredTests.Count -eq 0) {
+    throw (New-GateError -Code 'gate_configuration_error' -Message "$Milestone has no required tests")
+}
+foreach ($fixture in @($milestoneEntry.fixtures)) {
+    [void] (Resolve-RepositoryFile -Root $repoRoot -RelativePath ([string] $fixture))
+}
+
+$results = [System.Collections.Generic.List[object]]::new()
+Push-Location -LiteralPath $repoRoot
+try {
+    foreach ($step in @(
+        @{ Name = 'format'; File = 'cargo'; Arguments = @('fmt', '--all', '--', '--check') },
+        @{ Name = 'clippy'; File = 'cargo'; Arguments = @('clippy', '--workspace', '--all-targets', '--locked', '--', '-D', 'warnings') },
+        @{ Name = 'build'; File = 'cargo'; Arguments = @('build', '--workspace', '--locked') },
+        @{ Name = 'workspace-tests'; File = 'cargo'; Arguments = @('test', '--workspace', '--all-targets', '--locked') }
+    )) {
+        [void] (Invoke-CheckedCommand -Name $step.Name -FilePath $step.File -Arguments $step.Arguments)
+        $results.Add([pscustomobject]@{ name = $step.Name; result = 'passed' })
+        if (-not $Json) { Write-Output "GATE_STEP_OK: $($step.Name)" }
+    }
+
+    $dependency = Invoke-DependencyCheck -Root $repoRoot
+    if ($dependency.ExitCode -ne 0) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "dependency allowlist rejected the workspace`n$($dependency.Output -join [Environment]::NewLine)")
+    }
+    $dependencyReport = ($dependency.Output -join "`n") | ConvertFrom-Json
+    if ($dependencyReport.status -cne 'ok') {
+        throw (New-GateError -Code 'gate_configuration_error' -Message 'dependency checker did not report ok')
+    }
+    $results.Add([pscustomobject]@{ name = 'dependency-allowlist'; result = 'passed'; edges = $dependencyReport.edge_count })
+    if (-not $Json) { Write-Output "GATE_STEP_OK: dependency-allowlist ($($dependencyReport.edge_count) edges)" }
+
+    # Unit suites: every declared unit test must exist and pass, so a milestone
+    # cannot pass with a zero-test unit suite.
+    $unitTests = @($milestoneEntry.unit_tests)
+    $unitPassed = 0
+    foreach ($unit in $unitTests) {
+        $package = [string] $unit.package
+        $testName = [string] $unit.test_name
+        $result = Invoke-CheckedCommand -Name "unit-test:$package::$testName" -FilePath 'cargo' -Arguments @('test', '-p', $package, '--locked', $testName, '--', '--exact')
+        Assert-RequiredTestResult -TestName $testName -Output $result.Output
+        $unitPassed++
+    }
+    $results.Add([pscustomobject]@{ name = 'unit-tests'; result = 'passed'; count = $unitPassed })
+    if (-not $Json) { Write-Output "GATE_STEP_OK: unit-tests ($unitPassed tests)" }
+
+    $discovery = Invoke-CheckedCommand -Name 'milestone-test-discovery' -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $integrationTarget, '--locked', '--', '--list')
+    $discovered = Get-DiscoveredTestNames -Output $discovery.Output
+    Assert-RequiredTestDiscovery -Discovered $discovered -Required $requiredTests
+    $results.Add([pscustomobject]@{ name = 'milestone-test-discovery'; result = 'passed'; discovered = $discovered.Count })
+    if (-not $Json) { Write-Output "GATE_STEP_OK: milestone-test-discovery ($($discovered.Count) tests)" }
+
+    foreach ($testName in $requiredTests) {
+        $result = Invoke-CheckedCommand -Name "required-test:$testName" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $integrationTarget, '--locked', $testName, '--', '--exact')
+        Assert-RequiredTestResult -TestName $testName -Output $result.Output
+    }
+    $results.Add([pscustomobject]@{ name = 'required-tests'; result = 'passed'; count = $requiredTests.Count })
+    if (-not $Json) { Write-Output "GATE_STEP_OK: required-tests ($($requiredTests.Count) tests)" }
+
+    # The closure contains the milestone itself, whose required tests already
+    # ran above; only its prerequisites are re-run as regressions.
+    foreach ($closureMilestone in @($closure | Where-Object { $_ -cne $Milestone })) {
+        $entry = Resolve-Milestone -Registry $registry -MilestoneId $closureMilestone
+        $entryTests = @($entry.required_tests | ForEach-Object { [string] $_ } | Sort-Object -Unique)
+        if ($entryTests.Count -eq 0) {
+            throw (New-GateError -Code 'gate_configuration_error' -Message "closure milestone $closureMilestone has no required tests")
+        }
+        $entryTarget = [string] $entry.integration_target
+        $entryDiscovery = Invoke-CheckedCommand -Name "closure-$closureMilestone-discovery" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $entryTarget, '--locked', '--', '--list')
+        $entryDiscovered = Get-DiscoveredTestNames -Output $entryDiscovery.Output
+        Assert-RequiredTestDiscovery -Discovered $entryDiscovered -Required $entryTests
+        foreach ($testName in $entryTests) {
+            $result = Invoke-CheckedCommand -Name "closure-$closureMilestone-test:$testName" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $entryTarget, '--locked', $testName, '--', '--exact')
+            Assert-RequiredTestResult -TestName $testName -Output $result.Output
+        }
+        $results.Add([pscustomobject]@{ name = "closure-$closureMilestone"; result = 'passed'; count = $entryTests.Count })
+        if (-not $Json) { Write-Output "GATE_STEP_OK: closure-$closureMilestone ($($entryTests.Count) tests)" }
+    }
+} finally {
+    Pop-Location
+}
+
+$sourceTree = Get-SourceTreeDigest -Root $repoRoot -MilestoneId $Milestone
+$summary = [ordered]@{
+    schema_version = 1
+    milestone = $Milestone
+    result = 'passed'
+    closure = $closure
+    source_tree = $sourceTree
+    required_test_count = $requiredTests.Count
+    discovered_test_count = $discovered.Count
+    steps = @($results)
+}
+if ($Json) {
+    $summary | ConvertTo-Json -Depth 8 -Compress
+} else {
+    Write-Output "GATE_RESULT_JSON: $($summary | ConvertTo-Json -Depth 8 -Compress)"
+}

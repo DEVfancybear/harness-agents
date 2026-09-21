@@ -23,8 +23,8 @@ use harness_store_sqlite::{
     SqliteStore, StoreError,
 };
 use harness_types::{
-    AgentRunId, ContentHash, ErrorCode, InputId, SessionId, SourceAuthority, TaskId,
-    WorkspaceObservation,
+    AgentRunId, ContentHash, ErrorCode, InputId, ProducerIdentity, ScopeContext, ScopeTarget,
+    SessionId, SourceAuthority, TaskId, WorkspaceObservation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -42,6 +42,78 @@ pub enum AgentState {
     Disposed,
 }
 
+/// The validated domain command of the run state machine. Callers never write
+/// a next state directly: they ask the machine to apply a command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunCommand {
+    Start,
+    Pause,
+    Resume,
+    Complete,
+    Fail,
+    Cancel,
+    Dispose,
+}
+
+impl RunCommand {
+    pub const ALL: [Self; 7] = [
+        Self::Start,
+        Self::Pause,
+        Self::Resume,
+        Self::Complete,
+        Self::Fail,
+        Self::Cancel,
+        Self::Dispose,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Complete => "complete",
+            Self::Fail => "fail",
+            Self::Cancel => "cancel",
+            Self::Dispose => "dispose",
+        }
+    }
+}
+
+/// What a transition means, for durable logging and for callers that must react.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunStateEvent {
+    Started,
+    Paused,
+    Resumed,
+    Completed,
+    Failed,
+    Canceled,
+    Disposed,
+}
+
+impl RunStateEvent {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "run.started",
+            Self::Paused => "run.paused",
+            Self::Resumed => "run.resumed",
+            Self::Completed => "run.completed",
+            Self::Failed => "run.failed",
+            Self::Canceled => "run.canceled",
+            Self::Disposed => "run.disposed",
+        }
+    }
+}
+
+/// The reducer result: the next state plus the events that explain it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunTransition {
+    pub next: AgentState,
+    pub events: Vec<RunStateEvent>,
+}
+
 impl AgentState {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -56,28 +128,62 @@ impl AgentState {
         }
     }
 
-    pub fn transition(self, next: Self) -> Result<Self, RuntimeError> {
-        let allowed = matches!(
-            (self, next),
-            (Self::Idle, Self::Running)
-                | (
-                    Self::Running,
-                    Self::Paused | Self::Completed | Self::Failed | Self::Canceled
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Canceled)
+    }
+
+    /// Apply one command. Terminal states cannot regress: the only command they
+    /// accept is `Dispose`.
+    pub fn apply(self, command: RunCommand) -> Result<RunTransition, RuntimeError> {
+        let (next, event) = match (self, command) {
+            (Self::Idle, RunCommand::Start) => (Self::Running, RunStateEvent::Started),
+            (Self::Running, RunCommand::Pause) => (Self::Paused, RunStateEvent::Paused),
+            (Self::Paused, RunCommand::Resume) => (Self::Running, RunStateEvent::Resumed),
+            (Self::Running, RunCommand::Complete) => (Self::Completed, RunStateEvent::Completed),
+            (Self::Running, RunCommand::Fail) => (Self::Failed, RunStateEvent::Failed),
+            (Self::Running | Self::Paused, RunCommand::Cancel) => {
+                (Self::Canceled, RunStateEvent::Canceled)
+            }
+            (Self::Completed | Self::Failed | Self::Canceled, RunCommand::Dispose) => {
+                (Self::Disposed, RunStateEvent::Disposed)
+            }
+            _ => {
+                return Err(RuntimeError::new(
+                    ErrorCode::InvalidStateTransition,
+                    format!(
+                        "invalid agent state transition {self:?} -> command {}",
+                        command.as_str()
+                    ),
+                ));
+            }
+        };
+        Ok(RunTransition {
+            next,
+            events: vec![event],
+        })
+    }
+
+    /// Apply a command and return only the next state.
+    pub fn transition(self, command: RunCommand) -> Result<Self, RuntimeError> {
+        Ok(self.apply(command)?.next)
+    }
+
+    /// The command that reaches `next` from this state, if one exists. Used by
+    /// callers that already know the target and must not duplicate the table.
+    pub fn command_for(self, next: Self) -> Result<RunCommand, RuntimeError> {
+        RunCommand::ALL
+            .into_iter()
+            .find(|command| {
+                self.apply(*command)
+                    .is_ok_and(|transition| transition.next == next)
+            })
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    ErrorCode::InvalidStateTransition,
+                    format!("invalid agent state transition {self:?} -> {next:?}"),
                 )
-                | (Self::Paused, Self::Running | Self::Canceled)
-                | (
-                    Self::Completed | Self::Failed | Self::Canceled,
-                    Self::Disposed
-                )
-        );
-        if allowed {
-            Ok(next)
-        } else {
-            Err(RuntimeError::new(
-                ErrorCode::InvalidStateTransition,
-                format!("invalid agent state transition {self:?} -> {next:?}"),
-            ))
-        }
+            })
     }
 }
 
@@ -475,9 +581,12 @@ impl RuntimeService {
                 .await?;
         }
         let agent_run_id = AgentRunId::generate();
-        self.record_agent(&agent_run_id, &request, AgentState::Idle, 0)
+        self.record_agent(&agent_run_id, &request, AgentState::Idle, 0, &[])
             .await?;
-        self.record_agent(&agent_run_id, &request, AgentState::Running, 1)
+        // The run state machine is applied, never written directly, so terminal
+        // states cannot be re-entered by a later notification.
+        let started = AgentState::Idle.apply(RunCommand::Start)?;
+        self.record_agent(&agent_run_id, &request, started.next, 1, &started.events)
             .await?;
         let command_id = harness_types::RuntimeCommandId::generate();
         self.store
@@ -498,22 +607,20 @@ impl RuntimeService {
             .await?;
         self.last_attempts.store(command.attempts, Ordering::SeqCst);
         let recovery = session.recover(&request.session_id).await?;
+        let scope = self.run_scope(&request, &config)?;
         let mut request = request;
         if let Some(contribution) = &request.memory {
             let principal = &contribution.principal;
-            if principal
-                .project_id
-                .as_ref()
-                .is_some_and(|project| project != &request.workspace.project_id)
-                || principal
-                    .task_id
-                    .as_ref()
-                    .is_some_and(|task| task != &request.task_id)
-                || principal
-                    .session_id
-                    .as_ref()
-                    .is_some_and(|session| session != &request.session_id)
-            {
+            // A contribution names the scope it belongs to; the run's scope
+            // decides whether that target is inside it. Omitting a field means
+            // the contribution does not claim it, never that it may use it.
+            let named = ScopeTarget {
+                project_id: principal.project_id.clone(),
+                task_id: principal.task_id.clone(),
+                session_id: principal.session_id.clone(),
+                worktree_id: None,
+            };
+            if !scope.authorizes(&named) {
                 return Err(RuntimeError::new(
                     ErrorCode::PolicyDenied,
                     "memory contribution is outside run scope",
@@ -738,11 +845,13 @@ impl RuntimeService {
                     None,
                 )
                 .await?;
+            let completed = AgentState::Running.apply(RunCommand::Complete)?;
             self.record_agent(
                 &agent_run_id,
                 &request,
-                AgentState::Completed,
+                completed.next,
                 u64::from(attempts) + 1,
+                &completed.events,
             )
             .await?;
             Ok(RunResult {
@@ -773,16 +882,19 @@ impl RuntimeService {
                     Some(&error.to_string()),
                 )
                 .await;
+            let terminal =
+                AgentState::Running.apply(if error.code() == ErrorCode::ProviderCanceled {
+                    RunCommand::Cancel
+                } else {
+                    RunCommand::Fail
+                })?;
             let _ = self
                 .record_agent(
                     &agent_run_id,
                     &request,
-                    if error.code() == ErrorCode::ProviderCanceled {
-                        AgentState::Canceled
-                    } else {
-                        AgentState::Failed
-                    },
+                    terminal.next,
                     u64::from(attempts) + 1,
+                    &terminal.events,
                 )
                 .await;
             Err(error)
@@ -1026,12 +1138,52 @@ impl RuntimeService {
             .map_err(RuntimeError::from)
     }
 
+    /// Build the authority context of one run. The host creates it; tool
+    /// arguments and contributions are checked against it and can never widen
+    /// it.
+    fn run_scope(
+        &self,
+        request: &RunRequest,
+        config: &RuntimeConfig,
+    ) -> Result<ScopeContext, RuntimeError> {
+        let capabilities = request
+            .tool_schemas
+            .iter()
+            .filter_map(|schema| {
+                schema
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .or_else(|| schema.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_owned)
+            .collect();
+        let scope = ScopeContext {
+            principal: ProducerIdentity {
+                plugin_id: "harness.runtime".to_owned(),
+                implementation_version: env!("CARGO_PKG_VERSION").to_owned(),
+            },
+            project_id: request.workspace.project_id.clone(),
+            worktree_id: request.workspace.worktree_id.clone(),
+            task_id: request.task_id.clone(),
+            session_id: request.session_id.clone(),
+            capabilities,
+            config_revision: config.config_revision,
+            owner_generation: self.store.fence().map_err(RuntimeError::from)?.generation,
+        };
+        scope
+            .validate()
+            .map_err(|error| RuntimeError::new(error.code(), error.message().to_owned()))?;
+        Ok(scope)
+    }
+
     async fn record_agent(
         &self,
         agent_run_id: &AgentRunId,
         request: &RunRequest,
         state: AgentState,
         revision: u64,
+        events: &[RunStateEvent],
     ) -> Result<(), RuntimeError> {
         let generation = self.store.fence()?.generation;
         self.store
@@ -1042,7 +1194,11 @@ impl RuntimeService {
                 state: state.as_str().to_owned(),
                 generation,
                 revision,
-                detail: json!({}),
+                // The reducer's proposed events are durable with the state they
+                // explain, so a later reader does not have to re-derive them.
+                detail: json!({
+                    "events": events.iter().map(|event| event.as_str()).collect::<Vec<_>>()
+                }),
             })
             .await
             .map_err(RuntimeError::from)
@@ -1057,5 +1213,163 @@ impl SummaryProvider for DefaultSummaryProvider {
             "WorkingState revision {} is authoritative; preserve mandatory instructions.",
             recovery.working_state.revision
         ))
+    }
+}
+
+#[cfg(test)]
+mod run_state_tests {
+    use super::{AgentState, ErrorCode, RunCommand, RunStateEvent};
+
+    const STATES: [AgentState; 7] = [
+        AgentState::Idle,
+        AgentState::Running,
+        AgentState::Paused,
+        AgentState::Completed,
+        AgentState::Failed,
+        AgentState::Canceled,
+        AgentState::Disposed,
+    ];
+
+    /// The whole transition table, as data: `(state, command) -> (next, event)`.
+    const ALLOWED: &[(AgentState, RunCommand, AgentState, RunStateEvent)] = &[
+        (
+            AgentState::Idle,
+            RunCommand::Start,
+            AgentState::Running,
+            RunStateEvent::Started,
+        ),
+        (
+            AgentState::Running,
+            RunCommand::Pause,
+            AgentState::Paused,
+            RunStateEvent::Paused,
+        ),
+        (
+            AgentState::Paused,
+            RunCommand::Resume,
+            AgentState::Running,
+            RunStateEvent::Resumed,
+        ),
+        (
+            AgentState::Running,
+            RunCommand::Complete,
+            AgentState::Completed,
+            RunStateEvent::Completed,
+        ),
+        (
+            AgentState::Running,
+            RunCommand::Fail,
+            AgentState::Failed,
+            RunStateEvent::Failed,
+        ),
+        (
+            AgentState::Running,
+            RunCommand::Cancel,
+            AgentState::Canceled,
+            RunStateEvent::Canceled,
+        ),
+        (
+            AgentState::Paused,
+            RunCommand::Cancel,
+            AgentState::Canceled,
+            RunStateEvent::Canceled,
+        ),
+        (
+            AgentState::Completed,
+            RunCommand::Dispose,
+            AgentState::Disposed,
+            RunStateEvent::Disposed,
+        ),
+        (
+            AgentState::Failed,
+            RunCommand::Dispose,
+            AgentState::Disposed,
+            RunStateEvent::Disposed,
+        ),
+        (
+            AgentState::Canceled,
+            RunCommand::Dispose,
+            AgentState::Disposed,
+            RunStateEvent::Disposed,
+        ),
+    ];
+
+    #[test]
+    fn every_state_command_pair_is_decided_by_the_single_table() {
+        for state in STATES {
+            for command in RunCommand::ALL {
+                let expected = ALLOWED
+                    .iter()
+                    .find(|(from, applied, _, _)| *from == state && *applied == command);
+                match (state.apply(command), expected) {
+                    (Ok(transition), Some((_, _, next, event))) => {
+                        assert_eq!(transition.next, *next, "{state:?} + {command:?}");
+                        assert_eq!(transition.events, vec![*event], "{state:?} + {command:?}");
+                    }
+                    (Err(error), None) => {
+                        assert_eq!(
+                            error.code(),
+                            ErrorCode::InvalidStateTransition,
+                            "{state:?} + {command:?}"
+                        );
+                    }
+                    (outcome, _) => {
+                        panic!("unexpected outcome for {state:?} + {command:?}: {outcome:?}")
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_terminal_state_cannot_regress_and_command_for_agrees_with_apply() {
+        for terminal in [
+            AgentState::Completed,
+            AgentState::Failed,
+            AgentState::Canceled,
+        ] {
+            for command in RunCommand::ALL {
+                if command == RunCommand::Dispose {
+                    continue;
+                }
+                assert!(
+                    terminal.apply(command).is_err(),
+                    "{terminal:?} must not accept {command:?}"
+                );
+            }
+            assert_eq!(
+                terminal
+                    .apply(RunCommand::Dispose)
+                    .expect("a terminal state may be disposed")
+                    .next,
+                AgentState::Disposed
+            );
+            assert_eq!(
+                terminal
+                    .command_for(AgentState::Running)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::InvalidStateTransition
+            );
+        }
+        assert_eq!(
+            AgentState::Idle
+                .command_for(AgentState::Running)
+                .expect("start reaches running"),
+            RunCommand::Start
+        );
+        assert_eq!(
+            AgentState::Paused
+                .command_for(AgentState::Running)
+                .expect("resume reaches running"),
+            RunCommand::Resume
+        );
+    }
+
+    #[test]
+    fn state_events_are_stable_log_names() {
+        assert_eq!(RunStateEvent::Started.as_str(), "run.started");
+        assert_eq!(RunStateEvent::Completed.as_str(), "run.completed");
+        assert_eq!(RunStateEvent::Disposed.as_str(), "run.disposed");
     }
 }

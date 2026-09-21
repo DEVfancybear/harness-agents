@@ -87,3 +87,13 @@ path = "src/bin/p6_fixture_plugin.rs"
 [[bin]]
 name = "p6_fixture_mcp_server"
 path = "src/bin/p6_fixture_mcp_server.rs"
+
+# M0 test helpers: the dependency-edge checker the milestone gate runs, and the
+# child fixture that proves the readiness/failpoint protocol.
+[[bin]]
+name = "dependency_check"
+path = "src/bin/dependency_check.rs"
+
+[[bin]]
+name = "m0_fixture_host"
+path = "src/bin/m0_fixture_host.rs"

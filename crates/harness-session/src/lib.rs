@@ -71,16 +71,46 @@ pub struct RecoveryView {
     pub pending_execution_count: u64,
 }
 
+/// Convert a typed-ID failure into the store's error type.
+fn typed_id<T>(result: Result<T, harness_types::HarnessError>) -> Result<T, StoreError> {
+    result.map_err(|error| StoreError::new(error.code(), error.message().to_owned()))
+}
+
 /// P1 transaction commands and recovery operations.
 #[derive(Clone)]
 pub struct SessionService {
     store: Arc<SqliteStore>,
+    ids: Arc<dyn harness_types::IdSource>,
 }
 
 impl SessionService {
     #[must_use]
     pub fn new(store: Arc<SqliteStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            ids: Arc::new(harness_types::SystemIdSource),
+        }
+    }
+
+    /// Build a service whose generated IDs come from an injected source.
+    ///
+    /// Deterministic fixtures and crash tests need the ID admitted in one
+    /// process to be the ID they assert in the next one.
+    #[must_use]
+    pub fn with_id_source(store: Arc<SqliteStore>, ids: Arc<dyn harness_types::IdSource>) -> Self {
+        Self { store, ids }
+    }
+
+    fn event_id(&self) -> Result<EventId, StoreError> {
+        typed_id(EventId::generate_with(self.ids.as_ref()))
+    }
+
+    fn instruction_id(&self) -> Result<InstructionId, StoreError> {
+        typed_id(InstructionId::generate_with(self.ids.as_ref()))
+    }
+
+    fn snapshot_id(&self) -> Result<SnapshotId, StoreError> {
+        typed_id(SnapshotId::generate_with(self.ids.as_ref()))
     }
 
     #[must_use]
@@ -100,8 +130,8 @@ impl SessionService {
                 "input sequence must start at 1",
             ));
         }
-        let event_id = EventId::generate();
-        let instruction_id = InstructionId::generate();
+        let event_id = self.event_id()?;
+        let instruction_id = self.instruction_id()?;
         let payload = input_payload(&request, &instruction_id)?;
         let payload_hash = ContentHash::from_canonical_json(&Value::Object(payload.clone()))
             .map_err(|error| {
@@ -208,7 +238,7 @@ impl SessionService {
                     format!("receipt payload is not canonical: {error}"),
                 )
             })?;
-        let event_id = EventId::generate();
+        let event_id = self.event_id()?;
         let event = EventEnvelope {
             schema_version: P0_SCHEMA_VERSION,
             event_id: event_id.clone(),
@@ -267,7 +297,7 @@ impl SessionService {
             )
         })?;
         let snapshot = SnapshotRecord {
-            snapshot_id: SnapshotId::generate(),
+            snapshot_id: self.snapshot_id()?,
             session_id: session_id.clone(),
             task_id,
             through_sequence: recovered.replayed_through_sequence,
@@ -441,7 +471,7 @@ impl SessionService {
             ));
         }
         let sequence = self.store.next_sequence(session_id).await?;
-        let event_id = EventId::generate();
+        let event_id = self.event_id()?;
         let mut payload = Map::new();
         payload.insert(
             "task_id".to_owned(),
@@ -538,7 +568,7 @@ impl SessionService {
             ));
         }
         let sequence = self.store.next_sequence(session_id).await?;
-        let event_id = EventId::generate();
+        let event_id = self.event_id()?;
         let payload_hash = ContentHash::from_canonical_json(&Value::Object(payload.clone()))
             .map_err(|error| {
                 StoreError::new(

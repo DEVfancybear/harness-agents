@@ -318,14 +318,52 @@ async fn main() -> ExitCode {
         clippy::large_futures,
         reason = "one boxed dispatch future at the entry point"
     )]
-    let outcome = Box::pin(run(Cli::parse())).await;
+    let cli = Cli::parse();
+    let json_error_envelope = json_requested() && legacy_command(&cli);
+    let outcome = Box::pin(run(cli)).await;
     match outcome {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("{error}");
-            ExitCode::from(1)
+            // Failures stay on stderr, which is where every accepted H/P
+            // contract reads them; stdout keeps only the command's result. A
+            // legacy `--json` invocation gets the typed report as one JSON
+            // document instead of prose, and the exit code always comes from
+            // the stable error code (CONTRACTS §9).
+            if json_error_envelope {
+                eprintln!("{}", error_report_json(&error));
+            } else {
+                eprintln!("{error}");
+            }
+            ExitCode::from(error.exit_code())
         }
     }
+}
+
+/// True when the invoked command asked for a JSON result.
+///
+/// The flag is read before dispatch because an error can happen while the
+/// command is still being parsed or resolved.
+fn json_requested() -> bool {
+    std::env::args().any(|argument| argument == "--json")
+}
+
+/// The interactive launch reports its own failures as prose on stderr
+/// (`HA_LAUNCH` H01-I03), so the typed JSON error report is for the legacy
+/// subcommands that already write JSON.
+fn legacy_command(cli: &Cli) -> bool {
+    !matches!(cli.command, None | Some(Command::Chat(_)))
+}
+
+/// The versioned error envelope: `schema_version`, `status`, `exit_code` and
+/// the typed `error` report.
+fn error_report_json(error: &HarnessError) -> serde_json::Value {
+    let report = error.report();
+    serde_json::json!({
+        "schema_version": report.schema_version,
+        "status": "error",
+        "exit_code": report.exit_code(),
+        "error": report,
+    })
 }
 
 /// Route the launch contract added by `HA_LAUNCH` H01, then fall back to the

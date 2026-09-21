@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "registry_kind": "milestone-registry",
+  "notes": [
+    "Reference mapping for the M0-M12 plan. It never overrides tests/acceptance/registry.json:",
+    "P/H cases stay owned and reported there. A selector is listed here only when the test exists.",
+    "`status` uses the plan vocabulary: planned, in_progress, implemented_unverified, verified_local,",
+    "accepted, blocked. `implemented_unverified` means the test exists and runs; it is not a verdict.",
+    "A01-A36 are cross-layer acceptance cases from docs/implementation-next/ACCEPTANCE.vi.md and stay",
+    "`planned` until their owner milestone implements them."
+  ],
+  "milestones": [
+    {
+      "id": "M0",
+      "title": "Foundation và executable contracts",
+      "runbook": "docs/implementation-next/M0.vi.md",
+      "prerequisites": [],
+      "status": "implemented_unverified",
+      "integration_target": "milestone_m0",
+      "work_items": [
+        {
+          "id": "M0-01",
+          "title": "Identities và state reducers",
+          "status": "implemented_unverified",
+          "tests": [
+            "m0_01_retry_class_and_exit_codes_match_the_contract",
+            "m0_01_id_source_makes_admission_deterministic",
+            "m0_01_run_state_reducer_never_regresses_from_terminal",
+            "m0_01_completed_run_does_not_accept_a_task_without_criteria"
+          ]
+        },
+        {
+          "id": "M0-02",
+          "title": "Ports, envelopes và schema fixtures",
+          "status": "implemented_unverified",
+          "tests": [
+            "m0_02_versioned_envelope_golden_fixtures",
+            "m0_02_store_port_contract_is_declared_without_fake_implementation",
+            "m0_02_dependency_allowlist_rejects_forbidden_edge"
+          ]
+        },
+        {
+          "id": "M0-03",
+          "title": "Workspace hiện tại, configuration và CLI integration",
+          "status": "implemented_unverified",
+          "tests": [
+            "m0_03_cli_json_errors_keep_stdout_clean_with_typed_exit_codes",
+            "m0_03_non_utf8_config_is_a_typed_read_error"
+          ]
+        },
+        {
+          "id": "M0-04",
+          "title": "Acceptance registry và gate runner",
+          "status": "implemented_unverified",
+          "tests": [
+            "m0_04_milestone_registry_and_gate_self_test",
+            "m0_04_child_fixture_failpoint_protocol"
+          ]
+        }
+      ],
+      "required_tests": [
+        "m0_01_retry_class_and_exit_codes_match_the_contract",
+        "m0_01_id_source_makes_admission_deterministic",
+        "m0_01_run_state_reducer_never_regresses_from_terminal",
+        "m0_01_completed_run_does_not_accept_a_task_without_criteria",
+        "m0_02_versioned_envelope_golden_fixtures",
+        "m0_02_store_port_contract_is_declared_without_fake_implementation",
+        "m0_02_dependency_allowlist_rejects_forbidden_edge",
+        "m0_03_cli_json_errors_keep_stdout_clean_with_typed_exit_codes",
+        "m0_03_non_utf8_config_is_a_typed_read_error",
+        "m0_04_milestone_registry_and_gate_self_test",
+        "m0_04_child_fixture_failpoint_protocol"
+      ],
+      "unit_tests": [
+        {
+          "package": "harness-types",
+          "test_name": "acceptance::tests::a_completed_run_with_a_missing_criterion_is_not_an_accepted_task"
+        },
+        {
+          "package": "harness-types",
+          "test_name": "scope::tests::require_reports_the_typed_authority_code"
+        },
+        {
+          "package": "harness-types",
+          "test_name": "version::tests::canonical_bytes_ignore_input_key_order"
+        },
+        {
+          "package": "harness-types",
+          "test_name": "ports::tests::the_declared_shape_is_implementable_and_never_returns_fake_success"
+        },
+        {
+          "package": "harness-runtime",
+          "test_name": "run_state_tests::every_state_command_pair_is_decided_by_the_single_table"
+        }
+      ],
+      "fixtures": [
+        "tests/fixtures/m0/envelope/cases.json",
+        "tests/fixtures/m0/cli/exit-codes.json",
+        "schemas/dependency-allowlist.v1.json"
+      ],
+      "gate": {
+        "script": "scripts/Verify-Milestone.ps1",
+        "dependency_check_bin": "dependency_check",
+        "steps": [
+          "format",
+          "clippy",
+          "workspace-tests",
+          "dependency-allowlist",
+          "unit-test-discovery",
+          "required-test-discovery",
+          "required-tests"
+        ]
+      }
+    }
+  ],
+  "acceptance_cases": [
+    { "id": "A01", "owner_milestones": ["M1"], "planned_test": "a01_input_ack_dedupe", "status": "planned" },
+    { "id": "A02", "owner_milestones": ["M1"], "planned_test": "a02_owner_generation", "status": "planned" },
+    { "id": "A03", "owner_milestones": ["M4"], "planned_test": "a03_receipt_before_checkpoint", "status": "planned" },
+    { "id": "A04", "owner_milestones": ["M4"], "planned_test": "a04_effect_before_receipt", "status": "planned" },
+    { "id": "A05", "owner_milestones": ["M1"], "planned_test": "a05_checkpoint_compatibility", "status": "planned" },
+    { "id": "A06", "owner_milestones": ["M2"], "planned_test": "a06_sse_multicall", "status": "planned" },
+    { "id": "A07", "owner_milestones": ["M2"], "planned_test": "a07_provider_fail_cancel", "status": "planned" },
+    { "id": "A08", "owner_milestones": ["M4"], "planned_test": "a08_coding_e2e", "status": "planned" },
+    { "id": "A09", "owner_milestones": ["M3"], "planned_test": "a09_terminal_acceptance", "status": "planned" },
+    { "id": "A10", "owner_milestones": ["M3"], "planned_test": "a10_goal_no_progress", "status": "planned" },
+    { "id": "A11", "owner_milestones": ["M3", "M4"], "planned_test": "a11_human_input_grant", "status": "planned" },
+    { "id": "A12", "owner_milestones": ["M5"], "planned_test": "a12_compaction_cas", "status": "planned" },
+    { "id": "A13", "owner_milestones": ["M4"], "planned_test": "a13_queued_process_cancel", "status": "planned" },
+    { "id": "A14", "owner_milestones": ["M4"], "planned_test": "a14_approval_binding", "status": "planned" },
+    { "id": "A15", "owner_milestones": ["M4"], "planned_test": "a15_path_patch_safety", "status": "planned" },
+    { "id": "A16", "owner_milestones": ["M4"], "planned_test": "a16_process_tree_env", "status": "planned" },
+    { "id": "A17", "owner_milestones": ["M4"], "planned_test": "a17_output_quota", "status": "planned" },
+    { "id": "A18", "owner_milestones": ["M5"], "planned_test": "a18_history_after_compaction", "status": "planned" },
+    { "id": "A19", "owner_milestones": ["M5", "M7"], "planned_test": "a19_optional_services_failure", "status": "planned" },
+    { "id": "A20", "owner_milestones": ["M5"], "planned_test": "a20_source_scope_fork", "status": "planned" },
+    { "id": "A21", "owner_milestones": ["M5"], "planned_test": "a21_rollback_effects", "status": "planned" },
+    { "id": "A22", "owner_milestones": ["M6"], "planned_test": "a22_skill_version", "status": "planned" },
+    { "id": "A23", "owner_milestones": ["M6"], "planned_test": "a23_extension_bounds", "status": "planned" },
+    { "id": "A24", "owner_milestones": ["M6"], "planned_test": "a24_catalog_revocation", "status": "planned" },
+    { "id": "A25", "owner_milestones": ["M7"], "planned_test": "a25_memory_job_cas", "status": "planned" },
+    { "id": "A26", "owner_milestones": ["M7"], "planned_test": "a26_memory_provenance", "status": "planned" },
+    { "id": "A27", "owner_milestones": ["M8"], "planned_test": "a27_child_capacity_budget", "status": "planned" },
+    { "id": "A28", "owner_milestones": ["M8"], "planned_test": "a28_child_delivery_recovery", "status": "planned" },
+    { "id": "A29", "owner_milestones": ["M8"], "planned_test": "a29_integration_acceptance", "status": "planned" },
+    { "id": "A30", "owner_milestones": ["M8"], "planned_test": "a30_dirty_workspace_preservation", "status": "planned" },
+    { "id": "A31", "owner_milestones": ["M9"], "planned_test": "a31_backup_retention_restore", "status": "planned" },
+    { "id": "A32", "owner_milestones": ["M9"], "planned_test": "a32_diagnostics_isolation", "status": "planned" },
+    { "id": "A33", "owner_milestones": ["M10"], "planned_test": "a33_web_replay_gap", "status": "planned" },
+    { "id": "A34", "owner_milestones": ["M11"], "planned_test": "a34_schedule_occurrences", "status": "planned" },
+    { "id": "A35", "owner_milestones": ["M11"], "planned_test": "a35_external_task_ambiguity", "status": "planned" },
+    { "id": "A36", "owner_milestones": ["M12"], "planned_test": "a36_strict_confinement", "status": "planned" }
+  ]
+}

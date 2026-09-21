@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "kind": "cli-exit-codes",
+  "notes": [
+    "The exit-code contract M0-03 pins for the `ha` CLI (CONTRACTS §9).",
+    "0 succeeded, 2 invalid usage/config, 3 waiting/input/action required, 4 execution failed,",
+    "5 ownership/conflict, 130 user cancel, 1 otherwise.",
+    "The Rust test maps each `code` name to the typed ErrorCode and compares both the exit",
+    "code and the retry class, so the mapping cannot drift silently."
+  ],
+  "cases": [
+    { "code": "invalid_payload", "exit_code": 2, "retry_class": "never" },
+    { "code": "config_unknown_field", "exit_code": 2, "retry_class": "never" },
+    { "code": "config_read_error", "exit_code": 2, "retry_class": "never" },
+    { "code": "unsupported_schema_version", "exit_code": 2, "retry_class": "never" },
+    { "code": "gate_required_test_ignored", "exit_code": 2, "retry_class": "never" },
+    { "code": "approval_required", "exit_code": 3, "retry_class": "human_action" },
+    { "code": "runtime_blocked", "exit_code": 3, "retry_class": "human_action" },
+    { "code": "process_outcome_unknown", "exit_code": 3, "retry_class": "human_action" },
+    { "code": "storage_write_failed", "exit_code": 4, "retry_class": "transient" },
+    { "code": "provider_protocol", "exit_code": 4, "retry_class": "bounded" },
+    { "code": "sequence_conflict", "exit_code": 5, "retry_class": "conflict" },
+    { "code": "writer_locked", "exit_code": 5, "retry_class": "transient" },
+    { "code": "idempotency_conflict", "exit_code": 5, "retry_class": "conflict" },
+    { "code": "provider_canceled", "exit_code": 130, "retry_class": "never" },
+    { "code": "process_canceled", "exit_code": 130, "retry_class": "never" },
+    { "code": "policy_denied", "exit_code": 1, "retry_class": "never" },
+    { "code": "task_not_found", "exit_code": 1, "retry_class": "never" }
+  ]
+}

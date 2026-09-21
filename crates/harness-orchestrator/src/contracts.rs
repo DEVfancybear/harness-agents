@@ -10,8 +10,9 @@ use std::{
 };
 
 use harness_types::{
-    AgentProfileId, AgentRunId, ArtifactId, ContentHash, ErrorCode, ProjectId, SessionId, TaskId,
-    ToolExecutionReceipt, WorkspaceObservation,
+    AcceptanceCommand, AcceptanceRecord, AgentProfileId, AgentRunId, ArtifactId, CheckOutcome,
+    ContentHash, CriterionEvidence, CriterionState, CriterionStatus, ErrorCode, ProjectId,
+    SessionId, TaskId, ToolExecutionReceipt, WorkspaceObservation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1002,9 +1003,62 @@ impl DelegatedResult {
     }
 
     /// Host-accepted completion is a separate decision from the worker report.
+    ///
+    /// The decision is made by the shared acceptance reducer, so "the worker
+    /// said completed" and "the task is accepted" cannot drift apart: a
+    /// completed outcome with no typed evidence is not accepted work.
     #[must_use]
     pub fn accepted_completion(&self) -> bool {
-        matches!(self.outcome, DelegatedOutcome::Completed)
+        AcceptanceRecord::initial(self.task_id.clone())
+            .apply(AcceptanceCommand::Evaluate {
+                criteria: self.acceptance_criteria(),
+                pending_effects: 0,
+                evidence_fingerprint: None,
+            })
+            .is_ok_and(|transition| transition.next.is_accepted())
+    }
+
+    /// The criteria the host checks before accepting this report.
+    #[must_use]
+    pub fn acceptance_criteria(&self) -> Vec<CriterionState> {
+        vec![CriterionState {
+            criterion_id: "worker.outcome".to_owned(),
+            required: true,
+            status: if matches!(self.outcome, DelegatedOutcome::Completed) {
+                CriterionStatus::Satisfied
+            } else {
+                CriterionStatus::Failed
+            },
+            evidence: self.acceptance_evidence(),
+        }]
+    }
+
+    /// The typed evidence this report carries: artifacts it produced and checks
+    /// it executed with their receipts.
+    #[must_use]
+    pub fn acceptance_evidence(&self) -> Vec<CriterionEvidence> {
+        let mut evidence: Vec<CriterionEvidence> = self
+            .artifact_refs
+            .iter()
+            .map(|reference| CriterionEvidence::ArtifactProduced {
+                artifact_id: None,
+                reference: reference.clone(),
+            })
+            .collect();
+        evidence.extend(self.checked_revisions.iter().zip(&self.check_receipts).map(
+            |(revision, receipt)| CriterionEvidence::CheckExecuted {
+                command: revision.command.clone(),
+                workspace_digest: None,
+                exit_code: None,
+                outcome: if revision.passed {
+                    CheckOutcome::Passed
+                } else {
+                    CheckOutcome::Failed
+                },
+                receipt_ref: Some(receipt.tool_execution_id.to_string()),
+            },
+        ));
+        evidence
     }
 }
 

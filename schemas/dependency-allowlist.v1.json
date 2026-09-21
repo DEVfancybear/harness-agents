@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "kind": "dependency-allowlist",
+  "notes": [
+    "Internal (harness-*) dependency edges of the root workspace. Every edge must be declared here.",
+    "Checked by crates/harness-cli/src/bin/dependency_check.rs and by the milestone gate.",
+    "harness-cli may depend on every crate because it is the composition root and owns the product binary.",
+    "The allow map covers normal, dev and build dependencies; the workspace has no build-dependencies today."
+  ],
+  "allow": {
+    "harness-types": [],
+    "harness-providers": ["harness-types"],
+    "harness-kernel": ["harness-types"],
+    "harness-store-sqlite": ["harness-types"],
+    "harness-session": ["harness-store-sqlite", "harness-types"],
+    "harness-runtime": [
+      "harness-memory",
+      "harness-providers",
+      "harness-session",
+      "harness-store-sqlite",
+      "harness-types"
+    ],
+    "harness-tools": [
+      "harness-providers",
+      "harness-runtime",
+      "harness-session",
+      "harness-store-sqlite",
+      "harness-types"
+    ],
+    "harness-memory": ["harness-session", "harness-store-sqlite", "harness-types"],
+    "harness-orchestrator": [
+      "harness-kernel",
+      "harness-memory",
+      "harness-providers",
+      "harness-runtime",
+      "harness-session",
+      "harness-store-sqlite",
+      "harness-types"
+    ],
+    "harness-extensions": [
+      "harness-kernel",
+      "harness-providers",
+      "harness-tools",
+      "harness-types"
+    ],
+    "harness-maintenance": [
+      "harness-memory",
+      "harness-session",
+      "harness-store-sqlite",
+      "harness-types"
+    ],
+    "harness-cli": [
+      "harness-extensions",
+      "harness-kernel",
+      "harness-maintenance",
+      "harness-memory",
+      "harness-orchestrator",
+      "harness-providers",
+      "harness-runtime",
+      "harness-session",
+      "harness-store-sqlite",
+      "harness-tools",
+      "harness-types"
+    ]
+  },
+  "forbidden": [
+    {
+      "from": "harness-types",
+      "to": "*",
+      "reason": "harness-types is the base contract crate and must not depend on another harness crate"
+    },
+    {
+      "from": "harness-store-sqlite",
+      "to": [
+        "harness-cli",
+        "harness-extensions",
+        "harness-maintenance",
+        "harness-memory",
+        "harness-orchestrator",
+        "harness-runtime",
+        "harness-session",
+        "harness-tools"
+      ],
+      "reason": "the store owns durable rows; higher layers depend on it, never the reverse"
+    },
+    {
+      "from": "harness-runtime",
+      "to": ["harness-tools"],
+      "reason": "harness-tools depends on harness-runtime; the reverse edge is a cycle"
+    },
+    {
+      "from": "harness-providers",
+      "to": [
+        "harness-cli",
+        "harness-extensions",
+        "harness-kernel",
+        "harness-maintenance",
+        "harness-memory",
+        "harness-orchestrator",
+        "harness-runtime",
+        "harness-session",
+        "harness-store-sqlite",
+        "harness-tools"
+      ],
+      "reason": "provider transport must not reach into the host's state or execution layers"
+    }
+  ]
+}

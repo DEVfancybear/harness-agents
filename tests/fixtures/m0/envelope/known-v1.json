@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "kind": "input.admitted",
+  "critical": true,
+  "payload": {
+    "text": "recover this durable instruction",
+    "sequence": 1,
+    "future_optional_field": {
+      "kept": true
+    }
+  }
+}

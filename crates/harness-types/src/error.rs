@@ -199,9 +199,281 @@ impl ErrorCode {
     }
 }
 
+/// How a caller may retry after a failure. The class is derived from the
+/// stable code, never from the human-readable message.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryClass {
+    /// The same input cannot succeed by repeating it.
+    Never,
+    /// The operation may be repeated; the failure was environmental.
+    Transient,
+    /// The operation may be repeated inside a bounded retry budget.
+    Bounded,
+    /// State moved; re-read and rebase before trying again.
+    Conflict,
+    /// Progress needs a human decision, answer, or grant.
+    HumanAction,
+}
+
+impl RetryClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Transient => "transient",
+            Self::Bounded => "bounded",
+            Self::Conflict => "conflict",
+            Self::HumanAction => "human_action",
+        }
+    }
+}
+
+impl fmt::Display for RetryClass {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl ErrorCode {
+    /// The retry class of this failure. Total by construction: adding a code
+    /// forces an explicit decision here.
+    #[must_use]
+    pub const fn retry_class(self) -> RetryClass {
+        match self {
+            Self::WriterLocked
+            | Self::StorageOpenFailed
+            | Self::StorageWriteFailed
+            | Self::ArtifactWriteFailed
+            | Self::ServiceUnavailable
+            | Self::ShutdownFailed
+            | Self::SchedulerShutdown
+            | Self::InflightLimitExceeded => RetryClass::Transient,
+            Self::ProviderProtocol | Self::RetryExhausted | Self::ProcessTimedOut => {
+                RetryClass::Bounded
+            }
+            Self::StaleWriter
+            | Self::SequenceConflict
+            | Self::IdempotencyConflict
+            | Self::TaskLeaseConflict
+            | Self::DuplicateRegistration
+            | Self::InvalidStateTransition
+            | Self::CompactionConflict
+            | Self::RuntimeCommandConflict
+            | Self::ApprovalStale
+            | Self::ApprovalConsumed
+            | Self::StaleWorkspace
+            | Self::ProjectIdentityConflict
+            | Self::ToolIntentConflict
+            | Self::TaskOwnershipConflict
+            | Self::DuplicateTaskId
+            | Self::AmbiguousTaskOwner
+            | Self::IntegrationConflict
+            | Self::DeliveryConflict
+            | Self::DuplicateFrameId
+            | Self::SchemaVersionMismatch
+            | Self::RestoreTargetConflict
+            | Self::RetentionRefused => RetryClass::Conflict,
+            Self::RuntimeBlocked
+            | Self::ApprovalRequired
+            | Self::TaskNotReady
+            | Self::ProcessOutcomeUnknown
+            | Self::BudgetExhausted
+            | Self::DirtyWorkspaceDenied
+            | Self::SecretNotGranted
+            | Self::ConfigTrustRequired => RetryClass::HumanAction,
+            Self::InvalidHash
+            | Self::InvalidId
+            | Self::InvalidPayload
+            | Self::InvalidSequence
+            | Self::MissingAuthority
+            | Self::UnsupportedSchemaVersion
+            | Self::ConfigReadError
+            | Self::ConfigParseError
+            | Self::ConfigUnknownField
+            | Self::FixtureIntegrity
+            | Self::GateConfigurationError
+            | Self::GateRequiredTestIgnored
+            | Self::GateTestDiscoveryEmpty
+            | Self::ReadOnlyStore
+            | Self::MigrationFailed
+            | Self::SnapshotCorrupt
+            | Self::UnknownCriticalEvent
+            | Self::MissingRequiredService
+            | Self::IncompatibleService
+            | Self::PluginCycle
+            | Self::MandatoryContextOverflow
+            | Self::ProviderCanceled
+            | Self::PolicyDenied
+            | Self::ApprovalRevoked
+            | Self::WorkspaceEscape
+            | Self::SensitivePathDenied
+            | Self::UnsupportedTextEncoding
+            | Self::BinaryContentDenied
+            | Self::OutputLimitExceeded
+            | Self::ProcessCanceled
+            | Self::StrictIsolationUnavailable
+            | Self::TaskNotFound
+            | Self::TaskDependencyFailed
+            | Self::DagCycle
+            | Self::UnknownTaskDependency
+            | Self::DelegationDepthExceeded
+            | Self::ScopeAuthorityDenied
+            | Self::ResultIncomplete
+            | Self::ExtensionProtocolError
+            | Self::ExtensionDigestMismatch
+            | Self::ExtensionProtocolUnsupported
+            | Self::ExtensionNotFound
+            | Self::ExtensionUntrusted
+            | Self::ExtensionCapabilityMismatch
+            | Self::HostMethodDenied
+            | Self::EnvironmentDenied
+            | Self::FrameLimitExceeded
+            | Self::SkillUnavailable
+            | Self::BackupManifestInvalid => RetryClass::Never,
+        }
+    }
+
+    /// The process exit code the `ha` CLI uses for this failure (CONTRACTS §9):
+    /// 2 invalid usage/config, 3 waiting for input or action, 4 execution failed,
+    /// 5 ownership/conflict, 130 user cancel, 1 otherwise.
+    #[must_use]
+    pub const fn exit_code(self) -> u8 {
+        match self {
+            Self::ProviderCanceled | Self::ProcessCanceled => 130,
+            Self::InvalidHash
+            | Self::InvalidId
+            | Self::InvalidPayload
+            | Self::InvalidSequence
+            | Self::MissingAuthority
+            | Self::UnsupportedSchemaVersion
+            | Self::ConfigReadError
+            | Self::ConfigParseError
+            | Self::ConfigUnknownField
+            | Self::ConfigTrustRequired
+            | Self::FixtureIntegrity
+            | Self::GateConfigurationError
+            | Self::GateRequiredTestIgnored
+            | Self::GateTestDiscoveryEmpty => 2,
+            Self::RuntimeBlocked
+            | Self::ApprovalRequired
+            | Self::TaskNotReady
+            | Self::ProcessOutcomeUnknown
+            | Self::BudgetExhausted
+            | Self::DirtyWorkspaceDenied
+            | Self::SecretNotGranted
+            | Self::MandatoryContextOverflow => 3,
+            Self::WriterLocked
+            | Self::StaleWriter
+            | Self::SequenceConflict
+            | Self::IdempotencyConflict
+            | Self::TaskLeaseConflict
+            | Self::ApprovalStale
+            | Self::ApprovalConsumed
+            | Self::ApprovalRevoked
+            | Self::StaleWorkspace
+            | Self::ProjectIdentityConflict
+            | Self::ToolIntentConflict
+            | Self::TaskOwnershipConflict
+            | Self::DuplicateTaskId
+            | Self::AmbiguousTaskOwner
+            | Self::DeliveryConflict
+            | Self::DuplicateFrameId
+            | Self::DuplicateRegistration
+            | Self::RetentionRefused
+            | Self::RestoreTargetConflict => 5,
+            Self::StorageOpenFailed
+            | Self::StorageWriteFailed
+            | Self::MigrationFailed
+            | Self::SnapshotCorrupt
+            | Self::UnknownCriticalEvent
+            | Self::ArtifactWriteFailed
+            | Self::ServiceUnavailable
+            | Self::ShutdownFailed
+            | Self::SchedulerShutdown
+            | Self::InvalidStateTransition
+            | Self::ProviderProtocol
+            | Self::RetryExhausted
+            | Self::CompactionConflict
+            | Self::RuntimeCommandConflict
+            | Self::ProcessTimedOut
+            | Self::OutputLimitExceeded
+            | Self::StrictIsolationUnavailable
+            | Self::IntegrationConflict
+            | Self::ResultIncomplete
+            | Self::InflightLimitExceeded
+            | Self::SchemaVersionMismatch
+            | Self::BackupManifestInvalid => 4,
+            Self::ReadOnlyStore
+            | Self::MissingRequiredService
+            | Self::IncompatibleService
+            | Self::PluginCycle
+            | Self::PolicyDenied
+            | Self::WorkspaceEscape
+            | Self::SensitivePathDenied
+            | Self::UnsupportedTextEncoding
+            | Self::BinaryContentDenied
+            | Self::TaskNotFound
+            | Self::TaskDependencyFailed
+            | Self::DagCycle
+            | Self::UnknownTaskDependency
+            | Self::DelegationDepthExceeded
+            | Self::ScopeAuthorityDenied
+            | Self::ExtensionProtocolError
+            | Self::ExtensionDigestMismatch
+            | Self::ExtensionProtocolUnsupported
+            | Self::ExtensionNotFound
+            | Self::ExtensionUntrusted
+            | Self::ExtensionCapabilityMismatch
+            | Self::HostMethodDenied
+            | Self::EnvironmentDenied
+            | Self::FrameLimitExceeded
+            | Self::SkillUnavailable => 1,
+        }
+    }
+}
+
 impl fmt::Display for ErrorCode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+/// The serializable error contract. Display messages are diagnostics; only the
+/// code, retry class and envelope version are protocol.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorReport {
+    pub schema_version: u16,
+    pub code: ErrorCode,
+    pub retry_class: RetryClass,
+    /// A message that is safe to show and to log: it never carries credentials,
+    /// bearer tokens, or raw endpoint queries.
+    pub safe_message: String,
+    pub correlation_id: Option<crate::EventId>,
+    pub details_ref: Option<String>,
+}
+
+impl ErrorReport {
+    #[must_use]
+    pub fn from_error(
+        error: &HarnessError,
+        correlation_id: Option<crate::EventId>,
+        details_ref: Option<String>,
+    ) -> Self {
+        Self {
+            schema_version: crate::P0_SCHEMA_VERSION,
+            code: error.code(),
+            retry_class: error.code().retry_class(),
+            safe_message: error.message.clone(),
+            correlation_id,
+            details_ref,
+        }
+    }
+
+    #[must_use]
+    pub const fn exit_code(&self) -> u8 {
+        self.code.exit_code()
     }
 }
 
@@ -225,5 +497,28 @@ impl HarnessError {
     #[must_use]
     pub const fn code(&self) -> ErrorCode {
         self.code
+    }
+
+    /// The message this error carries. Messages are diagnostics and must stay
+    /// free of credentials; they are never the protocol.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    #[must_use]
+    pub const fn retry_class(&self) -> RetryClass {
+        self.code.retry_class()
+    }
+
+    #[must_use]
+    pub const fn exit_code(&self) -> u8 {
+        self.code.exit_code()
+    }
+
+    /// The serializable contract view of this error.
+    #[must_use]
+    pub fn report(&self) -> ErrorReport {
+        ErrorReport::from_error(self, None, None)
     }
 }

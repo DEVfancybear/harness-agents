@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "kind": "envelope-oracle",
+  "notes": [
+    "Hand-written oracle for the M0 versioned-document envelope.",
+    "The canonical bytes and sha256 were computed outside Rust (PowerShell SHA256 over the",
+    "minified, key-sorted JSON text), so the test cannot agree with the implementation by",
+    "generating its own expectation.",
+    "canonical_bytes: {\"critical\":true,\"kind\":\"input.admitted\",\"payload\":{\"future_optional_field\":{\"kept\":true},\"sequence\":1,\"text\":\"recover this durable instruction\"},\"schema_version\":1}",
+    "canonical_length: 165"
+  ],
+  "cases": [
+    {
+      "file": "known-v1.json",
+      "expected": "accepted",
+      "kind": "input.admitted",
+      "critical": true,
+      "canonical_length": 165,
+      "content_hash": "sha256:43cbbfc6cec4b8d61e48473808bcd8077a276bec80f594730555af605d707fe9"
+    },
+    {
+      "file": "reordered-v1.json",
+      "expected": "accepted",
+      "kind": "input.admitted",
+      "critical": true,
+      "canonical_length": 165,
+      "content_hash": "sha256:43cbbfc6cec4b8d61e48473808bcd8077a276bec80f594730555af605d707fe9"
+    },
+    {
+      "file": "unknown-optional-v1.json",
+      "expected": "accepted",
+      "kind": "future.additive",
+      "critical": false,
+      "content_hash": null
+    },
+    {
+      "file": "unknown-critical-v1.json",
+      "expected": "unknown_critical_event",
+      "kind": "future.critical",
+      "critical": true,
+      "content_hash": null
+    },
+    {
+      "file": "unsupported-version.json",
+      "expected": "unsupported_schema_version",
+      "kind": "input.admitted",
+      "critical": true,
+      "content_hash": null
+    }
+  ]
+}

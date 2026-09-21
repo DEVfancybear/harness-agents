@@ -38,6 +38,10 @@ pub fn generated_schema_documents() -> Vec<SchemaDocument> {
         ),
         schema_document("context-packet.v1.schema.json", schema_for!(ContextPacket)),
         schema_document("harness-config.v1.schema.json", schema_for!(HarnessConfig)),
+        schema_document(
+            "error-report.v1.schema.json",
+            schema_for!(crate::ErrorReport),
+        ),
     ]
 }
 
