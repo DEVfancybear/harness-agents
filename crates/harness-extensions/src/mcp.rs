@@ -20,7 +20,7 @@ use rmcp::{
     transport::TokioChildProcess,
 };
 
-use crate::contracts::ExtensionError;
+use crate::contracts::{ENVIRONMENT_ALLOWLIST, ExtensionError};
 
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
@@ -65,6 +65,12 @@ impl McpClient {
     ///
     /// Discovery is page-bounded: the adapter never loops forever asking for
     /// more pages from an untrusted server.
+    ///
+    /// The child receives the same minimal environment as a plugin transport —
+    /// the allowlist only — so an MCP server never inherits the host's provider
+    /// credentials. A host that wires repository or profile configuration to
+    /// this entry point must pin the executable digest and require a trust
+    /// grant first; this adapter itself performs no digest check.
     pub async fn connect_stdio(
         executable: impl Into<PathBuf>,
         arguments: Vec<String>,
@@ -78,6 +84,14 @@ impl McpClient {
         );
         let args = arguments.clone();
         let mut wrapped = CommandWrap::with_new(&executable, move |command| {
+            // The host environment is not inherited wholesale: a provider API
+            // key in the parent process must not reach an MCP server.
+            command.env_clear();
+            for name in ENVIRONMENT_ALLOWLIST {
+                if let Ok(value) = std::env::var(name) {
+                    command.env(name, value);
+                }
+            }
             command
                 .args(&args)
                 .stdin(Stdio::piped())

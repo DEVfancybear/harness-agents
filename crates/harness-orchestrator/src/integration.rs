@@ -80,9 +80,10 @@ pub struct ResultIntegrator {
 impl ResultIntegrator {
     #[must_use]
     pub fn new(workspace: Arc<WorkspaceManager>) -> Self {
+        let git_lock = workspace.git_lock();
         Self {
             workspace,
-            git_lock: Arc::new(Mutex::new(())),
+            git_lock,
         }
     }
 

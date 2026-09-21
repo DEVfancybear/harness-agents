@@ -2,7 +2,7 @@
 
 //! P1 session commands, deterministic projection, and recovery views.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use harness_store_sqlite::{
     AdmissionAck, AdmissionCommit, PersistedPluginManifest, PublishedArtifact, ReceiptAck,
@@ -366,6 +366,7 @@ impl SessionService {
                 "snapshot claims coverage beyond the committed journal",
             ));
         }
+        let mut seen = FoldSeen::seed(state.as_ref(), &receipts);
         let mut expected_sequence = through;
         let events = self.store.load_events_after(session_id, through).await?;
         for event in events {
@@ -396,6 +397,7 @@ impl SessionService {
                 &mut instruction_texts,
                 &task_id,
                 event,
+                &mut seen,
             )?;
             expected_sequence = next_sequence;
         }
@@ -749,12 +751,45 @@ fn restore_snapshot(
 }
 
 #[allow(clippy::too_many_lines)]
+/// Duplicate detection for journal folding.
+///
+/// Kept outside the folded state so one long journal folds in linear time
+/// instead of rescanning the receipt and pending vectors for every event.
+#[derive(Default)]
+struct FoldSeen {
+    receipts: BTreeSet<String>,
+    pending: BTreeSet<String>,
+}
+
+impl FoldSeen {
+    fn seed(state: Option<&WorkingState>, receipts: &[ToolExecutionReceipt]) -> Self {
+        let mut seen = Self::default();
+        seen.receipts.extend(
+            receipts
+                .iter()
+                .map(|receipt| receipt.tool_execution_id.as_str().to_owned()),
+        );
+        if let Some(state) = state {
+            seen.pending.extend(
+                state
+                    .pending_tool_calls
+                    .iter()
+                    .map(|pending| pending.execution_id.as_str().to_owned()),
+            );
+        }
+        seen
+    }
+}
+
+// One event type per arm; the length is the event vocabulary, not hidden logic.
+#[allow(clippy::too_many_lines)]
 fn fold_event(
     state: &mut Option<WorkingState>,
     receipts: &mut Vec<ToolExecutionReceipt>,
     instruction_texts: &mut Vec<String>,
     expected_task_id: &TaskId,
     event: EventEnvelope,
+    seen: &mut FoldSeen,
 ) -> Result<(), StoreError> {
     match event.event_type.as_str() {
         "input.admitted" => {
@@ -872,9 +907,9 @@ fn fold_event(
                     "receipt does not match its journal event",
                 ));
             }
-            if receipts
-                .iter()
-                .any(|existing| existing.tool_execution_id == receipt.tool_execution_id)
+            if !seen
+                .receipts
+                .insert(receipt.tool_execution_id.as_str().to_owned())
             {
                 return Err(StoreError::new(
                     harness_types::ErrorCode::IdempotencyConflict,
@@ -886,6 +921,7 @@ fn fold_event(
             current
                 .pending_tool_calls
                 .retain(|pending| pending.execution_id != receipt.tool_execution_id);
+            seen.pending.remove(receipt.tool_execution_id.as_str());
             receipts.push(receipt);
         }
         "tool.intent.recorded" => {
@@ -904,13 +940,8 @@ fn fold_event(
                         )
                     })?;
             let hint = payload_string(&event.payload, "reconciliation_hint")?;
-            if current
-                .pending_tool_calls
-                .iter()
-                .any(|pending| pending.execution_id == execution_id)
-                || receipts
-                    .iter()
-                    .any(|receipt| receipt.tool_execution_id == execution_id)
+            if !seen.pending.insert(execution_id.as_str().to_owned())
+                || seen.receipts.contains(execution_id.as_str())
             {
                 return Err(StoreError::new(
                     harness_types::ErrorCode::IdempotencyConflict,

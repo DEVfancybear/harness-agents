@@ -322,7 +322,6 @@ impl WorkerScheduler {
             }
         }
         let backend = Arc::clone(&self.backend);
-        let ledger = Arc::clone(&self.ledger);
         let live = Arc::clone(&self.live);
         let reserved = Arc::clone(&self.reserved);
         let outstanding = Arc::clone(&self.outstanding);
@@ -330,8 +329,17 @@ impl WorkerScheduler {
         let key_for_task = key.clone();
         let sender = self.settled.clone();
         // Charge before the worker exists: a worker that never reports usage
-        // still consumes budget, and the ledger is observable immediately.
-        self.ledger.charge_request()?;
+        // still consumes budget, and the ledger is observable immediately. This
+        // is the only charge for the dispatch; charging again once the slot is
+        // acquired would consume two request slots for one worker.
+        if let Err(error) = self.ledger.charge_request() {
+            // The task reservation must not outlive the failed dispatch, or the
+            // task could never be dispatched again.
+            if let Ok(mut reserved) = self.reserved.lock() {
+                reserved.remove(&key);
+            }
+            return Err(error);
+        }
         // Marked before the spawned task can report, so the outcome stream can
         // never look exhausted while this worker is still in flight.
         outstanding.fetch_add(1, Ordering::SeqCst);
@@ -389,18 +397,6 @@ impl WorkerScheduler {
             }
             if shutting_down.load(Ordering::SeqCst) && !cancellation.is_cancelled() {
                 cancellation.cancel();
-            }
-            // Charge before the worker runs so an unreported usage still costs.
-            if let Err(error) = ledger.charge_request() {
-                lease.release();
-                retire!();
-                let _ = sender
-                    .send(Ok((
-                        request.task_id.clone(),
-                        WorkerOutcome::Failed { error },
-                    )))
-                    .await;
-                return;
             }
             let observed = backend.dispatch(request).await;
             lease.release();

@@ -73,6 +73,16 @@ impl WorkspaceManager {
         &self.state_root
     }
 
+    /// The lock that serializes shared Git metadata operations.
+    ///
+    /// Every component that runs Git against the host-owned clone must take
+    /// this same lock; a second lock would let an integration fetch/merge race a
+    /// worktree creation on the same repository.
+    #[must_use]
+    pub fn git_lock(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.git_lock)
+    }
+
     /// Resolve the project identity for a verified repository root.
     ///
     /// The first verified inspection of a canonical root records a
@@ -307,7 +317,18 @@ impl WorkspaceManager {
                 "a worker that produced no change has no revision to integrate",
             ));
         }
-        let violations = scope_violations(&changes.paths, &worktree.write_scope);
+        // Stage first and validate exactly what will be committed. Checking the
+        // unstaged snapshot and then running `git add --all` would let a file
+        // created after the check enter the commit without a scope decision.
+        git(&root, &["add", "--all"])?;
+        let staged = staged_changes(&root)?;
+        if staged.is_empty() {
+            return Err(OrchestratorError::new(
+                ErrorCode::ResultIncomplete,
+                "a worker that produced no change has no revision to integrate",
+            ));
+        }
+        let violations = scope_violations(&staged.paths, &worktree.write_scope);
         if let Some(violation) = violations.first() {
             return Err(OrchestratorError::new(
                 ErrorCode::ScopeAuthorityDenied,
@@ -317,7 +338,6 @@ impl WorkspaceManager {
                 ),
             ));
         }
-        git(&root, &["add", "--all"])?;
         git(&root, &["commit", "--quiet", "-m", message])?;
         let revision = git(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
         Ok(revision)
@@ -369,17 +389,75 @@ impl WorkspaceManager {
 }
 
 /// Uncommitted and untracked paths reported by Git for a worktree.
+///
+/// A rename or copy line reports `old -> new`; both sides are changes to the
+/// worktree and both must be inside the worker's scope. Taking only the
+/// destination would let a worker move a file out of another scope.
 fn pending_changes(root: &Path) -> Result<ChangeSet, OrchestratorError> {
     let status = git(root, &["status", "--porcelain=v1", "--untracked-files=all"])?;
+    Ok(ChangeSet {
+        paths: parse_status_paths(&status),
+        insertions: 0,
+        deletions: 0,
+    })
+}
+
+/// Every path a `git status --porcelain=v1` or `git diff --name-status` body
+/// names, including both sides of a rename or copy.
+fn parse_status_paths(status: &str) -> Vec<String> {
     let mut paths = Vec::new();
     for line in status.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        let path = line.get(3..).unwrap_or("").trim();
-        let path = path.rsplit(" -> ").next().unwrap_or(path).trim_matches('"');
-        if !path.is_empty() {
-            paths.push(path.to_owned());
+        let payload = line.get(3..).unwrap_or("").trim();
+        let (old, new) = match payload.split_once(" -> ") {
+            Some((old, new)) => (Some(unquote_path(old)), unquote_path(new)),
+            None => (None, unquote_path(payload)),
+        };
+        if let Some(old) = old
+            && !old.is_empty()
+        {
+            paths.push(old);
+        }
+        if !new.is_empty() {
+            paths.push(new);
+        }
+    }
+    paths
+}
+
+/// Strip the quoting Git applies to paths with special characters.
+fn unquote_path(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        return trimmed[1..trimmed.len() - 1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\");
+    }
+    trimmed.to_owned()
+}
+
+/// The staged change set, both sides of a rename or copy included.
+///
+/// `--name-status` is tab-separated: the first field is the status (possibly
+/// `R100`/`C75`) and every following field is a path.
+fn staged_changes(root: &Path) -> Result<ChangeSet, OrchestratorError> {
+    let body = git(root, &["diff", "--cached", "--name-status"])?;
+    let mut paths = Vec::new();
+    for line in body.lines() {
+        let mut fields = line.split('\t');
+        let Some(status) = fields.next() else {
+            continue;
+        };
+        if status.trim().is_empty() {
+            continue;
+        }
+        for field in fields {
+            let path = unquote_path(field);
+            if !path.is_empty() {
+                paths.push(path);
+            }
         }
     }
     Ok(ChangeSet {

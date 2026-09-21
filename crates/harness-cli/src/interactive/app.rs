@@ -242,6 +242,7 @@ fn step(
                         .map_err(|error| terminal_error(&error))?;
                 }
                 for line in view::plain_lines(&item) {
+                    let line = terminal_safe(&line);
                     backend
                         .write(&line)
                         .map_err(|error| terminal_error(&error))?;
@@ -253,6 +254,7 @@ fn step(
             }
             Effect::Stream(text) => {
                 clear_prompt(backend, cursor)?;
+                let text = terminal_safe(&text);
                 backend
                     .write(&text)
                     .map_err(|error| terminal_error(&error))?;
@@ -474,11 +476,12 @@ fn render_line_mode(
         match effect {
             Effect::History(item) => {
                 for line in view::plain_lines(&item) {
-                    writeln!(output, "{line}").map_err(|error| io_error(&error))?;
+                    writeln!(output, "{}", terminal_safe(&line))
+                        .map_err(|error| io_error(&error))?;
                 }
             }
             Effect::Stream(text) => {
-                write!(output, "{text}").map_err(|error| io_error(&error))?;
+                write!(output, "{}", terminal_safe(&text)).map_err(|error| io_error(&error))?;
             }
             Effect::Redraw => redraw = true,
             Effect::Exit(code) => exit = Some(code),
@@ -491,6 +494,15 @@ fn render_line_mode(
     }
     output.flush().map_err(|error| io_error(&error))?;
     Ok(exit)
+}
+
+/// Terminal control characters are stripped at the write boundary: model text,
+/// file content and tool output can carry ESC sequences that would retitle the
+/// window, move the cursor or write the clipboard. Newlines and tabs stay.
+fn terminal_safe(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .collect()
 }
 
 fn io_error(error: &std::io::Error) -> HarnessError {

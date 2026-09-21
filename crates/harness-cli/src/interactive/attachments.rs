@@ -198,7 +198,17 @@ enum Read {
 /// quote into the message.
 fn read_file(path: &Path) -> Result<Read, String> {
     let name = path.display().to_string();
-    let metadata = std::fs::metadata(path).map_err(|error| format!("{name}: {error}"))?;
+    // A symlink is resolved first: the deny list must judge the file the bytes
+    // actually come from, or `notes.txt -> ~/.ssh/id_rsa` would pass the name
+    // check and attach the key.
+    let resolved = std::fs::canonicalize(path).map_err(|error| format!("{name}: {error}"))?;
+    let real_name = resolved.display().to_string();
+    if looks_like_credentials(&real_name) {
+        return Err(format!(
+            "{name}: a credential file is never attached to a request"
+        ));
+    }
+    let metadata = std::fs::metadata(&resolved).map_err(|error| format!("{name}: {error}"))?;
     if !metadata.is_file() {
         return Err(format!("{name}: not a file"));
     }
@@ -209,17 +219,19 @@ fn read_file(path: &Path) -> Result<Read, String> {
     }
     let declared_image = claims_to_be_an_image(&name);
     let (bytes, exceeded) = if declared_image {
-        let bytes = std::fs::read(path).map_err(|error| format!("{name}: {error}"))?;
-        if bytes.len() > MAX_IMAGE_BYTES {
+        // Refuse on the declared size before reading: a sparse or misnamed
+        // multi-gigabyte file must not be loaded to discover it is too big.
+        if metadata.len() > MAX_IMAGE_BYTES as u64 {
             return Err(format!(
                 "{name}: {} is larger than the {} MiB an image may be",
                 human_size(metadata.len()),
                 MAX_IMAGE_BYTES / (1024 * 1024)
             ));
         }
+        let bytes = std::fs::read(&resolved).map_err(|error| format!("{name}: {error}"))?;
         (bytes, false)
     } else {
-        read_capped(path)?
+        read_capped(&resolved)?
     };
     if let Some(media_type) = sniff(&bytes) {
         return Ok(Read::Image(image_attachment(&name, media_type, &bytes)?));
@@ -470,6 +482,8 @@ pub fn clipboard_text() -> Result<Option<String>, String> {
 /// The path is what the composer receives, so the ordinary path detection attaches it:
 /// one code path for a screenshot, a drag-and-drop and a typed path.
 pub fn save_pasted_png(directory: &Path, png: &[u8]) -> Result<PathBuf, String> {
+    use std::io::Write as _;
+
     std::fs::create_dir_all(directory)
         .map_err(|error| format!("{}: {error}", directory.display()))?;
     let digest = harness_types::ContentHash::from_bytes(png);
@@ -478,7 +492,20 @@ pub fn save_pasted_png(directory: &Path, png: &[u8]) -> Result<PathBuf, String> 
         .strip_prefix("sha256:")
         .unwrap_or(digest.as_str());
     let path = directory.join(format!("paste-{}.png", &stem[..16.min(stem.len())]));
-    std::fs::write(&path, png).map_err(|error| format!("{}: {error}", path.display()))?;
+    // Content-addressed and create-new: a pre-planted symlink at this path must
+    // not be followed, and an existing file already holds these exact bytes.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(png)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    }
     Ok(path)
 }
 
@@ -629,17 +656,36 @@ fn looks_like_credentials(path: &str) -> bool {
     // A name is suspicious when any of its dotted segments is a credential kind.
     // `split` rather than `Path::extension` because a dotfile has no extension:
     // `.env` and `.env.local` are both a stem with a leading dot.
-    let credential_segment = file_name
-        .split('.')
-        .skip(1)
-        .any(|segment| matches!(segment, "pem" | "key" | "env"));
+    let credential_segment = file_name.split('.').skip(1).any(|segment| {
+        matches!(
+            segment,
+            "pem"
+                | "key"
+                | "env"
+                | "p12"
+                | "pfx"
+                | "ppk"
+                | "jks"
+                | "keystore"
+                | "netrc"
+                | "npmrc"
+                | "git-credentials"
+                | "clixml"
+        )
+    });
     lowered.split(['/', '\\']).any(|part| {
         matches!(
             part,
-            ".ssh" | ".aws" | ".gnupg" | ".azure" | ".kube" | "credentials"
+            ".ssh"
+                | ".aws"
+                | ".gnupg"
+                | ".azure"
+                | ".kube"
+                | ".docker"
+                | ".git-credentials"
+                | "credentials"
         )
-    }) || file_name.starts_with("id_rsa")
-        || file_name.starts_with("id_ed25519")
+    }) || file_name.starts_with("id_")
         || file_name.starts_with("credentials")
         || credential_segment
 }

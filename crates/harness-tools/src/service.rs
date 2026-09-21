@@ -872,7 +872,20 @@ impl ToolExecutionService {
                 .map(|artifact| artifact.artifact_id.clone()),
             observed_at_seq: sequence,
         };
-        let event = event_for_receipt(&prepared.request.session_id, sequence, &receipt, "p3")?;
+        let model_view = json!({
+            "call_id": prepared.request.call_id,
+            "text": crate::turn_driver::render_tool_output(
+                prepared.final_action.kind().as_str(),
+                &output,
+            ),
+        });
+        let event = event_for_receipt(
+            &prepared.request.session_id,
+            sequence,
+            &receipt,
+            "p3",
+            Some(&model_view),
+        )?;
         self.store
             .commit_tool_settlement(ToolSettlementCommit {
                 expected_sequence: sequence,
@@ -947,6 +960,7 @@ impl ToolExecutionService {
             sequence,
             &receipt,
             "p3_denied",
+            None,
         )?;
         self.store
             .commit_receipt(harness_store_sqlite::ReceiptCommit {
@@ -1162,6 +1176,7 @@ fn event_for_receipt(
     sequence: u64,
     receipt: &ToolExecutionReceipt,
     kind: &str,
+    model_view: Option<&Value>,
 ) -> Result<EventEnvelope, HarnessError> {
     let mut payload = Map::new();
     payload.insert(
@@ -1174,6 +1189,12 @@ fn event_for_receipt(
         })?,
     );
     payload.insert("kind".to_owned(), Value::String(kind.to_owned()));
+    // The bounded, redacted view the model was given travels with the receipt
+    // event: a continuation after a crash replays it as a paired tool result
+    // instead of rerunning the tool or parsing the artifact.
+    if let Some(view) = model_view {
+        payload.insert("model_view".to_owned(), view.clone());
+    }
     let payload_hash = ContentHash::from_canonical_json(&Value::Object(payload.clone()))?;
     Ok(EventEnvelope {
         schema_version: P0_SCHEMA_VERSION,

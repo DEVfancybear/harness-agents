@@ -178,6 +178,17 @@ impl DelegationCoordinator {
                 "a completed task is never reassigned",
             ));
         }
+        // The fence is the host's generation, never a caller-supplied one: a
+        // worker from a dead activation must not claim an unowned task.
+        if worker.generation != self.generation {
+            return Err(OrchestratorError::new(
+                ErrorCode::TaskOwnershipConflict,
+                format!(
+                    "worker generation {} does not match the host generation {}",
+                    worker.generation, self.generation
+                ),
+            ));
+        }
         let revision = stored.revision;
         self.store
             .claim_task(
@@ -186,7 +197,7 @@ impl DelegationCoordinator {
                     owner_run_id: worker.run_id.clone(),
                     owner_session_id: session_id.clone(),
                     role: worker.role.as_str().to_owned(),
-                    generation: worker.generation,
+                    generation: self.generation,
                     lease_revision: revision,
                 },
                 revision,

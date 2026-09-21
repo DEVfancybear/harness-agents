@@ -423,8 +423,17 @@ fn restrict_acl(directory: &Path, account: Option<&str>) -> Protection {
 /// exist first, and that gap is exactly what this avoids.
 fn write_staged(staging: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    // A staging file left by an interrupted write must not be reused: it may
+    // carry wider permissions than this write grants, or be a symlink planted
+    // at the path. Removing the link and creating anew is the only shape that
+    // keeps the owner-only promise.
+    match std::fs::remove_file(staging) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

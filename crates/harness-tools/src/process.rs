@@ -89,6 +89,23 @@ async fn run(
     // and prevents two cleanup waits from starving each other; it does not
     // bypass the per-process tree ownership or output bounds.
     let _execution_guard = process_execution_lock().lock().await;
+    // A call canceled while it waited for the runner must not start a process:
+    // the caller has already withdrawn it, and the permit order is the only
+    // thing that could otherwise let it run.
+    if cancellation.is_cancelled() {
+        return Ok(ProcessResult {
+            executable: executable.to_owned(),
+            exit_code: None,
+            timed_out: false,
+            canceled: true,
+            // No process tree exists, so there is nothing left to clean up.
+            tree_cleanup_confirmed: true,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        });
+    }
     let mut command = CommandWrap::with_new(executable, |child_command| {
         child_command
             .args(args)

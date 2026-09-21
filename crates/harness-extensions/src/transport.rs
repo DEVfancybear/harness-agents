@@ -27,7 +27,7 @@ use harness_types::{ContentHash, ErrorCode, PluginInstanceId, ScopeId};
 use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use serde_json::Value;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::ChildStdin,
     sync::oneshot,
     time::timeout,
@@ -308,13 +308,14 @@ impl ExtensionTransport {
         let host = Arc::clone(&self.host);
         let writer = Arc::clone(&self.writer);
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).split(b'\n');
+            let mut lines = CappedLines::new(stdout, MAX_FRAME_BYTES);
             loop {
-                let Ok(Some(segment)) = lines.next_segment().await else {
+                let Ok(Some((segment, overflow))) = lines.next_line().await else {
                     break;
                 };
-                // A frame larger than the limit is refused without parsing it.
-                if segment.len() > MAX_FRAME_BYTES {
+                // A frame larger than the limit was drained and refused without
+                // ever being held in memory.
+                if overflow {
                     continue;
                 }
                 let Ok(frame) = ExtensionFrame::decode_line(&segment) else {
@@ -391,8 +392,10 @@ impl ExtensionTransport {
 
     fn spawn_stderr_reader(stderr: tokio::process::ChildStderr, tail: Arc<Mutex<String>>) {
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).split(b'\n');
-            while let Ok(Some(segment)) = lines.next_segment().await {
+            // The stderr tail is bounded, so a line longer than the whole tail is
+            // drained at the cap instead of buffered in full first.
+            let mut lines = CappedLines::new(stderr, MAX_STDERR_BYTES);
+            while let Ok(Some((segment, _overflow))) = lines.next_line().await {
                 if let Ok(mut captured) = tail.lock()
                     && captured.len() < MAX_STDERR_BYTES
                 {
@@ -586,4 +589,59 @@ pub fn executable_digest(path: &Path) -> Result<ContentHash, ExtensionError> {
         )
     })?;
     Ok(ContentHash::from_bytes(&bytes))
+}
+
+/// A line reader with a hard cap.
+///
+/// `BufReader::split` grows a line until its delimiter arrives, so a child that
+/// never writes `\n` can exhaust host memory before any size check runs. This
+/// reader keeps at most `max` bytes of the line being built (plus one read
+/// chunk) and reports `overflow` for the rest, so an unbounded line is drained
+/// and refused instead of held.
+struct CappedLines<R> {
+    reader: R,
+    buffer: Vec<u8>,
+    max: usize,
+    overflow: bool,
+}
+
+impl<R: AsyncRead + Unpin> CappedLines<R> {
+    fn new(reader: R, max: usize) -> Self {
+        Self {
+            reader,
+            buffer: Vec::new(),
+            max,
+            overflow: false,
+        }
+    }
+
+    /// The next line without its trailing `\n`, and whether its bytes past the
+    /// cap were discarded. `Ok(None)` at end of input.
+    async fn next_line(&mut self) -> std::io::Result<Option<(Vec<u8>, bool)>> {
+        loop {
+            if let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
+                let mut line = self.buffer.drain(..=index).collect::<Vec<_>>();
+                line.pop();
+                let overflow = self.overflow;
+                self.overflow = false;
+                return Ok(Some((line, overflow)));
+            }
+            if self.buffer.len() > self.max {
+                self.buffer.truncate(self.max);
+                self.overflow = true;
+            }
+            let mut scratch = [0_u8; 8 * 1024];
+            let read = self.reader.read(&mut scratch).await?;
+            if read == 0 {
+                if self.buffer.is_empty() && !self.overflow {
+                    return Ok(None);
+                }
+                let line = std::mem::take(&mut self.buffer);
+                let overflow = self.overflow;
+                self.overflow = false;
+                return Ok(Some((line, overflow)));
+            }
+            self.buffer.extend_from_slice(&scratch[..read]);
+        }
+    }
 }
