@@ -5,7 +5,7 @@
 //! the runtime layer.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     pin::Pin,
     sync::{
@@ -923,9 +923,14 @@ impl DeepSeekAdapter {
                 "provider endpoint is empty",
             ));
         }
+        validate_endpoint(&endpoint)?;
         let client = Client::builder()
             .connect_timeout(connect_timeout)
             .timeout(request_timeout)
+            // No redirects: a 307/308 would re-send the full body — conversation,
+            // inline images and tool schemas — to whatever host the response
+            // names, and the bearer token would follow a same-origin hop.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| {
                 ProviderError::new(
@@ -950,6 +955,48 @@ pub fn retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<Durat
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map(Duration::from_secs)
+}
+
+/// Refuse an endpoint that would send the API key in cleartext to a remote host.
+///
+/// `https` is accepted anywhere; plain `http` is accepted only for loopback
+/// hosts, which is what local fixtures and loopback proxies use. Any other
+/// scheme is refused rather than handed to the HTTP client.
+fn validate_endpoint(endpoint: &str) -> Result<(), ProviderError> {
+    let url = reqwest::Url::parse(endpoint).map_err(|_| {
+        ProviderError::new(
+            ErrorCode::ProviderProtocol,
+            "provider endpoint is not a valid URL",
+        )
+    })?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_host(&url) => Ok(()),
+        "http" => Err(ProviderError::new(
+            ErrorCode::ProviderProtocol,
+            "provider endpoint must use https; cleartext http is allowed only for loopback",
+        )),
+        _ => Err(ProviderError::new(
+            ErrorCode::ProviderProtocol,
+            "provider endpoint scheme is not supported",
+        )),
+    }
+}
+
+/// Whether the endpoint names the local machine.
+fn is_loopback_host(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(address)) => address.is_loopback(),
+        Ok(std::net::IpAddr::V6(address)) => address.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 impl ModelProvider for DeepSeekAdapter {
@@ -977,10 +1024,15 @@ impl ModelProvider for DeepSeekAdapter {
                 object.insert("tools".to_owned(), Value::Array(request.tool_schemas));
             }
             let response = tokio::select! {
-                result = client.post(endpoint).bearer_auth(token).json(&body).send() => result.map_err(|error| if error.is_timeout() {
-                    ProviderError::new(ErrorCode::ProcessTimedOut, format!("provider request timed out: {error}"))
-                } else {
-                    ProviderError::new(ErrorCode::ServiceUnavailable, format!("provider request failed: {error}"))
+                result = client.post(endpoint).bearer_auth(token).json(&body).send() => result.map_err(|error| {
+                    // `without_url` keeps a query-string token or userinfo out of
+                    // the message the runtime persists and renders.
+                    let error = error.without_url();
+                    if error.is_timeout() {
+                        ProviderError::new(ErrorCode::ProcessTimedOut, format!("provider request timed out: {error}"))
+                    } else {
+                        ProviderError::new(ErrorCode::ServiceUnavailable, format!("provider request failed: {error}"))
+                    }
                 })?,
                 () = cancellation.cancelled() => return Err(ProviderError::new(ErrorCode::ProviderCanceled, "provider request canceled")),
             };
@@ -994,6 +1046,7 @@ impl ModelProvider for DeepSeekAdapter {
             while let Some(chunk) = tokio::select! { item = stream.next() => item, () = cancellation.cancelled() => return Err(ProviderError::new(ErrorCode::ProviderCanceled, "provider stream canceled")), }
             {
                 let chunk = chunk.map_err(|error| {
+                    let error = error.without_url();
                     ProviderError::new(
                         if error.is_timeout() {
                             ErrorCode::ProcessTimedOut
@@ -1025,6 +1078,10 @@ pub struct SseLimits {
     pub max_frame_bytes: usize,
     pub max_tool_calls: usize,
     pub max_arguments_bytes: usize,
+    /// Total decoded answer bytes (text plus tool arguments) one stream may
+    /// produce. `max_buffered_bytes` bounds what is *unparsed*; this bounds what
+    /// a stream that keeps producing small frames hands to the caller.
+    pub max_output_bytes: usize,
 }
 
 impl Default for SseLimits {
@@ -1034,6 +1091,7 @@ impl Default for SseLimits {
             max_frame_bytes: 1024 * 1024,
             max_tool_calls: 64,
             max_arguments_bytes: 1024 * 1024,
+            max_output_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -1048,6 +1106,18 @@ pub struct SseDecoder {
     /// the pair is the only identity the whole stream agrees on. Choice is part of
     /// the key because an interleaved multi-choice stream reuses indexes per choice.
     tool_call_ids: BTreeMap<(u64, u64), String>,
+    /// Call identities that arrived with an `id` but no `index`. They cannot be
+    /// deduplicated against a slot, so they are remembered separately and counted
+    /// against the same cap.
+    id_only_ids: BTreeSet<String>,
+    /// Distinct call identities seen so far. Every arm that creates one must
+    /// count it here, or a stream can grow host memory with fresh identities.
+    identity_count: usize,
+    /// Running argument bytes per resolved call id, so a call cannot exceed
+    /// `max_arguments_bytes` by splitting its arguments across fragments.
+    arguments_bytes: BTreeMap<String, usize>,
+    /// Decoded text plus argument bytes handed to the caller.
+    decoded_bytes: usize,
     /// Call the most recent fragment belonged to, for a stream that omits `index`.
     last_tool_call_id: Option<String>,
     /// Whether a terminal marker (`[DONE]` or a `finish_reason`) was observed.
@@ -1095,19 +1165,30 @@ impl SseDecoder {
         final_chunk: bool,
     ) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
         let mut output = Vec::new();
+        // `consumed` is the end of the last parsed frame; `scanned` is how far a
+        // delimiter search has already looked, so a feed that carries many small
+        // frames is parsed in one pass instead of rescanning the tail per frame.
+        let mut consumed = 0_usize;
+        let mut scanned = 0_usize;
         loop {
-            let lf = self.buffer.windows(2).position(|window| window == b"\n\n");
-            let crlf = self
-                .buffer
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n");
-            let (index, width) = match (lf, crlf) {
-                (Some(a), Some(b)) if b < a => (b, 4),
-                (Some(a), _) => (a, 2),
-                (_, Some(b)) => (b, 4),
-                _ => break,
+            let mut found: Option<(usize, usize)> = None;
+            let mut index = scanned.max(consumed);
+            while index + 1 < self.buffer.len() {
+                if self.buffer[index] == b'\n' && self.buffer[index + 1] == b'\n' {
+                    found = Some((index, 2));
+                    break;
+                }
+                if index + 3 < self.buffer.len() && self.buffer[index..index + 4] == *b"\r\n\r\n" {
+                    found = Some((index, 4));
+                    break;
+                }
+                index += 1;
+            }
+            let Some((index, width)) = found else {
+                break;
             };
-            if index + width > self.limits.max_frame_bytes {
+            let frame_len = index + width - consumed;
+            if frame_len > self.limits.max_frame_bytes {
                 return Err(ProviderError::new(
                     ErrorCode::FrameLimitExceeded,
                     format!(
@@ -1116,7 +1197,9 @@ impl SseDecoder {
                     ),
                 ));
             }
-            let frame = self.buffer.drain(..index + width).collect::<Vec<_>>();
+            let frame = self.buffer[consumed..index + width].to_vec();
+            consumed = index + width;
+            scanned = consumed;
             let text = String::from_utf8(frame).map_err(|_| {
                 ProviderError::new(ErrorCode::ProviderProtocol, "SSE frame is not UTF-8")
             })?;
@@ -1140,6 +1223,9 @@ impl SseDecoder {
             } else {
                 output.extend(self.frame_events(&data)?);
             }
+        }
+        if consumed > 0 {
+            self.buffer.drain(..consumed);
         }
         if final_chunk && !self.buffer.iter().all(u8::is_ascii_whitespace) {
             return Err(ProviderError::new(
@@ -1192,6 +1278,7 @@ impl SseDecoder {
             let choice_index = u64::try_from(choice_index).unwrap_or(u64::MAX);
             let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
             if let Some(content) = delta.get("content").and_then(Value::as_str) {
+                self.note_output(content.len())?;
                 events.push(ProviderStreamEvent::text(content));
             }
             if let Some(fragments) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -1248,27 +1335,30 @@ impl SseDecoder {
                         ));
                     }
                     Some(_) => {}
-                    None => {
-                        if self.tool_call_ids.len() > self.limits.max_tool_calls {
-                            return Err(ProviderError::new(
-                                ErrorCode::FrameLimitExceeded,
-                                format!(
-                                    "provider stream announced more than {} tool calls",
-                                    self.limits.max_tool_calls
-                                ),
-                            ));
-                        }
-                    }
+                    None => self.note_identity()?,
                 }
                 id.to_owned()
             }
             // A continuation fragment: only the index says which call it belongs to.
-            (Some(index), None) => self
-                .tool_call_ids
-                .entry((choice, index))
-                .or_insert_with(|| format!("{DEFAULT_TOOL_CALL_ID}-{choice}-{index}"))
-                .clone(),
-            (None, Some(id)) => id.to_owned(),
+            (Some(index), None) => {
+                let key = (choice, index);
+                if !self.tool_call_ids.contains_key(&key) {
+                    self.note_identity()?;
+                }
+                self.tool_call_ids
+                    .entry(key)
+                    .or_insert_with(|| format!("{DEFAULT_TOOL_CALL_ID}-{choice}-{index}"))
+                    .clone()
+            }
+            (None, Some(id)) => {
+                // A fragment that names its own call without a slot. Fresh ids are
+                // as countable as slots, or a stream of one-fragment calls would
+                // grow the assembled map without limit.
+                if self.id_only_ids.insert(id.to_owned()) {
+                    self.note_identity()?;
+                }
+                id.to_owned()
+            }
             // Neither field: the fragment continues the call announced most
             // recently, and only a stream that never announced one keeps the
             // historical placeholder, which the gate then reports as malformed.
@@ -1286,7 +1376,11 @@ impl SseDecoder {
             .get("arguments")
             .and_then(Value::as_str)
             .unwrap_or("");
-        if arguments.len() > self.limits.max_arguments_bytes {
+        // The cap is on one call's whole argument text, not one fragment's: a
+        // stream that splits its arguments is still bounded by the same number.
+        let total = self.arguments_bytes.entry(call_id.clone()).or_default();
+        *total = total.saturating_add(arguments.len());
+        if *total > self.limits.max_arguments_bytes {
             return Err(ProviderError::new(
                 ErrorCode::OutputLimitExceeded,
                 format!(
@@ -1295,11 +1389,42 @@ impl SseDecoder {
                 ),
             ));
         }
+        self.note_output(arguments.len())?;
         Ok(ProviderStreamEvent::tool_delta(
             call_id,
             function.get("name").and_then(Value::as_str).unwrap_or(""),
             arguments,
         ))
+    }
+
+    /// Count one new call identity against the stream's cap.
+    fn note_identity(&mut self) -> Result<(), ProviderError> {
+        self.identity_count = self.identity_count.saturating_add(1);
+        if self.identity_count > self.limits.max_tool_calls {
+            return Err(ProviderError::new(
+                ErrorCode::FrameLimitExceeded,
+                format!(
+                    "provider stream announced more than {} tool calls",
+                    self.limits.max_tool_calls
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Count decoded answer bytes against the stream's cap.
+    fn note_output(&mut self, bytes: usize) -> Result<(), ProviderError> {
+        self.decoded_bytes = self.decoded_bytes.saturating_add(bytes);
+        if self.decoded_bytes > self.limits.max_output_bytes {
+            return Err(ProviderError::new(
+                ErrorCode::OutputLimitExceeded,
+                format!(
+                    "provider stream output exceeded {} bytes",
+                    self.limits.max_output_bytes
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1393,6 +1518,88 @@ mod sse_limit_tests {
             )
             .expect_err("one slot cannot change identity");
         assert_eq!(error.code(), ErrorCode::ProviderProtocol);
+    }
+
+    #[test]
+    fn index_only_fragments_cannot_grow_the_call_map() {
+        let limits = SseLimits {
+            max_tool_calls: 1,
+            ..SseLimits::default()
+        };
+        let mut decoder = SseDecoder::with_limits(limits);
+        decoder
+            .feed(
+                frame(&json!({"tool_calls": [{"index": 0, "function": {"arguments": "a"}}]}))
+                    .as_bytes(),
+            )
+            .expect("the first index-only call fits");
+        let error = decoder
+            .feed(
+                frame(&json!({"tool_calls": [{"index": 1, "function": {"arguments": "b"}}]}))
+                    .as_bytes(),
+            )
+            .expect_err("a fresh index is a fresh call and must be counted");
+        assert_eq!(error.code(), ErrorCode::FrameLimitExceeded);
+    }
+
+    #[test]
+    fn id_only_fragments_are_counted_against_the_call_cap() {
+        let limits = SseLimits {
+            max_tool_calls: 1,
+            ..SseLimits::default()
+        };
+        let mut decoder = SseDecoder::with_limits(limits);
+        decoder
+            .feed(
+                frame(&json!({"tool_calls": [{"id": "call_a", "function": {"arguments": "a"}}]}))
+                    .as_bytes(),
+            )
+            .expect("the first id-only call fits");
+        let error = decoder
+            .feed(
+                frame(&json!({"tool_calls": [{"id": "call_b", "function": {"arguments": "b"}}]}))
+                    .as_bytes(),
+            )
+            .expect_err("a fresh id is a fresh call and must be counted");
+        assert_eq!(error.code(), ErrorCode::FrameLimitExceeded);
+    }
+
+    #[test]
+    fn split_arguments_are_capped_by_the_running_total() {
+        let limits = SseLimits {
+            max_arguments_bytes: 8,
+            ..SseLimits::default()
+        };
+        let mut decoder = SseDecoder::with_limits(limits);
+        decoder
+            .feed(
+                frame(&json!({"tool_calls": [{"index": 0, "id": "call_a", "function": {"arguments": "01234"}}]}))
+                    .as_bytes(),
+            )
+            .expect("the first fragment fits");
+        let error = decoder
+            .feed(
+                frame(&json!({"tool_calls": [{"index": 0, "function": {"arguments": "56789"}}]}))
+                    .as_bytes(),
+            )
+            .expect_err("the per-call total, not the fragment, is capped");
+        assert_eq!(error.code(), ErrorCode::OutputLimitExceeded);
+    }
+
+    #[test]
+    fn decoded_output_is_capped_across_frames() {
+        let limits = SseLimits {
+            max_output_bytes: 8,
+            ..SseLimits::default()
+        };
+        let mut decoder = SseDecoder::with_limits(limits);
+        decoder
+            .feed(frame(&json!({"content": "12345"})).as_bytes())
+            .expect("the first delta fits");
+        let error = decoder
+            .feed(frame(&json!({"content": "67890"})).as_bytes())
+            .expect_err("many small frames still hit the output cap");
+        assert_eq!(error.code(), ErrorCode::OutputLimitExceeded);
     }
 
     #[test]
@@ -1642,7 +1849,20 @@ mod sse_tool_call_tests {
 
 #[cfg(test)]
 mod endpoint_tests {
-    use super::{CHAT_COMPLETIONS_PATH, chat_completions_endpoint};
+    use std::sync::Arc;
+
+    use super::{
+        CHAT_COMPLETIONS_PATH, DeepSeekAdapter, ErrorCode, ModelCapabilities,
+        StaticCredentialResolver, chat_completions_endpoint,
+    };
+
+    fn adapter(endpoint: &str) -> Result<DeepSeekAdapter, super::ProviderError> {
+        DeepSeekAdapter::new(
+            endpoint,
+            Arc::new(StaticCredentialResolver::new("fixture-secret")),
+            ModelCapabilities::deepseek_fixture(),
+        )
+    }
 
     /// The measured bug: a bare base URL posted to `/` and the API answered 404.
     ///
@@ -1697,6 +1917,33 @@ mod endpoint_tests {
             "https://gateway.internal/openai/chat"
         );
         assert_eq!(chat_completions_endpoint(""), "");
+    }
+
+    /// A remote cleartext endpoint would send the bearer token and the whole
+    /// conversation in the clear, so it is refused at configuration time.
+    #[test]
+    fn cleartext_http_to_a_remote_host_is_refused() {
+        let error = adapter("http://api.example.invalid/chat/completions")
+            .err()
+            .expect("remote http is refused");
+        assert_eq!(error.code(), ErrorCode::ProviderProtocol);
+    }
+
+    /// Loopback is what local fixtures and loopback proxies use.
+    #[test]
+    fn cleartext_http_to_loopback_is_allowed_for_local_fixtures() {
+        adapter("http://127.0.0.1:8080/chat/completions").expect("loopback http");
+        adapter("http://localhost:8080/v1/chat/completions").expect("localhost http");
+        adapter("http://[::1]:8080/chat/completions").expect("ipv6 loopback http");
+    }
+
+    #[test]
+    fn https_and_unsupported_schemes_are_classified() {
+        adapter("https://api.example.invalid/chat/completions").expect("https");
+        let error = adapter("ftp://api.example.invalid/chat/completions")
+            .err()
+            .expect("ftp is refused");
+        assert_eq!(error.code(), ErrorCode::ProviderProtocol);
     }
 }
 

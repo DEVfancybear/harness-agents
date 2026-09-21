@@ -65,6 +65,14 @@ const MEMORY_SCHEMA: &[&str] = &[
         priority INTEGER NOT NULL,
         revision INTEGER NOT NULL CHECK (revision >= 1)
     )",
+    // `bound_memory` and the search path filter bindings by principal; without
+    // this index every search scans the whole bindings table.
+    "CREATE INDEX IF NOT EXISTS memory_bindings_by_principal
+        ON memory_bindings(principal_id)",
+    // Deduplication looks an exact normalized content up; the version table has
+    // no other access path for it.
+    "CREATE INDEX IF NOT EXISTS memory_versions_by_normalized
+        ON memory_versions(normalized_content)",
     "CREATE TABLE IF NOT EXISTS memory_dependencies (
         derived_asset_id TEXT NOT NULL,
         derived_version INTEGER NOT NULL,

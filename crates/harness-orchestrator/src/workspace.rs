@@ -523,11 +523,21 @@ fn fingerprint_locked(root: &Path) -> Result<ContentHash, OrchestratorError> {
     let mut records = vec![format!("head\u{0}{head}")];
     for relative in &entries {
         let absolute = root.join(relative);
-        let bytes = std::fs::read(&absolute).unwrap_or_default();
-        records.push(format!(
-            "{relative}\u{0}{}",
-            ContentHash::from_bytes(&bytes).as_str()
-        ));
+        // Stream the file: a fingerprint must not load a whole tree into memory,
+        // and an unreadable file is a typed failure, not silently an empty file.
+        let mut file = std::fs::File::open(&absolute).map_err(|error| {
+            OrchestratorError::new(
+                ErrorCode::StorageOpenFailed,
+                format!("cannot read workspace file {}: {error}", absolute.display()),
+            )
+        })?;
+        let digest = ContentHash::from_reader(&mut file).map_err(|error| {
+            OrchestratorError::new(
+                ErrorCode::StorageOpenFailed,
+                format!("cannot hash workspace file {}: {error}", absolute.display()),
+            )
+        })?;
+        records.push(format!("{relative}\u{0}{}", digest.as_str()));
     }
     let joined = records.join("\n");
     Ok(ContentHash::from_bytes(joined.as_bytes()))

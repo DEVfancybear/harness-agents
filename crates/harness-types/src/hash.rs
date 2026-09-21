@@ -35,9 +35,29 @@ impl ContentHash {
 
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        let digest = Sha256::digest(bytes);
+        Self::from_digest(Sha256::digest(bytes))
+    }
+
+    /// Hash a reader's bytes without holding the whole file in memory.
+    ///
+    /// Streaming callers that must hash a large or unknown-size file use this
+    /// instead of reading it into a `Vec` first.
+    pub fn from_reader(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
+        let mut hash = Sha256::new();
+        let mut buffer = vec![0_u8; 32 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hash.update(&buffer[..read]);
+        }
+        Ok(Self::from_digest(hash.finalize()))
+    }
+
+    fn from_digest(digest: impl AsRef<[u8]>) -> Self {
         let mut rendered = String::from("sha256:");
-        for byte in digest {
+        for byte in digest.as_ref() {
             let _ = write!(rendered, "{byte:02x}");
         }
         Self(rendered)

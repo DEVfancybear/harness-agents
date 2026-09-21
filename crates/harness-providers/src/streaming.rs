@@ -173,6 +173,7 @@ pub(crate) fn adapter_stream(
                 result = client.post(&endpoint).bearer_auth(token).json(&body).send() => match result {
                     Ok(response) => response,
                     Err(error) => {
+                        let error = error.without_url();
                         let _ = sender.send(Err(ProviderError::new(
                             if error.is_timeout() {
                                 ErrorCode::ProcessTimedOut
@@ -221,6 +222,7 @@ pub(crate) fn adapter_stream(
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(error) => {
+                        let error = error.without_url();
                         let _ = sender
                             .send(Err(ProviderError::new(
                                 ErrorCode::ProviderProtocol,
