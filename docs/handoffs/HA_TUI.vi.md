@@ -778,3 +778,36 @@ thay vì khối dài nuốt hết (§7.9) — và memory được mở rộng t�
 thoại", quyết định hợp đồng ghi ở §19 của `docs/MEMORY_AND_CONTINUITY.vi.md`. Hai chỗ giao với lượt
 này: `HA_MEMORY=on` là điều kiện để thấy bất kỳ dòng `memory:` nào trong transcript, và gate phê
 duyệt ở §16 không đổi vì memory không đi qua `ApprovalGate`.
+
+## 17. `a` = cho phép cả lượt, cho **mọi** hành động (21/09/2026)
+
+**§16.4 mục 1 và §16.5 bước 1–2 đã bị mục này thay thế.** Người giao việc gửi ảnh chụp panel
+`RunProcess: run git log -1 --stat --format=fuller` và báo bị hỏi lặp từng lệnh; nguyên nhân là
+`a` cũ chỉ phủ 5 kind chỉ-đọc nên `run_process` không có phím nào để thoát. Quyết định: `a` phủ
+**mọi** kind trong **một lượt** (không thêm chế độ tin cậy vĩnh viễn, không phân loại lại shell
+chỉ-đọc).
+
+Hợp đồng, danh sách đổi tên API, test và ranh giới bằng chứng: [SPEC 3j](../specs/HA_TUI.vi.md).
+Tóm tắt cho người mở lại: `ApprovalDecision::GrantForRun`, `SessionPort::{grant,revoke}_run_approval`,
+`ChannelApprovalGate::{grant_for_run, clear_grant_for_run, granted_for_run}`, `UiState::granted_for_run`,
+thanh trạng thái `· tự động cả lượt`, nhãn transcript `granted (every action allowed for this turn)`.
+
+Việc còn lại của lượt này:
+
+1. **Commit `a5ac2e2` KHÔNG build được, và nó đã được push.** Writer song song (§12) commit cây
+   nguồn **giữa lúc** đổi tên nhiều file của lượt này, nên bản đã commit có `service.rs` mang tên
+   mới (`ApprovalDecision::GrantForRun`, `SessionPort::grant_run_approval`) trong khi
+   `controller.rs` vẫn dùng tên cũ (`GrantReadsForRun`, `approve_reads_for_run`) — tức
+   `cargo build` ở `a5ac2e2` đỏ. Cây làm việc hiện tại đã hoàn tất việc đổi tên và xanh test;
+   cần **một commit sửa** (không amend được vì đã push). Đây là bài học cho §12: đừng commit cây
+   khi một writer khác đang giữa một thay đổi nhiều file.
+2. **Chưa có ca PTY bấm `a`** (§16.4 mục 1 vẫn đúng): đường `a` được chứng minh ở cổng thật +
+   khung hình đã vẽ, chưa trên ConPTY. Nếu thêm, `scripts/Invoke-HaPtyAcceptance.ps1` phải nêu lại
+   con số 16 thành 17.
+3. **Chưa đo bằng mắt trên console thật**: panel giờ **luôn** 5 hàng nội dung (thêm dòng `a` cho
+   mọi panel, không chỉ panel chỉ-đọc), nên panel ghi trước kia 4 hàng → nay 5. Ở console thấp cần
+   một lần lái tay (cùng việc §16.4 mục 2).
+4. **Việc riêng chưa làm, đã ghi ở SPEC 3j.5**: `RunProcess`/`RunShell` không được
+   `validate_workspace_action` kiểm gì và không có sandbox filesystem/network, nên sau khi bấm `a`
+   một lệnh do model đề xuất chạy không hỏi. Đó là quyền người giao việc đã chọn; muốn hẹp hơn thì
+   phải phân loại lệnh shell chỉ-đọc (open item §16.4 mục 4, vẫn chưa làm).

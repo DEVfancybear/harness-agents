@@ -326,10 +326,10 @@ pub struct UiState {
     /// The open tool card, if any: it updates in place until it settles.
     pub open_tool: Option<(String, String)>,
     pub modal: Option<Modal>,
-    /// Whether the user allowed read-only actions for the run in flight, so the
+    /// Whether the user allowed every gated action for the run in flight, so the
     /// status row can say the gate is open instead of leaving a silent widening of
     /// what runs without asking.
-    pub reads_for_run: bool,
+    pub granted_for_run: bool,
     /// The last submitted request, so the status bar can name it.
     pub last_request: Option<String>,
     /// When the active run started, for the elapsed clock.

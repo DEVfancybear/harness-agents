@@ -381,39 +381,45 @@ identity trong store của nó, và mọi lượt sau, trong process này hay pr
 
 Trong ứng dụng: `/help`, `/status`, `/key`, `/config`, `/model`, `/new`, `/resume [số|id]`,
 `/exit`. Khi một action cần phê duyệt, ứng dụng in action, thư mục và scope thật rồi chờ
-bạn trả lời `y` (chạy một lần) hoặc `n` (từ chối); không có phê duyệt ngầm, hết thời gian
-chờ được tính là từ chối.
+bạn trả lời `y` (chạy một lần), `a` (cho phép cả lượt) hoặc `n` (từ chối); không có phê
+duyệt ngầm, hết thời gian chờ được tính là từ chối.
 
-### Phê duyệt: khi nào bị hỏi, và khi nào không
+### Phê duyệt: khi nào bị hỏi, và làm sao để hết bị hỏi
 
-Mặc định ban đầu vẫn là **hỏi mọi action**, kể cả đọc file. Nhưng panel có thêm một lựa
-chọn khi — và chỉ khi — action đó **chỉ đọc**:
+Mặc định ban đầu là **hỏi mọi action**, kể cả đọc file. Panel có ba lựa chọn, và cả ba
+đều có trên **mọi** panel:
 
 | Phím | Nghĩa | Hiệu lực |
 | --- | --- | --- |
 | `y` | chạy action này một lần | hết action là hết |
-| `a` | chạy action này **và** cho phép mọi thao tác chỉ-đọc trong **lượt này** | tới khi lượt kết thúc |
+| `a` | chạy action này **và** cho phép **mọi** thao tác trong **lượt này** | tới khi lượt kết thúc |
 | `n` | từ chối | action không chạy |
 
-`a` chỉ hiện với 5 action chỉ-đọc: `read_file`, `list_files`, `search_text`, `git_status`,
-`git_diff`. `apply_patch`, `run_process`, `run_shell`, `task_update` và tool của extension
-**luôn** hỏi từng lần, `a` không có tác dụng với chúng.
+**Bấm `a` một lần là hết bị hỏi cho tới khi lượt đó xong** — kể cả `run_process` (chạy
+`git log`, `cargo test`…), `apply_patch`, `run_shell` và tool của extension. Đây là thay
+đổi có chủ ý sau khi người dùng báo: một lượt chạy toàn lệnh `git` vẫn hỏi từng lệnh, vì
+`run_process` không phải action chỉ-đọc nên `a` cũ không phủ được nó.
 
-Sau khi bạn bấm `a`, thanh trạng thái hiện `· reads tự động` để bạn biết cổng đang mở, và
-transcript ghi một dòng `[info] read-only, allowed for this turn: <action>` cho mỗi thao tác
-được chạy theo diện này — không có gì chạy mà không để lại dấu.
+Sau khi bạn bấm `a`, thanh trạng thái hiện `· tự động cả lượt` để bạn biết cổng đang mở, và
+transcript ghi một dòng `[info] allowed for this turn: <action>` cho mỗi thao tác được chạy
+theo diện này (đọc thì có thêm chữ `read-only, `) — không có gì chạy mà không để lại dấu.
 
-Bốn điều `a` **không** làm được, kiểm bằng test:
+Bốn điều ngay cả `a` **cũng không** làm được, kiểm bằng test:
 
-1. **Không** đọc được file trong danh sách bảo vệ: `.env`, `.env.*`, `.git`, `.harness`, và
-   tên chứa `credential`, `secret`, `password`, `private_key`, hay đuôi `.pem`/`.key`/`.p12`/
-   `.pfx`/`.clixml`. Các đường này bị từ chối **trước khi** panel tồn tại, nên không có gì để
-   `a` cho phép.
+1. **Không** đọc/ghi được file trong danh sách bảo vệ: `.env`, `.env.*`, `.git`, `.harness`,
+   và tên chứa `credential`, `secret`, `password`, `private_key`, hay đuôi `.pem`/`.key`/
+   `.p12`/`.pfx`/`.clixml`. Các đường này bị từ chối **trước khi** panel tồn tại, nên không
+   có gì để `a` cho phép.
 2. **Không** ra khỏi workspace: đường dẫn tuyệt đối, `..`, và symlink/reparse point đều bị từ
    chối trước panel.
 3. **Không** sống qua lượt sau: hết lượt là cổng đóng, kể cả khi lượt kết thúc bằng lỗi hay
-   Ctrl-C.
+   Ctrl-C. Lượt kế tiếp hỏi lại từ đầu.
 4. **Không** áp cho lượt đang chạy khi bạn chưa bấm `a`: mặc định vẫn hỏi.
+
+Điều `a` **có** làm, nói thẳng vì nó là quyền lớn: từ lúc bấm, mọi lệnh và mọi ghi file
+trong lượt đó chạy mà không hỏi nữa. Nếu bạn muốn tự kiểm soát từng bước, dùng `y` (một
+lần) và để panel hiện lại — hoặc `n` để từ chối. Hiện **chưa** có chế độ tin cậy vĩnh viễn
+cho workspace (một công tắc để không bao giờ hỏi, kể cả lần mở sau).
 
 **Chỉ cần một API key.** `DEEPSEEK_API_KEY` (hoặc `HA_API_KEY`) là đủ: endpoint và
 model tự lấy giá trị `DeepSeek` công bố — `https://api.deepseek.com` và
@@ -496,7 +502,7 @@ Bàn phím (chỉ những phím đã đo trên console thật):
 | `Ctrl-D` | Buffer rỗng: thoát |
 | `Ctrl-L` | Vẽ lại vùng đáy, không xoá scrollback |
 | `y` / `n` | Trả lời panel phê duyệt (hoặc gõ `yes`/`no` rồi Enter) |
-| `a` | Chỉ khi action **chỉ đọc**: chạy nó và cho phép đọc cả lượt (hoặc gõ `all` rồi Enter) |
+| `a` | Chạy action này và cho phép **mọi** thao tác trong **lượt này** (kể cả ghi file và chạy lệnh); hết lượt là hết (hoặc gõ `all` rồi Enter) |
 
 **Gõ `/` là ra danh sách lệnh.** Menu hiện ngay trên ô soạn thảo và hẹp dần theo từng ký tự; nó
 **không** phải modal, nên con trỏ vẫn ở trong ô soạn thảo và bản nháp vẫn nguyên:
@@ -522,7 +528,9 @@ Menu chỉ tồn tại khi nó **được vẽ**: ở plain mode (không có men
 bạn không nhìn thấy. Trong lúc nhập API key (buffer mask) menu cũng không bao giờ hiện.
 
 Khi một action cần phê duyệt, panel hiện action, workspace, scope và **đếm ngược** tới
-hạn của gate; hết hạn thì action **không** chạy và panel tự đóng.
+hạn của gate; hết hạn thì action **không** chạy và panel tự đóng. Panel luôn có ba phím:
+`y` chạy một lần · `a` cho phép mọi thao tác trong lượt này (kể cả ghi file và chạy lệnh) ·
+`n` từ chối.
 
 ### 12.2. Khi nào ứng dụng dùng giao diện đơn giản (plain)
 

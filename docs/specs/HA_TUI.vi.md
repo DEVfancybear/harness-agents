@@ -703,10 +703,13 @@ phải người dùng dùng sai.
 1. **Miễn hỏi cho 5 action chỉ-đọc** trong workspace: `read_file`, `list_files`,
    `search_text`, `git_status`, `git_diff`.
 2. **Danh sách bảo vệ không bao giờ được miễn** — điểm tựa an toàn của cả thay đổi.
-3. **Ghi / patch / chạy lệnh vẫn hỏi từng lần.**
-4. **Panel thêm lựa chọn `a`** (cho phép đọc cả lượt), giống `[s] Accept for session` của Codex
-   nhưng **chỉ** cho chỉ-đọc và **chỉ** trong một lượt. **Không** làm mục "ghi vào policy vĩnh
-   viễn" như `[p]` của Codex: nó ghi ra file và cần người dùng quyết riêng.
+3. ~~**Ghi / patch / chạy lệnh vẫn hỏi từng lần.**~~ → **bị mục 3j thay thế**: sau khi người
+   dùng bấm `a`, ghi/patch/chạy lệnh trong lượt đó cũng không hỏi nữa (quyết định của người
+   giao việc, có lý do đo được).
+4. ~~**Panel thêm lựa chọn `a`** (cho phép đọc cả lượt), giống `[s] Accept for session` của
+   Codex nhưng **chỉ** cho chỉ-đọc và **chỉ** trong một lượt.~~ → **bị mục 3j thay thế**: `a`
+   nay phủ **mọi** kind, vẫn **chỉ** trong một lượt. Phần "**Không** làm mục ghi vào policy vĩnh
+   viễn như `[p]` của Codex" **vẫn đúng** — chưa có chế độ tin cậy vĩnh viễn.
 
 **Điểm tựa an toàn, đọc từ code chứ không suy đoán:** `ToolExecutionService::prepare` gọi
 `validate_workspace_action` → `resolve_relative` **trước khi** một `ApprovalProposal` tồn tại.
@@ -724,18 +727,21 @@ và cũng là lý do `read_only` trong proposal nghĩa là "không ghi gì", **k
 
 ```text
 request(proposal):
-  if proposal.read_only && reads_for_run  ->  Notice + Granted   (không mở panel)
-  else                                    ->  ApprovalRequired   (panel như cũ)
+  if granted_for_run               ->  Notice + Granted   (không mở panel)
+  else                             ->  ApprovalRequired   (panel như cũ)
 ```
+
+*(Mục 3j thay điều kiện `proposal.read_only && reads_for_run` bằng `granted_for_run`; hình dạng
+còn lại của cổng không đổi.)*
 
 Hệ quả đã kiểm: **plain mode được miễn hỏi y hệt** mà không phải viết thêm dòng nào, vì hai
 renderer dùng chung một cổng. `ApprovalMode` và trait `ApprovalGate` **không** đổi hình dạng —
 `read_only` đi kèm proposal, nên chỉ đúng một chỗ dựng proposal (`proposal_for`) phải sửa.
 
-Cờ `reads_for_run` là `AtomicBool` **trên object**, không ghi ra đĩa; `finish_run()` của
-controller thu hồi nó, nên nó không sống qua lượt sau kể cả khi lượt kết thúc bằng lỗi hay
-Ctrl-C. Thanh trạng thái hiện `· reads tự động` khi cổng đang mở: nới quyền mà không nói ra là
-điều tệ nhất có thể làm ở đây.
+Cờ `granted_for_run` (tên cũ `reads_for_run`) là `AtomicBool` **trên object**, không ghi ra đĩa;
+`finish_run()` của controller thu hồi nó, nên nó không sống qua lượt sau kể cả khi lượt kết thúc
+bằng lỗi hay Ctrl-C. Thanh trạng thái hiện `· tự động cả lượt` khi cổng đang mở: nới quyền mà
+không nói ra là điều tệ nhất có thể làm ở đây.
 
 ### 3g.4. Test canh ranh giới (tên thật, đã chạy)
 
@@ -956,6 +962,127 @@ từ chối `icacls` (mục 3d.4, evidence 11.2/11.7), không liên quan tới m
   có bàn phím.
 - Phím `↑`/`↓` **không** cuộn panel `/help`/`/more` (lỗi chữ đã ghi ở mục 3e.2); mục này không sửa
   nó, và cũng không làm nó nặng thêm: menu chỉ tồn tại khi **không** có panel nào mở.
+
+## 3j. `a` = cho phép cả lượt, cho **mọi** hành động (lượt này)
+
+### 3j.1. Vì sao đổi
+
+Người dùng gửi ảnh chụp panel duyệt và báo: *"tôi chọn `a` rồi đáng nhẽ chạy liên tục mà cứ được
+một lúc lại bắt tôi confirm rất khó chịu, nới quyền ra"*. Ảnh cho thấy panel của
+`RunProcess: run git log -1 --stat --format=fuller`, scope `one action, this turn only`.
+
+Đọc code thì nguyên nhân rõ ràng và **không** phải lỗi hiển thị:
+
+1. **`a` chỉ có tác dụng với 5 kind chỉ-đọc** (`read_file`, `list_files`, `search_text`,
+   `git_status`, `git_diff`) — nhánh `Key::Char('a') if !self.plain && self.pending_is_read_only()`.
+2. **`run_process` không nằm trong 5 kind đó** (`ToolKind::is_read_only`), nên panel của một lệnh
+   `git` chỉ có `y`/`n`, và cổng `ChannelApprovalGate` chỉ miễn hỏi khi
+   `proposal.read_only && reads_for_run` — tức một lượt toàn lệnh `git` bị hỏi **từng lệnh**, không
+   có phím nào thoát ra.
+3. Bấm `a` trên panel đó còn **tệ hơn không bấm**: ký tự rơi xuống editor (một chữ `a` trong bản
+   nháp) vì panel không nhận nó.
+
+Người giao việc đã chọn phương án **"`a` = cho phép cả lượt cho mọi hành động"** (không chọn thêm
+chế độ tin cậy vĩnh viễn, không chọn phân loại lại lệnh shell thành chỉ-đọc).
+
+### 3j.2. Hợp đồng đã chốt
+
+1. **`a` phủ mọi kind** trong **một lượt**: `run_process`, `run_shell`, `apply_patch`,
+   `task_update`, tool của extension - không chỉ 5 kind chỉ-đọc. Hết lượt là hết.
+2. **Mọi panel đều có `a`**, kể cả panel chỉ-đọc: ba phím `y` / `a` / `n` là hợp đồng chung, nên
+   không còn panel nào im lặng giấu phím thoát khỏi chuỗi hỏi.
+3. **Chữ trên panel nói đúng quyền nó cấp**: `a cho phép mọi thao tác trong lượt này (kể cả ghi
+   file và chạy lệnh)`, và viền composer ghi `a cho phép cả lượt`. Một phím làm nhiều hơn chữ của
+   nó là lỗi; đây là chỗ dễ mắc nhất khi mở rộng quyền.
+4. **Lượt nào cũng bắt đầu lại từ câu hỏi, và một lượt là *cả* công việc người dùng giao** -
+   kể cả khi app tự chạy tiếp sau một bound. Cờ là `AtomicBool` trên object cổng; controller thu
+   hồi nó ở đúng nơi lượt thật sự kết thúc: terminal event mà **không** có continuation nào được
+   phát, và nhánh `RecoverableError`. Nếu thu hồi ngay ở mọi `RunTerminal` thì một lượt dài bị
+   bound cắt sẽ **hỏi lại giữa việc** - đúng cái phiền mà thay đổi này sinh ra để chấm dứt. Bất
+   biến của 3g giữ nguyên (không sống qua lượt sau, không sống qua lỗi/huỷ); chỉ *phạm vi* của
+   grant rộng ra.
+5. **Không có gì chạy mà không để lại dấu.** Mỗi action được miễn hỏi phát một
+   `SessionEvent::Notice`: `[info] allowed for this turn: run git log -1 --stat --format=fuller`
+   (đọc thì thêm tiền tố `read-only, `), và thanh trạng thái hiện `· tự động cả lượt` suốt thời
+   gian cổng mở.
+6. **Kiểm tra trước panel không đổi.** `ToolExecutionService::prepare` vẫn validate path/policy
+   **trước khi** một proposal tồn tại, nên `.env`, `.git`, `.harness`, tên chứa
+   `credential`/`secret`/`private_key`, `..`, đường dẫn tuyệt đối và symlink vẫn bị **từ chối
+   thẳng**. `a` bỏ **câu hỏi**, không bao giờ bỏ **kiểm tra** - và vì không có proposal thì cũng
+   không có gì để `a` cho phép.
+7. **Không có chế độ tin cậy vĩnh viễn.** Không ghi policy ra file, không có `--yes`, không có
+   trust theo workspace; người giao việc chọn đúng một mục, nên phần đó **không** được làm và được
+   ghi ở đây thay vì hứa suông.
+
+### 3j.3. Đổi hợp đồng có chủ ý (ghi lại, không đổi ngầm)
+
+| Trước | Sau | Lý do |
+|---|---|---|
+| `ApprovalDecision::GrantReadsForRun` | `ApprovalDecision::GrantForRun` | Tên cũ hứa ít hơn việc nó làm sau thay đổi này |
+| `SessionPort::approve_reads_for_run` / `revoke_reads_for_run` | `grant_run_approval` / `revoke_run_approval` | Cùng lý do; chữ "reads" biến mất khỏi hợp đồng |
+| `ChannelApprovalGate::{grant_reads_for_run, clear_reads_for_run, reads_granted_for_run}` | `{grant_for_run, clear_grant_for_run, granted_for_run}` | Cùng lý do |
+| `ChannelApprovalGate::request`: `if proposal.read_only && reads_granted_for_run()` | `if granted_for_run()` | Chính là thay đổi người dùng yêu cầu |
+| `UiState::reads_for_run` | `UiState::granted_for_run` | Trạng thái thanh trạng thái đọc cùng một cờ |
+| Nhãn transcript `granted (reads allowed for this turn)` | `granted (every action allowed for this turn)` | Transcript phải nói đúng thứ đã cấp |
+| Thanh trạng thái `· reads tự động` | `· tự động cả lượt` | Cùng lý do |
+| Dòng `a` **chỉ** hiện trên panel chỉ-đọc | Luôn hiện, và nói rõ "kể cả ghi file và chạy lệnh" | Không còn panel nào giấu phím thoát |
+| `view::approval_lines` dòng 4: `answer y to run it once, or n to refuse` | `answer y to run it once, a to allow every action for this turn, or n to refuse` | Plain mode không có panel, nên chữ ở đó **là** panel của nó |
+| `a`/`all`/`/approve-reads` | `a`/`all`/`/approve-all` | Alias cũ nói sai nghĩa mới |
+| `read_only` trên `Modal::Approval`: quyết định **phím nào** được đưa ra | Chỉ còn **thông tin**: panel ghi `· chỉ đọc` cạnh proposal | Trường vẫn có nghĩa (người đọc biết action có ghi được không) mà không còn điều khiển UI |
+| `t08_a_granted_read_never_covers_a_mutating_action` | Bị **xoá**, thay bằng `t08_the_turn_grant_covers_a_command_and_a_patch_without_a_panel` | Test cũ khẳng định đúng điều vừa được đổi; giữ nó là giữ một hợp đồng đã chết |
+
+### 3j.4. Test canh hợp đồng (tên thật, đã chạy)
+
+```text
+harness-cli (cổng, service.rs):
+  t08_the_turn_grant_covers_a_command_and_a_patch_without_a_panel -> RunProcess + ApplyPatch đều
+                                                                     Granted, không panel, và CÓ Notice
+  t08_an_allowed_action_is_not_asked_about_again_and_is_still_recorded
+  t08_a_read_is_asked_about_until_the_user_allows_the_turn        -> chưa cấp thì cả đọc và lệnh đều Expired
+  t08_the_wider_answer_grants_the_pending_action_and_the_run      -> `GrantForRun` trả Granted + mở cổng;
+                                                                     clear rồi thì hỏi lại
+harness-cli (controller):
+  t06_the_turn_grant_is_offered_on_a_write_panel_and_on_a_read_panel
+  t06_the_turn_key_grants_the_action_and_the_whole_turn           -> answer `GrantForRun`, port nhận
+                                                                     grant_run_approval(true), nhãn transcript mới
+  t06_the_turn_grant_does_not_survive_the_turn                    -> [true, false] quanh RunTerminal
+  t06_the_turn_grant_survives_an_automatic_continuation_and_closes_with_the_turn
+    -> Paused(StepLimit) có continuation: cổng vẫn mở, port chưa hề bị bảo đóng;
+       pause thứ hai (hết budget): cổng đóng, port nhận [true, false]
+harness-cli (khung hình đã vẽ, tui/mod.rs):
+  the_approval_frame_offers_the_turn_grant_and_the_status_row_shows_it_open
+    -> panel RunProcess trong ảnh chụp: có "a cho phép mọi thao tác trong lượt này",
+       viền ghi "a cho phép cả lượt"; sau khi cấp: thanh trạng thái "tự động cả lượt"
+harness-cli (panel + viền):
+  t06_every_panel_offers_the_turn_grant_and_says_how_far_it_reaches -> cả panel ghi và panel đọc;
+                                                                       panel đọc vẫn ghi "· chỉ đọc"
+harness-cli: 263 passed; 1 failed; 1 ignored (cargo test -p harness-cli --bin ha --locked)
+```
+
+Con số 263/1 là **số đo có ngày** (lượt này, toolchain 1.97.1, Windows): 260 test của lượt trước,
+**+4** test mới (cổng, panel, khung hình, continuation), **−1** test bị xoá vì nó khẳng định đúng
+hợp đồng vừa đổi. Test đỏ vẫn là `k03_a_saved_key_is_restricted_to_this_account_by_an_acl` — đỏ
+**đúng như thiết kế** trong phiên bị từ chối `icacls` (mục 3d.4), không liên quan tới cổng duyệt.
+
+### 3j.5. `a` **không** làm gì, và ranh giới bằng chứng
+
+- **Không** mở đường tới file bảo vệ hay ra ngoài workspace: những đường đó bị từ chối trước khi
+  panel tồn tại (3g.2 và test `a_read_only_kind_cannot_reach_a_protected_path_through_the_gate`
+  trong `harness-tools`).
+- **Không** sống qua lượt sau (test `t06_the_turn_grant_does_not_survive_the_turn`).
+- **Không** miễn cho thứ chưa từng qua `prepare`: policy denial vẫn là denial.
+
+Nói thẳng phần **không** được bảo vệ, vì đây là quyền lớn: `validate_workspace_action` **không**
+kiểm gì cho `RunProcess`/`RunShell` (`service.rs:602`-`606`), và `ToolCapabilities` khai
+`filesystem_network_sandbox: false`, `strict_isolation: false`. Nghĩa là sau khi bấm `a`, một lệnh
+do model đề xuất trong lượt đó chạy **không hỏi** và **không** bị sandbox filesystem/network. Đó
+đúng là thứ người giao việc yêu cầu ("nới quyền ra"), nhưng nó là ranh giới thật, không phải chi
+tiết kỹ thuật: `a` chỉ nên bấm ở workspace bạn đang thật sự làm việc.
+
+**Chưa có ca PTY cho `a`** (ConPTY không chạy trong phiên này); bằng chứng mạnh nhất là khung hình
+đã vẽ + test cổng thật ở tầng `ChannelApprovalGate`. Ca PTY `g4_a_step_bound_continues_the_turn_by_itself`
+vẫn trả lời `y` từng lần nên **không** đổi hành vi; nó cũng chính là ví dụ của việc bị hỏi lặp mà
+`a` sinh ra để chấm dứt.
 
 ## 4. Kiến trúc chốt cho T02–T08
 

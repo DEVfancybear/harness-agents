@@ -187,7 +187,8 @@ pub fn approval_lines(
         format!("[approval] {action}: {summary}"),
         format!("           workspace: {workspace}"),
         format!("           scope: {scope} (request {request_id})"),
-        "           answer y to run it once, or n to refuse".to_owned(),
+        "           answer y to run it once, a to allow every action for this turn, or n to refuse"
+            .to_owned(),
     ]
 }
 

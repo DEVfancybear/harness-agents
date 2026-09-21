@@ -373,10 +373,30 @@ a later one, resolves that same identity.
 
 Inside the app: `/help`, `/status`, `/config`, `/model`, `/new`, `/resume [number|id]`,
 `/exit`. A gated action prints the action, working directory and scope, then waits for
-`y` (run it once) or `n` (refuse); there is no implicit approval and no answer in time
-counts as a refusal. A real model call needs `HA_PROVIDER_ENDPOINT`, `HA_PROVIDER_MODEL`
+`y` (run it once), `a` (allow every action for this turn) or `n` (refuse); there is no
+implicit approval and no answer in time counts as a refusal. A real model call needs
+`HA_PROVIDER_ENDPOINT`, `HA_PROVIDER_MODEL`
 and a credential (`DEEPSEEK_API_KEY` or `HA_API_KEY`); without them the app still opens
 in setup state and says what is missing, and it never fabricates an answer.
+
+**Approval: every panel offers the same three answers, and `a` ends the questions for the
+turn.** It is the answer to a measured complaint: a turn of `git log`, `git status`,
+`git diff` asked about every single command, because `run_process` is not a read-only action
+and the older read-only grant could not cover it.
+
+| Key | Meaning | How long it lasts |
+| --- | --- | --- |
+| `y` | run this action once | this action only |
+| `a` | run this action **and** allow **every** action for **this turn** - including file writes and commands | until the turn ends |
+| `n` | refuse | the action does not run |
+
+After `a`, the status row shows `· tự động cả lượt` (automatic for this turn) so an open gate
+is never silent, and the transcript records one `[info] allowed for this turn: <action>` line
+per action it covered (reads add `read-only, `). The grant dies with the turn - a later
+request asks again from the first action - and it never bypasses the checks that run *before*
+a panel exists: a path inside a protected file (`.env`, `.git`, `.harness`, `*credential*`,
+`*.pem`…) or outside the workspace is refused outright, so there is nothing for `a` to allow.
+There is currently **no** permanent trust mode for a workspace.
 
 **One API key is enough.** `DEEPSEEK_API_KEY` (or `HA_API_KEY`) is the whole
 credential: the endpoint and the model default to the values `DeepSeek` publishes -
@@ -430,7 +450,7 @@ Bàn phím / keys (only the combinations measured on a real console):
 | `Ctrl-D` | Empty buffer: leave |
 | `Ctrl-L` | Repaint the bottom area without clearing the scrollback |
 | `y` / `n` | Answer the approval panel (or type `yes`/`no` and press Enter) |
-| `a` | Read-only actions only: run it and allow reads for the turn (or type `all` and press Enter) |
+| `a` | Run this action and allow **every** action for **this turn** (including file writes and commands); the turn ends it (or type `all` and press Enter) |
 
 **Typing `/` lists the commands.** The menu appears directly above the composer and narrows with every
 character. It is **not** a modal window: the cursor stays in the composer and the draft is untouched.
@@ -457,7 +477,9 @@ panel/picker/overlay is open, `Enter`/`Tab`/`↑`/`↓` keep their old meaning �
 you cannot see. While an API key is being entered (masked buffer) the menu never appears either.
 
 The approval panel shows the action, workspace, scope and a **countdown** to the gate's
-deadline; when it expires the action does **not** run and the panel closes.
+deadline; when it expires the action does **not** run and the panel closes. Every panel offers
+the same three keys: `y` run once · `a` allow every action for this turn (including file
+writes and commands) · `n` refuse.
 
 ### 12.2. When the app uses the plain interface
 

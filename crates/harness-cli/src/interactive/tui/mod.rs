@@ -524,7 +524,7 @@ mod tests {
             live_text: "đang trả lời".to_owned(),
             open_tool: None,
             modal: None,
-            reads_for_run: false,
+            granted_for_run: false,
             last_request: None,
             run_started_at: None,
             last_run_elapsed: Duration::ZERO,
@@ -620,6 +620,58 @@ mod tests {
         assert!(
             !painted.contains("đang trả lời"),
             "the live block yields the upper region to the panel: {painted}"
+        );
+    }
+
+    /// The measured complaint, seen on the screen the user was looking at: a turn of
+    /// shell commands asked about each one, and the panel named no key that ended the
+    /// questions. This asserts the painted frame: the panel offers `a` and says what
+    /// it covers, and once the gate is open the status row says so for the rest of
+    /// the turn - a widened gate is never silent.
+    #[test]
+    fn the_approval_frame_offers_the_turn_grant_and_the_status_row_shows_it_open() {
+        let backend = ScriptedBackend::new(Vec::new());
+        let mut renderer = ScriptedRenderer::open(backend, 100, 30).expect("renderer opens");
+        let mut asking = state(AppPhase::Running);
+        asking.live_text = String::new();
+        asking.modal = Some(crate::interactive::events::Modal::Approval {
+            request_id: "approval-2-93e218c98fe4".to_owned(),
+            action: "RunProcess".to_owned(),
+            summary: "run git log -1 --stat --format=fuller".to_owned(),
+            workspace: "C:/Users/duong/orca/projects/harness-agents".to_owned(),
+            scope: "one action, this turn only".to_owned(),
+            expires_at: std::time::Instant::now() + Duration::from_mins(5),
+            read_only: false,
+        });
+        renderer.draw_state(&asking).expect("frame draws");
+        let painted = renderer.painted().join("\n");
+        assert!(
+            painted.contains("run git log -1 --stat --format=fuller"),
+            "the panel names the command: {painted}"
+        );
+        assert!(
+            painted.contains("a cho phép mọi thao tác trong lượt này"),
+            "the panel offers the key that ends the questions: {painted}"
+        );
+        assert!(
+            painted.contains("a cho phép cả lượt"),
+            "and the composer's border names the same key: {painted}"
+        );
+
+        // The answer is given: the panel closes, and the status row carries the state
+        // for the rest of the turn.
+        let mut granted = state(AppPhase::Running);
+        granted.live_text = String::new();
+        granted.granted_for_run = true;
+        renderer.draw_state(&granted).expect("frame draws");
+        let painted = renderer.painted().join("\n");
+        assert!(
+            painted.contains("tự động cả lượt"),
+            "an open gate is state the operator can see: {painted}"
+        );
+        assert!(
+            !painted.contains("panel duyệt đang chờ"),
+            "and no panel is up while it is open: {painted}"
         );
     }
 

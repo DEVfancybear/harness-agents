@@ -255,7 +255,7 @@ mod tests {
             live_text: String::new(),
             open_tool: None,
             modal: None,
-            reads_for_run: false,
+            granted_for_run: false,
             last_request: None,
             run_started_at: None,
             last_run_elapsed: Duration::ZERO,

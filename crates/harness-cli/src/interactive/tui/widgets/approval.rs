@@ -30,9 +30,9 @@ pub struct Proposal<'a> {
     pub workspace: &'a str,
     pub scope: &'a str,
     pub expires_at: Instant,
-    /// Whether the action only reads. The wider grant is offered only here, because
-    /// it can only ever cover read-only actions - offering it on a write would name
-    /// a key that does less than it says.
+    /// Whether the action only reads. The panel says so next to the proposal: it no
+    /// longer decides which keys are offered - `a` covers every kind - but a reader
+    /// still has the right to know whether the thing in front of them can write.
     pub read_only: bool,
 }
 
@@ -58,16 +58,18 @@ pub fn render(frame: &mut Frame, area: Rect, request: Proposal<'_>, theme: &Them
 #[must_use]
 pub fn rows(request: &Proposal<'_>, theme: &Theme) -> Vec<Line<'static>> {
     let remaining = request.expires_at.saturating_duration_since(Instant::now());
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            format!("[approval] {}: {}", request.action, request.summary),
-            theme.tool_ok,
-        ),
-        Span::styled(
-            format!("  (còn {})", view::clock_label(remaining)),
-            theme.dim,
-        ),
-    ])];
+    let mut header = vec![Span::styled(
+        format!("[approval] {}: {}", request.action, request.summary),
+        theme.tool_ok,
+    )];
+    if request.read_only {
+        header.push(Span::styled(" · chỉ đọc".to_owned(), theme.dim));
+    }
+    header.push(Span::styled(
+        format!("  (còn {})", view::clock_label(remaining)),
+        theme.dim,
+    ));
+    let mut lines = vec![Line::from(header)];
     lines.push(Line::from(vec![
         Span::styled("workspace: ".to_owned(), theme.dim),
         Span::raw(request.workspace.to_owned()),
@@ -83,14 +85,14 @@ pub fn rows(request: &Proposal<'_>, theme: &Theme) -> Vec<Line<'static>> {
         "y chạy một lần · n từ chối · hết hạn thì không chạy".to_owned(),
         theme.dim,
     )]));
-    // The wider grant is named only when it would cover something, and it is named
-    // last so the two keys that always exist keep the position they had.
-    if request.read_only {
-        lines.push(Line::from(vec![Span::styled(
-            "a cho phép mọi thao tác chỉ-đọc trong lượt này".to_owned(),
-            theme.dim,
-        )]));
-    }
+    // `a` is offered on every panel, read-only or not, and it says exactly how far
+    // it reaches: from here on this turn runs without asking, including file writes
+    // and commands. A key whose text promised less than it did would be worse than
+    // no key at all.
+    lines.push(Line::from(vec![Span::styled(
+        "a cho phép mọi thao tác trong lượt này (kể cả ghi file và chạy lệnh)".to_owned(),
+        theme.dim,
+    )]));
     lines
 }
 
@@ -131,6 +133,39 @@ mod tests {
         assert!(
             text.contains("còn 00:30") || text.contains("còn 00:29"),
             "the countdown reflects the reported deadline: {text}"
+        );
+    }
+
+    /// Measured complaint: a turn of `git log`, `git status`, `git diff` asked about
+    /// every command, and the panel offered no key that ended the questions. The `a`
+    /// row is now on every panel, and it says how far it reaches - including writes
+    /// and commands - so the key cannot do more than its own text promises.
+    #[test]
+    fn t06_every_panel_offers_the_turn_grant_and_says_how_far_it_reaches() {
+        let text = plain_text(&rows(&request(Duration::from_mins(5)), &Theme::plain()));
+        assert!(
+            text.contains("a cho phép mọi thao tác trong lượt này (kể cả ghi file và chạy lệnh)"),
+            "a write panel offers the turn grant and names what it covers: {text}"
+        );
+
+        let read = plain_text(&rows(
+            &Proposal {
+                read_only: true,
+                ..request(Duration::from_mins(5))
+            },
+            &Theme::plain(),
+        ));
+        assert!(
+            read.contains("a cho phép mọi thao tác trong lượt này"),
+            "and so does a read panel: {read}"
+        );
+        assert!(
+            read.contains("· chỉ đọc"),
+            "a read-only proposal still says so, even though the key no longer depends on it: {read}"
+        );
+        assert!(
+            !text.contains("· chỉ đọc"),
+            "a patch is not marked read-only: {text}"
         );
     }
 }
