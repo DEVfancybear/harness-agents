@@ -5,14 +5,14 @@
 ## 1. Assignment hiện tại và ràng buộc mới nhất của người dùng
 
 - Prompt người dùng (21/09/2026): triển khai M0 trong scope M0-01..M0-04; đọc README/CONTRACTS/M0/ACCEPTANCE; xác minh prerequisites; tạo SPEC; sửa crate hiện có trong root workspace và nối vào cùng binary `ha`; reuse tests/services; làm từng item theo thứ tự, chạy targeted tests rồi milestone gate; không dùng production stub-success hay đổi expected fixture để che lỗi; bàn giao evidence/digest/test discovery/OS limitations và CURRENT handoff; **dừng sau M0**, không tự chạy milestone tiếp.
-- Quyền: chỉ chạy local (cargo/PowerShell, temp dir, mock provider). **Không** commit/push/publish, không paid API, không spawn agent tự động. Prompt mẫu không tạo quyền mới.
+- Quyền: chạy local (cargo/PowerShell, temp dir, mock provider) và — theo yêu cầu trực tiếp "commit and push" của người dùng trong session này — commit/push M0. Không publish, không paid API, không spawn agent tự động. Prompt mẫu không tạo quyền mới.
 - Người dùng đã commit phần HA_TUI đang dở trong session (`dfee38a`, `bebc6cc`); M0 không sửa/revert phần đó.
 
 ## 2. Branch/base/source digest
 
-- Branch: `master` (làm việc trên working tree, **chưa commit** M0).
+- Branch: `master`, commit `f1fb002` (`feat(m0): executable contracts, run/acceptance reducers and a milestone gate`), đã push lên `origin/master` theo yêu cầu trực tiếp của người dùng.
 - Base: `bebc6cc` (`docs(HA_TUI): the measured counts, as measured on this tree`).
-- Source digest của lần gate cuối: `sha256:00f3d5bf25f652ab5e625a13c71e91cc0a82940be0dd68a7c10d5f7f48715db6` (312 file, loại trừ `docs/evidence/M0.vi.md` và file này).
+- Source digest của lần gate cuối: `sha256:00f3d5bf25f652ab5e625a13c71e91cc0a82940be0dd68a7c10d5f7f48715db6` (312 file, loại trừ `docs/evidence/M0.vi.md` và file này); đã xác minh lại trên cây đã commit.
 
 ## 3. Work item đã xong (kèm evidence)
 
