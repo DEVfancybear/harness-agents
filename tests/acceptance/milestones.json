@@ -285,6 +285,100 @@
           "closure-M0"
         ]
       }
+    },
+    {
+      "id": "M3",
+      "title": "TurnDriver, human input và bounded goals",
+      "runbook": "docs/implementation-next/M3.vi.md",
+      "prerequisites": ["M1", "M2"],
+      "status": "verified_local",
+      "integration_target": "milestone_m3",
+      "work_items": [
+        {
+          "id": "M3-01",
+          "title": "Durable driver và minimum context",
+          "status": "implemented_unverified",
+          "tests": [
+            "m3_01_one_input_distinct_steps",
+            "m3_01_incomplete_stream_is_not_dispatched",
+            "m3_01_store_fault_stops_dispatch",
+            "m3_01_manifest_and_overflow",
+            "m3_01_runtime_schema_upgrade"
+          ]
+        },
+        {
+          "id": "M3-02",
+          "title": "Question, approval ports và steering",
+          "status": "implemented_unverified",
+          "tests": [
+            "m3_02_question_restart_dedupe",
+            "m3_02_canceled_queue_does_not_invoke",
+            "m3_02_steering_reaches_next_step",
+            "a11_human_input_grant"
+          ]
+        },
+        {
+          "id": "M3-03",
+          "title": "Durable accounting và loop detection",
+          "status": "implemented_unverified",
+          "tests": [
+            "m3_03_budget_reservation_atomicity",
+            "m3_03_provider_usage_settles_reservation",
+            "m3_03_loop_detection",
+            "m3_03_valid_polling_is_not_a_loop"
+          ]
+        },
+        {
+          "id": "M3-04",
+          "title": "Terminal/goal evaluator và CLI run",
+          "status": "implemented_unverified",
+          "tests": [
+            "a09_terminal_acceptance",
+            "a10_goal_no_progress",
+            "m3_04_status_separates_acceptance",
+            "m3_04_cli_mock_profile",
+            "m3_04_goal_satisfied_by_evidence",
+            "m3_04_budget_guards_dispatch"
+          ]
+        }
+      ],
+      "required_tests": [
+        "a09_terminal_acceptance",
+        "a10_goal_no_progress",
+        "a11_human_input_grant",
+        "m3_01_one_input_distinct_steps",
+        "m3_01_incomplete_stream_is_not_dispatched",
+        "m3_01_store_fault_stops_dispatch",
+        "m3_01_manifest_and_overflow",
+        "m3_01_runtime_schema_upgrade",
+        "m3_02_question_restart_dedupe",
+        "m3_02_canceled_queue_does_not_invoke",
+        "m3_02_steering_reaches_next_step",
+        "m3_03_budget_reservation_atomicity",
+        "m3_03_provider_usage_settles_reservation",
+        "m3_03_loop_detection",
+        "m3_03_valid_polling_is_not_a_loop",
+        "m3_04_status_separates_acceptance",
+        "m3_04_cli_mock_profile",
+        "m3_04_goal_satisfied_by_evidence",
+        "m3_04_budget_guards_dispatch"
+      ],
+      "unit_tests": [],
+      "fixtures": ["crates/harness-cli/tests/milestone_m3.rs"],
+      "gate": {
+        "script": "scripts/Verify-Milestone.ps1",
+        "dependency_check_bin": "dependency_check",
+        "steps": [
+          "format",
+          "clippy",
+          "workspace-tests",
+          "dependency-allowlist",
+          "required-test-discovery",
+          "required-tests",
+          "closure-M1",
+          "closure-M2"
+        ]
+      }
     }
   ],
   "acceptance_cases": [
@@ -347,9 +441,27 @@
       ]
     },
     { "id": "A08", "owner_milestones": ["M4"], "planned_test": "a08_coding_e2e", "status": "planned" },
-    { "id": "A09", "owner_milestones": ["M3"], "planned_test": "a09_terminal_acceptance", "status": "planned" },
-    { "id": "A10", "owner_milestones": ["M3"], "planned_test": "a10_goal_no_progress", "status": "planned" },
-    { "id": "A11", "owner_milestones": ["M3", "M4"], "planned_test": "a11_human_input_grant", "status": "planned" },
+    {
+      "id": "A09",
+      "owner_milestones": ["M3"],
+      "planned_test": "a09_terminal_acceptance",
+      "status": "implemented",
+      "selectors": ["milestone_m3::a09_terminal_acceptance"]
+    },
+    {
+      "id": "A10",
+      "owner_milestones": ["M3"],
+      "planned_test": "a10_goal_no_progress",
+      "status": "implemented",
+      "selectors": ["milestone_m3::a10_goal_no_progress"]
+    },
+    {
+      "id": "A11",
+      "owner_milestones": ["M3", "M4"],
+      "planned_test": "a11_human_input_grant",
+      "status": "planned",
+      "note": "M3 question half is implemented and proven by milestone_m3::a11_human_input_grant; the real approval grant/consume half belongs to M4, so the case stays planned until M4"
+    },
     { "id": "A12", "owner_milestones": ["M5"], "planned_test": "a12_compaction_cas", "status": "planned" },
     { "id": "A13", "owner_milestones": ["M4"], "planned_test": "a13_queued_process_cancel", "status": "planned" },
     { "id": "A14", "owner_milestones": ["M4"], "planned_test": "a14_approval_binding", "status": "planned" },

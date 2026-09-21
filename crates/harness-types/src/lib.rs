@@ -32,11 +32,11 @@ pub use error::{ErrorCode, ErrorReport, HarnessError, RetryClass};
 pub use fixture::{ContinuationFixtureReport, verify_continuation_fixture};
 pub use hash::{ContentHash, canonical_json_bytes};
 pub use ids::{
-    AgentProfileId, AgentRunId, ArtifactId, CompositionSnapshotId, ContextPacketId, EventId,
-    ExtensionInstanceId, FixedIdSource, HostId, IdSource, InputId, InstructionId, MemoryAssetId,
-    PlanItemId, PluginInstanceId, ProjectId, ProviderAttemptId, RequestId, RuntimeCommandId,
-    ScopeId, SessionId, SkillId, SnapshotId, StepId, SystemIdSource, TaskId, ToolApprovalId,
-    ToolExecutionId, ToolInvocationId,
+    AgentProfileId, AgentRunId, ArtifactId, BudgetId, BudgetReservationId, CompositionSnapshotId,
+    ContextPacketId, EventId, ExtensionInstanceId, FixedIdSource, HostId, IdSource, InputId,
+    InstructionId, MemoryAssetId, PlanItemId, PluginInstanceId, ProjectId, ProviderAttemptId,
+    QuestionId, RequestId, RuntimeCommandId, ScopeId, SessionId, SkillId, SnapshotId, StepId,
+    SystemIdSource, TaskId, ToolApprovalId, ToolExecutionId, ToolInvocationId,
 };
 pub use ports::{
     AdmissionOutcome, AdmittedInput, BudgetReservation, CAPABILITY_MEMORY_READ,

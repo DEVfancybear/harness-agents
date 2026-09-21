@@ -124,6 +124,12 @@ pub enum PauseReason {
     StepLimit,
     ToolLimit,
     Deadline,
+    /// The goal continued without new evidence.
+    NoProgress,
+    /// The goal continuation bound was reached.
+    GoalLimit,
+    /// The goal's budget cannot fund another step.
+    BudgetExhausted,
 }
 
 impl PauseReason {
@@ -133,6 +139,9 @@ impl PauseReason {
             Self::StepLimit => "step limit reached",
             Self::ToolLimit => "tool-call limit reached",
             Self::Deadline => "deadline reached",
+            Self::NoProgress => "no progress across continuations",
+            Self::GoalLimit => "goal continuation limit reached",
+            Self::BudgetExhausted => "budget exhausted",
         }
     }
 
@@ -140,7 +149,9 @@ impl PauseReason {
     ///
     /// The step and tool-call bounds count work in progress; carrying on keeps the
     /// task moving. The deadline is wall-clock time already spent, so continuing it
-    /// by itself would spend the same budget again and again.
+    /// by itself would spend the same budget again and again. A goal that stopped
+    /// for no progress, a goal bound or a spent budget is a decision for the user:
+    /// continuing it by itself would repeat the thing that just stopped.
     #[must_use]
     pub fn is_continuable(self) -> bool {
         matches!(self, Self::StepLimit | Self::ToolLimit)
@@ -155,6 +166,16 @@ pub enum RunOutcome {
     /// breaking. Everything it did is durable and the conversation continues, so
     /// calling it a failure told the user their work was lost when it was not.
     Paused(PauseReason),
+    /// The run paused on a durable question; the id is printed so the operator
+    /// can answer it after a restart.
+    WaitingInput {
+        question_id: Option<String>,
+    },
+    /// The goal waits on something outside the host. The host does not poll.
+    ExternalWait,
+    /// The run stopped with an explicit reason that is not success and not a
+    /// transient bound: a detected loop or an unverifiable answer.
+    Blocked(String),
     Failed(String),
     Canceled,
 }
@@ -165,6 +186,12 @@ impl RunOutcome {
         match self {
             Self::Done => "done".to_owned(),
             Self::Paused(reason) => format!("paused: {}", reason.label()),
+            Self::WaitingInput { question_id } => match question_id {
+                Some(id) => format!("waiting for input: {id}"),
+                None => "waiting for input".to_owned(),
+            },
+            Self::ExternalWait => "waiting on an external system".to_owned(),
+            Self::Blocked(reason) => format!("blocked: {reason}"),
             Self::Failed(reason) => format!("failed: {reason}"),
             Self::Canceled => "canceled".to_owned(),
         }

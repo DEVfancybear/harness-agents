@@ -148,7 +148,7 @@ fn p2_s01_runtime_contracts_and_state_machine_are_versioned() {
             .code(),
         ErrorCode::InvalidStateTransition
     );
-    assert_eq!(harness_store_sqlite::RUNTIME_SCHEMA_VERSION, 1);
+    assert_eq!(harness_store_sqlite::RUNTIME_SCHEMA_VERSION, 2);
 }
 
 /// How many times a loopback client call may be retried.

@@ -21,10 +21,13 @@ pub use contracts::{
 };
 pub use loop_service::{CodingLoopResult, CodingLoopService};
 pub use policy::{PolicyEffect, PolicyRule, ToolPolicy};
+// Re-exported so a CLI that drives the loop reads acceptance from the same
+// place the driver writes it.
+pub use harness_runtime::AcceptanceState;
 pub use service::{ExternalToolDispatcher, ToolExecutionService, ToolObserver};
 pub use turn_driver::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ExternalToolCatalog,
-    ExternalTools, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnOutcome, TurnProgress,
-    TurnStop,
+    ExternalTools, GoalReport, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnOutcome,
+    TurnProgress, TurnStop,
 };
 pub use workspace::{observe_workspace, observed_file_hash, workspace_registration};

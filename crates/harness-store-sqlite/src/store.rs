@@ -33,6 +33,7 @@ use crate::{
 pub mod delegation;
 mod maintenance;
 mod memory;
+pub mod run;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -2712,6 +2713,34 @@ async fn ensure_runtime_schema(pool: &SqlitePool) -> Result<(), StoreError> {
             ErrorCode::MigrationFailed,
             "runtime schema is newer than this host supports",
         ));
+    }
+    if current < 2 {
+        // M3 adds the durable run/step, budget and human-input tables. Every
+        // statement is additive and idempotent, so a version 1 database upgrades
+        // in place and keeps its existing rows.
+        let m3_statements = [
+            "CREATE TABLE IF NOT EXISTS runs (run_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, input_id TEXT NOT NULL, state TEXT NOT NULL, acceptance TEXT, stop_reason TEXT, owner_generation INTEGER NOT NULL, revision INTEGER NOT NULL, budget_id TEXT, awaiting_question_id TEXT)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS runs_by_input ON runs(input_id)",
+            "CREATE INDEX IF NOT EXISTS runs_by_session ON runs(session_id)",
+            "CREATE TABLE IF NOT EXISTS run_steps (step_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_index INTEGER NOT NULL, request_id TEXT NOT NULL, packet_id TEXT NOT NULL, manifest_hash TEXT NOT NULL, source_sequence INTEGER NOT NULL, state TEXT NOT NULL, stop_reason TEXT)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS run_steps_by_index ON run_steps(run_id, step_index)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS run_steps_by_request ON run_steps(request_id)",
+            "CREATE TABLE IF NOT EXISTS budget_accounts (budget_id TEXT PRIMARY KEY, parent_budget_id TEXT, limit_tokens INTEGER NOT NULL, spent_tokens INTEGER NOT NULL, revision INTEGER NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS budget_reservations (reservation_id TEXT PRIMARY KEY, budget_id TEXT NOT NULL, operation_id TEXT NOT NULL, origin TEXT NOT NULL, upper_bound_tokens INTEGER NOT NULL, settled_tokens INTEGER, state TEXT NOT NULL, revision INTEGER NOT NULL, created_at_unix_ms INTEGER NOT NULL, settled_at_unix_ms INTEGER)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS budget_reservations_by_operation ON budget_reservations(operation_id)",
+            "CREATE TABLE IF NOT EXISTS questions (question_id TEXT PRIMARY KEY, scope_key TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT NOT NULL, run_id TEXT, kind TEXT NOT NULL, prompt TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, answer_json TEXT, answer_hash TEXT, answered_by TEXT, expires_at_unix_ms INTEGER, created_at_unix_ms INTEGER NOT NULL, answered_at_unix_ms INTEGER)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS questions_by_scope ON questions(scope_key)",
+            "CREATE TABLE IF NOT EXISTS run_commands (command_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, payload_json TEXT NOT NULL, detail TEXT, created_at_unix_ms INTEGER NOT NULL, claimed_at_unix_ms INTEGER, applied_at_unix_ms INTEGER)",
+            "CREATE INDEX IF NOT EXISTS run_commands_by_run ON run_commands(run_id)",
+        ];
+        for statement in m3_statements {
+            sqlx::query(statement)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    database_error(ErrorCode::MigrationFailed, "apply runtime schema 2", error)
+                })?;
+        }
     }
     if current < RUNTIME_SCHEMA_VERSION {
         sqlx::query("INSERT INTO runtime_schema_migrations(version) VALUES (?)")

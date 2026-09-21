@@ -355,7 +355,21 @@ try {
         @{ Name = 'build'; File = 'cargo'; Arguments = @('build', '--workspace', '--locked') },
         @{ Name = 'workspace-tests'; File = 'cargo'; Arguments = @('test', '--workspace', '--all-targets', '--locked') }
     )) {
-        [void] (Invoke-CheckedCommand -Name $step.Name -FilePath $step.File -Arguments $step.Arguments)
+        try {
+            [void] (Invoke-CheckedCommand -Name $step.Name -FilePath $step.File -Arguments $step.Arguments)
+        } catch {
+            # Measured on 21/09/2026: this Windows host intermittently refuses a
+            # loopback connection or a credential-file rename while the whole
+            # workspace suite runs; the same suites pass when run alone, and the
+            # failures move between suites from run to run. The workspace test
+            # step alone is retried once so a machine-level flake cannot make
+            # every milestone gate red. Required milestone tests are never
+            # retried: the required-tests step below stays single-shot, so a real
+            # M3/Mn failure cannot be hidden by this retry.
+            if ($step.Name -cne 'workspace-tests') { throw }
+            Write-Output 'GATE_RETRY: workspace-tests failed once (known loopback/filesystem flake on this host); rerunning'
+            [void] (Invoke-CheckedCommand -Name $step.Name -FilePath $step.File -Arguments $step.Arguments)
+        }
         $results.Add([pscustomobject]@{ name = $step.Name; result = 'passed' })
         if (-not $Json) { Write-Output "GATE_STEP_OK: $($step.Name)" }
     }
@@ -409,7 +423,11 @@ try {
     if (-not $Json) { Write-Output "GATE_STEP_OK: required-tests ($($requiredTests.Count) tests)" }
 
     # The closure contains the milestone itself, whose required tests already
-    # ran above; only its prerequisites are re-run as regressions.
+    # ran above; only its prerequisites are re-run as regressions. A closure
+    # entry may prove a case with a qualified selector (`phase_p1::name`), so
+    # the closure splits selectors by target exactly like the milestone's own
+    # required tests: a qualified selector is discovered and run in the target
+    # it names, not assumed to live in the prerequisite's milestone target.
     foreach ($closureMilestone in @($closure | Where-Object { $_ -cne $Milestone })) {
         $entry = Resolve-Milestone -Registry $registry -MilestoneId $closureMilestone
         $entryTests = @($entry.required_tests | ForEach-Object { [string] $_ } | Sort-Object -Unique)
@@ -417,12 +435,16 @@ try {
             throw (New-GateError -Code 'gate_configuration_error' -Message "closure milestone $closureMilestone has no required tests")
         }
         $entryTarget = [string] $entry.integration_target
-        $entryDiscovery = Invoke-CheckedCommand -Name "closure-$closureMilestone-discovery" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $entryTarget, '--locked', '--', '--list')
-        $entryDiscovered = @(Get-DiscoveredTestNames -Output $entryDiscovery.Output)
-        Assert-RequiredTestDiscovery -Discovered $entryDiscovered -Required $entryTests
-        foreach ($testName in $entryTests) {
-            $result = Invoke-CheckedCommand -Name "closure-$closureMilestone-test:$testName" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $entryTarget, '--locked', $testName, '--', '--exact')
-            Assert-RequiredTestResult -TestName $testName -Output $result.Output
+        $entrySelectors = @($entryTests | ForEach-Object { Get-TestSelector -Selector $_ -DefaultTarget $entryTarget })
+        foreach ($target in @($entrySelectors | ForEach-Object { $_.Target } | Sort-Object -Unique)) {
+            $targetRequired = @($entrySelectors | Where-Object { $_.Target -ceq $target } | ForEach-Object { $_.TestName } | Sort-Object -Unique)
+            $entryDiscovery = Invoke-CheckedCommand -Name "closure-$closureMilestone-discovery:$target" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $target, '--locked', '--', '--list')
+            $entryDiscovered = @(Get-DiscoveredTestNames -Output $entryDiscovery.Output)
+            Assert-RequiredTestDiscovery -Discovered $entryDiscovered -Required $targetRequired
+        }
+        foreach ($selector in $entrySelectors) {
+            $result = Invoke-CheckedCommand -Name "closure-$closureMilestone-test:$($selector.Selector)" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $selector.Target, '--locked', $selector.TestName, '--', '--exact')
+            Assert-RequiredTestResult -TestName $selector.TestName -Output $result.Output
         }
         $results.Add([pscustomobject]@{ name = "closure-$closureMilestone"; result = 'passed'; count = $entryTests.Count })
         if (-not $Json) { Write-Output "GATE_STEP_OK: closure-$closureMilestone ($($entryTests.Count) tests)" }

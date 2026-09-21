@@ -1570,7 +1570,10 @@ async fn p7_writer_options_open_a_fresh_directory() {
     let revisions = store.all_schema_revisions().await.expect("revisions");
     assert_eq!(revisions.get("store").copied(), Some(1));
     assert_eq!(revisions.get("maintenance").copied(), Some(1));
-    assert_eq!(revisions.get("runtime").copied(), Some(1));
+    // M3 added the durable run/step, budget and human-input tables, so the
+    // runtime surface advances to 2. The change is additive; older databases
+    // are migrated when a writer opens them.
+    assert_eq!(revisions.get("runtime").copied(), Some(2));
     assert_eq!(revisions.get("delegation").copied(), Some(1));
     let compatibility = check_store_compatibility(&data)
         .await

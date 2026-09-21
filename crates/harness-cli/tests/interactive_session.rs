@@ -444,15 +444,23 @@ async fn g2_the_tool_loop_is_bounded_and_reports_which_bound_stopped_it() {
 async fn g2_the_step_bound_counts_one_step_per_model_call() {
     let bench = bench();
     // The provider always asks for another tool call, so only the bound can stop it.
-    let provider = Arc::new(SequenceProvider::new(vec![vec![
-        ProviderStreamEvent::started(),
-        ProviderStreamEvent::tool_delta(
-            "call-loop",
-            "search_text",
-            json!({"query": "todo", "path": "."}).to_string(),
-        ),
-        ProviderStreamEvent::completed("tool_calls"),
-    ]]));
+    // The query varies per call on purpose: an identical call repeated is a loop,
+    // which M3 stops with its own typed reason, and this test is about the step
+    // bound counting one model call per step.
+    let responses = (0..8)
+        .map(|index| {
+            vec![
+                ProviderStreamEvent::started(),
+                ProviderStreamEvent::tool_delta(
+                    "call-loop",
+                    "search_text",
+                    json!({"query": format!("todo-{index}"), "path": "."}).to_string(),
+                ),
+                ProviderStreamEvent::completed("tool_calls"),
+            ]
+        })
+        .collect();
+    let provider = Arc::new(SequenceProvider::new(responses));
 
     let limits = TurnLimits {
         max_steps: 4,

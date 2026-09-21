@@ -19,8 +19,9 @@ use harness_tools::{
     observed_file_hash,
 };
 use harness_types::{
-    ContentHash, ErrorCode, HarnessConfig, HarnessError, HostId, InputId, PluginInstanceId,
-    PluginManifest, ProjectId, ScopeId, ServiceContract, SessionId, TaskId, WorkspaceObservation,
+    AgentRunId, ContentHash, ErrorCode, HarnessConfig, HarnessError, HostId, InputId,
+    PluginInstanceId, PluginManifest, ProjectId, ScopeId, ServiceContract, SessionId, TaskId,
+    WorkspaceObservation,
 };
 
 /// Personal coding-agent harness.
@@ -64,6 +65,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Durable human input: ask, answer or list questions (M3).
+    Input(InputCommand),
     /// List or inspect persisted plugin metadata without loading a plugin.
     Plugins(PluginsCommand),
     /// Execute one keyless local mock-provider run.
@@ -137,6 +140,24 @@ struct ChatArgs {
     /// not a real terminal, or `HA_UI=plain` is set.
     #[arg(long, conflicts_with = "headless")]
     plain: bool,
+    /// Use the explicit deterministic mock profile for a headless turn; no
+    /// provider is called and the JSON result says `"fixture": true`.
+    #[arg(long, requires = "headless")]
+    mock: bool,
+    /// Goal objective for a headless turn. Without it the turn is one bounded
+    /// pass; with it the host evaluates typed criteria and may continue.
+    #[arg(long, requires = "headless")]
+    goal: Option<String>,
+    /// Evidence a goal criterion requires; repeatable. One of: `response`,
+    /// `tool_execution`, `file_change`, `check`, `artifact`.
+    #[arg(long = "criteria", requires = "goal")]
+    criteria: Vec<String>,
+    /// Host continuations one headless run may spend on its goal.
+    #[arg(long, requires = "goal")]
+    max_continuations: Option<u32>,
+    /// Token budget for a headless run; the run reserves against it.
+    #[arg(long, requires = "headless")]
+    budget: Option<u64>,
 }
 
 impl ChatArgs {
@@ -149,6 +170,13 @@ impl ChatArgs {
             self.prompt.clone(),
             self.json,
             self.plain,
+            interactive::HeadlessOptions {
+                mock: self.mock,
+                goal: self.goal.clone(),
+                criteria: self.criteria.clone(),
+                max_continuations: self.max_continuations,
+                budget_tokens: self.budget,
+            },
         )
     }
 }
@@ -265,6 +293,73 @@ struct SessionsCommand {
     command: SessionsSubcommand,
 }
 
+#[derive(Debug, Args)]
+struct InputCommand {
+    #[command(subcommand)]
+    command: InputSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum InputSubcommand {
+    /// Persist a question for a run; the caller exits without holding anything.
+    Ask {
+        /// Local `SQLite` data directory owned by this harness.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Session the run belongs to.
+        #[arg(long)]
+        session_id: String,
+        /// Task the run belongs to.
+        #[arg(long)]
+        task_id: String,
+        /// Run ID the question is scoped to.
+        #[arg(long)]
+        run_id: Option<String>,
+        /// The question text shown to the user.
+        #[arg(long)]
+        prompt: String,
+        /// Unix milliseconds after which the question refuses answers.
+        #[arg(long)]
+        expires_at_unix_ms: Option<u64>,
+        /// Scope key override; defaults to the run/request scope.
+        #[arg(long)]
+        scope_key: Option<String>,
+        /// Emit a versioned JSON result to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Answer one question by scope key. Deduped and scope-checked.
+    Answer {
+        /// Local `SQLite` data directory owned by this harness.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Scope key printed when the question was asked.
+        #[arg(long)]
+        scope_key: String,
+        /// The answer text.
+        #[arg(long)]
+        text: String,
+        /// Who answered; recorded with the answer.
+        #[arg(long, default_value = "cli.user")]
+        actor: String,
+        /// Emit a versioned JSON result to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the questions of one session.
+    List {
+        /// Local `SQLite` data directory owned by this harness.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Session whose questions are listed.
+        #[arg(long)]
+        session_id: String,
+        /// Emit a versioned JSON result to stdout.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum SessionsSubcommand {
     /// List durable session summaries through a read-only store connection.
@@ -372,16 +467,16 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
     let Cli { command } = cli;
     match command {
         None => {
-            interactive::launch(interactive::LaunchMode::Interactive {
+            Box::pin(interactive::launch(interactive::LaunchMode::Interactive {
                 cwd: None,
                 resume: None,
                 fixture: false,
                 plain: interactive::plain_requested_from_environment(),
-            })
+            }))
             .await
         }
         Some(Command::Chat(args)) => match args.mode() {
-            Ok(mode) => interactive::launch(mode).await,
+            Ok(mode) => Box::pin(interactive::launch(mode)).await,
             Err(usage) => {
                 eprintln!("{usage}");
                 Ok(ExitCode::from(interactive::USAGE_EXIT_CODE))
@@ -450,6 +545,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
             session_id,
             json,
         }) => show_status(&data_dir, &session_id, json).await,
+        Some(Command::Input(InputCommand { command })) => run_input_command(command).await,
         Some(Command::Plugins(PluginsCommand {
             command: PluginsSubcommand::List { data_dir, json },
         })) => list_plugins(&data_dir, json).await,
@@ -957,6 +1053,7 @@ async fn list_sessions(data_dir: &PathBuf, json: bool) -> Result<(), HarnessErro
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // one inspection report, told in order
 async fn show_status(data_dir: &PathBuf, session_id: &str, json: bool) -> Result<(), HarnessError> {
     let session_id = harness_types::SessionId::parse(session_id.to_owned())?;
     let store = Arc::new(
@@ -1019,6 +1116,23 @@ async fn show_status(data_dir: &PathBuf, session_id: &str, json: bool) -> Result
             .await
             .map_err(store_error)?,
     });
+    // M3: the durable run of this session, when one exists. Run status and task
+    // acceptance are separate fields; a reopened store must not read a pause as
+    // success.
+    let run = store
+        .latest_run(&session_id)
+        .await
+        .map_err(store_error)?
+        .map(|run| {
+            serde_json::json!({
+                "run_id": run.run_id,
+                "state": run.state.as_str(),
+                "stop_reason": run.stop_reason,
+                "acceptance": run.acceptance,
+                "revision": run.revision,
+                "awaiting_question_id": run.awaiting_question_id,
+            })
+        });
     let result = serde_json::json!({
         "schema_version": 1,
         "session_id": summary.session_id,
@@ -1029,6 +1143,7 @@ async fn show_status(data_dir: &PathBuf, session_id: &str, json: bool) -> Result
         "recovery": recovery_json,
         "pending_work": pending_work,
         "blocking": blocking,
+        "run": run,
         "runtime": "not_available_in_p1"
     });
     if json {
@@ -1055,9 +1170,193 @@ async fn show_status(data_dir: &PathBuf, session_id: &str, json: bool) -> Result
             pending_work["pending_tool_intents"],
             pending_work["pending_runtime_commands"]
         );
+        if let Some(run) = result.get("run").filter(|run| !run.is_null()) {
+            println!(
+                "run {} state {} stop {} acceptance {}",
+                run["run_id"].as_str().unwrap_or_default(),
+                run["state"].as_str().unwrap_or_default(),
+                run["stop_reason"].as_str().unwrap_or("-"),
+                run["acceptance"].as_str().unwrap_or("-"),
+            );
+        }
         println!("runtime: not_available_in_p1");
     }
     Ok(())
+}
+
+/// Durable human input commands (M3-02): ask, answer, list.
+#[allow(clippy::too_many_lines)] // one subcommand arm per durable input action
+async fn run_input_command(command: InputSubcommand) -> Result<(), HarnessError> {
+    match command {
+        InputSubcommand::Ask {
+            data_dir,
+            session_id,
+            task_id,
+            run_id,
+            prompt,
+            expires_at_unix_ms,
+            scope_key,
+            json,
+        } => {
+            let session_id = SessionId::parse(session_id)?;
+            let task_id = TaskId::parse(task_id)?;
+            let run_id = run_id.map(AgentRunId::parse).transpose()?;
+            let scope_key = match scope_key {
+                Some(scope_key) => scope_key,
+                None => match &run_id {
+                    Some(run_id) => {
+                        harness_runtime::human_input::question_scope(run_id, "cli-question")
+                    }
+                    None => format!("{}|cli-question", session_id.as_str()),
+                },
+            };
+            let store = open_writer_store(&data_dir).await?;
+            let question = harness_runtime::HumanInputService::new(Arc::clone(&store))
+                .ask(
+                    harness_runtime::AskRequest {
+                        session_id,
+                        task_id,
+                        run_id,
+                        scope_key,
+                        kind: "clarification".to_owned(),
+                        prompt,
+                        payload: serde_json::Value::Null,
+                        expires_at_unix_ms,
+                    },
+                    harness_runtime::now_unix_ms(),
+                )
+                .await
+                .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+            close_store(store).await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "question_id": question.question_id,
+                        "scope_key": question.scope_key,
+                        "state": question.state.as_str(),
+                    })
+                );
+            } else {
+                println!(
+                    "question {} [{}] scope {}",
+                    question.question_id,
+                    question.state.as_str(),
+                    question.scope_key
+                );
+            }
+            Ok(())
+        }
+        InputSubcommand::Answer {
+            data_dir,
+            scope_key,
+            text,
+            actor,
+            json,
+        } => {
+            let store = open_writer_store(&data_dir).await?;
+            let answer = serde_json::Value::String(text);
+            let outcome = harness_runtime::HumanInputService::new(Arc::clone(&store))
+                .answer(&scope_key, &answer, &actor, harness_runtime::now_unix_ms())
+                .await
+                .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+            close_store(store).await?;
+            let (state, question_id) = match &outcome {
+                harness_store_sqlite::QuestionOutcome::Answered(question)
+                | harness_store_sqlite::QuestionOutcome::Duplicate(question) => {
+                    ("answered", Some(question.question_id.as_str().to_owned()))
+                }
+                harness_store_sqlite::QuestionOutcome::Expired(question) => {
+                    ("expired", Some(question.question_id.as_str().to_owned()))
+                }
+                harness_store_sqlite::QuestionOutcome::Conflict(question) => {
+                    ("conflict", Some(question.question_id.as_str().to_owned()))
+                }
+                harness_store_sqlite::QuestionOutcome::NotFound => ("not_found", None),
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "outcome": state,
+                        "question_id": question_id,
+                    })
+                );
+            } else {
+                println!("answer {state}");
+            }
+            Ok(())
+        }
+        InputSubcommand::List {
+            data_dir,
+            session_id,
+            json,
+        } => {
+            let session_id = SessionId::parse(session_id)?;
+            let store = Arc::new(
+                SqliteStore::open_read_only(&data_dir)
+                    .await
+                    .map_err(store_error)?,
+            );
+            let questions = harness_runtime::HumanInputService::new(Arc::clone(&store))
+                .questions(&session_id)
+                .await
+                .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+            close_store(store).await?;
+            let rows = questions
+                .iter()
+                .map(|question| {
+                    serde_json::json!({
+                        "question_id": question.question_id,
+                        "scope_key": question.scope_key,
+                        "kind": question.kind,
+                        "state": question.state.as_str(),
+                        "prompt": question.prompt,
+                        "expires_at_unix_ms": question.expires_at_unix_ms,
+                        "answered_by": question.answered_by,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version": 1, "questions": rows})
+                );
+            } else {
+                println!("questions: {}", rows.len());
+                for row in rows {
+                    println!(
+                        "{} [{}] {}",
+                        row["question_id"],
+                        row["state"].as_str().unwrap_or_default(),
+                        row["scope_key"].as_str().unwrap_or_default()
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Open the project store for one write and release it cleanly.
+async fn open_writer_store(data_dir: &std::path::Path) -> Result<Arc<SqliteStore>, HarnessError> {
+    Ok(Arc::new(
+        SqliteStore::open_writer(WriterOpenOptions::new(data_dir, HostId::generate()))
+            .await
+            .map_err(store_error)?,
+    ))
+}
+
+async fn close_store(store: Arc<SqliteStore>) -> Result<(), HarnessError> {
+    match Arc::try_unwrap(store) {
+        Ok(store) => store.close().await.map_err(store_error),
+        Err(_) => Err(HarnessError::new(
+            ErrorCode::StorageWriteFailed,
+            "store consumers were not released before close",
+        )),
+    }
 }
 
 async fn list_plugins(data_dir: &PathBuf, json: bool) -> Result<(), HarnessError> {

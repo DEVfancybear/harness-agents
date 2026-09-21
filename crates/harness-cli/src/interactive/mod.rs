@@ -77,7 +77,25 @@ pub enum LaunchMode {
         json: bool,
         cwd: Option<PathBuf>,
         resume: Option<String>,
+        options: HeadlessOptions,
     },
+}
+
+/// Optional headless-run inputs that shape the goal, budget and backend.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HeadlessOptions {
+    /// Explicit deterministic mock backend; never a default and never a silent
+    /// production fallback. The JSON result labels it.
+    pub mock: bool,
+    /// Goal objective. Without it the turn is one bounded pass.
+    pub goal: Option<String>,
+    /// Evidence kinds the goal requires: `response`, `tool_execution`,
+    /// `file_change`, `check`, `artifact`.
+    pub criteria: Vec<String>,
+    /// Host continuations one run may spend on the goal.
+    pub max_continuations: Option<u32>,
+    /// Token budget for the run, when the caller wants one.
+    pub budget_tokens: Option<u64>,
 }
 
 /// Validate parser output into a launch mode.
@@ -85,7 +103,11 @@ pub enum LaunchMode {
 /// Clap already enforces the flag conflicts, so this is the typed backstop that
 /// keeps the contract testable without spawning a process, and that keeps a
 /// missing prompt from ever being treated as free text.
-#[allow(clippy::fn_params_excessive_bools, reason = "one flag per launch mode")]
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    reason = "one flag per launch mode"
+)]
 pub fn mode_from_args(
     cwd: Option<PathBuf>,
     resume: Option<String>,
@@ -94,6 +116,7 @@ pub fn mode_from_args(
     prompt: Option<String>,
     json: bool,
     plain: bool,
+    options: HeadlessOptions,
 ) -> Result<LaunchMode, UsageError> {
     if !headless {
         if prompt.is_some() {
@@ -104,6 +127,16 @@ pub fn mode_from_args(
         if json {
             return Err(UsageError::new(
                 "--json is only valid with --headless; run ha chat --headless --prompt <text> --json",
+            ));
+        }
+        if options.mock
+            || options.goal.is_some()
+            || !options.criteria.is_empty()
+            || options.max_continuations.is_some()
+            || options.budget_tokens.is_some()
+        {
+            return Err(UsageError::new(
+                "--mock, --goal, --criteria, --max-continuations and --budget are only valid with --headless",
             ));
         }
         return Ok(LaunchMode::Interactive {
@@ -117,7 +150,7 @@ pub fn mode_from_args(
     }
     if fixture {
         return Err(UsageError::new(
-            "--fixture is only valid for the interactive app; a headless turn must report the real backend state",
+            "--fixture is only valid for the interactive app; a headless turn uses --mock for its explicit deterministic profile",
         ));
     }
     if plain {
@@ -138,6 +171,7 @@ pub fn mode_from_args(
         json,
         cwd,
         resume,
+        options,
     })
 }
 
@@ -255,13 +289,15 @@ pub async fn launch(mode: LaunchMode) -> Result<ExitCode, HarnessError> {
             json,
             cwd,
             resume,
+            options,
         } => {
-            headless::run(headless::HeadlessRequest {
+            Box::pin(headless::run(headless::HeadlessRequest {
                 prompt,
                 json,
                 cwd,
                 resume,
-            })
+                options,
+            }))
             .await
         }
         LaunchMode::Interactive {
@@ -317,7 +353,9 @@ pub fn non_terminal_guidance(capability: detector::TerminalCapability) -> String
 
 #[cfg(test)]
 mod tests {
-    use super::{LaunchMode, USAGE_EXIT_CODE, mode_from_args, non_terminal_guidance};
+    use super::{
+        HeadlessOptions, LaunchMode, USAGE_EXIT_CODE, mode_from_args, non_terminal_guidance,
+    };
     use crate::interactive::bootstrap;
     use crate::interactive::detector::TerminalCapability;
     use crate::interactive::paths::{self, LaunchEnvironment};
@@ -326,8 +364,17 @@ mod tests {
     #[test]
     fn h01_mode_from_args_accepts_bare_and_optioned_interactive_launch() {
         assert_eq!(
-            mode_from_args(None, None, false, false, None, false, false)
-                .expect("bare launch is valid"),
+            mode_from_args(
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+                false,
+                HeadlessOptions::default()
+            )
+            .expect("bare launch is valid"),
             LaunchMode::Interactive {
                 cwd: None,
                 resume: None,
@@ -343,7 +390,8 @@ mod tests {
                 false,
                 None,
                 false,
-                true
+                true,
+                HeadlessOptions::default(),
             )
             .expect("interactive launch with options is valid"),
             LaunchMode::Interactive {
@@ -357,8 +405,17 @@ mod tests {
 
     #[test]
     fn t07_plain_is_rejected_for_a_headless_turn() {
-        let error = mode_from_args(None, None, false, true, Some("hi".to_owned()), false, true)
-            .expect_err("a headless turn never draws a viewport");
+        let error = mode_from_args(
+            None,
+            None,
+            false,
+            true,
+            Some("hi".to_owned()),
+            false,
+            true,
+            HeadlessOptions::default(),
+        )
+        .expect_err("a headless turn never draws a viewport");
         assert!(error.to_string().contains("--plain is only valid"));
     }
 
@@ -373,8 +430,17 @@ mod tests {
 
     #[test]
     fn h01_mode_from_args_requires_prompt_for_headless() {
-        let error = mode_from_args(None, None, false, true, None, false, false)
-            .expect_err("headless needs a prompt");
+        let error = mode_from_args(
+            None,
+            None,
+            false,
+            true,
+            None,
+            false,
+            false,
+            HeadlessOptions::default(),
+        )
+        .expect_err("headless needs a prompt");
         assert!(error.to_string().contains("--headless requires --prompt"));
 
         let error = mode_from_args(
@@ -385,6 +451,7 @@ mod tests {
             Some("   ".to_owned()),
             false,
             false,
+            HeadlessOptions::default(),
         )
         .expect_err("blank prompt is rejected");
         assert!(error.to_string().contains("must not be empty"));
@@ -400,6 +467,7 @@ mod tests {
             Some("hello".to_owned()),
             false,
             false,
+            HeadlessOptions::default(),
         )
         .expect_err("prompt without headless is rejected");
         assert!(
@@ -408,8 +476,17 @@ mod tests {
                 .contains("--prompt is only valid with --headless")
         );
 
-        let error = mode_from_args(None, None, false, false, None, true, false)
-            .expect_err("json without headless is rejected");
+        let error = mode_from_args(
+            None,
+            None,
+            false,
+            false,
+            None,
+            true,
+            false,
+            HeadlessOptions::default(),
+        )
+        .expect_err("json without headless is rejected");
         assert!(
             error
                 .to_string()
@@ -427,6 +504,7 @@ mod tests {
             Some("fix the parser".to_owned()),
             false,
             false,
+            HeadlessOptions::default(),
         )
         .expect_err("a headless turn must not silently use the fixture");
         assert!(error.to_string().contains("--fixture is only valid"));
@@ -442,6 +520,7 @@ mod tests {
             Some("fix the parser".to_owned()),
             true,
             false,
+            HeadlessOptions::default(),
         )
         .expect("headless launch is valid");
         assert_eq!(
@@ -450,7 +529,8 @@ mod tests {
                 prompt: "fix the parser".to_owned(),
                 json: true,
                 cwd: None,
-                resume: None
+                resume: None,
+                options: HeadlessOptions::default(),
             }
         );
     }

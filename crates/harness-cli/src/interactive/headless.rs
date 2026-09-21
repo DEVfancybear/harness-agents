@@ -9,15 +9,21 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use harness_providers::{CancellationToken, DeepSeekAdapter, ModelCapabilities, ModelProvider};
-use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
+use harness_providers::{
+    CancellationToken, DeepSeekAdapter, MockProvider, ModelCapabilities, ModelProvider,
+};
+use harness_runtime::{
+    BudgetLedger, EvidenceKind, GoalCriterion, GoalSpec, HumanInputService, RunInbox, RunRequest,
+    RuntimeConfig, RuntimeService,
+};
 use harness_store_sqlite::{SqliteStore, StoreError, WriterOpenOptions};
 use harness_tools::{
     ApprovalMode, ToolExecutionService, TurnDriver, TurnObserver, TurnOptions, TurnProgress,
     coding_tool_schemas, observe_workspace,
 };
-use harness_types::{ErrorCode, HarnessError, HostId, InputId, SessionId, TaskId};
+use harness_types::{BudgetId, ErrorCode, HarnessError, HostId, InputId, SessionId, TaskId};
 
+use super::HeadlessOptions;
 use super::attachments;
 use super::bootstrap::{self, LaunchRequest};
 use super::bounds;
@@ -34,6 +40,7 @@ pub struct HeadlessRequest {
     pub json: bool,
     pub cwd: Option<PathBuf>,
     pub resume: Option<String>,
+    pub options: HeadlessOptions,
 }
 
 /// Progress is not rendered in headless mode; the final answer is printed once.
@@ -50,6 +57,52 @@ fn acceptance_trace(#[cfg_attr(not(debug_assertions), allow(unused_variables))] 
     if std::env::var_os("HA_TEST_TRACE_HEADLESS").is_some() {
         eprintln!("HA_HEADLESS_PHASE {stage}");
     }
+}
+
+/// Parse the `--criteria` values into typed evidence kinds.
+///
+/// An unknown kind is refused by name: a criterion the host cannot check must
+/// not silently disappear from the goal.
+fn parse_criteria(values: &[String]) -> Result<Vec<GoalCriterion>, HarnessError> {
+    let mut criteria = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        let kind = match value.trim().to_lowercase().as_str() {
+            "response" => EvidenceKind::Response,
+            "tool_execution" | "tool" => EvidenceKind::ToolExecution,
+            "file_change" | "file" => EvidenceKind::FileChange,
+            "check" | "test" => EvidenceKind::Check,
+            "artifact" => EvidenceKind::Artifact,
+            other => {
+                return Err(HarnessError::new(
+                    ErrorCode::InvalidPayload,
+                    format!(
+                        "unknown --criteria kind {other:?}; use response, tool_execution, file_change, check or artifact"
+                    ),
+                ));
+            }
+        };
+        criteria.push(GoalCriterion::required(
+            format!("criterion-{}", index + 1),
+            kind,
+        ));
+    }
+    if criteria.is_empty() {
+        criteria.push(GoalCriterion::required(
+            "criterion-1",
+            EvidenceKind::Response,
+        ));
+    }
+    Ok(criteria)
+}
+
+/// The durable run state, read back from the store for the JSON report.
+async fn run_state_label(store: &SqliteStore, outcome: &harness_tools::TurnOutcome) -> String {
+    store
+        .run_by_id(&outcome.run_id)
+        .await
+        .ok()
+        .flatten()
+        .map_or_else(|| "unknown".to_owned(), |run| run.state.as_str().to_owned())
 }
 
 /// Run one headless turn.
@@ -107,14 +160,21 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     })?;
     acceptance_trace("bootstrap_resolved");
     // Resolve the provider before opening anything: an unconfigured environment
-    // must fail fast with instructions and must not create state.
-    let config = resolve_provider(&environment, &context.paths.data_dir)
-        .map_err(|message| HarnessError::new(ErrorCode::ServiceUnavailable, message))?;
-    // A key the app saved is read by the resolver at call time. Prove that here,
-    // before a store is opened or a turn is admitted, so a saved-but-unreadable
-    // key fails with an actionable message instead of mid-turn.
-    validate_credential_file(&environment, &context.paths.data_dir)
-        .map_err(|message| HarnessError::new(ErrorCode::SecretNotGranted, message))?;
+    // must fail fast with instructions and must not create state. The explicit
+    // mock profile skips the provider configuration entirely, and the JSON
+    // result labels it as a fixture.
+    let provider_config = if request.options.mock {
+        None
+    } else {
+        let config = resolve_provider(&environment, &context.paths.data_dir)
+            .map_err(|message| HarnessError::new(ErrorCode::ServiceUnavailable, message))?;
+        // A key the app saved is read by the resolver at call time. Prove that here,
+        // before a store is opened or a turn is admitted, so a saved-but-unreadable
+        // key fails with an actionable message instead of mid-turn.
+        validate_credential_file(&environment, &context.paths.data_dir)
+            .map_err(|message| HarnessError::new(ErrorCode::SecretNotGranted, message))?;
+        Some(config)
+    };
 
     // Name the directory that could not be opened: an operator has to know which
     // path failed, and the typed code must survive the extra context.
@@ -180,29 +240,49 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     };
     let observation = observe_workspace(project_id, &context.project.root)?;
     acceptance_trace("workspace_observed");
-    let capabilities = ModelCapabilities {
-        provider_id: "deepseek".to_owned(),
-        model: config.model.clone(),
-        supports_streaming: true,
-        supports_tools: true,
-        fixture: false,
+    let capabilities = match &provider_config {
+        Some(config) => ModelCapabilities {
+            provider_id: "deepseek".to_owned(),
+            model: config.model.clone(),
+            supports_streaming: true,
+            supports_tools: true,
+            fixture: false,
+        },
+        None => ModelCapabilities {
+            provider_id: "mock".to_owned(),
+            model: "mock-profile".to_owned(),
+            supports_streaming: true,
+            supports_tools: false,
+            fixture: true,
+        },
     };
-    let provider: Arc<dyn ModelProvider> = Arc::new(
-        DeepSeekAdapter::new(
-            config.endpoint.clone(),
-            Arc::new(EnvironmentCredential::new(
-                config.credential_variable(),
-                context.paths.data_dir.clone(),
-            )),
-            capabilities,
-        )
-        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?,
-    );
-    let runtime = Arc::new(RuntimeService::new(
-        Arc::clone(&store),
-        provider,
-        RuntimeConfig::default(),
-    ));
+    let provider: Arc<dyn ModelProvider> = match &provider_config {
+        Some(config) => Arc::new(
+            DeepSeekAdapter::new(
+                config.endpoint.clone(),
+                Arc::new(EnvironmentCredential::new(
+                    config.credential_variable(),
+                    context.paths.data_dir.clone(),
+                )),
+                capabilities,
+            )
+            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?,
+        ),
+        None => Arc::new(MockProvider::text("mock profile: no model was called")),
+    };
+    let mut runtime = RuntimeService::new(Arc::clone(&store), provider, RuntimeConfig::default());
+    // A token budget is an explicit account the run reserves against; without
+    // one the run has no token bound to promise.
+    if let Some(limit) = request.options.budget_tokens {
+        let budget_id = BudgetId::generate();
+        let ledger = BudgetLedger::new(Arc::clone(&store));
+        ledger
+            .ensure_account(&budget_id, None, limit)
+            .await
+            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+        runtime = runtime.with_budget(ledger, budget_id);
+    }
+    let runtime = Arc::new(runtime);
     // Local extensions are opt-in, loaded for this one turn and stopped afterwards.
     let extension_root = extensions::extensions_root(&environment, &context.paths.data_dir);
     let active_extensions = if extensions::extensions_requested_from_environment(&environment) {
@@ -230,6 +310,24 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         Some(active) => driver.with_external(active.tools()),
         None => driver,
     };
+    // The goal, when the caller attached one, is host policy: typed criteria
+    // and bounded continuations. An unknown criterion kind is a usage error,
+    // not a silently ignored requirement.
+    let driver = match &request.options.goal {
+        Some(objective) => {
+            let criteria = parse_criteria(&request.options.criteria)?;
+            let spec = GoalSpec::new(objective.clone(), criteria);
+            let no_progress = spec.max_no_progress;
+            let goal = match request.options.max_continuations {
+                Some(max) => spec.with_limits(max, max.min(no_progress)),
+                None => spec,
+            };
+            driver.with_goal(goal)
+        }
+        None => driver,
+    };
+    // The durable steering/cancel inbox shares this turn's store.
+    let driver = driver.with_inbox(RunInbox::new(Arc::clone(&store)));
     let tool_schemas = match &active_extensions {
         Some(active) => {
             let mut schemas = coding_tool_schemas();
@@ -404,6 +502,41 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         }),
         None => serde_json::json!({"enabled": false}),
     };
+    // Run status and task acceptance are separate fields: a run that stopped
+    // cleanly is not the same claim as a task that was accepted.
+    let run_report = serde_json::json!({
+        "run_id": outcome.run_id,
+        "state": run_state_label(&store, &outcome).await,
+        "stop": outcome.stop.as_str(),
+        "stop_reason": outcome.stop.as_str(),
+        "steps": outcome.steps,
+        "tool_calls": outcome.tool_calls,
+    });
+    let goal_report = match &outcome.goal {
+        Some(goal) => serde_json::json!({
+            "objective": goal.objective,
+            "acceptance": goal.acceptance.as_str(),
+            "verdict": goal.verdict,
+            "continuations": goal.continuations,
+            "no_progress": goal.no_progress,
+            "stop": goal.stop.map(harness_tools::TurnStop::as_str),
+            "missing": goal.missing,
+        }),
+        None => serde_json::Value::Null,
+    };
+    let pending_question = match &outcome.pending_question {
+        Some(question_id) => {
+            let service = HumanInputService::new(Arc::clone(&store));
+            let question = service.question(question_id).await.ok().flatten();
+            serde_json::json!({
+                "question_id": question_id,
+                "state": question.as_ref().map(|question| question.state.as_str()),
+                "prompt": question.as_ref().map(|question| question.prompt.clone()),
+                "scope_key": question.as_ref().map(|question| question.scope_key.clone()),
+            })
+        }
+        None => serde_json::Value::Null,
+    };
     let output = serde_json::json!({
         "schema_version": 1,
         "session_id": outcome.session_id,
@@ -412,9 +545,13 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         "response": outcome.final_text,
         "steps": outcome.steps,
         "tool_calls": outcome.tool_calls,
-        "stop": format!("{:?}", outcome.stop).to_lowercase(),
+        "stop": outcome.stop.as_str(),
+        "run": run_report,
+        "acceptance": outcome.acceptance.as_str(),
+        "goal": goal_report,
+        "pending_question": pending_question,
         "approvals": "none",
-        "fixture": false,
+        "fixture": request.options.mock,
         "memory": memory_report,
         "extensions": extensions_report,
         "images": run_request_images,

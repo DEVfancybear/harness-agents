@@ -19,7 +19,13 @@ use std::time::{Duration, Instant};
 /// bound and accepting, and the refusal reaches a real child process as
 /// `provider_protocol: ... error sending request for url`. The retry is keyed on that
 /// exact text only, so a genuine protocol failure still fails on the first attempt.
-const LOOPBACK_ATTEMPTS: usize = 10;
+///
+/// Measured on 21/09/2026: with the whole workspace suite running, this binary runs
+/// its loopback fixtures in parallel and a refusal window can outlive ten attempts
+/// (the full M3 gate failed here twice while every suite passed when run alone).
+/// The budget is doubled; the sleep still caps at a few seconds so a broken host
+/// fails the suite instead of stalling it.
+const LOOPBACK_ATTEMPTS: usize = 20;
 
 /// Resolve the compiled ha executable this crate produced.
 fn cli_binary() -> PathBuf {

@@ -1239,6 +1239,21 @@ async fn run_turn(
                 TurnStop::StepLimit => RunOutcome::Paused(PauseReason::StepLimit),
                 TurnStop::ToolLimit => RunOutcome::Paused(PauseReason::ToolLimit),
                 TurnStop::Deadline => RunOutcome::Paused(PauseReason::Deadline),
+                // A goal that ran out of progress, continuations or budget is a
+                // decision for the user, not something the app repeats by itself.
+                TurnStop::NoProgress => RunOutcome::Paused(PauseReason::NoProgress),
+                TurnStop::GoalLimit => RunOutcome::Paused(PauseReason::GoalLimit),
+                TurnStop::BudgetExhausted => RunOutcome::Paused(PauseReason::BudgetExhausted),
+                TurnStop::NeedsInput => RunOutcome::WaitingInput {
+                    question_id: outcome.pending_question.as_ref().map(ToString::to_string),
+                },
+                TurnStop::ExternalWait => RunOutcome::ExternalWait,
+                TurnStop::LoopDetected => {
+                    RunOutcome::Blocked("the same tool call repeated".to_owned())
+                }
+                TurnStop::Unverified => {
+                    RunOutcome::Blocked("the final answer could not be verified".to_owned())
+                }
             }
         }
         Err(error) => RunOutcome::Failed(error.to_string()),

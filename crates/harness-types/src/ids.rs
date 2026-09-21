@@ -281,6 +281,24 @@ contract_id!(
     "runtime_command",
     "^runtime_command_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 );
+// M3 durable run identity. A run is one admitted input's bounded model loop; a
+// run step is one model call inside it. They are host-issued, like every other
+// record ID, and never come from the provider.
+contract_id!(
+    QuestionId,
+    "question",
+    "^question_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+);
+contract_id!(
+    BudgetId,
+    "budget",
+    "^budget_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+);
+contract_id!(
+    BudgetReservationId,
+    "budget_reservation",
+    "^budget_reservation_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+);
 contract_id!(
     ExtensionInstanceId,
     "extension_instance",

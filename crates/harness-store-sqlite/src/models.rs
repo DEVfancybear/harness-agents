@@ -5,11 +5,11 @@ use std::{
 };
 
 use harness_types::{
-    AgentProfileId, AgentRunId, ArtifactId, CompositionSnapshotId, ContentHash, ContextPacket,
-    ContextPacketId, ErrorCode, EventEnvelope, EventId, HostId, InputId, InstructionLedgerEntry,
-    MemoryAsset, MemoryAssetId, MemoryVersion, PluginManifest, ProjectId, ProviderAttemptId,
-    RequestId, RuntimeCommandId, SessionId, SnapshotId, TaskId, ToolApprovalId, ToolExecutionId,
-    ToolExecutionReceipt, WorkingState,
+    AgentProfileId, AgentRunId, ArtifactId, BudgetId, BudgetReservationId, CompositionSnapshotId,
+    ContentHash, ContextPacket, ContextPacketId, ErrorCode, EventEnvelope, EventId, HostId,
+    InputId, InstructionLedgerEntry, MemoryAsset, MemoryAssetId, MemoryVersion, PluginManifest,
+    ProjectId, ProviderAttemptId, QuestionId, RequestId, RuntimeCommandId, SessionId, SnapshotId,
+    StepId, TaskId, ToolApprovalId, ToolExecutionId, ToolExecutionReceipt, WorkingState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,7 +29,12 @@ pub const DATA_DIRECTORY_FORMAT_VERSION: u16 = 1;
 pub const DATA_DIRECTORY_KIND: &str = "harness-data";
 /// Additive runtime tables retain the P1 store schema version and have their
 /// own migration marker so older P1 databases remain readable.
-pub const RUNTIME_SCHEMA_VERSION: i64 = 1;
+///
+/// 2 adds the M3 durable run/step, budget and human-input tables. The change is
+/// additive: opening a version 1 database with this host creates the new tables
+/// and records version 2; a host that only supports version 1 refuses to write a
+/// version 2 database instead of silently dropping the new records.
+pub const RUNTIME_SCHEMA_VERSION: i64 = 2;
 /// Additive P3 tool tables use their own revision so P0/P1/P2 storage remains
 /// byte-for-byte compatible.
 pub const TOOLS_SCHEMA_VERSION: i64 = 1;
@@ -94,6 +99,12 @@ pub enum StoreFaultPoint {
     BeforeToolSettlementCommit,
     BeforeMemorySettlementCommit,
     BeforeDelegationDeliveryCommit,
+    /// Before a run step and its budget reservation commit together.
+    BeforeFreezeStepCommit,
+    /// Before a budget settlement commits.
+    BeforeBudgetSettleCommit,
+    /// Before a question answer commits.
+    BeforeQuestionAnswerCommit,
 }
 
 /// A one-shot, deterministic fault injector for component tests.
@@ -568,6 +579,284 @@ pub struct ProviderAttemptRecord {
     pub events: Value,
     pub response_hash: Option<ContentHash>,
     pub error: Option<String>,
+}
+
+/// Durable state of one admitted input's bounded model loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunState {
+    Running,
+    /// Paused on a durable question or an external wait; no compute permit and
+    /// no transaction is held. Mirrors the accepted `AgentState::Paused`.
+    Paused,
+    Completed,
+    Failed,
+    Canceled,
+}
+
+impl RunState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+        }
+    }
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "running" => Some(Self::Running),
+            "paused" => Some(Self::Paused),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "canceled" => Some(Self::Canceled),
+            _ => None,
+        }
+    }
+}
+
+/// One logical run: one admitted user input and every model step it produced.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunRecord {
+    pub run_id: AgentRunId,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub input_id: InputId,
+    pub state: RunState,
+    /// Typed task acceptance, written by the driver when a goal was attached.
+    pub acceptance: Option<String>,
+    /// Typed stop reason, written when the run leaves `running`.
+    pub stop_reason: Option<String>,
+    pub owner_generation: u64,
+    /// Bumped by every step freeze and terminal transition; used for CAS.
+    pub revision: u64,
+    pub budget_id: Option<BudgetId>,
+    /// The open question that paused this run, when one did.
+    pub awaiting_question_id: Option<QuestionId>,
+}
+
+/// One model call inside a run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunStepRecord {
+    pub step_id: StepId,
+    pub run_id: AgentRunId,
+    pub step_index: u32,
+    pub request_id: RequestId,
+    pub packet_id: ContextPacketId,
+    /// Hash of the frozen source manifest (block ids + source refs + packet hash).
+    pub manifest_hash: ContentHash,
+    pub source_sequence: u64,
+    pub state: String,
+    pub stop_reason: Option<String>,
+}
+
+/// A durable token account. Child accounts consume their parent's limit too.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BudgetAccountRecord {
+    pub budget_id: BudgetId,
+    pub parent_budget_id: Option<BudgetId>,
+    pub limit_tokens: u64,
+    pub spent_tokens: u64,
+    pub revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BudgetReservationState {
+    Reserved,
+    Settled,
+    /// The operation ended without a measurable usage; the conservative bound
+    /// stays charged until an explicit reconciliation releases it.
+    Unknown,
+    Released,
+    Expired,
+}
+
+impl BudgetReservationState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Settled => "settled",
+            Self::Unknown => "unknown",
+            Self::Released => "released",
+            Self::Expired => "expired",
+        }
+    }
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "reserved" => Some(Self::Reserved),
+            "settled" => Some(Self::Settled),
+            "unknown" => Some(Self::Unknown),
+            "released" => Some(Self::Released),
+            "expired" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+}
+
+/// One atomic reservation keyed by the operation that will settle it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BudgetReservationRecord {
+    pub reservation_id: BudgetReservationId,
+    pub budget_id: BudgetId,
+    /// Stable operation identity: an attempt ID, a summary, an evaluator call.
+    pub operation_id: String,
+    pub origin: String,
+    pub upper_bound_tokens: u64,
+    pub settled_tokens: Option<u64>,
+    pub state: BudgetReservationState,
+    pub revision: u64,
+}
+
+/// One durable question the host asked the user.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuestionState {
+    Open,
+    Answered,
+    Expired,
+    Canceled,
+}
+
+impl QuestionState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Answered => "answered",
+            Self::Expired => "expired",
+            Self::Canceled => "canceled",
+        }
+    }
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "open" => Some(Self::Open),
+            "answered" => Some(Self::Answered),
+            "expired" => Some(Self::Expired),
+            "canceled" => Some(Self::Canceled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuestionRecord {
+    pub question_id: QuestionId,
+    /// Dedupe scope: the same run and request resolves to one question row.
+    pub scope_key: String,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub run_id: Option<AgentRunId>,
+    pub kind: String,
+    pub prompt: String,
+    pub payload: Value,
+    pub state: QuestionState,
+    pub answer: Option<Value>,
+    pub answer_hash: Option<ContentHash>,
+    pub answered_by: Option<String>,
+    pub expires_at_unix_ms: Option<u64>,
+    pub created_at_unix_ms: u64,
+    pub answered_at_unix_ms: Option<u64>,
+}
+
+/// What one answer attempt did.
+#[derive(Clone, Debug, PartialEq)]
+pub enum QuestionAnswer {
+    /// First answer for this question; persisted now.
+    Answered(QuestionRecord),
+    /// The same answer was already recorded; the stored record comes back.
+    Duplicate(QuestionRecord),
+}
+
+/// The outcome of answering, including the states that are not an answer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum QuestionOutcome {
+    Answered(QuestionRecord),
+    Duplicate(QuestionRecord),
+    /// No question is scoped by that key: a wrong request ID or scope.
+    NotFound,
+    /// The question expired before an answer arrived.
+    Expired(QuestionRecord),
+    /// The question was already answered with a different payload.
+    Conflict(QuestionRecord),
+}
+
+/// How a reservation is settled when its operation ends.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BudgetSettlement {
+    pub reservation_id: BudgetReservationId,
+    /// `None` means the usage is unknown: the conservative bound stays charged.
+    pub measured_tokens: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunCommandKind {
+    /// A correction the model must see at the next safe boundary.
+    Steer,
+    /// Stop the run; queued work must not execute.
+    Cancel,
+}
+
+impl RunCommandKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Steer => "steer",
+            Self::Cancel => "cancel",
+        }
+    }
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "steer" => Some(Self::Steer),
+            "cancel" => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunCommandState {
+    Pending,
+    Claimed,
+    Applied,
+    Rejected,
+}
+
+impl RunCommandState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Claimed => "claimed",
+            Self::Applied => "applied",
+            Self::Rejected => "rejected",
+        }
+    }
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "claimed" => Some(Self::Claimed),
+            "applied" => Some(Self::Applied),
+            "rejected" => Some(Self::Rejected),
+            _ => None,
+        }
+    }
+}
+
+/// One steering or cancel command waiting for a run boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunCommandRecord {
+    pub command_id: RuntimeCommandId,
+    pub run_id: AgentRunId,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub kind: RunCommandKind,
+    pub state: RunCommandState,
+    pub payload: Value,
+    pub detail: Option<String>,
+    pub created_at_unix_ms: u64,
+    pub claimed_at_unix_ms: Option<u64>,
+    pub applied_at_unix_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

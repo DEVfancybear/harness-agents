@@ -18,17 +18,34 @@ use harness_session::{
     SessionService,
 };
 use harness_store_sqlite::{
-    AgentStateRecord, CompositionSnapshotRecord, ContextCheckpointRecord, ContextPacketRecord,
-    FrozenRequestRecord, ProviderAttemptRecord, RuntimeCommandRecord, RuntimeCommandState,
-    SqliteStore, StoreError,
+    AgentStateRecord, BudgetReservationRecord, BudgetReservationState, CompositionSnapshotRecord,
+    ContextCheckpointRecord, ContextPacketRecord, FrozenRequestRecord, ProviderAttemptRecord,
+    RunRecord, RunState, RunStepRecord, RuntimeCommandRecord, RuntimeCommandState, SqliteStore,
+    StoreError,
 };
 use harness_types::{
-    AgentRunId, ContentHash, ErrorCode, InputId, ProducerIdentity, ScopeContext, ScopeTarget,
-    SessionId, SourceAuthority, TaskId, WorkspaceObservation,
+    AgentRunId, BudgetId, BudgetReservationId, ContentHash, ErrorCode, InputId, ProducerIdentity,
+    ScopeContext, ScopeTarget, SessionId, SourceAuthority, StepId, TaskId, WorkspaceObservation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
+
+pub mod budget;
+pub mod goal;
+pub mod human_input;
+pub mod inbox;
+
+pub use budget::{BudgetLedger, BudgetView, Usage};
+pub use goal::{
+    AcceptanceState, EvidenceKind, GoalCriterion, GoalEvaluation, GoalEvaluationInput,
+    GoalEvaluator, GoalEvidence, GoalSpec, GoalVerdict, HostGoalEvaluator, default_evaluator,
+    validate_evaluation,
+};
+pub use human_input::{
+    AskRequest, HumanInputService, is_empty_answer, now_unix_ms, question_scope,
+};
+pub use inbox::RunInbox;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -354,12 +371,25 @@ fn image_marker(images: &[harness_providers::ImageAttachment]) -> String {
 pub struct RunResult {
     pub session_id: SessionId,
     pub task_id: TaskId,
+    pub run_id: AgentRunId,
+    /// Revision of the durable run after this step was frozen.
+    pub run_revision: u64,
+    /// The durable step this model call belongs to.
+    pub step_id: StepId,
     pub request_id: harness_types::RequestId,
     pub packet_id: harness_types::ContextPacketId,
     pub response: String,
     pub attempts: u32,
     pub tool_calls: Vec<NormalizedToolCall>,
     pub incomplete_tool_calls: bool,
+    /// Whether the assembled response may be turned into tool execution.
+    ///
+    /// A stream that never reached a terminal marker, or that left a call with
+    /// unparseable arguments, is reported to the caller but never dispatched:
+    /// the loop must stop without executing anything.
+    pub dispatchable: bool,
+    /// The provider's terminal finish reason, when it reported one.
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -463,6 +493,30 @@ async fn stream_with_sink(
     Ok(events)
 }
 
+/// The usage the provider reported for one attempt, when it reported any.
+///
+/// The last usage frame wins because a provider may repeat cumulative totals;
+/// adding frames would count one call twice. A frame with a zero total falls
+/// back to prompt plus completion, and no frame at all means the host estimate
+/// is used instead.
+fn provider_usage(events: &[ProviderStreamEvent]) -> Option<u64> {
+    events.iter().rev().find_map(|event| match event {
+        ProviderStreamEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        } => {
+            let total = if *total_tokens > 0 {
+                *total_tokens
+            } else {
+                prompt_tokens.saturating_add(*completion_tokens)
+            };
+            (total > 0).then_some(total)
+        }
+        _ => None,
+    })
+}
+
 #[derive(Clone)]
 pub struct RuntimeService {
     store: Arc<SqliteStore>,
@@ -470,6 +524,12 @@ pub struct RuntimeService {
     config: Arc<Mutex<RuntimeConfig>>,
     summarizer: Arc<dyn SummaryProvider>,
     last_attempts: Arc<AtomicU32>,
+    /// The account every provider dispatch is reserved against, when the host
+    /// attached one. Without an account the loop still runs; it just cannot
+    /// promise a token bound.
+    budget: Option<(BudgetLedger, BudgetId)>,
+    /// The goal evaluator; production uses the host evaluator.
+    evaluator: Arc<dyn GoalEvaluator>,
 }
 
 impl RuntimeService {
@@ -485,12 +545,30 @@ impl RuntimeService {
             config: Arc::new(Mutex::new(config)),
             summarizer: Arc::new(DefaultSummaryProvider),
             last_attempts: Arc::new(AtomicU32::new(0)),
+            budget: None,
+            evaluator: default_evaluator(),
         }
     }
     #[must_use]
     pub fn with_summarizer(mut self, summarizer: Arc<dyn SummaryProvider>) -> Self {
         self.summarizer = summarizer;
         self
+    }
+    /// Attach a durable budget account. Every provider attempt is reserved
+    /// before dispatch and settled after it.
+    #[must_use]
+    pub fn with_budget(mut self, ledger: BudgetLedger, budget_id: BudgetId) -> Self {
+        self.budget = Some((ledger, budget_id));
+        self
+    }
+    #[must_use]
+    pub fn with_evaluator(mut self, evaluator: Arc<dyn GoalEvaluator>) -> Self {
+        self.evaluator = evaluator;
+        self
+    }
+    #[must_use]
+    pub fn evaluator(&self) -> Arc<dyn GoalEvaluator> {
+        Arc::clone(&self.evaluator)
     }
     pub fn update_config(&self, config: RuntimeConfig) {
         if let Ok(mut current) = self.config.lock() {
@@ -594,6 +672,17 @@ impl RuntimeService {
         // states cannot be re-entered by a later notification.
         let started = AgentState::Idle.apply(RunCommand::Start)?;
         self.record_agent(&agent_run_id, &request, started.next, 1, &started.events)
+            .await?;
+        // One admitted input owns one durable run, whether this is the first
+        // step or a continuation: the identity was fixed at admission.
+        let run = self
+            .store
+            .start_run(
+                &request.session_id,
+                &request.task_id,
+                &request.input_id,
+                self.budget.as_ref().map(|(_, budget_id)| budget_id),
+            )
             .await?;
         let command_id = harness_types::RuntimeCommandId::generate();
         self.store
@@ -728,6 +817,66 @@ impl RuntimeService {
             config_revision: config.config_revision,
         };
         self.store.persist_frozen_request(frozen).await?;
+        // Freeze the step and its first attempt's budget reservation together.
+        // If this commit fails, nothing was dispatched and the caller gets a
+        // typed store error instead of a model call.
+        let step_id = StepId::generate();
+        let manifest_content = json!({
+            "packet_id": built.packet.packet_id,
+            "packet_hash": built.packet.content_hash,
+            "source_manifest": built.packet.source_manifest,
+            "mandatory_blocks": built.mandatory_block_ids,
+            "optional_blocks": built.optional_block_ids,
+            "omitted_optional": built.omitted_optional,
+        });
+        let manifest_hash = ContentHash::from_canonical_json(&manifest_content)
+            .map_err(|error| RuntimeError::new(error.code(), error.to_string()))?;
+        let step_index = u32::try_from(self.store.run_steps(&run.run_id).await?.len())
+            .map_err(|_| RuntimeError::new(ErrorCode::InvalidPayload, "too many run steps"))?;
+        let attempt_bound = built
+            .packet
+            .token_estimate
+            .saturating_add(config.output_reservation_tokens)
+            .max(1);
+        let first_reservation =
+            self.budget
+                .as_ref()
+                .map(|(_, budget_id)| BudgetReservationRecord {
+                    reservation_id: BudgetReservationId::generate(),
+                    budget_id: budget_id.clone(),
+                    operation_id: format!("attempt:{}:{step_index}:1", run.run_id),
+                    origin: "provider_attempt".to_owned(),
+                    upper_bound_tokens: attempt_bound,
+                    settled_tokens: None,
+                    state: BudgetReservationState::Reserved,
+                    revision: 1,
+                });
+        let first_reservation_id = first_reservation
+            .as_ref()
+            .map(|reservation| reservation.reservation_id.clone());
+        let run = self
+            .store
+            .freeze_run_step(
+                &run.run_id,
+                run.revision,
+                RunStepRecord {
+                    step_id: step_id.clone(),
+                    run_id: run.run_id.clone(),
+                    step_index,
+                    request_id: provider_request.request_id.clone(),
+                    packet_id: built.packet.packet_id.clone(),
+                    manifest_hash,
+                    source_sequence: built.packet.through_event_seq,
+                    state: "frozen".to_owned(),
+                    stop_reason: None,
+                },
+                first_reservation,
+            )
+            .await?;
+        // The reservation this attempt will settle. A retry gets its own
+        // reservation before it dispatches, so retries are counted by origin
+        // instead of hiding inside one bound.
+        let mut attempt_reservation = first_reservation_id;
 
         let mut final_response = None;
         let mut attempts = command.attempts;
@@ -752,6 +901,19 @@ impl RuntimeService {
                 break;
             }
             let attempt_number = attempts.max(1);
+            if attempt_number > 1
+                && let Some((ledger, budget_id)) = &self.budget
+            {
+                let reservation = ledger
+                    .reserve(
+                        budget_id,
+                        &format!("attempt:{}:{step_index}:{attempt_number}", run.run_id),
+                        "retry",
+                        attempt_bound,
+                    )
+                    .await?;
+                attempt_reservation = Some(reservation.reservation_id);
+            }
             let result = match &sink {
                 Some(sink) => {
                     stream_with_sink(
@@ -771,6 +933,16 @@ impl RuntimeService {
             match result {
                 Ok(events) => {
                     let assembled = assemble_stream(&events)?;
+                    // Settle this attempt before anything else reads the
+                    // result: measured when the response has text, unknown
+                    // when it does not (an empty response is not free).
+                    self.settle_attempt(
+                        attempt_reservation.as_ref(),
+                        &built.packet.token_estimate,
+                        &assembled.text,
+                        &events,
+                    )
+                    .await?;
                     let response_hash = ContentHash::from_canonical_json(
                         &serde_json::to_value(&assembled).map_err(|_| {
                             RuntimeError::new(
@@ -799,6 +971,13 @@ impl RuntimeService {
                 }
                 Err(error) => {
                     let canceled = error.code() == ErrorCode::ProviderCanceled;
+                    // The usage of a failed attempt is unknown, never zero:
+                    // the conservative bound stays charged until reconcile.
+                    if let Some(reservation_id) = &attempt_reservation
+                        && let Some((ledger, _)) = &self.budget
+                    {
+                        ledger.settle(reservation_id, Usage::Unknown).await?;
+                    }
                     self.store
                         .persist_provider_attempt(ProviderAttemptRecord {
                             attempt_id: harness_types::ProviderAttemptId::generate(),
@@ -900,15 +1079,27 @@ impl RuntimeService {
                 &completed.events,
             )
             .await?;
+            // The step is streamed but the run stays running: the driver owns
+            // the loop and either freezes another step or finishes the run with
+            // its typed stop reason.
+            self.store
+                .settle_run_step(&step_id, "streamed", None, None)
+                .await?;
+            let dispatchable = response.is_dispatchable();
             Ok(RunResult {
                 session_id: request.session_id,
                 task_id: request.task_id,
+                run_id: run.run_id,
+                run_revision: run.revision,
+                step_id,
                 request_id: provider_request.request_id,
                 packet_id: built.packet.packet_id,
                 response: response.text,
                 attempts,
                 tool_calls: response.tool_calls,
                 incomplete_tool_calls: response.incomplete_tool_calls,
+                dispatchable,
+                finish_reason: response.finish_reason,
             })
         } else {
             let error = last_error.unwrap_or_else(|| {
@@ -943,7 +1134,109 @@ impl RuntimeService {
                     &terminal.events,
                 )
                 .await;
+            // A provider failure ends the run's provider path; the run record
+            // says why, so a reopen never mistakes it for a completed turn.
+            let canceled = error.code() == ErrorCode::ProviderCanceled;
+            let _ = self
+                .store
+                .settle_run_step(
+                    &step_id,
+                    if canceled { "canceled" } else { "failed" },
+                    None,
+                    None,
+                )
+                .await;
+            let _ = self
+                .store
+                .finish_run(
+                    &run.run_id,
+                    run.revision,
+                    if canceled {
+                        RunState::Canceled
+                    } else {
+                        RunState::Failed
+                    },
+                    None,
+                    Some(if canceled {
+                        "provider_canceled"
+                    } else {
+                        "provider_failed"
+                    }),
+                    None,
+                )
+                .await;
             Err(error)
+        }
+    }
+
+    /// Settle one attempt's reservation from the host's measurement.
+    /// Settle one attempt's reservation from the provider's usage when it
+    /// reported one, or from the host's estimate when it did not.
+    ///
+    /// The last usage frame wins: a provider may repeat cumulative totals, and
+    /// adding them would double count one call. A missing usage is not zero:
+    /// the conservative bound stays charged.
+    async fn settle_attempt(
+        &self,
+        reservation_id: Option<&BudgetReservationId>,
+        prompt_tokens: &u64,
+        response_text: &str,
+        events: &[ProviderStreamEvent],
+    ) -> Result<(), RuntimeError> {
+        let (Some(reservation_id), Some((ledger, _))) = (reservation_id, &self.budget) else {
+            return Ok(());
+        };
+        let measured = provider_usage(events).unwrap_or_else(|| {
+            prompt_tokens.saturating_add(BudgetLedger::estimate_tokens(response_text))
+        });
+        ledger
+            .settle(reservation_id, Usage::Measured(measured))
+            .await?;
+        Ok(())
+    }
+
+    /// Finish the durable run with the driver's typed stop reason and acceptance.
+    pub async fn finish_run_record(
+        &self,
+        run_id: &AgentRunId,
+        expected_revision: u64,
+        state: RunState,
+        acceptance: Option<&str>,
+        stop_reason: &str,
+        awaiting_question_id: Option<&harness_types::QuestionId>,
+    ) -> Result<RunRecord, RuntimeError> {
+        self.store
+            .finish_run(
+                run_id,
+                expected_revision,
+                state,
+                acceptance,
+                Some(stop_reason),
+                awaiting_question_id,
+            )
+            .await
+            .map_err(RuntimeError::from)
+    }
+
+    pub async fn run_record(&self, run_id: &AgentRunId) -> Result<Option<RunRecord>, RuntimeError> {
+        self.store
+            .run_by_id(run_id)
+            .await
+            .map_err(RuntimeError::from)
+    }
+
+    /// The store this runtime writes through, for services that share it.
+    #[must_use]
+    pub fn store(&self) -> &Arc<SqliteStore> {
+        &self.store
+    }
+
+    /// How much the attached budget account may still commit, when one is
+    /// attached. `None` means the host attached no budget.
+    pub async fn budget_remaining(&self) -> Result<Option<u64>, RuntimeError> {
+        match &self.budget {
+            Some((ledger, budget_id)) => Ok(Some(ledger.remaining(budget_id).await?)),
+            None => Ok(None),
         }
     }
 

@@ -8,16 +8,19 @@ mod store;
 
 pub use error::StoreError;
 pub use models::{
-    AdmissionAck, AdmissionCommit, AgentStateRecord, BudgetUsageRecord, CompositionSnapshotRecord,
+    AdmissionAck, AdmissionCommit, AgentStateRecord, BudgetAccountRecord, BudgetReservationRecord,
+    BudgetReservationState, BudgetSettlement, BudgetUsageRecord, CompositionSnapshotRecord,
     ContextCheckpointRecord, ContextPacketRecord, ContinuationLinkRecord,
     DATA_DIRECTORY_FORMAT_VERSION, DATA_DIRECTORY_KIND, DATA_DIRECTORY_MARKER_FILE_NAME,
     DATABASE_FILE_NAME, DELEGATION_SCHEMA_VERSION, DataDirectoryMarker, DeliveryCommit,
     FrozenRequestRecord, HostFence, MAINTENANCE_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION,
     MemoryBindingRow, MemoryCreateCommit, MemoryVersionCommit, ParentDeliveryRecord,
     PersistedPluginManifest, ProjectRegistrationRecord, ProviderAttemptRecord, PublishedArtifact,
-    RUNTIME_SCHEMA_VERSION, ReceiptAck, ReceiptCommit, RuntimeCommandRecord, RuntimeCommandState,
-    STORE_SCHEMA_VERSION, SessionSummary, SnapshotRecord, SourceWorkMarker, StoreDiagnostics,
-    StoreFaultPlan, StoreFaultPoint, StoreMemoryPrincipal, StorePaths, StoredDelegatedResultRecord,
+    QuestionAnswer, QuestionOutcome, QuestionRecord, QuestionState, RUNTIME_SCHEMA_VERSION,
+    ReceiptAck, ReceiptCommit, RunCommandKind, RunCommandRecord, RunCommandState, RunRecord,
+    RunState, RunStepRecord, RuntimeCommandRecord, RuntimeCommandState, STORE_SCHEMA_VERSION,
+    SessionSummary, SnapshotRecord, SourceWorkMarker, StoreDiagnostics, StoreFaultPlan,
+    StoreFaultPoint, StoreMemoryPrincipal, StorePaths, StoredDelegatedResultRecord,
     StoredExtractionJobRecord, StoredExtractionLeaseRecord, StoredMemoryAssetRecord,
     StoredMemoryGrantRecord, StoredMemoryVersionRecord, StoredTaskNodeRecord, TOOLS_SCHEMA_VERSION,
     TaskOwnerRecord, TombstoneRow, ToolApprovalBinding, ToolApprovalRecord, ToolApprovalState,

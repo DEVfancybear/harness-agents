@@ -166,9 +166,13 @@ pub fn run_row(
     let style = match outcome {
         RunOutcome::Done => theme.tool_ok,
         // Neither a cancel nor a bound is a red line: nothing broke, and what the turn
-        // did is durable.
-        RunOutcome::Canceled | RunOutcome::Paused(_) => theme.dim,
-        RunOutcome::Failed(_) => theme.tool_failed,
+        // did is durable. A waiting run is not a failure either - it is the host
+        // asking for something only a person can give.
+        RunOutcome::Canceled
+        | RunOutcome::Paused(_)
+        | RunOutcome::WaitingInput { .. }
+        | RunOutcome::ExternalWait => theme.dim,
+        RunOutcome::Blocked(_) | RunOutcome::Failed(_) => theme.tool_failed,
     };
     Line::from(vec![
         Span::styled(

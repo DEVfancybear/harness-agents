@@ -15,10 +15,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use harness_providers::{
-    CancellationToken, NormalizedToolCall, ProviderMessage, ProviderStreamEvent, ProviderToolCall,
+    CancellationToken, MessageRole, NormalizedToolCall, ProviderMessage, ProviderStreamEvent,
+    ProviderToolCall,
 };
-use harness_runtime::{ProviderEventSink, RunRequest, RunResult, RuntimeService};
-use harness_types::{ErrorCode, HarnessError};
+use harness_runtime::{
+    AcceptanceState, AgentState, AskRequest, GoalEvaluationInput, GoalEvidence, GoalSpec,
+    GoalVerdict, HumanInputService, ProviderEventSink, RunCommand, RunInbox, RunRequest, RunResult,
+    RuntimeService, now_unix_ms,
+};
+use harness_store_sqlite::{RunCommandKind, RunState};
+use harness_types::{ErrorCode, HarnessError, QuestionId};
 use serde_json::Value;
 
 use crate::{
@@ -85,6 +91,56 @@ pub enum TurnStop {
     Deadline,
     /// The caller canceled the turn.
     Canceled,
+    /// The run paused on a durable question; nothing is held open.
+    NeedsInput,
+    /// The goal waits on something outside the host; the host does not poll.
+    ExternalWait,
+    /// Continuations repeated without new evidence.
+    NoProgress,
+    /// The goal continuation bound was reached.
+    GoalLimit,
+    /// The goal's budget cannot fund another step.
+    BudgetExhausted,
+    /// The same tool call repeated inside the loop window.
+    LoopDetected,
+    /// The terminal response cannot be trusted (empty or output-capped).
+    Unverified,
+}
+
+impl TurnStop {
+    /// The stable spelling persisted with the run and printed in JSON.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Final => "final",
+            Self::StepLimit => "step_limit",
+            Self::ToolLimit => "tool_limit",
+            Self::Deadline => "deadline",
+            Self::Canceled => "canceled",
+            Self::NeedsInput => "needs_input",
+            Self::ExternalWait => "external_wait",
+            Self::NoProgress => "no_progress",
+            Self::GoalLimit => "goal_limit",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::LoopDetected => "loop_detected",
+            Self::Unverified => "unverified",
+        }
+    }
+
+    /// Whether the run can be continued by a later turn without new input.
+    #[must_use]
+    pub const fn is_resumable(self) -> bool {
+        matches!(
+            self,
+            Self::StepLimit
+                | Self::ToolLimit
+                | Self::NoProgress
+                | Self::GoalLimit
+                | Self::BudgetExhausted
+                | Self::NeedsInput
+                | Self::ExternalWait
+        )
+    }
 }
 
 /// One gated action waiting for the user's decision.
@@ -175,11 +231,63 @@ pub struct TurnOutcome {
     pub session_id: harness_types::SessionId,
     pub task_id: harness_types::TaskId,
     pub input_id: harness_types::InputId,
+    pub run_id: harness_types::AgentRunId,
+    /// Run revision after the last frozen step.
+    pub run_revision: u64,
     pub final_text: String,
     pub steps: u32,
     pub tool_calls: u32,
     pub executions: Vec<ToolExecutionView>,
     pub stop: TurnStop,
+    /// Task acceptance, kept separate from the stop reason.
+    pub acceptance: AcceptanceState,
+    /// The goal report, when a goal was attached to this turn.
+    pub goal: Option<GoalReport>,
+    /// The durable question this run paused on, when it did.
+    pub pending_question: Option<harness_types::QuestionId>,
+}
+
+/// What one goal evaluation run reported, in words the CLI can print.
+#[derive(Clone, Debug)]
+pub struct GoalReport {
+    pub objective: String,
+    pub acceptance: AcceptanceState,
+    pub verdict: GoalVerdict,
+    pub continuations: u32,
+    pub no_progress: u32,
+    /// Why continuation stopped, when it did.
+    pub stop: Option<TurnStop>,
+    pub missing: Vec<String>,
+}
+
+impl GoalReport {
+    fn from_verdict(
+        objective: &str,
+        verdict: &GoalVerdict,
+        continuations: u32,
+        no_progress: u32,
+        stop: Option<TurnStop>,
+    ) -> Self {
+        Self {
+            objective: objective.to_owned(),
+            acceptance: verdict.acceptance(),
+            verdict: verdict.clone(),
+            continuations,
+            no_progress,
+            stop,
+            missing: missing_of(verdict),
+        }
+    }
+}
+
+fn missing_of(verdict: &GoalVerdict) -> Vec<String> {
+    match verdict {
+        GoalVerdict::Satisfied { .. } => Vec::new(),
+        GoalVerdict::NeedsWork { missing, .. }
+        | GoalVerdict::NeedsInput { missing, .. }
+        | GoalVerdict::ExternalWait { missing, .. }
+        | GoalVerdict::Unverified { missing, .. } => missing.clone(),
+    }
 }
 
 /// Host-owned view of the external tools one turn may see and call.
@@ -231,12 +339,24 @@ impl fmt::Debug for ExternalTools {
 /// Longest tool result text handed back to the model.
 const TOOL_RESULT_LIMIT: usize = 4000;
 
+/// How many recent tool signatures the loop detector remembers.
+const LOOP_WINDOW: usize = 6;
+
+/// How often the same tool signature may repeat in the window before the loop
+/// is stopped. Three repeats of one identical call is already a loop; two is a
+/// retry the model is allowed to make.
+const LOOP_REPEAT_LIMIT: usize = 3;
+
 /// Bounded model -> tool -> model loop.
 #[derive(Clone)]
 pub struct TurnDriver {
     runtime: Arc<RuntimeService>,
     tools: ToolExecutionService,
     external: Option<ExternalTools>,
+    /// The goal this turn must satisfy, when the caller attached one.
+    goal: Option<GoalSpec>,
+    /// Durable steering/cancel inbox, when the host attached one.
+    inbox: Option<RunInbox>,
 }
 
 impl TurnDriver {
@@ -246,6 +366,8 @@ impl TurnDriver {
             runtime,
             tools,
             external: None,
+            goal: None,
+            inbox: None,
         }
     }
 
@@ -253,6 +375,20 @@ impl TurnDriver {
     #[must_use]
     pub fn with_external(mut self, external: ExternalTools) -> Self {
         self.external = Some(external);
+        self
+    }
+
+    /// Attach the goal criteria and continuation bounds for this turn.
+    #[must_use]
+    pub fn with_goal(mut self, goal: GoalSpec) -> Self {
+        self.goal = Some(goal);
+        self
+    }
+
+    /// Attach the durable steering/cancel inbox.
+    #[must_use]
+    pub fn with_inbox(mut self, inbox: RunInbox) -> Self {
+        self.inbox = Some(inbox);
         self
     }
 
@@ -291,8 +427,9 @@ impl TurnDriver {
         .await
     }
 
-    // One linear pass per step with an explicit bound check between them; the
-    // length is the wiring, not hidden branching logic.
+    // The turn is one bounded pass per model call, wrapped in a goal loop that
+    // may continue the same admitted input. The length is the wiring, not
+    // hidden branching logic.
     #[allow(clippy::too_many_lines)]
     async fn run_turn_inner(
         &self,
@@ -312,6 +449,17 @@ impl TurnDriver {
         // dispatch again after each round of tools made `max_steps` mean about half of
         // what it says and reported a turn that used four calls as eight steps.
         let mut steps = 1_u32;
+        // Goal state. `continuations` counts host continuations of one admitted
+        // input; `no_progress` counts continuations whose evidence fingerprint
+        // did not change.
+        let mut continuations = 0_u32;
+        let mut no_progress = 0_u32;
+        let mut last_signature: Option<String> = None;
+        let mut goal_report: Option<GoalReport> = None;
+        let mut acceptance = AcceptanceState::NotEvaluated;
+        let mut pending_question: Option<QuestionId> = None;
+        // Recent tool signatures for the loop detector.
+        let mut loop_signatures: Vec<String> = Vec::new();
 
         let first_step = match source_session_id {
             Some(source) => {
@@ -334,8 +482,174 @@ impl TurnDriver {
             first_step.map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
 
         // The loop yields why it stopped, so no bound can silently fall through.
-        let stop = loop {
+        let stop = 'turn: loop {
+            // A06: a stream that never reached a terminal marker is not a
+            // completed answer. It is reported, but nothing may execute and the
+            // turn is not accepted. A terminal response whose call is malformed
+            // is a different case: the call is refused below with its own
+            // reason so the model can re-issue it.
+            if result.finish_reason.is_none() {
+                break TurnStop::Unverified;
+            }
             if result.tool_calls.is_empty() {
+                // A terminal answer is evaluated before it is accepted. The
+                // evaluator decides whether the goal is satisfied; a model that
+                // says "done" without evidence is continued or blocked.
+                if let Some(goal) = &self.goal {
+                    let evidence = goal_evidence(&result, &executions);
+                    let remaining_budget = self
+                        .runtime
+                        .budget_remaining()
+                        .await
+                        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+                    let evaluation = match self.runtime.evaluator().evaluate(&GoalEvaluationInput {
+                        spec: goal,
+                        evidence: &evidence,
+                        previous_signature: last_signature.as_deref(),
+                        continuations,
+                        no_progress,
+                        remaining_budget,
+                    }) {
+                        Ok(evaluation) => evaluation,
+                        Err(error) => {
+                            // An evaluator that cannot answer is not a satisfied
+                            // goal: the run ends failed and nothing is accepted.
+                            let _ = self
+                                .runtime
+                                .finish_run_record(
+                                    &result.run_id,
+                                    result.run_revision,
+                                    RunState::Failed,
+                                    Some(AcceptanceState::Unverified.as_str()),
+                                    "evaluator_failed",
+                                    None,
+                                )
+                                .await;
+                            return Err(HarnessError::new(error.code(), error.to_string()));
+                        }
+                    };
+                    if let Err(error) = harness_runtime::validate_evaluation(&evaluation) {
+                        let _ = self
+                            .runtime
+                            .finish_run_record(
+                                &result.run_id,
+                                result.run_revision,
+                                RunState::Failed,
+                                Some(AcceptanceState::Unverified.as_str()),
+                                "evaluator_invalid",
+                                None,
+                            )
+                            .await;
+                        return Err(HarnessError::new(error.code(), error.to_string()));
+                    }
+                    acceptance = evaluation.verdict.acceptance();
+                    match &evaluation.verdict {
+                        GoalVerdict::Satisfied { .. } => {
+                            goal_report = Some(GoalReport::from_verdict(
+                                &goal.objective,
+                                &evaluation.verdict,
+                                continuations,
+                                no_progress,
+                                None,
+                            ));
+                            break TurnStop::Final;
+                        }
+                        GoalVerdict::Unverified { .. } => {
+                            goal_report = Some(GoalReport::from_verdict(
+                                &goal.objective,
+                                &evaluation.verdict,
+                                continuations,
+                                no_progress,
+                                Some(TurnStop::Unverified),
+                            ));
+                            break TurnStop::Unverified;
+                        }
+                        GoalVerdict::NeedsInput { question, .. } => {
+                            let question =
+                                self.ask_question(&result, question)
+                                    .await
+                                    .map_err(|error| {
+                                        HarnessError::new(error.code(), error.to_string())
+                                    })?;
+                            pending_question = Some(question.question_id.clone());
+                            goal_report = Some(GoalReport::from_verdict(
+                                &goal.objective,
+                                &evaluation.verdict,
+                                continuations,
+                                no_progress,
+                                Some(TurnStop::NeedsInput),
+                            ));
+                            break TurnStop::NeedsInput;
+                        }
+                        GoalVerdict::ExternalWait { .. } => {
+                            goal_report = Some(GoalReport::from_verdict(
+                                &goal.objective,
+                                &evaluation.verdict,
+                                continuations,
+                                no_progress,
+                                Some(TurnStop::ExternalWait),
+                            ));
+                            break TurnStop::ExternalWait;
+                        }
+                        GoalVerdict::NeedsWork { next_action, .. } => {
+                            let progressed = last_signature
+                                .as_deref()
+                                .is_none_or(|previous| previous != evaluation.progress_signature);
+                            last_signature = Some(evaluation.progress_signature.clone());
+                            if progressed {
+                                no_progress = 0;
+                            } else {
+                                no_progress += 1;
+                            }
+                            let exhausted = remaining_budget == Some(0);
+                            let stop_reason = if no_progress > goal.max_no_progress {
+                                Some(TurnStop::NoProgress)
+                            } else if continuations >= goal.max_continuations {
+                                Some(TurnStop::GoalLimit)
+                            } else if exhausted {
+                                Some(TurnStop::BudgetExhausted)
+                            } else if steps >= options.limits.max_steps {
+                                Some(TurnStop::StepLimit)
+                            } else {
+                                None
+                            };
+                            if let Some(stop_reason) = stop_reason {
+                                goal_report = Some(GoalReport::from_verdict(
+                                    &goal.objective,
+                                    &evaluation.verdict,
+                                    continuations,
+                                    no_progress,
+                                    Some(stop_reason),
+                                ));
+                                break stop_reason;
+                            }
+                            continuations += 1;
+                            steps += 1;
+                            observer.observe(TurnProgress::StepStarted { step: steps });
+                            // The continuation instruction is host policy, not
+                            // user text: the input was admitted once and this
+                            // never creates a second input identity.
+                            result = self
+                                .runtime
+                                .continue_run(
+                                    request.clone(),
+                                    vec![ProviderMessage::new(
+                                        MessageRole::System,
+                                        format!(
+                                            "The goal is not complete yet. Next action: {next_action}. Produce the missing evidence, then answer again."
+                                        ),
+                                    )],
+                                    cancellation.clone(),
+                                    Some(sink_for(&observer)),
+                                )
+                                .await
+                                .map_err(|error| {
+                                    HarnessError::new(error.code(), error.to_string())
+                                })?;
+                            continue 'turn;
+                        }
+                    }
+                }
                 break TurnStop::Final;
             }
             if cancellation.is_cancelled() {
@@ -354,6 +668,75 @@ impl TurnDriver {
             }
 
             let mut appended = Vec::new();
+            // A safe boundary: steering is delivered and a cancel stops the turn
+            // before any queued work executes.
+            if let Some(inbox) = &self.inbox {
+                let run = self
+                    .runtime
+                    .run_record(&result.run_id)
+                    .await
+                    .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+                if let Some(run) = run {
+                    let commands = inbox
+                        .claim(&run, 8, now_unix_ms())
+                        .await
+                        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+                    let mut canceled = None;
+                    for command in &commands {
+                        match command.kind {
+                            RunCommandKind::Cancel => {
+                                canceled = Some(
+                                    RunInbox::cancel_reason(command)
+                                        .unwrap_or_else(|| "canceled by the user".to_owned()),
+                                );
+                                inbox
+                                    .apply(command, "canceled at a step boundary", now_unix_ms())
+                                    .await
+                                    .map_err(|error| {
+                                        HarnessError::new(error.code(), error.to_string())
+                                    })?;
+                            }
+                            RunCommandKind::Steer => {
+                                if let Some(text) = RunInbox::steering_text(command) {
+                                    appended.push(ProviderMessage::new(
+                                        MessageRole::User,
+                                        format!("[steering correction from the user]\n{text}"),
+                                    ));
+                                }
+                                inbox
+                                    .apply(
+                                        command,
+                                        "steering delivered to the next step",
+                                        now_unix_ms(),
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        HarnessError::new(error.code(), error.to_string())
+                                    })?;
+                            }
+                        }
+                    }
+                    if let Some(reason) = canceled {
+                        observer.observe(TurnProgress::TextDelta(format!(
+                            "canceled at a step boundary: {reason}"
+                        )));
+                        break TurnStop::Canceled;
+                    }
+                }
+            }
+            // Loop detection: the same tool call repeated inside the window is a
+            // loop, not progress. Different arguments or a changed batch are not.
+            for call in &result.tool_calls {
+                loop_signatures.push(call_signature(call));
+            }
+            if loop_signatures.len() > LOOP_WINDOW {
+                let drain = loop_signatures.len() - LOOP_WINDOW;
+                loop_signatures.drain(0..drain);
+            }
+            if repeated_tail(&loop_signatures) {
+                break TurnStop::LoopDetected;
+            }
+
             let names: Vec<String> = result
                 .tool_calls
                 .iter()
@@ -449,16 +832,138 @@ impl TurnDriver {
                 .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
         };
 
+        // Persist the terminal outcome of the run. Resumable bounds keep the run
+        // running: a later turn continues it, and a reopen must not read a pause
+        // as a failure.
+        if let Some(goal) = &self.goal
+            && goal_report.is_none()
+        {
+            // The loop stopped before (or instead of) an evaluator verdict. The
+            // report still says what happened and what acceptance that means.
+            let (state, verdict) = match stop {
+                TurnStop::Unverified => (
+                    AcceptanceState::Unverified,
+                    GoalVerdict::Unverified {
+                        reason: "the provider stream was not dispatchable".to_owned(),
+                        missing: goal.required_ids(),
+                    },
+                ),
+                TurnStop::NoProgress | TurnStop::GoalLimit | TurnStop::BudgetExhausted => (
+                    AcceptanceState::NeedsWork,
+                    GoalVerdict::NeedsWork {
+                        reason: format!("run stopped: {}", stop.as_str()),
+                        next_action: "resume the run to continue the goal".to_owned(),
+                        missing: goal.required_ids(),
+                    },
+                ),
+                TurnStop::LoopDetected => (
+                    AcceptanceState::Rejected,
+                    GoalVerdict::Unverified {
+                        reason: "the same tool call repeated".to_owned(),
+                        missing: goal.required_ids(),
+                    },
+                ),
+                _ => (
+                    AcceptanceState::NotEvaluated,
+                    GoalVerdict::NeedsWork {
+                        reason: format!("run stopped: {}", stop.as_str()),
+                        next_action: "resume the run to continue the goal".to_owned(),
+                        missing: goal.required_ids(),
+                    },
+                ),
+            };
+            acceptance = state;
+            goal_report = Some(GoalReport {
+                objective: goal.objective.clone(),
+                acceptance: state,
+                verdict,
+                continuations,
+                no_progress,
+                stop: Some(stop),
+                missing: goal.required_ids(),
+            });
+        }
+        // The accepted M0 reducer owns the run state vocabulary; M3 adds no
+        // state of its own. A waiting run is a paused run, a run that cannot
+        // satisfy its goal is a failed run, and the typed stop reason plus the
+        // acceptance field carry the M3 distinctions.
+        let run_state = match stop {
+            TurnStop::StepLimit | TurnStop::ToolLimit | TurnStop::Deadline => RunState::Running,
+            _ => {
+                let command = match stop {
+                    TurnStop::Canceled => RunCommand::Cancel,
+                    TurnStop::NeedsInput | TurnStop::ExternalWait => RunCommand::Pause,
+                    TurnStop::Final
+                        if self.goal.is_none() || acceptance == AcceptanceState::Satisfied =>
+                    {
+                        RunCommand::Complete
+                    }
+                    _ => RunCommand::Fail,
+                };
+                let next = AgentState::Running
+                    .apply(command)
+                    .map_or(AgentState::Failed, |transition| transition.next);
+                match next {
+                    AgentState::Running => RunState::Running,
+                    AgentState::Paused => RunState::Paused,
+                    AgentState::Completed => RunState::Completed,
+                    AgentState::Canceled => RunState::Canceled,
+                    AgentState::Idle | AgentState::Disposed | AgentState::Failed => {
+                        RunState::Failed
+                    }
+                }
+            }
+        };
+        if run_state != RunState::Running {
+            self.runtime
+                .finish_run_record(
+                    &result.run_id,
+                    result.run_revision,
+                    run_state,
+                    Some(acceptance.as_str()),
+                    stop.as_str(),
+                    pending_question.as_ref(),
+                )
+                .await
+                .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+        }
+
         Ok(TurnOutcome {
             session_id,
             task_id,
             input_id,
+            run_id: result.run_id.clone(),
+            run_revision: result.run_revision,
             final_text: result.response.clone(),
             steps,
             tool_calls,
             executions,
             stop,
+            acceptance,
+            goal: goal_report,
+            pending_question,
         })
+    }
+
+    /// Persist the question a `needs_input` verdict asks for.
+    async fn ask_question(
+        &self,
+        result: &RunResult,
+        question: &str,
+    ) -> Result<harness_store_sqlite::QuestionRecord, harness_runtime::RuntimeError> {
+        let service = HumanInputService::new(Arc::clone(self.runtime.store()));
+        service
+            .ask(
+                AskRequest::for_request(
+                    result.session_id.clone(),
+                    result.task_id.clone(),
+                    &result.run_id,
+                    result.step_id.as_str(),
+                    question,
+                ),
+                now_unix_ms(),
+            )
+            .await
     }
 
     async fn execute_call(
@@ -598,6 +1103,61 @@ fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
 /// Short, non-secret summary of the requested arguments for the transcript.
 fn summarize_arguments(arguments: &str) -> String {
     truncate_text(&arguments.replace(['\n', '\r'], " "), 160)
+}
+
+/// A stable signature of one requested tool call.
+fn call_signature(call: &NormalizedToolCall) -> String {
+    format!("{}|{}", call.name, call.arguments)
+}
+
+/// Whether the tail of the window is one signature repeated to the limit.
+fn repeated_tail(signatures: &[String]) -> bool {
+    let Some(last) = signatures.last() else {
+        return false;
+    };
+    signatures.len() >= LOOP_REPEAT_LIMIT
+        && signatures
+            .iter()
+            .rev()
+            .take(LOOP_REPEAT_LIMIT)
+            .all(|signature| signature == last)
+}
+
+/// What one terminal response proved, as typed evidence.
+fn goal_evidence(result: &RunResult, executions: &[ToolExecutionView]) -> GoalEvidence {
+    let mut evidence = GoalEvidence {
+        response: result.response.clone(),
+        finish_reason: result.finish_reason.clone(),
+        truncated: result.finish_reason.is_none(),
+        tool_executions: u32::try_from(executions.len()).unwrap_or(u32::MAX),
+        ..GoalEvidence::default()
+    };
+    for view in executions {
+        let settled = view.receipt.as_ref().is_some_and(|receipt| {
+            receipt.outcome_state == harness_types::ToolOutcomeState::Settled
+        });
+        if settled {
+            evidence.successful_tool_executions += 1;
+        }
+        match &view.output {
+            ToolOutput::ApplyPatch { .. } => evidence.file_changes += 1,
+            ToolOutput::Process {
+                exit_code: Some(0),
+                timed_out: false,
+                canceled: false,
+                ..
+            } => evidence.checks_passed += 1,
+            _ => {}
+        }
+        if view
+            .receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.artifact_id.is_some())
+        {
+            evidence.artifacts += 1;
+        }
+    }
+    evidence
 }
 
 /// Why a streamed call can never become an action.
