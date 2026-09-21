@@ -1,6 +1,6 @@
 # CURRENT — bàn giao đang mở
 
-**Cập nhật:** 22/09/2026 · **Assignment:** M4–M12 theo kế hoạch `implementation-next`, tuần tự theo dependency và gate từng checkpoint. **Checkpoint hiện tại:** M4-01 xong (M4-02 là bước kế tiếp). Tiền nhiệm: M0/M1/M2 (`4d6393e`/`f1fb002`, `a824b2c`, `6c91a62`) và M3 (`03bea9a`, verified_local).
+**Cập nhật:** 22/09/2026 · **Assignment:** M4–M12 theo kế hoạch `implementation-next`, tuần tự theo dependency và gate từng checkpoint. **Checkpoint hiện tại:** M4-01 xong, M4-02.1/.3 xong (M4-02.2 chờ, M4-03 là bước kế tiếp). Tiền nhiệm: M0/M1/M2 (`4d6393e`/`f1fb002`, `a824b2c`, `6c91a62`) và M3 (`03bea9a`, verified_local).
 
 ## 1. Assignment hiện tại và ràng buộc mới nhất
 
@@ -10,15 +10,15 @@
 
 ## 2. Branch/base/source digest
 
-- Branch `master`; M4-01 trên base `03bea9a` (M3).
-- Source digest lần gate checkpoint M4: **chưa có** vì gate dừng ở bước host flake (chưa in `GATE_RESULT_JSON`); digest của revision sẽ được ghi khi gate xanh. Cây nguồn hiện tại = base `03bea9a` + diff M4-01 đã ghi trong evidence §2.
+- Branch `master`; các commit M4: `1344fcd` (M4-01a), `30ffa25` (docs), `c482c05` (M4-01b), M4-02 commit kế tiếp — tất cả trên base `03bea9a` (M3).
+- Source digest lần gate checkpoint M4: **chưa có** vì gate dừng ở bước host flake (chưa in `GATE_RESULT_JSON`); digest của revision sẽ được ghi khi gate xanh.
 
 ## 3. Work item
 
 | Item | Trạng thái | Evidence |
 |---|---|---|
 | M4-01 gate/approvals/receipts | `implemented_unverified` | binding mang session/task/invocation/`call_id`; consume+intent atomic; expiry/revoke/replay; descriptor registry; `call_id` vào intent+receipt; tools schema v2; A03/A04 crash boundaries + replay tool result; `milestone_m4` **7/7**. Gate checkpoint **blocked** vì host loopback (evidence §4) |
-| M4-02 filesystem/git | planned | P3 coverage giữ; còn `git log`, locked-file typed error, A15 assertions |
+| M4-02 filesystem/git | `in_progress` | `git_log` structured + descriptor read-only + A15 (traversal/absolute/junction/sensitive/stale/CRLF-Unicode); `milestone_m4` **9/9**. **Thiếu:** locked-file typed error (M4-02.2) — bản sửa đang nằm trong working tree của session khác |
 | M4-03 process/spool | planned | permit queue (A13), env allowlist (A16), spool/quota (A17) |
 | M4-04 E2E/recovery | planned | digest-bound check evidence (A08), A03/A04 child-kill |
 
@@ -27,6 +27,9 @@
 Sửa: `crates/harness-store-sqlite/src/{models,store}.rs`, `crates/harness-tools/src/{contracts,service,turn_driver,loop_service,lib}.rs`, `crates/harness-types/src/contracts.rs`, `schemas/tool-execution-receipt.v1.schema.json`, fixture literals (`p1_fixture_host`, `phase_p1`, `milestone_m1`, `phase_p5/support`, `phase_p6`, `delegation_cli`, `harness-types/tests/contracts.rs`), `crates/harness-cli/src/interactive/service.rs` (boxed future), `tests/acceptance/milestones.json`.
 Thêm: `crates/harness-cli/tests/milestone_m4.rs`, `crates/harness-cli/src/bin/m4_fixture_host.rs` (child host cho A03/A04), `docs/specs/M4.vi.md`, `docs/adr/ADR-N03-EXECUTION-BINDING.{vi,en}.md`, `docs/evidence/M4.vi.md`.
 Sửa thêm (M4-01b): `crates/harness-store-sqlite/src/store.rs` (`recovered_tool_results`), `crates/harness-runtime/src/lib.rs` (`RunRequest.recovered_messages`, `prepare_continuation`, `recovered_messages` rebuild từ attempt events + receipt events), `crates/harness-tools/src/service.rs` (receipt event mang `model_view`), `crates/harness-tools/src/turn_driver.rs` (`render_tool_output` dùng chung).
+Sửa thêm (M4-02.1/.3): `crates/harness-tools/src/{contracts,policy,service,turn_driver,lib}.rs` (`ToolKind::GitLog`, schema `limit` 1..=100, dispatch `git_log_arguments`, đọc-only), `crates/harness-cli/tests/milestone_m4.rs` (+2 test), `crates/harness-cli/tests/phase_p3.rs` (schema count 9→10).
+
+**Push:** `1344fcd` (M4-01a), `30ffa25` (docs M4-01), `c482c05` (M4-01b). M4-02 commit kế tiếp.
 
 ## 5. Contract/ADR đã chốt — không đổi ngầm
 
@@ -34,30 +37,31 @@ Sửa thêm (M4-01b): `crates/harness-store-sqlite/src/store.rs` (`recovered_too
 - `TOOLS_SCHEMA_VERSION=2` additive (`ensure_column` dùng PRAGMA + ALTER); DB v1 upgrade tại chỗ, host cũ từ chối DB mới hơn.
 - `ToolExecutionReceipt.call_id` optional `serde(default)`; schema JSON regenerate, drift test xanh.
 - `ToolDescriptor{id,revision,schema_digest,effect_class,capabilities}` + `coding_tool_descriptors()`; `prepare` từ chối tên không được advertise (external tools do host catalogue quyết).
+- **M4-02:** `git_log` là built-in thứ 10 (schema count 9→10, `TOOL_CONTRACT_VERSION` giữ 1 vì digest từng tool mới là thứ versioned); `limit` bound 1..=100 (mặc định 20) kiểm ở parser trước khi có proposal; output tab-separated `%H %aI %s`, `--no-color`, không pager; path scope qua resolver như `git_diff`.
 - A14 đã `implemented` trong registry; A11 giữ `planned` tới khi M4 gate đầy đủ (hai nửa M3+M4 đã có test riêng).
 
 ## 6. Lệnh đã chạy và kết quả
 
-- `cargo test -p harness-cli --test milestone_m4 --locked` → **7/7 pass** (thêm A03/A04 sau lần gate đầu).
+- `cargo test -p harness-cli --test milestone_m4 --locked` → **9/9 pass** (thêm `m4_02_git_log_is_structured_and_bounded`, `a15_path_patch_safety`).
 - Regressions (khi host cho phép): `phase_p3` 21, `phase_p6` 15, `phase_p2` 17, `phase_p1` 21, `phase_p7` 15, `milestone_m0` 11, `milestone_m1` 6, `milestone_m3` 19, `harness-types` 20, `harness-tools` 6 — pass.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` + `cargo fmt --all -- --check` → pass.
-- `pwsh ... -Milestone M4` → **blocked**: `format/clippy/build/unit-tests/M4 required 5/closure-M3/closure-M1` xanh; `workspace-tests`/`closure-M2` đỏ vì loopback host (i03, a06_*, a07_401, m2_04). Bằng chứng môi trường: baseline `milestone_m2` (không có thay đổi harness M4) cũng fail 6-7/10 trong 3 lần chạy liên tiếp cùng ngày; từng test `--exact` một mình pass. Chi tiết ở `docs/evidence/M4.vi.md` §4.
+- `pwsh ... -Milestone M4` → **blocked**: `format/clippy/build/unit-tests/M4 required 5/closure-M3/closure-M1` xanh; `workspace-tests`/`closure-M2` đỏ vì loopback host (i03, a06_*, a07_401, m2_04). Bằng chứng môi trường: baseline `milestone_m2` (không có thay đổi harness M4) cũng fail 6-7/10 trong 3 lần chạy liên tiếp cùng ngày; từng test `--exact` một mình pass. Chi tiết ở `docs/evidence/M4.vi.md` §4. (Lần gate tới sẽ chạy M4 required **9 test**.)
 
 ## 7. Việc còn lại theo thứ tự (M4)
 
-0. **Chạy lại gate checkpoint M4 cho xanh** khi host hết flake loopback (đề xuất reboot máy hoặc chạy trên host khác); đây là điều kiện để chuyển sang M4-02. Nếu vẫn đỏ ở `milestone_m2`/`interactive_launch`, chạy full suite baseline để xác nhận lại nguyên nhân môi trường trước khi nghi code.
-1. **M4-02**: `git log` structured; `hash_file` locked → typed (không `WorkspaceEscape`); test A15 gộp (traversal/junction/alias/stale/CRLF/locked).
-3. **M4-03**: permit queue cancellation-aware + queued state (A13); env allowlist + secret JIT (A16); tree cleanup trung thực + Windows JobObject grandchild test; output spool + `read_process_output` page + quota/disk-full typed (A17).
-4. **M4-04**: `GoalEvidence.workspace_digest` + `EvidenceKind::Check` khớp fingerprint cuối; `a08_coding_e2e` repo tạm + cargo test thật; wrapper A03/A04.
-5. Gate M4 đầy đủ + evidence + nghiệm thu; sau đó mới sang M5.
+0. **Chạy lại gate checkpoint M4 cho xanh** khi host hết flake loopback (đề xuất reboot máy hoặc chạy trên host khác); đây là điều kiện để chốt M4-01/M4-02. Nếu vẫn đỏ ở `milestone_m2`/`interactive_launch`, chạy full suite baseline để xác nhận lại nguyên nhân môi trường trước khi nghi code.
+1. **M4-02.2**: locked-file typed error — xác nhận với user/session đang sửa `harness-tools/src/workspace.rs` (bản sửa đã có trong working tree, chưa commit) rồi adopt hoặc tự làm lại; sau đó thêm case locked vào `a15_path_patch_safety` và chuyển A15 sang `implemented`.
+2. **M4-03**: permit queue cancellation-aware + queued state (A13); env allowlist + secret JIT (A16); tree cleanup trung thực + Windows JobObject grandchild test; output spool + `read_process_output` page + quota/disk-full typed (A17). Lưu ý `process.rs` đang bị session khác sửa — phối hợp trước.
+3. **M4-04**: `GoalEvidence.workspace_digest` + `EvidenceKind::Check` khớp fingerprint cuối; `a08_coding_e2e` repo tạm + cargo test thật; wrapper A03/A04.
+4. Gate M4 đầy đủ + evidence + nghiệm thu; sau đó mới sang M5.
 
 ## 8. Next action chính xác
 
-Mở `crates/harness-cli/tests/milestone_m4.rs` và thêm `a03_receipt_before_checkpoint`/`a04_effect_before_receipt` với fixture host bị kill thật (barrier env), rồi chạy `cargo test -p harness-cli --test milestone_m4 --locked` trước khi làm M4-02.
+Xác nhận với user về phần working tree của session thứ hai (đặc biệt `harness-tools/src/workspace.rs` chứa bản sửa locked-file của M4-02.2). Nếu được phép adopt: tách hunks bằng `git add -p`, thêm case locked vào `a15_path_patch_safety`, chạy `cargo test -p harness-cli --test milestone_m4 --locked`, rồi sang M4-03 (`process.rs` — cũng đang bị session kia sửa).
 
 ## 9. Blocked on
 
-**Host loopback**: gate checkpoint M4 không xanh được vì môi trường (baseline M2 cũng fail 6-7/10 khi chạy full suite; từng test một mình pass). Cần reboot máy hoặc chạy gate trên host/OS khác. (M9 install/PATH/paid smoke/publish sẽ cần quyền riêng — sẽ hỏi khi tới.)
+**Hai việc song song:** (1) host loopback — gate checkpoint M4 chưa xanh được vì môi trường (baseline M2 cũng fail khi chạy full suite; từng test một mình pass); cần reboot/host khác. (2) working tree có thay đổi chưa commit của một session khác ở `workspace.rs`/`process.rs`/`session`/`interactive`/`orchestrator` — M4-02.2 và M4-03 chạm đúng các file đó, cần user quyết định adopt hay chờ. (M9 install/PATH/paid smoke/publish sẽ cần quyền riêng — sẽ hỏi khi tới.)
 
 ## 10. Không lặp lại
 

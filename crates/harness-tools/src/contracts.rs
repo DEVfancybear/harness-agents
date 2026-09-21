@@ -10,6 +10,13 @@ use serde_json::{Value, json};
 /// The independently versioned P3 tool contract.
 pub const TOOL_CONTRACT_VERSION: u16 = 1;
 
+/// Default number of commits `git_log` returns when the model names no limit.
+pub const GIT_LOG_DEFAULT_LIMIT: u32 = 20;
+
+/// Hard ceiling for `git_log`: a model may ask for fewer, never for unbounded
+/// history. The provider schema and the typed action both carry this bound.
+pub const GIT_LOG_MAX_LIMIT: u32 = 100;
+
 /// A stable capability name used by policy, approvals, receipts, and UI views.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -22,6 +29,7 @@ pub enum ToolKind {
     RunShell,
     GitStatus,
     GitDiff,
+    GitLog,
     TaskUpdate,
     /// An external extension tool, reachable only through the same policy gate.
     ExternalTool,
@@ -39,6 +47,7 @@ impl ToolKind {
             Self::RunShell => "run_shell",
             Self::GitStatus => "git_status",
             Self::GitDiff => "git_diff",
+            Self::GitLog => "git_log",
             Self::TaskUpdate => "task_update",
             Self::ExternalTool => "external_tool",
         }
@@ -48,7 +57,7 @@ impl ToolKind {
     ///
     /// Reading is the one capability that cannot damage the workspace, so the host
     /// is allowed to stop asking for it. The list is deliberately an allowlist of
-    /// five and nothing else: a kind is read-only because it was classified here,
+    /// six and nothing else: a kind is read-only because it was classified here,
     /// never because its name suggests it.
     ///
     /// This predicate is not the whole guard. A path is checked against the
@@ -60,7 +69,12 @@ impl ToolKind {
     pub const fn is_read_only(self) -> bool {
         matches!(
             self,
-            Self::ReadFile | Self::ListFiles | Self::SearchText | Self::GitStatus | Self::GitDiff
+            Self::ReadFile
+                | Self::ListFiles
+                | Self::SearchText
+                | Self::GitStatus
+                | Self::GitDiff
+                | Self::GitLog
         )
     }
 }
@@ -80,6 +94,7 @@ pub const fn coding_tool_names() -> &'static [&'static str] {
         "run_shell",
         "git_status",
         "git_diff",
+        "git_log",
         "task_update",
     ]
 }
@@ -149,6 +164,15 @@ pub fn coding_tool_schemas() -> Vec<Value> {
             "git_diff",
             "Inspect Git diff without changing the workspace.",
             json!({"path": nullable_string_schema()}),
+            &[],
+        ),
+        function_schema(
+            "git_log",
+            "Inspect recent Git history as bounded tab-separated fields without changing the workspace.",
+            json!({
+                "path": nullable_string_schema(),
+                "limit": {"type": "integer", "minimum": 1, "maximum": GIT_LOG_MAX_LIMIT}
+            }),
             &[],
         ),
         function_schema(
@@ -233,6 +257,10 @@ pub enum CodingToolAction {
     GitDiff {
         path: Option<String>,
     },
+    GitLog {
+        path: Option<String>,
+        limit: Option<u32>,
+    },
     TaskUpdate {
         note: String,
     },
@@ -261,6 +289,7 @@ impl CodingToolAction {
             Self::RunShell { .. } => ToolKind::RunShell,
             Self::GitStatus => ToolKind::GitStatus,
             Self::GitDiff { .. } => ToolKind::GitDiff,
+            Self::GitLog { .. } => ToolKind::GitLog,
             Self::TaskUpdate { .. } => ToolKind::TaskUpdate,
             Self::ExternalTool { .. } => ToolKind::ExternalTool,
         }
@@ -273,6 +302,7 @@ impl CodingToolAction {
             Self::ListFiles { path } | Self::SearchText { path, .. } | Self::GitDiff { path } => {
                 path.as_deref()
             }
+            Self::GitLog { path, .. } => path.as_deref(),
             Self::RunProcess { .. }
             | Self::RunShell { .. }
             | Self::GitStatus
@@ -332,6 +362,7 @@ impl CodingToolAction {
             "run_process" => &["executable", "args", "timeout_ms", "isolation"],
             "run_shell" => &["command", "timeout_ms", "isolation"],
             "git_status" => &[],
+            "git_log" => &["path", "limit"],
             "task_update" => &["note"],
             _ => {
                 return Err(harness_types::HarnessError::new(
@@ -346,7 +377,7 @@ impl CodingToolAction {
                 "provider tool arguments contain an unknown field",
             ));
         }
-        if matches!(name, "list_files" | "search_text" | "git_diff")
+        if matches!(name, "list_files" | "search_text" | "git_diff" | "git_log")
             && object
                 .get("path")
                 .is_some_and(|value| !value.is_null() && !value.is_string())
@@ -434,6 +465,32 @@ impl CodingToolAction {
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
             }),
+            "git_log" => {
+                let limit = match object.get("limit") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(
+                        value
+                            .as_u64()
+                            .and_then(|limit| u32::try_from(limit).ok())
+                            .filter(|limit| (1..=GIT_LOG_MAX_LIMIT).contains(limit))
+                            .ok_or_else(|| {
+                                harness_types::HarnessError::new(
+                                    harness_types::ErrorCode::InvalidPayload,
+                                    format!(
+                                        "provider git_log limit must be an integer between 1 and {GIT_LOG_MAX_LIMIT}"
+                                    ),
+                                )
+                            })?,
+                    ),
+                };
+                Ok(Self::GitLog {
+                    path: object
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    limit,
+                })
+            }
             "task_update" => Ok(Self::TaskUpdate {
                 note: required_string(object, "note")?,
             }),

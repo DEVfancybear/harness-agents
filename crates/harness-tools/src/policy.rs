@@ -125,6 +125,7 @@ impl ToolPolicy {
             CodingToolAction::ListFiles { .. }
                 | CodingToolAction::SearchText { .. }
                 | CodingToolAction::GitDiff { .. }
+                | CodingToolAction::GitLog { .. }
                 | CodingToolAction::GitStatus
         );
         let path = action
@@ -164,6 +165,7 @@ fn validate_action_shape(action: &CodingToolAction) -> Result<(), HarnessError> 
         CodingToolAction::ListFiles { path }
         | CodingToolAction::SearchText { path, .. }
         | CodingToolAction::GitDiff { path }
+        | CodingToolAction::GitLog { path, .. }
             if path.as_deref().is_some_and(|value| value.trim().is_empty()) =>
         {
             Err(HarnessError::new(
