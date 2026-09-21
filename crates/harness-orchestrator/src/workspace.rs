@@ -507,7 +507,7 @@ fn parse_shortstat(stats: &str) -> (u64, u64) {
     (insertions, deletions)
 }
 
-fn fingerprint_locked(root: &Path) -> Result<ContentHash, OrchestratorError> {
+pub(crate) fn fingerprint_locked(root: &Path) -> Result<ContentHash, OrchestratorError> {
     let head = git(root, &["rev-parse", "HEAD"])?.trim().to_owned();
     let listing = git(
         root,

@@ -17,7 +17,9 @@ use tokio::sync::Mutex;
 use crate::contracts::{
     CheckedRevision, IntegrationReport, IntegrationStep, OrchestratorError, VerifiedSnapshot,
 };
-use crate::workspace::{ChangeSet, ScopeViolation, WorkspaceManager, scope_violations};
+use crate::workspace::{
+    ChangeSet, ScopeViolation, WorkspaceManager, fingerprint_locked, scope_violations,
+};
 
 /// Verdict for one integration attempt.
 #[derive(Clone, Debug, PartialEq)]
@@ -168,7 +170,9 @@ impl ResultIntegrator {
             });
         }
         report.final_commit = head(&root)?;
-        report.final_fingerprint = self.workspace.fingerprint(&root).await?;
+        // `fingerprint_locked` is called directly: `integrate` already holds the
+        // shared Git lock, and taking it again would deadlock.
+        report.final_fingerprint = fingerprint_locked(&root)?;
         let mut failures = Vec::new();
         for check in checks {
             let outcome = run_check(&root, check);
