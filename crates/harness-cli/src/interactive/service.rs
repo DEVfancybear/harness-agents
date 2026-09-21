@@ -763,7 +763,7 @@ impl SessionPort for AgentSessionService {
         // sessions linked to the same task.
         let session_id = SessionId::generate();
         handle.spawn(async move {
-            run_turn(
+            Box::pin(run_turn(
                 sender,
                 store_dir,
                 data_dir,
@@ -776,7 +776,7 @@ impl SessionPort for AgentSessionService {
                 limits,
                 request,
                 cancellation,
-            )
+            ))
             .await;
         });
     }

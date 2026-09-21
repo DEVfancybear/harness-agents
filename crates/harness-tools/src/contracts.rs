@@ -481,6 +481,9 @@ pub struct ToolRequest {
     pub task_id: TaskId,
     pub actor_id: String,
     pub invocation_id: ToolInvocationId,
+    /// The provider `call_id` this proposal came from, when it came from a
+    /// model call. Correlation only: the host invocation id stays the authority.
+    pub call_id: Option<String>,
     pub workspace_root: PathBuf,
     pub action: CodingToolAction,
 }
@@ -499,9 +502,111 @@ impl ToolRequest {
             task_id,
             actor_id: actor_id.into(),
             invocation_id: ToolInvocationId::generate(),
+            call_id: None,
             workspace_root: workspace_root.into(),
             action,
         }
+    }
+
+    /// Attach the provider call identity this proposal answers.
+    #[must_use]
+    pub fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
+        self.call_id = Some(call_id.into());
+        self
+    }
+}
+
+/// How an advertised tool changes the world. The gate uses it to decide what an
+/// approval must cover; it is part of the tool's durable descriptor, not a
+/// property the model may choose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectClass {
+    /// Reads only; never writes the workspace.
+    ReadOnly,
+    /// Writes inside the workspace root.
+    Mutating,
+    /// Starts a process or an external tool with host privileges.
+    External,
+}
+
+impl EffectClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Mutating => "mutating",
+            Self::External => "external",
+        }
+    }
+}
+
+/// One advertised coding tool, with the revision and schema digest the gate
+/// validates a proposal against.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ToolDescriptor {
+    pub id: String,
+    pub revision: u32,
+    /// Hash of the tool's provider-facing schema.
+    pub schema_digest: String,
+    pub effect_class: EffectClass,
+    pub capabilities: Vec<String>,
+}
+
+/// The durable descriptors of every built-in coding tool.
+///
+/// The schema digest is computed from the same schema `coding_tool_schemas`
+/// hands to the provider, so a schema change without a descriptor revision is
+/// visible in the digest.
+#[must_use]
+pub fn coding_tool_descriptors() -> Vec<ToolDescriptor> {
+    let schemas = coding_tool_schemas();
+    let mut descriptors = coding_tool_names()
+        .iter()
+        .filter_map(|name| {
+            let schema = schemas.iter().find(|schema| {
+                schema
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(*name)
+            })?;
+            let effect = effect_class_for(name);
+            let capabilities = match effect {
+                EffectClass::ReadOnly => vec!["workspace.read".to_owned()],
+                EffectClass::Mutating => {
+                    vec!["workspace.read".to_owned(), "workspace.write".to_owned()]
+                }
+                EffectClass::External => vec![
+                    "workspace.read".to_owned(),
+                    "process.spawn".to_owned(),
+                    "network.none".to_owned(),
+                ],
+            };
+            Some(ToolDescriptor {
+                id: (*name).to_owned(),
+                revision: u32::from(TOOL_CONTRACT_VERSION),
+                schema_digest: ContentHash::from_canonical_json(schema)
+                    .map(|hash| hash.as_str().to_owned())
+                    .unwrap_or_default(),
+                effect_class: effect,
+                capabilities,
+            })
+        })
+        .collect::<Vec<_>>();
+    descriptors.sort_by(|left, right| left.id.cmp(&right.id));
+    descriptors
+}
+
+/// The declared effect class of one built-in tool name.
+#[must_use]
+pub fn effect_class_for(name: &str) -> EffectClass {
+    match name {
+        "read_file" | "list_files" | "search_text" | "git_status" | "git_diff" | "git_log" => {
+            EffectClass::ReadOnly
+        }
+        "apply_patch" => EffectClass::Mutating,
+        _ => EffectClass::External,
     }
 }
 
@@ -557,6 +662,10 @@ impl PreparedToolRequest {
 #[derive(Clone, Debug)]
 pub struct ApprovalGrant {
     pub(crate) approval_id: ToolApprovalId,
+    pub(crate) session_id: harness_types::SessionId,
+    pub(crate) task_id: harness_types::TaskId,
+    pub(crate) invocation_id: harness_types::ToolInvocationId,
+    pub(crate) call_id: Option<String>,
     pub(crate) actor_id: String,
     pub(crate) action_hash: ContentHash,
     pub(crate) workspace_root: String,
@@ -570,6 +679,11 @@ impl ApprovalGrant {
     #[must_use]
     pub fn approval_id(&self) -> &ToolApprovalId {
         &self.approval_id
+    }
+
+    #[must_use]
+    pub fn call_id(&self) -> Option<&str> {
+        self.call_id.as_deref()
     }
 }
 

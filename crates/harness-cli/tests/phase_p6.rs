@@ -416,6 +416,7 @@ async fn p6_s03_external_tools_cross_the_same_policy_gate() {
         task_id: task.clone(),
         actor_id: "p6-acceptance".to_owned(),
         invocation_id: ToolInvocationId::generate(),
+        call_id: None,
         workspace_root: workspace.clone(),
         action: harness_tools::CodingToolAction::ExternalTool {
             plugin_id: manifest.plugin_id.clone(),
@@ -478,6 +479,7 @@ async fn p6_s03_external_tools_cross_the_same_policy_gate() {
         task_id: task.clone(),
         actor_id: "p6-acceptance".to_owned(),
         invocation_id: ToolInvocationId::generate(),
+        call_id: None,
         workspace_root: workspace.clone(),
         action: harness_tools::CodingToolAction::ExternalTool {
             plugin_id: manifest.plugin_id.clone(),
@@ -507,6 +509,7 @@ async fn p6_s03_external_tools_cross_the_same_policy_gate() {
         task_id: task.clone(),
         actor_id: "p6-acceptance".to_owned(),
         invocation_id: ToolInvocationId::generate(),
+        call_id: None,
         workspace_root: workspace.clone(),
         action: harness_tools::CodingToolAction::ExternalTool {
             plugin_id: manifest.plugin_id.clone(),

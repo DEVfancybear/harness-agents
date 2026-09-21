@@ -363,6 +363,11 @@ pub struct ToolExecutionReceipt {
     pub tool_execution_id: ToolExecutionId,
     pub task_id: TaskId,
     pub invocation_id: String,
+    /// The provider `call_id` this execution answers, when it came from a model
+    /// call. Correlation only; the host invocation id stays the authority.
+    /// Optional so records written before M4 still deserialize.
+    #[serde(default)]
+    pub call_id: Option<String>,
     pub input_hash: ContentHash,
     pub policy_revision: u64,
     pub approval_id: Option<String>,

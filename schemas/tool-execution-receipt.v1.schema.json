@@ -61,6 +61,14 @@
         }
       ]
     },
+    "call_id": {
+      "default": null,
+      "description": "The provider `call_id` this execution answers, when it came from a model\ncall. Correlation only; the host invocation id stays the authority.\nOptional so records written before M4 still deserialize.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "input_hash": {
       "$ref": "#/$defs/ContentHash"
     },

@@ -219,6 +219,7 @@ impl WorkerBackend for ScriptedWorkerBackend {
                     tool_execution_id: ToolExecutionId::generate(),
                     task_id: task_id.clone(),
                     invocation_id: format!("{}-self-check", role.as_str()),
+                    call_id: None,
                     input_hash: ContentHash::from_bytes(result_revision.as_bytes()),
                     policy_revision: 1,
                     approval_id: None,

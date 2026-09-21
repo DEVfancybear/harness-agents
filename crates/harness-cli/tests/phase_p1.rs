@@ -56,6 +56,7 @@ fn receipt(task_id: TaskId, sequence: u64) -> ToolExecutionReceipt {
         tool_execution_id: ToolExecutionId::generate(),
         task_id,
         invocation_id: format!("receipt-{sequence}"),
+        call_id: None,
         input_hash: ContentHash::from_bytes(b"synthetic receipt"),
         policy_revision: 1,
         approval_id: None,

@@ -379,6 +379,69 @@
           "closure-M2"
         ]
       }
+    },
+    {
+      "id": "M4",
+      "title": "Coding tools và host runner",
+      "runbook": "docs/implementation-next/M4.vi.md",
+      "prerequisites": ["M3"],
+      "status": "in_progress",
+      "integration_target": "milestone_m4",
+      "work_items": [
+        {
+          "id": "M4-01",
+          "title": "Gate, approvals và receipts",
+          "status": "implemented_unverified",
+          "tests": [
+            "a14_approval_binding",
+            "a11_approval_grant",
+            "m4_01_descriptor_registry_is_versioned",
+            "m4_01_call_id_is_bound_to_intent_and_receipt",
+            "m4_01_tools_schema_upgrade"
+          ]
+        },
+        {
+          "id": "M4-02",
+          "title": "Filesystem và Git read/patch",
+          "status": "planned",
+          "tests": []
+        },
+        {
+          "id": "M4-03",
+          "title": "Process lifecycle và spool",
+          "status": "planned",
+          "tests": []
+        },
+        {
+          "id": "M4-04",
+          "title": "End-to-end coding và recovery",
+          "status": "planned",
+          "tests": []
+        }
+      ],
+      "required_tests": [
+        "a14_approval_binding",
+        "a11_approval_grant",
+        "m4_01_descriptor_registry_is_versioned",
+        "m4_01_call_id_is_bound_to_intent_and_receipt",
+        "m4_01_tools_schema_upgrade"
+      ],
+      "unit_tests": [],
+      "fixtures": ["crates/harness-cli/tests/milestone_m4.rs"],
+      "gate": {
+        "script": "scripts/Verify-Milestone.ps1",
+        "dependency_check_bin": "dependency_check",
+        "steps": [
+          "format",
+          "clippy",
+          "workspace-tests",
+          "dependency-allowlist",
+          "required-test-discovery",
+          "required-tests",
+          "closure-M3",
+          "closure-M0"
+        ]
+      }
     }
   ],
   "acceptance_cases": [
@@ -464,7 +527,13 @@
     },
     { "id": "A12", "owner_milestones": ["M5"], "planned_test": "a12_compaction_cas", "status": "planned" },
     { "id": "A13", "owner_milestones": ["M4"], "planned_test": "a13_queued_process_cancel", "status": "planned" },
-    { "id": "A14", "owner_milestones": ["M4"], "planned_test": "a14_approval_binding", "status": "planned" },
+    {
+      "id": "A14",
+      "owner_milestones": ["M4"],
+      "planned_test": "a14_approval_binding",
+      "status": "implemented",
+      "selectors": ["milestone_m4::a14_approval_binding"]
+    },
     { "id": "A15", "owner_milestones": ["M4"], "planned_test": "a15_path_patch_safety", "status": "planned" },
     { "id": "A16", "owner_milestones": ["M4"], "planned_test": "a16_process_tree_env", "status": "planned" },
     { "id": "A17", "owner_milestones": ["M4"], "planned_test": "a17_output_quota", "status": "planned" },

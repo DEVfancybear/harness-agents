@@ -103,6 +103,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 tool_execution_id: ToolExecutionId::generate(),
                 task_id,
                 invocation_id: "p1-fixture-receipt".to_owned(),
+                call_id: None,
                 input_hash: ContentHash::from_bytes(b"fixture input"),
                 policy_revision: 1,
                 approval_id: None,

@@ -15,9 +15,10 @@ mod turn_driver;
 mod workspace;
 
 pub use contracts::{
-    ApprovalGrant, CodingToolAction, IsolationMode, PreparedToolRequest, TOOL_CONTRACT_VERSION,
-    ToolCapabilities, ToolExecutionView, ToolKind, ToolOutput, ToolRequest, coding_tool_names,
-    coding_tool_schemas,
+    ApprovalGrant, CodingToolAction, EffectClass, IsolationMode, PreparedToolRequest,
+    TOOL_CONTRACT_VERSION, ToolCapabilities, ToolDescriptor, ToolExecutionView, ToolKind,
+    ToolOutput, ToolRequest, coding_tool_descriptors, coding_tool_names, coding_tool_schemas,
+    effect_class_for,
 };
 pub use loop_service::{CodingLoopResult, CodingLoopService};
 pub use policy::{PolicyEffect, PolicyRule, ToolPolicy};

@@ -224,11 +224,22 @@ impl FakeProvider {
     /// Wait until the fixture is accepting connections.
     async fn wait_ready(&mut self) {
         let _ = (&mut self.ready).await;
-        for _ in 0..20 {
+        // Confirm the listener really accepts a connection before the test
+        // sends its real request. The old loop returned after twenty probes
+        // whether or not any of them connected, so under load the request could
+        // race a listener that was not accepting yet and fail as
+        // `error sending request for url`. Now readiness is asserted, with a
+        // short sleep after the first success so the accept loop is scheduled.
+        let mut accepted = false;
+        for _ in 0..300 {
             if std::net::TcpStream::connect(self.address).is_ok() {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                accepted = true;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                break;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        assert!(accepted, "fixture listener must be accepting connections");
     }
 
     /// Wait until a barrier part has been written.
@@ -298,12 +309,61 @@ fn multicall_parts() -> Vec<String> {
 }
 
 async fn collect(adapter: &DeepSeekAdapter) -> Vec<ProviderStreamEvent> {
-    collect_events(adapter.stream_events(
-        provider_request(),
-        harness_providers::CancellationToken::new(),
-    ))
-    .await
-    .expect("the fixture stream is valid")
+    // Retry only a refused loopback connection: this Windows host intermittently
+    // refuses a connection to a listener that is already bound and accepting,
+    // even when this exact test runs alone in the milestone closure (measured
+    // 21-22/09/2026). The refusal never reaches the fixture, so a retry cannot
+    // consume a scripted response, and every other error still fails at once.
+    let mut attempt = 0_u32;
+    loop {
+        attempt += 1;
+        let result = collect_events(adapter.stream_events(
+            provider_request(),
+            harness_providers::CancellationToken::new(),
+        ))
+        .await;
+        match result {
+            Ok(events) => return events,
+            Err(error)
+                if attempt < 12 && error.to_string().contains("error sending request for url") =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    50 * (1_u64 << attempt.min(6)),
+                ))
+                .await;
+            }
+            Err(error) => panic!("the fixture stream is valid: {error}"),
+        }
+    }
+}
+
+/// Collect the stream of a test that expects an error.
+///
+/// Like [`collect`], only a refused loopback connection is retried; every other
+/// error is returned so the test's own assertion decides. The refusal never
+/// reaches the fixture, so a retry cannot consume a scripted response.
+async fn stream_error(adapter: &DeepSeekAdapter) -> harness_providers::ProviderError {
+    let mut attempt = 0_u32;
+    loop {
+        attempt += 1;
+        let result = collect_events(adapter.stream_events(
+            provider_request(),
+            harness_providers::CancellationToken::new(),
+        ))
+        .await;
+        match result {
+            Err(error)
+                if attempt < 12 && error.to_string().contains("error sending request for url") =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    50 * (1_u64 << attempt.min(6)),
+                ))
+                .await;
+            }
+            Err(error) => return error,
+            Ok(_) => panic!("the fixture stream must fail"),
+        }
+    }
 }
 
 fn workspace() -> WorkspaceObservation {
@@ -420,12 +480,7 @@ async fn a06_id_conflict_is_typed_and_never_dispatched() {
     ];
     let mut provider = FakeProvider::start(vec![FakeResponse::ok(parts)]).await;
     provider.wait_ready().await;
-    let error = collect_events(adapter(&provider, "fixture-secret").stream_events(
-        provider_request(),
-        harness_providers::CancellationToken::new(),
-    ))
-    .await
-    .expect_err("one slot announcing two identities is not a valid stream");
+    let error = stream_error(&adapter(&provider, "fixture-secret")).await;
     assert_eq!(error.code(), ErrorCode::ProviderProtocol);
     assert!(error.to_string().contains("call slot"), "{error}");
 }

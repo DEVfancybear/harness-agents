@@ -353,6 +353,14 @@ impl BackupManifest {
                 "a backup manifest requires the database file name",
             ));
         }
+        // A manifest is untrusted input: `verify_backup` and `restore_backup`
+        // join these names under the backup directory, so an absolute path or a
+        // `..` component would read or write outside it. Every name must stay a
+        // plain relative path.
+        validate_relative_path("database_file", &self.database_file)?;
+        for pin in &self.artifacts {
+            validate_relative_path("artifact path", &pin.relative_path)?;
+        }
         if self.schema_revisions.is_empty() {
             return Err(MaintenanceError::new(
                 ErrorCode::BackupManifestInvalid,
@@ -368,6 +376,27 @@ impl BackupManifest {
         }
         Ok(())
     }
+}
+
+/// Refuse any manifest-supplied path that could leave the backup directory.
+fn validate_relative_path(field: &str, value: &str) -> Result<(), MaintenanceError> {
+    let path = std::path::Path::new(value);
+    let escapes = path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        });
+    if value.trim().is_empty() || escapes {
+        return Err(MaintenanceError::new(
+            ErrorCode::BackupManifestInvalid,
+            format!("{field} must be a relative path inside the backup directory: {value}"),
+        ));
+    }
+    Ok(())
 }
 
 /// What a restore validated before it is allowed to activate.

@@ -227,6 +227,7 @@ fn assert_instruction_and_receipt_round_trip() {
         tool_execution_id: tool_execution_id(),
         task_id: task_id(),
         invocation_id: "invoke-1".to_owned(),
+        call_id: Some("call-1".to_owned()),
         input_hash: hash("input"),
         policy_revision: 1,
         approval_id: None,

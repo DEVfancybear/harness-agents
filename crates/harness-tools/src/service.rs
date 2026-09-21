@@ -20,7 +20,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     ApprovalGrant, CodingToolAction, IsolationMode, PreparedToolRequest, TOOL_CONTRACT_VERSION,
-    ToolCapabilities, ToolExecutionView, ToolOutput, ToolPolicy, ToolRequest,
+    ToolCapabilities, ToolExecutionView, ToolOutput, ToolPolicy, ToolRequest, coding_tool_names,
     process::{self, ProcessResult},
     workspace::{
         apply_text_patch, inspect_workspace, list_files, read_text, read_text_output, redact_text,
@@ -130,6 +130,21 @@ impl ToolExecutionService {
         // blank), so an action that cannot be executed must not pay for it — and must
         // not register a project on its way to being refused either.
         let final_action = self.policy.transform_and_validate(request.action.clone())?;
+        // The advertised descriptor registry is the authority for built-in
+        // names: an unadvertised name is refused before any workspace work.
+        // External tools are resolved by the host catalogue that advertised
+        // them, so they are validated by their own dispatcher.
+        if !matches!(final_action, CodingToolAction::ExternalTool { .. })
+            && !coding_tool_names().contains(&final_action.kind().as_str())
+        {
+            return Err(HarnessError::new(
+                ErrorCode::PolicyDenied,
+                format!(
+                    "tool {} is not in the advertised descriptor registry",
+                    final_action.kind().as_str()
+                ),
+            ));
+        }
         let state = self
             .current_state(&request.session_id, &request.task_id)
             .await?;
@@ -191,6 +206,10 @@ impl ToolExecutionService {
         let binding_json = json!({
             "schema_version": TOOL_CONTRACT_VERSION,
             "approval_id": approval_id,
+            "session_id": prepared.request.session_id,
+            "task_id": prepared.request.task_id,
+            "invocation_id": prepared.request.invocation_id,
+            "call_id": prepared.request.call_id,
             "actor_id": prepared.request.actor_id,
             "action_hash": prepared.action_hash,
             "workspace_root": prepared.workspace_root_text,
@@ -202,6 +221,10 @@ impl ToolExecutionService {
         let binding_hash = ContentHash::from_canonical_json(&binding_json)?;
         let grant = ApprovalGrant {
             approval_id: approval_id.clone(),
+            session_id: prepared.request.session_id.clone(),
+            task_id: prepared.request.task_id.clone(),
+            invocation_id: prepared.request.invocation_id.clone(),
+            call_id: prepared.request.call_id.clone(),
             actor_id: prepared.request.actor_id.clone(),
             action_hash: prepared.action_hash.clone(),
             workspace_root: prepared.workspace_root_text.clone(),
@@ -213,6 +236,10 @@ impl ToolExecutionService {
         self.store
             .issue_tool_approval(ToolApprovalRecord {
                 approval_id,
+                session_id: grant.session_id.clone(),
+                task_id: grant.task_id.clone(),
+                invocation_id: grant.invocation_id.as_str().to_owned(),
+                call_id: grant.call_id.clone(),
                 actor_id: grant.actor_id.clone(),
                 binding_hash,
                 action_hash: grant.action_hash.clone(),
@@ -386,6 +413,7 @@ impl ToolExecutionService {
             session_id: prepared.request.session_id.clone(),
             task_id: prepared.request.task_id.clone(),
             invocation_id: prepared.request.invocation_id.as_str().to_owned(),
+            call_id: prepared.request.call_id.clone(),
             actor_id: prepared.request.actor_id.clone(),
             tool_name: transformed.kind().as_str().to_owned(),
             action_json: transformed.canonical_value()?,
@@ -541,6 +569,7 @@ impl ToolExecutionService {
                 invocation_id: harness_types::ToolInvocationId::parse(
                     intent.invocation_id.clone(),
                 )?,
+                call_id: intent.call_id.clone(),
                 workspace_root: root.to_owned(),
                 action: action.clone(),
             },
@@ -830,6 +859,7 @@ impl ToolExecutionService {
             tool_execution_id: execution_id.clone(),
             task_id: prepared.request.task_id.clone(),
             invocation_id: prepared.request.invocation_id.as_str().to_owned(),
+            call_id: prepared.request.call_id.clone(),
             input_hash: prepared.action_hash.clone(),
             policy_revision: prepared.policy_revision,
             approval_id: approval_id.map(ToOwned::to_owned),
@@ -901,6 +931,7 @@ impl ToolExecutionService {
             tool_execution_id: execution_id.clone(),
             task_id: prepared.request.task_id.clone(),
             invocation_id: prepared.request.invocation_id.as_str().to_owned(),
+            call_id: prepared.request.call_id.clone(),
             input_hash: prepared.action_hash.clone(),
             policy_revision: prepared.policy_revision,
             approval_id: approval.map(|grant| grant.approval_id.as_str().to_owned()),
@@ -1007,6 +1038,10 @@ impl ToolExecutionService {
 fn binding_from_grant(grant: &ApprovalGrant) -> ToolApprovalBinding {
     ToolApprovalBinding {
         approval_id: grant.approval_id.clone(),
+        session_id: grant.session_id.clone(),
+        task_id: grant.task_id.clone(),
+        invocation_id: grant.invocation_id.as_str().to_owned(),
+        call_id: grant.call_id.clone(),
         actor_id: grant.actor_id.clone(),
         action_hash: grant.action_hash.clone(),
         workspace_root: grant.workspace_root.clone(),
@@ -1021,6 +1056,10 @@ fn approval_mismatch(
     approval: &ApprovalGrant,
 ) -> Option<(ErrorCode, String)> {
     if approval.actor_id != prepared.request.actor_id
+        || approval.session_id != prepared.request.session_id
+        || approval.task_id != prepared.request.task_id
+        || approval.invocation_id != prepared.request.invocation_id
+        || approval.call_id != prepared.request.call_id
         || approval.action_hash != prepared.action_hash
         || approval.workspace_root != prepared.workspace_root_text
         || approval.workspace_fingerprint != prepared.workspace_fingerprint
@@ -1029,7 +1068,7 @@ fn approval_mismatch(
     {
         return Some((
             ErrorCode::ApprovalStale,
-            "approval does not bind the final actor/action/workspace/policy revision".to_owned(),
+            "approval does not bind the final session/task/invocation/actor/action/workspace/policy revision".to_owned(),
         ));
     }
     if approval

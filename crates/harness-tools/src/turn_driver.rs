@@ -974,16 +974,21 @@ impl TurnDriver {
         sequence: u32,
     ) -> Result<ToolExecutionView, HarnessError> {
         let action = self.resolve_action(call)?;
-        let prepared = self
-            .tools
-            .prepare(ToolRequest::new(
-                result.session_id.clone(),
-                result.task_id.clone(),
-                options.actor_id.clone(),
-                options.workspace_root.clone(),
-                action,
-            ))
-            .await?;
+        let request = ToolRequest::new(
+            result.session_id.clone(),
+            result.task_id.clone(),
+            options.actor_id.clone(),
+            options.workspace_root.clone(),
+            action,
+        );
+        // Correlation only: the provider call id is recorded with the intent and
+        // receipt so the transcript and the durable records can be paired.
+        let request = if call.call_id.trim().is_empty() {
+            request
+        } else {
+            request.with_call_id(call.call_id.clone())
+        };
+        let prepared = self.tools.prepare(request).await?;
         let approval = match &options.approvals {
             ApprovalMode::Auto => Some(self.tools.approve(&prepared).await?),
             ApprovalMode::None => None,

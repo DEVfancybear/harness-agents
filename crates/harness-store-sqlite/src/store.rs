@@ -671,11 +671,15 @@ impl SqliteStore {
         let fence = self.fence()?;
         let mut transaction = self.begin_write(&fence).await?;
         let inserted = sqlx::query(
-            "INSERT INTO tool_approvals(approval_id, actor_id, binding_hash, action_hash, workspace_root, workspace_fingerprint, policy_revision, tool_revision, expires_at_unix_ms, state, approval_json, consumed_by, revoked_reason)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+            "INSERT INTO tool_approvals(approval_id, session_id, task_id, invocation_id, call_id, actor_id, binding_hash, action_hash, workspace_root, workspace_fingerprint, policy_revision, tool_revision, expires_at_unix_ms, state, approval_json, consumed_by, revoked_reason)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
              ON CONFLICT(approval_id) DO NOTHING",
         )
         .bind(record.approval_id.as_str())
+        .bind(record.session_id.as_str())
+        .bind(record.task_id.as_str())
+        .bind(&record.invocation_id)
+        .bind(record.call_id.as_deref())
         .bind(&record.actor_id)
         .bind(record.binding_hash.as_str())
         .bind(record.action_hash.as_str())
@@ -765,7 +769,7 @@ impl SqliteStore {
         approval_id: &ToolApprovalId,
     ) -> Result<Option<ToolApprovalRecord>, StoreError> {
         let row = sqlx::query(
-            "SELECT approval_id, actor_id, binding_hash, action_hash, workspace_root, workspace_fingerprint, policy_revision, tool_revision, expires_at_unix_ms, state, approval_json
+            "SELECT approval_id, session_id, task_id, invocation_id, call_id, actor_id, binding_hash, action_hash, workspace_root, workspace_fingerprint, policy_revision, tool_revision, expires_at_unix_ms, state, approval_json
              FROM tool_approvals WHERE approval_id = ?",
         )
         .bind(approval_id.as_str())
@@ -948,13 +952,14 @@ impl SqliteStore {
             )
         })?;
         sqlx::query(
-            "INSERT INTO tool_intents(tool_execution_id, session_id, task_id, invocation_id, actor_id, tool_name, action_json, action_hash, workspace_root, workspace_fingerprint, before_fingerprint, policy_revision, tool_revision, approval_id, status, intent_sequence, intent_event_id, settlement_receipt_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            "INSERT INTO tool_intents(tool_execution_id, session_id, task_id, invocation_id, call_id, actor_id, tool_name, action_json, action_hash, workspace_root, workspace_fingerprint, before_fingerprint, policy_revision, tool_revision, approval_id, status, intent_sequence, intent_event_id, settlement_receipt_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
         )
         .bind(commit.intent.tool_execution_id.as_str())
         .bind(commit.intent.session_id.as_str())
         .bind(commit.intent.task_id.as_str())
         .bind(&commit.intent.invocation_id)
+        .bind(commit.intent.call_id.as_deref())
         .bind(&commit.intent.actor_id)
         .bind(&commit.intent.tool_name)
         .bind(to_json(&commit.intent.action_json, "serialize tool action")?)
@@ -1296,7 +1301,7 @@ impl SqliteStore {
         session_id: &SessionId,
     ) -> Result<Vec<ToolIntentRecord>, StoreError> {
         let rows = sqlx::query(
-            "SELECT tool_execution_id, session_id, task_id, invocation_id, actor_id, tool_name, action_json, action_hash, workspace_root, workspace_fingerprint, before_fingerprint, policy_revision, tool_revision, approval_id, status, intent_sequence
+            "SELECT tool_execution_id, session_id, task_id, invocation_id, call_id, actor_id, tool_name, action_json, action_hash, workspace_root, workspace_fingerprint, before_fingerprint, policy_revision, tool_revision, approval_id, status, intent_sequence
              FROM tool_intents WHERE session_id = ? AND status = 'recorded' ORDER BY intent_sequence",
         )
         .bind(session_id.as_str())
@@ -1315,7 +1320,7 @@ impl SqliteStore {
         tool_execution_id: &ToolExecutionId,
     ) -> Result<Option<ToolIntentRecord>, StoreError> {
         let row = sqlx::query(
-            "SELECT tool_execution_id, session_id, task_id, invocation_id, actor_id, tool_name, action_json, action_hash, workspace_root, workspace_fingerprint, before_fingerprint, policy_revision, tool_revision, approval_id, status, intent_sequence
+            "SELECT tool_execution_id, session_id, task_id, invocation_id, call_id, actor_id, tool_name, action_json, action_hash, workspace_root, workspace_fingerprint, before_fingerprint, policy_revision, tool_revision, approval_id, status, intent_sequence
              FROM tool_intents WHERE tool_execution_id = ?",
         )
         .bind(tool_execution_id.as_str())
@@ -2799,6 +2804,21 @@ async fn ensure_tools_schema(pool: &SqlitePool) -> Result<(), StoreError> {
             "tools schema is newer than this host supports",
         ));
     }
+    if current < 2 {
+        // M4 adds the approval scope and the provider call id. SQLite has no
+        // `ADD COLUMN IF NOT EXISTS`, so each column is checked against
+        // `PRAGMA table_info` first; a fresh database gets them here and a
+        // version 1 database upgrades in place with its rows intact.
+        for (table, column, definition) in [
+            ("tool_approvals", "session_id", "TEXT"),
+            ("tool_approvals", "task_id", "TEXT"),
+            ("tool_approvals", "invocation_id", "TEXT"),
+            ("tool_approvals", "call_id", "TEXT"),
+            ("tool_intents", "call_id", "TEXT"),
+        ] {
+            ensure_column(&mut tx, table, column, definition).await?;
+        }
+    }
     if current < TOOLS_SCHEMA_VERSION {
         sqlx::query("INSERT INTO tools_schema_migrations(version) VALUES (?)")
             .bind(TOOLS_SCHEMA_VERSION)
@@ -2811,6 +2831,38 @@ async fn ensure_tools_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     tx.commit().await.map_err(|error| {
         database_error(ErrorCode::MigrationFailed, "commit tools migration", error)
     })
+}
+
+/// Add one column to an existing table when it is missing.
+///
+/// `SQLite` has no `ADD COLUMN IF NOT EXISTS`, so the column list is read first.
+/// Additive only: the migration never drops or rewrites existing data, and the
+/// statement text is built from fixed, code-owned identifiers (never user
+/// input), which is why it is wrapped in `AssertSqlSafe`.
+async fn ensure_column(
+    transaction: &mut Transaction<'_, Sqlite>,
+    table: &'static str,
+    column: &str,
+    definition: &'static str,
+) -> Result<(), StoreError> {
+    let rows = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})")))
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|error| database_error(ErrorCode::MigrationFailed, "read table columns", error))?;
+    let present = rows.iter().any(|row| {
+        row.try_get::<String, _>("name")
+            .is_ok_and(|name| name == column)
+    });
+    if present {
+        return Ok(());
+    }
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+    )))
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| database_error(ErrorCode::MigrationFailed, "add table column", error))?;
+    Ok(())
 }
 
 async fn acquire_fence(pool: &SqlitePool, host_id: HostId) -> Result<HostFence, StoreError> {
@@ -3412,13 +3464,14 @@ async fn consume_tool_approval_for_task_update(
     consume_tool_approval_inner(transaction, binding, "task_update").await
 }
 
+#[allow(clippy::too_many_lines)] // one consume boundary: state, expiry, binding, CAS
 async fn consume_tool_approval_inner(
     transaction: &mut Transaction<'_, Sqlite>,
     binding: &ToolApprovalBinding,
     consumed_by: &str,
 ) -> Result<(), StoreError> {
     let row = sqlx::query(
-        "SELECT actor_id, action_hash, workspace_root, workspace_fingerprint, policy_revision, tool_revision, expires_at_unix_ms, state
+        "SELECT session_id, task_id, invocation_id, call_id, actor_id, action_hash, workspace_root, workspace_fingerprint, policy_revision, tool_revision, expires_at_unix_ms, state
          FROM tool_approvals WHERE approval_id = ?",
     )
     .bind(binding.approval_id.as_str())
@@ -3463,6 +3516,15 @@ async fn consume_tool_approval_inner(
         }
     }
     let actor_id: String = row_get(&row, "actor_id")?;
+    let session_id: String = row_get(&row, "session_id")?;
+    let task_id: String = row_get(&row, "task_id")?;
+    let invocation_id: String = row_get(&row, "invocation_id")?;
+    let call_id: Option<String> = row.try_get("call_id").map_err(|_| {
+        StoreError::new(
+            ErrorCode::StorageWriteFailed,
+            "stored tool approval call id is invalid",
+        )
+    })?;
     let action_hash: String = row_get(&row, "action_hash")?;
     let workspace_root: String = row_get(&row, "workspace_root")?;
     let workspace_fingerprint: String = row_get(&row, "workspace_fingerprint")?;
@@ -3475,6 +3537,10 @@ async fn consume_tool_approval_inner(
         "tool approval revision",
     )?;
     if actor_id != binding.actor_id
+        || session_id != binding.session_id.as_str()
+        || task_id != binding.task_id.as_str()
+        || invocation_id != binding.invocation_id
+        || call_id != binding.call_id
         || action_hash != binding.action_hash.as_str()
         || workspace_root != binding.workspace_root
         || workspace_fingerprint != binding.workspace_fingerprint.as_str()
@@ -3712,6 +3778,25 @@ fn tool_approval_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ToolApprovalR
                 )
             },
         )?,
+        session_id: parse_session(row_get::<String>(row, "session_id")?).map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "stored tool approval session ID is invalid",
+            )
+        })?,
+        task_id: parse_task(row_get::<String>(row, "task_id")?).map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "stored tool approval task ID is invalid",
+            )
+        })?,
+        invocation_id: row_get(row, "invocation_id")?,
+        call_id: row.try_get("call_id").map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "stored tool approval call id is invalid",
+            )
+        })?,
         actor_id: row_get(row, "actor_id")?,
         binding_hash: ContentHash::parse(row_get::<String>(row, "binding_hash")?).map_err(
             |_| {
@@ -3777,6 +3862,7 @@ fn validate_tool_approval_loaded(record: &ToolApprovalRecord) -> Result<(), Stor
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // one row, every typed field it carries
 fn tool_intent_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ToolIntentRecord, StoreError> {
     let action_json: Value = serde_json::from_str(&row_get::<String>(row, "action_json")?)
         .map_err(|_| {
@@ -3822,6 +3908,15 @@ fn tool_intent_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ToolIntentRecor
                 "stored tool approval ID is invalid",
             )
         })?;
+    let session_id = parse_session(row_get(row, "session_id")?)?;
+    let task_id = parse_task(row_get(row, "task_id")?)?;
+    let invocation_id: String = row_get(row, "invocation_id")?;
+    let call_id: Option<String> = row.try_get("call_id").map_err(|_| {
+        StoreError::new(
+            ErrorCode::StorageWriteFailed,
+            "stored tool intent call id is invalid",
+        )
+    })?;
     Ok(ToolIntentRecord {
         tool_execution_id: ToolExecutionId::parse(row_get::<String>(row, "tool_execution_id")?)
             .map_err(|_| {
@@ -3830,9 +3925,10 @@ fn tool_intent_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ToolIntentRecor
                     "stored tool execution ID is invalid",
                 )
             })?,
-        session_id: parse_session(row_get(row, "session_id")?)?,
-        task_id: parse_task(row_get(row, "task_id")?)?,
-        invocation_id: row_get(row, "invocation_id")?,
+        session_id: session_id.clone(),
+        task_id: task_id.clone(),
+        invocation_id: invocation_id.clone(),
+        call_id: call_id.clone(),
         actor_id: actor_id.clone(),
         tool_name: row_get(row, "tool_name")?,
         action_json,
@@ -3860,6 +3956,10 @@ fn tool_intent_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<ToolIntentRecor
         tool_revision,
         approval: ToolApprovalBinding {
             approval_id,
+            session_id,
+            task_id,
+            invocation_id,
+            call_id,
             actor_id,
             action_hash,
             workspace_root,

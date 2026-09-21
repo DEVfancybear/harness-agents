@@ -425,6 +425,7 @@ pub fn explorer_report(
             tool_execution_id: ToolExecutionId::generate(),
             task_id: task_id.clone(),
             invocation_id: "fixture-check".to_owned(),
+            call_id: None,
             input_hash: ContentHash::from_bytes(revision.as_bytes()),
             policy_revision: 1,
             approval_id: None,

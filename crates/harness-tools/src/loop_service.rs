@@ -52,16 +52,19 @@ impl CodingLoopService {
         let mut executions = Vec::new();
         for call in &runtime.tool_calls {
             let action = crate::CodingToolAction::from_provider_call(&call.name, &call.arguments)?;
-            let prepared = self
-                .tools
-                .prepare(ToolRequest::new(
-                    runtime.session_id.clone(),
-                    runtime.task_id.clone(),
-                    actor_id.clone(),
-                    workspace_root.clone(),
-                    action,
-                ))
-                .await?;
+            let request = ToolRequest::new(
+                runtime.session_id.clone(),
+                runtime.task_id.clone(),
+                actor_id.clone(),
+                workspace_root.clone(),
+                action,
+            );
+            let request = if call.call_id.trim().is_empty() {
+                request
+            } else {
+                request.with_call_id(call.call_id.clone())
+            };
+            let prepared = self.tools.prepare(request).await?;
             let approval = if grant_approvals {
                 Some(self.tools.approve(&prepared).await?)
             } else {

@@ -35,9 +35,10 @@ pub const DATA_DIRECTORY_KIND: &str = "harness-data";
 /// and records version 2; a host that only supports version 1 refuses to write a
 /// version 2 database instead of silently dropping the new records.
 pub const RUNTIME_SCHEMA_VERSION: i64 = 2;
-/// Additive P3 tool tables use their own revision so P0/P1/P2 storage remains
-/// byte-for-byte compatible.
-pub const TOOLS_SCHEMA_VERSION: i64 = 1;
+/// Additive P3 tool tables. 2 adds the M4 approval scope (session/task/
+/// invocation/call correlation) and the provider call id on intents; both are
+/// additive columns so a version 1 database upgrades in place.
+pub const TOOLS_SCHEMA_VERSION: i64 = 2;
 /// Additive P4 memory tables retain all earlier schema revisions.
 pub const MEMORY_SCHEMA_VERSION: i64 = 1;
 /// Additive P5 delegation tables retain all earlier schema revisions.
@@ -313,9 +314,17 @@ impl ToolApprovalState {
 }
 
 /// Immutable binding persisted for a single-use P3 approval.
+///
+/// M4: the binding carries the scope it was issued for (session, task,
+/// invocation) and the provider `call_id` when one exists, so a grant cannot be
+/// replayed against another invocation that happens to look identical.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolApprovalRecord {
     pub approval_id: ToolApprovalId,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub invocation_id: String,
+    pub call_id: Option<String>,
     pub actor_id: String,
     pub binding_hash: ContentHash,
     pub action_hash: ContentHash,
@@ -332,6 +341,10 @@ pub struct ToolApprovalRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolApprovalBinding {
     pub approval_id: ToolApprovalId,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub invocation_id: String,
+    pub call_id: Option<String>,
     pub actor_id: String,
     pub action_hash: ContentHash,
     pub workspace_root: String,
@@ -376,6 +389,8 @@ pub struct ToolIntentRecord {
     pub session_id: SessionId,
     pub task_id: TaskId,
     pub invocation_id: String,
+    /// The provider's `call_id`, when the intent came from a model call.
+    pub call_id: Option<String>,
     pub actor_id: String,
     pub tool_name: String,
     pub action_json: Value,
