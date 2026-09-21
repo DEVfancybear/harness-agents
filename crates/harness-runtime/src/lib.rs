@@ -187,6 +187,13 @@ impl AgentState {
     }
 }
 
+/// Longest backoff this runtime will honour from a provider's `Retry-After`.
+///
+/// A provider is free to ask for minutes; a turn is not. Bounding the wait keeps
+/// a hostile or confused header from parking the run, and the attempt cap still
+/// limits the total work.
+const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub context_window_tokens: u64,
@@ -669,12 +676,30 @@ impl RuntimeService {
         ];
         // Continuation turns carry the tool results back to the model.
         conversation.extend(appended);
+        // The protocol is validated before anything is frozen or dispatched: a
+        // tool result that cannot be correlated, or a request that needs a
+        // capability the provider explicitly lacks, is a host bug, not a model
+        // error to discover after the call.
+        harness_providers::validate_transcript(&conversation).map_err(|error| {
+            RuntimeError::new(
+                error.code(),
+                format!("provider transcript is invalid: {error}"),
+            )
+        })?;
         let provider_request = ProviderRequest::new(
             harness_types::RequestId::generate(),
             capabilities.model.clone(),
             conversation,
         )
         .with_tool_schemas(request.tool_schemas.clone());
+        harness_providers::CapabilityMatrix::from_capabilities(&capabilities)
+            .validate(&provider_request)
+            .map_err(|error| {
+                RuntimeError::new(
+                    error.code(),
+                    format!("provider capability refuses this request: {error}"),
+                )
+            })?;
         self.store
             .persist_context_packet(ContextPacketRecord {
                 packet: built.packet.clone(),
@@ -787,13 +812,34 @@ impl RuntimeService {
                             error: Some(error.to_string()),
                         })
                         .await?;
+                    let retryable = error.is_retryable();
+                    let retry_after = error.retry_after();
                     last_error = Some(RuntimeError::from(error));
                     attempts = attempt_number;
                     if canceled {
                         break;
                     }
-                    if attempts >= config.max_attempts {
+                    // The retry owner is this loop alone: a permanent provider
+                    // failure (401, 402, 400, 422) is reported after one attempt
+                    // instead of being repeated, and a transient one is bounded by
+                    // `max_attempts`.
+                    if !retryable || attempts >= config.max_attempts {
                         break;
+                    }
+                    if let Some(wait) = retry_after {
+                        let wait = wait.min(MAX_RETRY_AFTER);
+                        if !wait.is_zero() {
+                            tokio::select! {
+                                () = tokio::time::sleep(wait) => {}
+                                () = cancellation.cancelled() => {
+                                    last_error = Some(RuntimeError::new(
+                                        ErrorCode::ProviderCanceled,
+                                        "run canceled during provider backoff",
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
                     }
                     let _ = self
                         .store

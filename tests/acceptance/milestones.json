@@ -194,6 +194,97 @@
           "closure-M0"
         ]
       }
+    },
+    {
+      "id": "M2",
+      "title": "Provider protocol và incremental stream",
+      "runbook": "docs/implementation-next/M2.vi.md",
+      "prerequisites": ["M0"],
+      "status": "implemented_unverified",
+      "integration_target": "milestone_m2",
+      "work_items": [
+        {
+          "id": "M2-01",
+          "title": "Typed messages và capability registry",
+          "status": "implemented_unverified",
+          "tests": [
+            "m2_01_transcript_validation_refuses_orphan_and_duplicate_calls",
+            "m2_01_capability_unsupported_is_refused_unknown_is_allowed"
+          ]
+        },
+        {
+          "id": "M2-02",
+          "title": "SSE assembler có state",
+          "status": "implemented_unverified",
+          "tests": [
+            "a06_sse_multicall_and_usage_survive_chunk_boundaries",
+            "a06_missing_terminal_and_truncated_arguments_are_not_dispatchable",
+            "a06_id_conflict_is_typed_and_never_dispatched"
+          ]
+        },
+        {
+          "id": "M2-03",
+          "title": "Transport, DeepSeek và cancellation",
+          "status": "implemented_unverified",
+          "tests": [
+            "a07_401_is_not_retried_and_transient_is_bounded",
+            "a07_errors_never_carry_the_token",
+            "a07_cancel_settles_the_stream"
+          ]
+        },
+        {
+          "id": "M2-04",
+          "title": "Conformance harness và smoke recipe",
+          "status": "implemented_unverified",
+          "tests": [
+            "m2_04_text_arrives_before_the_terminal_barrier",
+            "m2_04_conformance_mock_and_adapter_agree"
+          ]
+        }
+      ],
+      "required_tests": [
+        "m2_01_transcript_validation_refuses_orphan_and_duplicate_calls",
+        "m2_01_capability_unsupported_is_refused_unknown_is_allowed",
+        "a06_sse_multicall_and_usage_survive_chunk_boundaries",
+        "a06_missing_terminal_and_truncated_arguments_are_not_dispatchable",
+        "a06_id_conflict_is_typed_and_never_dispatched",
+        "a07_401_is_not_retried_and_transient_is_bounded",
+        "a07_errors_never_carry_the_token",
+        "a07_cancel_settles_the_stream",
+        "m2_04_text_arrives_before_the_terminal_barrier",
+        "m2_04_conformance_mock_and_adapter_agree",
+        "phase_p2::p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized",
+        "phase_p2::p2_s06_cancel_and_retry_are_bounded_and_recoverable"
+      ],
+      "unit_tests": [
+        {
+          "package": "harness-providers",
+          "test_name": "sse_limit_tests::a_stream_without_a_frame_terminator_is_bounded"
+        },
+        {
+          "package": "harness-providers",
+          "test_name": "sse_limit_tests::a_slot_reannounced_with_another_id_is_refused"
+        },
+        {
+          "package": "harness-providers",
+          "test_name": "sse_limit_tests::a_usage_only_frame_becomes_its_own_event_and_done_keeps_the_named_reason"
+        }
+      ],
+      "fixtures": ["crates/harness-cli/tests/milestone_m2.rs"],
+      "gate": {
+        "script": "scripts/Verify-Milestone.ps1",
+        "dependency_check_bin": "dependency_check",
+        "steps": [
+          "format",
+          "clippy",
+          "workspace-tests",
+          "dependency-allowlist",
+          "unit-test-discovery",
+          "required-test-discovery",
+          "required-tests",
+          "closure-M0"
+        ]
+      }
     }
   ],
   "acceptance_cases": [
@@ -232,8 +323,29 @@
         "milestone_m1::m1_03_checkpoint_commit_failure_leaves_the_journal_foldable"
       ]
     },
-    { "id": "A06", "owner_milestones": ["M2"], "planned_test": "a06_sse_multicall", "status": "planned" },
-    { "id": "A07", "owner_milestones": ["M2"], "planned_test": "a07_provider_fail_cancel", "status": "planned" },
+    {
+      "id": "A06",
+      "owner_milestones": ["M2"],
+      "planned_test": "a06_sse_multicall",
+      "status": "implemented",
+      "selectors": [
+        "milestone_m2::a06_sse_multicall_and_usage_survive_chunk_boundaries",
+        "milestone_m2::a06_missing_terminal_and_truncated_arguments_are_not_dispatchable",
+        "milestone_m2::a06_id_conflict_is_typed_and_never_dispatched"
+      ]
+    },
+    {
+      "id": "A07",
+      "owner_milestones": ["M2"],
+      "planned_test": "a07_provider_fail_cancel",
+      "status": "implemented",
+      "selectors": [
+        "milestone_m2::a07_401_is_not_retried_and_transient_is_bounded",
+        "milestone_m2::a07_errors_never_carry_the_token",
+        "milestone_m2::a07_cancel_settles_the_stream",
+        "phase_p2::p2_s06_cancel_and_retry_are_bounded_and_recoverable"
+      ]
+    },
     { "id": "A08", "owner_milestones": ["M4"], "planned_test": "a08_coding_e2e", "status": "planned" },
     { "id": "A09", "owner_milestones": ["M3"], "planned_test": "a09_terminal_acceptance", "status": "planned" },
     { "id": "A10", "owner_milestones": ["M3"], "planned_test": "a10_goal_no_progress", "status": "planned" },

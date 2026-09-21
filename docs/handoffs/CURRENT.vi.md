@@ -1,65 +1,64 @@
 # CURRENT — bàn giao đang mở
 
-**Cập nhật:** 21/09/2026 · **Assignment:** M1 (SQLite store, journal và recovery), scope `M1-01..M1-04`.
+**Cập nhật:** 21/09/2026 · **Assignment:** M2 (Provider protocol và incremental stream), scope `M2-01..M2-04`.
 
-## 1. Assignment hiện tại và ràng buộc mới nhất của người dùng
+## 1. Assignment hiện tại và ràng buộc mới nhất
 
-- Prompt người dùng (21/09/2026): triển khai M1 trong scope M1-01..M1-04; đọc README/CONTRACTS/M1 + acceptance A01/A02/A05; xác minh prerequisites M0; tạo SPEC; sửa crate hiện có và nối vào cùng binary `ha`; reuse tests; làm từng item theo thứ tự, targeted tests rồi milestone gate; không production stub-success, không đổi expected fixture để che lỗi; bàn giao evidence/digest/test discovery/OS limitations + CURRENT handoff; **dừng sau M1**, không tự chạy milestone tiếp.
-- Quyền: chạy local (cargo/PowerShell, temp dir, mock provider). **Không** commit/push/publish, không paid API, không spawn agent. Prompt mẫu không tạo quyền mới; M0 đã commit/push ở session trước theo yêu cầu riêng.
+- Prompt người dùng (21/09/2026): triển khai M2; đọc README/CONTRACTS/M2 + acceptance A06/A07; xác minh prerequisites; tạo SPEC; sửa crate hiện có, nối vào cùng binary `ha`; reuse tests; từng item theo thứ tự, targeted tests rồi milestone gate; không stub-success/không đổi fixture để che lỗi; bàn giao evidence/digest/discovery/OS limitations + CURRENT handoff; **dừng sau M2**; **commit and push sau khi xong việc**.
+- Quyền đã cấp trong assignment này: local + đọc docs công khai DeepSeek + **commit/push** M2 sau khi gate xanh. Không paid API, không live smoke, không spawn agent.
 
 ## 2. Branch/base/source digest
 
-- Branch: `master`; base `4d6393e` (M0 committed/pushed).
-- M1 **chưa commit** (git status sẽ hiện các file ở §4).
-- Source digest lần gate cuối: `sha256:1af1a78c218af4f4cd5bae129fcbbe98f75a41621de54f68af7f2bfc75c3aa73` (319 file, loại trừ evidence M1 + file này).
+- Branch `master`; base `a824b2c` (M1 đã push).
+- Source digest lần gate cuối: `sha256:d67a4e07b6191deb77969aef0c333f02babe5f9edc9fe2ca90524665c0229750` (324 file, loại trừ `docs/evidence/M2.vi.md` và file này).
 
 ## 3. Work item
 
 | Item | Trạng thái | Evidence |
 |---|---|---|
-| M1-01 Migrations và writer ownership | `implemented_unverified` | marker `harness-data.json` + validate/reject; test newer schema; generation takeover/stale fence (`crates/harness-store-sqlite/src/{store,models}.rs`) |
-| M1-02 Input, inbox và projections | `verified_by_existing_suites` | reuse P1 (`p1_c21`, `p1_s04`, `p1_property_*`); **StorePort hoãn sang M3/M4** (ADR-N02 §2.8) |
-| M1-03 Artifacts, checkpoints và replay | `implemented_unverified` | `m1_03_orphan_artifact_is_only_reachable_by_reference` + `m1_03_checkpoint_commit_failure_leaves_the_journal_foldable` (failpoint `BeforeSnapshotCommit`) |
-| M1-04 Recovery queries và CLI inspection | `implemented_unverified` | `ha status`: `pending_work` + `blocking`, không fail khi block; `resume` vẫn typed |
+| M2-01 typed messages + capability registry | `implemented_unverified` | `ProviderMessage::{tool_calls,tool_call_id}` + `assistant_with_calls`/`tool_result`; `validate_transcript` gọi trong `RuntimeService::run_inner`; `CapabilityClaim`/`CapabilityMatrix::validate` |
+| M2-02 SSE assembler có state | `implemented_unverified` | `SseLimits` (buffer/frame/calls/args), key `(choice,index)` + conflict, `Usage` event, `[DONE]` không ghi đè reason, `ProviderResponse::is_dispatchable()` |
+| M2-03 transport/DeepSeek/cancellation | `implemented_unverified` | `http_status_error` theo bảng lỗi chính thức; timeout connect/total; `Retry-After` + cap 2s; runtime retry theo `RetryClass`; redaction test |
+| M2-04 conformance + smoke recipe | `implemented_unverified` | `FakeProvider` barrier trong `milestone_m2`; conformance mock vs adapter; live smoke không chạy (ghi rõ) |
 
 ## 4. File đã đổi
 
-Sửa: `crates/harness-store-sqlite/src/{store,models,lib}.rs`, `crates/harness-cli/src/main.rs`, `crates/harness-cli/tests/milestone_m0.rs` (adapt registry), `scripts/Verify-Milestone.ps1` (qualified selector `target::test` + self-test), `tests/acceptance/milestones.json` (entry M1 + A01/A02/A05 `implemented`).
-Thêm: `crates/harness-cli/tests/milestone_m1.rs`, `tests/fixtures/m1/marker/{newer-format,corrupt}.json`, `docs/specs/M1.vi.md`, `docs/adr/ADR-N02-STORE-OWNERSHIP-DURABILITY.{vi,en}.md`, `docs/evidence/M1.vi.md`, file này.
+Sửa: `crates/harness-providers/src/{lib,streaming}.rs`, `crates/harness-runtime/src/lib.rs`, `crates/harness-tools/src/turn_driver.rs`, `crates/harness-cli/Cargo.toml` (dev-dep `futures-util`), `Cargo.lock`, `tests/acceptance/milestones.json`.
+Thêm: `crates/harness-cli/tests/milestone_m2.rs`, `docs/specs/M2.vi.md`, `docs/adr/ADR-N04-PROVIDER-PROTOCOL.{vi,en}.md`, `docs/evidence/M2.vi.md`, file này.
 
 ## 5. Contract/ADR đã chốt — không đổi ngầm
 
-- ADR-N02: lock scope = một data directory (`writer.lock`), fence durable (`host_epoch.generation`, `StaleWriter`), durability WAL+FULL+FK+busy 5s, marker `harness-data.json` không bao giờ bị ghi đè, artifact sống theo reachability/pin (`RetentionRefused`), outbox logic = `parent_deliveries`, reopen ≠ rerun.
-- `ha status --json` chỉ thêm key (`pending_work`, `blocking`); session bị block báo cáo thay vì fail.
-- A01/A02/A05 do M1 sở hữu, map sang selector qualified trong `tests/acceptance/milestones.json`; registry P/H không đổi.
-- Gate hỗ trợ required test dạng `target::test_name`; `-SelfTest` có 7 negative control.
+- ADR-N04: canonical model vs wire encoding (tool result vẫn là user message có marker **vì API đo được** yêu cầu `tool_call_id`; canonical giữ identity); validator trước dispatch; capability tri-state (`Unknown` không phải bằng chứng); `[DONE]` là transport marker không ghi đè finish reason; identity theo `(choice,index)`; limits; retry owner = runtime, adapter không retry; redaction.
+- Taxonomy lỗi theo bảng chính thức DeepSeek: 400/401/402/422 Never; 429/500/503 transient.
+- A06/A07 do M2 sở hữu, map sang selector qualified; registry P/H không đổi.
 
 ## 6. Lệnh đã chạy và kết quả cuối
 
 - `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings` → pass.
-- `cargo test -p harness-cli --test milestone_m1 --locked` → 6 pass.
-- `cargo test -p harness-cli --test milestone_m0 --locked` → pass (adapt).
-- `cargo test -p harness-cli --test phase_p1 --test phase_p2 --test phase_p7 --locked` → pass.
-- `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M1 -SelfTest` → 7/7 OK.
-- `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M1 -Json` → `result: passed`, closure `[M1, M0]`, 11 required test M1 + 11 closure M0 + 1 unit test + 44 edge; digest ở §2.
+- `cargo test -p harness-providers --locked` → 21 pass.
+- `cargo test -p harness-cli --test milestone_m2 --locked` → 10 pass.
+- `cargo test -p harness-cli --test milestone_m0 --test milestone_m1 --locked` → 11 + 6 pass.
+- `cargo test -p harness-cli --test phase_p2 --test phase_p3 --test interactive_session --locked` → 17 + 21 + 13 pass.
+- `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M2 -SelfTest` → 7/7 OK.
+- `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M2 -Json` → `result: passed`, closure `[M2, M0]`, 12 required + 11 closure M0 + 3 unit test + 44 edge; digest ở §2.
 
 ## 7. Việc còn lại theo thứ tự
 
-1. **Commit/push M1** nếu người dùng cấp quyền (chỉ khi được yêu cầu trực tiếp).
-2. **Chạy gate P1 (và P7) như regression đa nền tảng**, cùng gate M1 trên Linux → platform proof.
-3. **M3/M4:** implement `StorePort` khi lease/step/proposal/grant/receipt shape đã chốt (ADR-N02 §3); reconciliation side effect thuộc M3/M4.
-4. **M1 hardening (tùy chọn):** thêm negative control cho marker xuất hiện giữa hai writer (race) — hiện đã fail-closed bằng `create_new` + validate.
+1. Commit + push M2 (assignment này đã cấp quyền) sau khi digest khớp evidence.
+2. Chạy gate M2 trên **Linux** và chạy `Verify-Phase.ps1 -Phase P2`/`P3` như regression đa nền tảng.
+3. **Live smoke tùy chọn** (`scripts/Smoke-HaProvider.ps1`) với credential riêng nếu muốn claim tương thích live — evidence hiện tại **không** claim điều đó.
+4. **M3:** tiêu thụ `ProviderResponse::is_dispatchable()` trước khi dựng step; M4 bind `tool_call_id` vào intent/receipt; `StorePort` implement ở M3/M4.
 
 ## 8. Next action chính xác
 
-Chạy `pwsh -NoProfile -File scripts/Verify-Phase.ps1 -Phase P1` (Windows) để xác nhận regression P1 trên digest M1, rồi giao reviewer đọc `docs/evidence/M1.vi.md`.
+`pwsh -NoProfile -File scripts/Verify-Phase.ps1 -Phase P2` (Windows) để xác nhận regression P2 trên digest M2, rồi reviewer đọc `docs/evidence/M2.vi.md`.
 
 ## 9. Blocked on
 
-Không. (M1 không cần credential/paid API.)
+Không. (Live smoke cần credential — không nằm trong scope bắt buộc.)
 
 ## 10. Không lặp lại
 
-- Không thêm bảng `outbox` thứ hai; không đổi `STORE_SCHEMA_VERSION`.
-- Không implement `StorePort` giả; không "sửa" test để che lỗi (mọi thay đổi test đều là adapt contract, ghi trong evidence §8).
-- Không chạy migration/store M2+ khi chưa được giao.
+- Không thêm provider thứ hai; không đổi wire sang tool role (đã đo là API từ chối).
+- Không "sửa" test để che lỗi: thay đổi test duy nhất là bổ sung (`sse_limit_tests`) và adapt registry/selector.
+- Không claim live compatibility từ mock/fixture.

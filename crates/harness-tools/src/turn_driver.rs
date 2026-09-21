@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use harness_providers::{
-    CancellationToken, MessageRole, NormalizedToolCall, ProviderMessage, ProviderStreamEvent,
+    CancellationToken, NormalizedToolCall, ProviderMessage, ProviderStreamEvent, ProviderToolCall,
 };
 use harness_runtime::{ProviderEventSink, RunRequest, RunResult, RuntimeService};
 use harness_types::{ErrorCode, HarnessError};
@@ -359,9 +359,21 @@ impl TurnDriver {
                 .iter()
                 .map(|call| call.name.clone())
                 .collect();
-            appended.push(ProviderMessage::new(
-                MessageRole::Assistant,
+            // The assistant turn keeps its typed calls, so every result below can
+            // be correlated with the call that asked for it.
+            appended.push(ProviderMessage::assistant_with_calls(
                 format!("requested tool calls: {}", names.join(", ")),
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        ProviderToolCall::new(
+                            call.call_id.clone(),
+                            call.name.clone(),
+                            call.arguments.clone(),
+                        )
+                    })
+                    .collect(),
             ));
             for call in result.tool_calls.clone() {
                 tool_calls += 1;
@@ -380,8 +392,8 @@ impl TurnDriver {
                         ok: false,
                         detail: Some(reason.to_owned()),
                     });
-                    appended.push(ProviderMessage::new(
-                        MessageRole::Tool,
+                    appended.push(ProviderMessage::tool_result(
+                        call.call_id.clone(),
                         format!(
                             "tool call {name:?} was not executed: {reason}; re-issue it with a function name and complete JSON arguments"
                         ),
@@ -398,8 +410,8 @@ impl TurnDriver {
                             ok: true,
                             detail: None,
                         });
-                        appended.push(ProviderMessage::new(
-                            MessageRole::Tool,
+                        appended.push(ProviderMessage::tool_result(
+                            call.call_id.clone(),
                             render_tool_output(&name, &view.output),
                         ));
                         executions.push(view);
@@ -412,8 +424,8 @@ impl TurnDriver {
                             ok: false,
                             detail: Some(error.to_string()),
                         });
-                        appended.push(ProviderMessage::new(
-                            MessageRole::Tool,
+                        appended.push(ProviderMessage::tool_result(
+                            call.call_id.clone(),
                             format!("tool {name} failed: {error}"),
                         ));
                     }

@@ -62,6 +62,9 @@ tokio.workspace = true
 # Pinned in the HA_LAUNCH H07 spike: real ConPTY on Windows and a real pty on
 # Unix, so the no-arg launch is proven in a terminal instead of a pipe.
 portable-pty = "=0.9.0"
+# The M2 provider stream is a `Stream`; consuming it incrementally needs the
+# same stream combinator the provider crate already uses.
+futures-util.workspace = true
 sqlx.workspace = true
 harness-kernel = { path = "../harness-kernel" }
 harness-session = { path = "../harness-session" }

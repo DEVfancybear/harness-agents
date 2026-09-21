@@ -174,7 +174,11 @@ pub(crate) fn adapter_stream(
                     Ok(response) => response,
                     Err(error) => {
                         let _ = sender.send(Err(ProviderError::new(
-                            ErrorCode::ProviderProtocol,
+                            if error.is_timeout() {
+                                ErrorCode::ProcessTimedOut
+                            } else {
+                                ErrorCode::ServiceUnavailable
+                            },
                             format!("provider request failed: {error}"),
                         ))).await;
                         return;
@@ -189,10 +193,13 @@ pub(crate) fn adapter_stream(
                 }
             };
             if !response.status().is_success() {
+                // The taxonomy (401 no retry, 429/5xx transient, Retry-After) is
+                // decided here, and the retry owner is the runtime.
+                let retry_after = crate::retry_after_seconds(response.headers());
                 let _ = sender
-                    .send(Err(ProviderError::new(
-                        ErrorCode::ProviderProtocol,
-                        format!("provider returned HTTP {}", response.status()),
+                    .send(Err(crate::http_status_error(
+                        response.status().as_u16(),
+                        retry_after,
                     )))
                     .await;
                 return;

@@ -48,6 +48,112 @@ impl ModelCapabilities {
     }
 }
 
+/// What a host knows about one provider parameter.
+///
+/// `Unknown` is not `Unsupported`: it means no claim was made, so the parameter
+/// may be sent — but it is never evidence of compatibility (ADR-N04).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityClaim {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+impl CapabilityClaim {
+    #[must_use]
+    pub const fn from_flag(supported: bool) -> Self {
+        if supported {
+            Self::Supported
+        } else {
+            Self::Unsupported
+        }
+    }
+
+    #[must_use]
+    pub const fn is_unsupported(self) -> bool {
+        matches!(self, Self::Unsupported)
+    }
+}
+
+/// The capability claims one provider/model pair makes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityMatrix {
+    pub provider_id: String,
+    pub model: String,
+    pub streaming: CapabilityClaim,
+    pub tools: CapabilityClaim,
+    pub images: CapabilityClaim,
+}
+
+impl CapabilityMatrix {
+    /// Claims derived from the boolean capability record the runtime already has:
+    /// a `false` flag is an explicit "unsupported", never an "unknown".
+    #[must_use]
+    pub fn from_capabilities(capabilities: &ModelCapabilities) -> Self {
+        Self {
+            provider_id: capabilities.provider_id.clone(),
+            model: capabilities.model.clone(),
+            streaming: CapabilityClaim::from_flag(capabilities.supports_streaming),
+            tools: CapabilityClaim::from_flag(capabilities.supports_tools),
+            images: CapabilityClaim::Unknown,
+        }
+    }
+
+    /// The `DeepSeek` claims measured against the official API docs at M2 time:
+    /// `deepseek-flash` and `deepseek-v4-pro` speak the `OpenAI` chat format with
+    /// streaming and tool calls; thinking mode defaults on, which this app turns
+    /// off explicitly. Images are only claimed for the model that documents them,
+    /// and `Unknown` is used where this host has no claim.
+    #[must_use]
+    pub fn deepseek_documented(model: impl Into<String>) -> Self {
+        let model = model.into();
+        let vision = model.contains("flash") || model.starts_with("deepseek-chat");
+        Self {
+            provider_id: "deepseek".to_owned(),
+            model,
+            streaming: CapabilityClaim::Supported,
+            tools: CapabilityClaim::Supported,
+            images: if vision {
+                CapabilityClaim::Supported
+            } else {
+                CapabilityClaim::Unknown
+            },
+        }
+    }
+
+    /// Refuse a request that needs a parameter the provider explicitly lacks.
+    ///
+    /// `Unknown` passes: the request may still succeed, and the caller must not
+    /// read the pass as proof of support.
+    pub fn validate(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
+        if !request.tool_schemas.is_empty() && self.tools.is_unsupported() {
+            return Err(ProviderError::new(
+                ErrorCode::IncompatibleService,
+                format!(
+                    "provider {} model {} does not support tool calls",
+                    self.provider_id, self.model
+                ),
+            ));
+        }
+        if self.images.is_unsupported()
+            && request
+                .messages
+                .iter()
+                .any(|message| !message.attachments.is_empty())
+        {
+            return Err(ProviderError::new(
+                ErrorCode::IncompatibleService,
+                format!(
+                    "provider {} model {} does not accept images",
+                    self.provider_id, self.model
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
@@ -68,6 +174,39 @@ pub struct ProviderMessage {
     /// every other role rather than sending a request that cannot succeed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ImageAttachment>,
+    /// The calls an assistant message asked for (canonical model only).
+    ///
+    /// This is what the transcript validator correlates tool results against. The
+    /// Chat Completions encoding deliberately does not carry it mid-conversation
+    /// (ADR-N04), so the field is canonical, not wire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ProviderToolCall>,
+    /// The call a tool result answers (canonical model only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// One call an assistant message asked for, as the canonical model keeps it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+impl ProviderToolCall {
+    #[must_use]
+    pub fn new(
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        }
+    }
 }
 
 /// Where the bytes of an attached image come from.
@@ -171,6 +310,8 @@ impl ProviderMessage {
             role,
             content: content.into(),
             attachments: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
@@ -181,6 +322,35 @@ impl ProviderMessage {
             role: MessageRole::User,
             content: content.into(),
             attachments: images,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// An assistant message that asked for the given calls.
+    #[must_use]
+    pub fn assistant_with_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ProviderToolCall>,
+    ) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: content.into(),
+            attachments: Vec::new(),
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+
+    /// A tool result answering one call.
+    #[must_use]
+    pub fn tool_result(call_id: impl Into<String>, payload: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::Tool,
+            content: payload.into(),
+            attachments: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(call_id.into()),
         }
     }
 
@@ -236,6 +406,58 @@ impl ProviderMessage {
 #[must_use]
 pub fn wire_messages(messages: &[ProviderMessage]) -> Vec<Value> {
     messages.iter().map(ProviderMessage::to_wire).collect()
+}
+
+/// Validate the paired transcript before anything is dispatched.
+///
+/// The canonical model carries call identity, so the host can refuse a
+/// transcript whose tool results cannot be correlated instead of sending it and
+/// guessing later:
+///
+/// - a tool result must name a call an assistant message announced **earlier**;
+/// - a call id may appear once as a call and be answered once;
+/// - a tool result may not precede its call.
+///
+/// The check is about the visible transcript, not about provider behaviour: an
+/// invalid transcript is a host bug and is refused before the network call.
+pub fn validate_transcript(messages: &[ProviderMessage]) -> Result<(), ProviderError> {
+    let mut announced: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut answered: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        for call in &message.tool_calls {
+            if call.call_id.trim().is_empty() {
+                return Err(ProviderError::new(
+                    ErrorCode::ProviderProtocol,
+                    format!("assistant message {index} has a call without an id"),
+                ));
+            }
+            if !announced.insert(call.call_id.as_str()) {
+                return Err(ProviderError::new(
+                    ErrorCode::ProviderProtocol,
+                    format!(
+                        "call id {} is announced twice in the transcript",
+                        call.call_id
+                    ),
+                ));
+            }
+        }
+        let Some(call_id) = message.tool_call_id.as_deref() else {
+            continue;
+        };
+        if !announced.contains(call_id) {
+            return Err(ProviderError::new(
+                ErrorCode::ProviderProtocol,
+                format!("tool result references call {call_id} before it was announced"),
+            ));
+        }
+        if !answered.insert(call_id) {
+            return Err(ProviderError::new(
+                ErrorCode::ProviderProtocol,
+                format!("call {call_id} is answered twice"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Thinking mode is off, deliberately.
@@ -299,6 +521,15 @@ pub enum ProviderStreamEvent {
         name: String,
         arguments: String,
     },
+    /// Token accounting the provider reported for this call.
+    ///
+    /// A usage-only frame carries no choice, so it is its own event instead of
+    /// being dropped or mistaken for the terminal one.
+    Usage {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+    },
     Completed {
         finish_reason: String,
     },
@@ -334,6 +565,14 @@ impl ProviderStreamEvent {
         }
     }
     #[must_use]
+    pub const fn usage(prompt_tokens: u64, completion_tokens: u64, total_tokens: u64) -> Self {
+        Self::Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        }
+    }
+    #[must_use]
     pub fn is_completed(&self) -> bool {
         matches!(self, Self::Completed { .. })
     }
@@ -354,6 +593,18 @@ pub struct ProviderResponse {
     pub tool_calls: Vec<NormalizedToolCall>,
 }
 
+impl ProviderResponse {
+    /// Whether this response may be turned into tool execution.
+    ///
+    /// A stream that never reached a terminal marker, or that left a call with
+    /// unparseable arguments, is reported to the caller but never dispatched: a
+    /// truncated stream is not a completed answer (A06).
+    #[must_use]
+    pub fn is_dispatchable(&self) -> bool {
+        self.finish_reason.is_some() && !self.incomplete_tool_calls
+    }
+}
+
 pub fn assemble_stream(events: &[ProviderStreamEvent]) -> Result<ProviderResponse, ProviderError> {
     let mut text = String::new();
     let mut finish_reason = None;
@@ -361,6 +612,9 @@ pub fn assemble_stream(events: &[ProviderStreamEvent]) -> Result<ProviderRespons
     for event in events {
         match event {
             ProviderStreamEvent::TextDelta { text: delta } => text.push_str(delta),
+            // Token accounting is durable in the event log; it does not change the
+            // assembled answer, and `Started` was never part of one.
+            ProviderStreamEvent::Usage { .. } | ProviderStreamEvent::Started { .. } => {}
             ProviderStreamEvent::ToolCallDelta {
                 call_id,
                 name,
@@ -381,7 +635,6 @@ pub fn assemble_stream(events: &[ProviderStreamEvent]) -> Result<ProviderRespons
             ProviderStreamEvent::Completed {
                 finish_reason: reason,
             } => finish_reason = Some(reason.clone()),
-            ProviderStreamEvent::Started { .. } => {}
         }
     }
     // A call with no name or with arguments that never completed JSON cannot be
@@ -403,6 +656,7 @@ pub fn assemble_stream(events: &[ProviderStreamEvent]) -> Result<ProviderRespons
 pub struct ProviderError {
     code: ErrorCode,
     message: String,
+    retry_after: Option<Duration>,
 }
 
 impl ProviderError {
@@ -411,12 +665,51 @@ impl ProviderError {
         Self {
             code,
             message: message.into(),
+            retry_after: None,
         }
+    }
+    #[must_use]
+    pub fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
+        self.retry_after = retry_after;
+        self
     }
     #[must_use]
     pub const fn code(&self) -> ErrorCode {
         self.code
     }
+    /// The wait the provider asked for, when it named one.
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+    /// Whether repeating the call may succeed. The class comes from the stable
+    /// code, never from the message.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        matches!(
+            self.code.retry_class(),
+            harness_types::RetryClass::Transient | harness_types::RetryClass::Bounded
+        )
+    }
+}
+
+/// Map one HTTP status from the provider onto the typed error taxonomy.
+///
+/// The codes come from the provider's own documented table: 400 and 422 are
+/// request defects, 401 is authority, 402 is balance, 429/500/503 are transient
+/// and worth a bounded retry. A `Retry-After` header is carried on the error so
+/// the retry owner can honour it instead of guessing.
+#[must_use]
+pub fn http_status_error(status: u16, retry_after: Option<Duration>) -> ProviderError {
+    let code = match status {
+        400 | 422 => ErrorCode::InvalidPayload,
+        401 => ErrorCode::MissingAuthority,
+        402 => ErrorCode::BudgetExhausted,
+        429 | 500 | 502 | 503 | 504 => ErrorCode::ServiceUnavailable,
+        _ => ErrorCode::ProviderProtocol,
+    };
+    ProviderError::new(code, format!("provider returned HTTP {status}"))
+        .with_retry_after(retry_after)
 }
 
 pub type ProviderFuture =
@@ -585,6 +878,11 @@ pub fn chat_completions_endpoint(endpoint: &str) -> String {
     trimmed.to_owned()
 }
 
+/// Default seconds allowed to establish one provider connection.
+pub const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 10;
+/// Default seconds allowed for one provider call end to end.
+pub const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 120;
+
 pub struct DeepSeekAdapter {
     endpoint: String,
     credentials: Arc<dyn CredentialResolver>,
@@ -598,6 +896,26 @@ impl DeepSeekAdapter {
         credentials: Arc<dyn CredentialResolver>,
         capabilities: ModelCapabilities,
     ) -> Result<Self, ProviderError> {
+        Self::with_timeouts(
+            endpoint,
+            credentials,
+            capabilities,
+            Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECONDS),
+            Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECONDS),
+        )
+    }
+
+    /// Build the adapter with explicit transport timeouts.
+    ///
+    /// A hung socket must fail as a typed timeout instead of parking a turn
+    /// forever; tests use short values instead of sleeping.
+    pub fn with_timeouts(
+        endpoint: impl Into<String>,
+        credentials: Arc<dyn CredentialResolver>,
+        capabilities: ModelCapabilities,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self, ProviderError> {
         let endpoint = chat_completions_endpoint(&endpoint.into());
         if endpoint.trim().is_empty() {
             return Err(ProviderError::new(
@@ -605,13 +923,33 @@ impl DeepSeekAdapter {
                 "provider endpoint is empty",
             ));
         }
+        let client = Client::builder()
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout)
+            .build()
+            .map_err(|error| {
+                ProviderError::new(
+                    ErrorCode::ProviderProtocol,
+                    format!("provider client is not buildable: {error}"),
+                )
+            })?;
         Ok(Self {
             endpoint,
             credentials,
             capabilities,
-            client: Client::new(),
+            client,
         })
     }
+}
+
+/// The wait a `Retry-After` header asks for, in seconds; other forms are ignored.
+#[must_use]
+pub fn retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 impl ModelProvider for DeepSeekAdapter {
@@ -639,14 +977,16 @@ impl ModelProvider for DeepSeekAdapter {
                 object.insert("tools".to_owned(), Value::Array(request.tool_schemas));
             }
             let response = tokio::select! {
-                result = client.post(endpoint).bearer_auth(token).json(&body).send() => result.map_err(|error| ProviderError::new(ErrorCode::ProviderProtocol, format!("provider request failed: {error}")))?,
+                result = client.post(endpoint).bearer_auth(token).json(&body).send() => result.map_err(|error| if error.is_timeout() {
+                    ProviderError::new(ErrorCode::ProcessTimedOut, format!("provider request timed out: {error}"))
+                } else {
+                    ProviderError::new(ErrorCode::ServiceUnavailable, format!("provider request failed: {error}"))
+                })?,
                 () = cancellation.cancelled() => return Err(ProviderError::new(ErrorCode::ProviderCanceled, "provider request canceled")),
             };
             if !response.status().is_success() {
-                return Err(ProviderError::new(
-                    ErrorCode::ProviderProtocol,
-                    format!("provider returned HTTP {}", response.status()),
-                ));
+                let retry_after = retry_after_seconds(response.headers());
+                return Err(http_status_error(response.status().as_u16(), retry_after));
             }
             let mut stream = response.bytes_stream();
             let mut decoder = SseDecoder::new();
@@ -655,7 +995,11 @@ impl ModelProvider for DeepSeekAdapter {
             {
                 let chunk = chunk.map_err(|error| {
                     ProviderError::new(
-                        ErrorCode::ProviderProtocol,
+                        if error.is_timeout() {
+                            ErrorCode::ProcessTimedOut
+                        } else {
+                            ErrorCode::ProviderProtocol
+                        },
                         format!("provider stream failed: {error}"),
                     )
                 })?;
@@ -670,17 +1014,45 @@ impl ModelProvider for DeepSeekAdapter {
 /// Identity a fragment gets when the stream never announced one.
 const DEFAULT_TOOL_CALL_ID: &str = "tool-call";
 
+/// Bounds one SSE stream may not exceed (M2-02).
+///
+/// A stream is untrusted input: without caps, a provider that never terminates a
+/// frame or never stops announcing calls grows host memory without limit. The
+/// defaults are generous for real answers and small enough to fail fast.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SseLimits {
+    pub max_buffered_bytes: usize,
+    pub max_frame_bytes: usize,
+    pub max_tool_calls: usize,
+    pub max_arguments_bytes: usize,
+}
+
+impl Default for SseLimits {
+    fn default() -> Self {
+        Self {
+            max_buffered_bytes: 4 * 1024 * 1024,
+            max_frame_bytes: 1024 * 1024,
+            max_tool_calls: 64,
+            max_arguments_bytes: 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct SseDecoder {
     buffer: Vec<u8>,
-    /// Call identity announced for each streamed tool-call `index`.
+    /// Call identity announced for each streamed `(choice, index)`.
     ///
     /// The fragment that opens a call carries `id` and `function.name`; every later
     /// fragment of the same call carries `index` and `function.arguments` only, so
-    /// the index is the only field that identifies the call for the whole stream.
-    tool_call_ids: BTreeMap<u64, String>,
+    /// the pair is the only identity the whole stream agrees on. Choice is part of
+    /// the key because an interleaved multi-choice stream reuses indexes per choice.
+    tool_call_ids: BTreeMap<(u64, u64), String>,
     /// Call the most recent fragment belonged to, for a stream that omits `index`.
     last_tool_call_id: Option<String>,
+    /// Whether a terminal marker (`[DONE]` or a `finish_reason`) was observed.
+    saw_terminal: bool,
+    limits: SseLimits,
 }
 
 impl SseDecoder {
@@ -688,8 +1060,31 @@ impl SseDecoder {
     pub fn new() -> Self {
         Self::default()
     }
+
+    #[must_use]
+    pub fn with_limits(limits: SseLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the stream reached a terminal marker before it ended.
+    #[must_use]
+    pub const fn saw_terminal(&self) -> bool {
+        self.saw_terminal
+    }
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
         self.buffer.extend_from_slice(bytes);
+        if self.buffer.len() > self.limits.max_buffered_bytes {
+            return Err(ProviderError::new(
+                ErrorCode::FrameLimitExceeded,
+                format!(
+                    "provider SSE buffer exceeded {} bytes",
+                    self.limits.max_buffered_bytes
+                ),
+            ));
+        }
         self.drain_frames(false)
     }
     pub fn finish(&mut self) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
@@ -712,6 +1107,15 @@ impl SseDecoder {
                 (_, Some(b)) => (b, 4),
                 _ => break,
             };
+            if index + width > self.limits.max_frame_bytes {
+                return Err(ProviderError::new(
+                    ErrorCode::FrameLimitExceeded,
+                    format!(
+                        "provider SSE frame exceeded {} bytes",
+                        self.limits.max_frame_bytes
+                    ),
+                ));
+            }
             let frame = self.buffer.drain(..index + width).collect::<Vec<_>>();
             let text = String::from_utf8(frame).map_err(|_| {
                 ProviderError::new(ErrorCode::ProviderProtocol, "SSE frame is not UTF-8")
@@ -726,7 +1130,13 @@ impl SseDecoder {
                 continue;
             }
             if data == "[DONE]" {
-                output.push(ProviderStreamEvent::completed("stop"));
+                // The transport marker says the body ended; it does not overwrite a
+                // finish reason the provider already named (a `tool_calls` turn ends
+                // with both, and the reason is the provider's, not the marker's).
+                if !self.saw_terminal {
+                    self.saw_terminal = true;
+                    output.push(ProviderStreamEvent::completed("stop"));
+                }
             } else {
                 output.extend(self.frame_events(&data)?);
             }
@@ -755,35 +1165,51 @@ impl SseDecoder {
                 format!("malformed provider SSE JSON: {error}"),
             )
         })?;
-        let choice = value
+        let mut events = Vec::new();
+        let choices = value
             .get("choices")
             .and_then(Value::as_array)
-            .and_then(|items| items.first())
-            .ok_or_else(|| {
-                ProviderError::new(
-                    ErrorCode::ProviderProtocol,
-                    "provider SSE frame has no choice",
-                )
-            })?;
-        let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
-        let mut events = Vec::new();
-        if let Some(content) = delta.get("content").and_then(Value::as_str) {
-            events.push(ProviderStreamEvent::text(content));
+            .cloned()
+            .unwrap_or_default();
+        if choices.is_empty() {
+            // A usage-only frame carries no choice. Dropping it lost token
+            // accounting silently, and refusing it turned a valid stream into an
+            // error, so it becomes its own event (A06).
+            if let Some(usage) = value.get("usage").and_then(Value::as_object) {
+                let number = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+                return Ok(vec![ProviderStreamEvent::usage(
+                    number("prompt_tokens"),
+                    number("completion_tokens"),
+                    number("total_tokens"),
+                )]);
+            }
+            return Err(ProviderError::new(
+                ErrorCode::ProviderProtocol,
+                "provider SSE frame has no choice",
+            ));
         }
-        if let Some(fragments) = delta.get("tool_calls").and_then(Value::as_array) {
-            for fragment in fragments {
-                events.push(self.tool_call_fragment(fragment));
+        for (choice_index, choice) in choices.iter().enumerate() {
+            let choice_index = u64::try_from(choice_index).unwrap_or(u64::MAX);
+            let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
+            if let Some(content) = delta.get("content").and_then(Value::as_str) {
+                events.push(ProviderStreamEvent::text(content));
+            }
+            if let Some(fragments) = delta.get("tool_calls").and_then(Value::as_array) {
+                for fragment in fragments {
+                    events.push(self.tool_call_fragment(choice_index, fragment)?);
+                }
+            }
+            // A terminal frame can carry the last of the answer with it, so the
+            // reason is reported in addition to that content: taking whichever
+            // came first dropped `finish_reason` from every frame that also
+            // carried prose or a fragment.
+            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                self.saw_terminal = true;
+                events.push(ProviderStreamEvent::completed(reason));
             }
         }
-        // A terminal frame can carry the last of the answer with it, so the reason is
-        // reported in addition to that content: taking whichever came first dropped
-        // `finish_reason` from every frame that also carried prose or a fragment. A
-        // frame with neither stays what it always was — the terminal event when it
-        // names a reason, an empty text delta otherwise.
-        match choice.get("finish_reason").and_then(Value::as_str) {
-            Some(reason) => events.push(ProviderStreamEvent::completed(reason)),
-            None if events.is_empty() => events.push(ProviderStreamEvent::text("")),
-            None => {}
+        if events.is_empty() {
+            events.push(ProviderStreamEvent::text(""));
         }
         Ok(events)
     }
@@ -798,7 +1224,11 @@ impl SseDecoder {
     /// execution gate, at 0 ms, as `provider_protocol` and `policy_denied`. `index`
     /// is present for the whole call, so the announced id is remembered per index
     /// and stamped onto every later fragment.
-    fn tool_call_fragment(&mut self, fragment: &Value) -> ProviderStreamEvent {
+    fn tool_call_fragment(
+        &mut self,
+        choice: u64,
+        fragment: &Value,
+    ) -> Result<ProviderStreamEvent, ProviderError> {
         let announced = fragment
             .get("id")
             .and_then(Value::as_str)
@@ -806,14 +1236,37 @@ impl SseDecoder {
         let index = fragment.get("index").and_then(Value::as_u64);
         let call_id = match (index, announced) {
             (Some(index), Some(id)) => {
-                self.tool_call_ids.insert(index, id.to_owned());
+                let key = (choice, index);
+                match self.tool_call_ids.insert(key, id.to_owned()) {
+                    // The same slot announcing a different id means the stream is
+                    // not the paired transcript it claims to be; silently keeping
+                    // the newer id turned one call into two identities.
+                    Some(previous) if previous != id => {
+                        return Err(ProviderError::new(
+                            ErrorCode::ProviderProtocol,
+                            format!("provider reused call slot {index} for {previous} and {id}"),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        if self.tool_call_ids.len() > self.limits.max_tool_calls {
+                            return Err(ProviderError::new(
+                                ErrorCode::FrameLimitExceeded,
+                                format!(
+                                    "provider stream announced more than {} tool calls",
+                                    self.limits.max_tool_calls
+                                ),
+                            ));
+                        }
+                    }
+                }
                 id.to_owned()
             }
             // A continuation fragment: only the index says which call it belongs to.
             (Some(index), None) => self
                 .tool_call_ids
-                .entry(index)
-                .or_insert_with(|| format!("{DEFAULT_TOOL_CALL_ID}-{index}"))
+                .entry((choice, index))
+                .or_insert_with(|| format!("{DEFAULT_TOOL_CALL_ID}-{choice}-{index}"))
                 .clone(),
             (None, Some(id)) => id.to_owned(),
             // Neither field: the fragment continues the call announced most
@@ -829,14 +1282,140 @@ impl SseDecoder {
             .get("function")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        ProviderStreamEvent::tool_delta(
+        let arguments = function
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if arguments.len() > self.limits.max_arguments_bytes {
+            return Err(ProviderError::new(
+                ErrorCode::OutputLimitExceeded,
+                format!(
+                    "provider tool arguments exceeded {} bytes",
+                    self.limits.max_arguments_bytes
+                ),
+            ));
+        }
+        Ok(ProviderStreamEvent::tool_delta(
             call_id,
             function.get("name").and_then(Value::as_str).unwrap_or(""),
-            function
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
+            arguments,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod sse_limit_tests {
+    use super::{ErrorCode, SseDecoder, SseLimits};
+    use serde_json::json;
+
+    fn frame(choice_delta: &serde_json::Value) -> String {
+        format!(
+            "data: {}\n\n",
+            json!({"choices": [{"delta": choice_delta}]})
         )
+    }
+
+    #[test]
+    fn a_stream_without_a_frame_terminator_is_bounded() {
+        let limits = SseLimits {
+            max_buffered_bytes: 64,
+            ..SseLimits::default()
+        };
+        let mut decoder = SseDecoder::with_limits(limits);
+        let error = decoder
+            .feed(&[b'x'; 128])
+            .expect_err("an unterminated stream must not grow without limit");
+        assert_eq!(error.code(), ErrorCode::FrameLimitExceeded);
+    }
+
+    #[test]
+    fn a_frame_larger_than_the_cap_is_typed() {
+        let limits = SseLimits {
+            max_frame_bytes: 32,
+            ..SseLimits::default()
+        };
+        let mut decoder = SseDecoder::with_limits(limits);
+        let oversized = frame(&json!({"content": "x".repeat(64)}));
+        let error = decoder
+            .feed(oversized.as_bytes())
+            .expect_err("oversized frames are refused");
+        assert_eq!(error.code(), ErrorCode::FrameLimitExceeded);
+    }
+
+    #[test]
+    fn too_many_calls_and_too_many_argument_bytes_are_typed() {
+        let limits = SseLimits {
+            max_tool_calls: 1,
+            max_arguments_bytes: 8,
+            ..SseLimits::default()
+        };
+        let mut decoder = SseDecoder::with_limits(limits);
+        decoder
+            .feed(
+                frame(&json!({"tool_calls": [{"index": 0, "id": "call_a", "function": {"name": "read_file", "arguments": "{}"}}]}))
+                    .as_bytes(),
+            )
+            .expect("the first call fits");
+        let error = decoder
+            .feed(
+                frame(&json!({"tool_calls": [{"index": 1, "id": "call_b", "function": {"name": "read_file", "arguments": "{}"}}]}))
+                    .as_bytes(),
+            )
+            .expect_err("the call cap is enforced");
+        assert_eq!(error.code(), ErrorCode::FrameLimitExceeded);
+
+        let mut decoder = SseDecoder::with_limits(SseLimits {
+            max_arguments_bytes: 8,
+            ..SseLimits::default()
+        });
+        let error = decoder
+            .feed(
+                frame(&json!({"tool_calls": [{"index": 0, "id": "call_a", "function": {"name": "read_file", "arguments": "0123456789"}}]}))
+                    .as_bytes(),
+            )
+            .expect_err("argument bytes are capped");
+        assert_eq!(error.code(), ErrorCode::OutputLimitExceeded);
+    }
+
+    #[test]
+    fn a_slot_reannounced_with_another_id_is_refused() {
+        let mut decoder = SseDecoder::new();
+        decoder
+            .feed(
+                frame(&json!({"tool_calls": [{"index": 0, "id": "call_a", "function": {"name": "read_file", "arguments": ""}}]}))
+                    .as_bytes(),
+            )
+            .expect("the first announcement");
+        let error = decoder
+            .feed(
+                frame(&json!({"tool_calls": [{"index": 0, "id": "call_b", "function": {"name": "read_file", "arguments": ""}}]}))
+                    .as_bytes(),
+            )
+            .expect_err("one slot cannot change identity");
+        assert_eq!(error.code(), ErrorCode::ProviderProtocol);
+    }
+
+    #[test]
+    fn a_usage_only_frame_becomes_its_own_event_and_done_keeps_the_named_reason() {
+        let mut decoder = SseDecoder::new();
+        let events = decoder
+            .feed(b"data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n")
+            .expect("usage frame");
+        assert_eq!(events, vec![super::ProviderStreamEvent::usage(3, 4, 7)]);
+
+        let named = decoder
+            .feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n")
+            .expect("terminal frame");
+        assert_eq!(
+            named,
+            vec![super::ProviderStreamEvent::completed("tool_calls")]
+        );
+        let done = decoder.feed(b"data: [DONE]\n\n").expect("transport marker");
+        assert!(
+            done.is_empty(),
+            "the transport marker must not replace the provider's finish reason"
+        );
+        assert!(decoder.saw_terminal());
     }
 }
 
