@@ -1,71 +1,67 @@
 # CURRENT — bàn giao đang mở
 
-**Cập nhật:** 21/09/2026 · **Assignment:** M3 (TurnDriver, human input và bounded goals), scope `M3-01..M3-04`. Tiền nhiệm: M0/M1/M2 đã push (`f1fb002`+`4d6393e`, `a824b2c`, `6c91a62`).
+**Cập nhật:** 22/09/2026 · **Assignment:** M4–M12 theo kế hoạch `implementation-next`, tuần tự theo dependency và gate từng checkpoint. **Checkpoint hiện tại:** M4-01 xong (M4-02 là bước kế tiếp). Tiền nhiệm: M0/M1/M2 (`4d6393e`/`f1fb002`, `a824b2c`, `6c91a62`) và M3 (`03bea9a`, verified_local).
 
 ## 1. Assignment hiện tại và ràng buộc mới nhất
 
-- Prompt người dùng (21/09/2026): triển khai M3; đọc README/CONTRACTS/M3 + acceptance A09/A10/A11; xác minh prerequisites M1/M2; tạo SPEC; sửa crate hiện có, nối vào cùng binary `ha`; reuse tests; từng item theo thứ tự, targeted tests rồi milestone gate; không stub-success/không đổi fixture để che lỗi; bàn giao evidence/digest/discovery/OS limitations + CURRENT handoff; **dừng sau M3**; sau đó user yêu cầu trực tiếp **commit and push**.
-- Quyền đã cấp trong session: local cargo/pwsh, **commit/push** M3 sau khi gate xanh. Không paid API, không live smoke, không spawn agent.
-- Ràng buộc từ sổ tay: một workspace/CLI `ha`; không tạo runner/registry cạnh tranh với M0-04; giữ thay đổi không liên quan của user (`docs/OPERATOR_GUIDE.*`).
+- User (22/09/2026): triển khai M4–M12 theo dependencies, gate từng checkpoint, không chuyển tiếp khi prerequisites chưa đạt; cập nhật handoff sau mỗi checkpoint.
+- Quyền: local cargo/pwsh, docs SPEC/ADR/evidence/handoff, commit/push cho công việc M (đã cấp trong session). **Không** cấp: đổi User PATH, cài thật (`Install-Ha.ps1`), paid smoke/live provider, publish/release — tới M9 sẽ dừng và xin phép trước các bước đó.
+- Giữ `docs/OPERATOR_GUIDE.*` (thay đổi có trước của user, không commit).
 
 ## 2. Branch/base/source digest
 
-- Branch `master`; M3 rebase trên `6c91a62` (M2).
-- Source digest lần gate cuối: `sha256:09a19d63cb4559901eec6f6df3ce1087ca9baa8101b4a3fe3a4a098c948794d7` (332 file, loại `docs/evidence/M3.vi.md` + file này) — từ `GATE_RESULT_JSON.source_tree`.
+- Branch `master`; M4-01 trên base `03bea9a` (M3).
+- Source digest lần gate checkpoint M4: **chưa có** vì gate dừng ở bước host flake (chưa in `GATE_RESULT_JSON`); digest của revision sẽ được ghi khi gate xanh. Cây nguồn hiện tại = base `03bea9a` + diff M4-01 đã ghi trong evidence §2.
 
 ## 3. Work item
 
 | Item | Trạng thái | Evidence |
 |---|---|---|
-| M3-01 durable driver + minimum context | `implemented_unverified` | runtime schema v2 (`runs`, `run_steps`), `freeze_run_step` atomic với budget, manifest hash/step, `AgentRunId`/`StepId`, `is_dispatchable()` chặn stream invalid; `m3_01_*` (5 test) |
-| M3-02 question/steering/cancel | `implemented_unverified` | `questions` + `HumanInputService`, `run_commands` + `RunInbox`, CLI `ha input`; `m3_02_*` (3) + `a11_human_input_grant` (M3 half) |
-| M3-03 accounting + loop detection | `implemented_unverified` | `BudgetLedger` + 2 bảng, settle theo usage M2 khi có, loop detector window 6/limit 3; `m3_03_*` (4) |
-| M3-04 terminal/goal + CLI run | `implemented_unverified` | `goal.rs` typed criteria/verdict, continuation bounded, CLI `--mock/--goal/...`, JSON run/acceptance; `a09`, `a10`, `m3_04_*` (5) |
-| Registry/gate | đã nối | thêm entry `M3` vào `tests/acceptance/milestones.json` của M0-04; không tạo runner thứ hai |
+| M4-01 gate/approvals/receipts | `implemented_unverified` | binding mang session/task/invocation/`call_id`; consume+intent atomic; expiry/revoke/replay; descriptor registry; `call_id` vào intent+receipt; tools schema v2; `milestone_m4` 5/5. Gate checkpoint **blocked** vì host loopback (evidence §4) |
+| M4-02 filesystem/git | planned | P3 coverage giữ; còn `git log`, locked-file typed error, A15 assertions |
+| M4-03 process/spool | planned | permit queue (A13), env allowlist (A16), spool/quota (A17) |
+| M4-04 E2E/recovery | planned | digest-bound check evidence (A08), A03/A04 child-kill |
 
-## 4. File đã đổi
+## 4. File đã đổi (M4-01)
 
-Sửa: `crates/harness-types/src/{ids,lib}.rs`, `crates/harness-store-sqlite/src/{lib,models,store}.rs`, `crates/harness-runtime/src/lib.rs`, `crates/harness-tools/src/{lib,turn_driver}.rs`, `crates/harness-cli/src/main.rs`, `crates/harness-cli/src/interactive/{events,headless,mod,service}.rs`, `crates/harness-cli/src/interactive/tui/history.rs`, `crates/harness-cli/tests/{interactive_session,phase_p2,phase_p7}.rs`, `tests/acceptance/milestones.json`.
-Thêm: `crates/harness-store-sqlite/src/store/run.rs`, `crates/harness-runtime/src/{budget,goal,human_input,inbox}.rs`, `crates/harness-cli/tests/milestone_m3.rs`, `docs/specs/M3.vi.md`, `docs/evidence/M3.vi.md`, file này.
+Sửa: `crates/harness-store-sqlite/src/{models,store}.rs`, `crates/harness-tools/src/{contracts,service,turn_driver,loop_service,lib}.rs`, `crates/harness-types/src/contracts.rs`, `schemas/tool-execution-receipt.v1.schema.json`, fixture literals (`p1_fixture_host`, `phase_p1`, `milestone_m1`, `phase_p5/support`, `phase_p6`, `delegation_cli`, `harness-types/tests/contracts.rs`), `crates/harness-cli/src/interactive/service.rs` (boxed future), `tests/acceptance/milestones.json`.
+Thêm: `crates/harness-cli/tests/milestone_m4.rs`, `docs/specs/M4.vi.md`, `docs/adr/ADR-N03-EXECUTION-BINDING.{vi,en}.md`, `docs/evidence/M4.vi.md`.
 
 ## 5. Contract/ADR đã chốt — không đổi ngầm
 
-- Run/step identity dùng M0: `AgentRunId`, `StepId`; state vocabulary mirror `AgentState` (running/paused/completed/failed/canceled); driver chọn state qua `AgentState::apply(RunCommand)`. `waiting`/`blocked` phân biệt bằng `stop_reason` + `runs.acceptance`, không thêm state thứ hai.
-- `RUNTIME_SCHEMA_VERSION = 2`; DDL additive; DB mới hơn bị từ chối ghi (`MigrationFailed`), read-only vẫn đọc; test nâng cấp v1→v2.
-- Budget: `operation_id` unique; reserve trước dispatch; settle ưu tiên usage provider (frame cuối thắng), thiếu thì host estimate; unknown giữ bound; checked arithmetic; parent limit chặn child.
-- Question: `scope_key` unique, answer one-shot; cùng payload → Duplicate, khác → Conflict, empty/expired không consent.
-- A06 ở loop: stream thiếu terminal marker → `Unverified` (không execute/không retry); call malformed trong response có terminal → từ chối theo call, báo model, không execute.
-- Task acceptance vẫn thuộc `AcceptanceTransition` (M0); M3 chỉ ghi proposal gắn run.
+- **ADR-N03** (accepted M4): grant bind actor/task/session/invocation/action/workspace/fingerprint/policy+tool revision/expiry; một lần consume chung transaction với intent; `call_id` chỉ là correlation, `InvocationId` là authority; final guard revalidate trước dispatch; host **không** phải sandbox (`filesystem_network_sandbox=false`, `strict_isolation=false`); effect-before-receipt ⇒ `outcome_unknown`, không auto-rerun; spool/quota typed; check evidence phải khớp workspace digest.
+- `TOOLS_SCHEMA_VERSION=2` additive (`ensure_column` dùng PRAGMA + ALTER); DB v1 upgrade tại chỗ, host cũ từ chối DB mới hơn.
+- `ToolExecutionReceipt.call_id` optional `serde(default)`; schema JSON regenerate, drift test xanh.
+- `ToolDescriptor{id,revision,schema_digest,effect_class,capabilities}` + `coding_tool_descriptors()`; `prepare` từ chối tên không được advertise (external tools do host catalogue quyết).
+- A14 đã `implemented` trong registry; A11 giữ `planned` tới khi M4 gate đầy đủ (hai nửa M3+M4 đã có test riêng).
 
-## 6. Lệnh đã chạy và kết quả cuối
+## 6. Lệnh đã chạy và kết quả
 
-- `cargo test -p harness-cli --test milestone_m3 --locked` → **19 pass**.
-- `cargo test -p harness-cli --test milestone_m0|m1|m2 --locked` → 11 / 6 / 10 pass (m2 có 1 lần flake loopback khi chạy liền chuỗi, chạy riêng pass).
-- `cargo test -p harness-cli --test phase_p1|phase_p2|phase_p3|phase_p7|interactive_session --locked` → 21 / 17 / 21 / 15 / 13 pass.
-- `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check` → pass.
-- `$env:RUST_TEST_THREADS='4'; pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M3` → **passed**: format/clippy/build/workspace-tests + dependency-allowlist 44 edge + M3 19 required + closure M1 11 + M2 12 + M0 11; digest §2. (Biến môi trường chỉ giảm song song test trên host flake; runner không đổi bước/assertion.)
+- `cargo test -p harness-cli --test milestone_m4 --locked` → **5/5 pass**.
+- Regressions (khi host cho phép): `phase_p3` 21, `phase_p6` 15, `phase_p2` 17, `phase_p1` 21, `phase_p7` 15, `milestone_m0` 11, `milestone_m1` 6, `milestone_m3` 19, `harness-types` 20, `harness-tools` 6 — pass.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` + `cargo fmt --all -- --check` → pass.
+- `pwsh ... -Milestone M4` → **blocked**: `format/clippy/build/unit-tests/M4 required 5/closure-M3/closure-M1` xanh; `workspace-tests`/`closure-M2` đỏ vì loopback host (i03, a06_*, a07_401, m2_04). Bằng chứng môi trường: baseline `milestone_m2` (không có thay đổi harness M4) cũng fail 6-7/10 trong 3 lần chạy liên tiếp cùng ngày; từng test `--exact` một mình pass. Chi tiết ở `docs/evidence/M4.vi.md` §4.
 
-## 7. Việc còn lại theo thứ tự
+## 7. Việc còn lại theo thứ tự (M4)
 
-1. Reviewer đọc diff + `docs/evidence/M3.vi.md`; nếu gate xanh, nghiệm thu M3 (implementer không tự đặt `accepted`).
-2. Chạy gate M3 trên **Linux** (và `Verify-Phase.ps1 -Phase P2/P3` như regression đa nền tảng).
-3. **M4** mở A11 phần grant: normalized invocation proposal + grant bound, consume một lần, expiry/revoke; đồng thời bind `tool_call_id` vào intent/receipt (handoff M2) và implement `StorePort` qua adapter quanh store methods M3.
-4. Khi M4/M5 chạm: phát `AcceptanceCommand` từ goal satisfied; reconciliation/expiry cho reservation `Unknown` (M9).
-5. **Live smoke tùy chọn** (`scripts/Smoke-HaProvider.ps1`) với credential riêng — evidence hiện tại không claim tương thích live.
+0. **Chạy lại gate checkpoint M4 cho xanh** khi host hết flake loopback (đề xuất reboot máy hoặc chạy trên host khác); đây là điều kiện để chuyển sang M4-02. Nếu vẫn đỏ ở `milestone_m2`/`interactive_launch`, chạy full suite baseline để xác nhận lại nguyên nhân môi trường trước khi nghi code.
+1. **M4-01b**: A03/A04 child-kill fixture host (mở rộng `p1_fixture_host` hoặc bin mới) — receipt trước checkpoint, effect trước receipt, reopen/reconcile.
+2. **M4-02**: `git log` structured; `hash_file` locked → typed (không `WorkspaceEscape`); test A15 gộp (traversal/junction/alias/stale/CRLF/locked).
+3. **M4-03**: permit queue cancellation-aware + queued state (A13); env allowlist + secret JIT (A16); tree cleanup trung thực + Windows JobObject grandchild test; output spool + `read_process_output` page + quota/disk-full typed (A17).
+4. **M4-04**: `GoalEvidence.workspace_digest` + `EvidenceKind::Check` khớp fingerprint cuối; `a08_coding_e2e` repo tạm + cargo test thật; wrapper A03/A04.
+5. Gate M4 đầy đủ + evidence + nghiệm thu; sau đó mới sang M5.
 
 ## 8. Next action chính xác
 
-`pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M3 -Json` trên digest đã push; đọc `GATE_RESULT_JSON`, rồi reviewer quyết định nghiệm thu (không bắt đầu M4 trong session này).
+Mở `crates/harness-cli/tests/milestone_m4.rs` và thêm `a03_receipt_before_checkpoint`/`a04_effect_before_receipt` với fixture host bị kill thật (barrier env), rồi chạy `cargo test -p harness-cli --test milestone_m4 --locked` trước khi làm M4-02.
 
 ## 9. Blocked on
 
-Không. (Live smoke cần credential — ngoài scope bắt buộc.)
+**Host loopback**: gate checkpoint M4 không xanh được vì môi trường (baseline M2 cũng fail 6-7/10 khi chạy full suite; từng test một mình pass). Cần reboot máy hoặc chạy gate trên host/OS khác. (M9 install/PATH/paid smoke/publish sẽ cần quyền riêng — sẽ hỏi khi tới.)
 
 ## 10. Không lặp lại
 
-- Không thêm `RunId`/`RunStepId` hay state run thứ hai; dùng M0 contracts.
-- Không thay `RUNTIME_SCHEMA_VERSION` thêm lần nữa nếu không có contract change + test compat.
-- Không chạy migration trên data dir thật của user; fixture dùng temp dir.
-- Không tạo `Verify-Milestone.ps1`/`milestones.json` cạnh tranh với M0-04.
-- Gate `workspace-tests` có retry một lần (flake loopback/FS của host); **không** thêm retry cho `required-tests` hay nới assertion để đối phó flake.
-- Không "sửa" test để che lỗi: thay đổi test của M3 là bổ sung (`milestone_m3`) và hai assertion version có chủ đích; fixture step-bound đổi query vì loop detector (ghi rõ).
+- Không đổi `TOOLS_SCHEMA_VERSION` thêm lần nữa nếu không có contract change + test compat.
+- Không dùng `call_id` làm global identity; không bỏ scope khỏi binding hash.
+- Không claim sandbox/strict isolation; không claim M4 accepted khi M4-02..04 còn thiếu.
+- Không chạy live provider/paid smoke; không cài đặt/đổi PATH user; không publish.
