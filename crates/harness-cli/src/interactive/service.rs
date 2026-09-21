@@ -62,14 +62,19 @@ pub struct SubmitRequest {
 pub enum ApprovalDecision {
     /// Run this exact action once.
     Granted,
-    /// Run this action once, and stop asking about read-only actions until the run
+    /// Run this action once, and stop asking about **any** action until the run
     /// ends.
     ///
     /// It grants the pending request as well, because a panel that offers "allow
-    /// reads" and then blocks the read in front of you would be a lie. The wider
-    /// grant is bounded twice: it never covers a mutating action, and it is dropped
-    /// when the run reaches its terminal event.
-    GrantReadsForRun,
+    /// this turn" and then blocks the action in front of you would be a lie. The
+    /// grant is bounded by the turn: it is dropped when the run reaches its
+    /// terminal event, and it is recorded - one transcript line per action it
+    /// covers - so nothing runs unasked *and* unseen.
+    ///
+    /// Measured complaint that widened it: a turn of `git log`, `git status`,
+    /// `git diff` asked about every single command, and the old read-only grant
+    /// could not cover any of them, because `run_process` is not a read-only kind.
+    GrantForRun,
     /// Do not run it.
     Denied,
 }
@@ -84,14 +89,16 @@ pub trait SessionPort: Send {
     fn answer(&mut self, _request_id: &str, _decision: ApprovalDecision) -> bool {
         false
     }
-    /// Allow read-only actions without asking, until the current run ends.
+    /// Stop asking about gated actions until the current run ends.
     ///
     /// Separate from `answer` because it is a property of the run rather than a
-    /// reply to one proposal: the controller grants it when the user picks the wider
-    /// option, and revokes it when the run reaches its terminal event.
-    fn approve_reads_for_run(&mut self) {}
-    /// Revoke the read-only grant, because the run it was given for is over.
-    fn revoke_reads_for_run(&mut self) {}
+    /// reply to one proposal: the controller grants it when the user picks the
+    /// wider option, and revokes it when the run reaches its terminal event. The
+    /// policy checks that run before a proposal exists are **not** part of this
+    /// grant: it skips the question, never the check.
+    fn grant_run_approval(&mut self) {}
+    /// Revoke the turn-wide grant, because the run it was given for is over.
+    fn revoke_run_approval(&mut self) {}
     /// Ask for the resumable sessions of this project; the list arrives as an event.
     fn list_sessions(&mut self) {}
     /// Continue from a persisted session, or start a fresh conversation when None.
@@ -1080,40 +1087,42 @@ async fn run_turn(
         }
         None => coding_tool_schemas(),
     };
-    let run_request = RunRequest::new(
-        session_id.clone(),
-        task_id,
-        request.input_id.clone(),
-        request.text.clone(),
-        observation,
-    )
-    .with_tool_schemas(tool_schemas);
-    // Images the message names ride with it, so the model is shown the picture instead of
-    // being handed a path it would try to open with a text reader. A candidate that
-    // cannot be shown is said out loud: a reader who is not told why cannot tell it from
-    // a bug.
+    // Content the message names rides with it: images as blocks the model is shown, files
+    // as text the model reads. A candidate that cannot be attached is said out loud: a
+    // reader who is not told why cannot tell it from a bug.
     let attached = attachments::from_message(&request.text, &workspace_root);
     for note in &attached.notes {
         send(SessionEvent::Notice {
-            message: format!("image not attached ({note})"),
+            message: format!("not attached ({note})"),
         });
     }
-    let run_request = if attached.is_empty() {
-        run_request
-    } else {
-        for image in &attached.images {
-            send(SessionEvent::Notice {
-                message: format!("image attached: {}", image.attachment.label),
-            });
+    // The file text becomes part of the message itself, so what runs is what the user
+    // handed over: the API has no file block, and text is the only shape a file travels in.
+    let prompt = format!(
+        "{}{}",
+        request.text,
+        attachments::attachment_blocks(&attached.files)
+    );
+    let mut run_request = RunRequest::new(
+        session_id.clone(),
+        task_id,
+        request.input_id.clone(),
+        prompt,
+        observation,
+    )
+    .with_tool_schemas(tool_schemas);
+    if !attached.is_empty() {
+        for notice in attachments::attachment_notices(&attached.images, &attached.files) {
+            send(SessionEvent::Notice { message: notice });
         }
-        run_request.with_images(
+        run_request = run_request.with_images(
             attached
                 .images
                 .into_iter()
                 .map(|image| image.attachment)
                 .collect(),
-        )
-    };
+        );
+    }
     // Retrieval happens before dispatch, so the packet the runtime freezes carries
     // the exact memory versions that were read.
     let run_request = match &memory_principal {

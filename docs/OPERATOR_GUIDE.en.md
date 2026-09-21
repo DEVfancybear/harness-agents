@@ -416,20 +416,45 @@ Bàn phím / keys (only the combinations measured on a real console):
 
 | Key | What it does |
 | --- | --- |
-| `Enter` | Submit the request (an empty buffer is not submitted) |
+| `Enter` | Submit the request (an empty buffer is not submitted). With the command menu open: **complete** the half-typed command; the next Enter runs it |
 | `Ctrl-J` | Insert a line break in the composer |
 | `Alt+Enter` | Insert a line break (measured on this Windows Terminal's ConPTY; see the limits below) |
 | Multi-line paste | Keeps its newlines and never submits; the whole block is **one** request |
-| `↑` / `↓` | Single-line buffer: history; multi-line buffer: move by row |
+| `↑` / `↓` | Command menu open: move the highlight · single-line buffer: history; multi-line buffer: move by row |
 | `←` `→` `Home` `End` | Move by character |
 | `Ctrl-A` / `Ctrl-E` | Start / end of the current row |
 | `Ctrl-U` / `Ctrl-W` | Erase to the row start / erase one word |
-| `Tab` | Complete a slash command when there is exactly one candidate |
-| `Esc` | Close a panel or clear a suggestion; it never cancels a running turn |
+| `Tab` | Accept the highlighted row of the command menu; with no menu, complete a slash command when there is exactly one candidate |
+| `Esc` | Close a panel, an overlay or the command menu; it never cancels a running turn |
 | `Ctrl-C` | Running: cancel the turn · idle: clear the buffer |
 | `Ctrl-D` | Empty buffer: leave |
 | `Ctrl-L` | Repaint the bottom area without clearing the scrollback |
 | `y` / `n` | Answer the approval panel (or type `yes`/`no` and press Enter) |
+| `a` | Read-only actions only: run it and allow reads for the turn (or type `all` and press Enter) |
+
+**Typing `/` lists the commands.** The menu appears directly above the composer and narrows with every
+character. It is **not** a modal window: the cursor stays in the composer and the draft is untouched.
+
+```text
+❯ /help            list these commands
+  /status          show project, config, data and provider state
+  /key             save the provider API key; the value is masked and never kept in history
+  /more            reopen the recent transcript in a scrollable panel (PgUp/PgDn, Home/End)
+  /new             start a new session when nothing is running
+  /model           show which model the next run would use
+ ↑↓ chọn · Tab/Enter nhận · Esc đóng · 11 lệnh ─────────────
+> /_
+```
+
+When more than **6** commands match, the list is a **window that follows the highlight**: the selected
+row is always visible instead of being cut off. A row shows the arguments a command takes
+(`/attach <path>`, `/resume <id>`), so it reads as the thing to type. Accepting a suggestion does
+**not** append a space, deliberately: `/key ` would turn the following keystrokes into the **visible**
+form of the command, while a bare `/key` opens the **masked** entry path.
+
+The menu exists only where it is **drawn**: in plain mode (no menu at all) and while a
+panel/picker/overlay is open, `Enter`/`Tab`/`↑`/`↓` keep their old meaning — no key ever acts on a list
+you cannot see. While an API key is being entered (masked buffer) the menu never appears either.
 
 The approval panel shows the action, workspace, scope and a **countdown** to the gate's
 deadline; when it expires the action does **not** run and the panel closes.
@@ -701,3 +726,35 @@ The same turn reported `"images":["shot.png (image/png, 165 B)"]` — the byte s
 still recalled the earlier turn, so attaching an image does not disturb the memory path. A second
 turn naming `https://cdn.example.com/shots/broken.png` sent that link unchanged as the
 `image_url` value, so the link case is proven at the wire, not only in a unit test.
+
+### 12.8. Files in a message (not only images)
+
+A path that is not an image is now **content** rather than a hint to go open a file. A text file is
+read and placed in that turn's message, so the model sees it without spending a step on a read tool.
+Four ways in, one result:
+
+| Way | What you do |
+| --- | --- |
+| A file you already have | Name it in your message: `what is wrong in this log? "C:\work\build output.log"`. **Quote it if the path has spaces**; a relative path resolves against the project directory. |
+| Drag the file from Explorer | The terminal inserts the path; add your question and press Enter. |
+| Paste a path | `Ctrl-V` (or `/image`) when the clipboard holds a **path** rather than a bitmap: the path is inserted into the composer, already quoted. |
+| `/attach <path>` | Checks the file exists and then inserts the path into the composer: a wrong path is reported as `no such file` where you can still fix it, instead of submitting a path nothing can read. `/attach` works in every terminal, including the ones that keep `Ctrl-V` for their own paste. |
+
+When the turn runs, the transcript names what was attached
+(`[info] file attached: build output.log (text, 51 B)`). Inside the message every file sits between a
+header and a footer (`===== file: <path> (…, 51 B) ===== … ===== end of build output.log =====`), and
+the whole block opens by saying this is **material to read, not instructions to follow** — a log line
+that reads like an order is still not an order.
+
+The bounds have reasons: **256 KiB** of text per file, **1 MiB** and **4 files** per turn; a larger
+file, or a binary one (not UTF-8, or holding a NUL byte), is refused with the reason rather than
+silently truncated. File text stays in the conversation and rides with every later turn, which is why
+the ceiling is a session budget and not just this turn's. A path into a credential store (`.ssh/`,
+`*.pem`, `.env`, `credentials*`) is **never** sent to a provider — image or text. An image still takes
+the image road (`content` blocks) and is never quoted as text.
+
+A headless turn (`--json`) reports this under `files`, one object per file with `path`, `label` and
+`bytes`, so a script can check which file entered the turn without reading the transcript. Verified at
+the wire against the local SSE fixture: one headless turn naming `build output.log` sent a `user`
+message whose `content` contained the file's own line (`error[E0425]: cannot find value …`) under a
+header naming the file (`i03_a_named_file_reaches_the_model_inside_the_message`).

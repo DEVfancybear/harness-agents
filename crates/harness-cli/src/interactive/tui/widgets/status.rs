@@ -209,7 +209,8 @@ mod tests {
             max_steps: 8,
             tool_calls: 0,
             max_tool_calls: 16,
-            completion: Vec::new(),
+            suggestions: Vec::new(),
+            suggestion_selected: 0,
             fallback_reason: None,
             tick: 0,
         }

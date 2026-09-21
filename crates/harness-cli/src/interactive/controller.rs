@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use harness_types::InputId;
 
-use super::attachments;
+use super::attachments::{self, paths_touched};
 use super::bootstrap::LaunchContext;
 use super::bounds::{self, DEFAULT_CONTINUATIONS};
 use super::credentials::CredentialSource;
@@ -290,7 +290,8 @@ impl InteractiveController {
             max_steps: self.bounds.max_steps,
             tool_calls: self.tool_calls,
             max_tool_calls: self.bounds.max_tool_calls,
-            completion: self.completion(),
+            suggestions: self.editor.suggestions().to_vec(),
+            suggestion_selected: self.editor.suggestion_selected(),
             fallback_reason: self.fallback_reason.clone(),
             tick: self.tick,
         }
@@ -322,9 +323,18 @@ impl InteractiveController {
         })
     }
 
-    /// Slash commands that complete the current buffer.
-    fn completion(&self) -> Vec<&'static str> {
-        self.editor.suggestions().to_vec()
+    /// Whether the slash-command menu is on screen right now.
+    ///
+    /// This is the same predicate the layout uses to reserve rows for it, and it
+    /// has to be: a key must never act on a list the user cannot see. The plain
+    /// renderer draws no menu, and a panel or picker that owns the keyboard
+    /// replaces it, so neither may consume an arrow or an Enter for it.
+    fn suggestion_menu_open(&self) -> bool {
+        !self.plain
+            && self.pending_approval.is_none()
+            && self.editor.picker().is_none()
+            && self.editor.overlay().is_none()
+            && !self.editor.suggestions().is_empty()
     }
 
     /// Everything the host prints once, before the first prompt.
@@ -409,6 +419,27 @@ impl InteractiveController {
                     };
                 }
                 Key::EndOfInput => return self.command("/exit"),
+                _ => {}
+            }
+        }
+        // The suggestion menu does not own the keyboard - the composer keeps the
+        // focus and the draft stays visible - but while it is drawn these keys act
+        // on it, and only then. Enter completes a half-typed command instead of
+        // submitting it; the next Enter runs it.
+        if self.suggestion_menu_open() {
+            match key {
+                Key::Up => {
+                    self.editor.move_suggestion(-1);
+                    return vec![Effect::Redraw];
+                }
+                Key::Down => {
+                    self.editor.move_suggestion(1);
+                    return vec![Effect::Redraw];
+                }
+                Key::Tab | Key::Enter => {
+                    self.editor.accept_suggestion();
+                    return vec![Effect::Redraw];
+                }
                 _ => {}
             }
         }
@@ -836,6 +867,18 @@ impl InteractiveController {
             "/image" => {
                 self.paste_image(&mut effects);
             }
+            "/attach" => {
+                match raw_argument {
+                    Some(paths) => self.attach_file(paths, &mut effects),
+                    None => self.push_history(
+                        &mut effects,
+                        HistoryItem::Notice {
+                            message: "/attach <path>: name the file to attach, or type or paste the path into your message. An image is shown to the model, a text file is put in the message; a path with spaces has to be quoted"
+                                .to_owned(),
+                        },
+                    ),
+                }
+            }
             "/status" => {
                 let mut lines = self.header.clone();
                 lines.push(format!("Phase:   {}", self.phase.label()));
@@ -1174,22 +1217,24 @@ impl InteractiveController {
         effects.push(Effect::History(item));
     }
 
-    /// Take a bitmap off the clipboard and name it in the composer.
+    /// Take what the clipboard holds and make it part of the message.
     ///
-    /// The bytes are written next to the store and their path is inserted, quoted: from
-    /// there the ordinary message scan attaches it, so a screenshot, a drag-and-drop and
-    /// a typed path all take the same road into the request.
+    /// A bitmap first: a screenshot has no text form, so the app reads it itself, writes it
+    /// next to the store and names the file in the composer, and from there the ordinary
+    /// message scan attaches it. Then text: the clipboard of someone who copied a file in
+    /// Explorer, or dragged one into the terminal, holds that file's path, and pasting the
+    /// path is exactly what the message scan needs in order to read the file. Pasting
+    /// **nothing** is the one case that has to say so: a key that does nothing reads as a
+    /// broken key.
+    ///
+    /// Deliberately not pasted here: a clipboard holding a wall of unrelated text. That is
+    /// what the terminal's own paste is for, and a stray Ctrl-V must not turn a draft into a
+    /// document.
     fn paste_image(&mut self, effects: &mut Vec<Effect>) {
         let png = match attachments::clipboard_png() {
             Ok(Some(png)) => png,
             Ok(None) => {
-                self.push_history(
-                    effects,
-                    HistoryItem::Notice {
-                        message: "the clipboard holds no image; copy a screenshot first, or name an image file in your message"
-                            .to_owned(),
-                    },
-                );
+                self.paste_clipboard_text(effects);
                 return;
             }
             Err(reason) => {
@@ -1217,6 +1262,83 @@ impl InteractiveController {
         // The editor's own outcome is deliberately ignored beyond the redraw: the text
         // was inserted by this call, so it cannot be a submit or an exit.
         let _ = outcome;
+    }
+
+    /// Paste a path the clipboard holds, or say that the clipboard has nothing to paste.
+    fn paste_clipboard_text(&mut self, effects: &mut Vec<Effect>) {
+        match attachments::clipboard_text() {
+            Ok(Some(text)) if !text.trim().is_empty() => {
+                let candidate = text.trim().to_owned();
+                let quoted = quote_for_composer(&candidate);
+                let outcome = self.editor.handle(Key::Paste(format!("{quoted} ")));
+                self.push_history(
+                    effects,
+                    HistoryItem::Notice {
+                        message: format!(
+                            "pasted {candidate}: it is read and attached when you send the message"
+                        ),
+                    },
+                );
+                effects.push(Effect::Redraw);
+                let _ = outcome;
+            }
+            Ok(_) => {
+                self.push_history(
+                    effects,
+                    HistoryItem::Notice {
+                        message: "the clipboard holds no image and no text; copy a screenshot or a file, or name a path in your message"
+                            .to_owned(),
+                    },
+                );
+            }
+            Err(reason) => {
+                self.push_history(effects, HistoryItem::Error { message: reason });
+            }
+        }
+    }
+
+    /// The paths one `/attach` argument names, each as the message scan would see it.
+    ///
+    /// `/attach` is the path that works in every terminal, including the ones that keep
+    /// Ctrl-V for their own paste. Rather than keep a second attachment pipeline, it checks
+    /// the path is a real file and then puts it in the composer, so the message that is
+    /// submitted is the same one a typed or dragged path produces.
+    fn attach_file(&mut self, argument: &str, effects: &mut Vec<Effect>) {
+        let workspace = self.context.project.root.clone();
+        let mut accepted: Vec<String> = Vec::new();
+        for candidate in paths_touched(argument) {
+            let Some(path) = attachments::resolve_path(&candidate, &workspace) else {
+                self.push_history(
+                    effects,
+                    HistoryItem::Error {
+                        message: format!("{candidate}: no such file"),
+                    },
+                );
+                continue;
+            };
+            accepted.push(quote_for_composer(&path.display().to_string()));
+        }
+        if accepted.is_empty() {
+            return;
+        }
+        let pasted = format!("{} ", accepted.join(" "));
+        let outcome = self.editor.handle(Key::Paste(pasted));
+        self.push_history(
+            effects,
+            HistoryItem::Notice {
+                message: format!(
+                    "{} file(s) named in the message: they are read and attached when you send it",
+                    accepted.len()
+                ),
+            },
+        );
+        effects.push(Effect::Redraw);
+        // Nothing was submitted by naming a file, so any other outcome would be a bug this
+        // call is not allowed to hide.
+        debug_assert!(
+            !matches!(outcome, InputOutcome::Submit(_) | InputOutcome::Exit),
+            "naming a file must not submit or exit"
+        );
     }
 
     /// Keep the newest lines for `/more`.
@@ -1343,6 +1465,20 @@ impl InteractiveController {
     }
 }
 
+/// A path as the composer should hold it: quoted, because a path with spaces is one token
+/// and the message scan only sees one that way.
+///
+/// Free rather than a method because it touches no state: the paste path and `/attach` have
+/// to agree on it exactly, or one of them would put a message in the composer that the other
+/// cannot read back as a path.
+fn quote_for_composer(path: &str) -> String {
+    let already_quoted = path.len() >= 2 && path.starts_with('"') && path.ends_with('"');
+    if already_quoted || !path.contains(char::is_whitespace) {
+        return path.to_owned();
+    }
+    format!("\"{path}\"")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_CONTINUATIONS, EXIT_SUCCESS, Effect, InteractiveController, TurnBounds};
@@ -1351,6 +1487,7 @@ mod tests {
         AppPhase, HistoryItem, Key, Modal, PauseReason, RunOutcome, SessionCandidate, SessionEvent,
         ToolState,
     };
+    use crate::interactive::input::SLASH_COMMANDS;
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
     use crate::interactive::service::{
         ApprovalDecision, FixtureService, SessionChannel, SessionPort, SubmitRequest,
@@ -1492,7 +1629,9 @@ mod tests {
         controller: InteractiveController,
         events: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
         port: RecordingPort,
-        _temp: tempfile::TempDir,
+        /// Kept alive for the fixture's lifetime: dropping it would delete the home and
+        /// project directories out from under the controller.
+        temp: tempfile::TempDir,
     }
 
     fn bench(configured: bool) -> Bench {
@@ -1515,7 +1654,7 @@ mod tests {
             controller,
             events,
             port,
-            _temp: temp,
+            temp,
         }
     }
 
@@ -1536,7 +1675,7 @@ mod tests {
             controller,
             events,
             port,
-            _temp: temp,
+            temp,
         }
     }
 
@@ -2239,6 +2378,153 @@ mod tests {
         let exit = submit_text(&mut harness.controller, "/exit");
         assert!(exit.contains(&Effect::Exit(EXIT_SUCCESS)), "{exit:#?}");
         assert_eq!(harness.controller.phase(), AppPhase::Closed);
+    }
+
+    /// The measured gap this closes: typing `/` listed nothing. The user had to
+    /// know the command already, and `/help` was the only way to find out - after
+    /// the fact. Now the frame carries the matches and the row that the next Tab
+    /// or Enter would accept, from the first slash.
+    #[test]
+    fn slash_the_snapshot_carries_the_menu_and_the_highlight() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+
+        type_text(&mut harness.controller, "/");
+        let state = harness.controller.ui_state();
+        assert_eq!(
+            state
+                .suggestions
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            SLASH_COMMANDS
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            "one slash offers every command"
+        );
+        assert_eq!(state.suggestion_selected, 0);
+        assert_eq!(state.buffer, "/", "and the draft is untouched");
+
+        type_text(&mut harness.controller, "re");
+        let state = harness.controller.ui_state();
+        assert_eq!(
+            state
+                .suggestions
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            ["/resume"],
+            "the menu narrows with every letter"
+        );
+
+        let _ = harness.controller.handle_key(Key::Down);
+        assert_eq!(
+            harness.controller.ui_state().suggestion_selected,
+            0,
+            "one match: the highlight cannot move off it"
+        );
+        assert_eq!(harness.controller.ui_state().buffer, "/re");
+    }
+
+    /// Tab accepts the highlighted command even when several match - that is what
+    /// the menu on screen is for. The editor alone would refuse, which is why the
+    /// decision lives where the drawing happens.
+    #[test]
+    fn slash_tab_accepts_the_row_the_menu_has_highlighted() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        type_text(&mut harness.controller, "/");
+        assert!(
+            harness.controller.ui_state().suggestions.len() > 1,
+            "the ambiguous case is the one under test"
+        );
+
+        let effects = harness.controller.handle_key(Key::Tab);
+        assert_eq!(effects, vec![Effect::Redraw]);
+        assert_eq!(
+            harness.controller.ui_state().buffer,
+            "/help",
+            "Tab takes the first row"
+        );
+
+        // Move the highlight, and Tab takes that row instead.
+        let _ = harness.controller.handle_key(Key::EraseToLineStart);
+        type_text(&mut harness.controller, "/");
+        let _ = harness.controller.handle_key(Key::Down);
+        let _ = harness.controller.handle_key(Key::Down);
+        let _ = harness.controller.handle_key(Key::Tab);
+        assert_eq!(harness.controller.ui_state().buffer, "/key");
+    }
+
+    /// Enter completes a half-typed command instead of submitting it; the next
+    /// Enter runs the command. `/he` used to be answered with "unknown command".
+    #[test]
+    fn slash_enter_completes_a_half_typed_command_then_runs_it() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        type_text(&mut harness.controller, "/he");
+
+        let effects = harness.controller.handle_key(Key::Enter);
+        assert_eq!(effects, vec![Effect::Redraw], "nothing ran yet");
+        assert_eq!(harness.controller.ui_state().buffer, "/help");
+        assert!(
+            submissions(&harness).is_empty(),
+            "completing a command is not submitting a request"
+        );
+        assert!(
+            harness.controller.transcript().is_empty(),
+            "and not a command either"
+        );
+
+        let _ = harness.controller.handle_key(Key::Enter);
+        assert!(
+            matches!(
+                harness.controller.ui_state().modal,
+                Some(Modal::Overlay { ref title, .. }) if title == "/help"
+            ),
+            "the second Enter ran the completed command: {:?}",
+            harness.controller.ui_state().modal
+        );
+    }
+
+    /// Where the menu is not drawn it must not take a key. Two places: the plain
+    /// renderer, which has no menu at all, and a panel that owns the keyboard.
+    #[test]
+    fn slash_the_menu_never_takes_a_key_where_it_is_not_drawn() {
+        // Plain line input: Enter submits what was typed, as it always has.
+        let mut plain = bench(true);
+        let _ = plain.controller.boot_lines();
+        let lines = effects_to_plain(&submit_text(&mut plain.controller, "/he")).join("\n");
+        assert!(
+            lines.contains("unknown command /he"),
+            "plain mode must not complete a list it never showed: {lines}"
+        );
+
+        // TUI with a panel open: the panel owns the frame, so the same draft is
+        // submitted rather than silently completed into a list nobody can see.
+        let mut tui = tui_bench(true);
+        let _ = tui.controller.boot_lines();
+        let _ = submit_text(&mut tui.controller, "/help");
+        assert!(
+            tui.controller.ui_state().modal.is_some(),
+            "the reference panel is open"
+        );
+        type_text(&mut tui.controller, "/he");
+        assert_eq!(
+            tui.controller.ui_state().suggestions.len(),
+            1,
+            "the editor still holds the candidate; the frame is what hides it"
+        );
+        let _ = tui.controller.handle_key(Key::Enter);
+        assert!(
+            tui.controller
+                .transcript()
+                .join("\n")
+                .contains("unknown command /he"),
+            "Enter answered the draft, not a menu that is not on screen: {:?}",
+            tui.controller.transcript()
+        );
     }
 
     #[test]
@@ -3382,6 +3668,101 @@ mod tests {
         assert!(
             line.contains(&format!("{DEFAULT_CONTINUATIONS} automatic continuation")),
             "{line}"
+        );
+    }
+
+    /// `/attach` names a file in the message, and sending that message attaches it.
+    ///
+    /// The point of the command is that it needs no clipboard and no terminal support, so
+    /// this drives it the way a user does: type the command, press Enter, then write the
+    /// message. The notice that comes back says the file is named in the message; the real
+    /// read happens when that message is sent.
+    #[test]
+    fn t_attach_names_a_file_in_the_message_and_the_turn_reads_it() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        // A name with a space, because that is the case the quoting exists for.
+        let spaced = harness.temp.path().join("my notes.txt");
+        std::fs::write(&spaced, b"the parser drops the last line\n").expect("fixture file");
+        let quoted = format!("\"{}\"", spaced.display());
+
+        type_text(&mut harness.controller, &format!("/attach {quoted}"));
+        let plain = effects_to_plain(&harness.controller.handle_key(Key::Enter));
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("1 file(s) named in the message")),
+            "{plain:#?}"
+        );
+        assert_eq!(harness.controller.display_buffer(), format!("{quoted} "));
+
+        // The message that follows carries the path, so the turn reads the file.
+        let _ = harness.controller.handle_key(Key::Newline);
+        type_text(&mut harness.controller, "what is wrong?");
+        let submitted = submissions(&harness);
+        assert!(submitted.is_empty(), "nothing was sent yet: {submitted:?}");
+        let _ = harness.controller.handle_key(Key::Enter);
+        let submitted = submissions(&harness);
+        assert_eq!(submitted.len(), 1, "{submitted:?}");
+        assert!(
+            submitted[0].contains("what is wrong?")
+                && submitted[0].contains(&spaced.display().to_string()),
+            "{submitted:?}"
+        );
+    }
+
+    /// A path that is not there is refused where the user can still fix it.
+    #[test]
+    fn t_attach_refuses_a_path_that_is_not_there_and_explains_itself() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+
+        let plain = effects_to_plain(&submit_text(
+            &mut harness.controller,
+            "/attach definitely-not-here.txt",
+        ));
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("no such file") && line.starts_with("[error]")),
+            "{plain:#?}"
+        );
+        assert_eq!(
+            harness.controller.display_buffer(),
+            "",
+            "a refused path must not be pasted into the message"
+        );
+
+        // No argument: the command says how it is used instead of doing nothing.
+        let plain = effects_to_plain(&submit_text(&mut harness.controller, "/attach"));
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("/attach <path>") && line.contains("quoted")),
+            "{plain:#?}"
+        );
+    }
+
+    /// A path the composer receives is quoted exactly once, whichever road it came in by.
+    ///
+    /// A paste with no bitmap on the clipboard pastes the path it holds, so a file copied
+    /// in Explorer becomes an attachment without any terminal support for it. The clipboard
+    /// itself is machine state this crate cannot set, so what is asserted here is the text
+    /// that branch hands the composer.
+    #[test]
+    fn t_a_pasted_path_is_quoted_once() {
+        assert_eq!(
+            super::quote_for_composer(r"C:\work\a b\shot.png"),
+            "\"C:\\work\\a b\\shot.png\""
+        );
+        assert_eq!(
+            super::quote_for_composer(r"C:\work\shot.png"),
+            r"C:\work\shot.png"
+        );
+        assert_eq!(
+            super::quote_for_composer("\"C:\\work\\shot.png\""),
+            "\"C:\\work\\shot.png\"",
+            "an already quoted path is not quoted twice"
         );
     }
 }

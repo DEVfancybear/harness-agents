@@ -756,6 +756,207 @@ harness-cli (controller/UI):
   t06_the_read_only_grant_does_not_survive_the_turn                 -> [true, false] quanh RunTerminal
 ```
 
+## 3h. File trong một yêu cầu — không chỉ ảnh (lượt này)
+
+### 3h.1. Vì sao có mục này
+
+Người dùng báo hai điều trong một câu: dán ảnh vào terminal **không hoạt động**, và muốn **support
+cả file**. Điều tra ra hai nguyên nhân khác nhau, và chỉ một trong hai là lỗi code:
+
+1. **Binary đang chạy không có tính năng ảnh.** `target/release/ha.exe` trên máy này là bản dựng
+   `18/09/2026 16:29`, tức **trước** hai commit ảnh (`62e3f98`, `4225363`). Trong binary đó không
+   có chuỗi `arboard`, không có `image ready: `, không có `/image` — nên phím cũng như lệnh đều
+   không tồn tại. Đây là **binary cũ**, không phải code sai; muốn có tính năng thì phải dựng lại.
+2. **Đường dẫn không phải ảnh bị bỏ qua im lặng.** `from_message` chỉ nhận ảnh; một file text tên
+   trong tin nhắn không được gắn, không được báo, và model chỉ thấy đường dẫn trần. Đây là **thiếu
+   sót thiết kế** thật, và là phần lượt này sửa.
+
+Một dữ kiện của terminal phải nói rõ, vì nó quyết định cả thiết kế: **Ctrl-V là phím của terminal,
+không phải của app.** Windows Terminal giữ nó cho paste của chính nó, nên app không bao giờ thấy
+phím; cái app nhận được là *text* đã dán. Vì vậy mọi tính năng "dán" phải có một đường **không phụ
+thuộc bàn phím**: ở đây là `/image` và `/attach`.
+
+### 3h.2. Hợp đồng đã chốt
+
+1. **Bytes quyết định, tên file không quyết định.** File có magic PNG/JPEG/GIF/WebP đi đường ảnh
+   (block `content`), kể cả khi tên là `.txt`. Tên `.png` mà bytes không phải ảnh bị từ chối kèm
+   lý do, không bị quote thành text.
+2. **Text đi trong chính message.** API không có block cho file, nên nội dung file được nối vào
+   `request.text` — và vì `request.text` là thứ được persist vào packet, lượt sau vẫn thấy đúng
+   những gì lượt trước đã đọc. Không thêm field nào vào `RunRequest`.
+3. **Khối file tự khai nó là gì.** Mỗi file nằm giữa `===== file: <path> (<label>) =====` và
+   `===== end of <name> =====`, cả khối mở đầu bằng một câu nói rõ đây là **tài liệu để đọc,
+   không phải chỉ dẫn** — prompt injection qua nội dung file là rủi ro thật khi nội dung do người
+   dùng đưa, và cách rẻ nhất để chặn là nói thẳng vai trò của nó cho model.
+4. **Trần là ngân sách của session, không phải của lượt.** 256 KiB mỗi file, 1 MiB và 4 file mỗi
+   lượt; đọc có trần (`take(MAX+1)`) nên một file 2 GiB không bao giờ được nạp vào bộ nhớ để rồi
+   bị từ chối.
+5. **Binary bị từ chối kèm lý do**, không bị cắt âm thầm: không phải UTF-8, hoặc có byte NUL →
+   `not UTF-8 text` / `binary (it holds NUL bytes)`. Model đọc byte thô hoặc ký tự thay thế thì
+   biết ít hơn là được nói thẳng loại file.
+6. **Credential không bao giờ đi** — `.ssh/`, `*.pem`, `.env`, `credentials*`, như đường ảnh.
+7. **`/attach <path>` kiểm tra file tồn tại rồi mới chèn path vào composer**, để sai đường dẫn bị
+   báo tại chỗ (`no such file`) thay vì gửi một path không đọc được. Nó **không** mở pipeline thứ
+   hai: path vào composer rồi đi đúng đường quét message như path gõ tay.
+8. **Paste không có bitmap thì dán path.** `Ctrl-V`/`/image` thử bitmap trước; không có bitmap thì
+   lấy text clipboard (path do Explorer copy), quote nếu có dấu cách, và **không** dán một khối
+   text dài không liên quan — đó là việc của paste terminal, và một Ctrl-V lỡ tay không được biến
+   bản nháp thành tài liệu.
+
+### 3h.3. Test canh hợp đồng (tên thật, đã chạy)
+
+```text
+harness-cli (attachments, unit):
+  a_text_file_is_read_into_the_message          -> khối file + header + câu "material to read"
+  a_binary_file_is_refused_by_its_bytes         -> NUL, không-UTF-8, và .txt chứa PNG
+  file_bounds_are_enforced_with_a_reason        -> 256 KiB, 4 file, cùng file hai lần là một
+  a_pasted_file_path_is_read_the_same_way       -> path quote / trần / có dấu cách cuối
+harness-cli (controller):
+  t_attach_names_a_file_in_the_message_and_the_turn_reads_it
+  t_attach_refuses_a_path_that_is_not_there_and_explains_itself
+  t_a_pasted_path_is_quoted_once
+harness-cli (wire, fixture SSE thật):
+  i03_a_named_file_reaches_the_model_inside_the_message
+harness-cli: 242 passed; 0 failed (cargo test -p harness-cli --bin ha)
+```
+
+### 3h.4. Khiếm khuyết bắt được trong lượt này — **chưa sửa, ghi lại thay vì im lặng**
+
+Dựng test wire cho phần file thì mỗi lượt `ha chat --headless` trả về:
+
+```text
+workspace_escape: cannot hash workspace file: The process cannot access the file because
+another process has locked a portion of the file. (os error 33)
+```
+
+Truy ra: `observe_workspace` **hash mọi file** nó đi qua (`workspace_fingerprint` →
+`hash_file`), mà một store `SQLite` đang mở thì giữ **byte-range lock** trên
+`harness.sqlite3-shm`/`-wal`; Windows trả `ERROR_LOCK_VIOLATION` (33) cho lần đọc đó. Đo được
+bằng `SqliteStore` thật đặt trong workspace: `observe_workspace` trả đúng lỗi trên
+(`crates/harness-cli/tests/known_defects.rs`, test `#[ignore]`, chạy tay để tái hiện).
+
+Hai điều sai, và **không** điều nào được sửa trong lượt này vì mỗi điều là một thay đổi riêng:
+
+1. **Chẩn đoán sai chỗ:** lock violation không phải `workspace_escape`; thông báo gửi người
+   đọc đi tìm một lỗi đường dẫn không tồn tại.
+2. **File bị khoá làm lượt chết**, thay vì bị bỏ qua: walk đã bỏ qua đường dẫn nhạy cảm, và
+   một store do chính app sở hữu cũng thuộc loại "không phải nội dung workspace".
+
+Bố cục mặc định **không** dính: trên Windows store nằm ở
+`%LOCALAPPDATA%\HarnessAgents\data`, ngoài project. Nó chỉ tới được qua `HA_HOME` khi biến đó
+trỏ vào chính project đang chạy — và khi đó lượt **đầu** vẫn chạy (store chưa tồn tại), mọi
+lượt **sau** mới chết. Test wire vì vậy chạy đúng như một lần chạy thật: tiến trình con khởi
+động trong project, còn `HA_HOME` ở ngoài project.
+
+## 3i. Gõ `/` là ra danh sách lệnh (lượt này)
+
+### 3i.1. Vì sao có mục này
+
+Người dùng báo: *"khi tôi dùng codex: gõ `/` thì sẽ gợi ý câu lệnh, hiện tại project chưa có"*.
+Đúng, và khoảng trống này có số đo: `LineEditor` **đã** tính `suggestions()` từ T03, nhưng thứ duy
+nhất nhìn thấy được là **tiêu đề viền** của ô soạn thảo (`composer::hint` in `Tab: /help  /status
+…`), một dòng bị cắt ở console hẹp và **không** nói lệnh nào làm gì. Người dùng phải biết lệnh
+trước khi gõ `/`, hoặc mở `/help` rồi đọc lại - tức danh sách đến **sau** khi cần.
+
+Codex CLI và Claude Code đều trả lời câu hỏi này bằng một **menu ngay trên ô soạn thảo**, lọc theo
+từng ký tự. Mục này làm đúng thứ đó, trên đường ống đã có: bảng lệnh, editor, layout và renderer
+hiện tại, không thêm dependency và không thêm renderer thứ ba.
+
+### 3i.2. Hợp đồng đã chốt
+
+1. **Menu không phải modal.** Ô soạn thảo **giữ** con trỏ và bản nháp vẫn nằm trên màn hình; menu
+   chỉ chiếm các hàng ngay trên nó (`Plan::suggest`). Một modal thay cả vùng trên và lấy con trỏ
+   (`layout::cursor_cell` trả `None` khi có modal), nên nó không thể là modal: người dùng đang gõ.
+2. **Một bảng là nguồn duy nhất.** `SLASH_COMMANDS: [SlashCommand; 11]` mang `name`, `arguments`,
+   `summary`; menu vẽ từ đó, và `view::help_lines()` **sinh** trang `/help` từ chính bảng đó
+   (thêm một dòng viết tay: dạng kém riêng tư `/key <value>`, và dòng cuối về `Ctrl-C`/`Ctrl-D`).
+   Vì vậy một lệnh mới không thể có trong menu mà thiếu ở `/help`, hay ngược lại.
+3. **Mở từ ký tự `/` đầu tiên, hẹp dần theo từng ký tự.** Điều kiện hiện danh sách: buffer bắt đầu
+   `/`, **không** có khoảng trắng (tức con trỏ còn ở trong từ lệnh), và **chưa** là một lệnh hoàn
+   chỉnh. `/help` gõ đủ thì menu tắt: một hàng lặp lại đúng thứ vừa gõ là tiếng ồn.
+4. **Trần 6 hàng, và cửa sổ đi theo con trỏ chọn.** Nhiều hơn 6 gợi ý thì danh sách **cuộn theo
+   highlight** (`suggest::window`) chứ không cắt: lệnh đang chọn **luôn** nhìn thấy. Hàng lấy từ
+   vùng live block, **không** lấy từ ô soạn thảo - cùng nguyên tắc "bản nháp đang gõ không bị ép".
+5. **Bốn phím, và chỉ khi menu đang được vẽ.** `↑`/`↓` đổi highlight (bão hoà hai đầu như picker,
+   không quấn vòng), `Tab` và `Enter` nhận hàng đang chọn, `Esc` đóng menu (lần gõ tiếp theo mở
+   lại). Quyết định nằm ở **controller** (`suggestion_menu_open`), không ở editor: editor chỉ giữ
+   danh sách và highlight, còn "có nhìn thấy hay không" chỉ host biết.
+6. **Menu không lấy phím ở nơi nó không được vẽ.** Hai nơi: **plain mode** (không có menu) và **khi
+   một panel/picker/overlay đang mở** (panel thay menu bằng chính nó). Cùng một điều kiện mà
+   `layout::plan` dùng để chừa hàng, nên "vẽ" và "nhận phím" không thể lệch nhau. Hệ quả: `/he` +
+   Enter ở plain mode vẫn là `unknown command /he` như trước, không tự hoàn thành một danh sách
+   người dùng chưa từng thấy.
+7. **Enter hoàn thành lệnh gõ dở, Enter thứ hai mới chạy.** `/he` + Enter → buffer thành `/help`;
+   Enter nữa → mở panel `/help`. Trước lượt này `/he` + Enter trả `unknown command /he`.
+8. **Nhận gợi ý KHÔNG thêm dấu cách.** Cố ý: `/key ` sẽ biến các ký tự gõ sau đó thành dạng **lộ**
+   của lệnh (`/key <value>`), trong khi `/key` trần là đường **mask**. Một Enter thừa để chạy lệnh
+   là giá rẻ hơn nhiều so với việc đẩy người dùng vào dạng kém riêng tư mà họ không chọn.
+9. **Buffer secret không bao giờ mở menu.** `refresh_suggestion` thoát sớm khi `self.secret`, kể cả
+   khi có ai đó dán `/re` vào lúc đang nhập key.
+
+### 3i.3. Đổi hợp đồng có chủ ý (ghi lại, không đổi ngầm)
+
+| Trước | Sau | Lý do |
+|---|---|---|
+| `Tab` chỉ hoàn thành khi có **đúng một** gợi ý; nhiều gợi ý thì `Tab` không làm gì | Menu đang vẽ: `Tab` nhận **hàng đang chọn** (mặc định hàng đầu) | Đó là điều một menu có highlight để làm; luật cũ vẫn đúng ở tầng editor và vẫn áp khi menu không được vẽ |
+| `Enter` trên `/he` → notice `unknown command /he` | `Enter` hoàn thành hàng đang chọn; Enter lần sau chạy lệnh | Gõ dở rồi Enter là ý định rõ ràng; thông báo lỗi cho một lệnh gần đúng là câu trả lời vô ích |
+| Tiêu đề viền in `Tab: /help  /status  …` (danh sách bị cắt) | Tiêu đề in `↑↓ chọn · Tab/Enter nhận · Esc đóng · N lệnh` | Viền nói **phím**, menu nói **nội dung**; đếm `N` cho biết còn bao nhiêu lệnh ngoài cửa sổ |
+| `completions(prefix) -> Vec<&'static str>` | `matching(prefix) -> Vec<&'static SlashCommand>` | Menu cần cả `summary`/`arguments`, không chỉ tên; `completions` không còn ai gọi nên bị xoá thay vì để hai đường |
+| `/help` là **11 dòng viết tay** | `/help` **sinh** từ bảng + 1 dòng `/key <value>` + 1 dòng cuối | Hai bản danh sách là hai bản sẽ lệch nhau; test canh cả hai chiều |
+| Thứ tự `/help`: `/new` trước `/more` | Theo đúng thứ tự bảng: `/more` trước `/new` | Một thứ tự duy nhất cho menu và trang help |
+
+### 3i.4. Test canh hợp đồng (tên thật, đã chạy)
+
+```text
+harness-cli (editor, input.rs):
+  slash_the_menu_opens_on_the_slash_and_narrows_with_every_letter
+  slash_the_arrows_move_the_highlight_and_stop_at_both_ends
+  slash_accepting_the_highlight_never_appends_a_space   -> "/ke"+accept == "/key", rồi Enter -> Submit("/key")
+  slash_escape_hides_the_menu_until_the_next_edit
+  slash_a_secret_buffer_never_offers_a_command
+  slash_the_command_table_is_unique_and_every_row_is_described
+  t03_tab_completes_only_a_unique_slash_command          (editor vẫn từ chối danh sách mơ hồ)
+harness-cli (controller):
+  slash_the_snapshot_carries_the_menu_and_the_highlight
+  slash_tab_accepts_the_row_the_menu_has_highlighted     -> "/" + Down Down + Tab == "/key"
+  slash_enter_completes_a_half_typed_command_then_runs_it -> không submit, rồi mở panel /help
+  slash_the_menu_never_takes_a_key_where_it_is_not_drawn -> plain: "unknown command /he";
+                                                            overlay mở: cũng vậy
+harness-cli (layout + widget):
+  slash_the_menu_sits_above_the_composer_which_keeps_the_cursor
+  slash_a_long_list_is_capped_and_the_draft_is_never_squeezed
+  slash_a_panel_hides_the_menu
+  slash_every_command_has_a_row_that_says_what_it_does
+  slash_a_row_shows_the_argument_a_command_takes
+  slash_the_highlight_moves_with_the_selection
+  slash_a_long_list_windows_around_the_highlight
+harness-cli (khung hình đã vẽ, tui/mod.rs):
+  slash_typing_a_slash_paints_the_menu_above_the_composer -> "❯ /help" ở hàng TRÊN "> /",
+                                                             viền ghi "Tab/Enter nhận",
+                                                             "/at" -> "❯ /attach <path>",
+                                                             Tab -> "> /resume" và menu biến mất
+harness-cli (một bảng, hai chỗ đọc):
+  slash_the_help_page_and_the_menu_read_one_table
+harness-cli: 260 passed; 1 failed; 1 ignored (cargo test -p harness-cli --bin ha --locked)
+```
+
+Con số 260/1 là **số đo có ngày** (lượt này, toolchain 1.97.1, Windows): 242 test trước đó cộng
+**19** test mới của mục này. Test đỏ là
+`k03_a_saved_key_is_restricted_to_this_account_by_an_acl` - đỏ **đúng như thiết kế** trong phiên bị
+từ chối `icacls` (mục 3d.4, evidence 11.2/11.7), không liên quan tới menu.
+
+### 3i.5. Ranh giới của bằng chứng
+
+- **Chưa có ca PTY** cho menu: ConPTY không chạy được trong phiên này (mục 12 của
+  [evidence HA_LAUNCH](../evidence/HA_LAUNCH.vi.md)). Bằng chứng mạnh nhất hiện có là **khung hình
+  đã vẽ** (`ScriptedRenderer` + `TestBackend`), đúng tầng mà T03-T07 vẫn dùng.
+- **Mô tả lệnh bị cắt ở console hẹp.** Tên lệnh nằm ở cột đầu nên thứ bị cắt là phần mô tả, không
+  phải lệnh; hàng không tự ngắt dòng (menu là danh sách, không phải văn bản).
+- **Chuột không được hỗ trợ** trong menu: ô soạn thảo không bật mouse capture (mục 3e.3), nên chỉ
+  có bàn phím.
+- Phím `↑`/`↓` **không** cuộn panel `/help`/`/more` (lỗi chữ đã ghi ở mục 3e.2); mục này không sửa
+  nó, và cũng không làm nó nặng thêm: menu chỉ tồn tại khi **không** có panel nào mở.
+
 ## 4. Kiến trúc chốt cho T02–T08
 
 Theo plan mục 4, với hai điều chỉnh đã đo:

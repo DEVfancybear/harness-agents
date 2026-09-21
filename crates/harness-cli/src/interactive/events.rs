@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use harness_types::InputId;
 
+use super::input::SlashCommand;
+
 /// One normalized terminal input event.
 ///
 /// The T03 key set is defined here in T02 so the vocabulary is complete in one
@@ -338,7 +340,14 @@ pub struct UiState {
     pub max_steps: u32,
     pub tool_calls: u32,
     pub max_tool_calls: u32,
-    pub completion: Vec<&'static str>,
+    /// Slash commands the composer is offering right now, in table order.
+    ///
+    /// The menu that draws these is not a modal: the composer keeps the focus and
+    /// the draft stays visible. It is drawn only while the composer owns the
+    /// keyboard, so a panel or picker that replaces it also takes the menu away.
+    pub suggestions: Vec<&'static SlashCommand>,
+    /// Which suggestion row carries the highlight.
+    pub suggestion_selected: usize,
     /// Why the TUI is not in use, when the host fell back to the plain renderer.
     pub fallback_reason: Option<String>,
     /// How many ticks have passed, so the spinner animates without wall clock.

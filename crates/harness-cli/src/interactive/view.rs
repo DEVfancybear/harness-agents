@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use super::events::{AppPhase, HistoryItem, ToolState};
+use super::input::SLASH_COMMANDS;
 
 /// The plain lines one history item must produce.
 ///
@@ -129,29 +130,40 @@ pub fn cursor_cell(phase: AppPhase, buffer: &str, cursor: usize) -> (usize, usiz
     (row, column)
 }
 
+/// The `/help` page, built from the same table the suggestion menu draws.
+///
+/// One row is added by hand: `/key <value>` is the *less private* form of `/key`,
+/// and it is the only command whose second form earns a line of its own. A command
+/// added to `SLASH_COMMANDS` therefore appears here without anyone remembering to
+/// write a second row, which is the point: the list a user sees while typing and
+/// the list `/help` prints cannot drift apart.
 #[must_use]
 pub fn help_lines() -> Vec<String> {
-    vec![
-        "/help            list these commands".to_owned(),
-        "/status          show project, config, data and provider state".to_owned(),
-        "/key             save the provider API key; the value is masked and never kept in history"
-            .to_owned(),
-        "/key <value>     save it in one line: less private because the value is visible while \
-         typed; it is removed from recall history afterwards"
-            .to_owned(),
-        "/new             start a new session when nothing is running".to_owned(),
-        "/more            reopen the recent transcript in a scrollable panel (PgUp/PgDn, Home/End)"
-            .to_owned(),
-        "/model           show which model the next run would use".to_owned(),
-        "/config          show the resolved configuration and data files".to_owned(),
-        "/image           attach the image on the clipboard (Ctrl-V where the terminal forwards it)"
-            .to_owned(),
-        "/resume <id>     resume a persisted session".to_owned(),
-        "/exit            leave the app".to_owned(),
+    let mut lines = Vec::with_capacity(SLASH_COMMANDS.len() + 2);
+    for command in SLASH_COMMANDS {
+        lines.push(usage_line(&command.usage(), command.summary));
+        if command.name == "/key" {
+            lines.push(usage_line(
+                "/key <value>",
+                "save it in one line: less private because the value is visible while typed; it is \
+                 removed from recall history afterwards",
+            ));
+        }
+    }
+    lines.push(
         "Ctrl-C cancels an active run or clears an idle prompt; Ctrl-D on an empty line exits."
             .to_owned(),
-    ]
+    );
+    lines
 }
+
+/// One help row: the command in a fixed column, then what it does.
+fn usage_line(usage: &str, summary: &str) -> String {
+    format!("{usage:<HELP_COLUMN$}{summary}")
+}
+
+/// Cells the command column of `/help` occupies.
+const HELP_COLUMN: usize = 17;
 
 #[must_use]
 pub fn tool_line(name: &str, detail: &str) -> String {
@@ -199,6 +211,7 @@ mod tests {
         short_id, tool_line,
     };
     use crate::interactive::events::{AppPhase, HistoryItem, PauseReason, RunOutcome, ToolState};
+    use crate::interactive::input::SLASH_COMMANDS;
     use std::time::Duration;
 
     /// A bound is a pause, not a break: the measured turn printed
@@ -335,6 +348,51 @@ mod tests {
         }
         assert!(help.contains("Ctrl-C"));
         assert!(help.contains("Ctrl-D"));
+        assert!(
+            help.contains("/help            list these commands"),
+            "the reference page keeps its column layout: {help}"
+        );
+    }
+
+    /// `/help` is generated from the same table the suggestion menu draws, so the
+    /// two cannot drift: a command added to the table is on the page, and the page
+    /// names no command the menu would not offer.
+    #[test]
+    fn slash_the_help_page_and_the_menu_read_one_table() {
+        let help = help_lines();
+        let text = help.join("\n");
+        for command in SLASH_COMMANDS {
+            assert!(
+                help.iter()
+                    .any(|line| line.starts_with(&format!("{:<17}", command.usage()))
+                        && line.contains(command.summary)),
+                "{} is offered by the menu but missing from /help: {text}",
+                command.name
+            );
+        }
+
+        // The one row written by hand: the less private form of `/key`.
+        assert!(
+            help.iter().any(|line| line.starts_with("/key <value>")),
+            "{text}"
+        );
+
+        // Nothing else names a command: the footer is the only row that is not one.
+        for line in &help {
+            let first = line.split_whitespace().next().unwrap_or_default();
+            if first.starts_with("Ctrl-") {
+                continue;
+            }
+            assert!(
+                SLASH_COMMANDS.iter().any(|command| command.name == first),
+                "the page names a command the table does not have: {line}"
+            );
+        }
+        assert_eq!(
+            help.len(),
+            SLASH_COMMANDS.len() + 2,
+            "one row per command, the /key <value> row, and the footer"
+        );
     }
 
     #[test]

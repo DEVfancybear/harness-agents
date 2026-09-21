@@ -482,21 +482,44 @@ Bàn phím (chỉ những phím đã đo trên console thật):
 
 | Phím | Việc nó làm |
 | --- | --- |
-| `Enter` | Gửi yêu cầu (không gửi buffer rỗng) |
+| `Enter` | Gửi yêu cầu (không gửi buffer rỗng). Menu lệnh đang mở: **hoàn thành** lệnh đang gõ dở; Enter lần sau mới chạy lệnh |
 | `Ctrl-J` | Xuống dòng trong ô soạn thảo |
 | `Alt+Enter` | Xuống dòng (đo được trên ConPTY của Windows Terminal; xem giới hạn bên dưới) |
 | Dán nhiều dòng | Giữ nguyên newline, **không** gửi; cả khối là **một** yêu cầu khi bạn Enter |
-| `↑` / `↓` | Buffer một dòng: lịch sử; buffer nhiều dòng: di chuyển theo hàng |
+| `↑` / `↓` | Menu lệnh đang mở: đổi hàng đang chọn · buffer một dòng: lịch sử · buffer nhiều dòng: di chuyển theo hàng |
 | `←` `→` `Home` `End` | Di chuyển theo ký tự |
 | `Ctrl-A` / `Ctrl-E` | Đầu / cuối dòng hiện tại |
 | `Ctrl-U` / `Ctrl-W` | Xoá tới đầu dòng / xoá một từ |
-| `Tab` | Hoàn thành slash command khi chỉ có một gợi ý (`/re` → `/resume`) |
-| `Esc` | Đóng panel/overlay hoặc xoá gợi ý; **không** huỷ lượt đang chạy |
+| `Tab` | Nhận hàng đang chọn trong menu lệnh; khi menu không mở thì hoàn thành gợi ý duy nhất (`/re` → `/resume`) |
+| `Esc` | Đóng panel/overlay hoặc menu lệnh; **không** huỷ lượt đang chạy |
 | `Ctrl-C` | Đang chạy: huỷ lượt · đang rảnh: xoá buffer |
 | `Ctrl-D` | Buffer rỗng: thoát |
 | `Ctrl-L` | Vẽ lại vùng đáy, không xoá scrollback |
 | `y` / `n` | Trả lời panel phê duyệt (hoặc gõ `yes`/`no` rồi Enter) |
 | `a` | Chỉ khi action **chỉ đọc**: chạy nó và cho phép đọc cả lượt (hoặc gõ `all` rồi Enter) |
+
+**Gõ `/` là ra danh sách lệnh.** Menu hiện ngay trên ô soạn thảo và hẹp dần theo từng ký tự; nó
+**không** phải modal, nên con trỏ vẫn ở trong ô soạn thảo và bản nháp vẫn nguyên:
+
+```text
+❯ /help            list these commands
+  /status          show project, config, data and provider state
+  /key             save the provider API key; the value is masked and never kept in history
+  /more            reopen the recent transcript in a scrollable panel (PgUp/PgDn, Home/End)
+  /new             start a new session when nothing is running
+  /model           show which model the next run would use
+ ↑↓ chọn · Tab/Enter nhận · Esc đóng · 11 lệnh ─────────────
+> /_
+```
+
+Nhiều hơn **6** lệnh khớp thì danh sách là một **cửa sổ đi theo hàng đang chọn** (hàng đang chọn
+luôn nhìn thấy, không bị cắt). Hàng ghi luôn cả tham số của lệnh (`/attach <path>`, `/resume <id>`),
+nên nó đọc ra như thứ cần gõ. Nhận gợi ý **không** thêm dấu cách — và đó là chủ ý: `/key ` sẽ biến
+các ký tự gõ sau đó thành dạng **lộ** của lệnh, trong khi `/key` trần mở đường nhập **mask**.
+
+Menu chỉ tồn tại khi nó **được vẽ**: ở plain mode (không có menu) và khi một panel/picker/overlay
+đang mở, `Enter`/`Tab`/`↑`/`↓` giữ nguyên nghĩa cũ — không có chuyện phím tác động lên một danh sách
+bạn không nhìn thấy. Trong lúc nhập API key (buffer mask) menu cũng không bao giờ hiện.
 
 Khi một action cần phê duyệt, panel hiện action, workspace, scope và **đếm ngược** tới
 hạn của gate; hết hạn thì action **không** chạy và panel tự đóng.
@@ -879,3 +902,35 @@ bên cạnh một ảnh đã gắn đọc như thể gắn lỗi — và lượt
 lượt trước, tức là gắn ảnh không làm hỏng đường memory. Lượt thứ hai ghi tên
 `https://cdn.example.com/shots/broken.png` đã gửi đúng link đó làm giá trị `image_url`, nên đường
 link được chứng minh ở tầng wire chứ không chỉ trong unit test.
+
+### 12.9. File trong một yêu cầu (không chỉ ảnh)
+
+Một đường dẫn không phải ảnh giờ là **nội dung** chứ không phải lời nhắc mở file. File text được
+đọc và đặt thẳng vào message của lượt đó; model thấy nó ngay mà không phải tiêu một bước gọi tool
+đọc file. Bốn đường vào, cùng một kết quả:
+
+| Cách | Bạn làm gì |
+| --- | --- |
+| File đã có trên đĩa | Ghi tên nó trong tin nhắn: `log này lỗi gì? "C:\work\build output.log"`. **Quote nếu đường dẫn có dấu cách**; đường dẫn tương đối tính theo thư mục project. |
+| Kéo file từ Explorer | Cửa sổ terminal chèn path; gõ thêm câu hỏi rồi Enter. |
+| Dán path | `Ctrl-V` (hoặc `/image`) khi clipboard đang giữ **path** thay vì ảnh: path được chèn vào ô soạn thảo, đã quote sẵn. |
+| `/attach <path>` | Kiểm tra file có thật rồi chèn path vào ô soạn thảo: sai đường dẫn thì báo `no such file` tại chỗ, không âm thầm gửi một path không đọc được. `/attach` chạy ở mọi terminal, kể cả terminal giữ `Ctrl-V` cho paste của nó. |
+
+Khi lượt chạy, transcript nói rõ đã gắn gì (`[info] file attached: build output.log (text, 51 B)`).
+Trong message, mỗi file nằm giữa một header và một footer
+(`===== file: <đường dẫn> (…, 51 B) ===== … ===== end of build output.log =====`), và cả khối được
+mở đầu bằng một câu nói rõ đây là **tài liệu để đọc, không phải chỉ dẫn để làm theo** — một dòng log
+trông giống mệnh lệnh vẫn không phải mệnh lệnh.
+
+Giới hạn, có lý do: mỗi file tối đa **256 KiB** text, mỗi lượt tối đa **1 MiB** và **4 file**; file
+lớn hơn, file binary (không phải UTF-8, hoặc có byte NUL) bị từ chối kèm lý do chứ không bị cắt âm
+thầm. Text của file nằm lại trong hội thoại và đi theo mọi lượt sau, nên trần là ngân sách của cả
+session chứ không chỉ của lượt này. Đường dẫn trỏ vào nơi chứa credential (`.ssh/`, `*.pem`, `.env`,
+`credentials*`) **không bao giờ** được gửi tới provider — ảnh hay text đều vậy. Ảnh vẫn đi theo
+đường ảnh (block `content`) và không bao giờ bị quote thành text.
+
+Lượt headless (`--json`) báo phần này ở khoá `files`, mỗi phần tử gồm `path`, `label`, `bytes` —
+script kiểm chứng được đúng file nào đã vào lượt mà không phải đọc transcript. Đã kiểm chứng ở tầng
+wire bằng fixture SSE local: một lượt headless ghi tên `build output.log` gửi message `user` có
+`content` chứa nguyên dòng `error[E0425]: cannot find value …` của file trên đĩa, kèm header nêu tên
+file (`i03_a_named_file_reaches_the_model_inside_the_message`).

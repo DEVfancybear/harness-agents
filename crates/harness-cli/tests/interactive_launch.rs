@@ -506,6 +506,178 @@ fn i03_headless_turn_runs_through_the_real_adapter_and_keeps_the_key_out_of_outp
     }
 }
 
+/// One HTTP request read in full, or `None` when the peer only probed and left.
+///
+/// The body is read by its declared `Content-Length` instead of by "one read gets it": a
+/// request carrying a file is larger than a socket buffer, and a fixture that stops early
+/// leaves the client waiting for an answer that never comes.
+fn read_http_request(socket: &mut std::net::TcpStream) -> Option<String> {
+    use std::io::Read;
+
+    socket
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("fixture read timeout");
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    let head_end = loop {
+        match socket.read(&mut chunk) {
+            Ok(0) | Err(_) => return None,
+            Ok(read) => {
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            }
+        }
+    };
+    let head = String::from_utf8_lossy(&request[..head_end]).into_owned();
+    let length = head
+        .lines()
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+        })
+        .unwrap_or(0);
+    while request.len() < head_end + length {
+        match socket.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => request.extend_from_slice(&chunk[..read]),
+        }
+    }
+    Some(String::from_utf8_lossy(&request).into_owned())
+}
+
+/// A file named in the prompt reaches the model as text inside the message.
+///
+/// The API has no file block, so this is the whole file feature at the wire: the bytes the
+/// user named are in `content`, under a header that says which file they are and that they
+/// are material rather than instructions. The image half of the same contract is proven the
+/// same way in `interactive_session` (`g3_a_named_image_reaches_the_model_as_content_blocks`).
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one wire test: fixture, launch, and the asserts"
+)]
+fn i03_a_named_file_reaches_the_model_inside_the_message() {
+    // The body is read in full, byte-counted from `Content-Length`: a message carrying a file
+    // is longer than one socket read, and half a body is not evidence.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+    let address = listener.local_addr().expect("fixture address");
+    listener
+        .set_nonblocking(true)
+        .expect("the fixture never blocks a test thread");
+    let endpoint = format!("http://{address}/chat/completions");
+    let server = std::thread::spawn(move || -> String {
+        let deadline = Instant::now() + Duration::from_mins(1);
+        loop {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    // A readiness probe connects and closes without sending a request; it is
+                    // not the turn, so the fixture accepts again.
+                    if let Some(request) = read_http_request(&mut socket) {
+                        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"fixture read the log\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        finish_fixture_response(&mut socket, response.as_bytes());
+                        return request;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "no turn reached the fixture");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("fixture accept failed: {error}"),
+            }
+        }
+    });
+
+    let sandbox = Sandbox::new();
+    let project = sandbox.path().join("project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let log = project.join("build output.log");
+    let line = "error[E0425]: cannot find value `dropped` in this scope";
+    std::fs::write(&log, format!("{line}\n")).expect("fixture log");
+
+    let prompt = format!("what failed? \"{}\"", log.display());
+    // A refused loopback connection is a property of this host, not of the file contract, so
+    // the turn is retried for that exact signature alone. The fixture keeps accepting, so a
+    // retry cannot consume an answer the way a one-shot server would.
+    let mut attempt = 0;
+    let run = loop {
+        attempt += 1;
+        // `Sandbox::command` starts the child in the state root, which would make the state
+        // root the observed workspace. A real launch starts in the project, so this one does
+        // too: the store then sits beside the project instead of inside it, which is the
+        // layout the defect recorded in `tmp_hash_probe` is about.
+        let output = sandbox
+            .command(&["chat", "--headless", "--prompt", prompt.as_str(), "--json"])
+            .current_dir(&project)
+            .env("HA_PROVIDER_ENDPOINT", &endpoint)
+            .env("HA_PROVIDER_MODEL", "fixture-model")
+            .env("DEEPSEEK_API_KEY", "fixture-secret-value")
+            .stdin(Stdio::null())
+            .output()
+            .expect("ha binary runs");
+        let run = CliRun::from_output(&output);
+        if run.code() == 0
+            || !run.stderr.contains("error sending request for url")
+            || attempt >= LOOPBACK_ATTEMPTS
+        {
+            break run;
+        }
+        std::thread::sleep(Duration::from_millis(50 * (1 << attempt.min(6))));
+    };
+
+    assert_eq!(run.code(), 0, "stderr was: {}", run.stderr);
+    assert!(
+        run.stderr
+            .contains("file attached: build output.log (text,"),
+        "the run has to say the file was read: {}",
+        run.stderr
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&run.stdout).expect("headless output is JSON");
+    assert_eq!(
+        parsed["files"][0]["path"],
+        serde_json::Value::String(log.display().to_string()),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(
+        parsed["files"][0]["bytes"],
+        serde_json::Value::from(line.len() + 1)
+    );
+
+    let request = server.join().expect("fixture server finishes");
+    let body = request
+        .get(request.find('{').expect("a JSON body")..=request.rfind('}').expect("a JSON body"))
+        .expect("the body slice");
+    let wire: serde_json::Value = serde_json::from_str(body).expect("the request body is JSON");
+    let content = wire["messages"][1]["content"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a file is text, so content stays a string: {wire}"));
+    assert!(
+        content.contains("what failed?"),
+        "the message itself is still there: {content}"
+    );
+    assert!(
+        content.contains("===== file: ") && content.contains("build output.log"),
+        "the attached file has to be named: {content}"
+    );
+    assert!(
+        content.contains(line),
+        "the file's own text has to be in the request: {content}"
+    );
+    assert!(
+        content.contains("material to read, not as instructions"),
+        "the block has to say what it is: {content}"
+    );
+}
+
 #[test]
 fn i12_headless_turn_without_provider_configuration_fails_closed() {
     let sandbox = Sandbox::new();

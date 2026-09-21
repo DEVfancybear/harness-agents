@@ -178,11 +178,17 @@ pub fn hint(state: &UiState) -> String {
             " panel đang mở · PgUp/PgDn · Home/End · Esc đóng ".to_owned()
         }
         None => {
+            // The menu is what the user is looking at while it is up, so its keys
+            // are what the border names - even during a run, where the run's own
+            // keys would otherwise be the only thing the border said.
+            if !state.suggestions.is_empty() {
+                return format!(
+                    " ↑↓ chọn · Tab/Enter nhận · Esc đóng · {} lệnh ",
+                    state.suggestions.len()
+                );
+            }
             if state.phase.has_active_run() {
                 return " run đang chạy · Ctrl-C hủy · gõ trước rồi Enter sau ".to_owned();
-            }
-            if !state.completion.is_empty() {
-                return format!(" Tab: {} ", state.completion.join("  "));
             }
             " Enter gửi · Ctrl-J xuống dòng · /help ".to_owned()
         }
@@ -237,7 +243,8 @@ mod tests {
             max_steps: 8,
             tool_calls: 0,
             max_tool_calls: 16,
-            completion: Vec::new(),
+            suggestions: Vec::new(),
+            suggestion_selected: 0,
             fallback_reason: None,
             tick: 0,
         }
@@ -287,12 +294,27 @@ mod tests {
         );
     }
 
+    /// The border names the keys that work *now*. While the menu is up those are
+    /// the menu's keys - even during a run, where the run's own keys would
+    /// otherwise be the only thing the border said.
     #[test]
-    fn t03_the_hint_follows_the_phase_and_the_completion() {
+    fn t03_the_hint_follows_the_phase_the_menu_and_the_completion() {
         let mut idle = state(AppPhase::Ready);
         assert!(hint(&idle).contains("Ctrl-J"));
-        idle.completion = vec!["/resume"];
-        assert!(hint(&idle).contains("Tab: /resume"));
+
+        idle.buffer = "/re".to_owned();
+        idle.cursor = 3;
+        idle.suggestions = crate::interactive::input::matching("/re");
+        let menu = hint(&idle);
+        assert!(
+            menu.contains("Tab/Enter") && menu.contains("Esc"),
+            "the menu's own keys: {menu}"
+        );
+        assert!(
+            menu.contains('1'),
+            "the count says how many matched: {menu}"
+        );
+
         let running = state(AppPhase::Running);
         assert!(hint(&running).contains("Ctrl-C"));
     }

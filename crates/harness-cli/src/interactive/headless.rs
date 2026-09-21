@@ -238,31 +238,32 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         }
         None => coding_tool_schemas(),
     };
+    // Content the prompt names rides with it, exactly as it does in the app: an image is
+    // shown to the model, and a text file is put in the message. A scripted run can
+    // therefore look at a screenshot or read a log the same way a person can.
+    let attached = attachments::from_message(&request.prompt, &context.project.root);
+    for note in &attached.notes {
+        eprintln!("not attached ({note})");
+    }
+    for notice in attachments::attachment_notices(&attached.images, &attached.files) {
+        eprintln!("{notice}");
+    }
+    let prompt = format!(
+        "{}{}",
+        request.prompt,
+        attachments::attachment_blocks(&attached.files)
+    );
     let run_request = RunRequest::new(
         session_id.clone(),
         task_id,
         InputId::generate(),
-        request.prompt.clone(),
+        prompt,
         observation,
     )
     .with_tool_schemas(tool_schemas);
-    // An image the prompt names is attached the same way it is in the app, so a scripted
-    // run can look at a screenshot too.
-    let attached = attachments::from_message(&request.prompt, &context.project.root);
-    for note in &attached.notes {
-        eprintln!("image not attached ({note})");
-    }
     let run_request = if attached.is_empty() {
         run_request
     } else {
-        let labels = attached
-            .images
-            .iter()
-            .map(|image| image.attachment.label.clone())
-            .collect::<Vec<_>>();
-        for label in &labels {
-            eprintln!("image attached: {label}");
-        }
         run_request.with_images(
             attached
                 .images
@@ -276,6 +277,19 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         .iter()
         .map(|image| image.label.clone())
         .collect::<Vec<_>>();
+    // One object per attached file: a script needs the path it was read from as well as
+    // the label a reader sees, and the byte count is what the turn's budget was spent on.
+    let run_request_files: Vec<serde_json::Value> = attached
+        .files
+        .iter()
+        .map(|file| {
+            serde_json::json!({
+                "path": file.path,
+                "label": file.label,
+                "bytes": file.bytes,
+            })
+        })
+        .collect();
     let mut recall = None;
     let run_request = match &memory_principal {
         Some(principal) => {
@@ -404,6 +418,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         "memory": memory_report,
         "extensions": extensions_report,
         "images": run_request_images,
+        "files": run_request_files,
         "resumed_from": resumed_from
             .as_ref()
             .map(|(source, _)| source.as_str().to_owned()),

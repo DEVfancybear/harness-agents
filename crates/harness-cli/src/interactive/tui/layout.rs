@@ -27,11 +27,21 @@ pub const MAX_COMPOSER_ROWS: u16 = 8;
 /// committed to the scrollback instead.
 pub const MAX_LIVE_ROWS: u16 = 8;
 
+/// The slash-command menu never shows more rows than this.
+///
+/// It sits directly above the composer, inside the same region the live block
+/// uses, so the list a user is choosing from must not swallow the whole frame:
+/// past this many matches the window follows the highlight ([`super::widgets::suggest`]),
+/// which is why the cap is a window and not a truncation.
+pub const MAX_SUGGEST_ROWS: u16 = 6;
+
 /// Where each part of the frame goes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Plan {
     pub live: Option<Rect>,
     pub modal: Option<Rect>,
+    /// The slash-command menu, when the composer is offering one.
+    pub suggest: Option<Rect>,
     pub composer: Rect,
     pub status: Rect,
     /// Where the terminal cursor belongs, when the composer owns the focus.
@@ -89,6 +99,25 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
         height: body_height.saturating_sub(composer_height),
     };
 
+    // The slash-command menu takes its rows from the live region, directly above
+    // the composer. A draft being chosen from and the list it is choosing from
+    // must not be squeezed by streamed text, and a panel that owns the keyboard
+    // replaces the menu with itself - which is the same condition the controller
+    // uses before letting a key act on it.
+    let suggest_height = if state.modal.is_some() {
+        0
+    } else {
+        u16::try_from(state.suggestions.len())
+            .unwrap_or(u16::MAX)
+            .min(MAX_SUGGEST_ROWS)
+            .min(upper.height)
+    };
+    let suggest = take_rows(upper, suggest_height);
+    let upper = Rect {
+        height: upper.height.saturating_sub(suggest_height),
+        ..upper
+    };
+
     let (modal, live) = if let Some(modal) = &state.modal {
         (
             Some(take_rows(upper, modal_rows(modal, upper.height))),
@@ -113,6 +142,7 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
     Plan {
         live,
         modal,
+        suggest: (suggest.height > 0).then_some(suggest),
         composer,
         status,
         cursor,
@@ -209,6 +239,7 @@ fn cursor_cell(
 mod tests {
     use super::{MAX_COMPOSER_ROWS, composer_rows, live_rows, plan};
     use crate::interactive::events::{AppPhase, Modal, UiState};
+    use crate::interactive::input::matching;
     use crate::interactive::tui::theme::Theme;
     use ratatui::layout::Rect;
     use std::time::Duration;
@@ -232,7 +263,8 @@ mod tests {
             max_steps: 8,
             tool_calls: 0,
             max_tool_calls: 16,
-            completion: Vec::new(),
+            suggestions: Vec::new(),
+            suggestion_selected: 0,
             fallback_reason: None,
             tick: 0,
         }
@@ -340,5 +372,67 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(live_rows(&state, 80), super::MAX_LIVE_ROWS);
+    }
+
+    /// The menu belongs to the draft, so it sits directly above the composer and
+    /// the composer keeps the cursor: the user is still typing, not browsing.
+    #[test]
+    fn slash_the_menu_sits_above_the_composer_which_keeps_the_cursor() {
+        let mut state = state(AppPhase::Ready);
+        state.buffer = "/re".to_owned();
+        state.cursor = 3;
+        state.suggestions = matching("/re");
+        let outline = plan(Rect::new(0, 0, 80, 12), &state, &Theme::plain());
+        let menu = outline.suggest.expect("the menu has a row");
+        assert_eq!(menu.height, 1, "one match, one row");
+        assert_eq!(menu.y + menu.height, outline.composer.y);
+        assert!(
+            outline.cursor.is_some(),
+            "the composer is still the focused widget"
+        );
+    }
+
+    /// A long list takes its rows from the live block, never from the composer, and
+    /// never more than its cap: the row the user is choosing from must stay visible.
+    #[test]
+    fn slash_a_long_list_is_capped_and_the_draft_is_never_squeezed() {
+        let mut state = state(AppPhase::Running);
+        state.buffer = "/".to_owned();
+        state.cursor = 1;
+        state.live_text = "streaming".to_owned();
+        state.suggestions = matching("/");
+        let outline = plan(Rect::new(0, 0, 80, 12), &state, &Theme::plain());
+        let menu = outline.suggest.expect("the menu is drawn");
+        assert_eq!(menu.height, super::MAX_SUGGEST_ROWS);
+        assert_eq!(
+            outline.composer.height, 2,
+            "the draft keeps its row and its border"
+        );
+        let live = outline.live.expect("the live text still has a row");
+        assert!(
+            live.y + live.height <= menu.y,
+            "the live block stays above it"
+        );
+    }
+
+    /// A panel that owns the keyboard replaces the menu with itself, which is the
+    /// same condition the controller checks before letting a key act on the list.
+    #[test]
+    fn slash_a_panel_hides_the_menu() {
+        let mut state = state(AppPhase::Ready);
+        state.buffer = "/re".to_owned();
+        state.cursor = 3;
+        state.suggestions = matching("/re");
+        state.modal = Some(Modal::Overlay {
+            title: "/help".to_owned(),
+            lines: vec!["/help  list these commands".to_owned()],
+            scroll: 0,
+        });
+        let outline = plan(Rect::new(0, 0, 80, 12), &state, &Theme::plain());
+        assert!(outline.modal.is_some());
+        assert!(
+            outline.suggest.is_none(),
+            "a menu nobody can see must not be drawn"
+        );
     }
 }

@@ -101,8 +101,14 @@ pub struct LineEditor {
     history: Vec<String>,
     history_index: Option<usize>,
     draft: String,
-    /// Slash commands matching the buffer right now; Tab accepts the only one.
-    suggestion: Vec<&'static str>,
+    /// Slash commands matching the buffer right now, in table order.
+    ///
+    /// The editor owns the candidates and the highlight; whether the list is on
+    /// screen - and therefore whether a key may act on it - is the host's
+    /// decision, because only the host knows what it drew.
+    suggestion: Vec<&'static SlashCommand>,
+    /// Which candidate the highlight is on.
+    suggestion_index: usize,
     picker: Option<Picker>,
     overlay: Option<Overlay>,
     /// The buffer is a secret: it is masked in every rendered form and never
@@ -157,10 +163,55 @@ impl LineEditor {
     }
 
     /// The completion candidates matching the current buffer.
-    #[allow(dead_code, reason = "T03 shows the candidates in the composer hint")]
     #[must_use]
-    pub fn suggestions(&self) -> &[&'static str] {
+    pub fn suggestions(&self) -> &[&'static SlashCommand] {
         &self.suggestion
+    }
+
+    /// Which candidate row is highlighted.
+    #[must_use]
+    pub const fn suggestion_selected(&self) -> usize {
+        self.suggestion_index
+    }
+
+    /// Move the highlight inside the candidate list; a no-op when it is empty.
+    ///
+    /// It saturates at both ends instead of wrapping, like the session picker: a
+    /// highlight that jumps from the last row to the first reads as if the list
+    /// moved on its own.
+    pub fn move_suggestion(&mut self, delta: i32) -> bool {
+        if self.suggestion.is_empty() {
+            return false;
+        }
+        let last = self.suggestion.len() - 1;
+        let next = if delta.is_negative() {
+            self.suggestion_index
+                .saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.suggestion_index
+                .saturating_add(delta.unsigned_abs() as usize)
+        };
+        self.suggestion_index = next.min(last);
+        true
+    }
+
+    /// Accept the highlighted candidate: the buffer becomes exactly that name.
+    ///
+    /// Returns whether there was anything to accept.
+    ///
+    /// No trailing space is added, deliberately. `/key ` would turn the next
+    /// keystrokes into the visible, less private form of the command, while a bare
+    /// `/key` is the masked path; and one extra Enter to run the completed command
+    /// is the cheaper trade for every other command too.
+    pub fn accept_suggestion(&mut self) -> bool {
+        let Some(command) = self.suggestion.get(self.suggestion_index).copied() else {
+            return false;
+        };
+        self.buffer = command.name.to_owned();
+        self.cursor = self.char_len();
+        self.suggestion.clear();
+        self.suggestion_index = 0;
+        true
     }
 
     /// Open the session picker with one label per candidate.
@@ -236,6 +287,7 @@ impl LineEditor {
         self.history_index = None;
         self.draft.clear();
         self.suggestion.clear();
+        self.suggestion_index = 0;
     }
 
     /// Remove a just-submitted command when it carried a secret inline.
@@ -291,6 +343,7 @@ impl LineEditor {
         self.secret = false;
         self.cursor = 0;
         self.suggestion.clear();
+        self.suggestion_index = 0;
         value
     }
 
@@ -414,10 +467,15 @@ impl LineEditor {
                 InputOutcome::Redraw
             }
             Key::Tab => {
+                // The editor completes only what cannot be misread: one candidate,
+                // longer than what is typed. Accepting the *highlighted* row of a
+                // drawn menu is the host's call, because only the host knows
+                // whether the menu is on screen at all.
                 if let Some(only) = self.unique_suggestion() {
                     self.buffer = only.to_owned();
                     self.cursor = self.char_len();
                     self.suggestion.clear();
+                    self.suggestion_index = 0;
                     return InputOutcome::CompleteSuggestion;
                 }
                 InputOutcome::Unchanged
@@ -435,7 +493,11 @@ impl LineEditor {
                     return InputOutcome::Redraw;
                 }
                 if !self.suggestion.is_empty() {
+                    // Dismissing hides the list until the next edit: the editor
+                    // recomputes it on every keystroke, so one more character
+                    // brings it back.
                     self.suggestion.clear();
+                    self.suggestion_index = 0;
                     return InputOutcome::Redraw;
                 }
                 InputOutcome::Unchanged
@@ -497,6 +559,7 @@ impl LineEditor {
         self.history_index = None;
         self.draft.clear();
         self.suggestion.clear();
+        self.suggestion_index = 0;
         InputOutcome::Submit(submitted)
     }
 
@@ -529,20 +592,33 @@ impl LineEditor {
         InputOutcome::Redraw
     }
 
-    /// The commands the buffer could still become.
+    /// The candidates the buffer could still become.
+    ///
+    /// The menu is offered only while the word being typed is a slash command and
+    /// that command is not already complete: once `/help` is on the line there is
+    /// nothing left to suggest, and a row that repeats what is typed is noise. A
+    /// secret buffer never offers anything, whatever is pasted into it.
     fn refresh_suggestion(&mut self) {
-        if !self.buffer.starts_with('/') || self.buffer.contains(char::is_whitespace) {
-            self.suggestion.clear();
+        self.suggestion_index = 0;
+        self.suggestion.clear();
+        if self.secret || !self.buffer.starts_with('/') || self.buffer.contains(char::is_whitespace)
+        {
             return;
         }
-        self.suggestion = completions(&self.buffer);
+        if SLASH_COMMANDS
+            .iter()
+            .any(|command| command.name == self.buffer)
+        {
+            return;
+        }
+        self.suggestion = matching(&self.buffer);
     }
 
     /// The one command Tab may accept: exactly one candidate, and it is longer
     /// than what is typed.
     fn unique_suggestion(&self) -> Option<&'static str> {
         match self.suggestion.as_slice() {
-            [only] if *only != self.buffer => Some(only),
+            [only] if only.name != self.buffer.as_str() => Some(only.name),
             _ => None,
         }
     }
@@ -670,18 +746,100 @@ impl LineEditor {
     }
 }
 
-/// Slash commands this revision understands, in help order.
-pub const SLASH_COMMANDS: [&str; 10] = [
-    "/help", "/status", "/key", "/more", "/new", "/model", "/config", "/image", "/resume", "/exit",
+/// Slash commands this revision understands, in the order `/help` prints them and
+/// the order the suggestion menu lists them.
+///
+/// This table is the **one** source for both: [`crate::interactive::view::help_lines`]
+/// builds the reference page from it and the menu draws its rows from it, so the
+/// list a user sees while typing cannot drift from the list `/help` promises.
+pub const SLASH_COMMANDS: [SlashCommand; 11] = [
+    SlashCommand {
+        name: "/help",
+        arguments: "",
+        summary: "list these commands",
+    },
+    SlashCommand {
+        name: "/status",
+        arguments: "",
+        summary: "show project, config, data and provider state",
+    },
+    SlashCommand {
+        name: "/key",
+        arguments: "",
+        summary: "save the provider API key; the value is masked and never kept in history",
+    },
+    SlashCommand {
+        name: "/more",
+        arguments: "",
+        summary: "reopen the recent transcript in a scrollable panel (PgUp/PgDn, Home/End)",
+    },
+    SlashCommand {
+        name: "/new",
+        arguments: "",
+        summary: "start a new session when nothing is running",
+    },
+    SlashCommand {
+        name: "/model",
+        arguments: "",
+        summary: "show which model the next run would use",
+    },
+    SlashCommand {
+        name: "/config",
+        arguments: "",
+        summary: "show the resolved configuration and data files",
+    },
+    SlashCommand {
+        name: "/image",
+        arguments: "",
+        summary: "paste what the clipboard holds: a screenshot, or a file path (Ctrl-V where the \
+                  terminal forwards it)",
+    },
+    SlashCommand {
+        name: "/attach",
+        arguments: "<path>",
+        summary: "attach a file to this message: an image is shown to the model, a text file is put \
+                  in the message",
+    },
+    SlashCommand {
+        name: "/resume",
+        arguments: "<id>",
+        summary: "resume a persisted session",
+    },
+    SlashCommand {
+        name: "/exit",
+        arguments: "",
+        summary: "leave the app",
+    },
 ];
 
-/// Commands whose name starts with `prefix`.
+/// One slash command: its name, the argument it takes and what it does.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SlashCommand {
+    pub name: &'static str,
+    /// The argument placeholder, empty for a command that takes none.
+    pub arguments: &'static str,
+    /// One line, short enough for one menu row.
+    pub summary: &'static str,
+}
+
+impl SlashCommand {
+    /// The name as it is typed, with its placeholder when it takes an argument.
+    #[must_use]
+    pub fn usage(&self) -> String {
+        if self.arguments.is_empty() {
+            self.name.to_owned()
+        } else {
+            format!("{} {}", self.name, self.arguments)
+        }
+    }
+}
+
+/// The commands whose name starts with `prefix`, in table order.
 #[must_use]
-pub fn completions(prefix: &str) -> Vec<&'static str> {
+pub fn matching(prefix: &str) -> Vec<&'static SlashCommand> {
     SLASH_COMMANDS
         .iter()
-        .copied()
-        .filter(|command| command.starts_with(prefix))
+        .filter(|command| command.name.starts_with(prefix))
         .collect()
 }
 
@@ -709,7 +867,7 @@ fn normalize_paste(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputOutcome, LineEditor, SECRET_MASK, completions};
+    use super::{InputOutcome, LineEditor, SECRET_MASK};
     use crate::interactive::events::Key;
 
     fn type_text(editor: &mut LineEditor, text: &str) {
@@ -1003,7 +1161,7 @@ mod tests {
     fn t03_tab_completes_only_a_unique_slash_command() {
         let mut editor = LineEditor::new();
         type_text(&mut editor, "/re");
-        assert_eq!(editor.suggestions(), ["/resume"]);
+        assert_eq!(names(&editor), ["/resume"]);
         assert_eq!(
             editor.handle(Key::Tab),
             InputOutcome::CompleteSuggestion,
@@ -1011,7 +1169,9 @@ mod tests {
         );
         assert_eq!(editor.buffer(), "/resume");
 
-        // With two candidates Tab does nothing and the hint stays visible.
+        // With two candidates Tab does nothing *in the editor*: accepting the
+        // highlighted row of a menu that is actually on screen is the
+        // controller's call, because only the controller knows what it drew.
         let mut ambiguous = LineEditor::new();
         type_text(&mut ambiguous, "/");
         assert_eq!(ambiguous.suggestions().len(), super::SLASH_COMMANDS.len());
@@ -1024,6 +1184,192 @@ mod tests {
         assert_eq!(escaping.handle(Key::Esc), InputOutcome::Redraw);
         assert!(escaping.suggestions().is_empty());
         assert_eq!(escaping.buffer(), "/re");
+    }
+
+    /// The names of the candidates the editor is offering, in order.
+    fn names(editor: &LineEditor) -> Vec<&'static str> {
+        editor
+            .suggestions()
+            .iter()
+            .map(|command| command.name)
+            .collect()
+    }
+
+    /// Typing `/` is the question the menu exists to answer, so the list has to be
+    /// there from the first character and narrow with every one after it.
+    #[test]
+    fn slash_the_menu_opens_on_the_slash_and_narrows_with_every_letter() {
+        let mut editor = LineEditor::new();
+        type_text(&mut editor, "/");
+        assert_eq!(
+            names(&editor),
+            super::SLASH_COMMANDS
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            "one slash offers every command, in table order"
+        );
+
+        type_text(&mut editor, "re");
+        assert_eq!(names(&editor), ["/resume"]);
+
+        // A complete command has nothing left to suggest, and an argument means
+        // the word is over: neither keeps a menu on screen.
+        let mut complete = LineEditor::new();
+        type_text(&mut complete, "/help");
+        assert!(
+            complete.suggestions().is_empty(),
+            "nothing left to complete"
+        );
+        type_text(&mut complete, " ");
+        assert!(complete.suggestions().is_empty());
+
+        let mut unknown = LineEditor::new();
+        type_text(&mut unknown, "/zzz");
+        assert!(unknown.suggestions().is_empty());
+    }
+
+    /// The highlight is what Tab and Enter accept, so it has to move with the
+    /// arrows and stop at both ends rather than wrap.
+    #[test]
+    fn slash_the_arrows_move_the_highlight_and_stop_at_both_ends() {
+        let mut editor = LineEditor::new();
+        type_text(&mut editor, "/");
+        assert_eq!(editor.suggestion_selected(), 0);
+        assert!(editor.move_suggestion(1));
+        assert_eq!(editor.suggestion_selected(), 1);
+        assert!(editor.move_suggestion(-9));
+        assert_eq!(editor.suggestion_selected(), 0, "clamped at the top");
+        assert!(editor.move_suggestion(99));
+        assert_eq!(
+            editor.suggestion_selected(),
+            super::SLASH_COMMANDS.len() - 1,
+            "clamped at the bottom"
+        );
+
+        // Typing again restarts at the first match, so the highlight never sits on
+        // a row that is no longer the one the user was looking at.
+        type_text(&mut editor, "x");
+        assert!(editor.suggestions().is_empty());
+        assert!(!editor.move_suggestion(1), "there is no list to move in");
+        assert!(!editor.accept_suggestion(), "and nothing to accept");
+    }
+
+    /// Accepting puts the highlighted name in the buffer, ready to run - and
+    /// deliberately without a trailing space.
+    #[test]
+    fn slash_accepting_the_highlight_never_appends_a_space() {
+        let mut editor = LineEditor::new();
+        type_text(&mut editor, "/ke");
+        assert_eq!(names(&editor), ["/key"]);
+        assert!(editor.accept_suggestion());
+        assert_eq!(
+            editor.buffer(),
+            "/key",
+            "a space would make the next keystrokes the visible form of /key"
+        );
+        assert!(editor.suggestions().is_empty());
+        assert_eq!(
+            editor.handle(Key::Enter),
+            InputOutcome::Submit("/key".to_owned())
+        );
+
+        // The highlight is honoured, not just the first row.
+        let mut chosen = LineEditor::new();
+        type_text(&mut chosen, "/");
+        assert!(chosen.move_suggestion(2));
+        assert!(chosen.accept_suggestion());
+        assert_eq!(chosen.buffer(), "/key", "the third row was highlighted");
+    }
+
+    /// Escape hides the list until the next edit: one more character brings it
+    /// back, which is what makes dismissing cheap.
+    #[test]
+    fn slash_escape_hides_the_menu_until_the_next_edit() {
+        let mut editor = LineEditor::new();
+        type_text(&mut editor, "/re");
+        assert_eq!(editor.handle(Key::Esc), InputOutcome::Redraw);
+        assert!(editor.suggestions().is_empty());
+        assert!(
+            !editor.accept_suggestion(),
+            "a dismissed menu accepts nothing"
+        );
+
+        type_text(&mut editor, "s");
+        assert_eq!(names(&editor), ["/resume"], "the next edit brings it back");
+    }
+
+    /// Secret entry promises no completion, whatever reaches the buffer.
+    #[test]
+    fn slash_a_secret_buffer_never_offers_a_command() {
+        let mut editor = LineEditor::new();
+        editor.begin_secret_entry();
+        let _ = editor.handle(Key::Paste("/re".to_owned()));
+        assert!(
+            editor.suggestions().is_empty(),
+            "a masked buffer must not open a menu"
+        );
+    }
+
+    /// The table is what `/help`, the menu and completion all read, so its shape
+    /// is a contract: unique names, a leading slash, and a summary that fits a row.
+    #[test]
+    fn slash_the_command_table_is_unique_and_every_row_is_described() {
+        let mut seen: Vec<&str> = Vec::new();
+        for command in super::SLASH_COMMANDS {
+            assert!(command.name.starts_with('/'), "{}", command.name);
+            assert!(
+                !command.summary.is_empty(),
+                "{} has no summary to show",
+                command.name
+            );
+            assert!(
+                !command.summary.contains('\n') && command.summary.len() < 160,
+                "{}: the summary is one short row, not a paragraph",
+                command.name
+            );
+            assert!(!seen.contains(&command.name), "{} twice", command.name);
+            seen.push(command.name);
+            assert_eq!(
+                command.usage(),
+                if command.arguments.is_empty() {
+                    command.name.to_owned()
+                } else {
+                    format!("{} {}", command.name, command.arguments)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn t03_completions_are_prefix_matches_in_help_order() {
+        let all: Vec<&str> = super::SLASH_COMMANDS
+            .iter()
+            .map(|command| command.name)
+            .collect();
+        assert_eq!(
+            super::matching("/")
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            all
+        );
+        assert_eq!(
+            super::matching("/re")
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            ["/resume"]
+        );
+        assert_eq!(
+            super::matching("/c")
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            ["/config"]
+        );
+        assert!(super::matching("/zzz").is_empty());
+        assert!(super::matching("hello").is_empty());
     }
 
     #[test]
@@ -1050,14 +1396,5 @@ mod tests {
         assert_eq!(editor.picker().expect("picker").selected(), 0, "clamped");
         editor.close_picker();
         assert!(editor.picker().is_none());
-    }
-
-    #[test]
-    fn t03_completions_are_prefix_matches_in_help_order() {
-        assert_eq!(completions("/"), super::SLASH_COMMANDS.to_vec());
-        assert_eq!(completions("/re"), ["/resume"]);
-        assert_eq!(completions("/c"), ["/config"]);
-        assert!(completions("/zzz").is_empty());
-        assert!(completions("hello").is_empty());
     }
 }

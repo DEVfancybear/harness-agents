@@ -9,6 +9,7 @@ pub mod composer;
 pub mod help;
 pub mod picker;
 pub mod status;
+pub mod suggest;
 
 use ratatui::Frame;
 
@@ -57,6 +58,11 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
             }
             None => {}
         }
+    }
+    // The slash-command menu sits between the upper region and the composer: it
+    // belongs to the draft being typed, not to the conversation above it.
+    if let Some(area) = plan.suggest {
+        suggest::render(frame, area, state, theme);
     }
     composer::render(frame, plan, state, theme);
     status::render(frame, plan.status, state, theme);

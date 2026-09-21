@@ -532,7 +532,8 @@ mod tests {
             max_steps: 8,
             tool_calls: 1,
             max_tool_calls: 16,
-            completion: Vec::new(),
+            suggestions: Vec::new(),
+            suggestion_selected: 0,
             fallback_reason: None,
             tick: 0,
         }
@@ -797,6 +798,121 @@ mod tests {
             state.live_text.contains("BURST-LAST-LINE"),
             "a burst of lines pushed the end of the answer out of the viewport: {:?}",
             state.live_text
+        );
+    }
+
+    /// The measured complaint: typing `/` offered nothing, so the only way to learn
+    /// a command was to already know it. This asserts the **painted frame**: the
+    /// list is above the composer, the draft stays where it was, the border names
+    /// the menu's keys, and accepting a row does not run anything by itself.
+    #[test]
+    fn slash_typing_a_slash_paints_the_menu_above_the_composer() {
+        use crate::interactive::bootstrap::{self, LaunchRequest};
+        use crate::interactive::controller::InteractiveController;
+        use crate::interactive::events::Key;
+        use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
+        use crate::interactive::service::{FixtureService, SessionChannel};
+
+        let temp = tempfile::tempdir().expect("temp root");
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&project).expect("project");
+        std::fs::write(home.join("config.toml"), "schema_version = 1\n").expect("config");
+        let context = bootstrap::resolve(LaunchRequest {
+            cwd: None,
+            caller_dir: project,
+            platform: HostPlatform::current(),
+            environment: LaunchEnvironment::from_pairs([
+                ("HA_HOME", home.to_string_lossy().into_owned()),
+                ("DEEPSEEK_API_KEY", "fixture-secret".to_owned()),
+            ]),
+            explicit_data_dir: None,
+        })
+        .expect("context");
+        let channel = SessionChannel::new();
+        let events = channel.sender();
+        let mut controller = InteractiveController::new(
+            &context,
+            Box::new(FixtureService::new(events)),
+            channel,
+            false,
+        );
+        let _ = controller.boot_lines();
+        let backend = ScriptedBackend::new(Vec::new());
+        let mut renderer = ScriptedRenderer::open(backend, 100, 30).expect("renderer");
+
+        let _ = controller.handle_key(Key::Char('/'));
+        renderer
+            .draw_state(&controller.ui_state())
+            .expect("frame draws");
+        let painted = renderer.painted();
+        let text = painted.join("\n");
+        assert!(
+            text.contains("❯ /help"),
+            "the first row is highlighted: {text}"
+        );
+        assert!(
+            text.contains("> /"),
+            "the composer keeps the draft while the menu is up: {text}"
+        );
+        assert!(
+            text.contains("Tab/Enter nhận"),
+            "the border names the menu's keys, not the composer's: {text}"
+        );
+        let menu_row = painted
+            .iter()
+            .position(|row| row.contains("❯ /help"))
+            .expect("a menu row");
+        let composer_row = painted
+            .iter()
+            .position(|row| row.starts_with("> /"))
+            .expect("the composer row");
+        assert!(
+            menu_row < composer_row,
+            "the list belongs above the draft: {text}"
+        );
+
+        // The window follows the highlight, and a row shows the argument its
+        // command takes, so the line reads as the thing to type.
+        let _ = controller.handle_key(Key::Char('a'));
+        let _ = controller.handle_key(Key::Char('t'));
+        renderer
+            .draw_state(&controller.ui_state())
+            .expect("frame draws");
+        assert!(
+            renderer.painted().join("\n").contains("❯ /attach <path>"),
+            "{:?}",
+            renderer.painted()
+        );
+
+        // Narrowing the word narrows the list, and Tab accepts the row it points
+        // at - without running the command, which still needs its own Enter.
+        let _ = controller.handle_key(Key::EraseToLineStart);
+        let _ = controller.handle_key(Key::Char('/'));
+        let _ = controller.handle_key(Key::Char('r'));
+        let _ = controller.handle_key(Key::Char('e'));
+        renderer
+            .draw_state(&controller.ui_state())
+            .expect("frame draws");
+        assert!(
+            renderer.painted().join("\n").contains("❯ /resume"),
+            "{:?}",
+            renderer.painted()
+        );
+
+        let _ = controller.handle_key(Key::Tab);
+        renderer
+            .draw_state(&controller.ui_state())
+            .expect("frame draws");
+        let text = renderer.painted().join("\n");
+        assert!(
+            text.contains("> /resume"),
+            "the accepted command is in the composer: {text}"
+        );
+        assert!(
+            !text.contains("❯ /resume"),
+            "a whole command has nothing left to suggest: {text}"
         );
     }
 
