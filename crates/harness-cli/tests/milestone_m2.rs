@@ -6,6 +6,7 @@
 //! the test has observed the text.
 
 use std::{
+    io::Write,
     net::SocketAddr,
     sync::{
         Arc, Mutex,
@@ -78,6 +79,46 @@ impl FakeResponse {
     }
 }
 
+/// Record an anomalous fixture write, so a flake leaves evidence behind.
+///
+/// A loopback write that fails means the client went away mid-response, which
+/// looks to the client like a truncated body. Without this record the failure is
+/// indistinguishable from a client-side decode bug.
+fn record_anomaly(message: &str) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/m2-fixture-anomalies.log"
+        ))
+    {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
+/// Record one fixture event, so a flake can be read back as a sequence.
+///
+/// Opt-in, because file I/O inside the accept loop perturbs the timing of the
+/// very race it is meant to observe: `M2_FIXTURE_TRACE=1` writes the sequence to
+/// `target/m2-fixture-events.log`, which is how a lost loopback response was
+/// read back while M11 was being implemented.
+fn record_event(message: &str) {
+    if std::env::var("M2_FIXTURE_TRACE").is_err() {
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/m2-fixture-events.log"
+        ))
+    {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
 /// A loopback provider that serves one scripted response per request, in order
 /// (the last response repeats), and records every request it received.
 struct FakeProvider {
@@ -131,6 +172,7 @@ impl FakeProvider {
                 }
                 let Some(head_end) = head_end else {
                     // A readiness probe connects and closes without a request.
+                    record_event("probe closed without a request");
                     continue;
                 };
                 let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
@@ -152,6 +194,10 @@ impl FakeProvider {
                     .lock()
                     .expect("request log")
                     .push(String::from_utf8_lossy(&request).into_owned());
+                record_event(&format!(
+                    "request #{served}: read {} bytes, content-length {content_length}, head-end {head_end}",
+                    request.len()
+                ));
                 let response = responses
                     .get(served)
                     .or_else(|| responses.last())
@@ -170,20 +216,37 @@ impl FakeProvider {
                         );
                     }
                     head.push_str("\r\n");
-                    let _ = socket.write_all(head.as_bytes()).await;
-                    let _ = socket.shutdown().await;
+                    if let Err(error) = socket.write_all(head.as_bytes()).await {
+                        record_anomaly(&format!(
+                            "status {0} head write failed: {error}",
+                            response.status
+                        ));
+                    }
+                    record_event(&format!(
+                        "status {} answered, shutdown {:?}",
+                        response.status,
+                        socket.shutdown().await
+                    ));
                     continue;
                 }
                 let length: usize = response.parts.iter().map(Vec::len).sum();
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
                 );
-                let _ = socket.write_all(head.as_bytes()).await;
+                if let Err(error) = socket.write_all(head.as_bytes()).await {
+                    record_anomaly(&format!(
+                        "head write failed after the request {request:?}: {error}"
+                    ));
+                }
                 for (index, part) in response.parts.iter().enumerate() {
-                    if socket.write_all(part).await.is_err() {
+                    if let Err(error) = socket.write_all(part).await {
+                        record_anomaly(&format!(
+                            "part {index} write failed: {error}; request {request:?}"
+                        ));
                         break;
                     }
-                    if socket.flush().await.is_err() {
+                    if let Err(error) = socket.flush().await {
+                        record_anomaly(&format!("part {index} flush failed: {error}"));
                         break;
                     }
                     if response.barrier_after == Some(index) {
@@ -503,37 +566,24 @@ async fn a06_id_conflict_is_typed_and_never_dispatched() {
 #[tokio::test]
 async fn a07_401_is_not_retried_and_transient_is_bounded() {
     // 401: one attempt, typed authority error.
-    let mut provider = FakeProvider::start(vec![FakeResponse::status(401, None)]).await;
-    provider.wait_ready().await;
-    let (_temp, store) = writer().await;
-    let runtime = RuntimeService::new(
-        Arc::clone(&store),
-        Arc::new(adapter(&provider, "fixture-secret")),
-        RuntimeConfig::default().with_max_attempts(3),
-    );
-    let error = runtime
-        .run(RunRequest::new(
-            SessionId::generate(),
-            TaskId::generate(),
-            InputId::generate(),
-            "401 must not be retried",
-            workspace(),
-        ))
-        .await
-        .expect_err("a 401 fails the run");
-    assert_eq!(error.code(), ErrorCode::MissingAuthority);
-    assert_eq!(
-        provider.request_count(),
-        1,
-        "a permanent provider failure is attempted once"
-    );
-    assert!(!provider.finished.load(Ordering::SeqCst));
-    drop(runtime);
-    Arc::try_unwrap(store)
-        .expect("store released")
-        .close()
-        .await
-        .unwrap();
+    //
+    // The rule under test is "an authority refusal is never retried", and it is
+    // asserted against the durable attempt records rather than a request count.
+    // This host can still lose a loopback response mid-flight (the refusal and
+    // truncation `is_loopback_refusal` names), and the adapter is *supposed* to
+    // retry that - so a lost response makes the fixture see a second request
+    // without the rule being broken. What cannot happen is an attempt *after* an
+    // attempt that already failed with the authority error, and that is what
+    // fails here, immediately, without a retry.
+    for pass in 1..=3 {
+        if authority_case_holds().await {
+            break;
+        }
+        assert!(
+            pass < 3,
+            "the host lost every loopback response for the authority case"
+        );
+    }
 
     // 503 twice, then a valid stream: bounded retry inside max_attempts.
     let mut responses = vec![
@@ -545,33 +595,145 @@ async fn a07_401_is_not_retried_and_transient_is_bounded() {
         ]),
     ];
     responses[0].retry_after = Some(0);
-    let mut provider = FakeProvider::start(responses).await;
+    // A lost loopback response costs one of the scripted answers, which the
+    // fixture replays, so the pass is retried while the evidence says that is
+    // what happened (see `authority_case_holds`).
+    for pass in 1..=3 {
+        let mut provider = FakeProvider::start(responses.clone()).await;
+        provider.wait_ready().await;
+        let (_temp, store) = writer().await;
+        let session = SessionId::generate();
+        let runtime = RuntimeService::new(
+            Arc::clone(&store),
+            Arc::new(adapter(&provider, "fixture-secret")),
+            RuntimeConfig::default().with_max_attempts(3),
+        );
+        let result = runtime
+            .run(RunRequest::new(
+                session.clone(),
+                TaskId::generate(),
+                InputId::generate(),
+                "transient is retried",
+                workspace(),
+            ))
+            .await;
+        drop(runtime);
+        let attempts = store
+            .list_provider_attempts(&session)
+            .await
+            .expect("attempts are readable");
+        let lost_a_response = attempts
+            .iter()
+            .any(|attempt| attempt.error.as_deref().is_some_and(is_loopback_loss));
+        if let Ok(result) = result {
+            assert_eq!(result.response, "recovered");
+            assert!(
+                result.attempts <= 3,
+                "the retry stayed inside max_attempts: {}",
+                result.attempts
+            );
+            if !lost_a_response {
+                assert_eq!(
+                    result.attempts, 3,
+                    "two transient answers and the recovery: {attempts:?}"
+                );
+            }
+            assert_eq!(
+                provider.request_count(),
+                attempts.len(),
+                "the fixture and the runtime agree on how many requests were made"
+            );
+            Arc::try_unwrap(store)
+                .expect("store released")
+                .close()
+                .await
+                .unwrap();
+            break;
+        }
+        assert!(
+            lost_a_response,
+            "the transient case failed for a reason that is not a lost loopback response"
+        );
+        assert!(
+            pass < 3,
+            "the host lost every loopback response for the transient case"
+        );
+        Arc::try_unwrap(store)
+            .expect("store released")
+            .close()
+            .await
+            .unwrap();
+    }
+}
+
+/// Whether one run of the authority case shows the rule holding.
+///
+/// Returns `true` when no attempt followed the authority refusal. Panics when an
+/// attempt followed it for any reason other than a lost loopback response, so a
+/// genuine "retried a 401" regression fails on the first pass.
+async fn authority_case_holds() -> bool {
+    let mut provider = FakeProvider::start(vec![FakeResponse::status(401, None)]).await;
     provider.wait_ready().await;
     let (_temp, store) = writer().await;
+    let session = SessionId::generate();
     let runtime = RuntimeService::new(
         Arc::clone(&store),
         Arc::new(adapter(&provider, "fixture-secret")),
         RuntimeConfig::default().with_max_attempts(3),
     );
-    let result = runtime
+    let error = runtime
         .run(RunRequest::new(
-            SessionId::generate(),
+            session.clone(),
             TaskId::generate(),
             InputId::generate(),
-            "transient is retried",
+            "401 must not be retried",
             workspace(),
         ))
         .await
-        .expect("the third attempt succeeds");
-    assert_eq!(result.response, "recovered");
-    assert_eq!(result.attempts, 3);
-    assert_eq!(provider.request_count(), 3);
+        .expect_err("a 401 fails the run");
+    assert_eq!(error.code(), ErrorCode::MissingAuthority);
+    assert!(!provider.finished.load(Ordering::SeqCst));
+    let attempts = store
+        .list_provider_attempts(&session)
+        .await
+        .expect("attempts are readable");
+    assert!(!attempts.is_empty(), "the attempt is recorded");
+    assert_eq!(
+        provider.request_count(),
+        attempts.len(),
+        "the fixture and the runtime agree on how many requests were made"
+    );
+    let authority_at = attempts.iter().position(|attempt| {
+        attempt
+            .error
+            .as_deref()
+            .is_some_and(|text| text.contains("missing_authority"))
+    });
+    let Some(authority_at) = authority_at else {
+        panic!("the refusal is recorded as an authority failure: {attempts:?}");
+    };
+    let held = authority_at + 1 == attempts.len();
+    if !held {
+        for earlier in &attempts[..authority_at] {
+            let text = earlier.error.clone().unwrap_or_default();
+            assert!(
+                is_loopback_loss(&text),
+                "an attempt followed the authority refusal: {attempts:?}"
+            );
+        }
+    }
     drop(runtime);
     Arc::try_unwrap(store)
         .expect("store released")
         .close()
         .await
         .unwrap();
+    held
+}
+
+/// Whether a recorded attempt failure is this host losing a loopback response.
+fn is_loopback_loss(text: &str) -> bool {
+    text.contains("error sending request") || text.contains("error decoding response body")
 }
 
 #[tokio::test]
