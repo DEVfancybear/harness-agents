@@ -7,7 +7,14 @@
 //! work starts. That is the whole difference, and it is why nothing here opens
 //! its own database authority.
 
+pub mod host;
 pub mod schedule;
+
+pub use host::{
+    CONTROL_READ_TIMEOUT, DaemonEndpoint, DaemonHost, DaemonRunReport, DaemonRunner, DaemonStatus,
+    ENDPOINT_FILE, LaunchedOccurrence, MAX_CONTROL_BYTES, StartRefusal, control, process_is_alive,
+    read_endpoint, remove_endpoint, start, write_endpoint,
+};
 
 pub use schedule::{
     Clock, DueDecision, FixedClock, LaunchGrants, MAX_CATCH_UP_OCCURRENCES, MisfirePolicy,
@@ -49,3 +56,18 @@ impl std::fmt::Display for ScheduleError {
 }
 
 impl std::error::Error for ScheduleError {}
+
+impl From<ScheduleError> for harness_types::HarnessError {
+    fn from(error: ScheduleError) -> Self {
+        // The schedule surface speaks the same stable code vocabulary as the
+        // rest of the host, so a caller never has to translate between two
+        // error languages.
+        let code = match error.code() {
+            "policy_denied" => harness_types::ErrorCode::PolicyDenied,
+            "sequence_conflict" => harness_types::ErrorCode::SequenceConflict,
+            "task_not_found" => harness_types::ErrorCode::TaskNotFound,
+            _ => harness_types::ErrorCode::InvalidPayload,
+        };
+        harness_types::HarnessError::new(code, error.message().to_owned())
+    }
+}
