@@ -1,8 +1,10 @@
 # CURRENT — bàn giao đang mở
 
-**Cập nhật:** 23/09/2026 · **Assignment:** M7–M12 theo kế hoạch `implementation-next`, tuần tự theo dependency và gate từng checkpoint; commit+push sau mỗi action. **Checkpoint hiện tại:** **M7 xong, gate xanh, đã push** (`e5ef55c`); **M8 đã có SPEC + inventory, đã push** (`2cc1d08`) — **code M8 chưa bắt đầu**. Tiền nhiệm: M0/M1/M2 (`4d6393e`/`f1fb002`, `a824b2c`, `6c91a62`), M3 (`03bea9a`), M4 (`79c5165`), M5 (`b6e99bc`/`b8fa717`), M6 (`2b88396`/`9bc7d49`).
+**Cập nhật:** 23/09/2026 · **Assignment:** M7–M12 theo kế hoạch `implementation-next`, tuần tự theo dependency và gate từng checkpoint; commit+push sau mỗi action. **Checkpoint hiện tại:** **M7 xong + gate xanh** (`e5ef55c`); **M8 xong + gate xanh** (`32c3400`). **Milestone kế tiếp: M9.** Tiền nhiệm: M0/M1/M2 (`4d6393e`/`f1fb002`, `a824b2c`, `6c91a62`), M3 (`03bea9a`), M4 (`79c5165`), M5 (`b6e99bc`/`b8fa717`), M6 (`2b88396`/`9bc7d49`).
 
-**Trạng thái git:** branch `master`, đã push tới `2cc1d08`; 3 commit M7 = `98117d0` (fix gate), `711d9e7` (feat M7), `883d25f`→ rebase thành `e5ef55c` (docs M7). Lưu ý: `origin/master` có trước một commit docs không thuộc session này (`2590624 docs(ha-agent): plan the G01–G14 track`); M7 đã rebase lên trên nó.
+**Quyền (cập nhật 23/09/2026, user cấp trực tiếp):** user cho phép **install ở M9** và nói rõ "cứ làm full goal không cần hỏi". ⇒ Được phép: `Install-Ha.ps1` (cài thật) khi M9 cần. **Vẫn chưa được cấp rõ ràng:** đổi User PATH, paid smoke/live provider, publish/release (release tạo artifact công khai). Nếu M9 chạm tới các mục đó: làm phần install, còn PATH/publish thì ghi lại là cần xác nhận riêng.
+
+**Trạng thái git:** branch `master`, đã push tới `32c3400`. M7 = `e99afce`/`19dd792`/`e5ef55c`; M8 = `f18c510`/`8578c59`/`32c3400`; gate fix = `2891c18`. `origin/master` có một commit docs không thuộc session này (`2590624 docs(ha-agent): plan the G01–G14 track`).
 
 ## 1. Assignment hiện tại và ràng buộc mới nhất
 
@@ -59,16 +61,25 @@
 ## 7. Việc còn lại theo thứ tự
 
 0. **Reviewer nghiệm thu M7**: gate xanh + `docs/evidence/M7.vi.md` §4/§7/§9. Điểm cần soi: (a) **disposition `filtered` là thay đổi contract** làm `p4_c13` phải đổi expected (§8 evidence); (b) **`recall` chưa truyền `MemoryIndex::Log`** nên stamp của block từ log là `fresh` (§9 evidence) — đây là điểm dễ hiểu sai nhất; (c) freshness chỉ áp cho source kind `file`/`commit` có digest.
-1. **Flake loopback của host vẫn còn** ở `interactive_launch::i04`/`i13` và `milestone_m2::a07`. Gate đã có fallback tách-test, nhưng **chưa có ai sửa gốc**. Việc của M2.
-2. **Gate đa nền tảng**: `milestone_m5`/`milestone_m6`/`milestone_m7` **không** nằm trong `ci.yml` (chỉ P0/P3–P7 trên ubuntu+windows). Muốn `accepted` đa nền tảng phải thêm bước gate M vào CI hoặc chạy trên Linux/WSL.
-3. **M8 — SPEC xong, code chưa bắt đầu.** `docs/specs/M8.vi.md` đã chốt path map, inventory `reuse_verified/adapt/missing` cho A27–A30, 14 invariant và 8 slice. Việc kế tiếp là implement M8-01 → M8-04 theo thứ tự đó, cộng `ADR-N08` (budget/slot ownership, child brief/evidence delivery, Git integration policy).
+3. **M8 — xong, gate xanh.** Chi tiết đầy đủ ở `docs/evidence/M8.vi.md`. Bốn acceptance A27–A30 + 1 test CLI đều xanh; gate M8 passed (digest `sha256:730c4206…`, 362 file) sau 1 retry, và fallback tách đúng `milestone_m2::a07_401` rồi chạy nó một mình.
 4. Không thuộc M7/M8: StorePort vẫn chưa implement (handoff M3); live/paid smoke; backup/restore/retention (M9).
+
+## 7b. Work item M8
+
+| Item | Trạng thái | Evidence |
+|---|---|---|
+| M8-01 DAG/scheduling/briefs | `implemented_unverified` | `SchedulerConfig::max_queued_workers` + `DEFAULT_MAX_QUEUED_WORKERS` (cap 8, `#[serde(default)]` về default host); `require_queue_capacity(reserved)`; `ErrorCode::DelegationQueueFull` (HumanAction, exit 3); `WorkerScheduler::{reserved_workers, queued_workers}`; test `a27_child_capacity_budget` |
+| M8-02 result + parent delivery | `implemented_unverified` | Dùng `commit_delivery`/`consume_delivery`/`pending_deliveries`/`task_result`/`durable_progress` đang có; test `a28_child_delivery_recovery` (kill sau commit trước notify, duplicate delivery, stale owner, no respawn) |
+| M8-03 worktree + integration | `implemented_unverified` | Dùng `inspect_input`/`recheck_before_apply`/`remove_worktree` đang có; test `a30_dirty_workspace_preservation` |
+| M8-04 verifier + terminal task | `implemented_unverified` | `StepOutcome::{stop_reason, claimed_but_unverified}`; CLI `ha tasks run --json` thêm `stop_reason`/`claimed_but_unverified`/`verification`; test `a29_integration_acceptance` + `m8_04_cli_reports_stop_reasons_and_unverified_claims` |
 
 ## 8. Next action chính xác
 
-**Bắt đầu code M8 tại slice M8-01a.** Cụ thể: (1) chạy lại `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M7` để xác minh prereq trên revision hiện tại; (2) dựng `crates/harness-cli/tests/milestone_m8.rs` với fixture `WorkerBackend` xác định + store/git thật; (3) viết `a27_child_capacity_budget` trước — nó chốt luôn hình dạng API cho queue/per-role bound, reject reason và reservation phân cấp (các mục **Thiếu** ở `docs/specs/M8.vi.md` §4); (4) `ADR-N08`; (5) registry `milestones.json` thêm M8 (prerequisites `["M7"]`, target `milestone_m8`, 4 acceptance A27–A30); (6) gate `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M8`; (7) `docs/evidence/M8.vi.md` + handoff; (8) commit + push mỗi action.
+**Bắt đầu M9.** Đọc `docs/implementation-next/M9.vi.md` + `CONTRACTS.vi.md` §9 + acceptance A31/A32; xác minh gate M8 trên revision hiện tại; viết `docs/specs/M9.vi.md` trước khi code; dùng `crates/harness-maintenance/src/{backup,retention,migration}.rs`, `maintenance_cli.rs`, `scripts/Install-Ha.ps1`, `scripts/New-HaRelease.ps1`; thêm target `crates/harness-cli/tests/milestone_m9.rs`; registry `milestones.json` thêm M9 (prerequisites `["M8"]`); gate `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M9`; evidence + handoff; commit + push. **Install được phép** theo cấp quyền mới; PATH/publish vẫn cần xác nhận riêng.
 
 ## 9. Blocked on
+
+Không có blocker kỹ thuật. Bốn điểm cần người quyết: (1) `accepted` đa nền tảng cần chạy Linux (máy này không có WSL/Docker — CI là đường duy nhất); (2) disposition `no_facts` → `filtered` (M7) cần reviewer xác nhận; (3) flake loopback cần một lượt M2 riêng — gate M7/M8 chỉ xanh được nhờ fallback tách test; (4) **A29 chỉ phủ nhánh conflict, chưa phủ nhánh `ChecksFailed`** (xem evidence M8 §9) — đây là khoảng trống thật của M8, cần một lần bổ sung.
 
 Không có blocker kỹ thuật. Bốn điểm cần người quyết: (1) `accepted` đa nền tảng cần chạy Linux (máy này không có WSL/Docker — CI là đường duy nhất); (2) đổi disposition `no_facts` → `filtered` cho range không có nguồn đọc được cần reviewer xác nhận; (3) flake loopback cần một lượt M2 riêng nếu muốn `workspace-tests` xanh ổn định không cần fallback; (4) quyền mới (đổi PATH/cài thật/paid smoke/publish) chưa được cấp và sẽ chỉ cần ở M9.
 
@@ -87,7 +98,15 @@ Không có blocker kỹ thuật. Bốn điểm cần người quyết: (1) `acce
 - Không để secret vào evidence.
 - Không tự đặt `verified_local`/`accepted` trong registry.
 
-## 11. Checkpoint M7 (lượt này) — tóm tắt
+## 11. Checkpoint M8 (lượt này) — tóm tắt
+
+- **Base:** `8578c59`; thay đổi: 6 file sửa + 2 file mới (`docs/adr/ADR-N08-…`, `docs/evidence/M8.vi.md`).
+- **Gate:** `-Milestone M8` **passed**, digest `sha256:730c4206…` (362 file), 5/5 required + closure M7/M6/M5/M4/M3/M1/M2/M0. `workspace-tests` cần 1 retry rồi fallback tách `milestone_m2::a07_401` và chạy nó một mình → xanh.
+- **Hai bug thật của fallback gate** do chạy gate thật bắt được: parser xoá `$target` khi gặp dòng `running N tests` (làm mọi failure trong milestone target không gán được); `Invoke-FlakeTolerantCommand` chỉ ghi output khi hết retry (lần isolated đỏ vì lý do khác flake thì caller chỉ có message bị cắt).
+- **Một API mới:** `StepOutcome::{stop_reason, claimed_but_unverified}` + khối `verification` trong CLI; nhãn `completed_unverified` là trường hợp dễ đọc nhầm thành công nhất.
+- **Giới hạn đã ghi:** A29 phủ nhánh **conflict**, chưa phủ nhánh `ChecksFailed`; benchmark single-vs-multi chưa đo; chưa chạy Linux.
+
+### Checkpoint trước (tham chiếu M7) — tóm tắt
 
 - **Base:** `9bc7d49`; thay đổi: 13 file sửa + 4 file mới (`milestone_m7.rs`, `ADR-N07`, `docs/specs/M7.vi.md`, `docs/evidence/M7.vi.md`).
 - **Gate:** `-Milestone M7` **passed một lần thử**, digest `sha256:b5d266d2…` (356 file), 9/9 required + 1 unit test + closure M6/M5/M4/M3/M1/M2/M0.
