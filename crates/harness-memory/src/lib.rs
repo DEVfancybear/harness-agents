@@ -6,9 +6,9 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use harness_store_sqlite::SqliteStore;
 use harness_store_sqlite::{
-    MemoryCreateCommit, MemoryVersionCommit, StoreMemoryPrincipal, StoredExtractionJobRecord,
-    StoredExtractionLeaseRecord, StoredMemoryAssetRecord, StoredMemoryGrantRecord,
-    StoredMemoryVersionRecord,
+    MemoryCreateCommit, MemorySourceKind, MemorySourceRecord, MemoryVersionCommit, RefreshSource,
+    StoreMemoryPrincipal, StoredExtractionJobRecord, StoredExtractionLeaseRecord,
+    StoredMemoryAssetRecord, StoredMemoryGrantRecord, StoredMemoryVersionRecord,
 };
 use harness_types::{
     AgentProfileId, ContentHash, ErrorCode, EventId, HarnessError, MemoryAsset, MemoryAssetId,
@@ -108,8 +108,12 @@ pub enum MemoryAction {
     Read,
     Search,
     Export,
+    /// Record a candidate and stop there: the model's or a caller's proposal,
+    /// which is not usable memory until a host act publishes it.
     Propose,
     Publish,
+    /// Refuse a candidate on the record, with a reason, without deleting it.
+    Reject,
     Bind,
     Invalidate,
 }
@@ -174,6 +178,171 @@ pub struct CreateMemoryAsset {
     pub source_file_hashes: Vec<ContentHash>,
     pub source_commit: Option<String>,
     pub provenance_kind: String,
+    /// Keyed sources of this version, in addition to the legacy fields above.
+    ///
+    /// The legacy fields are kept because P4/`interactive::memory` write them and
+    /// because they are part of the version JSON other readers use. A caller that
+    /// knows *which* file or commit a fact came from names it here, and that is
+    /// what makes the version checkable later (`ADR-N07`, D1). When both are
+    /// given, the keyed list wins for the source that carries the digest.
+    pub sources: Vec<MemorySource>,
+}
+
+/// One source of a memory version, named the way the store keys it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemorySource {
+    pub kind: MemorySourceKind,
+    pub id: String,
+    pub observed_digest: Option<ContentHash>,
+    pub source_version: Option<u64>,
+}
+
+impl MemorySource {
+    /// A workspace file, relative to the workspace root.
+    ///
+    /// `observed_digest` is required: without it the dependency could never be
+    /// compared against the file again, which would be a claim the freshness
+    /// filter cannot check.
+    #[must_use]
+    pub fn file(path: impl Into<String>, observed_digest: ContentHash) -> Self {
+        Self {
+            kind: MemorySourceKind::File,
+            id: path.into(),
+            observed_digest: Some(observed_digest),
+            source_version: None,
+        }
+    }
+
+    /// The commit a fact was read at. `id` is the revision name the workspace
+    /// reports, never a synthesized order.
+    #[must_use]
+    pub fn commit(revision: impl Into<String>) -> Self {
+        Self {
+            kind: MemorySourceKind::Commit,
+            id: revision.into(),
+            observed_digest: None,
+            source_version: None,
+        }
+    }
+
+    /// A journal event the host admitted.
+    #[must_use]
+    pub fn event(event_id: &EventId, sequence: u64) -> Self {
+        Self {
+            kind: MemorySourceKind::Event,
+            id: event_id.as_str().to_owned(),
+            observed_digest: None,
+            source_version: Some(sequence),
+        }
+    }
+
+    /// Another memory version this one was derived from.
+    #[must_use]
+    pub fn asset(memory_asset_id: &MemoryAssetId, version: u64) -> Self {
+        Self {
+            kind: MemorySourceKind::Asset,
+            id: memory_asset_id.as_str().to_owned(),
+            observed_digest: None,
+            source_version: Some(version),
+        }
+    }
+
+    pub(crate) fn to_record(&self) -> MemorySourceRecord {
+        MemorySourceRecord {
+            source_kind: self.kind,
+            source_id: self.id.clone(),
+            observed_digest: self.observed_digest.clone(),
+            source_version: self.source_version,
+        }
+    }
+
+    /// Reject a source that names nothing.
+    fn validate(&self) -> Result<(), HarnessError> {
+        if self.id.trim().is_empty() {
+            return Err(HarnessError::new(
+                ErrorCode::InvalidPayload,
+                "memory source needs a non-empty id",
+            ));
+        }
+        if self.kind == MemorySourceKind::File && self.observed_digest.is_none() {
+            return Err(HarnessError::new(
+                ErrorCode::InvalidPayload,
+                "a file source requires the digest observed when it was written",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Deduplicate sources by `(kind, id)`, keeping the first mention.
+///
+/// Two mentions of the same file with different digests are not merged: the
+/// first is kept and the second is dropped, because a version cannot have been
+/// read from one file at two contents. The caller that has two different digests
+/// for one path has two sources and should say so with two ids.
+fn dedupe_sources(sources: Vec<MemorySource>) -> Vec<MemorySource> {
+    let mut seen = BTreeSet::new();
+    let mut kept = Vec::with_capacity(sources.len());
+    for source in sources {
+        if seen.insert((source.kind, source.id.clone())) {
+            kept.push(source);
+        }
+    }
+    kept
+}
+
+/// The keyed sources of a version, including the ones only the legacy fields name.
+///
+/// A caller that passes `source_event_refs` or `source_commit` without keyed
+/// sources is still writing a version that came from somewhere, and M7 has to be
+/// able to answer "what depends on this event/commit" for it. Deriving the keyed
+/// rows here, at the single point where a version is built, is what keeps the two
+/// representations from drifting; the caller's explicit list wins for a source
+/// both halves name, because it is the one that carries the observed digest.
+fn collect_sources(
+    declared: &[MemorySource],
+    event_refs: &[EventId],
+    source_commit: Option<&str>,
+) -> Result<Vec<MemorySource>, HarnessError> {
+    let mut sources = Vec::with_capacity(declared.len() + event_refs.len() + 1);
+    for source in declared {
+        source.validate()?;
+        sources.push(source.clone());
+    }
+    let mut keyed_events = BTreeSet::new();
+    for source in declared {
+        if source.kind == MemorySourceKind::Event {
+            keyed_events.insert(source.id.clone());
+        }
+    }
+    for event_id in event_refs {
+        if keyed_events.contains(event_id.as_str()) {
+            continue;
+        }
+        sources.push(MemorySource {
+            kind: MemorySourceKind::Event,
+            id: event_id.as_str().to_owned(),
+            observed_digest: None,
+            source_version: None,
+        });
+    }
+    if let Some(revision) = source_commit.filter(|value| !value.trim().is_empty())
+        && !declared
+            .iter()
+            .any(|source| source.kind == MemorySourceKind::Commit && source.id == revision)
+    {
+        sources.push(MemorySource {
+            kind: MemorySourceKind::Commit,
+            id: revision.to_owned(),
+            observed_digest: None,
+            source_version: None,
+        });
+    }
+    Ok(dedupe_sources(sources))
+}
+
+fn source_records(sources: &[MemorySource]) -> Vec<MemorySourceRecord> {
+    sources.iter().map(MemorySource::to_record).collect()
 }
 
 #[derive(Clone, Debug)]
@@ -192,6 +361,10 @@ pub struct WriteMemoryVersion {
     pub supersedes: Option<u64>,
     pub extractor_version: Option<String>,
     pub strategy_digest: Option<ContentHash>,
+    /// Keyed sources of the new version. Empty means the version inherits the
+    /// sources of the version it supersedes, because a correction of a fact read
+    /// from a file is still about that file.
+    pub sources: Vec<MemorySource>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,6 +372,8 @@ pub struct StoredMemoryVersion {
     pub record: MemoryVersion,
     pub content: String,
     pub strategy_digest: Option<ContentHash>,
+    /// The keyed sources recorded with this version.
+    pub sources: Vec<MemorySource>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -277,6 +452,20 @@ pub struct ExtractionLease {
     pub generation: u64,
 }
 
+/// What one [`MemoryService::reconcile`] call found and left behind.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconcileReport {
+    /// Jobs this call created. Zero means the backlog was already enqueued, which
+    /// is the normal answer on a second call with nothing new committed.
+    pub enqueued: usize,
+    /// The durable cursor after enqueueing; it only moves when a job settles.
+    pub cursor: u64,
+    /// Jobs for this strategy that are not `Completed`, in range order. A blocked
+    /// or dead-lettered range appears here rather than being skipped, because a
+    /// caller that resumed past it would leave a hole in the cursor.
+    pub outstanding: Vec<ExtractionJob>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExtractionFailureKind {
     Unavailable,
@@ -314,6 +503,18 @@ impl MemoryService {
         );
         let memory_asset_id = MemoryAssetId::generate();
         let content_hash = ContentHash::from_bytes(request.content.as_bytes());
+        let sources = collect_sources(
+            &request.sources,
+            &request.source_event_refs,
+            request.source_commit.as_deref(),
+        )?;
+        validate_source_evidence(
+            request.evidence,
+            &request.source_event_refs,
+            &request.source_file_hashes,
+            request.source_commit.as_deref(),
+            &sources,
+        )?;
         let asset = MemoryAsset {
             schema_version: MEMORY_CONTRACT_VERSION,
             memory_asset_id: memory_asset_id.clone(),
@@ -353,6 +554,7 @@ impl MemoryService {
                 normalized_content: normalize_search_text(&request.content),
                 content: request.content,
                 strategy_digest: None,
+                sources: source_records(&sources),
             },
         };
         let stored = self
@@ -395,6 +597,12 @@ impl MemoryService {
                 HarnessError::new(ErrorCode::InvalidPayload, "memory asset was not found")
             })?;
         let layer = parse_layer(&current.layer)?;
+        // A correction of a fact read from a file is still about that file, so an
+        // empty keyed list inherits the sources of the version it supersedes
+        // unless the caller names the merge sources, in which case those sources
+        // replace the inherited set: a summary of two assets does not depend on
+        // whatever the first of them happened to be read from.
+        let inherited_sources = current.current.sources.clone();
         if request.source_assets.len() > 32
             || (!request.source_assets.is_empty() && layer != MemoryLayer::L2)
         {
@@ -426,6 +634,44 @@ impl MemoryService {
                 .source_file_hashes
                 .extend(current.current.record.source_file_hashes.clone());
         }
+        let sources = if !request.sources.is_empty() {
+            collect_sources(
+                &request.sources,
+                &request.source_event_refs,
+                request.source_commit.as_deref(),
+            )?
+        } else if !request.source_assets.is_empty() {
+            let mut declared = request
+                .source_assets
+                .iter()
+                .map(|source| MemorySource::asset(&source.memory_asset_id, source.version))
+                .collect::<Vec<_>>();
+            declared.extend(
+                request
+                    .source_event_refs
+                    .iter()
+                    .map(|event| MemorySource::event(event, 0)),
+            );
+            collect_sources(&declared, &[], request.source_commit.as_deref())?
+        } else {
+            // `collect_sources` derives the event and commit rows from the legacy
+            // fields; the inherited keyed rows (files, most importantly) are added
+            // here, because only the previous version knows them.
+            let inherited = inherited_sources
+                .iter()
+                .map(|record| MemorySource {
+                    kind: record.source_kind,
+                    id: record.source_id.clone(),
+                    observed_digest: record.observed_digest.clone(),
+                    source_version: record.source_version,
+                })
+                .collect::<Vec<_>>();
+            collect_sources(
+                &inherited,
+                &request.source_event_refs,
+                request.source_commit.as_deref(),
+            )?
+        };
         request.source_event_refs.sort();
         request.source_event_refs.dedup();
         request
@@ -437,6 +683,7 @@ impl MemoryService {
             &request.source_event_refs,
             &request.source_file_hashes,
             request.source_commit.as_deref(),
+            &sources,
         )?;
         let decision = self.publication.classify(
             request.authority,
@@ -469,6 +716,7 @@ impl MemoryService {
             normalized_content: normalize_search_text(&request.content),
             content: request.content,
             strategy_digest: request.strategy_digest,
+            sources: source_records(&sources),
         };
         let stored = self
             .store
@@ -552,9 +800,125 @@ impl MemoryService {
                 supersedes: Some(expected_version),
                 extractor_version: record.extractor_version,
                 strategy_digest: current.current.strategy_digest,
+                sources: Vec::new(),
             },
         )
         .await
+    }
+
+    /// Record a candidate version and stop there.
+    ///
+    /// The propose/publish split is what keeps a model's suggestion from becoming
+    /// memory: this writes a version whose publication policy decides the status,
+    /// and for anything but a host observation with a durable source that status
+    /// is `Candidate`. Nothing here can publish, because the decision comes from
+    /// [`PublicationPolicy::classify`] and not from the caller's argument.
+    ///
+    /// `expected_version` is the version the proposer read. `None` asks for a new
+    /// asset, which is created at version 1 as a candidate; `Some(n)` adds a
+    /// version to an existing asset and fails typed if the asset moved, so a
+    /// proposal built on a stale read is refused instead of overwriting the
+    /// version someone else published.
+    pub async fn propose(
+        &self,
+        principal: &MemoryPrincipal,
+        target: Option<(&MemoryAssetId, u64)>,
+        request: CreateMemoryAsset,
+    ) -> Result<StoredMemoryAsset, HarnessError> {
+        match target {
+            None => self.create_asset(principal, request).await,
+            Some((memory_asset_id, expected_version)) => {
+                let sources = request.sources.clone();
+                self.write_version(
+                    principal,
+                    memory_asset_id,
+                    expected_version,
+                    WriteMemoryVersion {
+                        source_assets: Vec::new(),
+                        content: request.content,
+                        authority: request.authority,
+                        evidence: request.evidence,
+                        user_confirmed: request.user_confirmed,
+                        source_event_refs: request.source_event_refs,
+                        source_file_hashes: request.source_file_hashes,
+                        source_commit: request.source_commit,
+                        provenance_kind: request.provenance_kind,
+                        validity: Validity::Valid,
+                        supersedes: Some(expected_version),
+                        extractor_version: None,
+                        strategy_digest: None,
+                        sources,
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    /// Refuse a candidate on the record, at the version the human inspected.
+    ///
+    /// A rejection is not a deletion: the asset stays, its version is marked
+    /// invalid with the reason attached, and derived assets are invalidated with
+    /// it. Deleting would remove the audit trail that says the host looked at this
+    /// and said no, which is exactly the trail a later extraction needs in order
+    /// not to propose the same thing again.
+    pub async fn reject(
+        &self,
+        principal: &MemoryPrincipal,
+        memory_asset_id: &MemoryAssetId,
+        expected_version: u64,
+        reason: &str,
+    ) -> Result<Vec<MemoryAssetId>, HarnessError> {
+        if reason.trim().is_empty() {
+            return Err(HarnessError::new(
+                ErrorCode::InvalidPayload,
+                "a rejection needs a reason",
+            ));
+        }
+        let current = self
+            .read(principal, memory_asset_id)
+            .await?
+            .ok_or_else(|| {
+                HarnessError::new(ErrorCode::InvalidPayload, "candidate asset not found")
+            })?;
+        if current.asset.current_version != expected_version {
+            return Err(HarnessError::new(
+                ErrorCode::SequenceConflict,
+                "the asset changed since it was inspected; review it again",
+            ));
+        }
+        self.invalidate(principal, memory_asset_id, reason).await
+    }
+
+    /// Retire every asset whose recorded source no longer matches what the caller sees.
+    ///
+    /// The caller re-reads the sources it cares about and hands over what it
+    /// observed; this does not touch the filesystem, because memory is not the
+    /// owner of the workspace. A source that still hashes the same is not a change,
+    /// which is why a re-read that finds identical bytes is a no-op rather than a
+    /// retirement.
+    pub async fn invalidate_changed_sources(
+        &self,
+        principal: &MemoryPrincipal,
+        refresh: &[RefreshSource],
+    ) -> Result<Vec<MemoryAssetId>, HarnessError> {
+        validate_principal(principal)?;
+        let changed = self
+            .store
+            .memory_versions_with_changed_sources(&store_principal(principal), refresh)
+            .await
+            .map_err(to_harness_error)?;
+        let mut retired = Vec::new();
+        for id in changed {
+            retired.extend(
+                self.invalidate(principal, &id, "source_changed")
+                    .await
+                    .unwrap_or_default(),
+            );
+        }
+        retired.sort();
+        retired.dedup();
+        Ok(retired)
     }
 
     /// Confirm a bounded batch of candidate assets at their current version.
@@ -638,8 +1002,59 @@ impl MemoryService {
         Ok(found)
     }
 
-    /// Record one more source event on a version that already exists.
+    /// The sources a version was derived from, in a stable order.
     ///
+    /// Read through the same authorization as the asset: what a version was built
+    /// from is part of what it says, and a principal that may not read the asset
+    /// may not enumerate its sources either.
+    pub async fn version_sources(
+        &self,
+        principal: &MemoryPrincipal,
+        memory_asset_id: &MemoryAssetId,
+        version: u64,
+    ) -> Result<Vec<MemorySource>, HarnessError> {
+        validate_principal(principal)?;
+        self.store
+            .memory_version_sources(&store_principal(principal), memory_asset_id, version)
+            .await
+            .map_err(to_harness_error)
+            .map(|records| {
+                records
+                    .into_iter()
+                    .map(|record| MemorySource {
+                        kind: record.source_kind,
+                        id: record.source_id,
+                        observed_digest: record.observed_digest,
+                        source_version: record.source_version,
+                    })
+                    .collect()
+            })
+    }
+
+    /// The asset that already holds this exact text, whatever its status.
+    ///
+    /// The extraction loop's guard against publishing its own output. It is not
+    /// [`Self::find_active_by_content`]: extraction settles candidates, so the
+    /// sentence it must recognise on the second pass is not `active` yet.
+    ///
+    /// # Errors
+    /// Fails when the principal is unusable or the store cannot answer.
+    pub async fn find_any_by_content(
+        &self,
+        principal: &MemoryPrincipal,
+        content: &str,
+    ) -> Result<Option<MemoryAssetId>, HarnessError> {
+        validate_principal(principal)?;
+        self.store
+            .find_memory_by_content_any_status(
+                &store_principal(principal),
+                &normalize_search_text(content),
+            )
+            .await
+            .map_err(to_harness_error)
+    }
+
+    /// Record one more source event on a version that already exists.    ///
     /// Used by deduplication: the same text said twice is one memory with two
     /// sources, not two memories. The asset keeps its id, its version number and its
     /// content hash, so nothing that depends on it needs rebuilding.
@@ -791,6 +1206,51 @@ impl MemoryService {
             .map_err(to_harness_error)
     }
 
+    /// Enqueue every committed source-work range above the cursor, and report what
+    /// is still outstanding.
+    ///
+    /// This is the durable consumer's entry point. It is idempotent by
+    /// construction: the ranges come from `source_work_markers`, which are written
+    /// in the same transaction as the journal event they mark, and the cursor only
+    /// moves when a job settles. A process that dies between the commit and this
+    /// call therefore finds the same range on the next call, and a range that was
+    /// already enqueued hits the unique constraint on
+    /// `(stream, start, end, extractor_version, strategy_digest)` instead of
+    /// producing a second job.
+    ///
+    /// Nothing here is a timer or an in-process queue: durability is the marker
+    /// table and the job table, and this call is just the query that couples them.
+    ///
+    /// # Errors
+    /// Fails when the strategy is malformed, a strategy change arrives without an
+    /// explicit replay start, or the store cannot write.
+    pub async fn reconcile(
+        &self,
+        source_stream: &SessionId,
+        strategy: &ExtractionStrategy,
+        batch_size: usize,
+    ) -> Result<ReconcileReport, HarnessError> {
+        let enqueued = self
+            .schedule_backlog(source_stream, strategy, batch_size)
+            .await?;
+        let cursor = self.extraction_cursor(source_stream, strategy).await?;
+        let outstanding = self
+            .list_jobs_for(source_stream)
+            .await?
+            .into_iter()
+            .filter(|job| {
+                job.extractor_version == strategy.extractor_version
+                    && job.strategy_digest == strategy.strategy_digest
+                    && job.status != ExtractionJobStatus::Completed
+            })
+            .collect();
+        Ok(ReconcileReport {
+            enqueued: enqueued.len(),
+            cursor,
+            outstanding,
+        })
+    }
+
     #[allow(clippy::too_many_lines)] // Durable range planning preserves one ordering invariant.
     pub async fn schedule_backlog(
         &self,
@@ -833,7 +1293,7 @@ impl MemoryService {
             )
             .await
             .map_err(to_harness_error)?;
-        let mut next = self
+        let next = self
             .store
             .extraction_schedule_start(
                 source_stream,
@@ -842,66 +1302,101 @@ impl MemoryService {
             )
             .await
             .map_err(to_harness_error)?;
+        let ranges = self
+            .store
+            .source_work_ranges(source_stream, next.saturating_sub(1))
+            .await
+            .map_err(to_harness_error)?;
         let mut scheduled = Vec::new();
-        while scheduled.len() < 256 {
-            let events = self
-                .store
-                .load_memory_source_events(source_stream, next.saturating_sub(1), batch_size)
-                .await
-                .map_err(to_harness_error)?;
-            if events.is_empty() {
+        for range in ranges {
+            // One range may be larger than a job: split it into contiguous batches
+            // that stay under the byte bound. Each batch is its own job and its own
+            // digest, so a settlement can never cover a range whose bytes it did
+            // not read.
+            let mut batch: Vec<harness_types::EventEnvelope> = Vec::new();
+            let mut bytes = 0usize;
+            for event in range.events {
+                let event_bytes =
+                    serde_json::to_vec(&event).map_or(usize::MAX, |bytes| bytes.len());
+                if !batch.is_empty()
+                    && (batch.len() >= batch_size || bytes + event_bytes > 1_048_576)
+                {
+                    scheduled.push(self.enqueue_batch(source_stream, strategy, &batch).await?);
+                    batch = Vec::new();
+                    bytes = 0;
+                }
+                bytes = bytes.saturating_add(event_bytes);
+                batch.push(event);
+            }
+            if !batch.is_empty() {
+                scheduled.push(self.enqueue_batch(source_stream, strategy, &batch).await?);
+            }
+            if scheduled.len() >= 256 {
                 break;
             }
-            let bytes = events
-                .iter()
-                .map(|event| serde_json::to_vec(event).map_or(usize::MAX, |bytes| bytes.len()))
-                .fold(0usize, usize::saturating_add);
-            if bytes > 1_048_576 {
-                return Err(HarnessError::new(
-                    ErrorCode::InvalidPayload,
-                    "source batch exceeds byte limit; choose a smaller range",
-                ));
-            }
-            if events[0].seq != next
-                || events
-                    .windows(2)
-                    .any(|pair| pair[1].seq != pair[0].seq.saturating_add(1))
-            {
-                return Err(HarnessError::new(
-                    ErrorCode::InvalidSequence,
-                    "memory source-work markers are not contiguous",
-                ));
-            }
-            let source_event_ids = events
-                .iter()
-                .map(|event| event.event_id.clone())
-                .collect::<Vec<_>>();
-            let end_sequence = events.last().map_or(next, |event| event.seq);
-            let source_digest = source_batch_digest(&events)?;
-            let job = StoredExtractionJobRecord {
-                job_id: new_job_id(),
-                source_stream: source_stream.clone(),
-                start_sequence: next,
-                end_sequence,
-                source_digest,
-                source_event_ids,
-                extractor_version: strategy.extractor_version.clone(),
-                strategy_digest: strategy.strategy_digest.clone(),
-                status: ExtractionJobStatus::Pending.as_str().to_owned(),
-                attempts: 0,
-                lease_owner: None,
-                lease_generation: 0,
-                last_error: None,
-                disposition: None,
-            };
-            self.store
-                .insert_extraction_job(job.clone())
-                .await
-                .map_err(to_harness_error)?;
-            scheduled.push(convert_job(job)?);
-            next = end_sequence.saturating_add(1);
         }
         Ok(scheduled)
+    }
+
+    /// Insert one job for an already-selected contiguous batch.
+    ///
+    /// The batch is re-validated here rather than trusted: a job whose digest or
+    /// id list does not match the events it covers is a job whose settlement could
+    /// advance a cursor over source bytes nobody read.
+    async fn enqueue_batch(
+        &self,
+        source_stream: &SessionId,
+        strategy: &ExtractionStrategy,
+        batch: &[harness_types::EventEnvelope],
+    ) -> Result<ExtractionJob, HarnessError> {
+        let start_sequence = batch
+            .first()
+            .map(|event| event.seq)
+            .ok_or_else(|| HarnessError::new(ErrorCode::InvalidPayload, "empty source batch"))?;
+        let end_sequence = batch.last().map_or(start_sequence, |event| event.seq);
+        let bytes = batch
+            .iter()
+            .map(|event| serde_json::to_vec(event).map_or(usize::MAX, |bytes| bytes.len()))
+            .fold(0usize, usize::saturating_add);
+        if bytes > 1_048_576 {
+            return Err(HarnessError::new(
+                ErrorCode::InvalidPayload,
+                "source batch exceeds byte limit; choose a smaller range",
+            ));
+        }
+        if batch
+            .windows(2)
+            .any(|pair| pair[1].seq != pair[0].seq.saturating_add(1))
+        {
+            return Err(HarnessError::new(
+                ErrorCode::InvalidSequence,
+                "memory source-work markers are not contiguous",
+            ));
+        }
+        let job = StoredExtractionJobRecord {
+            job_id: new_job_id(),
+            source_stream: source_stream.clone(),
+            start_sequence,
+            end_sequence,
+            source_digest: source_batch_digest(batch)?,
+            source_event_ids: batch
+                .iter()
+                .map(|event| event.event_id.clone())
+                .collect::<Vec<_>>(),
+            extractor_version: strategy.extractor_version.clone(),
+            strategy_digest: strategy.strategy_digest.clone(),
+            status: ExtractionJobStatus::Pending.as_str().to_owned(),
+            attempts: 0,
+            lease_owner: None,
+            lease_generation: 0,
+            last_error: None,
+            disposition: None,
+        };
+        self.store
+            .insert_extraction_job(job.clone())
+            .await
+            .map_err(to_harness_error)?;
+        convert_job(job)
     }
 
     pub async fn lease_job(
@@ -937,6 +1432,19 @@ impl MemoryService {
     pub async fn settle_no_facts(&self, lease: &ExtractionLease) -> Result<(), HarnessError> {
         self.store
             .settle_extraction_no_facts(&store_lease(lease))
+            .await
+            .map_err(to_harness_error)
+    }
+
+    /// Settle a range whose sources the extractor declined to read.
+    ///
+    /// Separate from [`Self::settle_no_facts`] so the disposition on the job says
+    /// which happened: a range nobody will ever extract must still be visible as
+    /// such, or a later reader of the cursor cannot tell it from a range that was
+    /// read and held nothing.
+    pub async fn settle_filtered(&self, lease: &ExtractionLease) -> Result<(), HarnessError> {
+        self.store
+            .settle_extraction_filtered(&store_lease(lease))
             .await
             .map_err(to_harness_error)
     }
@@ -1020,6 +1528,7 @@ impl MemoryAction {
             Self::Export => "export",
             Self::Propose => "propose",
             Self::Publish => "publish",
+            Self::Reject => "reject",
             Self::Bind => "bind",
             Self::Invalidate => "invalidate",
         }
@@ -1110,6 +1619,16 @@ fn convert_version(record: StoredMemoryVersionRecord) -> Result<StoredMemoryVers
         record: record.record,
         content: record.content,
         strategy_digest: record.strategy_digest,
+        sources: record
+            .sources
+            .into_iter()
+            .map(|source| MemorySource {
+                kind: source.source_kind,
+                id: source.source_id,
+                observed_digest: source.observed_digest,
+                source_version: source.source_version,
+            })
+            .collect(),
     })
 }
 
@@ -1251,6 +1770,7 @@ fn validate_create(
         &request.source_event_refs,
         &request.source_file_hashes,
         request.source_commit.as_deref(),
+        &request.sources,
     )
 }
 
@@ -1259,11 +1779,17 @@ fn validate_source_evidence(
     events: &[EventId],
     files: &[ContentHash],
     source_commit: Option<&str>,
+    sources: &[MemorySource],
 ) -> Result<(), HarnessError> {
     if evidence == EvidenceState::VerifiedObservation
         && events.is_empty()
         && files.is_empty()
         && source_commit.is_none_or(str::is_empty)
+        // A keyed source is a durable reference too, and it is the one M7 added:
+        // an observation read from a named file or commit was verified against
+        // something, even though the caller had no event id and no bare hash to
+        // put in the legacy fields.
+        && sources.is_empty()
     {
         return Err(HarnessError::new(
             ErrorCode::InvalidPayload,

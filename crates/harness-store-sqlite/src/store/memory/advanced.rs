@@ -1,15 +1,73 @@
 use super::{
-    ContentHash, ErrorCode, MemoryAssetId, MemoryAssetStatus, Row, SessionId, Sqlite, SqliteStore,
-    StoreError, StoreMemoryPrincipal, StoredMemoryAssetRecord, Transaction, Validity,
-    assert_authorized, database_error, insert_asset, insert_version, load_asset_in_tx, refresh_fts,
-    to_i64, validate_record,
+    ContentHash, ErrorCode, MemoryAssetId, MemoryAssetStatus, RefreshSource, Row, SessionId,
+    Sqlite, SqliteStore, StoreError, StoreMemoryPrincipal, StoredMemoryAssetRecord, Transaction,
+    Validity, assert_authorized, database_error, insert_asset, insert_version, load_asset_in_tx,
+    refresh_fts, to_i64, validate_record,
 };
 use harness_types::MemoryVersionRef;
+
+/// The caller's current view of the sources it re-read, as a temporary table.
+///
+/// A temporary table rather than an `IN (…)` list because the pairs are
+/// `(kind, id, digest)` triples and the freshness predicate is a join: a list
+/// would have to be re-bound per row, and the query planner can use the index on
+/// `memory_sources(source_kind, source_id)` against a table.
+async fn load_refresh_table(
+    tx: &mut Transaction<'_, Sqlite>,
+    refresh: &[RefreshSource],
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "CREATE TEMP TABLE IF NOT EXISTS refresh_current(
+             source_kind TEXT NOT NULL,
+             source_id TEXT NOT NULL,
+             observed_digest TEXT NOT NULL,
+             PRIMARY KEY (source_kind, source_id)
+         )",
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| database_error(ErrorCode::StorageOpenFailed, "create refresh view", error))?;
+    sqlx::query("DELETE FROM refresh_current")
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| {
+            database_error(ErrorCode::StorageOpenFailed, "clear refresh view", error)
+        })?;
+    for source in refresh {
+        sqlx::query(
+            "INSERT OR REPLACE INTO refresh_current(source_kind, source_id, observed_digest)
+             VALUES (?, ?, ?)",
+        )
+        .bind(source.kind.as_str())
+        .bind(&source.id)
+        .bind(source.observed.as_str())
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| {
+            database_error(ErrorCode::StorageOpenFailed, "fill refresh view", error)
+        })?;
+    }
+    Ok(())
+}
 
 impl SqliteStore {
     pub async fn bound_memory(
         &self,
         principal: &StoreMemoryPrincipal,
+    ) -> Result<(Vec<(StoredMemoryAssetRecord, String)>, u64), StoreError> {
+        self.bound_memory_fresh(principal, &[]).await
+    }
+
+    /// Bound memory, leaving out versions whose named sources the caller saw move.
+    ///
+    /// The same freshness rule as [`Self::search_memory_fresh`], applied to the
+    /// injection path: a bootstrap block built from a version whose source changed
+    /// would put stale text in the frozen packet, where nothing downstream can
+    /// tell it apart from a current fact.
+    pub async fn bound_memory_fresh(
+        &self,
+        principal: &StoreMemoryPrincipal,
+        refresh: &[RefreshSource],
     ) -> Result<(Vec<(StoredMemoryAssetRecord, String)>, u64), StoreError> {
         let mut tx = self.pool.begin().await.map_err(|error| {
             database_error(
@@ -19,11 +77,16 @@ impl SqliteStore {
             )
         })?;
         let revision = read_revision(&mut tx).await?;
+        load_refresh_table(&mut tx, refresh).await?;
         let rows = sqlx::query("SELECT a.memory_asset_id, b.injection_mode FROM memory_bindings b JOIN memory_assets a ON a.memory_asset_id = b.memory_asset_id
             WHERE b.principal_id = ?1 AND b.injection_mode IN ('bootstrap', 'index') AND a.status = 'active'
               AND (a.project_id IS NULL OR a.project_id = ?2) AND (a.task_id IS NULL OR a.task_id = ?3)
               AND (a.agent_profile_id IS NULL OR a.agent_profile_id = ?4) AND (a.session_id IS NULL OR a.session_id = ?5)
               AND (a.owner_id = ?1 OR EXISTS (SELECT 1 FROM memory_grants g, json_each(g.actions_json) action WHERE g.memory_asset_id = a.memory_asset_id AND g.principal_id = ?1 AND g.active = 1 AND (g.project_id IS NULL OR g.project_id = ?2) AND action.value = 'search'))
+              AND NOT EXISTS (SELECT 1 FROM memory_sources ms
+                  JOIN refresh_current rc ON rc.source_kind = ms.source_kind AND rc.source_id = ms.source_id
+                  WHERE ms.derived_asset_id = a.memory_asset_id AND ms.derived_version = a.current_version
+                    AND (ms.observed_digest IS NULL OR ms.observed_digest != rc.observed_digest))
             ORDER BY b.priority DESC, b.binding_id")
             .bind(&principal.principal_id).bind(principal.project_id.as_ref().map(ToString::to_string)).bind(principal.task_id.as_ref().map(ToString::to_string))
             .bind(principal.agent_profile_id.as_ref().map(ToString::to_string)).bind(principal.session_id.as_ref().map(ToString::to_string))
@@ -596,6 +659,27 @@ impl SqliteStore {
         limit: usize,
         exclude_provenance: Option<&str>,
     ) -> Result<(Vec<StoredMemoryAssetRecord>, u64), StoreError> {
+        self.search_memory_fresh(principal, query, limit, exclude_provenance, &[])
+            .await
+    }
+
+    /// Search, treating the named sources as moved.
+    ///
+    /// `refresh` is what the caller currently sees for the sources it re-read. A
+    /// version whose recorded digest differs from the caller's observation is not
+    /// returned, and the filter is applied in SQL before `bm25`/`LIMIT`, so a
+    /// stale version cannot push a live one off the end of the page. The caller
+    /// does the reading because memory does not own the workspace; an empty
+    /// `refresh` filters nothing, which is the honest answer for a caller that has
+    /// re-read nothing (ADR-N07, D2).
+    pub async fn search_memory_fresh(
+        &self,
+        principal: &StoreMemoryPrincipal,
+        query: &str,
+        limit: usize,
+        exclude_provenance: Option<&str>,
+        refresh: &[RefreshSource],
+    ) -> Result<(Vec<StoredMemoryAssetRecord>, u64), StoreError> {
         let mut tx = self.pool.begin().await.map_err(|error| {
             database_error(
                 ErrorCode::StorageOpenFailed,
@@ -607,6 +691,7 @@ impl SqliteStore {
         if query.is_empty() {
             return Ok((Vec::new(), revision));
         }
+        load_refresh_table(&mut tx, refresh).await?;
         // All scope, grant, binding and validity predicates precede ranking/LIMIT in SQL.
         let rows = sqlx::query(
             "WITH RECURSIVE allowed(id, readable, searchable) AS (
@@ -630,6 +715,14 @@ impl SqliteStore {
                    LEFT JOIN memory_assets s ON s.memory_asset_id = l.id
                    JOIN memory_versions sv ON sv.memory_asset_id = s.memory_asset_id AND sv.version = s.current_version
                    WHERE l.root = a.memory_asset_id AND (coalesce(p.readable, 0) = 0 OR s.status IN ('invalidated', 'archived') OR s.current_version != l.version OR json_extract(sv.version_json, '$.validity') != 'valid'))
+               -- A source that moved since this version was written makes the
+               -- version stale. `refresh_current` holds only the pairs the caller
+               -- re-read; a source that is not in it cannot be judged, and is left
+               -- alone rather than assumed fresh.
+               AND NOT EXISTS (SELECT 1 FROM memory_sources ms
+                   JOIN refresh_current rc ON rc.source_kind = ms.source_kind AND rc.source_id = ms.source_id
+                   WHERE ms.derived_asset_id = a.memory_asset_id AND ms.derived_version = a.current_version
+                     AND (ms.observed_digest IS NULL OR ms.observed_digest != rc.observed_digest))
              ORDER BY bm25(memory_fts), a.memory_asset_id LIMIT ?7")
             .bind(query).bind(principal.project_id.as_ref().map(ToString::to_string))
             .bind(principal.task_id.as_ref().map(ToString::to_string)).bind(principal.agent_profile_id.as_ref().map(ToString::to_string))
@@ -654,6 +747,74 @@ impl SqliteStore {
             )
         })?;
         Ok((hits, revision))
+    }
+
+    #[allow(clippy::too_many_arguments)] // All fields belong to one atomic binding update.
+    /// The asset that already holds this exact text, whatever its status.
+    ///
+    /// The extraction loop's guard against feeding on its own output. It cannot use
+    /// the active-only lookup: an extraction settles a *candidate*, so the first
+    /// time a sentence is extracted it is a candidate, and the second time the
+    /// quote has to be recognised against something that is not `active` yet.
+    /// Looking only at active memory would let the loop publish the same sentence
+    /// twice and call the second one evidence.
+    ///
+    /// Reachability and scope are the same predicates a search uses, so this never
+    /// reports an asset the principal could not have found. Row lifetime differs on
+    /// purpose: an `invalidated` row still counts, because a candidate a human
+    /// refused must not come back as a fresh proposal.
+    pub async fn find_memory_by_content_any_status(
+        &self,
+        principal: &StoreMemoryPrincipal,
+        normalized_content: &str,
+    ) -> Result<Option<MemoryAssetId>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "begin memory content lookup",
+                error,
+            )
+        })?;
+        let row = sqlx::query(
+            "SELECT a.memory_asset_id FROM memory_versions v
+             JOIN memory_assets a ON a.memory_asset_id = v.memory_asset_id
+             WHERE v.normalized_content = ?1
+               AND v.version = a.current_version
+               AND a.status != 'archived'
+               AND (a.project_id IS NULL OR a.project_id = ?2)
+               AND (a.task_id IS NULL OR a.task_id = ?3)
+               AND (a.agent_profile_id IS NULL OR a.agent_profile_id = ?4)
+               AND (a.session_id IS NULL OR a.session_id = ?5)
+               AND a.owner_id = ?6
+             ORDER BY a.memory_asset_id LIMIT 1",
+        )
+        .bind(normalized_content)
+        .bind(principal.project_id.as_ref().map(ToString::to_string))
+        .bind(principal.task_id.as_ref().map(ToString::to_string))
+        .bind(principal.agent_profile_id.as_ref().map(ToString::to_string))
+        .bind(principal.session_id.as_ref().map(ToString::to_string))
+        .bind(&principal.principal_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "look up memory by content",
+                error,
+            )
+        })?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "close memory content lookup",
+                error,
+            )
+        })?;
+        row.map(|row| {
+            MemoryAssetId::parse(row.get::<String, _>("memory_asset_id"))
+                .map_err(|error| StoreError::new(error.code(), error.to_string()))
+        })
+        .transpose()
     }
 
     #[allow(clippy::too_many_arguments)] // All fields belong to one atomic binding update.

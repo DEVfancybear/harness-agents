@@ -608,7 +608,13 @@ async fn p4_c13_injected_memory_never_becomes_independent_evidence() {
     );
     assert_eq!(
         memory.list_jobs().await.unwrap()[1].disposition.as_deref(),
-        Some("no_facts")
+        // M7 split this disposition in two. A range whose committed markers project
+        // no eligible source at all - a `memory.injected` event is exactly that -
+        // is `filtered`: nothing in it was readable as a source. `no_facts` now
+        // means the extractor read the range and proposed nothing. The invariant
+        // this case checks is unchanged: nothing was published and the cursor
+        // still crossed the range.
+        Some("filtered")
     );
     assert!(
         !original[0]
@@ -1075,6 +1081,7 @@ fn project_asset(project_id: ProjectId, content: &str) -> CreateMemoryAsset {
         source_file_hashes: Vec::new(),
         source_commit: Some("fixture-r1".to_owned()),
         provenance_kind: "runtime_observation".to_owned(),
+        sources: Vec::new(),
     }
 }
 
@@ -1093,6 +1100,7 @@ fn observed_version(content: &str) -> WriteMemoryVersion {
         supersedes: None,
         extractor_version: None,
         strategy_digest: None,
+        sources: Vec::new(),
     }
 }
 

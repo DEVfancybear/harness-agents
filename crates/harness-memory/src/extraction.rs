@@ -87,7 +87,13 @@ impl MemoryService {
         }
         let sources = project_sources(lease);
         if sources.is_empty() {
-            self.settle_no_facts(lease).await?;
+            // A range the host committed but that projects no eligible source - a
+            // range of rendered packets, provider output or memory injections - is
+            // `filtered`, not `no_facts`. The two are different dispositions on
+            // purpose: a human reading the cursor later has to be able to tell a
+            // range the extractor declined to read from a range it read and found
+            // nothing in.
+            self.settle_filtered(lease).await?;
             return Ok(Vec::new());
         }
         let output = match tokio::time::timeout(
@@ -139,28 +145,56 @@ impl MemoryService {
             ));
         };
         let mut seen = BTreeSet::new();
-        let records = parsed
-            .candidates
-            .into_iter()
-            .filter(|candidate| {
-                seen.insert((
-                    candidate.content.clone(),
-                    candidate.source_event_refs.clone(),
-                ))
-            })
-            .map(|candidate| {
-                let mut record = candidate_record(
-                    principal,
-                    MemoryLayer::L1,
-                    &candidate.content,
-                    candidate.source_event_refs,
-                    asset_scope,
-                );
-                record.current.record.extractor_version = Some(lease.job.extractor_version.clone());
-                record.current.strategy_digest = Some(lease.job.strategy_digest.clone());
-                record
-            })
-            .collect::<Vec<_>>();
+        let mut self_referential = 0usize;
+        let mut records = Vec::new();
+        for candidate in parsed.candidates {
+            if !seen.insert((
+                candidate.content.clone(),
+                candidate.source_event_refs.clone(),
+            )) {
+                continue;
+            }
+            // A candidate whose text is already memory is the model quoting memory
+            // back, not new evidence. Storing it would let one injected block become
+            // an independent fact that a later extraction cites as its own source,
+            // which is self-reinforcement: run the loop twice and a quoted sentence
+            // is indistinguishable from something the runtime observed.
+            //
+            // The lookup is the same reachability rule a search uses, so a candidate
+            // that duplicates an asset the principal may not read is a new candidate
+            // and not a shadow of something else. It is deliberately *not* the
+            // active-only lookup: the thing this guard has to catch is the candidate
+            // the previous pass wrote.
+            if self
+                .find_any_by_content(principal, &candidate.content)
+                .await?
+                .is_some()
+            {
+                self_referential += 1;
+                continue;
+            }
+            let mut record = candidate_record(
+                principal,
+                MemoryLayer::L1,
+                &candidate.content,
+                &candidate.source_event_refs,
+                asset_scope,
+            );
+            record.current.record.extractor_version = Some(lease.job.extractor_version.clone());
+            record.current.strategy_digest = Some(lease.job.strategy_digest.clone());
+            records.push(record);
+        }
+        if records.is_empty() && self_referential > 0 {
+            // Everything the extractor proposed was already memory. The range is
+            // covered, and the disposition says why nothing was published, because a
+            // cursor that advanced over an unrecorded reason is a range nobody can
+            // account for later.
+            self.store
+                .settle_extraction_self_referential(&store_lease(lease), self_referential)
+                .await
+                .map_err(to_harness_error)?;
+            return Ok(Vec::new());
+        }
         self.store
             .settle_extraction_assets(&store_lease(lease), &records)
             .await
@@ -219,11 +253,12 @@ impl MemoryService {
                 });
             }
         }
+        let ordered_events = events.into_iter().collect::<Vec<EventId>>();
         let mut record = candidate_record(
             principal,
             MemoryLayer::L2,
             content,
-            events.into_iter().collect(),
+            &ordered_events,
             ExtractionScope::Session,
         );
         if let Some(inherited) = inherited {
@@ -315,7 +350,7 @@ fn candidate_record(
     principal: &MemoryPrincipal,
     layer: MemoryLayer,
     content: &str,
-    sources: Vec<EventId>,
+    sources: &[EventId],
     asset_scope: ExtractionScope,
 ) -> StoredMemoryAssetRecord {
     let id = MemoryAssetId::generate();
@@ -369,7 +404,7 @@ fn candidate_record(
                 version: 1,
                 content_or_artifact_hash: hash.clone(),
                 content_hash: hash,
-                source_event_refs: sources,
+                source_event_refs: sources.to_vec(),
                 source_file_hashes: Vec::new(),
                 source_commit: None,
                 provenance_kind: "journal_derived".to_owned(),
@@ -382,6 +417,13 @@ fn candidate_record(
             normalized_content: normalize_search_text(&content),
             content,
             strategy_digest: None,
+            // Every extracted candidate names the journal events it came from, so
+            // the versions that depend on those events are queryable without
+            // re-deriving lineage from the version JSON.
+            sources: sources
+                .iter()
+                .map(|event| super::MemorySource::event(event, 0).to_record())
+                .collect(),
         },
     }
 }

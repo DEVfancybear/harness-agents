@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use harness_types::{
     AgentProfileId, ContentHash, ErrorCode, MemoryAsset, MemoryAssetId, MemoryAssetStatus,
     MemoryVersion, SessionId, TaskId, Validity,
@@ -6,7 +8,8 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use super::{SqliteStore, database_error, to_i64};
 use crate::{
-    MEMORY_SCHEMA_VERSION, MemoryCreateCommit, MemoryVersionCommit, StoreError, StoreFaultPoint,
+    MEMORY_SCHEMA_VERSION, MemoryCreateCommit, MemorySourceKind, MemorySourceRecord,
+    MemoryVersionCommit, RefreshSource, SourceWorkRange, StoreError, StoreFaultPoint,
     StoreMemoryPrincipal, StoredExtractionJobRecord, StoredExtractionLeaseRecord,
     StoredMemoryAssetRecord, StoredMemoryGrantRecord, StoredMemoryVersionRecord,
 };
@@ -81,6 +84,31 @@ const MEMORY_SCHEMA: &[&str] = &[
         source_version INTEGER,
         PRIMARY KEY (derived_asset_id, derived_version, source_kind, source_id)
     )",
+    // M7 (schema version 2): the keyed source of one version. `memory_dependencies`
+    // keeps its P4 meaning (asset -> asset lineage) and is read by the transitive
+    // invalidation walk; this table answers the two questions that walk cannot:
+    // "which versions depend on this file/commit" and "did that source move since
+    // the version was written". A version with no row here predates M7 and has no
+    // evidence that its sources moved.
+    "CREATE TABLE IF NOT EXISTS memory_sources (
+        derived_asset_id TEXT NOT NULL,
+        derived_version INTEGER NOT NULL CHECK (derived_version >= 1),
+        source_kind TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        observed_digest TEXT,
+        source_version INTEGER,
+        scope_project_id TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (derived_asset_id, derived_version, source_kind, source_id)
+    )",
+    // The freshness filter and the source invalidation both start from
+    // `(kind, id)`; without this index they scan every version in the store.
+    "CREATE INDEX IF NOT EXISTS memory_sources_by_source
+        ON memory_sources(source_kind, source_id)",
+    // The freshness filter only ever asks about a version still pointed at by an
+    // active asset, so the asset side is indexed too.
+    "CREATE INDEX IF NOT EXISTS memory_sources_by_asset
+        ON memory_sources(derived_asset_id, derived_version)",
     "CREATE TABLE IF NOT EXISTS memory_jobs (
         job_id TEXT PRIMARY KEY,
         source_stream TEXT NOT NULL,
@@ -120,6 +148,30 @@ const MEMORY_SCHEMA: &[&str] = &[
     "CREATE TRIGGER IF NOT EXISTS memory_grant_update_revision AFTER UPDATE ON memory_grants BEGIN UPDATE memory_revision SET revision = revision + 1; END",
     "CREATE TRIGGER IF NOT EXISTS memory_binding_insert_revision AFTER INSERT ON memory_bindings BEGIN UPDATE memory_revision SET revision = revision + 1; END",
     "CREATE TRIGGER IF NOT EXISTS memory_binding_update_revision AFTER UPDATE ON memory_bindings BEGIN UPDATE memory_revision SET revision = revision + 1; END",
+];
+
+/// The upgrade slice for a store whose marker is older than this host.
+///
+/// Split from [`MEMORY_SCHEMA`] on purpose: the creation slice runs on every
+/// open and only lets a store go from "no marker" to the newest version, so a
+/// store that already recorded version 1 never sees the new tables unless the
+/// upgrade path carries them. Every statement here is additive and idempotent.
+const MEMORY_SCHEMA_VERSION_2: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS memory_sources (
+        derived_asset_id TEXT NOT NULL,
+        derived_version INTEGER NOT NULL CHECK (derived_version >= 1),
+        source_kind TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        observed_digest TEXT,
+        source_version INTEGER,
+        scope_project_id TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (derived_asset_id, derived_version, source_kind, source_id)
+    )",
+    "CREATE INDEX IF NOT EXISTS memory_sources_by_source
+        ON memory_sources(source_kind, source_id)",
+    "CREATE INDEX IF NOT EXISTS memory_sources_by_asset
+        ON memory_sources(derived_asset_id, derived_version)",
 ];
 
 pub(super) async fn ensure_memory_schema(pool: &SqlitePool) -> Result<(), StoreError> {
@@ -165,11 +217,38 @@ pub(super) async fn ensure_memory_schema(pool: &SqlitePool) -> Result<(), StoreE
                 )
             })?;
     }
+    // M7 (version 2). The creation slice above runs on every open, but it only
+    // ever records the newest version, so a store that already recorded 1 would
+    // keep the old marker while this host believes it wrote 2. Recording the
+    // upgrade and creating the table together is what makes the pair true; the
+    // remembered-empty case is the store that already ran this.
+    if current > 0 && current < MEMORY_SCHEMA_VERSION {
+        for statement in MEMORY_SCHEMA_VERSION_2 {
+            sqlx::query(*statement)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    database_error(ErrorCode::MigrationFailed, "apply memory upgrade", error)
+                })?;
+        }
+        for version in (current + 1)..=MEMORY_SCHEMA_VERSION {
+            sqlx::query("INSERT OR IGNORE INTO memory_schema_migrations(version) VALUES (?)")
+                .bind(version)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    database_error(
+                        ErrorCode::MigrationFailed,
+                        "record memory schema upgrade",
+                        error,
+                    )
+                })?;
+        }
+    }
     tx.commit().await.map_err(|error| {
         database_error(ErrorCode::MigrationFailed, "commit memory migration", error)
     })
 }
-
 impl SqliteStore {
     pub async fn create_memory_asset(
         &self,
@@ -186,6 +265,19 @@ impl SqliteStore {
         let mut tx = self.begin_write(&fence).await?;
         insert_asset(&mut tx, &commit.record).await?;
         insert_version(&mut tx, &commit.record.current).await?;
+        write_version_sources(
+            &mut tx,
+            &commit.record.asset.memory_asset_id,
+            commit.record.current.record.version,
+            &commit.record.current.sources,
+            commit
+                .record
+                .asset
+                .project_id
+                .as_ref()
+                .map(harness_types::ProjectId::as_str),
+        )
+        .await?;
         refresh_fts(&mut tx, &commit.record).await?;
         tx.commit().await.map_err(|error| {
             database_error(ErrorCode::StorageWriteFailed, "commit memory asset", error)
@@ -274,6 +366,18 @@ impl SqliteStore {
             .await?;
         }
         insert_version(&mut tx, &commit.version).await?;
+        write_version_sources(
+            &mut tx,
+            &commit.memory_asset_id,
+            commit.version.record.version,
+            &commit.version.sources,
+            commit
+                .asset
+                .project_id
+                .as_ref()
+                .map(harness_types::ProjectId::as_str),
+        )
+        .await?;
         if commit.source_assets.is_empty() {
             sqlx::query("INSERT OR IGNORE INTO memory_dependencies SELECT derived_asset_id, ?, source_kind, source_id, source_version FROM memory_dependencies WHERE derived_asset_id = ? AND derived_version = ? AND source_kind = 'asset'")
             .bind(to_i64(commit.version.record.version, "derived version")?).bind(commit.memory_asset_id.as_str()).bind(to_i64(commit.expected_version, "previous version")?)
@@ -575,6 +679,69 @@ impl SqliteStore {
         Ok(cursor.max(latest).saturating_add(1))
     }
 
+    /// The committed source-work ranges of one stream, above a sequence.
+    ///
+    /// A range is a maximal run of contiguous marker sequences, which is the unit
+    /// an extraction job covers. Reading this is what makes "enqueue what the
+    /// journal has committed" a query rather than a hook: the markers are written
+    /// in the same transaction as the event, so anything this returns is committed
+    /// by definition, and a process that died before enqueueing finds the same
+    /// range on its next call.
+    ///
+    /// A gap in the marker sequence ends a range and starts the next one. The gap
+    /// is real - a sequence with no marker is a journal entry that was never
+    /// declared a source - and a job may not span it, because the source digest of
+    /// a job is the digest of exactly its range.
+    pub async fn source_work_ranges(
+        &self,
+        source_stream: &SessionId,
+        after_sequence: u64,
+    ) -> Result<Vec<SourceWorkRange>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT m.sequence, m.event_id, e.event_json
+             FROM source_work_markers m
+             JOIN events e ON e.session_id = m.session_id AND e.event_id = m.event_id
+             WHERE m.session_id = ? AND m.sequence > ?
+             ORDER BY m.sequence",
+        )
+        .bind(source_stream.as_str())
+        .bind(to_i64(after_sequence, "memory source range start")?)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "load source-work ranges",
+                error,
+            )
+        })?;
+        let mut ranges: Vec<SourceWorkRange> = Vec::new();
+        for row in &rows {
+            let sequence = u64::try_from(row.get::<i64, _>("sequence")).map_err(|_| {
+                StoreError::new(
+                    ErrorCode::InvalidSequence,
+                    "stored source-work sequence is negative",
+                )
+            })?;
+            let event: harness_types::EventEnvelope = serde_json::from_str(row.get("event_json"))
+                .map_err(|_| {
+                StoreError::new(ErrorCode::InvalidPayload, "stored source event is invalid")
+            })?;
+            match ranges.last_mut() {
+                Some(range) if range.end_sequence.saturating_add(1) == sequence => {
+                    range.end_sequence = sequence;
+                    range.events.push(event);
+                }
+                _ => ranges.push(SourceWorkRange {
+                    start_sequence: sequence,
+                    end_sequence: sequence,
+                    events: vec![event],
+                }),
+            }
+        }
+        Ok(ranges)
+    }
+
     pub async fn load_memory_source_events(
         &self,
         source_stream: &harness_types::SessionId,
@@ -713,9 +880,13 @@ impl SqliteStore {
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;
         let changed = sqlx::query(
+            // `blocked` is leaseable because it means the extractor was not there,
+            // and a later attempt is exactly the event that can change that. It is
+            // not a backoff state, so no due time gates it; `retry_wait` is the one
+            // that waits.
             "UPDATE memory_jobs SET status = 'leased', lease_owner = ?,
              lease_generation = lease_generation + 1, attempts = attempts + 1, last_error = NULL
-             WHERE job_id = ? AND status IN ('pending', 'retry_wait', 'paused')
+             WHERE job_id = ? AND status IN ('pending', 'retry_wait', 'paused', 'blocked')
              AND (status != 'retry_wait' OR next_due_unix_ms <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))",
         )
         .bind(owner)
@@ -789,11 +960,46 @@ impl SqliteStore {
         self.settle_extraction_assets(lease, &[]).await
     }
 
+    /// Settle a range whose sources the extractor declined to read.
+    ///
+    /// The range is covered exactly like one that held no facts - the cursor moves
+    /// and the job completes - and only the disposition on the job differs, which
+    /// is why it goes through the same settlement rather than a second write. A
+    /// cursor that stopped on a range nobody will ever extract is a hole the rest
+    /// of the backlog never crosses.
+    pub async fn settle_extraction_filtered(
+        &self,
+        lease: &StoredExtractionLeaseRecord,
+    ) -> Result<(), StoreError> {
+        self.settle_extraction_assets_disposition(lease, &[], "filtered")
+            .await
+    }
+
     pub async fn settle_extraction_assets(
         &self,
         lease: &StoredExtractionLeaseRecord,
         assets: &[StoredMemoryAssetRecord],
     ) -> Result<(), StoreError> {
+        self.settle_extraction_assets_disposition(lease, assets, "candidates")
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)] // Lease check, assets, disposition and cursor are one transaction.
+    async fn settle_extraction_assets_disposition(
+        &self,
+        lease: &StoredExtractionLeaseRecord,
+        assets: &[StoredMemoryAssetRecord],
+        disposition: &str,
+    ) -> Result<(), StoreError> {
+        if !matches!(
+            disposition,
+            "candidates" | "filtered" | "no_facts" | "self_referential"
+        ) {
+            return Err(StoreError::new(
+                ErrorCode::InvalidPayload,
+                "unsupported extraction disposition",
+            ));
+        }
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;
         assert_job_lease(&mut tx, lease).await?;
@@ -827,6 +1033,18 @@ impl SqliteStore {
             }
             insert_asset(&mut tx, asset).await?;
             insert_version(&mut tx, &asset.current).await?;
+            write_version_sources(
+                &mut tx,
+                &asset.asset.memory_asset_id,
+                asset.current.record.version,
+                &asset.current.sources,
+                asset
+                    .asset
+                    .project_id
+                    .as_ref()
+                    .map(harness_types::ProjectId::as_str),
+            )
+            .await?;
             refresh_fts(&mut tx, asset).await?;
         }
         sqlx::query(
@@ -834,7 +1052,15 @@ impl SqliteStore {
              lease_owner = NULL WHERE job_id = ? AND lease_owner = ? AND lease_generation = ?",
         )
         .bind(if assets.is_empty() {
-            "no_facts"
+            // The caller's disposition decides which kind of empty this was. The
+            // default says the range was read and held nothing; `filtered` says it
+            // held nothing the extractor may read, and `self_referential` that it
+            // held only material the store already had.
+            match disposition {
+                "filtered" => "filtered",
+                "self_referential" => "self_referential",
+                _ => "no_facts",
+            }
         } else {
             "candidates"
         })
@@ -875,6 +1101,43 @@ impl SqliteStore {
         })
     }
 
+    /// Settle a range whose candidates were all quotes of memory that already exists.
+    ///
+    /// The range is covered like any other empty settlement - the cursor moves, the
+    /// job completes - and the disposition says the extractor proposed only material
+    /// the store already held. That is the difference between "this range held no
+    /// facts" and "this range held only echoes", and only the second one means the
+    /// extraction loop is feeding on its own output.
+    pub async fn settle_extraction_self_referential(
+        &self,
+        lease: &StoredExtractionLeaseRecord,
+        proposed: usize,
+    ) -> Result<(), StoreError> {
+        self.settle_extraction_assets_disposition(lease, &[], "self_referential")
+            .await?;
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        sqlx::query("UPDATE memory_jobs SET last_error = ? WHERE job_id = ?")
+            .bind(format!("{proposed} proposed candidate(s) already existed"))
+            .bind(&lease.job.job_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::StorageWriteFailed,
+                    "record self-referential range",
+                    error,
+                )
+            })?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit self-referential range",
+                error,
+            )
+        })
+    }
+
     pub async fn fail_extraction_job(
         &self,
         lease: &StoredExtractionLeaseRecord,
@@ -891,13 +1154,21 @@ impl SqliteStore {
         let mut tx = self.begin_write(&fence).await?;
         assert_job_lease(&mut tx, lease).await?;
         sqlx::query(
+            // Backoff applies to a failure another attempt might get past. `blocked`
+            // is the opposite: it means the extractor is not there, so there is
+            // nothing to wait out and the next explicit catch-up should be able to
+            // try again. Leaving a one-minute backoff on a blocked range made
+            // "enable the extractor and catch up" a command that silently did
+            // nothing for a minute.
             "UPDATE memory_jobs SET status = ?, last_error = ?, lease_owner = NULL,
-             next_due_unix_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
-                 + min(60000, 100 * (1 << min(attempts, 9))) + abs(random() % 100)
+             next_due_unix_ms = CASE WHEN ? = 'blocked' THEN 0
+                 ELSE CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+                     + min(60000, 100 * (1 << min(attempts, 9))) + abs(random() % 100) END
              WHERE job_id = ? AND lease_owner = ? AND lease_generation = ?",
         )
         .bind(status)
         .bind(message)
+        .bind(status)
         .bind(&lease.job.job_id)
         .bind(&lease.owner)
         .bind(to_i64(lease.generation, "extraction lease generation")?)
@@ -1008,6 +1279,182 @@ impl SqliteStore {
             )
         })?;
         Ok(result.rows_affected())
+    }
+
+    /// Put a store back to the version 1 memory shape. Test-only.
+    ///
+    /// The migration this exercises is additive, so the only way to have a version
+    /// 1 store is to remove what version 2 adds. Doing it through SQL here keeps
+    /// the fixture honest: it reproduces exactly the two differences (the table and
+    /// the marker) instead of asserting against a hand-written schema that could
+    /// drift from the real one.
+    #[cfg(test)]
+    pub(crate) async fn demote_memory_schema_to_version_one(&self) -> Result<(), StoreError> {
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        for statement in [
+            "DROP INDEX IF EXISTS memory_sources_by_source",
+            "DROP INDEX IF EXISTS memory_sources_by_asset",
+            "DROP TABLE IF EXISTS memory_sources",
+            "DELETE FROM memory_schema_migrations WHERE version = 2",
+        ] {
+            sqlx::query(statement)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    database_error(ErrorCode::MigrationFailed, "demote memory schema", error)
+                })?;
+        }
+        tx.commit().await.map_err(|error| {
+            database_error(ErrorCode::MigrationFailed, "commit memory demotion", error)
+        })
+    }
+
+    /// Whether `memory_sources` exists, and the recorded memory schema revision.
+    /// Test-only.
+    #[cfg(test)]
+    pub(crate) async fn memory_schema_shape(&self) -> Result<(bool, i64), StoreError> {
+        let present = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_sources'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "read memory schema shape",
+                error,
+            )
+        })?;
+        let version = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(version) FROM memory_schema_migrations",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "read memory schema revision",
+                error,
+            )
+        })?
+        .unwrap_or(0);
+        Ok((present == 1, version))
+    }
+
+    /// The sources of one version, in a stable order.
+    ///
+    /// Authorized like any other read of the asset: the sources of a version are
+    /// part of what the version says about itself, so a principal that may not
+    /// read the asset may not enumerate them either.
+    pub async fn memory_version_sources(
+        &self,
+        principal: &StoreMemoryPrincipal,
+        memory_asset_id: &MemoryAssetId,
+        version: u64,
+    ) -> Result<Vec<MemorySourceRecord>, StoreError> {
+        let asset = self
+            .read_memory_asset(principal, memory_asset_id, "read")
+            .await?
+            .ok_or_else(|| {
+                StoreError::new(ErrorCode::InvalidPayload, "memory asset was not found")
+            })?;
+        // Only a version that has existed may be named; a caller asking about a
+        // version the asset never had gets a typed refusal rather than an empty
+        // success that reads like "this version has no sources".
+        if version == 0 || version > asset.asset.current_version {
+            return Err(StoreError::new(
+                ErrorCode::InvalidPayload,
+                "memory version does not exist on this asset",
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "begin memory source read",
+                error,
+            )
+        })?;
+        let sources = load_version_sources(&mut tx, memory_asset_id, version).await?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "close memory source read",
+                error,
+            )
+        })?;
+        Ok(sources)
+    }
+
+    /// The current version of every asset whose recorded source no longer matches.
+    ///
+    /// `scope_project_id` is applied to the source row, which carries the project
+    /// of the asset that owned it: the same relative path in two projects is two
+    /// sources, and a stale file in one project must not retire knowledge in the
+    /// other. The comparison is deliberately "has this changed", not "is this
+    /// gone": a deletion is reported as a change too, because a missing file is
+    /// not the file that was read.
+    pub async fn memory_versions_with_changed_sources(
+        &self,
+        principal: &StoreMemoryPrincipal,
+        refresh: &[RefreshSource],
+    ) -> Result<Vec<MemoryAssetId>, StoreError> {
+        if refresh.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "begin stale memory source read",
+                error,
+            )
+        })?;
+        let mut changed = BTreeSet::new();
+        for candidate in refresh {
+            let rows = sqlx::query(
+                "SELECT a.memory_asset_id
+                 FROM memory_sources s
+                 JOIN memory_assets a
+                   ON a.memory_asset_id = s.derived_asset_id
+                  AND a.current_version = s.derived_version
+                 WHERE s.source_kind = ?1 AND s.source_id = ?2
+                   AND (a.project_id IS NULL OR a.project_id = ?3)
+                   AND a.status = 'active'
+                   AND (s.observed_digest IS NULL OR s.observed_digest != ?4)
+                 ORDER BY a.memory_asset_id",
+            )
+            .bind(candidate.kind.as_str())
+            .bind(&candidate.id)
+            .bind(principal.project_id.as_ref().map(ToString::to_string))
+            .bind(candidate.observed.as_str())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::StorageOpenFailed,
+                    "find versions whose source moved",
+                    error,
+                )
+            })?;
+            for row in &rows {
+                let id = MemoryAssetId::parse(row.get::<String, _>("memory_asset_id"))
+                    .map_err(|error| StoreError::new(error.code(), error.to_string()))?;
+                if assert_authorized(&mut tx, principal, &id, "invalidate")
+                    .await
+                    .is_ok()
+                {
+                    changed.insert(id);
+                }
+            }
+        }
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "close stale memory source read",
+                error,
+            )
+        })?;
+        Ok(changed.into_iter().collect())
     }
 }
 
@@ -1432,7 +1879,10 @@ async fn load_asset_in_tx(
             error,
         )
     })?;
-    decode_asset_row(&row, asset, decode_version(&version_row)?).map(Some)
+    let mut version = decode_version(&version_row)?;
+    version.sources =
+        load_version_sources(tx, &asset.memory_asset_id, asset.current_version).await?;
+    decode_asset_row(&row, asset, version).map(Some)
 }
 
 fn decode_asset_row(
@@ -1469,7 +1919,152 @@ fn decode_version(row: &sqlx::sqlite::SqliteRow) -> Result<StoredMemoryVersionRe
         content: row.get("content"),
         normalized_content: row.get("normalized_content"),
         strategy_digest: digest,
+        sources: Vec::new(),
     })
+}
+
+/// The sources of one version, read as a second statement.
+///
+/// Not a join on the version query: `decode_version` is also called on rows that
+/// were just written and whose sources are already in hand, and a join would
+/// multiply those rows by their source count for no gain.
+async fn load_version_sources(
+    tx: &mut Transaction<'_, Sqlite>,
+    memory_asset_id: &MemoryAssetId,
+    version: u64,
+) -> Result<Vec<MemorySourceRecord>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT source_kind, source_id, observed_digest, source_version
+         FROM memory_sources WHERE derived_asset_id = ? AND derived_version = ?
+         ORDER BY source_kind, source_id",
+    )
+    .bind(memory_asset_id.as_str())
+    .bind(to_i64(version, "memory version")?)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|error| {
+        database_error(
+            ErrorCode::StorageWriteFailed,
+            "load memory version sources",
+            error,
+        )
+    })?;
+    rows.iter()
+        .map(|row| {
+            let kind = MemorySourceKind::parse(&row.get::<String, _>("source_kind"))?;
+            let observed = row
+                .get::<Option<String>, _>("observed_digest")
+                .map(|value| {
+                    ContentHash::parse(value)
+                        .map_err(|error| StoreError::new(error.code(), error.to_string()))
+                })
+                .transpose()?;
+            let source_version = row
+                .get::<Option<i64>, _>("source_version")
+                .map(|value| {
+                    u64::try_from(value).map_err(|_| {
+                        StoreError::new(
+                            ErrorCode::InvalidPayload,
+                            "stored memory source version is negative",
+                        )
+                    })
+                })
+                .transpose()?;
+            Ok(MemorySourceRecord {
+                source_kind: kind,
+                source_id: row.get("source_id"),
+                observed_digest: observed,
+                source_version,
+            })
+        })
+        .collect()
+}
+
+/// Replace the source rows of one version. Delete-then-insert, in the caller's
+/// transaction: a version's sources are immutable along with the version, so a
+/// second write of the same version is an upgrade of the row, never a merge.
+async fn write_version_sources(
+    tx: &mut Transaction<'_, Sqlite>,
+    memory_asset_id: &MemoryAssetId,
+    version: u64,
+    sources: &[MemorySourceRecord],
+    scope_project_id: Option<&str>,
+) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM memory_sources WHERE derived_asset_id = ? AND derived_version = ?")
+        .bind(memory_asset_id.as_str())
+        .bind(to_i64(version, "memory version")?)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "clear memory version sources",
+                error,
+            )
+        })?;
+    for source in sources {
+        validate_source(source)?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO memory_sources(
+                 derived_asset_id, derived_version, source_kind, source_id,
+                 observed_digest, source_version, scope_project_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(memory_asset_id.as_str())
+        .bind(to_i64(version, "memory version")?)
+        .bind(source.source_kind.as_str())
+        .bind(&source.source_id)
+        .bind(source.observed_digest.as_ref().map(ContentHash::as_str))
+        .bind(
+            source
+                .source_version
+                .map(|value| {
+                    i64::try_from(value).map_err(|_| {
+                        StoreError::new(
+                            ErrorCode::InvalidPayload,
+                            "memory source version does not fit the store",
+                        )
+                    })
+                })
+                .transpose()?,
+        )
+        .bind(scope_project_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "record memory version source",
+                error,
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_source(source: &MemorySourceRecord) -> Result<(), StoreError> {
+    if source.source_id.trim().is_empty() {
+        return Err(StoreError::new(
+            ErrorCode::InvalidPayload,
+            "memory source needs a non-empty id",
+        ));
+    }
+    if source.source_kind == MemorySourceKind::File
+        && source
+            .observed_digest
+            .as_ref()
+            .is_none_or(|digest| digest.as_str().trim().is_empty())
+    {
+        // A file source without the digest read at write time can never be
+        // compared against the file later, so it would be a dependency that
+        // silently never expires. Refuse it instead of storing a claim the
+        // freshness filter cannot check.
+        return Err(StoreError::new(
+            ErrorCode::InvalidPayload,
+            "a file memory source requires the digest observed when it was written",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_optional_id<T, F>(value: Option<String>, parse: F) -> Result<Option<T>, StoreError>

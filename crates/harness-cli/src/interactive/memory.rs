@@ -396,6 +396,7 @@ pub async fn remember_input(
                 source_file_hashes: Vec::new(),
                 source_commit: None,
                 provenance_kind: "interactive_admission".to_owned(),
+                sources: Vec::new(),
             },
         )
         .await?;
@@ -491,6 +492,7 @@ pub async fn remember_turn(
                 source_file_hashes: Vec::new(),
                 source_commit: None,
                 provenance_kind: TURN_PROVENANCE.to_owned(),
+                sources: Vec::new(),
             },
         )
         .await?;
@@ -1344,6 +1346,7 @@ mod tests {
                     source_file_hashes: Vec::new(),
                     source_commit: Some("legacy-edge-fixture".to_owned()),
                     provenance_kind: "runtime_observation".to_owned(),
+                    sources: Vec::new(),
                 },
             )
             .await
@@ -1749,6 +1752,7 @@ mod tests {
                         source_file_hashes: Vec::new(),
                         source_commit: Some("long-hit-fixture".to_owned()),
                         provenance_kind: "runtime_observation".to_owned(),
+                        sources: Vec::new(),
                     },
                 )
                 .await
@@ -1995,6 +1999,7 @@ mod tests {
                         source_file_hashes: Vec::new(),
                         source_commit: Some("crowded-window-fixture".to_owned()),
                         provenance_kind: "runtime_observation".to_owned(),
+                        sources: Vec::new(),
                     },
                 )
                 .await
@@ -2020,6 +2025,7 @@ mod tests {
                     source_file_hashes: Vec::new(),
                     source_commit: Some("crowded-window-fixture".to_owned()),
                     provenance_kind: "runtime_observation".to_owned(),
+                    sources: Vec::new(),
                 },
             )
             .await

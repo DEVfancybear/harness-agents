@@ -43,6 +43,7 @@ fn observation_asset(
         source_file_hashes: vec![ContentHash::from_bytes(format!("w{index}").as_bytes())],
         source_commit: Some(commit.to_owned()),
         provenance_kind: "runtime_observation".to_owned(),
+        sources: Vec::new(),
     }
 }
 
@@ -818,6 +819,7 @@ async fn p5_s06_delegated_memory_binding_respects_child_scope() {
                 supersedes: Some(asset.asset.current_version),
                 extractor_version: None,
                 strategy_digest: None,
+                sources: Vec::new(),
             },
         )
         .await

@@ -1,10 +1,11 @@
 use super::{
-    ErrorCode, HarnessError, InjectionMode, MEMORY_BLOCK_HEADING, MemoryBinding, MemoryPrincipal,
-    MemoryService, Serialize, StoredMemoryAsset, TURN_PROVENANCE_KIND, convert_asset,
-    normalize_search_text, store_principal, to_harness_error,
+    ErrorCode, EvidenceState, HarnessError, InjectionMode, MEMORY_BLOCK_HEADING, MemoryBinding,
+    MemoryPrincipal, MemoryService, Serialize, StoredMemoryAsset, TURN_PROVENANCE_KIND,
+    convert_asset, normalize_search_text, store_principal, to_harness_error,
 };
 use harness_session::{ContextBlock, ContextBlockKind};
-use harness_types::{ContentHash, MemoryVersionRef};
+use harness_store_sqlite::RefreshSource;
+use harness_types::{ContentHash, MemoryAssetId, MemoryVersionRef};
 use std::{future::Future, pin::Pin};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -44,6 +45,7 @@ impl MemoryContribution {
                 "principal": self.principal,
                 "blocks": self.blocks,
                 "versions": self.versions,
+                "stamps": self.stamps,
                 "revision": self.revision,
             })
             .to_string()
@@ -62,11 +64,68 @@ impl MemoryContribution {
     }
 }
 
+/// Why one version was the one injected, and what it was checked against.
+///
+/// The packet has to be able to say which version of a fact it carried and why
+/// that one, because the answer to "why does the model believe this" is otherwise
+/// only recoverable by re-running the search - which may select something else by
+/// then. `source_digests` are the digests recorded when the version was written,
+/// so a later reader can see what the version was built from without the workspace
+/// still being in that state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SelectionStamp {
+    pub memory_asset_id: MemoryAssetId,
+    pub version: u64,
+    /// The content hash of the exact version injected.
+    pub content_digest: ContentHash,
+    pub reason: SelectionReason,
+    pub source_digests: Vec<SourceDigest>,
+}
+
+/// One named source of the injected version, with the digest read at write time.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SourceDigest {
+    pub kind: String,
+    pub id: String,
+    pub observed_digest: Option<ContentHash>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionReason {
+    /// Live memory of a host observation or a user instruction.
+    Fresh,
+    /// A version a human confirmed; it outranks whatever it superseded.
+    UserConfirmed,
+    /// A version that exists because a previous one was corrected or replaced.
+    UserCorrected,
+    /// The conversation log, which answers only when durable memory is silent.
+    LogFallback,
+}
+
+impl SelectionReason {
+    /// The short spelling used inside an injected block.
+    ///
+    /// Short because it is charged to every block's fixed cost, and because the
+    /// long form is already available to a caller through [`SelectionStamp`].
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::UserConfirmed => "confirmed",
+            Self::UserCorrected => "corrected",
+            Self::LogFallback => "log",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MemoryContribution {
     pub principal: MemoryPrincipal,
     pub blocks: Vec<ContextBlock>,
     pub versions: Vec<MemoryVersionRef>,
+    /// One entry per injected block, in the same order as `blocks`.
+    pub stamps: Vec<SelectionStamp>,
     pub revision: u64,
     seal: ContentHash,
 }
@@ -102,7 +161,7 @@ impl MemoryService {
             }
             hits.push(asset);
         }
-        Ok(self.contribute(
+        Ok(self.contribute_indexed(
             principal,
             &RetrievalResult {
                 state: RetrievalState::Found,
@@ -111,6 +170,7 @@ impl MemoryService {
                 revision,
             },
             max_tokens,
+            MemoryIndex::Durable,
         ))
     }
     /// Search with the recall strategy this crate owns.
@@ -149,7 +209,27 @@ impl MemoryService {
         limit: usize,
         vector: Option<&dyn VectorAdapter>,
     ) -> Result<RetrievalResult, HarnessError> {
-        self.search_terms_in(principal, terms, limit, vector, None)
+        self.search_terms_fresh(principal, terms, limit, vector, &[])
+            .await
+    }
+
+    /// Search with the caller's current view of the sources it re-read.
+    ///
+    /// `refresh` filters, it does not invalidate: a version whose named file changed
+    /// is left out of this answer, while the asset keeps its status and its audit
+    /// until someone invalidates it on purpose. See `ADR-N07` D2.
+    ///
+    /// # Errors
+    /// Fails when the query is unusable or the store refuses it.
+    pub async fn search_terms_fresh(
+        &self,
+        principal: &MemoryPrincipal,
+        terms: &[String],
+        limit: usize,
+        vector: Option<&dyn VectorAdapter>,
+        refresh: &[RefreshSource],
+    ) -> Result<RetrievalResult, HarnessError> {
+        self.search_terms_in(principal, terms, limit, vector, None, refresh)
             .await
     }
 
@@ -164,6 +244,7 @@ impl MemoryService {
         limit: usize,
         vector: Option<&dyn VectorAdapter>,
         exclude_provenance: Option<&str>,
+        refresh: &[RefreshSource],
     ) -> Result<RetrievalResult, HarnessError> {
         if principal.principal_id.trim().is_empty() {
             return Err(HarnessError::new(
@@ -218,6 +299,7 @@ impl MemoryService {
                 &match_any(&terms),
                 candidates,
                 exclude_provenance,
+                refresh,
             )
             .await?;
         let Some((records, mut revision)) = outcome else {
@@ -234,7 +316,13 @@ impl MemoryService {
             // revision with the number from another makes the whole contribution be
             // dropped in silence - which is the defect this path was written to fix.
             let outcome = self
-                .search_store(principal, &match_all(&terms), limit, exclude_provenance)
+                .search_store(
+                    principal,
+                    &match_all(&terms),
+                    limit,
+                    exclude_provenance,
+                    refresh,
+                )
                 .await?;
             let Some((found, fallback_revision)) = outcome else {
                 return Ok(Self::unavailable());
@@ -297,13 +385,20 @@ impl MemoryService {
         vector: Option<&dyn VectorAdapter>,
     ) -> Result<(MemoryIndex, RetrievalResult), HarnessError> {
         let durable = self
-            .search_terms_in(principal, terms, limit, vector, Some(TURN_PROVENANCE_KIND))
+            .search_terms_in(
+                principal,
+                terms,
+                limit,
+                vector,
+                Some(TURN_PROVENANCE_KIND),
+                &[],
+            )
             .await?;
         if durable.state != RetrievalState::Empty {
             return Ok((MemoryIndex::Durable, durable));
         }
         let log = self
-            .search_terms_in(principal, terms, limit, vector, None)
+            .search_terms_in(principal, terms, limit, vector, None, &[])
             .await?;
         Ok((MemoryIndex::Log, log))
     }
@@ -321,14 +416,16 @@ impl MemoryService {
         expression: &str,
         limit: usize,
         exclude_provenance: Option<&str>,
+        refresh: &[RefreshSource],
     ) -> Result<Option<(Vec<super::StoredMemoryAssetRecord>, u64)>, HarnessError> {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            self.store.search_memory(
+            self.store.search_memory_fresh(
                 &store_principal(principal),
                 expression,
                 limit,
                 exclude_provenance,
+                refresh,
             ),
         )
         .await;
@@ -426,11 +523,27 @@ impl MemoryService {
         result: &RetrievalResult,
         max_tokens: u64,
     ) -> MemoryContribution {
+        self.contribute_indexed(principal, result, max_tokens, MemoryIndex::Durable)
+    }
+
+    /// Render one turn's memory blocks, saying which index answered.
+    ///
+    /// The index is what decides the selection reason on each stamp: a log entry is
+    /// a fallback and a durable version is not, and a packet that reported both the
+    /// same way would hide the one fact a reader needs to weigh the block.
+    pub fn contribute_indexed(
+        &self,
+        principal: &MemoryPrincipal,
+        result: &RetrievalResult,
+        max_tokens: u64,
+        index: MemoryIndex,
+    ) -> MemoryContribution {
         let mut remaining = max_tokens.min(2000);
         let mut contribution = MemoryContribution {
             principal: principal.clone(),
             blocks: Vec::new(),
             versions: Vec::new(),
+            stamps: Vec::new(),
             revision: result.revision,
             seal: ContentHash::from_bytes(b""),
         };
@@ -441,7 +554,8 @@ impl MemoryService {
             if share < MIN_BLOCK_TOKENS {
                 break;
             }
-            let text = render_memory_block(hit, share);
+            let stamp = selection_stamp(hit, index);
+            let text = render_memory_block(hit, share, stamp.reason);
             // The heading and the source line are fixed costs, and for a small share they
             // are the whole block. Injecting that would spend the budget of every hit
             // after this one to tell the model nothing, so the hit is left out instead.
@@ -464,10 +578,45 @@ impl MemoryService {
                 // read the memory in effectively random order.
                 relevance_for(rank),
             ));
+            contribution.stamps.push(stamp);
             contribution.versions.push(reference);
         }
         contribution.seal = contribution.rendering_hash();
         contribution
+    }
+}
+
+/// The stamp for one selected hit.
+///
+/// `UserConfirmed` and `Superseded` are read from the *version*, because they are
+/// properties of that version rather than of the query: a version a human confirmed
+/// stays confirmed however it was found, and a version that recorded the version it
+/// replaced is the correction of it.
+fn selection_stamp(hit: &StoredMemoryAsset, index: MemoryIndex) -> SelectionStamp {
+    let reason = if hit.current.record.evidence_state == EvidenceState::UserConfirmed.as_str() {
+        SelectionReason::UserConfirmed
+    } else if hit.current.record.supersedes.is_some() {
+        SelectionReason::UserCorrected
+    } else if index == MemoryIndex::Log {
+        SelectionReason::LogFallback
+    } else {
+        SelectionReason::Fresh
+    };
+    SelectionStamp {
+        memory_asset_id: hit.asset.memory_asset_id.clone(),
+        version: hit.asset.current_version,
+        content_digest: hit.current.record.content_hash.clone(),
+        reason,
+        source_digests: hit
+            .current
+            .sources
+            .iter()
+            .map(|source| SourceDigest {
+                kind: source.kind.as_str().to_owned(),
+                id: source.id.clone(),
+                observed_digest: source.observed_digest.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -541,11 +690,22 @@ fn estimate_tokens(text: &str) -> u64 {
 /// before deciding whether to read on. A clip therefore shortens the *content* and keeps
 /// both ends: the heading is what tells the model how to read what follows, and the
 /// source line is what an auditor follows back to the version this came from.
-fn render_memory_block(hit: &StoredMemoryAsset, share: u64) -> String {
+///
+/// The note is kept short on purpose. It is a fixed cost charged to every block, and
+/// the budget is shared: a first hit offered an eighth of 800 tokens has room for about
+/// a hundred, so a verbose note spends the whole share and the hit is dropped for
+/// telling the model nothing. Version, digest prefix and reason are what a reader needs
+/// to identify the selection; the event refs are already carried by the block id.
+fn render_memory_block(hit: &StoredMemoryAsset, share: u64, reason: SelectionReason) -> String {
     let head = format!("{MEMORY_BLOCK_HEADING}\n");
+    let digest = hit.current.record.content_hash.as_str();
     let tail = format!(
-        "\n(source: authority={:?}, validity={:?}, refs={:?})",
-        hit.asset.created_by, hit.current.record.validity, hit.current.record.source_event_refs,
+        "\n(source: authority={:?}, validity={:?}, v{} {} {})",
+        hit.asset.created_by,
+        hit.current.record.validity,
+        hit.asset.current_version,
+        reason.as_str(),
+        digest.get(..19).unwrap_or(digest),
     );
     let whole = format!("{head}{}{tail}", hit.current.content);
     if estimate_tokens(&whole) <= share {

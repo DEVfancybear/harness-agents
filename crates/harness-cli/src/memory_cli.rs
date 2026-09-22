@@ -94,6 +94,38 @@ enum MemoryAction {
         #[arg(long)]
         content: String,
     },
+    /// Propose a candidate: recorded, inspectable, not usable memory yet.
+    ///
+    /// Without an `--asset` this creates a new candidate at version 1. With one, it
+    /// adds a version to that asset and `--expected-version` is required, so a
+    /// proposal built on a stale read is refused instead of overwriting whatever
+    /// was published in the meantime.
+    Propose {
+        /// Existing asset to propose a new version on; omit to propose a new asset.
+        #[arg(long)]
+        asset: Option<String>,
+        #[arg(long)]
+        expected_version: Option<u64>,
+        #[arg(long)]
+        content: String,
+        /// Project scope for a new asset. Required when `--asset` is absent.
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long, default_value = "proposed")]
+        kind: String,
+    },
+    /// Refuse a candidate on the record, at the version the human inspected.
+    Reject {
+        asset_id: String,
+        #[arg(long)]
+        expected_version: u64,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Dump every version of an asset with its recorded sources.
+    Export {
+        asset_id: String,
+    },
     Jobs,
     CatchUp {
         #[arg(long)]
@@ -180,6 +212,7 @@ pub async fn run(command: MemoryCommand) -> Result<(), HarnessError> {
         MemoryAction::Search { .. }
             | MemoryAction::Read { .. }
             | MemoryAction::Inspect { .. }
+            | MemoryAction::Export { .. }
             | MemoryAction::Candidates { .. }
             | MemoryAction::Jobs
     );
@@ -351,6 +384,7 @@ async fn execute(
                         supersedes: Some(expected_version),
                         extractor_version: record.extractor_version,
                         strategy_digest: current.current.strategy_digest,
+                        sources: Vec::new(),
                     },
                 )
                 .await?;
@@ -372,6 +406,105 @@ async fn execute(
                 )
                 .await?;
             Ok(asset_json(&asset))
+        }
+        MemoryAction::Propose {
+            asset,
+            expected_version,
+            content,
+            scope,
+            kind,
+        } => {
+            let sources = Vec::new();
+            let request = |scope: harness_types::MemoryScope, project_id: Option<ProjectId>| {
+                harness_memory::CreateMemoryAsset {
+                    kind: kind.clone(),
+                    scope,
+                    layer: harness_memory::MemoryLayer::L1,
+                    project_id,
+                    task_id: None,
+                    agent_profile_id: None,
+                    session_id: None,
+                    visibility: "scoped".to_owned(),
+                    content: content.clone(),
+                    // A proposal is the model's or the operator's suggestion. It is
+                    // recorded as such, and the publication policy is what decides
+                    // it stays a candidate.
+                    authority: SourceAuthority::ModelProposed,
+                    evidence: harness_memory::EvidenceState::ModelInference,
+                    user_confirmed: false,
+                    source_event_refs: Vec::new(),
+                    source_file_hashes: Vec::new(),
+                    source_commit: None,
+                    provenance_kind: "cli_proposal".to_owned(),
+                    sources: sources.clone(),
+                }
+            };
+            // Parsed before the call so the borrow lives long enough for
+            // `propose`, which takes the target by reference.
+            let parsed_target = match (asset.as_deref(), expected_version) {
+                (Some(id), Some(version)) => Some((MemoryAssetId::parse(id)?, version)),
+                (Some(_), None) => {
+                    return Err(HarnessError::new(
+                        ErrorCode::InvalidPayload,
+                        "proposing a version needs --expected-version, so a stale proposal cannot overwrite a published one",
+                    ));
+                }
+                (None, _) => None,
+            };
+            let target = parsed_target.as_ref().map(|(id, version)| (id, *version));
+            let scope = match scope.as_deref() {
+                None | Some("project") => harness_types::MemoryScope::Project,
+                Some("user") => harness_types::MemoryScope::User,
+                Some("task") => harness_types::MemoryScope::Task,
+                Some("session") => harness_types::MemoryScope::Session,
+                Some("agent_profile") => harness_types::MemoryScope::AgentProfile,
+                Some(other) => {
+                    return Err(HarnessError::new(
+                        ErrorCode::InvalidPayload,
+                        format!("unsupported memory scope: {other}"),
+                    ));
+                }
+            };
+            let proposed = service
+                .propose(
+                    principal,
+                    target,
+                    request(scope, principal.project_id.clone()),
+                )
+                .await?;
+            Ok(json!({
+                "proposed": asset_json(&proposed),
+                "status": proposed.asset.status,
+                "published": proposed.asset.status == harness_types::MemoryAssetStatus::Active,
+            }))
+        }
+        MemoryAction::Reject {
+            asset_id,
+            expected_version,
+            reason,
+        } => Ok(json!({
+            "rejected": service
+                .reject(principal, &MemoryAssetId::parse(asset_id)?, expected_version, &reason)
+                .await?,
+        })),
+        MemoryAction::Export { asset_id } => {
+            let id = MemoryAssetId::parse(asset_id)?;
+            let versions = service.export_versions(principal, &id).await?;
+            let mut exported = Vec::new();
+            for version in versions {
+                exported.push(json!({
+                    "record": version.record,
+                    "content": version.content,
+                    "strategy_digest": version.strategy_digest,
+                    "sources": version.sources.iter().map(|source| json!({
+                        "kind": source.kind,
+                        "id": source.id,
+                        "observed_digest": source.observed_digest,
+                        "source_version": source.source_version,
+                    })).collect::<Vec<_>>(),
+                }));
+            }
+            Ok(json!({"asset_id": id, "versions": exported, "redacted": true}))
         }
         MemoryAction::Jobs => {
             let stream = principal.session_id.as_ref().ok_or_else(|| {
@@ -405,7 +538,13 @@ async fn execute(
                 asset_scope: asset_scope.scope(),
             };
             service.recover_interrupted_jobs().await?;
-            let scheduled = service.schedule_backlog(stream, &strategy, 16).await?.len();
+            // Reconcile rather than schedule: the backlog is what the journal
+            // committed and this host has not settled, so a range lost to a crash
+            // between the commit and the enqueue is created here, and a range that
+            // was already enqueued is not created twice.
+            let reconciled = service.reconcile(stream, &strategy, 16).await?;
+            let scheduled = reconciled.enqueued;
+            let cursor_before = reconciled.cursor;
             let cancellation = harness_providers::CancellationToken::new();
             let signal = cancellation.clone();
             let listener = tokio::spawn(async move {
@@ -425,7 +564,7 @@ async fn execute(
             listener.abort();
             let _ = listener.await;
             Ok(
-                json!({"scheduled": scheduled, "report": result?, "contiguous_sequence": service.extraction_cursor(stream, &strategy).await?, "extractor": if matches!(extractor, ExtractorMode::Mock) { "deterministic_mock" } else { "disabled" }, "asset_scope": asset_scope.label()}),
+                json!({"scheduled": scheduled, "cursor_before": cursor_before, "report": result?, "contiguous_sequence": service.extraction_cursor(stream, &strategy).await?, "extractor": if matches!(extractor, ExtractorMode::Mock) { "deterministic_mock" } else { "disabled" }, "asset_scope": asset_scope.label()}),
             )
         }
     }

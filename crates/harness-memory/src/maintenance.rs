@@ -30,6 +30,8 @@ impl MemoryBudget {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CatchUpReport {
+    /// Ranges this call had to enqueue because nothing else had.
+    pub enqueued: usize,
     pub calls: u32,
     pub completed: u32,
     pub failed: u32,
@@ -104,21 +106,28 @@ impl MemoryService {
         }
         let mut report = CatchUpReport::default();
         let mut budget_exhausted = budget.max_calls == 0;
-        let jobs = self.list_jobs_for(stream).await?;
-        for job in jobs.into_iter().filter(|job| {
-            job.extractor_version == strategy.extractor_version
-                && job.strategy_digest == strategy.strategy_digest
-                && job.status != ExtractionJobStatus::Completed
-        }) {
+        // Reconcile first: the backlog is whatever the journal committed and this
+        // host has not settled. Doing it here, rather than trusting a previous
+        // enqueue, is what makes a crash between commit and enqueue recoverable -
+        // the range is still on disk, so the next call creates the same job.
+        let reconciled = self.reconcile(stream, strategy, 64).await?;
+        report.enqueued = reconciled.enqueued;
+        for job in reconciled.outstanding {
             if cancel.is_cancelled() || report.calls >= budget.max_calls {
                 break;
             }
-            // A blocked/dead-letter/leased earlier range must not be skipped.
+            // The ranges this call may act on. `blocked` is included on purpose: it
+            // means the extractor was not there, and an explicit catch-up is the
+            // command that says it is there now. `leased` and `dead_letter` are not:
+            // the first belongs to another consumer, and the second is a range that
+            // has already failed its bounded number of attempts - retrying it here
+            // would either loop forever or silently exceed the retry policy.
             if !matches!(
                 job.status,
                 ExtractionJobStatus::Pending
                     | ExtractionJobStatus::Paused
                     | ExtractionJobStatus::RetryWait
+                    | ExtractionJobStatus::Blocked
             ) {
                 break;
             }
