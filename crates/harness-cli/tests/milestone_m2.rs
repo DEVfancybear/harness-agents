@@ -308,12 +308,27 @@ fn multicall_parts() -> Vec<String> {
     ]
 }
 
+/// Whether a provider failure is this host refusing or truncating a loopback
+/// connection rather than a property of the stream under test.
+///
+/// Measured 21-22/09/2026 and again 23/09/2026: the refusal reaches a real child
+/// process as `error sending request`, sometimes with a ` for url` suffix and
+/// sometimes without one, and the same window can surface as
+/// `error decoding response body` when the connection is cut mid-response. The
+/// older key named only the suffixed form, so these tests failed immediately
+/// instead of using the bounded retry that exists for exactly this condition.
+fn is_loopback_refusal(error: &harness_providers::ProviderError) -> bool {
+    let text = error.to_string();
+    text.contains("error sending request") || text.contains("error decoding response body")
+}
+
 async fn collect(adapter: &DeepSeekAdapter) -> Vec<ProviderStreamEvent> {
-    // Retry only a refused loopback connection: this Windows host intermittently
-    // refuses a connection to a listener that is already bound and accepting,
-    // even when this exact test runs alone in the milestone closure (measured
-    // 21-22/09/2026). The refusal never reaches the fixture, so a retry cannot
-    // consume a scripted response, and every other error still fails at once.
+    // Retry only a refused or truncated loopback connection: this Windows host
+    // intermittently refuses a connection to a listener that is already bound and
+    // accepting, even when this exact test runs alone in the milestone closure
+    // (measured 21-22/09/2026). The refusal never reaches the fixture, so a retry
+    // cannot consume a scripted response, and every other error still fails at
+    // once.
     let mut attempt = 0_u32;
     loop {
         attempt += 1;
@@ -324,9 +339,7 @@ async fn collect(adapter: &DeepSeekAdapter) -> Vec<ProviderStreamEvent> {
         .await;
         match result {
             Ok(events) => return events,
-            Err(error)
-                if attempt < 12 && error.to_string().contains("error sending request for url") =>
-            {
+            Err(error) if attempt < 12 && is_loopback_refusal(&error) => {
                 tokio::time::sleep(std::time::Duration::from_millis(
                     50 * (1_u64 << attempt.min(6)),
                 ))
@@ -339,9 +352,9 @@ async fn collect(adapter: &DeepSeekAdapter) -> Vec<ProviderStreamEvent> {
 
 /// Collect the stream of a test that expects an error.
 ///
-/// Like [`collect`], only a refused loopback connection is retried; every other
-/// error is returned so the test's own assertion decides. The refusal never
-/// reaches the fixture, so a retry cannot consume a scripted response.
+/// Like [`collect`], only a refused or truncated loopback connection is retried;
+/// every other error is returned so the test's own assertion decides. The refusal
+/// never reaches the fixture, so a retry cannot consume a scripted response.
 async fn stream_error(adapter: &DeepSeekAdapter) -> harness_providers::ProviderError {
     let mut attempt = 0_u32;
     loop {
@@ -352,9 +365,7 @@ async fn stream_error(adapter: &DeepSeekAdapter) -> harness_providers::ProviderE
         ))
         .await;
         match result {
-            Err(error)
-                if attempt < 12 && error.to_string().contains("error sending request for url") =>
-            {
+            Err(error) if attempt < 12 && is_loopback_refusal(&error) => {
                 tokio::time::sleep(std::time::Duration::from_millis(
                     50 * (1_u64 << attempt.min(6)),
                 ))

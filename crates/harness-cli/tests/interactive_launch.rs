@@ -17,8 +17,10 @@ use std::time::{Duration, Instant};
 ///
 /// This machine intermittently refuses a connection to a listener that is already
 /// bound and accepting, and the refusal reaches a real child process as
-/// `provider_protocol: ... error sending request for url`. The retry is keyed on that
-/// exact text only, so a genuine protocol failure still fails on the first attempt.
+/// `provider_protocol: ... error sending request`, sometimes with a ` for url`
+/// suffix and sometimes without one (measured 23/09/2026 under workspace load).
+/// The retry is keyed on the transport-level phrase alone, so a genuine protocol
+/// failure still fails on the first attempt.
 ///
 /// Measured on 21/09/2026: with the whole workspace suite running, this binary runs
 /// its loopback fixtures in parallel and a refusal window can outlive ten attempts
@@ -423,27 +425,34 @@ fn finish_fixture_response(socket: &mut std::net::TcpStream, response: &[u8]) {
 
 /// One-shot SSE fixture server on a real socket.
 fn sse_fixture(text: &'static str) -> (String, std::thread::JoinHandle<String>) {
-    use std::io::Read;
-
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
     let address = listener.local_addr().expect("fixture address");
     let handle = std::thread::spawn(move || {
-        let (mut socket, _) = listener.accept().expect("fixture accepts");
-        let mut request = vec![0_u8; 8192];
-        // A readiness probe connects and closes without sending a request, and
-        // Windows reports that as a reset rather than a clean end of stream.
-        let read = socket.read(&mut request).unwrap_or(0);
-        request.truncate(read);
-        let body = format!(
-            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
-        );
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        finish_fixture_response(&mut socket, response.as_bytes());
-        String::from_utf8_lossy(&request).into_owned()
+        // Accept until a connection actually sends a request.
+        //
+        // A readiness probe connects and closes without sending one, and Windows
+        // reports that as a reset rather than a clean end of stream. A fixture that
+        // served the probe dropped its listener before the real turn arrived, so the
+        // turn was refused by a listener that no longer existed — measured on this
+        // host under workspace load as `service_unavailable: ... error sending
+        // request` with no URL, which is a fixture lifetime artifact and not a
+        // property of the turn under test. The newest fixture in this file already
+        // accepts in a loop; this one now does too.
+        loop {
+            let (mut socket, _) = listener.accept().expect("fixture accepts");
+            if let Some(request) = read_http_request(&mut socket) {
+                let body = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                finish_fixture_response(&mut socket, response.as_bytes());
+                break request;
+            }
+        }
     });
     (format!("http://{address}/chat/completions"), handle)
 }
@@ -630,7 +639,7 @@ fn i03_a_named_file_reaches_the_model_inside_the_message() {
             .expect("ha binary runs");
         let run = CliRun::from_output(&output);
         if run.code() == 0
-            || !run.stderr.contains("error sending request for url")
+            || !run.stderr.contains("error sending request")
             || attempt >= LOOPBACK_ATTEMPTS
         {
             break run;
@@ -825,7 +834,7 @@ fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
         loop {
             attempt += 1;
             let run = run_turn(arguments.clone());
-            let refused = run.stderr.contains("error sending request for url");
+            let refused = run.stderr.contains("error sending request");
             if run.code() == 0 || !refused || attempt >= LOOPBACK_ATTEMPTS {
                 return run;
             }

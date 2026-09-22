@@ -21,6 +21,15 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Retry notices from the flake-tolerant step, forwarded to the log by its caller
+# so a green run still says whether it needed a retry.
+$script:GateRetryNotices = [System.Collections.Generic.List[string]]::new()
+
+function Write-GateRetryNotices {
+    foreach ($notice in $script:GateRetryNotices) { Write-Output $notice }
+    $script:GateRetryNotices.Clear()
+}
+
 function New-GateError {
     param(
         [Parameter(Mandatory)] [string] $Code,
@@ -60,22 +69,35 @@ function Invoke-FlakeTolerantCommand {
     # Measured on 21-22/09/2026: this Windows host intermittently refuses a
     # loopback connection or a credential-file rename while the whole workspace
     # suite runs, and the same suites pass when run alone (the failure moves
-    # between suites from run to run). Only these two exact signatures are
-    # retried, and only for the workspace test step; anything else rethrows at
-    # once, so a real regression can never be hidden by this retry.
+    # between suites from run to run). Only these exact signatures are retried,
+    # and only for the workspace test step; anything else rethrows at once, so a
+    # real regression can never be hidden by this retry.
+    #
+    # 23/09/2026 (M6): a refusal arrived as
+    # `service_unavailable: ... provider request failed: error sending request`
+    # with no ` for url` suffix, which the narrower pattern missed, so the
+    # workspace step failed on a flake the retry existed to absorb. The
+    # signature now matches the transport-level phrase itself; it still cannot
+    # match an assertion failure, and a genuinely unreachable provider is
+    # retried at most MaxAttempts times and then rethrown.
+    #
+    # The retry notice is collected here and forwarded by the caller, because a
+    # discarded `[void]` call hid whether a green step had needed a retry at all
+    # — and an evidence claim about a gate run has to say that.
     $attempt = 0
     while ($true) {
         $attempt++
         try {
-            return Invoke-CheckedCommand -Name $Name -FilePath $FilePath -Arguments $Arguments
+            $command = Invoke-CheckedCommand -Name $Name -FilePath $FilePath -Arguments $Arguments
+            return [pscustomobject]@{ Command = $command; Attempts = $attempt }
         } catch {
             $message = $_.Exception.Message
-            $isFlake = $message -match 'error sending request for url' -or
+            $isFlake = $message -match 'error sending request' -or
                 $message -match 'error decoding response body' -or
                 $message -match 'connection reset|broken pipe' -or
                 $message -match 'credential file .* could not be (written|replaced)'
             if (-not $isFlake -or $attempt -ge $MaxAttempts) { throw }
-            Write-Output "GATE_RETRY: $Name failed with the known host flake (attempt $attempt of $MaxAttempts); rerunning"
+            $script:GateRetryNotices.Add("GATE_RETRY: $Name failed with the known host flake (attempt $attempt of $MaxAttempts); rerunning")
         }
     }
 }
@@ -388,8 +410,20 @@ try {
     )) {
         if ($step.Name -ceq 'workspace-tests') {
             # The whole-workspace regression run is the only step retried for the
-            # host flake; required milestone tests below stay single-shot.
-            [void] (Invoke-FlakeTolerantCommand -Name $step.Name -FilePath $step.File -Arguments $step.Arguments -MaxAttempts 3)
+            # host flake; required milestone tests below stay single-shot. The
+            # retry notices are forwarded so the log says whether a green step
+            # needed one.
+            $tolerant = $null
+            try {
+                $tolerant = Invoke-FlakeTolerantCommand -Name $step.Name -FilePath $step.File -Arguments $step.Arguments -MaxAttempts 3
+            } finally {
+                # Forwarded whether the step passed or gave up, so the log always
+                # says how many attempts a result cost.
+                Write-GateRetryNotices
+            }
+            if ($tolerant.Attempts -gt 1) {
+                Write-Output "GATE_STEP_RETRIED: $($step.Name) needed $($tolerant.Attempts) attempts"
+            }
         } else {
             [void] (Invoke-CheckedCommand -Name $step.Name -FilePath $step.File -Arguments $step.Arguments)
         }
@@ -471,7 +505,13 @@ try {
             # workspace step) may be retried once more here; a typed or
             # assertion failure rethrows at once, and every milestone's own
             # required tests above stay single-shot.
-            $result = Invoke-FlakeTolerantCommand -Name "closure-$closureMilestone-test:$($selector.Selector)" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $selector.Target, '--locked', $selector.TestName, '--', '--exact')
+            $tolerant = $null
+            try {
+                $tolerant = Invoke-FlakeTolerantCommand -Name "closure-$closureMilestone-test:$($selector.Selector)" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $selector.Target, '--locked', $selector.TestName, '--', '--exact')
+            } finally {
+                Write-GateRetryNotices
+            }
+            $result = $tolerant.Command
             Assert-RequiredTestResult -TestName $selector.TestName -Output $result.Output
         }
         $results.Add([pscustomobject]@{ name = "closure-$closureMilestone"; result = 'passed'; count = $entryTests.Count })
