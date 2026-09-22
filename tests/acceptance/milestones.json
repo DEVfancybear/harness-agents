@@ -847,6 +847,70 @@
           "closure-M0"
         ]
       }
+    },
+    {
+      "id": "M10",
+      "title": "Web API và durable event projections",
+      "runbook": "docs/implementation-next/M10.vi.md",
+      "prerequisites": ["M9"],
+      "status": "in_progress",
+      "integration_target": "milestone_m10",
+      "work_items": [
+        {
+          "id": "M10-01",
+          "title": "Authenticated commands/queries",
+          "status": "implemented_unverified",
+          "tests": ["a33_web_replay_gap"]
+        },
+        {
+          "id": "M10-02",
+          "title": "Events, replay và gap",
+          "status": "implemented_unverified",
+          "tests": ["a33_web_replay_gap"]
+        },
+        {
+          "id": "M10-03",
+          "title": "Task workspace UI",
+          "status": "implemented_unverified",
+          "tests": ["a33_web_replay_gap"]
+        },
+        {
+          "id": "M10-04",
+          "title": "Uploads và artifact previews",
+          "status": "in_progress",
+          "tests": []
+        }
+      ],
+      "required_tests": ["a33_web_replay_gap"],
+      "unit_tests": [],
+      "fixtures": [
+        "crates/harness-cli/tests/milestone_m10.rs",
+        "crates/harness-cli/src/web/assets/app.js",
+        "docs/adr/ADR-N10-WEB-STACK-AND-IDENTITY.vi.md"
+      ],
+      "gate": {
+        "script": "scripts/Verify-Milestone.ps1",
+        "dependency_check_bin": "dependency_check",
+        "steps": [
+          "format",
+          "clippy",
+          "build",
+          "workspace-tests",
+          "dependency-allowlist",
+          "required-test-discovery",
+          "required-tests",
+          "closure-M9",
+          "closure-M8",
+          "closure-M7",
+          "closure-M6",
+          "closure-M5",
+          "closure-M4",
+          "closure-M3",
+          "closure-M1",
+          "closure-M2",
+          "closure-M0"
+        ]
+      }
     }
   ],
   "acceptance_cases": [
@@ -1130,7 +1194,9 @@
       "id": "A33",
       "owner_milestones": ["M10"],
       "planned_test": "a33_web_replay_gap",
-      "status": "planned"
+      "status": "implemented",
+      "selectors": ["milestone_m10::a33_web_replay_gap"],
+      "note": "a real hyper service on a real loopback socket, driven with raw HTTP/1.1: an unauthenticated mutation is 401 and writes nothing, a foreign Origin is 403 and writes nothing, a missing request id is 400, the same request id and payload replays with idempotent_replay true and the same durable sequence, a changed payload under a used id is 409 and writes nothing, the reload path carries event identity and correlation but never a payload, the SSE stream numbers frames by journal sequence, a non-loopback bind and a weak token are refused, and the web adapter contains no SQL"
     },
     {
       "id": "A34",
