@@ -793,6 +793,81 @@ async fn a15_path_patch_safety() {
         .expect_err("sensitive path must be refused");
     assert_eq!(error.code(), ErrorCode::SensitivePathDenied);
 
+    // A file another process holds open is observed as present-but-unreadable,
+    // never as a path escape. Windows is where the share violation is
+    // observable; POSIX advisory locks never block a plain read.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let locked = bench.workspace.join("src").join("locked.txt");
+        std::fs::write(&locked, "locked content\r\n").expect("lock fixture");
+        let unlocked = observe_workspace(bench.project_id.clone(), &bench.workspace)
+            .expect("the fixture workspace is observable");
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked)
+            .expect("exclusive lock fixture");
+        let locked_observation = observe_workspace(bench.project_id.clone(), &bench.workspace)
+            .expect("a locked file must not fail the whole observation");
+        assert_ne!(
+            unlocked.observed_fingerprint, locked_observation.observed_fingerprint,
+            "the locked state is part of the fingerprint, so an approval cannot slip through"
+        );
+
+        // A patch of the locked file is refused, and the refusal is not called a
+        // path escape.
+        let prepared = tools
+            .prepare(ToolRequest::new(
+                session.clone(),
+                task.clone(),
+                "actor.a",
+                &bench.workspace,
+                CodingToolAction::ApplyPatch {
+                    path: "src/locked.txt".to_owned(),
+                    expected_hash: ContentHash::from_bytes(b"locked content\r\n"),
+                    replacement: "replaced\r\n".to_owned(),
+                },
+            ))
+            .await
+            .expect("the proposal itself is a normal path");
+        let grant = tools.approve(&prepared).await.expect("approved");
+        let view = tools
+            .execute(prepared, Some(grant))
+            .await
+            .expect("a locked file is a typed denial, not a crash");
+        let receipt = view.receipt.expect("denial carries a receipt");
+        assert_eq!(receipt.outcome_state, ToolOutcomeState::Denied);
+        let ToolOutput::Denied { code, reason } = &view.output else {
+            panic!("the lock refusal must be a denial: {:?}", view.output);
+        };
+        assert_ne!(
+            code, "workspace_escape",
+            "a lock is a read failure, not a path escape: {reason}"
+        );
+        assert!(
+            store
+                .pending_tool_intents(&session)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a denied patch never creates an intent"
+        );
+        drop(handle);
+        assert_eq!(
+            std::fs::read_to_string(&locked).expect("lock target readable after release"),
+            "locked content\r\n",
+            "the refused patch did not write through the lock"
+        );
+        let readable_again = observe_workspace(bench.project_id.clone(), &bench.workspace)
+            .expect("observable once readable");
+        assert_eq!(
+            unlocked.observed_fingerprint, readable_again.observed_fingerprint,
+            "an unlocked file returns to the same fingerprint"
+        );
+    }
+
     // A stale patch is refused by hash before any intent claims a side effect.
     let prepared = tools
         .prepare(ToolRequest::new(

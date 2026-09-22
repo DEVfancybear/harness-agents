@@ -192,8 +192,19 @@ pub(crate) fn workspace_fingerprint(
 ) -> Result<ContentHash, HarnessError> {
     let mut entries = Vec::new();
     for item in walk_files(root)? {
-        let hash = hash_file(&item.absolute)?;
-        entries.push(json!({"path": item.relative, "content_hash": hash}));
+        match hash_file(&item.absolute)? {
+            Some(hash) => entries.push(json!({"path": item.relative, "content_hash": hash})),
+            // Present but locked by another process. The path stays in the
+            // fingerprint; its content does not. Once it becomes readable the
+            // content hash appears and the fingerprint changes, so an approval
+            // bound to the unreadable state is invalidated rather than silently
+            // comparing equal.
+            None => entries.push(json!({
+                "path": item.relative,
+                "content_hash": null,
+                "unreadable": "locked",
+            })),
+        }
     }
     let status = git_output(root, ["status", "--porcelain=v1", "--untracked-files=all"])
         .unwrap_or_else(|| "not_git".to_owned());
@@ -583,6 +594,13 @@ fn write_text_atomically(path: &Path, replacement: &str) -> Result<(), HarnessEr
             "patch path has no parent directory",
         )
     })?;
+    // A rename replaces the target with the temporary file, so the temporary
+    // file must carry the target's own permissions: without this a private
+    // (0600) file would become group/world readable after a patch on Unix.
+    #[cfg(unix)]
+    let target_permissions = fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
     let started = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| HarnessError::new(ErrorCode::StorageWriteFailed, "system clock is invalid"))?
@@ -611,6 +629,15 @@ fn write_text_atomically(path: &Path, replacement: &str) -> Result<(), HarnessEr
                         format!("cannot flush patch temporary file: {error}"),
                     )
                 })?;
+                #[cfg(unix)]
+                if let Some(permissions) = target_permissions {
+                    fs::set_permissions(&candidate, permissions).map_err(|error| {
+                        HarnessError::new(
+                            ErrorCode::StorageWriteFailed,
+                            format!("cannot preserve patch target permissions: {error}"),
+                        )
+                    })?;
+                }
                 temporary = Some(candidate);
                 break;
             }
@@ -656,22 +683,28 @@ fn decode_utf8(bytes: &[u8]) -> Result<String, HarnessError> {
     })
 }
 
-fn hash_file(path: &Path) -> Result<ContentHash, HarnessError> {
-    let mut file = File::open(path).map_err(|error| {
-        HarnessError::new(
-            ErrorCode::WorkspaceEscape,
-            format!("cannot hash workspace file: {error}"),
-        )
-    })?;
+/// Hash one workspace file.
+///
+/// A lock violation means another process holds a byte range of the file — the
+/// app's own store does exactly that for `-shm`/`-wal` when it lives inside the
+/// workspace. It is reported as `Ok(None)` so the fingerprint can record the
+/// path as present-but-unreadable instead of failing the whole turn. Every
+/// other failure is a read failure with its own typed code: `workspace_escape`
+/// would send an operator looking for a path bug that does not exist.
+fn hash_file(path: &Path) -> Result<Option<ContentHash>, HarnessError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if is_lock_violation(&error) => return Ok(None),
+        Err(error) => return Err(hash_failure(path, &error)),
+    };
     let mut hash = Sha256::new();
     let mut buffer = vec![0_u8; 32 * 1024];
     loop {
-        let read = file.read(&mut buffer).map_err(|error| {
-            HarnessError::new(
-                ErrorCode::WorkspaceEscape,
-                format!("cannot hash workspace file: {error}"),
-            )
-        })?;
+        let read = match file.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) if is_lock_violation(&error) => return Ok(None),
+            Err(error) => return Err(hash_failure(path, &error)),
+        };
         if read == 0 {
             break;
         }
@@ -684,7 +717,29 @@ fn hash_file(path: &Path) -> Result<ContentHash, HarnessError> {
         use std::fmt::Write as _;
         let _ = write!(text, "{byte:02x}");
     }
-    ContentHash::parse(text)
+    ContentHash::parse(text).map(Some)
+}
+
+fn hash_failure(path: &Path, error: &std::io::Error) -> HarnessError {
+    HarnessError::new(
+        ErrorCode::StorageOpenFailed,
+        format!("cannot hash workspace file {}: {error}", path.display()),
+    )
+}
+
+/// Whether an I/O failure is another process's byte-range lock rather than an
+/// access or path problem. Windows reports `ERROR_SHARING_VIOLATION` (32) and
+/// `ERROR_LOCK_VIOLATION` (33); POSIX advisory locks never block a plain read.
+fn is_lock_violation(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(32 | 33))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 fn git_output<const N: usize>(root: &Path, arguments: [&str; N]) -> Option<String> {

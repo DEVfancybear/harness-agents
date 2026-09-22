@@ -18,7 +18,7 @@
 | Item | Trạng thái | Evidence |
 |---|---|---|
 | M4-01 gate/approvals/receipts | `implemented_unverified` | binding mang session/task/invocation/`call_id`; consume+intent atomic; expiry/revoke/replay; descriptor registry; `call_id` vào intent+receipt; tools schema v2; A03/A04 crash boundaries + replay tool result; `milestone_m4` **7/7**. Gate checkpoint **blocked** vì host loopback (evidence §4) |
-| M4-02 filesystem/git | `in_progress` | `git_log` structured + descriptor read-only + A15 (traversal/absolute/junction/sensitive/stale/CRLF-Unicode); `milestone_m4` **9/9**. **Thiếu:** locked-file typed error (M4-02.2) — bản sửa đang nằm trong working tree của session khác |
+| M4-02 filesystem/git | `implemented_unverified` | `git_log` structured + descriptor read-only + A15 đầy đủ (traversal/absolute/junction/sensitive/stale/**locked**/CRLF-Unicode); locked-file typed error adopt từ working tree; `milestone_m4` **9/9** |
 | M4-03 process/spool | planned | permit queue (A13), env allowlist (A16), spool/quota (A17) |
 | M4-04 E2E/recovery | planned | digest-bound check evidence (A08), A03/A04 child-kill |
 
@@ -28,8 +28,9 @@ Sửa: `crates/harness-store-sqlite/src/{models,store}.rs`, `crates/harness-tool
 Thêm: `crates/harness-cli/tests/milestone_m4.rs`, `crates/harness-cli/src/bin/m4_fixture_host.rs` (child host cho A03/A04), `docs/specs/M4.vi.md`, `docs/adr/ADR-N03-EXECUTION-BINDING.{vi,en}.md`, `docs/evidence/M4.vi.md`.
 Sửa thêm (M4-01b): `crates/harness-store-sqlite/src/store.rs` (`recovered_tool_results`), `crates/harness-runtime/src/lib.rs` (`RunRequest.recovered_messages`, `prepare_continuation`, `recovered_messages` rebuild từ attempt events + receipt events), `crates/harness-tools/src/service.rs` (receipt event mang `model_view`), `crates/harness-tools/src/turn_driver.rs` (`render_tool_output` dùng chung).
 Sửa thêm (M4-02.1/.3): `crates/harness-tools/src/{contracts,policy,service,turn_driver,lib}.rs` (`ToolKind::GitLog`, schema `limit` 1..=100, dispatch `git_log_arguments`, đọc-only), `crates/harness-cli/tests/milestone_m4.rs` (+2 test), `crates/harness-cli/tests/phase_p3.rs` (schema count 9→10).
+Sửa thêm (M4-02.2): `crates/harness-tools/src/workspace.rs` (adopt: lock → `Ok(None)` + fingerprint `unreadable:"locked"`; lỗi đọc khác → `StorageOpenFailed`; giữ permission target khi patch trên Unix), `milestone_m4.rs` thêm case locked vào A15.
 
-**Push:** `1344fcd` (M4-01a), `30ffa25` (docs M4-01), `c482c05` (M4-01b). M4-02 commit kế tiếp.
+**Push:** `1344fcd` (M4-01a), `30ffa25` (docs M4-01), `c482c05` (M4-01b), `c470d0c` (M4-02.1/.3). M4-02.2 commit kế tiếp.
 
 ## 5. Contract/ADR đã chốt — không đổi ngầm
 
@@ -42,7 +43,8 @@ Sửa thêm (M4-02.1/.3): `crates/harness-tools/src/{contracts,policy,service,tu
 
 ## 6. Lệnh đã chạy và kết quả
 
-- `cargo test -p harness-cli --test milestone_m4 --locked` → **9/9 pass** (thêm `m4_02_git_log_is_structured_and_bounded`, `a15_path_patch_safety`).
+- `cargo test -p harness-cli --test milestone_m4 --locked` → **9/9 pass** (thêm `m4_02_git_log_is_structured_and_bounded`, `a15_path_patch_safety` với case locked).
+- Index-check M4-02.2 (stash toàn bộ phần working tree còn lại, chỉ giữ `workspace.rs` trong index): `harness-tools` 6/6, `milestone_m4` 9/9, `phase_p3` 21/21, `phase_p1` 21/21 — pass, chứng minh phần adopt tự đứng vững.
 - Regressions (khi host cho phép): `phase_p3` 21, `phase_p6` 15, `phase_p2` 17, `phase_p1` 21, `phase_p7` 15, `milestone_m0` 11, `milestone_m1` 6, `milestone_m3` 19, `harness-types` 20, `harness-tools` 6 — pass.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` + `cargo fmt --all -- --check` → pass.
 - `pwsh ... -Milestone M4` → **blocked**: `format/clippy/build/unit-tests/M4 required 5/closure-M3/closure-M1` xanh; `workspace-tests`/`closure-M2` đỏ vì loopback host (i03, a06_*, a07_401, m2_04). Bằng chứng môi trường: baseline `milestone_m2` (không có thay đổi harness M4) cũng fail 6-7/10 trong 3 lần chạy liên tiếp cùng ngày; từng test `--exact` một mình pass. Chi tiết ở `docs/evidence/M4.vi.md` §4. (Lần gate tới sẽ chạy M4 required **9 test**.)
@@ -50,21 +52,21 @@ Sửa thêm (M4-02.1/.3): `crates/harness-tools/src/{contracts,policy,service,tu
 ## 7. Việc còn lại theo thứ tự (M4)
 
 0. **Chạy lại gate checkpoint M4 cho xanh** khi host hết flake loopback (đề xuất reboot máy hoặc chạy trên host khác); đây là điều kiện để chốt M4-01/M4-02. Nếu vẫn đỏ ở `milestone_m2`/`interactive_launch`, chạy full suite baseline để xác nhận lại nguyên nhân môi trường trước khi nghi code.
-1. **M4-02.2**: locked-file typed error — xác nhận với user/session đang sửa `harness-tools/src/workspace.rs` (bản sửa đã có trong working tree, chưa commit) rồi adopt hoặc tự làm lại; sau đó thêm case locked vào `a15_path_patch_safety` và chuyển A15 sang `implemented`.
-2. **M4-03**: permit queue cancellation-aware + queued state (A13); env allowlist + secret JIT (A16); tree cleanup trung thực + Windows JobObject grandchild test; output spool + `read_process_output` page + quota/disk-full typed (A17). Lưu ý `process.rs` đang bị session khác sửa — phối hợp trước.
-3. **M4-04**: `GoalEvidence.workspace_digest` + `EvidenceKind::Check` khớp fingerprint cuối; `a08_coding_e2e` repo tạm + cargo test thật; wrapper A03/A04.
-4. Gate M4 đầy đủ + evidence + nghiệm thu; sau đó mới sang M5.
+1. **M4-03**: permit queue cancellation-aware + queued state (A13); env allowlist + secret JIT (A16); tree cleanup trung thực + Windows JobObject grandchild test; output spool + `read_process_output` page + quota/disk-full typed (A17). `process.rs` đang có hunk chưa commit (cancel khi chờ lock → không spawn) — adopt trước khi sửa tiếp, cùng cách đã làm với `workspace.rs`.
+2. **M4-04**: `GoalEvidence.workspace_digest` + `EvidenceKind::Check` khớp fingerprint cuối; `a08_coding_e2e` repo tạm + cargo test thật; wrapper A03/A04.
+3. Gate M4 đầy đủ + evidence + nghiệm thu; sau đó mới sang M5.
 
 ## 8. Next action chính xác
 
-Xác nhận với user về phần working tree của session thứ hai (đặc biệt `harness-tools/src/workspace.rs` chứa bản sửa locked-file của M4-02.2). Nếu được phép adopt: tách hunks bằng `git add -p`, thêm case locked vào `a15_path_patch_safety`, chạy `cargo test -p harness-cli --test milestone_m4 --locked`, rồi sang M4-03 (`process.rs` — cũng đang bị session kia sửa).
+Bắt đầu M4-03.1: adopt `crates/harness-tools/src/process.rs` (hunk cancel-waiting-for-lock) bằng index-check như `workspace.rs`; đọc `service.rs` chỗ `process_execution_lock` để thêm `ProcessPermit` queue + queued state; viết `a13_queued_process_cancel` (B queued, cancel trước permit → marker absent) trong `milestone_m4.rs`; chạy `cargo test -p harness-cli --test milestone_m4 --locked`.
 
 ## 9. Blocked on
 
-**Hai việc song song:** (1) host loopback — gate checkpoint M4 chưa xanh được vì môi trường (baseline M2 cũng fail khi chạy full suite; từng test một mình pass); cần reboot/host khác. (2) working tree có thay đổi chưa commit của một session khác ở `workspace.rs`/`process.rs`/`session`/`interactive`/`orchestrator` — M4-02.2 và M4-03 chạm đúng các file đó, cần user quyết định adopt hay chờ. (M9 install/PATH/paid smoke/publish sẽ cần quyền riêng — sẽ hỏi khi tới.)
+**Hai việc song song:** (1) host loopback — gate checkpoint M4 chưa xanh được vì môi trường (baseline M2 cũng fail khi chạy full suite; từng test một mình pass); cần reboot/host khác. (2) working tree còn thay đổi chưa commit của session khác ở `process.rs`, `session`, `interactive`, `orchestrator`, `maintenance` — `workspace.rs` đã adopt; `process.rs` sẽ adopt ở M4-03.1; các file còn lại không thuộc M4. (M9 install/PATH/paid smoke/publish sẽ cần quyền riêng — sẽ hỏi khi tới.)
 
 ## 10. Không lặp lại
 
+- Không commit file của session khác: stage theo path cụ thể hoặc `git add -p`; tránh `cargo fmt --all` khi tree còn code chưa commit của họ. `workspace.rs` đã adopt có chủ đích (đúng M4-02.2, đã index-check).
 - Không đổi `TOOLS_SCHEMA_VERSION` thêm lần nữa nếu không có contract change + test compat.
 - Không dùng `call_id` làm global identity; không bỏ scope khỏi binding hash.
 - Không claim sandbox/strict isolation; không claim M4 accepted khi M4-02..04 còn thiếu.
