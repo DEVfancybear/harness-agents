@@ -6,6 +6,7 @@ mod extension_cli;
 mod interactive;
 mod maintenance_cli;
 mod memory_cli;
+mod web;
 
 use std::{fs, path::PathBuf, process::ExitCode, sync::Arc};
 
@@ -40,9 +41,18 @@ enum Command {
     Chat(ChatArgs),
     /// Search, inspect and maintain scoped reusable memory.
     Memory(memory_cli::MemoryCommand),
+    /// Serve the loopback web surface: an authenticated API and the local UI.
+    Web {
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Port on loopback. A non-loopback bind is refused.
+        #[arg(long, default_value_t = 8799)]
+        port: u16,
+        #[arg(long)]
+        json: bool,
+    },
     /// Initialize a local P1 `SQLite` data directory and inspectable built-in metadata.
     Init {
-        /// Directory owned by this local harness store.
         #[arg(long)]
         data_dir: PathBuf,
         /// Emit a versioned JSON result to stdout.
@@ -189,6 +199,7 @@ struct ContextCommand {
 
 #[derive(Debug, Subcommand)]
 enum ContextSubcommand {
+    /// Inspect the durable context of one session.
     Inspect {
         #[arg(long)]
         data_dir: PathBuf,
@@ -495,6 +506,40 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
 #[allow(clippy::too_many_lines)]
 async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
     match cli.command {
+        Some(Command::Web {
+            data_dir,
+            port,
+            json,
+        }) => {
+            let config = web::WebConfig::loopback(&data_dir, port);
+            let handle = web::serve(config).await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "status": "serving",
+                        "url": format!("http://{}/", handle.address),
+                        "session_token": handle.token,
+                        "note": "a mutation needs the X-Ha-Session header; loopback is not an authentication boundary",
+                    })
+                );
+            } else {
+                println!("ha web is serving http://{}/", handle.address);
+                println!(
+                    "session token (keep it out of URLs and logs): {}",
+                    handle.token
+                );
+                println!("press Ctrl+C to stop");
+            }
+            tokio::signal::ctrl_c().await.map_err(|error| {
+                HarnessError::new(
+                    ErrorCode::RuntimeBlocked,
+                    format!("cannot wait for shutdown: {error}"),
+                )
+            })?;
+            Ok(())
+        }
         // Boxed: this arm now resolves a project identity before it opens a store,
         // which grows the future past the size the other arms keep. Boxing one arm is
         // cheaper than reshaping the dispatch.

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Harness — bảng điều khiển cục bộ</title>
+    <link rel="stylesheet" href="/assets/app.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Harness</h1>
+      <p id="connection" class="muted">đang kết nối…</p>
+    </header>
+
+    <main>
+      <section aria-labelledby="sessions-heading">
+        <h2 id="sessions-heading">Phiên</h2>
+        <ul id="sessions"></ul>
+      </section>
+
+      <section aria-labelledby="state-heading">
+        <h2 id="state-heading">Trạng thái đã ghi</h2>
+        <p id="state-summary" class="muted">chọn một phiên</p>
+        <h3>Sự kiện</h3>
+        <ol id="events"></ol>
+      </section>
+    </main>
+
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

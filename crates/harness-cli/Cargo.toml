@@ -50,6 +50,17 @@ harness-orchestrator = { path = "../harness-orchestrator" }
 harness-extensions = { path = "../harness-extensions" }
 harness-kernel = { path = "../harness-kernel" }
 harness-maintenance = { path = "../harness-maintenance" }
+# The web surface (`ha web`). Every one of these is already in Cargo.lock
+# because reqwest pulls them in; ADR-N10 D1 is that the surface adds no
+# dependency tree, so the versions are pinned to what is already resolved.
+hyper = { version = "=1.11.1", features = ["server", "http1"] }
+http = "=1.5.0"
+# The SSE body is a stream; the workspace already pins this for the provider
+# stream, so the web surface reuses it rather than adding tokio-stream.
+futures-util.workspace = true
+hyper-util = { version = "=0.1.20", features = ["tokio"] }
+http-body-util = "=0.1.5"
+bytes = "=1.12.1"
 rmcp = { version = "=3.4.0", default-features = false, features = ["client", "server", "macros", "schemars", "transport-child-process", "transport-io"] }
 schemars.workspace = true
 serde.workspace = true
