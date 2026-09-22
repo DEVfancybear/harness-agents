@@ -9,4 +9,5 @@
 //! keeps the binary the product while making the behaviour testable without a
 //! second entry point.
 
+pub mod daemon;
 pub mod web;

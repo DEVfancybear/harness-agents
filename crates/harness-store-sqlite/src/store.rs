@@ -36,6 +36,7 @@ pub mod history;
 mod maintenance;
 mod memory;
 pub mod run;
+pub mod schedules;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -3003,6 +3004,28 @@ async fn ensure_runtime_schema(pool: &SqlitePool) -> Result<(), StoreError> {
                 .await
                 .map_err(|error| {
                     database_error(ErrorCode::MigrationFailed, "apply runtime schema 2", error)
+                })?;
+        }
+    }
+    if current < 3 {
+        // M11 adds the durable schedule and occurrence tables. The occurrence
+        // primary key is what makes a launch idempotent: it is built from the
+        // schedule, its revision and the nominal due instant, so two hosts that
+        // evaluate the same schedule for the same instant insert the same row and
+        // the second insert loses. Nothing about the wall clock is in the key.
+        let m11_statements = [
+            "CREATE TABLE IF NOT EXISTS schedules (schedule_id TEXT PRIMARY KEY, title TEXT NOT NULL, state TEXT NOT NULL, revision INTEGER NOT NULL CHECK (revision >= 1), next_due_unix_ms INTEGER NOT NULL, spec_json TEXT NOT NULL, grants_json TEXT NOT NULL, created_at_unix_ms INTEGER NOT NULL, updated_at_unix_ms INTEGER NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS schedules_by_due ON schedules(state, next_due_unix_ms)",
+            "CREATE TABLE IF NOT EXISTS schedule_occurrences (occurrence_key TEXT PRIMARY KEY, schedule_id TEXT NOT NULL REFERENCES schedules(schedule_id), revision INTEGER NOT NULL, due_unix_ms INTEGER NOT NULL, claimed_at_unix_ms INTEGER NOT NULL, state TEXT NOT NULL, trigger_kind TEXT NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS occurrences_by_schedule ON schedule_occurrences(schedule_id, due_unix_ms)",
+            "CREATE INDEX IF NOT EXISTS occurrences_by_state ON schedule_occurrences(state)",
+        ];
+        for statement in m11_statements {
+            sqlx::query(statement)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    database_error(ErrorCode::MigrationFailed, "apply runtime schema 3", error)
                 })?;
         }
     }

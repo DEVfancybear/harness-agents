@@ -36,3 +36,4 @@ pub use store::history::{
     HistoryPage, HistoryScope, HistorySource, NOTE_CONTENT_LIMIT_BYTES, NOTE_KEY_LIMIT_CHARS,
     NoteRecord, SourceAvailability, history_terms,
 };
+pub use store::schedules::{StoredOccurrenceRecord, StoredScheduleRecord};

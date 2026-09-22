@@ -54,6 +54,10 @@ harness-maintenance = { path = "../harness-maintenance" }
 # because reqwest pulls them in; ADR-N10 D1 is that the surface adds no
 # dependency tree, so the versions are pinned to what is already resolved.
 hyper = { version = "=1.11.1", features = ["server", "http1"] }
+# The schedule evaluator needs a real timezone database: a cron expression in a
+# zone with daylight saving cannot be evaluated with a fixed offset. Both are
+# already in Cargo.lock through other dependencies.
+chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std", "serde"] }
 http = "=1.5.0"
 # The SSE body is a stream; the workspace already pins this for the provider
 # stream, so the web surface reuses it rather than adding tokio-stream.
