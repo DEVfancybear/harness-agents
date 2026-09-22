@@ -460,6 +460,88 @@
           "closure-M0"
         ]
       }
+    },
+    {
+      "id": "M5",
+      "title": "Context, compaction và source continuity",
+      "runbook": "docs/implementation-next/M5.vi.md",
+      "prerequisites": ["M4"],
+      "status": "in_progress",
+      "integration_target": "milestone_m5",
+      "work_items": [
+        {
+          "id": "M5-01",
+          "title": "Context channels, authority và manifest đóng băng",
+          "status": "implemented_unverified",
+          "tests": [
+            "m5_01_channels_authority_and_manifest",
+            "m5_01_a_window_that_cannot_hold_the_request_pauses_typed"
+          ]
+        },
+        {
+          "id": "M5-02",
+          "title": "Compaction generation barrier, CAS/rebase và summary fallback",
+          "status": "implemented_unverified",
+          "tests": [
+            "a12_compaction_cas",
+            "m5_02_compaction_tail_carries_pairs_not_orphans",
+            "a19_summary_failure_falls_back_to_the_mandatory_state"
+          ]
+        },
+        {
+          "id": "M5-03",
+          "title": "History index rebuildable, exact paged reads và notes CAS",
+          "status": "implemented_unverified",
+          "tests": [
+            "m5_03_index_rebuild_is_identical_and_scope_is_a_filter",
+            "m5_03_notes_are_revision_checked_model_reports",
+            "a18_history_after_compaction"
+          ]
+        },
+        {
+          "id": "M5-04",
+          "title": "Resume/fork/rollback và workspace staleness",
+          "status": "implemented_unverified",
+          "tests": [
+            "a20_source_scope_fork",
+            "m5_04_fork_policy_can_only_narrow",
+            "a21_rollback_effects"
+          ]
+        }
+      ],
+      "required_tests": [
+        "m5_01_channels_authority_and_manifest",
+        "m5_01_a_window_that_cannot_hold_the_request_pauses_typed",
+        "a12_compaction_cas",
+        "m5_02_compaction_tail_carries_pairs_not_orphans",
+        "a19_summary_failure_falls_back_to_the_mandatory_state",
+        "m5_03_index_rebuild_is_identical_and_scope_is_a_filter",
+        "m5_03_notes_are_revision_checked_model_reports",
+        "a18_history_after_compaction",
+        "a20_source_scope_fork",
+        "m5_04_fork_policy_can_only_narrow",
+        "a21_rollback_effects"
+      ],
+      "unit_tests": [],
+      "fixtures": [
+        "crates/harness-cli/tests/milestone_m5.rs",
+        "crates/harness-cli/src/bin/m5_fixture_host.rs"
+      ],
+      "gate": {
+        "script": "scripts/Verify-Milestone.ps1",
+        "dependency_check_bin": "dependency_check",
+        "steps": [
+          "format",
+          "clippy",
+          "workspace-tests",
+          "dependency-allowlist",
+          "required-test-discovery",
+          "required-tests",
+          "closure-M4",
+          "closure-M3",
+          "closure-M0"
+        ]
+      }
     }
   ],
   "acceptance_cases": [
@@ -569,7 +651,14 @@
       ],
       "note": "M3 half: a durable question is answered exactly once across a restart and the answer never becomes a permission. M4 half: an already expired grant cannot be issued, a grant that expires before consume is a typed denial with no write, a revoked grant never executes, and a replayed grant is refused - both halves now exist, so the case is implemented rather than planned"
     },
-    { "id": "A12", "owner_milestones": ["M5"], "planned_test": "a12_compaction_cas", "status": "planned" },
+    {
+      "id": "A12",
+      "owner_milestones": ["M5"],
+      "planned_test": "a12_compaction_cas",
+      "status": "implemented",
+      "selectors": ["milestone_m5::a12_compaction_cas"],
+      "note": "a compaction candidate is published compare-and-swap against the sequence it covered: a correction committed while a summary is generated is never overwritten by the stale candidate"
+    },
     {
       "id": "A13",
       "owner_milestones": ["M4"],
@@ -612,10 +701,37 @@
       "selectors": ["milestone_m4::a17_output_quota"],
       "note": "an output larger than the capture quota is cut exactly at the quota and says so (capture_truncated, header quota, digest of the stored bytes, tail preview equal to the stored tail); a small capture reads back through read_process_output at the tail offset; a page past the captured length is a typed refusal naming the captured length; another task cannot page the artifact; an unwritable spool settles outcome_unknown with the side effect visible and no reference to a capture that was never written"
     },
-    { "id": "A18", "owner_milestones": ["M5"], "planned_test": "a18_history_after_compaction", "status": "planned" },
-    { "id": "A19", "owner_milestones": ["M5", "M7"], "planned_test": "a19_optional_services_failure", "status": "planned" },
-    { "id": "A20", "owner_milestones": ["M5"], "planned_test": "a20_source_scope_fork", "status": "planned" },
-    { "id": "A21", "owner_milestones": ["M5"], "planned_test": "a21_rollback_effects", "status": "planned" },
+    {
+      "id": "A18",
+      "owner_milestones": ["M5"],
+      "planned_test": "a18_history_after_compaction",
+      "status": "implemented",
+      "selectors": ["milestone_m5::a18_history_after_compaction"],
+      "note": "five compactions whose summaries drop the identifier, a hard kill, a reopen and a new session of the same task: the source stays indexed and in scope, the exact read returns it, and the model's answer carries the identifier it read rather than one it was given"
+    },
+    {
+      "id": "A19",
+      "owner_milestones": ["M5", "M7"],
+      "planned_test": "a19_optional_services_failure",
+      "status": "planned",
+      "note": "M5 half exists and is gated as milestone_m5::a19_summary_failure_falls_back_to_the_mandatory_state: a summarizer that fails or returns nothing is not a summary, so the checkpoint holds the deterministic rendering of the mandatory state. The case stays planned because the M7 half (a durable extraction job that never settles) is not implemented, and a multi-owner case is only complete when every owner has its part"
+    },
+    {
+      "id": "A20",
+      "owner_milestones": ["M5"],
+      "planned_test": "a20_source_scope_fork",
+      "status": "implemented",
+      "selectors": ["milestone_m5::a20_source_scope_fork"],
+      "note": "scope is a filter inside the query: two tasks with the same keywords cannot read each other's sources, a fork inherits only the lineage sources its policy allows, the child gets a view rather than the task (no lease, no projection, so it cannot prepare an execution), and no approval is copied"
+    },
+    {
+      "id": "A21",
+      "owner_milestones": ["M5"],
+      "planned_test": "a21_rollback_effects",
+      "status": "implemented",
+      "selectors": ["milestone_m5::a21_rollback_effects"],
+      "note": "the conversational head moves back to an earlier checkpoint while the file keeps the later edit: the report names the retained effect and says the filesystem was not restored, and the resume flags the workspace evidence as stale instead of presenting it as current"
+    },
     { "id": "A22", "owner_milestones": ["M6"], "planned_test": "a22_skill_version", "status": "planned" },
     { "id": "A23", "owner_milestones": ["M6"], "planned_test": "a23_extension_bounds", "status": "planned" },
     { "id": "A24", "owner_milestones": ["M6"], "planned_test": "a24_catalog_revocation", "status": "planned" },

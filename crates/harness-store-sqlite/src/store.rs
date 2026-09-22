@@ -19,18 +19,20 @@ use sqlx::{
 };
 
 use crate::{
-    AdmissionAck, AdmissionCommit, AgentStateRecord, ArtifactPage, CompositionSnapshotRecord,
-    ContextCheckpointRecord, ContextPacketRecord, ContinuationLinkRecord, DataDirectoryMarker,
-    FrozenRequestRecord, HostFence, PersistedPluginManifest, ProjectRegistrationRecord,
-    ProviderAttemptRecord, PublishedArtifact, RUNTIME_SCHEMA_VERSION, ReceiptAck, ReceiptCommit,
-    RecoveredToolResult, RuntimeCommandRecord, RuntimeCommandState, STORE_SCHEMA_VERSION,
-    SessionSummary, SnapshotRecord, SourceWorkMarker, StoreDiagnostics, StoreError, StoreFaultPlan,
-    StoreFaultPoint, StorePaths, TOOLS_SCHEMA_VERSION, ToolApprovalBinding, ToolApprovalRecord,
-    ToolApprovalState, ToolIntentCommit, ToolIntentRecord, ToolIntentStatus, ToolSettlementCommit,
+    AdmissionAck, AdmissionCommit, AgentStateRecord, ArtifactPage, CONTEXT_SCHEMA_VERSION,
+    CompositionSnapshotRecord, ContextCheckpointRecord, ContextPacketRecord,
+    ContinuationLinkRecord, DataDirectoryMarker, FrozenRequestRecord, HostFence,
+    PersistedPluginManifest, ProjectRegistrationRecord, ProviderAttemptRecord, PublishedArtifact,
+    RUNTIME_SCHEMA_VERSION, ReceiptAck, ReceiptCommit, RecoveredToolResult, RuntimeCommandRecord,
+    RuntimeCommandState, STORE_SCHEMA_VERSION, SessionSummary, SnapshotRecord, SourceWorkMarker,
+    StoreDiagnostics, StoreError, StoreFaultPlan, StoreFaultPoint, StorePaths,
+    TOOLS_SCHEMA_VERSION, ToolApprovalBinding, ToolApprovalRecord, ToolApprovalState,
+    ToolIntentCommit, ToolIntentRecord, ToolIntentStatus, ToolSettlementCommit,
     ToolTaskUpdateCommit, WriterOpenOptions,
 };
 
 pub mod delegation;
+pub mod history;
 mod maintenance;
 mod memory;
 pub mod run;
@@ -201,6 +203,10 @@ impl SqliteStore {
             return Err(error);
         }
         if let Err(error) = ensure_tools_schema(&pool).await {
+            let _ = FileExt::unlock(&lock_file);
+            return Err(error);
+        }
+        if let Err(error) = ensure_context_schema(&pool).await {
             let _ = FileExt::unlock(&lock_file);
             return Err(error);
         }
@@ -2500,6 +2506,133 @@ impl SqliteStore {
         })
     }
 
+    /// Open the session a fork will read its lineage from.
+    ///
+    /// A fork copies a view of the parent's indexed sources, never an
+    /// ownership: the child is a session of the same task, so the grants it
+    /// receives can be scoped to that task, and nothing else about the parent
+    /// moves. The parent keeps the lease, the working state and its approvals,
+    /// and the child cannot execute against the task until it owns it in its
+    /// own right.
+    pub async fn open_forked_session(
+        &self,
+        task_id: &TaskId,
+        source_session_id: &SessionId,
+        new_session_id: &SessionId,
+    ) -> Result<(), StoreError> {
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        // A fork copies a *view*, never an ownership: the child gets a session
+        // bound to the same task so its grants can be scoped to it, and the
+        // task lease, the working state and every approval stay exactly where
+        // they were. Handing the lease over here would leave a child that
+        // holds the task while its predecessor still owns the projection, and
+        // a child that never admitted an input could not be recovered at all.
+        match session_task_in_tx(&mut tx, source_session_id).await? {
+            Some(source_task) if source_task == *task_id => {}
+            Some(_) => {
+                return Err(StoreError::new(
+                    ErrorCode::ScopeAuthorityDenied,
+                    "a fork may not cross into another task",
+                ));
+            }
+            None => {
+                return Err(StoreError::new(
+                    ErrorCode::InvalidPayload,
+                    "source session does not exist",
+                ));
+            }
+        }
+        sqlx::query(
+            "INSERT INTO sessions(session_id, task_id, next_sequence) VALUES (?, ?, 1)
+             ON CONFLICT(session_id) DO NOTHING",
+        )
+        .bind(new_session_id.as_str())
+        .bind(task_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "open the forked session",
+                error,
+            )
+        })?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit the forked session",
+                error,
+            )
+        })
+    }
+
+    /// Link a fork to its source session and record the lineage policy.
+    ///
+    /// A fork is a lineage edge with an explicit grant list: the new session may
+    /// read the sources named there and nothing else of its parent's, and no
+    /// approval, owner generation or pending intent is copied by this call or
+    /// any other.
+    pub async fn record_fork_link(
+        &self,
+        source_session_id: &SessionId,
+        new_session_id: &SessionId,
+        task_id: &TaskId,
+        allowed_source_ids: &[String],
+    ) -> Result<(), StoreError> {
+        let policy = serde_json::json!({
+            "schema_version": 1,
+            "kind": "fork",
+            "allowed_source_ids": allowed_source_ids,
+        })
+        .to_string();
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        sqlx::query("INSERT INTO session_lineage(source_session_id, new_session_id, task_id, fork_policy) VALUES (?, ?, ?, ?) ON CONFLICT(new_session_id) DO UPDATE SET source_session_id=excluded.source_session_id, task_id=excluded.task_id, fork_policy=excluded.fork_policy")
+            .bind(source_session_id.as_str())
+            .bind(new_session_id.as_str())
+            .bind(task_id.as_str())
+            .bind(policy)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "record fork link", error))?;
+        tx.commit().await.map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "commit fork link", error)
+        })
+    }
+
+    /// One context checkpoint by id, scoped to its session.
+    pub async fn context_checkpoint(
+        &self,
+        session_id: &SessionId,
+        checkpoint_id: &str,
+    ) -> Result<Option<ContextCheckpointRecord>, StoreError> {
+        let row = sqlx::query("SELECT checkpoint_id, session_id, task_id, through_sequence, revision, content_json, content_hash FROM context_checkpoints WHERE session_id = ? AND checkpoint_id = ?")
+            .bind(session_id.as_str())
+            .bind(checkpoint_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::StorageWriteFailed, "read context checkpoint", error)
+            })?;
+        row.map(|row| checkpoint_from_row(&row)).transpose()
+    }
+
+    /// Context checkpoints of one session, oldest revision first.
+    pub async fn context_checkpoints(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ContextCheckpointRecord>, StoreError> {
+        let rows = sqlx::query("SELECT checkpoint_id, session_id, task_id, through_sequence, revision, content_json, content_hash FROM context_checkpoints WHERE session_id = ? ORDER BY revision")
+            .bind(session_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::StorageWriteFailed, "list context checkpoints", error)
+            })?;
+        rows.iter().map(checkpoint_from_row).collect()
+    }
+
     pub async fn continuation_link(
         &self,
         new_session_id: &SessionId,
@@ -2886,6 +3019,79 @@ async fn ensure_runtime_schema(pool: &SqlitePool) -> Result<(), StoreError> {
         database_error(
             ErrorCode::MigrationFailed,
             "commit runtime migration",
+            error,
+        )
+    })
+}
+
+/// M5 context surface: the rebuildable journal index, the notes table and the
+/// manifest column a frozen packet records.
+///
+/// The history index is a plain term table rather than an FTS5 virtual table:
+/// FTS5 is a build flag, and the plan requires the index to be rebuildable and
+/// its results to be identical after a rebuild. A term table this host writes
+/// itself is deterministic, tokenizer-independent and testable on any build.
+async fn ensure_context_schema(pool: &SqlitePool) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await.map_err(|error| {
+        database_error(ErrorCode::MigrationFailed, "begin context migration", error)
+    })?;
+    let statements = [
+        "CREATE TABLE IF NOT EXISTS context_schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS history_sources (source_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, project_id TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, content_hash TEXT NOT NULL, availability TEXT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS history_sources_by_task ON history_sources(task_id, sequence)",
+        "CREATE TABLE IF NOT EXISTS history_terms (term TEXT NOT NULL, source_id TEXT NOT NULL REFERENCES history_sources(source_id) ON DELETE CASCADE, PRIMARY KEY(term, source_id))",
+        "CREATE INDEX IF NOT EXISTS history_terms_by_term ON history_terms(term)",
+        "CREATE TABLE IF NOT EXISTS session_notes (note_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, session_id TEXT NOT NULL, note_key TEXT NOT NULL, revision INTEGER NOT NULL, content TEXT NOT NULL, sources_json TEXT NOT NULL, authority TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(task_id, note_key))",
+        "CREATE INDEX IF NOT EXISTS session_notes_by_task ON session_notes(task_id, note_key)",
+    ];
+    for statement in statements {
+        sqlx::query(statement)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::MigrationFailed, "apply context schema", error)
+            })?;
+    }
+    let current =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM context_schema_migrations")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::MigrationFailed,
+                    "read context schema version",
+                    error,
+                )
+            })?
+            .unwrap_or(0);
+    if current > CONTEXT_SCHEMA_VERSION {
+        return Err(StoreError::new(
+            ErrorCode::MigrationFailed,
+            "context schema is newer than this host supports",
+        ));
+    }
+    if current < 1 {
+        for (table, column, definition) in [
+            ("context_packets", "manifest_json", "TEXT"),
+            ("context_checkpoints", "manifest_json", "TEXT"),
+            ("session_lineage", "fork_policy", "TEXT"),
+        ] {
+            ensure_column(&mut tx, table, column, definition).await?;
+        }
+    }
+    if current < CONTEXT_SCHEMA_VERSION {
+        sqlx::query("INSERT INTO context_schema_migrations(version) VALUES (?)")
+            .bind(CONTEXT_SCHEMA_VERSION)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::MigrationFailed, "record context schema", error)
+            })?;
+    }
+    tx.commit().await.map_err(|error| {
+        database_error(
+            ErrorCode::MigrationFailed,
+            "commit context migration",
             error,
         )
     })

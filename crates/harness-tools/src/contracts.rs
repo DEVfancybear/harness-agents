@@ -90,6 +90,10 @@ const fn default_page_length() -> u32 {
     PROCESS_OUTPUT_PAGE_DEFAULT_BYTES
 }
 
+const fn default_history_page_length() -> u32 {
+    HISTORY_READ_DEFAULT_BYTES
+}
+
 fn is_environment_name(name: &str) -> bool {
     let mut characters = name.chars();
     let Some(first) = characters.next() else {
@@ -133,6 +137,18 @@ pub const PROCESS_OUTPUT_PAGE_MAX_BYTES: u32 = 64 * 1024;
 
 /// Page size used when a caller names no length.
 pub const PROCESS_OUTPUT_PAGE_DEFAULT_BYTES: u32 = 16 * 1024;
+
+/// Most history hits one search returns.
+pub const HISTORY_SEARCH_MAX_LIMIT: u32 = 50;
+
+/// Hits returned when a caller names no limit.
+pub const HISTORY_SEARCH_DEFAULT_LIMIT: u32 = 10;
+
+/// Largest history page one read returns.
+pub const HISTORY_READ_MAX_BYTES: u32 = 64 * 1024;
+
+/// Page size used when a caller names no length.
+pub const HISTORY_READ_DEFAULT_BYTES: u32 = 16 * 1024;
 /// Hard ceiling for `git_log`: a model may ask for fewer, never for unbounded
 /// history. The provider schema and the typed action both carry this bound.
 pub const GIT_LOG_MAX_LIMIT: u32 = 100;
@@ -148,6 +164,10 @@ pub enum ToolKind {
     RunProcess,
     RunShell,
     ReadProcessOutput,
+    /// Search the session's journal index for a source it may read.
+    HistorySearch,
+    /// Read one exact page of an indexed journal source.
+    HistoryRead,
     GitStatus,
     GitDiff,
     GitLog,
@@ -167,6 +187,8 @@ impl ToolKind {
             Self::RunProcess => "run_process",
             Self::RunShell => "run_shell",
             Self::ReadProcessOutput => "read_process_output",
+            Self::HistorySearch => "history_search",
+            Self::HistoryRead => "history_read",
             Self::GitStatus => "git_status",
             Self::GitDiff => "git_diff",
             Self::GitLog => "git_log",
@@ -196,6 +218,8 @@ impl ToolKind {
                 | Self::ListFiles
                 | Self::SearchText
                 | Self::ReadProcessOutput
+                | Self::HistorySearch
+                | Self::HistoryRead
                 | Self::GitStatus
                 | Self::GitDiff
                 | Self::GitLog
@@ -217,6 +241,8 @@ pub const fn coding_tool_names() -> &'static [&'static str] {
         "run_process",
         "run_shell",
         "read_process_output",
+        "history_search",
+        "history_read",
         "git_status",
         "git_diff",
         "git_log",
@@ -229,7 +255,7 @@ pub const fn coding_tool_names() -> &'static [&'static str] {
 /// typed execution gate and its policy/approval checks.
 #[must_use]
 pub fn coding_tool_schemas() -> Vec<Value> {
-    vec![
+    let mut schemas = vec![
         function_schema(
             "read_file",
             "Read one bounded UTF-8 text file rooted in the registered workspace.",
@@ -318,6 +344,38 @@ pub fn coding_tool_schemas() -> Vec<Value> {
             "Persist a bounded next-action note without fabricating a process receipt.",
             json!({"note": string_schema()}),
             &["note"],
+        ),
+    ];
+    schemas.extend(history_tool_schemas());
+    schemas
+}
+
+/// The two read-only history tools.
+///
+/// They are the only way a model can ask for earlier journal text, they are
+/// scoped to the task that owns the sources, and neither can change anything:
+/// a page of history is evidence to read, never an action to take.
+#[must_use]
+pub fn history_tool_schemas() -> Vec<Value> {
+    vec![
+        function_schema(
+            "history_search",
+            "Search this task's journal for earlier sources by keyword, including exact identifiers.",
+            json!({
+                "query": string_schema(),
+                "limit": {"type": "integer", "minimum": 1, "maximum": HISTORY_SEARCH_MAX_LIMIT}
+            }),
+            &["query"],
+        ),
+        function_schema(
+            "history_read",
+            "Read one exact page of an indexed journal source that belongs to this task.",
+            json!({
+                "source_id": string_schema(),
+                "offset": {"type": "integer", "minimum": 0},
+                "length": {"type": "integer", "minimum": 1, "maximum": HISTORY_READ_MAX_BYTES}
+            }),
+            &["source_id"],
         ),
     ]
 }
@@ -421,6 +479,19 @@ pub enum CodingToolAction {
         #[serde(default = "default_page_length")]
         length: u32,
     },
+    /// Search this task's indexed journal.
+    HistorySearch {
+        query: String,
+        limit: Option<u32>,
+    },
+    /// Read one exact page of an indexed journal source.
+    HistoryRead {
+        source_id: String,
+        #[serde(default)]
+        offset: u64,
+        #[serde(default = "default_history_page_length")]
+        length: u32,
+    },
     GitStatus,
     GitDiff {
         path: Option<String>,
@@ -456,6 +527,8 @@ impl CodingToolAction {
             Self::RunProcess { .. } => ToolKind::RunProcess,
             Self::RunShell { .. } => ToolKind::RunShell,
             Self::ReadProcessOutput { .. } => ToolKind::ReadProcessOutput,
+            Self::HistorySearch { .. } => ToolKind::HistorySearch,
+            Self::HistoryRead { .. } => ToolKind::HistoryRead,
             Self::GitStatus => ToolKind::GitStatus,
             Self::GitDiff { .. } => ToolKind::GitDiff,
             Self::GitLog { .. } => ToolKind::GitLog,
@@ -475,6 +548,8 @@ impl CodingToolAction {
             Self::RunProcess { .. }
             | Self::RunShell { .. }
             | Self::ReadProcessOutput { .. }
+            | Self::HistorySearch { .. }
+            | Self::HistoryRead { .. }
             | Self::GitStatus
             | Self::TaskUpdate { .. }
             | Self::ExternalTool { .. } => None,
@@ -533,6 +608,8 @@ impl CodingToolAction {
             "run_shell" => &["command", "timeout_ms", "isolation", "env"],
             "git_status" => &[],
             "read_process_output" => &["artifact_id", "stream", "offset", "length"],
+            "history_search" => &["query", "limit"],
+            "history_read" => &["source_id", "offset", "length"],
             "git_log" => &["path", "limit"],
             "task_update" => &["note"],
             _ => {
@@ -631,6 +708,71 @@ impl CodingToolAction {
                 isolation: parse_isolation(object.get("isolation"))?,
                 env: parse_env_bindings(object.get("env"))?,
             }),
+            "history_search" => {
+                let query = required_string(object, "query")?;
+                if query.trim().is_empty() {
+                    return Err(harness_types::HarnessError::new(
+                        harness_types::ErrorCode::InvalidPayload,
+                        "provider history_search query must not be blank",
+                    ));
+                }
+                let limit = match object.get("limit") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(
+                        value
+                            .as_u64()
+                            .and_then(|limit| u32::try_from(limit).ok())
+                            .filter(|limit| (1..=HISTORY_SEARCH_MAX_LIMIT).contains(limit))
+                            .ok_or_else(|| {
+                                harness_types::HarnessError::new(
+                                    harness_types::ErrorCode::InvalidPayload,
+                                    format!(
+                                        "provider history_search limit must be an integer between 1 and {HISTORY_SEARCH_MAX_LIMIT}"
+                                    ),
+                                )
+                            })?,
+                    ),
+                };
+                Ok(Self::HistorySearch { query, limit })
+            }
+            "history_read" => {
+                let source_id = required_string(object, "source_id")?;
+                if source_id.trim().is_empty() {
+                    return Err(harness_types::HarnessError::new(
+                        harness_types::ErrorCode::InvalidPayload,
+                        "provider history_read source_id must not be blank",
+                    ));
+                }
+                let offset = match object.get("offset") {
+                    None | Some(Value::Null) => 0,
+                    Some(value) => value.as_u64().ok_or_else(|| {
+                        harness_types::HarnessError::new(
+                            harness_types::ErrorCode::InvalidPayload,
+                            "provider history_read offset must be a non-negative integer",
+                        )
+                    })?,
+                };
+                let length = match object.get("length") {
+                    None | Some(Value::Null) => HISTORY_READ_DEFAULT_BYTES,
+                    Some(value) => value
+                        .as_u64()
+                        .and_then(|length| u32::try_from(length).ok())
+                        .filter(|length| (1..=HISTORY_READ_MAX_BYTES).contains(length))
+                        .ok_or_else(|| {
+                            harness_types::HarnessError::new(
+                                harness_types::ErrorCode::InvalidPayload,
+                                format!(
+                                    "provider history_read length must be an integer between 1 and {HISTORY_READ_MAX_BYTES}"
+                                ),
+                            )
+                        })?,
+                };
+                Ok(Self::HistoryRead {
+                    source_id,
+                    offset,
+                    length,
+                })
+            }
             "git_status" => Ok(Self::GitStatus),
             "read_process_output" => {
                 let artifact_id = required_string(object, "artifact_id")?;
@@ -921,7 +1063,9 @@ pub fn effect_class_for(name: &str) -> EffectClass {
         | "git_status"
         | "git_diff"
         | "git_log"
-        | "read_process_output" => EffectClass::ReadOnly,
+        | "read_process_output"
+        | "history_search"
+        | "history_read" => EffectClass::ReadOnly,
         "apply_patch" => EffectClass::Mutating,
         _ => EffectClass::External,
     }
@@ -1070,6 +1214,22 @@ pub enum ToolOutput {
         total_bytes: u64,
         text: String,
     },
+    /// Hits from this task's journal index.
+    HistorySearch {
+        hits: Vec<HistoryHitView>,
+        /// Whether the result was cut at the requested limit.
+        truncated: bool,
+    },
+    /// One exact page of an indexed journal source.
+    HistoryRead {
+        source_id: String,
+        sequence: u64,
+        source_kind: String,
+        offset: u64,
+        length: u64,
+        total_bytes: u64,
+        text: String,
+    },
     Git {
         operation: String,
         output: String,
@@ -1101,6 +1261,18 @@ pub struct SearchMatch {
     pub path: String,
     pub line: u64,
     pub column: u64,
+    pub preview: String,
+}
+
+/// One journal hit as the model sees it. The preview is for orientation; the
+/// exact bytes come from `history_read`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct HistoryHitView {
+    pub source_id: String,
+    pub sequence: u64,
+    pub kind: String,
+    pub availability: String,
+    pub matched_terms: u64,
     pub preview: String,
 }
 

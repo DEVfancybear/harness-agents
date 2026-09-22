@@ -94,6 +94,10 @@ pub enum ErrorCode {
     DuplicateFrameId,
     SchemaVersionMismatch,
     SkillUnavailable,
+    /// A referenced durable source is no longer available to read. Distinct
+    /// from a scope refusal: the caller may read it in principle, but the bytes
+    /// behind the reference are gone.
+    SourceUnavailable,
     ConfigTrustRequired,
     BackupManifestInvalid,
     RestoreTargetConflict,
@@ -191,6 +195,7 @@ impl ErrorCode {
             Self::DuplicateFrameId => "duplicate_frame_id",
             Self::SchemaVersionMismatch => "schema_version_mismatch",
             Self::SkillUnavailable => "skill_unavailable",
+            Self::SourceUnavailable => "source_unavailable",
             Self::ConfigTrustRequired => "config_trust_required",
             Self::BackupManifestInvalid => "backup_manifest_invalid",
             Self::RestoreTargetConflict => "restore_target_conflict",
@@ -330,6 +335,7 @@ impl ErrorCode {
             | Self::EnvironmentDenied
             | Self::FrameLimitExceeded
             | Self::SkillUnavailable
+            | Self::SourceUnavailable
             | Self::BackupManifestInvalid => RetryClass::Never,
         }
     }
@@ -428,7 +434,8 @@ impl ErrorCode {
             | Self::HostMethodDenied
             | Self::EnvironmentDenied
             | Self::FrameLimitExceeded
-            | Self::SkillUnavailable => 1,
+            | Self::SkillUnavailable
+            | Self::SourceUnavailable => 1,
         }
     }
 }

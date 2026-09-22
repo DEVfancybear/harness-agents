@@ -3,6 +3,7 @@
 //! Durable P2 runtime.  It owns the admission -> context -> frozen request ->
 //! provider attempt sequence; providers never receive mutable session state.
 
+use std::fmt::Write as _;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU32, Ordering},
@@ -410,6 +411,15 @@ pub struct RunResult {
 pub struct CompactionResult {
     pub packet: harness_types::ContextPacket,
     pub fallback_used: bool,
+    /// The sequence the published checkpoint covers.
+    pub covered_through: u64,
+    /// How many candidates were rejected by the CAS before one published.
+    ///
+    /// A non-zero value means a correction landed while the summary was being
+    /// generated and the candidate was rebuilt from the newer state.
+    pub rebase_attempts: u32,
+    /// `model` or `deterministic_fallback`.
+    pub summary_source: String,
 }
 
 #[derive(Clone, Debug)]
@@ -417,6 +427,71 @@ pub struct ResumeReport {
     pub working_state: harness_types::WorkingState,
     pub packet: Option<harness_types::ContextPacket>,
     pub blocked: bool,
+    /// Evidence that no longer describes the workspace on disk.
+    pub stale_evidence: Vec<StaleEvidence>,
+    /// The fingerprint observed now, when a workspace root was supplied.
+    pub observed_fingerprint: Option<ContentHash>,
+}
+
+/// One piece of evidence a re-observation invalidated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaleEvidence {
+    /// `workspace`, `change` or `check`.
+    pub kind: String,
+    pub detail: String,
+}
+
+/// What a fork is allowed to carry into its new session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForkPolicy {
+    /// Journal sources the child may read even though they belong to the
+    /// parent's session. `None` inherits everything the parent has indexed,
+    /// which is the default a host offers when a user asks to continue a task
+    /// in a new session; `Some` narrows it and can never widen it.
+    pub allowed_source_ids: Option<Vec<String>>,
+}
+
+impl ForkPolicy {
+    #[must_use]
+    pub const fn inherit_indexed() -> Self {
+        Self {
+            allowed_source_ids: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_sources(source_ids: Vec<String>) -> Self {
+        Self {
+            allowed_source_ids: Some(source_ids),
+        }
+    }
+}
+
+/// The durable result of a fork.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForkReport {
+    pub source_session_id: SessionId,
+    pub new_session_id: SessionId,
+    pub task_id: harness_types::TaskId,
+    /// Sources the child may read from its parent's journal.
+    pub inherited_source_ids: Vec<String>,
+    /// One-shot approvals carried over. Always zero: a grant is bound to the
+    /// invocation that was approved, never to a session's descendants.
+    pub approvals_copied: u32,
+}
+
+/// What a conversational rollback did, and what it did not do.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RollbackReport {
+    pub session_id: SessionId,
+    pub checkpoint_id: String,
+    pub rolled_back_to_sequence: u64,
+    /// External effects committed after the checkpoint. They are retained: a
+    /// rollback moves the conversation, never the world.
+    pub retained_effects: Vec<String>,
+    pub stale_evidence: Vec<StaleEvidence>,
+    /// Always false. Undo would be a separate, gated action.
+    pub filesystem_restored: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -464,8 +539,80 @@ impl From<harness_session::ContextError> for RuntimeError {
     }
 }
 
+/// How many times a compaction candidate may be rebuilt after a CAS conflict
+/// before the caller is told the state will not settle.
+const MAX_COMPACTION_REBASE: u32 = 3;
+
+/// How many recent call/result pairs a compaction tail carries.
+const TAIL_PAIRS: usize = 4;
+
+/// Longest rendering of one tail entry.
+const TAIL_ENTRY_CHARS: usize = 600;
+
+/// A deterministic, bounded rendering of the mandatory state.
+///
+/// It is what a checkpoint holds when the model could not summarize: the facts
+/// the host can prove, in a fixed order, so a resume still has the objective,
+/// the plan and the instructions even though no model was available.
+fn deterministic_summary(recovery: &RecoveryView, budget_tokens: u64) -> String {
+    let state = &recovery.working_state;
+    let mut lines = vec![
+        "deterministic state summary (no model summary was available)".to_owned(),
+        format!("objective event sequence: {}", state.objective_ref.sequence),
+        format!("state revision: {}", state.revision),
+    ];
+    for item in &state.plan_items {
+        lines.push(format!("plan {}: {:?}", item.id, item.status));
+    }
+    for (index, instruction) in recovery.instruction_texts.iter().enumerate() {
+        lines.push(format!(
+            "instruction {index}: {}",
+            preview(instruction, 200)
+        ));
+    }
+    for question in &state.pending_questions {
+        lines.push(format!("pending question: {}", preview(question, 120)));
+    }
+    for blocker in &state.blockers {
+        lines.push(format!("blocker: {}", preview(blocker, 120)));
+    }
+    let limit = usize::try_from(budget_tokens.saturating_mul(4)).unwrap_or(usize::MAX);
+    let mut text = String::new();
+    for line in lines {
+        if text.len() + line.len() + 1 > limit {
+            break;
+        }
+        text.push_str(&line);
+        text.push('\n');
+    }
+    text
+}
+
+fn preview(text: &str, limit: usize) -> String {
+    let flattened = text.replace(['\n', '\r'], " ");
+    if flattened.chars().count() <= limit {
+        return flattened;
+    }
+    let kept = flattened.chars().take(limit).collect::<String>();
+    format!("{kept}…")
+}
+
 pub trait SummaryProvider: Send + Sync {
     fn summarize(&self, recovery: &RecoveryView) -> Result<String, RuntimeError>;
+
+    /// Summarize into a stated token budget.
+    ///
+    /// A provider that cannot honour a budget still answers through the
+    /// unbounded call: the caller measures what came back and refuses an
+    /// oversized summary rather than trusting the provider to have counted.
+    fn summarize_bounded(
+        &self,
+        recovery: &RecoveryView,
+        budget_tokens: u64,
+    ) -> Result<String, RuntimeError> {
+        let _ = budget_tokens;
+        self.summarize(recovery)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -744,7 +891,8 @@ impl RuntimeService {
                 request.memory = None;
             }
         }
-        let built = self.build_context(&request, recovery)?;
+        let checkpoint_id = format!("checkpoint-{}", recovery.replayed_through_sequence);
+        let built = self.build_context(&request, recovery, checkpoint_id)?;
         let capabilities = self.provider.capabilities();
         let composition_content = json!({"config_revision": config.config_revision, "provider_id": capabilities.provider_id, "model": capabilities.model, "packet_checkpoint": built.packet.checkpoint_id, "tool_schemas": request.tool_schemas});
         let composition_id = harness_types::CompositionSnapshotId::generate();
@@ -1272,6 +1420,7 @@ impl RuntimeService {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // one generation barrier, told in order
     pub async fn compact(&self, session_id: &SessionId) -> Result<CompactionResult, RuntimeError> {
         let session = SessionService::new(Arc::clone(&self.store));
         let task_id = self.store.session_task(session_id).await?.ok_or_else(|| {
@@ -1285,73 +1434,219 @@ impl RuntimeService {
         let _ = session
             .append_runtime_event(session_id, &task_id, "compaction.started", started, false)
             .await?;
-        let recovery = session.recover(session_id).await?;
-        // The sequence this checkpoint will cover, captured before the packet is
-        // built. The CAS below expects exactly it: sampling the session's last
-        // sequence after the build would always match, so an event committed
-        // while the packet was being built would be silently omitted from the
-        // checkpoint instead of refusing it.
-        let covered_through = recovery.replayed_through_sequence;
-        let summary = self.summarizer.summarize(&recovery);
-        let fallback_used = summary.is_err();
-        let system_policy = summary.unwrap_or_else(|_| "Deterministic WorkingState fallback; preserve every mandatory instruction and correction.".to_owned());
-        let request = RunRequest::new(
-            session_id.clone(),
-            task_id.clone(),
-            InputId::generate(),
-            recovery
-                .instruction_texts
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "continue task".to_owned()),
-            recovery.working_state.workspace.clone(),
-        )
-        .with_system_policy(system_policy);
-        let built = self.build_context(&request, recovery)?;
-        let content_json = json!({"packet": built.packet.content, "fallback_used": fallback_used, "task_id": task_id});
-        let checkpoint = ContextCheckpointRecord {
-            checkpoint_id: built.packet.checkpoint_id.clone(),
-            session_id: session_id.clone(),
-            task_id: task_id.clone(),
-            through_sequence: built.packet.through_event_seq,
-            revision: built.packet.through_event_seq,
-            content_hash: ContentHash::from_canonical_json(&content_json)
-                .map_err(|error| RuntimeError::new(error.code(), error.to_string()))?,
-            content: content_json,
-        };
-        let expected_last = covered_through;
-        self.store
-            .write_context_checkpoint_cas(checkpoint, expected_last)
-            .await?;
-        self.store
-            .persist_context_packet(ContextPacketRecord {
-                packet: built.packet.clone(),
-                composition_snapshot_id: None,
-                omitted_optional: built.omitted_optional,
-                degradation: built.degradation,
-            })
-            .await?;
-        let mut completed = Map::new();
-        completed.insert(
-            "checkpoint_id".to_owned(),
-            Value::String(built.packet.checkpoint_id.clone()),
-        );
-        let _ = session
-            .append_runtime_event(
-                session_id,
-                &task_id,
-                "compaction.completed",
-                completed,
-                false,
-            )
-            .await?;
-        Ok(CompactionResult {
-            packet: built.packet,
-            fallback_used,
+        let budget = self.summary_budget_tokens();
+        // A candidate is built from a state that may move while the summary is
+        // being generated. The sequence it covers is therefore captured *before*
+        // generation, and a candidate whose sequence no longer matches is
+        // rebuilt from the newer state rather than published stale.
+        let mut rebase_attempts = 0_u32;
+        loop {
+            let recovery = session.recover(session_id).await?;
+            let covered_through = recovery.replayed_through_sequence;
+            // The summary port is synchronous and may do real I/O (a provider
+            // call, a file read). It runs on a blocking thread so a slow or
+            // blocking summarizer cannot stall the async workers — measured:
+            // blocking a worker here starved the store's pool and the next
+            // durable write timed out.
+            let summary = {
+                let summarizer = Arc::clone(&self.summarizer);
+                let recovery_for_summary = recovery.clone();
+                tokio::task::spawn_blocking(move || {
+                    summarizer.summarize_bounded(&recovery_for_summary, budget)
+                })
+                .await
+                .map_err(|_| {
+                    RuntimeError::new(
+                        ErrorCode::RuntimeBlocked,
+                        "the summarizer task did not complete",
+                    )
+                })?
+            };
+            // A summary that failed *or came back empty* is not a summary: the
+            // deterministic rendering of the mandatory state is used instead,
+            // and the result says which one the checkpoint holds.
+            let (system_policy, fallback_used, summary_source) = match summary {
+                Ok(text) if !text.trim().is_empty() => (text, false, "model".to_owned()),
+                _ => (
+                    deterministic_summary(&recovery, budget),
+                    true,
+                    "deterministic_fallback".to_owned(),
+                ),
+            };
+            // A checkpoint id is minted per publication, never derived from the
+            // sequence it covers: two compactions may legitimately cover the
+            // same sequence, and a derived id would reject the second one.
+            let checkpoint_id = harness_types::ContextPacketId::generate()
+                .as_str()
+                .to_owned();
+            let request = RunRequest::new(
+                session_id.clone(),
+                task_id.clone(),
+                InputId::generate(),
+                recovery
+                    .instruction_texts
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "continue task".to_owned()),
+                recovery.working_state.workspace.clone(),
+            );
+            // The summary the checkpoint holds is a block inside the packet, on
+            // the host's own summary channel: a checkpoint that dropped it would
+            // have compacted nothing, and a channel that could be mistaken for a
+            // contributor's note would let derived text claim host authority.
+            let mut context_text = system_policy;
+            if let Some(tail) = self.paired_tail(session_id).await? {
+                context_text.push_str("\n\n");
+                context_text.push_str(&tail);
+            }
+            let request = request.with_continuation_context(context_text);
+            let built = self.build_context(&request, recovery, checkpoint_id.clone())?;
+            let manifest_json = serde_json::to_value(&built.manifest).map_err(|_| {
+                RuntimeError::new(
+                    ErrorCode::InvalidPayload,
+                    "context manifest cannot be recorded",
+                )
+            })?;
+            let content_json = json!({
+                "packet": built.packet.content,
+                "fallback_used": fallback_used,
+                "summary_source": summary_source,
+                "task_id": task_id,
+                "manifest": manifest_json,
+                "mandatory_block_ids": built.mandatory_block_ids,
+                "optional_block_ids": built.optional_block_ids,
+                "omitted_optional": built.omitted_optional,
+                "superseded_block_ids": built.superseded_block_ids,
+            });
+            let checkpoint = ContextCheckpointRecord {
+                checkpoint_id: checkpoint_id.clone(),
+                session_id: session_id.clone(),
+                task_id: task_id.clone(),
+                through_sequence: built.packet.through_event_seq,
+                revision: built.packet.through_event_seq,
+                content_hash: ContentHash::from_canonical_json(&content_json)
+                    .map_err(|error| RuntimeError::new(error.code(), error.to_string()))?,
+                content: content_json,
+            };
+            match self
+                .store
+                .write_context_checkpoint_cas(checkpoint, covered_through)
+                .await
+            {
+                Ok(()) => {
+                    self.store
+                        .persist_context_packet(ContextPacketRecord {
+                            packet: built.packet.clone(),
+                            composition_snapshot_id: None,
+                            omitted_optional: built.omitted_optional,
+                            degradation: built.degradation,
+                        })
+                        .await?;
+                    let mut completed = Map::new();
+                    completed.insert(
+                        "checkpoint_id".to_owned(),
+                        Value::String(built.packet.checkpoint_id.clone()),
+                    );
+                    completed.insert(
+                        "covered_through".to_owned(),
+                        Value::Number(built.packet.through_event_seq.into()),
+                    );
+                    completed.insert(
+                        "summary_source".to_owned(),
+                        Value::String(summary_source.clone()),
+                    );
+                    completed.insert(
+                        "rebase_attempts".to_owned(),
+                        Value::Number(rebase_attempts.into()),
+                    );
+                    let _ = session
+                        .append_runtime_event(
+                            session_id,
+                            &task_id,
+                            "compaction.completed",
+                            completed,
+                            false,
+                        )
+                        .await?;
+                    return Ok(CompactionResult {
+                        covered_through: built.packet.through_event_seq,
+                        packet: built.packet,
+                        fallback_used,
+                        rebase_attempts,
+                        summary_source,
+                    });
+                }
+                Err(error)
+                    if error.code() == ErrorCode::CompactionConflict
+                        && rebase_attempts < MAX_COMPACTION_REBASE =>
+                {
+                    // The state moved under the candidate: rebuild it from the
+                    // newer journal instead of overwriting the correction.
+                    rebase_attempts += 1;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// The token budget one summary may occupy.
+    fn summary_budget_tokens(&self) -> u64 {
+        let config = self.config.lock().map(|config| config.clone()).ok();
+        config.map_or(1024, |config| {
+            config
+                .optional_token_budget
+                .min(config.context_window_tokens / 8)
+                .max(64)
         })
     }
 
+    /// The recent executed calls, each rendered with the result it produced.
+    ///
+    /// A tail that carried a tool result without the call it answers would be a
+    /// transcript the provider protocol cannot accept, so the pair is the unit:
+    /// both halves or neither, and the newest pairs only.
+    async fn paired_tail(&self, session_id: &SessionId) -> Result<Option<String>, RuntimeError> {
+        let results = self.store.recovered_tool_results(session_id).await?;
+        if results.is_empty() {
+            return Ok(None);
+        }
+        let recent = results
+            .iter()
+            .rev()
+            .take(TAIL_PAIRS)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev();
+        let mut text = String::from("recent executed calls, each with the result it produced:\n");
+        for result in recent {
+            let call = result.call_id.as_deref().unwrap_or("(host invocation)");
+            let _ = writeln!(
+                text,
+                "call {call} at seq {} -> {}",
+                result.seq,
+                preview(&result.text, TAIL_ENTRY_CHARS)
+            );
+        }
+        Ok(Some(text))
+    }
+
     pub async fn resume(&self, session_id: &SessionId) -> Result<ResumeReport, RuntimeError> {
+        self.resume_with_observation(session_id, None).await
+    }
+
+    /// Recover a session and, when a fresh workspace observation is supplied,
+    /// compare what the journal believes about the workspace with it.
+    ///
+    /// The comparison only reports: it marks the old evidence stale and names
+    /// the digest it was written against. Nothing here rewrites a file or
+    /// claims the workspace was restored. The observation is computed by the
+    /// caller because walking a workspace is a tool-layer concern, and this
+    /// crate must not depend on the tool layer to recover a session.
+    pub async fn resume_with_observation(
+        &self,
+        session_id: &SessionId,
+        observed: Option<harness_types::WorkspaceObservation>,
+    ) -> Result<ResumeReport, RuntimeError> {
         let session = SessionService::new(Arc::clone(&self.store));
         let recovery = session.recover(session_id).await?;
         let packet = self
@@ -1359,10 +1654,191 @@ impl RuntimeService {
             .latest_context_packet(session_id)
             .await?
             .map(|record| record.packet);
+        let mut stale_evidence = Vec::new();
+        let mut observed_fingerprint = None;
+        if let Some(observed) = observed {
+            observed_fingerprint = Some(observed.observed_fingerprint.clone());
+            if observed.project_id != recovery.working_state.workspace.project_id {
+                return Err(RuntimeError::new(
+                    ErrorCode::ScopeAuthorityDenied,
+                    "the observation belongs to another project",
+                ));
+            }
+            if observed.observed_fingerprint
+                != recovery.working_state.workspace.observed_fingerprint
+            {
+                stale_evidence.push(StaleEvidence {
+                    kind: "workspace".to_owned(),
+                    detail: format!(
+                        "workspace changed since the state was written: recorded {} observed {}",
+                        recovery
+                            .working_state
+                            .workspace
+                            .observed_fingerprint
+                            .as_str(),
+                        observed.observed_fingerprint.as_str()
+                    ),
+                });
+                for change in &recovery.working_state.changes {
+                    stale_evidence.push(StaleEvidence {
+                        kind: "change".to_owned(),
+                        detail: format!(
+                            "change to {} was recorded against an older workspace digest",
+                            change.path
+                        ),
+                    });
+                }
+                for check in &recovery.working_state.checks {
+                    stale_evidence.push(StaleEvidence {
+                        kind: "check".to_owned(),
+                        detail: format!(
+                            "check {:?} ran against {}",
+                            check.command, check.tested_revision
+                        ),
+                    });
+                }
+            }
+        }
         Ok(ResumeReport {
             working_state: recovery.working_state,
             packet,
             blocked: false,
+            stale_evidence,
+            observed_fingerprint,
+        })
+    }
+
+    /// Fork a session's lineage into a new session.
+    ///
+    /// The child inherits an explicit list of the parent's indexed sources and
+    /// nothing else: no approval, no owner generation, no pending intent, no
+    /// run identity. The list is recorded with the lineage edge, so a later
+    /// `history_read` can prove which references it was allowed to keep.
+    pub async fn fork_session(
+        &self,
+        source_session_id: &SessionId,
+        new_session_id: &SessionId,
+        policy: ForkPolicy,
+    ) -> Result<ForkReport, RuntimeError> {
+        let task_id = self
+            .store
+            .session_task(source_session_id)
+            .await?
+            .ok_or_else(|| {
+                RuntimeError::new(ErrorCode::InvalidPayload, "source session does not exist")
+            })?;
+        let new_task = self.store.session_task(new_session_id).await?;
+        if let Some(new_task) = new_task
+            && new_task != task_id
+        {
+            return Err(RuntimeError::new(
+                ErrorCode::ScopeAuthorityDenied,
+                "a fork may not move into another task",
+            ));
+        }
+        // The fork opens a new session for the child and gives it a *view* of
+        // the parent's indexed sources. Nothing executable crosses: the task's
+        // lease, working state and approvals stay with the parent, so a child
+        // that was never admitted cannot act on the task at all.
+        self.store
+            .open_forked_session(&task_id, source_session_id, new_session_id)
+            .await?;
+        self.store.index_history(source_session_id).await?;
+        let available = self
+            .store
+            .history_source_ids(source_session_id, 200)
+            .await?;
+        // The policy may narrow what the child inherits; it can never widen it
+        // beyond what the parent actually holds.
+        let sources = match &policy.allowed_source_ids {
+            None => available,
+            Some(only) => available
+                .into_iter()
+                .filter(|source| only.contains(source))
+                .collect(),
+        };
+        self.store
+            .record_fork_link(source_session_id, new_session_id, &task_id, &sources)
+            .await?;
+        Ok(ForkReport {
+            source_session_id: source_session_id.clone(),
+            new_session_id: new_session_id.clone(),
+            task_id,
+            inherited_source_ids: sources,
+            approvals_copied: 0,
+        })
+    }
+
+    /// Move a session's conversational head back to an earlier checkpoint.
+    ///
+    /// External effects stay exactly where they are: the report names every
+    /// tool execution the rollback walked past, and says plainly that the
+    /// filesystem was not restored. A caller that wants the files back needs a
+    /// separate, gated action.
+    pub async fn rollback_conversation(
+        &self,
+        session_id: &SessionId,
+        checkpoint_id: &str,
+    ) -> Result<RollbackReport, RuntimeError> {
+        let session = SessionService::new(Arc::clone(&self.store));
+        let checkpoint = self
+            .store
+            .context_checkpoint(session_id, checkpoint_id)
+            .await?
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    ErrorCode::InvalidPayload,
+                    "context checkpoint does not belong to this session",
+                )
+            })?;
+        let recovery = session.recover(session_id).await?;
+        let task_id = self.store.session_task(session_id).await?.ok_or_else(|| {
+            RuntimeError::new(ErrorCode::InvalidPayload, "session does not exist")
+        })?;
+        let retained_effects = recovery
+            .receipts
+            .iter()
+            .filter(|receipt| receipt.observed_at_seq > checkpoint.through_sequence)
+            .map(|receipt| {
+                format!(
+                    "tool execution {} settled at sequence {}",
+                    receipt.tool_execution_id, receipt.observed_at_seq
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut payload = Map::new();
+        payload.insert(
+            "checkpoint_id".to_owned(),
+            Value::String(checkpoint_id.to_owned()),
+        );
+        payload.insert(
+            "rolled_back_to_sequence".to_owned(),
+            Value::Number(checkpoint.through_sequence.into()),
+        );
+        payload.insert(
+            "retained_effects".to_owned(),
+            Value::Number(retained_effects.len().into()),
+        );
+        payload.insert("filesystem_restored".to_owned(), Value::Bool(false));
+        session
+            .append_runtime_event(session_id, &task_id, "session.rolled_back", payload, false)
+            .await?;
+        let stale_evidence = retained_effects
+            .iter()
+            .map(|effect| StaleEvidence {
+                kind: "change".to_owned(),
+                detail: format!(
+                    "{effect} happened after the checkpoint and is retained; the workspace was not restored"
+                ),
+            })
+            .collect();
+        Ok(RollbackReport {
+            session_id: session_id.clone(),
+            checkpoint_id: checkpoint_id.to_owned(),
+            rolled_back_to_sequence: checkpoint.through_sequence,
+            retained_effects,
+            stale_evidence,
+            filesystem_restored: false,
         })
     }
 
@@ -1553,6 +2029,7 @@ impl RuntimeService {
         &self,
         request: &RunRequest,
         recovery: RecoveryView,
+        checkpoint_id: String,
     ) -> Result<harness_session::ContextBuildResult, RuntimeError> {
         let config = self
             .config
@@ -1565,18 +2042,60 @@ impl RuntimeService {
             .continuation_context
             .as_ref()
             .map(|text| {
-                vec![ContextBlock::mandatory(
-                    "continuation-context",
-                    harness_session::ContextBlockKind::RecentTail,
-                    text.clone(),
-                )]
+                vec![
+                    ContextBlock::mandatory(
+                        "continuation-context",
+                        harness_session::ContextBlockKind::RecentTail,
+                        text.clone(),
+                    )
+                    .on_channel(harness_session::ContextChannel::Summary),
+                ]
             })
             .unwrap_or_default();
+        // Everything the request carries that this compiler does not write: the
+        // system policy, the tool definitions, the user message and any images.
+        // A budget that ignores them is a budget for the wrong thing.
+        let tool_digests = request
+            .tool_schemas
+            .iter()
+            .map(|schema| {
+                ContentHash::from_canonical_json(schema)
+                    .map(|hash| hash.as_str().to_owned())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let fixed_request_bytes = request.system_policy.len()
+            + request.text.len()
+            + request
+                .tool_schemas
+                .iter()
+                .map(|schema| schema.to_string().len())
+                .sum::<usize>()
+            + request
+                .images
+                .iter()
+                .map(|image| serde_json::to_string(image).map_or(0, |rendered| rendered.len()))
+                .sum::<usize>()
+            + request
+                .recovered_messages
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>();
+        let capabilities = self.provider.capabilities();
+        let model_capabilities_digest = ContentHash::from_canonical_json(
+            &serde_json::to_value(&capabilities).map_err(|_| {
+                RuntimeError::new(
+                    ErrorCode::InvalidPayload,
+                    "model capabilities cannot be recorded",
+                )
+            })?,
+        )
+        .map_err(|error| RuntimeError::new(error.code(), error.to_string()))?;
         ContextBuilder::new()
             .build(ContextBuildRequest {
                 session_id: request.session_id.clone(),
                 task_id: request.task_id.clone(),
-                checkpoint_id: format!("checkpoint-{}", recovery.replayed_through_sequence),
+                checkpoint_id,
                 through_event_seq: recovery.replayed_through_sequence,
                 recovery,
                 project_rules: Vec::<ContextBlock>::new(),
@@ -1594,6 +2113,13 @@ impl RuntimeService {
                     .memory
                     .as_ref()
                     .map_or_else(Vec::new, |memory| memory.versions.clone()),
+                fixed_request_bytes,
+                manifest: harness_session::ContextManifestInputs {
+                    config_revision: config.config_revision,
+                    model_id: format!("{}/{}", capabilities.provider_id, capabilities.model),
+                    model_capabilities_digest,
+                    tool_definition_digests: tool_digests,
+                },
             })
             .map_err(RuntimeError::from)
     }

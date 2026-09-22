@@ -61,6 +61,8 @@ async fn review_p2_context_budget_includes_rendered_headers() {
             safety_margin_tokens: 1,
             optional_token_budget: 100_000,
             memory_versions: vec![],
+            fixed_request_bytes: 0,
+            manifest: harness_session::ContextManifestInputs::default(),
         })
     };
     let baseline = build(100_000, vec![]).unwrap();
@@ -350,6 +352,8 @@ async fn p2_s03_mandatory_context_overflow_pauses_with_explanation() {
         safety_margin_tokens: 4,
         optional_token_budget: 0,
         memory_versions: vec![],
+        fixed_request_bytes: 0,
+        manifest: harness_session::ContextManifestInputs::default(),
     });
     let error = build.expect_err("mandatory overflow must pause");
     assert_eq!(error.code(), ErrorCode::MandatoryContextOverflow);
@@ -394,6 +398,8 @@ async fn p2_c18_unclassified_instruction_is_mandatory_after_compaction() {
             safety_margin_tokens: 8,
             optional_token_budget: 64,
             memory_versions: vec![],
+            fixed_request_bytes: 0,
+            manifest: harness_session::ContextManifestInputs::default(),
         })
         .unwrap();
     assert!(
@@ -453,6 +459,8 @@ async fn p2_c19_project_rule_with_zero_relevance_is_admitted() {
             safety_margin_tokens: 8,
             optional_token_budget: 64,
             memory_versions: vec![],
+            fixed_request_bytes: 0,
+            manifest: harness_session::ContextManifestInputs::default(),
         })
         .unwrap();
     assert!(

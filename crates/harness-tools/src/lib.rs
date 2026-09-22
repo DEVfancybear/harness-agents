@@ -22,11 +22,12 @@ pub use capture::{
 };
 pub use contracts::{
     ApprovalGrant, CaptureStream, CodingToolAction, ENV_REFERENCE_PREFIX, EffectClass, EnvBinding,
-    GIT_LOG_DEFAULT_LIMIT, GIT_LOG_MAX_LIMIT, IsolationMode, MAX_ENV_BINDINGS,
-    PROCESS_OUTPUT_PAGE_DEFAULT_BYTES, PROCESS_OUTPUT_PAGE_MAX_BYTES, PreparedToolRequest,
-    TOOL_CONTRACT_VERSION, ToolCapabilities, ToolDescriptor, ToolExecutionView, ToolKind,
-    ToolOutput, ToolRequest, coding_tool_descriptors, coding_tool_names, coding_tool_schemas,
-    effect_class_for, normalize_env_bindings,
+    GIT_LOG_DEFAULT_LIMIT, GIT_LOG_MAX_LIMIT, HISTORY_READ_DEFAULT_BYTES, HISTORY_READ_MAX_BYTES,
+    HISTORY_SEARCH_DEFAULT_LIMIT, HISTORY_SEARCH_MAX_LIMIT, HistoryHitView, IsolationMode,
+    MAX_ENV_BINDINGS, PROCESS_OUTPUT_PAGE_DEFAULT_BYTES, PROCESS_OUTPUT_PAGE_MAX_BYTES,
+    PreparedToolRequest, TOOL_CONTRACT_VERSION, ToolCapabilities, ToolDescriptor,
+    ToolExecutionView, ToolKind, ToolOutput, ToolRequest, coding_tool_descriptors,
+    coding_tool_names, coding_tool_schemas, effect_class_for, normalize_env_bindings,
 };
 pub use loop_service::{CodingLoopResult, CodingLoopService};
 pub use policy::{PolicyEffect, PolicyRule, ToolPolicy};

@@ -418,8 +418,9 @@ async fn p3_s01_tool_contracts_are_versioned_and_receipts_are_immutable() {
     let schemas = coding_tool_schemas();
     // M4-02 added `git_log` and M4-03 added `read_process_output`; the schema
     // set, not the contract version, is what grows when a tool is added, and
-    // each tool's own digest is versioned.
-    assert_eq!(schemas.len(), 11);
+    // each tool's own digest is versioned. M5-03 added the two read-only
+    // history tools the same way.
+    assert_eq!(schemas.len(), 13);
     let names = schemas
         .iter()
         .map(|schema| {
@@ -1530,9 +1531,9 @@ async fn p3_s07_cli_fixture_runs_p2_response_through_p3_tools_and_recovers_after
     let capabilities: Value =
         serde_json::from_slice(&capability.stdout).expect("capabilities JSON");
     assert_eq!(capabilities["tool_contract_version"], 1);
-    // M4-02 added `git_log` and M4-03 added `read_process_output` to the
-    // advertised schemas.
-    assert_eq!(capabilities["tool_schema_count"], 11);
+    // M4-02 added `git_log`, M4-03 added `read_process_output` and M5-03 added
+    // `history_search`/`history_read` to the advertised schemas.
+    assert_eq!(capabilities["tool_schema_count"], 13);
 
     let fixture = run_ha(&[
         "code",

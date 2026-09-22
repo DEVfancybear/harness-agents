@@ -10,10 +10,10 @@ pub use error::StoreError;
 pub use models::{
     AdmissionAck, AdmissionCommit, AgentStateRecord, ArtifactPage, BudgetAccountRecord,
     BudgetReservationRecord, BudgetReservationState, BudgetSettlement, BudgetUsageRecord,
-    CompositionSnapshotRecord, ContextCheckpointRecord, ContextPacketRecord,
-    ContinuationLinkRecord, DATA_DIRECTORY_FORMAT_VERSION, DATA_DIRECTORY_KIND,
-    DATA_DIRECTORY_MARKER_FILE_NAME, DATABASE_FILE_NAME, DELEGATION_SCHEMA_VERSION,
-    DataDirectoryMarker, DeliveryCommit, FrozenRequestRecord, HostFence,
+    CONTEXT_SCHEMA_VERSION, CompositionSnapshotRecord, ContextCheckpointRecord,
+    ContextPacketRecord, ContinuationLinkRecord, DATA_DIRECTORY_FORMAT_VERSION,
+    DATA_DIRECTORY_KIND, DATA_DIRECTORY_MARKER_FILE_NAME, DATABASE_FILE_NAME,
+    DELEGATION_SCHEMA_VERSION, DataDirectoryMarker, DeliveryCommit, FrozenRequestRecord, HostFence,
     MAINTENANCE_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION, MemoryBindingRow, MemoryCreateCommit,
     MemoryVersionCommit, ParentDeliveryRecord, PersistedPluginManifest, ProjectRegistrationRecord,
     ProviderAttemptRecord, PublishedArtifact, QuestionAnswer, QuestionOutcome, QuestionRecord,
@@ -30,3 +30,8 @@ pub use models::{
 };
 pub use store::SqliteStore;
 pub use store::delegation::TaskAdmission;
+pub use store::history::{
+    HISTORY_READ_DEFAULT_BYTES, HISTORY_READ_MAX_BYTES, HISTORY_SOURCE_LIMIT_BYTES, HistoryHit,
+    HistoryPage, HistoryScope, HistorySource, NOTE_CONTENT_LIMIT_BYTES, NOTE_KEY_LIMIT_CHARS,
+    NoteRecord, SourceAvailability, history_terms,
+};

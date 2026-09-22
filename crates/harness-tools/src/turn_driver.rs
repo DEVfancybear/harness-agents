@@ -28,8 +28,8 @@ use harness_types::{ErrorCode, HarnessError, QuestionId};
 use serde_json::Value;
 
 use crate::{
-    CodingToolAction, GIT_LOG_DEFAULT_LIMIT, PreparedToolRequest, ToolExecutionService,
-    ToolExecutionView, ToolOutput, ToolRequest, coding_tool_names,
+    CodingToolAction, GIT_LOG_DEFAULT_LIMIT, HISTORY_SEARCH_DEFAULT_LIMIT, PreparedToolRequest,
+    ToolExecutionService, ToolExecutionView, ToolOutput, ToolRequest, coding_tool_names,
 };
 
 /// Limits that bound one user turn.
@@ -1092,6 +1092,13 @@ fn summarize_action(action: &CodingToolAction) -> String {
             "read captured {} of {artifact_id} at {offset} ({length} bytes)",
             stream.as_str()
         ),
+        CodingToolAction::HistorySearch { query, limit } => format!(
+            "search history {query:?} (limit {})",
+            limit.unwrap_or(HISTORY_SEARCH_DEFAULT_LIMIT)
+        ),
+        CodingToolAction::HistoryRead {
+            source_id, offset, ..
+        } => format!("read history source {source_id} at {offset}"),
         CodingToolAction::GitStatus => "git status".to_owned(),
         CodingToolAction::GitDiff { path } => {
             format!("git diff {}", path.as_deref().unwrap_or("."))
@@ -1267,6 +1274,34 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             text,
         } => format!(
             "read_process_output {artifact_id} {stream} @{offset} ({length}/{total_bytes} bytes):\n{text}"
+        ),
+        ToolOutput::HistorySearch { hits, truncated } => format!(
+            "history_search{}: {} hit(s)\n{}",
+            if *truncated { " (truncated)" } else { "" },
+            hits.len(),
+            hits.iter()
+                .map(|hit| format!(
+                    "{} seq={} kind={} availability={} matched={} :: {}",
+                    hit.source_id,
+                    hit.sequence,
+                    hit.kind,
+                    hit.availability,
+                    hit.matched_terms,
+                    hit.preview
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        ToolOutput::HistoryRead {
+            source_id,
+            sequence,
+            source_kind,
+            offset,
+            length,
+            total_bytes,
+            text,
+        } => format!(
+            "history_read {source_id} seq={sequence} kind={source_kind} @{offset} ({length}/{total_bytes} bytes):\n{text}"
         ),
         ToolOutput::Git {
             operation, output, ..

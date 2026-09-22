@@ -22,7 +22,7 @@ mod context;
 
 pub use context::{
     ContextBlock, ContextBlockKind, ContextBuildRequest, ContextBuildResult, ContextBuilder,
-    ContextError,
+    ContextChannel, ContextError, ContextManifest, ContextManifestInputs,
 };
 
 /// Input accepted by the durable admission command.

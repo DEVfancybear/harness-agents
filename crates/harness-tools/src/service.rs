@@ -19,9 +19,10 @@ use harness_types::{
 use serde_json::{Map, Value, json};
 
 use crate::{
-    ApprovalGrant, CaptureStream, CodingToolAction, GIT_LOG_DEFAULT_LIMIT, IsolationMode,
-    PROCESS_OUTPUT_PAGE_MAX_BYTES, PreparedToolRequest, TOOL_CONTRACT_VERSION, ToolCapabilities,
-    ToolExecutionView, ToolOutput, ToolPolicy, ToolRequest, capture, coding_tool_names,
+    ApprovalGrant, CaptureStream, CodingToolAction, GIT_LOG_DEFAULT_LIMIT, HISTORY_READ_MAX_BYTES,
+    HISTORY_SEARCH_DEFAULT_LIMIT, IsolationMode, PROCESS_OUTPUT_PAGE_MAX_BYTES,
+    PreparedToolRequest, TOOL_CONTRACT_VERSION, ToolCapabilities, ToolExecutionView, ToolOutput,
+    ToolPolicy, ToolRequest, capture, coding_tool_names,
     process::{self, ProcessResult, TreeCleanup},
     secrets::{HostEnvironmentSecrets, ProcessEnvironment, SecretResolver},
     workspace::{
@@ -29,6 +30,7 @@ use crate::{
         resolve_relative, search_text,
     },
 };
+use harness_store_sqlite::HistoryScope;
 
 /// Dispatches an `ExternalTool` action after the gate has authorized it and the
 /// durable intent is committed. A returned error is treated exactly like any
@@ -411,7 +413,7 @@ impl ToolExecutionService {
             .await
             .map_err(store_error)?;
         if let Err(error) = self
-            .validate_dispatch_preconditions(&prepared.workspace_root, &transformed)
+            .validate_dispatch_preconditions(&prepared, &transformed)
             .await
         {
             let code = error.code();
@@ -511,7 +513,7 @@ impl ToolExecutionService {
                 );
                 match environment {
                     Ok(environment) => {
-                        self.dispatch(&prepared.workspace_root, other, cancellation, &environment)
+                        self.dispatch(&prepared, other, cancellation, &environment)
                             .await
                     }
                     Err(error) => Err(error),
@@ -685,6 +687,8 @@ impl ToolExecutionService {
             CodingToolAction::RunProcess { .. }
             | CodingToolAction::RunShell { .. }
             | CodingToolAction::ReadProcessOutput { .. }
+            | CodingToolAction::HistorySearch { .. }
+            | CodingToolAction::HistoryRead { .. }
             | CodingToolAction::GitStatus
             | CodingToolAction::TaskUpdate { .. }
             | CodingToolAction::ExternalTool { .. } => {}
@@ -700,9 +704,10 @@ impl ToolExecutionService {
     /// unknown outcome that implies a side effect might have happened.
     async fn validate_dispatch_preconditions(
         &self,
-        root: &Path,
+        prepared: &PreparedToolRequest,
         action: &CodingToolAction,
     ) -> Result<(), HarnessError> {
+        let root = prepared.workspace_root.as_path();
         match action {
             CodingToolAction::ReadFile { path } => {
                 // Deterministic content-policy failures (binary or unsupported
@@ -746,6 +751,27 @@ impl ToolExecutionService {
                         ),
                     ));
                 }
+            }
+            CodingToolAction::HistorySearch { query, .. } => {
+                if query.trim().is_empty() {
+                    return Err(HarnessError::new(
+                        ErrorCode::InvalidPayload,
+                        "a history search needs at least one searchable term",
+                    ));
+                }
+            }
+            CodingToolAction::HistoryRead {
+                source_id, offset, ..
+            } => {
+                // A foreign or expired reference is a refusal, not an unknown
+                // outcome: the read can be decided before any intent exists.
+                let scope = self.history_scope(prepared).await?;
+                let page = self
+                    .store
+                    .history_read(&scope, source_id, *offset, 1)
+                    .await
+                    .map_err(store_error)?;
+                let _ = page;
             }
             _ => {}
         }
@@ -825,11 +851,12 @@ impl ToolExecutionService {
     #[allow(clippy::too_many_lines)] // one dispatch table, one arm per tool
     async fn dispatch(
         &self,
-        root: &Path,
+        prepared: &PreparedToolRequest,
         action: &CodingToolAction,
         cancellation: CancellationToken,
         environment: &ProcessEnvironment,
     ) -> Result<Dispatched, HarnessError> {
+        let root = prepared.workspace_root.as_path();
         match action {
             CodingToolAction::ExternalTool { .. } => Err(HarnessError::new(
                 ErrorCode::PolicyDenied,
@@ -880,6 +907,20 @@ impl ToolExecutionService {
             } => {
                 let page = self
                     .read_capture_page(artifact_id, *stream, *offset, *length)
+                    .await?;
+                Ok(Dispatched::plain(page))
+            }
+            CodingToolAction::HistorySearch { query, limit } => {
+                let hits = self.history_search(prepared, query, *limit).await?;
+                Ok(Dispatched::plain(hits))
+            }
+            CodingToolAction::HistoryRead {
+                source_id,
+                offset,
+                length,
+            } => {
+                let page = self
+                    .history_read(prepared, source_id, *offset, *length)
                     .await?;
                 Ok(Dispatched::plain(page))
             }
@@ -972,6 +1013,92 @@ impl ToolExecutionService {
                 "task update must use its atomic task projection path",
             )),
         }
+    }
+
+    /// The scope one history read runs under: this task, plus whatever lineage a
+    /// fork was explicitly allowed to keep reading.
+    pub async fn history_scope(
+        &self,
+        prepared: &PreparedToolRequest,
+    ) -> Result<HistoryScope, HarnessError> {
+        let grants = self
+            .store
+            .history_grants(&prepared.request.session_id)
+            .await
+            .map_err(store_error)?;
+        Ok(HistoryScope::new(
+            prepared.project_id.clone(),
+            prepared.request.task_id.clone(),
+        )
+        .with_grants(grants))
+    }
+
+    /// Bring the journal index up to date and search it inside this task.
+    async fn history_search(
+        &self,
+        prepared: &PreparedToolRequest,
+        query: &str,
+        limit: Option<u32>,
+    ) -> Result<ToolOutput, HarnessError> {
+        // The read scope is the task, so the index has to cover every session
+        // that worked on it; otherwise a continuation session could not find
+        // what its predecessor wrote.
+        self.store
+            .index_task_history(&prepared.request.task_id)
+            .await
+            .map_err(store_error)?;
+        let scope = self.history_scope(prepared).await?;
+        let wanted = limit.unwrap_or(HISTORY_SEARCH_DEFAULT_LIMIT);
+        let hits = self
+            .store
+            .history_search(&scope, query, usize::try_from(wanted).unwrap_or(10))
+            .await
+            .map_err(store_error)?;
+        let truncated = hits.len() >= usize::try_from(wanted).unwrap_or(10);
+        Ok(ToolOutput::HistorySearch {
+            hits: hits
+                .into_iter()
+                .map(|hit| crate::HistoryHitView {
+                    source_id: hit.source_id,
+                    sequence: hit.sequence,
+                    kind: hit.kind,
+                    availability: hit.availability.as_str().to_owned(),
+                    matched_terms: hit.matched_terms,
+                    preview: hit.preview,
+                })
+                .collect(),
+            truncated,
+        })
+    }
+
+    /// Read one exact page of an indexed source.
+    async fn history_read(
+        &self,
+        prepared: &PreparedToolRequest,
+        source_id: &str,
+        offset: u64,
+        length: u32,
+    ) -> Result<ToolOutput, HarnessError> {
+        let scope = self.history_scope(prepared).await?;
+        let page = self
+            .store
+            .history_read(
+                &scope,
+                source_id,
+                offset,
+                usize::try_from(length.min(HISTORY_READ_MAX_BYTES)).unwrap_or(usize::MAX),
+            )
+            .await
+            .map_err(store_error)?;
+        Ok(ToolOutput::HistoryRead {
+            source_id: page.source_id,
+            sequence: page.sequence,
+            source_kind: page.kind,
+            offset: page.offset,
+            length: u64::try_from(page.bytes.len()).unwrap_or(u64::MAX),
+            total_bytes: page.total_bytes,
+            text: String::from_utf8_lossy(&page.bytes).into_owned(),
+        })
     }
 
     /// Publish a finished process capture as the durable artifact the receipt

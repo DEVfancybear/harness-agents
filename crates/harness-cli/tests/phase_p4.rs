@@ -679,6 +679,8 @@ async fn p4_s05_bounded_fts_retrieval_contributes_through_context_builder() {
             safety_margin_tokens: 128,
             optional_token_budget: 2000,
             memory_versions: contribution.versions,
+            fixed_request_bytes: 0,
+            manifest: harness_session::ContextManifestInputs::default(),
         })
         .unwrap();
     assert!(built.packet.content.contains("parser preserves Unicode"));
