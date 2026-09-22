@@ -156,14 +156,28 @@ function Get-FailedIntegrationTests {
     # "no failing integration test to isolate". The backticks are stripped before
     # matching, which is also what makes the reported name the name `cargo test
     # --exact` accepts.
+    #
+    # 23/09/2026 (M8): the flake then landed in a *milestone* target
+    # (`milestone_m2::m2_04_text_arrives_before_the_terminal_barrier`), and the
+    # parser - which only recognized a target under `tests/` - refused to
+    # isolate it. Every integration-test binary has the same shape
+    # (`tests/<name>.rs (target/.../<name>-<hash>.exe)`), so the rule is now the
+    # file name itself rather than where it sits: a milestone target is exactly
+    # as re-runnable by name as the workspace's own suites.
     param([Parameter(Mandatory)] [AllowEmptyCollection()] [AllowEmptyString()] [string[]] $Output)
 
     $target = $null
     $failures = [System.Collections.Generic.List[object]]::new()
     foreach ($line in $Output) {
+        # `$Matches` is a single script-wide hashtable: the `.Replace` call below
+        # runs a regex match of its own and overwrites it. The name therefore has
+        # to be captured into a variable in the same statement that matches it,
+        # or a backticked failure line reports whatever matched last - measured on
+        # this host, where that made the parser find nothing and the step give up
+        # on a failure it could have isolated.
         $normalized = $line.Replace('`', '')
-        if ($normalized -match '^\s*Running\s+(?:[^()]*?[/\\])?tests[/\\](?<name>[A-Za-z0-9_]+)\.rs') {
-            $target = $Matches.name
+        if ($normalized -match '^\s*Running\s+\S*tests[/\\](?<name>[A-Za-z0-9_]+)\.rs') {
+            $target = $Matches['name']
             continue
         }
         # Any other `Running` line (unit binary, doc test, example) clears the
@@ -175,7 +189,7 @@ function Get-FailedIntegrationTests {
         }
         if ($normalized -match '^\s*test\s+(?<name>[^\s]+)\s+\.\.\.\s+FAILED\b') {
             if ($null -ne $target) {
-                $failures.Add([pscustomobject]@{ Target = $target; TestName = $Matches.name })
+                $failures.Add([pscustomobject]@{ Target = $target; TestName = $Matches['name'] })
             }
         }
     }
@@ -470,15 +484,43 @@ function Invoke-GateSelfTest {
         $parsed[0].TestName -cne 'i04_the_binary_installed_under_a_unicode_path_follows_the_caller_directory') {
         throw (New-GateError -Code 'gate_configuration_error' -Message "cargo output parsing is wrong: $($parsed | ConvertTo-Json -Compress)")
     }
-    # Cargo brackets the failing name with backticks in its own report.
+    # Cargo brackets the failing name with backticks in its own report, and the
+    # replacement that strips them runs a match of its own: this case is what
+    # catches a parser that reads `$Matches` after the replace instead of
+    # capturing the name when it matched.
     $backticked = @(
         '     Running tests/milestone_m7.rs (target/debug/deps/milestone_m7-0123456789abcdef.exe)',
-        'test `a25_memory_job_cas` ... FAILED'
+        'test `a25_memory_job_cas` ... FAILED',
+        'test `m7_04_cli_propose_confirm_reject_export` ... FAILED'
     )
     $parsed = @(Get-FailedIntegrationTests -Output $backticked)
-    if ($parsed.Count -ne 1 -or $parsed[0].Target -cne 'milestone_m7' -or
-        $parsed[0].TestName -cne 'a25_memory_job_cas') {
+    if ($parsed.Count -ne 2 -or $parsed[0].Target -cne 'milestone_m7' -or
+        $parsed[0].TestName -cne 'a25_memory_job_cas' -or
+        $parsed[1].TestName -cne 'm7_04_cli_propose_confirm_reject_export') {
         throw (New-GateError -Code 'gate_configuration_error' -Message "backticked cargo output parsing is wrong: $($parsed | ConvertTo-Json -Compress)")
+    }
+    # A milestone target under crates/ is just as re-runnable by name as the
+    # workspace's own tests/ suites, and the flake does land in it.
+    $nested = @(
+        '     Running crates\harness-cli\tests\milestone_m2.rs (target\debug\deps\milestone_m2-d92cb5d5c0ffb6ac.exe)',
+        'test m2_04_text_arrives_before_the_terminal_barrier ... FAILED'
+    )
+    $parsed = @(Get-FailedIntegrationTests -Output $nested)
+    if ($parsed.Count -ne 1 -or $parsed[0].Target -cne 'milestone_m2' -or
+        $parsed[0].TestName -cne 'm2_04_text_arrives_before_the_terminal_barrier') {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "nested cargo output parsing is wrong: $($parsed | ConvertTo-Json -Compress)")
+    }
+    # A unit-test binary has no target file to re-run, so a failure under it must
+    # not be attributed to whichever integration target ran last.
+    $after_unit = @(
+        '     Running tests/milestone_m7.rs (target/debug/deps/milestone_m7-0123456789abcdef.exe)',
+        'test a25_memory_job_cas ... FAILED',
+        '     Running unittests src\main.rs (target\debug\deps\ha-dd3932fc9bd5f0e9.exe)',
+        'test interactive::memory::tests::something ... FAILED'
+    )
+    $parsed = @(Get-FailedIntegrationTests -Output $after_unit)
+    if ($parsed.Count -ne 1 -or $parsed[0].Target -cne 'milestone_m7') {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "a unit failure was attributed to an integration target: $($parsed | ConvertTo-Json -Compress)")
     }
     Invoke-NegativeControl -Name 'no-failure-no-isolation' -ExpectedCode 'gate_configuration_error' -Action {
         $none = @(Get-FailedIntegrationTests -Output @('     Running tests/phase_p1.rs (target/debug/deps/phase_p1-abcdef0123456789.exe)', 'test result: ok. 21 passed; 0 failed'))
@@ -559,9 +601,14 @@ try {
                 # rendering truncates a long failure and collapses its whitespace,
                 # and both of those hid the failing test names from this step.
                 $output = @($script:GateLastFailureOutput)
+                $dump = Join-Path $repoRoot 'target/verification/workspace-tests-failure.log'
+                [void] (New-Item -ItemType Directory -Path (Split-Path -Parent $dump) -Force)
+                Set-Content -LiteralPath $dump -Value $output -Encoding utf8
                 if ($null -eq (Get-FlakeSignature -Output $output)) { throw $lastFailure }
                 $failed = @(Get-FailedIntegrationTests -Output $output)
-                if ($failed.Count -eq 0) { throw $lastFailure }
+                if ($failed.Count -eq 0) {
+                    throw (New-GateError -Code 'gate_configuration_error' -Message "workspace-tests hit the host flake but no failing integration test could be isolated; the captured output is at $dump`n$lastFailure")
+                }
                 foreach ($failure in $failed) {
                     $isolated = $null
                     try {
