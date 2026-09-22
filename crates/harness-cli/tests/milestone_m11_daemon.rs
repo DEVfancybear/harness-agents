@@ -73,9 +73,18 @@ async fn m11_01_daemon_ownership_and_control() {
     let root = temp_root();
     let data_dir = root.path().join("data");
     std::fs::create_dir_all(&data_dir).expect("the data directory is created");
-    // 2026-06-01T09:00:00Z, so a minute later the schedule is due.
+    // 2026-06-01T09:00:00Z, with the schedule due exactly one minute later.
+    //
+    // The fixture is deliberately *not* due at the starting instant. A schedule
+    // that is already due is claimed by the evaluator on its own tick, which
+    // advances the next due instant - by design, since the evaluator owns it. A
+    // test that seeded it due would then be racing the evaluator for the value
+    // it asserts on, and the manual trigger is the thing under test here, not
+    // the evaluator: it must leave the next due where the evaluator put it, so
+    // the assertion needs the evaluator to have put it somewhere and left it.
     let start_instant = 1_780_304_400_000_i64;
-    seed_schedule(&data_dir, start_instant).await;
+    let seeded_due = start_instant + 60_000;
+    seed_schedule(&data_dir, seeded_due).await;
     let clock = Arc::new(FixedClock::new(start_instant));
 
     // -----------------------------------------------------------------------
@@ -211,7 +220,7 @@ async fn m11_01_daemon_ownership_and_control() {
     assert_eq!(triggered["status"], json!("ok"));
     assert_eq!(
         triggered["triggered"]["next_due_unix_ms"],
-        json!(start_instant),
+        json!(seeded_due),
         "a manual trigger does not move the next due instant"
     );
     let unknown = control(&host.endpoint, "trigger", Some("no_such_schedule"))
@@ -222,12 +231,11 @@ async fn m11_01_daemon_ownership_and_control() {
     // -----------------------------------------------------------------------
     // The daemon runs what is due, and a restart does not double it
     // -----------------------------------------------------------------------
-    // Let the loop evaluate at least once, then advance the clock so the next
-    // occurrence is due.
+    // Let the loop evaluate at least once, then advance the clock onto the
+    // seeded due instant so the next occurrence comes due.
     tokio::time::sleep(Duration::from_millis(400)).await;
     clock.advance(60_000);
     tokio::time::sleep(Duration::from_millis(600)).await;
-
     let running = control(&host.endpoint, "status", None)
         .await
         .expect("status answers while running");

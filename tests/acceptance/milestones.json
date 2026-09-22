@@ -923,8 +923,8 @@
         {
           "id": "M11-01",
           "title": "Daemon host và IPC",
-          "status": "in_progress",
-          "tests": []
+          "status": "implemented_unverified",
+          "tests": ["m11_01_daemon_ownership_and_control", "m11_01_a_stale_endpoint_is_cleaned_up"]
         },
         {
           "id": "M11-02",
@@ -945,11 +945,17 @@
           "tests": []
         }
       ],
-      "required_tests": ["a34_schedule_occurrences"],
+      "required_tests": [
+        "a34_schedule_occurrences",
+        "milestone_m11_daemon::m11_01_daemon_ownership_and_control",
+        "milestone_m11_daemon::m11_01_a_stale_endpoint_is_cleaned_up"
+      ],
       "unit_tests": [],
       "fixtures": [
         "crates/harness-cli/tests/milestone_m11.rs",
+        "crates/harness-cli/tests/milestone_m11_daemon.rs",
         "crates/harness-cli/src/daemon/schedule.rs",
+        "crates/harness-cli/src/daemon/host.rs",
         "docs/adr/ADR-N11-SCHEDULE-AND-DAEMON-SEMANTICS.vi.md"
       ],
       "gate": {
