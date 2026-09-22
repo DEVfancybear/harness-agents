@@ -87,6 +87,7 @@ một cái — vì vậy gate local (Windows) xanh mà CI vẫn đỏ:
 | ubuntu | `clippy` mọi phase, đỏ sau ~1 phút | `crates/harness-cli/tests/milestone_m4.rs`: `millis as f64 / 1000.0` trong helper **`#[cfg(unix)]`** `write_then_sleep` → `clippy::cast_precision_loss` dưới `-D warnings` (đúng lint đã từng bị ở P3, sửa bởi `f0a4ac8`) | helper bị **thay** bằng `write_then_wait(marker, release)` không còn cast; hai nhánh shell dùng `cfg!` để nhánh OS kia **vẫn được biên dịch** khi gate chạy |
 | windows | `workspace-tests` → `milestone_m4::a13_queued_process_cancel` | test hẹp thời gian: `sleep(300ms)` sau khi spawn B rồi mới cancel; máy chậm thì cancel tới **trước** durable intent của B → nhánh `ProcessCanceled` "before the durable intent" (`service.rs`) trả `Denied`, không phải `Settled` | A **giữ permit tới khi test thả** (chờ file `a13-release.txt`); test chờ **2 pending intent** rồi mới cancel. Nhánh `Denied` giữ nguyên — nó trung thực cho call chưa có intent |
 | ubuntu | `workspace-tests` → `milestone_m4::a15_path_patch_safety` (chỉ lộ ra **sau** khi sửa clippy) | case `C:/Windows/win.ini` bị assert là "phải bị từ chối": trên POSIX đó là đường dẫn **tương đối** hợp lệ (thư mục tên `C:`), nên `prepare` cho qua | danh sách dựng theo nền tảng bằng `cfg!`; `/etc/hosts` giữ case đường dẫn tuyệt đối cho POSIX. **Không** đổi `resolve_relative`: sản phẩm đúng, test mới là chỗ sai nền tảng |
+| windows | `P0 (windows-latest)` bị **cancel** (không phải test đỏ) | `timeout-minutes: 10` của job P0: lần đầu gate chạy hết test trên windows cần ~12-13 phút, nên job bị chính timeout của nó cắt ở 10,1 phút | `.github/workflows/ci.yml`: cả sáu phase job lên `timeout-minutes: 30`, kèm số đo từng OS trong comment |
 
 Kiểm chứng (Windows; working tree còn việc dở M4-03.2 của session khác nên dùng **checkout sạch**
 `git archive HEAD` vào `%TEMP%` + chép đè đúng file test):
@@ -94,6 +95,7 @@ Kiểm chứng (Windows; working tree còn việc dở M4-03.2 của session kh�
 - `milestone_m4` → **10/10 pass** (gồm A13 và A15); `a13_queued_process_cancel` lặp **5 lần** → 5/5 pass.
 - `cargo fmt --all -- --check` exit 0; `cargo clippy -p harness-cli --all-targets --locked -- -D warnings` xanh.
 - Push `4b8a844` (run `35682323925`): ubuntu qua `format` + `clippy`, 264 unit test xanh, `milestone_m0`–`m3` xanh, **`a13` xanh trên cả ubuntu lẫn windows**; còn `a15` (bảng trên) → đã sửa tiếp trong push kế tiếp.
+- Push `6159823` (run `35683233548`): **11/12 job xanh** — toàn bộ ubuntu (P0/P3/P4/P5/P6/P7) và P3/P4/P5/P6/P7 windows; job đỏ duy nhất là `P0 (windows-latest)` bị timeout 10 phút cắt (bảng trên) → đã nâng timeout trong push kế tiếp. Đây là lần đầu ubuntu xanh kể từ 21/09.
 - Chi tiết + số đo: `docs/evidence/M4.vi.md` §4c.
 
 **Lưu ý cho lượt sau:** hai lỗi này nằm trong file `milestone_m4.rs` mà lượt M4-03.2 cũng đang sửa;

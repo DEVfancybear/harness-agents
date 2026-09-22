@@ -29,6 +29,11 @@ permissions:
   contents: read
 
 jobs:
+  # Job timeouts are a hung-job guard, not a target. Measured on run 35683233548
+  # (the first run whose gates reached the tests on both OSes): ubuntu side 4.4-7.0
+  # minutes per phase, windows side 12.1 (P3), 13.8 (P4), 15.2 (P5), 15.7 (P6) and
+  # 16.7 (P7). P0's old 10-minute limit cancelled a windows gate that was still
+  # running, so every limit below is roughly twice its measured worst case.
   verify-p0:
     name: P0 (${{ matrix.os }})
     strategy:
@@ -36,7 +41,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
       - name: Install pinned Rust toolchain
@@ -53,7 +58,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
       - name: Install pinned Rust toolchain
@@ -70,7 +75,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
       - name: Install pinned Rust toolchain
