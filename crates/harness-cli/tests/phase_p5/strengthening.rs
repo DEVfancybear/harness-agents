@@ -574,6 +574,7 @@ async fn p5_k06_provider_loss_drains_dependent_children() {
             SchedulerConfig {
                 max_concurrent_workers: 2,
                 max_depth: 2,
+                max_queued_workers: harness_orchestrator::DEFAULT_MAX_QUEUED_WORKERS,
                 budget: DelegationBudget {
                     max_workers: 2,
                     max_model_requests: FIXTURE_REQUESTS,
@@ -645,6 +646,7 @@ async fn p5_k07_racing_shutdown_shares_completion_and_reports_failures() {
             SchedulerConfig {
                 max_concurrent_workers: 1,
                 max_depth: 2,
+                max_queued_workers: harness_orchestrator::DEFAULT_MAX_QUEUED_WORKERS,
                 budget: DelegationBudget {
                     max_workers: 1,
                     max_model_requests: FIXTURE_REQUESTS,

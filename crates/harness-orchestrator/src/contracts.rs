@@ -21,6 +21,9 @@ use serde_json::Value;
 pub const DELEGATION_CONTRACT_VERSION: u16 = 1;
 
 pub const DEFAULT_MAX_WORKERS: u32 = 3;
+/// The host cap on dispatched-but-not-yet-settled workers. See
+/// [`SchedulerConfig::max_queued_workers`] for why a bound exists at all.
+pub const DEFAULT_MAX_QUEUED_WORKERS: u32 = 8;
 pub const DEFAULT_MAX_DEPTH: u32 = 2;
 pub const DEFAULT_MAX_MODEL_REQUESTS: u32 = 24;
 pub const MAX_ROLE_PRESETS: usize = 4;
@@ -1154,7 +1157,25 @@ impl ParentDelivery {
 pub struct SchedulerConfig {
     pub max_concurrent_workers: u32,
     pub max_depth: u32,
+    /// How many workers may be dispatched but not yet holding a compute slot.
+    ///
+    /// The queue is what makes dispatch backpressure instead of an unbounded
+    /// spawn: a caller that asks to fan out more work than the host can run has
+    /// to be told it was refused, not discover it when the host runs out of
+    /// memory. `0` is legal and means "no waiting at all" - a dispatch is then
+    /// refused unless a slot is free at that instant.
+    #[serde(default = "default_max_queued_workers")]
+    pub max_queued_workers: u32,
     pub budget: DelegationBudget,
+}
+
+/// The absence of a queue bound in a stored config means the default, not zero.
+///
+/// Serde's `default` on a field is what keeps a `SchedulerConfig` written before
+/// M8 readable: without it, every stored config would fail to deserialize, and
+/// with a plain `Default` it would silently become unbounded.
+fn default_max_queued_workers() -> u32 {
+    DEFAULT_MAX_QUEUED_WORKERS
 }
 
 impl Default for SchedulerConfig {
@@ -1162,6 +1183,7 @@ impl Default for SchedulerConfig {
         Self {
             max_concurrent_workers: DEFAULT_MAX_WORKERS,
             max_depth: DEFAULT_MAX_DEPTH,
+            max_queued_workers: DEFAULT_MAX_QUEUED_WORKERS,
             budget: DelegationBudget::default(),
         }
     }
@@ -1187,7 +1209,39 @@ impl SchedulerConfig {
                 ),
             ));
         }
+        if self.max_queued_workers > DEFAULT_MAX_QUEUED_WORKERS {
+            return Err(OrchestratorError::new(
+                ErrorCode::DelegationQueueFull,
+                format!(
+                    "a queue of {} workers exceeds the host cap {DEFAULT_MAX_QUEUED_WORKERS}",
+                    self.max_queued_workers
+                ),
+            ));
+        }
         self.budget.validate()
+    }
+
+    /// Refuse a dispatch that would put more than the queue bound in waiting.
+    ///
+    /// `reserved` counts every worker that has been dispatched and has not
+    /// settled, so it is exactly "running plus queued". The bound is therefore
+    /// expressed once, on the total the caller can see, instead of twice on two
+    /// numbers that can drift apart.
+    pub fn require_queue_capacity(&self, reserved: u32) -> Result<(), OrchestratorError> {
+        let capacity = self
+            .max_concurrent_workers
+            .saturating_add(self.max_queued_workers);
+        if reserved >= capacity {
+            return Err(OrchestratorError::new(
+                ErrorCode::DelegationQueueFull,
+                format!(
+                    "the delegation queue is full: {reserved} worker(s) are dispatched and at most \
+                     {capacity} may be ({} running, {} waiting)",
+                    self.max_concurrent_workers, self.max_queued_workers
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub fn require_slot(&self, in_use: u32) -> Result<(), OrchestratorError> {

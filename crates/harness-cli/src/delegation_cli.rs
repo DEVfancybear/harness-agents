@@ -366,6 +366,10 @@ async fn run_delegation(
             SchedulerConfig {
                 max_concurrent_workers: agents,
                 max_depth: harness_orchestrator::DEFAULT_MAX_DEPTH,
+                // The demo plan is exactly `agents` wide, so a queue is never
+                // needed; the bound still exists so the run cannot outgrow the
+                // plan if that ever changes.
+                max_queued_workers: harness_orchestrator::DEFAULT_MAX_QUEUED_WORKERS,
                 budget: DelegationBudget {
                     max_workers: agents,
                     max_model_requests: DELEGATION_BUDGET_REQUESTS,

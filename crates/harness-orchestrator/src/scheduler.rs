@@ -275,6 +275,25 @@ impl WorkerScheduler {
         u32::try_from(self.slots.available_permits()).unwrap_or(0)
     }
 
+    /// Workers dispatched and not yet settled: running plus queued.
+    ///
+    /// This is the number the queue bound is expressed on, and it is observable
+    /// so a caller can report backpressure instead of guessing at it.
+    #[must_use]
+    pub fn reserved_workers(&self) -> u32 {
+        self.reserved
+            .lock()
+            .map(|reserved| u32::try_from(reserved.len()).unwrap_or(u32::MAX))
+            .unwrap_or(0)
+    }
+
+    /// Dispatched workers without a compute slot yet.
+    #[must_use]
+    pub fn queued_workers(&self) -> u32 {
+        self.reserved_workers()
+            .saturating_sub(self.live_worker_count().try_into().unwrap_or(u32::MAX))
+    }
+
     /// Admit a delegation at a given depth. Depth is checked before any worker
     /// is created, and an exhausted budget is terminal for new dispatch.
     pub fn require_admission(&self, depth: u32) -> Result<(), OrchestratorError> {
@@ -297,6 +316,10 @@ impl WorkerScheduler {
     /// Dispatch one worker. The returned future resolves when the worker
     /// settles; the permit is released when the worker's turn ends, including
     /// when the caller stops waiting.
+    ///
+    /// The queue bound is checked before the task reservation is taken, so a
+    /// refused dispatch leaves nothing behind: a caller that retries after a
+    /// worker settles is not fighting a reservation its own refusal created.
     pub fn dispatch(
         self: &Arc<Self>,
         request: WorkerRequest,
@@ -314,6 +337,8 @@ impl WorkerScheduler {
             let mut reserved = self.reserved.lock().map_err(|_| {
                 OrchestratorError::new(ErrorCode::RuntimeBlocked, "scheduler state is poisoned")
             })?;
+            self.config
+                .require_queue_capacity(u32::try_from(reserved.len()).unwrap_or(u32::MAX))?;
             if !reserved.insert(key.clone()) {
                 return Err(OrchestratorError::new(
                     ErrorCode::TaskOwnershipConflict,

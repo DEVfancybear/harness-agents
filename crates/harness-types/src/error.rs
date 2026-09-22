@@ -79,6 +79,11 @@ pub enum ErrorCode {
     IntegrationConflict,
     ResultIncomplete,
     SchedulerShutdown,
+    /// A delegation was refused because the queue already holds as many workers
+    /// as it may. Distinct from `BudgetExhausted`, which says no more requests may
+    /// be spent: a full queue is backpressure and clears when a worker settles,
+    /// where an exhausted budget does not clear at all.
+    DelegationQueueFull,
     DeliveryConflict,
     ExtensionProtocolError,
     ExtensionDigestMismatch,
@@ -180,6 +185,7 @@ impl ErrorCode {
             Self::IntegrationConflict => "integration_conflict",
             Self::ResultIncomplete => "result_incomplete",
             Self::SchedulerShutdown => "scheduler_shutdown",
+            Self::DelegationQueueFull => "delegation_queue_full",
             Self::DeliveryConflict => "delivery_conflict",
             Self::ExtensionProtocolError => "extension_protocol_error",
             Self::ExtensionDigestMismatch => "extension_digest_mismatch",
@@ -284,6 +290,7 @@ impl ErrorCode {
             | Self::TaskNotReady
             | Self::ProcessOutcomeUnknown
             | Self::BudgetExhausted
+            | Self::DelegationQueueFull
             | Self::DirtyWorkspaceDenied
             | Self::SecretNotGranted
             | Self::ConfigTrustRequired => RetryClass::HumanAction,
@@ -366,6 +373,7 @@ impl ErrorCode {
             | Self::TaskNotReady
             | Self::ProcessOutcomeUnknown
             | Self::BudgetExhausted
+            | Self::DelegationQueueFull
             | Self::DirtyWorkspaceDenied
             | Self::SecretNotGranted
             | Self::MandatoryContextOverflow => 3,

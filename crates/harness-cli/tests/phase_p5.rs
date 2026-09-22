@@ -601,6 +601,7 @@ async fn p5_s03_scheduler_bounds_slots_depth_and_budget() {
             SchedulerConfig {
                 max_concurrent_workers: 2,
                 max_depth: 1,
+                max_queued_workers: harness_orchestrator::DEFAULT_MAX_QUEUED_WORKERS,
                 budget: DelegationBudget {
                     max_workers: 2,
                     max_model_requests: 3,
@@ -682,6 +683,7 @@ async fn p5_s03_parent_wait_releases_slots_and_shutdown_drains_descendants() {
             SchedulerConfig {
                 max_concurrent_workers: 1,
                 max_depth: 2,
+                max_queued_workers: harness_orchestrator::DEFAULT_MAX_QUEUED_WORKERS,
                 budget: DelegationBudget {
                     max_workers: 1,
                     max_model_requests: FIXTURE_REQUESTS,
@@ -741,6 +743,7 @@ async fn p5_s03_parent_wait_releases_slots_and_shutdown_drains_descendants() {
             SchedulerConfig {
                 max_concurrent_workers: 1,
                 max_depth: 2,
+                max_queued_workers: harness_orchestrator::DEFAULT_MAX_QUEUED_WORKERS,
                 budget: DelegationBudget {
                     max_workers: 1,
                     max_model_requests: FIXTURE_REQUESTS,

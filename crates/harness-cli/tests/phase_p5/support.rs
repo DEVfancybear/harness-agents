@@ -31,6 +31,15 @@ use harness_types::{
 /// Requests available to a fixture budget.
 pub const FIXTURE_REQUESTS: u32 = 24;
 
+/// The delegation workspace manager for one fixture repository.
+///
+/// Public so the M8 milestone target reuses the same state root rather than
+/// inventing a second layout; the worktrees it creates are still per-test.
+#[must_use]
+pub fn workspace_for(root: &TestRepo) -> Arc<WorkspaceManager> {
+    Arc::new(WorkspaceManager::new(root.data_dir("delegation")))
+}
+
 /// A real Git repository in a temporary directory.
 pub struct TestRepo {
     root: tempfile::TempDir,
