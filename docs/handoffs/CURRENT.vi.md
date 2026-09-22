@@ -96,6 +96,7 @@ Kiểm chứng (Windows; working tree còn việc dở M4-03.2 của session kh�
 - `cargo fmt --all -- --check` exit 0; `cargo clippy -p harness-cli --all-targets --locked -- -D warnings` xanh.
 - Push `4b8a844` (run `35682323925`): ubuntu qua `format` + `clippy`, 264 unit test xanh, `milestone_m0`–`m3` xanh, **`a13` xanh trên cả ubuntu lẫn windows**; còn `a15` (bảng trên) → đã sửa tiếp trong push kế tiếp.
 - Push `6159823` (run `35683233548`): **11/12 job xanh** — toàn bộ ubuntu (P0/P3/P4/P5/P6/P7) và P3/P4/P5/P6/P7 windows; job đỏ duy nhất là `P0 (windows-latest)` bị timeout 10 phút cắt (bảng trên) → đã nâng timeout trong push kế tiếp. Đây là lần đầu ubuntu xanh kể từ 21/09.
+- Push `90171e0` (run [35684353612](https://github.com/DEVfancybear/harness-agents/actions/runs/35684353612)): **12/12 job xanh** — CI `ci.yml` trên `master` xanh trở lại, lần đầu kể từ `feat(m2)` (21/09). `P0 (windows)` mất 10,9 phút, đúng lý do phải nâng timeout.
 - Chi tiết + số đo: `docs/evidence/M4.vi.md` §4c.
 
 **Lưu ý cho lượt sau:** hai lỗi này nằm trong file `milestone_m4.rs` mà lượt M4-03.2 cũng đang sửa;
