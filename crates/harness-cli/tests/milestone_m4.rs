@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use harness_providers::{
     CancellationToken, MessageRole, ModelCapabilities, ModelProvider, ProviderFuture,
@@ -960,31 +960,44 @@ async fn a15_path_patch_safety() {
 // M4-03: process permit queue (A13 queued cancel)
 // ---------------------------------------------------------------------------
 
-#[cfg(windows)]
-fn write_then_sleep(marker: &Path, millis: u64) -> String {
-    format!(
-        "Set-Content -LiteralPath '{}' -Value x; Start-Sleep -Milliseconds {millis}",
-        marker.display()
-    )
+/// A process that writes its marker and then holds the host permit until the test
+/// creates `release`.
+///
+/// A13 needs a *first* call that owns the permit while a *second* one waits in the
+/// queue, and it needs that to be true at the moment the test withdraws the second
+/// call - not to be a bet on how fast it got there. A process that blocks until the
+/// test says so makes "B is queued" a fact instead of a delay.
+///
+/// Both shells are built with `cfg!` rather than a `#[cfg]` pair so the *other*
+/// platform's command is still compiled on the host running the gate. That is the
+/// lesson from the failure this replaced: `millis as f64 / 1000.0` sat in a
+/// `#[cfg(unix)]` helper, so `cast_precision_loss` (the `u64 -> f64` cast clippy
+/// refuses under `-D warnings`, recorded once before as `f0a4ac8` in the P3
+/// evidence) could not be seen by a Windows-only gate and only ever failed on
+/// ubuntu.
+fn write_then_wait(marker: &Path, release: &Path) -> String {
+    if cfg!(windows) {
+        format!(
+            "Set-Content -LiteralPath '{}' -Value x; while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 20 }}",
+            marker.display(),
+            release.display()
+        )
+    } else {
+        format!(
+            "echo x > '{}'; while [ ! -f '{}' ]; do sleep 0.02; done",
+            marker.display(),
+            release.display()
+        )
+    }
 }
 
-#[cfg(unix)]
-fn write_then_sleep(marker: &Path, millis: u64) -> String {
-    format!(
-        "echo x > '{}'; sleep {}",
-        marker.display(),
-        millis as f64 / 1000.0
-    )
-}
-
-#[cfg(windows)]
+/// A process that only writes its marker: the queued call must never run at all.
 fn write_now(marker: &Path) -> String {
-    format!("Set-Content -LiteralPath '{}' -Value x", marker.display())
-}
-
-#[cfg(unix)]
-fn write_now(marker: &Path) -> String {
-    format!("echo x > '{}'", marker.display())
+    if cfg!(windows) {
+        format!("Set-Content -LiteralPath '{}' -Value x", marker.display())
+    } else {
+        format!("echo x > '{}'", marker.display())
+    }
 }
 
 #[tokio::test]
@@ -997,6 +1010,7 @@ async fn a13_queued_process_cancel() {
 
     let marker_a = bench.workspace.join("a13-a.txt");
     let marker_b = bench.workspace.join("a13-b.txt");
+    let release_a = bench.workspace.join("a13-release.txt");
 
     let prepared = tools
         .prepare(ToolRequest::new(
@@ -1005,8 +1019,10 @@ async fn a13_queued_process_cancel() {
             "actor.a13",
             &bench.workspace,
             CodingToolAction::RunShell {
-                command: write_then_sleep(&marker_a, 1_500),
-                timeout_ms: 30_000,
+                command: write_then_wait(&marker_a, &release_a),
+                // Generous on purpose: A is held open until this test releases it,
+                // so a slow host must not turn the harness into a timeout test.
+                timeout_ms: 120_000,
                 isolation: IsolationMode::BestEffort,
             },
         ))
@@ -1018,8 +1034,16 @@ async fn a13_queued_process_cancel() {
         tokio::spawn(async move { tools.execute(prepared, Some(approval)).await })
     };
 
-    // Let A take the host permit before B queues behind it.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // A takes the host permit and holds it until this test releases it, so B is
+    // guaranteed to queue behind A rather than to race A to the permit.
+    let a_deadline = Instant::now() + Duration::from_secs(20);
+    while !marker_a.exists() {
+        assert!(
+            Instant::now() < a_deadline,
+            "A never wrote its marker, so it never took the permit"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     let prepared_b = tools
         .prepare(ToolRequest::new(
@@ -1046,11 +1070,34 @@ async fn a13_queued_process_cancel() {
                 .await
         })
     };
-    // B is inside the runner now, waiting for A's permit.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // B is inside the runner now, waiting for A's permit. A fixed sleep here was
+    // the flake CI caught: under load the withdrawal could land before B's durable
+    // intent, which is a *different* and equally truthful outcome (`Denied`,
+    // "canceled before the durable intent"), so asserting queue semantics on it was
+    // a race rather than a test. B's intent on the record is the observable that
+    // says the call is past that point; A holds the permit until this test releases
+    // it, so the queue is a fact and not a delay.
+    let queued_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let pending = store
+            .pending_tool_intents(&session)
+            .await
+            .expect("pending intents readable");
+        if pending.len() >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < queued_deadline,
+            "B never reached the durable intent, so there is no queued call to withdraw: {} pending",
+            pending.len()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     token.cancel();
 
     let b_view = b.await.expect("B joins").expect("B settles truthfully");
+    // A is still holding the permit; release it now that B's withdrawal is settled.
+    std::fs::write(&release_a, b"go").expect("A is released");
     let a_view = a.await.expect("A joins").expect("A completes");
 
     assert!(
