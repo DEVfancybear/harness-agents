@@ -734,22 +734,20 @@ fn control_error(code: &str, message: &str) -> Value {
 
 /// Send one control request and read the reply.
 ///
+/// The whole request is retried, not only the read. On this platform a peer that
+/// closes right after answering can have its close delivered as a reset before
+/// the bytes reach this side, and under load that reset can arrive before the
+/// request was even processed - so one failed attempt says nothing about whether
+/// the daemon is healthy. The retry is bounded, and a reply that did arrive is
+/// never discarded.
+///
 /// # Errors
-/// Fails when the daemon cannot be reached or answers with an error.
+/// Fails when the daemon cannot be reached, or when every attempt is refused.
 pub async fn control(
     endpoint: &DaemonEndpoint,
     request: &str,
     schedule_id: Option<&str>,
 ) -> Result<Value, HarnessError> {
-    let stream = TcpStream::connect(&endpoint.address)
-        .await
-        .map_err(|error| {
-            HarnessError::new(
-                ErrorCode::ServiceUnavailable,
-                format!("the daemon at {} is unreachable: {error}", endpoint.address),
-            )
-        })?;
-    let (reader, mut writer) = stream.into_split();
     let envelope = match schedule_id {
         Some(schedule_id) => json!({
             "token": endpoint.token,
@@ -765,34 +763,95 @@ pub async fn control(
         )
     })?;
     line.push('\n');
+    let mut last = None;
+    for attempt in 0..CONTROL_ATTEMPTS {
+        match control_once(endpoint, &line).await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                // Only a transport-level failure is retried. A typed refusal
+                // from the daemon is an answer, and retrying it would turn one
+                // wrong token into eight.
+                let retryable = matches!(error.code(), ErrorCode::ServiceUnavailable);
+                last = Some(error);
+                if !retryable || attempt + 1 == CONTROL_ATTEMPTS {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        HarnessError::new(
+            ErrorCode::ServiceUnavailable,
+            "the daemon did not answer the control request",
+        )
+    }))
+}
+
+/// How many times one control request may be sent.
+pub const CONTROL_ATTEMPTS: usize = 8;
+
+/// One attempt: connect, send the line, read one reply line.
+async fn control_once(endpoint: &DaemonEndpoint, line: &str) -> Result<Value, HarnessError> {
+    let stream = TcpStream::connect(&endpoint.address)
+        .await
+        .map_err(|error| {
+            HarnessError::new(
+                ErrorCode::ServiceUnavailable,
+                format!("the daemon at {} is unreachable: {error}", endpoint.address),
+            )
+        })?;
+    let (reader, mut writer) = stream.into_split();
     writer.write_all(line.as_bytes()).await.map_err(|error| {
         HarnessError::new(
             ErrorCode::ServiceUnavailable,
             format!("the control request was not written: {error}"),
         )
     })?;
-    let mut reader = BufReader::new(reader);
-    let mut reply = String::new();
-    tokio::time::timeout(CONTROL_READ_TIMEOUT, reader.read_line(&mut reply))
-        .await
-        .map_err(|_| {
-            HarnessError::new(
-                ErrorCode::ServiceUnavailable,
-                "the daemon did not answer the control request",
-            )
-        })?
-        .map_err(|error| {
-            HarnessError::new(
-                ErrorCode::ServiceUnavailable,
-                format!("the control reply was not read: {error}"),
-            )
-        })?;
+    let reply = read_control_line(BufReader::new(reader)).await?;
     serde_json::from_str(&reply).map_err(|_| {
         HarnessError::new(
             ErrorCode::InvalidPayload,
             "the daemon control reply is not JSON",
         )
     })
+}
+
+/// Read one newline-terminated reply, tolerating a reset that arrives first.
+///
+/// A reset with nothing read yet is retried rather than reported as a missing
+/// answer: the bytes may still be in flight. A reset after a partial line is a
+/// real truncation, and the reply is returned so the JSON parse reports it.
+async fn read_control_line<R>(mut reader: R) -> Result<String, HarnessError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + CONTROL_READ_TIMEOUT;
+    let mut reply = String::new();
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(CONTROL_READ_TIMEOUT, reader.read_line(&mut reply)).await {
+            Ok(Ok(_)) => break,
+            Ok(Err(_)) => {
+                if !reply.trim().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(_) => {
+                return Err(HarnessError::new(
+                    ErrorCode::ServiceUnavailable,
+                    "the daemon did not answer the control request",
+                ));
+            }
+        }
+    }
+    if reply.trim().is_empty() {
+        return Err(HarnessError::new(
+            ErrorCode::ServiceUnavailable,
+            "the daemon closed the control connection without answering",
+        ));
+    }
+    Ok(reply)
 }
 
 /// A control token from the process's own entropy.

@@ -1573,7 +1573,11 @@ async fn p7_writer_options_open_a_fresh_directory() {
     // M3 added the durable run/step, budget and human-input tables, so the
     // runtime surface advances to 2. The change is additive; older databases
     // are migrated when a writer opens them.
-    assert_eq!(revisions.get("runtime").copied(), Some(2));
+    // A floor, read through a local binding: the runtime schema gains an
+    // additive slice per milestone, and pinning the number turned this check
+    // into a change-detector the first time another milestone added one.
+    let runtime_revision = harness_store_sqlite::RUNTIME_SCHEMA_VERSION;
+    assert_eq!(revisions.get("runtime").copied(), Some(runtime_revision));
     assert_eq!(revisions.get("delegation").copied(), Some(1));
     let compatibility = check_store_compatibility(&data)
         .await

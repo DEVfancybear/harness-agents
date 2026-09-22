@@ -150,7 +150,15 @@ fn p2_s01_runtime_contracts_and_state_machine_are_versioned() {
             .code(),
         ErrorCode::InvalidStateTransition
     );
-    assert_eq!(harness_store_sqlite::RUNTIME_SCHEMA_VERSION, 2);
+    // The runtime schema is asserted as a floor rather than a pinned number: the
+    // schema gains an additive slice per milestone, and pinning the number turned
+    // this contract test into a change-detector the first time another milestone
+    // added one.
+    let runtime_revision = harness_store_sqlite::RUNTIME_SCHEMA_VERSION;
+    assert!(
+        runtime_revision >= 2,
+        "the runtime schema carries the M3 slice"
+    );
 }
 
 /// How many times a loopback client call may be retried.
