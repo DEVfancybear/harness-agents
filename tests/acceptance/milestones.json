@@ -717,6 +717,76 @@
           "closure-M0"
         ]
       }
+    },
+    {
+      "id": "M8",
+      "title": "Durable DAG và worktree integration",
+      "runbook": "docs/implementation-next/M8.vi.md",
+      "prerequisites": ["M7"],
+      "status": "in_progress",
+      "integration_target": "milestone_m8",
+      "work_items": [
+        {
+          "id": "M8-01",
+          "title": "DAG, scheduling và briefs",
+          "status": "implemented_unverified",
+          "tests": ["a27_child_capacity_budget"]
+        },
+        {
+          "id": "M8-02",
+          "title": "Result và parent delivery",
+          "status": "implemented_unverified",
+          "tests": ["a28_child_delivery_recovery"]
+        },
+        {
+          "id": "M8-03",
+          "title": "Worktree ownership và integration",
+          "status": "implemented_unverified",
+          "tests": ["a30_dirty_workspace_preservation"]
+        },
+        {
+          "id": "M8-04",
+          "title": "Evidence verifier và terminal task",
+          "status": "implemented_unverified",
+          "tests": [
+            "a29_integration_acceptance",
+            "m8_04_cli_reports_stop_reasons_and_unverified_claims"
+          ]
+        }
+      ],
+      "required_tests": [
+        "a27_child_capacity_budget",
+        "a28_child_delivery_recovery",
+        "a29_integration_acceptance",
+        "a30_dirty_workspace_preservation",
+        "m8_04_cli_reports_stop_reasons_and_unverified_claims"
+      ],
+      "unit_tests": [],
+      "fixtures": [
+        "crates/harness-cli/tests/milestone_m8.rs",
+        "docs/adr/ADR-N08-DELEGATION-CAPACITY-DELIVERY.vi.md"
+      ],
+      "gate": {
+        "script": "scripts/Verify-Milestone.ps1",
+        "dependency_check_bin": "dependency_check",
+        "steps": [
+          "format",
+          "clippy",
+          "build",
+          "workspace-tests",
+          "dependency-allowlist",
+          "required-test-discovery",
+          "required-tests",
+          "closure-M7",
+          "closure-M6",
+          "closure-M5",
+          "closure-M4",
+          "closure-M3",
+          "closure-M1",
+          "closure-M2",
+          "closure-M0"
+        ]
+      }
     }
   ],
   "acceptance_cases": [
@@ -951,10 +1021,38 @@
       "selectors": ["milestone_m7::a26_memory_provenance"],
       "note": "a version read from a named file records the digest observed when it was written; re-reading that file and finding it moved excludes the version from the next packet while leaving the audit intact until an explicit invalidation; the invalidation cascades to a derived summary; a user correction is a new version that outranks what it replaced and the packet stamps the version it selected; and an extractor that quotes memory back settles `self_referential` instead of publishing the quote as independent evidence, while genuinely new material is still extracted"
     },
-    { "id": "A27", "owner_milestones": ["M8"], "planned_test": "a27_child_capacity_budget", "status": "planned" },
-    { "id": "A28", "owner_milestones": ["M8"], "planned_test": "a28_child_delivery_recovery", "status": "planned" },
-    { "id": "A29", "owner_milestones": ["M8"], "planned_test": "a29_integration_acceptance", "status": "planned" },
-    { "id": "A30", "owner_milestones": ["M8"], "planned_test": "a30_dirty_workspace_preservation", "status": "planned" },
+    {
+      "id": "A27",
+      "owner_milestones": ["M8"],
+      "planned_test": "a27_child_capacity_budget",
+      "status": "implemented",
+      "selectors": ["milestone_m8::a27_child_capacity_budget"],
+      "note": "a dependency cycle, a depth beyond the cap and two tasks claiming one path are all refused at compile time with their own codes; a two-slot/one-queue scheduler accepts exactly three dispatches and refuses the fourth with DelegationQueueFull without charging it or leaving a reservation; the queue drains once the gate opens; a two-request budget is spent exactly and the refusal is BudgetExhausted, which is a different answer from a full queue; a child brief copies no authority and hashes the same twice"
+    },
+    {
+      "id": "A28",
+      "owner_milestones": ["M8"],
+      "planned_test": "a28_child_delivery_recovery",
+      "status": "implemented",
+      "selectors": ["milestone_m8::a28_child_delivery_recovery"],
+      "note": "a real coordinator over a real scheduler commits the child's result and its parent delivery in one transaction, the process is dropped with the delivery still pending, and the reopened host rebuilds the same terminal state and reads the same result; a superseded owner and a completed task are both refused a claim with no worker created; consuming the delivery twice acknowledges once and does not overwrite the result"
+    },
+    {
+      "id": "A29",
+      "owner_milestones": ["M8"],
+      "planned_test": "a29_integration_acceptance",
+      "status": "implemented",
+      "selectors": ["milestone_m8::a29_integration_acceptance"],
+      "note": "two branches replace the same function and each passes the declared check on its own committed revision; the integrator then applies one, conflicts on the second, offers no final revision and runs no check on a tree that is not the integration; the refusal is stable across a second attempt; the destination file is byte-for-byte what the user had"
+    },
+    {
+      "id": "A30",
+      "owner_milestones": ["M8"],
+      "planned_test": "a30_dirty_workspace_preservation",
+      "status": "implemented",
+      "selectors": ["milestone_m8::a30_dirty_workspace_preservation"],
+      "note": "a staged file, an unstaged edit and an untracked file produce three structured refusal reasons, and the sentinel bytes, the index tree hash, HEAD and the porcelain status are all unchanged; an edit to the destination after the snapshot makes the apply refused with a reason and never rewrites the file; cleanup removes exactly the worktree the host created and leaves a second worktree, a user file and the project registration alone"
+    },
     { "id": "A31", "owner_milestones": ["M9"], "planned_test": "a31_backup_retention_restore", "status": "planned" },
     { "id": "A32", "owner_milestones": ["M9"], "planned_test": "a32_diagnostics_isolation", "status": "planned" },
     { "id": "A33", "owner_milestones": ["M10"], "planned_test": "a33_web_replay_gap", "status": "planned" },

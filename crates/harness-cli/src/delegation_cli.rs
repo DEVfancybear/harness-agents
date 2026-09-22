@@ -423,8 +423,18 @@ async fn run_delegation(
             "task_id": step.task_id,
             "status": step.status.as_str(),
             "accepted": step.accepted,
+            "stop_reason": step.stop_reason(),
+            "claimed_but_unverified": step.claimed_but_unverified(),
             "detail": step.detail,
         })).collect::<Vec<_>>(),
+        "verification": {
+            "accepted": outcomes.iter().filter(|step| step.accepted).count(),
+            "claimed_but_unverified": outcomes
+                .iter()
+                .filter(|step| step.claimed_but_unverified())
+                .count(),
+            "note": "a worker's completion report is a claim; only the host's acceptance is verified work",
+        },
         "requests_used": scheduler.ledger().requests_used(),
         "pending_deliveries": deliveries.len(),
         "deliveries": deliveries.iter().map(|delivery| json!({

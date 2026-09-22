@@ -104,12 +104,15 @@ function Invoke-FlakeTolerantCommand {
             # caller that needs to read cargo's report uses this instead of the
             # message, because `Invoke-CheckedCommand` keeps the stream and the
             # message is for humans.
+            #
+            # It is recorded on every failure, not only when the retries run out:
+            # an isolated re-run that fails for a reason that is not the flake
+            # rethrows on its first attempt, and a caller that only saw the
+            # exhausted path would have nothing to report but a truncated message.
             $lastOutput = @($message -split "`n")
+            $script:GateLastFailureOutput = $lastOutput
             if ($null -eq (Get-FlakeSignature -Output $lastOutput)) { throw }
-            if ($attempt -ge $MaxAttempts) {
-                $script:GateLastFailureOutput = $lastOutput
-                throw
-            }
+            if ($attempt -ge $MaxAttempts) { throw }
             $script:GateRetryNotices.Add("GATE_RETRY: $Name failed with the known host flake (attempt $attempt of $MaxAttempts); rerunning")
         }
     }
@@ -176,8 +179,15 @@ function Get-FailedIntegrationTests {
         # this host, where that made the parser find nothing and the step give up
         # on a failure it could have isolated.
         $normalized = $line.Replace('`', '')
-        if ($normalized -match '^\s*Running\s+\S*tests[/\\](?<name>[A-Za-z0-9_]+)\.rs') {
+        if ($normalized -match 'Running\s+\S*tests[/\\](?<name>[A-Za-z0-9_]+)\.rs') {
             $target = $Matches['name']
+            continue
+        }
+        # Cargo's own summary line for the target under test is `running N tests`,
+        # lowercase and with no path. It names no target, so it must not clear the
+        # one the preceding `Running` line set: doing that made every failure in a
+        # milestone target unattributable, which is exactly where the flake lands.
+        if ($normalized -match '^\s*running\s+\d+\s+test') {
             continue
         }
         # Any other `Running` line (unit binary, doc test, example) clears the
@@ -521,6 +531,21 @@ function Invoke-GateSelfTest {
     $parsed = @(Get-FailedIntegrationTests -Output $after_unit)
     if ($parsed.Count -ne 1 -or $parsed[0].Target -cne 'milestone_m7') {
         throw (New-GateError -Code 'gate_configuration_error' -Message "a unit failure was attributed to an integration target: $($parsed | ConvertTo-Json -Compress)")
+    }
+    # Cargo's own `running N tests` summary line names no target. Clearing the
+    # target on it made every failure in a milestone target unattributable, which
+    # is where the host flake actually lands.
+    $with_summary = @(
+        '     Running tests\milestone_m2.rs (target\debug\deps\milestone_m2-d92cb5d5c0ffb6ac.exe)',
+        'running 10 tests',
+        'test `m2_04_text_arrives_before_the_terminal_barrier` ... FAILED',
+        'test `a07_401_is_not_retried_and_transient_is_bounded` ... FAILED'
+    )
+    $parsed = @(Get-FailedIntegrationTests -Output $with_summary)
+    if ($parsed.Count -ne 2 -or $parsed[0].Target -cne 'milestone_m2' -or
+        $parsed[0].TestName -cne 'm2_04_text_arrives_before_the_terminal_barrier' -or
+        $parsed[1].TestName -cne 'a07_401_is_not_retried_and_transient_is_bounded') {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "a summary line hid the target: $($parsed | ConvertTo-Json -Compress)")
     }
     Invoke-NegativeControl -Name 'no-failure-no-isolation' -ExpectedCode 'gate_configuration_error' -Action {
         $none = @(Get-FailedIntegrationTests -Output @('     Running tests/phase_p1.rs (target/debug/deps/phase_p1-abcdef0123456789.exe)', 'test result: ok. 21 passed; 0 failed'))

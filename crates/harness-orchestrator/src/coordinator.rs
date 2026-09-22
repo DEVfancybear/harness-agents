@@ -29,6 +29,42 @@ pub struct StepOutcome {
     pub detail: String,
 }
 
+impl StepOutcome {
+    /// Why this task stopped where it did, as a stable label.
+    ///
+    /// `detail` is prose for a human and is not a contract; a caller that wants
+    /// to group or count outcomes needs a value it can compare, and inventing
+    /// one by matching the prose is how a report starts lying after a wording
+    /// change. The labels are the same vocabulary as the refusal codes.
+    #[must_use]
+    pub const fn stop_reason(&self) -> &'static str {
+        if self.accepted {
+            return "accepted";
+        }
+        match self.status {
+            TaskStatus::Completed => "completed_unverified",
+            TaskStatus::Failed => "worker_failed",
+            TaskStatus::Canceled => "canceled",
+            TaskStatus::Blocked => "evidence_incomplete",
+            TaskStatus::Ready => "ready_not_dispatched",
+            TaskStatus::Assigned => "assigned_not_settled",
+            TaskStatus::Running => "running",
+            TaskStatus::Pending => "pending",
+        }
+    }
+
+    /// Whether the host verified this task's claim, as opposed to being told it.
+    ///
+    /// A claim is unverified when the task did not finish, and also when it
+    /// finished but the host did not accept the evidence - the second case is the
+    /// one a caller is most likely to read as success, because the worker did
+    /// report a completion.
+    #[must_use]
+    pub const fn claimed_but_unverified(&self) -> bool {
+        !self.accepted
+    }
+}
+
 /// Token that marks one physical session slot per task. A child task owns its
 /// own session, so one agent never appends to another agent's session log.
 #[derive(Clone, Debug)]

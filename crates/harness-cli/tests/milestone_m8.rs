@@ -44,6 +44,7 @@ use harness_orchestrator::{
     TaskPlan, TaskStatus, WorkerBackend, WorkerOutcome, WorkerRequest, WorkerScheduler,
 };
 use harness_types::{ErrorCode, TaskId};
+use serde_json::json;
 use support::{
     ScriptedWorker, TestRepo, close, coordinator_root, graph_from, make_node, open_store,
     test_repo, workspace_for,
@@ -1076,4 +1077,79 @@ async fn a30_dirty_workspace_preservation() {
         .remove_worktree(&second, &snapshot.root)
         .await
         .expect("the second worktree is removed");
+}
+
+// ---------------------------------------------------------------------------
+// M8-04 — the CLI says why a child stopped and what was not verified
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn m8_04_cli_reports_stop_reasons_and_unverified_claims() {
+    let repo = test_repo();
+    let data_dir = repo.data_dir("m8-cli-data");
+    let output = support::run_cli(&[
+        "tasks",
+        "run",
+        "--data-dir",
+        &data_dir.to_string_lossy(),
+        "--text",
+        "add a greeting",
+        "--agents",
+        "3",
+        "--workspace",
+        &repo.root().to_string_lossy(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "the CLI run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("the CLI emits JSON");
+
+    let outcomes = summary["outcomes"].as_array().expect("outcomes are listed");
+    assert_eq!(outcomes.len(), 3, "three roles were asked for");
+    for outcome in outcomes {
+        // A stable label, not prose: a caller that groups or counts outcomes
+        // cannot do it by matching a sentence that may be reworded.
+        let reason = outcome["stop_reason"]
+            .as_str()
+            .expect("every outcome names a stop reason");
+        assert!(
+            !reason.is_empty() && reason.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "the stop reason is a label, not a sentence: {reason}"
+        );
+        assert!(
+            outcome["claimed_but_unverified"].is_boolean(),
+            "every outcome says whether its claim was verified"
+        );
+    }
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome["accepted"] == json!(true)),
+        "the fixture's honest workers are accepted: {outcomes:?}"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome["stop_reason"] == json!("accepted")),
+        "an accepted task says so with the same label vocabulary"
+    );
+
+    // The summary separates verified work from claims, and says which is which.
+    let verification = &summary["verification"];
+    assert_eq!(verification["accepted"], json!(3));
+    assert_eq!(
+        verification["claimed_but_unverified"],
+        json!(0),
+        "nothing in this run was claimed and left unverified"
+    );
+    assert!(
+        verification["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("claim")),
+        "the summary states that a report is a claim: {verification:?}"
+    );
 }
