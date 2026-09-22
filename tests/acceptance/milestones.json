@@ -815,7 +815,10 @@
       "required_tests": [
         "a31_backup_retention_restore",
         "a32_diagnostics_isolation",
-        "m9_02_doctor_and_support_bundle_are_usable_from_the_cli"
+        "m9_02_doctor_and_support_bundle_are_usable_from_the_cli",
+        "m9_03_release_matrix_is_honest_about_unmeasured_work",
+        "m9_04_install_smoke_preserves_existing_data",
+        "m9_04_release_candidate_has_checksums_and_is_not_published"
       ],
       "unit_tests": [],
       "fixtures": [

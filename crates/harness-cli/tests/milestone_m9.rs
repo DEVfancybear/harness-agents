@@ -610,3 +610,293 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// M9-04 — packaging, a fresh install and an honest release candidate
+// ---------------------------------------------------------------------------
+
+/// Run the repository's install script into a disposable destination.
+///
+/// The script is the product's own installer, not a fixture: the point of this
+/// case is that the artefact a user would run installs, starts and uninstalls
+/// cleanly. `-NoModifyPath` is not a convenience here - changing the persisted
+/// user PATH is outside this session's authority, and an install that quietly
+/// did it would be a side effect on the machine running the test.
+fn install_ha(destination: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    let root = support::repository_root();
+    let mut arguments = vec![
+        "-NoProfile".to_owned(),
+        "-File".to_owned(),
+        root.join("scripts/Install-Ha.ps1")
+            .to_string_lossy()
+            .into_owned(),
+        "-Destination".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "-NoModifyPath".to_owned(),
+    ];
+    arguments.extend(extra.iter().map(|value| (*value).to_owned()));
+    std::process::Command::new("pwsh")
+        .args(&arguments)
+        .current_dir(&root)
+        .output()
+        .expect("pwsh runs the installer")
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one install's whole life, step by step
+async fn m9_04_install_smoke_preserves_existing_data() {
+    let root = temp_root();
+    let destination = root.path().join("install");
+    let data_dir = root.path().join("data");
+
+    // A user's data directory that exists before the install does. An installer
+    // that reset or moved it would be destroying the thing it exists to serve.
+    std::fs::create_dir_all(&data_dir).expect("the data directory is created");
+    let sentinel = data_dir.join("user-sentinel.txt");
+    std::fs::write(&sentinel, "user data that predates the install\n")
+        .expect("the sentinel is written");
+    let fixture = seed(&data_dir).await;
+    let database = data_dir.join("harness.sqlite3");
+    assert!(database.is_file(), "the fixture store exists");
+
+    // `-SkipBuild` because the workspace test run already built the binary this
+    // test is about: rebuilding it here would test cargo, not the installer.
+    let installed = install_ha(&destination, &["-Profile", "Debug", "-SkipBuild"]);
+    assert!(
+        installed.status.success(),
+        "the installer succeeded: {}{}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr)
+    );
+
+    let binary = destination.join(format!("ha{}", std::env::consts::EXE_SUFFIX));
+    assert!(binary.is_file(), "the executable is installed");
+
+    // The installed binary answers for itself.
+    let version = std::process::Command::new(&binary)
+        .arg("--version")
+        .output()
+        .expect("the installed binary runs");
+    assert!(version.status.success());
+    let version_text = String::from_utf8_lossy(&version.stdout);
+    assert!(
+        version_text.contains(env!("CARGO_PKG_VERSION")),
+        "the installed binary reports the version it was built from: {version_text}"
+    );
+
+    // The install is honest about the PATH it did not touch.
+    let manifest_path = destination.join("ha.install.json");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path).expect("the install manifest is readable"),
+    )
+    .expect("the install manifest is JSON");
+    assert_eq!(
+        manifest["added_path_entry"],
+        serde_json::Value::Null,
+        "an install that was told not to touch PATH records that it did not"
+    );
+    assert_eq!(manifest["schema_version"], json!(1));
+    let owned = manifest["owned_files"]
+        .as_array()
+        .expect("the manifest lists what it owns");
+    assert!(
+        owned.iter().all(|path| path
+            .as_str()
+            .is_some_and(|text| text.starts_with(&destination.to_string_lossy().into_owned()))),
+        "every owned file is inside the destination: {owned:?}"
+    );
+
+    // The subcommand this milestone added is present in the artefact. This is the
+    // assertion that caught a stale release binary during the manual smoke: an
+    // installer can succeed perfectly while installing yesterday's build.
+    let help = std::process::Command::new(&binary)
+        .args(["maintenance", "--help"])
+        .output()
+        .expect("the installed binary answers for its subcommands");
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help_text.contains("support-bundle"),
+        "the installed artefact carries the M9 subcommand: {help_text}"
+    );
+    assert!(
+        help_text.contains("doctor") && help_text.contains("backup"),
+        "and the P7 surface it builds on"
+    );
+
+    // The installer did not move the user's data.
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).expect("the sentinel is readable"),
+        "user data that predates the install\n",
+        "an install never rewrites the user's data directory"
+    );
+    assert!(database.is_file(), "the store is still where it was");
+
+    // Uninstalling removes exactly what the install owns, and nothing else.
+    let removed = install_ha(&destination, &["-Uninstall"]);
+    assert!(
+        removed.status.success(),
+        "the uninstall succeeded: {}{}",
+        String::from_utf8_lossy(&removed.stdout),
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!binary.exists(), "the owned executable is gone");
+    assert!(
+        !manifest_path.exists(),
+        "the owned manifest is gone with it"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).expect("the sentinel survives the uninstall"),
+        "user data that predates the install\n",
+        "uninstall never removes user config or session data"
+    );
+    assert!(database.is_file(), "and never the store");
+    let _ = fixture;
+}
+
+#[tokio::test]
+async fn m9_04_release_candidate_has_checksums_and_is_not_published() {
+    // A real release candidate, if one was built. Its absence is reported rather
+    // than skipped silently: a missing artefact is not a pass.
+    let root = support::repository_root();
+    let candidate_root = root.join("target/release-candidate");
+    let Some(bundle) = std::fs::read_dir(&candidate_root).ok().and_then(|entries| {
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.is_dir())
+    }) else {
+        panic!(
+            "no release candidate under {}; build one with \
+             `pwsh -NoProfile -File scripts/New-HaRelease.ps1 -PublishDryRun` before this test",
+            candidate_root.display()
+        );
+    };
+
+    let checksums = std::fs::read_to_string(bundle.join("checksums.txt"))
+        .expect("the candidate ships checksums");
+    let release: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(bundle.join("ha.release.json"))
+            .expect("the candidate ships release metadata"),
+    )
+    .expect("the release metadata is JSON");
+
+    // Every checksum is the checksum of the file it names.
+    let mut checked = 0;
+    for line in checksums.lines().filter(|line| !line.trim().is_empty()) {
+        let mut parts = line.split_whitespace();
+        let expected = parts.next().expect("a checksum");
+        let name = parts.next().expect("a file name");
+        let bytes = std::fs::read(bundle.join(name)).expect("the named file exists");
+        assert_eq!(
+            harness_types::ContentHash::from_bytes(&bytes).as_str(),
+            format!("sha256:{expected}"),
+            "the checksum of {name} is the one published for it"
+        );
+        checked += 1;
+    }
+    assert!(checked >= 2, "both the binary and its metadata are checked");
+
+    // The metadata describes a local candidate, not a release.
+    assert_eq!(
+        release["published"],
+        json!(false),
+        "a candidate built with -PublishDryRun says it was not published"
+    );
+    assert!(
+        release["build_commit"]
+            .as_str()
+            .is_some_and(|commit| commit.len() == 40),
+        "the candidate names the revision it was built from: {}",
+        release["build_commit"]
+    );
+    // The release metadata spells the digest as bare hex, the same way the
+    // checksum file does; `ContentHash` is what adds the algorithm prefix. The
+    // assertion is that the two agree, not that they are spelled identically.
+    let binary_digest = checksums
+        .lines()
+        .find(|line| line.contains("ha.exe"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("the binary is in the checksum list")
+        .to_owned();
+    assert_eq!(
+        release["sha256"].as_str(),
+        Some(binary_digest.as_str()),
+        "the metadata digest and the checksum file agree about the binary"
+    );
+    assert!(
+        release["target"]
+            .as_str()
+            .is_some_and(|target| target.contains(std::env::consts::ARCH)),
+        "the candidate names the target it was built for: {}",
+        release["target"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M9-03 — the release matrix refuses to hide unmeasured work
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn m9_03_release_matrix_is_honest_about_unmeasured_work() {
+    // The shipped matrix, as the CLI builds it with no measurements passed.
+    let matrix = run_cli(&["maintenance", "release-matrix", "--json"]);
+    assert!(
+        matrix.status.success(),
+        "the release matrix runs: {}",
+        String::from_utf8_lossy(&matrix.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&matrix.stdout).expect("release-matrix emits JSON");
+
+    // Every benchmark either has a measurement or says it does not. There is no
+    // third state, and `met` is null exactly when `measured` is.
+    for benchmark in report["benchmarks"]
+        .as_array()
+        .expect("benchmarks are listed")
+    {
+        let measured = &benchmark["measured"];
+        let met = &benchmark["met"];
+        if measured.is_null() {
+            assert!(
+                met.is_null(),
+                "an unmeasured benchmark is never reported as met: {benchmark}"
+            );
+        } else {
+            assert!(
+                met.is_boolean(),
+                "a measured benchmark has a verdict: {benchmark}"
+            );
+        }
+    }
+
+    // The matrix names the platform evidence it has and the checks it does not.
+    let platforms = report["platforms"]
+        .as_array()
+        .expect("platforms are listed");
+    assert!(!platforms.is_empty(), "at least one platform is described");
+    for platform in platforms {
+        assert!(
+            platform["evidence"]
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty()),
+            "every platform states what was actually run: {platform}"
+        );
+    }
+    assert!(
+        !report["unverified_checks"]
+            .as_array()
+            .expect("unverified checks are listed")
+            .is_empty(),
+        "the matrix names checks that were not run rather than implying they were"
+    );
+    // And it does not claim a capability this release does not have.
+    let capabilities = report["capabilities"]
+        .as_array()
+        .expect("capabilities are listed");
+    assert!(
+        capabilities
+            .iter()
+            .any(|capability| capability["status"] != json!("supported")),
+        "the matrix states what is unsupported instead of listing only successes"
+    );
+}
