@@ -347,21 +347,37 @@ async fn await_control(endpoint: &DaemonEndpoint) {
 }
 
 /// Send one raw line to the control port and read the reply.
+///
+/// A whole request that read nothing back is retried, for the same reason the
+/// production control client retries one: a reset can reach this side before the
+/// bytes of an answer that was already written, and one refused attempt says
+/// nothing about the daemon. A reply that *did* arrive is returned as it is, so
+/// no assertion can be retried away.
 async fn raw_control(address: &str, line: &str) -> serde_json::Value {
+    for _ in 0..8 {
+        match raw_control_once(address, line).await {
+            Ok(reply) => return reply,
+            Err(error) => {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset,
+                    "an unexpected transport failure: {error}"
+                );
+            }
+        }
+    }
+    panic!("the control port refused every raw request");
+}
+
+async fn raw_control_once(address: &str, line: &str) -> Result<serde_json::Value, std::io::Error> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let stream = tokio::net::TcpStream::connect(address)
-        .await
-        .expect("the control port accepts");
+    let stream = tokio::net::TcpStream::connect(address).await?;
     let (reader, mut writer) = stream.into_split();
-    writer
-        .write_all(line.as_bytes())
-        .await
-        .expect("the line is written");
+    writer.write_all(line.as_bytes()).await?;
     let mut reader = BufReader::new(reader);
     let mut reply = String::new();
     tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut reply))
         .await
-        .expect("the daemon answers")
-        .expect("the reply is read");
-    serde_json::from_str(&reply).expect("the reply is JSON")
+        .expect("the daemon answers")?;
+    Ok(serde_json::from_str(&reply).expect("the reply is JSON"))
 }

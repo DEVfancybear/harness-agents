@@ -49,6 +49,16 @@ pub const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// The longest control line the daemon will read.
 pub const MAX_CONTROL_BYTES: usize = 8 * 1024;
 
+/// How many requests one control connection may carry.
+///
+/// The daemon answers and then keeps reading instead of closing on top of its
+/// own reply: on this platform a close that races the peer's read can reach the
+/// peer as a reset, and a reset discards bytes the peer has already been sent.
+/// Waiting for the peer to close removes that race for every client, and this
+/// bound is what stops a peer from holding a task open forever by staying
+/// connected.
+pub const MAX_CONTROL_REQUESTS_PER_CONNECTION: usize = 8;
+
 /// What the daemon wrote to its endpoint file.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -634,75 +644,88 @@ async fn serve_control(
 ) -> Result<(), HarnessError> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    // Bounded: a client that sends half a line and stops does not hold this
-    // task, and a client that sends a megabyte is refused.
-    let read = tokio::time::timeout(CONTROL_READ_TIMEOUT, reader.read_line(&mut line)).await;
-    let response = match read {
-        Err(_) => control_error("control_timeout", "the control request timed out"),
-        Ok(Err(error)) => control_error("control_read_failed", &error.to_string()),
-        Ok(Ok(0)) => control_error("control_empty", "the control request was empty"),
-        Ok(Ok(_)) if line.len() > MAX_CONTROL_BYTES => {
-            control_error("control_too_large", "the control request is too large")
-        }
-        Ok(Ok(_)) => {
-            let parsed: Result<ControlEnvelope, _> = serde_json::from_str(&line);
-            match parsed {
-                Err(_) => control_error("control_malformed", "the control request is not JSON"),
-                Ok(envelope) if envelope.token() != token => control_error(
-                    "control_unauthorized",
-                    "the control token is not this daemon's",
-                ),
-                Ok(envelope) => match envelope {
-                    ControlEnvelope::Status { .. } => json!({
-                        "status": "ok",
-                        "daemon": {
-                            "pid": status.pid,
-                            "started_at_unix_ms": status.started_at_unix_ms,
-                            "schedules": status.schedules,
-                            "active": status.active,
-                            "occurrences_launched": status.occurrences_launched,
-                            "stopping": status.stopping,
-                        },
-                    }),
-                    ControlEnvelope::Trigger { schedule_id, .. } => {
-                        let now = SystemClock.now_unix_ms();
-                        let stored = store
-                            .schedule(&schedule_id)
-                            .await
-                            .map_err(|error| store_error(&error));
-                        match stored {
-                            Err(error) => control_error(error.code().as_str(), error.message()),
-                            Ok(None) => control_error("task_not_found", "no such schedule"),
-                            Ok(Some(schedule)) => json!({
-                                "schema_version": 1,
-                                "status": "ok",
-                                "triggered": {
-                                    "schedule_id": schedule_id,
-                                    "revision": schedule.revision,
-                                    "requested_at_unix_ms": now,
-                                    "next_due_unix_ms": schedule.next_due_unix_ms,
-                                },
-                            }),
-                        }
-                    }
-                    ControlEnvelope::Shutdown { .. } => json!({
-                        "schema_version": 1,
-                        "status": "ok",
-                        "shutdown": "accepted",
-                    }),
-                },
+    for _ in 0..MAX_CONTROL_REQUESTS_PER_CONNECTION {
+        let mut line = String::new();
+        // Bounded: a client that sends half a line and stops does not hold this
+        // task, and a client that sends a megabyte is refused.
+        let read = tokio::time::timeout(CONTROL_READ_TIMEOUT, reader.read_line(&mut line)).await;
+        // Whether the conversation continues after this reply.
+        let mut more = false;
+        let response = match read {
+            // The peer closed. There is nothing to answer and nobody to answer.
+            Ok(Ok(0)) => break,
+            Err(_) => control_error("control_timeout", "the control request timed out"),
+            Ok(Err(error)) => control_error("control_read_failed", &error.to_string()),
+            Ok(Ok(_)) if line.len() > MAX_CONTROL_BYTES => {
+                control_error("control_too_large", "the control request is too large")
             }
+            Ok(Ok(_)) => {
+                let parsed: Result<ControlEnvelope, _> = serde_json::from_str(&line);
+                match parsed {
+                    Err(_) => control_error("control_malformed", "the control request is not JSON"),
+                    Ok(envelope) if envelope.token() != token => control_error(
+                        "control_unauthorized",
+                        "the control token is not this daemon's",
+                    ),
+                    Ok(envelope) => match envelope {
+                        ControlEnvelope::Status { .. } => {
+                            more = true;
+                            json!({
+                                "status": "ok",
+                                "daemon": {
+                                    "pid": status.pid,
+                                    "started_at_unix_ms": status.started_at_unix_ms,
+                                    "schedules": status.schedules,
+                                    "active": status.active,
+                                    "occurrences_launched": status.occurrences_launched,
+                                    "stopping": status.stopping,
+                                },
+                            })
+                        }
+                        ControlEnvelope::Trigger { schedule_id, .. } => {
+                            more = true;
+                            let now = SystemClock.now_unix_ms();
+                            let stored = store
+                                .schedule(&schedule_id)
+                                .await
+                                .map_err(|error| store_error(&error));
+                            match stored {
+                                Err(error) => control_error(error.code().as_str(), error.message()),
+                                Ok(None) => control_error("task_not_found", "no such schedule"),
+                                Ok(Some(schedule)) => json!({
+                                    "schema_version": 1,
+                                    "status": "ok",
+                                    "triggered": {
+                                        "schedule_id": schedule_id,
+                                        "revision": schedule.revision,
+                                        "requested_at_unix_ms": now,
+                                        "next_due_unix_ms": schedule.next_due_unix_ms,
+                                    },
+                                }),
+                            }
+                        }
+                        // Asking the daemon to stop ends the conversation: the
+                        // next thing this peer sees is the process stopping.
+                        ControlEnvelope::Shutdown { .. } => json!({
+                            "schema_version": 1,
+                            "status": "ok",
+                            "shutdown": "accepted",
+                        }),
+                    },
+                }
+            }
+        };
+        let mut body = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_owned());
+        body.push('\n');
+        // A reply that cannot be written means the peer left; there is no error
+        // to report to a peer that is no longer there.
+        if writer.write_all(body.as_bytes()).await.is_err() {
+            break;
         }
-    };
-    let mut body = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_owned());
-    body.push('\n');
-    writer.write_all(body.as_bytes()).await.map_err(|error| {
-        HarnessError::new(
-            ErrorCode::ServiceUnavailable,
-            format!("the control reply was not written: {error}"),
-        )
-    })?;
+        if !more {
+            break;
+        }
+    }
     Ok(())
 }
 
