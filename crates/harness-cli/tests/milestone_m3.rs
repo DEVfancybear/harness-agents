@@ -1616,6 +1616,7 @@ async fn m3_04_budget_guards_dispatch() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one upgrade, told in order
 async fn m3_01_runtime_schema_upgrade() {
     let bench = bench();
     let store = bench.open_store().await;
@@ -1678,7 +1679,27 @@ async fn m3_01_runtime_schema_upgrade() {
     // Opening a writer upgrades the copy in place and keeps the old rows.
     let store = bench.open_store().await;
     let revisions = store.all_schema_revisions().await.expect("revisions");
-    assert_eq!(revisions.get("runtime").copied(), Some(2));
+    // The assertion is that the marker reached the revision this host writes,
+    // not that it is a particular number: a hard-coded 2 turned this upgrade test
+    // into a change-detector the first time another milestone added a table.
+    assert_eq!(
+        revisions.get("runtime").copied(),
+        Some(harness_store_sqlite::RUNTIME_SCHEMA_VERSION)
+    );
+    // And the M11 tables exist after the same upgrade, because the slice runs
+    // from whatever revision the database was at.
+    store
+        .create_schedule(&harness_store_sqlite::StoredScheduleRecord {
+            schedule_id: "m3-upgrade-fixture".to_owned(),
+            title: "created after the upgrade".to_owned(),
+            state: "active".to_owned(),
+            revision: 1,
+            next_due_unix_ms: 1_700_000_000_000,
+            spec_json: r#"{"kind":"once","at_unix_ms":1700000000000}"#.to_owned(),
+            grants_json: "{}".to_owned(),
+        })
+        .await
+        .expect("M11 tables exist after the upgrade");
     assert_eq!(
         store
             .session_summary(&session)

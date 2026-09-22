@@ -911,6 +911,70 @@
           "closure-M0"
         ]
       }
+    },
+    {
+      "id": "M11",
+      "title": "Daemon, schedules và external tasks",
+      "runbook": "docs/implementation-next/M11.vi.md",
+      "prerequisites": ["M9"],
+      "status": "in_progress",
+      "integration_target": "milestone_m11",
+      "work_items": [
+        {
+          "id": "M11-01",
+          "title": "Daemon host và IPC",
+          "status": "in_progress",
+          "tests": []
+        },
+        {
+          "id": "M11-02",
+          "title": "Durable schedules/occurrences",
+          "status": "implemented_unverified",
+          "tests": ["a34_schedule_occurrences", "m11_02_a_once_schedule_fires_once"]
+        },
+        {
+          "id": "M11-03",
+          "title": "External task driver và polling",
+          "status": "in_progress",
+          "tests": []
+        },
+        {
+          "id": "M11-04",
+          "title": "Non-interactive policy và notifications",
+          "status": "in_progress",
+          "tests": []
+        }
+      ],
+      "required_tests": ["a34_schedule_occurrences"],
+      "unit_tests": [],
+      "fixtures": [
+        "crates/harness-cli/tests/milestone_m11.rs",
+        "crates/harness-cli/src/daemon/schedule.rs",
+        "docs/adr/ADR-N11-SCHEDULE-AND-DAEMON-SEMANTICS.vi.md"
+      ],
+      "gate": {
+        "script": "scripts/Verify-Milestone.ps1",
+        "dependency_check_bin": "dependency_check",
+        "steps": [
+          "format",
+          "clippy",
+          "build",
+          "workspace-tests",
+          "dependency-allowlist",
+          "required-test-discovery",
+          "required-tests",
+          "closure-M9",
+          "closure-M8",
+          "closure-M7",
+          "closure-M6",
+          "closure-M5",
+          "closure-M4",
+          "closure-M3",
+          "closure-M1",
+          "closure-M2",
+          "closure-M0"
+        ]
+      }
     }
   ],
   "acceptance_cases": [
@@ -1202,13 +1266,16 @@
       "id": "A34",
       "owner_milestones": ["M11"],
       "planned_test": "a34_schedule_occurrences",
-      "status": "planned"
+      "status": "implemented",
+      "selectors": ["milestone_m11::a34_schedule_occurrences"],
+      "note": "the occurrence key is (schedule, revision, nominal due) and carries no wall-clock stamp, so two hosts agree on it and a re-claim cannot look new; a spring-forward gap skips the occurrence rather than moving it; a fall-back repeat fires once, which needed the cron walk to advance on the local clock because a UTC step lands on the same local minute again; the misfire backlog is bounded at one occurrence with the skipped count reported; a manual trigger is its own occurrence and leaves the next due where the evaluator put it; a pause bumps the revision and a stale claim is refused; a claimed-but-unlaunched occurrence is canceled on restart rather than relaunched; and a schedule never carries auto-approval"
     },
     {
       "id": "A35",
       "owner_milestones": ["M11"],
       "planned_test": "a35_external_task_ambiguity",
-      "status": "planned"
+      "status": "planned",
+      "note": "NOT IMPLEMENTED in this pass: M11-03 (external task driver and polling) is registered as in_progress with no tests. The case stays planned."
     },
     {
       "id": "A36",
