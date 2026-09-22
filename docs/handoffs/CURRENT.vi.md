@@ -59,7 +59,7 @@ Sửa thêm (M4-03.1): `harness-tools/src/process.rs` (permit queue cancellation
 ## 7. Việc còn lại theo thứ tự
 
 0. **Reviewer nghiệm thu M4**: gate đã xanh + evidence §8; implementer không tự đặt `accepted`. Điểm cần soi kỹ: (a) cơ chế reap `wait()` **không được test phân biệt** trên host này (§8.4 evidence) — chỉ kết quả "cả cây chết" được kiểm; (b) page đọc byte thô của section, không parse dòng.
-1. **Gate đa nền tảng**: nhánh Unix của A16/A17/A08 mới chỉ được *biên dịch* trên Windows (pattern `cfg!`); CI ubuntu 12/12 xanh cho tới `90171e0`, nhưng các test M4 mới chưa từng chạy trên Linux. Nếu cần `accepted` đa nền tảng: push và xem job ubuntu, hoặc chạy trên host Linux/WSL.
+1. **Gate đa nền tảng**: CI `ci.yml` chạy P0/P3–P7 trên ubuntu **và** windows nhưng **không** chạy `milestone_m4`. Push `79c5165` → run `35691776833` **success 12/12** (17m48s), tức code M4 biên dịch + `clippy -D warnings` xanh trên ubuntu (kể cả nhánh `cfg(unix)`) và các phase suite xanh — nhưng **A16/A17/A08 chưa từng chạy trên Linux**. Muốn `accepted` đa nền tảng: thêm `milestone_m4` vào CI (một job/bước `Verify-Milestone.ps1 -Milestone M4` trên ubuntu) hoặc chạy trên host Linux/WSL.
 2. **M5** (context/continuity) chỉ khi được giao — prerequisites M4 đã xong.
 3. Việc không thuộc M4: StorePort vẫn chưa implement (handoff M3); live/paid smoke; backup/restore/retention (M9).
 
