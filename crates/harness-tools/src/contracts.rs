@@ -772,6 +772,8 @@ pub enum ToolOutput {
         exit_code: Option<i32>,
         timed_out: bool,
         canceled: bool,
+        /// Whether the call waited behind another process for the host permit.
+        queued: bool,
         tree_cleanup_confirmed: bool,
         stdout: String,
         stderr: String,

@@ -20,10 +20,10 @@ use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
 use harness_session::{AdmitInputRequest, SessionService};
 use harness_store_sqlite::{SqliteStore, ToolIntentStatus, WriterOpenOptions};
 use harness_tools::{
-    ApprovalMode, CodingToolAction, EffectClass, ToolExecutionService, ToolOutput, ToolRequest,
-    TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnProgress, coding_tool_descriptors,
-    coding_tool_names, coding_tool_schemas, effect_class_for, observe_workspace,
-    observed_file_hash,
+    ApprovalMode, CodingToolAction, EffectClass, IsolationMode, ToolExecutionService, ToolOutput,
+    ToolRequest, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnProgress,
+    coding_tool_descriptors, coding_tool_names, coding_tool_schemas, effect_class_for,
+    observe_workspace, observed_file_hash,
 };
 use harness_types::{
     ContentHash, ErrorCode, HostId, InputId, ProjectId, SessionId, SourceAuthority, TaskId,
@@ -951,6 +951,159 @@ async fn a15_path_patch_safety() {
             .expect("unicode readable"),
         unicode,
         "bytes are preserved exactly, including CRLF and Unicode"
+    );
+    drop(tools);
+    close(store).await;
+}
+
+// ---------------------------------------------------------------------------
+// M4-03: process permit queue (A13 queued cancel)
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+fn write_then_sleep(marker: &Path, millis: u64) -> String {
+    format!(
+        "Set-Content -LiteralPath '{}' -Value x; Start-Sleep -Milliseconds {millis}",
+        marker.display()
+    )
+}
+
+#[cfg(unix)]
+fn write_then_sleep(marker: &Path, millis: u64) -> String {
+    format!(
+        "echo x > '{}'; sleep {}",
+        marker.display(),
+        millis as f64 / 1000.0
+    )
+}
+
+#[cfg(windows)]
+fn write_now(marker: &Path) -> String {
+    format!("Set-Content -LiteralPath '{}' -Value x", marker.display())
+}
+
+#[cfg(unix)]
+fn write_now(marker: &Path) -> String {
+    format!("echo x > '{}'", marker.display())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one queue scenario, told in order
+async fn a13_queued_process_cancel() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let (session, task) = admit(&store, &bench).await;
+
+    let marker_a = bench.workspace.join("a13-a.txt");
+    let marker_b = bench.workspace.join("a13-b.txt");
+
+    let prepared = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a13",
+            &bench.workspace,
+            CodingToolAction::RunShell {
+                command: write_then_sleep(&marker_a, 1_500),
+                timeout_ms: 30_000,
+                isolation: IsolationMode::BestEffort,
+            },
+        ))
+        .await
+        .expect("A prepares");
+    let approval = tools.approve(&prepared).await.expect("A approved");
+    let a = {
+        let tools = tools.clone();
+        tokio::spawn(async move { tools.execute(prepared, Some(approval)).await })
+    };
+
+    // Let A take the host permit before B queues behind it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let prepared_b = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a13",
+            &bench.workspace,
+            CodingToolAction::RunShell {
+                command: write_now(&marker_b),
+                timeout_ms: 30_000,
+                isolation: IsolationMode::BestEffort,
+            },
+        ))
+        .await
+        .expect("B prepares");
+    let approval_b = tools.approve(&prepared_b).await.expect("B approved");
+    let token = CancellationToken::new();
+    let b = {
+        let tools = tools.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            tools
+                .execute_with_cancellation(prepared_b, Some(approval_b), token)
+                .await
+        })
+    };
+    // B is inside the runner now, waiting for A's permit.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    token.cancel();
+
+    let b_view = b.await.expect("B joins").expect("B settles truthfully");
+    let a_view = a.await.expect("A joins").expect("A completes");
+
+    assert!(
+        !marker_b.exists(),
+        "a call canceled while queued must never spawn its process"
+    );
+    assert!(
+        b_view.execution_id.is_some(),
+        "B crossed the durable intent, so it was inside the runner, not denied early"
+    );
+    assert_eq!(
+        b_view.receipt.expect("B carries a receipt").outcome_state,
+        ToolOutcomeState::Settled,
+        "a withdrawal before any effect settles as a real, truthful result"
+    );
+    let ToolOutput::Process {
+        canceled: b_canceled,
+        queued: b_queued,
+        exit_code: b_exit,
+        tree_cleanup_confirmed: b_clean,
+        ..
+    } = &b_view.output
+    else {
+        panic!("B must produce a process output: {:?}", b_view.output);
+    };
+    assert!(b_canceled, "B was withdrawn");
+    assert!(b_queued, "B really waited behind A before being withdrawn");
+    assert!(
+        b_exit.is_none(),
+        "no exit code for a process that never ran"
+    );
+    assert!(b_clean, "no process exists, so the tree is clean");
+
+    let ToolOutput::Process {
+        exit_code: a_exit,
+        queued: a_queued,
+        canceled: a_canceled,
+        ..
+    } = &a_view.output
+    else {
+        panic!("A must produce a process output: {:?}", a_view.output);
+    };
+    assert_eq!(a_exit, &Some(0), "A ran to completion");
+    assert!(!a_canceled);
+    assert!(!a_queued, "A took the permit without waiting");
+    assert!(marker_a.exists(), "A's effect landed");
+    assert!(
+        store
+            .pending_tool_intents(&session)
+            .await
+            .unwrap()
+            .is_empty(),
+        "both calls settled, nothing is pending"
     );
     drop(tools);
     close(store).await;

@@ -1121,6 +1121,7 @@ fn process_output(output: ProcessResult) -> ToolOutput {
         exit_code: output.exit_code,
         timed_out: output.timed_out,
         canceled: output.canceled,
+        queued: output.queued,
         tree_cleanup_confirmed: output.tree_cleanup_confirmed,
         stdout: redact_text(&output.stdout),
         stderr: redact_text(&output.stderr),

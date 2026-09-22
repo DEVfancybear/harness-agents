@@ -39,6 +39,11 @@ pub(crate) struct ProcessResult {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub canceled: bool,
+    /// Whether this call had to wait for the host-wide process permit.
+    ///
+    /// It is recorded so a canceled queue member is distinguishable from a call
+    /// that was withdrawn before it ever reached the runner.
+    pub queued: bool,
     pub tree_cleanup_confirmed: bool,
     pub stdout: String,
     pub stderr: String,
@@ -85,10 +90,30 @@ async fn run(
     cancellation: CancellationToken,
 ) -> Result<ProcessResult, HarnessError> {
     // Windows Job Object completion ports are process-lifecycle resources. A
-    // single host-wide runner lock makes concurrent tool calls deterministic
+    // single host-wide runner permit makes concurrent tool calls deterministic
     // and prevents two cleanup waits from starving each other; it does not
     // bypass the per-process tree ownership or output bounds.
-    let _execution_guard = process_execution_lock().lock().await;
+    //
+    // The queue is cancellation-aware: a call withdrawn by its caller must not
+    // start a process later, when the permit finally reaches it. The fast path
+    // keeps the uncontended case free of a select branch.
+    let (guard, queued) = if let Ok(guard) = process_execution_lock().try_lock() {
+        (guard, false)
+    } else {
+        let guard = tokio::select! {
+            guard = process_execution_lock().lock() => guard,
+            () = cancellation.cancelled() => {
+                return Ok(canceled_before_spawn(executable, true));
+            }
+        };
+        (guard, true)
+    };
+    let _execution_guard = guard;
+    // A call canceled in the instant the permit became available must not start
+    // a process either: the caller has already withdrawn it.
+    if cancellation.is_cancelled() {
+        return Ok(canceled_before_spawn(executable, queued));
+    }
     let mut command = CommandWrap::with_new(executable, |child_command| {
         child_command
             .args(args)
@@ -157,12 +182,33 @@ async fn run(
         exit_code: status.code(),
         timed_out,
         canceled,
+        queued,
         tree_cleanup_confirmed: true,
         stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
         stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
         stdout_truncated: stdout.truncated,
         stderr_truncated: stderr.truncated,
     })
+}
+
+/// A call withdrawn while it was queued (or the moment its permit arrived).
+///
+/// No process exists, so there is nothing to terminate or reap and the tree is
+/// trivially clean; `queued` records whether the caller actually waited behind
+/// another call or was withdrawn before the runner took it.
+fn canceled_before_spawn(executable: &str, queued: bool) -> ProcessResult {
+    ProcessResult {
+        executable: executable.to_owned(),
+        exit_code: None,
+        timed_out: false,
+        canceled: true,
+        queued,
+        tree_cleanup_confirmed: true,
+        stdout: String::new(),
+        stderr: String::new(),
+        stdout_truncated: false,
+        stderr_truncated: false,
+    }
 }
 
 async fn terminate_and_reap(

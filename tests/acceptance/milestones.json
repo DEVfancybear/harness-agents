@@ -411,8 +411,8 @@
         {
           "id": "M4-03",
           "title": "Process lifecycle và spool",
-          "status": "planned",
-          "tests": []
+          "status": "in_progress",
+          "tests": ["a13_queued_process_cancel"]
         },
         {
           "id": "M4-04",
@@ -430,7 +430,8 @@
         "a03_receipt_before_checkpoint",
         "a04_effect_before_receipt",
         "m4_02_git_log_is_structured_and_bounded",
-        "a15_path_patch_safety"
+        "a15_path_patch_safety",
+        "a13_queued_process_cancel"
       ],
       "unit_tests": [],
       "fixtures": ["crates/harness-cli/tests/milestone_m4.rs"],
@@ -544,7 +545,14 @@
       "note": "M3 question half is implemented and proven by milestone_m3::a11_human_input_grant; the real approval grant/consume half belongs to M4, so the case stays planned until M4"
     },
     { "id": "A12", "owner_milestones": ["M5"], "planned_test": "a12_compaction_cas", "status": "planned" },
-    { "id": "A13", "owner_milestones": ["M4"], "planned_test": "a13_queued_process_cancel", "status": "planned" },
+    {
+      "id": "A13",
+      "owner_milestones": ["M4"],
+      "planned_test": "a13_queued_process_cancel",
+      "status": "implemented",
+      "selectors": ["milestone_m4::a13_queued_process_cancel"],
+      "note": "B queued behind A's host permit and canceled while queued never spawns (marker absent), reports queued=true/canceled=true with no exit code and a clean tree, and crossed the durable intent"
+    },
     {
       "id": "A14",
       "owner_milestones": ["M4"],

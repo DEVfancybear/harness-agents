@@ -1222,11 +1222,12 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             exit_code,
             timed_out,
             canceled,
+            queued,
             stdout,
             stderr,
             ..
         } => format!(
-            "process {executable} exit={exit_code:?} timed_out={timed_out} canceled={canceled}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            "process {executable} exit={exit_code:?} timed_out={timed_out} canceled={canceled} queued={queued}\nstdout:\n{stdout}\nstderr:\n{stderr}"
         ),
         ToolOutput::Git {
             operation, output, ..
