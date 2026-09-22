@@ -1,6 +1,8 @@
 # CURRENT — bàn giao đang mở
 
-**Cập nhật:** 23/09/2026 · **Assignment:** M7–M12 theo kế hoạch `implementation-next`, tuần tự theo dependency và gate từng checkpoint; commit+push sau mỗi action. **Checkpoint hiện tại:** **M7-01..M7-04 xong, gate M7 đã xanh** (chi tiết §11). Tiền nhiệm: M0/M1/M2 (`4d6393e`/`f1fb002`, `a824b2c`, `6c91a62`), M3 (`03bea9a`), M4 (`79c5165`), M5 (`b6e99bc`/`b8fa717`), M6 (`2b88396`/`9bc7d49`).
+**Cập nhật:** 23/09/2026 · **Assignment:** M7–M12 theo kế hoạch `implementation-next`, tuần tự theo dependency và gate từng checkpoint; commit+push sau mỗi action. **Checkpoint hiện tại:** **M7 xong, gate xanh, đã push** (`e5ef55c`); **M8 đã có SPEC + inventory, đã push** (`2cc1d08`) — **code M8 chưa bắt đầu**. Tiền nhiệm: M0/M1/M2 (`4d6393e`/`f1fb002`, `a824b2c`, `6c91a62`), M3 (`03bea9a`), M4 (`79c5165`), M5 (`b6e99bc`/`b8fa717`), M6 (`2b88396`/`9bc7d49`).
+
+**Trạng thái git:** branch `master`, đã push tới `2cc1d08`; 3 commit M7 = `98117d0` (fix gate), `711d9e7` (feat M7), `883d25f`→ rebase thành `e5ef55c` (docs M7). Lưu ý: `origin/master` có trước một commit docs không thuộc session này (`2590624 docs(ha-agent): plan the G01–G14 track`); M7 đã rebase lên trên nó.
 
 ## 1. Assignment hiện tại và ràng buộc mới nhất
 
@@ -59,16 +61,16 @@
 0. **Reviewer nghiệm thu M7**: gate xanh + `docs/evidence/M7.vi.md` §4/§7/§9. Điểm cần soi: (a) **disposition `filtered` là thay đổi contract** làm `p4_c13` phải đổi expected (§8 evidence); (b) **`recall` chưa truyền `MemoryIndex::Log`** nên stamp của block từ log là `fresh` (§9 evidence) — đây là điểm dễ hiểu sai nhất; (c) freshness chỉ áp cho source kind `file`/`commit` có digest.
 1. **Flake loopback của host vẫn còn** ở `interactive_launch::i04`/`i13` và `milestone_m2::a07`. Gate đã có fallback tách-test, nhưng **chưa có ai sửa gốc**. Việc của M2.
 2. **Gate đa nền tảng**: `milestone_m5`/`milestone_m6`/`milestone_m7` **không** nằm trong `ci.yml` (chỉ P0/P3–P7 trên ubuntu+windows). Muốn `accepted` đa nền tảng phải thêm bước gate M vào CI hoặc chạy trên Linux/WSL.
-3. **M8** — prerequisites M7 đã xong. Đọc `docs/implementation-next/M8.vi.md`, xác minh gate M7 trên revision hiện tại, rồi viết SPEC M8 trước khi code.
-4. Không thuộc M7: StorePort vẫn chưa implement (handoff M3); live/paid smoke; backup/restore/retention (M9).
+3. **M8 — SPEC xong, code chưa bắt đầu.** `docs/specs/M8.vi.md` đã chốt path map, inventory `reuse_verified/adapt/missing` cho A27–A30, 14 invariant và 8 slice. Việc kế tiếp là implement M8-01 → M8-04 theo thứ tự đó, cộng `ADR-N08` (budget/slot ownership, child brief/evidence delivery, Git integration policy).
+4. Không thuộc M7/M8: StorePort vẫn chưa implement (handoff M3); live/paid smoke; backup/restore/retention (M9).
 
 ## 8. Next action chính xác
 
-**Đi tiếp M8.** Đọc `docs/implementation-next/M8.vi.md` + `CONTRACTS.vi.md` §8 + acceptance A27–A30; lấy revision/status mới nhất; xác minh gate M7 trên revision hiện tại; viết `docs/specs/M8.vi.md` (path map, gap inventory, oracle, commands) **trước** khi code; dùng `crates/harness-orchestrator/src/{coordinator,scheduler,workspace,integration,contracts}.rs` và `harness-cli/src/delegation_cli.rs` đang có; thêm target `crates/harness-cli/tests/milestone_m8.rs`; registry `milestones.json` thêm M8 (prerequisites `["M7"]`); gate `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M8`; evidence + handoff; commit + push.
+**Bắt đầu code M8 tại slice M8-01a.** Cụ thể: (1) chạy lại `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M7` để xác minh prereq trên revision hiện tại; (2) dựng `crates/harness-cli/tests/milestone_m8.rs` với fixture `WorkerBackend` xác định + store/git thật; (3) viết `a27_child_capacity_budget` trước — nó chốt luôn hình dạng API cho queue/per-role bound, reject reason và reservation phân cấp (các mục **Thiếu** ở `docs/specs/M8.vi.md` §4); (4) `ADR-N08`; (5) registry `milestones.json` thêm M8 (prerequisites `["M7"]`, target `milestone_m8`, 4 acceptance A27–A30); (6) gate `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M8`; (7) `docs/evidence/M8.vi.md` + handoff; (8) commit + push mỗi action.
 
 ## 9. Blocked on
 
-Không có blocker kỹ thuật cho M7. Ba điểm cần người quyết: (1) `accepted` đa nền tảng cần chạy Linux (máy này không có WSL/Docker — CI là đường duy nhất); (2) đổi disposition `no_facts` → `filtered` cho range không có nguồn đọc được cần reviewer xác nhận; (3) flake loopback cần một lượt M2 riêng nếu muốn `workspace-tests` xanh ổn định không cần fallback.
+Không có blocker kỹ thuật. Bốn điểm cần người quyết: (1) `accepted` đa nền tảng cần chạy Linux (máy này không có WSL/Docker — CI là đường duy nhất); (2) đổi disposition `no_facts` → `filtered` cho range không có nguồn đọc được cần reviewer xác nhận; (3) flake loopback cần một lượt M2 riêng nếu muốn `workspace-tests` xanh ổn định không cần fallback; (4) quyền mới (đổi PATH/cài thật/paid smoke/publish) chưa được cấp và sẽ chỉ cần ở M9.
 
 ## 10. Không lặp lại
 
