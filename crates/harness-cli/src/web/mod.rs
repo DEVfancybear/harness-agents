@@ -235,8 +235,12 @@ pub async fn serve(config: WebConfig) -> Result<WebHandle, HarnessError> {
     };
     tokio::spawn(async move {
         loop {
-            let Ok((stream, _peer)) = listener.accept().await else {
-                break;
+            let (stream, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(error) => {
+                    eprintln!("ha web: accept failed, the surface is stopping: {error}");
+                    break;
+                }
             };
             let state = Arc::clone(&state);
             tokio::spawn(async move {
@@ -245,9 +249,18 @@ pub async fn serve(config: WebConfig) -> Result<WebHandle, HarnessError> {
                     let state = Arc::clone(&state);
                     async move { Ok::<_, Infallible>(route(state, request).await) }
                 });
-                let _ = hyper::server::conn::http1::Builder::new()
+                // A connection error is reported rather than swallowed: a
+                // response that never arrives looks identical to a hang from
+                // the client side, and that is exactly the failure a test
+                // cannot diagnose.
+                if let Err(error) = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
-                    .await;
+                    .await
+                {
+                    // Reported rather than swallowed: a response that never
+                    // arrives looks identical to a hang from the client side.
+                    eprintln!("ha web: connection ended: {error}");
+                }
             });
         }
     });
@@ -777,6 +790,10 @@ async fn admit_input(
             initial_plan_items: Vec::new(),
         })
         .await;
+    // The writer is released before the response is returned. Leaving it to the
+    // last `Arc` to drop makes the next request race this one for the writer
+    // lock, which is how a second mutation intermittently came back empty.
+    let closer = Arc::clone(&store);
     let response = match admitted {
         Ok(ack) => json_response(
             StatusCode::OK,
@@ -797,7 +814,9 @@ async fn admit_input(
             Some(request_id),
         ),
     };
-    if let Ok(store) = Arc::try_unwrap(store) {
+    drop(service);
+    drop(store);
+    if let Ok(store) = Arc::try_unwrap(closer) {
         let _ = store.close().await;
     }
     response

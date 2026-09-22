@@ -54,12 +54,24 @@ async fn request(
     headers: &[(&str, &str)],
     body: Option<&str>,
 ) -> Reply {
+    request_labelled(address, method, path, headers, body, path).await
+}
+
+/// The same request, with a label so an empty reply names which one it was.
+async fn request_labelled(
+    address: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+    label: &str,
+) -> Reply {
     let mut stream = TcpStream::connect(address)
         .await
         .expect("the server accepts a connection");
     let payload = body.unwrap_or_default();
     let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
         payload.len()
     );
     for (name, value) in headers {
@@ -77,37 +89,46 @@ async fn request(
     // Read the head, then exactly the declared body length. Reading to EOF races
     // the server's own close, which on this platform surfaces as a reset even
     // though the reply arrived complete.
+    // Read until the declared body length has arrived. A reset after the peer
+    // closed a `Connection: close` reply is normal on this platform and can
+    // arrive before the bytes are delivered to this side, so a reset with an
+    // incomplete reply is retried rather than treated as the end of the answer.
     let mut raw = Vec::new();
     let mut buffer = [0_u8; 4096];
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut head_end = None;
+    let mut head_end: Option<usize> = None;
+    let mut declared = 0_usize;
     while tokio::time::Instant::now() < deadline {
-        let Ok(read) =
-            tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buffer)).await
-        else {
-            continue;
-        };
-        let Ok(read) = read else { break };
-        if read == 0 {
-            break;
+        match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buffer)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => raw.extend_from_slice(&buffer[..read]),
+            Ok(Err(_)) => {
+                // Reset: if the reply is already complete, this is the peer
+                // closing; if it is not, the bytes may still be in flight.
+                if head_end.is_some_and(|end| raw.len() >= end + declared) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+            Err(_) => continue,
         }
-        raw.extend_from_slice(&buffer[..read]);
         if head_end.is_none() {
             head_end = raw
                 .windows(4)
                 .position(|window| window == b"\r\n\r\n")
                 .map(|index| index + 4);
-        }
-        if let Some(end) = head_end {
-            let head_text = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
-            let declared = head_text
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length:"))
-                .and_then(|value| value.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            if raw.len() >= end + declared {
-                break;
+            if let Some(end) = head_end {
+                let head_text = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                declared = head_text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
             }
+        }
+        if head_end.is_some_and(|end| raw.len() >= end + declared) {
+            break;
         }
     }
     let text = String::from_utf8_lossy(&raw).into_owned();
@@ -115,7 +136,12 @@ async fn request(
         .split_whitespace()
         .nth(1)
         .and_then(|code| code.parse::<u16>().ok())
-        .unwrap_or(0);
+        .unwrap_or_else(|| {
+            panic!(
+                "no status line in the reply to {label}: {text:?} ({} bytes read)",
+                raw.len()
+            )
+        });
     let body = text
         .split_once("\r\n\r\n")
         .map(|(_, body)| body.to_owned())
@@ -472,3 +498,80 @@ async fn store_input_count(data: &std::path::Path, session: &SessionId) -> u64 {
 /// A store handle kept for the fixture's identity values.
 #[allow(dead_code)]
 fn unused(_: Option<Arc<SqliteStore>>, _: Option<TaskId>, _: Option<ProjectId>) {}
+
+/// A single-purpose probe: one admitted input, then a conflict on the same id.
+///
+/// Kept beside the acceptance case because a failure here and a failure there
+/// mean different things: this one isolates the conflict path from the replay
+/// path that precedes it.
+#[tokio::test]
+async fn m10_01_a_changed_payload_under_a_used_request_id_is_a_conflict() {
+    let root = temp_root();
+    let data = root.path().join("data");
+    let testbed = seed(&data).await;
+    let session_id = testbed.session_id.clone();
+    let config = WebConfig::loopback(&data, 0);
+    let token = config.session_token.clone();
+    let handle = harness_cli::web::serve(config)
+        .await
+        .expect("the web surface starts");
+    let address = handle.address;
+    let origin = format!("http://127.0.0.1:{}", address.port());
+    let request_id = "44444444-4444-7444-8444-444444444444";
+
+    let first = request(
+        address,
+        "POST",
+        &format!("/api/sessions/{}/inputs", session_id.as_str()),
+        &[
+            (SESSION_HEADER, &token),
+            ("Origin", &origin),
+            (REQUEST_ID_HEADER, request_id),
+        ],
+        Some(&json!({"text": "the first payload"}).to_string()),
+    )
+    .await;
+    assert_eq!(
+        first.status, 200,
+        "the first write succeeds: {}",
+        first.body
+    );
+
+    // A second, unrelated write first: if this also comes back empty, the
+    // problem is the second request on a fresh connection, not the conflict.
+    let second = request(
+        address,
+        "POST",
+        &format!("/api/sessions/{}/inputs", session_id.as_str()),
+        &[
+            (SESSION_HEADER, &token),
+            ("Origin", &origin),
+            (REQUEST_ID_HEADER, "55555555-5555-7555-8555-555555555555"),
+        ],
+        Some(&json!({"text": "a second payload"}).to_string()),
+    )
+    .await;
+    assert_eq!(
+        second.status, 200,
+        "a second write succeeds: {:?}",
+        second.body
+    );
+
+    let conflict = request(
+        address,
+        "POST",
+        &format!("/api/sessions/{}/inputs", session_id.as_str()),
+        &[
+            (SESSION_HEADER, &token),
+            ("Origin", &origin),
+            (REQUEST_ID_HEADER, request_id),
+        ],
+        Some(&json!({"text": "a different payload"}).to_string()),
+    )
+    .await;
+    assert_eq!(
+        conflict.status, 409,
+        "a changed payload under a used request id is a conflict: {:?}",
+        conflict.body
+    );
+}
