@@ -1,6 +1,6 @@
 # CURRENT — bàn giao đang mở
 
-**Cập nhật:** 23/09/2026 · **Assignment:** M7–M12 theo kế hoạch `implementation-next`, tuần tự theo dependency và gate từng checkpoint; commit+push sau mỗi action. **Checkpoint hiện tại:** M7 (`e5ef55c`), M8 (`32c3400`), M9 (`4035f8b`), M10 (`0a1167d`) xong + gate xanh; **M11-02 xong + gate M11 xanh** (`9d55914`, digest `sha256:0e2dd98b…`, 383 file, A34 pass). **M11-01/M11-03/M11-04 chưa làm** (xem §7e) ⇒ **A35 chưa implement**. **Milestone còn lại: hoàn tất M11-01/03/04, rồi M12** (prerequisites M4).
+**Cập nhật:** 23/09/2026 · **Assignment:** M7–M12 theo kế hoạch `implementation-next`, tuần tự theo dependency và gate từng checkpoint; commit+push sau mỗi action. **Checkpoint hiện tại:** M7 (`e5ef55c`), M8 (`32c3400`), M9 (`4035f8b`), M10 (`0a1167d`) xong + gate xanh; **M11-02 xong** (`9d55914`); **M11-01 xong + gate M11 xanh lần hai** (`90bd0f6`, `3915b5f`, `ada1917`; digest `sha256:bf8bf84d…`, 385 file, **3 required test** gồm hai test daemon). **M11-03/M11-04 chưa làm** (xem §7e) ⇒ **A35 chưa implement**. **Milestone còn lại: hoàn tất M11-03/04, rồi M12** (prerequisites M4).
 
 **Quyền (cập nhật 23/09/2026, user cấp trực tiếp):** user cho phép **install ở M9** và nói rõ "cứ làm full goal không cần hỏi". ⇒ Được phép: `Install-Ha.ps1` (cài thật) khi M9 cần. **Vẫn chưa được cấp rõ ràng:** đổi User PATH, paid smoke/live provider, publish/release (release tạo artifact công khai). Nếu M9 chạm tới các mục đó: làm phần install, còn PATH/publish thì ghi lại là cần xác nhận riêng.
 
@@ -15,9 +15,11 @@
 
 ## 2. Branch/base/source digest
 
-- Branch `master`; base M7 `9bc7d49` (= đầu M7).
-- **Source digest của revision đã test:** `sha256:b5d266d22f079885a3119a9ef340059b4a19cff2027851f1204d5bb0bdffca99` (**356 file**), từ `GATE_RESULT_JSON` của `-Milestone M7` (log `target/verification-m7-gate.log`), **trừ** `docs/evidence/M7.vi.md` + `docs/handoffs/CURRENT.vi.md`.
-- Trạng thái registry: M7 để `in_progress` — implementer **không** tự đặt `accepted`/`verified_local`; verdict là việc của reviewer.
+- Branch `master`; base M7 `9bc7d49` (= đầu M7); base checkpoint M11-01 `3915b5f`.
+- **Source digest mới nhất (M11-01):** `sha256:bf8bf84d6f7a019371003221b3f1b22490d9d0bf6c211cecf4e987fdf849beea` (**385 file**), từ `GATE_RESULT_JSON` của `-Milestone M11` (log `target/verification-m11-gate-3.log`), **trừ** `docs/evidence/M11.vi.md` + `docs/handoffs/CURRENT.vi.md`.
+- Digest của M11-02 (trước đó): `sha256:0e2dd98b…` (383 file), log `target/verification-m11-gate.log`.
+- **Source digest của revision đã test (M7):** `sha256:b5d266d22f079885a3119a9ef340059b4a19cff2027851f1204d5bb0bdffca99` (**356 file**), log `target/verification-m7-gate.log`.
+- Trạng thái registry: M11 để `in_progress` — implementer **không** tự đặt `accepted`/`verified_local`; verdict là việc của reviewer.
 
 ## 3. Work item M7
 
@@ -89,17 +91,20 @@
 - **Còn nợ thật:** M10-04 (uploads/artifact preview/CSP) **chưa làm**; UI mới ở mức tối thiểu (chưa conversation/plan/diff/checks/tool status/budget/approval panel); **gap chưa chứng minh end-to-end** (fixture không trim được journal nên chỉ khẳng định quyết định); chưa có browser E2E; **M10 chưa nằm trong matrix CI**.
 **Bắt đầu M10.** Prerequisites M9 đã xong về kỹ thuật (gate xanh, 6/6). Việc cụ thể: (1) đọc `docs/implementation-next/M10.vi.md` + `CONTRACTS.vi.md` §9 + acceptance A33; (2) chạy lại `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M9` để xác minh prereq trên revision hiện tại; (3) viết `docs/specs/M10.vi.md` trước khi code; (4) implement trong root workspace, dùng chung runtime/services, **không** tạo CLI/workspace thứ hai; (5) thêm target `crates/harness-cli/tests/milestone_m10.rs`; (6) registry `milestones.json` thêm M10 (prerequisites `["M9"]`); (7) gate `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M10`; (8) evidence + handoff; (9) commit + push. **Việc còn nợ của M9** (ghi ở §7c) phải được nêu lại trong evidence M10 nếu chưa giải quyết: chưa có bằng chứng CI/Linux, chưa có eval baseline.
 
-## 7e. M11 — mới xong M11-02 (không được đọc là "xong")
+## 7e. M11 — M11-01 + M11-02 xong (không được đọc là "xong milestone")
 
-- **Xong + gate xanh:** M11-02 (durable schedules/occurrences) với `a34_schedule_occurrences` + `m11_02_a_once_schedule_fires_once`; `ADR-N11`. Runtime store schema **2 → 3** (additive).
-- **Ba bug thật:** (1) **giờ lặp fall-back chạy hai lần** vì cron walk cộng một phút **UTC** — phải đi trên local clock; (2) hằng số chuyển đổi DST tôi tính tay **sai năm** ⇒ local time lệch một giờ; (3) `m3_01_runtime_schema_upgrade` hard-code `Some(2)` ⇒ đỏ khi bump lên 3 (change-detector, đã sửa thành so với `RUNTIME_SCHEMA_VERSION`).
-- **Chưa làm:** M11-01 (daemon host + IPC + attach/detach + chống hai writer + shutdown drain) — **không có test nào**; M11-03 (external task driver/polling) ⇒ **A35 chưa implement**; M11-04 (non-interactive policy + notification outbox). **Không có daemon process thật**: M11-02 là evaluator + store, chưa có vòng lặp nền trong `ha`.
+- **Xong + gate xanh:** M11-02 (durable schedules/occurrences) với `a34_schedule_occurrences` + `m11_02_a_once_schedule_fires_once`; **M11-01 (daemon host + IPC)** với `m11_01_daemon_ownership_and_control` + `m11_01_a_stale_endpoint_is_cleaned_up`. `ADR-N11`. Runtime store schema **2 → 3** (additive). Gate M11 lần hai: digest `sha256:bf8bf84d…`, 385 file, **3/3 required**, `workspace-tests` cần **1 retry**.
+- **M11-01 đã đăng ký là required test của gate** bằng qualified selector `milestone_m11_daemon::…`; `fixtures` thêm target test + `daemon/host.rs`. Trước đó daemon chỉ được chạy trong `workspace-tests` (bước duy nhất có retry) — đó là lỗ hổng bằng chứng đã đóng.
+- **Bốn bug thật của M11-01:** (1) control envelope để token trong `#[serde(flatten)]` ⇒ mọi request hợp lệ trả `control_malformed`; (2) daemon chưa mở socket cho tới `run()` (tách `recover()`/`serve()`); (3) shutdown để lại claim `claimed` ⇒ `recover_claimed_occurrences` trong shutdown; (4) **Windows RST**: peer đóng ngay sau reply có thể bị deliver thành reset **trước** byte của reply, phá cả client production lẫn helper raw socket ⇒ sửa **cả hai đầu**: daemon trả lời rồi **tiếp tục đọc** (trần 8 request/connection), client retry **cả request** (trần 8) và chỉ retry lỗi transport. Cộng một bug của test: fixture seed schedule đã due nên đua với evaluator (2/10 lần đỏ).
+- **Ba bug thật của M11-02:** (1) **giờ lặp fall-back chạy hai lần** vì cron walk cộng một phút **UTC** — phải đi trên local clock; (2) hằng số chuyển đổi DST tôi tính tay **sai năm**; (3) `m3_01_runtime_schema_upgrade` hard-code `Some(2)` ⇒ change-detector, đã sửa (kèm `phase_p2`/`phase_p7`) thành so với `RUNTIME_SCHEMA_VERSION`.
+- **Chưa làm:** M11-03 (external task driver/polling) ⇒ **A35 chưa implement**; M11-04 (non-interactive policy + notification outbox).
 - **Giới hạn zone:** chỉ `UTC` + central European 2026–2027; zone khác (kể cả `Asia/Ho_Chi_Minh`) bị **từ chối** — giới hạn thật, ghi rõ trong evidence.
+- **M11 chưa nằm trong matrix CI** (`ci.yml` mới M0–M9) ⇒ chưa có bằng chứng Linux.
 **Bắt đầu M11.** Prerequisites M9 đã xong. Việc cụ thể: (1) đọc `docs/implementation-next/M11.vi.md` + acceptance A34/A35; (2) chạy lại `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M10` để xác minh prereq trên revision hiện tại; (3) viết `docs/specs/M11.vi.md` + ADR-N11 (daemon/scheduler ownership, clock semantics, external handle) **trước** khi code; (4) implement trong root workspace, dùng chung runtime/services, **không** tạo daemon authority thứ hai; (5) thêm target `crates/harness-cli/tests/milestone_m11.rs`; (6) registry `milestones.json` thêm M11 (prerequisites `["M9"]`); (7) gate `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M11`; (8) evidence + handoff; (9) commit + push. Sau M11 còn **M12** (prerequisites **M4**, không phụ thuộc M10/M11).
 **Hoàn tất M9-03/M9-04 trước khi sang M10.** Cụ thể: (1) thêm `m9_04_install_smoke_preserves_existing_data` vào `milestone_m9.rs` — chạy `Install-Ha.ps1 -NoModifyPath` vào temp destination, kiểm version/checksum/subcommand/uninstall-giữ-data; (2) thêm `m9_04_release_candidate_has_checksums_and_no_secrets` — kiểm `checksums.txt` khớp `ha.exe` và `ha.release.json` có `published: false`; (3) ghi eval baseline trung thực (`measured: None` khi chưa đo) và/hoặc test `m9_03_*`; (4) chạy lại gate M9; (5) push để CI chạy `verify-milestones` lần đầu rồi ghi kết quả vào evidence; (6) commit + push. Sau đó **M10** (`M10.vi.md`, prerequisites M9; M10 và M11 **cùng** phụ thuộc M9).
 
 ## 8. Next action chính xác
-**Hoàn tất M11 rồi mới sang M12.** Việc cụ thể, theo thứ tự dependency: (1) **M11-01** daemon host + IPC trong `crates/harness-cli/src/daemon/` (IPC có xác thực, bounded request, chống hai daemon writer bằng ownership đã kiểm, attach/detach không sở hữu execution, shutdown drain/checkpoint) + test oracle "hai daemon race / IPC hỏng / client thoát để run sống / daemon stop cho state phục hồi"; (2) **M11-03** external task driver + polling ⇒ **A35** (`extensions/tasks` + store external_jobs: persist handle trước khi poll, submit mơ hồ ⇒ reconcile tường minh, backoff/deadline/cancel bounded, settle terminal + parent delivery một transaction, không resubmit mù); (3) **M11-04** non-interactive policy + notification outbox (schedule không mang auto-approve — đã có trường và test; còn thiếu outbox dedupe/backoff và "no-human ⇒ blocked"); (4) thêm M11 vào matrix CI `verify-milestones`; (5) chạy lại gate M11; (6) evidence + handoff; (7) commit + push. **Sau đó M12** (`M12.vi.md`, prerequisites **M4**, acceptance A36 strict confinement).
+**Hoàn tất M11 rồi mới sang M12.** Việc cụ thể, theo thứ tự dependency: (1) ~~**M11-01** daemon host + IPC~~ **xong, gate xanh, required test**; (2) **M11-03** external task driver + polling ⇒ **A35** (`harness-extensions/src/tasks.rs` + `harness-store-sqlite/src/store/external_jobs.rs` + `harness-cli/src/daemon/external.rs`: ghi request digest **trước** khi gửi, submit trùng ⇒ `idempotency_conflict`, mất answer ⇒ `ambiguous` (không resubmit, reconcile bằng handle), poll có backoff trần + deadline, settle terminal + parent delivery **một transaction**, cancel chỉ là request — remote tự settle); (3) **M11-04** non-interactive policy + notification outbox (schedule không mang auto-approve — đã có trường và test; còn thiếu outbox dedupe/backoff và "no-human ⇒ blocked"); (4) thêm M11 vào matrix CI `verify-milestones`; (5) chạy lại gate M11; (6) evidence + handoff; (7) commit + push. **Sau đó M12** (`M12.vi.md`, prerequisites **M4**, acceptance A36 strict confinement).
 ## 9. Blocked on
 
 Không có blocker kỹ thuật. Bốn điểm cần người quyết: (1) `accepted` đa nền tảng cần chạy Linux (máy này không có WSL/Docker — CI là đường duy nhất); (2) disposition `no_facts` → `filtered` (M7) cần reviewer xác nhận; (3) flake loopback cần một lượt M2 riêng — gate M7/M8 chỉ xanh được nhờ fallback tách test; (4) **A29 chỉ phủ nhánh conflict, chưa phủ nhánh `ChecksFailed`** (xem evidence M8 §9) — đây là khoảng trống thật của M8, cần một lần bổ sung.
@@ -118,10 +123,23 @@ Không có blocker kỹ thuật. Bốn điểm cần người quyết: (1) `acce
   - Dùng message lỗi PowerShell để parse output cargo trong gate: **cắt mất tên test** và **gộp khoảng trắng** thành `error  sending request` nên chữ ký flake không khớp. Phải dùng stream output (`$script:GateLastFailureOutput`).
   - Regex `[\\/]` trong PowerShell regex khớp **backslash + ký tự bất kỳ**, không phải lớp `[\/]`. Dùng `[/\\]`.
   - `catch_up` chỉ nhận `Pending|Paused|RetryWait`: job `blocked` bị bỏ qua im lặng. Đã sửa — nếu thấy "blocked range not retried", kiểm tra CẢ `catch_up` filter **và** `lease_extraction_job` SQL (cả hai đều phải nhận `blocked`).
+  - **Không** sửa một đầu của race đóng socket rồi coi đầu kia là "test flaky": trên Windows peer đóng ngay sau reply có thể thành RST **trước** byte của reply. Đã sửa **cả hai**: daemon không đóng trước peer (`MAX_CONTROL_REQUESTS_PER_CONNECTION`), client retry cả request (`CONTROL_ATTEMPTS`) và **chỉ** retry lỗi transport — retry một refusal có mã sẽ biến một token sai thành tám.
+  - **Không** pin số revision của runtime schema trong test (`Some(2)`, `Some(3)`): mỗi milestone thêm một slice additive. So với `RUNTIME_SCHEMA_VERSION`.
+  - **Không** seed fixture bằng một schedule **đã due** rồi assert `next_due` của manual trigger: evaluator sở hữu `next_due` và sẽ claim trước. Seed due instant ở **tương lai** rồi nhích clock tới đúng nó.
+  - **Không** thêm `chrono-tz`: zone viết tay (UTC + central European 2026–2027), zone lạ ⇒ typed refusal.
+  - **Không** dùng `-SkipBuild` cho gate M9 trở lên: nó lấy `target/release/ha.exe` cũ và test sẽ khẳng định nhầm binary.
 - Không để secret vào evidence.
 - Không tự đặt `verified_local`/`accepted` trong registry.
 
-## 11. Checkpoint M8 (lượt này) — tóm tắt
+## 11. Checkpoint M11-01 (lượt này) — tóm tắt
+
+- **Base:** `3915b5f`; ba commit: `90bd0f6` (host + control channel), `3915b5f` (đăng ký M11-01 vào registry + sửa race của fixture), `ada1917` (không đóng trước peer + helper raw retry). Docs: `docs/evidence/M11.vi.md` §4/§5/§7.
+- **Gate:** `-Milestone M11` **passed**, digest `sha256:bf8bf84d…` (**385** file), **3/3 required** trên **2** target, closure M9…M0 xanh; `workspace-tests` **1 retry** (flake loopback đã biết; log không ghi tên test vì retry thành công).
+- **Bốn bug thật của implementation:** control envelope flatten token; daemon chưa mở socket tới `run()`; claim treo khi shutdown; RST trên Windows phá **cả** client production **và** helper raw socket của test ⇒ sửa cả hai đầu. Cộng một bug của test (fixture đã due ⇒ đua evaluator, 2/10 lần đỏ) và một bug registry (M11-01 không có required test ⇒ daemon chỉ được chứng minh bởi bước duy nhất có retry).
+- **Một thay đổi contract:** control connection **không** còn one-shot; trần `MAX_CONTROL_REQUESTS_PER_CONNECTION = 8`.
+- **Giới hạn đã ghi:** M11-03/M11-04 chưa làm ⇒ A35 chưa implement; chưa có bằng chứng Linux; M11 chưa ở matrix CI.
+
+### Checkpoint trước (tham chiếu M8) — tóm tắt
 
 - **Base:** `8578c59`; thay đổi: 6 file sửa + 2 file mới (`docs/adr/ADR-N08-…`, `docs/evidence/M8.vi.md`).
 - **Gate:** `-Milestone M8` **passed**, digest `sha256:730c4206…` (362 file), 5/5 required + closure M7/M6/M5/M4/M3/M1/M2/M0. `workspace-tests` cần 1 retry rồi fallback tách `milestone_m2::a07_401` và chạy nó một mình → xanh.
