@@ -11,6 +11,7 @@
 
 pub mod backup;
 pub mod contracts;
+pub mod diagnostics;
 pub mod migration;
 pub mod retention;
 
@@ -20,6 +21,11 @@ pub use contracts::{
     CapabilityStatus, CapabilitySupport, DEFAULT_GC_GRACE_SECONDS, GcCandidate, GcReport,
     MAINTENANCE_CONTRACT_VERSION, MaintenanceError, PlatformStatus, PlatformSupport, ReleaseMatrix,
     RestoreReport, RetentionAction, RetentionPin, RetentionReport, Tombstone, now_unix_ms,
+};
+pub use diagnostics::{
+    BundleFile, MAX_CORRELATION_REFS, MAX_FIELD_CHARS, REDACTED, SupportBundle,
+    build_support_bundle, clip, is_secret_name, looks_like_a_secret, redact_field, redact_value,
+    reproducible_commands,
 };
 pub use migration::{
     MigrationOutcome, StoreCompatibility, check_store_compatibility, migrate_copy,

@@ -11,9 +11,9 @@ use std::sync::Arc;
 use clap::{Args, Subcommand};
 use harness_maintenance::{
     CapabilityStatus, CapabilitySupport, DEFAULT_GC_GRACE_SECONDS, PlatformStatus, PlatformSupport,
-    ReleaseMatrix, RetentionAction, check_store_compatibility, collect_garbage, create_backup,
-    forget_source, list_tombstones, migrate_copy, restore_backup, retention_summary, run_retention,
-    verify_backup,
+    ReleaseMatrix, RetentionAction, build_support_bundle, check_store_compatibility,
+    collect_garbage, create_backup, forget_source, list_tombstones, migrate_copy, restore_backup,
+    retention_summary, run_retention, verify_backup,
 };
 use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
 use harness_types::{ErrorCode, HarnessError, HostId};
@@ -120,9 +120,28 @@ enum MaintenanceSubcommand {
         #[arg(long)]
         json: bool,
     },
+    /// Write a bounded, redacted support bundle for a host you cannot reach.
+    ///
+    /// The bundle carries metadata, counts, schema revisions, configuration and
+    /// correlation references - never a credential, a raw transcript or an
+    /// environment value. Every redaction is counted in the manifest, so a reader
+    /// can see that it happened instead of trusting that it did.
+    SupportBundle {
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Directory to write the bundle into; must not already hold files.
+        #[arg(long)]
+        into: PathBuf,
+        /// Include the host's config file (redacted). Off by default.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Run one `ha maintenance` subcommand.
+#[allow(clippy::too_many_lines)] // One explicit subcommand table.
 pub async fn run(command: MaintenanceCommand) -> Result<(), HarnessError> {
     match command.command {
         MaintenanceSubcommand::Doctor { data_dir, json } => doctor(&data_dir, json).await,
@@ -221,7 +240,85 @@ pub async fn run(command: MaintenanceCommand) -> Result<(), HarnessError> {
             }
             Ok(())
         }
+        MaintenanceSubcommand::SupportBundle {
+            data_dir,
+            into,
+            config,
+            json,
+        } => support_bundle(&data_dir, &into, config.as_deref(), json).await,
     }
+}
+
+/// Write a support bundle and report exactly what was withheld.
+///
+/// The environment is passed as **names only**: `std::env::vars` would hand the
+/// bundle every value the host holds, and a bundle that carried them would be a
+/// credential export with a diagnostics label on it. The names are still useful -
+/// "is `DEEPSEEK_API_KEY` set at all" is a real diagnostic question - and the
+/// config is the one place where a value is carried, through redaction.
+async fn support_bundle(
+    data_dir: &PathBuf,
+    into: &PathBuf,
+    config: Option<&std::path::Path>,
+    json_output: bool,
+) -> Result<(), HarnessError> {
+    let environment = std::env::vars().collect::<Vec<_>>();
+    let config_value = match config {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).map_err(|error| {
+                HarnessError::new(
+                    ErrorCode::ConfigReadError,
+                    format!("cannot read {}: {error}", path.display()),
+                )
+            })?;
+            Some(
+                serde_json::from_str::<serde_json::Value>(&text)
+                    .unwrap_or_else(|_| serde_json::json!({ "unparsed_config_bytes": text.len() })),
+            )
+        }
+        None => None,
+    };
+    let bundle = build_support_bundle(data_dir, into, &environment, config_value.as_ref())
+        .await
+        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+    let output = json!({
+        "schema_version": 1,
+        "output_dir": bundle.output_dir,
+        "manifest_hash": bundle.manifest_hash,
+        "files": bundle.files.iter().map(|file| json!({
+            "name": file.name,
+            "byte_len": file.byte_len,
+            "content_hash": file.content_hash,
+        })).collect::<Vec<_>>(),
+        "redacted_fields": bundle.redacted_fields,
+        "carried": [
+            "platform and build identity",
+            "sqlite pragmas and schema revisions",
+            "session and delegated-task counts",
+            "retention summary",
+            "environment variable names",
+            "configuration, redacted",
+            "correlation references (ids and types, not payloads)",
+        ],
+        "excluded": [
+            "credentials and environment values",
+            "raw transcripts and message bodies",
+            "artifact bytes",
+            "provider requests and responses",
+        ],
+    });
+    if json_output {
+        println!("{output}");
+    } else {
+        println!(
+            "support bundle written to {} ({} file(s), {} redacted field(s))",
+            output["output_dir"].as_str().unwrap_or_default(),
+            output["files"].as_array().map_or(0, Vec::len),
+            output["redacted_fields"].as_array().map_or(0, Vec::len)
+        );
+        println!("manifest: {}", output["manifest_hash"]);
+    }
+    Ok(())
 }
 
 async fn doctor(data_dir: &PathBuf, json_output: bool) -> Result<(), HarnessError> {
