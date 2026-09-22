@@ -542,6 +542,95 @@
           "closure-M0"
         ]
       }
+    },
+    {
+      "id": "M6",
+      "title": "Skills, MCP và versioned extensions",
+      "runbook": "docs/implementation-next/M6.vi.md",
+      "prerequisites": ["M5"],
+      "status": "in_progress",
+      "integration_target": "milestone_m6",
+      "work_items": [
+        {
+          "id": "M6-01",
+          "title": "Local skills, catalogue metadata và activation pin",
+          "status": "implemented_unverified",
+          "tests": [
+            "m6_01_catalog_lists_metadata_without_reading_content",
+            "m6_01_a_hostile_skill_script_never_runs_during_a_scan",
+            "a22_skill_version"
+          ]
+        },
+        {
+          "id": "M6-02",
+          "title": "Kernel, process protocol, cancel và generation lease",
+          "status": "implemented_unverified",
+          "tests": [
+            "m6_02_cancel_is_bounded_and_a_crash_invalidates_handles",
+            "m6_02_scope_lease_and_partial_init_cleanup"
+          ]
+        },
+        {
+          "id": "M6-03",
+          "title": "MCP client adapter: tools/resources, schema validate, gate",
+          "status": "implemented_unverified",
+          "tests": [
+            "m6_03_mcp_schema_and_resource_provenance",
+            "a23_extension_bounds"
+          ]
+        },
+        {
+          "id": "M6-04",
+          "title": "Deferred schema promotion, revocation và config explain",
+          "status": "implemented_unverified",
+          "tests": [
+            "m6_04_promotion_is_bounded_and_revalidated",
+            "m6_04_unload_drains_or_rejects_inflight",
+            "m6_04_config_explain_reports_precedence_and_inactive_reasons",
+            "a24_catalog_revocation"
+          ]
+        }
+      ],
+      "required_tests": [
+        "m6_01_catalog_lists_metadata_without_reading_content",
+        "m6_01_a_hostile_skill_script_never_runs_during_a_scan",
+        "a22_skill_version",
+        "m6_02_cancel_is_bounded_and_a_crash_invalidates_handles",
+        "m6_02_scope_lease_and_partial_init_cleanup",
+        "m6_03_mcp_schema_and_resource_provenance",
+        "a23_extension_bounds",
+        "m6_04_promotion_is_bounded_and_revalidated",
+        "m6_04_unload_drains_or_rejects_inflight",
+        "m6_04_config_explain_reports_precedence_and_inactive_reasons",
+        "a24_catalog_revocation",
+        "m6_cli_reports_capability_matrix_and_catalog",
+        "m6_cli_catalog_and_config_explain"
+      ],
+      "unit_tests": [],
+      "fixtures": [
+        "crates/harness-cli/tests/milestone_m6.rs",
+        "crates/harness-cli/src/bin/m6_fixture_mcp_server.rs",
+        "crates/harness-cli/src/bin/p6_fixture_plugin.rs",
+        "crates/harness-extensions/fixtures/skills/observe-source.md"
+      ],
+      "gate": {
+        "script": "scripts/Verify-Milestone.ps1",
+        "dependency_check_bin": "dependency_check",
+        "steps": [
+          "format",
+          "clippy",
+          "workspace-tests",
+          "dependency-allowlist",
+          "required-test-discovery",
+          "required-tests",
+          "closure-M5",
+          "closure-M4",
+          "closure-M3",
+          "closure-M1",
+          "closure-M2",
+          "closure-M0"
+        ]
+      }
     }
   ],
   "acceptance_cases": [
@@ -732,9 +821,30 @@
       "selectors": ["milestone_m5::a21_rollback_effects"],
       "note": "the conversational head moves back to an earlier checkpoint while the file keeps the later edit: the report names the retained effect and says the filesystem was not restored, and the resume flags the workspace evidence as stale instead of presenting it as current"
     },
-    { "id": "A22", "owner_milestones": ["M6"], "planned_test": "a22_skill_version", "status": "planned" },
-    { "id": "A23", "owner_milestones": ["M6"], "planned_test": "a23_extension_bounds", "status": "planned" },
-    { "id": "A24", "owner_milestones": ["M6"], "planned_test": "a24_catalog_revocation", "status": "planned" },
+    {
+      "id": "A22",
+      "owner_milestones": ["M6"],
+      "planned_test": "a22_skill_version",
+      "status": "implemented",
+      "selectors": ["milestone_m6::a22_skill_version"],
+      "note": "listing a skill directory reads metadata only and executes nothing; activation pins version and digest, a file that changed between the listing and the activation is refused, a replay inside the same boundary serves the pinned bytes, a deleted file makes a fresh activation explicitly unavailable while the pin still replays, and a skill's requested tools never become authority"
+    },
+    {
+      "id": "A23",
+      "owner_milestones": ["M6"],
+      "planned_test": "a23_extension_bounds",
+      "status": "implemented",
+      "selectors": ["milestone_m6::a23_extension_bounds"],
+      "note": "a malformed tool catalogue fails discovery closed, an endless page walk is cut off by the page bound, a duplicate frame id and a 20000-frame protocol flood settle nothing but the fixture's own answer, a crash mid-call is uncertain and invalidates the handle, and a call the tool gate denied provably never reached the MCP server (the fixture's own call log stays empty) while an approved one reached it exactly once"
+    },
+    {
+      "id": "A24",
+      "owner_milestones": ["M6"],
+      "planned_test": "a24_catalog_revocation",
+      "status": "implemented",
+      "selectors": ["milestone_m6::a24_catalog_revocation"],
+      "note": "a listing exposes authorized names and metadata but never a schema; promotion is refused for an unauthorized caller and for a catalogue that moved since the search; a promoted definition is refused once the policy revision or the catalogue digest moves, so a revoked capability has no effect from the old schema, and the next request names the new catalogue revision"
+    },
     { "id": "A25", "owner_milestones": ["M7"], "planned_test": "a25_memory_job_cas", "status": "planned" },
     { "id": "A26", "owner_milestones": ["M7"], "planned_test": "a26_memory_provenance", "status": "planned" },
     { "id": "A27", "owner_milestones": ["M8"], "planned_test": "a27_child_capacity_budget", "status": "planned" },

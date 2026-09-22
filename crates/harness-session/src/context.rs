@@ -16,6 +16,8 @@ pub enum ContextBlockKind {
     RecentTail,
     Memory,
     Optional,
+    /// Text authored in a local skill the user explicitly activated.
+    Skill,
 }
 
 /// Where a block came from, and therefore what it is allowed to be.
@@ -36,6 +38,9 @@ pub enum ContextChannel {
     Memory,
     Reference,
     Note,
+    /// An activated local skill. The activation is the user's act, so the text
+    /// may be mandatory; what the skill *requests* is still only a proposal.
+    Skill,
 }
 
 impl ContextChannel {
@@ -50,6 +55,7 @@ impl ContextChannel {
             ContextBlockKind::RecentTail => Self::Tail,
             ContextBlockKind::Memory => Self::Memory,
             ContextBlockKind::Optional => Self::Reference,
+            ContextBlockKind::Skill => Self::Skill,
         }
     }
 
@@ -65,6 +71,7 @@ impl ContextChannel {
             Self::Memory => "memory",
             Self::Reference => "reference",
             Self::Note => "note",
+            Self::Skill => "skill",
         }
     }
 
@@ -75,6 +82,12 @@ impl ContextChannel {
     /// *derived* — a note, a retrieved memory, an optional reference — may be
     /// read, never obeyed: a note whose text claims new powers must not reach
     /// the model wearing the host's authority.
+    ///
+    /// A skill is not derived: it is an authored document the user activated by
+    /// name, which is why it sits with project rules rather than with notes.
+    /// Being mandatory here only means the text is *sent*; it never means the
+    /// skill may do anything, because tool and secret requests still have to
+    /// pass the tool gate on every proposal.
     #[must_use]
     pub const fn may_be_mandatory(self) -> bool {
         matches!(
@@ -85,6 +98,7 @@ impl ContextChannel {
                 | Self::State
                 | Self::Tail
                 | Self::Summary
+                | Self::Skill
         )
     }
 
@@ -93,7 +107,7 @@ impl ContextChannel {
     pub const fn default_authority(self) -> SourceAuthority {
         match self {
             Self::Policy | Self::ProjectRule => SourceAuthority::HostPolicy,
-            Self::Instruction => SourceAuthority::User,
+            Self::Instruction | Self::Skill => SourceAuthority::User,
             Self::State | Self::Tail | Self::Memory => SourceAuthority::RuntimeObserved,
             Self::Summary | Self::Note | Self::Reference => SourceAuthority::ModelProposed,
         }
@@ -318,14 +332,92 @@ impl ContextError {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ContextBuilder;
 
+/// What a contributor is allowed to know about the run it contributes to.
+///
+/// It is deliberately a read-only view: a contributor receives identity and
+/// revisions, never a store handle, a transaction or a mutable packet. A
+/// contributor that cannot reach the packet cannot inject into a frozen step.
+pub struct ContributorScope<'a> {
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    /// The event sequence the packet will be frozen at.
+    pub source_revision: u64,
+    pub config_revision: u64,
+    /// Workspace root, when the caller knows it. Contributors must not read
+    /// outside it, and a contributor that needs no filesystem gets `None`.
+    pub workspace_root: Option<&'a std::path::Path>,
+}
+
+/// A read-only producer of proposed context blocks.
+///
+/// The port exists so M6/M7/M8 can add sources — skills, memory, child results —
+/// without any of them owning the compiler. Everything a contributor returns
+/// goes through the same admission the caller's own blocks do, which is what
+/// keeps a contributor from widening its own authority:
+///
+/// * a block on a channel that cannot be mandatory is forced optional;
+/// * a block that is superseded is dropped;
+/// * the surviving blocks are hashed into the frozen manifest's channel digest.
+pub trait ContextContributor: Send + Sync {
+    /// Stable identity, used in diagnostics and in the contribution report.
+    fn contributor_id(&self) -> &str;
+
+    /// Propose blocks for one compilation.
+    ///
+    /// `token_limit` is the budget this contributor may spend; returning more
+    /// than the budget is not an error, the compiler ranks and drops the
+    /// overflow like any other optional block. A contributor that cannot read
+    /// its source must say so with a typed error rather than return an empty
+    /// vector, because "no content" and "content unavailable" are different
+    /// facts for the packet's provenance.
+    fn collect(
+        &self,
+        scope: &ContributorScope<'_>,
+        token_limit: u64,
+    ) -> Result<Vec<ContextBlock>, ContextError>;
+}
+
 impl ContextBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Compile a packet with no contributors. Kept as the default entry point so
+    /// callers that have no extra sources do not carry the port.
     pub fn build(&self, request: ContextBuildRequest) -> Result<ContextBuildResult, ContextError> {
+        self.build_with_contributors(request, &[])
+    }
+
+    /// Compile a packet, letting each contributor propose optional blocks.
+    ///
+    /// A contributor failure is a typed compile failure: a source that is
+    /// supposed to be present but cannot be read must not silently compile into
+    /// a packet that looks complete.
+    pub fn build_with_contributors(
+        &self,
+        request: ContextBuildRequest,
+        contributors: &[std::sync::Arc<dyn ContextContributor>],
+    ) -> Result<ContextBuildResult, ContextError> {
+        let mut request = request;
+        if !contributors.is_empty() {
+            let scope = ContributorScope {
+                session_id: request.session_id.clone(),
+                task_id: request.task_id.clone(),
+                source_revision: request.through_event_seq,
+                config_revision: request.manifest.config_revision,
+                workspace_root: None,
+            };
+            for contributor in contributors {
+                let proposed = contributor.collect(&scope, request.optional_token_budget)?;
+                request.optional_blocks.extend(proposed);
+            }
+        }
+        Self::build_inner(request)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn build_inner(request: ContextBuildRequest) -> Result<ContextBuildResult, ContextError> {
         if request.context_window_tokens
             <= request
                 .output_reservation_tokens
@@ -548,6 +640,9 @@ impl ContextBlock {
         match self.channel {
             ContextChannel::Summary => "earlier context summary".to_owned(),
             ContextChannel::Note => format!("note {}", self.id),
+            // A skill block names the skill and the version it was pinned at, so
+            // the model can tell an activated document from the user's own words.
+            ContextChannel::Skill => format!("activated skill {}", self.id),
             _ => match self.kind {
                 ContextBlockKind::SystemPolicy => "system policy".to_owned(),
                 ContextBlockKind::Instruction => "user instruction".to_owned(),
@@ -556,6 +651,7 @@ impl ContextBlock {
                 ContextBlockKind::ProjectRule => format!("project rule {}", self.id),
                 ContextBlockKind::Memory => format!("memory {}", self.id),
                 ContextBlockKind::Optional => format!("reference {}", self.id),
+                ContextBlockKind::Skill => format!("activated skill {}", self.id),
             },
         }
     }

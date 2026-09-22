@@ -9,7 +9,8 @@
 //! - `P6_FIXTURE_MODE`: `normal` (default) | `malformed_frame` | `oversize_frame`
 //!   | `duplicate_id` | `flood_stderr` | `ignore_cancel` | `bad_protocol` |
 //!   `unknown_capability` | `denied_host_method` | `exit_before_handshake`
-//!   | `crash_after_effect` | `noisy_stderr`
+//!   | `crash_after_effect` | `noisy_stderr` | `honour_cancel`
+//!   | `crash_mid_call` | `flood_stdout` | `malformed_after_handshake`
 //! - `P6_FIXTURE_SECRET`: if set, the plugin echoes only whether the variable
 //!   exists, never its value. It exists to prove the host does not leak one.
 
@@ -33,6 +34,9 @@ fn main() {
     }
 
     let mut handshake_done = false;
+    // Call ids this fixture has deliberately left unanswered so a later cancel
+    // can settle them.
+    let mut parked: Vec<String> = Vec::new();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -53,6 +57,29 @@ fn main() {
             .and_then(|value| value.as_str())
             .unwrap_or("")
             .to_owned();
+        let kind = frame
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .unwrap_or("message")
+            .to_owned();
+
+        // A host cancel is answered only when this fixture is told to honour it;
+        // otherwise the fixture keeps working, which is what the host's grace
+        // window and process-tree termination exist for.
+        if kind == "cancel" {
+            if mode == "honour_cancel" && parked.iter().any(|parked| parked == &id) {
+                parked.retain(|parked| parked != &id);
+                let reply = serde_json::json!({
+                    "protocol_version": 1,
+                    "id": id,
+                    "kind": "error",
+                    "payload": {"code": "canceled", "message": "fixture stopped on request"},
+                });
+                let _ = writeln!(stdout, "{reply}");
+                let _ = stdout.flush();
+            }
+            continue;
+        }
 
         if method == "handshake" {
             if mode == "crash_after_effect" && std::env::var("P6_FIXTURE_CRASH_FIRST").is_ok() {
@@ -132,6 +159,62 @@ fn main() {
         if mode == "ignore_cancel" {
             // Never answer: the host must expire the deadline and terminate us.
             std::thread::sleep(std::time::Duration::from_secs(30));
+            continue;
+        }
+
+        if mode == "honour_cancel" {
+            // Park the call instead of answering it. A later cancel for this id
+            // is what settles it, which is exactly the contract under test.
+            parked.push(id);
+            continue;
+        }
+
+        if mode == "malformed_after_handshake" {
+            // Handshake succeeded, then the protocol channel goes bad. The host
+            // must drop the garbage framed as data and still bound the call.
+            let _ = writeln!(stdout, "{{ this is not json");
+            let _ = writeln!(stdout, "{{\"protocol_version\":1,\"id\":\"{id}\"");
+            let _ = stdout.flush();
+            let reply = serde_json::json!({
+                "protocol_version": 1,
+                "id": id,
+                "kind": "response",
+                "payload": {"survived": "malformed_after_handshake"},
+            });
+            let _ = writeln!(stdout, "{reply}");
+            let _ = stdout.flush();
+            continue;
+        }
+
+        if mode == "crash_mid_call" {
+            // Die without answering: every pending call must settle as
+            // uncertain, and the handle must be invalid afterwards.
+            std::process::exit(11);
+        }
+
+        if mode == "flood_stdout" {
+            // Flood the protocol channel with frames the host never asked for.
+            // The host must drop them without growing a buffer and without
+            // settling anything.
+            for index in 0..20_000 {
+                let filler = "f".repeat(64);
+                let noise = serde_json::json!({
+                    "protocol_version": 1,
+                    "id": format!("flood-{index}"),
+                    "kind": "response",
+                    "payload": {"filler": filler},
+                });
+                let _ = writeln!(stdout, "{noise}");
+            }
+            let _ = stdout.flush();
+            let reply = serde_json::json!({
+                "protocol_version": 1,
+                "id": id,
+                "kind": "response",
+                "payload": {"survived": "flood"},
+            });
+            let _ = writeln!(stdout, "{reply}");
+            let _ = stdout.flush();
             continue;
         }
 

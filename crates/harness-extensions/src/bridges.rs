@@ -86,6 +86,10 @@ impl ExternalToolDispatcher for ExtensionToolDispatcher {
                     ErrorCode::PolicyDenied,
                     format!("extension {plugin_id} refused {tool_name}: {code}: {message}"),
                 )),
+                CallOutcome::Canceled { reason } => Err(HarnessError::new(
+                    ErrorCode::ProcessCanceled,
+                    format!("extension {plugin_id} cancelled {tool_name}: {reason}"),
+                )),
                 CallOutcome::Uncertain { reason } => {
                     Err(HarnessError::new(ErrorCode::ProcessOutcomeUnknown, reason))
                 }
@@ -237,7 +241,10 @@ impl ModelProvider for ExtensionProvider {
                     ErrorCode::ProviderProtocol,
                     format!("extension provider failed: {code}: {message}"),
                 )),
-                CallOutcome::Uncertain { reason } => {
+                // A cancelled stream and an unsettled one are the same fact for
+                // a provider caller: no usable answer arrived, and a retry is a
+                // new attempt rather than a resumed one.
+                CallOutcome::Canceled { reason } | CallOutcome::Uncertain { reason } => {
                     Err(ProviderError::new(ErrorCode::ProviderCanceled, reason))
                 }
             }

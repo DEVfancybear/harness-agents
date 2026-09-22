@@ -17,7 +17,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -34,9 +34,10 @@ use tokio::{
 };
 
 use crate::contracts::{
-    DEFAULT_CALL_TIMEOUT_MS, ENVIRONMENT_ALLOWLIST, ExtensionError, ExtensionFrame,
-    ExtensionHandshake, ExtensionManifest, FrameKind, HANDSHAKE_TIMEOUT_MS, HostHandshakeOffer,
-    MAX_FRAME_BYTES, MAX_INFLIGHT_CALLS, MAX_STDERR_BYTES, NegotiatedSession, TrustGrant,
+    CANCEL_GRACE_MS, DEFAULT_CALL_TIMEOUT_MS, ENVIRONMENT_ALLOWLIST, ExtensionError,
+    ExtensionFrame, ExtensionHandshake, ExtensionManifest, FrameKind, HANDSHAKE_TIMEOUT_MS,
+    HostHandshakeOffer, MAX_FRAME_BYTES, MAX_INFLIGHT_CALLS, MAX_STDERR_BYTES, NegotiatedSession,
+    TrustGrant,
 };
 
 #[cfg(windows)]
@@ -55,6 +56,9 @@ pub enum CallOutcome {
     Answered { payload: Value },
     /// The plugin reported a protocol-level error.
     PluginError { code: String, message: String },
+    /// The plugin acknowledged a host cancel instead of completing the work.
+    /// The side effect did not happen, and the caller must not retry blind.
+    Canceled { reason: String },
     /// The call crossed a side-effect boundary without a settled answer.
     Uncertain { reason: String },
 }
@@ -64,7 +68,7 @@ impl CallOutcome {
     pub fn answered(&self) -> Option<&Value> {
         match self {
             Self::Answered { payload } => Some(payload),
-            Self::PluginError { .. } | Self::Uncertain { .. } => None,
+            Self::PluginError { .. } | Self::Canceled { .. } | Self::Uncertain { .. } => None,
         }
     }
 
@@ -72,6 +76,20 @@ impl CallOutcome {
     pub fn is_uncertain(&self) -> bool {
         matches!(self, Self::Uncertain { .. })
     }
+}
+
+/// What happened to a cancel request.
+///
+/// The host promises it *sent* the cancel and that it stopped waiting at a
+/// bound. It cannot promise the plugin obeyed, so the two outcomes are named
+/// separately rather than folded into one success.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancelOutcome {
+    /// The plugin settled the call inside the grace window.
+    Acknowledged,
+    /// The plugin did not settle in time; its process tree was terminated and
+    /// the in-flight call is uncertain.
+    Ignored,
 }
 
 /// Host methods a plugin may call back into. Only an allowlisted method can
@@ -124,6 +142,10 @@ pub struct ExtensionTransport {
     inflight: Arc<AtomicU64>,
     stderr_tail: Arc<Mutex<String>>,
     host: Arc<dyn HostMethodHandler>,
+    /// Set once the process tree is gone. A handle that outlives its process
+    /// must fail typed rather than write into a closed pipe and call the result
+    /// a transport error.
+    dead: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for ExtensionTransport {
@@ -249,8 +271,9 @@ impl ExtensionTransport {
             inflight: Arc::new(AtomicU64::new(0)),
             stderr_tail: Arc::clone(&stderr_tail),
             host: Arc::clone(&host),
+            dead: Arc::new(AtomicBool::new(false)),
         };
-        transport.spawn_stdout_reader(stdout, Arc::clone(&pending));
+        transport.spawn_stdout_reader(stdout, Arc::clone(&pending), Arc::clone(&transport.dead));
         Self::spawn_stderr_reader(stderr, stderr_tail);
 
         let offer = HostHandshakeOffer::default();
@@ -276,6 +299,13 @@ impl ExtensionTransport {
                 return Err(ExtensionError::new(
                     ErrorCode::ExtensionProtocolUnsupported,
                     format!("plugin refused the handshake: {code}: {message}"),
+                ));
+            }
+            CallOutcome::Canceled { reason } => {
+                transport.shutdown().await;
+                return Err(ExtensionError::new(
+                    ErrorCode::ExtensionProtocolError,
+                    format!("plugin cancelled the handshake: {reason}"),
                 ));
             }
             CallOutcome::Uncertain { reason } => {
@@ -304,7 +334,12 @@ impl ExtensionTransport {
         Ok(transport)
     }
 
-    fn spawn_stdout_reader(&self, stdout: tokio::process::ChildStdout, pending: PendingMap) {
+    fn spawn_stdout_reader(
+        &self,
+        stdout: tokio::process::ChildStdout,
+        pending: PendingMap,
+        dead: Arc<AtomicBool>,
+    ) {
         let host = Arc::clone(&self.host);
         let writer = Arc::clone(&self.writer);
         tokio::spawn(async move {
@@ -346,7 +381,7 @@ impl ExtensionTransport {
                             let _ = writer.flush().await;
                         }
                     }
-                    FrameKind::Response | FrameKind::Error => {
+                    FrameKind::Response | FrameKind::Error | FrameKind::Cancel => {
                         let sender = pending
                             .lock()
                             .ok()
@@ -360,26 +395,43 @@ impl ExtensionTransport {
                             FrameKind::Response => CallOutcome::Answered {
                                 payload: frame.payload,
                             },
-                            _ => CallOutcome::PluginError {
-                                code: frame
+                            FrameKind::Cancel => CallOutcome::Canceled {
+                                reason: "the plugin acknowledged the cancel".to_owned(),
+                            },
+                            _ => {
+                                let code = frame
                                     .payload
                                     .get("code")
                                     .and_then(Value::as_str)
-                                    .unwrap_or("extension_error")
-                                    .to_owned(),
-                                message: frame
+                                    .unwrap_or("extension_error");
+                                let message = frame
                                     .payload
                                     .get("message")
                                     .and_then(Value::as_str)
                                     .unwrap_or("plugin reported an error")
-                                    .to_owned(),
-                            },
+                                    .to_owned();
+                                // A plugin that honours a cancel says so with a
+                                // cancelled error code; that is a settled
+                                // "did not happen", not a failure.
+                                if code == "canceled" || code == "cancelled" {
+                                    CallOutcome::Canceled { reason: message }
+                                } else {
+                                    CallOutcome::PluginError {
+                                        code: code.to_owned(),
+                                        message,
+                                    }
+                                }
+                            }
                         };
                         let _ = sender.send(outcome);
                     }
                 }
             }
-            // EOF: every pending call becomes uncertain, never a success.
+            // EOF: the plugin's protocol channel closed, which means the process
+            // is gone whether it exited cleanly or crashed. Every pending call
+            // becomes uncertain, and the handle is marked dead so nothing tries
+            // to write into a closed pipe afterwards.
+            dead.store(true, Ordering::Release);
             if let Ok(mut map) = pending.lock() {
                 for (_, sender) in map.drain() {
                     let _ = sender.send(CallOutcome::Uncertain {
@@ -460,6 +512,29 @@ impl ExtensionTransport {
         payload: Value,
         deadline_ms: u64,
     ) -> Result<CallOutcome, ExtensionError> {
+        let id = format!("call-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+        self.call_with_id(&id, method, payload, deadline_ms).await
+    }
+
+    /// Send one request under a caller-chosen id.
+    ///
+    /// The host owns invocation identity, so a caller that already has one — a
+    /// tool invocation id, say — uses it here. That is also what makes a call
+    /// cancellable: the caller knows the id before the call settles and can hand
+    /// it to [`Self::cancel_call`] from another task.
+    pub async fn call_with_id(
+        &self,
+        id: &str,
+        method: &str,
+        payload: Value,
+        deadline_ms: u64,
+    ) -> Result<CallOutcome, ExtensionError> {
+        if id.trim().is_empty() {
+            return Err(ExtensionError::new(
+                ErrorCode::InvalidPayload,
+                "an extension call requires a non-empty id",
+            ));
+        }
         let previous = self.inflight.fetch_add(1, Ordering::SeqCst);
         if previous >= MAX_INFLIGHT_CALLS as u64 {
             self.inflight.fetch_sub(1, Ordering::SeqCst);
@@ -468,7 +543,9 @@ impl ExtensionTransport {
                 format!("the extension already has {MAX_INFLIGHT_CALLS} calls in flight"),
             ));
         }
-        let result = self.call_inner(method, payload, deadline_ms).await;
+        let result = self
+            .call_inner(method, payload, deadline_ms, id.to_owned())
+            .await;
         self.inflight.fetch_sub(1, Ordering::SeqCst);
         result
     }
@@ -478,8 +555,9 @@ impl ExtensionTransport {
         method: &str,
         payload: Value,
         deadline_ms: u64,
+        id: String,
     ) -> Result<CallOutcome, ExtensionError> {
-        let id = format!("call-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+        self.require_alive()?;
         let bytes = ExtensionFrame::message(id.clone(), method, payload).encode_line()?;
         let (sender, receiver) = oneshot::channel();
         {
@@ -526,9 +604,76 @@ impl ExtensionTransport {
         }
     }
 
+    /// Whether the plugin process tree is still there.
+    ///
+    /// A handle whose process is gone stays invalid for its whole lifetime: a
+    /// later call fails typed instead of appearing to succeed. That is what
+    /// makes a crashed plugin visible to every holder of the handle at once.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        !self.dead.load(Ordering::Acquire)
+    }
+
+    fn require_alive(&self) -> Result<(), ExtensionError> {
+        if self.dead.load(Ordering::Acquire) {
+            return Err(ExtensionError::new(
+                ErrorCode::ServiceUnavailable,
+                format!(
+                    "extension {} generation {} is no longer running; this handle is invalid",
+                    self.session.plugin_id, self.generation
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Ask the plugin to stop one in-flight call, bounded by a grace window.
+    ///
+    /// A plugin that answers in time settles the call; one that does not has its
+    /// process tree terminated, which settles every pending call as uncertain.
+    /// Either way this returns inside `grace_ms`, so an ignored cancel cannot
+    /// become a hung host.
+    pub async fn cancel_call(
+        &self,
+        call_id: &str,
+        grace_ms: u64,
+    ) -> Result<CancelOutcome, ExtensionError> {
+        self.require_alive()?;
+        let bytes = ExtensionFrame::cancel(call_id).encode_line()?;
+        {
+            let mut writer = self.writer.lock().await;
+            if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
+                // The pipe is already gone: the process is dead either way.
+                self.terminate_process_tree().await;
+                return Ok(CancelOutcome::Ignored);
+            }
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
+        loop {
+            let still_pending = self
+                .pending
+                .lock()
+                .is_ok_and(|pending| pending.contains_key(call_id));
+            if !still_pending {
+                return Ok(CancelOutcome::Acknowledged);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                self.terminate_process_tree().await;
+                return Ok(CancelOutcome::Ignored);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Cancel with the default grace window.
+    pub async fn cancel(&self, call_id: &str) -> Result<CancelOutcome, ExtensionError> {
+        self.cancel_call(call_id, CANCEL_GRACE_MS).await
+    }
+
     /// Terminate the plugin and every descendant, then settle pending calls as
     /// uncertain.
     pub async fn terminate_process_tree(&self) {
+        self.dead.store(true, Ordering::Release);
         let child = {
             let mut slot = self.child.lock().await;
             slot.take()

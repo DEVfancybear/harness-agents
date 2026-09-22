@@ -12,13 +12,14 @@ use std::{
 
 use harness_kernel::{KernelError, ManagedResource, RegistrationToken, ScopedRegistry};
 use harness_types::{ErrorCode, PluginInstanceId, ScopeId};
+use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::contracts::{
     CapabilityOffer, ExtensionCapability, ExtensionError, ExtensionInventoryEntry,
     ExtensionManifest, InactiveReason, NegotiatedSession, RestartPolicy, TrustGrant,
 };
-use crate::transport::{EnvironmentOverrides, ExtensionTransport};
+use crate::transport::{CallOutcome, EnvironmentOverrides, ExtensionTransport};
 
 /// The result of asking the host to load one extension.
 #[derive(Clone, Debug, PartialEq)]
@@ -303,6 +304,86 @@ impl ExtensionRuntime {
             .and_then(|slot| slot.transport.clone())
     }
 
+    /// The generation currently live for one plugin id, if any.
+    pub async fn live_generation(&self, plugin_id: &str) -> Option<u64> {
+        self.slots
+            .lock()
+            .await
+            .get(plugin_id)
+            .filter(|slot| slot.transport.is_some())
+            .map(|slot| slot.generation)
+    }
+
+    /// Take a generation-bound lease on one active extension.
+    ///
+    /// A lease is the only way a consumer reaches a plugin process through the
+    /// host, and it is bound to the exact generation it was taken from. After an
+    /// unload or a reload the lease is refused, so a consumer that cached one
+    /// cannot dispatch into a process that is gone or into its replacement.
+    pub async fn lease(self: &Arc<Self>, plugin_id: &str) -> Option<ExtensionLease> {
+        let slots = self.slots.lock().await;
+        let slot = slots.get(plugin_id)?;
+        let transport = slot.transport.clone()?;
+        Some(ExtensionLease {
+            runtime: Arc::clone(self),
+            plugin_id: slot.plugin_id.clone(),
+            instance_id: transport.instance_id().clone(),
+            scope_id: self.scope_id.clone(),
+            generation: slot.generation,
+            transport,
+        })
+    }
+
+    /// Unload one extension, giving in-flight calls a bounded chance to settle.
+    ///
+    /// The slot is removed first, so no new lease or call can be taken while the
+    /// drain runs. Calls still pending at the deadline are terminated and
+    /// reported as uncertain — an unload never silently drops work that had
+    /// already crossed the process boundary.
+    pub async fn unload_draining(&self, plugin_id: &str, drain_ms: u64) -> UnloadReport {
+        let slot = self.slots.lock().await.remove(plugin_id);
+        let Some(slot) = slot else {
+            return UnloadReport {
+                plugin_id: plugin_id.to_owned(),
+                generation: 0,
+                inflight: 0,
+                drained: true,
+                uncertain: 0,
+            };
+        };
+        {
+            let mut registry = self.registry.lock().await;
+            for token in &slot.tokens {
+                registry.undo(token);
+            }
+        }
+        let Some(transport) = slot.transport else {
+            return UnloadReport {
+                plugin_id: slot.plugin_id,
+                generation: slot.generation,
+                inflight: 0,
+                drained: true,
+                uncertain: 0,
+            };
+        };
+        let inflight = transport.inflight();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(drain_ms);
+        while transport.inflight() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let still_pending = transport.inflight();
+        // Termination settles anything left as uncertain rather than leaving a
+        // caller waiting on a process that no longer exists.
+        transport.shutdown().await;
+        UnloadReport {
+            plugin_id: slot.plugin_id,
+            generation: slot.generation,
+            inflight,
+            drained: still_pending == 0,
+            uncertain: still_pending,
+        }
+    }
+
     /// The negotiated session for one active extension.
     pub async fn session(&self, plugin_id: &str) -> Option<NegotiatedSession> {
         self.transport(plugin_id)
@@ -456,6 +537,125 @@ impl ManagedResource for ExtensionRuntime {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), KernelError>> + Send + 'a>>
     {
         Box::pin(async move { Ok(()) })
+    }
+}
+
+/// What one unload did to the work that was already in flight.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnloadReport {
+    pub plugin_id: String,
+    pub generation: u64,
+    /// Calls that were in flight when the unload started.
+    pub inflight: u64,
+    /// Whether every in-flight call settled inside the drain window.
+    pub drained: bool,
+    /// Calls terminated before they settled. Their outcome is uncertain and the
+    /// caller must reconcile rather than retry.
+    pub uncertain: u64,
+}
+
+impl UnloadReport {
+    /// Whether the unload had to cut anything short.
+    #[must_use]
+    pub const fn cut_short(&self) -> bool {
+        !self.drained
+    }
+}
+
+/// A generation-bound handle on one live extension.
+///
+/// Holding a lease is not authority: it says *which process* a call would reach,
+/// never whether the call is allowed. Every tool call still crosses the M4 gate,
+/// and the lease only guarantees that a stale handle cannot reach a replacement
+/// process.
+#[derive(Clone)]
+pub struct ExtensionLease {
+    runtime: Arc<ExtensionRuntime>,
+    plugin_id: String,
+    instance_id: PluginInstanceId,
+    scope_id: ScopeId,
+    generation: u64,
+    transport: Arc<ExtensionTransport>,
+}
+
+impl std::fmt::Debug for ExtensionLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExtensionLease")
+            .field("plugin_id", &self.plugin_id)
+            .field("generation", &self.generation)
+            .field("alive", &self.transport.is_alive())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExtensionLease {
+    #[must_use]
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    #[must_use]
+    pub const fn instance_id(&self) -> &PluginInstanceId {
+        &self.instance_id
+    }
+
+    #[must_use]
+    pub const fn scope_id(&self) -> &ScopeId {
+        &self.scope_id
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub fn transport(&self) -> &Arc<ExtensionTransport> {
+        &self.transport
+    }
+
+    /// Whether this lease still points at the live generation.
+    pub async fn is_valid(&self) -> bool {
+        self.transport.is_alive()
+            && self.runtime.live_generation(&self.plugin_id).await == Some(self.generation)
+    }
+
+    /// Dispatch one call under this lease.
+    ///
+    /// Both the generation and the process are re-checked here, so a lease taken
+    /// before a reload fails typed instead of reaching the new process with the
+    /// old caller's intent.
+    pub async fn call(
+        &self,
+        method: &str,
+        payload: Value,
+        deadline_ms: u64,
+    ) -> Result<CallOutcome, ExtensionError> {
+        let id = format!("{}:{}", self.instance_id, self.transport.inflight());
+        self.call_with_id(&id, method, payload, deadline_ms).await
+    }
+
+    /// Dispatch one call under a caller-chosen id, so the caller can cancel it.
+    pub async fn call_with_id(
+        &self,
+        id: &str,
+        method: &str,
+        payload: Value,
+        deadline_ms: u64,
+    ) -> Result<CallOutcome, ExtensionError> {
+        if !self.is_valid().await {
+            return Err(ExtensionError::new(
+                ErrorCode::ServiceUnavailable,
+                format!(
+                    "extension {} generation {} is no longer live; this lease is stale",
+                    self.plugin_id, self.generation
+                ),
+            ));
+        }
+        self.transport
+            .call_with_id(id, method, payload, deadline_ms)
+            .await
     }
 }
 

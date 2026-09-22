@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 harness-kernel = { path = "../harness-kernel" }
 harness-providers = { path = "../harness-providers" }
+harness-session = { path = "../harness-session" }
 harness-tools = { path = "../harness-tools" }
 harness-types = { path = "../harness-types" }
 process-wrap.workspace = true

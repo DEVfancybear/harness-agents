@@ -1107,6 +1107,7 @@ version = "0.1.0"
 dependencies = [
  "harness-kernel",
  "harness-providers",
+ "harness-session",
  "harness-tools",
  "harness-types",
  "process-wrap",

@@ -33,6 +33,14 @@ pub const HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
 /// Default per-call deadline before process-tree termination.
 pub const DEFAULT_CALL_TIMEOUT_MS: u64 = 30_000;
 
+/// How long a plugin has to acknowledge a cancel before the host stops waiting.
+///
+/// Cancellation of an external process is best effort: the host can send the
+/// frame and it can terminate the tree, but it cannot make foreign code stop.
+/// This bound is what turns "ignored the cancel" into a settled, typed outcome
+/// instead of a hung call.
+pub const CANCEL_GRACE_MS: u64 = 2_000;
+
 /// Bounds one skill document read at admission.
 pub const MAX_SKILL_BYTES: usize = 256 * 1024;
 
@@ -518,13 +526,20 @@ pub struct ExtensionFrame {
     pub payload: Value,
 }
 
-/// The three legal frame shapes.
+/// The four legal frame shapes.
+///
+/// `Cancel` is additive to the versioned protocol: a host sends it for an
+/// in-flight call id, and a peer that does not understand it rejects the frame
+/// through the same unknown-shape path as any other malformed frame. The
+/// protocol version is therefore unchanged — bumping it would refuse every
+/// plugin that works today for no gain.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameKind {
     Message,
     Response,
     Error,
+    Cancel,
 }
 
 impl ExtensionFrame {
@@ -562,6 +577,19 @@ impl ExtensionFrame {
             kind: FrameKind::Error,
             method: None,
             payload: serde_json::json!({"code": code.into(), "message": message.into()}),
+        }
+    }
+
+    /// A cancel for one in-flight call id. It carries no payload: the id is the
+    /// whole request, so a cancel can never be confused with work.
+    #[must_use]
+    pub fn cancel(id: impl Into<String>) -> Self {
+        Self {
+            protocol_version: EXTENSION_PROTOCOL_VERSION,
+            id: id.into(),
+            kind: FrameKind::Cancel,
+            method: None,
+            payload: Value::Null,
         }
     }
 
