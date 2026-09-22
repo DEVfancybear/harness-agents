@@ -36,7 +36,7 @@ pub const DATA_DIRECTORY_KIND: &str = "harness-data";
 /// version 2 database instead of silently dropping the new records.
 /// 3 adds the M11 durable schedule and occurrence tables. The change is
 /// additive, so a version 2 database upgrades in place.
-pub const RUNTIME_SCHEMA_VERSION: i64 = 3;
+pub const RUNTIME_SCHEMA_VERSION: i64 = 4;
 /// Additive P3 tool tables. 2 adds the M4 approval scope (session/task/
 /// invocation/call correlation) and the provider call id on intents; both are
 /// additive columns so a version 1 database upgrades in place.

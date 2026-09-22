@@ -115,3 +115,10 @@ path = "src/bin/dependency_check.rs"
 [[bin]]
 name = "m0_fixture_host"
 path = "src/bin/m0_fixture_host.rs"
+
+# M11-03 fixture: a real MCP server that declares the SEP-2663 tasks extension,
+# so the external-task driver negotiates task handles over the wire rather than
+# being handed one by a stub.
+[[bin]]
+name = "m11_fixture_task_server"
+path = "src/bin/m11_fixture_task_server.rs"

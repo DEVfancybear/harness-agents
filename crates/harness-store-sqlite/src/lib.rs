@@ -31,6 +31,10 @@ pub use models::{
 };
 pub use store::SqliteStore;
 pub use store::delegation::TaskAdmission;
+pub use store::external_jobs::{
+    EXTERNAL_JOB_STATES, EXTERNAL_JOB_TERMINAL_STATES, ExternalJobSettlement,
+    RecoveredExternalJobs, StoredExternalJob, StoredExternalJobPoll, external_job_delivery_id,
+};
 pub use store::history::{
     HISTORY_READ_DEFAULT_BYTES, HISTORY_READ_MAX_BYTES, HISTORY_SOURCE_LIMIT_BYTES, HistoryHit,
     HistoryPage, HistoryScope, HistorySource, NOTE_CONTENT_LIMIT_BYTES, NOTE_KEY_LIMIT_CHARS,

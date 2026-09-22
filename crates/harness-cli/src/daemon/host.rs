@@ -34,7 +34,8 @@ use tokio::{
 };
 
 use crate::daemon::{
-    Clock, MisfirePolicy, ScheduleSpec, ScheduleState, SystemClock, due_now, occurrence_key,
+    Clock, ExternalTaskRunner, MisfirePolicy, ScheduleSpec, ScheduleState, SystemClock,
+    TaskRemoteResolver, due_now, occurrence_key,
 };
 
 /// The file the running daemon records its control endpoint in.
@@ -362,6 +363,7 @@ pub async fn start(
         stopping: Arc::clone(&stopping),
         occurrences_launched: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         drained: Vec::new(),
+        external: None,
     };
     Ok((host, runner))
 }
@@ -377,6 +379,10 @@ pub struct DaemonRunner {
     stopping: Arc<AtomicBool>,
     occurrences_launched: Arc<std::sync::atomic::AtomicU64>,
     drained: Vec<String>,
+    /// The external-task worker, when this daemon was given transports to reach
+    /// remote servers with. Without it, external jobs stay exactly as durable as
+    /// they were: recorded, and waiting.
+    external: Option<Arc<ExternalTaskRunner>>,
 }
 
 /// One schedule evaluation, as the loop sees it.
@@ -389,6 +395,25 @@ pub struct LaunchedOccurrence {
 }
 
 impl DaemonRunner {
+    /// Give this daemon the transports it needs to drive external jobs.
+    ///
+    /// The runner is built from the daemon's own store and clock, so external
+    /// work shares the writer fence and the injected time of everything else
+    /// here. Returns the worker, which is also how a caller submits, cancels or
+    /// reconciles a job outside the loop.
+    pub fn attach_external_tasks(
+        &mut self,
+        remotes: Arc<dyn TaskRemoteResolver>,
+    ) -> Arc<ExternalTaskRunner> {
+        let runner = Arc::new(ExternalTaskRunner::new(
+            Arc::clone(&self.store),
+            remotes,
+            Arc::clone(&self.clock),
+        ));
+        self.external = Some(Arc::clone(&runner));
+        runner
+    }
+
     /// Evaluate every active schedule once and claim what is due.
     ///
     /// Claiming is the only side effect, and it is durable: a caller that
@@ -573,6 +598,12 @@ impl DaemonRunner {
     /// Fails when the store refuses during shutdown.
     pub async fn run(mut self) -> Result<DaemonRunReport, HarnessError> {
         self.recover().await?;
+        // External work is recovered the same way schedules are: a handle that
+        // was recorded before the stop resumes polling, and a submission with no
+        // answer waits for a human instead of being sent again.
+        if let Some(external) = &self.external {
+            external.recover().await?;
+        }
         let tick = Duration::from_millis(250);
         loop {
             if self.stopping.load(Ordering::SeqCst) {
@@ -592,6 +623,12 @@ impl DaemonRunner {
                 () = self.shutdown.notified() => break,
                 () = tokio::time::sleep(tick) => {
                     self.evaluate_once().await?;
+                    // The external worker is a consumer of the same tick, not a
+                    // loop of its own: one clock, one store, one place where the
+                    // daemon's work is bounded.
+                    if let Some(external) = &self.external {
+                        external.poll_due().await?;
+                    }
                 }
             }
         }

@@ -32,6 +32,7 @@ use crate::{
 };
 
 pub mod delegation;
+pub mod external_jobs;
 pub mod history;
 mod maintenance;
 mod memory;
@@ -2980,54 +2981,13 @@ async fn ensure_runtime_schema(pool: &SqlitePool) -> Result<(), StoreError> {
         ));
     }
     if current < 2 {
-        // M3 adds the durable run/step, budget and human-input tables. Every
-        // statement is additive and idempotent, so a version 1 database upgrades
-        // in place and keeps its existing rows.
-        let m3_statements = [
-            "CREATE TABLE IF NOT EXISTS runs (run_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, input_id TEXT NOT NULL, state TEXT NOT NULL, acceptance TEXT, stop_reason TEXT, owner_generation INTEGER NOT NULL, revision INTEGER NOT NULL, budget_id TEXT, awaiting_question_id TEXT)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS runs_by_input ON runs(input_id)",
-            "CREATE INDEX IF NOT EXISTS runs_by_session ON runs(session_id)",
-            "CREATE TABLE IF NOT EXISTS run_steps (step_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_index INTEGER NOT NULL, request_id TEXT NOT NULL, packet_id TEXT NOT NULL, manifest_hash TEXT NOT NULL, source_sequence INTEGER NOT NULL, state TEXT NOT NULL, stop_reason TEXT)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS run_steps_by_index ON run_steps(run_id, step_index)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS run_steps_by_request ON run_steps(request_id)",
-            "CREATE TABLE IF NOT EXISTS budget_accounts (budget_id TEXT PRIMARY KEY, parent_budget_id TEXT, limit_tokens INTEGER NOT NULL, spent_tokens INTEGER NOT NULL, revision INTEGER NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS budget_reservations (reservation_id TEXT PRIMARY KEY, budget_id TEXT NOT NULL, operation_id TEXT NOT NULL, origin TEXT NOT NULL, upper_bound_tokens INTEGER NOT NULL, settled_tokens INTEGER, state TEXT NOT NULL, revision INTEGER NOT NULL, created_at_unix_ms INTEGER NOT NULL, settled_at_unix_ms INTEGER)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS budget_reservations_by_operation ON budget_reservations(operation_id)",
-            "CREATE TABLE IF NOT EXISTS questions (question_id TEXT PRIMARY KEY, scope_key TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT NOT NULL, run_id TEXT, kind TEXT NOT NULL, prompt TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, answer_json TEXT, answer_hash TEXT, answered_by TEXT, expires_at_unix_ms INTEGER, created_at_unix_ms INTEGER NOT NULL, answered_at_unix_ms INTEGER)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS questions_by_scope ON questions(scope_key)",
-            "CREATE TABLE IF NOT EXISTS run_commands (command_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, payload_json TEXT NOT NULL, detail TEXT, created_at_unix_ms INTEGER NOT NULL, claimed_at_unix_ms INTEGER, applied_at_unix_ms INTEGER)",
-            "CREATE INDEX IF NOT EXISTS run_commands_by_run ON run_commands(run_id)",
-        ];
-        for statement in m3_statements {
-            sqlx::query(statement)
-                .execute(&mut *tx)
-                .await
-                .map_err(|error| {
-                    database_error(ErrorCode::MigrationFailed, "apply runtime schema 2", error)
-                })?;
-        }
+        apply_runtime_slice_2(&mut tx).await?;
     }
     if current < 3 {
-        // M11 adds the durable schedule and occurrence tables. The occurrence
-        // primary key is what makes a launch idempotent: it is built from the
-        // schedule, its revision and the nominal due instant, so two hosts that
-        // evaluate the same schedule for the same instant insert the same row and
-        // the second insert loses. Nothing about the wall clock is in the key.
-        let m11_statements = [
-            "CREATE TABLE IF NOT EXISTS schedules (schedule_id TEXT PRIMARY KEY, title TEXT NOT NULL, state TEXT NOT NULL, revision INTEGER NOT NULL CHECK (revision >= 1), next_due_unix_ms INTEGER NOT NULL, spec_json TEXT NOT NULL, grants_json TEXT NOT NULL, created_at_unix_ms INTEGER NOT NULL, updated_at_unix_ms INTEGER NOT NULL)",
-            "CREATE INDEX IF NOT EXISTS schedules_by_due ON schedules(state, next_due_unix_ms)",
-            "CREATE TABLE IF NOT EXISTS schedule_occurrences (occurrence_key TEXT PRIMARY KEY, schedule_id TEXT NOT NULL REFERENCES schedules(schedule_id), revision INTEGER NOT NULL, due_unix_ms INTEGER NOT NULL, claimed_at_unix_ms INTEGER NOT NULL, state TEXT NOT NULL, trigger_kind TEXT NOT NULL)",
-            "CREATE INDEX IF NOT EXISTS occurrences_by_schedule ON schedule_occurrences(schedule_id, due_unix_ms)",
-            "CREATE INDEX IF NOT EXISTS occurrences_by_state ON schedule_occurrences(state)",
-        ];
-        for statement in m11_statements {
-            sqlx::query(statement)
-                .execute(&mut *tx)
-                .await
-                .map_err(|error| {
-                    database_error(ErrorCode::MigrationFailed, "apply runtime schema 3", error)
-                })?;
-        }
+        apply_runtime_slice_3(&mut tx).await?;
+    }
+    if current < 4 {
+        apply_runtime_slice_4(&mut tx).await?;
     }
     if current < RUNTIME_SCHEMA_VERSION {
         sqlx::query("INSERT INTO runtime_schema_migrations(version) VALUES (?)")
@@ -3045,6 +3005,89 @@ async fn ensure_runtime_schema(pool: &SqlitePool) -> Result<(), StoreError> {
             error,
         )
     })
+}
+
+/// Apply one additive runtime schema slice, statement by statement.
+///
+/// Each slice is idempotent, so a database at an older version upgrades in
+/// place and keeps its rows. The slices are separate functions because the
+/// revision they belong to is the thing a reader needs to see, not because they
+/// share any state.
+async fn apply_runtime_statements(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    statements: &[&str],
+    label: &str,
+) -> Result<(), StoreError> {
+    for statement in statements {
+        // The statements are compile-time constants of this file, never caller
+        // input; the annotation is what records that audit rather than hiding it.
+        sqlx::query(sqlx::AssertSqlSafe((*statement).to_owned()))
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| database_error(ErrorCode::MigrationFailed, label, error))?;
+    }
+    Ok(())
+}
+
+/// M3: the durable run/step, budget and human-input tables.
+async fn apply_runtime_slice_2(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StoreError> {
+    const STATEMENTS: [&str; 13] = [
+        "CREATE TABLE IF NOT EXISTS runs (run_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, input_id TEXT NOT NULL, state TEXT NOT NULL, acceptance TEXT, stop_reason TEXT, owner_generation INTEGER NOT NULL, revision INTEGER NOT NULL, budget_id TEXT, awaiting_question_id TEXT)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS runs_by_input ON runs(input_id)",
+        "CREATE INDEX IF NOT EXISTS runs_by_session ON runs(session_id)",
+        "CREATE TABLE IF NOT EXISTS run_steps (step_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_index INTEGER NOT NULL, request_id TEXT NOT NULL, packet_id TEXT NOT NULL, manifest_hash TEXT NOT NULL, source_sequence INTEGER NOT NULL, state TEXT NOT NULL, stop_reason TEXT)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS run_steps_by_index ON run_steps(run_id, step_index)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS run_steps_by_request ON run_steps(request_id)",
+        "CREATE TABLE IF NOT EXISTS budget_accounts (budget_id TEXT PRIMARY KEY, parent_budget_id TEXT, limit_tokens INTEGER NOT NULL, spent_tokens INTEGER NOT NULL, revision INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS budget_reservations (reservation_id TEXT PRIMARY KEY, budget_id TEXT NOT NULL, operation_id TEXT NOT NULL, origin TEXT NOT NULL, upper_bound_tokens INTEGER NOT NULL, settled_tokens INTEGER, state TEXT NOT NULL, revision INTEGER NOT NULL, created_at_unix_ms INTEGER NOT NULL, settled_at_unix_ms INTEGER)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS budget_reservations_by_operation ON budget_reservations(operation_id)",
+        "CREATE TABLE IF NOT EXISTS questions (question_id TEXT PRIMARY KEY, scope_key TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT NOT NULL, run_id TEXT, kind TEXT NOT NULL, prompt TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, answer_json TEXT, answer_hash TEXT, answered_by TEXT, expires_at_unix_ms INTEGER, created_at_unix_ms INTEGER NOT NULL, answered_at_unix_ms INTEGER)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS questions_by_scope ON questions(scope_key)",
+        "CREATE TABLE IF NOT EXISTS run_commands (command_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, payload_json TEXT NOT NULL, detail TEXT, created_at_unix_ms INTEGER NOT NULL, claimed_at_unix_ms INTEGER, applied_at_unix_ms INTEGER)",
+        "CREATE INDEX IF NOT EXISTS run_commands_by_run ON run_commands(run_id)",
+    ];
+    apply_runtime_statements(tx, &STATEMENTS, "apply runtime schema 2").await
+}
+
+/// M11: the durable schedule and occurrence tables.
+///
+/// The occurrence primary key is what makes a launch idempotent: it is built
+/// from the schedule, its revision and the nominal due instant, so two hosts
+/// that evaluate the same schedule for the same instant insert the same row and
+/// the second insert loses. Nothing about the wall clock is in the key.
+async fn apply_runtime_slice_3(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StoreError> {
+    const STATEMENTS: [&str; 5] = [
+        "CREATE TABLE IF NOT EXISTS schedules (schedule_id TEXT PRIMARY KEY, title TEXT NOT NULL, state TEXT NOT NULL, revision INTEGER NOT NULL CHECK (revision >= 1), next_due_unix_ms INTEGER NOT NULL, spec_json TEXT NOT NULL, grants_json TEXT NOT NULL, created_at_unix_ms INTEGER NOT NULL, updated_at_unix_ms INTEGER NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS schedules_by_due ON schedules(state, next_due_unix_ms)",
+        "CREATE TABLE IF NOT EXISTS schedule_occurrences (occurrence_key TEXT PRIMARY KEY, schedule_id TEXT NOT NULL REFERENCES schedules(schedule_id), revision INTEGER NOT NULL, due_unix_ms INTEGER NOT NULL, claimed_at_unix_ms INTEGER NOT NULL, state TEXT NOT NULL, trigger_kind TEXT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS occurrences_by_schedule ON schedule_occurrences(schedule_id, due_unix_ms)",
+        "CREATE INDEX IF NOT EXISTS occurrences_by_state ON schedule_occurrences(state)",
+    ];
+    apply_runtime_statements(tx, &STATEMENTS, "apply runtime schema 3").await
+}
+
+/// M11-03: the external-job tables.
+///
+/// The partial unique index over `(server_id, request_digest)` for unsettled
+/// jobs is the load-bearing constraint: an unresolved submission of the same
+/// request cannot be recorded twice, so a retry after a lost answer is a typed
+/// refusal instead of a second mutation.
+async fn apply_runtime_slice_4(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StoreError> {
+    const STATEMENTS: [&str; 6] = [
+        "CREATE TABLE IF NOT EXISTS external_jobs (job_id TEXT PRIMARY KEY, parent_task_id TEXT NOT NULL, session_id TEXT NOT NULL, server_id TEXT NOT NULL, operation TEXT NOT NULL, request_json TEXT NOT NULL, request_digest TEXT NOT NULL, remote_task_id TEXT, state TEXT NOT NULL, attempt INTEGER NOT NULL, poll_interval_ms INTEGER, next_poll_unix_ms INTEGER NOT NULL, deadline_unix_ms INTEGER NOT NULL, submitted_at_unix_ms INTEGER NOT NULL, updated_at_unix_ms INTEGER NOT NULL, settled_at_unix_ms INTEGER, outcome_json TEXT, outcome_digest TEXT, remote_state TEXT, ambiguity TEXT, delivery_message_id TEXT)",
+        "CREATE INDEX IF NOT EXISTS external_jobs_by_poll ON external_jobs(state, next_poll_unix_ms)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS external_jobs_open_request ON external_jobs(server_id, request_digest) WHERE settled_at_unix_ms IS NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS external_jobs_remote_task ON external_jobs(server_id, remote_task_id) WHERE remote_task_id IS NOT NULL",
+        "CREATE TABLE IF NOT EXISTS external_job_polls (poll_id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, polled_at_unix_ms INTEGER NOT NULL, observed_state TEXT NOT NULL, outcome TEXT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS external_job_polls_by_job ON external_job_polls(job_id)",
+    ];
+    apply_runtime_statements(tx, &STATEMENTS, "apply runtime schema 4").await
 }
 
 /// M5 context surface: the rebuildable journal index, the notes table and the

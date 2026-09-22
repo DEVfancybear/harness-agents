@@ -956,7 +956,7 @@ async fn insert_result(
     Ok(())
 }
 
-async fn insert_delivery(
+pub(crate) async fn insert_delivery(
     tx: &mut Transaction<'_, Sqlite>,
     delivery: &ParentDeliveryRecord,
 ) -> Result<(), StoreError> {

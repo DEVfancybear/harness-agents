@@ -935,8 +935,12 @@
         {
           "id": "M11-03",
           "title": "External task driver và polling",
-          "status": "in_progress",
-          "tests": []
+          "status": "implemented_unverified",
+          "tests": [
+            "a35_external_task_ambiguity",
+            "m11_03_the_tasks_declaration_is_load_bearing",
+            "m11_03_the_daemon_polls_external_work_on_its_own_tick"
+          ]
         },
         {
           "id": "M11-04",
@@ -948,15 +952,23 @@
       "required_tests": [
         "a34_schedule_occurrences",
         "milestone_m11_daemon::m11_01_daemon_ownership_and_control",
-        "milestone_m11_daemon::m11_01_a_stale_endpoint_is_cleaned_up"
+        "milestone_m11_daemon::m11_01_a_stale_endpoint_is_cleaned_up",
+        "milestone_m11_external::a35_external_task_ambiguity",
+        "milestone_m11_external::m11_03_the_tasks_declaration_is_load_bearing"
       ],
       "unit_tests": [],
       "fixtures": [
         "crates/harness-cli/tests/milestone_m11.rs",
         "crates/harness-cli/tests/milestone_m11_daemon.rs",
+        "crates/harness-cli/tests/milestone_m11_external.rs",
+        "crates/harness-cli/src/bin/m11_fixture_task_server.rs",
         "crates/harness-cli/src/daemon/schedule.rs",
         "crates/harness-cli/src/daemon/host.rs",
-        "docs/adr/ADR-N11-SCHEDULE-AND-DAEMON-SEMANTICS.vi.md"
+        "crates/harness-cli/src/daemon/external.rs",
+        "crates/harness-extensions/src/tasks.rs",
+        "crates/harness-store-sqlite/src/store/external_jobs.rs",
+        "docs/adr/ADR-N11-SCHEDULE-AND-DAEMON-SEMANTICS.vi.md",
+        "docs/specs/M11.vi.md"
       ],
       "gate": {
         "script": "scripts/Verify-Milestone.ps1",
@@ -1280,8 +1292,9 @@
       "id": "A35",
       "owner_milestones": ["M11"],
       "planned_test": "a35_external_task_ambiguity",
-      "status": "planned",
-      "note": "NOT IMPLEMENTED in this pass: M11-03 (external task driver and polling) is registered as in_progress with no tests. The case stays planned."
+      "status": "implemented",
+      "selectors": ["milestone_m11_external::a35_external_task_ambiguity"],
+      "note": "a real MCP server process declaring the SEP-2663 tasks extension is asked to start work and dies before answering: the host records the request digest before sending, marks the submission ambiguous, refuses to send it again (idempotency_conflict, and the fixture is called exactly once), and only an explicit reconciliation with the handle the remote persisted resumes polling to one settlement and one delivery; a terminal result observed twice is delivered once; a restarted host resumes polling from the durable handle without resubmitting; a cancel acknowledged while the work was already finishing settles as completed, not cancelled, because a cancel is a request and never a rollback; a remote that never finishes runs out of deadline, records unresolved: true with its last observation, and stops polling after a bounded number of asks; and a client that does not declare the extension is refused a task handle even though the remote created one, which is why every post-send failure is ambiguous"
     },
     {
       "id": "A36",
