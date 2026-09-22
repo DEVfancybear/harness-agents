@@ -731,12 +731,17 @@ async fn a15_path_patch_safety() {
     let (session, task) = admit(&store, &bench).await;
 
     // Parent traversal and absolute paths never reach a proposal.
-    for path in [
-        "../outside.txt",
-        "src/../../outside.txt",
-        "C:/Windows/win.ini",
-        "/etc/hosts",
-    ] {
+    //
+    // A drive-letter path is absolute only on Windows: on POSIX `C:/Windows/win.ini`
+    // is an ordinary relative name (a directory called `C:`), so asserting an escape
+    // there would assert the wrong thing about the platform - it is the unix absolute
+    // path that carries the case on the other side. Both branches are built with
+    // `cfg!` so the list stays compiled, and therefore linted, everywhere.
+    let mut escapes = vec!["../outside.txt", "src/../../outside.txt", "/etc/hosts"];
+    if cfg!(windows) {
+        escapes.push("C:/Windows/win.ini");
+    }
+    for path in escapes {
         let error = tools
             .prepare(ToolRequest::new(
                 session.clone(),
