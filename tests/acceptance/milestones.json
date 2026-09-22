@@ -411,14 +411,21 @@
         {
           "id": "M4-03",
           "title": "Process lifecycle và spool",
-          "status": "in_progress",
-          "tests": ["a13_queued_process_cancel"]
+          "status": "implemented_unverified",
+          "tests": [
+            "a13_queued_process_cancel",
+            "a16_process_tree_env",
+            "a17_output_quota"
+          ]
         },
         {
           "id": "M4-04",
           "title": "End-to-end coding và recovery",
-          "status": "planned",
-          "tests": []
+          "status": "implemented_unverified",
+          "tests": [
+            "a08_coding_e2e",
+            "m4_04_check_evidence_is_digest_bound"
+          ]
         }
       ],
       "required_tests": [
@@ -431,7 +438,11 @@
         "a04_effect_before_receipt",
         "m4_02_git_log_is_structured_and_bounded",
         "a15_path_patch_safety",
-        "a13_queued_process_cancel"
+        "a13_queued_process_cancel",
+        "a16_process_tree_env",
+        "a17_output_quota",
+        "a08_coding_e2e",
+        "m4_04_check_evidence_is_digest_bound"
       ],
       "unit_tests": [],
       "fixtures": ["crates/harness-cli/tests/milestone_m4.rs"],
@@ -522,7 +533,17 @@
         "phase_p2::p2_s06_cancel_and_retry_are_bounded_and_recoverable"
       ]
     },
-    { "id": "A08", "owner_milestones": ["M4"], "planned_test": "a08_coding_e2e", "status": "planned" },
+    {
+      "id": "A08",
+      "owner_milestones": ["M4"],
+      "planned_test": "a08_coding_e2e",
+      "status": "implemented",
+      "selectors": [
+        "milestone_m4::a08_coding_e2e",
+        "milestone_m4::m4_04_check_evidence_is_digest_bound"
+      ],
+      "note": "a disposable Rust crate with a failing parser test, patched wrongly then correctly by a scripted provider over real read/patch/process tools: the first `cargo test` really fails, the second really passes, receipts exist for both, and acceptance requires a check that ran at the workspace digest the run ended on. The digest-bound negative control edits the test file after the passing run and is refused"
+    },
     {
       "id": "A09",
       "owner_milestones": ["M3"],
@@ -541,8 +562,12 @@
       "id": "A11",
       "owner_milestones": ["M3", "M4"],
       "planned_test": "a11_human_input_grant",
-      "status": "planned",
-      "note": "M3 question half is implemented and proven by milestone_m3::a11_human_input_grant; the real approval grant/consume half belongs to M4, so the case stays planned until M4"
+      "status": "implemented",
+      "selectors": [
+        "milestone_m3::a11_human_input_grant",
+        "milestone_m4::a11_approval_grant"
+      ],
+      "note": "M3 half: a durable question is answered exactly once across a restart and the answer never becomes a permission. M4 half: an already expired grant cannot be issued, a grant that expires before consume is a typed denial with no write, a revoked grant never executes, and a replayed grant is refused - both halves now exist, so the case is implemented rather than planned"
     },
     { "id": "A12", "owner_milestones": ["M5"], "planned_test": "a12_compaction_cas", "status": "planned" },
     {
@@ -571,8 +596,22 @@
       ],
       "note": "traversal, absolute paths, junction/symlink alias, sensitive names, stale patch, locked file (Windows share violation observed as present-but-unreadable) and CRLF/Unicode byte preservation; the known_defects regression proves a live store inside the workspace no longer fails the fingerprint"
     },
-    { "id": "A16", "owner_milestones": ["M4"], "planned_test": "a16_process_tree_env", "status": "planned" },
-    { "id": "A17", "owner_milestones": ["M4"], "planned_test": "a17_output_quota", "status": "planned" },
+    {
+      "id": "A16",
+      "owner_milestones": ["M4"],
+      "planned_test": "a16_process_tree_env",
+      "status": "implemented",
+      "selectors": ["milestone_m4::a16_process_tree_env"],
+      "note": "a tool process inherits only the host allowlist (the child dumps its own environment; no host variable outside the list reaches it, and the check is non-vacuous because this host has many), a granted secret:// reference is resolved just in time into the child while never reaching the model view, the durable intent, or the artifact, an un-granted reference is refused before a proposal exists, and a heartbeat grandchild stops with the process tree when the call times out (tree_cleanup=killed_and_reaped)"
+    },
+    {
+      "id": "A17",
+      "owner_milestones": ["M4"],
+      "planned_test": "a17_output_quota",
+      "status": "implemented",
+      "selectors": ["milestone_m4::a17_output_quota"],
+      "note": "an output larger than the capture quota is cut exactly at the quota and says so (capture_truncated, header quota, digest of the stored bytes, tail preview equal to the stored tail); a small capture reads back through read_process_output at the tail offset; a page past the captured length is a typed refusal naming the captured length; another task cannot page the artifact; an unwritable spool settles outcome_unknown with the side effect visible and no reference to a capture that was never written"
+    },
     { "id": "A18", "owner_milestones": ["M5"], "planned_test": "a18_history_after_compaction", "status": "planned" },
     { "id": "A19", "owner_milestones": ["M5", "M7"], "planned_test": "a19_optional_services_failure", "status": "planned" },
     { "id": "A20", "owner_milestones": ["M5"], "planned_test": "a20_source_scope_fork", "status": "planned" },

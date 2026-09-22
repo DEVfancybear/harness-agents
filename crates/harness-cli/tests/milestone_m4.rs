@@ -16,18 +16,22 @@ use harness_providers::{
     CancellationToken, MessageRole, ModelCapabilities, ModelProvider, ProviderFuture,
     ProviderRequest, ProviderStreamEvent,
 };
-use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
+use harness_runtime::{
+    EvidenceKind, GoalCriterion, GoalSpec, RunRequest, RuntimeConfig, RuntimeService,
+};
 use harness_session::{AdmitInputRequest, SessionService};
 use harness_store_sqlite::{SqliteStore, ToolIntentStatus, WriterOpenOptions};
 use harness_tools::{
-    ApprovalMode, CodingToolAction, EffectClass, IsolationMode, ToolExecutionService, ToolOutput,
-    ToolRequest, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnProgress,
-    coding_tool_descriptors, coding_tool_names, coding_tool_schemas, effect_class_for,
-    observe_workspace, observed_file_hash,
+    AcceptanceState, ApprovalMode, CaptureStream, CodingToolAction, EffectClass, EnvBinding,
+    IsolationMode, PROCESS_ENVIRONMENT_ALLOWLIST, ProcessSpoolConfig, SecretResolver, SpoolLimits,
+    ToolExecutionService, ToolOutput, ToolPolicy, ToolRequest, TurnDriver, TurnLimits,
+    TurnObserver, TurnOptions, TurnOutcome, TurnProgress, TurnStop, coding_tool_descriptors,
+    coding_tool_names, coding_tool_schemas, effect_class_for, observe_workspace,
+    observed_file_hash, parse_capture_header,
 };
 use harness_types::{
-    ContentHash, ErrorCode, HostId, InputId, ProjectId, SessionId, SourceAuthority, TaskId,
-    ToolIntentState, ToolOutcomeState,
+    ContentHash, ErrorCode, HarnessError, HostId, InputId, ProjectId, SessionId, SourceAuthority,
+    TaskId, ToolIntentState, ToolOutcomeState,
 };
 
 // ---------------------------------------------------------------------------
@@ -183,6 +187,16 @@ struct SilentObserver;
 
 impl TurnObserver for SilentObserver {
     fn observe(&self, _progress: TurnProgress) {}
+}
+
+/// The process permit is host-wide, which is the behavior under test: a call in
+/// this test binary holds it against every other call in the same binary. Two
+/// tests that assert *queue* semantics therefore have to take turns, or one of
+/// them observes the other's process holding the permit and its own call
+/// legitimately reports `queued`.
+fn process_queue_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1022,7 @@ fn write_now(marker: &Path) -> String {
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // one queue scenario, told in order
 async fn a13_queued_process_cancel() {
+    let _serial = process_queue_lock().lock().await;
     let bench = bench();
     let store = bench.open_store().await;
     let tools = ToolExecutionService::new(Arc::clone(&store));
@@ -1029,6 +1044,7 @@ async fn a13_queued_process_cancel() {
                 // so a slow host must not turn the harness into a timeout test.
                 timeout_ms: 120_000,
                 isolation: IsolationMode::BestEffort,
+                env: Vec::new(),
             },
         ))
         .await
@@ -1060,6 +1076,7 @@ async fn a13_queued_process_cancel() {
                 command: write_now(&marker_b),
                 timeout_ms: 30_000,
                 isolation: IsolationMode::BestEffort,
+                env: Vec::new(),
             },
         ))
         .await
@@ -1393,7 +1410,1134 @@ async fn a04_effect_before_receipt() {
     close(store).await;
 }
 
+// ---------------------------------------------------------------------------
+// M4-03.2/.3: process environment and process-tree cleanup (A16)
+// ---------------------------------------------------------------------------
+
+/// The value a deployment's vault would hand back. It never exists in this
+/// process's environment, so seeing it in the child proves the grant resolved
+/// it, and seeing it anywhere in the evidence proves the redaction failed.
+const A16_SENTINEL: &str = "m4-sentinel-3f9c1d7e-2a44";
+
+/// A resolver for a host that keeps secrets somewhere other than its own
+/// environment. It answers exactly one reference; anything else is refused, so
+/// the test also proves the port cannot be talked into widening a grant.
+struct FixtureSecrets;
+
+impl SecretResolver for FixtureSecrets {
+    fn resolve(&self, reference: &str) -> Result<String, HarnessError> {
+        if reference == "secret://HA_M4_SENTINEL" {
+            return Ok(A16_SENTINEL.to_owned());
+        }
+        Err(HarnessError::new(
+            ErrorCode::SecretNotGranted,
+            "the fixture vault holds no such reference",
+        ))
+    }
+}
+
+fn fixture_host_argument(flag: &str, value: &Path) -> Vec<String> {
+    vec![flag.to_owned(), value.to_string_lossy().into_owned()]
+}
+
+fn tree_parent_action(
+    args: Vec<String>,
+    timeout_ms: u64,
+    env: Vec<EnvBinding>,
+) -> CodingToolAction {
+    CodingToolAction::RunProcess {
+        executable: fixture_host().to_string_lossy().into_owned(),
+        args,
+        timeout_ms,
+        isolation: IsolationMode::BestEffort,
+        env,
+    }
+}
+
+/// The environment a fixture child actually received, from the file the child
+/// itself wrote. Windows environment names are case-insensitive, so lookups are
+/// folded on both sides.
+fn child_environment(path: &Path) -> Vec<(String, String)> {
+    let bytes = std::fs::read(path).expect("the fixture child wrote its environment");
+    serde_json::from_slice(&bytes).expect("the environment dump is a name/value list")
+}
+
+fn child_environment_get<'a>(visible: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    visible
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one process contract, told in order
+async fn a16_process_tree_env() {
+    let _serial = process_queue_lock().lock().await;
+    let bench = bench();
+    let store = bench.open_store().await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let (session, task) = admit(&store, &bench).await;
+
+    // A literal environment value is refused by the parser, before any proposal
+    // exists: a model may name a reference, never a value.
+    let literal = CodingToolAction::from_provider_call(
+        "run_shell",
+        r#"{"command":"echo hi","timeout_ms":10,"env":{"HA_LITERAL":"plain-value"}}"#,
+    )
+    .expect_err("a literal environment value must not reach the gate");
+    assert_eq!(literal.code(), ErrorCode::EnvironmentDenied);
+    let malformed = CodingToolAction::from_provider_call(
+        "run_shell",
+        r#"{"command":"echo hi","timeout_ms":10,"env":{"HA_BAD":"secret://"}}"#,
+    )
+    .expect_err("an empty secret reference must not reach the gate");
+    assert_eq!(malformed.code(), ErrorCode::EnvironmentDenied);
+
+    // (1) The tree: a parent holds while its grandchild heartbeats, and the call
+    // times out. The heartbeat must stop with the tree, not with the parent.
+    let heartbeat = bench.temp.path().join("a16-heartbeat.txt");
+    let env_out = bench.temp.path().join("a16-env.json");
+    let mut args = vec!["--mode".to_owned(), "tree-parent".to_owned()];
+    args.extend(fixture_host_argument("--heartbeat", &heartbeat));
+    args.extend(fixture_host_argument("--env-out", &env_out));
+    args.extend(["--hold-ms".to_owned(), "30000".to_owned()]);
+    let prepared = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a16",
+            &bench.workspace,
+            tree_parent_action(args, 2_000, Vec::new()),
+        ))
+        .await
+        .expect("tree-parent prepares");
+    let grant = tools.approve(&prepared).await.expect("approved");
+    let view = tools
+        .execute(prepared, Some(grant))
+        .await
+        .expect("a timed-out tree settles with cleanup evidence");
+    let ToolOutput::Process {
+        timed_out,
+        tree_cleanup,
+        tree_cleanup_confirmed,
+        stdout,
+        ..
+    } = &view.output
+    else {
+        panic!(
+            "the fixture must return a process output: {:?}",
+            view.output
+        );
+    };
+    assert!(timed_out, "the parent holds past the timeout");
+    assert!(
+        tree_cleanup_confirmed,
+        "the tree was confirmed empty before the result was settled"
+    );
+    assert_eq!(
+        tree_cleanup, "killed_and_reaped",
+        "killing the parent is not the claim: the whole tree was reaped"
+    );
+    let heartbeat_lines =
+        || std::fs::read_to_string(&heartbeat).map_or(0, |text| text.lines().count());
+    let stopped_at = heartbeat_lines();
+    assert!(
+        stopped_at >= 3,
+        "the grandchild must have been running during the call: {stopped_at} heartbeat lines"
+    );
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        heartbeat_lines(),
+        stopped_at,
+        "a grandchild that outlives its parent must not survive the process-tree cleanup"
+    );
+    assert!(stdout.is_empty(), "the fixture printed nothing: {stdout}");
+
+    // The environment the child received holds nothing this host did not
+    // allowlist: the host's own variables are not inherited wholesale.
+    let visible = child_environment(&env_out);
+    let allowed = visible
+        .iter()
+        .filter(|(name, _)| {
+            PROCESS_ENVIRONMENT_ALLOWLIST
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(name))
+        })
+        .count();
+    assert_eq!(
+        allowed,
+        visible.len(),
+        "the child environment must be allowlisted, not inherited: {visible:?}"
+    );
+    assert!(
+        child_environment_get(&visible, "PATH").is_some(),
+        "a child that cannot resolve executables is useless: {visible:?}"
+    );
+    let host_only: Vec<String> = std::env::vars()
+        .map(|(name, _)| name)
+        .filter(|name| {
+            !PROCESS_ENVIRONMENT_ALLOWLIST
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(name))
+        })
+        .collect();
+    assert!(
+        !host_only.is_empty(),
+        "this host has no non-allowlisted variables, so the check above would be vacuous"
+    );
+    for name in &host_only {
+        assert!(
+            child_environment_get(&visible, name).is_none(),
+            "host variable {name} must not reach a tool process"
+        );
+    }
+
+    // (2) A granted reference is resolved just in time and never persisted: the
+    // child sees it, the evidence does not.
+    let vault = ToolExecutionService::new(Arc::clone(&store))
+        .with_secrets(Arc::new(FixtureSecrets))
+        .with_policy(
+            ToolPolicy::default().with_granted_secrets(vec!["secret://HA_M4_SENTINEL".to_owned()]),
+        );
+    let granted_env_out = bench.temp.path().join("a16-granted-env.json");
+    let mut args = vec!["--mode".to_owned(), "tree-parent".to_owned()];
+    args.extend(fixture_host_argument("--env-out", &granted_env_out));
+    args.extend(["--hold-ms".to_owned(), "0".to_owned()]);
+    args.extend(["--echo-env".to_owned(), "HA_M4_GRANTED".to_owned()]);
+    let prepared = vault
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a16",
+            &bench.workspace,
+            tree_parent_action(
+                args,
+                30_000,
+                vec![EnvBinding {
+                    name: "HA_M4_GRANTED".to_owned(),
+                    reference: "secret://HA_M4_SENTINEL".to_owned(),
+                }],
+            ),
+        ))
+        .await
+        .expect("a granted reference prepares");
+    let grant = vault.approve(&prepared).await.expect("approved");
+    let view = vault
+        .execute(prepared, Some(grant))
+        .await
+        .expect("the granted call executes");
+    let ToolOutput::Process {
+        stdout,
+        stderr,
+        tree_cleanup,
+        ..
+    } = &view.output
+    else {
+        panic!(
+            "the fixture must return a process output: {:?}",
+            view.output
+        );
+    };
+    assert_eq!(
+        tree_cleanup, "reaped_on_exit",
+        "the parent exited by itself and the backend reported the tree empty"
+    );
+    let granted = child_environment(&granted_env_out);
+    assert_eq!(
+        child_environment_get(&granted, "HA_M4_GRANTED"),
+        Some(A16_SENTINEL),
+        "the granted reference was resolved into the child environment"
+    );
+    assert!(
+        stdout.contains("echo=[REDACTED]"),
+        "the child echoed the granted value, so the redaction must be visible: {stdout}"
+    );
+    assert!(
+        !stdout.contains(A16_SENTINEL) && !stderr.contains(A16_SENTINEL),
+        "a granted value must never reach the model view"
+    );
+    let receipt = view.receipt.clone().expect("receipt");
+    let artifact_id = receipt.artifact_id.clone().expect("output artifact");
+    let artifact_bytes = std::fs::read(
+        bench
+            .data_dir
+            .join("artifacts")
+            .join(format!("{artifact_id}.bin")),
+    )
+    .expect("the published artifact is readable");
+    assert!(
+        !String::from_utf8_lossy(&artifact_bytes).contains(A16_SENTINEL),
+        "a granted value must never reach durable tool evidence"
+    );
+    let intent = store
+        .tool_intent(&receipt.tool_execution_id)
+        .await
+        .expect("read intent")
+        .expect("intent exists");
+    assert!(
+        !intent.action_json.to_string().contains(A16_SENTINEL),
+        "the durable intent keeps the reference, never the value: {}",
+        intent.action_json
+    );
+    assert!(
+        intent
+            .action_json
+            .to_string()
+            .contains("secret://HA_M4_SENTINEL")
+    );
+
+    // (3) The same reference without a grant never resolves, never spawns, and
+    // never becomes an intent.
+    let ungranted_env_out = bench.temp.path().join("a16-ungranted-env.json");
+    let mut args = vec!["--mode".to_owned(), "tree-parent".to_owned()];
+    args.extend(fixture_host_argument("--env-out", &ungranted_env_out));
+    args.extend(["--hold-ms".to_owned(), "0".to_owned()]);
+    let error = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a16",
+            &bench.workspace,
+            tree_parent_action(
+                args,
+                30_000,
+                vec![EnvBinding {
+                    name: "HA_M4_GRANTED".to_owned(),
+                    reference: "secret://HA_M4_SENTINEL".to_owned(),
+                }],
+            ),
+        ))
+        .await
+        .expect_err("an un-granted reference must be refused before a proposal exists");
+    assert_eq!(error.code(), ErrorCode::SecretNotGranted);
+    assert!(
+        !ungranted_env_out.exists(),
+        "a refused reference never starts a process"
+    );
+    assert!(
+        store
+            .pending_tool_intents(&session)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a refused reference never becomes a pending intent"
+    );
+
+    // (4) The host's own environment is a legitimate source when the operator
+    // exposes one of its variables by reference.
+    let path_reference = "secret://PATH";
+    let path_tools = ToolExecutionService::new(Arc::clone(&store))
+        .with_policy(ToolPolicy::default().with_granted_secrets(vec![path_reference.to_owned()]));
+    let host_path = std::env::var("PATH").expect("this host has a PATH");
+    let path_env_out = bench.temp.path().join("a16-path-env.json");
+    let mut args = vec!["--mode".to_owned(), "tree-parent".to_owned()];
+    args.extend(fixture_host_argument("--env-out", &path_env_out));
+    args.extend(["--hold-ms".to_owned(), "0".to_owned()]);
+    args.extend(["--echo-env".to_owned(), "HA_M4_HOST_PATH".to_owned()]);
+    let prepared = path_tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a16",
+            &bench.workspace,
+            tree_parent_action(
+                args,
+                30_000,
+                vec![EnvBinding {
+                    name: "HA_M4_HOST_PATH".to_owned(),
+                    reference: path_reference.to_owned(),
+                }],
+            ),
+        ))
+        .await
+        .expect("an exposed host variable prepares");
+    let grant = path_tools.approve(&prepared).await.expect("approved");
+    let view = path_tools
+        .execute(prepared, Some(grant))
+        .await
+        .expect("the exposed host variable executes");
+    assert_eq!(
+        child_environment_get(&child_environment(&path_env_out), "HA_M4_HOST_PATH"),
+        Some(host_path.as_str()),
+        "the host resolver must read the value at spawn time"
+    );
+    // The value came from this host's own environment and the child echoed it,
+    // so the redaction has to hold for it exactly as it did for the vault.
+    let ToolOutput::Process { stdout, .. } = &view.output else {
+        panic!(
+            "the fixture must return a process output: {:?}",
+            view.output
+        );
+    };
+    assert!(
+        stdout.contains("echo=[REDACTED]") && !stdout.contains(&host_path),
+        "a granted host variable is redacted from the model view: {stdout}"
+    );
+    drop(tools);
+    drop(vault);
+    drop(path_tools);
+    close(store).await;
+}
+
 #[allow(dead_code)]
 fn _hash_marker(value: &str) -> ContentHash {
     ContentHash::from_bytes(value.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// M4-04: end-to-end coding in a real repository, with digest-bound criteria
+// ---------------------------------------------------------------------------
+
+/// The buggy parser the disposable repository starts with.
+const A08_BUGGY: &str = r"/// Normalize a value read from the configuration file.
+pub fn normalize(input: &str) -> String {
+    // The padding the file happened to have is kept.
+    input.trim_end().to_string()
+}
+";
+
+/// A plausible fix that does not repair the bug: the first attempt must fail
+/// its own test, or the run would prove nothing about failure handling.
+const A08_WRONG: &str = r"/// Normalize a value read from the configuration file.
+pub fn normalize(input: &str) -> String {
+    input.to_string()
+}
+";
+
+/// The fix that makes the suite pass.
+const A08_FIXED: &str = r"/// Normalize a value read from the configuration file.
+pub fn normalize(input: &str) -> String {
+    input.trim().to_string()
+}
+";
+
+const A08_TEST: &str = r#"#[test]
+fn normalize_trims_both_ends() {
+    assert_eq!(m4_fixture_parser::normalize("  value  "), "value");
+}
+"#;
+
+/// A disposable Rust crate with a failing parser test, committed to its own Git
+/// repository. `target/` is ignored so the workspace fingerprint describes the
+/// sources rather than a build directory.
+fn parser_repo(bench: &Bench) -> PathBuf {
+    let repo = bench.temp.path().join("parser-repo");
+    std::fs::create_dir_all(repo.join("src")).expect("source directory");
+    std::fs::create_dir_all(repo.join("tests")).expect("test directory");
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"m4_fixture_parser\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )
+    .expect("manifest");
+    std::fs::write(repo.join(".gitignore"), "/target\n").expect("ignore file");
+    std::fs::write(repo.join("src").join("lib.rs"), A08_BUGGY).expect("buggy parser");
+    std::fs::write(repo.join("tests").join("parser.rs"), A08_TEST).expect("failing test");
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.email", "m4@example.invalid"]);
+    git(&repo, &["config", "user.name", "M4 Fixture"]);
+    git(&repo, &["add", "."]);
+    git(
+        &repo,
+        &["commit", "-m", "fixture parser with a failing test"],
+    );
+    repo
+}
+
+fn cargo_test_call(call_id: &str) -> ProviderStreamEvent {
+    ProviderStreamEvent::tool_delta(
+        call_id,
+        "run_process",
+        serde_json::json!({
+            "executable": "cargo",
+            "args": ["test", "--offline", "--quiet"],
+            "timeout_ms": 300_000
+        })
+        .to_string(),
+    )
+}
+
+fn patch_call(
+    call_id: &str,
+    path: &str,
+    expected: &ContentHash,
+    replacement: &str,
+) -> ProviderStreamEvent {
+    ProviderStreamEvent::tool_delta(
+        call_id,
+        "apply_patch",
+        serde_json::json!({
+            "path": path,
+            "expected_hash": expected.as_str(),
+            "replacement": replacement
+        })
+        .to_string(),
+    )
+}
+
+fn coding_goal() -> GoalSpec {
+    GoalSpec::new(
+        "make the parser test pass",
+        vec![
+            GoalCriterion::required("file-changed", EvidenceKind::FileChange),
+            GoalCriterion::required("tests-pass", EvidenceKind::Check),
+        ],
+    )
+}
+
+fn repo_process_view(outcome: &TurnOutcome, index: usize) -> &harness_tools::ToolExecutionView {
+    outcome
+        .executions
+        .iter()
+        .filter(|view| matches!(view.output, ToolOutput::Process { .. }))
+        .nth(index)
+        .unwrap_or_else(|| panic!("the run must contain at least {} process calls", index + 1))
+}
+
+fn process_exit_code(view: &harness_tools::ToolExecutionView) -> Option<i32> {
+    match &view.output {
+        ToolOutput::Process { exit_code, .. } => *exit_code,
+        other => panic!("expected a process output: {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one end-to-end story, told in order
+async fn a08_coding_e2e() {
+    let _serial = process_queue_lock().lock().await;
+    let bench = bench();
+    let repo = parser_repo(&bench);
+    let store = bench.open_store().await;
+    let buggy_hash = observed_file_hash(&repo, "src/lib.rs").expect("buggy hash");
+    let wrong_hash = ContentHash::from_bytes(A08_WRONG.as_bytes());
+
+    // The model: read, patch wrongly, run the suite, read, patch correctly, run
+    // the suite, answer. Every call is correlated by its provider call id.
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                "call-1",
+                "read_file",
+                serde_json::json!({"path": "src/lib.rs"}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            patch_call("call-2", "src/lib.rs", &buggy_hash, A08_WRONG),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            cargo_test_call("call-3"),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                "call-4",
+                "read_file",
+                serde_json::json!({"path": "src/lib.rs"}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            patch_call("call-5", "src/lib.rs", &wrong_hash, A08_FIXED),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            cargo_test_call("call-6"),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("the parser trims both ends now and the suite passes"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let session = SessionId::generate();
+    let task = TaskId::generate();
+    let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)))
+        .with_goal(coding_goal());
+    let request = RunRequest::new(
+        session.clone(),
+        task.clone(),
+        InputId::generate(),
+        "repair the parser".to_owned(),
+        observe_workspace(bench.project_id.clone(), &repo).expect("observation"),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    let outcome = driver
+        .run_turn(
+            request,
+            TurnOptions {
+                workspace_root: repo.clone(),
+                actor_id: "m4.a08".to_owned(),
+                approvals: ApprovalMode::Auto,
+                limits: TurnLimits::default(),
+            },
+            Arc::new(SilentObserver),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the coding turn runs");
+
+    // The real filesystem decided the outcome: the fixed source is on disk.
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src").join("lib.rs")).expect("source readable"),
+        A08_FIXED
+    );
+    assert_eq!(
+        outcome.tool_calls, 6,
+        "every scripted call reached the gate"
+    );
+    let failed = repo_process_view(&outcome, 0);
+    let passed = repo_process_view(&outcome, 1);
+    assert_ne!(
+        process_exit_code(failed),
+        Some(0),
+        "the first attempt must really fail its own test"
+    );
+    assert_eq!(
+        process_exit_code(passed),
+        Some(0),
+        "the second attempt must really pass it"
+    );
+    assert_eq!(
+        failed
+            .receipt
+            .as_ref()
+            .map(|receipt| receipt.call_id.clone()),
+        Some(Some("call-3".to_owned()))
+    );
+    assert_eq!(
+        passed
+            .receipt
+            .as_ref()
+            .map(|receipt| receipt.call_id.clone()),
+        Some(Some("call-6".to_owned()))
+    );
+    // Failure and success are both durable evidence, not just a transcript.
+    let receipts = SessionService::new(Arc::clone(&store))
+        .recover(&session)
+        .await
+        .expect("recovery")
+        .receipts;
+    assert_eq!(receipts.len(), 6, "one receipt per executed call");
+    // The real Git repository shows exactly the fix.
+    let diff = Command::new("git")
+        .args(["diff", "--", "src/lib.rs"])
+        .current_dir(&repo)
+        .output()
+        .expect("git starts");
+    let diff = String::from_utf8_lossy(&diff.stdout).into_owned();
+    assert!(
+        diff.contains("input.trim()"),
+        "the fix is in the diff: {diff}"
+    );
+    assert!(
+        !diff.contains("input.to_string()"),
+        "the wrong attempt is gone: {diff}"
+    );
+
+    // Acceptance comes from the evidence: a change plus a check that ran at the
+    // workspace digest the run ended on.
+    assert_eq!(outcome.stop, TurnStop::Final);
+    assert_eq!(outcome.acceptance, AcceptanceState::Satisfied);
+    let goal = outcome.goal.clone().expect("the turn reported its goal");
+    assert_eq!(goal.acceptance, AcceptanceState::Satisfied);
+    assert!(
+        goal.missing.is_empty(),
+        "nothing is missing: {:?}",
+        goal.missing
+    );
+
+    // The model was given each result paired with the call it answers. The
+    // context window is bounded, so a result only has to reach a *later* step;
+    // demanding all six in the final request would assert a window size.
+    let seen = provider.seen();
+    assert!(seen.len() >= 7, "one provider call per scripted step");
+    for call_id in ["call-1", "call-2", "call-3", "call-4", "call-5", "call-6"] {
+        assert!(
+            seen.iter().skip(1).any(|request| {
+                request.messages.iter().any(|message| {
+                    message.role == MessageRole::Tool
+                        && message.tool_call_id.as_deref() == Some(call_id)
+                })
+            }),
+            "tool result for {call_id} must be paired into a later step"
+        );
+    }
+    assert!(
+        seen.iter().skip(1).any(|request| {
+            request.messages.iter().any(|message| {
+                message.role == MessageRole::Tool
+                    && message.tool_call_id.as_deref() == Some("call-3")
+                    && message.content.contains("exit=")
+            })
+        }),
+        "the failing run's output reaches the model"
+    );
+    drop(driver);
+    close(store).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one negative control, told in order
+async fn m4_04_check_evidence_is_digest_bound() {
+    let _serial = process_queue_lock().lock().await;
+    let bench = bench();
+    let repo = parser_repo(&bench);
+    let store = bench.open_store().await;
+    let buggy_hash = observed_file_hash(&repo, "src/lib.rs").expect("buggy hash");
+    let test_hash = observed_file_hash(&repo, "tests/parser.rs").expect("test hash");
+    let amended_test = format!("{A08_TEST}\n// touched after the suite ran\n");
+
+    // The model fixes the bug, proves it with a real run, and then edits the
+    // test file. The passing run observed the workspace *before* that edit.
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            patch_call("call-1", "src/lib.rs", &buggy_hash, A08_FIXED),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            cargo_test_call("call-2"),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            patch_call("call-3", "tests/parser.rs", &test_hash, &amended_test),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("done"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store))).with_goal(
+        GoalSpec::new(
+            "prove the suite passes at the revision you leave behind",
+            vec![GoalCriterion::required("tests-pass", EvidenceKind::Check)],
+        ),
+    );
+    let request = RunRequest::new(
+        SessionId::generate(),
+        TaskId::generate(),
+        InputId::generate(),
+        "fix and prove it".to_owned(),
+        observe_workspace(bench.project_id.clone(), &repo).expect("observation"),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    let outcome = driver
+        .run_turn(
+            request,
+            TurnOptions {
+                workspace_root: repo.clone(),
+                actor_id: "m4.a08".to_owned(),
+                approvals: ApprovalMode::Auto,
+                limits: TurnLimits::default(),
+            },
+            Arc::new(SilentObserver),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the turn runs to a bound");
+
+    // The check really ran and really passed - at an earlier digest.
+    let checked = repo_process_view(&outcome, 0);
+    assert_eq!(process_exit_code(checked), Some(0));
+    let checked_digest = checked
+        .receipt
+        .as_ref()
+        .and_then(|receipt| receipt.after_fingerprint.clone())
+        .expect("a settled check records the workspace it observed");
+    let last_digest = outcome
+        .executions
+        .last()
+        .and_then(|view| view.receipt.as_ref())
+        .and_then(|receipt| receipt.after_fingerprint.clone())
+        .expect("the last execution records its workspace");
+    assert_ne!(
+        checked_digest, last_digest,
+        "the test file was edited after the suite ran, so the digests must differ"
+    );
+
+    // A passing check from an earlier revision is not evidence for this one.
+    assert_ne!(outcome.acceptance, AcceptanceState::Satisfied);
+    assert_eq!(outcome.acceptance, AcceptanceState::NeedsWork);
+    let goal = outcome.goal.clone().expect("the turn reported its goal");
+    assert_eq!(goal.missing, vec!["tests-pass".to_owned()]);
+    assert!(
+        matches!(outcome.stop, TurnStop::NoProgress | TurnStop::GoalLimit),
+        "the run stops instead of accepting stale evidence: {:?}",
+        outcome.stop
+    );
+    drop(driver);
+    close(store).await;
+}
+
+// ---------------------------------------------------------------------------
+// M4-03.4: bounded capture, previews and paged reads (A17)
+// ---------------------------------------------------------------------------
+
+const A17_HEAD: &str = "A17-HEAD-SENTINEL";
+const A17_TAIL: &str = "A17-TAIL-SENTINEL";
+const A17_ERR: &str = "A17-ERR-SENTINEL";
+
+/// A process that writes a head sentinel, a large middle, a tail sentinel on
+/// stdout, and one sentinel on stderr. Both shells are built with `cfg!` so the
+/// other platform's command still has to compile under this host's clippy.
+fn noisy_script(middle_bytes: usize) -> String {
+    if cfg!(windows) {
+        format!(
+            "[Console]::Out.Write('{A17_HEAD}'); [Console]::Out.Write('m' * {middle_bytes}); [Console]::Out.Write('{A17_TAIL}'); [Console]::Error.Write('{A17_ERR}')"
+        )
+    } else {
+        format!(
+            "printf '{A17_HEAD}'; head -c {middle_bytes} /dev/zero | tr '\\0' 'm'; printf '{A17_TAIL}'; printf '{A17_ERR}' >&2"
+        )
+    }
+}
+
+fn capture_bytes(bench: &Bench, artifact_id: &str) -> Vec<u8> {
+    std::fs::read(
+        bench
+            .data_dir
+            .join("artifacts")
+            .join(format!("{artifact_id}.bin")),
+    )
+    .expect("the published capture is readable")
+}
+
+fn shell_action(command: String, timeout_ms: u64) -> CodingToolAction {
+    CodingToolAction::RunShell {
+        command,
+        timeout_ms,
+        isolation: IsolationMode::BestEffort,
+        env: Vec::new(),
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one capture contract, told in order
+async fn a17_output_quota() {
+    let _serial = process_queue_lock().lock().await;
+    let bench = bench();
+    let store = bench.open_store().await;
+    let (session, task) = admit(&store, &bench).await;
+    let quota = 64 * 1024_u64;
+    let limits = SpoolLimits {
+        max_capture_bytes: quota,
+        head_preview_bytes: 1024,
+        tail_preview_bytes: 256,
+    };
+    let spool_root = bench.temp.path().join("a17-spool");
+    let tools = ToolExecutionService::new(Arc::clone(&store))
+        .with_spool(ProcessSpoolConfig::new(&spool_root, limits));
+
+    // (1) An output larger than the quota is cut exactly at the quota, and the
+    // result says so instead of pretending the whole log was kept.
+    let prepared = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a17",
+            &bench.workspace,
+            shell_action(noisy_script(400_000), 30_000),
+        ))
+        .await
+        .expect("the noisy call prepares");
+    let grant = tools.approve(&prepared).await.expect("approved");
+    let view = tools
+        .execute(prepared, Some(grant))
+        .await
+        .expect("the noisy call executes");
+    let receipt = view.receipt.clone().expect("receipt");
+    assert_eq!(receipt.outcome_state, ToolOutcomeState::Settled);
+    let ToolOutput::Process {
+        stdout,
+        stdout_truncated,
+        artifact_id,
+        captured_bytes,
+        capture_hash,
+        capture_truncated,
+        capture_tail,
+        ..
+    } = &view.output
+    else {
+        panic!(
+            "the fixture must return a process output: {:?}",
+            view.output
+        );
+    };
+    assert!(stdout_truncated, "the head preview is bounded");
+    assert!(capture_truncated, "the capture stopped at the quota");
+    assert!(
+        stdout.starts_with(A17_HEAD),
+        "the head preview starts at the beginning of the stream: {stdout}"
+    );
+    assert!(
+        stdout.len() <= limits.head_preview_bytes,
+        "memory holds a bounded preview, not the log: {} bytes",
+        stdout.len()
+    );
+    assert!(
+        !capture_tail.contains(A17_TAIL),
+        "the tail was past the quota, so it was never captured: {capture_tail}"
+    );
+    let capture_id = artifact_id.clone().expect("the capture is referenced");
+    let bytes = capture_bytes(&bench, &capture_id);
+    let header = parse_capture_header(&bytes).expect("the artifact carries a capture header");
+    assert_eq!(
+        header.stdout_bytes, quota,
+        "the stdout section is exactly the quota"
+    );
+    assert!(header.stdout_truncated);
+    assert_eq!(header.quota_bytes, quota);
+    assert_eq!(
+        *captured_bytes,
+        u64::try_from(bytes.len()).unwrap(),
+        "the reported capture length is the length of the stored bytes"
+    );
+    assert_eq!(
+        capture_hash.as_ref(),
+        Some(&ContentHash::from_bytes(&bytes)),
+        "the recorded digest is the digest of the stored bytes"
+    );
+    assert_eq!(
+        capture_tail.as_str(),
+        String::from_utf8_lossy(&bytes[bytes.len() - limits.tail_preview_bytes..]),
+        "the tail preview is the tail of the stored bytes"
+    );
+    assert_eq!(
+        receipt
+            .artifact_id
+            .as_ref()
+            .map(harness_types::ArtifactId::as_str),
+        Some(capture_id.as_str()),
+        "the receipt points at the capture, not at a re-serialized view"
+    );
+    assert_eq!(
+        std::fs::read_dir(&spool_root)
+            .expect("the spool directory exists")
+            .count(),
+        0,
+        "spool staging is removed once the capture is published"
+    );
+
+    // (2) An output inside the quota keeps its tail, and a page reads it back
+    // through the same gate as every other tool call.
+    let prepared = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a17",
+            &bench.workspace,
+            shell_action(noisy_script(2_000), 30_000),
+        ))
+        .await
+        .expect("the small call prepares");
+    let grant = tools.approve(&prepared).await.expect("approved");
+    let view = tools
+        .execute(prepared, Some(grant))
+        .await
+        .expect("the small call executes");
+    let ToolOutput::Process {
+        artifact_id,
+        capture_truncated,
+        capture_tail,
+        ..
+    } = &view.output
+    else {
+        panic!(
+            "the fixture must return a process output: {:?}",
+            view.output
+        );
+    };
+    assert!(!capture_truncated, "a small output is captured whole");
+    assert!(
+        capture_tail.contains(A17_TAIL) && capture_tail.contains(A17_ERR),
+        "the tail preview shows how the capture ended: {capture_tail}"
+    );
+    let small_id = artifact_id.clone().expect("the capture is referenced");
+    let small_bytes = capture_bytes(&bench, &small_id);
+    let small_header =
+        parse_capture_header(&small_bytes).expect("the artifact carries a capture header");
+    assert!(!small_header.stdout_truncated && !small_header.stderr_truncated);
+    let tail_offset = small_header.stdout_bytes - u64::try_from(A17_TAIL.len()).unwrap();
+    let prepared = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a17",
+            &bench.workspace,
+            CodingToolAction::ReadProcessOutput {
+                artifact_id: small_id.clone(),
+                stream: CaptureStream::Stdout,
+                offset: tail_offset,
+                length: 64,
+            },
+        ))
+        .await
+        .expect("a page of this task's own capture prepares");
+    let grant = tools.approve(&prepared).await.expect("approved");
+    let view = tools
+        .execute(prepared, Some(grant))
+        .await
+        .expect("the page read executes");
+    let ToolOutput::ProcessOutput {
+        stream,
+        offset,
+        length,
+        total_bytes,
+        text,
+        ..
+    } = &view.output
+    else {
+        panic!("a page read must return a page: {:?}", view.output);
+    };
+    assert_eq!(stream, "stdout");
+    assert_eq!(*offset, tail_offset);
+    assert_eq!(*total_bytes, small_header.stdout_bytes);
+    assert_eq!(
+        *length,
+        u64::try_from(A17_TAIL.len()).unwrap(),
+        "a page is bounded by the remaining bytes"
+    );
+    assert_eq!(
+        text, A17_TAIL,
+        "the stored tail reads back exactly, with no missing bytes"
+    );
+
+    // A page past the captured bytes names the captured length instead of
+    // returning an empty page that looks like the end of the log.
+    let prepared = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a17",
+            &bench.workspace,
+            CodingToolAction::ReadProcessOutput {
+                artifact_id: small_id.clone(),
+                stream: CaptureStream::Stdout,
+                offset: small_header.stdout_bytes + 1,
+                length: 64,
+            },
+        ))
+        .await
+        .expect("the proposal itself is a well-formed read");
+    let grant = tools.approve(&prepared).await.expect("approved");
+    let view = tools
+        .execute(prepared, Some(grant))
+        .await
+        .expect("a page past the end is a typed refusal");
+    let receipt = view.receipt.clone().expect("refusal carries a receipt");
+    assert_eq!(receipt.outcome_state, ToolOutcomeState::Denied);
+    let ToolOutput::Denied { code, reason } = &view.output else {
+        panic!("the refusal must be a denial: {:?}", view.output);
+    };
+    assert_eq!(code, "invalid_payload");
+    assert!(
+        reason.contains(&small_header.stdout_bytes.to_string()),
+        "the refusal names the captured length: {reason}"
+    );
+    assert!(
+        store
+            .pending_tool_intents(&session)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a refused page never creates an intent"
+    );
+
+    // Another task cannot page this task's capture, even knowing its id.
+    let (other_session, other_task) = admit(&store, &bench).await;
+    let error = tools
+        .prepare(ToolRequest::new(
+            other_session,
+            other_task,
+            "actor.a17",
+            &bench.workspace,
+            CodingToolAction::ReadProcessOutput {
+                artifact_id: small_id.clone(),
+                stream: CaptureStream::Stdout,
+                offset: 0,
+                length: 64,
+            },
+        ))
+        .await
+        .expect_err("an artifact id is not a capability");
+    assert_eq!(error.code(), ErrorCode::ScopeAuthorityDenied);
+
+    // (3) A capture that cannot be written is reported honestly: the process
+    // really ran, so the outcome is unknown and nothing points at bytes that do
+    // not exist.
+    let blocked = bench.temp.path().join("a17-blocked");
+    std::fs::write(&blocked, b"not a directory").expect("blocking fixture");
+    let broken = ToolExecutionService::new(Arc::clone(&store))
+        .with_spool(ProcessSpoolConfig::new(blocked.join("spool"), limits));
+    let marker = bench.workspace.join("a17-marker.txt");
+    let prepared = broken
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a17",
+            &bench.workspace,
+            shell_action(write_now(&marker), 30_000),
+        ))
+        .await
+        .expect("the call prepares before its capture is attempted");
+    let grant = broken.approve(&prepared).await.expect("approved");
+    let view = broken
+        .execute(prepared, Some(grant))
+        .await
+        .expect("a failed capture settles truthfully");
+    let receipt = view.receipt.clone().expect("receipt");
+    assert_eq!(
+        receipt.outcome_state,
+        ToolOutcomeState::OutcomeUnknown,
+        "a capture that could not be written is not a settled success"
+    );
+    assert!(
+        matches!(view.output, ToolOutput::OutcomeUnknown { .. }),
+        "the model is told the outcome is unknown: {:?}",
+        view.output
+    );
+    assert!(
+        marker.exists(),
+        "the process really ran, so 'no effect' would be a lie"
+    );
+    if let Some(artifact_id) = &receipt.artifact_id {
+        let bytes = capture_bytes(&bench, artifact_id.as_str());
+        assert!(
+            parse_capture_header(&bytes).is_err(),
+            "an unknown outcome must not reference a capture that was never written"
+        );
+    }
+    assert!(
+        store
+            .pending_tool_intents(&session)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the unknown outcome was settled, not left pending"
+    );
+    drop(tools);
+    drop(broken);
+    close(store).await;
 }

@@ -38,9 +38,9 @@ pub mod inbox;
 
 pub use budget::{BudgetLedger, BudgetView, Usage};
 pub use goal::{
-    AcceptanceState, EvidenceKind, GoalCriterion, GoalEvaluation, GoalEvaluationInput,
-    GoalEvaluator, GoalEvidence, GoalSpec, GoalVerdict, HostGoalEvaluator, default_evaluator,
-    validate_evaluation,
+    AcceptanceState, CheckObservation, EvidenceKind, GoalCriterion, GoalEvaluation,
+    GoalEvaluationInput, GoalEvaluator, GoalEvidence, GoalSpec, GoalVerdict, HostGoalEvaluator,
+    default_evaluator, validate_evaluation,
 };
 pub use human_input::{
     AskRequest, HumanInputService, is_empty_answer, now_unix_ms, question_scope,

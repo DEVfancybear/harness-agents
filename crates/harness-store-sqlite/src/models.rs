@@ -483,6 +483,19 @@ pub struct PublishedArtifact {
     pub relative_path: String,
 }
 
+/// One bounded page of a published artifact, with the record's own length and
+/// digest so a reader can prove it got the bytes the receipt points at.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactPage {
+    pub artifact_id: String,
+    pub offset: u64,
+    /// Bytes returned in this page.
+    pub bytes: Vec<u8>,
+    /// Bytes recorded for the whole artifact.
+    pub total_bytes: u64,
+    pub content_hash: ContentHash,
+}
+
 /// A session row suitable for a read-only CLI listing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionSummary {

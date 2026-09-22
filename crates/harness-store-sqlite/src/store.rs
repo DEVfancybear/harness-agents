@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,7 +19,7 @@ use sqlx::{
 };
 
 use crate::{
-    AdmissionAck, AdmissionCommit, AgentStateRecord, CompositionSnapshotRecord,
+    AdmissionAck, AdmissionCommit, AgentStateRecord, ArtifactPage, CompositionSnapshotRecord,
     ContextCheckpointRecord, ContextPacketRecord, ContinuationLinkRecord, DataDirectoryMarker,
     FrozenRequestRecord, HostFence, PersistedPluginManifest, ProjectRegistrationRecord,
     ProviderAttemptRecord, PublishedArtifact, RUNTIME_SCHEMA_VERSION, ReceiptAck, ReceiptCommit,
@@ -1515,6 +1515,97 @@ impl SqliteStore {
             })?,
             relative_path,
         })
+    }
+
+    /// Read one bounded page of a published artifact.
+    ///
+    /// The record is the authority for how many bytes exist and what they hash
+    /// to, so a reader that asks past the end is told the captured length rather
+    /// than handed an empty page that looks like the end of the log, and a file
+    /// whose length disagrees with its record is reported as a real fault.
+    pub async fn read_artifact_page(
+        &self,
+        artifact_id: &str,
+        offset: u64,
+        length: usize,
+    ) -> Result<Option<ArtifactPage>, StoreError> {
+        let row = sqlx::query(
+            "SELECT content_hash, byte_len, relative_path FROM artifacts WHERE artifact_id = ?",
+        )
+        .bind(artifact_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "read artifact record", error)
+        })?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let content_hash = ContentHash::parse(row_get::<String>(&row, "content_hash")?)?;
+        let total_bytes = u64::try_from(row_get::<i64>(&row, "byte_len")?).map_err(|_| {
+            StoreError::new(
+                ErrorCode::ArtifactWriteFailed,
+                "artifact length is negative",
+            )
+        })?;
+        let relative_path = row_get::<String>(&row, "relative_path")?;
+        if offset > total_bytes {
+            return Err(StoreError::new(
+                ErrorCode::InvalidPayload,
+                format!("requested offset {offset} is past the {total_bytes} captured bytes"),
+            ));
+        }
+        let path = self.paths.data_dir.join(&relative_path);
+        let mut file = fs::File::open(&path).map_err(|error| {
+            StoreError::new(
+                ErrorCode::StorageOpenFailed,
+                format!("captured artifact bytes are missing: {error}"),
+            )
+        })?;
+        let file_len = file
+            .metadata()
+            .map_err(|error| {
+                StoreError::new(
+                    ErrorCode::StorageOpenFailed,
+                    format!("cannot measure captured artifact bytes: {error}"),
+                )
+            })?
+            .len();
+        if file_len != total_bytes {
+            return Err(StoreError::new(
+                ErrorCode::ArtifactWriteFailed,
+                format!("captured artifact has {file_len} bytes but its record says {total_bytes}"),
+            ));
+        }
+        file.seek(SeekFrom::Start(offset)).map_err(|error| {
+            StoreError::new(
+                ErrorCode::StorageOpenFailed,
+                format!("cannot seek captured artifact bytes: {error}"),
+            )
+        })?;
+        let room = usize::try_from(total_bytes - offset).unwrap_or(usize::MAX);
+        let mut bytes = vec![0_u8; length.min(room)];
+        let mut filled = 0;
+        while filled < bytes.len() {
+            let read = file.read(&mut bytes[filled..]).map_err(|error| {
+                StoreError::new(
+                    ErrorCode::StorageOpenFailed,
+                    format!("cannot read captured artifact bytes: {error}"),
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        bytes.truncate(filled);
+        Ok(Some(ArtifactPage {
+            artifact_id: artifact_id.to_owned(),
+            offset,
+            bytes,
+            total_bytes,
+            content_hash,
+        }))
     }
 
     /// Persist implementation metadata for later inspection; this does not load

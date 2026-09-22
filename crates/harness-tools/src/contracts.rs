@@ -10,9 +10,129 @@ use serde_json::{Value, json};
 /// The independently versioned P3 tool contract.
 pub const TOOL_CONTRACT_VERSION: u16 = 1;
 
+/// The only accepted shape of an environment reference a process action may
+/// name. A model never supplies an environment *value*: it names a reference,
+/// and the host resolves it immediately before spawn from a source the operator
+/// granted. A literal value would let the model inject anything into the child,
+/// so it is refused instead of being passed through.
+pub const ENV_REFERENCE_PREFIX: &str = "secret://";
+
+/// How many environment references one process action may carry.
+pub const MAX_ENV_BINDINGS: usize = 8;
+
+/// Longest accepted environment variable name.
+pub const MAX_ENV_NAME_LEN: usize = 64;
+
+/// Longest accepted secret reference, including its scheme.
+pub const MAX_ENV_REFERENCE_LEN: usize = 200;
+
+/// One environment variable a process action asks the host to set, named by a
+/// reference rather than by a value.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EnvBinding {
+    /// The name the child sees.
+    pub name: String,
+    /// The reference the host resolves just before spawn (`secret://NAME`).
+    pub reference: String,
+}
+
+impl EnvBinding {
+    /// Validate one binding without resolving anything: shape only.
+    pub fn validate(&self) -> Result<(), harness_types::HarnessError> {
+        if self.name.len() > MAX_ENV_NAME_LEN || !is_environment_name(&self.name) {
+            return Err(harness_types::HarnessError::new(
+                harness_types::ErrorCode::EnvironmentDenied,
+                "environment binding name must be a portable variable name",
+            ));
+        }
+        if self.reference.len() > MAX_ENV_REFERENCE_LEN {
+            return Err(harness_types::HarnessError::new(
+                harness_types::ErrorCode::EnvironmentDenied,
+                "environment binding reference is too long",
+            ));
+        }
+        let Some(target) = self.reference.strip_prefix(ENV_REFERENCE_PREFIX) else {
+            return Err(harness_types::HarnessError::new(
+                harness_types::ErrorCode::EnvironmentDenied,
+                "environment values are never taken from the model: use a secret:// reference",
+            ));
+        };
+        if target.is_empty() || !is_environment_name(target) {
+            return Err(harness_types::HarnessError::new(
+                harness_types::ErrorCode::EnvironmentDenied,
+                "secret reference must name a portable variable name",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Which captured stream a paged read asks for.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureStream {
+    #[default]
+    Stdout,
+    Stderr,
+}
+
+impl CaptureStream {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+const fn default_page_length() -> u32 {
+    PROCESS_OUTPUT_PAGE_DEFAULT_BYTES
+}
+
+fn is_environment_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// Validate every environment binding of one action and return them in a
+/// stable order, so the action hash does not depend on the model's key order.
+pub fn normalize_env_bindings(
+    bindings: &[EnvBinding],
+) -> Result<Vec<EnvBinding>, harness_types::HarnessError> {
+    if bindings.len() > MAX_ENV_BINDINGS {
+        return Err(harness_types::HarnessError::new(
+            harness_types::ErrorCode::EnvironmentDenied,
+            format!("a process action may carry at most {MAX_ENV_BINDINGS} environment bindings"),
+        ));
+    }
+    let mut normalized = bindings.to_vec();
+    normalized.sort_by(|left, right| left.name.cmp(&right.name));
+    for (index, binding) in normalized.iter().enumerate() {
+        binding.validate()?;
+        if index > 0 && normalized[index - 1].name == binding.name {
+            return Err(harness_types::HarnessError::new(
+                harness_types::ErrorCode::EnvironmentDenied,
+                "environment binding names must be unique",
+            ));
+        }
+    }
+    Ok(normalized)
+}
+
 /// Default number of commits `git_log` returns when the model names no limit.
 pub const GIT_LOG_DEFAULT_LIMIT: u32 = 20;
+/// Largest page `read_process_output` returns in one call.
+pub const PROCESS_OUTPUT_PAGE_MAX_BYTES: u32 = 64 * 1024;
 
+/// Page size used when a caller names no length.
+pub const PROCESS_OUTPUT_PAGE_DEFAULT_BYTES: u32 = 16 * 1024;
 /// Hard ceiling for `git_log`: a model may ask for fewer, never for unbounded
 /// history. The provider schema and the typed action both carry this bound.
 pub const GIT_LOG_MAX_LIMIT: u32 = 100;
@@ -27,6 +147,7 @@ pub enum ToolKind {
     ApplyPatch,
     RunProcess,
     RunShell,
+    ReadProcessOutput,
     GitStatus,
     GitDiff,
     GitLog,
@@ -45,6 +166,7 @@ impl ToolKind {
             Self::ApplyPatch => "apply_patch",
             Self::RunProcess => "run_process",
             Self::RunShell => "run_shell",
+            Self::ReadProcessOutput => "read_process_output",
             Self::GitStatus => "git_status",
             Self::GitDiff => "git_diff",
             Self::GitLog => "git_log",
@@ -56,15 +178,16 @@ impl ToolKind {
     /// Whether this action only reads.
     ///
     /// Reading is the one capability that cannot damage the workspace, so the host
-    /// is allowed to stop asking for it. The list is deliberately an allowlist of
-    /// six and nothing else: a kind is read-only because it was classified here,
-    /// never because its name suggests it.
+    /// is allowed to stop asking for it. The list is deliberately an allowlist and
+    /// nothing else: a kind is read-only because it was classified here, never
+    /// because its name suggests it.
     ///
     /// This predicate is not the whole guard. A path is checked against the
     /// workspace root - traversal, symlinks and credential-like names - by
-    /// `ToolExecutionService::prepare` *before* any proposal exists, so a read that
-    /// is read-only by kind can still be refused outright. Auto-approving skips the
-    /// question, never the check.
+    /// `ToolExecutionService::prepare` *before* any proposal exists, and a paged
+    /// artifact read is checked against the task that owns the artifact, so a read
+    /// that is read-only by kind can still be refused outright. Auto-approving
+    /// skips the question, never the check.
     #[must_use]
     pub const fn is_read_only(self) -> bool {
         matches!(
@@ -72,6 +195,7 @@ impl ToolKind {
             Self::ReadFile
                 | Self::ListFiles
                 | Self::SearchText
+                | Self::ReadProcessOutput
                 | Self::GitStatus
                 | Self::GitDiff
                 | Self::GitLog
@@ -92,6 +216,7 @@ pub const fn coding_tool_names() -> &'static [&'static str] {
         "apply_patch",
         "run_process",
         "run_shell",
+        "read_process_output",
         "git_status",
         "git_diff",
         "git_log",
@@ -140,7 +265,8 @@ pub fn coding_tool_schemas() -> Vec<Value> {
                 "executable": string_schema(),
                 "args": {"type": "array", "items": string_schema()},
                 "timeout_ms": {"type": "integer", "minimum": 1},
-                "isolation": isolation_schema()
+                "isolation": isolation_schema(),
+                "env": environment_schema()
             }),
             &["executable", "args", "timeout_ms"],
         ),
@@ -150,9 +276,21 @@ pub fn coding_tool_schemas() -> Vec<Value> {
             json!({
                 "command": string_schema(),
                 "timeout_ms": {"type": "integer", "minimum": 1},
-                "isolation": isolation_schema()
+                "isolation": isolation_schema(),
+                "env": environment_schema()
             }),
             &["command", "timeout_ms"],
+        ),
+        function_schema(
+            "read_process_output",
+            "Read one bounded page of a captured process output artifact owned by this task.",
+            json!({
+                "artifact_id": string_schema(),
+                "stream": {"type": "string", "enum": ["stdout", "stderr"]},
+                "offset": {"type": "integer", "minimum": 0},
+                "length": {"type": "integer", "minimum": 1, "maximum": PROCESS_OUTPUT_PAGE_MAX_BYTES}
+            }),
+            &["artifact_id"],
         ),
         function_schema(
             "git_status",
@@ -213,6 +351,18 @@ fn isolation_schema() -> Value {
     json!({"type": "string", "enum": ["best_effort", "strict"]})
 }
 
+/// The child environment is never inherited. A call may name `secret://`
+/// references the host is willing to resolve; anything else is refused, so a
+/// model cannot hand a literal value to a process it starts.
+fn environment_schema() -> Value {
+    json!({
+        "type": "object",
+        "maxProperties": MAX_ENV_BINDINGS,
+        "additionalProperties": {"type": "string"},
+        "description": "Environment variables resolved by the host from secret:// references; literal values are refused."
+    })
+}
+
 /// Isolation claims are deliberately small. `Strict` must be denied until a
 /// verified sandbox backend exists instead of being mapped to best effort.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -247,11 +397,29 @@ pub enum CodingToolAction {
         args: Vec<String>,
         timeout_ms: u64,
         isolation: IsolationMode,
+        /// Environment variables the host resolves just before spawn. Empty for
+        /// a process that needs nothing beyond the host allowlist; the field is
+        /// skipped when empty so pre-M4 action hashes stay byte-identical.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<EnvBinding>,
     },
     RunShell {
         command: String,
         timeout_ms: u64,
         isolation: IsolationMode,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<EnvBinding>,
+    },
+    /// Read a page of a captured process output. The artifact must belong to the
+    /// calling task: an artifact id is not a capability by itself.
+    ReadProcessOutput {
+        artifact_id: String,
+        #[serde(default)]
+        stream: CaptureStream,
+        #[serde(default)]
+        offset: u64,
+        #[serde(default = "default_page_length")]
+        length: u32,
     },
     GitStatus,
     GitDiff {
@@ -287,6 +455,7 @@ impl CodingToolAction {
             Self::ApplyPatch { .. } => ToolKind::ApplyPatch,
             Self::RunProcess { .. } => ToolKind::RunProcess,
             Self::RunShell { .. } => ToolKind::RunShell,
+            Self::ReadProcessOutput { .. } => ToolKind::ReadProcessOutput,
             Self::GitStatus => ToolKind::GitStatus,
             Self::GitDiff { .. } => ToolKind::GitDiff,
             Self::GitLog { .. } => ToolKind::GitLog,
@@ -305,6 +474,7 @@ impl CodingToolAction {
             Self::GitLog { path, .. } => path.as_deref(),
             Self::RunProcess { .. }
             | Self::RunShell { .. }
+            | Self::ReadProcessOutput { .. }
             | Self::GitStatus
             | Self::TaskUpdate { .. }
             | Self::ExternalTool { .. } => None,
@@ -359,9 +529,10 @@ impl CodingToolAction {
             "read_file" | "list_files" | "git_diff" => &["path"],
             "search_text" => &["query", "path"],
             "apply_patch" => &["path", "expected_hash", "replacement"],
-            "run_process" => &["executable", "args", "timeout_ms", "isolation"],
-            "run_shell" => &["command", "timeout_ms", "isolation"],
+            "run_process" => &["executable", "args", "timeout_ms", "isolation", "env"],
+            "run_shell" => &["command", "timeout_ms", "isolation", "env"],
             "git_status" => &[],
+            "read_process_output" => &["artifact_id", "stream", "offset", "length"],
             "git_log" => &["path", "limit"],
             "task_update" => &["note"],
             _ => {
@@ -443,6 +614,7 @@ impl CodingToolAction {
                     args,
                     timeout_ms,
                     isolation: parse_isolation(object.get("isolation"))?,
+                    env: parse_env_bindings(object.get("env"))?,
                 })
             }
             "run_shell" => Ok(Self::RunShell {
@@ -457,8 +629,53 @@ impl CodingToolAction {
                         )
                     })?,
                 isolation: parse_isolation(object.get("isolation"))?,
+                env: parse_env_bindings(object.get("env"))?,
             }),
             "git_status" => Ok(Self::GitStatus),
+            "read_process_output" => {
+                let artifact_id = required_string(object, "artifact_id")?;
+                let stream = match object.get("stream") {
+                    None | Some(Value::Null) => CaptureStream::Stdout,
+                    Some(Value::String(value)) if value == "stdout" => CaptureStream::Stdout,
+                    Some(Value::String(value)) if value == "stderr" => CaptureStream::Stderr,
+                    _ => {
+                        return Err(harness_types::HarnessError::new(
+                            harness_types::ErrorCode::InvalidPayload,
+                            "provider read_process_output stream must be stdout or stderr",
+                        ));
+                    }
+                };
+                let offset = match object.get("offset") {
+                    None | Some(Value::Null) => 0,
+                    Some(value) => value.as_u64().ok_or_else(|| {
+                        harness_types::HarnessError::new(
+                            harness_types::ErrorCode::InvalidPayload,
+                            "provider read_process_output offset must be a non-negative integer",
+                        )
+                    })?,
+                };
+                let length = match object.get("length") {
+                    None | Some(Value::Null) => PROCESS_OUTPUT_PAGE_DEFAULT_BYTES,
+                    Some(value) => value
+                        .as_u64()
+                        .and_then(|length| u32::try_from(length).ok())
+                        .filter(|length| (1..=PROCESS_OUTPUT_PAGE_MAX_BYTES).contains(length))
+                        .ok_or_else(|| {
+                            harness_types::HarnessError::new(
+                                harness_types::ErrorCode::InvalidPayload,
+                                format!(
+                                    "provider read_process_output length must be an integer between 1 and {PROCESS_OUTPUT_PAGE_MAX_BYTES}"
+                                ),
+                            )
+                        })?,
+                };
+                Ok(Self::ReadProcessOutput {
+                    artifact_id,
+                    stream,
+                    offset,
+                    length,
+                })
+            }
             "git_diff" => Ok(Self::GitDiff {
                 path: object
                     .get("path")
@@ -516,6 +733,45 @@ fn required_string(
                 format!("provider tool field {key} is missing or invalid"),
             )
         })
+}
+
+/// Parse the optional `env` object of a process call. It is a name → reference
+/// map; a non-string or malformed reference never reaches the gate.
+fn parse_env_bindings(
+    value: Option<&Value>,
+) -> Result<Vec<EnvBinding>, harness_types::HarnessError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let object = value.as_object().ok_or_else(|| {
+        harness_types::HarnessError::new(
+            harness_types::ErrorCode::EnvironmentDenied,
+            "provider process env must be an object of secret references",
+        )
+    })?;
+    if object.len() > MAX_ENV_BINDINGS {
+        return Err(harness_types::HarnessError::new(
+            harness_types::ErrorCode::EnvironmentDenied,
+            format!("provider process env may name at most {MAX_ENV_BINDINGS} variables"),
+        ));
+    }
+    let mut bindings = Vec::with_capacity(object.len());
+    for (name, reference) in object {
+        let reference = reference.as_str().ok_or_else(|| {
+            harness_types::HarnessError::new(
+                harness_types::ErrorCode::EnvironmentDenied,
+                "provider process env values must be secret:// references, never literal values",
+            )
+        })?;
+        bindings.push(EnvBinding {
+            name: name.clone(),
+            reference: reference.to_owned(),
+        });
+    }
+    normalize_env_bindings(&bindings)
 }
 
 fn parse_isolation(value: Option<&Value>) -> Result<IsolationMode, harness_types::HarnessError> {
@@ -659,9 +915,13 @@ pub fn coding_tool_descriptors() -> Vec<ToolDescriptor> {
 #[must_use]
 pub fn effect_class_for(name: &str) -> EffectClass {
     match name {
-        "read_file" | "list_files" | "search_text" | "git_status" | "git_diff" | "git_log" => {
-            EffectClass::ReadOnly
-        }
+        "read_file"
+        | "list_files"
+        | "search_text"
+        | "git_status"
+        | "git_diff"
+        | "git_log"
+        | "read_process_output" => EffectClass::ReadOnly,
         "apply_patch" => EffectClass::Mutating,
         _ => EffectClass::External,
     }
@@ -774,11 +1034,41 @@ pub enum ToolOutput {
         canceled: bool,
         /// Whether the call waited behind another process for the host permit.
         queued: bool,
+        /// True only when the backend confirmed the whole tree is gone; an
+        /// unconfirmed reap is never reported as a settled success.
         tree_cleanup_confirmed: bool,
+        /// How that confirmation was obtained: `nothing_to_clean`,
+        /// `reaped_on_exit` or `killed_and_reaped`. A bare boolean cannot tell
+        /// an operator whether a kill happened at all.
+        tree_cleanup: String,
+        /// Head preview of stdout, bounded by the spool's head limit.
         stdout: String,
         stderr: String,
         stdout_truncated: bool,
         stderr_truncated: bool,
+        /// The durable capture of both streams, when one was published. It is
+        /// what `read_process_output` pages through; `stdout`/`stderr` above are
+        /// only the head of it.
+        artifact_id: Option<String>,
+        /// Bytes actually captured in that artifact.
+        captured_bytes: u64,
+        /// Digest of exactly those bytes.
+        capture_hash: Option<ContentHash>,
+        /// Whether the capture stopped at the quota before the stream ended.
+        capture_truncated: bool,
+        /// Tail preview of the capture, so a long log still shows how it ended.
+        capture_tail: String,
+    },
+    /// One page of a captured process output.
+    ProcessOutput {
+        artifact_id: String,
+        stream: String,
+        offset: u64,
+        /// Bytes in this page.
+        length: u64,
+        /// Bytes captured for this stream in total.
+        total_bytes: u64,
+        text: String,
     },
     Git {
         operation: String,

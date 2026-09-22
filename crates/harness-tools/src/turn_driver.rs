@@ -19,9 +19,9 @@ use harness_providers::{
     ProviderToolCall,
 };
 use harness_runtime::{
-    AcceptanceState, AgentState, AskRequest, GoalEvaluationInput, GoalEvidence, GoalSpec,
-    GoalVerdict, HumanInputService, ProviderEventSink, RunCommand, RunInbox, RunRequest, RunResult,
-    RuntimeService, now_unix_ms,
+    AcceptanceState, AgentState, AskRequest, CheckObservation, GoalEvaluationInput, GoalEvidence,
+    GoalSpec, GoalVerdict, HumanInputService, ProviderEventSink, RunCommand, RunInbox, RunRequest,
+    RunResult, RuntimeService, now_unix_ms,
 };
 use harness_store_sqlite::{RunCommandKind, RunState};
 use harness_types::{ErrorCode, HarnessError, QuestionId};
@@ -1083,6 +1083,15 @@ fn summarize_action(action: &CodingToolAction) -> String {
             executable, args, ..
         } => format!("run {executable} {}", args.join(" ")),
         CodingToolAction::RunShell { command, .. } => format!("shell: {command}"),
+        CodingToolAction::ReadProcessOutput {
+            artifact_id,
+            stream,
+            offset,
+            length,
+        } => format!(
+            "read captured {} of {artifact_id} at {offset} ({length} bytes)",
+            stream.as_str()
+        ),
         CodingToolAction::GitStatus => "git status".to_owned(),
         CodingToolAction::GitDiff { path } => {
             format!("git diff {}", path.as_deref().unwrap_or("."))
@@ -1134,6 +1143,10 @@ fn repeated_tail(signatures: &[String]) -> bool {
 }
 
 /// What one terminal response proved, as typed evidence.
+///
+/// A check counts only at the digest it observed, so the final criteria are
+/// judged against the workspace the run actually left behind rather than
+/// against the model's account of it.
 fn goal_evidence(result: &RunResult, executions: &[ToolExecutionView]) -> GoalEvidence {
     let mut evidence = GoalEvidence {
         response: result.response.clone(),
@@ -1143,27 +1156,42 @@ fn goal_evidence(result: &RunResult, executions: &[ToolExecutionView]) -> GoalEv
         ..GoalEvidence::default()
     };
     for view in executions {
-        let settled = view.receipt.as_ref().is_some_and(|receipt| {
+        let receipt = view.receipt.as_ref();
+        let settled = receipt.is_some_and(|receipt| {
             receipt.outcome_state == harness_types::ToolOutcomeState::Settled
         });
         if settled {
             evidence.successful_tool_executions += 1;
         }
+        // The digest after this execution, when it settled one: it is the
+        // workspace every later criterion is measured against.
+        if let Some(after) = receipt.and_then(|receipt| receipt.after_fingerprint.clone()) {
+            evidence.workspace_digest = Some(after);
+        }
         match &view.output {
             ToolOutput::ApplyPatch { .. } => evidence.file_changes += 1,
             ToolOutput::Process {
-                exit_code: Some(0),
+                exit_code,
                 timed_out: false,
                 canceled: false,
                 ..
-            } => evidence.checks_passed += 1,
+            } => {
+                let passed = *exit_code == Some(0);
+                if passed {
+                    evidence.checks_passed += 1;
+                }
+                if let Some(receipt) = receipt {
+                    evidence.checks.push(CheckObservation {
+                        command_digest: receipt.input_hash.clone(),
+                        workspace_digest: receipt.after_fingerprint.clone(),
+                        exit_code: *exit_code,
+                        passed,
+                    });
+                }
+            }
             _ => {}
         }
-        if view
-            .receipt
-            .as_ref()
-            .is_some_and(|receipt| receipt.artifact_id.is_some())
-        {
+        if receipt.is_some_and(|receipt| receipt.artifact_id.is_some()) {
             evidence.artifacts += 1;
         }
     }
@@ -1223,11 +1251,22 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             timed_out,
             canceled,
             queued,
+            tree_cleanup,
             stdout,
             stderr,
             ..
         } => format!(
-            "process {executable} exit={exit_code:?} timed_out={timed_out} canceled={canceled} queued={queued}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            "process {executable} exit={exit_code:?} timed_out={timed_out} canceled={canceled} queued={queued} tree_cleanup={tree_cleanup}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        ),
+        ToolOutput::ProcessOutput {
+            artifact_id,
+            stream,
+            offset,
+            length,
+            total_bytes,
+            text,
+        } => format!(
+            "read_process_output {artifact_id} {stream} @{offset} ({length}/{total_bytes} bytes):\n{text}"
         ),
         ToolOutput::Git {
             operation, output, ..

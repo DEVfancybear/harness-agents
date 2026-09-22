@@ -48,6 +48,10 @@ pub struct ToolPolicy {
     revision: u64,
     rules: Vec<PolicyRule>,
     max_process_timeout_ms: u64,
+    /// Secret references the operator has exposed to tool processes. It is host
+    /// configuration, never model input: with the default empty list, every
+    /// `secret://` request is refused before an approval can even be proposed.
+    granted_secrets: Vec<String>,
 }
 
 impl Default for ToolPolicy {
@@ -56,6 +60,7 @@ impl Default for ToolPolicy {
             revision: 1,
             rules: Vec::new(),
             max_process_timeout_ms: 60_000,
+            granted_secrets: Vec::new(),
         }
     }
 }
@@ -76,9 +81,24 @@ impl ToolPolicy {
         self
     }
 
+    /// Expose secret references to this host's tool processes.
+    #[must_use]
+    pub fn with_granted_secrets(mut self, secrets: Vec<String>) -> Self {
+        self.granted_secrets = secrets;
+        self
+    }
+
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Whether the host has exposed this exact reference to a tool process.
+    #[must_use]
+    pub fn allows_secret(&self, reference: &str) -> bool {
+        self.granted_secrets
+            .iter()
+            .any(|granted| granted == reference)
     }
 
     /// Validate the original action shape, apply deterministic policy
@@ -89,31 +109,55 @@ impl ToolPolicy {
         action: CodingToolAction,
     ) -> Result<CodingToolAction, HarnessError> {
         validate_action_shape(&action)?;
+        self.validate_secret_grants(&action)?;
         let transformed = match action {
             CodingToolAction::RunProcess {
                 executable,
                 args,
                 timeout_ms,
                 isolation,
+                env,
             } => CodingToolAction::RunProcess {
                 executable,
                 args,
                 timeout_ms: timeout_ms.min(self.max_process_timeout_ms),
                 isolation,
+                env,
             },
             CodingToolAction::RunShell {
                 command,
                 timeout_ms,
                 isolation,
+                env,
             } => CodingToolAction::RunShell {
                 command,
                 timeout_ms: timeout_ms.min(self.max_process_timeout_ms),
                 isolation,
+                env,
             },
             action => action,
         };
         validate_action_shape(&transformed)?;
         Ok(transformed)
+    }
+
+    /// Refuse a process action that names a secret the host has not exposed.
+    ///
+    /// This runs before a proposal exists, so an un-granted reference can never
+    /// be approved, never reaches an executor, and never becomes an intent.
+    fn validate_secret_grants(&self, action: &CodingToolAction) -> Result<(), HarnessError> {
+        for binding in env_bindings_of(action) {
+            if !self.allows_secret(&binding.reference) {
+                return Err(HarnessError::new(
+                    ErrorCode::SecretNotGranted,
+                    format!(
+                        "secret reference {} is not exposed to this host's tool processes",
+                        binding.reference
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Returns a policy denial without converting an allow into implicit
@@ -196,6 +240,25 @@ fn validate_action_shape(action: &CodingToolAction) -> Result<(), HarnessError> 
             ErrorCode::InvalidPayload,
             "task update note must not be empty",
         )),
+        CodingToolAction::ReadProcessOutput { artifact_id, .. }
+            if artifact_id.trim().is_empty() =>
+        {
+            Err(HarnessError::new(
+                ErrorCode::InvalidPayload,
+                "captured artifact id must not be empty",
+            ))
+        }
+        CodingToolAction::ReadProcessOutput { length, .. }
+            if *length == 0 || *length > crate::PROCESS_OUTPUT_PAGE_MAX_BYTES =>
+        {
+            Err(HarnessError::new(
+                ErrorCode::InvalidPayload,
+                format!(
+                    "captured output page must be between 1 and {} bytes",
+                    crate::PROCESS_OUTPUT_PAGE_MAX_BYTES
+                ),
+            ))
+        }
         CodingToolAction::ApplyPatch { replacement, .. } if replacement.contains('\0') => {
             Err(HarnessError::new(
                 ErrorCode::BinaryContentDenied,
@@ -203,6 +266,15 @@ fn validate_action_shape(action: &CodingToolAction) -> Result<(), HarnessError> 
             ))
         }
         _ => Ok(()),
+    }
+}
+
+/// The environment bindings of an action, or nothing for an action that starts
+/// no process.
+fn env_bindings_of(action: &CodingToolAction) -> &[crate::EnvBinding] {
+    match action {
+        CodingToolAction::RunProcess { env, .. } | CodingToolAction::RunShell { env, .. } => env,
+        _ => &[],
     }
 }
 

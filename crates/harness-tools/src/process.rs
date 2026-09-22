@@ -19,7 +19,78 @@ use tokio::{
     time::{Instant, sleep},
 };
 
-const PROCESS_OUTPUT_LIMIT: usize = 64 * 1024;
+use crate::{
+    capture::{
+        FinalizedCapture, ProcessSpoolConfig, Redactor, SpoolLimits, SpoolWriter, SpooledStream,
+        finalize_capture,
+    },
+    secrets::ProcessEnvironment,
+};
+
+/// How long a kill may take to be confirmed as a fully reaped tree.
+const CLEANUP_BOUND: Duration = Duration::from_secs(5);
+
+/// The only host environment names a tool process inherits.
+///
+/// A child never inherits the host environment wholesale: an agent host holds
+/// provider credentials, and a model that can start a process must not be able
+/// to read them by asking. The list is the smallest set that lets a shell, a
+/// compiler and a test runner work; anything else a call genuinely needs must
+/// be named as a `secret://` reference the operator exposed.
+pub const PROCESS_ENVIRONMENT_ALLOWLIST: &[&str] = &[
+    // Shell and executable resolution.
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "COMSPEC",
+    "SHELL",
+    // Temporary directories.
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    // User context a toolchain expects to exist.
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USER",
+    // Locale.
+    "LANG",
+    "LC_ALL",
+    // Rust toolchain locations, so a real build/test runner resolves its own
+    // compiler instead of falling back to a guessed home directory.
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+];
+
+/// How the process tree's cleanup was established.
+///
+/// This is recorded instead of a bare boolean because "the kill request
+/// succeeded" and "every process in the tree is gone" are different claims.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TreeCleanup {
+    /// The call was withdrawn before a process existed.
+    NothingToClean,
+    /// The process exited by itself and the backend reported the tree empty.
+    ReapedOnExit,
+    /// A kill was requested and the backend confirmed the whole tree is gone.
+    KilledAndReaped,
+}
+
+impl TreeCleanup {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NothingToClean => "nothing_to_clean",
+            Self::ReapedOnExit => "reaped_on_exit",
+            Self::KilledAndReaped => "killed_and_reaped",
+        }
+    }
+}
 
 enum WaitSignal {
     Exited(io::Result<ExitStatus>),
@@ -44,11 +115,14 @@ pub(crate) struct ProcessResult {
     /// It is recorded so a canceled queue member is distinguishable from a call
     /// that was withdrawn before it ever reached the runner.
     pub queued: bool,
-    pub tree_cleanup_confirmed: bool,
+    pub tree_cleanup: TreeCleanup,
     pub stdout: String,
     pub stderr: String,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// The spooled capture, when the call actually ran a process. It is the
+    /// durable copy of everything the process wrote, bounded by the quota.
+    pub capture: Option<FinalizedCapture>,
 }
 
 pub(crate) async fn run_structured(
@@ -57,8 +131,19 @@ pub(crate) async fn run_structured(
     args: &[String],
     timeout_ms: u64,
     cancellation: CancellationToken,
+    environment: &ProcessEnvironment,
+    spool: &ProcessSpoolConfig,
 ) -> Result<ProcessResult, HarnessError> {
-    run(root, executable, args, timeout_ms, cancellation).await
+    run(
+        root,
+        executable,
+        args,
+        timeout_ms,
+        cancellation,
+        environment,
+        spool,
+    )
+    .await
 }
 
 pub(crate) async fn run_shell(
@@ -66,6 +151,8 @@ pub(crate) async fn run_shell(
     command: &str,
     timeout_ms: u64,
     cancellation: CancellationToken,
+    environment: &ProcessEnvironment,
+    spool: &ProcessSpoolConfig,
 ) -> Result<ProcessResult, HarnessError> {
     #[cfg(windows)]
     let (executable, args) = (
@@ -79,15 +166,27 @@ pub(crate) async fn run_shell(
     );
     #[cfg(not(windows))]
     let (executable, args) = ("sh".to_owned(), vec!["-c".to_owned(), command.to_owned()]);
-    run(root, &executable, &args, timeout_ms, cancellation).await
+    run(
+        root,
+        &executable,
+        &args,
+        timeout_ms,
+        cancellation,
+        environment,
+        spool,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_lines)] // one process lifecycle, told in order
 async fn run(
     root: &Path,
     executable: &str,
     args: &[String],
     timeout_ms: u64,
     cancellation: CancellationToken,
+    environment: &ProcessEnvironment,
+    spool: &ProcessSpoolConfig,
 ) -> Result<ProcessResult, HarnessError> {
     // Windows Job Object completion ports are process-lifecycle resources. A
     // single host-wide runner permit makes concurrent tool calls deterministic
@@ -121,6 +220,19 @@ async fn run(
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // The host environment is not inherited: only the allowlist, plus the
+        // values this call's grants resolved. A child that dumps its own
+        // environment therefore shows the host's credentials only if the
+        // operator exposed them for this exact action.
+        child_command.env_clear();
+        for name in PROCESS_ENVIRONMENT_ALLOWLIST {
+            if let Ok(value) = std::env::var(name) {
+                child_command.env(name, value);
+            }
+        }
+        for (name, value) in environment.values() {
+            child_command.env(name, value);
+        }
     });
     command.wrap(KillOnDrop);
     #[cfg(windows)]
@@ -135,8 +247,28 @@ async fn run(
     })?;
     let stdout = child.stdout().take();
     let stderr = child.stderr().take();
-    let stdout_reader = stdout.map(|stream| tokio::spawn(read_bounded(stream)));
-    let stderr_reader = stderr.map(|stream| tokio::spawn(read_bounded(stream)));
+    let limits = spool.limits();
+    // Both streams stream to their own spool file. Memory holds a bounded head
+    // preview per stream and nothing else, so a process that logs a gigabyte
+    // costs the same as one that logs a line.
+    let stdout_reader = stdout.map(|stream| {
+        tokio::spawn(read_spooled(
+            stream,
+            spool.root().to_owned(),
+            limits,
+            "stdout",
+            environment.redactions().to_vec(),
+        ))
+    });
+    let stderr_reader = stderr.map(|stream| {
+        tokio::spawn(read_spooled(
+            stream,
+            spool.root().to_owned(),
+            limits,
+            "stderr",
+            environment.redactions().to_vec(),
+        ))
+    });
     let deadline = Instant::now()
         .checked_add(Duration::from_millis(timeout_ms))
         .ok_or_else(|| HarnessError::new(ErrorCode::InvalidPayload, "process timeout overflows"))?;
@@ -153,7 +285,7 @@ async fn run(
             () = sleep(deadline.saturating_duration_since(Instant::now())) => WaitSignal::TimedOut,
         }
     };
-    let (status, timed_out, canceled) = match signal {
+    let (status, timed_out, canceled, tree_cleanup) = match signal {
         WaitSignal::Exited(result) => {
             let status = result.map_err(|error| {
                 HarnessError::new(
@@ -161,33 +293,43 @@ async fn run(
                     format!("cannot confirm process tree completion: {error}"),
                 )
             })?;
-            (status, false, false)
+            // `wait` on either backend reaps the whole container (job object /
+            // process group), so its completion is the evidence that nothing
+            // was left behind.
+            (status, false, false, TreeCleanup::ReapedOnExit)
         }
         WaitSignal::TimedOut => (
             terminate_and_reap(&mut child, "timed-out").await?,
             true,
             false,
+            TreeCleanup::KilledAndReaped,
         ),
         WaitSignal::Canceled => (
             terminate_and_reap(&mut child, "canceled").await?,
             false,
             true,
+            TreeCleanup::KilledAndReaped,
         ),
     };
     drop(child);
     let stdout = join_reader(stdout_reader).await?;
     let stderr = join_reader(stderr_reader).await?;
+    // A capture that cannot be assembled is a real failure, but the process has
+    // already run: the caller turns this into an outcome-unknown receipt rather
+    // than pretending no side effect happened.
+    let capture = finalize_capture(stdout, stderr, limits)?;
     Ok(ProcessResult {
         executable: executable.to_owned(),
         exit_code: status.code(),
         timed_out,
         canceled,
         queued,
-        tree_cleanup_confirmed: true,
-        stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
-        stdout_truncated: stdout.truncated,
-        stderr_truncated: stderr.truncated,
+        tree_cleanup,
+        stdout: capture.stdout_head.clone(),
+        stderr: capture.stderr_head.clone(),
+        stdout_truncated: capture.stdout_preview_truncated,
+        stderr_truncated: capture.stderr_preview_truncated,
+        capture: Some(capture),
     })
 }
 
@@ -203,14 +345,21 @@ fn canceled_before_spawn(executable: &str, queued: bool) -> ProcessResult {
         timed_out: false,
         canceled: true,
         queued,
-        tree_cleanup_confirmed: true,
+        tree_cleanup: TreeCleanup::NothingToClean,
         stdout: String::new(),
         stderr: String::new(),
         stdout_truncated: false,
         stderr_truncated: false,
+        capture: None,
     }
 }
 
+/// Kill the whole container, then prove it is gone.
+///
+/// The kill request alone is not evidence: `start_kill` only asks the OS to
+/// terminate the tree. Awaiting the backend's `wait` is what confirms every
+/// process left it, so an unconfirmed reap is reported as an unknown outcome
+/// instead of a settled success.
 async fn terminate_and_reap(
     child: &mut Box<dyn process_wrap::tokio::ChildWrapper>,
     reason: &str,
@@ -221,79 +370,75 @@ async fn terminate_and_reap(
             format!("cannot terminate {reason} process tree: {error}"),
         )
     })?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        if let Some(status) = child.try_wait().map_err(|error| {
-            HarnessError::new(
-                ErrorCode::ProcessOutcomeUnknown,
-                format!("cannot reap {reason} process tree: {error}"),
-            )
-        })? {
-            return Ok(status);
-        }
-        if Instant::now() >= deadline {
-            return Err(HarnessError::new(
-                ErrorCode::ProcessOutcomeUnknown,
-                format!("{reason} process tree did not become reapable within the cleanup bound"),
-            ));
-        }
-        sleep(Duration::from_millis(10)).await;
+    match tokio::time::timeout(CLEANUP_BOUND, child.wait()).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(HarnessError::new(
+            ErrorCode::ProcessOutcomeUnknown,
+            format!("cannot reap {reason} process tree: {error}"),
+        )),
+        Err(_) => Err(HarnessError::new(
+            ErrorCode::ProcessOutcomeUnknown,
+            format!(
+                "the {reason} process tree was not confirmed empty within {} ms",
+                CLEANUP_BOUND.as_millis()
+            ),
+        )),
     }
 }
 
-#[derive(Debug)]
-struct BoundedBytes {
-    bytes: Vec<u8>,
-    truncated: bool,
-}
-
-async fn read_bounded<R>(mut stream: R) -> io::Result<BoundedBytes>
+/// Drain one stream into a spool file, redacting granted values as it goes.
+///
+/// The redaction happens on the way in, so a granted secret never exists in the
+/// spool file, the artifact, or a preview — only in the child's own memory.
+async fn read_spooled<R>(
+    mut stream: R,
+    root: std::path::PathBuf,
+    limits: SpoolLimits,
+    label: &'static str,
+    secrets: Vec<Vec<u8>>,
+) -> Result<SpooledStream, HarnessError>
 where
     R: AsyncRead + Unpin,
 {
-    let mut bytes = Vec::new();
+    let mut writer = SpoolWriter::create(&root, limits, label)?;
+    let mut redactor = Redactor::new(&secrets);
     let mut buffer = [0_u8; 8 * 1024];
-    let mut truncated = false;
     loop {
-        let read = stream.read(&mut buffer).await?;
+        let read = stream
+            .read(&mut buffer)
+            .await
+            .map_err(|error| drain_error(&error))?;
         if read == 0 {
             break;
         }
-        let room = PROCESS_OUTPUT_LIMIT.saturating_sub(bytes.len());
-        if room == 0 {
-            truncated = true;
-            continue;
-        }
-        let take = room.min(read);
-        bytes.extend_from_slice(&buffer[..take]);
-        if take < read {
-            truncated = true;
-        }
+        let safe = redactor.push(&buffer[..read]);
+        writer.write(&safe)?;
     }
-    Ok(BoundedBytes { bytes, truncated })
+    let tail = redactor.finish();
+    writer.write(&tail)?;
+    Ok(writer.finish())
+}
+
+fn drain_error(error: &io::Error) -> HarnessError {
+    HarnessError::new(
+        ErrorCode::ProcessOutcomeUnknown,
+        format!("cannot drain process output: {error}"),
+    )
 }
 
 async fn join_reader(
-    reader: Option<JoinHandle<io::Result<BoundedBytes>>>,
-) -> Result<BoundedBytes, HarnessError> {
+    reader: Option<JoinHandle<Result<SpooledStream, HarnessError>>>,
+) -> Result<SpooledStream, HarnessError> {
     let Some(reader) = reader else {
-        return Ok(BoundedBytes {
-            bytes: Vec::new(),
-            truncated: false,
-        });
+        return Err(HarnessError::new(
+            ErrorCode::ProcessOutcomeUnknown,
+            "process output stream was not captured",
+        ));
     };
-    reader
-        .await
-        .map_err(|error| {
-            HarnessError::new(
-                ErrorCode::ProcessOutcomeUnknown,
-                format!("process output reader did not complete: {error}"),
-            )
-        })?
-        .map_err(|error| {
-            HarnessError::new(
-                ErrorCode::ProcessOutcomeUnknown,
-                format!("cannot drain process output: {error}"),
-            )
-        })
+    reader.await.map_err(|error| {
+        HarnessError::new(
+            ErrorCode::ProcessOutcomeUnknown,
+            format!("process output reader did not complete: {error}"),
+        )
+    })?
 }

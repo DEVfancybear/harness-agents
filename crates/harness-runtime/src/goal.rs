@@ -113,6 +113,21 @@ impl GoalSpec {
     }
 }
 
+/// One check that ran, with the workspace it observed.
+///
+/// A check is evidence only for the revision it actually ran against: a passing
+/// test run from before the last edit says nothing about the code that is there
+/// now, so the digest is part of the record rather than a detail.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CheckObservation {
+    /// Digest of the exact command that ran (the action hash of the call).
+    pub command_digest: ContentHash,
+    /// Workspace fingerprint observed when the check settled.
+    pub workspace_digest: Option<ContentHash>,
+    pub exit_code: Option<i32>,
+    pub passed: bool,
+}
+
 /// Everything the host knows about what one run produced.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GoalEvidence {
@@ -125,6 +140,12 @@ pub struct GoalEvidence {
     pub checks_passed: u32,
     pub artifacts: u32,
     pub pending_tool_calls: u32,
+    /// The workspace digest the evidence was collected against: the fingerprint
+    /// after the last settled execution. Final criteria are judged against this,
+    /// never against a model's description of it.
+    pub workspace_digest: Option<ContentHash>,
+    /// Every check that ran, in order, with its own digest.
+    pub checks: Vec<CheckObservation>,
 }
 
 impl GoalEvidence {
@@ -135,9 +156,23 @@ impl GoalEvidence {
             EvidenceKind::Response => !self.response.trim().is_empty(),
             EvidenceKind::ToolExecution => self.successful_tool_executions > 0,
             EvidenceKind::FileChange => self.file_changes > 0,
-            EvidenceKind::Check => self.checks_passed > 0,
+            EvidenceKind::Check => self.check_at_final_digest(),
             EvidenceKind::Artifact => self.artifacts > 0,
         }
+    }
+
+    /// Whether a passing check ran against the workspace as it stands now.
+    ///
+    /// A run whose evidence carries no digest cannot satisfy a check criterion:
+    /// the absence of a fingerprint is not a fingerprint that matches.
+    #[must_use]
+    pub fn check_at_final_digest(&self) -> bool {
+        let Some(final_digest) = &self.workspace_digest else {
+            return false;
+        };
+        self.checks
+            .iter()
+            .any(|check| check.passed && check.workspace_digest.as_ref() == Some(final_digest))
     }
 
     /// A stable fingerprint of what this evidence proves.
@@ -156,6 +191,17 @@ impl GoalEvidence {
             "checks_passed": self.checks_passed,
             "artifacts": self.artifacts,
             "pending_tool_calls": self.pending_tool_calls,
+            "workspace_digest": self.workspace_digest,
+            "checks": self
+                .checks
+                .iter()
+                .map(|check| json!({
+                    "command_digest": check.command_digest,
+                    "workspace_digest": check.workspace_digest,
+                    "exit_code": check.exit_code,
+                    "passed": check.passed,
+                }))
+                .collect::<Vec<_>>(),
         });
         ContentHash::from_canonical_json(&payload).map_or_else(
             |_| format!("unhashed:{payload}"),

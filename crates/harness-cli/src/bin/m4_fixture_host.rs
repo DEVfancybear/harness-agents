@@ -8,7 +8,12 @@
 //!   * `receipt-barrier` settles one patch and then parks inside the turn
 //!     observer (after the receipt commit, before the next step);
 //!   * `marker-process` starts a process that writes a marker and then sleeps,
-//!     and the parent kills it while the side effect exists but no receipt does.
+//!     and the parent kills it while the side effect exists but no receipt does;
+//!   * `tree-parent` spawns a `heartbeat` grandchild, dumps the environment it
+//!     actually received, and holds, so a test can prove the whole tree dies
+//!     with the call and that the host environment was not inherited;
+//!   * `heartbeat` appends to a file forever and is only ever stopped by the
+//!     process tree cleanup of whoever started it.
 //!
 //! It never runs a model: the provider is a deterministic sequence fixture.
 
@@ -37,11 +42,11 @@ use harness_types::{HostId, InputId, ProjectId, SessionId, SourceAuthority, Task
 #[command(name = "m4-fixture-host")]
 struct Cli {
     #[arg(long)]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
     #[arg(long)]
-    workspace: PathBuf,
+    workspace: Option<PathBuf>,
     #[arg(long)]
-    project_id: String,
+    project_id: Option<String>,
     #[arg(long, value_enum)]
     mode: Mode,
     /// Barrier file the parent waits for before it kills this process.
@@ -50,6 +55,19 @@ struct Cli {
     /// Marker file the fixture process writes before holding.
     #[arg(long)]
     marker: Option<PathBuf>,
+    /// File the `heartbeat` mode appends to until its tree is cleaned up.
+    #[arg(long)]
+    heartbeat: Option<PathBuf>,
+    /// File the `tree-parent` mode writes its visible environment into.
+    #[arg(long)]
+    env_out: Option<PathBuf>,
+    /// Environment variable `tree-parent` echoes to stdout, so a test can prove
+    /// a granted value never reaches the model view even when the child prints it.
+    #[arg(long)]
+    echo_env: Option<String>,
+    /// How long `tree-parent` holds before it exits on its own.
+    #[arg(long, default_value_t = 30_000)]
+    hold_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -58,11 +76,25 @@ enum Mode {
     ReceiptBarrier,
     /// Run a process that writes a marker and holds; no receipt is committed.
     MarkerProcess,
+    /// Spawn a heartbeat grandchild, dump the environment, then hold.
+    TreeParent,
+    /// Append to the heartbeat file until the process tree is cleaned up.
+    Heartbeat,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match run(Cli::parse()).await {
+    let cli = Cli::parse();
+    // The tree/environment modes need no store: they exist to be started *by* a
+    // tool call, not to drive one.
+    let outcome = match cli.mode {
+        Mode::Heartbeat => heartbeat(cli.heartbeat.as_deref()),
+        Mode::TreeParent => tree_parent(&cli),
+        // Boxed so the fixture's async half does not inflate the future of the
+        // synchronous modes it shares a process with.
+        Mode::ReceiptBarrier | Mode::MarkerProcess => Box::pin(run(cli)).await,
+    };
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
@@ -71,11 +103,69 @@ async fn main() -> ExitCode {
     }
 }
 
-#[allow(clippy::too_many_lines)] // one fixture with two crash boundaries
+/// Append to the heartbeat file every 100 ms, forever.
+///
+/// Nothing here stops on its own: the only thing that can end this process is
+/// the process-tree cleanup of the call that started it, which is exactly what
+/// the A16 test measures.
+fn heartbeat(path: Option<&std::path::Path>) -> Result<(), String> {
+    let path = path.ok_or("heartbeat needs --heartbeat")?;
+    loop {
+        let mut line = std::fs::read_to_string(path).unwrap_or_default();
+        line.push_str("x\n");
+        std::fs::write(path, line).map_err(|error| error.to_string())?;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn tree_parent(cli: &Cli) -> Result<(), String> {
+    let env_out = cli.env_out.clone().ok_or("tree-parent needs --env-out")?;
+    // The grandchild inherits this process's job object / process session, so it
+    // is inside the tree the host owns. Its stdio is detached so it can never
+    // hold the host's output pipes open. A caller that only wants the
+    // environment picture omits `--heartbeat` and this process exits at once.
+    if let Some(heartbeat_path) = &cli.heartbeat {
+        std::process::Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
+            .args(["--mode", "heartbeat", "--heartbeat"])
+            .arg(heartbeat_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| format!("cannot spawn the heartbeat grandchild: {error}"))?;
+    }
+    // The environment this process really received, secret values included: the
+    // test reads it from outside the host's evidence path on purpose.
+    let mut visible: Vec<(String, String)> = std::env::vars().collect();
+    visible.sort();
+    std::fs::write(
+        &env_out,
+        serde_json::to_vec(&visible).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(name) = &cli.echo_env
+        && let Ok(value) = std::env::var(name)
+    {
+        // A child that prints its own environment: the host must redact the
+        // granted value before it becomes tool evidence.
+        println!("echo={value}");
+    }
+    std::thread::sleep(Duration::from_millis(cli.hold_ms));
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // one fixture with several crash boundaries
 async fn run(cli: Cli) -> Result<(), String> {
-    let project_id = ProjectId::parse(cli.project_id.clone()).map_err(|error| error.to_string())?;
+    let project_id = ProjectId::parse(
+        cli.project_id
+            .clone()
+            .ok_or("this mode needs --project-id")?,
+    )
+    .map_err(|error| error.to_string())?;
+    let workspace = cli.workspace.clone().ok_or("this mode needs --workspace")?;
+    let data_dir = cli.data_dir.clone().ok_or("this mode needs --data-dir")?;
     let store = Arc::new(
-        SqliteStore::open_writer(WriterOpenOptions::new(cli.data_dir, HostId::generate()))
+        SqliteStore::open_writer(WriterOpenOptions::new(data_dir, HostId::generate()))
             .await
             .map_err(|error| error.to_string())?,
     );
@@ -85,7 +175,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     match cli.mode {
         Mode::ReceiptBarrier => {
             let barrier = cli.barrier.ok_or("receipt-barrier needs --barrier")?;
-            let expected_hash = observed_file_hash(&cli.workspace, "src/parser.txt")
+            let expected_hash = observed_file_hash(&workspace, "src/parser.txt")
                 .map_err(|error| error.to_string())?;
             let patch = serde_json::json!({
                 "path": "src/parser.txt",
@@ -115,7 +205,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 task_id,
                 InputId::generate(),
                 "patch the fixture".to_owned(),
-                observe_workspace(project_id, &cli.workspace).map_err(|error| error.to_string())?,
+                observe_workspace(project_id, &workspace).map_err(|error| error.to_string())?,
             )
             .with_tool_schemas(coding_tool_schemas());
             // The observer parks the worker after the settled receipt; the
@@ -128,7 +218,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .run_turn(
                     request,
                     TurnOptions {
-                        workspace_root: cli.workspace,
+                        workspace_root: workspace,
                         actor_id: "m4.fixture".to_owned(),
                         approvals: ApprovalMode::Auto,
                         limits: TurnLimits::default(),
@@ -151,7 +241,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     expected_sequence: 1,
                     authority: SourceAuthority::User,
                     raw_text: "m4 fixture".to_owned(),
-                    workspace: observe_workspace(project_id, &cli.workspace)
+                    workspace: observe_workspace(project_id, &workspace)
                         .map_err(|error| error.to_string())?,
                     initial_plan_items: Vec::new(),
                 })
@@ -164,12 +254,13 @@ async fn run(cli: Cli) -> Result<(), String> {
                     session_id,
                     task_id,
                     "m4.fixture",
-                    &cli.workspace,
+                    &workspace,
                     CodingToolAction::RunProcess {
                         executable,
                         args,
                         timeout_ms: 120_000,
                         isolation: IsolationMode::BestEffort,
+                        env: Vec::new(),
                     },
                 ))
                 .await
@@ -184,6 +275,9 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .execute(prepared, Some(approval))
                 .await
                 .map_err(|error| error.to_string())?;
+        }
+        Mode::TreeParent | Mode::Heartbeat => {
+            return Err("this mode is handled before the store is opened".to_owned());
         }
     }
     Ok(())

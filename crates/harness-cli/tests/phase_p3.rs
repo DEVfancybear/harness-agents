@@ -317,6 +317,7 @@ fn process_action(script: &str, timeout_ms: u64) -> CodingToolAction {
         args,
         timeout_ms,
         isolation: IsolationMode::BestEffort,
+        env: Vec::new(),
     }
 }
 
@@ -415,9 +416,10 @@ fn make_escape_link(_link: &Path, _target: &Path) {
 async fn p3_s01_tool_contracts_are_versioned_and_receipts_are_immutable() {
     assert_eq!(ToolExecutionService::contract_version(), 1);
     let schemas = coding_tool_schemas();
-    // M4-02 added `git_log`; the schema set, not the contract version, is what
-    // grows when a tool is added, and each tool's own digest is versioned.
-    assert_eq!(schemas.len(), 10);
+    // M4-02 added `git_log` and M4-03 added `read_process_output`; the schema
+    // set, not the contract version, is what grows when a tool is added, and
+    // each tool's own digest is versioned.
+    assert_eq!(schemas.len(), 11);
     let names = schemas
         .iter()
         .map(|schema| {
@@ -980,6 +982,7 @@ async fn p3_s04_strict_isolation_is_explicitly_denied_when_unavailable() {
             args: Vec::new(),
             timeout_ms: 1_000,
             isolation: IsolationMode::Strict,
+            env: Vec::new(),
         },
     )
     .await;
@@ -1527,8 +1530,9 @@ async fn p3_s07_cli_fixture_runs_p2_response_through_p3_tools_and_recovers_after
     let capabilities: Value =
         serde_json::from_slice(&capability.stdout).expect("capabilities JSON");
     assert_eq!(capabilities["tool_contract_version"], 1);
-    // M4-02 added `git_log` to the advertised schemas.
-    assert_eq!(capabilities["tool_schema_count"], 10);
+    // M4-02 added `git_log` and M4-03 added `read_process_output` to the
+    // advertised schemas.
+    assert_eq!(capabilities["tool_schema_count"], 11);
 
     let fixture = run_ha(&[
         "code",

@@ -19,10 +19,11 @@ use harness_types::{
 use serde_json::{Map, Value, json};
 
 use crate::{
-    ApprovalGrant, CodingToolAction, GIT_LOG_DEFAULT_LIMIT, IsolationMode, PreparedToolRequest,
-    TOOL_CONTRACT_VERSION, ToolCapabilities, ToolExecutionView, ToolOutput, ToolPolicy,
-    ToolRequest, coding_tool_names,
-    process::{self, ProcessResult},
+    ApprovalGrant, CaptureStream, CodingToolAction, GIT_LOG_DEFAULT_LIMIT, IsolationMode,
+    PROCESS_OUTPUT_PAGE_MAX_BYTES, PreparedToolRequest, TOOL_CONTRACT_VERSION, ToolCapabilities,
+    ToolExecutionView, ToolOutput, ToolPolicy, ToolRequest, capture, coding_tool_names,
+    process::{self, ProcessResult, TreeCleanup},
+    secrets::{HostEnvironmentSecrets, ProcessEnvironment, SecretResolver},
     workspace::{
         apply_text_patch, inspect_workspace, list_files, read_text, read_text_output, redact_text,
         resolve_relative, search_text,
@@ -62,6 +63,8 @@ pub struct ToolExecutionService {
     policy: ToolPolicy,
     observer: Option<Arc<dyn ToolObserver>>,
     external: Option<Arc<dyn ExternalToolDispatcher>>,
+    secrets: Arc<dyn SecretResolver>,
+    spool: crate::capture::ProcessSpoolConfig,
 }
 
 impl ToolExecutionService {
@@ -72,12 +75,28 @@ impl ToolExecutionService {
             policy: ToolPolicy::default(),
             observer: None,
             external: None,
+            secrets: Arc::new(HostEnvironmentSecrets),
+            spool: crate::capture::ProcessSpoolConfig::default(),
         }
     }
 
     #[must_use]
     pub fn with_policy(mut self, policy: ToolPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Replace how `secret://` references are resolved for this host.
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: Arc<dyn SecretResolver>) -> Self {
+        self.secrets = secrets;
+        self
+    }
+
+    /// Where process output is spooled and how much of it is kept.
+    #[must_use]
+    pub fn with_spool(mut self, spool: crate::capture::ProcessSpoolConfig) -> Self {
+        self.spool = spool;
         self
     }
 
@@ -149,6 +168,23 @@ impl ToolExecutionService {
         let state = self
             .current_state(&request.session_id, &request.task_id)
             .await?;
+        // An artifact id is not a capability. A paged read is refused before a
+        // proposal exists unless the artifact belongs to this exact project and
+        // task, so a model cannot enumerate another task's evidence.
+        if let CodingToolAction::ReadProcessOutput { artifact_id, .. } = &final_action {
+            let artifact_id = harness_types::ArtifactId::parse(artifact_id.clone())?;
+            let scoped = self
+                .store
+                .artifact_is_scoped_to(&artifact_id, &state.workspace.project_id, &request.task_id)
+                .await
+                .map_err(store_error)?;
+            if !scoped {
+                return Err(HarnessError::new(
+                    ErrorCode::ScopeAuthorityDenied,
+                    "captured artifact is not scoped to this task",
+                ));
+            }
+        }
         let workspace =
             inspect_workspace(&request.workspace_root, state.workspace.project_id.clone())?;
         self.store
@@ -374,8 +410,9 @@ impl ToolExecutionService {
             .register_project(reobserved.registration())
             .await
             .map_err(store_error)?;
-        if let Err(error) =
-            Self::validate_dispatch_preconditions(&prepared.workspace_root, &transformed)
+        if let Err(error) = self
+            .validate_dispatch_preconditions(&prepared.workspace_root, &transformed)
+            .await
         {
             let code = error.code();
             return self
@@ -454,28 +491,41 @@ impl ToolExecutionService {
                 timeout_ms,
                 ..
             } => match &self.external {
-                Some(external) => {
-                    external
-                        .dispatch_external(plugin_id, tool_name, arguments, *timeout_ms)
-                        .await
-                }
+                Some(external) => external
+                    .dispatch_external(plugin_id, tool_name, arguments, *timeout_ms)
+                    .await
+                    .map(Dispatched::plain),
                 None => Err(HarnessError::new(
                     ErrorCode::PolicyDenied,
                     "no external tool dispatcher is configured for this host",
                 )),
             },
             other => {
-                self.dispatch(&prepared.workspace_root, other, cancellation)
-                    .await
+                // Secret values are resolved here, after the durable intent and
+                // immediately before the spawn: they exist only for the length
+                // of this dispatch.
+                let environment = ProcessEnvironment::resolve(
+                    ProcessEnvironment::bindings_of(other),
+                    |reference| self.policy.allows_secret(reference),
+                    self.secrets.as_ref(),
+                );
+                match environment {
+                    Ok(environment) => {
+                        self.dispatch(&prepared.workspace_root, other, cancellation, &environment)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
             }
         };
         match dispatched {
-            Ok(output) => {
+            Ok(dispatched) => {
                 self.settle(
                     &prepared,
                     execution_id,
                     Some(approval.approval_id.as_str()),
-                    output,
+                    dispatched.output,
+                    dispatched.artifact,
                     ToolOutcomeState::Settled,
                     ToolIntentStatus::Settled,
                 )
@@ -489,6 +539,7 @@ impl ToolExecutionService {
                     execution_id,
                     Some(approval.approval_id.as_str()),
                     ToolOutput::OutcomeUnknown { reason },
+                    None,
                     ToolOutcomeState::OutcomeUnknown,
                     ToolIntentStatus::OutcomeUnknown,
                 )
@@ -589,6 +640,7 @@ impl ToolExecutionService {
             execution_id.clone(),
             Some(intent.approval.approval_id.as_str()),
             output,
+            None,
             outcome,
             final_status,
         )
@@ -632,6 +684,7 @@ impl ToolExecutionService {
             }
             CodingToolAction::RunProcess { .. }
             | CodingToolAction::RunShell { .. }
+            | CodingToolAction::ReadProcessOutput { .. }
             | CodingToolAction::GitStatus
             | CodingToolAction::TaskUpdate { .. }
             | CodingToolAction::ExternalTool { .. } => {}
@@ -642,8 +695,11 @@ impl ToolExecutionService {
     /// Validate operation-specific state before a durable intent claims a
     /// side effect may occur. The patch hash is checked here and again inside
     /// the atomic write helper to close the ordinary stale-edit case while
-    /// still treating a race after intent conservatively.
-    fn validate_dispatch_preconditions(
+    /// still treating a race after intent conservatively. A paged capture read
+    /// is checked here too: a page that cannot exist is a refusal, not an
+    /// unknown outcome that implies a side effect might have happened.
+    async fn validate_dispatch_preconditions(
+        &self,
         root: &Path,
         action: &CodingToolAction,
     ) -> Result<(), HarnessError> {
@@ -670,9 +726,44 @@ impl ToolExecutionService {
                     ));
                 }
             }
+            CodingToolAction::ReadProcessOutput {
+                artifact_id,
+                stream,
+                offset,
+                ..
+            } => {
+                let header = self.capture_header(artifact_id).await?;
+                let total = match stream {
+                    CaptureStream::Stdout => header.stdout_bytes,
+                    CaptureStream::Stderr => header.stderr_bytes,
+                };
+                if *offset > total {
+                    return Err(HarnessError::new(
+                        ErrorCode::InvalidPayload,
+                        format!(
+                            "requested offset {offset} is past the {total} captured {} bytes",
+                            stream.as_str()
+                        ),
+                    ));
+                }
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    /// The capture header of a published process artifact.
+    async fn capture_header(
+        &self,
+        artifact_id: &str,
+    ) -> Result<capture::CaptureHeader, HarnessError> {
+        let probe = self
+            .store
+            .read_artifact_page(artifact_id, 0, CAPTURE_HEADER_PROBE_BYTES)
+            .await
+            .map_err(store_error)?
+            .ok_or_else(capture_not_found)?;
+        capture::parse_capture_header(&probe.bytes)
     }
 
     async fn execute_task_update(
@@ -731,12 +822,14 @@ impl ToolExecutionService {
         Ok(view)
     }
 
+    #[allow(clippy::too_many_lines)] // one dispatch table, one arm per tool
     async fn dispatch(
         &self,
         root: &Path,
         action: &CodingToolAction,
         cancellation: CancellationToken,
-    ) -> Result<ToolOutput, HarnessError> {
+        environment: &ProcessEnvironment,
+    ) -> Result<Dispatched, HarnessError> {
         match action {
             CodingToolAction::ExternalTool { .. } => Err(HarnessError::new(
                 ErrorCode::PolicyDenied,
@@ -745,22 +838,25 @@ impl ToolExecutionService {
             CodingToolAction::ReadFile { path } => {
                 let target = resolve_relative(root, path, false)?;
                 let output = read_text_output(&target)?;
-                Ok(ToolOutput::ReadFile {
+                Ok(Dispatched::plain(ToolOutput::ReadFile {
                     path: path.replace('\\', "/"),
                     content: output.text,
                     truncated: output.truncated,
-                })
+                }))
             }
             CodingToolAction::ListFiles { path } => {
                 let (paths, truncated) = list_files(root, path.as_deref())?;
-                Ok(ToolOutput::ListFiles { paths, truncated })
+                Ok(Dispatched::plain(ToolOutput::ListFiles {
+                    paths,
+                    truncated,
+                }))
             }
             CodingToolAction::SearchText { query, path } => {
                 let output = search_text(root, query, path.as_deref())?;
-                Ok(ToolOutput::SearchText {
+                Ok(Dispatched::plain(ToolOutput::SearchText {
                     matches: output.matches,
                     truncated: output.truncated,
-                })
+                }))
             }
             CodingToolAction::ApplyPatch {
                 path,
@@ -770,11 +866,22 @@ impl ToolExecutionService {
                 let target = resolve_relative(root, path, false)?;
                 let (before_hash, after_hash) =
                     apply_text_patch(&target, expected_hash, replacement)?;
-                Ok(ToolOutput::ApplyPatch {
+                Ok(Dispatched::plain(ToolOutput::ApplyPatch {
                     path: path.replace('\\', "/"),
                     before_hash,
                     after_hash,
-                })
+                }))
+            }
+            CodingToolAction::ReadProcessOutput {
+                artifact_id,
+                stream,
+                offset,
+                length,
+            } => {
+                let page = self
+                    .read_capture_page(artifact_id, *stream, *offset, *length)
+                    .await?;
+                Ok(Dispatched::plain(page))
             }
             CodingToolAction::RunProcess {
                 executable,
@@ -782,18 +889,33 @@ impl ToolExecutionService {
                 timeout_ms,
                 ..
             } => {
-                let output =
-                    process::run_structured(root, executable, args, *timeout_ms, cancellation)
-                        .await?;
-                Ok(process_output(output))
+                let output = process::run_structured(
+                    root,
+                    executable,
+                    args,
+                    *timeout_ms,
+                    cancellation,
+                    environment,
+                    &self.spool,
+                )
+                .await?;
+                self.dispatched_process(output)
             }
             CodingToolAction::RunShell {
                 command,
                 timeout_ms,
                 ..
             } => {
-                let output = process::run_shell(root, command, *timeout_ms, cancellation).await?;
-                Ok(process_output(output))
+                let output = process::run_shell(
+                    root,
+                    command,
+                    *timeout_ms,
+                    cancellation,
+                    environment,
+                    &self.spool,
+                )
+                .await?;
+                self.dispatched_process(output)
             }
             CodingToolAction::GitStatus => {
                 let output = process::run_structured(
@@ -807,9 +929,11 @@ impl ToolExecutionService {
                     ],
                     15_000,
                     cancellation,
+                    &ProcessEnvironment::empty(),
+                    &self.spool,
                 )
                 .await?;
-                Ok(git_output("status", output))
+                Ok(Dispatched::plain(git_output("status", output)))
             }
             CodingToolAction::GitDiff { path } => {
                 let mut args = vec!["diff".to_owned(), "--no-ext-diff".to_owned()];
@@ -817,15 +941,31 @@ impl ToolExecutionService {
                     args.push("--".to_owned());
                     args.push(path.clone());
                 }
-                let output =
-                    process::run_structured(root, "git", &args, 15_000, cancellation).await?;
-                Ok(git_output("diff", output))
+                let output = process::run_structured(
+                    root,
+                    "git",
+                    &args,
+                    15_000,
+                    cancellation,
+                    &ProcessEnvironment::empty(),
+                    &self.spool,
+                )
+                .await?;
+                Ok(Dispatched::plain(git_output("diff", output)))
             }
             CodingToolAction::GitLog { path, limit } => {
                 let args = git_log_arguments(path.as_deref(), *limit);
-                let output =
-                    process::run_structured(root, "git", &args, 15_000, cancellation).await?;
-                Ok(git_output("log", output))
+                let output = process::run_structured(
+                    root,
+                    "git",
+                    &args,
+                    15_000,
+                    cancellation,
+                    &ProcessEnvironment::empty(),
+                    &self.spool,
+                )
+                .await?;
+                Ok(Dispatched::plain(git_output("log", output)))
             }
             CodingToolAction::TaskUpdate { .. } => Err(HarnessError::new(
                 ErrorCode::InvalidPayload,
@@ -834,12 +974,102 @@ impl ToolExecutionService {
         }
     }
 
+    /// Publish a finished process capture as the durable artifact the receipt
+    /// will reference, and describe it in the model-facing output.
+    ///
+    /// The capture is published *before* the receipt exists, so a receipt can
+    /// only ever point at bytes that are already flushed.
+    fn dispatched_process(&self, output: ProcessResult) -> Result<Dispatched, HarnessError> {
+        let (artifact, captured_bytes, capture_hash, capture_truncated, capture_tail) =
+            match &output.capture {
+                Some(capture) => {
+                    let bytes = std::fs::read(&capture.path).map_err(|error| {
+                        HarnessError::new(
+                            ErrorCode::ArtifactWriteFailed,
+                            format!("cannot read the finished capture: {error}"),
+                        )
+                    })?;
+                    let published = self.store.publish_artifact(&bytes).map_err(store_error)?;
+                    let _ = std::fs::remove_file(&capture.path);
+                    (
+                        Some(published),
+                        capture.bytes,
+                        Some(capture.hash.clone()),
+                        capture.truncated,
+                        capture.tail.clone(),
+                    )
+                }
+                None => (None, 0, None, false, String::new()),
+            };
+        let output = process_output(
+            output,
+            artifact.as_ref(),
+            capture_hash,
+            capture_truncated,
+            &capture_tail,
+            captured_bytes,
+        );
+        Ok(Dispatched { output, artifact })
+    }
+
+    /// Read one page of a captured process output.
+    ///
+    /// The scope check already happened at preparation; this re-checks it, so a
+    /// dispatch can never read an artifact the gate did not authorize.
+    pub async fn read_capture_page(
+        &self,
+        artifact_id: &str,
+        stream: CaptureStream,
+        offset: u64,
+        length: u32,
+    ) -> Result<ToolOutput, HarnessError> {
+        let page_length =
+            usize::try_from(length.min(PROCESS_OUTPUT_PAGE_MAX_BYTES)).unwrap_or(usize::MAX);
+        // The header is host framing at the very start of the artifact; it says
+        // where each stream's bytes live so a page never has to guess. The
+        // request was already validated before the intent; this re-reads it so
+        // the dispatch itself cannot page outside the captured bytes.
+        let header = self.capture_header(artifact_id).await?;
+        let (start, total) = match stream {
+            CaptureStream::Stdout => (header.stdout_offset(), header.stdout_bytes),
+            CaptureStream::Stderr => (header.stderr_offset(), header.stderr_bytes),
+        };
+        if offset > total {
+            return Err(HarnessError::new(
+                ErrorCode::InvalidPayload,
+                format!(
+                    "requested offset {offset} is past the {total} captured {} bytes",
+                    stream.as_str()
+                ),
+            ));
+        }
+        // A page never runs past the end of its own stream: the next section of
+        // the artifact is a different stream, not more of this one.
+        let remaining = usize::try_from(total - offset).unwrap_or(usize::MAX);
+        let page = self
+            .store
+            .read_artifact_page(artifact_id, start + offset, page_length.min(remaining))
+            .await
+            .map_err(store_error)?
+            .ok_or_else(capture_not_found)?;
+        Ok(ToolOutput::ProcessOutput {
+            artifact_id: artifact_id.to_owned(),
+            stream: stream.as_str().to_owned(),
+            offset,
+            length: u64::try_from(page.bytes.len()).unwrap_or(u64::MAX),
+            total_bytes: total,
+            text: String::from_utf8_lossy(&page.bytes).into_owned(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)] // the settlement of one invocation
     async fn settle(
         &self,
         prepared: &PreparedToolRequest,
         execution_id: ToolExecutionId,
         approval_id: Option<&str>,
         output: ToolOutput,
+        artifact: Option<PublishedArtifact>,
         outcome_state: ToolOutcomeState,
         final_status: ToolIntentStatus,
     ) -> Result<ToolExecutionView, HarnessError> {
@@ -861,7 +1091,14 @@ impl ToolExecutionService {
                 |_| prepared.workspace_fingerprint.clone(),
                 |workspace| workspace.fingerprint,
             );
-        let artifact = self.publish_output_artifact(&output)?;
+        // A process capture is its own durable evidence: the receipt points at
+        // the captured bytes rather than at a re-serialization of them. Every
+        // other output keeps the long-standing behavior of publishing its own
+        // model-facing view.
+        let artifact = match artifact {
+            Some(artifact) => Some(artifact),
+            None => self.publish_output_artifact(&output)?,
+        };
         let receipt = ToolExecutionReceipt {
             schema_version: P0_SCHEMA_VERSION,
             tool_execution_id: execution_id.clone(),
@@ -1115,19 +1352,66 @@ fn action_requests_strict_isolation(action: &CodingToolAction) -> bool {
     )
 }
 
-fn process_output(output: ProcessResult) -> ToolOutput {
+/// How much of an artifact is read to parse the capture header that precedes
+/// the captured bytes. The header is a short JSON line written by this host.
+const CAPTURE_HEADER_PROBE_BYTES: usize = 8 * 1024;
+
+fn process_output(
+    output: ProcessResult,
+    artifact: Option<&PublishedArtifact>,
+    capture_hash: Option<ContentHash>,
+    capture_truncated: bool,
+    capture_tail: &str,
+    captured_bytes: u64,
+) -> ToolOutput {
     ToolOutput::Process {
         executable: output.executable,
         exit_code: output.exit_code,
         timed_out: output.timed_out,
         canceled: output.canceled,
         queued: output.queued,
-        tree_cleanup_confirmed: output.tree_cleanup_confirmed,
+        // Only a confirmed reap produces a `ProcessResult` at all: an unconfirmed
+        // one is a `ProcessOutcomeUnknown` error that settles as an
+        // outcome-unknown receipt, so this stays a property of the evidence
+        // rather than an assumption about the kill request.
+        tree_cleanup_confirmed: matches!(
+            output.tree_cleanup,
+            TreeCleanup::NothingToClean | TreeCleanup::ReapedOnExit | TreeCleanup::KilledAndReaped
+        ),
+        tree_cleanup: output.tree_cleanup.as_str().to_owned(),
         stdout: redact_text(&output.stdout),
         stderr: redact_text(&output.stderr),
         stdout_truncated: output.stdout_truncated,
         stderr_truncated: output.stderr_truncated,
+        artifact_id: artifact.map(|artifact| artifact.artifact_id.as_str().to_owned()),
+        captured_bytes,
+        capture_hash,
+        capture_truncated,
+        capture_tail: redact_text(capture_tail),
     }
+}
+
+/// A dispatched action: what the model sees, and the durable artifact that
+/// belongs to the receipt when the action produced one of its own.
+struct Dispatched {
+    output: ToolOutput,
+    artifact: Option<PublishedArtifact>,
+}
+
+impl Dispatched {
+    const fn plain(output: ToolOutput) -> Self {
+        Self {
+            output,
+            artifact: None,
+        }
+    }
+}
+
+fn capture_not_found() -> HarnessError {
+    HarnessError::new(
+        ErrorCode::InvalidPayload,
+        "captured artifact was not found for this task",
+    )
 }
 
 /// The exact `git log` argv: no pager, no color, bounded, and tab-separated
