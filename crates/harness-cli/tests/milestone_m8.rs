@@ -39,13 +39,14 @@ use std::{
 };
 
 use harness_orchestrator::{
-    AgentRole, DEFAULT_MAX_DEPTH, DelegationBudget, OrchestratorError, SchedulerConfig, TaskPlan,
-    StepOutcome, TaskStatus, WorkerBackend, WorkerOutcome, WorkerRequest, WorkerScheduler,
+    AgentRole, DEFAULT_MAX_DEPTH, DelegationBudget, DirtyReason, FinalApply, InputInspection,
+    IntegrationOutcome, OrchestratorError, ResultIntegrator, SchedulerConfig, StepOutcome,
+    TaskPlan, TaskStatus, WorkerBackend, WorkerOutcome, WorkerRequest, WorkerScheduler,
 };
 use harness_types::{ErrorCode, TaskId};
 use support::{
-    ScriptedWorker, TestRepo, close, coordinator_root, graph_from, make_node, open_store, test_repo,
-    workspace_for,
+    ScriptedWorker, TestRepo, close, coordinator_root, graph_from, make_node, open_store,
+    test_repo, workspace_for,
 };
 use tokio::sync::Semaphore;
 
@@ -165,7 +166,7 @@ fn request_for(plan: &TaskPlan, task_id: &TaskId) -> WorkerRequest {
     support::request_of(plan, task_id, 3)
 }
 
-fn assert_code(error: OrchestratorError, code: ErrorCode) {
+fn assert_code(error: &OrchestratorError, code: ErrorCode) {
     assert_eq!(
         error.code(),
         code,
@@ -199,7 +200,7 @@ async fn a27_child_capacity_budget() {
         AgentRole::Coder,
         &snapshot,
         3,
-        &[second.clone()],
+        std::slice::from_ref(&second),
         &[FIXTURE_ARTIFACT],
         vec!["src/a/".to_owned()],
     );
@@ -209,7 +210,7 @@ async fn a27_child_capacity_budget() {
         AgentRole::Coder,
         &snapshot,
         3,
-        &[first.clone()],
+        std::slice::from_ref(&first),
         &[FIXTURE_ARTIFACT],
         vec!["src/b/".to_owned()],
     );
@@ -217,7 +218,7 @@ async fn a27_child_capacity_budget() {
     node_b.depth = 0;
     let cycle = TaskPlan::compile(graph_from(vec![node_a, node_b]));
     assert_code(
-        cycle.expect_err("a dependency cycle is not a plan"),
+        &cycle.expect_err("a dependency cycle is not a plan"),
         ErrorCode::DagCycle,
     );
 
@@ -245,7 +246,7 @@ async fn a27_child_capacity_budget() {
         vec!["src/".to_owned()],
     );
     assert_code(
-        TaskPlan::compile(graph_from(vec![shared_a, shared_b]))
+        &TaskPlan::compile(graph_from(vec![shared_a, shared_b]))
             .expect_err("one path has one writer"),
         ErrorCode::AmbiguousTaskOwner,
     );
@@ -264,7 +265,7 @@ async fn a27_child_capacity_budget() {
     deep.depth = DEFAULT_MAX_DEPTH + 1;
     let overflow = TaskPlan::compile(graph_from(vec![deep]));
     assert_code(
-        overflow.expect_err("a depth beyond the cap is not a plan"),
+        &overflow.expect_err("a depth beyond the cap is not a plan"),
         ErrorCode::DelegationDepthExceeded,
     );
 
@@ -289,7 +290,7 @@ async fn a27_child_capacity_budget() {
     // A configuration that asks for an unbounded queue is refused outright: the
     // host cap is not advisory.
     assert_code(
-        SchedulerConfig {
+        &SchedulerConfig {
             max_queued_workers: harness_orchestrator::DEFAULT_MAX_QUEUED_WORKERS + 1,
             ..SchedulerConfig::default()
         }
@@ -322,7 +323,7 @@ async fn a27_child_capacity_budget() {
     // only has to wait for a worker to settle.
     let (extra_ids, extra_plan) = sibling_plan(&repo, &snapshot, &parent, 1);
     assert_code(
-        scheduler
+        &scheduler
             .dispatch(request_for(&extra_plan, &extra_ids[0]))
             .expect_err("the queue is full"),
         ErrorCode::DelegationQueueFull,
@@ -392,7 +393,9 @@ async fn a27_child_capacity_budget() {
     assert_eq!(tight.ledger().requests_used(), 2, "exactly the budget");
     assert_eq!(tight.ledger().remaining_requests(), 0);
     assert!(
-        refused.iter().all(|code| *code == ErrorCode::BudgetExhausted),
+        refused
+            .iter()
+            .all(|code| *code == ErrorCode::BudgetExhausted),
         "an exhausted budget is its own reason: {refused:?}"
     );
 
@@ -451,8 +454,12 @@ async fn a27_child_capacity_budget() {
         vec!["src/".to_owned()],
     )]);
     assert_eq!(
-        stable_a.node(&ids[0]).and_then(|node| node.brief.content_hash()),
-        stable_b.node(&ids[0]).and_then(|node| node.brief.content_hash()),
+        stable_a
+            .node(&ids[0])
+            .and_then(|node| node.brief.content_hash()),
+        stable_b
+            .node(&ids[0])
+            .and_then(|node| node.brief.content_hash()),
         "the same brief has the same content hash"
     );
 
@@ -497,7 +504,10 @@ async fn a28_child_delivery_recovery() {
         Arc::clone(&scheduler),
         1,
     );
-    coordinator.admit(&plan).await.expect("the plan is admitted");
+    coordinator
+        .admit(&plan)
+        .await
+        .expect("the plan is admitted");
 
     let worker = support::worker_ref(AgentRole::Explorer, 1);
     let _handle = coordinator
@@ -523,7 +533,11 @@ async fn a28_child_delivery_recovery() {
         .await
         .expect("the host settles the task");
     assert_eq!(step.status, TaskStatus::Completed);
-    assert!(step.accepted, "the honest report is accepted: {}", step.detail);
+    assert!(
+        step.accepted,
+        "the honest report is accepted: {}",
+        step.detail
+    );
 
     // The delivery is durable and addressed to the parent's session, not to an
     // in-process notification.
@@ -553,7 +567,10 @@ async fn a28_child_delivery_recovery() {
 
     let reopened = Arc::new(
         harness_store_sqlite::SqliteStore::open_writer(
-            harness_store_sqlite::WriterOpenOptions::new(&data_dir, harness_types::HostId::generate()),
+            harness_store_sqlite::WriterOpenOptions::new(
+                &data_dir,
+                harness_types::HostId::generate(),
+            ),
         )
         .await
         .expect("the store reopens after the kill"),
@@ -602,7 +619,7 @@ async fn a28_child_delivery_recovery() {
     );
     let stale_worker = support::worker_ref(AgentRole::Explorer, 1);
     assert_code(
-        second_host
+        &second_host
             .claim(&task_id, &stale_worker, &session)
             .await
             .expect_err("a superseded owner cannot claim"),
@@ -610,7 +627,7 @@ async fn a28_child_delivery_recovery() {
     );
     let live_worker = support::worker_ref(AgentRole::Explorer, 2);
     assert_code(
-        second_host
+        &second_host
             .claim(&task_id, &live_worker, &session)
             .await
             .expect_err("a completed task is not reassigned"),
@@ -660,4 +677,403 @@ async fn a28_child_delivery_recovery() {
     drop(counter_scheduler);
     drop(revived);
     close(reopened).await;
+}
+
+// ---------------------------------------------------------------------------
+// A29 — branches pass and the integrated tree does not
+// ---------------------------------------------------------------------------
+
+/// The base module both branches edit.
+///
+/// Two branches that each replace it conflict at the content level, which is what
+/// makes the integration refuse. The point of the case is that neither branch's
+/// own revision could have revealed the problem.
+const PAIR_MODULE: &str = "src/lib.rs";
+
+/// The declared check, run the way `ResultIntegrator` runs it.
+///
+/// One definition, used for both the branch run and the integration run, so the
+/// comparison is between two runs of the same command rather than between two
+/// different commands.
+const CHECK: &str = "git diff --quiet --exit-code HEAD";
+
+fn pair_module(body: &str) -> String {
+    format!("pub fn greet() -> &'static str {{\n    \"{body}\"\n}}\n")
+}
+
+/// The exact bytes the destination file holds in the base revision.
+///
+/// Derived from the same expression the fixture wrote, because the assertion this
+/// feeds is "the user's file did not move": comparing against a second guess at
+/// the content would only prove the two guesses agree.
+fn base_module() -> String {
+    pair_module("hi").replace("pub fn greet", "pub fn greet_v1")
+}
+
+/// Run the declared check in one workspace.
+fn branch_check(root: &str) -> std::process::Output {
+    let (program, arguments) = harness_orchestrator::integration::split_command(CHECK);
+    std::process::Command::new(program)
+        .args(arguments)
+        .current_dir(root)
+        .output()
+        .expect("the check runs")
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one integration story, told in order
+async fn a29_integration_acceptance() {
+    let repo = test_repo();
+    let manager = workspace_for(&repo);
+    let base = repo.root().join(PAIR_MODULE);
+    // A real content change, so this commit exists: the fixture repository's own
+    // starter file is not byte-identical to what the test writes, and a test that
+    // committed nothing would still satisfy its own assertions.
+    std::fs::write(
+        &base,
+        pair_module("hi").replace("pub fn greet", "pub fn greet_v1"),
+    )
+    .expect("the base module is written");
+    repo.git(&["add", PAIR_MODULE]);
+    repo.git(&["commit", "-qm", "fixture base module"]);
+
+    let snapshot = repo.snapshot(&manager).await;
+    let first_task = TaskId::generate();
+    let second_task = TaskId::generate();
+    let first = manager
+        .create_worktree(
+            &snapshot,
+            &first_task,
+            &harness_types::AgentRunId::generate(),
+            &[PAIR_MODULE.to_owned()],
+            1,
+        )
+        .await
+        .expect("the first worktree is created");
+    let second = manager
+        .create_worktree(
+            &snapshot,
+            &second_task,
+            &harness_types::AgentRunId::generate(),
+            &[PAIR_MODULE.to_owned()],
+            1,
+        )
+        .await
+        .expect("the second worktree is created");
+    // Each branch replaces the same function. On its own revision each file is
+    // complete and correct; nothing about either branch is broken.
+    std::fs::write(
+        std::path::Path::new(&first.path).join(PAIR_MODULE),
+        pair_module("hello from the first branch"),
+    )
+    .expect("the first branch edits the module");
+    std::fs::write(
+        std::path::Path::new(&second.path).join(PAIR_MODULE),
+        pair_module("hello from the second branch"),
+    )
+    .expect("the second branch edits the module");
+
+    let first_revision = manager
+        .commit_worker_changes(&first, "first branch")
+        .await
+        .expect("the first branch commits");
+    let second_revision = manager
+        .commit_worker_changes(&second, "second branch")
+        .await
+        .expect("the second branch commits");
+    assert_ne!(
+        first_revision, second_revision,
+        "each branch has its own revision"
+    );
+
+    // The branch receipts are real: this is the same command the host runs on the
+    // integrated tree, and it passes on each branch's own committed revision.
+    let first_branch_check = branch_check(&first.path);
+    let second_branch_check = branch_check(&second.path);
+    assert!(
+        first_branch_check.status.success() && second_branch_check.status.success(),
+        "both branches pass the declared check on their own revision: first={:?} second={:?}",
+        String::from_utf8_lossy(&first_branch_check.stderr),
+        String::from_utf8_lossy(&second_branch_check.stderr)
+    );
+
+    let integrator = harness_orchestrator::ResultIntegrator::new(Arc::clone(&manager));
+    let candidates = vec![
+        harness_orchestrator::workspace_candidate(
+            &first,
+            &first_revision,
+            vec![PAIR_MODULE.to_owned()],
+        ),
+        harness_orchestrator::workspace_candidate(
+            &second,
+            &second_revision,
+            vec![PAIR_MODULE.to_owned()],
+        ),
+    ];
+    let outcome = integrator
+        .integrate(
+            &snapshot,
+            &[first_task.clone(), second_task.clone()],
+            &candidates,
+            &[CHECK.to_owned()],
+        )
+        .await
+        .expect("the integration runs");
+
+    // The integration is not ready, and it says which branch could not be applied
+    // - a caller cannot mistake this for a clean result it may accept.
+    assert!(
+        !outcome.is_ready(),
+        "an integration that did not apply every branch is not ready"
+    );
+    let IntegrationOutcome::Conflicted { report, conflicts } = &outcome else {
+        panic!("two edits to one function must conflict, got {outcome:?}");
+    };
+    assert_eq!(conflicts.len(), 1, "one branch conflicted: {conflicts:?}");
+    assert!(
+        conflicts[0].contains(second_task.as_str()),
+        "the conflict names the branch that could not be applied: {}",
+        conflicts[0]
+    );
+    assert_eq!(
+        report.steps.len(),
+        1,
+        "only the first branch was applied, and the report does not pretend otherwise"
+    );
+    assert_eq!(
+        report.final_commit, snapshot.base_commit,
+        "no final revision is offered when a branch did not apply"
+    );
+    assert!(
+        report.checks.is_empty(),
+        "no check ran on a tree that is not the integration"
+    );
+
+    // The refusal is stable: re-running reaches the same verdict rather than
+    // succeeding on a retry that would hide the conflict.
+    let again = integrator
+        .integrate(
+            &snapshot,
+            &[first_task.clone(), second_task.clone()],
+            &candidates,
+            &[CHECK.to_owned()],
+        )
+        .await
+        .expect("the integration runs again");
+    assert!(!again.is_ready(), "a conflicting integration stays refused");
+
+    // The user's workspace is untouched: the integration happened in its own
+    // workspace and the destination revision never moved.
+    assert!(
+        repo.is_clean(),
+        "the destination workspace is still clean: {}",
+        repo.status_porcelain()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&base).expect("the base module is readable"),
+        base_module(),
+        "the destination file is byte-for-byte what the user had"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A30 — a dirty repository and a destination that moves
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one preservation story, sentinel by sentinel
+async fn a30_dirty_workspace_preservation() {
+    let repo = test_repo();
+    let manager = workspace_for(&repo);
+    let project_id = harness_types::ProjectId::generate();
+
+    // Three kinds of user work at once: staged, unstaged, and untracked.
+    let staged = repo.root().join("staged-sentinel.txt");
+    let unstaged = repo.root().join("src/lib.rs");
+    let untracked = repo.root().join("untracked-sentinel.txt");
+    std::fs::write(&staged, "staged sentinel\n").expect("the staged sentinel is written");
+    repo.git(&["add", "staged-sentinel.txt"]);
+    std::fs::write(
+        &unstaged,
+        "pub fn greet() -> &'static str {\n    \"changed\"\n}\n",
+    )
+    .expect("the tracked file is edited in the working tree");
+    std::fs::write(&untracked, "untracked sentinel\n").expect("the untracked file is written");
+    let head_before = repo.head();
+    let index_before = repo.git(&["write-tree"]);
+    let index_hash_before = String::from_utf8_lossy(&index_before.stdout)
+        .trim()
+        .to_owned();
+    let status_before = repo.status_porcelain();
+
+    // The host refuses the input instead of stashing or resetting anything.
+    let inspection = manager
+        .inspect_input(repo.root(), &project_id)
+        .await
+        .expect("the input inspection runs");
+    let InputInspection::Dirty(reasons) = inspection else {
+        panic!("a staged, unstaged and untracked tree is not a clean input");
+    };
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| matches!(reason, DirtyReason::StagedChange { .. })),
+        "the refusal names the staged change: {reasons:?}"
+    );
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| matches!(reason, DirtyReason::TrackedModification { .. })),
+        "the refusal names the unstaged change: {reasons:?}"
+    );
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| matches!(reason, DirtyReason::UntrackedFile { .. })),
+        "the refusal names the untracked file: {reasons:?}"
+    );
+
+    // Every sentinel, the index and HEAD are exactly where the user left them.
+    assert_eq!(
+        std::fs::read_to_string(&staged).expect("the staged sentinel is readable"),
+        "staged sentinel\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&unstaged).expect("the edited file is readable"),
+        "pub fn greet() -> &'static str {\n    \"changed\"\n}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&untracked).expect("the untracked sentinel is readable"),
+        "untracked sentinel\n"
+    );
+    let index_after = repo.git(&["write-tree"]);
+    assert_eq!(
+        String::from_utf8_lossy(&index_after.stdout).trim(),
+        index_hash_before,
+        "the index is byte-for-byte what the user staged"
+    );
+    assert_eq!(repo.head(), head_before, "HEAD did not move");
+    assert_eq!(
+        repo.status_porcelain(),
+        status_before,
+        "the working tree reports exactly the same changes"
+    );
+
+    // A clean input is what the host needs to go on; the user's changes have to
+    // be put away by the user, not by the host.
+    repo.git(&["reset", "-q"]);
+    repo.git(&["checkout", "--", "src/lib.rs"]);
+    std::fs::remove_file(&untracked).expect("the untracked sentinel is removed");
+    // Unstaging leaves the previously staged file untracked, so it goes too: the
+    // point here is only to reach a clean base for the next half of the case.
+    std::fs::remove_file(&staged).expect("the unstaged sentinel is removed");
+    let clean = manager
+        .inspect_input(repo.root(), &project_id)
+        .await
+        .expect("the input inspection runs");
+    let InputInspection::Clean(snapshot) = clean else {
+        panic!(
+            "a clean tree is a clean input, but the host still sees: {}",
+            repo.status_porcelain()
+        );
+    };
+
+    // The destination moves after the snapshot was taken: the apply is refused
+    // rather than overwriting the edit.
+    std::fs::write(
+        repo.root().join("src/lib.rs"),
+        "pub fn greet() -> &'static str {\n    \"edited while integrating\"\n}\n",
+    )
+    .expect("the destination is edited after the snapshot");
+
+    let integrator = ResultIntegrator::new(Arc::clone(&manager));
+    let report = harness_orchestrator::IntegrationReport {
+        project_id: snapshot.project_id.clone(),
+        integration_root: manager
+            .state_root()
+            .join("integration")
+            .join("worktree")
+            .to_string_lossy()
+            .into_owned(),
+        base_commit: snapshot.base_commit.clone(),
+        final_commit: snapshot.base_commit.clone(),
+        final_fingerprint: snapshot.fingerprint.clone(),
+        steps: Vec::new(),
+        conflicts: Vec::new(),
+        checks: Vec::new(),
+    };
+    let decision = integrator
+        .recheck_before_apply(repo.root(), &snapshot.fingerprint, &report)
+        .await
+        .expect("the recheck runs");
+    let FinalApply::Refused { reason } = decision else {
+        panic!("an edited destination must not be applied to");
+    };
+    assert!(
+        reason.contains("changed since the input snapshot"),
+        "the refusal says why: {reason}"
+    );
+
+    // The user's edit is still there, untouched by the refusal.
+    assert_eq!(
+        std::fs::read_to_string(repo.root().join("src/lib.rs"))
+            .expect("the destination file is readable"),
+        "pub fn greet() -> &'static str {\n    \"edited while integrating\"\n}\n",
+        "a refused apply never rewrites the destination"
+    );
+
+    // Cleanup touches only the worktrees the host created. A file next to them is
+    // not the host's to remove, and a second worktree survives the first one's
+    // removal.
+    let kept = repo.root().join("keep-me.txt");
+    std::fs::write(&kept, "user data\n").expect("the user file is written");
+    let first = manager
+        .create_worktree(
+            &snapshot,
+            &TaskId::generate(),
+            &harness_types::AgentRunId::generate(),
+            &["src/".to_owned()],
+            1,
+        )
+        .await
+        .expect("the first worktree is created");
+    let second = manager
+        .create_worktree(
+            &snapshot,
+            &TaskId::generate(),
+            &harness_types::AgentRunId::generate(),
+            &["src/".to_owned()],
+            1,
+        )
+        .await
+        .expect("the second worktree is created");
+    assert!(std::path::Path::new(&first.path).is_dir());
+    assert!(std::path::Path::new(&second.path).is_dir());
+
+    manager
+        .remove_worktree(&first, &snapshot.root)
+        .await
+        .expect("the first worktree is removed");
+    assert!(
+        !std::path::Path::new(&first.path).exists(),
+        "the worktree the host created is gone"
+    );
+    assert!(
+        std::path::Path::new(&second.path).is_dir(),
+        "another worktree is not collateral damage"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&kept).expect("the user file is readable"),
+        "user data\n",
+        "cleanup does not reach into the user's own files"
+    );
+    assert_eq!(
+        manager.registered_project(repo.root()),
+        Some(project_id.clone()),
+        "cleanup does not unregister the project it was told about"
+    );
+    manager
+        .remove_worktree(&second, &snapshot.root)
+        .await
+        .expect("the second worktree is removed");
 }

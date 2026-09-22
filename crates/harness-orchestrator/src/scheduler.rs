@@ -281,10 +281,9 @@ impl WorkerScheduler {
     /// so a caller can report backpressure instead of guessing at it.
     #[must_use]
     pub fn reserved_workers(&self) -> u32 {
-        self.reserved
-            .lock()
-            .map(|reserved| u32::try_from(reserved.len()).unwrap_or(u32::MAX))
-            .unwrap_or(0)
+        self.reserved.lock().map_or(0, |reserved| {
+            u32::try_from(reserved.len()).unwrap_or(u32::MAX)
+        })
     }
 
     /// Dispatched workers without a compute slot yet.
