@@ -215,7 +215,6 @@ pub async fn collect_garbage(
         retained_young: Vec::new(),
         bytes_reclaimed: 0,
     };
-    let paths = StorePaths::new(store.paths().data_dir.clone());
     for candidate in candidates {
         if candidate.pinned {
             report.retained_pinned.push(candidate.artifact_id);
@@ -230,18 +229,23 @@ pub async fn collect_garbage(
             continue;
         }
         if !dry_run {
-            let path = paths.data_dir.join(&candidate.relative_path);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(MaintenanceError::new(
-                        ErrorCode::ArtifactWriteFailed,
-                        format!("cannot remove {}: {error}", path.display()),
-                    ));
+            // The candidate list is a snapshot; the authoritative pin/reference
+            // check and the unlink happen together inside one writer
+            // transaction, so a pin committed after the snapshot refuses the
+            // sweep instead of losing its bytes.
+            if !store.collect_artifact(&candidate.artifact_id).await? {
+                let pinned = store
+                    .pinned_artifact_ids()
+                    .await?
+                    .iter()
+                    .any(|id| id == &candidate.artifact_id);
+                if pinned {
+                    report.retained_pinned.push(candidate.artifact_id);
+                } else {
+                    report.retained_referenced.push(candidate.artifact_id);
                 }
+                continue;
             }
-            store.remove_artifact_record(&candidate.artifact_id).await?;
         }
         report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(candidate.byte_len);
         report.collected.push(candidate.artifact_id);

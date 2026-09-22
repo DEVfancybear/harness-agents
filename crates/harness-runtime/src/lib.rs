@@ -1286,6 +1286,12 @@ impl RuntimeService {
             .append_runtime_event(session_id, &task_id, "compaction.started", started, false)
             .await?;
         let recovery = session.recover(session_id).await?;
+        // The sequence this checkpoint will cover, captured before the packet is
+        // built. The CAS below expects exactly it: sampling the session's last
+        // sequence after the build would always match, so an event committed
+        // while the packet was being built would be silently omitted from the
+        // checkpoint instead of refusing it.
+        let covered_through = recovery.replayed_through_sequence;
         let summary = self.summarizer.summarize(&recovery);
         let fallback_used = summary.is_err();
         let system_policy = summary.unwrap_or_else(|_| "Deterministic WorkingState fallback; preserve every mandatory instruction and correction.".to_owned());
@@ -1313,11 +1319,7 @@ impl RuntimeService {
                 .map_err(|error| RuntimeError::new(error.code(), error.to_string()))?,
             content: content_json,
         };
-        let expected_last = self
-            .store
-            .next_sequence(session_id)
-            .await?
-            .saturating_sub(1);
+        let expected_last = covered_through;
         self.store
             .write_context_checkpoint_cas(checkpoint, expected_last)
             .await?;

@@ -697,19 +697,26 @@ impl TaskPlan {
             }
         }
         // Ambiguous owner: two tasks may not claim the same write scope, which
-        // would make concurrent edits undecidable.
+        // would make concurrent edits undecidable. Exact duplicates and nested
+        // scopes are both ambiguous: `src` and `src/foo` name overlapping files,
+        // so two workers could edit the same tree under different grants.
         for task_id in &order {
             let node = nodes.get(task_id).ok_or_else(|| {
                 OrchestratorError::new(ErrorCode::TaskNotFound, "task disappeared during compile")
             })?;
             for path in &node.brief.grants.write_scope {
-                if let Some(owner) = scopes.get(path) {
-                    return Err(OrchestratorError::new(
-                        ErrorCode::AmbiguousTaskOwner,
-                        format!("write scope {path} is claimed by both {owner} and {task_id}"),
-                    ));
+                let normalized = normalize_scope_path(path);
+                for (existing, owner) in &scopes {
+                    if scopes_overlap(&normalized, existing) {
+                        return Err(OrchestratorError::new(
+                            ErrorCode::AmbiguousTaskOwner,
+                            format!(
+                                "write scope {path} overlaps {existing}, claimed by both {owner} and {task_id}"
+                            ),
+                        ));
+                    }
                 }
-                scopes.insert(path.clone(), task_id.clone());
+                scopes.insert(normalized, task_id.clone());
             }
         }
         // Dependency validation and cycle detection.
@@ -805,6 +812,25 @@ fn depth_from_parents(
         cursor = parent.parent_task_id.as_ref();
     }
     Ok(depth)
+}
+
+/// Normalize one declared write scope for comparison: forward slashes, no
+/// trailing separator, no leading `./`.
+fn normalize_scope_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let normalized = normalized.trim_end_matches('/');
+    normalized
+        .strip_prefix("./")
+        .unwrap_or(normalized)
+        .to_owned()
+}
+
+/// Whether two write scopes can name the same file: equal paths, or one scope
+/// nested under the other.
+fn scopes_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left.starts_with(&format!("{right}/"))
+        || right.starts_with(&format!("{left}/"))
 }
 
 fn topological_sort(

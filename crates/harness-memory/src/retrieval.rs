@@ -243,8 +243,12 @@ impl MemoryService {
             revision = fallback_revision;
         }
         // Breadth first, then the store's own ranking. A stable sort is what keeps
-        // bm25 as the tie-break instead of replacing it.
-        records.sort_by_key(|record| std::cmp::Reverse(covers(&record.current.content, &terms)));
+        // bm25 as the tie-break instead of replacing it. The key is cached: `covers`
+        // normalizes the whole content, and recomputing it per comparison made one
+        // search normalize each candidate O(log n) times.
+        records.sort_by_cached_key(|record| {
+            std::cmp::Reverse(covers(&record.current.content, &terms))
+        });
         records.truncate(limit);
         let hits = records
             .into_iter()

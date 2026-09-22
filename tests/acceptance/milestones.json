@@ -565,8 +565,11 @@
       "owner_milestones": ["M4"],
       "planned_test": "a15_path_patch_safety",
       "status": "implemented",
-      "selectors": ["milestone_m4::a15_path_patch_safety"],
-      "note": "traversal, absolute paths, junction/symlink alias, sensitive names, stale patch, locked file (Windows share violation observed as present-but-unreadable) and CRLF/Unicode byte preservation"
+      "selectors": [
+        "milestone_m4::a15_path_patch_safety",
+        "known_defects::a_live_store_inside_the_workspace_no_longer_breaks_the_fingerprint"
+      ],
+      "note": "traversal, absolute paths, junction/symlink alias, sensitive names, stale patch, locked file (Windows share violation observed as present-but-unreadable) and CRLF/Unicode byte preservation; the known_defects regression proves a live store inside the workspace no longer fails the fingerprint"
     },
     { "id": "A16", "owner_milestones": ["M4"], "planned_test": "a16_process_tree_env", "status": "planned" },
     { "id": "A17", "owner_milestones": ["M4"], "planned_test": "a17_output_quota", "status": "planned" },

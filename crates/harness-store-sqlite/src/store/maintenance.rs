@@ -503,23 +503,30 @@ impl SqliteStore {
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;
         assert_fence_in_tx(&mut tx, &fence).await?;
-        let referenced =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM receipts WHERE artifact_id = ?")
+        for (query, reason) in [
+            (
+                "SELECT COUNT(*) FROM receipts WHERE artifact_id = ?",
+                "a referenced artifact cannot be removed",
+            ),
+            (
+                "SELECT COUNT(*) FROM maintenance_pins WHERE artifact_id = ?",
+                "a pinned artifact cannot be removed",
+            ),
+            (
+                "SELECT COUNT(*) FROM tool_artifact_scopes WHERE artifact_id = ?",
+                "an artifact scoped to a tool execution cannot be removed",
+            ),
+        ] {
+            let held = sqlx::query_scalar::<_, i64>(query)
                 .bind(artifact_id)
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(|error| {
-                    database_error(
-                        ErrorCode::StorageWriteFailed,
-                        "check artifact references",
-                        error,
-                    )
+                    database_error(ErrorCode::StorageWriteFailed, "check artifact holds", error)
                 })?;
-        if referenced > 0 {
-            return Err(StoreError::new(
-                ErrorCode::RetentionRefused,
-                "a referenced artifact cannot be removed",
-            ));
+            if held > 0 {
+                return Err(StoreError::new(ErrorCode::RetentionRefused, reason));
+            }
         }
         sqlx::query("DELETE FROM artifacts WHERE artifact_id = ?")
             .bind(artifact_id)
@@ -539,5 +546,109 @@ impl SqliteStore {
                 error,
             )
         })
+    }
+
+    /// Reclaim one unreferenced artifact's bytes and record together.
+    ///
+    /// The pin, receipt and scope checks and the row deletion run inside one
+    /// writer transaction, and the file is unlinked inside it. A backup that
+    /// pins the artifact concurrently either commits before the checks (and this
+    /// refuses) or after this transaction (and the pin then names a record that
+    /// no longer exists, which retention reporting tolerates). A check made
+    /// before the unlink in a separate transaction would leave a window where a
+    /// fresh pin still loses its bytes.
+    ///
+    /// Returns `Ok(false)` when the artifact is still pinned or referenced; the
+    /// caller decides how to report it.
+    pub async fn collect_artifact(&self, artifact_id: &str) -> Result<bool, StoreError> {
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        assert_fence_in_tx(&mut tx, &fence).await?;
+        let relative_path = sqlx::query_scalar::<_, String>(
+            "SELECT relative_path FROM artifacts WHERE artifact_id = ?",
+        )
+        .bind(artifact_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "read artifact path", error)
+        })?;
+        let Some(relative_path) = relative_path else {
+            // Already collected by an earlier sweep; nothing to reclaim.
+            return tx
+                .rollback()
+                .await
+                .map_err(|error| {
+                    database_error(
+                        ErrorCode::StorageWriteFailed,
+                        "rollback artifact sweep",
+                        error,
+                    )
+                })
+                .map(|()| true);
+        };
+        for query in [
+            "SELECT COUNT(*) FROM maintenance_pins WHERE artifact_id = ?",
+            "SELECT COUNT(*) FROM receipts WHERE artifact_id = ?",
+            "SELECT COUNT(*) FROM tool_artifact_scopes WHERE artifact_id = ?",
+        ] {
+            let held = sqlx::query_scalar::<_, i64>(query)
+                .bind(artifact_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|error| {
+                    database_error(ErrorCode::StorageWriteFailed, "check artifact holds", error)
+                })?;
+            if held > 0 {
+                tx.rollback().await.map_err(|error| {
+                    database_error(
+                        ErrorCode::StorageWriteFailed,
+                        "rollback refused artifact sweep",
+                        error,
+                    )
+                })?;
+                return Ok(false);
+            }
+        }
+        let path = self.paths.data_dir.join(&relative_path);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tx.rollback().await.map_err(|rollback| {
+                    database_error(
+                        ErrorCode::StorageWriteFailed,
+                        "rollback failed artifact sweep",
+                        rollback,
+                    )
+                })?;
+                return Err(StoreError::new(
+                    ErrorCode::ArtifactWriteFailed,
+                    format!(
+                        "cannot remove artifact bytes at {}: {error}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        sqlx::query("DELETE FROM artifacts WHERE artifact_id = ?")
+            .bind(artifact_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::StorageWriteFailed,
+                    "remove artifact record",
+                    error,
+                )
+            })?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit artifact sweep",
+                error,
+            )
+        })?;
+        Ok(true)
     }
 }

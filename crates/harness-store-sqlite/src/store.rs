@@ -1637,38 +1637,7 @@ impl SqliteStore {
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list sessions", error))?;
         rows.into_iter()
-            .map(|row| {
-                let session_id =
-                    SessionId::parse(row_get::<String>(&row, "session_id")?).map_err(|_| {
-                        StoreError::new(
-                            ErrorCode::StorageWriteFailed,
-                            "stored session ID is invalid",
-                        )
-                    })?;
-                let task_id = TaskId::parse(row_get::<String>(&row, "task_id")?).map_err(|_| {
-                    StoreError::new(ErrorCode::StorageWriteFailed, "stored task ID is invalid")
-                })?;
-                let next_sequence =
-                    to_u64(row_get::<i64>(&row, "next_sequence")?, "next sequence")?;
-                let input_count = to_u64(row_get::<i64>(&row, "input_count")?, "input count")?;
-                let snapshot_sequence = row
-                    .try_get::<Option<i64>, _>("snapshot_sequence")
-                    .map_err(|_| {
-                        StoreError::new(
-                            ErrorCode::StorageWriteFailed,
-                            "stored snapshot sequence is invalid",
-                        )
-                    })?
-                    .map(|value| to_u64(value, "snapshot sequence"))
-                    .transpose()?;
-                Ok(SessionSummary {
-                    session_id,
-                    task_id,
-                    next_sequence,
-                    input_count,
-                    latest_snapshot_sequence: snapshot_sequence,
-                })
-            })
+            .map(|row| session_summary_from_row(&row))
             .collect()
     }
 
@@ -1676,10 +1645,21 @@ impl SqliteStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<SessionSummary>, StoreError> {
-        let summaries = self.list_sessions().await?;
-        Ok(summaries
-            .into_iter()
-            .find(|summary| &summary.session_id == session_id))
+        // One row by primary key: the previous implementation listed and grouped
+        // every session and then searched the vector, so a hot path that only
+        // needs one summary paid for the whole store.
+        let row = sqlx::query(
+            "SELECT sessions.session_id, sessions.task_id, sessions.next_sequence,
+                    (SELECT COUNT(*) FROM inbox WHERE inbox.session_id = sessions.session_id) AS input_count,
+                    (SELECT MAX(through_sequence) FROM snapshots WHERE snapshots.session_id = sessions.session_id) AS snapshot_sequence
+             FROM sessions
+             WHERE sessions.session_id = ?",
+        )
+        .bind(session_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read session summary", error))?;
+        row.map(|row| session_summary_from_row(&row)).transpose()
     }
 
     pub async fn session_task(&self, session_id: &SessionId) -> Result<Option<TaskId>, StoreError> {
@@ -3915,6 +3895,37 @@ fn validate_tool_approval_loaded(record: &ToolApprovalRecord) -> Result<(), Stor
         ));
     }
     Ok(())
+}
+
+/// One `SessionSummary` from a row carrying the shared summary columns.
+fn session_summary_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SessionSummary, StoreError> {
+    let session_id = SessionId::parse(row_get::<String>(row, "session_id")?).map_err(|_| {
+        StoreError::new(
+            ErrorCode::StorageWriteFailed,
+            "stored session ID is invalid",
+        )
+    })?;
+    let task_id = TaskId::parse(row_get::<String>(row, "task_id")?)
+        .map_err(|_| StoreError::new(ErrorCode::StorageWriteFailed, "stored task ID is invalid"))?;
+    let next_sequence = to_u64(row_get::<i64>(row, "next_sequence")?, "next sequence")?;
+    let input_count = to_u64(row_get::<i64>(row, "input_count")?, "input count")?;
+    let snapshot_sequence = row
+        .try_get::<Option<i64>, _>("snapshot_sequence")
+        .map_err(|_| {
+            StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "stored snapshot sequence is invalid",
+            )
+        })?
+        .map(|value| to_u64(value, "snapshot sequence"))
+        .transpose()?;
+    Ok(SessionSummary {
+        session_id,
+        task_id,
+        next_sequence,
+        input_count,
+        latest_snapshot_sequence: snapshot_sequence,
+    })
 }
 
 #[allow(clippy::too_many_lines)] // one row, every typed field it carries

@@ -725,7 +725,9 @@ impl InteractiveController {
         if self.phase == AppPhase::WaitingApproval {
             return self.answer(&text);
         }
-        if text.starts_with('/') {
+        if text.trim_start().starts_with('/') {
+            // A leading space must not turn a command into chat text: `/key`
+            // would otherwise be sent to the provider and stored in history.
             return self.command(&text);
         }
         if self.phase.has_active_run() {
@@ -931,7 +933,10 @@ impl InteractiveController {
             }
             "/key" => match raw_argument {
                 Some(value) => {
-                    self.editor.forget_submission(trimmed);
+                    // `line` is the raw submitted buffer, which is what the
+                    // editor stored: forgetting the trimmed form would leave the
+                    // key reachable through Up-arrow history.
+                    self.editor.forget_submission(line);
                     return self.save_key(value);
                 }
                 None if self.phase.has_active_run() => {
@@ -1194,25 +1199,43 @@ impl InteractiveController {
     ///
     /// Width-dependent wrapping stays in the renderer. Here we commit only
     /// complete logical lines, leaving at most eight in the viewport; no partial
-    /// line can jump into scrollback while the model is still writing it.
+    /// line can jump into scrollback while the model is still writing it. The
+    /// block is also capped by bytes, so a model that never emits a newline
+    /// cannot grow the live view (and its per-frame clone) without bound.
     fn flush_stream_overflow(&mut self, effects: &mut Vec<Effect>) {
         const LIVE_LINES: usize = 8;
+        const LIVE_BYTES: usize = 16 * 1024;
         let line_count = self.pending_newlines.saturating_add(1);
-        if line_count <= LIVE_LINES {
+        let line_cut = if line_count > LIVE_LINES {
+            let overflow = line_count - LIVE_LINES;
+            self.pending_text
+                .match_indices('\n')
+                .nth(overflow - 1)
+                .map(|(index, _)| index + 1)
+        } else {
+            None
+        };
+        let byte_cut = (self.pending_text.len() > LIVE_BYTES).then(|| {
+            let mut end = LIVE_BYTES;
+            while end > 0 && !self.pending_text.is_char_boundary(end) {
+                end -= 1;
+            }
+            end
+        });
+        let cut = match (line_cut, byte_cut) {
+            (Some(line), Some(byte)) => line.min(byte),
+            (Some(line), None) => line,
+            (None, Some(byte)) => byte,
+            (None, None) => return,
+        };
+        if cut == 0 {
             return;
         }
-        let overflow = line_count - LIVE_LINES;
-        let Some(cut) = self
-            .pending_text
-            .match_indices('\n')
-            .nth(overflow - 1)
-            .map(|(index, _)| index + 1)
-        else {
-            return;
-        };
         let tail = self.pending_text.split_off(cut);
         let committed = std::mem::replace(&mut self.pending_text, tail);
-        self.pending_newlines = self.pending_newlines.saturating_sub(overflow);
+        // The committed prefix may hold newlines of its own; recount from what is
+        // left (bounded by the byte cap) instead of guessing.
+        self.pending_newlines = self.pending_text.matches('\n').count();
         effects.push(Effect::Stream(committed.clone()));
         self.transcript.push(committed.clone());
         self.remember(committed.split('\n').map(str::to_owned).collect());
