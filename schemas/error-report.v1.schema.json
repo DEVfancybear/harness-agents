@@ -99,6 +99,11 @@
           "type": "string"
         },
         {
+          "const": "delegation_queue_full",
+          "description": "A delegation was refused because the queue already holds as many workers\nas it may. Distinct from `BudgetExhausted`, which says no more requests may\nbe spent: a full queue is backpressure and clears when a worker settles,\nwhere an exhausted budget does not clear at all.",
+          "type": "string"
+        },
+        {
           "const": "source_unavailable",
           "description": "A referenced durable source is no longer available to read. Distinct\nfrom a scope refusal: the caller may read it in principle, but the bytes\nbehind the reference are gone.",
           "type": "string"

@@ -152,9 +152,7 @@
           "id": "M1-04",
           "title": "Recovery queries và CLI inspection",
           "status": "implemented_unverified",
-          "tests": [
-            "m1_04_status_reports_pending_work_and_blocking_reasons_without_a_provider"
-          ]
+          "tests": ["m1_04_status_reports_pending_work_and_blocking_reasons_without_a_provider"]
         }
       ],
       "required_tests": [
@@ -412,20 +410,13 @@
           "id": "M4-03",
           "title": "Process lifecycle và spool",
           "status": "implemented_unverified",
-          "tests": [
-            "a13_queued_process_cancel",
-            "a16_process_tree_env",
-            "a17_output_quota"
-          ]
+          "tests": ["a13_queued_process_cancel", "a16_process_tree_env", "a17_output_quota"]
         },
         {
           "id": "M4-04",
           "title": "End-to-end coding và recovery",
           "status": "implemented_unverified",
-          "tests": [
-            "a08_coding_e2e",
-            "m4_04_check_evidence_is_digest_bound"
-          ]
+          "tests": ["a08_coding_e2e", "m4_04_check_evidence_is_digest_bound"]
         }
       ],
       "required_tests": [
@@ -574,10 +565,7 @@
           "id": "M6-03",
           "title": "MCP client adapter: tools/resources, schema validate, gate",
           "status": "implemented_unverified",
-          "tests": [
-            "m6_03_mcp_schema_and_resource_provenance",
-            "a23_extension_bounds"
-          ]
+          "tests": ["m6_03_mcp_schema_and_resource_provenance", "a23_extension_bounds"]
         },
         {
           "id": "M6-04",
@@ -787,6 +775,75 @@
           "closure-M0"
         ]
       }
+    },
+    {
+      "id": "M9",
+      "title": "Data lifecycle và CLI release",
+      "runbook": "docs/implementation-next/M9.vi.md",
+      "prerequisites": ["M8"],
+      "status": "in_progress",
+      "integration_target": "milestone_m9",
+      "work_items": [
+        {
+          "id": "M9-01",
+          "title": "Backup, restore và retention",
+          "status": "implemented_unverified",
+          "tests": ["a31_backup_retention_restore"]
+        },
+        {
+          "id": "M9-02",
+          "title": "Diagnostics và redacted observability",
+          "status": "implemented_unverified",
+          "tests": [
+            "a32_diagnostics_isolation",
+            "m9_02_doctor_and_support_bundle_are_usable_from_the_cli"
+          ]
+        },
+        {
+          "id": "M9-03",
+          "title": "Full gates và eval baseline",
+          "status": "in_progress",
+          "tests": []
+        },
+        {
+          "id": "M9-04",
+          "title": "Packaging và documented profile",
+          "status": "in_progress",
+          "tests": []
+        }
+      ],
+      "required_tests": [
+        "a31_backup_retention_restore",
+        "a32_diagnostics_isolation",
+        "m9_02_doctor_and_support_bundle_are_usable_from_the_cli"
+      ],
+      "unit_tests": [],
+      "fixtures": [
+        "crates/harness-cli/tests/milestone_m9.rs",
+        "docs/adr/ADR-N09-DATA-LIFECYCLE-AND-RELEASE.vi.md"
+      ],
+      "gate": {
+        "script": "scripts/Verify-Milestone.ps1",
+        "dependency_check_bin": "dependency_check",
+        "steps": [
+          "format",
+          "clippy",
+          "build",
+          "workspace-tests",
+          "dependency-allowlist",
+          "required-test-discovery",
+          "required-tests",
+          "closure-M8",
+          "closure-M7",
+          "closure-M6",
+          "closure-M5",
+          "closure-M4",
+          "closure-M3",
+          "closure-M1",
+          "closure-M2",
+          "closure-M0"
+        ]
+      }
     }
   ],
   "acceptance_cases": [
@@ -890,10 +947,7 @@
       "owner_milestones": ["M3", "M4"],
       "planned_test": "a11_human_input_grant",
       "status": "implemented",
-      "selectors": [
-        "milestone_m3::a11_human_input_grant",
-        "milestone_m4::a11_approval_grant"
-      ],
+      "selectors": ["milestone_m3::a11_human_input_grant", "milestone_m4::a11_approval_grant"],
       "note": "M3 half: a durable question is answered exactly once across a restart and the answer never becomes a permission. M4 half: an already expired grant cannot be issued, a grant that expires before consume is a typed denial with no write, a revoked grant never executes, and a replayed grant is refused - both halves now exist, so the case is implemented rather than planned"
     },
     {
@@ -1053,11 +1107,45 @@
       "selectors": ["milestone_m8::a30_dirty_workspace_preservation"],
       "note": "a staged file, an unstaged edit and an untracked file produce three structured refusal reasons, and the sentinel bytes, the index tree hash, HEAD and the porcelain status are all unchanged; an edit to the destination after the snapshot makes the apply refused with a reason and never rewrites the file; cleanup removes exactly the worktree the host created and leaves a second worktree, a user file and the project registration alone"
     },
-    { "id": "A31", "owner_milestones": ["M9"], "planned_test": "a31_backup_retention_restore", "status": "planned" },
-    { "id": "A32", "owner_milestones": ["M9"], "planned_test": "a32_diagnostics_isolation", "status": "planned" },
-    { "id": "A33", "owner_milestones": ["M10"], "planned_test": "a33_web_replay_gap", "status": "planned" },
-    { "id": "A34", "owner_milestones": ["M11"], "planned_test": "a34_schedule_occurrences", "status": "planned" },
-    { "id": "A35", "owner_milestones": ["M11"], "planned_test": "a35_external_task_ambiguity", "status": "planned" },
-    { "id": "A36", "owner_milestones": ["M12"], "planned_test": "a36_strict_confinement", "status": "planned" }
+    {
+      "id": "A31",
+      "owner_milestones": ["M9"],
+      "planned_test": "a31_backup_retention_restore",
+      "status": "implemented",
+      "selectors": ["milestone_m9::a31_backup_retention_restore"],
+      "note": "a live store is backed up while open, a backup with one flipped byte is refused before anything is written into the destination and the source backup survives, a restore into an occupied directory is refused, a real restore yields a store whose journal, artifact record and artifact bytes are intact and which accepts a new write, a pin survives garbage collection, and a migration into an unusable destination leaves the source readable with its data and bytes"
+    },
+    {
+      "id": "A32",
+      "owner_milestones": ["M9"],
+      "planned_test": "a32_diagnostics_isolation",
+      "status": "implemented",
+      "selectors": ["milestone_m9::a32_diagnostics_isolation"],
+      "note": "the two redaction rules are asserted as rules and then against the raw bytes of every bundle file built from a host that really carries a fake credential in its environment and its config; the bundle carries schema revisions, counts, retention and correlation references that point at real events without carrying their payloads, names transcripts among what it excludes, and an unavailable exporter cannot turn a settled domain write into a failure"
+    },
+    {
+      "id": "A33",
+      "owner_milestones": ["M10"],
+      "planned_test": "a33_web_replay_gap",
+      "status": "planned"
+    },
+    {
+      "id": "A34",
+      "owner_milestones": ["M11"],
+      "planned_test": "a34_schedule_occurrences",
+      "status": "planned"
+    },
+    {
+      "id": "A35",
+      "owner_milestones": ["M11"],
+      "planned_test": "a35_external_task_ambiguity",
+      "status": "planned"
+    },
+    {
+      "id": "A36",
+      "owner_milestones": ["M12"],
+      "planned_test": "a36_strict_confinement",
+      "status": "planned"
+    }
   ]
 }
