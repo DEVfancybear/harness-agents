@@ -20,8 +20,8 @@ use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
 use harness_session::{AdmitInputRequest, SessionService};
 use harness_store_sqlite::{SqliteStore, ToolIntentStatus, WriterOpenOptions};
 use harness_tools::{
-    ApprovalMode, CodingToolAction, EffectClass, ToolExecutionService, ToolRequest, TurnDriver,
-    TurnLimits, TurnObserver, TurnOptions, TurnProgress, coding_tool_descriptors,
+    ApprovalMode, CodingToolAction, EffectClass, ToolExecutionService, ToolOutput, ToolRequest,
+    TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnProgress, coding_tool_descriptors,
     coding_tool_names, coding_tool_schemas, effect_class_for, observe_workspace,
     observed_file_hash,
 };
@@ -563,6 +563,319 @@ async fn m4_01_tools_schema_upgrade() {
     assert_eq!(
         view.receipt.expect("receipt").call_id.as_deref(),
         Some("call-upgrade")
+    );
+    drop(tools);
+    close(store).await;
+}
+
+// ---------------------------------------------------------------------------
+// M4-02: structured git log, path and patch safety (A15)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one tool's whole contract, told in order
+async fn m4_02_git_log_is_structured_and_bounded() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let (session, task) = admit(&store, &bench).await;
+
+    // The registry advertises it as a bounded read before any call exists.
+    let descriptor = coding_tool_descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.id == "git_log")
+        .expect("git_log is advertised");
+    assert_eq!(descriptor.effect_class, EffectClass::ReadOnly);
+    assert_eq!(effect_class_for("git_log"), EffectClass::ReadOnly);
+    assert!(descriptor.schema_digest.starts_with("sha256:"));
+
+    // The parser accepts an omitted limit and refuses an out-of-range one
+    // before a proposal exists.
+    assert!(matches!(
+        CodingToolAction::from_provider_call("git_log", "{}").expect("empty args parse"),
+        CodingToolAction::GitLog {
+            path: None,
+            limit: None
+        }
+    ));
+    assert!(matches!(
+        CodingToolAction::from_provider_call("git_log", r#"{"limit":1}"#).expect("limit parses"),
+        CodingToolAction::GitLog { limit: Some(1), .. }
+    ));
+    for arguments in [
+        r#"{"limit":0}"#,
+        r#"{"limit":101}"#,
+        r#"{"limit":"2"}"#,
+        r#"{"limit":1.5}"#,
+        r#"{"unknown":1}"#,
+    ] {
+        assert!(
+            CodingToolAction::from_provider_call("git_log", arguments).is_err(),
+            "{arguments} must not reach the gate"
+        );
+    }
+
+    // Real history, bounded to the requested count and machine-readable.
+    git(
+        &bench.workspace,
+        &["commit", "--allow-empty", "-m", "second commit"],
+    );
+    let prepared = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.log",
+            &bench.workspace,
+            CodingToolAction::GitLog {
+                path: None,
+                limit: Some(1),
+            },
+        ))
+        .await
+        .expect("git_log prepares");
+    let grant = tools.approve(&prepared).await.expect("approved");
+    let view = tools
+        .execute(prepared, Some(grant))
+        .await
+        .expect("executes");
+    assert_eq!(
+        view.receipt.expect("receipt").outcome_state,
+        ToolOutcomeState::Settled
+    );
+    let ToolOutput::Git {
+        operation, output, ..
+    } = &view.output
+    else {
+        panic!("git_log must return a git output: {:?}", view.output);
+    };
+    assert_eq!(operation, "log");
+    let lines = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "the limit bounds the history: {output}");
+    let fields = lines[0].split('\t').collect::<Vec<_>>();
+    assert_eq!(fields.len(), 3, "hash, author date and subject: {output}");
+    assert!(fields[2].contains("second commit"), "{output}");
+    assert!(fields[1].contains('T'), "author date is ISO 8601: {output}");
+
+    // A path scope finds the baseline commit that touched it.
+    let prepared = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.log",
+            &bench.workspace,
+            CodingToolAction::GitLog {
+                path: Some("src".to_owned()),
+                limit: Some(5),
+            },
+        ))
+        .await
+        .expect("scoped git_log prepares");
+    let grant = tools.approve(&prepared).await.expect("approved");
+    let view = tools
+        .execute(prepared, Some(grant))
+        .await
+        .expect("executes");
+    let ToolOutput::Git { output, .. } = &view.output else {
+        panic!("git_log must return a git output: {:?}", view.output);
+    };
+    assert!(output.contains("fixture baseline"), "{output}");
+
+    // An escaping scope is refused before a proposal exists.
+    let error = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.log",
+            &bench.workspace,
+            CodingToolAction::GitLog {
+                path: Some("../".to_owned()),
+                limit: None,
+            },
+        ))
+        .await
+        .expect_err("escape is refused");
+    assert_eq!(error.code(), ErrorCode::WorkspaceEscape);
+    drop(tools);
+    close(store).await;
+}
+
+#[cfg(windows)]
+fn make_dir_link(target: &Path, link: &Path) {
+    let status = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .expect("mklink starts");
+    assert!(
+        status.status.success(),
+        "junction creation failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+}
+
+#[cfg(unix)]
+fn make_dir_link(target: &Path, link: &Path) {
+    std::os::unix::fs::symlink(target, link).expect("symlink");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one safety surface, case by case
+async fn a15_path_patch_safety() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let (session, task) = admit(&store, &bench).await;
+
+    // Parent traversal and absolute paths never reach a proposal.
+    for path in [
+        "../outside.txt",
+        "src/../../outside.txt",
+        "C:/Windows/win.ini",
+        "/etc/hosts",
+    ] {
+        let error = tools
+            .prepare(ToolRequest::new(
+                session.clone(),
+                task.clone(),
+                "actor.a",
+                &bench.workspace,
+                CodingToolAction::ReadFile {
+                    path: path.to_owned(),
+                },
+            ))
+            .await
+            .expect_err("escape must be refused");
+        assert_eq!(error.code(), ErrorCode::WorkspaceEscape, "{path}");
+    }
+
+    // A directory link inside the workspace is refused even though its target
+    // exists: the link name itself is the escape.
+    let outside = bench.temp.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("outside dir");
+    std::fs::write(outside.join("secret.txt"), "outside secret").expect("secret");
+    let link = bench.workspace.join("linked");
+    make_dir_link(&outside, &link);
+    let error = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a",
+            &bench.workspace,
+            CodingToolAction::ReadFile {
+                path: "linked/secret.txt".to_owned(),
+            },
+        ))
+        .await
+        .expect_err("link traversal must be refused");
+    assert_eq!(error.code(), ErrorCode::WorkspaceEscape);
+    assert_eq!(
+        std::fs::read_to_string(outside.join("secret.txt")).expect("outside readable"),
+        "outside secret",
+        "nothing read or wrote through the link"
+    );
+
+    // Credential-like names are denied as sensitive, not as an escape.
+    let error = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a",
+            &bench.workspace,
+            CodingToolAction::ReadFile {
+                path: ".env".to_owned(),
+            },
+        ))
+        .await
+        .expect_err("sensitive path must be refused");
+    assert_eq!(error.code(), ErrorCode::SensitivePathDenied);
+
+    // A stale patch is refused by hash before any intent claims a side effect.
+    let prepared = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a",
+            &bench.workspace,
+            patch_action(&bench.workspace),
+        ))
+        .await
+        .expect("patch prepares");
+    let grant = tools.approve(&prepared).await.expect("approved");
+    std::fs::write(
+        bench.workspace.join("src").join("parser.txt"),
+        "CLEAN parser\r\n",
+    )
+    .expect("external edit");
+    let view = tools
+        .execute(prepared, Some(grant))
+        .await
+        .expect("a stale patch is a typed denial, not a crash");
+    let receipt = view.receipt.expect("denial carries a receipt");
+    assert_eq!(receipt.outcome_state, ToolOutcomeState::Denied);
+    assert!(
+        matches!(&view.output, ToolOutput::Denied { code, .. } if code == "stale_workspace"),
+        "the denial names the stale fingerprint: {:?}",
+        view.output
+    );
+    assert_eq!(
+        file_text(&bench.workspace),
+        "CLEAN parser\r\n",
+        "the refused patch did not touch the file"
+    );
+    assert!(
+        store
+            .pending_tool_intents(&session)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a refused patch never creates an intent"
+    );
+
+    // CRLF and Unicode survive a patch byte for byte.
+    std::fs::write(
+        bench.workspace.join("src").join("parser.txt"),
+        "BUG parser\r\n",
+    )
+    .expect("restore");
+    let unicode = "café ✓ — 日本語\r\nsecond\r\n";
+    std::fs::write(
+        bench.workspace.join("src").join("unicode.txt"),
+        "placeholder\r\n",
+    )
+    .expect("unicode fixture");
+    let expected = observed_file_hash(&bench.workspace, "src/unicode.txt").expect("hash");
+    let prepared = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a",
+            &bench.workspace,
+            CodingToolAction::ApplyPatch {
+                path: "src/unicode.txt".to_owned(),
+                expected_hash: expected,
+                replacement: unicode.to_owned(),
+            },
+        ))
+        .await
+        .expect("unicode patch prepares");
+    let grant = tools.approve(&prepared).await.expect("approved");
+    let view = tools
+        .execute(prepared, Some(grant))
+        .await
+        .expect("unicode patch executes");
+    assert_eq!(
+        view.receipt.expect("receipt").outcome_state,
+        ToolOutcomeState::Settled
+    );
+    assert_eq!(
+        std::fs::read_to_string(bench.workspace.join("src").join("unicode.txt"))
+            .expect("unicode readable"),
+        unicode,
+        "bytes are preserved exactly, including CRLF and Unicode"
     );
     drop(tools);
     close(store).await;

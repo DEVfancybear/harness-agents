@@ -405,8 +405,8 @@
         {
           "id": "M4-02",
           "title": "Filesystem và Git read/patch",
-          "status": "planned",
-          "tests": []
+          "status": "in_progress",
+          "tests": ["m4_02_git_log_is_structured_and_bounded", "a15_path_patch_safety"]
         },
         {
           "id": "M4-03",
@@ -428,7 +428,9 @@
         "m4_01_call_id_is_bound_to_intent_and_receipt",
         "m4_01_tools_schema_upgrade",
         "a03_receipt_before_checkpoint",
-        "a04_effect_before_receipt"
+        "a04_effect_before_receipt",
+        "m4_02_git_log_is_structured_and_bounded",
+        "a15_path_patch_safety"
       ],
       "unit_tests": [],
       "fixtures": ["crates/harness-cli/tests/milestone_m4.rs"],
@@ -550,7 +552,7 @@
       "status": "implemented",
       "selectors": ["milestone_m4::a14_approval_binding"]
     },
-    { "id": "A15", "owner_milestones": ["M4"], "planned_test": "a15_path_patch_safety", "status": "planned" },
+    { "id": "A15", "owner_milestones": ["M4"], "planned_test": "a15_path_patch_safety", "status": "in_progress", "note": "milestone_m4::a15_path_patch_safety covers traversal, absolute paths, junction/symlink alias, sensitive names, stale patch and CRLF/Unicode byte preservation; the locked-file typed-error case (M4-02.2) is pending, so the case stays in_progress until it lands" },
     { "id": "A16", "owner_milestones": ["M4"], "planned_test": "a16_process_tree_env", "status": "planned" },
     { "id": "A17", "owner_milestones": ["M4"], "planned_test": "a17_output_quota", "status": "planned" },
     { "id": "A18", "owner_milestones": ["M5"], "planned_test": "a18_history_after_compaction", "status": "planned" },

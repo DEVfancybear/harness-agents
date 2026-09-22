@@ -19,8 +19,9 @@ use harness_types::{
 use serde_json::{Map, Value, json};
 
 use crate::{
-    ApprovalGrant, CodingToolAction, IsolationMode, PreparedToolRequest, TOOL_CONTRACT_VERSION,
-    ToolCapabilities, ToolExecutionView, ToolOutput, ToolPolicy, ToolRequest, coding_tool_names,
+    ApprovalGrant, CodingToolAction, GIT_LOG_DEFAULT_LIMIT, IsolationMode, PreparedToolRequest,
+    TOOL_CONTRACT_VERSION, ToolCapabilities, ToolExecutionView, ToolOutput, ToolPolicy,
+    ToolRequest, coding_tool_names,
     process::{self, ProcessResult},
     workspace::{
         apply_text_patch, inspect_workspace, list_files, read_text, read_text_output, redact_text,
@@ -623,7 +624,8 @@ impl ToolExecutionService {
             }
             CodingToolAction::ListFiles { path }
             | CodingToolAction::SearchText { path, .. }
-            | CodingToolAction::GitDiff { path } => {
+            | CodingToolAction::GitDiff { path }
+            | CodingToolAction::GitLog { path, .. } => {
                 if let Some(path) = path {
                     let _ = resolve_relative(root, path, true)?;
                 }
@@ -818,6 +820,12 @@ impl ToolExecutionService {
                 let output =
                     process::run_structured(root, "git", &args, 15_000, cancellation).await?;
                 Ok(git_output("diff", output))
+            }
+            CodingToolAction::GitLog { path, limit } => {
+                let args = git_log_arguments(path.as_deref(), *limit);
+                let output =
+                    process::run_structured(root, "git", &args, 15_000, cancellation).await?;
+                Ok(git_output("log", output))
             }
             CodingToolAction::TaskUpdate { .. } => Err(HarnessError::new(
                 ErrorCode::InvalidPayload,
@@ -1121,6 +1129,24 @@ fn process_output(output: ProcessResult) -> ToolOutput {
     }
 }
 
+/// The exact `git log` argv: no pager, no color, bounded, and tab-separated
+/// fields (full hash, ISO 8601 author date, subject) so a caller can parse it
+/// without a second command.
+fn git_log_arguments(path: Option<&str>, limit: Option<u32>) -> Vec<String> {
+    let count = limit.unwrap_or(GIT_LOG_DEFAULT_LIMIT);
+    let mut args = vec![
+        "log".to_owned(),
+        "--no-color".to_owned(),
+        format!("-n{count}"),
+        "--format=%H%x09%aI%x09%s".to_owned(),
+    ];
+    if let Some(path) = path {
+        args.push("--".to_owned());
+        args.push(path.to_owned());
+    }
+    args
+}
+
 fn git_output(operation: &str, output: ProcessResult) -> ToolOutput {
     let combined = if output.stderr.is_empty() {
         output.stdout
@@ -1344,6 +1370,7 @@ mod tests {
             ToolKind::SearchText,
             ToolKind::GitStatus,
             ToolKind::GitDiff,
+            ToolKind::GitLog,
         ] {
             assert!(
                 kind.is_read_only(),

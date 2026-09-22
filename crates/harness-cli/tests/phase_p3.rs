@@ -415,7 +415,9 @@ fn make_escape_link(_link: &Path, _target: &Path) {
 async fn p3_s01_tool_contracts_are_versioned_and_receipts_are_immutable() {
     assert_eq!(ToolExecutionService::contract_version(), 1);
     let schemas = coding_tool_schemas();
-    assert_eq!(schemas.len(), 9);
+    // M4-02 added `git_log`; the schema set, not the contract version, is what
+    // grows when a tool is added, and each tool's own digest is versioned.
+    assert_eq!(schemas.len(), 10);
     let names = schemas
         .iter()
         .map(|schema| {
@@ -1525,7 +1527,8 @@ async fn p3_s07_cli_fixture_runs_p2_response_through_p3_tools_and_recovers_after
     let capabilities: Value =
         serde_json::from_slice(&capability.stdout).expect("capabilities JSON");
     assert_eq!(capabilities["tool_contract_version"], 1);
-    assert_eq!(capabilities["tool_schema_count"], 9);
+    // M4-02 added `git_log` to the advertised schemas.
+    assert_eq!(capabilities["tool_schema_count"], 10);
 
     let fixture = run_ha(&[
         "code",

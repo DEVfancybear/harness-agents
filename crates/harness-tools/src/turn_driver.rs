@@ -28,8 +28,8 @@ use harness_types::{ErrorCode, HarnessError, QuestionId};
 use serde_json::Value;
 
 use crate::{
-    CodingToolAction, PreparedToolRequest, ToolExecutionService, ToolExecutionView, ToolOutput,
-    ToolRequest, coding_tool_names,
+    CodingToolAction, GIT_LOG_DEFAULT_LIMIT, PreparedToolRequest, ToolExecutionService,
+    ToolExecutionView, ToolOutput, ToolRequest, coding_tool_names,
 };
 
 /// Limits that bound one user turn.
@@ -1087,6 +1087,11 @@ fn summarize_action(action: &CodingToolAction) -> String {
         CodingToolAction::GitDiff { path } => {
             format!("git diff {}", path.as_deref().unwrap_or("."))
         }
+        CodingToolAction::GitLog { path, limit } => format!(
+            "git log {} (limit {})",
+            path.as_deref().unwrap_or("."),
+            limit.unwrap_or(GIT_LOG_DEFAULT_LIMIT)
+        ),
         CodingToolAction::TaskUpdate { note } => format!("task update: {note}"),
         CodingToolAction::ExternalTool {
             plugin_id,
