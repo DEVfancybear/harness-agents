@@ -552,7 +552,7 @@
       "status": "implemented",
       "selectors": ["milestone_m4::a14_approval_binding"]
     },
-    { "id": "A15", "owner_milestones": ["M4"], "planned_test": "a15_path_patch_safety", "status": "in_progress", "note": "milestone_m4::a15_path_patch_safety covers traversal, absolute paths, junction/symlink alias, sensitive names, stale patch and CRLF/Unicode byte preservation; the locked-file typed-error case (M4-02.2) is pending, so the case stays in_progress until it lands" },
+    { "id": "A15", "owner_milestones": ["M4"], "planned_test": "a15_path_patch_safety", "status": "implemented", "selectors": ["milestone_m4::a15_path_patch_safety", "known_defects::a_live_store_inside_the_workspace_no_longer_breaks_the_fingerprint"], "note": "milestone_m4::a15_path_patch_safety covers traversal, absolute paths, junction/symlink alias, sensitive names, stale patch and CRLF/Unicode byte preservation; the locked-file case landed with the audit fix (lock violations are recorded as unreadable in the fingerprint, other read failures are typed storage_open_failed), proven by the known_defects regression test" },
     { "id": "A16", "owner_milestones": ["M4"], "planned_test": "a16_process_tree_env", "status": "planned" },
     { "id": "A17", "owner_milestones": ["M4"], "planned_test": "a17_output_quota", "status": "planned" },
     { "id": "A18", "owner_milestones": ["M5"], "planned_test": "a18_history_after_compaction", "status": "planned" },
