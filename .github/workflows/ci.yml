@@ -133,3 +133,29 @@ jobs:
       - name: Run P7 release gate, backup/restore fixtures and every predecessor regression
         shell: pwsh
         run: ./scripts/Verify-Phase.ps1 -Phase P7
+
+  # The M-milestone gates run on both platforms. The plan's M9-03 asks for the
+  # dependency closure on Windows *and* Linux, and a milestone that was only ever
+  # proven on one OS is not accepted multi-platform. The Windows runner re-proves
+  # what the local host proves; the ubuntu runner is the only Linux evidence this
+  # repository can produce.
+  #
+  # The timeout is generous because each gate runs the whole workspace test suite
+  # as a regression step before its own required tests.
+  verify-milestones:
+    name: M-gates (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        milestone: [M0, M1, M2, M3, M4, M5, M6, M7, M8, M9]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+      - name: Run the ${{ matrix.milestone }} milestone gate
+        shell: pwsh
+        run: ./scripts/Verify-Milestone.ps1 -Milestone ${{ matrix.milestone }}

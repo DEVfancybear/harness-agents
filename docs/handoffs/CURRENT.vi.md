@@ -1,6 +1,6 @@
 # CURRENT — bàn giao đang mở
 
-**Cập nhật:** 23/09/2026 · **Assignment:** M7–M12 theo kế hoạch `implementation-next`, tuần tự theo dependency và gate từng checkpoint; commit+push sau mỗi action. **Checkpoint hiện tại:** **M7 xong + gate xanh** (`e5ef55c`); **M8 xong + gate xanh** (`32c3400`). **Milestone kế tiếp: M9.** Tiền nhiệm: M0/M1/M2 (`4d6393e`/`f1fb002`, `a824b2c`, `6c91a62`), M3 (`03bea9a`), M4 (`79c5165`), M5 (`b6e99bc`/`b8fa717`), M6 (`2b88396`/`9bc7d49`).
+**Cập nhật:** 23/09/2026 · **Assignment:** M7–M12 theo kế hoạch `implementation-next`, tuần tự theo dependency và gate từng checkpoint; commit+push sau mỗi action. **Checkpoint hiện tại:** **M7 xong + gate xanh** (`e5ef55c`); **M8 xong + gate xanh** (`32c3400`); **M9: M9-01/M9-02 xong + gate xanh** (`af80397`, digest `sha256:fa7f6af5…`, 367 file), **M9-03/M9-04 mới một phần** — xem §7c. **Milestone kế tiếp: hoàn tất M9-03/M9-04, rồi M10.**
 
 **Quyền (cập nhật 23/09/2026, user cấp trực tiếp):** user cho phép **install ở M9** và nói rõ "cứ làm full goal không cần hỏi". ⇒ Được phép: `Install-Ha.ps1` (cài thật) khi M9 cần. **Vẫn chưa được cấp rõ ràng:** đổi User PATH, paid smoke/live provider, publish/release (release tạo artifact công khai). Nếu M9 chạm tới các mục đó: làm phần install, còn PATH/publish thì ghi lại là cần xác nhận riêng.
 
@@ -73,9 +73,17 @@
 | M8-03 worktree + integration | `implemented_unverified` | Dùng `inspect_input`/`recheck_before_apply`/`remove_worktree` đang có; test `a30_dirty_workspace_preservation` |
 | M8-04 verifier + terminal task | `implemented_unverified` | `StepOutcome::{stop_reason, claimed_but_unverified}`; CLI `ha tasks run --json` thêm `stop_reason`/`claimed_but_unverified`/`verification`; test `a29_integration_acceptance` + `m8_04_cli_reports_stop_reasons_and_unverified_claims` |
 
+## 7c. M9 — trạng thái thật (không được đọc là "xong")
+
+- **Xong + gate xanh:** M9-01 (backup/restore/retention/migration, `a31_backup_retention_restore`), M9-02 (`diagnostics.rs` + `ha maintenance support-bundle`, `a32_diagnostics_isolation`, `m9_02_doctor_and_support_bundle_are_usable_from_the_cli`), `ADR-N09`. Gate M9 **passed** (3/3 required, closure M8→M0), cần 1 retry cho `workspace-tests`.
+- **M9-03 chưa xong:** `ci.yml` nay có job `verify-milestones` (matrix os × M0..M9, ubuntu+windows) nhưng **chưa chạy lần nào**; **chưa có eval baseline** — không số đo nào được đưa ra, không claim chất lượng nào.
+- **M9-04 chưa xong một phần:** release candidate **đã build thật** (`target/release-candidate/ha-0.1.0-windows-x64.zip` + `checksums.txt` + `ha.release.json` với `published: false`); install smoke **đã chạy thật** với `-NoModifyPath`: `--version` → `ha 0.1.0`, checksum binary đã cài **khớp** checksum candidate, `maintenance support-bundle` **có mặt**, `init`/`doctor`/`support-bundle`/`backup` chạy trên data dir mới, uninstall xoá đúng file nó sở hữu và **giữ** data người dùng, **User PATH không bị chạm**. **Chưa có test `m9_04_*` tự động** — đây là thao tác thủ công có ghi output, không phải gate.
+- **Bug thật đã bắt (build):** dùng `-SkipBuild` lấy `target/release/ha.exe` **cũ từ hôm trước** ⇒ binary đó **không** có `support-bundle`. Artifact phải được build lại từ revision đang test.
+- **Bug thật gate bắt:** `ErrorCode::DelegationQueueFull` (thêm ở M8) chưa regenerate `schemas/error-report.v1.schema.json` ⇒ `p0_f03` đỏ; và registry JSON do chèn tay bị **trailing comma** — PowerShell `ConvertFrom-Json` chấp nhận, `serde_json` không ⇒ `m0_04` đỏ.
+
 ## 8. Next action chính xác
 
-**Bắt đầu M9.** Đọc `docs/implementation-next/M9.vi.md` + `CONTRACTS.vi.md` §9 + acceptance A31/A32; xác minh gate M8 trên revision hiện tại; viết `docs/specs/M9.vi.md` trước khi code; dùng `crates/harness-maintenance/src/{backup,retention,migration}.rs`, `maintenance_cli.rs`, `scripts/Install-Ha.ps1`, `scripts/New-HaRelease.ps1`; thêm target `crates/harness-cli/tests/milestone_m9.rs`; registry `milestones.json` thêm M9 (prerequisites `["M8"]`); gate `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M9`; evidence + handoff; commit + push. **Install được phép** theo cấp quyền mới; PATH/publish vẫn cần xác nhận riêng.
+**Hoàn tất M9-03/M9-04 trước khi sang M10.** Cụ thể: (1) thêm `m9_04_install_smoke_preserves_existing_data` vào `milestone_m9.rs` — chạy `Install-Ha.ps1 -NoModifyPath` vào temp destination, kiểm version/checksum/subcommand/uninstall-giữ-data; (2) thêm `m9_04_release_candidate_has_checksums_and_no_secrets` — kiểm `checksums.txt` khớp `ha.exe` và `ha.release.json` có `published: false`; (3) ghi eval baseline trung thực (`measured: None` khi chưa đo) và/hoặc test `m9_03_*`; (4) chạy lại gate M9; (5) push để CI chạy `verify-milestones` lần đầu rồi ghi kết quả vào evidence; (6) commit + push. Sau đó **M10** (`M10.vi.md`, prerequisites M9; M10 và M11 **cùng** phụ thuộc M9).
 
 ## 9. Blocked on
 
