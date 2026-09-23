@@ -311,9 +311,9 @@ mod tests {
         let mut idle = state(AppPhase::Ready);
         assert!(hint(&idle).contains("Ctrl-J"));
 
-        idle.buffer = "/re".to_owned();
-        idle.cursor = 3;
-        idle.suggestions = crate::interactive::input::matching("/re");
+        idle.buffer = "/res".to_owned();
+        idle.cursor = 4;
+        idle.suggestions = crate::interactive::input::matching("/res");
         let menu = hint(&idle);
         assert!(
             menu.contains("Tab/Enter") && menu.contains("Esc"),

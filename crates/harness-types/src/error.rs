@@ -41,12 +41,14 @@ pub enum ErrorCode {
     ShutdownFailed,
     InvalidStateTransition,
     MandatoryContextOverflow,
+    ContextOverflow,
     ProviderCanceled,
     ProviderProtocol,
     RetryExhausted,
     CompactionConflict,
     RuntimeCommandConflict,
     RuntimeBlocked,
+    BlockedByHook,
     PolicyDenied,
     ApprovalRequired,
     ApprovalStale,
@@ -149,12 +151,14 @@ impl ErrorCode {
             Self::ShutdownFailed => "shutdown_failed",
             Self::InvalidStateTransition => "invalid_state_transition",
             Self::MandatoryContextOverflow => "mandatory_context_overflow",
+            Self::ContextOverflow => "context_overflow",
             Self::ProviderCanceled => "provider_canceled",
             Self::ProviderProtocol => "provider_protocol",
             Self::RetryExhausted => "retry_exhausted",
             Self::CompactionConflict => "compaction_conflict",
             Self::RuntimeCommandConflict => "runtime_command_conflict",
             Self::RuntimeBlocked => "runtime_blocked",
+            Self::BlockedByHook => "blocked_by_hook",
             Self::PolicyDenied => "policy_denied",
             Self::ApprovalRequired => "approval_required",
             Self::ApprovalStale => "approval_stale",
@@ -290,6 +294,7 @@ impl ErrorCode {
             | Self::RestoreTargetConflict
             | Self::RetentionRefused => RetryClass::Conflict,
             Self::RuntimeBlocked
+            | Self::BlockedByHook
             | Self::ApprovalRequired
             | Self::TaskNotReady
             | Self::ProcessOutcomeUnknown
@@ -319,6 +324,7 @@ impl ErrorCode {
             | Self::IncompatibleService
             | Self::PluginCycle
             | Self::MandatoryContextOverflow
+            | Self::ContextOverflow
             | Self::ProviderCanceled
             | Self::PolicyDenied
             | Self::ApprovalRevoked
@@ -382,7 +388,8 @@ impl ErrorCode {
             | Self::DelegationQueueFull
             | Self::DirtyWorkspaceDenied
             | Self::SecretNotGranted
-            | Self::MandatoryContextOverflow => 3,
+            | Self::MandatoryContextOverflow
+            | Self::ContextOverflow => 3,
             Self::WriterLocked
             | Self::StaleWriter
             | Self::SequenceConflict
@@ -429,6 +436,7 @@ impl ErrorCode {
             | Self::IncompatibleService
             | Self::PluginCycle
             | Self::PolicyDenied
+            | Self::BlockedByHook
             | Self::WorkspaceEscape
             | Self::SensitivePathDenied
             | Self::UnsupportedTextEncoding

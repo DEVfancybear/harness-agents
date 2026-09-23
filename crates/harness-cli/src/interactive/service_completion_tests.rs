@@ -254,6 +254,7 @@ async fn resume_flow() {
         text: "continue source".to_owned(),
         answer_question_id: None,
         shell_prefix: None,
+        compact_guidance: None,
     });
     // The accept loop must be listening before the service connects: this
     // environment refuses a connection to a fresh loopback listener that nobody is
@@ -333,6 +334,7 @@ async fn resume_flow() {
         text: "must not start fresh".to_owned(),
         answer_question_id: None,
         shell_prefix: None,
+        compact_guidance: None,
     });
     let outcome = terminal(&mut channel).await;
     assert!(
@@ -381,6 +383,7 @@ async fn g06_bang_prefix_uses_interactive_approval_and_attaches_output() {
             command: "echo HA_AGENT_G06_SERVICE".to_owned(),
             mode: ShellPrefixMode::AttachToNextMessage,
         }),
+        compact_guidance: None,
     });
 
     let approval = tokio::time::timeout(Duration::from_secs(30), async {

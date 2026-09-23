@@ -469,10 +469,17 @@ pub enum SessionEvent {
     SessionsListed {
         sessions: Vec<SessionCandidate>,
     },
+    /// Read-only session diff result for the reference overlay.
+    Reference {
+        title: String,
+        lines: Vec<String>,
+    },
     /// Something the user should know that is not an error.
     Notice {
         message: String,
     },
+    /// Emit BEL in the interactive terminal when the user configured it.
+    Bell,
     ShellPrefixCompleted {
         command: String,
         output: String,

@@ -51,12 +51,18 @@ pub use policy::{
 // The environment a tool process may inherit is an operator-facing contract:
 // it is published so a host can state what it exposes instead of implying a
 // sandbox it does not have.
-pub use process::{HostEnvironment, PROCESS_ENVIRONMENT_ALLOWLIST};
+pub use process::{
+    HookProcessResult, HookProcessStatus, HostEnvironment, PROCESS_ENVIRONMENT_ALLOWLIST,
+    run_hook_command, run_hook_command_with_host,
+};
 // Re-exported so a CLI that drives the loop reads acceptance from the same
 // place the driver writes it.
 pub use harness_runtime::AcceptanceState;
 pub use secrets::{HostEnvironmentSecrets, SecretResolver};
-pub use service::{ExternalToolDispatcher, ToolExecutionService, ToolObserver};
+pub use service::{
+    ConfiguredToolHook, ExternalToolDispatcher, ToolExecutionService, ToolObserver, git_diff_from,
+    git_head_commit,
+};
 pub use turn_driver::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ExternalToolCatalog,
     ExternalTools, GoalReport, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnOutcome,

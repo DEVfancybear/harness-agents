@@ -50,14 +50,23 @@ pub struct HeadlessRequest {
 #[derive(Default)]
 struct HeadlessObserver {
     auto_allowed: Mutex<Vec<String>>,
+    notices: Mutex<Vec<String>>,
 }
 
 impl TurnObserver for HeadlessObserver {
     fn observe(&self, progress: TurnProgress) {
-        if let TurnProgress::Info(message) = progress
-            && let Ok(mut messages) = self.auto_allowed.lock()
-        {
-            messages.push(message);
+        match progress {
+            TurnProgress::Info(message) => {
+                if let Ok(mut messages) = self.auto_allowed.lock() {
+                    messages.push(message);
+                }
+            }
+            TurnProgress::Notice(message) => {
+                if let Ok(mut messages) = self.notices.lock() {
+                    messages.push(message);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -306,7 +315,16 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         ),
         None => Arc::new(MockProvider::text("mock profile: no model was called")),
     };
-    let mut runtime = RuntimeService::new(Arc::clone(&store), provider, RuntimeConfig::default());
+    let mut runtime = RuntimeService::new(
+        Arc::clone(&store),
+        provider,
+        RuntimeConfig {
+            context_window_tokens: resolved_config.context_window_tokens,
+            output_reservation_tokens: resolved_config.output_reservation_tokens,
+            compaction_reserve_tokens: resolved_config.compaction_reserve_tokens,
+            ..RuntimeConfig::default()
+        },
+    );
     // A token budget is an explicit account the run reserves against; without
     // one the run has no token bound to promise.
     if let Some(limit) = request.options.budget_tokens {
@@ -338,8 +356,11 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     let tools = match &active_extensions {
         Some(active) => ToolExecutionService::new(Arc::clone(&store))
             .with_policy(tool_policy)
+            .with_hooks(resolved_config.hooks.clone())
             .with_external(active.dispatcher()),
-        None => ToolExecutionService::new(Arc::clone(&store)).with_policy(tool_policy),
+        None => ToolExecutionService::new(Arc::clone(&store))
+            .with_policy(tool_policy)
+            .with_hooks(resolved_config.hooks.clone()),
     };
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
     let driver = match &active_extensions {
@@ -487,6 +508,13 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         .auto_allowed
         .lock()
         .map_or_else(|_| Vec::new(), |messages| messages.clone());
+    let mut notices = observer
+        .notices
+        .lock()
+        .map_or_else(|_| Vec::new(), |messages| messages.clone());
+    if let Some(notice) = &resolved_config.context_window_notice {
+        notices.push(notice.clone());
+    }
     acceptance_trace("turn_finished");
     // Stored before the writer is released, exactly like the interactive turn: the
     // admitted text comes back from the journal and is committed as reusable memory.
@@ -601,6 +629,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         "pending_question": pending_question,
         "approvals": "none",
         "auto_allowed": auto_allowed,
+        "notices": notices,
         "fixture": request.options.mock,
         "memory": memory_report,
         "extensions": extensions_report,
@@ -632,6 +661,9 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     if request.json {
         println!("{output}");
     } else {
+        for message in notices {
+            println!("[info] {message}");
+        }
         for message in auto_allowed {
             println!("[info] {message}");
         }

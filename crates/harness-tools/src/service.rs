@@ -33,6 +33,184 @@ use crate::{
 };
 use harness_store_sqlite::HistoryScope;
 
+fn hook_matches(matcher: Option<&str>, tool_name: &str) -> bool {
+    matcher.is_none_or(|matcher| {
+        matcher
+            .split('|')
+            .map(str::trim)
+            .any(|pattern| pattern == "*" || pattern == tool_name)
+    })
+}
+
+fn tool_hook_payload(prepared: &PreparedToolRequest, event: &str) -> Value {
+    let mut args = prepared
+        .final_action
+        .canonical_value()
+        .unwrap_or_else(|_| json!({"unavailable": true}));
+    redact_hook_arguments(&mut args);
+    let mut payload = json!({
+        "event": event,
+        "session_id": prepared.request.session_id.as_str(),
+        "task_id": prepared.request.task_id.as_str(),
+        "tool": {
+            "name": prepared.final_action.kind().as_str(),
+            "args_digest": prepared.action_hash.as_str(),
+            "args": args,
+        },
+        "cwd": prepared.workspace_root_text,
+    });
+    if serde_json::to_vec(&payload).is_ok_and(|bytes| bytes.len() <= 8 * 1024) {
+        return payload;
+    }
+    let args = payload["tool"]["args"].to_string();
+    let mut preview = args.chars().take(5_000).collect::<String>();
+    payload["tool"]["args"] = json!({"truncated": true, "preview": preview});
+    while serde_json::to_vec(&payload).is_ok_and(|bytes| bytes.len() > 8 * 1024) {
+        if preview.is_empty() {
+            payload["tool"]["args"] = json!({"truncated": true});
+            break;
+        }
+        preview = preview
+            .chars()
+            .take(preview.chars().count().saturating_sub(256))
+            .collect();
+        payload["tool"]["args"] = json!({"truncated": true, "preview": preview});
+    }
+    payload
+}
+
+fn redact_hook_arguments(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object.iter_mut() {
+                let normalized = key.to_ascii_lowercase();
+                if [
+                    "secret",
+                    "token",
+                    "password",
+                    "api_key",
+                    "credential",
+                    "authorization",
+                ]
+                .iter()
+                .any(|needle| normalized.contains(needle))
+                {
+                    *child = Value::String("[REDACTED]".to_owned());
+                } else {
+                    redact_hook_arguments(child);
+                }
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(redact_hook_arguments),
+        _ => {}
+    }
+}
+
+async fn run_configured_hook(
+    hook: &ConfiguredToolHook,
+    mut payload: Value,
+    cancellation: CancellationToken,
+) -> Result<(), String> {
+    payload["event"] = Value::String(hook.event.clone());
+    let input =
+        serde_json::to_vec(&payload).map_err(|_| "hook input is invalid JSON".to_owned())?;
+    let cwd = payload["cwd"]
+        .as_str()
+        .map_or_else(|| Path::new("."), Path::new);
+    let result = process::run_hook_command(
+        cwd,
+        &hook.command,
+        &hook.args,
+        &input,
+        hook.timeout_seconds.min(60).saturating_mul(1000),
+        cancellation,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if result.status == process::HookProcessStatus::TimedOut {
+        return Err("hook timed out".to_owned());
+    }
+    if result.status == process::HookProcessStatus::Canceled {
+        return Err("hook was canceled".to_owned());
+    }
+    if result.exit_code == Some(0) {
+        return Ok(());
+    }
+    let reason = if result.exit_code == Some(2) {
+        result
+            .stdout
+            .trim()
+            .lines()
+            .next()
+            .or_else(|| result.stderr.trim().lines().next())
+            .filter(|line| !line.is_empty())
+            .map_or_else(
+                || "hook exited with status 2".to_owned(),
+                |line| line.chars().take(512).collect::<String>(),
+            )
+    } else {
+        format!("hook exited with status {:?}", result.exit_code)
+    };
+    Err(reason)
+}
+
+/// Read the current repository commit through the bounded Git process runner.
+/// A missing or uncommitted HEAD is represented as `None`.
+pub async fn git_head_commit(root: &Path) -> Result<Option<String>, HarnessError> {
+    let output = process::run_structured(
+        root,
+        "git",
+        &["rev-parse".to_owned(), "HEAD".to_owned()],
+        15_000,
+        CancellationToken::new(),
+        &ProcessEnvironment::empty(),
+        &crate::capture::ProcessSpoolConfig::default(),
+    )
+    .await?;
+    if output.timed_out || output.canceled || output.exit_code != Some(0) {
+        return Ok(None);
+    }
+    let commit = output.stdout.trim();
+    let valid =
+        matches!(commit.len(), 40 | 64) && commit.bytes().all(|byte| byte.is_ascii_hexdigit());
+    Ok(valid.then(|| commit.to_owned()))
+}
+
+/// Show all tracked changes since a recorded commit through the built-in Git
+/// process runner. Both staged and unstaged changes are included.
+pub async fn git_diff_from(root: &Path, base_commit: &str) -> Result<String, HarnessError> {
+    let valid = matches!(base_commit.len(), 40 | 64)
+        && base_commit.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !valid {
+        return Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            "stored Git base is not a full commit id",
+        ));
+    }
+    let output = process::run_structured(
+        root,
+        "git",
+        &[
+            "diff".to_owned(),
+            "--no-ext-diff".to_owned(),
+            base_commit.to_owned(),
+            "--".to_owned(),
+        ],
+        15_000,
+        CancellationToken::new(),
+        &ProcessEnvironment::empty(),
+        &crate::capture::ProcessSpoolConfig::default(),
+    )
+    .await?;
+    if output.timed_out || output.canceled || output.exit_code != Some(0) {
+        return Err(HarnessError::new(
+            ErrorCode::ProcessOutcomeUnknown,
+            "Git diff did not complete successfully",
+        ));
+    }
+    Ok(output.stdout)
+}
+
 /// Dispatches an `ExternalTool` action after the gate has authorized it and the
 /// durable intent is committed. A returned error is treated exactly like any
 /// other dispatch failure: the outcome becomes uncertain, never a success.
@@ -58,6 +236,18 @@ pub trait ToolObserver: Send + Sync {
     fn observe(&self, view: &ToolExecutionView) -> Result<(), String>;
 }
 
+/// A trusted, bounded host hook. `command` is an executable, never shell text;
+/// `args` are passed as individual arguments to the existing process runner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfiguredToolHook {
+    pub event: String,
+    pub matcher: Option<String>,
+    pub command: String,
+    pub args: Vec<String>,
+    pub timeout_seconds: u64,
+    pub source: String,
+}
+
 /// The one P3 authority permitted to move a coding proposal across a side
 /// effect. Direct helpers in sibling modules are crate-private.
 #[derive(Clone)]
@@ -68,6 +258,7 @@ pub struct ToolExecutionService {
     external: Option<Arc<dyn ExternalToolDispatcher>>,
     secrets: Arc<dyn SecretResolver>,
     spool: crate::capture::ProcessSpoolConfig,
+    hooks: Vec<ConfiguredToolHook>,
     /// What this host has actually been measured to enforce (M12).
     ///
     /// It is `None` until a caller supplies a measured matrix, and `None` means
@@ -86,6 +277,7 @@ impl ToolExecutionService {
             external: None,
             secrets: Arc::new(HostEnvironmentSecrets),
             spool: crate::capture::ProcessSpoolConfig::default(),
+            hooks: Vec::new(),
             capabilities: None,
         }
     }
@@ -132,6 +324,78 @@ impl ToolExecutionService {
     pub fn with_policy(mut self, policy: ToolPolicy) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// Attach hooks already filtered by the config trust layer.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: Vec<ConfiguredToolHook>) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    /// Run observational hooks. Their failures are returned as notices for the
+    /// caller and never alter a completed action or receipt.
+    pub async fn run_event_hooks(
+        &self,
+        event: &str,
+        payload: Value,
+        cancellation: CancellationToken,
+    ) -> Vec<String> {
+        let tool_name = payload["tool"]["name"].as_str();
+        let hooks = self
+            .hooks
+            .iter()
+            .filter(|hook| {
+                hook.event == event
+                    && tool_name.is_none_or(|name| hook_matches(hook.matcher.as_deref(), name))
+            })
+            .collect::<Vec<_>>();
+        let mut notices = Vec::new();
+        for hook in hooks {
+            if let Err(reason) =
+                run_configured_hook(hook, payload.clone(), cancellation.clone()).await
+            {
+                notices.push(format!(
+                    "{event} hook from {} failed: {reason}",
+                    hook.source
+                ));
+            }
+        }
+        notices
+    }
+
+    pub(crate) async fn run_pre_tool_hooks(
+        &self,
+        prepared: &PreparedToolRequest,
+        cancellation: &CancellationToken,
+    ) -> Option<String> {
+        let name = prepared.final_action.kind().as_str();
+        let payload = tool_hook_payload(prepared, "pre_tool_use");
+        for hook in self.hooks.iter().filter(|hook| {
+            hook.event == "pre_tool_use" && hook_matches(hook.matcher.as_deref(), name)
+        }) {
+            match run_configured_hook(hook, payload.clone(), cancellation.clone()).await {
+                Ok(()) => {}
+                Err(reason) => return Some(format!("{} ({})", reason, hook.source)),
+            }
+        }
+        None
+    }
+
+    /// Record a pre-hook refusal with its stable error code and ordinary receipt.
+    pub async fn record_hook_block(
+        &self,
+        prepared: &PreparedToolRequest,
+        reason: &str,
+    ) -> Result<ToolExecutionView, HarnessError> {
+        self.record_denied(
+            prepared,
+            ToolExecutionId::generate(),
+            None,
+            ErrorCode::BlockedByHook,
+            reason,
+        )
+        .await
     }
 
     /// Explain whether an already prepared action is denied, allowed without a
@@ -1782,12 +2046,19 @@ impl ToolExecutionService {
             artifact_id: None,
             observed_at_seq: sequence,
         };
+        let denied_view = (code == ErrorCode::BlockedByHook).then(|| {
+            json!({
+                "kind": "denied",
+                "code": code.as_str(),
+                "reason": reason,
+            })
+        });
         let event = event_for_receipt(
             &prepared.request.session_id,
             sequence,
             &receipt,
             "p3_denied",
-            None,
+            denied_view.as_ref(),
         )?;
         self.store
             .commit_receipt(harness_store_sqlite::ReceiptCommit {
@@ -2178,11 +2449,47 @@ fn store_error(error: StoreError) -> HarnessError {
 mod tests {
     use super::ToolExecutionService;
     use crate::{
-        CodingToolAction, PolicyMode, ToolPatternRule, ToolPolicy, ToolRequest, observe_workspace,
+        CodingToolAction, PolicyMode, PreparedToolRequest, ToolPatternRule, ToolPolicy,
+        ToolRequest, observe_workspace,
     };
     use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
-    use harness_types::{ErrorCode, HostId, InputId, ProjectId, SessionId, TaskId};
+    use harness_types::{ContentHash, ErrorCode, HostId, InputId, ProjectId, SessionId, TaskId};
     use std::sync::Arc;
+
+    #[test]
+    fn g09_hook_payload_truncates_large_action_arguments_to_eight_kibibytes() {
+        let root = std::env::temp_dir().join("ha-g09-hook-payload");
+        let action = CodingToolAction::WriteFile {
+            path: "src/generated.txt".to_owned(),
+            content: "x".repeat(20_000),
+            expected_hash: None,
+        };
+        let request = ToolRequest::new(
+            SessionId::generate(),
+            TaskId::generate(),
+            "test.actor",
+            root.clone(),
+            action.clone(),
+        );
+        let prepared = PreparedToolRequest {
+            request,
+            action_hash: action.canonical_hash().expect("canonical action hash"),
+            final_action: action,
+            workspace_root: root.clone(),
+            workspace_root_text: root.to_string_lossy().into_owned(),
+            workspace_fingerprint: ContentHash::from_bytes(b"workspace"),
+            workspace_identity_hash: ContentHash::from_bytes(b"identity"),
+            project_id: ProjectId::generate(),
+            policy_revision: 0,
+            policy_denial: None,
+        };
+
+        let payload = super::tool_hook_payload(&prepared, "pre_tool_use");
+        let bytes = serde_json::to_vec(&payload).expect("bounded payload serializes");
+        assert!(bytes.len() <= 8 * 1024, "payload was {} bytes", bytes.len());
+        assert_eq!(payload["tool"]["args"]["truncated"], true);
+        assert!(payload["tool"]["args"]["preview"].as_str().is_some());
+    }
 
     /// A malformed action is refused by the cheap check, not by the workspace walk.
     ///

@@ -168,6 +168,7 @@ struct ScriptedProvider {
     responses: Vec<Vec<ProviderStreamEvent>>,
     calls: AtomicUsize,
     seen: Mutex<Vec<ProviderRequest>>,
+    fixture: bool,
 }
 
 impl ScriptedProvider {
@@ -177,7 +178,14 @@ impl ScriptedProvider {
             responses,
             calls: AtomicUsize::new(0),
             seen: Mutex::new(Vec::new()),
+            fixture: true,
         }
+    }
+
+    fn for_model_summary(responses: Vec<Vec<ProviderStreamEvent>>) -> Self {
+        let mut provider = Self::new(responses);
+        provider.fixture = false;
+        provider
     }
 
     /// The requests this provider was actually given, in order. The runtime
@@ -190,7 +198,9 @@ impl ScriptedProvider {
 
 impl ModelProvider for ScriptedProvider {
     fn capabilities(&self) -> ModelCapabilities {
-        ModelCapabilities::deepseek_fixture()
+        let mut capabilities = ModelCapabilities::deepseek_fixture();
+        capabilities.fixture = self.fixture;
+        capabilities
     }
 
     fn stream(&self, request: ProviderRequest, _cancellation: CancellationToken) -> ProviderFuture {
@@ -556,6 +566,150 @@ async fn m5_01_a_window_that_cannot_hold_the_request_pauses_typed() {
 // ---------------------------------------------------------------------------
 // M5-02: generation barrier, CAS rebase and the deterministic fallback
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn g07_compact_uses_the_model_and_records_the_source() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let (session, _) = admit(&store, &bench, "objective: repair parser safely").await;
+    let provider = Arc::new(ScriptedProvider::for_model_summary(vec![vec![
+        ProviderStreamEvent::started(),
+        ProviderStreamEvent::text("objective: repair parser safely; remaining: run tests"),
+        ProviderStreamEvent::completed("stop"),
+    ]]));
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    );
+
+    let result = runtime
+        .compact(&session)
+        .await
+        .expect("compaction succeeds");
+
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(result.summary_source, "model");
+    assert!(!result.fallback_used);
+    assert!(result.packet.content.contains("remaining: run tests"));
+    let seen = provider.seen();
+    let prompt = seen[0]
+        .messages
+        .iter()
+        .find(|message| message.role == MessageRole::User)
+        .expect("summary prompt is a user message")
+        .content
+        .as_str();
+    for required in [
+        "objective",
+        "work completed",
+        "files touched",
+        "decisions",
+        "remaining",
+    ] {
+        assert!(
+            prompt.contains(required),
+            "summary prompt lacks {required:?}: {prompt}"
+        );
+    }
+    drop(runtime);
+    close(store).await;
+}
+
+#[tokio::test]
+async fn g07_compact_falls_back_when_the_provider_fails() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let (session, _) = admit(&store, &bench, "objective: retain fallback marker").await;
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        Arc::new(ScriptedProvider::new(vec![vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("unused fixture response"),
+            ProviderStreamEvent::completed("stop"),
+        ]])),
+        RuntimeConfig::default(),
+    )
+    .with_summarizer(Arc::new(FailingSummaryProvider));
+
+    let result = runtime.compact(&session).await.expect("fallback compacts");
+
+    assert!(result.fallback_used);
+    assert_eq!(result.summary_source, "deterministic_fallback");
+    assert!(result.packet.content.contains("retain fallback marker"));
+    drop(runtime);
+    close(store).await;
+}
+
+#[tokio::test]
+async fn g07_auto_compaction_triggers_at_threshold_and_never_loops() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let long_input = "large mandatory instruction ".repeat(390);
+    let session = SessionId::generate();
+    let task = TaskId::generate();
+    let provider = Arc::new(ScriptedProvider::for_model_summary(vec![vec![
+        ProviderStreamEvent::started(),
+        ProviderStreamEvent::text("compact objective; remaining: shorten the instruction"),
+        ProviderStreamEvent::completed("stop"),
+    ]]));
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    );
+
+    let result = runtime
+        .run(RunRequest::new(
+            session.clone(),
+            task,
+            InputId::generate(),
+            long_input,
+            observe_workspace(bench.project_id.clone(), &bench.workspace).expect("workspace"),
+        ))
+        .await;
+    let Err(error) = result else {
+        panic!("an instruction still over threshold must not dispatch");
+    };
+
+    assert_eq!(error.code().as_str(), "context_overflow");
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        1,
+        "summary only; no loop or run dispatch"
+    );
+    assert_eq!(
+        store
+            .context_checkpoints(&session)
+            .await
+            .expect("checkpoints")
+            .len(),
+        1
+    );
+    drop(runtime);
+    close(store).await;
+}
+
+#[tokio::test]
+async fn g08_diff_since_session_start_uses_the_recorded_base() {
+    let bench = bench();
+    let base = harness_tools::git_head_commit(&bench.workspace)
+        .await
+        .expect("read the session's starting commit")
+        .expect("fixture has a HEAD");
+    std::fs::write(
+        bench.workspace.join("src").join("parser.txt"),
+        "BUG parser\nchange after session start\n",
+    )
+    .expect("make an uncommitted session change");
+
+    let diff = harness_tools::git_diff_from(&bench.workspace, &base)
+        .await
+        .expect("read diff from recorded base");
+
+    assert!(diff.contains("change after session start"), "{diff}");
+    assert!(diff.contains("BUG parser"), "{diff}");
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)] // one race, told in order

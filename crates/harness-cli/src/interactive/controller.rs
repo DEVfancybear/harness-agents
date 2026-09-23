@@ -60,6 +60,12 @@ pub enum Effect {
     Stream(String),
     /// TUI-only provider reasoning, excluded from plain transcript output.
     Thinking(String),
+    /// Copy the latest assistant answer (TUI mode only).
+    Copy(String),
+    /// Emit BEL in the interactive terminal.
+    Bell,
+    /// Clear only the TUI viewport; terminal scrollback and transcript stay intact.
+    ClearViewport,
     /// Repaint the viewport (the composer, the live block and the status bar).
     Redraw,
     /// Leave the app with this exit code.
@@ -127,6 +133,8 @@ pub struct InteractiveController {
     channel: SessionChannel,
     /// Model text that has not been printed yet.
     pending_text: String,
+    /// The assistant answer accumulated for `/copy`.
+    last_answer: String,
     /// Number of line breaks in `pending_text`. It is maintained as deltas
     /// arrive, so the common streaming path does not rescan an ever-growing
     /// buffer on every token.
@@ -201,6 +209,7 @@ impl InteractiveController {
             service,
             channel,
             pending_text: String::new(),
+            last_answer: String::new(),
             pending_newlines: 0,
             pending_approval: None,
             pending_question: None,
@@ -831,10 +840,15 @@ impl InteractiveController {
                 }
                 self.session_candidates = sessions;
             }
+            SessionEvent::Reference { title, lines } => {
+                self.flush_stream(effects);
+                self.reference(&title, lines, effects);
+            }
             SessionEvent::Notice { message } => {
                 self.flush_stream(effects);
                 self.push_history(effects, HistoryItem::Notice { message });
             }
+            SessionEvent::Bell => effects.push(Effect::Bell),
             SessionEvent::ShellPrefixCompleted {
                 command,
                 output,
@@ -1009,6 +1023,7 @@ impl InteractiveController {
             text: text.clone(),
             answer_question_id: None,
             shell_prefix: None,
+            compact_guidance: None,
         });
         let mut effects = Vec::new();
         let item = if automatic {
@@ -1041,6 +1056,7 @@ impl InteractiveController {
             text: text.clone(),
             answer_question_id: Some(question.question_id),
             shell_prefix: None,
+            compact_guidance: None,
         });
         vec![Effect::History(HistoryItem::User { text }), Effect::Redraw]
     }
@@ -1053,6 +1069,7 @@ impl InteractiveController {
             text: text.clone(),
             answer_question_id: None,
             shell_prefix: Some(shell_prefix),
+            compact_guidance: None,
         });
         let mut effects = Vec::new();
         self.push_history(&mut effects, HistoryItem::User { text });
@@ -1129,6 +1146,7 @@ impl InteractiveController {
     fn fresh_run(&mut self, now: Instant, request: Option<String>) {
         self.pending_text.clear();
         self.pending_newlines = 0;
+        self.last_answer.clear();
         self.open_tool = None;
         self.steps = 0;
         self.tool_calls = 0;
@@ -1294,6 +1312,9 @@ impl InteractiveController {
                 let lines = self.service.permissions_summary();
                 self.reference("/permissions", lines, &mut effects);
             }
+            "/hooks" => {
+                self.reference("/hooks", self.service.hooks_summary(), &mut effects);
+            }
             "/mode" => {
                 if self.phase.has_active_run() {
                     self.push_history(
@@ -1352,6 +1373,97 @@ impl InteractiveController {
                     vec![format!("session cost: {}", self.service.cost_summary())],
                     &mut effects,
                 );
+            }
+            "/context" => {
+                self.reference("/context", self.service.context_summary(), &mut effects);
+            }
+            "/diff" => {
+                if self.phase.has_active_run() {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "cannot show the session diff while a run is active".to_owned(),
+                    });
+                } else if let Err(message) = self.service.git_diff() {
+                    self.push_history(&mut effects, HistoryItem::Error { message });
+                } else {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "reading tracked changes since this session started...".to_owned(),
+                    });
+                }
+            }
+            "/undo" => self.start_host_action("/undo".to_owned(), &mut effects),
+            "/export" => {
+                let path = raw_argument.unwrap_or("session-export.md");
+                let path_value = std::path::Path::new(path);
+                if path_value.is_absolute()
+                    || path_value.components().any(|component| {
+                        matches!(component, std::path::Component::ParentDir)
+                    })
+                {
+                    self.push_history(&mut effects, HistoryItem::Error {
+                        message: "export path must stay inside the workspace".to_owned(),
+                    });
+                } else if !matches!(path_value.extension().and_then(|ext| ext.to_str()), Some("md" | "jsonl")) {
+                    self.push_history(&mut effects, HistoryItem::Error {
+                        message: "usage: /export [path.md|path.jsonl]".to_owned(),
+                    });
+                } else {
+                    self.start_host_action(format!("/export {path}"), &mut effects);
+                }
+            }
+            "/copy" => {
+                if self.plain {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "/copy is available in TUI mode; the plain renderer does not access the clipboard".to_owned(),
+                    });
+                } else if self.last_answer.is_empty() {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "there is no assistant answer to copy yet".to_owned(),
+                    });
+                } else {
+                    effects.push(Effect::Copy(self.last_answer.clone()));
+                }
+            }
+            "/rename" => {
+                if self.phase.has_active_run() {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "cannot rename the session while a run is active".to_owned(),
+                    });
+                } else if let Some(title) = raw_argument {
+                    match self.service.rename(title) {
+                        Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
+                        Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                    }
+                } else {
+                    self.push_history(&mut effects, HistoryItem::Error {
+                        message: "usage: /rename <name up to 60 characters>".to_owned(),
+                    });
+                }
+            }
+            "/compact" => {
+                if self.phase.has_active_run() {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "cannot compact while a run is active; wait for it to finish".to_owned(),
+                    });
+                } else if let Some(problem) = self.service.provider_problem() {
+                    self.push_history(&mut effects, HistoryItem::Error { message: problem });
+                } else {
+                    let guidance = raw_argument.unwrap_or_default().to_owned();
+                    let text = if guidance.is_empty() {
+                        "/compact".to_owned()
+                    } else {
+                        format!("/compact {guidance}")
+                    };
+                    self.continuations = 0;
+                    self.fresh_run(Instant::now(), Some(text.clone()));
+                    self.service.submit(SubmitRequest {
+                        input_id: InputId::generate(),
+                        text: text.clone(),
+                        answer_question_id: None,
+                        shell_prefix: None,
+                        compact_guidance: Some(guidance),
+                    });
+                    self.push_history(&mut effects, HistoryItem::User { text });
+                }
             }
             "/trust" => {
                 if self.phase.has_active_run() {
@@ -1452,6 +1564,22 @@ impl InteractiveController {
                                 .to_owned(),
                         },
                     );
+                }
+            }
+            "/clear" => {
+                if self.phase.has_active_run() {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "cannot clear the session while a run is active; press Ctrl-C first".to_owned(),
+                    });
+                } else if let Err(error) = self.service.resume(None) {
+                    self.push_history(&mut effects, HistoryItem::Error { message: error });
+                } else {
+                    self.session_candidates.clear();
+                    self.editor.close_picker();
+                    effects.push(Effect::ClearViewport);
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "started a new session; earlier output remains in scrollback".to_owned(),
+                    });
                 }
             }
             "/model" => {
@@ -1647,6 +1775,28 @@ impl InteractiveController {
         effects
     }
 
+    fn start_host_action(&mut self, text: String, effects: &mut Vec<Effect>) {
+        if self.phase.has_active_run() {
+            self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: "cannot start a session action while a run is active".to_owned(),
+                },
+            );
+            return;
+        }
+        self.continuations = 0;
+        self.fresh_run(Instant::now(), Some(text.clone()));
+        self.service.submit(SubmitRequest {
+            input_id: InputId::generate(),
+            text: text.clone(),
+            answer_question_id: None,
+            shell_prefix: None,
+            compact_guidance: None,
+        });
+        self.push_history(effects, HistoryItem::User { text });
+    }
+
     /// The session the picker currently highlights.
     fn selected_candidate(&self) -> Option<String> {
         let picker = self.editor.picker()?;
@@ -1666,6 +1816,7 @@ impl InteractiveController {
         // arrives (that is what makes the transcript byte-identical), and the TUI
         // commits it to the scrollback through the history renderer.
         effects.push(Effect::Stream(text.clone()));
+        self.last_answer.push_str(&text);
         self.transcript.push(text.clone());
         self.remember(text.split('\n').map(str::to_owned).collect());
     }
@@ -2785,7 +2936,12 @@ mod tests {
                     }
                     streaming = true;
                 }
-                Effect::Thinking(_) | Effect::Redraw | Effect::Exit(_) => {}
+                Effect::Thinking(_)
+                | Effect::Copy(_)
+                | Effect::Bell
+                | Effect::Redraw
+                | Effect::ClearViewport
+                | Effect::Exit(_) => {}
             }
         }
         lines
@@ -3324,7 +3480,7 @@ mod tests {
         assert_eq!(state.suggestion_selected, 0);
         assert_eq!(state.buffer, "/", "and the draft is untouched");
 
-        type_text(&mut harness.controller, "re");
+        type_text(&mut harness.controller, "res");
         let state = harness.controller.ui_state();
         assert_eq!(
             state
@@ -3342,7 +3498,7 @@ mod tests {
             0,
             "one match: the highlight cannot move off it"
         );
-        assert_eq!(harness.controller.ui_state().buffer, "/re");
+        assert_eq!(harness.controller.ui_state().buffer, "/res");
     }
 
     /// Tab accepts the highlighted command even when several match - that is what
@@ -4890,6 +5046,70 @@ mod tests {
             super::quote_for_composer("\"C:\\work\\shot.png\""),
             "\"C:\\work\\shot.png\"",
             "an already quoted path is not quoted twice"
+        );
+    }
+
+    #[test]
+    fn g08_clear_starts_a_new_session_and_clears_only_the_viewport() {
+        let mut harness = bench(true);
+        let effects = submit_text(&mut harness.controller, "/clear");
+
+        assert_eq!(*harness.port.resumes.lock().expect("resume log"), [None]);
+        assert!(effects.contains(&Effect::ClearViewport));
+        let plain = effects_to_plain(&effects).join("\n");
+        assert!(
+            plain.contains("earlier output remains in scrollback"),
+            "{plain}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Exit(_)))
+        );
+    }
+
+    #[test]
+    fn g08_session_commands_are_listed_and_not_reported_as_unknown() {
+        for command in ["/diff", "/undo", "/export", "/copy", "/hooks"] {
+            assert!(
+                SLASH_COMMANDS.iter().any(|entry| entry.name == command),
+                "{command} is missing from the help and suggestion table"
+            );
+        }
+    }
+
+    #[test]
+    fn g09_bell_event_becomes_a_tui_effect() {
+        let mut harness = tui_bench(true);
+        harness.events.send(SessionEvent::Bell).expect("bell event");
+        let effects = harness.controller.pump_events();
+        assert!(effects.contains(&Effect::Bell), "{effects:#?}");
+    }
+
+    #[test]
+    fn g08_copy_writes_the_last_answer_to_clipboard() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "question");
+        harness
+            .events
+            .send(SessionEvent::TextDelta {
+                text: "final answer".to_owned(),
+            })
+            .expect("answer delta");
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("turn finished");
+        let _ = harness.controller.pump_events();
+
+        let effects = submit_text(&mut harness.controller, "/copy");
+
+        assert!(
+            effects.contains(&Effect::Copy("final answer".to_owned())),
+            "{effects:#?}"
         );
     }
 }

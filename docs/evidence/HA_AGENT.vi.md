@@ -1,10 +1,46 @@
-# Evidence — HA_AGENT CP-A archive and CP-B / Bằng chứng — hồ sơ CP-A và CP-B HA_AGENT
+# Evidence — HA_AGENT CP-C current; CP-A/CP-B archive / Bằng chứng — CP-C hiện tại; lưu trữ CP-A/CP-B
 
-**Current status / Trạng thái hiện tại:** `implemented_unverified` at CP-B. G04–G06 source and tests are implemented, but the last two Verify-HaLaunch runs failed one loopback test each in `acceptance-launch`. The retry cap is exhausted; no G07+ work started. / `implemented_unverified` tại CP-B. Source và test G04–G06 đã triển khai, nhưng hai lượt Verify-HaLaunch cuối đều lỗi một test loopback trong `acceptance-launch`. Đã hết retry budget; chưa làm G07 trở đi.
+**Current status / Trạng thái hiện tại:** `implemented_unverified` at CP-C. G07–G09 source, schema, and required selectors are implemented. M5 passed. Verify-HaLaunch remained flaky through the initial run plus three allowed retries; the final run reported `providers-streaming` and `regression-phase_p2`. The exact affected suites/selectors passed in focused reruns, but no whole-gate run returned `failures: []`, so CP-C is not accepted. No G10 work started. / `implemented_unverified` tại CP-C. Source G07–G09, schema và test selector bắt buộc đã triển khai. M5 pass. Verify-HaLaunch vẫn chập chờn sau lượt đầu và ba lượt retry được phép; lượt cuối báo `providers-streaming` và `regression-phase_p2`. Các suite/selector bị ảnh hưởng đều pass khi chạy riêng lại, nhưng chưa có lượt gate tổng thể nào trả `failures: []`, nên CP-C chưa được accepted. Chưa làm G10.
 
 SPEC: [HA_AGENT.vi.md](../specs/HA_AGENT.vi.md) · Plan: [HA_AGENT_PLAN.vi.md](../HA_AGENT_PLAN.vi.md) · Assignment handoff: [HA_AGENT.vi.md](../handoffs/HA_AGENT.vi.md)
 
-## Current checkpoint CP-B / Checkpoint hiện tại CP-B
+## Current checkpoint CP-C / Checkpoint hiện tại CP-C
+
+### Source snapshot / Snapshot source
+
+| Field / Trường | Value / Giá trị |
+|---|---|
+| Branch and base / Branch và commit gốc | `master`, base `e3f55d435a2267deac040c0f31d07fe9bded519e` |
+| Implementation commit / Commit triển khai | Will be recorded in the documentation follow-up after the implementation commit. / Sẽ ghi ở commit tài liệu tiếp theo sau commit triển khai. |
+| Source digest / Digest source | `sha256:51542466e75e522f54d646ca89a268801e725939ee7e66cc105e8497e6906056`; **420 files**. SHA-256 over sorted repo-relative paths (UTF-8 + NUL), file bytes + NUL; tracked and non-ignored untracked files; excludes only this evidence and `docs/handoffs/HA_AGENT.vi.md`. / **420 file**; SHA-256 trên path repo-relative đã sắp xếp (UTF-8 + NUL), bytes file + NUL; gồm file tracked và untracked không ignore; chỉ loại evidence này và `docs/handoffs/HA_AGENT.vi.md`. |
+| `Cargo.lock` SHA-256 | `193d2574da4a994777bf8961780e264a123c1397d04d7e66f7bf49d33d919876`; unchanged; no dependency was added. / Không đổi; không thêm dependency. |
+| OS / Hệ điều hành | Windows 11 Pro, `10.0.26200.0`, x64 |
+| Toolchain | `rustc 1.97.1 (8bab26f4f 2026-07-14)`, `cargo 1.97.1 (c980f4866 2026-06-30)`, isolated `RUSTUP_HOME=C:\Users\duong\.rustup-ha-agent-2026-09-23`; commands used `--locked`. / `rustc 1.97.1`, `cargo 1.97.1`, dùng Rustup home riêng; lệnh Cargo có `--locked`. |
+| Test configuration / Cấu hình test | `RUST_TEST_THREADS=1` for milestone and launch gates; no paid/live provider calls. / Dùng `RUST_TEST_THREADS=1` cho gate milestone và launch; không gọi provider live/trả phí. |
+
+### Gate ledger / Nhật ký gate
+
+| Run / Lượt | Result / Kết quả |
+|---|---|
+| `Verify-Milestone.ps1 -Milestone M5 -Json` | `passed`; closure M0–M5; required selectors 15/15; workspace tests, format, Clippy, build and dependency allowlist passed. A known host flake at `p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` retried once inside the verifier, then closure M2 passed (12/12). / `passed`; closure M0–M5; selector bắt buộc 15/15; workspace, format, Clippy, build và dependency allowlist pass. Host flake đã biết ở `p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized` được verifier retry một lần rồi closure M2 pass (12/12). |
+| Verify-HaLaunch attempt 1 / Lượt 1 | `failures=[providers-streaming, regression-phase_p2]`; unit 320 pass/1 ignored; launch 19/19; session 14/14; P0–P1 and P3–P7 passed. Providers 30/32; visible failing selector included `g03_openai_chat_adapter_keeps_m2_wire_format` (the verifier retained only the last three log lines, so the other failed selector is not identified). P2 17/18 (`p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized`). Installer, release and docs self-tests passed. / `failures=[providers-streaming, regression-phase_p2]`; unit 320 pass/1 ignored; launch 19/19; session 14/14; P0–P1 và P3–P7 pass. Providers 30/32; log còn thấy `g03_openai_chat_adapter_keeps_m2_wire_format` (verifier chỉ giữ ba dòng cuối nên không nhận diện được selector fail còn lại). P2 17/18 (`p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized`). Installer, release và docs self-test pass. |
+| Verify-HaLaunch attempt 2 / Lượt 2 | `failures=[acceptance-launch, regression-phase_p2]`; launch 18/19, i13 resume timed out after 225 s; session 14/14; providers 32/32; P0–P1 and P3–P7 passed; P2 17/18 (`p2_s02`). Installer, release and docs passed. / `failures=[acceptance-launch, regression-phase_p2]`; launch 18/19, i13 resume timeout sau 225 giây; session 14/14; providers 32/32; P0–P1 và P3–P7 pass; P2 17/18 (`p2_s02`). Installer, release và docs pass. |
+| Verify-HaLaunch attempt 3 / Lượt 3 | `failures=[acceptance-launch]`; launch 18/19, i04 Unicode install/caller-directory test failed after 43 s; session 14/14; providers 32/32; P0–P7, installer, release and docs passed. / `failures=[acceptance-launch]`; launch 18/19, test i04 đường dẫn Unicode fail sau 43 giây; session 14/14; providers 32/32; P0–P7, installer, release và docs pass. |
+| Verify-HaLaunch attempt 4 / Lượt 4 | Final allowed retry: `failures=[providers-streaming, regression-phase_p2]`; launch 19/19; session 14/14; P0–P1 and P3–P7 passed. Providers 30/32 (visible failing selector again included G03 OpenAI wire snapshot); P2 17/18 (`p2_s02`). Installer, release and docs passed. / Lượt retry cuối: `failures=[providers-streaming, regression-phase_p2]`; launch 19/19; session 14/14; P0–P1 và P3–P7 pass. Providers 30/32 (log lại hiện selector G03 OpenAI wire snapshot); P2 17/18 (`p2_s02`). Installer, release và docs pass. |
+
+### Focused reruns and controls / Chạy riêng và kiểm tra đối chứng
+
+- After H attempt 1, `cargo test -p harness-providers --locked -- --test-threads=1`: **32/32 passed**; `g03_openai_chat_adapter_keeps_m2_wire_format`: **1/1 passed**. `cargo test -p harness-cli --test phase_p2 --locked -- --test-threads=1`: **18/18 passed**; exact `p2_s02...` selector: **1/1 passed**. After H attempt 3, exact i04 selector: **1/1 passed**. / Sau H lượt 1, providers pass **32/32**; G03 snapshot pass **1/1**. `phase_p2` pass **18/18**; selector `p2_s02...` pass **1/1**. Sau H lượt 3, selector i04 pass **1/1**.
+- `cargo test -p harness-cli --bin ha --locked -- --test-threads=1`: **320 passed, 0 failed, 1 ignored** (also reported by each H run). `milestone_m5`: **15/15**; `phase_p2`: **18/18** on clean runs; `interactive_launch`: **19/19** on H attempts 1 and 4; `interactive_session`: **14/14**. P0–P7 counts: 8, 21, 18, 21, 26, 27, 15, 15. / CLI: **320 pass, 0 fail, 1 ignored**; M5 **15/15**; P2 **18/18** ở lượt xanh; launch **19/19** ở H lượt 1 và 4; session **14/14**. Số test P0–P7: 8, 21, 18, 21, 26, 27, 15, 15.
+- `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed in every H run. `cargo run -p harness-types --bin generate_schemas --locked` regenerated both schema files; `Cargo.lock` is unchanged. / Format và Clippy pass ở mọi H run. Đã chạy schema generator để tạo lại hai schema; `Cargo.lock` không đổi.
+- Negative controls: removing the `/undo` hash guard made V23 red; restoring it returned that selector to green. Treating hook stdout `allow` as policy permission made V25 red; restoring the fail-closed path returned its selector to green. / Đối chứng âm: bỏ hash guard `/undo` làm V23 đỏ; phục hồi guard thì selector xanh. Coi stdout `allow` là quyền làm V25 đỏ; khôi phục fail-closed thì selector xanh.
+- Inference, not a gate verdict: the failures move between loopback-backed tests across otherwise identical runs, and each named failed selector passed when isolated. This indicates host/fixture flakiness; it does not turn the final gate result into a pass. / Suy luận, không phải kết quả gate: lỗi chuyển giữa các test dùng loopback trong những lượt chạy tương tự; từng selector lỗi có tên đều pass khi chạy riêng. Điều này cho thấy host/fixture không ổn định; không biến kết quả gate cuối thành pass.
+
+### Not run / Chưa chạy
+
+Paid/live provider calls; Linux build/run; `scripts/Invoke-HaPtyAcceptance.ps1` (not assigned for CP-C; gate reports PTY as not run); real user install/PATH mutation; G10 and later. CP-C test fixtures use only local loopback and temporary directories. / Chưa gọi provider trả phí/live; chưa build/run Linux; chưa chạy `scripts/Invoke-HaPtyAcceptance.ps1` (ngoài yêu cầu CP-C; gate ghi PTY chưa chạy); chưa cài/PATH thật; chưa làm G10 trở đi. Fixture CP-C chỉ dùng loopback cục bộ và thư mục tạm.
+
+## Historical checkpoint CP-B / Hồ sơ cũ CP-B
 
 ### Source snapshot / Snapshot source
 

@@ -1734,7 +1734,7 @@ impl SqliteStore {
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, StoreError> {
         let rows = sqlx::query(
-            "SELECT sessions.session_id, sessions.task_id, sessions.next_sequence,
+            "SELECT sessions.session_id, sessions.task_id, sessions.next_sequence, sessions.created_at,
                      COUNT(DISTINCT inbox.input_id) AS input_count,
                     MAX(snapshots.through_sequence) AS snapshot_sequence
              FROM sessions
@@ -1759,7 +1759,7 @@ impl SqliteStore {
         // every session and then searched the vector, so a hot path that only
         // needs one summary paid for the whole store.
         let row = sqlx::query(
-            "SELECT sessions.session_id, sessions.task_id, sessions.next_sequence,
+            "SELECT sessions.session_id, sessions.task_id, sessions.next_sequence, sessions.created_at,
                     (SELECT COUNT(*) FROM inbox WHERE inbox.session_id = sessions.session_id) AS input_count,
                     (SELECT MAX(through_sequence) FROM snapshots WHERE snapshots.session_id = sessions.session_id) AS snapshot_sequence
              FROM sessions
@@ -4421,6 +4421,7 @@ fn session_summary_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SessionSumm
         next_sequence,
         input_count,
         latest_snapshot_sequence: snapshot_sequence,
+        created_at: row_get(row, "created_at")?,
     })
 }
 

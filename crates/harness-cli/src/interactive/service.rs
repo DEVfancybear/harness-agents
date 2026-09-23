@@ -28,7 +28,8 @@ use harness_tools::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CodingToolAction, IsolationMode,
     PolicyMode, ToolExecutionService, ToolOutput, ToolPatternRule, ToolPolicyRules, TurnDriver,
     TurnLimits, TurnObserver, TurnOptions, TurnProgress, TurnStop, coding_tool_names,
-    coding_tool_schemas, execute_action_with_approval, observe_workspace, validate_tool_pattern,
+    coding_tool_schemas, execute_action_with_approval, observe_workspace, observed_file_hash,
+    validate_tool_pattern,
 };
 use harness_types::{ErrorCode, HostId, InputId, QuestionId, SessionId, SourceAuthority, TaskId};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -109,6 +110,9 @@ pub struct SubmitRequest {
     pub answer_question_id: Option<String>,
     /// Host-initiated shell action represented by this admitted input, when set.
     pub shell_prefix: Option<ShellPrefix>,
+    /// A host-issued compaction action. It shares the normal admitted-input and
+    /// cancellation path but never dispatches the command text to the model.
+    pub compact_guidance: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,8 +203,20 @@ pub trait SessionPort: Send {
     fn config_explain(&self) -> Vec<String> {
         Vec::new()
     }
+    fn hooks_summary(&self) -> Vec<String> {
+        vec!["no hooks are configured".to_owned()]
+    }
     fn cost_summary(&self) -> String {
         "n/a".to_owned()
+    }
+    fn context_summary(&self) -> Vec<String> {
+        vec!["no context packet has been built in this session yet".to_owned()]
+    }
+    fn git_diff(&mut self) -> Result<(), String> {
+        Err("this backend does not support session diffs".to_owned())
+    }
+    fn rename(&mut self, _title: &str) -> Result<String, String> {
+        Err("this backend does not support session titles".to_owned())
     }
     fn set_model(&mut self, _model: &str) -> Result<String, String> {
         Err("this backend does not support model switching".to_owned())
@@ -274,6 +290,7 @@ pub struct ChannelApprovalGate {
     granted_for_run: Arc<AtomicBool>,
     confirmed_rules: Mutex<HashMap<String, ToolPatternRule>>,
     turn_rules: ToolPolicyRules,
+    bell: AtomicBool,
 }
 
 impl ChannelApprovalGate {
@@ -286,6 +303,7 @@ impl ChannelApprovalGate {
             granted_for_run: Arc::new(AtomicBool::new(false)),
             confirmed_rules: Mutex::new(HashMap::new()),
             turn_rules: ToolPolicyRules::default(),
+            bell: AtomicBool::new(false),
         }
     }
 
@@ -332,6 +350,10 @@ impl ChannelApprovalGate {
     /// grant covers one turn and never the next one.
     pub fn clear_grant_for_run(&self) {
         self.granted_for_run.store(false, Ordering::SeqCst);
+    }
+
+    fn set_bell(&self, enabled: bool) {
+        self.bell.store(enabled, Ordering::SeqCst);
     }
 
     /// Whether gated actions are currently allowed without asking.
@@ -414,6 +436,9 @@ impl ApprovalGate for ChannelApprovalGate {
         let (sender, receiver) = oneshot::channel();
         if let Ok(mut pending) = self.pending.lock() {
             pending.insert(proposal.request_id.clone(), sender);
+        }
+        if self.bell.load(Ordering::SeqCst) {
+            let _ = self.sender.send(SessionEvent::Bell);
         }
         let _ = self.sender.send(SessionEvent::ApprovalRequired {
             request_id: proposal.request_id.clone(),
@@ -498,7 +523,13 @@ pub struct ProviderConfig {
     pub allow_rules: Vec<String>,
     pub deny_rules: Vec<String>,
     pub model_price: Option<ModelPrice>,
+    pub context_window_tokens: u64,
+    pub context_window_notice: Option<String>,
+    pub output_reservation_tokens: u64,
+    pub compaction_reserve_tokens: u64,
     pub max_retry_after_seconds: u64,
+    pub hooks: Vec<harness_tools::ConfiguredToolHook>,
+    pub bell: bool,
     /// Name of the source that holds the key; never the key.
     pub credential: CredentialSource,
 }
@@ -594,7 +625,13 @@ pub(super) fn resolve_provider_with_overrides(
         allow_rules: resolved.allow_rules,
         deny_rules: resolved.deny_rules,
         model_price,
+        context_window_tokens: resolved.context_window_tokens,
+        context_window_notice: resolved.context_window_notice,
+        output_reservation_tokens: resolved.output_reservation_tokens,
+        compaction_reserve_tokens: resolved.compaction_reserve_tokens,
         max_retry_after_seconds,
+        hooks: resolved.hooks,
+        bell: resolved.bell,
         credential,
     })
 }
@@ -840,6 +877,7 @@ struct ChannelObserver {
     cost_tracker: Arc<Mutex<CostTracker>>,
     model_price: Option<ModelPrice>,
     auto_allowed_count: Arc<AtomicUsize>,
+    bell: bool,
     /// Calls are executed serially by the turn driver. Keeping the current
     /// boundary here makes duration delivery O(1) and avoids a process-lifetime
     /// map keyed by a non-unique tool name.
@@ -855,6 +893,7 @@ impl TurnObserver for ChannelObserver {
                 self.auto_allowed_count.fetch_add(1, Ordering::Relaxed);
                 Some(SessionEvent::Notice { message })
             }
+            TurnProgress::Notice(message) => Some(SessionEvent::Notice { message }),
             TurnProgress::Usage {
                 prompt_tokens,
                 completion_tokens,
@@ -876,6 +915,9 @@ impl TurnObserver for ChannelObserver {
             // Step boundaries are what the status bar counts (`step 2/8`).
             TurnProgress::StepStarted { step } => Some(SessionEvent::StepStarted { step }),
             TurnProgress::ToolStarted { name, summary } => {
+                if self.bell && name == "ask_user" {
+                    let _ = self.sender.send(SessionEvent::Bell);
+                }
                 if let Ok(mut started) = self.tool_started.lock() {
                     *started = Some((name.clone(), Instant::now()));
                 }
@@ -939,6 +981,7 @@ pub struct AgentSessionService {
     /// request should pay for that: the app deliberately opens no store until the
     /// first turn arrives.
     project_id: Arc<Mutex<Option<String>>>,
+    context_summary: Arc<Mutex<Vec<String>>>,
 }
 
 #[derive(Clone)]
@@ -1007,6 +1050,7 @@ impl AgentSessionService {
             cancellation: None,
             limits,
             project_id: Arc::new(Mutex::new(None)),
+            context_summary: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1060,6 +1104,35 @@ impl AgentSessionService {
             &overrides,
         )
     }
+
+    fn newest_project_session(&self) -> Result<SessionId, String> {
+        let store_dir = self.store_dir.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("session lookup runtime could not start: {error}"))?;
+            runtime.block_on(async move {
+                let store = SqliteStore::open_read_only(store_dir)
+                    .await
+                    .map_err(|error| format!("project session store could not open: {error}"))?;
+                let mut sessions = store
+                    .list_sessions()
+                    .await
+                    .map_err(|error| format!("project sessions could not be listed: {error}"))?;
+                sessions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+                let latest = sessions
+                    .into_iter()
+                    .next()
+                    .map(|session| session.session_id)
+                    .ok_or_else(|| "this project has no session to continue".to_owned());
+                let _ = store.close().await;
+                latest
+            })
+        })
+        .join()
+        .map_err(|_| "project session lookup thread failed".to_owned())?
+    }
 }
 
 impl SessionPort for AgentSessionService {
@@ -1099,6 +1172,7 @@ impl SessionPort for AgentSessionService {
         let cost_tracker = Arc::clone(&self.cost_tracker);
         let session_mode = self.session_mode.lock().ok().and_then(|mode| *mode);
         let auto_allowed_count = Arc::clone(&self.auto_allowed_count);
+        let context_summary = Arc::clone(&self.context_summary);
         let task_id = self.task_id.clone();
         let previous_session = Arc::clone(&self.previous_session);
         let active_inbox = Arc::clone(&self.active_inbox);
@@ -1122,6 +1196,7 @@ impl SessionPort for AgentSessionService {
                 cost_tracker,
                 session_mode,
                 auto_allowed_count,
+                context_summary,
                 session_id,
                 task_id,
                 previous_session,
@@ -1202,10 +1277,135 @@ impl SessionPort for AgentSessionService {
         )
     }
 
+    fn hooks_summary(&self) -> Vec<String> {
+        match super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        ) {
+            Ok(config) if config.hooks.is_empty() => {
+                vec!["no trusted hooks are configured".to_owned()]
+            }
+            Ok(config) => config
+                .hooks
+                .iter()
+                .map(|hook| {
+                    format!(
+                        "{} matcher={} command={} timeout={}s source={}",
+                        hook.event,
+                        hook.matcher.as_deref().unwrap_or("*"),
+                        hook.command,
+                        hook.timeout_seconds,
+                        hook.source,
+                    )
+                })
+                .collect(),
+            Err(error) => vec![format!("hooks unavailable: {error}")],
+        }
+    }
+
     fn cost_summary(&self) -> String {
         self.cost_tracker
             .lock()
             .map_or_else(|_| "n/a".to_owned(), |tracker| tracker.display())
+    }
+
+    fn context_summary(&self) -> Vec<String> {
+        self.context_summary.lock().map_or_else(
+            |_| vec!["context details are unavailable".to_owned()],
+            |lines| {
+                if lines.is_empty() {
+                    vec!["no context packet has been built in this session yet".to_owned()]
+                } else {
+                    lines.clone()
+                }
+            },
+        )
+    }
+
+    fn git_diff(&mut self) -> Result<(), String> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        let sender = self.sender.clone();
+        let store_dir = self.store_dir.clone();
+        let workspace_root = self.workspace_root.clone();
+        let task_id = self.task_id.clone();
+        handle.spawn(async move {
+            let result = async {
+                let store = SqliteStore::open_read_only(store_dir)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let base = store
+                    .session_setting(&task_id, "git_base")
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let lines = if let Some(base) = base {
+                    let diff = harness_tools::git_diff_from(&workspace_root, &base)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if diff.is_empty() {
+                        vec!["no tracked changes since this session started".to_owned()]
+                    } else {
+                        let mut lines = diff
+                            .lines()
+                            .take(512)
+                            .map(ToOwned::to_owned)
+                            .collect::<Vec<_>>();
+                        if diff.lines().count() > 512 {
+                            lines.push("[diff truncated after 512 lines]".to_owned());
+                        }
+                        lines
+                    }
+                } else {
+                    vec!["no Git commit was recorded when this session started".to_owned()]
+                };
+                let _ = store.close().await;
+                Ok::<_, String>(lines)
+            }
+            .await;
+            let lines = result.unwrap_or_else(|error| vec![format!("git diff failed: {error}")]);
+            let _ = sender.send(SessionEvent::Reference {
+                title: "/diff".to_owned(),
+                lines,
+            });
+        });
+        Ok(())
+    }
+
+    fn rename(&mut self, title: &str) -> Result<String, String> {
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        if title.is_empty() || title.chars().count() > 60 {
+            return Err("usage: /rename <name up to 60 characters>".to_owned());
+        }
+        let task_id = self.task_id.clone();
+        let store_dir = self.store_dir.clone();
+        let sender = self.sender.clone();
+        let title_for_write = title.clone();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            let result = async {
+                let store =
+                    SqliteStore::open_writer(WriterOpenOptions::new(store_dir, HostId::generate()))
+                        .await
+                        .map_err(|error| error.to_string())?;
+                let write = store
+                    .set_session_setting(&task_id, "title", &title_for_write)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = store.close().await;
+                write
+            }
+            .await;
+            let _ = sender.send(SessionEvent::Notice {
+                message: result.map_or_else(
+                    |error| format!("session title could not be saved: {error}"),
+                    |()| format!("session renamed to {title_for_write}"),
+                ),
+            });
+        });
+        Ok(format!("saving session title: {title}"))
     }
 
     fn set_model(&mut self, model: &str) -> Result<String, String> {
@@ -1336,19 +1536,39 @@ impl SessionPort for AgentSessionService {
                 Ok(store) => match store.list_sessions().await {
                     Ok(summaries) => {
                         // Newest first, bounded: a resume list is a menu, not a dump.
-                        let mut sessions: Vec<SessionCandidate> = summaries
-                            .into_iter()
-                            .map(|summary| SessionCandidate {
+                        let mut summaries = summaries;
+                        summaries.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+                        let mut sessions = Vec::new();
+                        for summary in summaries.into_iter().take(RESUME_LIST_LIMIT) {
+                            let title = store
+                                .session_setting(&summary.task_id, "title")
+                                .await
+                                .ok()
+                                .flatten()
+                                .unwrap_or_else(|| "untitled session".to_owned());
+                            let model = store
+                                .session_setting(&summary.task_id, "model")
+                                .await
+                                .ok()
+                                .flatten()
+                                .unwrap_or_else(|| "model unknown".to_owned());
+                            let created = chrono::NaiveDateTime::parse_from_str(
+                                &summary.created_at,
+                                "%Y-%m-%d %H:%M:%S",
+                            )
+                            .map_or_else(
+                                |_| summary.created_at.clone(),
+                                |time| time.format("%Y-%m-%d %H:%M UTC").to_string(),
+                            );
+                            sessions.push(SessionCandidate {
                                 session_id: summary.session_id.as_str().to_owned(),
                                 task_id: summary.task_id.as_str().to_owned(),
                                 detail: format!(
-                                    "{} input(s), {} event(s)",
+                                    "{title} · {model} · {created} · {} input(s), {} event(s)",
                                     summary.input_count, summary.next_sequence
                                 ),
-                            })
-                            .collect();
-                        sessions.reverse();
-                        sessions.truncate(RESUME_LIST_LIMIT);
+                            });
+                        }
                         let _ = sender.send(SessionEvent::SessionsListed { sessions });
                     }
                     Err(error) => {
@@ -1369,10 +1589,14 @@ impl SessionPort for AgentSessionService {
     }
 
     fn resume(&mut self, session_id: Option<String>) -> Result<(), String> {
-        let source = session_id
-            .map(SessionId::parse)
-            .transpose()
-            .map_err(|error| format!("resume needs a canonical session id: {error}"))?;
+        let source = match session_id.as_deref() {
+            Some("latest") => Some(self.newest_project_session()?),
+            Some(value) => Some(
+                SessionId::parse(value.to_owned())
+                    .map_err(|error| format!("resume needs a canonical session id: {error}"))?,
+            ),
+            None => None,
+        };
         let mut previous = self
             .previous_session
             .lock()
@@ -1564,6 +1788,7 @@ async fn run_turn(
     cost_tracker: Arc<Mutex<CostTracker>>,
     session_mode: Option<PolicyMode>,
     auto_allowed_count: Arc<AtomicUsize>,
+    context_summary: Arc<Mutex<Vec<String>>>,
     session_id: SessionId,
     task_id: TaskId,
     previous_session: Arc<Mutex<Option<SessionId>>>,
@@ -1627,6 +1852,20 @@ async fn run_turn(
         None => task_id,
     };
 
+    if store
+        .session_setting(&task_id, "git_base")
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+        && let Ok(Some(base)) = harness_tools::git_head_commit(&workspace_root).await
+        && let Err(error) = store.set_session_setting(&task_id, "git_base", &base).await
+    {
+        send(SessionEvent::Notice {
+            message: format!("session Git base could not be saved: {error}"),
+        });
+    }
+
     if let Some(shell_prefix) = request.shell_prefix.clone() {
         run_shell_prefix_turn(
             sender,
@@ -1646,6 +1885,31 @@ async fn run_turn(
             limits,
             request,
             shell_prefix,
+            cancellation,
+        )
+        .await;
+        return;
+    }
+
+    if request.text == "/undo" || request.text.starts_with("/export ") {
+        run_session_file_action(
+            sender,
+            store,
+            data_dir,
+            config_file,
+            workspace_root,
+            environment,
+            config_overrides,
+            session_mode,
+            session_id,
+            task_id,
+            source,
+            previous_session,
+            gate,
+            cost_tracker,
+            auto_allowed_count,
+            limits,
+            request,
             cancellation,
         )
         .await;
@@ -1685,6 +1949,31 @@ async fn run_turn(
                 let _ = store.close().await;
             }
             return;
+        }
+    }
+
+    if request.compact_guidance.is_none()
+        && store
+            .session_setting(&task_id, "title")
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        let title = request
+            .text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(60)
+            .collect::<String>();
+        if !title.is_empty()
+            && let Err(error) = store.set_session_setting(&task_id, "title", &title).await
+        {
+            send(SessionEvent::Notice {
+                message: format!("session title could not be saved: {error}"),
+            });
         }
     }
 
@@ -1731,10 +2020,16 @@ async fn run_turn(
             return;
         }
     };
+    gate.set_bell(config.bell);
 
     // A workspace root keeps one project identity, whether or not memory is on: a
     // generated id per turn would put every project-scoped record this turn writes
     // out of reach of the next one.
+    if let Some(message) = &config.context_window_notice {
+        send(SessionEvent::Notice {
+            message: message.clone(),
+        });
+    }
     let project_id = match project::resolve_project_id(&store, &workspace_root).await {
         Ok(project_id) => project_id,
         Err(error) => {
@@ -1811,10 +2106,46 @@ async fn run_turn(
         Arc::clone(&store),
         provider,
         RuntimeConfig {
+            context_window_tokens: config.context_window_tokens,
+            output_reservation_tokens: config.output_reservation_tokens,
+            compaction_reserve_tokens: config.compaction_reserve_tokens,
             max_retry_after_seconds: config.max_retry_after_seconds,
             ..RuntimeConfig::default()
         },
     ));
+    if let Some(guidance) = request.compact_guidance.as_deref() {
+        let result = match source.as_ref() {
+            Some(source_session) => runtime
+                .compact_with_guidance(source_session, Some(guidance))
+                .await
+                .map(|compacted| {
+                    send(SessionEvent::Notice {
+                        message: format!(
+                            "compacted through event {}; summary source: {}",
+                            compacted.covered_through, compacted.summary_source
+                        ),
+                    });
+                })
+                .map_err(|error| format!("compaction failed: {error}")),
+            None => Err("there is no earlier session to compact".to_owned()),
+        };
+        drop(runtime);
+        if let Ok(store) = Arc::try_unwrap(store) {
+            let _ = store.close().await;
+        }
+        match result {
+            Ok(()) => send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            }),
+            Err(message) => {
+                send(SessionEvent::RecoverableError { message });
+                send(SessionEvent::RunTerminal {
+                    outcome: RunOutcome::Failed("compaction failed".to_owned()),
+                });
+            }
+        }
+        return;
+    }
     // Local extensions are explicit opt-in, loaded for this turn and stopped when it
     // ends: a chat turn never leaves an extension process behind.
     let extension_root = extensions::extensions_root(&environment, &data_dir);
@@ -1856,8 +2187,11 @@ async fn run_turn(
     let tools = match &active_extensions {
         Some(active) => ToolExecutionService::new(Arc::clone(&store))
             .with_policy(tool_policy)
+            .with_hooks(config.hooks.clone())
             .with_external(active.dispatcher()),
-        None => ToolExecutionService::new(Arc::clone(&store)).with_policy(tool_policy),
+        None => ToolExecutionService::new(Arc::clone(&store))
+            .with_policy(tool_policy)
+            .with_hooks(config.hooks.clone()),
     };
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
     let driver = match &active_extensions {
@@ -2009,6 +2343,7 @@ async fn run_turn(
         cost_tracker,
         model_price: config.model_price,
         auto_allowed_count,
+        bell: config.bell,
         tool_started: Mutex::new(None),
     });
 
@@ -2035,6 +2370,37 @@ async fn run_turn(
                 .await
         }
     };
+
+    if let Some(built) = runtime.context_result(&session_id) {
+        let mut lines = vec![
+            format!("model: {}", built.manifest.model_id),
+            format!("source revision: {}", built.manifest.source_revision),
+            format!(
+                "tokens: mandatory {}, optional {}",
+                built.mandatory_tokens, built.optional_tokens
+            ),
+        ];
+        lines.extend(built.block_usage.iter().map(|block| {
+            format!(
+                "{} [{}] {} tokens — {}{}",
+                block.block_id,
+                block.channel.as_str(),
+                block.token_estimate,
+                if block.included {
+                    "included"
+                } else {
+                    "omitted"
+                },
+                block
+                    .drop_reason
+                    .as_ref()
+                    .map_or_else(String::new, |reason| format!(" ({reason})"))
+            )
+        }));
+        if let Ok(mut current) = context_summary.lock() {
+            *current = lines;
+        }
+    }
 
     if let Ok(turn) = &outcome
         && let Some(question_id) = turn.pending_question.as_ref()
@@ -2104,6 +2470,10 @@ async fn run_turn(
         let _ = store.close().await;
     }
 
+    if config.bell {
+        send(SessionEvent::Bell);
+    }
+
     let terminal = match outcome {
         Ok(outcome) => {
             if let Ok(mut guard) = previous_session.lock() {
@@ -2140,6 +2510,458 @@ async fn run_turn(
         Err(error) => RunOutcome::Failed(error.to_string()),
     };
     send(SessionEvent::RunTerminal { outcome: terminal });
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_session_file_action(
+    sender: UnboundedSender<SessionEvent>,
+    store: Arc<SqliteStore>,
+    data_dir: PathBuf,
+    config_file: PathBuf,
+    workspace_root: PathBuf,
+    environment: LaunchEnvironment,
+    config_overrides: ConfigOverrides,
+    session_mode: Option<PolicyMode>,
+    session_id: SessionId,
+    task_id: TaskId,
+    source: Option<SessionId>,
+    previous_session: Arc<Mutex<Option<SessionId>>>,
+    gate: Arc<ChannelApprovalGate>,
+    cost_tracker: Arc<Mutex<CostTracker>>,
+    auto_allowed_count: Arc<AtomicUsize>,
+    limits: TurnLimits,
+    request: SubmitRequest,
+    cancellation: CancellationToken,
+) {
+    let result = run_session_file_action_inner(
+        &sender,
+        Arc::clone(&store),
+        data_dir,
+        config_file,
+        workspace_root,
+        environment,
+        config_overrides,
+        session_mode,
+        session_id,
+        task_id,
+        source,
+        previous_session,
+        gate,
+        cost_tracker,
+        auto_allowed_count,
+        limits,
+        request,
+        cancellation,
+    )
+    .await;
+    if let Ok(store) = Arc::try_unwrap(store) {
+        let _ = store.close().await;
+    }
+    match result {
+        Ok(outcome) => {
+            let _ = sender.send(SessionEvent::RunTerminal { outcome });
+        }
+        Err(message) => {
+            let _ = sender.send(SessionEvent::RecoverableError { message });
+            let _ = sender.send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Failed("session file action failed".to_owned()),
+            });
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_session_file_action_inner(
+    sender: &UnboundedSender<SessionEvent>,
+    store: Arc<SqliteStore>,
+    data_dir: PathBuf,
+    config_file: PathBuf,
+    workspace_root: PathBuf,
+    environment: LaunchEnvironment,
+    config_overrides: ConfigOverrides,
+    session_mode: Option<PolicyMode>,
+    session_id: SessionId,
+    task_id: TaskId,
+    source: Option<SessionId>,
+    previous_session: Arc<Mutex<Option<SessionId>>>,
+    gate: Arc<ChannelApprovalGate>,
+    cost_tracker: Arc<Mutex<CostTracker>>,
+    auto_allowed_count: Arc<AtomicUsize>,
+    limits: TurnLimits,
+    request: SubmitRequest,
+    cancellation: CancellationToken,
+) -> Result<RunOutcome, String> {
+    let config = super::config::resolve_layers(
+        &config_file,
+        &workspace_root,
+        &environment,
+        &config_overrides,
+    )
+    .map_err(|error| error.to_string())?;
+    gate.set_bell(config.bell);
+    let project_id = project::resolve_project_id(&store, &workspace_root)
+        .await
+        .map_err(|error| error.to_string())?;
+    let observation = observe_workspace(project_id.clone(), &workspace_root)
+        .map_err(|error| error.to_string())?;
+    let expected_sequence = store
+        .session_summary(&session_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .map_or(1, |summary| summary.next_sequence);
+    SessionService::new(Arc::clone(&store))
+        .admit_input(AdmitInputRequest {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            input_id: request.input_id.clone(),
+            expected_sequence,
+            authority: SourceAuthority::User,
+            raw_text: request.text.clone(),
+            workspace: observation,
+            initial_plan_items: Vec::new(),
+        })
+        .await
+        .map_err(|error| format!("session action was not admitted: {error}"))?;
+    if let Some(source) = &source {
+        store
+            .record_continuation_link(source, &session_id, &task_id)
+            .await
+            .map_err(|error| format!("session action link could not be recorded: {error}"))?;
+    }
+    if let Ok(mut previous) = previous_session.lock() {
+        *previous = Some(session_id.clone());
+    }
+
+    let is_undo = request.text == "/undo";
+    let action = if is_undo {
+        latest_undo_action(&store, &task_id, &project_id, &workspace_root).await?
+    } else {
+        let path = request
+            .text
+            .strip_prefix("/export ")
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| "usage: /export [path.md|path.jsonl]".to_owned())?;
+        let extension = Path::new(path).extension();
+        let jsonl = extension.is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"));
+        let markdown = extension.is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
+        if !jsonl && !markdown {
+            return Err("usage: /export [path.md|path.jsonl]".to_owned());
+        }
+        if Path::new(path).is_absolute()
+            || Path::new(path)
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err("export path must stay inside the workspace".to_owned());
+        }
+        let content = render_session_export(
+            &store,
+            &task_id,
+            &environment,
+            &data_dir,
+            &config.provider.api_key_env,
+            jsonl,
+        )
+        .await?;
+        let expected_hash = if workspace_root.join(path).exists() {
+            Some(observed_file_hash(&workspace_root, path).map_err(|error| error.to_string())?)
+        } else {
+            None
+        };
+        CodingToolAction::WriteFile {
+            path: path.to_owned(),
+            content,
+            expected_hash,
+        }
+    };
+    let policy = if is_undo {
+        super::permissions::build_tool_policy("ask", &[], &config.deny_rules, Some(PolicyMode::Ask))
+    } else {
+        super::permissions::build_tool_policy(
+            &config.approval,
+            &config.allow_rules,
+            &config.deny_rules,
+            session_mode,
+        )
+    }
+    .map_err(|error| format!("tool permissions are invalid: {error}"))?
+    .with_turn_rules(gate.turn_rules());
+    let tools = ToolExecutionService::new(Arc::clone(&store))
+        .with_policy(policy)
+        .with_hooks(config.hooks.clone());
+    let options = TurnOptions {
+        workspace_root: workspace_root.clone(),
+        actor_id: "interactive.user".to_owned(),
+        approvals: ApprovalMode::Ask(gate as Arc<dyn ApprovalGate>),
+        limits,
+    };
+    let observer: Arc<dyn TurnObserver> = Arc::new(ChannelObserver {
+        sender: sender.clone(),
+        cost_tracker,
+        model_price: config.model_prices.get(&config.provider.model).copied(),
+        auto_allowed_count,
+        bell: config.bell,
+        tool_started: Mutex::new(None),
+    });
+    let name = if is_undo { "undo" } else { "write_file" };
+    observer.observe(TurnProgress::StepStarted { step: 1 });
+    observer.observe(TurnProgress::ToolStarted {
+        name: name.to_owned(),
+        summary: if is_undo {
+            "restore the most recent changed file".to_owned()
+        } else {
+            "export session transcript".to_owned()
+        },
+    });
+    let tool_request = harness_tools::ToolRequest::new(
+        session_id,
+        task_id,
+        "interactive.user",
+        &workspace_root,
+        action,
+    );
+    let executed =
+        execute_action_with_approval(&tools, tool_request, &options, 1, &observer, &cancellation)
+            .await;
+    let (message, outcome) = match executed {
+        Ok(view) => {
+            let settled = view
+                .receipt
+                .as_ref()
+                .is_some_and(|r| r.outcome_state == harness_types::ToolOutcomeState::Settled);
+            let message = if settled {
+                if is_undo {
+                    "undo action completed"
+                } else {
+                    "session export written"
+                }
+            } else {
+                "session action was not completed"
+            };
+            observer.observe(TurnProgress::ToolSettled {
+                name: name.to_owned(),
+                ok: settled,
+                detail: (!settled).then(|| message.to_owned()),
+            });
+            (
+                message.to_owned(),
+                if settled {
+                    RunOutcome::Done
+                } else {
+                    RunOutcome::Blocked(message.to_owned())
+                },
+            )
+        }
+        Err(error) => {
+            let message = format!("session action was not run: {error}");
+            observer.observe(TurnProgress::ToolSettled {
+                name: name.to_owned(),
+                ok: false,
+                detail: Some(message.clone()),
+            });
+            (message.clone(), RunOutcome::Blocked(message))
+        }
+    };
+    let _ = sender.send(SessionEvent::Notice { message });
+    Ok(outcome)
+}
+
+async fn latest_undo_action(
+    store: &SqliteStore,
+    task_id: &TaskId,
+    project_id: &harness_types::ProjectId,
+    workspace_root: &Path,
+) -> Result<CodingToolAction, String> {
+    let mut sessions = store
+        .list_sessions()
+        .await
+        .map_err(|error| error.to_string())?;
+    sessions.retain(|session| &session.task_id == task_id);
+    sessions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    for session in sessions {
+        let receipts = store
+            .load_receipts(&session.session_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        for receipt in receipts.into_iter().rev() {
+            if receipt.task_id != *task_id
+                || receipt.outcome_state != harness_types::ToolOutcomeState::Settled
+            {
+                continue;
+            }
+            let (Some(before_hash), Some(after_hash), Some(artifact_id)) = (
+                receipt.before_hash.clone(),
+                receipt.after_hash.clone(),
+                receipt.artifact_id.clone(),
+            ) else {
+                continue;
+            };
+            let intent = store
+                .tool_intent(&receipt.tool_execution_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "the latest file receipt has no matching intent".to_owned())?;
+            if !matches!(
+                intent.tool_name.as_str(),
+                "write_file" | "edit_file" | "apply_patch"
+            ) {
+                continue;
+            }
+            let path = intent
+                .action_json
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "the latest file intent has no path".to_owned())?;
+            if !store
+                .artifact_is_scoped_to(&artifact_id, project_id, task_id)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                return Err("the original file artifact is outside this task's scope".to_owned());
+            }
+            let page = store
+                .read_artifact_page(artifact_id.as_str(), 0, 1024 * 1024 + 1)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "the original file artifact is missing".to_owned())?;
+            if page.total_bytes > 1024 * 1024
+                || page.bytes.len() as u64 != page.total_bytes
+                || harness_types::ContentHash::from_bytes(&page.bytes) != before_hash
+                || page.content_hash != before_hash
+            {
+                return Err("the original file artifact failed its size or hash check".to_owned());
+            }
+            let current_hash =
+                observed_file_hash(workspace_root, path).map_err(|error| error.to_string())?;
+            if current_hash != after_hash {
+                return Err(format!(
+                    "undo skipped {path}: its current hash differs from the last receipt"
+                ));
+            }
+            let content = String::from_utf8(page.bytes)
+                .map_err(|_| "the original file artifact is not UTF-8".to_owned())?;
+            return Ok(CodingToolAction::WriteFile {
+                path: path.to_owned(),
+                content,
+                expected_hash: Some(after_hash),
+            });
+        }
+    }
+    Err("no reversible file change with a before artifact was found in this session".to_owned())
+}
+
+async fn render_session_export(
+    store: &SqliteStore,
+    task_id: &TaskId,
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+    provider_key_variable: &str,
+    jsonl: bool,
+) -> Result<String, String> {
+    const EXPORT_LIMIT: usize = 1024 * 1024;
+    let mut secrets = super::bootstrap::CREDENTIAL_VARIABLES
+        .iter()
+        .filter_map(|name| environment.value(name))
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if let Some(value) = environment.value(provider_key_variable) {
+        let value = value.to_string_lossy().into_owned();
+        if !value.is_empty() {
+            secrets.push(value);
+        }
+    }
+    if let Some(value) = credentials::load(&credentials::resolve_file(environment, data_dir))
+        .map_err(|error| error.to_string())?
+        && !value.is_empty()
+    {
+        secrets.push(value);
+    }
+    let mut sessions = store
+        .list_sessions()
+        .await
+        .map_err(|error| error.to_string())?;
+    sessions.retain(|session| &session.task_id == task_id);
+    sessions.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    let mut output = if jsonl {
+        String::new()
+    } else {
+        "# Harness session export\n\n".to_owned()
+    };
+    for session in sessions {
+        let mut cursor = 0;
+        loop {
+            let events = store
+                .load_events_after_limit(&session.session_id, cursor, 256)
+                .await
+                .map_err(|error| error.to_string())?;
+            if events.is_empty() {
+                break;
+            }
+            let count = events.len();
+            for event in events {
+                cursor = event.seq;
+                let mut value = serde_json::to_value(event).map_err(|error| error.to_string())?;
+                redact_export_value(&mut value, &secrets);
+                if jsonl {
+                    output.push_str(
+                        &serde_json::to_string(&value).map_err(|error| error.to_string())?,
+                    );
+                    output.push('\n');
+                } else {
+                    output.push_str("## Event\n\n```json\n");
+                    output.push_str(
+                        &serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?,
+                    );
+                    output.push_str("\n```\n\n");
+                }
+                if output.len() > EXPORT_LIMIT {
+                    return Err("session export exceeds the 1 MiB file limit".to_owned());
+                }
+            }
+            if count < 256 {
+                break;
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn redact_export_value(value: &mut serde_json::Value, secrets: &[String]) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, child) in object.iter_mut() {
+                let key = key.to_ascii_lowercase();
+                if [
+                    "secret",
+                    "token",
+                    "password",
+                    "api_key",
+                    "credential",
+                    "authorization",
+                ]
+                .iter()
+                .any(|needle| key.contains(needle))
+                {
+                    *child = serde_json::Value::String("[REDACTED]".to_owned());
+                } else {
+                    redact_export_value(child, secrets);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_export_value(value, secrets);
+            }
+        }
+        serde_json::Value::String(text) => {
+            for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+                *text = text.replace(secret, "[REDACTED]");
+            }
+        }
+        _ => {}
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2187,6 +3009,12 @@ async fn run_shell_prefix_turn(
             return;
         }
     };
+    gate.set_bell(config.bell);
+    if let Some(message) = &config.context_window_notice {
+        send(SessionEvent::Notice {
+            message: message.clone(),
+        });
+    }
     let project_id = match project::resolve_project_id(&store, &workspace_root).await {
         Ok(project_id) => project_id,
         Err(error) => {
@@ -2278,7 +3106,9 @@ async fn run_shell_prefix_turn(
             return;
         }
     };
-    let tools = ToolExecutionService::new(Arc::clone(&store)).with_policy(policy);
+    let tools = ToolExecutionService::new(Arc::clone(&store))
+        .with_policy(policy)
+        .with_hooks(config.hooks.clone());
     let options = TurnOptions {
         workspace_root: workspace_root.clone(),
         actor_id: "interactive.user".to_owned(),
@@ -2290,6 +3120,7 @@ async fn run_shell_prefix_turn(
         cost_tracker,
         model_price: config.model_prices.get(&config.provider.model).copied(),
         auto_allowed_count,
+        bell: config.bell,
         tool_started: Mutex::new(None),
     });
     observer.observe(TurnProgress::StepStarted { step: 1 });
@@ -2587,21 +3418,26 @@ impl SessionPort for FixtureService {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentSessionService, ApprovalDecision, ApprovalGate, ApprovalProposal, ChannelApprovalGate,
-        DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL, ENDPOINT_VARIABLE, EnvironmentCredential,
-        FixtureService, MODEL_VARIABLE, SessionChannel, SessionPort, SubmitRequest,
-        provider_diagnostics, resolve_provider, validate_credential_file,
+        AdmitInputRequest, AgentSessionService, ApprovalDecision, ApprovalGate, ApprovalProposal,
+        ChannelApprovalGate, CodingToolAction, DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL,
+        ENDPOINT_VARIABLE, EnvironmentCredential, FixtureService, MODEL_VARIABLE, SessionChannel,
+        SessionPort, SessionService, SourceAuthority, SubmitRequest, ToolOutput,
+        execute_action_with_approval, latest_undo_action, observe_workspace, observed_file_hash,
+        provider_diagnostics, render_session_export, resolve_provider, validate_credential_file,
     };
     use crate::interactive::bootstrap::{self, LaunchRequest};
     use crate::interactive::credentials::{self, CredentialSource, Protection};
     use crate::interactive::events::{RunOutcome, SessionEvent};
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
     use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
-    use harness_tools::ApprovalAnswer;
-    use harness_types::InputId;
+    use harness_tools::{
+        ApprovalAnswer, ApprovalMode, ConfiguredToolHook, HostEnvironment, TurnLimits,
+        TurnObserver, TurnOptions, TurnProgress,
+    };
+    use harness_types::{ErrorCode, InputId};
     use std::path::PathBuf;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     fn request() -> SubmitRequest {
@@ -2610,7 +3446,459 @@ mod tests {
             text: "fix the parser".to_owned(),
             answer_question_id: None,
             shell_prefix: None,
+            compact_guidance: None,
         }
+    }
+
+    #[derive(Default)]
+    struct HookTestObserver {
+        progress: Mutex<Vec<TurnProgress>>,
+    }
+
+    impl TurnObserver for HookTestObserver {
+        fn observe(&self, progress: TurnProgress) {
+            if let Ok(mut entries) = self.progress.lock() {
+                entries.push(progress);
+            }
+        }
+    }
+
+    fn hook_process(script: &str) -> (String, Vec<String>) {
+        #[cfg(windows)]
+        {
+            (
+                "pwsh".to_owned(),
+                vec![
+                    "-NoProfile".to_owned(),
+                    "-NonInteractive".to_owned(),
+                    "-Command".to_owned(),
+                    script.to_owned(),
+                ],
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            ("sh".to_owned(), vec!["-c".to_owned(), script.to_owned()])
+        }
+    }
+
+    fn hook(
+        event: &str,
+        matcher: Option<&str>,
+        timeout_seconds: u64,
+        script: &str,
+    ) -> ConfiguredToolHook {
+        let (command, args) = hook_process(script);
+        ConfiguredToolHook {
+            event: event.to_owned(),
+            matcher: matcher.map(str::to_owned),
+            command,
+            args,
+            timeout_seconds,
+            source: "test fixture".to_owned(),
+        }
+    }
+
+    fn hook_read_stdin_script(output: &str, exit: i32) -> String {
+        #[cfg(windows)]
+        {
+            format!(
+                "$null = [Console]::In.ReadToEnd(); Write-Output '{}'; exit {}",
+                output.replace('\'', "''"),
+                exit
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            format!(
+                "cat >/dev/null; printf '%s\\n' '{}'; exit {exit}",
+                output.replace('\'', "'\\''")
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn g09_pre_tool_use_exit_2_blocks_and_records_the_reason() {
+        let fixture = undo_fixture().await;
+        let mut channel = SessionChannel::new();
+        let gate = Arc::new(ChannelApprovalGate::new(
+            channel.sender(),
+            Duration::from_secs(3),
+        ));
+        let tools = harness_tools::ToolExecutionService::new(Arc::clone(&fixture.store))
+            .with_hooks(vec![hook(
+                "pre_tool_use",
+                Some("write_file"),
+                5,
+                &hook_read_stdin_script("fixture refused this write", 2),
+            )]);
+        let action = CodingToolAction::WriteFile {
+            path: "src/blocked.txt".to_owned(),
+            content: "must stay absent".to_owned(),
+            expected_hash: None,
+        };
+        let request = harness_tools::ToolRequest::new(
+            fixture.source_session.clone(),
+            fixture.task_id.clone(),
+            "hook.test",
+            &fixture.workspace,
+            action,
+        );
+        let options = TurnOptions {
+            workspace_root: fixture.workspace.clone(),
+            actor_id: "hook.test".to_owned(),
+            approvals: ApprovalMode::Ask(gate),
+            limits: TurnLimits::default(),
+        };
+        let observer = Arc::new(HookTestObserver::default());
+        let observer_trait: Arc<dyn TurnObserver> = observer.clone();
+        let view = execute_action_with_approval(
+            &tools,
+            request,
+            &options,
+            2,
+            &observer_trait,
+            &harness_providers::CancellationToken::new(),
+        )
+        .await
+        .expect("hook denial is a settled receipt");
+
+        let ToolOutput::Denied { code, reason } = &view.output else {
+            panic!("exit 2 must block the action: {:?}", view.output);
+        };
+        assert_eq!(code, "blocked_by_hook");
+        assert!(reason.contains("fixture refused this write"), "{reason}");
+        assert!(observer.progress.lock().expect("observer entries").iter().any(|progress| matches!(progress, TurnProgress::Notice(message) if message.contains("blocked by hook"))));
+        assert_eq!(
+            view.receipt.as_ref().expect("denial receipt").outcome_state,
+            harness_types::ToolOutcomeState::Denied
+        );
+        assert!(!fixture.workspace.join("src/blocked.txt").exists());
+        assert!(
+            channel
+                .drain()
+                .iter()
+                .all(|event| !matches!(event, SessionEvent::ApprovalRequired { .. }))
+        );
+        let events = fixture
+            .store
+            .load_events_after(&fixture.source_session, 0)
+            .await
+            .expect("journal");
+        let denial = events
+            .iter()
+            .find(|event| {
+                event
+                    .payload
+                    .get("model_view")
+                    .is_some_and(|view| view["code"] == "blocked_by_hook")
+            })
+            .expect("blocked_by_hook and reason are durable with the receipt event");
+        assert!(
+            denial.payload["model_view"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("fixture refused"))
+        );
+        drop(tools);
+        Arc::try_unwrap(fixture.store)
+            .expect("store consumers released")
+            .close()
+            .await
+            .expect("close store");
+    }
+
+    #[tokio::test]
+    async fn g09_hook_cannot_turn_ask_into_allow() {
+        let fixture = undo_fixture().await;
+        let mut channel = SessionChannel::new();
+        let gate = Arc::new(ChannelApprovalGate::new(
+            channel.sender(),
+            Duration::from_secs(3),
+        ));
+        let tools = harness_tools::ToolExecutionService::new(Arc::clone(&fixture.store))
+            .with_hooks(vec![hook(
+                "pre_tool_use",
+                Some("write_file"),
+                5,
+                &hook_read_stdin_script("allow", 0),
+            )]);
+        let request = harness_tools::ToolRequest::new(
+            fixture.source_session.clone(),
+            fixture.task_id.clone(),
+            "hook.test",
+            &fixture.workspace,
+            CodingToolAction::WriteFile {
+                path: "src/allow.txt".to_owned(),
+                content: "still needs approval".to_owned(),
+                expected_hash: None,
+            },
+        );
+        let options = TurnOptions {
+            workspace_root: fixture.workspace.clone(),
+            actor_id: "hook.test".to_owned(),
+            approvals: ApprovalMode::Ask(Arc::clone(&gate) as Arc<dyn harness_tools::ApprovalGate>),
+            limits: TurnLimits::default(),
+        };
+        let observer: Arc<dyn TurnObserver> = Arc::new(HookTestObserver::default());
+        let execution = tokio::spawn(async move {
+            execute_action_with_approval(
+                &tools,
+                request,
+                &options,
+                2,
+                &observer,
+                &harness_providers::CancellationToken::new(),
+            )
+            .await
+        });
+        let request_id = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if let Some(id) = channel.drain().into_iter().find_map(|event| match event {
+                    SessionEvent::ApprovalRequired { request_id, .. } => Some(request_id),
+                    _ => None,
+                }) {
+                    break id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("exit 0 stdout allow still opens Ask panel");
+        assert!(!fixture.workspace.join("src/allow.txt").exists());
+        assert!(gate.answer(&request_id, ApprovalDecision::Denied));
+        assert_eq!(
+            execution
+                .await
+                .expect("tool task joined")
+                .expect_err("explicit denial")
+                .code(),
+            ErrorCode::PolicyDenied
+        );
+        assert!(!fixture.workspace.join("src/allow.txt").exists());
+        Arc::try_unwrap(fixture.store)
+            .expect("store consumers released")
+            .close()
+            .await
+            .expect("close store");
+    }
+
+    #[tokio::test]
+    async fn g09_hook_timeout_blocks_not_allows() {
+        let fixture = undo_fixture().await;
+        #[cfg(windows)]
+        let wait_script = "$null = [Console]::In.ReadToEnd(); Start-Sleep -Seconds 5; exit 0";
+        #[cfg(not(windows))]
+        let wait_script = "cat >/dev/null; sleep 5; exit 0";
+        let tools =
+            harness_tools::ToolExecutionService::new(Arc::clone(&fixture.store)).with_hooks(vec![
+                hook("pre_tool_use", Some("write_file"), 1, wait_script),
+            ]);
+        let request = harness_tools::ToolRequest::new(
+            fixture.source_session.clone(),
+            fixture.task_id.clone(),
+            "hook.test",
+            &fixture.workspace,
+            CodingToolAction::WriteFile {
+                path: "src/timeout.txt".to_owned(),
+                content: "must stay absent".to_owned(),
+                expected_hash: None,
+            },
+        );
+        let options = TurnOptions {
+            workspace_root: fixture.workspace.clone(),
+            actor_id: "hook.test".to_owned(),
+            approvals: ApprovalMode::None,
+            limits: TurnLimits::default(),
+        };
+        let observer: Arc<dyn TurnObserver> = Arc::new(HookTestObserver::default());
+        let view = execute_action_with_approval(
+            &tools,
+            request,
+            &options,
+            2,
+            &observer,
+            &harness_providers::CancellationToken::new(),
+        )
+        .await
+        .expect("timeout is a fail-closed receipt");
+        assert!(
+            matches!(&view.output, ToolOutput::Denied { code, reason } if code == "blocked_by_hook" && reason.contains("timed out"))
+        );
+        assert!(!fixture.workspace.join("src/timeout.txt").exists());
+        drop(tools);
+        Arc::try_unwrap(fixture.store)
+            .expect("store consumers released")
+            .close()
+            .await
+            .expect("close store");
+    }
+
+    #[tokio::test]
+    async fn g09_post_tool_hook_failure_does_not_change_the_settled_receipt() {
+        let fixture = undo_fixture().await;
+        let mut channel = SessionChannel::new();
+        let gate = Arc::new(ChannelApprovalGate::new(
+            channel.sender(),
+            Duration::from_secs(3),
+        ));
+        let tools = harness_tools::ToolExecutionService::new(Arc::clone(&fixture.store))
+            .with_hooks(vec![hook(
+                "post_tool_use",
+                Some("write_file"),
+                5,
+                &hook_read_stdin_script("post hook failed", 2),
+            )]);
+        let request = harness_tools::ToolRequest::new(
+            fixture.source_session.clone(),
+            fixture.task_id.clone(),
+            "hook.test",
+            &fixture.workspace,
+            CodingToolAction::WriteFile {
+                path: "src/post-hook.txt".to_owned(),
+                content: "committed".to_owned(),
+                expected_hash: None,
+            },
+        );
+        let options = TurnOptions {
+            workspace_root: fixture.workspace.clone(),
+            actor_id: "hook.test".to_owned(),
+            approvals: ApprovalMode::Ask(Arc::clone(&gate) as Arc<dyn harness_tools::ApprovalGate>),
+            limits: TurnLimits::default(),
+        };
+        let observer = Arc::new(HookTestObserver::default());
+        let observer_trait: Arc<dyn TurnObserver> = observer.clone();
+        let execution = tokio::spawn(async move {
+            execute_action_with_approval(
+                &tools,
+                request,
+                &options,
+                2,
+                &observer_trait,
+                &harness_providers::CancellationToken::new(),
+            )
+            .await
+        });
+        let request_id = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if let Some(id) = channel.drain().into_iter().find_map(|event| match event {
+                    SessionEvent::ApprovalRequired { request_id, .. } => Some(request_id),
+                    _ => None,
+                }) {
+                    break id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("write waits at Ask");
+        assert!(gate.answer(&request_id, ApprovalDecision::Granted));
+        let view = execution
+            .await
+            .expect("tool task joined")
+            .expect("action settled");
+        assert_eq!(
+            view.receipt.expect("settled receipt").outcome_state,
+            harness_types::ToolOutcomeState::Settled
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.join("src/post-hook.txt"))
+                .expect("write committed"),
+            "committed"
+        );
+        assert!(observer.progress.lock().expect("observer entries").iter().any(|progress| matches!(progress, TurnProgress::Notice(message) if message.contains("post_tool_use hook") && message.contains("post hook failed"))));
+        Arc::try_unwrap(fixture.store)
+            .expect("store consumers released")
+            .close()
+            .await
+            .expect("close store");
+    }
+
+    #[tokio::test]
+    async fn g09_stop_hook_failure_is_notice_only() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                temp.path().join("data"),
+                harness_types::HostId::generate(),
+            ))
+            .await
+            .expect("store opens"),
+        );
+        let tools =
+            harness_tools::ToolExecutionService::new(Arc::clone(&store)).with_hooks(vec![hook(
+                "stop",
+                None,
+                5,
+                &hook_read_stdin_script("stop hook failed", 2),
+            )]);
+        let payload = serde_json::json!({"event":"stop", "cwd": temp.path()});
+        let notices = tools
+            .run_event_hooks("stop", payload, harness_providers::CancellationToken::new())
+            .await;
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].contains("stop hook") && notices[0].contains("stop hook failed"),
+            "{notices:?}"
+        );
+        drop(tools);
+        Arc::try_unwrap(store)
+            .expect("store consumers released")
+            .close()
+            .await
+            .expect("close store");
+    }
+
+    #[tokio::test]
+    async fn g09_hook_receives_bounded_json_without_secrets() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let host = HostEnvironment::from_process().with_values([(
+            "DEEPSEEK_API_KEY".to_owned(),
+            "sk-hook-fixture-secret".to_owned(),
+        )]);
+        let input = serde_json::json!({
+            "event": "pre_tool_use",
+            "tool": {"name": "write_file", "args": {"api_key": "[REDACTED]", "content": "x".repeat(7000)}},
+        }).to_string();
+        assert!(input.len() <= 8 * 1024);
+        let script = {
+            #[cfg(windows)]
+            {
+                "$payload = [Console]::In.ReadToEnd(); Write-Output $payload; if ($env:DEEPSEEK_API_KEY) { Write-Output $env:DEEPSEEK_API_KEY; exit 9 }; exit 0"
+            }
+            #[cfg(not(windows))]
+            {
+                "cat; if [ -n \"$DEEPSEEK_API_KEY\" ]; then printf '%s' \"$DEEPSEEK_API_KEY\"; exit 9; fi; exit 0"
+            }
+        };
+        let (command, args) = hook_process(script);
+        let result = harness_tools::run_hook_command_with_host(
+            temp.path(),
+            &command,
+            &args,
+            input.as_bytes(),
+            5000,
+            harness_providers::CancellationToken::new(),
+            &host,
+        )
+        .await
+        .expect("fixture process ran through harness-tools::process");
+        assert_eq!(result.exit_code, Some(0), "{}", result.stdout);
+        assert!(result.stdout.contains("pre_tool_use"));
+        assert!(!result.stdout.contains("sk-hook-fixture-secret"));
+        assert!(
+            harness_tools::run_hook_command_with_host(
+                temp.path(),
+                &command,
+                &args,
+                &vec![b'x'; 8 * 1024 + 1],
+                5000,
+                harness_providers::CancellationToken::new(),
+                &host,
+            )
+            .await
+            .is_err(),
+            "input beyond 8 KiB never spawns"
+        );
     }
 
     fn environment(pairs: &[(&str, &str)]) -> LaunchEnvironment {
@@ -2648,6 +3936,256 @@ mod tests {
             )])
             .collect::<Vec<_>>();
         (LaunchEnvironment::from_pairs(merged), directory)
+    }
+
+    async fn record_project_session(
+        store: &Arc<SqliteStore>,
+        workspace_root: &std::path::Path,
+        session_id: harness_types::SessionId,
+    ) {
+        let project_id = crate::interactive::project::resolve_project_id(store, workspace_root)
+            .await
+            .expect("project id");
+        let workspace = observe_workspace(project_id, workspace_root).expect("workspace snapshot");
+        SessionService::new(Arc::clone(store))
+            .admit_input(AdmitInputRequest {
+                session_id,
+                task_id: harness_types::TaskId::generate(),
+                input_id: InputId::generate(),
+                expected_sequence: 1,
+                authority: SourceAuthority::User,
+                raw_text: "session input".to_owned(),
+                workspace,
+                initial_plan_items: Vec::new(),
+            })
+            .await
+            .expect("session input admitted");
+    }
+
+    struct UndoFixture {
+        temp: tempfile::TempDir,
+        store: Arc<SqliteStore>,
+        workspace: PathBuf,
+        project_id: harness_types::ProjectId,
+        task_id: harness_types::TaskId,
+        source_session: harness_types::SessionId,
+        original_receipt: harness_types::ToolExecutionReceipt,
+    }
+
+    struct UndoContext {
+        workspace: PathBuf,
+        project_id: harness_types::ProjectId,
+        task_id: harness_types::TaskId,
+        source_session: harness_types::SessionId,
+        original_receipt: harness_types::ToolExecutionReceipt,
+    }
+
+    async fn undo_fixture() -> UndoFixture {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let workspace = temp.path().join("workspace");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(workspace.join("src")).expect("source directory");
+        std::fs::create_dir_all(&data_dir).expect("data directory");
+        std::fs::write(workspace.join("src").join("undo.txt"), "before\n").expect("original file");
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                data_dir,
+                harness_types::HostId::generate(),
+            ))
+            .await
+            .expect("project store"),
+        );
+        let project_id = crate::interactive::project::resolve_project_id(&store, &workspace)
+            .await
+            .expect("project id");
+        let task_id = harness_types::TaskId::generate();
+        let source_session = harness_types::SessionId::generate();
+        let observation =
+            observe_workspace(project_id.clone(), &workspace).expect("workspace snapshot");
+        SessionService::new(Arc::clone(&store))
+            .admit_input(AdmitInputRequest {
+                session_id: source_session.clone(),
+                task_id: task_id.clone(),
+                input_id: InputId::generate(),
+                expected_sequence: 1,
+                authority: SourceAuthority::User,
+                raw_text: "change a file".to_owned(),
+                workspace: observation,
+                initial_plan_items: Vec::new(),
+            })
+            .await
+            .expect("admit source turn");
+        let tools = harness_tools::ToolExecutionService::new(Arc::clone(&store));
+        let before_hash = observed_file_hash(&workspace, "src/undo.txt").expect("before hash");
+        let prepared = tools
+            .prepare(harness_tools::ToolRequest::new(
+                source_session.clone(),
+                task_id.clone(),
+                "undo.fixture",
+                &workspace,
+                harness_tools::CodingToolAction::WriteFile {
+                    path: "src/undo.txt".to_owned(),
+                    content: "after\n".to_owned(),
+                    expected_hash: Some(before_hash),
+                },
+            ))
+            .await
+            .expect("write proposal prepares");
+        let approval = tools
+            .approve(&prepared)
+            .await
+            .expect("test grants exact write");
+        tools
+            .execute_with_cancellation(
+                prepared,
+                Some(approval),
+                harness_providers::CancellationToken::new(),
+            )
+            .await
+            .expect("write settles");
+        let original_receipt = store
+            .load_receipts(&source_session)
+            .await
+            .expect("receipt list")
+            .into_iter()
+            .next()
+            .expect("write receipt");
+        drop(tools);
+        UndoFixture {
+            temp,
+            store,
+            workspace,
+            project_id,
+            task_id,
+            source_session,
+            original_receipt,
+        }
+    }
+
+    async fn reopen_undo_store(
+        temp: &tempfile::TempDir,
+        previous: Arc<SqliteStore>,
+    ) -> Arc<SqliteStore> {
+        Arc::try_unwrap(previous)
+            .expect("setup store released")
+            .close()
+            .await
+            .expect("close the source turn writer");
+        Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                temp.path().join("data"),
+                harness_types::HostId::generate(),
+            ))
+            .await
+            .expect("next turn opens a newer writer generation"),
+        )
+    }
+
+    async fn admit_undo_input(
+        fixture: &UndoContext,
+        store: &Arc<SqliteStore>,
+    ) -> (harness_types::SessionId, harness_tools::CodingToolAction) {
+        let action = latest_undo_action(
+            store,
+            &fixture.task_id,
+            &fixture.project_id,
+            &fixture.workspace,
+        )
+        .await
+        .expect("undo proposal");
+        let session_id = harness_types::SessionId::generate();
+        let workspace = observe_workspace(fixture.project_id.clone(), &fixture.workspace)
+            .expect("fresh workspace snapshot");
+        SessionService::new(Arc::clone(store))
+            .admit_input(AdmitInputRequest {
+                session_id: session_id.clone(),
+                task_id: fixture.task_id.clone(),
+                input_id: InputId::generate(),
+                expected_sequence: 1,
+                authority: SourceAuthority::User,
+                raw_text: "/undo".to_owned(),
+                workspace,
+                initial_plan_items: Vec::new(),
+            })
+            .await
+            .expect("admit the separate undo action input");
+        store
+            .record_continuation_link(&fixture.source_session, &session_id, &fixture.task_id)
+            .await
+            .expect("link undo turn");
+        (session_id, action)
+    }
+
+    struct UndoQuietObserver;
+
+    impl harness_tools::TurnObserver for UndoQuietObserver {
+        fn observe(&self, _progress: harness_tools::TurnProgress) {}
+    }
+
+    async fn run_undo_through_approval(
+        fixture: &UndoContext,
+        store: &Arc<SqliteStore>,
+        session_id: harness_types::SessionId,
+        action: harness_tools::CodingToolAction,
+    ) -> harness_tools::ToolExecutionView {
+        let mut channel = SessionChannel::new();
+        let gate = Arc::new(ChannelApprovalGate::new(
+            channel.sender(),
+            Duration::from_secs(3),
+        ));
+        let tools = harness_tools::ToolExecutionService::new(Arc::clone(store));
+        let observer: Arc<dyn harness_tools::TurnObserver> = Arc::new(UndoQuietObserver);
+        let options = harness_tools::TurnOptions {
+            workspace_root: fixture.workspace.clone(),
+            actor_id: "interactive.user".to_owned(),
+            approvals: harness_tools::ApprovalMode::Ask(Arc::clone(&gate) as Arc<dyn ApprovalGate>),
+            limits: harness_tools::TurnLimits::default(),
+        };
+        let tool_request = harness_tools::ToolRequest::new(
+            session_id,
+            fixture.task_id.clone(),
+            "interactive.user",
+            &fixture.workspace,
+            action,
+        );
+        let execution = tokio::spawn(async move {
+            execute_action_with_approval(
+                &tools,
+                tool_request,
+                &options,
+                1,
+                &observer,
+                &harness_providers::CancellationToken::new(),
+            )
+            .await
+        });
+        let request_id = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(request_id) =
+                    channel.drain().into_iter().find_map(|event| match event {
+                        SessionEvent::ApprovalRequired {
+                            request_id, action, ..
+                        } if action == "WriteFile" => Some(request_id),
+                        _ => None,
+                    })
+                {
+                    break request_id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("undo displays an approval panel");
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.join("src/undo.txt")).expect("still current"),
+            "after\n",
+            "undo does not mutate while its panel is waiting",
+        );
+        assert!(gate.answer(&request_id, ApprovalDecision::Granted));
+        execution
+            .await
+            .expect("undo task joined")
+            .expect("approval executes")
     }
 
     #[test]
@@ -2773,6 +4311,355 @@ mod tests {
             service.project_id().as_deref(),
             Some(registered.as_str()),
             "a second ask answers from the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn g08_rename_persists_and_shows_in_the_picker() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&project).expect("project");
+        let environment =
+            LaunchEnvironment::from_pairs([("HA_HOME", home.to_string_lossy().into_owned())]);
+        let context = bootstrap::resolve(LaunchRequest {
+            cwd: None,
+            caller_dir: project,
+            platform: HostPlatform::current(),
+            environment: environment.clone(),
+            explicit_data_dir: None,
+        })
+        .expect("launch context");
+        let mut channel = SessionChannel::new();
+        let mut service = AgentSessionService::new(&context, environment, channel.sender());
+        let task_id = service.task_id.clone();
+        let session_id = harness_types::SessionId::generate();
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                context.project_store_dir(),
+                harness_types::HostId::generate(),
+            ))
+            .await
+            .expect("project store"),
+        );
+        let project_id =
+            crate::interactive::project::resolve_project_id(&store, &context.project.root)
+                .await
+                .expect("project id");
+        let workspace =
+            observe_workspace(project_id, &context.project.root).expect("workspace snapshot");
+        SessionService::new(Arc::clone(&store))
+            .admit_input(AdmitInputRequest {
+                session_id,
+                task_id,
+                input_id: InputId::generate(),
+                expected_sequence: 1,
+                authority: SourceAuthority::User,
+                raw_text: "start a named session".to_owned(),
+                workspace,
+                initial_plan_items: Vec::new(),
+            })
+            .await
+            .expect("admit a session for the picker");
+        Arc::try_unwrap(store)
+            .expect("setup store consumers released")
+            .close()
+            .await
+            .expect("close setup store");
+
+        service
+            .rename("CP-C review")
+            .expect("rename schedules persistence");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if channel.drain().iter().any(|event| matches!(
+                    event, SessionEvent::Notice { message } if message.contains("renamed to CP-C review")
+                )) { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("rename completed");
+        service.list_sessions();
+        let sessions = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(sessions) = channel.drain().into_iter().find_map(|event| {
+                    if let SessionEvent::SessionsListed { sessions } = event {
+                        Some(sessions)
+                    } else {
+                        None
+                    }
+                }) {
+                    break sessions;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("picker list arrived");
+        assert_eq!(sessions.len(), 1);
+        assert!(
+            sessions[0].detail.contains("CP-C review"),
+            "{}",
+            sessions[0].detail
+        );
+    }
+
+    #[tokio::test]
+    async fn g09_hooks_overlay_lists_event_matcher_and_source() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&project).expect("project");
+        let environment =
+            LaunchEnvironment::from_pairs([("HA_HOME", home.to_string_lossy().into_owned())]);
+        let context = bootstrap::resolve(LaunchRequest {
+            cwd: None,
+            caller_dir: project,
+            platform: HostPlatform::current(),
+            environment: environment.clone(),
+            explicit_data_dir: None,
+        })
+        .expect("launch context");
+        std::fs::create_dir_all(context.paths.config_file.parent().expect("config parent"))
+            .expect("config directory");
+        std::fs::write(
+            &context.paths.config_file,
+            "schema_version = 2\n[[hooks.pre_tool_use]]\nmatcher = 'write_file|edit_file'\ncommand = 'check-hook'\ntimeout_seconds = 2\n",
+        ).expect("trusted user config");
+        let channel = SessionChannel::new();
+        let service = AgentSessionService::new(&context, environment, channel.sender());
+
+        let lines = service.hooks_summary();
+
+        assert!(
+            lines.iter().any(|line| line.contains("pre_tool_use")
+                && line.contains("write_file|edit_file")
+                && line.contains("source=user")),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn g08_export_contains_no_credential_values() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let workspace_root = temp.path().join("workspace");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&workspace_root).expect("workspace");
+        std::fs::create_dir_all(&data_dir).expect("data directory");
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                data_dir.clone(),
+                harness_types::HostId::generate(),
+            ))
+            .await
+            .expect("project store"),
+        );
+        let session_id = harness_types::SessionId::generate();
+        let task_id = harness_types::TaskId::generate();
+        let workspace = observe_workspace(harness_types::ProjectId::generate(), &workspace_root)
+            .expect("workspace snapshot");
+        SessionService::new(Arc::clone(&store))
+            .admit_input(AdmitInputRequest {
+                session_id,
+                task_id: task_id.clone(),
+                input_id: InputId::generate(),
+                expected_sequence: 1,
+                authority: SourceAuthority::User,
+                raw_text: "remember sk-fixture-export-secret for later".to_owned(),
+                workspace,
+                initial_plan_items: Vec::new(),
+            })
+            .await
+            .expect("admit transcript text");
+        let environment =
+            LaunchEnvironment::from_pairs([("DEEPSEEK_API_KEY", "sk-fixture-export-secret")]);
+
+        let exported = render_session_export(
+            &store,
+            &task_id,
+            &environment,
+            &data_dir,
+            "DEEPSEEK_API_KEY",
+            true,
+        )
+        .await
+        .expect("export is built");
+
+        assert!(!exported.contains("sk-fixture-export-secret"), "{exported}");
+        assert!(exported.contains("[REDACTED]"), "{exported}");
+        for line in exported.lines() {
+            serde_json::from_str::<serde_json::Value>(line).expect("JSONL line stays valid JSON");
+        }
+        Arc::try_unwrap(store)
+            .expect("store consumers released")
+            .close()
+            .await
+            .expect("close store");
+    }
+
+    #[tokio::test]
+    async fn g08_undo_restores_only_files_whose_hash_is_unchanged() {
+        let fixture = undo_fixture().await;
+        let store = &fixture.store;
+        let action = latest_undo_action(
+            store,
+            &fixture.task_id,
+            &fixture.project_id,
+            &fixture.workspace,
+        )
+        .await
+        .expect("unchanged file produces an undo proposal");
+        let harness_tools::CodingToolAction::WriteFile {
+            path,
+            content,
+            expected_hash,
+        } = action
+        else {
+            panic!("undo must use the normal write_file action");
+        };
+        assert_eq!(path, "src/undo.txt");
+        assert_eq!(content, "before\n");
+        assert_eq!(expected_hash, fixture.original_receipt.after_hash);
+
+        std::fs::write(fixture.workspace.join(&path), "newer manual edit\n").expect("new edit");
+        let stale = latest_undo_action(
+            store,
+            &fixture.task_id,
+            &fixture.project_id,
+            &fixture.workspace,
+        )
+        .await
+        .expect_err("changed file is refused before approval");
+
+        assert!(stale.contains("current hash differs"), "{stale}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.join(path)).expect("current file"),
+            "newer manual edit\n"
+        );
+        Arc::try_unwrap(fixture.store)
+            .expect("store consumers released")
+            .close()
+            .await
+            .expect("close store");
+    }
+
+    #[tokio::test]
+    async fn g08_undo_is_an_approved_action_with_its_own_receipt() {
+        let UndoFixture {
+            temp,
+            store: previous_store,
+            workspace,
+            project_id,
+            task_id,
+            source_session,
+            original_receipt,
+        } = undo_fixture().await;
+        let store = reopen_undo_store(&temp, previous_store).await;
+        let fixture = UndoContext {
+            workspace,
+            project_id,
+            task_id,
+            source_session,
+            original_receipt,
+        };
+        let (undo_session, action) = admit_undo_input(&fixture, &store).await;
+        let view = run_undo_through_approval(&fixture, &store, undo_session.clone(), action).await;
+        let undo_receipt = view.receipt.expect("undo's own receipt");
+        assert_ne!(
+            undo_receipt.tool_execution_id,
+            fixture.original_receipt.tool_execution_id
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.join("src/undo.txt")).expect("restored"),
+            "before\n",
+        );
+        assert_eq!(
+            store
+                .load_receipts(&undo_session)
+                .await
+                .expect("undo receipt list")
+                .len(),
+            1
+        );
+        Arc::try_unwrap(store)
+            .expect("store consumers released")
+            .close()
+            .await
+            .expect("close store");
+    }
+
+    #[tokio::test]
+    async fn g08_continue_picks_the_newest_session_of_this_project_only() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let home = temp.path().join("home");
+        let project_a = temp.path().join("project-a");
+        let project_b = temp.path().join("project-b");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&project_a).expect("project A");
+        std::fs::create_dir_all(&project_b).expect("project B");
+        let environment =
+            LaunchEnvironment::from_pairs([("HA_HOME", home.to_string_lossy().into_owned())]);
+        let context_a = bootstrap::resolve(LaunchRequest {
+            cwd: None,
+            caller_dir: project_a.clone(),
+            platform: HostPlatform::current(),
+            environment: environment.clone(),
+            explicit_data_dir: None,
+        })
+        .expect("project A context");
+        let context_b = bootstrap::resolve(LaunchRequest {
+            cwd: None,
+            caller_dir: project_b.clone(),
+            platform: HostPlatform::current(),
+            environment: environment.clone(),
+            explicit_data_dir: None,
+        })
+        .expect("project B context");
+        let channel = SessionChannel::new();
+        let service_a = AgentSessionService::new(&context_a, environment.clone(), channel.sender());
+        let store_a = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                context_a.project_store_dir(),
+                harness_types::HostId::generate(),
+            ))
+            .await
+            .expect("project A store"),
+        );
+        let oldest = harness_types::SessionId::generate();
+        record_project_session(&store_a, &project_a, oldest).await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let newest = harness_types::SessionId::generate();
+        record_project_session(&store_a, &project_a, newest.clone()).await;
+        Arc::try_unwrap(store_a)
+            .expect("project A store consumers released")
+            .close()
+            .await
+            .expect("close project A store");
+
+        let store_b = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                context_b.project_store_dir(),
+                harness_types::HostId::generate(),
+            ))
+            .await
+            .expect("project B store"),
+        );
+        let foreign = harness_types::SessionId::generate();
+        record_project_session(&store_b, &project_b, foreign.clone()).await;
+        Arc::try_unwrap(store_b)
+            .expect("project B store consumers released")
+            .close()
+            .await
+            .expect("close project B store");
+
+        assert_eq!(
+            service_a.newest_project_session().expect("continue lookup"),
+            newest
+        );
+        assert_ne!(
+            service_a.newest_project_session().expect("repeat lookup"),
+            foreign
         );
     }
 

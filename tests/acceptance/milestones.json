@@ -476,7 +476,10 @@
           "tests": [
             "a12_compaction_cas",
             "m5_02_compaction_tail_carries_pairs_not_orphans",
-            "a19_summary_failure_falls_back_to_the_mandatory_state"
+            "a19_summary_failure_falls_back_to_the_mandatory_state",
+            "g07_compact_uses_the_model_and_records_the_source",
+            "g07_compact_falls_back_when_the_provider_fails",
+            "g07_auto_compaction_triggers_at_threshold_and_never_loops"
           ]
         },
         {
@@ -496,7 +499,8 @@
           "tests": [
             "a20_source_scope_fork",
             "m5_04_fork_policy_can_only_narrow",
-            "a21_rollback_effects"
+            "a21_rollback_effects",
+            "g08_diff_since_session_start_uses_the_recorded_base"
           ]
         }
       ],
@@ -506,11 +510,15 @@
         "a12_compaction_cas",
         "m5_02_compaction_tail_carries_pairs_not_orphans",
         "a19_summary_failure_falls_back_to_the_mandatory_state",
+        "g07_compact_uses_the_model_and_records_the_source",
+        "g07_compact_falls_back_when_the_provider_fails",
+        "g07_auto_compaction_triggers_at_threshold_and_never_loops",
         "m5_03_index_rebuild_is_identical_and_scope_is_a_filter",
         "m5_03_notes_are_revision_checked_model_reports",
         "a18_history_after_compaction",
         "a20_source_scope_fork",
         "m5_04_fork_policy_can_only_narrow",
+        "g08_diff_since_session_start_uses_the_recorded_base",
         "a21_rollback_effects"
       ],
       "unit_tests": [],

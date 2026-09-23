@@ -131,7 +131,7 @@ mod tests {
         let text = plain_text(&rows(&state("/at", 0), &Theme::plain()));
         assert!(text.contains("/attach <path>"), "{text}");
         assert_eq!(
-            plain_text(&rows(&state("/re", 0), &Theme::plain())).trim_start_matches("❯ "),
+            plain_text(&rows(&state("/res", 0), &Theme::plain())).trim_start_matches("❯ "),
             format!(
                 "{:<NAME_COLUMN$}{}",
                 "/resume <id>", "resume a persisted session"

@@ -89,6 +89,18 @@ pub trait TuiRenderer {
     fn draw_state(&mut self, state: &UiState) -> io::Result<()>;
     /// Push one finished history entry into the scrollback above the viewport.
     fn insert_history(&mut self, item: &HistoryItem) -> io::Result<()>;
+    /// Clear only the inline viewport; terminal scrollback remains intact.
+    fn clear_viewport(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    /// Write plain assistant text to the OS clipboard.
+    fn copy_text(&mut self, _text: &str) -> io::Result<()> {
+        Ok(())
+    }
+    /// Emit the configured terminal bell.
+    fn bell(&mut self) -> io::Result<()> {
+        Ok(())
+    }
     /// Erase the viewport footprint and leave the cursor on a fresh line.
     fn finish(&mut self) -> io::Result<()>;
 }
@@ -174,6 +186,10 @@ where
             .map_err(to_io)
     }
 
+    fn clear_viewport(&mut self) -> io::Result<()> {
+        self.terminal.clear().map_err(to_io)
+    }
+
     fn finish(&mut self) -> io::Result<()> {
         // Measured in Windows Terminal (T01): the viewport moves as rows are
         // inserted, so the rows it left behind are only erased by painting them
@@ -244,6 +260,23 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
         self.inner.insert_history(item)
     }
 
+    fn clear_viewport(&mut self) -> io::Result<()> {
+        self.inner.clear_viewport()
+    }
+
+    fn copy_text(&mut self, text: &str) -> io::Result<()> {
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|error| io::Error::other(error.to_string()))?;
+        clipboard
+            .set_text(text.to_owned())
+            .map_err(|error| io::Error::other(error.to_string()))
+    }
+
+    fn bell(&mut self) -> io::Result<()> {
+        self.backend.write("\x07")?;
+        self.backend.flush()
+    }
+
     fn finish(&mut self) -> io::Result<()> {
         self.inner.finish()?;
         // Leave the cursor at column zero of a fresh line, so the shell prompt
@@ -260,6 +293,8 @@ pub struct ScriptedRenderer<T: TerminalBackend> {
     backend: T,
     inner: RealRenderer<ratatui::backend::TestBackend>,
     painted: Vec<String>,
+    copied: Vec<String>,
+    bells: usize,
 }
 
 impl<T: TerminalBackend> ScriptedRenderer<T> {
@@ -274,6 +309,8 @@ impl<T: TerminalBackend> ScriptedRenderer<T> {
             backend,
             inner: RealRenderer::open(test)?,
             painted: Vec::new(),
+            copied: Vec::new(),
+            bells: 0,
         })
     }
 
@@ -282,6 +319,18 @@ impl<T: TerminalBackend> ScriptedRenderer<T> {
     #[must_use]
     pub fn painted(&self) -> &[String] {
         &self.painted
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn copied(&self) -> &[String] {
+        &self.copied
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub const fn bells(&self) -> usize {
+        self.bells
     }
 
     /// The host backend, so a test can read what the loop wrote.
@@ -347,6 +396,21 @@ impl<T: TerminalBackend> TuiRenderer for ScriptedRenderer<T> {
             self.backend.write("\r\n")?;
         }
         self.backend.flush()?;
+        Ok(())
+    }
+
+    fn clear_viewport(&mut self) -> io::Result<()> {
+        self.inner.clear_viewport()?;
+        self.mirror()
+    }
+
+    fn copy_text(&mut self, text: &str) -> io::Result<()> {
+        self.copied.push(text.to_owned());
+        Ok(())
+    }
+
+    fn bell(&mut self) -> io::Result<()> {
+        self.bells += 1;
         Ok(())
     }
 
@@ -478,6 +542,20 @@ fn apply(renderer: &mut impl TuiRenderer, effects: Vec<Effect>) -> Result<Step, 
             Effect::Thinking(text) => renderer
                 .insert_history(&HistoryItem::Thinking { text })
                 .map_err(|error| terminal_error(&error))?,
+            Effect::Copy(text) => {
+                renderer
+                    .copy_text(&text)
+                    .map_err(|error| terminal_error(&error))?;
+                renderer
+                    .insert_history(&HistoryItem::Notice {
+                        message: "assistant answer copied to clipboard".to_owned(),
+                    })
+                    .map_err(|error| terminal_error(&error))?;
+            }
+            Effect::Bell => renderer.bell().map_err(|error| terminal_error(&error))?,
+            Effect::ClearViewport => renderer
+                .clear_viewport()
+                .map_err(|error| terminal_error(&error))?,
             Effect::Redraw => {}
             Effect::Exit(code) => {
                 renderer.finish().map_err(|error| terminal_error(&error))?;
@@ -502,6 +580,7 @@ mod tests {
     use super::{
         MAX_VIEWPORT_ROWS, MIN_VIEWPORT_ROWS, ScriptedRenderer, TuiRenderer, viewport_rows,
     };
+    use crate::interactive::controller::Effect;
     use crate::interactive::events::{AppPhase, HistoryItem, Key, UiState};
     use crate::interactive::terminal::ScriptedBackend;
     use std::io;
@@ -673,6 +752,27 @@ mod tests {
             !painted.contains("đang trả lời"),
             "the live block yields the upper region to the panel: {painted}"
         );
+    }
+
+    #[test]
+    fn g08_copy_uses_the_scripted_clipboard_boundary() {
+        let backend = ScriptedBackend::new(Vec::new());
+        let mut renderer = ScriptedRenderer::open(backend, 80, 24).expect("renderer opens");
+
+        super::apply(&mut renderer, vec![Effect::Copy("answer text".to_owned())])
+            .expect("copy effect applies");
+
+        assert_eq!(renderer.copied(), ["answer text"]);
+    }
+
+    #[test]
+    fn g09_bell_effect_reaches_the_testbackend_renderer() {
+        let backend = ScriptedBackend::new(Vec::new());
+        let mut renderer = ScriptedRenderer::open(backend, 80, 24).expect("renderer opens");
+
+        super::apply(&mut renderer, vec![Effect::Bell]).expect("bell effect applies");
+
+        assert_eq!(renderer.bells(), 1);
     }
 
     #[test]
@@ -1049,6 +1149,7 @@ mod tests {
         let _ = controller.handle_key(Key::Char('/'));
         let _ = controller.handle_key(Key::Char('r'));
         let _ = controller.handle_key(Key::Char('e'));
+        let _ = controller.handle_key(Key::Char('s'));
         renderer
             .draw_state(&controller.ui_state())
             .expect("frame draws");

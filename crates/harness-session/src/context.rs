@@ -307,6 +307,17 @@ pub struct ContextBuildResult {
     pub mandatory_tokens: u64,
     pub optional_tokens: u64,
     pub degradation: Option<String>,
+    /// Per-block accounting for inspection surfaces such as `/context`.
+    pub block_usage: Vec<ContextBlockUsage>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextBlockUsage {
+    pub block_id: String,
+    pub channel: ContextChannel,
+    pub token_estimate: u64,
+    pub included: bool,
+    pub drop_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -485,13 +496,30 @@ impl ContextBuilder {
             .flat_map(|block| block.supersedes.iter().cloned())
             .collect::<std::collections::BTreeSet<_>>();
         let mut superseded_block_ids = Vec::new();
+        let mut block_usage = Vec::new();
         mandatory.retain(|block| {
             let replaced = superseded_ids.contains(&block.id);
             if replaced {
                 superseded_block_ids.push(block.id.clone());
+                block_usage.push(ContextBlockUsage {
+                    block_id: block.id.clone(),
+                    channel: block.channel,
+                    token_estimate: estimate_bytes(render_block(block).len()),
+                    included: false,
+                    drop_reason: Some("superseded by a newer block".to_owned()),
+                });
             }
             !replaced
         });
+        for block in &mandatory {
+            block_usage.push(ContextBlockUsage {
+                block_id: block.id.clone(),
+                channel: block.channel,
+                token_estimate: estimate_bytes(render_block(block).len()),
+                included: true,
+                drop_reason: None,
+            });
+        }
 
         let mut content = mandatory
             .iter()
@@ -516,7 +544,21 @@ impl ContextBuilder {
                 block.mandatory = false;
             }
         }
-        optional.retain(|block| !superseded_ids.contains(&block.id));
+        optional.retain(|block| {
+            if superseded_ids.contains(&block.id) {
+                superseded_block_ids.push(block.id.clone());
+                block_usage.push(ContextBlockUsage {
+                    block_id: block.id.clone(),
+                    channel: block.channel,
+                    token_estimate: estimate_bytes(render_block(block).len()),
+                    included: false,
+                    drop_reason: Some("superseded by a newer block".to_owned()),
+                });
+                false
+            } else {
+                true
+            }
+        });
         optional.sort_by(|left, right| {
             right
                 .relevance
@@ -542,8 +584,22 @@ impl ContextBuilder {
                 optional_tokens = candidate_optional_tokens;
                 content.push_str("\n\n");
                 content.push_str(&rendered);
+                block_usage.push(ContextBlockUsage {
+                    block_id: block.id.clone(),
+                    channel: block.channel,
+                    token_estimate: estimate_bytes(rendered.len()),
+                    included: true,
+                    drop_reason: None,
+                });
                 optional_kept.push(block);
             } else {
+                block_usage.push(ContextBlockUsage {
+                    block_id: block.id.clone(),
+                    channel: block.channel,
+                    token_estimate: estimate_bytes(rendered.len()),
+                    included: false,
+                    drop_reason: Some("optional token budget".to_owned()),
+                });
                 omitted_optional.push(block.id);
             }
         }
@@ -606,6 +662,7 @@ impl ContextBuilder {
         packet.validate().map_err(|error| {
             ContextError::new(error.code(), format!("context packet is invalid: {error}"))
         })?;
+        block_usage.sort_by(|left, right| left.block_id.cmp(&right.block_id));
         let degradation =
             (!omitted_optional.is_empty()).then(|| "optional_context_omitted".to_owned());
         Ok(ContextBuildResult {
@@ -618,6 +675,7 @@ impl ContextBuilder {
             mandatory_tokens,
             optional_tokens,
             degradation,
+            block_usage,
         })
     }
 }

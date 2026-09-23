@@ -647,7 +647,7 @@ pub struct HarnessConfigV2 {
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
-    pub hooks: BTreeMap<String, serde_json::Value>,
+    pub hooks: BTreeMap<String, Vec<HookConfigV2>>,
     #[serde(default)]
     pub ui: Option<UiConfigV2>,
     #[serde(default)]
@@ -670,6 +670,54 @@ impl HarnessConfigV2 {
         }
         for model in self.models.values() {
             model.validate()?;
+        }
+        for (event, hooks) in &self.hooks {
+            if !matches!(
+                event.as_str(),
+                "pre_tool_use" | "post_tool_use" | "stop" | "notification"
+            ) {
+                return Err(HarnessError::new(
+                    ErrorCode::ConfigParseError,
+                    format!("unsupported hook event {event:?}"),
+                ));
+            }
+            for hook in hooks {
+                hook.validate(event)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookConfigV2 {
+    #[serde(default)]
+    pub matcher: Option<String>,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+}
+
+impl HookConfigV2 {
+    fn validate(&self, event: &str) -> Result<(), HarnessError> {
+        if self.command.trim().is_empty()
+            || self
+                .timeout_seconds
+                .is_some_and(|timeout| timeout == 0 || timeout > 60)
+            || self.args.len() > 64
+            || self.args.iter().any(|arg| arg.len() > 4096)
+            || self
+                .matcher
+                .as_deref()
+                .is_some_and(|matcher| matcher.trim().is_empty())
+        {
+            return Err(HarnessError::new(
+                ErrorCode::ConfigParseError,
+                format!("hooks.{event} command, matcher, args, or timeout is out of bounds"),
+            ));
         }
         Ok(())
     }
@@ -738,9 +786,10 @@ pub struct ModelConfigV2 {
 
 impl ModelConfigV2 {
     fn validate(&self) -> Result<(), HarnessError> {
-        if self
-            .input_price_per_mtok
-            .is_some_and(|price| !price.is_finite() || price < 0.0)
+        if self.context_window.is_some_and(|window| window == 0)
+            || self
+                .input_price_per_mtok
+                .is_some_and(|price| !price.is_finite() || price < 0.0)
             || self
                 .output_price_per_mtok
                 .is_some_and(|price| !price.is_finite() || price < 0.0)
@@ -791,6 +840,10 @@ pub struct UiConfigV2 {
     pub renderer: Option<String>,
     #[serde(default)]
     pub color: Option<String>,
+    #[serde(default)]
+    pub bell: Option<bool>,
+    #[serde(default)]
+    pub notify_command: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

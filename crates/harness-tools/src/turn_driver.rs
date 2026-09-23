@@ -28,9 +28,9 @@ use harness_types::{ErrorCode, HarnessError, QuestionId};
 use serde_json::{Value, json};
 
 use crate::{
-    AskUserInput, CodingToolAction, Decision, GIT_LOG_DEFAULT_LIMIT, HISTORY_SEARCH_DEFAULT_LIMIT,
-    PreparedToolRequest, ToolExecutionService, ToolExecutionView, ToolOutput, ToolRequest,
-    coding_tool_names, tool_pattern_for_action,
+    ApprovalGrant, AskUserInput, CodingToolAction, Decision, GIT_LOG_DEFAULT_LIMIT,
+    HISTORY_SEARCH_DEFAULT_LIMIT, PreparedToolRequest, ToolExecutionService, ToolExecutionView,
+    ToolOutput, ToolRequest, coding_tool_names, tool_pattern_for_action,
 };
 
 /// Limits that bound one user turn.
@@ -80,6 +80,8 @@ pub enum TurnProgress {
     /// An action ran without opening the approval panel; this reason is part of
     /// the user-visible transcript.
     Info(String),
+    /// A non-fatal host condition the user should know about.
+    Notice(String),
 }
 
 /// Receives progress; the interactive service maps it to display events.
@@ -415,8 +417,13 @@ impl TurnDriver {
         observer: Arc<dyn TurnObserver>,
         cancellation: CancellationToken,
     ) -> Result<TurnOutcome, HarnessError> {
-        self.run_turn_inner(None, request, options, observer, cancellation)
-            .await
+        let hook_observer = Arc::clone(&observer);
+        let outcome =
+            Box::pin(self.run_turn_inner(None, request, options, observer, cancellation.clone()))
+                .await?;
+        self.run_stop_hooks(&outcome, &hook_observer, cancellation)
+            .await;
+        Ok(outcome)
     }
 
     /// Run one user turn that continues a previous session.
@@ -432,14 +439,43 @@ impl TurnDriver {
         observer: Arc<dyn TurnObserver>,
         cancellation: CancellationToken,
     ) -> Result<TurnOutcome, HarnessError> {
-        self.run_turn_inner(
+        let hook_observer = Arc::clone(&observer);
+        let outcome = Box::pin(self.run_turn_inner(
             Some(source_session_id),
             request,
             options,
             observer,
-            cancellation,
-        )
-        .await
+            cancellation.clone(),
+        ))
+        .await?;
+        self.run_stop_hooks(&outcome, &hook_observer, cancellation)
+            .await;
+        Ok(outcome)
+    }
+
+    async fn run_stop_hooks(
+        &self,
+        outcome: &TurnOutcome,
+        observer: &Arc<dyn TurnObserver>,
+        cancellation: CancellationToken,
+    ) {
+        let notices = self
+            .tools
+            .run_event_hooks(
+                "stop",
+                json!({
+                    "event": "stop",
+                    "session_id": outcome.session_id.as_str(),
+                    "task_id": outcome.task_id.as_str(),
+                    "stop": outcome.stop.as_str(),
+                    "tool_calls": outcome.tool_calls,
+                }),
+                cancellation,
+            )
+            .await;
+        for notice in notices {
+            observer.observe(TurnProgress::Notice(notice));
+        }
     }
 
     // The turn is one bounded pass per model call, wrapped in a goal loop that
@@ -498,6 +534,9 @@ impl TurnDriver {
 
         // The loop yields why it stopped, so no bound can silently fall through.
         let stop = 'turn: loop {
+            for notice in std::mem::take(&mut result.notices) {
+                observer.observe(TurnProgress::Notice(notice));
+            }
             // A06: a stream that never reached a terminal marker is not a
             // completed answer. It is reported, but nothing may execute and the
             // turn is not accepted. A terminal response whose call is malformed
@@ -799,6 +838,22 @@ impl TurnDriver {
                     continue;
                 }
                 if name == "ask_user" {
+                    for notice in self
+                        .tools
+                        .run_event_hooks(
+                            "notification",
+                            json!({
+                                "event": "notification",
+                                "notification": "ask_user",
+                                "session_id": result.session_id.as_str(),
+                                "task_id": result.task_id.as_str(),
+                            }),
+                            cancellation.clone(),
+                        )
+                        .await
+                    {
+                        observer.observe(TurnProgress::Notice(notice));
+                    }
                     match self.ask_user(&result, &call).await {
                         Ok(question_id) => {
                             pending_question = Some(question_id);
@@ -835,10 +890,16 @@ impl TurnDriver {
                     .await
                 {
                     Ok(view) => {
+                        let blocked = match &view.output {
+                            ToolOutput::Denied { code, reason } => {
+                                Some(format!("{code}: {reason}"))
+                            }
+                            _ => None,
+                        };
                         observer.observe(TurnProgress::ToolSettled {
                             name: name.clone(),
-                            ok: true,
-                            detail: None,
+                            ok: blocked.is_none(),
+                            detail: blocked,
                         });
                         appended.push(ProviderMessage::tool_result(
                             call.call_id.clone(),
@@ -1123,36 +1184,97 @@ pub async fn execute_action_with_approval(
         },
         (decision, _) => decision,
     };
+    if matches!(&decision, Decision::Blocked(_) | Decision::Deny(_)) {
+        return tools
+            .execute_with_cancellation(prepared, None, cancellation.clone())
+            .await;
+    }
+    if let Some(reason) = tools.run_pre_tool_hooks(&prepared, cancellation).await {
+        observer.observe(TurnProgress::Notice(format!("blocked by hook: {reason}")));
+        return tools.record_hook_block(&prepared, &reason).await;
+    }
+    notify_action_approval_required(tools, &prepared, &decision, observer, cancellation).await;
+    let (approval, granted_gate) =
+        resolve_action_approval(tools, &prepared, decision, options, sequence, observer).await?;
+    let execution = tools
+        .execute_with_cancellation(prepared.clone(), approval, cancellation.clone())
+        .await;
+    if let Some((gate, request_id)) = granted_gate {
+        gate.action_completed(&request_id);
+    }
+    if execution.is_ok() {
+        run_post_tool_hooks(tools, &prepared, observer, cancellation).await;
+    }
+    execution
+}
+
+async fn notify_action_approval_required(
+    tools: &ToolExecutionService,
+    prepared: &PreparedToolRequest,
+    decision: &Decision,
+    observer: &Arc<dyn TurnObserver>,
+    cancellation: &CancellationToken,
+) {
+    if matches!(decision, Decision::Ask) {
+        for notice in tools
+            .run_event_hooks(
+                "notification",
+                json!({
+                    "event": "notification",
+                    "notification": "approval_required",
+                    "session_id": prepared.request.session_id.as_str(),
+                    "task_id": prepared.request.task_id.as_str(),
+                    "cwd": prepared.workspace_root_text,
+                    "tool": {"name": prepared.final_action.kind().as_str()},
+                }),
+                cancellation.clone(),
+            )
+            .await
+        {
+            observer.observe(TurnProgress::Notice(notice));
+        }
+    }
+}
+
+async fn resolve_action_approval(
+    tools: &ToolExecutionService,
+    prepared: &PreparedToolRequest,
+    decision: Decision,
+    options: &TurnOptions,
+    sequence: u32,
+    observer: &Arc<dyn TurnObserver>,
+) -> Result<
+    (
+        Option<ApprovalGrant>,
+        Option<(Arc<dyn ApprovalGate>, String)>,
+    ),
+    HarnessError,
+> {
     let mut granted_gate = None;
     let approval = match decision {
-        Decision::Blocked(_) | Decision::Deny(_) => {
-            return tools
-                .execute_with_cancellation(prepared, None, cancellation.clone())
-                .await;
-        }
+        Decision::Blocked(_) | Decision::Deny(_) => unreachable!("handled before hooks"),
         Decision::Allow { reason } => {
             observer.observe(TurnProgress::Info(format!(
                 "allowed by {reason}: {}",
                 summarize_action(prepared.action())
             )));
-            Some(tools.approve(&prepared).await?)
+            Some(tools.approve(prepared).await?)
         }
         Decision::Ask => match &options.approvals {
-            // An explicit fixture approval was translated into Decision::Allow.
             ApprovalMode::Auto => unreachable!("auto is an allow decision"),
             ApprovalMode::None => None,
             ApprovalMode::Ask(gate) => {
                 let proposal = proposal_for(
                     sequence,
-                    &prepared,
+                    prepared,
                     &options.workspace_root,
-                    ToolExecutionService::approval_diff(&prepared)?,
+                    ToolExecutionService::approval_diff(prepared)?,
                 );
                 let request_id = proposal.request_id.clone();
                 match gate.request(proposal).await {
                     ApprovalAnswer::Granted => {
                         granted_gate = Some((Arc::clone(gate), request_id));
-                        Some(tools.approve(&prepared).await?)
+                        Some(tools.approve(prepared).await?)
                     }
                     ApprovalAnswer::Denied => {
                         return Err(HarnessError::new(
@@ -1170,13 +1292,31 @@ pub async fn execute_action_with_approval(
             }
         },
     };
-    let execution = tools
-        .execute_with_cancellation(prepared, approval, cancellation.clone())
-        .await;
-    if let Some((gate, request_id)) = granted_gate {
-        gate.action_completed(&request_id);
+    Ok((approval, granted_gate))
+}
+
+async fn run_post_tool_hooks(
+    tools: &ToolExecutionService,
+    prepared: &PreparedToolRequest,
+    observer: &Arc<dyn TurnObserver>,
+    cancellation: &CancellationToken,
+) {
+    let payload = json!({
+        "event": "post_tool_use",
+        "session_id": prepared.request.session_id.as_str(),
+        "task_id": prepared.request.task_id.as_str(),
+        "cwd": prepared.workspace_root_text,
+        "tool": {
+            "name": prepared.final_action.kind().as_str(),
+            "args_digest": prepared.action_hash.as_str(),
+        },
+    });
+    for notice in tools
+        .run_event_hooks("post_tool_use", payload, cancellation.clone())
+        .await
+    {
+        observer.observe(TurnProgress::Notice(notice));
     }
-    execution
 }
 
 /// Build the proposal the user answers.

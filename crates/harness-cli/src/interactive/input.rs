@@ -752,7 +752,7 @@ impl LineEditor {
 /// This table is the **one** source for both: [`crate::interactive::view::help_lines`]
 /// builds the reference page from it and the menu draws its rows from it, so the
 /// list a user sees while typing cannot drift from the list `/help` promises.
-pub const SLASH_COMMANDS: [SlashCommand; 17] = [
+pub const SLASH_COMMANDS: [SlashCommand; 26] = [
     SlashCommand {
         name: "/help",
         arguments: "",
@@ -807,6 +807,51 @@ pub const SLASH_COMMANDS: [SlashCommand; 17] = [
         name: "/cost",
         arguments: "",
         summary: "show the session cost from configured model prices",
+    },
+    SlashCommand {
+        name: "/hooks",
+        arguments: "",
+        summary: "list trusted hook commands and their configuration source",
+    },
+    SlashCommand {
+        name: "/clear",
+        arguments: "",
+        summary: "start a new session and clear only the TUI viewport",
+    },
+    SlashCommand {
+        name: "/rename",
+        arguments: "<name>",
+        summary: "set the title shown in the session picker",
+    },
+    SlashCommand {
+        name: "/context",
+        arguments: "",
+        summary: "show context channels, token estimates and omitted blocks",
+    },
+    SlashCommand {
+        name: "/compact",
+        arguments: "[guidance]",
+        summary: "summarize this session for continuation",
+    },
+    SlashCommand {
+        name: "/diff",
+        arguments: "",
+        summary: "show tracked changes since this session started",
+    },
+    SlashCommand {
+        name: "/undo",
+        arguments: "",
+        summary: "request approval to restore the latest safe file change",
+    },
+    SlashCommand {
+        name: "/export",
+        arguments: "[path.md|path.jsonl]",
+        summary: "export this conversation through the normal write approval",
+    },
+    SlashCommand {
+        name: "/copy",
+        arguments: "",
+        summary: "copy the latest answer to the TUI clipboard",
     },
     SlashCommand {
         name: "/trust",
@@ -1190,7 +1235,7 @@ mod tests {
     #[test]
     fn t03_tab_completes_only_a_unique_slash_command() {
         let mut editor = LineEditor::new();
-        type_text(&mut editor, "/re");
+        type_text(&mut editor, "/res");
         assert_eq!(names(&editor), ["/resume"]);
         assert_eq!(
             editor.handle(Key::Tab),
@@ -1210,10 +1255,10 @@ mod tests {
 
         // Escape clears the suggestion instead of completing it.
         let mut escaping = LineEditor::new();
-        type_text(&mut escaping, "/re");
+        type_text(&mut escaping, "/res");
         assert_eq!(escaping.handle(Key::Esc), InputOutcome::Redraw);
         assert!(escaping.suggestions().is_empty());
-        assert_eq!(escaping.buffer(), "/re");
+        assert_eq!(escaping.buffer(), "/res");
     }
 
     /// The names of the candidates the editor is offering, in order.
@@ -1241,7 +1286,7 @@ mod tests {
         );
 
         type_text(&mut editor, "re");
-        assert_eq!(names(&editor), ["/resume"]);
+        assert_eq!(names(&editor), ["/rename", "/resume"]);
 
         // A complete command has nothing left to suggest, and an argument means
         // the word is over: neither keeps a menu on screen.
@@ -1389,14 +1434,16 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["/resume"]
+            ["/rename", "/resume"]
         );
         assert_eq!(
             super::matching("/c")
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["/config", "/cost"]
+            [
+                "/config", "/cost", "/clear", "/context", "/compact", "/copy"
+            ]
         );
         assert!(super::matching("/zzz").is_empty());
         assert!(super::matching("hello").is_empty());

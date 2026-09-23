@@ -452,6 +452,7 @@ async fn m3_01_manifest_and_overflow() {
         RuntimeConfig {
             context_window_tokens: 400,
             output_reservation_tokens: 100,
+            compaction_reserve_tokens: 0,
             protocol_overhead_tokens: 10,
             safety_margin_tokens: 10,
             optional_token_budget: 0,

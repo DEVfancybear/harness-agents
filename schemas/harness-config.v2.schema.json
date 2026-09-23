@@ -17,6 +17,41 @@
       },
       "type": "object"
     },
+    "HookConfigV2": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "type": "string"
+        },
+        "matcher": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_seconds": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "type": "object"
+    },
     "LimitsConfigV2": {
       "additionalProperties": false,
       "properties": {
@@ -244,7 +279,21 @@
     "UiConfigV2": {
       "additionalProperties": false,
       "properties": {
+        "bell": {
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "color": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notify_command": {
           "default": null,
           "type": [
             "string",
@@ -274,7 +323,12 @@
       }
     },
     "hooks": {
-      "additionalProperties": true,
+      "additionalProperties": {
+        "items": {
+          "$ref": "#/$defs/HookConfigV2"
+        },
+        "type": "array"
+      },
       "default": {},
       "type": "object"
     },

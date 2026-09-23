@@ -220,7 +220,13 @@ mod tests {
             allow_rules: vec!["run_shell(cargo test *)".to_owned()],
             deny_rules: vec!["run_shell(cargo test secrets *)".to_owned()],
             model_prices: BTreeMap::new(),
+            context_window_tokens: 8192,
+            context_window_notice: None,
+            output_reservation_tokens: 1024,
+            compaction_reserve_tokens: 16_384,
             retry_after_max_seconds: 30,
+            hooks: Vec::new(),
+            bell: false,
             explain: vec![ConfigExplainEntry {
                 key: "approval".to_owned(),
                 value: approval.to_owned(),

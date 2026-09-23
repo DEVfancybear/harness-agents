@@ -133,6 +133,9 @@ struct ChatArgs {
     /// Resume one persisted session inside the interactive app.
     #[arg(long)]
     resume: Option<String>,
+    /// Continue the newest persisted session in this project.
+    #[arg(long = "continue", conflicts_with = "resume")]
+    continue_session: bool,
     /// Select the model for this conversation; `/model` switches subsequent turns.
     #[arg(long)]
     model: Option<String>,
@@ -189,9 +192,19 @@ struct ChatArgs {
 
 impl ChatArgs {
     fn mode(&self) -> Result<interactive::LaunchMode, interactive::UsageError> {
+        if self.continue_session && self.headless {
+            return Err(interactive::UsageError::new(
+                "--continue applies to interactive chat only",
+            ));
+        }
+        let resume = if self.continue_session {
+            Some("latest".to_owned())
+        } else {
+            self.resume.clone()
+        };
         let mut mode = interactive::mode_from_args(
             self.cwd.clone(),
-            self.resume.clone(),
+            resume,
             self.fixture,
             self.headless,
             self.prompt.clone(),
@@ -430,7 +443,10 @@ enum SessionsSubcommand {
     List {
         /// Local P1 `SQLite` data directory.
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
+        /// Project directory whose project-scoped session store to list.
+        #[arg(long, conflicts_with = "data_dir")]
+        cwd: Option<PathBuf>,
         /// Emit a versioned JSON result to stdout.
         #[arg(long)]
         json: bool,
@@ -548,9 +564,9 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
             }
         },
         Some(command) => {
-            legacy_run(Cli {
+            Box::pin(legacy_run(Cli {
                 command: Some(command),
-            })
+            }))
             .await?;
             Ok(ExitCode::SUCCESS)
         }
@@ -668,6 +684,9 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
                     "provider": effective.provider,
                     "profile": effective.profile,
                     "approval": effective.approval,
+                    "context_window_tokens": effective.context_window_tokens,
+                    "output_reservation_tokens": effective.output_reservation_tokens,
+                    "compaction_reserve_tokens": effective.compaction_reserve_tokens,
                     "permissions": {
                         "allow": effective.allow_rules,
                         "deny": effective.deny_rules
@@ -695,8 +714,13 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
             Ok(())
         }
         Some(Command::Sessions(SessionsCommand {
-            command: SessionsSubcommand::List { data_dir, json },
-        })) => list_sessions(&data_dir, json).await,
+            command:
+                SessionsSubcommand::List {
+                    data_dir,
+                    cwd,
+                    json,
+                },
+        })) => list_sessions(data_dir, cwd, json).await,
         Some(Command::Status {
             data_dir,
             session_id,
@@ -1180,8 +1204,30 @@ async fn init_store(data_dir: &PathBuf, json: bool) -> Result<(), HarnessError> 
     Ok(())
 }
 
-async fn list_sessions(data_dir: &PathBuf, json: bool) -> Result<(), HarnessError> {
-    let store = SqliteStore::open_read_only(data_dir)
+async fn list_sessions(
+    explicit_data_dir: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    json: bool,
+) -> Result<(), HarnessError> {
+    let caller_dir = std::env::current_dir().map_err(|error| {
+        HarnessError::new(
+            ErrorCode::StorageOpenFailed,
+            format!("current directory could not be resolved: {error}"),
+        )
+    })?;
+    let data_dir = if let Some(data_dir) = explicit_data_dir {
+        data_dir
+    } else {
+        interactive::bootstrap::resolve(interactive::bootstrap::LaunchRequest {
+            cwd: cwd.or_else(|| Some(caller_dir.clone())),
+            caller_dir,
+            platform: interactive::paths::HostPlatform::current(),
+            environment: interactive::paths::LaunchEnvironment::capture(),
+            explicit_data_dir: None,
+        })?
+        .project_store_dir()
+    };
+    let store = SqliteStore::open_read_only(&data_dir)
         .await
         .map_err(store_error)?;
     let sessions = store.list_sessions().await.map_err(store_error)?;
@@ -1193,7 +1239,8 @@ async fn list_sessions(data_dir: &PathBuf, json: bool) -> Result<(), HarnessErro
                 "task_id": session.task_id,
                 "next_sequence": session.next_sequence,
                 "input_count": session.input_count,
-                "latest_snapshot_sequence": session.latest_snapshot_sequence
+                "latest_snapshot_sequence": session.latest_snapshot_sequence,
+                "created_at": session.created_at
             })
         })
         .collect::<Vec<_>>();

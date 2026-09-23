@@ -292,7 +292,12 @@ fn step(
                     .map_err(|error| terminal_error(&error))?;
                 cursor.at_line_start = false;
             }
-            Effect::Thinking(_) => {}
+            Effect::Thinking(_) | Effect::Bell | Effect::ClearViewport => {}
+            Effect::Copy(_) => {
+                backend
+                    .write("/copy is available in TUI mode; the plain renderer does not access the clipboard\r\n")
+                    .map_err(|error| terminal_error(&error))?;
+            }
             Effect::Redraw => redraw = true,
             Effect::Exit(code) => exit = Some(code),
         }
@@ -521,7 +526,12 @@ fn render_line_mode(
             Effect::Stream(text) => {
                 write!(output, "{}", terminal_safe(&text)).map_err(|error| io_error(&error))?;
             }
-            Effect::Thinking(_) => {}
+            Effect::Thinking(_) | Effect::Bell | Effect::ClearViewport => {}
+            Effect::Copy(_) => writeln!(
+                output,
+                "/copy is available in TUI mode; the plain renderer does not access the clipboard"
+            )
+            .map_err(|error| io_error(&error))?,
             Effect::Redraw => redraw = true,
             Effect::Exit(code) => exit = Some(code),
         }

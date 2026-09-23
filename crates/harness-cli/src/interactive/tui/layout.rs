@@ -386,9 +386,9 @@ mod tests {
     #[test]
     fn slash_the_menu_sits_above_the_composer_which_keeps_the_cursor() {
         let mut state = state(AppPhase::Ready);
-        state.buffer = "/re".to_owned();
-        state.cursor = 3;
-        state.suggestions = matching("/re");
+        state.buffer = "/res".to_owned();
+        state.cursor = 4;
+        state.suggestions = matching("/res");
         let outline = plan(Rect::new(0, 0, 80, 12), &state, &Theme::plain());
         let menu = outline.suggest.expect("the menu has a row");
         assert_eq!(menu.height, 1, "one match, one row");

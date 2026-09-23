@@ -521,6 +521,8 @@ pub struct SessionSummary {
     pub next_sequence: u64,
     pub input_count: u64,
     pub latest_snapshot_sequence: Option<u64>,
+    /// `SQLite` UTC creation time, retained for the interactive session picker.
+    pub created_at: String,
 }
 
 /// Persisted plugin metadata available before a runtime exists.

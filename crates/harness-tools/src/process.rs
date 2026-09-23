@@ -14,7 +14,7 @@ use process_wrap::tokio::JobObject;
 use process_wrap::tokio::ProcessSession;
 use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     task::JoinHandle,
     time::{Instant, sleep},
 };
@@ -243,8 +243,98 @@ pub(crate) async fn run_structured_with_host(
         environment,
         spool,
         host,
+        None,
     )
     .await
+}
+
+/// Run an executable with bounded JSON or other explicit bytes on stdin.
+///
+/// The input is capped before spawn so the hook channel cannot turn into an
+/// unbounded memory or pipe write. Hook processes receive the same scrubbed
+/// environment as every other structured process.
+pub async fn run_hook_command(
+    root: &Path,
+    executable: &str,
+    args: &[String],
+    input: &[u8],
+    timeout_ms: u64,
+    cancellation: CancellationToken,
+) -> Result<HookProcessResult, HarnessError> {
+    run_hook_command_with_host(
+        root,
+        executable,
+        args,
+        input,
+        timeout_ms,
+        cancellation,
+        &HostEnvironment::from_process(),
+    )
+    .await
+}
+
+/// Same bounded hook run with an explicit host environment for tests.
+pub async fn run_hook_command_with_host(
+    root: &Path,
+    executable: &str,
+    args: &[String],
+    input: &[u8],
+    timeout_ms: u64,
+    cancellation: CancellationToken,
+    host: &HostEnvironment,
+) -> Result<HookProcessResult, HarnessError> {
+    if input.len() > 8 * 1024 {
+        return Err(HarnessError::new(
+            ErrorCode::OutputLimitExceeded,
+            "hook JSON input exceeds the 8 KiB limit",
+        ));
+    }
+    let spool = ProcessSpoolConfig::default();
+    let result = run(
+        root,
+        executable,
+        args,
+        timeout_ms.min(60_000),
+        cancellation,
+        &ProcessEnvironment::empty(),
+        &spool,
+        host,
+        Some(input.to_vec()),
+    )
+    .await?;
+    Ok(HookProcessResult {
+        exit_code: result.exit_code,
+        status: if result.timed_out {
+            HookProcessStatus::TimedOut
+        } else if result.canceled {
+            HookProcessStatus::Canceled
+        } else {
+            HookProcessStatus::Exited
+        },
+        stdout: result.stdout,
+        stderr: result.stderr,
+        stdout_truncated: result.stdout_truncated,
+        stderr_truncated: result.stderr_truncated,
+    })
+}
+
+/// Bounded output and status from one hook process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HookProcessResult {
+    pub exit_code: Option<i32>,
+    pub status: HookProcessStatus,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+/// Completion state of one bounded hook process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HookProcessStatus {
+    Exited,
+    TimedOut,
+    Canceled,
 }
 
 pub(crate) async fn run_shell(
@@ -298,6 +388,7 @@ pub(crate) async fn run_shell_with_host(
         environment,
         spool,
         host,
+        None,
     )
     .await
 }
@@ -312,6 +403,7 @@ async fn run(
     environment: &ProcessEnvironment,
     spool: &ProcessSpoolConfig,
     host: &HostEnvironment,
+    stdin: Option<Vec<u8>>,
 ) -> Result<ProcessResult, HarnessError> {
     // Windows Job Object completion ports are process-lifecycle resources. A
     // single host-wide runner permit makes concurrent tool calls deterministic
@@ -338,11 +430,16 @@ async fn run(
     if cancellation.is_cancelled() {
         return Ok(canceled_before_spawn(executable, queued));
     }
+    let pipe_stdin = stdin.is_some();
     let mut command = CommandWrap::with_new(executable, |child_command| {
         child_command
             .args(args)
             .current_dir(root)
-            .stdin(Stdio::null())
+            .stdin(if pipe_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // The host environment is not inherited: only the allowlist, plus the
@@ -371,6 +468,26 @@ async fn run(
             format!("cannot spawn structured process: {error}"),
         )
     })?;
+    if let Some(input) = stdin {
+        let mut child_stdin = child.stdin().take().ok_or_else(|| {
+            HarnessError::new(
+                ErrorCode::ProcessOutcomeUnknown,
+                "hook process stdin was not available",
+            )
+        })?;
+        child_stdin.write_all(&input).await.map_err(|error| {
+            HarnessError::new(
+                ErrorCode::ProcessOutcomeUnknown,
+                format!("hook process did not accept its bounded input: {error}"),
+            )
+        })?;
+        child_stdin.shutdown().await.map_err(|error| {
+            HarnessError::new(
+                ErrorCode::ProcessOutcomeUnknown,
+                format!("hook process input could not be closed: {error}"),
+            )
+        })?;
+    }
     let stdout = child.stdout().take();
     let stderr = child.stderr().take();
     let limits = spool.limits();

@@ -21,9 +21,9 @@ use serde_json::{Map, Value};
 mod context;
 
 pub use context::{
-    ContextBlock, ContextBlockKind, ContextBuildRequest, ContextBuildResult, ContextBuilder,
-    ContextChannel, ContextContributor, ContextError, ContextManifest, ContextManifestInputs,
-    ContributorScope,
+    ContextBlock, ContextBlockKind, ContextBlockUsage, ContextBuildRequest, ContextBuildResult,
+    ContextBuilder, ContextChannel, ContextContributor, ContextError, ContextManifest,
+    ContextManifestInputs, ContributorScope,
 };
 
 /// Input accepted by the durable admission command.

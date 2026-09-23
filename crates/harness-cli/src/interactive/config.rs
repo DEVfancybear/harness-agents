@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use harness_tools::ConfiguredToolHook;
 use harness_types::{ErrorCode, HarnessConfig, HarnessConfigV2, HarnessError, ProviderConfigV2};
 use serde::Serialize;
 
@@ -96,7 +97,13 @@ pub struct ResolvedConfig {
     pub allow_rules: Vec<String>,
     pub deny_rules: Vec<String>,
     pub model_prices: BTreeMap<String, super::cost::ModelPrice>,
+    pub context_window_tokens: u64,
+    pub context_window_notice: Option<String>,
+    pub output_reservation_tokens: u64,
+    pub compaction_reserve_tokens: u64,
     pub retry_after_max_seconds: u64,
+    pub hooks: Vec<ConfiguredToolHook>,
+    pub bell: bool,
     pub explain: Vec<ConfigExplainEntry>,
     pub project_config_reason: Option<String>,
 }
@@ -118,7 +125,13 @@ pub fn resolve_layers(
     };
     let mut entries = BTreeMap::new();
     let mut model_prices = BTreeMap::new();
+    let mut model_context_windows = BTreeMap::new();
     let mut retry_after_max_seconds = 30_u64;
+    let mut output_reservation_tokens = 1024_u64;
+    let mut compaction_reserve_tokens = 16_384_u64;
+    let mut hooks = Vec::new();
+    let mut notify_command = None;
+    let mut bell = false;
     let mut approval = "ask".to_owned();
     let mut approval_layer = ConfigLayer::Default;
     let mut allow_rules = Vec::new();
@@ -133,6 +146,20 @@ pub fn resolve_layers(
         ConfigLayer::Default,
         None,
     );
+    set_explain(
+        &mut entries,
+        "limits.output_reservation_tokens",
+        &output_reservation_tokens.to_string(),
+        ConfigLayer::Default,
+        None,
+    );
+    set_explain(
+        &mut entries,
+        "limits.compaction_reserve_tokens",
+        &compaction_reserve_tokens.to_string(),
+        ConfigLayer::Default,
+        None,
+    );
 
     let user = load_v2_layer(user_path)?;
     if let Some(config) = &user {
@@ -144,7 +171,20 @@ pub fn resolve_layers(
                 &mut entries,
             );
         }
-        apply_models(&mut model_prices, config, ConfigLayer::User, &mut entries);
+        apply_models(
+            &mut model_prices,
+            &mut model_context_windows,
+            config,
+            ConfigLayer::User,
+            &mut entries,
+        );
+        apply_context_limits(
+            &mut output_reservation_tokens,
+            &mut compaction_reserve_tokens,
+            config,
+            ConfigLayer::User,
+            &mut entries,
+        );
         apply_retry_limit(
             &mut retry_after_max_seconds,
             config,
@@ -159,6 +199,13 @@ pub fn resolve_layers(
             config,
             ConfigLayer::User,
             &mut entries,
+        )?;
+        apply_hooks(
+            &mut hooks,
+            &mut notify_command,
+            &mut bell,
+            config,
+            ConfigLayer::User,
         )?;
     }
 
@@ -190,6 +237,14 @@ pub fn resolve_layers(
             }
             apply_models(
                 &mut model_prices,
+                &mut model_context_windows,
+                &config,
+                ConfigLayer::Project,
+                &mut entries,
+            );
+            apply_context_limits(
+                &mut output_reservation_tokens,
+                &mut compaction_reserve_tokens,
                 &config,
                 ConfigLayer::Project,
                 &mut entries,
@@ -208,6 +263,13 @@ pub fn resolve_layers(
                 &config,
                 ConfigLayer::Project,
                 &mut entries,
+            )?;
+            apply_hooks(
+                &mut hooks,
+                &mut notify_command,
+                &mut bell,
+                &config,
+                ConfigLayer::Project,
             )?;
         }
     } else if project_path.exists() {
@@ -241,7 +303,20 @@ pub fn resolve_layers(
                 &mut entries,
             );
         }
-        apply_models(&mut model_prices, &config, ConfigLayer::Local, &mut entries);
+        apply_models(
+            &mut model_prices,
+            &mut model_context_windows,
+            &config,
+            ConfigLayer::Local,
+            &mut entries,
+        );
+        apply_context_limits(
+            &mut output_reservation_tokens,
+            &mut compaction_reserve_tokens,
+            &config,
+            ConfigLayer::Local,
+            &mut entries,
+        );
         apply_retry_limit(
             &mut retry_after_max_seconds,
             &config,
@@ -257,6 +332,9 @@ pub fn resolve_layers(
             ConfigLayer::Local,
             &mut entries,
         )?;
+        if let Some(value) = config.ui.as_ref().and_then(|ui| ui.bell) {
+            bell = value;
+        }
     }
 
     let mut profile = overrides.profile.clone().or_else(|| {
@@ -380,6 +458,48 @@ pub fn resolve_layers(
         );
     }
 
+    let (context_window_tokens, context_window_layer, context_window_reason) =
+        if let Some((value, layer)) = model_context_windows.get(&provider.model).copied() {
+            (value, layer, None)
+        } else if let Some(value) = known_context_window(&provider.id, &provider.model) {
+            (
+                value,
+                ConfigLayer::Default,
+                Some("resolved from the built-in model table".to_owned()),
+            )
+        } else {
+            (
+                8192,
+                ConfigLayer::Default,
+                Some(format!(
+                    "notice: no context window is known for {}; using 8192",
+                    provider.model
+                )),
+            )
+        };
+    let context_window_notice = context_window_reason
+        .as_deref()
+        .filter(|reason| reason.contains("notice:"))
+        .map(str::to_owned);
+    set_explain(
+        &mut entries,
+        "runtime.context_window_tokens",
+        &context_window_tokens.to_string(),
+        context_window_layer,
+        context_window_reason,
+    );
+
+    if let Some(command) = notify_command {
+        hooks.push(ConfiguredToolHook {
+            event: "notification".to_owned(),
+            matcher: None,
+            command,
+            args: Vec::new(),
+            timeout_seconds: 60,
+            source: "user/trusted project [ui].notify_command".to_owned(),
+        });
+    }
+
     let explain = entries.into_values().collect();
     Ok(ResolvedConfig {
         provider,
@@ -388,7 +508,13 @@ pub fn resolve_layers(
         allow_rules,
         deny_rules,
         model_prices,
+        context_window_tokens,
+        context_window_notice,
+        output_reservation_tokens,
+        compaction_reserve_tokens,
         retry_after_max_seconds,
+        hooks,
+        bell,
         explain,
         project_config_reason: project_reason,
     })
@@ -454,6 +580,51 @@ fn apply_permissions(
     Ok(())
 }
 
+fn apply_hooks(
+    hooks: &mut Vec<ConfiguredToolHook>,
+    notify_command: &mut Option<String>,
+    bell: &mut bool,
+    config: &HarnessConfigV2,
+    layer: ConfigLayer,
+) -> Result<(), HarnessError> {
+    for (event, value) in &config.hooks {
+        if !matches!(
+            event.as_str(),
+            "pre_tool_use" | "post_tool_use" | "stop" | "notification"
+        ) {
+            return Err(HarnessError::new(
+                ErrorCode::ConfigParseError,
+                format!("unsupported hook event {event:?}"),
+            ));
+        }
+        for entry in value {
+            hooks.push(ConfiguredToolHook {
+                event: event.clone(),
+                matcher: entry.matcher.clone(),
+                command: entry.command.clone(),
+                args: entry.args.clone(),
+                timeout_seconds: entry.timeout_seconds.unwrap_or(60),
+                source: layer.as_str().to_owned(),
+            });
+        }
+    }
+    if let Some(ui) = &config.ui {
+        if let Some(value) = ui.bell {
+            *bell = value;
+        }
+        if let Some(command) = &ui.notify_command {
+            if command.trim().is_empty() {
+                return Err(HarnessError::new(
+                    ErrorCode::ConfigParseError,
+                    "ui.notify_command must name an executable",
+                ));
+            }
+            *notify_command = Some(command.clone());
+        }
+    }
+    Ok(())
+}
+
 fn explain_permission_rules(
     entries: &mut BTreeMap<String, ConfigExplainEntry>,
     key: &str,
@@ -487,11 +658,22 @@ fn load_v2_layer(path: &Path) -> Result<Option<HarnessConfigV2>, HarnessError> {
 
 fn apply_models(
     prices: &mut BTreeMap<String, super::cost::ModelPrice>,
+    context_windows: &mut BTreeMap<String, (u64, ConfigLayer)>,
     config: &HarnessConfigV2,
     layer: ConfigLayer,
     entries: &mut BTreeMap<String, ConfigExplainEntry>,
 ) {
     for (model, value) in &config.models {
+        if let Some(window) = value.context_window {
+            context_windows.insert(model.clone(), (window, layer));
+            set_explain(
+                entries,
+                &format!("models.{model}.context_window"),
+                &window.to_string(),
+                layer,
+                None,
+            );
+        }
         if let (Some(input), Some(output)) =
             (value.input_price_per_mtok, value.output_price_per_mtok)
         {
@@ -517,6 +699,50 @@ fn apply_models(
                 None,
             );
         }
+    }
+}
+
+fn apply_context_limits(
+    output_reservation_tokens: &mut u64,
+    compaction_reserve_tokens: &mut u64,
+    config: &HarnessConfigV2,
+    layer: ConfigLayer,
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+) {
+    if let Some(value) = config
+        .limits
+        .as_ref()
+        .and_then(|limits| limits.output_reservation_tokens)
+    {
+        *output_reservation_tokens = value;
+        set_explain(
+            entries,
+            "limits.output_reservation_tokens",
+            &value.to_string(),
+            layer,
+            None,
+        );
+    }
+    if let Some(value) = config
+        .limits
+        .as_ref()
+        .and_then(|limits| limits.compaction_reserve_tokens)
+    {
+        *compaction_reserve_tokens = value;
+        set_explain(
+            entries,
+            "limits.compaction_reserve_tokens",
+            &value.to_string(),
+            layer,
+            None,
+        );
+    }
+}
+
+fn known_context_window(provider: &str, model: &str) -> Option<u64> {
+    match (provider, model) {
+        ("deepseek", "deepseek-flash" | "deepseek-v4-pro") => Some(1_048_576),
+        _ => None,
     }
 }
 
@@ -942,6 +1168,81 @@ mod tests {
     }
 
     #[test]
+    fn g07_context_window_comes_from_config_then_table_then_default_with_notice() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(&root).expect("project root");
+        let user = temp.path().join("user.toml");
+        std::fs::write(
+            &user,
+            "schema_version = 2\n[models.deepseek-flash]\ncontext_window = 24576\n",
+        )
+        .expect("configured model window");
+        let configured = resolve_layers(
+            &user,
+            &root,
+            &super::super::paths::LaunchEnvironment::default(),
+            &ConfigOverrides::default(),
+        )
+        .expect("configured window resolves");
+        let source = configured
+            .explain
+            .iter()
+            .find(|entry| entry.key == "runtime.context_window_tokens")
+            .expect("context window is explained");
+        assert_eq!(source.value, "24576");
+        assert_eq!(source.layer, super::ConfigLayer::User);
+
+        std::fs::write(
+            &user,
+            "schema_version = 2\n[provider]\nmodel = 'deepseek-v4-pro'\n",
+        )
+        .expect("known model");
+        let known = resolve_layers(
+            &user,
+            &root,
+            &super::super::paths::LaunchEnvironment::default(),
+            &ConfigOverrides::default(),
+        )
+        .expect("known model window resolves");
+        let source = known
+            .explain
+            .iter()
+            .find(|entry| entry.key == "runtime.context_window_tokens")
+            .expect("known model window is explained");
+        assert_eq!(source.value, "1048576");
+        assert!(
+            source
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("table"))
+        );
+
+        let unknown = resolve_layers(
+            &user,
+            &root,
+            &super::super::paths::LaunchEnvironment::default(),
+            &ConfigOverrides {
+                model: Some("local-unknown-model".to_owned()),
+                ..ConfigOverrides::default()
+            },
+        )
+        .expect("unknown model uses the safe fallback");
+        let source = unknown
+            .explain
+            .iter()
+            .find(|entry| entry.key == "runtime.context_window_tokens")
+            .expect("fallback window is explained");
+        assert_eq!(source.value, "8192");
+        assert!(
+            source
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("notice"))
+        );
+    }
+
+    #[test]
     fn g02_untrusted_project_config_is_ignored_with_reason() {
         let temp = tempfile::tempdir().expect("temp root");
         let root = temp.path().join("project");
@@ -967,6 +1268,125 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("trust"))
         );
+    }
+
+    #[test]
+    fn g09_untrusted_project_hooks_do_not_run() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join(".harness")).expect("project config dir");
+        let user = temp.path().join("user.toml");
+        std::fs::write(&user, "schema_version = 2\n").expect("user config");
+        std::fs::write(
+            root.join(".harness/config.toml"),
+            "schema_version = 2\n[[hooks.pre_tool_use]]\nmatcher = 'run_shell'\ncommand = 'must-not-run'\n",
+        ).expect("untrusted hook config");
+        std::fs::write(
+            root.join(".harness/config.local.toml"),
+            "schema_version = 2\n[[hooks.pre_tool_use]]\nmatcher = 'run_shell'\ncommand = 'local-must-not-run'\n",
+        ).expect("local hook config");
+
+        let resolved = resolve_layers(
+            &user,
+            &root,
+            &super::super::paths::LaunchEnvironment::default(),
+            &ConfigOverrides::default(),
+        )
+        .expect("untrusted project hook is ignored");
+
+        assert!(
+            resolved.hooks.is_empty(),
+            "untrusted commands must never execute"
+        );
+        assert!(
+            resolved
+                .project_config_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("trust"))
+        );
+    }
+
+    #[test]
+    fn g09_trusted_project_hooks_load_but_local_hooks_do_not() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join(".harness")).expect("project config dir");
+        let user = temp.path().join("user.toml");
+        let trusted_root = root.canonicalize().expect("canonical root");
+        std::fs::write(
+            &user,
+            format!(
+                "schema_version = 2\n[trust]\nprojects = [{:?}]\n[[hooks.stop]]\ncommand = 'user-stop'\n",
+                trusted_root.to_string_lossy()
+            ),
+        ).expect("trusted user config");
+        std::fs::write(
+            root.join(".harness/config.toml"),
+            "schema_version = 2\n[[hooks.pre_tool_use]]\nmatcher = 'run_shell|run_process'\ncommand = 'trusted-hook'\nargs = ['--quiet']\ntimeout_seconds = 3\n[ui]\nbell = true\nnotify_command = 'notify-user'\n",
+        ).expect("trusted project config");
+        std::fs::write(
+            root.join(".harness/config.local.toml"),
+            "schema_version = 2\n[[hooks.stop]]\ncommand = 'local-stop'\n[ui]\nbell = false\nnotify_command = 'local-notify'\n",
+        ).expect("local config");
+
+        let resolved = resolve_layers(
+            &user,
+            &root,
+            &super::super::paths::LaunchEnvironment::default(),
+            &ConfigOverrides::default(),
+        )
+        .expect("trusted hook config resolves");
+
+        assert!(
+            resolved
+                .hooks
+                .iter()
+                .any(|hook| hook.command == "trusted-hook" && hook.source == "project(trust)")
+        );
+        assert!(
+            resolved
+                .hooks
+                .iter()
+                .any(|hook| hook.command == "user-stop" && hook.source == "user")
+        );
+        assert!(
+            resolved
+                .hooks
+                .iter()
+                .any(|hook| hook.command == "notify-user")
+        );
+        assert!(
+            !resolved
+                .hooks
+                .iter()
+                .any(|hook| hook.command.starts_with("local-"))
+        );
+        assert!(
+            !resolved.bell,
+            "the explicit local UI preference wins for this machine"
+        );
+    }
+
+    #[test]
+    fn g09_invalid_hook_config_is_rejected() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(&root).expect("project root");
+        let user = temp.path().join("user.toml");
+        std::fs::write(
+            &user,
+            "schema_version = 2\n[[hooks.pre_tool_use]]\ncommand = 'bad-timeout'\ntimeout_seconds = 61\n",
+        ).expect("invalid hook config");
+
+        let error = resolve_layers(
+            &user,
+            &root,
+            &super::super::paths::LaunchEnvironment::default(),
+            &ConfigOverrides::default(),
+        )
+        .expect_err("hook timeout above 60 seconds is rejected");
+
+        assert_eq!(error.code(), ErrorCode::ConfigParseError);
     }
 
     #[test]
