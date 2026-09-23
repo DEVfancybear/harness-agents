@@ -7,9 +7,10 @@ use std::{
 use harness_types::{
     AgentProfileId, AgentRunId, ArtifactId, BudgetId, BudgetReservationId, CompositionSnapshotId,
     ContentHash, ContextPacket, ContextPacketId, ErrorCode, EventEnvelope, EventId, HostId,
-    InputId, InstructionLedgerEntry, MemoryAsset, MemoryAssetId, MemoryVersion, PluginManifest,
-    ProjectId, ProviderAttemptId, QuestionId, RequestId, RuntimeCommandId, SessionId, SnapshotId,
-    StepId, TaskId, ToolApprovalId, ToolExecutionId, ToolExecutionReceipt, WorkingState,
+    InputId, InstructionLedgerEntry, MemoryAsset, MemoryAssetId, MemoryAssetStatus, MemoryVersion,
+    PluginManifest, ProjectId, ProviderAttemptId, QuestionId, RequestId, RuntimeCommandId,
+    SessionId, SnapshotId, StepId, TaskId, ToolApprovalId, ToolExecutionId, ToolExecutionReceipt,
+    WorkingState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1201,6 +1202,29 @@ pub struct TombstoneRow {
     pub reason: String,
     pub surviving_copies: Vec<String>,
     pub created_unix_ms: u64,
+}
+
+/// One atomic operator request to change memory retention and append its journal record.
+#[derive(Clone, Debug)]
+pub struct MemorySourceRetentionUpdate {
+    pub source_kind: String,
+    pub source_id: String,
+    pub status: MemoryAssetStatus,
+    pub reason: Option<String>,
+    pub journal_entry_id: String,
+    pub journal_detail: Value,
+    pub created_unix_ms: u64,
+}
+
+/// One atomic operator request to forget a source, persist its tombstone and journal record.
+#[derive(Clone, Debug)]
+pub struct MemorySourceForget {
+    pub source_kind: String,
+    pub source_id: String,
+    pub tombstone: TombstoneRow,
+    pub journal_entry_id: String,
+    pub journal_action: String,
+    pub journal_detail: Value,
 }
 
 #[cfg(test)]

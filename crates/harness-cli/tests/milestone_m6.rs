@@ -781,6 +781,67 @@ async fn m6_02_cancel_is_bounded_and_a_crash_invalidates_handles() {
 }
 
 #[tokio::test]
+async fn m6_02_dropping_a_call_future_releases_and_stops_its_extension() {
+    let runtime = Arc::new(new_runtime());
+    let manifest = manifest_for_plugin();
+    let grant = grant_for(&manifest);
+    let loaded = runtime
+        .load(
+            fixture_plugin(),
+            manifest.clone(),
+            Some(&grant),
+            plugin_environment("ignore_cancel"),
+        )
+        .await;
+    assert!(matches!(loaded, LoadOutcome::Active { .. }), "{loaded:?}");
+    let lease = runtime.lease(&manifest.plugin_id).await.expect("lease");
+    let transport = Arc::clone(lease.transport());
+    let pending = {
+        let transport = Arc::clone(&transport);
+        tokio::spawn(async move {
+            transport
+                .call_with_id(
+                    "m6-dropped-call",
+                    "tool.write_note",
+                    json!({"text": "abandoned"}),
+                    30_000,
+                )
+                .await
+        })
+    };
+    for _ in 0..200 {
+        if transport.inflight() > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(transport.inflight(), 1, "the call reached its wait state");
+    pending.abort();
+    assert!(
+        pending
+            .await
+            .expect_err("the task was aborted")
+            .is_cancelled()
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while transport.is_alive() || transport.inflight() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("dropping an unknown-outcome call stops the process and releases its slot");
+    match transport
+        .call("tool.write_note", json!({"text": "must not dispatch"}))
+        .await
+    {
+        Err(error) => assert_eq!(error.code(), ErrorCode::ServiceUnavailable),
+        Ok(outcome) => panic!("the terminated transport must reject later calls: {outcome:?}"),
+    }
+    runtime.shutdown_all().await;
+}
+
+#[tokio::test]
 async fn m6_02_scope_lease_and_partial_init_cleanup() {
     let runtime = Arc::new(new_runtime());
     let manifest = manifest_for_plugin();

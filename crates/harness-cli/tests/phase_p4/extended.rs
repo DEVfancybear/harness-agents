@@ -4,15 +4,16 @@ use super::{
 };
 use harness_memory::{
     InjectionMode, MemoryAction, MemoryBinding, MemoryBudget, MemoryGrant, MemoryPrincipal,
-    MemoryService,
+    MemoryService, MemorySource,
 };
 use harness_providers::{
     CancellationToken, ModelCapabilities, ModelProvider, ProviderError, ProviderFuture,
     ProviderRequest,
 };
+use harness_store_sqlite::{MemorySourceForget, MemorySourceRetentionUpdate, TombstoneRow};
 use harness_types::{
-    ContentHash, ErrorCode, InputId, MemoryVersionRef, ProjectId, SessionId, TaskId,
-    WorkspaceObservation,
+    ContentHash, ErrorCode, InputId, MemoryAssetStatus, MemoryVersionRef, ProjectId, SessionId,
+    TaskId, WorkspaceObservation,
 };
 use std::sync::{
     Arc,
@@ -200,7 +201,9 @@ async fn p4_source_changes_semantic_merge_and_binding_are_versioned() {
     let principal = MemoryPrincipal::user("host").with_project(project.clone());
     let hash = ContentHash::from_bytes(b"source-v1");
     let mut request = project_asset(project, "HTTPParser đọc đường dẫn");
-    request.source_file_hashes.push(hash.clone());
+    request
+        .sources
+        .push(MemorySource::file("src/parser.txt", hash.clone()));
     let root = memory.create_asset(&principal, request).await.unwrap();
     let summary = memory
         .derive_l2(
@@ -273,7 +276,7 @@ async fn p4_source_changes_semantic_merge_and_binding_are_versioned() {
     assert_eq!(bootstrap.blocks.len(), 1);
     assert!(bootstrap.blocks[0].text.contains("source updated"));
     let invalidated = memory
-        .invalidate_source(&principal, "file", hash.as_str())
+        .invalidate_source(&principal, "file", "src/parser.txt")
         .await
         .unwrap();
     assert_eq!(invalidated.len(), 2);
@@ -285,6 +288,233 @@ async fn p4_source_changes_semantic_merge_and_binding_are_versioned() {
             .hits
             .is_empty()
     );
+    close_store(memory, store).await;
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one store regression covers source replacement, retention, and dependent invalidation"
+)]
+async fn p4_source_invalidation_only_uses_the_current_version_sources() {
+    let (_temp, store, memory) = memory_fixture().await;
+    let project = ProjectId::generate();
+    let principal = MemoryPrincipal::user("host").with_project(project.clone());
+    let old_path = "src/old-parser.rs";
+    let new_path = "src/current-parser.rs";
+    let mut request = project_asset(project.clone(), "parser behavior from old source");
+    request.sources.push(MemorySource::file(
+        old_path,
+        ContentHash::from_bytes(b"old source bytes"),
+    ));
+    let original = memory.create_asset(&principal, request).await.unwrap();
+    let unrelated = memory
+        .create_asset(
+            &principal,
+            project_asset(project.clone(), "unrelated source fact"),
+        )
+        .await
+        .unwrap();
+    let derived = memory
+        .derive_l2(
+            &principal,
+            &[MemoryVersionRef {
+                memory_asset_id: original.asset.memory_asset_id.clone(),
+                version: 1,
+            }],
+            "summary from old source",
+        )
+        .await
+        .unwrap();
+
+    let mut correction = observed_version("parser behavior from current source");
+    correction.sources.push(MemorySource::file(
+        new_path,
+        ContentHash::from_bytes(b"current source bytes"),
+    ));
+    memory
+        .write_version(&principal, &original.asset.memory_asset_id, 1, correction)
+        .await
+        .unwrap();
+    let mut derived_correction = observed_version("summary from unrelated source");
+    derived_correction.source_assets = vec![MemoryVersionRef {
+        memory_asset_id: unrelated.asset.memory_asset_id,
+        version: 1,
+    }];
+    memory
+        .write_version(
+            &principal,
+            &derived.asset.memory_asset_id,
+            1,
+            derived_correction,
+        )
+        .await
+        .unwrap();
+
+    let old_file_invalidation = memory
+        .invalidate_source(&principal, "file", old_path)
+        .await
+        .unwrap();
+    assert!(
+        old_file_invalidation.is_empty(),
+        "a source used only by a superseded version cannot invalidate the current asset"
+    );
+    let old_file_retention = store
+        .update_memory_source_retention_and_journal(MemorySourceRetentionUpdate {
+            source_kind: "file".to_owned(),
+            source_id: old_path.to_owned(),
+            status: MemoryAssetStatus::Archived,
+            reason: None,
+            journal_entry_id: "old-source-only.archive".to_owned(),
+            journal_detail: serde_json::json!({"reason": "not a current source"}),
+            created_unix_ms: 1,
+        })
+        .await
+        .unwrap();
+    assert!(
+        old_file_retention.is_empty(),
+        "global retention also ignores superseded source rows"
+    );
+    let current = memory
+        .read(&principal, &original.asset.memory_asset_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.asset.status, MemoryAssetStatus::Active);
+    let current_derived = memory
+        .read(&principal, &derived.asset.memory_asset_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current_derived.asset.status, MemoryAssetStatus::Active);
+
+    let current_file_invalidation = memory
+        .invalidate_source(&principal, "file", new_path)
+        .await
+        .unwrap();
+    assert_eq!(
+        current_file_invalidation,
+        vec![original.asset.memory_asset_id],
+        "only the asset whose current version cites the changed file is invalidated; a derived asset whose current version changed lineage stays active"
+    );
+    assert_eq!(
+        memory
+            .read(&principal, &derived.asset.memory_asset_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .asset
+            .status,
+        MemoryAssetStatus::Active,
+        "historical dependency rows cannot invalidate a current version with different lineage"
+    );
+    close_store(memory, store).await;
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one privacy regression covers historical source and transitive payload deletion"
+)]
+async fn p4_source_forget_removes_assets_that_only_match_historical_lineage() {
+    let (_temp, store, memory) = memory_fixture().await;
+    let project = ProjectId::generate();
+    let principal = MemoryPrincipal::user("host").with_project(project.clone());
+    let forgotten_path = "src/forgotten-history.rs";
+    let mut root_request = project_asset(project.clone(), "old sensitive source content");
+    root_request.sources.push(MemorySource::file(
+        forgotten_path,
+        ContentHash::from_bytes(b"old sensitive bytes"),
+    ));
+    let root = memory.create_asset(&principal, root_request).await.unwrap();
+    let unrelated = memory
+        .create_asset(
+            &principal,
+            project_asset(project.clone(), "unrelated current source"),
+        )
+        .await
+        .unwrap();
+    let derived = memory
+        .derive_l2(
+            &principal,
+            &[MemoryVersionRef {
+                memory_asset_id: root.asset.memory_asset_id.clone(),
+                version: 1,
+            }],
+            "derived sensitive history",
+        )
+        .await
+        .unwrap();
+
+    let mut root_correction = observed_version("new root content");
+    root_correction.sources.push(MemorySource::file(
+        "src/current-root.rs",
+        ContentHash::from_bytes(b"current root bytes"),
+    ));
+    memory
+        .write_version(&principal, &root.asset.memory_asset_id, 1, root_correction)
+        .await
+        .unwrap();
+    let mut derived_correction = observed_version("new unrelated derived content");
+    derived_correction.source_assets = vec![MemoryVersionRef {
+        memory_asset_id: unrelated.asset.memory_asset_id.clone(),
+        version: 1,
+    }];
+    memory
+        .write_version(
+            &principal,
+            &derived.asset.memory_asset_id,
+            1,
+            derived_correction,
+        )
+        .await
+        .unwrap();
+
+    let forgotten = store
+        .forget_memory_source_and_tombstone(MemorySourceForget {
+            source_kind: "file".to_owned(),
+            source_id: forgotten_path.to_owned(),
+            tombstone: TombstoneRow {
+                tombstone_id: "tombstone-forgotten-history".to_owned(),
+                source_kind: "file".to_owned(),
+                source_id: forgotten_path.to_owned(),
+                reason: "remove source and all retained derived history".to_owned(),
+                surviving_copies: vec!["external-backup".to_owned()],
+                created_unix_ms: 1,
+            },
+            journal_entry_id: "journal-forgotten-history".to_owned(),
+            journal_action: "forget".to_owned(),
+            journal_detail: serde_json::json!({"reason": "historical source purge"}),
+        })
+        .await
+        .unwrap();
+    assert_eq!(forgotten.len(), 2);
+    assert!(forgotten.contains(&root.asset.memory_asset_id));
+    assert!(forgotten.contains(&derived.asset.memory_asset_id));
+    assert!(
+        memory
+            .read(&principal, &root.asset.memory_asset_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        memory
+            .read(&principal, &derived.asset.memory_asset_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "forget must remove assets with historical versions that retained the forgotten source"
+    );
+    assert!(
+        memory
+            .read(&principal, &unrelated.asset.memory_asset_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "unrelated current data survives the historical purge"
+    );
+    assert!(store.is_tombstoned("file", forgotten_path).await.unwrap());
     close_store(memory, store).await;
 }
 

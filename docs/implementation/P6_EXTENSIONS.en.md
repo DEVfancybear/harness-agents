@@ -2,7 +2,7 @@
 
 English | [Tiếng Việt](P6_EXTENSIONS.vi.md)
 
-Implementation runbook; status: **implemented locally, acceptance pending remote CI**. Estimate: 5–8 person-days. All target files, Rust tests and `ha` commands below are future outputs unless already present in the checkout. This document alone is not completion evidence.
+Implementation runbook; P0–P7 implementation was delivered after this plan was written. See [P0–P7 audit evidence](../evidence/P0-P7_AUDIT.en.md) for verification and current limits; this runbook is not completion evidence. Original estimate: 5–8 person-days.
 
 ## 1. Outcome and entry gate
 

@@ -148,6 +148,9 @@ const MEMORY_SCHEMA: &[&str] = &[
     "CREATE TRIGGER IF NOT EXISTS memory_grant_update_revision AFTER UPDATE ON memory_grants BEGIN UPDATE memory_revision SET revision = revision + 1; END",
     "CREATE TRIGGER IF NOT EXISTS memory_binding_insert_revision AFTER INSERT ON memory_bindings BEGIN UPDATE memory_revision SET revision = revision + 1; END",
     "CREATE TRIGGER IF NOT EXISTS memory_binding_update_revision AFTER UPDATE ON memory_bindings BEGIN UPDATE memory_revision SET revision = revision + 1; END",
+    "CREATE TRIGGER IF NOT EXISTS memory_asset_delete_revision AFTER DELETE ON memory_assets BEGIN UPDATE memory_revision SET revision = revision + 1; END",
+    "CREATE TRIGGER IF NOT EXISTS memory_grant_delete_revision AFTER DELETE ON memory_grants BEGIN UPDATE memory_revision SET revision = revision + 1; END",
+    "CREATE TRIGGER IF NOT EXISTS memory_binding_delete_revision AFTER DELETE ON memory_bindings BEGIN UPDATE memory_revision SET revision = revision + 1; END",
 ];
 
 /// The upgrade slice for a store whose marker is older than this host.
@@ -2087,6 +2090,42 @@ async fn write_version_sources(
     sources: &[MemorySourceRecord],
     scope_project_id: Option<&str>,
 ) -> Result<(), StoreError> {
+    // Enforce the retention tombstone on the write path itself, inside the
+    // same fenced transaction as the version. A preflight check in maintenance
+    // code alone would race a concurrent forget and allow the source to return.
+    for source in sources {
+        validate_source(source)?;
+        if matches!(source.source_kind.as_str(), "file" | "commit") {
+            let forgotten = sqlx::query_scalar::<_, i64>(
+                "SELECT EXISTS(
+                     SELECT 1 FROM maintenance_tombstones
+                     WHERE source_kind = ? AND source_id = ?
+                 )",
+            )
+            .bind(source.source_kind.as_str())
+            .bind(&source.source_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::StorageWriteFailed,
+                    "check memory source tombstone",
+                    error,
+                )
+            })?;
+            if forgotten != 0 {
+                return Err(StoreError::new(
+                    ErrorCode::RetentionRefused,
+                    format!(
+                        "source {}:{} was forgotten; re-extraction is refused",
+                        source.source_kind.as_str(),
+                        source.source_id
+                    ),
+                ));
+            }
+        }
+    }
+
     sqlx::query("DELETE FROM memory_sources WHERE derived_asset_id = ? AND derived_version = ?")
         .bind(memory_asset_id.as_str())
         .bind(to_i64(version, "memory version")?)
@@ -2100,7 +2139,6 @@ async fn write_version_sources(
             )
         })?;
     for source in sources {
-        validate_source(source)?;
         sqlx::query(
             "INSERT OR REPLACE INTO memory_sources(
                  derived_asset_id, derived_version, source_kind, source_id,

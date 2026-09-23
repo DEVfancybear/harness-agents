@@ -379,7 +379,7 @@ impl BackupManifest {
 }
 
 /// Refuse any manifest-supplied path that could leave the backup directory.
-fn validate_relative_path(field: &str, value: &str) -> Result<(), MaintenanceError> {
+pub(crate) fn validate_relative_path(field: &str, value: &str) -> Result<(), MaintenanceError> {
     let path = std::path::Path::new(value);
     let escapes = path.is_absolute()
         || path.components().any(|component| {

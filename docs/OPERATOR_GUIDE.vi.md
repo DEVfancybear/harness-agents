@@ -156,7 +156,7 @@ ha maintenance retain --data-dir <DATA_DIR> --action archive \
     --source-kind file --source-id src/lib.rs --reason "giữ để kiểm toán" --json
 ha maintenance retain --data-dir <DATA_DIR> --action forget \
     --source-kind file --source-id src/lib.rs --reason "yêu cầu của người vận hành" \
-    --confirm src/lib.rs --surviving-copy backup-2026-01 --json
+    --confirm file:src/lib.rs --surviving-copy backup-2026-01 --json
 ha maintenance tombstones --data-dir <DATA_DIR> --json
 ```
 
@@ -172,8 +172,11 @@ ha maintenance tombstones --data-dir <DATA_DIR> --json
 việc dùng tiếp trong khi bản ghi của nó — cùng sự thật rằng nó từng tồn tại và đã
 đổi — vẫn được giữ. Chỉ `forget` mới xóa nội dung.
 
-`forget` yêu cầu `--confirm` bằng đúng `--source-id`. Sai lệch hoặc để rỗng đều bị
-từ chối với `retention_refused`, và không có gì được ghi.
+`forget` yêu cầu `--confirm` bằng đủ target `--source-kind:--source-id` (ví dụ
+`file:src/lib.rs`). Chỉ source ID, sai kind/ID hoặc để rỗng đều bị từ chối với
+`retention_refused`, và không có gì được ghi. Retention áp dụng cho mọi project
+trong store có cùng cặp kind/ID; file source identity hiện là path tương đối với
+workspace.
 
 `tombstone` là bản ghi bền vững rằng một nguồn đã bị cố ý quên. Nó được ghi trong
 cùng giao dịch với thao tác forget, tồn tại qua sao lưu và phục hồi, và chặn việc
@@ -204,11 +207,12 @@ Báo cáo nêu đúng lý do từng artifact sống sót: `retained_pinned`,
 `retained_referenced` hay `retained_young`. Hãy chạy `--dry-run` trước; nó phân tích
 y hệt và không xóa gì.
 
-Pin tồn tại để bịt một cuộc đua cụ thể: một bản sao lưu hứa giữ một artifact, và một
-lượt thu gom đồng thời nếu không có pin sẽ xóa nó giữa lời hứa và lúc sao chép. Vì
-pin được kiểm tra trước khi xóa bất kỳ file nào, và pin nằm trong chính cơ sở dữ liệu
-mà lượt thu gom vừa đọc, artifact bị pin sẽ sống sót. Bản sao lưu ghi lại pin của nó
-trong manifest, nên lời hứa vẫn kiểm toán được về sau.
+Pin tồn tại để bịt một cuộc đua cụ thể: bản sao lưu hứa giữ artifact trong khi lượt
+thu gom muốn xóa. Candidate list chỉ là snapshot; trước khi quarantine, store kiểm
+tra lại pin, reference và mtime trong writer transaction. Nếu mtime không đọc được,
+artifact được giữ trong grace period. `pin_artifacts` chỉ chấp nhận ID có artifact
+row hiện hữu, và cả batch bị từ chối nếu thiếu dù chỉ một ID. Bản sao lưu ghi lại
+pin của nó trong manifest để có thể kiểm toán về sau.
 
 ## 8. Ma trận phát hành
 
@@ -259,7 +263,7 @@ benchmark chưa đo vẫn được nêu là chưa đo ngay cả khi mọi nền 
 | `ha maintenance backup` | Ảnh chụp vào một thư mục mới | Thư mục sao lưu đã tồn tại; nguồn không có store |
 | `ha maintenance verify-backup` | Kiểm tra một bản sao lưu và các artifact của nó | Manifest, cơ sở dữ liệu hay bất kỳ artifact nào sai hash |
 | `ha maintenance restore` | Phục hồi vào thư mục mới, không kích hoạt | Đích đã có store hoặc đang active; ảnh chụp không đầy đủ |
-| `ha maintenance retain` | `invalidate`, `archive` hay `forget` một nguồn | `forget` thiếu `--confirm` bằng `--source-id` |
+| `ha maintenance retain` | `invalidate`, `archive` hay `forget` một nguồn | `forget` thiếu `--confirm` bằng `--source-kind:--source-id` |
 | `ha maintenance tombstones` | Liệt kê nguồn đã quên và các bản sao còn lại | Không bao giờ |
 | `ha maintenance gc` | Thu gom artifact không tham chiếu, không pin, đã cũ | Không bao giờ; nó báo những gì được giữ và vì sao |
 | `ha maintenance migrate-copy` | Chuyển đổi store trên một bản sao | Đích đã có dữ liệu; nguồn không có store |

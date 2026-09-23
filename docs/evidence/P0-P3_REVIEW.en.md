@@ -85,6 +85,23 @@ with failure fixtures; this repair set does not establish full P0–P3 conforman
    cancellation. A canceled queued operation can still briefly start a process.
    Make admission cancellation-aware and add a marker-file negative test.
 
+### Follow-up audit — 2026-09-23
+
+The three findings above were fixed in later phase source and now have dedicated
+regressions; the list is historical, not current open work:
+
+- Approval binding checks session/task/invocation/call/action/workspace and
+  revisions; `milestone_m4::a14_approval_binding`.
+- Compaction captures the source sequence before building the summary, uses CAS
+  when writing the checkpoint and rebases with a bound;
+  `milestone_m5::a12_compaction_cas`.
+- A process canceled while queued on the lifecycle mutex does not spawn after
+  acquiring the permit; `milestone_m3::m3_02_canceled_queue_does_not_invoke`.
+
+These source checks do not make the frozen review entry point at baseline
+`c9bb106cce67c5c0b7e3c02fafe1484e5f69d379` build again. The P0–P7 audit is the
+verification on a matching worktree/revision. Limits below remain open.
+
 ### Later repair: streamed tool-call identity (finding 2 of this review)
 
 The second finding above — `parse_sse_payload` reading only the first tool delta and
@@ -113,9 +130,9 @@ because the owned `crates/harness-tools/src/contracts.rs` has moved past the bas
 `crates/harness-tools/src/service.rs`. The review entry point therefore needs a fresh
 baseline (or a wider owned set) before it can be re-run at all.
 
-The runbooks/handbook still say `not started`; they were retained as historical
-planning documents, consistent with their catalog role. Consult phase evidence
-for historical implementation status and this review for current defects.
+The implementation runbooks began as historical plans. Their stale status lines
+have been corrected by the P0–P7 audit; consult phase evidence and the current
+handoff for revision-specific verification and open work.
 
 ## Limits
 

@@ -1166,26 +1166,43 @@ async fn a36_strict_confinement() {
         .expect("listener");
     let port = listener.local_addr().expect("address").port();
     let network_nonce = format!("A36-NET-{}", probe.nonce());
-    let accept = async {
-        let Ok(Ok((mut stream, _))) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept()).await
-        else {
-            return String::new();
-        };
-        let mut buffer = vec![0_u8; 256];
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            tokio::io::AsyncReadExt::read(&mut stream, &mut buffer),
+    let expected_network_nonce = network_nonce.clone();
+    // Accept while the real process runs. A TCP handshake can complete and
+    // write_all can return before the peer is accepted; on Windows the client
+    // process may then exit quickly enough for the queued payload to be reset.
+    // Keeping accept alive during the run makes this canary verify delivery,
+    // rather than relying on the OS backlog to preserve bytes after close.
+    let mut accept = tokio::spawn(async move {
+        let (mut stream, peer) = listener
+            .accept()
+            .await
+            .map_err(|error| format!("listener accept failed: {error}"))?;
+        let mut buffer = vec![0_u8; expected_network_nonce.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buffer),
         )
         .await
-        {
-            Ok(Ok(read)) => String::from_utf8_lossy(&buffer[..read]).into_owned(),
-            _ => String::new(),
+        .map_err(|_| format!("timed out reading from {peer}"))?
+        .map_err(|error| format!("read from {peer} failed: {error}"))?;
+        let received = String::from_utf8_lossy(&buffer).into_owned();
+        if received == expected_network_nonce {
+            tokio::io::AsyncWriteExt::write_all(&mut stream, &[0xA5])
+                .await
+                .map_err(|error| format!("cannot acknowledge {peer}: {error}"))?;
+            // Keep the response side alive until the child has read the ACK and
+            // closed its socket. `write_all` only confirms the byte was queued
+            // locally; dropping immediately can reset it before Windows delivers
+            // it under workspace load.
+            let mut close = [0_u8; 1];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tokio::io::AsyncReadExt::read(&mut stream, &mut close),
+            )
+            .await;
         }
-    };
-    // The listener is read *after* the run: the connection and its bytes are
-    // queued by the OS, and racing a run that may be waiting behind the
-    // host-wide process permit would measure the queue rather than the boundary.
+        Ok::<_, String>(received)
+    });
     let output = run_through_gate(
         &tools,
         &bench,
@@ -1199,14 +1216,23 @@ async fn a36_strict_confinement() {
         ],
     )
     .await;
+    let received = match tokio::time::timeout(std::time::Duration::from_secs(2), &mut accept).await
+    {
+        Ok(Ok(Ok(received))) => received,
+        Ok(Ok(Err(error))) => error,
+        Ok(Err(error)) => format!("listener task failed: {error}"),
+        Err(_) => {
+            accept.abort();
+            "timed out waiting for the egress canary".to_owned()
+        }
+    };
     assert!(
         output.contains("connected=true"),
-        "the fixture reports whether its connection succeeded: {output}"
+        "the fixture reports whether its connection succeeded: {output}; listener={received:?}"
     );
-    let received = accept.await;
     assert!(
         received.contains(&network_nonce),
-        "an egress canary must reach a loopback listener on this host, and the measurement must say so"
+        "an egress canary must reach a loopback listener on this host, and the measurement must say so; received={received:?}"
     );
     assert_eq!(
         matrix.verdict(Capability::NetworkEgressDenial),

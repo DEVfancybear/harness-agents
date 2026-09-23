@@ -1,6 +1,53 @@
 # CURRENT — bàn giao đang mở
 
-## Follow-up audit M7–M12 — trạng thái có hiệu lực mới nhất
+## Audit đang thực hiện — P0–P7 code review và sửa defects
+
+**Cập nhật:** 23/09/2026 · **Branch/worktree:** `codex/p0-p7-audit` tại
+`C:\Users\duong\AppData\Local\Temp\harness-agents-p0-p7-audit` · **Base:**
+`5498f74071aae04998e51afdfa4eeb4281f5e870`. Đây là bàn giao có hiệu lực của task
+audit hiện tại; phần M7–M12 bên dưới là checkpoint/lịch sử riêng, không phải kết
+quả của nhánh audit này.
+
+- Đã sửa Rust production code: P6 cancellation guard kill đồng bộ + accounting; P4/M7
+  source invalidation và descendant cascade chỉ theo lineage của phiên bản hiện hành;
+  P7 archive/invalidate cũng theo nguồn hiện hành, còn forget quét mọi version lịch sử;
+  journal atomic và tombstone enforcement;
+  backup staging/publish atomic và verify manifest/snapshot; GC quarantine/path checks;
+  pin chỉ chấp nhận artifact tồn tại; journal/tombstone store API insert-only. Sửa CLI,
+  operator guide, handoff và test fixtures đồng bộ.
+- RED/GREEN đã quan sát: restore directory có sẵn; status trước journal; GC DB delete
+  fail; tombstone write path; manifest metadata mismatch; mtime thiếu; forget lặp;
+  reason trắng; confirmation thiếu kind; backup path đã tồn tại/lỗi để snapshot dở;
+  GC directory/path escape; store API ghi đè journal/tombstone; batch pin ID thiếu.
+- Kết quả regression trên source hiện tại: `phase_p4` **28/28** (gồm current-source,
+  stale dependency và purge lịch sử); `phase_p7` **30/30** sau khi cập nhật shared
+  store query; `milestone_m12` **11/11** sau khi giữ socket tới ACK peer;
+  `interactive_launch` qua trong workspace run cuối. Official P7 gate cuối **PASS**:
+  format, Clippy, workspace tests, predecessor P0–P6, P7 discovery **30**, required
+  **11**, docs checks đều xanh; P0/P1/P2/P3/P4/P5/P6 closure lần lượt **8/25/17/19/
+  21/19/12**. Gate-time source tree: **413 files**, digest
+  `sha256:e1da3e99101a7b407dbff67cc0bfe537d90b660de5080a12f9072b3974ffa37b`.
+  Sau gate chỉ có evidence/handoff thay đổi, không có Rust code thay đổi. Lượt trước từng dừng ở A36 do ACK bị
+  reset; listener/child nay giữ handshake tới khi peer đóng. Trước đó `i13_resume...`
+  lộ fixture upload dở tiêu thụ câu trả lời; fixture nay bỏ request chưa hoàn chỉnh.
+- P2 loopback server đọc hết body `Content-Length`, phục vụ bounded retries và match
+  lỗi transport sau khi URL được sanitize; `phase_p2` **17/17 PASS**. Những lần gate
+  đầu dừng ở test/fixture được liệt kê cùng kết quả thật trong
+  [evidence P0–P7](../evidence/P0-P7_AUDIT.vi.md). `Verify-Docs.ps1 -SelfTest` pass
+  sau cập nhật evidence/handoff cuối: 171 Markdown, 15 cặp ngôn ngữ, đủ 12 negative
+  controls, 63 bước P0–P8.
+- Có regression symlink artifact root chỉ biên dịch trên Unix; Windows hiện tại không
+  chạy ca đó. Linux giữ **pending** theo yêu cầu. Retention target là kind:id global
+  trong store; file ID hiện là path tương đối workspace. Backup manifest không có chữ ký.
+- Delivery chỉ gồm nhánh audit `codex/p0-p7-audit`; Git history trên nhánh xác định
+  revision chính xác. Không đưa thay đổi G01–G03 từ checkout chính vào.
+- Linux vẫn **pending** theo chỉ dẫn người dùng. Không claim toàn workspace/Linux
+  đã verified. Spec approval trước code và independent review không có; evidence
+  phải ghi rõ giới hạn này.
+- Checkout chính cùng G01–G03 giữ nguyên; tuyệt đối không stage/commit/push thay đổi
+  đó từ nhánh này.
+
+## Follow-up audit M7–M12 — lịch sử checkpoint trước đó
 
 **Cập nhật:** 23/09/2026 · **Branch:** `master` · Phần này supersede trạng thái cũ bên dưới khi có mâu thuẫn; checkpoint cũ giữ làm lịch sử.
 

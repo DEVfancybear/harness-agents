@@ -2,7 +2,7 @@
 //!
 //! Every command is explicit about what it did and what it refused. A restore
 //! never activates on its own, a forget requires a confirmation equal to its
-//! target, and a garbage collection reports exactly which artifacts it kept and
+//! full `source_kind:source_id` target, and garbage collection reports artifacts kept and
 //! why.
 
 use std::path::PathBuf;
@@ -60,7 +60,7 @@ enum MaintenanceSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Apply a retention action. Forget requires --confirm equal to the target.
+    /// Apply a retention action. Forget requires --confirm equal to kind:id.
     Retain {
         #[arg(long)]
         data_dir: PathBuf,
@@ -73,7 +73,7 @@ enum MaintenanceSubcommand {
         source_id: String,
         #[arg(long)]
         reason: String,
-        /// Explicit confirmation token; must equal --source-id for forget.
+        /// Explicit confirmation token; must equal --source-kind:--source-id for forget.
         #[arg(long)]
         confirm: Option<String>,
         /// A copy that may still contain the data, repeatable.
@@ -529,6 +529,8 @@ async fn retain(
         "target": report.target,
         "affected_assets": report.affected_assets.len(),
         "derived_invalidated": report.derived_invalidated,
+        "derived_archived": if report.action == RetentionAction::Archive { report.affected_assets.len() } else { 0 },
+        "derived_forgotten": if report.action == RetentionAction::Forget { report.affected_assets.len() } else { 0 },
         "tombstone_id": report.tombstone_id,
         "surviving_copies": report.surviving_copies,
         "note": "invalidate keeps history; only forget removes content and records a tombstone",
@@ -536,9 +538,14 @@ async fn retain(
     if json_output {
         println!("{output}");
     } else {
+        let (count, disposition) = match report.action {
+            RetentionAction::Invalidate => (report.derived_invalidated, "invalidated"),
+            RetentionAction::Archive => (report.affected_assets.len(), "archived"),
+            RetentionAction::Forget => (report.affected_assets.len(), "removed"),
+        };
         println!(
-            "{} applied to {}; {} derived records invalidated",
-            output["action"], output["target"], output["derived_invalidated"]
+            "{} applied to {}; {} derived records {disposition}",
+            output["action"], output["target"], count
         );
     }
     Ok(())

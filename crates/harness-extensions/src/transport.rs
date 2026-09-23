@@ -127,6 +127,73 @@ impl HostMethodHandler for EchoOnlyHost {
 
 type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<CallOutcome>>>>;
 type SharedWriter = Arc<tokio::sync::Mutex<ChildStdin>>;
+type SharedChild = Arc<Mutex<Option<Box<dyn process_wrap::tokio::ChildWrapper>>>>;
+
+struct InflightGuard(Arc<AtomicU64>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A call future being dropped leaves its outcome unknown. In that case the
+/// plugin process is terminated so abandoned work cannot outlive the host's
+/// inflight accounting or race a later call with the same id.
+struct PendingCallGuard {
+    id: String,
+    pending: PendingMap,
+    child: SharedChild,
+    dead: Arc<AtomicBool>,
+}
+
+impl Drop for PendingCallGuard {
+    fn drop(&mut self) {
+        let should_terminate = if let Ok(mut pending) = self.pending.lock() {
+            if pending.remove(&self.id).is_none() {
+                false
+            } else {
+                self.dead.store(true, Ordering::Release);
+                for (_, sender) in pending.drain() {
+                    let _ = sender.send(CallOutcome::Uncertain {
+                        reason: "the extension call future was canceled by its caller".to_owned(),
+                    });
+                }
+                true
+            }
+        } else {
+            self.dead.store(true, Ordering::Release);
+            true
+        };
+        if !should_terminate {
+            return;
+        }
+        let mut child = match self.child.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        let Some(mut child) = child.take() else {
+            return;
+        };
+        // Dispatch termination synchronously from Drop; scheduling an async
+        // task first could let the abandoned plugin keep running after the
+        // caller has already observed cancellation.
+        let _ = child.start_kill();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    if !matches!(child.try_wait(), Ok(None))
+                        || tokio::time::Instant::now() >= deadline
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+        }
+    }
+}
 
 /// An external extension process after a successful handshake.
 pub struct ExtensionTransport {
@@ -135,7 +202,7 @@ pub struct ExtensionTransport {
     generation: u64,
     session: NegotiatedSession,
     executable: PathBuf,
-    child: tokio::sync::Mutex<Option<Box<dyn process_wrap::tokio::ChildWrapper>>>,
+    child: SharedChild,
     writer: SharedWriter,
     pending: PendingMap,
     next_id: AtomicU64,
@@ -264,7 +331,7 @@ impl ExtensionTransport {
                 config_schema_version: manifest.config_schema_version,
             },
             executable: executable.to_path_buf(),
-            child: tokio::sync::Mutex::new(Some(child)),
+            child: Arc::new(Mutex::new(Some(child))),
             writer: Arc::new(tokio::sync::Mutex::new(stdin)),
             pending: Arc::clone(&pending),
             next_id: AtomicU64::new(1),
@@ -543,11 +610,9 @@ impl ExtensionTransport {
                 format!("the extension already has {MAX_INFLIGHT_CALLS} calls in flight"),
             ));
         }
-        let result = self
-            .call_inner(method, payload, deadline_ms, id.to_owned())
-            .await;
-        self.inflight.fetch_sub(1, Ordering::SeqCst);
-        result
+        let _inflight = InflightGuard(Arc::clone(&self.inflight));
+        self.call_inner(method, payload, deadline_ms, id.to_owned())
+            .await
     }
 
     async fn call_inner(
@@ -564,6 +629,9 @@ impl ExtensionTransport {
             let mut pending = self.pending.lock().map_err(|_| {
                 ExtensionError::new(ErrorCode::RuntimeBlocked, "transport state is poisoned")
             })?;
+            // A caller can cancel another task while this call waits to register.
+            // Recheck under the same lock the cancellation guard drains.
+            self.require_alive()?;
             if pending.contains_key(&id) {
                 return Err(ExtensionError::new(
                     ErrorCode::DuplicateFrameId,
@@ -572,6 +640,12 @@ impl ExtensionTransport {
             }
             pending.insert(id.clone(), sender);
         }
+        let _pending_call = PendingCallGuard {
+            id: id.clone(),
+            pending: Arc::clone(&self.pending),
+            child: Arc::clone(&self.child),
+            dead: Arc::clone(&self.dead),
+        };
         {
             let mut writer = self.writer.lock().await;
             if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
@@ -675,8 +749,10 @@ impl ExtensionTransport {
     pub async fn terminate_process_tree(&self) {
         self.dead.store(true, Ordering::Release);
         let child = {
-            let mut slot = self.child.lock().await;
-            slot.take()
+            match self.child.lock() {
+                Ok(mut slot) => slot.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            }
         };
         if let Some(mut child) = child {
             let _ = child.start_kill();

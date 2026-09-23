@@ -2,11 +2,11 @@
 
 English | [Tiếng Việt](README.vi.md)
 
-Runbook revision 1 — September 10, 2026. Derived from architecture revision 2 at commit `b636208`. This directory specifies future implementation work; every phase is currently **not started**. No Rust runtime or phase test runner has been created by writing these documents.
+Runbook revision 1 — September 10, 2026. Derived from architecture revision 2 at commit `b636208`. These documents were written before implementation; P0–P7 now have implementations and evidence tied to separate source revisions. The table below is the known status, not acceptance evidence for the current HEAD. P8 has not started.
 
 ## 1. How to use this pack
 
-Start an implementation agent with the prompt in section 9 of the selected phase. Begin with P0. Give the agent repository access and an explicit assignment; merely reading this pack is not permission to run later phases, spawn workers, install arbitrary tools or publish a release.
+For implemented P0–P7 phases, use their evidence and handoffs to check the tested revision and open items; do not treat them as new assignments. Use the section 9 prompt for an unimplemented phase. Merely reading these docs does not authorize worker spawning, arbitrary tool installation or release publication.
 
 Every phase contains seven ordered work items, proposed file ownership, contract decisions, tests, a demonstration, an exit gate and handoff requirements. The 63 step IDs are stable task identifiers. Target paths describe files to create or extend after inspecting actual code; do not replace existing implementations with fresh scaffolding blindly.
 
@@ -16,21 +16,23 @@ Source of truth: [architecture plan](../RUST_HARNESS_PLAN.en.md), [plugin contra
 
 | Phase | Runbook | Prerequisite | Person-days | Current status |
 |---|---|---|---:|---|
-| P0 | [Foundation, contracts and test scaffolding](P0_FOUNDATION.en.md) | — | 3–4 | not_started |
-| P1 | [Plugin kernel and durable storage](P1_KERNEL_STORAGE.en.md) | P0 | 8–11 | not_started |
-| P2 | [Agent runtime, context and compaction](P2_RUNTIME_CONTEXT.en.md) | P1 | 7–10 | not_started |
-| P3 | [Coding tools, execution policy and receipts](P3_CODING_TOOLS.en.md) | P2 | 7–10 | not_started |
-| P4 | [Reusable memory and recovery-safe extraction](P4_MEMORY.en.md) | P3 | 7–10 | not_started |
-| P5 | [Delegation, task DAG and isolated workspaces](P5_MULTI_AGENT.en.md) | P4 | 8–12 | implemented_local_pending_ci (see [P5 evidence](../evidence/P5.en.md)) |
-| P6 | [Skills, MCP and external plugin protocol](P6_EXTENSIONS.en.md) | P5 | 5–8 | implemented_local_pending_ci (see [P6 evidence](../evidence/P6.en.md)) |
-| P7 | [Recovery hardening and CLI release](P7_RELEASE.en.md) | P6 | 8–11 | implemented_local_pending_ci (see [P7 evidence](../evidence/P7.en.md)) |
+| P0 | [Foundation, contracts and test scaffolding](P0_FOUNDATION.en.md) | — | 3–4 | implemented; see [P0 evidence](../evidence/P0.en.md) |
+| P1 | [Plugin kernel and durable storage](P1_KERNEL_STORAGE.en.md) | P0 | 8–11 | implemented; see [P1 evidence](../evidence/P1.en.md) |
+| P2 | [Agent runtime, context and compaction](P2_RUNTIME_CONTEXT.en.md) | P1 | 7–10 | implemented; see [P2 evidence](../evidence/P2.en.md) |
+| P3 | [Coding tools, execution policy and receipts](P3_CODING_TOOLS.en.md) | P2 | 7–10 | implemented; see [P3 evidence](../evidence/P3.en.md) |
+| P4 | [Reusable memory and recovery-safe extraction](P4_MEMORY.en.md) | P3 | 7–10 | implemented; check current status in [P4 evidence](../evidence/P4.en.md) |
+| P5 | [Delegation, task DAG and isolated workspaces](P5_MULTI_AGENT.en.md) | P4 | 8–12 | implemented; historical CI in [P5 evidence](../evidence/P5.en.md) |
+| P6 | [Skills, MCP and external plugin protocol](P6_EXTENSIONS.en.md) | P5 | 5–8 | implemented; historical CI in [P6 evidence](../evidence/P6.en.md) |
+| P7 | [Recovery hardening and CLI release](P7_RELEASE.en.md) | P6 | 8–11 | implemented; historical CI in [P7 evidence](../evidence/P7.en.md) |
 | P8 | [Web UI over the same host services](P8_WEB.en.md) | P7 | 10–15 | not_started |
 
 P0 → P1 → P2 → P3 → P4 → P5 → P6 → P7 → optional P8. A phase starts after its predecessor's integration gate is accepted. Design review and fixture preparation may overlap, but do not merge code against an unaccepted predecessor interface.
 
 P0–P7 remain 53–76 person-days before contingency; P8 is additional. These estimates are not agent execution deadlines. Multiple agents do not automatically divide the calendar estimate by their count.
 
-`manifest.json` is a planning catalog of dependencies, steps and case ownership. It is **not** the live product task database. Future completion status requires evidence at a source revision, not an edited JSON status alone.
+`manifest.json` is a planning catalog of dependencies, steps and case ownership. It is **not** the live product task database; its phases intentionally retain `not_started` under the docs-validator contract and do not reflect implementation status. Future completion status requires evidence at a source revision, not an edited JSON status alone.
+
+P0–P7 evidence records gates on historical revisions; do not infer that every gate has been rerun on the current audit source tree. Linux verification remains pending in the current handoff.
 
 ## 3. Common startup procedure for every coding agent
 

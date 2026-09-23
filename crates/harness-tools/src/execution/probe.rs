@@ -21,7 +21,11 @@ use std::{
 
 use harness_providers::CancellationToken;
 use harness_types::{ContentHash, ErrorCode, HarnessError};
-use tokio::{io::AsyncReadExt, net::TcpListener, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    time::timeout,
+};
 
 use crate::{
     capture::{ProcessSpoolConfig, SpoolLimits},
@@ -608,9 +612,19 @@ impl CapabilityProbe {
             let Ok(Ok((mut stream, _))) = timeout(ESCAPE_WINDOW, listener.accept()).await else {
                 return String::new();
             };
-            let mut buffer = vec![0_u8; 256];
-            match timeout(Duration::from_secs(2), stream.read(&mut buffer)).await {
-                Ok(Ok(read)) => String::from_utf8_lossy(&buffer[..read]).into_owned(),
+            let mut buffer = vec![0_u8; nonce.len()];
+            match timeout(Duration::from_secs(2), stream.read_exact(&mut buffer)).await {
+                Ok(Ok(_)) => {
+                    let received = String::from_utf8_lossy(&buffer).into_owned();
+                    if received == nonce {
+                        // Require the short-lived fixture to observe that its
+                        // complete canary reached this listener before it
+                        // exits. This avoids a successful local write being
+                        // mistaken for a delivered connection on Windows.
+                        let _ = stream.write_all(&[0xA5]).await;
+                    }
+                    received
+                }
                 _ => String::new(),
             }
         };

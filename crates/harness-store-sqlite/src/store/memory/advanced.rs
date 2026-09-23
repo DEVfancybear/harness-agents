@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use super::{
     ContentHash, ErrorCode, MemoryAssetId, MemoryAssetStatus, RefreshSource, Row, SessionId,
     Sqlite, SqliteStore, StoreError, StoreMemoryPrincipal, StoredMemoryAssetRecord, Transaction,
@@ -292,8 +294,26 @@ impl SqliteStore {
         }
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;
-        let ids = sqlx::query_scalar::<_, String>("SELECT DISTINCT derived_asset_id FROM memory_dependencies WHERE source_kind = ? AND source_id = ?")
-            .bind(kind).bind(source_id).fetch_all(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "find changed memory sources", error))?;
+        let ids = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT ms.derived_asset_id FROM memory_sources ms
+             JOIN memory_assets a ON a.memory_asset_id = ms.derived_asset_id
+                                  AND a.current_version = ms.derived_version
+             WHERE ms.source_kind = ?1 AND ms.source_id = ?2
+               AND (?3 IS NULL OR ms.scope_project_id IS NULL OR ms.scope_project_id = ?3)
+             ORDER BY ms.derived_asset_id",
+        )
+        .bind(kind)
+        .bind(source_id)
+        .bind(principal.project_id.as_ref().map(ToString::to_string))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "find changed memory sources",
+                error,
+            )
+        })?;
         let mut affected = Vec::new();
         for id in ids {
             let id = MemoryAssetId::parse(id)
@@ -317,6 +337,135 @@ impl SqliteStore {
         })?;
         Ok(affected)
     }
+
+    /// Apply one operator retention status and its journal entry atomically.
+    ///
+    /// Retention addresses a global source identity; the tombstone key is also
+    /// global, so every project copy derived from that exact file/commit source
+    /// is included. Ordinary source invalidation remains principal-scoped.
+    pub async fn update_memory_source_retention_and_journal(
+        &self,
+        request: crate::MemorySourceRetentionUpdate,
+    ) -> Result<Vec<MemoryAssetId>, StoreError> {
+        let crate::MemorySourceRetentionUpdate {
+            source_kind: kind,
+            source_id,
+            status,
+            reason,
+            journal_entry_id,
+            journal_detail,
+            created_unix_ms,
+        } = request;
+        let (journal_action, invalidation_reason) = match status {
+            MemoryAssetStatus::Invalidated => {
+                let reason = reason
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        StoreError::new(ErrorCode::InvalidPayload, "invalidation reason required")
+                    })?;
+                ("invalidate", Some(reason))
+            }
+            MemoryAssetStatus::Archived => ("archive", None),
+            _ => {
+                return Err(StoreError::new(
+                    ErrorCode::InvalidPayload,
+                    "retention may only invalidate or archive a source",
+                ));
+            }
+        };
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        super::super::assert_fence_in_tx(&mut tx, &fence).await?;
+        let affected = source_derived_assets(&mut tx, &kind, &source_id, false).await?;
+        set_source_assets_status(&mut tx, &affected, status, invalidation_reason).await?;
+
+        let mut detail = journal_detail;
+        if let Some(fields) = detail.as_object_mut() {
+            fields.insert(
+                "affected_assets".to_owned(),
+                serde_json::json!(affected.len()),
+            );
+        }
+        let detail = serde_json::to_string(&detail).map_err(|_| {
+            StoreError::new(
+                ErrorCode::InvalidPayload,
+                "retention journal detail is not serializable",
+            )
+        })?;
+        sqlx::query(
+            "INSERT INTO maintenance_journal(
+                 entry_id, action, target, detail_json, created_unix_ms)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(journal_entry_id)
+        .bind(journal_action)
+        .bind(format!("{kind}:{source_id}"))
+        .bind(detail)
+        .bind(to_i64(created_unix_ms, "retention journal time")?)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "record retention journal entry",
+                error,
+            )
+        })?;
+
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit memory retention",
+                error,
+            )
+        })?;
+        Ok(affected)
+    }
+
+    /// Physically forget memory derived from a source and write its tombstone in
+    /// the same fenced transaction. A failed tombstone or journal write rolls
+    /// back the deletion, so the source cannot be re-extracted after a partial
+    /// forget.
+    pub async fn forget_memory_source_and_tombstone(
+        &self,
+        request: crate::MemorySourceForget,
+    ) -> Result<Vec<MemoryAssetId>, StoreError> {
+        let crate::MemorySourceForget {
+            source_kind: kind,
+            source_id,
+            tombstone,
+            journal_entry_id,
+            journal_action,
+            journal_detail,
+        } = request;
+        validate_forget_request(&kind, &source_id, &tombstone)?;
+
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        super::super::assert_fence_in_tx(&mut tx, &fence).await?;
+        ensure_source_not_forgotten(&mut tx, &kind, &source_id).await?;
+        // Forget must purge the asset's historical versions too: an older
+        // version can still contain content derived from this source even when
+        // the current version has moved on to different sources.
+        let affected = source_derived_assets(&mut tx, &kind, &source_id, true).await?;
+        delete_forgotten_source_assets(&mut tx, &affected).await?;
+        insert_forget_records(
+            &mut tx,
+            &kind,
+            &source_id,
+            &tombstone,
+            &journal_entry_id,
+            &journal_action,
+            &journal_detail,
+        )
+        .await?;
+        tx.commit().await.map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "commit source forget", error)
+        })?;
+        Ok(affected)
+    }
+
     /// The active asset that already holds this exact text, if any.
     ///
     /// A write path uses this to avoid minting a second asset for text it has already
@@ -940,13 +1089,322 @@ impl SqliteStore {
     }
 }
 
+fn validate_forget_request(
+    kind: &str,
+    source_id: &str,
+    tombstone: &crate::TombstoneRow,
+) -> Result<(), StoreError> {
+    if tombstone.source_kind != kind || tombstone.source_id != source_id {
+        return Err(StoreError::new(
+            ErrorCode::InvalidPayload,
+            "forget tombstone identity does not match its source",
+        ));
+    }
+    if kind.trim().is_empty() || source_id.trim().is_empty() || tombstone.reason.trim().is_empty() {
+        return Err(StoreError::new(
+            ErrorCode::InvalidPayload,
+            "forget requires a source kind, identity and reason",
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_source_not_forgotten(
+    tx: &mut Transaction<'_, Sqlite>,
+    kind: &str,
+    source_id: &str,
+) -> Result<(), StoreError> {
+    let already_forgotten = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(
+             SELECT 1 FROM maintenance_tombstones
+             WHERE source_kind = ? AND source_id = ?
+         )",
+    )
+    .bind(kind)
+    .bind(source_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| {
+        database_error(
+            ErrorCode::StorageWriteFailed,
+            "check existing forget tombstone",
+            error,
+        )
+    })?;
+    if already_forgotten != 0 {
+        return Err(StoreError::new(
+            ErrorCode::RetentionRefused,
+            format!("source {kind}:{source_id} was already forgotten"),
+        ));
+    }
+    Ok(())
+}
+
+async fn delete_forgotten_source_assets(
+    tx: &mut Transaction<'_, Sqlite>,
+    affected: &[MemoryAssetId],
+) -> Result<(), StoreError> {
+    let deletions = [
+        (
+            "DELETE FROM memory_fts WHERE memory_asset_id = ?",
+            "remove forgotten memory from search index",
+            false,
+        ),
+        (
+            "DELETE FROM memory_invalidations WHERE memory_asset_id = ?",
+            "remove forgotten memory invalidation history",
+            false,
+        ),
+        (
+            "DELETE FROM memory_bindings WHERE memory_asset_id = ?",
+            "remove forgotten memory bindings",
+            false,
+        ),
+        (
+            "DELETE FROM memory_grants WHERE memory_asset_id = ?",
+            "remove forgotten memory grants",
+            false,
+        ),
+        (
+            "DELETE FROM memory_versions WHERE memory_asset_id = ?",
+            "remove forgotten memory versions",
+            false,
+        ),
+        (
+            "DELETE FROM memory_sources WHERE derived_asset_id = ?",
+            "remove forgotten memory sources",
+            false,
+        ),
+        (
+            "DELETE FROM memory_dependencies
+             WHERE derived_asset_id = ? OR (source_kind = 'asset' AND source_id = ?)",
+            "remove forgotten memory dependencies",
+            true,
+        ),
+        (
+            "DELETE FROM memory_assets WHERE memory_asset_id = ?",
+            "remove forgotten memory asset",
+            false,
+        ),
+    ];
+    for id in affected {
+        for (statement, operation, has_source_id) in deletions {
+            let mut query = sqlx::query(statement).bind(id.as_str());
+            if has_source_id {
+                query = query.bind(id.as_str());
+            }
+            query
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| database_error(ErrorCode::StorageWriteFailed, operation, error))?;
+        }
+    }
+    Ok(())
+}
+
+async fn insert_forget_records(
+    tx: &mut Transaction<'_, Sqlite>,
+    kind: &str,
+    source_id: &str,
+    tombstone: &crate::TombstoneRow,
+    journal_entry_id: &str,
+    journal_action: &str,
+    journal_detail: &serde_json::Value,
+) -> Result<(), StoreError> {
+    let copies = serde_json::to_string(&tombstone.surviving_copies).map_err(|_| {
+        StoreError::new(
+            ErrorCode::InvalidPayload,
+            "surviving copies are not serializable",
+        )
+    })?;
+    sqlx::query(
+        "INSERT INTO maintenance_tombstones(
+             tombstone_id, source_kind, source_id, reason, surviving_copies_json, created_unix_ms)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&tombstone.tombstone_id)
+    .bind(&tombstone.source_kind)
+    .bind(&tombstone.source_id)
+    .bind(&tombstone.reason)
+    .bind(copies)
+    .bind(to_i64(tombstone.created_unix_ms, "tombstone time")?)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| {
+        database_error(
+            ErrorCode::StorageWriteFailed,
+            "record forget tombstone",
+            error,
+        )
+    })?;
+    let detail = serde_json::to_string(journal_detail).map_err(|_| {
+        StoreError::new(
+            ErrorCode::InvalidPayload,
+            "journal detail is not serializable",
+        )
+    })?;
+    sqlx::query(
+        "INSERT INTO maintenance_journal(
+             entry_id, action, target, detail_json, created_unix_ms)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(journal_entry_id)
+    .bind(journal_action)
+    .bind(format!("{kind}:{source_id}"))
+    .bind(detail)
+    .bind(to_i64(tombstone.created_unix_ms, "journal time")?)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| {
+        database_error(
+            ErrorCode::StorageWriteFailed,
+            "record forget journal entry",
+            error,
+        )
+    })?;
+    Ok(())
+}
+
+async fn set_source_assets_status(
+    tx: &mut Transaction<'_, Sqlite>,
+    affected: &[MemoryAssetId],
+    status: MemoryAssetStatus,
+    invalidation_reason: Option<&str>,
+) -> Result<(), StoreError> {
+    let status_value = match status {
+        MemoryAssetStatus::Active => "active",
+        MemoryAssetStatus::Candidate => "candidate",
+        MemoryAssetStatus::Superseded => "superseded",
+        MemoryAssetStatus::Invalidated => "invalidated",
+        MemoryAssetStatus::Archived => "archived",
+    };
+    for id in affected {
+        let Some(mut record) = load_asset_in_tx(tx, id).await? else {
+            continue;
+        };
+        record.asset.status = status;
+        let asset_json = serde_json::to_string(&record.asset)
+            .map_err(|_| StoreError::new(ErrorCode::InvalidPayload, "invalid memory asset"))?;
+        sqlx::query(
+            "UPDATE memory_assets SET status = ?, asset_json = ?, revision = revision + 1
+             WHERE memory_asset_id = ?",
+        )
+        .bind(status_value)
+        .bind(asset_json)
+        .bind(id.as_str())
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "update derived memory status",
+                error,
+            )
+        })?;
+        if let Some(reason) = invalidation_reason {
+            sqlx::query("INSERT INTO memory_invalidations(memory_asset_id, reason) VALUES (?, ?)")
+                .bind(id.as_str())
+                .bind(reason)
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| {
+                    database_error(
+                        ErrorCode::StorageWriteFailed,
+                        "record invalidation audit",
+                        error,
+                    )
+                })?;
+        }
+        refresh_fts(tx, &record).await?;
+    }
+    Ok(())
+}
+
+async fn source_derived_assets(
+    tx: &mut Transaction<'_, Sqlite>,
+    kind: &str,
+    source_id: &str,
+    include_history: bool,
+) -> Result<Vec<MemoryAssetId>, StoreError> {
+    if !matches!(kind, "file" | "commit") {
+        return Err(StoreError::new(
+            ErrorCode::InvalidPayload,
+            "unsupported source change",
+        ));
+    }
+    let roots_query = if include_history {
+        "SELECT DISTINCT ms.derived_asset_id FROM memory_sources ms
+         WHERE ms.source_kind = ?1 AND ms.source_id = ?2 ORDER BY ms.derived_asset_id"
+    } else {
+        "SELECT DISTINCT ms.derived_asset_id FROM memory_sources ms
+         JOIN memory_assets a ON a.memory_asset_id = ms.derived_asset_id
+                              AND a.current_version = ms.derived_version
+         WHERE ms.source_kind = ?1 AND ms.source_id = ?2 ORDER BY ms.derived_asset_id"
+    };
+    let roots = sqlx::query_scalar::<_, String>(roots_query)
+        .bind(kind)
+        .bind(source_id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "find changed memory sources",
+                error,
+            )
+        })?;
+
+    let mut affected = BTreeSet::new();
+    for root in roots {
+        let root = MemoryAssetId::parse(root)
+            .map_err(|error| StoreError::new(error.code(), error.to_string()))?;
+        let descendants_query = if include_history {
+            "WITH RECURSIVE affected(id) AS (
+                 SELECT ?
+                 UNION
+                 SELECT d.derived_asset_id FROM memory_dependencies d
+                 JOIN affected a ON d.source_kind = 'asset' AND d.source_id = a.id
+             )
+             SELECT id FROM affected ORDER BY id"
+        } else {
+            "WITH RECURSIVE affected(id) AS (
+                 SELECT ?
+                 UNION
+                 SELECT d.derived_asset_id FROM memory_dependencies d
+                 JOIN memory_assets current ON current.memory_asset_id = d.derived_asset_id
+                                           AND current.current_version = d.derived_version
+                 JOIN affected a ON d.source_kind = 'asset' AND d.source_id = a.id
+             )
+             SELECT id FROM affected ORDER BY id"
+        };
+        let descendants = sqlx::query_scalar::<_, String>(descendants_query)
+            .bind(root.as_str())
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::StorageWriteFailed,
+                    "find transitive memory dependents",
+                    error,
+                )
+            })?;
+        for id in descendants {
+            affected.insert(
+                MemoryAssetId::parse(id)
+                    .map_err(|error| StoreError::new(error.code(), error.to_string()))?,
+            );
+        }
+    }
+    Ok(affected.into_iter().collect())
+}
+
 pub(super) async fn invalidate_tree(
     tx: &mut Transaction<'_, Sqlite>,
     root: &MemoryAssetId,
     include_root: bool,
     reason: &str,
 ) -> Result<Vec<MemoryAssetId>, StoreError> {
-    let ids = sqlx::query_scalar::<_, String>("WITH RECURSIVE affected(id) AS (SELECT ? UNION SELECT d.derived_asset_id FROM memory_dependencies d JOIN affected a ON d.source_id = a.id WHERE d.source_kind = 'asset') SELECT id FROM affected ORDER BY id")
+    let ids = sqlx::query_scalar::<_, String>("WITH RECURSIVE affected(id) AS (SELECT ? UNION SELECT d.derived_asset_id FROM memory_dependencies d JOIN memory_assets current ON current.memory_asset_id = d.derived_asset_id AND current.current_version = d.derived_version JOIN affected a ON d.source_id = a.id WHERE d.source_kind = 'asset') SELECT id FROM affected ORDER BY id")
         .bind(root.as_str()).fetch_all(&mut **tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "find transitive memory dependents", error))?;
     let mut affected = Vec::new();
     for id in ids {

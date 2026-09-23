@@ -2,7 +2,7 @@
 
 English | [Tiếng Việt](P7_RELEASE.vi.md)
 
-Implementation runbook; status: **implemented locally, acceptance pending remote CI**. Estimate: 8–11 person-days. All target files, Rust tests and `ha` commands below are future outputs unless already present in the checkout. This document alone is not completion evidence.
+Implementation runbook; P0–P7 implementation was delivered after this plan was written. See [P0–P7 audit evidence](../evidence/P0-P7_AUDIT.en.md) for verification and current limits; this runbook is not completion evidence. Original estimate: 8–11 person-days.
 
 ## 1. Outcome and entry gate
 
@@ -48,7 +48,7 @@ Evidence: C27 upgrade works with backlog/incomplete work; interrupted migration 
 
 Depends on: P7-S01, P7-S02.
 
-Separate invalidate/archive/forget APIs. Require an explicit deletion target/confirmation, propagate deletion to derived payloads/indexes/caches, add tombstones and prevent re-extraction. Pin unfinished work and backups; GC only unreferenced artifacts after the chosen grace period.
+Separate invalidate/archive/forget APIs. Invalidate/archive affect only the current version's source lineage; `forget` traverses every historical source/dependency version and removes all asset versions that may retain that source, together with payloads/indexes/caches and a tombstone that prevents re-extraction. Pin unfinished work and backups; GC only unreferenced artifacts after the chosen grace period.
 
 Evidence: C28 reports reduced old-session evidence and prevents deleted content from reappearing; remaining external/backup copies are disclosed.
 
