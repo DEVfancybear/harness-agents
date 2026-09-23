@@ -1002,6 +1002,99 @@
           "closure-M0"
         ]
       }
+    },
+    {
+      "id": "M12",
+      "title": "Strict execution backend",
+      "runbook": "docs/implementation-next/M12.vi.md",
+      "prerequisites": ["M4"],
+      "status": "in_progress",
+      "integration_target": "milestone_m12",
+      "work_items": [
+        {
+          "id": "M12-01",
+          "title": "Capability spike và backend selection",
+          "status": "implemented_unverified",
+          "tests": [
+            "m12_01_capability_matrix_is_measured_on_this_host",
+            "m12_01_a_strict_request_is_refused_before_anything_runs"
+          ]
+        },
+        {
+          "id": "M12-02",
+          "title": "Confinement và execution mapping",
+          "status": "implemented_unverified",
+          "tests": [
+            "m12_02_the_plan_names_the_controls_it_does_not_have",
+            "m12_02_a_normal_command_succeeds_inside_the_backend",
+            "m12_02_artifact_export_is_bounded_and_digest_bound"
+          ]
+        },
+        {
+          "id": "M12-03",
+          "title": "Ownership leases và orphan recovery",
+          "status": "implemented_unverified",
+          "tests": [
+            "m12_03_a_lease_is_written_before_the_process_and_settled_once",
+            "m12_03_recovery_protects_a_live_owner_and_settles_an_orphan",
+            "m12_03_a_real_execution_records_its_lease_and_artifact"
+          ]
+        },
+        {
+          "id": "M12-04",
+          "title": "Adversarial gates và profile documentation",
+          "status": "implemented_unverified",
+          "tests": [
+            "a36_strict_confinement",
+            "m12_04_the_cli_refuses_a_profile_this_host_cannot_enforce"
+          ]
+        }
+      ],
+      "required_tests": [
+        "milestone_m12::a36_strict_confinement",
+        "milestone_m12::m12_01_capability_matrix_is_measured_on_this_host",
+        "milestone_m12::m12_01_a_strict_request_is_refused_before_anything_runs",
+        "milestone_m12::m12_02_the_plan_names_the_controls_it_does_not_have",
+        "milestone_m12::m12_02_a_normal_command_succeeds_inside_the_backend",
+        "milestone_m12::m12_02_artifact_export_is_bounded_and_digest_bound",
+        "milestone_m12::m12_03_a_lease_is_written_before_the_process_and_settled_once",
+        "milestone_m12::m12_03_recovery_protects_a_live_owner_and_settles_an_orphan",
+        "milestone_m12::m12_03_a_real_execution_records_its_lease_and_artifact",
+        "milestone_m12::m12_04_the_cli_refuses_a_profile_this_host_cannot_enforce"
+      ],
+      "unit_tests": [],
+      "fixtures": [
+        "crates/harness-cli/src/bin/m12_probe_child.rs",
+        "crates/harness-cli/src/sandbox_cli.rs",
+        "crates/harness-cli/tests/milestone_m12.rs",
+        "crates/harness-store-sqlite/src/store/backend_leases.rs",
+        "crates/harness-tools/src/execution/capability.rs",
+        "crates/harness-tools/src/execution/export.rs",
+        "crates/harness-tools/src/execution/lease.rs",
+        "crates/harness-tools/src/execution/plan.rs",
+        "crates/harness-tools/src/execution/probe.rs",
+        "crates/harness-tools/src/execution/probe_control.rs",
+        "docs/adr/ADR-N12-STRICT-BACKEND-AND-CAPABILITIES.vi.md",
+        "docs/specs/M12.vi.md",
+        "docs/support/STRICT_EXECUTION_SUPPORT.vi.md"
+      ],
+      "gate": {
+        "script": "scripts/Verify-Milestone.ps1",
+        "dependency_check_bin": "dependency_check",
+        "steps": [
+          "format",
+          "clippy",
+          "workspace-tests",
+          "dependency-allowlist",
+          "required-test-discovery",
+          "required-tests",
+          "closure-M4",
+          "closure-M3",
+          "closure-M1",
+          "closure-M2",
+          "closure-M0"
+        ]
+      }
     }
   ],
   "acceptance_cases": [
@@ -1309,7 +1402,9 @@
       "id": "A36",
       "owner_milestones": ["M12"],
       "planned_test": "a36_strict_confinement",
-      "status": "planned"
+      "status": "planned",
+      "selectors": null,
+      "note": "demonstrated in part, and the part that is not demonstrated is the part this host cannot do: the capability matrix is measured by probes on the real backend (Windows build 26200, process-wrap 10.0.0) and the published support matrix is compared with it by the test itself; containment, tree kill, environment allowlist, deadline and output bounds are enforced with positive observations, and the boundary-break and environment-inheritance controls prove the probes can lose; the file, network and credential-pipe canaries are run end to end through the gate and they SUCCEED, which is why those capabilities are recorded unsupported and a strict profile is refused by name instead of being served as containment; leases are written before the process exists, reconciliation settles only a lease whose OS-held lock it can take, and a live owner is reported still_owned and left untouched. NOT demonstrated: denied filesystem, network and credential-socket access (there is no OS mechanism for them here), and any non-Windows platform, where no probe has ever been run. A36 stays planned until a host with a real confinement backend can run the same test."
     }
   ]
 }

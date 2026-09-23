@@ -969,3 +969,539 @@ async fn m12_03_a_real_execution_records_its_lease_and_artifact() {
     drop(tools);
     close(store).await;
 }
+
+// ---------------------------------------------------------------------------
+// A36 — strict backend proof
+// ---------------------------------------------------------------------------
+
+/// The support matrix this repository publishes for the platform the test is
+/// running on, as key/value pairs.
+fn support_matrix_for_this_platform() -> std::collections::BTreeMap<String, String> {
+    const DOC: &str = include_str!("../../../docs/support/STRICT_EXECUTION_SUPPORT.vi.md");
+    let mut blocks = Vec::new();
+    let mut current: Option<std::collections::BTreeMap<String, String>> = None;
+    for line in DOC.lines() {
+        let line = line.trim();
+        if line == "<!-- support-matrix:begin -->" {
+            current = Some(std::collections::BTreeMap::new());
+            continue;
+        }
+        if line == "<!-- support-matrix:end -->" {
+            if let Some(block) = current.take() {
+                blocks.push(block);
+            }
+            continue;
+        }
+        if let Some(block) = current.as_mut()
+            && let Some((key, value)) = line.split_once('=')
+        {
+            block.insert(key.trim().to_owned(), value.trim().to_owned());
+        }
+    }
+    blocks
+        .into_iter()
+        .find(|block| {
+            block.get("platform").map(String::as_str) == Some(std::env::consts::OS)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the support matrix has no block for {}; an unmeasured platform is not a supported one",
+                std::env::consts::OS
+            )
+        })
+}
+
+/// A36: the whole strict-backend story, on the real backend, with real canaries.
+#[allow(clippy::too_many_lines)] // one acceptance case, told in order
+#[tokio::test]
+async fn a36_strict_confinement() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let (session, task) = admit(&store, &bench).await;
+    let probe_root = tempfile::tempdir().expect("probe root");
+    let child = probe_child();
+    let probe = CapabilityProbe::new(probe_root.path(), child.clone());
+    let matrix = probe
+        .run()
+        .await
+        .expect("the probes run on the real backend");
+    matrix.validate().expect("every verdict carries evidence");
+
+    // (1) The support matrix has to match what was measured here, not what was
+    // hoped for: this is the clause A36 calls "support matrix matches real
+    // environment", and it is checked rather than asserted in prose.
+    let published = support_matrix_for_this_platform();
+    assert_eq!(
+        published.get("measured").map(String::as_str),
+        Some("true"),
+        "this platform is documented as unmeasured; a probe ran here, so record its result"
+    );
+    assert_eq!(
+        published.get("backend").map(String::as_str),
+        Some(matrix.host.backend.as_str())
+    );
+    assert_eq!(
+        published.get("backend_version").map(String::as_str),
+        Some(matrix.host.backend_version.as_str())
+    );
+    for capability in Capability::ALL {
+        let measured = match matrix.verdict(capability) {
+            Some(CapabilityVerdict::Enforced) => "enforced",
+            Some(CapabilityVerdict::Unsupported) => "unsupported",
+            None => panic!("{} has no verdict", capability.as_str()),
+        };
+        assert_eq!(
+            published.get(capability.as_str()).map(String::as_str),
+            Some(measured),
+            "the published matrix disagrees with the measurement for {}",
+            capability.as_str()
+        );
+    }
+    let full_refused = StrictProfile::Full.refusal(&matrix).is_some();
+    assert_eq!(
+        published.get("strict_profile_full").map(String::as_str),
+        Some(if full_refused { "refused" } else { "served" }),
+        "the published profile line disagrees with the measurement"
+    );
+
+    let tools = ToolExecutionService::new(Arc::clone(&store))
+        .with_capability_matrix(Arc::new(matrix.clone()));
+
+    // (2) Denied actions are denied outside the model: a strict request is
+    // refused before a process exists, whatever the model asked for.
+    let marker = bench.temp.path().join("a36-strict-marker.txt");
+    let prepared = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a36",
+            &bench.workspace,
+            marker_action(&child, &marker, IsolationMode::Strict),
+        ))
+        .await
+        .expect("prepares");
+    let grant = tools.approve(&prepared).await.expect("approval");
+    let view = tools.execute(prepared, Some(grant)).await.expect("denied");
+    let (code, reason) = denied(&view);
+    assert_eq!(code, ErrorCode::StrictIsolationUnavailable.as_str());
+    assert!(!marker.exists(), "a refused strict request runs nothing");
+    for capability in matrix.missing_for(StrictProfile::Full) {
+        assert!(
+            reason.contains(capability.as_str()),
+            "the refusal names every missing capability: {reason}"
+        );
+    }
+
+    // (3) The canaries, end to end through the gate rather than through the
+    // probe's word: a real tool call reaches outside the workspace, reaches the
+    // network, and reaches a credential pipe, because this host does not deny
+    // any of them. Each is a receipt-backed execution.
+    let outside = probe_root.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("canary root");
+    let file_canary = outside.join("a36-read-canary.txt");
+    let file_nonce = format!("A36-FILE-{}", probe.nonce());
+    std::fs::write(&file_canary, &file_nonce).expect("write canary");
+    let output = run_through_gate(
+        &tools,
+        &bench,
+        &session,
+        &task,
+        &child,
+        vec![
+            "read".to_owned(),
+            file_canary.to_string_lossy().into_owned(),
+        ],
+    )
+    .await;
+    assert!(
+        output.contains(&file_nonce),
+        "the file canary outside the workspace must be reachable on this host, and the measurement must say so: {output}"
+    );
+    assert_eq!(
+        matrix.verdict(Capability::FilesystemReadConfinement),
+        Some(CapabilityVerdict::Unsupported)
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener");
+    let port = listener.local_addr().expect("address").port();
+    let network_nonce = format!("A36-NET-{}", probe.nonce());
+    let accept = async {
+        let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept()).await
+        else {
+            return String::new();
+        };
+        let mut buffer = vec![0_u8; 256];
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read(&mut stream, &mut buffer),
+        )
+        .await
+        {
+            Ok(Ok(read)) => String::from_utf8_lossy(&buffer[..read]).into_owned(),
+            _ => String::new(),
+        }
+    };
+    // The listener is read *after* the run: the connection and its bytes are
+    // queued by the OS, and racing a run that may be waiting behind the
+    // host-wide process permit would measure the queue rather than the boundary.
+    let output = run_through_gate(
+        &tools,
+        &bench,
+        &session,
+        &task,
+        &child,
+        vec![
+            "connect".to_owned(),
+            port.to_string(),
+            network_nonce.clone(),
+        ],
+    )
+    .await;
+    assert!(
+        output.contains("connected=true"),
+        "the fixture reports whether its connection succeeded: {output}"
+    );
+    let received = accept.await;
+    assert!(
+        received.contains(&network_nonce),
+        "an egress canary must reach a loopback listener on this host, and the measurement must say so"
+    );
+    assert_eq!(
+        matrix.verdict(Capability::NetworkEgressDenial),
+        Some(CapabilityVerdict::Unsupported)
+    );
+
+    let socket_nonce = format!("A36-SOCK-{}", probe.nonce());
+    let socket_canary = credential_canary(&socket_nonce).await;
+    assert!(
+        socket_canary.reached,
+        "a credential pipe must be reachable on this host, and the measurement must say so: {}",
+        socket_canary.detail
+    );
+    assert_eq!(
+        matrix.verdict(Capability::CredentialSocketDenial),
+        Some(CapabilityVerdict::Unsupported)
+    );
+
+    // (4) Resource exhaustion is bounded, not capped, and the difference is in
+    // the matrix: a flood is cut by the quota and a crowd is reaped with the
+    // tree, while memory and process count stay explicitly unclaimed.
+    let flooded = run_through_gate(
+        &tools,
+        &bench,
+        &session,
+        &task,
+        &child,
+        vec!["flood".to_owned(), (256 * 1024).to_string()],
+    )
+    .await;
+    assert!(
+        flooded.len() < 256 * 1024,
+        "the capture quota bounds the flood"
+    );
+    assert_eq!(
+        matrix.verdict(Capability::ResourceLimitMemory),
+        Some(CapabilityVerdict::Unsupported)
+    );
+    assert_eq!(
+        matrix.verdict(Capability::ResourceLimitProcessCount),
+        Some(CapabilityVerdict::Unsupported)
+    );
+
+    // (5) Lifecycle: every execution above left a settled lease with the
+    // artifact digest an export must check, a live owner is never touched by
+    // reconciliation, and a killed owner is settled with a note.
+    let host_id = store.fence().expect("fence").host_id.as_str().to_owned();
+    let live = LeaseOwner::open(
+        &store,
+        &LeaseRequest::from_plan(
+            &ExecutionPlan::for_process_action(
+                &CodingToolAction::RunShell {
+                    command: "echo hi".to_owned(),
+                    timeout_ms: 1_000,
+                    isolation: IsolationMode::BestEffort,
+                    env: Vec::new(),
+                },
+                &bench.workspace,
+                &matrix,
+                StrictProfile::Containment,
+                1_000,
+                65_536,
+            ),
+            "session.a36",
+            "task.a36",
+            "execution.a36-live",
+            bench.data_dir.join("leases"),
+        ),
+    )
+    .await
+    .expect("live lease");
+    let live_id = live.lease_id().to_owned();
+    let report = reconcile_backend_leases(&store, u64::MAX, 1_800_000_000_000)
+        .await
+        .expect("reconcile");
+    assert_eq!(
+        report.outcome_for(&live_id),
+        Some(LeaseOutcome::StillOwned),
+        "reconciliation may not touch a live owner: {report:?}"
+    );
+    let settled = store
+        .unsettled_backend_leases(i64::MAX)
+        .await
+        .expect("list");
+    assert!(
+        settled.iter().all(|lease| lease.lease_id == live_id),
+        "the executions above left no unsettled lease: {settled:?}"
+    );
+    assert!(
+        store
+            .backend_lease(&live_id)
+            .await
+            .expect("read")
+            .expect("row")
+            .released_at_unix_ms
+            .is_none()
+    );
+    assert!(host_id.starts_with("host_"));
+    live.release(&store, None).await.expect("release");
+
+    // (6) The negative control: the same fixtures with the boundary removed must
+    // fail, or the probes are measuring nothing. Nothing here is mocked -- the
+    // child is a real process and the control really omits the wrapper.
+    let boundary = probe.boundary_break_control().await.expect("control");
+    assert!(
+        boundary.escaped,
+        "without the job object a descendant must survive the kill: {}",
+        boundary.detail
+    );
+    assert!(
+        probe
+            .environment_inheritance_control()
+            .await
+            .expect("control"),
+        "without the allowlist the canary must reach the child"
+    );
+
+    drop(tools);
+    close(store).await;
+}
+
+/// Run one fixture command through the real gate and return its stdout.
+async fn run_through_gate(
+    tools: &ToolExecutionService,
+    bench: &Bench,
+    session: &SessionId,
+    task: &TaskId,
+    child: &ProbeChild,
+    args: Vec<String>,
+) -> String {
+    let prepared = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.a36",
+            &bench.workspace,
+            CodingToolAction::RunProcess {
+                executable: child.executable().to_string_lossy().into_owned(),
+                args,
+                timeout_ms: 20_000,
+                isolation: IsolationMode::BestEffort,
+                env: Vec::new(),
+            },
+        ))
+        .await
+        .expect("prepares");
+    let grant = tools.approve(&prepared).await.expect("approval");
+    let view = tools.execute(prepared, Some(grant)).await.expect("runs");
+    match view.output {
+        ToolOutput::Process { stdout, .. } => stdout,
+        other => panic!("a process canary must settle as a process: {other:?}"),
+    }
+}
+
+struct SocketCanary {
+    reached: bool,
+    detail: String,
+}
+
+/// Host a credential-like endpoint and let a real tool call try to open it.
+#[cfg(windows)]
+async fn credential_canary(nonce: &str) -> SocketCanary {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let name = format!(r"\\.\pipe\a36-{nonce}");
+    let mut server = match ServerOptions::new().first_pipe_instance(true).create(&name) {
+        Ok(server) => server,
+        Err(error) => {
+            return SocketCanary {
+                reached: false,
+                detail: format!("cannot host the canary pipe: {error}"),
+            };
+        }
+    };
+    let accept = async {
+        let Ok(Ok(())) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), server.connect()).await
+        else {
+            return String::new();
+        };
+        let mut buffer = vec![0_u8; 256];
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read(&mut server, &mut buffer),
+        )
+        .await
+        {
+            Ok(Ok(read)) => String::from_utf8_lossy(&buffer[..read]).into_owned(),
+            _ => String::new(),
+        }
+    };
+    let (_, received) = tokio::join!(run_pipe_canary(&name, nonce), accept);
+    SocketCanary {
+        reached: received.contains(nonce),
+        detail: format!("pipe {name} received {received:?}"),
+    }
+}
+
+#[cfg(unix)]
+async fn credential_canary(nonce: &str) -> SocketCanary {
+    let path = std::env::temp_dir().join(format!("a36-{nonce}.sock"));
+    let listener = match tokio::net::UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            return SocketCanary {
+                reached: false,
+                detail: format!("cannot host the canary socket: {error}"),
+            };
+        }
+    };
+    let accept = async {
+        let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept()).await
+        else {
+            return String::new();
+        };
+        let mut buffer = vec![0_u8; 256];
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read(&mut stream, &mut buffer),
+        )
+        .await
+        {
+            Ok(Ok(read)) => String::from_utf8_lossy(&buffer[..read]).into_owned(),
+            _ => String::new(),
+        }
+    };
+    let address = path.to_string_lossy().into_owned();
+    let (_, received) = tokio::join!(run_pipe_canary(&address, nonce), accept);
+    SocketCanary {
+        reached: received.contains(nonce),
+        detail: format!("socket {address} received {received:?}"),
+    }
+}
+
+/// The tool call side of the socket canary, through its own service and store.
+async fn run_pipe_canary(address: &str, nonce: &str) -> String {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let (session, task) = admit(&store, &bench).await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let output = run_through_gate(
+        &tools,
+        &bench,
+        &session,
+        &task,
+        &probe_child(),
+        vec!["pipe".to_owned(), address.to_owned(), nonce.to_owned()],
+    )
+    .await;
+    drop(tools);
+    close(store).await;
+    output
+}
+
+// ---------------------------------------------------------------------------
+// M12-04 — the operator surface tells the same truth as the matrix
+// ---------------------------------------------------------------------------
+
+/// The CLI is the surface an operator reads, so it is run for real: `--require
+/// full` must fail here, and `--require containment` must not.
+#[tokio::test]
+async fn m12_04_the_cli_refuses_a_profile_this_host_cannot_enforce() {
+    let ha = PathBuf::from(env!("CARGO_BIN_EXE_ha"));
+    let child = probe_child();
+    let temp = tempfile::tempdir().expect("probe root");
+    let root = temp.path().join("probe");
+
+    let refused = Command::new(&ha)
+        .args([
+            "sandbox",
+            "probe",
+            "--probe-child",
+            child.executable().to_string_lossy().as_ref(),
+            "--root",
+            root.to_string_lossy().as_ref(),
+            "--require",
+            "full",
+            "--json",
+        ])
+        .output()
+        .expect("ha runs");
+    assert!(
+        !refused.status.success(),
+        "a profile this host cannot enforce must not exit zero"
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        text.contains("strict_isolation_unavailable"),
+        "the refusal has to be the typed one: {text}"
+    );
+    for capability in [
+        "filesystem_read_confinement",
+        "network_egress_denial",
+        "credential_socket_denial",
+    ] {
+        assert!(
+            text.contains(capability),
+            "the refusal has to name {capability}: {text}"
+        );
+    }
+
+    let served = Command::new(&ha)
+        .args([
+            "sandbox",
+            "probe",
+            "--probe-child",
+            child.executable().to_string_lossy().as_ref(),
+            "--root",
+            root.to_string_lossy().as_ref(),
+            "--require",
+            "containment",
+            "--json",
+        ])
+        .output()
+        .expect("ha runs");
+    assert!(
+        served.status.success(),
+        "containment is servable here: {}",
+        String::from_utf8_lossy(&served.stderr)
+    );
+    let matrix: serde_json::Value =
+        serde_json::from_slice(&served.stdout).expect("the CLI prints the versioned matrix");
+    assert_eq!(matrix["schema_version"], 1);
+    assert_eq!(
+        matrix["findings"].as_array().map(Vec::len),
+        Some(Capability::ALL.len())
+    );
+    assert_eq!(
+        matrix["host"]["backend"].as_str(),
+        Some(harness_tools::CONTAINMENT_BACKEND)
+    );
+}
