@@ -16,6 +16,8 @@
 //!   itself detectable.
 
 mod capability;
+mod export;
+mod plan;
 mod probe;
 mod probe_control;
 
@@ -23,5 +25,13 @@ pub use capability::{
     CAPABILITY_MATRIX_SCHEMA_VERSION, CONTAINMENT_BACKEND, CONTAINMENT_BACKEND_VERSION, Capability,
     CapabilityEvidence, CapabilityFinding, CapabilityMatrix, CapabilityVerdict, HostIdentity,
     StrictProfile,
+};
+pub use export::{
+    ARTIFACT_EXPORT_SCHEMA_VERSION, ArtifactExport, ExportProvenance, MAX_EXPORT_BYTES,
+    export_artifact, export_destination,
+};
+pub use plan::{
+    EXECUTION_PLAN_SCHEMA_VERSION, EnvironmentPlan, ExecutionPlan, ScopeAccess, ScopeGrant,
+    UnmappedControl, resolve_within,
 };
 pub use probe::{BoundaryBreakObservation, CapabilityProbe, PROBE_CANARY_NAME, ProbeChild};

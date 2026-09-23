@@ -36,6 +36,21 @@ enum SandboxSubcommand {
         #[arg(long)]
         json: bool,
     },
+    /// Export a published capture with its digest, without copying anything else.
+    Export {
+        /// Local `SQLite` data directory owned by this harness.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// The artifact id a receipt points at.
+        #[arg(long)]
+        artifact_id: String,
+        /// Directory the bytes are written into; the name is derived from the id.
+        #[arg(long)]
+        to: PathBuf,
+        /// Emit the versioned export record as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub async fn run(command: SandboxCommand) -> Result<(), HarnessError> {
@@ -46,7 +61,53 @@ pub async fn run(command: SandboxCommand) -> Result<(), HarnessError> {
             require,
             json,
         } => probe(&probe_child, root, require.as_deref(), json).await,
+        SandboxSubcommand::Export {
+            data_dir,
+            artifact_id,
+            to,
+            json,
+        } => export(&data_dir, &artifact_id, &to, json).await,
     }
+}
+
+/// Export one artifact. The store is opened read-only: an export must not be
+/// able to become a writer, and a daemon that owns the data directory must not
+/// have to stop for a copy to happen.
+async fn export(
+    data_dir: &Path,
+    artifact_id: &str,
+    to: &Path,
+    json_output: bool,
+) -> Result<(), HarnessError> {
+    let store = harness_store_sqlite::SqliteStore::open_read_only(data_dir.to_owned())
+        .await
+        .map_err(harness_store_sqlite::StoreError::into_harness_error)?;
+    let record = harness_tools::export_artifact(
+        &store,
+        artifact_id,
+        to,
+        None,
+        harness_tools::PROCESS_OUTPUT_PAGE_MAX_BYTES as usize,
+    )
+    .await?;
+    if json_output {
+        let value = serde_json::to_value(&record).map_err(|_| {
+            HarnessError::new(
+                ErrorCode::InvalidPayload,
+                "export record is not serializable",
+            )
+        })?;
+        println!("{value}");
+    } else {
+        println!(
+            "exported {} ({} bytes, {}) to {}",
+            record.artifact_id,
+            record.byte_len,
+            record.exported_digest,
+            to.join(&record.relative_path).display()
+        );
+    }
+    Ok(())
 }
 
 async fn probe(

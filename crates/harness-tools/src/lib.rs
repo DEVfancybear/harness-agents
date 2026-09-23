@@ -35,10 +35,12 @@ pub use loop_service::{CodingLoopResult, CodingLoopService};
 // a strict request is answered against. The vocabulary is exported because an
 // operator has to be able to read the evidence, not just the verdict.
 pub use execution::{
-    BoundaryBreakObservation, CAPABILITY_MATRIX_SCHEMA_VERSION, CONTAINMENT_BACKEND,
-    CONTAINMENT_BACKEND_VERSION, Capability, CapabilityEvidence, CapabilityFinding,
-    CapabilityMatrix, CapabilityProbe, CapabilityVerdict, HostIdentity, PROBE_CANARY_NAME,
-    ProbeChild, StrictProfile,
+    ARTIFACT_EXPORT_SCHEMA_VERSION, ArtifactExport, BoundaryBreakObservation,
+    CAPABILITY_MATRIX_SCHEMA_VERSION, CONTAINMENT_BACKEND, CONTAINMENT_BACKEND_VERSION, Capability,
+    CapabilityEvidence, CapabilityFinding, CapabilityMatrix, CapabilityProbe, CapabilityVerdict,
+    EXECUTION_PLAN_SCHEMA_VERSION, EnvironmentPlan, ExecutionPlan, ExportProvenance, HostIdentity,
+    MAX_EXPORT_BYTES, PROBE_CANARY_NAME, ProbeChild, ScopeAccess, ScopeGrant, StrictProfile,
+    UnmappedControl, export_artifact, export_destination, resolve_within,
 };
 pub use policy::{PolicyEffect, PolicyRule, ToolPolicy};
 // The environment a tool process may inherit is an operator-facing contract:
