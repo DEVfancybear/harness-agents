@@ -179,7 +179,11 @@ async fn m1_01_store_schema_newer_than_host_is_refused() {
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", database.display()))
         .await
         .expect("fixture database opens");
-    sqlx::query("INSERT INTO schema_migrations(version) VALUES (2)")
+    sqlx::query(
+        "UPDATE schema_migrations
+         SET version = (SELECT MAX(version) + 1 FROM schema_migrations)
+         WHERE version = (SELECT MAX(version) FROM schema_migrations)",
+    )
         .execute(&pool)
         .await
         .expect("newer migration row");
