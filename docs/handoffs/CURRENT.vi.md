@@ -1,5 +1,18 @@
 # CURRENT — bàn giao đang mở
 
+## Follow-up audit M7–M12 — trạng thái có hiệu lực mới nhất
+
+**Cập nhật:** 23/09/2026 · **Branch:** `master` · Phần này supersede trạng thái cũ bên dưới khi có mâu thuẫn; checkpoint cũ giữ làm lịch sử.
+
+- **Đã sửa:** M7 freshness/provenance của recall; M8 A29 final-revision `ChecksFailed`; M10 Host/Origin/cursor/body/store/SSE bounds và raw-client retry idempotent; M4/M12 semantics đúng cho direct-child cleanup + CLI contracts; M11 Windows daemon endpoint probe fail-safe (PID hiện tại sống, `tasklist` CSV exact PID, output lỗi/không rõ không xóa endpoint). M11 bug được phát hiện khi gate M10 closure báo daemon thứ hai thành `writer_locked`; test ownership đã pass sau fix.
+- **Kiểm tra trên source sau M11 fix:** format và `cargo build --workspace --locked` pass; M4 **14/14**, M7 **9/9**, M8 **6/6**, M10 **2/2**, M11 **9 integration tests/4 targets + 2 Windows parser unit tests**, M12 **11/11** (gồm A36 probe), `harness-memory` lib **2/2**. Ba provider-loopback integration failures trong full workspace chạy song song đều pass khi chạy riêng. Full workspace suite vì thế **chưa được ghi xanh**.
+- **Gates:** M7 và M8 official gates pass trước M11 fix (lần lượt digest `sha256:dee8ea13e6b3685fb8fdface3061d4e0491b114b64833b618e5dabb89b7d2481`, `sha256:3dd01dc796a1d5381a0c7f7f93ac687b3d316b495ae61f307a3a1e93b70ad994`). M10 gate hậu kiểm sau fix chưa hoàn tất: toolchain Rust 1.97.1 thiếu `clippy-driver.exe`; metadata nói component up-to-date, remove báo file thiếu, rustup reinstall bị proxy trả `InvalidContentType`. Không coi Clippy/full gate là pass. M10 direct target và M11 ownership regressions đều pass.
+- **Linux:** pending theo chỉ dẫn mới nhất của người dùng; không claim Linux verified.
+- **Scope còn mở theo SPEC/ADR, không phải fix code nhỏ:** A36 cần OS confinement backend và quyết định kiến trúc; M10-04 upload/artifact preview + browser E2E chưa triển khai; M8 benchmark chưa đo; M11 chưa có notification connector thật và chưa có CLI cho external jobs/approval. Không tự đổi trạng thái reviewer-owned `planned`/`in_progress`.
+- **Phần G01/HA_AGENT trong working tree thuộc task khác:** `docs/specs/HA_AGENT.vi.md`, `interactive/instructions.rs`, `interactive/prompt.rs`, và các thay đổi G01 khác giữ nguyên, không stage/commit trong lượt M7–M12.
+
+**Commit/push:** user đã yêu cầu trực tiếp; bundle M7–M12 này sẽ được commit và push trong lượt hiện tại. SHA sẽ được trả trong kết quả task. Clippy bị chặn bởi toolchain; không ghi một kết quả giả.
+
 **Cập nhật:** 23/09/2026 · **Assignment:** M7–M12 theo kế hoạch `implementation-next`, tuần tự theo dependency và gate từng checkpoint; commit+push sau mỗi action. **Checkpoint hiện tại:** M7 (`e5ef55c`), M8 (`32c3400`), M9 (`4035f8b`), M10 (`0a1167d`), M11 (`9d55914`), **M12-01..04 xong** (`65a084e`/`5985bd0`/`cfb215a`/`56d4f72`/`dd3c3fa`/`3030233`) + **gate M12 xanh hai lần** (cây cuối: digest `sha256:65b41f72400c58378c0f8ceeb6849a7b7c895e9cf741c0ceacfb4672c9a03cf5`, **411** file, **10 required test**, closure M4/M3/M1/M2/M0). **Milestone còn lại: không còn — M0–M12 đã triển khai xong; việc tiếp theo là reviewer nghiệm thu.**
 
 
@@ -89,7 +102,7 @@
 - **Gate M10 passed** (`a33_web_replay_gap` 1/1 required, closure M9→M0). Test ổn định **6/6 lần liên tiếp** sau khi sửa.
 - **Stack:** không thêm HTTP framework — `hyper`/`hyper-util`/`http`/`http-body-util`/`bytes` đã có trong `Cargo.lock` qua `reqwest`; frontend không build step (asset nhúng `include_str!`). `Cargo.lock` +12 dòng.
 - **Ba bug thật, đều do chạy thật:** allowlist origin tính từ port cấu hình (sai khi port 0); writer lock chưa nhả trước khi trả response (⇒ reply rỗng, flake 8/8); client test gửi `Connection: close` làm reset tới trước byte của reply trên Windows — server log cho thấy nó **đã** trả lời đủ, nên nếu không có log đó thì rất dễ sửa nhầm phía server.
-- **Còn nợ thật:** M10-04 (uploads/artifact preview/CSP) **chưa làm**; UI mới ở mức tối thiểu (chưa conversation/plan/diff/checks/tool status/budget/approval panel); **gap chưa chứng minh end-to-end** (fixture không trim được journal nên chỉ khẳng định quyết định); chưa có browser E2E; **M10 chưa nằm trong matrix CI**.
+- **Lịch sử tại gate đầu:** M10-04 (uploads/artifact preview/CSP), phần UI đầy đủ và browser E2E vẫn là scope chưa triển khai; fixture A33 khi đó chưa tạo gap retention thật. M10 hiện có trong matrix CI Windows. Follow-up API/SSE được ghi ở đầu handoff và `docs/evidence/M10.vi.md` §11.
 **Bắt đầu M10.** Prerequisites M9 đã xong về kỹ thuật (gate xanh, 6/6). Việc cụ thể: (1) đọc `docs/implementation-next/M10.vi.md` + `CONTRACTS.vi.md` §9 + acceptance A33; (2) chạy lại `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M9` để xác minh prereq trên revision hiện tại; (3) viết `docs/specs/M10.vi.md` trước khi code; (4) implement trong root workspace, dùng chung runtime/services, **không** tạo CLI/workspace thứ hai; (5) thêm target `crates/harness-cli/tests/milestone_m10.rs`; (6) registry `milestones.json` thêm M10 (prerequisites `["M9"]`); (7) gate `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M10`; (8) evidence + handoff; (9) commit + push. **Việc còn nợ của M9** (ghi ở §7c) phải được nêu lại trong evidence M10 nếu chưa giải quyết: chưa có bằng chứng CI/Linux, chưa có eval baseline.
 
 ## 7e. M11 — XONG CẢ BỐN ITEM (milestone vẫn chưa accepted)
@@ -130,30 +143,18 @@
   minh được trên host này (không có cơ chế OS nào; probe đo escape), nên strict phải từ chối thay vì giả vờ; **chưa có
   bằng chứng Linux** (CI hiện **chỉ chạy Windows** — `504cf95` của session khác thu hẹp phạm vi — và workflow **chưa
   chạy lần nào** trên revision này); không có confinement backend
-  (AppContainer cần crate opt-out `unsafe` + ADR — **cần người quyết**); `ha sandbox export|leases|reconcile` chưa có
-  test tự động (logic bên dưới thì có); bộ probe tốn ~60 s và `P-MEM` cấp phát thật 256 MiB.
+  (AppContainer cần crate opt-out `unsafe` + ADR — **cần người quyết**); bộ probe tốn ~60 s và `P-MEM` cấp phát thật 256 MiB.
 
 ## 8. Next action chính xác
-**M12 đã xong cả bốn item và gate xanh ⇒ M0–M12 đã triển khai hết; không còn milestone nào để chạy tiếp.** Việc tiếp
-theo **không phải** code thêm mà là **nghiệm thu**: (1) đọc `docs/evidence/M12.vi.md` §3 (ma trận đo được), §5 (A36
-chứng minh gì / không gì), §6 (9 bug thật), §9 (gate chưa chạy); (2) quyết ba điểm ở §9 — cách ghi `unsupported` +
-fail-closed có đủ cho A36 không, khiếm khuyết `tree_cleanup_confirmed` (§6.1) có sửa trong một assignment M4 riêng
-không, và có cấp phép cho một crate **opt-out `unsafe`** để làm AppContainer hay không; (3) nếu muốn một host thật sự
-confine: đó là assignment kế tiếp, kèm ADR lật D1/D9 của ADR-N12 và probe mới — **không** sửa tài liệu suông.
-Nợ đã ghi vẫn còn nguyên: chưa có bằng chứng Linux (CI hiện **chỉ chạy Windows** — `504cf95` của session khác thu hẹp phạm vi — và workflow **chưa chạy lần nào** trên revision này), chưa
-có connector notification thật, chưa có CLI cho external job/approve-deny, `ha sandbox export|leases|reconcile` chưa
-có test tự động.
-## 9. Blocked on
 
-Không có blocker kỹ thuật. Năm điểm cần người quyết: (1) `accepted` đa nền tảng cần chạy Linux (máy này không có
-WSL/Docker — CI là đường duy nhất, và workflow **chưa chạy lần nào**); (2) disposition `no_facts` → `filtered` (M7) cần
-reviewer xác nhận; (3) **A29 chỉ phủ nhánh conflict, chưa phủ nhánh `ChecksFailed`** (evidence M8 §9) — khoảng trống
-thật của M8; (4) **M12 đã trả lời câu hỏi cũ** ("chỉ Job Object + token là enforce được thì phần filesystem/egress
-phải ghi unsupported và strict profile phải fail closed"): đo được rồi — containment/tree-kill/env/deadline/output
-`enforced`, filesystem/network/socket/resource-cap `unsupported` **kèm bằng chứng escape**, `strict` bị từ chối theo
-tên capability, và A36 ở `planned` vì hai clause của nó không chứng minh được ở đây. **Reviewer cần xác nhận cách ghi
-đó là đủ cho A36**; (5) `tree_cleanup = reaped_on_exit` **không** chứng minh job rỗng khi direct child thoát trước
-descendant (evidence M12 §6.1, tái hiện được bằng probe P-CONT) — sửa nó là thay đổi hợp đồng M4 nên cần quyết riêng.
+Hoàn tất fmt/clippy và chạy full verification gates M7, M8, M10, M12 trên Windows; cập nhật digest/log vào các evidence §11 và phần đầu handoff; stage theo path cụ thể để không kéo G01 vào; commit và push lên `origin/master`. Sau khi push, bàn giao các mục deferred/decision-required ở phần đầu để task tiếp theo có trạng thái chính xác.
+## 9. Blocked on / quyết định còn cần
+
+- Không có blocker để hoàn tất commit/push của lượt audit này.
+- Linux verification đang **pending theo yêu cầu người dùng**; không chặn local Windows gates.
+- A36 vẫn `planned`: muốn strict filesystem/network/socket confinement cần chọn và triển khai backend OS phù hợp, có ADR/probe mới. Không tự bật `unsafe` hoặc đổi nghĩa `strict`.
+- Reviewer vẫn quyết định `verified_local`/`accepted` và việc disposition M7 `filtered` có khớp contract; implementer không ghi verdict thay reviewer.
+- M10-04/UI đầy đủ, benchmark M8, connector notification thật và CLI external-job/approval là scope còn thiếu hoặc phụ thuộc cấu hình. Không được mô tả chúng như đã hoàn tất bởi các sửa lỗi audit này.
 
 
 ## 10. Không lặp lại

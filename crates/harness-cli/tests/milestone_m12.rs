@@ -159,6 +159,31 @@ fn denied(view: &harness_tools::ToolExecutionView) -> (String, String) {
     (code.clone(), reason.clone())
 }
 
+fn assert_cli_export(data_dir: &Path, artifact_id: &str, digest: &ContentHash, to: &Path) {
+    let cli = Command::new(env!("CARGO_BIN_EXE_ha"))
+        .args(["sandbox", "export", "--data-dir"])
+        .arg(data_dir)
+        .args(["--artifact-id", artifact_id, "--to"])
+        .arg(to)
+        .arg("--json")
+        .output()
+        .expect("ha sandbox export runs");
+    assert!(
+        cli.status.success(),
+        "export CLI succeeds: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_record: serde_json::Value =
+        serde_json::from_slice(&cli.stdout).expect("export CLI emits JSON");
+    assert_eq!(cli_record["artifact_id"], artifact_id);
+    assert_eq!(cli_record["exported_digest"], digest.as_str());
+    let relative_path = cli_record["relative_path"]
+        .as_str()
+        .expect("export path is present");
+    let written = std::fs::read(to.join(relative_path)).expect("CLI export bytes are written");
+    assert_eq!(ContentHash::from_bytes(&written).as_str(), digest.as_str());
+}
+
 // ---------------------------------------------------------------------------
 // M12-01 — the capability matrix is measured, and strict fails closed
 // ---------------------------------------------------------------------------
@@ -503,7 +528,10 @@ async fn m12_02_a_normal_command_succeeds_inside_the_backend() {
     };
     assert_eq!(*exit_code, Some(0));
     assert!(!timed_out);
-    assert!(tree_cleanup_confirmed);
+    assert!(
+        !*tree_cleanup_confirmed,
+        "the direct child exited, but this backend did not prove the job empty"
+    );
     assert!(artifact_id.is_some(), "the capture is published");
 
     // The environment the child printed contains nothing outside the allowlist.
@@ -526,6 +554,7 @@ async fn m12_02_a_normal_command_succeeds_inside_the_backend() {
 
 /// Export is digest-bound and cannot be talked out of the export root.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one fixture covers capture, CLI export and tamper refusal
 async fn m12_02_artifact_export_is_bounded_and_digest_bound() {
     let bench = bench();
     let store = bench.open_store().await;
@@ -597,6 +626,16 @@ async fn m12_02_artifact_export_is_bounded_and_digest_bound() {
         export.provenance.as_ref().map(|item| item.profile.as_str()),
         Some("containment"),
         "the export records what the execution was and was not promised"
+    );
+
+    // Exercise the operator wrapper against the published artifact, not only
+    // the lower-level export service. The wrapper must preserve the digest and
+    // write only under the caller-selected export root.
+    assert_cli_export(
+        &bench.data_dir,
+        &artifact_id,
+        &capture_hash,
+        &bench.temp.path().join("cli-export"),
     );
 
     // The destination is derived from the id and resolved inside the root.
@@ -1504,4 +1543,48 @@ async fn m12_04_the_cli_refuses_a_profile_this_host_cannot_enforce() {
         matrix["host"]["backend"].as_str(),
         Some(harness_tools::CONTAINMENT_BACKEND)
     );
+}
+
+/// The lease operator commands expose valid JSON and an empty-store
+/// reconciliation without inventing lease rows.
+#[tokio::test]
+async fn m12_04_cli_lease_commands_have_json_contracts() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    close(store).await;
+
+    let ha = PathBuf::from(env!("CARGO_BIN_EXE_ha"));
+    let listed = Command::new(&ha)
+        .args(["sandbox", "leases", "--data-dir"])
+        .arg(&bench.data_dir)
+        .arg("--json")
+        .output()
+        .expect("ha sandbox leases runs");
+    assert!(
+        listed.status.success(),
+        "leases CLI succeeds: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let leases: serde_json::Value =
+        serde_json::from_slice(&listed.stdout).expect("leases CLI emits JSON");
+    assert_eq!(leases["schema_version"], 1);
+    assert!(leases["grace_ms"].as_u64().is_some());
+    assert_eq!(leases["unsettled"], serde_json::json!([]));
+
+    let reconciled = Command::new(&ha)
+        .args(["sandbox", "reconcile", "--data-dir"])
+        .arg(&bench.data_dir)
+        .args(["--grace-ms", "0", "--json"])
+        .output()
+        .expect("ha sandbox reconcile runs");
+    assert!(
+        reconciled.status.success(),
+        "reconcile CLI succeeds: {}",
+        String::from_utf8_lossy(&reconciled.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&reconciled.stdout).expect("reconcile CLI emits JSON");
+    assert_eq!(report["recovered"], serde_json::json!([]));
+    assert_eq!(report["still_owned"], serde_json::json!([]));
+    assert_eq!(report["already_settled"], serde_json::json!([]));
 }

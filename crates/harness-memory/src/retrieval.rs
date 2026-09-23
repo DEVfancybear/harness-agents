@@ -384,6 +384,20 @@ impl MemoryService {
         limit: usize,
         vector: Option<&dyn VectorAdapter>,
     ) -> Result<(MemoryIndex, RetrievalResult), HarnessError> {
+        self.search_durable_before_log_fresh(principal, terms, limit, vector, &[])
+            .await
+    }
+
+    /// Search durable memory before the conversation log using the caller's
+    /// current view of source files. Stale assets are removed before ranking.
+    pub async fn search_durable_before_log_fresh(
+        &self,
+        principal: &MemoryPrincipal,
+        terms: &[String],
+        limit: usize,
+        vector: Option<&dyn VectorAdapter>,
+        refresh: &[RefreshSource],
+    ) -> Result<(MemoryIndex, RetrievalResult), HarnessError> {
         let durable = self
             .search_terms_in(
                 principal,
@@ -391,14 +405,14 @@ impl MemoryService {
                 limit,
                 vector,
                 Some(TURN_PROVENANCE_KIND),
-                &[],
+                refresh,
             )
             .await?;
         if durable.state != RetrievalState::Empty {
             return Ok((MemoryIndex::Durable, durable));
         }
         let log = self
-            .search_terms_in(principal, terms, limit, vector, None, &[])
+            .search_terms_in(principal, terms, limit, vector, None, refresh)
             .await?;
         Ok((MemoryIndex::Log, log))
     }

@@ -44,6 +44,9 @@ pub mod assets;
 /// buffer is the bound, and the cut is reported as a gap rather than as silence.
 pub const LIVE_BUFFER_EVENTS: usize = 256;
 
+/// Maximum JSON body accepted by the input mutation route.
+pub const MAX_INPUT_BODY_BYTES: usize = 64 * 1024;
+
 /// The token header a mutation must carry.
 pub const SESSION_HEADER: &str = "x-ha-session";
 
@@ -103,11 +106,10 @@ impl WebConfig {
     /// Whether an `Origin` header is acceptable for a mutation.
     ///
     /// Same-origin loopback is always allowed; anything else has to be listed.
-    /// An absent `Origin` is accepted only for a request with no body, because a
-    /// browser always sends one for a cross-origin form post.
+    /// Mutations without an `Origin` fail closed.
     #[must_use]
     pub fn origin_allowed(&self, origin: Option<&str>) -> bool {
-        let Some(origin) = origin else { return true };
+        let Some(origin) = origin else { return false };
         if self.allowed_origins.iter().any(|allowed| allowed == origin) {
             return true;
         }
@@ -119,6 +121,20 @@ impl WebConfig {
         ]
         .iter()
         .any(|allowed| allowed == origin)
+    }
+
+    /// Whether the request's authority names this loopback server.
+    #[must_use]
+    pub fn host_allowed(&self, host: Option<&str>) -> bool {
+        let Some(host) = host else { return false };
+        let port = self.bind.port();
+        [
+            format!("127.0.0.1:{port}"),
+            format!("localhost:{port}"),
+            format!("[::1]:{port}"),
+        ]
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(host))
     }
 }
 
@@ -268,6 +284,7 @@ pub async fn serve(config: WebConfig) -> Result<WebHandle, HarnessError> {
 }
 
 /// One request, dispatched.
+#[allow(clippy::too_many_lines)] // routing, auth and body limits share one request boundary
 async fn route(state: Arc<WebConfig>, request: Request<Incoming>) -> Response<Body> {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
@@ -275,6 +292,11 @@ async fn route(state: Arc<WebConfig>, request: Request<Incoming>) -> Response<Bo
     let origin = request
         .headers()
         .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let host = request
+        .headers()
+        .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     let token = request
@@ -334,13 +356,22 @@ async fn route(state: Arc<WebConfig>, request: Request<Incoming>) -> Response<Bo
                 &state,
                 token.as_deref(),
                 origin.as_deref(),
+                host.as_deref(),
                 request_id.as_deref(),
             ) {
                 return response;
             }
-            let body = match request.into_body().collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(error) => {
+            let body = match read_limited_body(request.into_body()).await {
+                Ok(body) => body,
+                Err(BodyReadError::TooLarge) => {
+                    return error_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        ErrorCode::InvalidPayload,
+                        "the request body exceeds the 64 KiB limit",
+                        request_id.as_deref(),
+                    );
+                }
+                Err(BodyReadError::Read(error)) => {
                     return error_response(
                         StatusCode::BAD_REQUEST,
                         ErrorCode::InvalidPayload,
@@ -365,24 +396,60 @@ fn authorize(
     state: &WebConfig,
     token: Option<&str>,
     origin: Option<&str>,
+    host: Option<&str>,
     request_id: Option<&str>,
 ) -> Option<Response<Body>> {
-    if !state.origin_allowed(origin) {
+    match token {
+        Some(token) if constant_time_eq(token, &state.session_token) => {}
+        _ => {
+            return Some(error_response(
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::MissingAuthority,
+                "a mutation requires the session token this host printed at startup",
+                request_id,
+            ));
+        }
+    }
+    if !state.host_allowed(host) || !state.origin_allowed(origin) {
         return Some(error_response(
             StatusCode::FORBIDDEN,
             ErrorCode::PolicyDenied,
-            "the request origin is not allowed to mutate this host",
+            "the request Host and Origin must name this loopback server or an allowed origin",
             request_id,
         ));
     }
-    match token {
-        Some(token) if constant_time_eq(token, &state.session_token) => None,
-        _ => Some(error_response(
-            StatusCode::UNAUTHORIZED,
-            ErrorCode::MissingAuthority,
-            "a mutation requires the session token this host printed at startup",
-            request_id,
-        )),
+    None
+}
+
+enum BodyReadError {
+    TooLarge,
+    Read(hyper::Error),
+}
+
+async fn read_limited_body(mut body: Incoming) -> Result<Bytes, BodyReadError> {
+    let mut bytes = Vec::new();
+    let mut received = 0_usize;
+    let mut oversized = false;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(BodyReadError::Read)?;
+        if let Ok(data) = frame.into_data() {
+            received = received.saturating_add(data.len());
+            if received > MAX_INPUT_BODY_BYTES {
+                oversized = true;
+                // Keep memory bounded while draining a rejected body so the
+                // server can still return a typed 413 on a reusable connection.
+                if received > MAX_INPUT_BODY_BYTES * 16 {
+                    return Err(BodyReadError::TooLarge);
+                }
+            } else {
+                bytes.extend_from_slice(&data);
+            }
+        }
+    }
+    if oversized {
+        Err(BodyReadError::TooLarge)
+    } else {
+        Ok(Bytes::from(bytes))
     }
 }
 
@@ -481,17 +548,35 @@ async fn session_state(state: &WebConfig, session: &str) -> Response<Body> {
     };
     // The projection and the newest events: this is the reload path a client
     // takes after a gap, so it has to describe committed state, not a buffer.
-    let projection = store
-        .current_projection(&summary.task_id)
-        .await
-        .ok()
-        .flatten();
+    let projection = match store.current_projection(&summary.task_id).await {
+        Ok(projection) => projection,
+        Err(error) => {
+            let _ = store.close().await;
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error.code(),
+                &error.to_string(),
+                None,
+            );
+        }
+    };
     let through = summary.next_sequence.saturating_sub(1);
     let from = through.saturating_sub(31);
-    let events = store
-        .load_events_after(&session_id, from)
-        .await
-        .unwrap_or_default();
+    let events = match store.load_events_after_limit(&session_id, from, 32).await {
+        Ok(events) => events
+            .into_iter()
+            .filter(|event| event.seq <= through)
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            let _ = store.close().await;
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error.code(),
+                &error.to_string(),
+                None,
+            );
+        }
+    };
     let body = json!({
         "schema_version": 1,
         "status": "ok",
@@ -558,11 +643,23 @@ async fn session_events(state: &WebConfig, session: &str, query: &str) -> Respon
             return error_response(StatusCode::BAD_REQUEST, error.code(), error.message(), None);
         }
     };
-    let cursor = query
+    let cursor_value = query
         .split('&')
-        .find_map(|pair| pair.strip_prefix("cursor="))
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
+        .find_map(|pair| pair.strip_prefix("cursor="));
+    let cursor = match cursor_value {
+        Some(value) => match value.parse::<u64>() {
+            Ok(cursor) => cursor,
+            Err(_) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    ErrorCode::InvalidPayload,
+                    "the event cursor must be a non-negative integer",
+                    None,
+                );
+            }
+        },
+        None => 0,
+    };
     let store = match open_store(state).await {
         Ok(store) => store,
         Err(error) => {
@@ -598,56 +695,124 @@ async fn session_events(state: &WebConfig, session: &str, query: &str) -> Respon
     // The retained range starts at the oldest sequence still in the journal. A
     // cursor below it means the client missed events that no longer exist, and
     // that is stated rather than papered over by replaying what is left.
-    let oldest = store
-        .load_events_after(&session_id, 0)
+    let oldest = match store.oldest_event_sequence(&session_id).await {
+        Ok(oldest) => oldest.unwrap_or(summary.next_sequence),
+        Err(error) => {
+            let _ = store.close().await;
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error.code(),
+                &error.to_string(),
+                None,
+            );
+        }
+    };
+    let gap = cursor.saturating_add(1) < oldest;
+    let effective_cursor = if gap {
+        oldest.saturating_sub(1)
+    } else {
+        cursor
+    };
+    let initial_limit = if gap {
+        LIVE_BUFFER_EVENTS.saturating_sub(1)
+    } else {
+        LIVE_BUFFER_EVENTS
+    };
+    let events = match store
+        .load_events_after_limit(&session_id, effective_cursor, initial_limit)
         .await
-        .unwrap_or_default()
-        .first()
-        .map_or(summary.next_sequence, |event| event.seq);
-    let gap = cursor.saturating_add(1) < oldest && cursor != 0;
-    let events = store
-        .load_events_after(&session_id, cursor)
-        .await
-        .unwrap_or_default();
+    {
+        Ok(events) => events,
+        Err(error) => {
+            let _ = store.close().await;
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error.code(),
+                &error.to_string(),
+                None,
+            );
+        }
+    };
     let _ = store.close().await;
 
     let (sender, receiver) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(LIVE_BUFFER_EVENTS);
+    let stream_state = state.clone();
     tokio::spawn(async move {
         if gap {
             let frame = format!(
                 "event: gap\ndata: {{\"reason\":\"cursor_below_retained_range\",\"cursor\":{cursor},\"oldest_retained\":{oldest}}}\n\n"
             );
             if sender
-                .send(Ok(Frame::data(Bytes::from(frame))))
-                .await
+                .try_send(Ok(Frame::data(Bytes::from(frame))))
                 .is_err()
             {
                 return;
             }
         }
-        for event in &events {
-            let data =
-                serde_json::to_string(&event_view(event)).unwrap_or_else(|_| "{}".to_owned());
-            let frame = format!("id: {}\nevent: journal\ndata: {data}\n\n", event.seq);
+        let mut last_sent = effective_cursor;
+        for event in events {
             if sender
-                .send(Ok(Frame::data(Bytes::from(frame))))
-                .await
+                .try_send(Ok(Frame::data(Bytes::from(journal_frame(&event)))))
                 .is_err()
             {
-                // The subscriber is gone or too slow; the host does not wait.
+                // A subscriber is cut at the buffer bound. EventSource resumes
+                // from the last event id it received.
                 return;
             }
+            last_sent = event.seq;
         }
-        // A heartbeat keeps the connection alive without carrying a sequence: a
-        // client that has fallen behind must not read liveness as progress.
+        let mut last_heartbeat = tokio::time::Instant::now();
         loop {
-            tokio::time::sleep(Duration::from_secs(15)).await;
-            if sender
-                .send(Ok(Frame::data(Bytes::from_static(b": heartbeat\n\n"))))
-                .await
-                .is_err()
-            {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let Ok(store) = open_store(&stream_state).await else {
                 return;
+            };
+            let Ok(Some(summary)) = store.session_summary(&session_id).await else {
+                let _ = store.close().await;
+                return;
+            };
+            let latest = summary.next_sequence.saturating_sub(1);
+            let Ok(oldest_event) = store.oldest_event_sequence(&session_id).await else {
+                let _ = store.close().await;
+                return;
+            };
+            let oldest = oldest_event.unwrap_or_else(|| latest.saturating_add(1));
+            if last_sent.saturating_add(1) < oldest {
+                let gap = format!(
+                    "event: gap\ndata: {{\"reason\":\"cursor_below_retained_range\",\"cursor\":{last_sent},\"oldest_retained\":{oldest}}}\n\n"
+                );
+                let _ = store.close().await;
+                let _ = sender.try_send(Ok(Frame::data(Bytes::from(gap))));
+                return;
+            }
+            let Ok(events) = store
+                .load_events_after_limit(&session_id, last_sent, LIVE_BUFFER_EVENTS)
+                .await
+            else {
+                let _ = store.close().await;
+                return;
+            };
+            let _ = store.close().await;
+            for event in events {
+                if event.seq <= last_sent {
+                    continue;
+                }
+                if sender
+                    .try_send(Ok(Frame::data(Bytes::from(journal_frame(&event)))))
+                    .is_err()
+                {
+                    return;
+                }
+                last_sent = event.seq;
+            }
+            if last_heartbeat.elapsed() >= Duration::from_secs(15) {
+                if sender
+                    .try_send(Ok(Frame::data(Bytes::from_static(b": heartbeat\n\n"))))
+                    .is_err()
+                {
+                    return;
+                }
+                last_heartbeat = tokio::time::Instant::now();
             }
         }
     });
@@ -666,6 +831,11 @@ async fn session_events(state: &WebConfig, session: &str, query: &str) -> Respon
         .headers_mut()
         .insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
     response
+}
+
+fn journal_frame(event: &harness_types::EventEnvelope) -> String {
+    let data = serde_json::to_string(&event_view(event)).unwrap_or_else(|_| "{}".to_owned());
+    format!("id: {}\nevent: journal\ndata: {data}\n\n", event.seq)
 }
 
 /// Admit one input through the session service, idempotently.

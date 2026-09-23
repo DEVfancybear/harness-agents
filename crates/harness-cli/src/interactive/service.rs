@@ -1140,7 +1140,13 @@ async fn run_turn(
     // Retrieval happens before dispatch, so the packet the runtime freezes carries
     // the exact memory versions that were read.
     let run_request = match &memory_principal {
-        Some(principal) => match memory::recall(Arc::clone(&store), principal, &request.text).await
+        Some(principal) => match memory::recall(
+            Arc::clone(&store),
+            principal,
+            &workspace_root,
+            &request.text,
+        )
+        .await
         {
             Ok(recall) => {
                 send(SessionEvent::Notice {

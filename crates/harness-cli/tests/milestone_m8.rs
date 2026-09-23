@@ -877,6 +877,98 @@ async fn a29_integration_acceptance() {
     );
 }
 
+/// A clean merge still has to run the check on the merged revision, and a
+/// failed check cannot leave that revision eligible for acceptance.
+#[tokio::test]
+async fn a29_integrated_tree_check_failure_is_recorded_against_final_revision() {
+    let repo = test_repo();
+    let manager = workspace_for(&repo);
+    let base_a = repo.root().join("src/first.rs");
+    let base_b = repo.root().join("src/second.rs");
+    std::fs::write(&base_a, "pub const FIRST: u8 = 0;\n").expect("first base file");
+    std::fs::write(&base_b, "pub const SECOND: u8 = 0;\n").expect("second base file");
+    repo.git(&["add", "src/first.rs", "src/second.rs"]);
+    repo.git(&["commit", "-qm", "fixture integration base"]);
+    let snapshot = repo.snapshot(&manager).await;
+    let first_task = TaskId::generate();
+    let second_task = TaskId::generate();
+    let first = manager
+        .create_worktree(
+            &snapshot,
+            &first_task,
+            &harness_types::AgentRunId::generate(),
+            &["src/first.rs".to_owned()],
+            1,
+        )
+        .await
+        .expect("first worktree");
+    let second = manager
+        .create_worktree(
+            &snapshot,
+            &second_task,
+            &harness_types::AgentRunId::generate(),
+            &["src/second.rs".to_owned()],
+            1,
+        )
+        .await
+        .expect("second worktree");
+    std::fs::write(
+        std::path::Path::new(&first.path).join("src/first.rs"),
+        "pub const FIRST: u8 = 1;\n",
+    )
+    .expect("first branch change");
+    std::fs::write(
+        std::path::Path::new(&second.path).join("src/second.rs"),
+        "pub const SECOND: u8 = 2;\n",
+    )
+    .expect("second branch change");
+    let first_revision = manager
+        .commit_worker_changes(&first, "first independent branch")
+        .await
+        .expect("first branch commits");
+    let second_revision = manager
+        .commit_worker_changes(&second, "second independent branch")
+        .await
+        .expect("second branch commits");
+    assert_ne!(first_revision, second_revision);
+
+    let integrator = ResultIntegrator::new(Arc::clone(&manager));
+    let outcome = integrator
+        .integrate(
+            &snapshot,
+            &[first_task.clone(), second_task.clone()],
+            &[
+                harness_orchestrator::workspace_candidate(
+                    &first,
+                    &first_revision,
+                    vec!["src/first.rs".to_owned()],
+                ),
+                harness_orchestrator::workspace_candidate(
+                    &second,
+                    &second_revision,
+                    vec!["src/second.rs".to_owned()],
+                ),
+            ],
+            &["git not-a-real-check-command".to_owned()],
+        )
+        .await
+        .expect("integration returns a typed verdict");
+    let IntegrationOutcome::ChecksFailed { report, failures } = &outcome else {
+        panic!("a failed integrated check must not be ready: {outcome:?}");
+    };
+    assert!(!outcome.is_ready());
+    assert_eq!(report.steps.len(), 2, "both independent branches applied");
+    assert_ne!(report.final_commit, snapshot.base_commit);
+    assert_eq!(failures.len(), 1);
+    assert_eq!(report.checks.len(), 1);
+    assert_eq!(report.checks[0].revision, report.final_commit);
+    assert!(!report.checks[0].passed);
+    assert!(
+        repo.is_clean(),
+        "a failed check on the integration worktree leaves the user's checkout untouched"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A30 — a dirty repository and a destination that moves
 // ---------------------------------------------------------------------------

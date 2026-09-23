@@ -139,6 +139,14 @@ const MIGRATION_1: &[&str] = &[
     )",
 ];
 
+const MIGRATION_2: &[&str] = &["CREATE TABLE IF NOT EXISTS session_settings (
+        task_id TEXT NOT NULL,
+        setting_key TEXT NOT NULL,
+        setting_value TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (task_id, setting_key)
+    )"];
+
 struct WriterLease {
     lock_file: File,
     fence: HostFence,
@@ -1807,6 +1815,65 @@ impl SqliteStore {
             .collect()
     }
 
+    /// Read a bounded journal page after a durable cursor.
+    pub async fn load_events_after_limit(
+        &self,
+        session_id: &SessionId,
+        through_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<EventEnvelope>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT event_json FROM events WHERE session_id = ? AND sequence > ? ORDER BY sequence LIMIT ?",
+        )
+        .bind(session_id.as_str())
+        .bind(to_i64(through_sequence, "tail sequence")?)
+        .bind(to_i64(limit.min(4096) as u64, "journal page limit")?)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read journal page", error))?;
+        rows.into_iter()
+            .map(|row| {
+                let serialized: String = row_get(&row, "event_json")?;
+                EventEnvelope::parse_json(&serialized).map_err(|error| {
+                    StoreError::new(error.code(), format!("stored event is invalid: {error}"))
+                })
+            })
+            .collect()
+    }
+
+    /// The oldest retained sequence without loading the journal into memory.
+    pub async fn oldest_event_sequence(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<u64>, StoreError> {
+        let sequence = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MIN(sequence) FROM events WHERE session_id = ?",
+        )
+        .bind(session_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "read oldest journal sequence",
+                error,
+            )
+        })?;
+        sequence
+            .map(|sequence| {
+                u64::try_from(sequence).map_err(|_| {
+                    StoreError::new(
+                        ErrorCode::StorageWriteFailed,
+                        "stored journal sequence is negative",
+                    )
+                })
+            })
+            .transpose()
+    }
+
     pub async fn latest_snapshot(
         &self,
         session_id: &SessionId,
@@ -2856,7 +2923,7 @@ async fn run_migrations(pool: &SqlitePool, fault_plan: &StoreFaultPlan) -> Resul
             "database schema is newer than this host supports",
         ));
     }
-    if current < STORE_SCHEMA_VERSION {
+    if current < 1 {
         for statement in MIGRATION_1 {
             sqlx::query(*statement)
                 .execute(&mut *transaction)
@@ -2866,11 +2933,27 @@ async fn run_migrations(pool: &SqlitePool, fault_plan: &StoreFaultPlan) -> Resul
                 })?;
         }
         sqlx::query("INSERT INTO schema_migrations(version) VALUES (?)")
-            .bind(STORE_SCHEMA_VERSION)
+            .bind(1_i64)
             .execute(&mut *transaction)
             .await
             .map_err(|error| {
                 database_error(ErrorCode::MigrationFailed, "record migration 1", error)
+            })?;
+    }
+    if current < 2 {
+        for statement in MIGRATION_2 {
+            sqlx::query(*statement)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    database_error(ErrorCode::MigrationFailed, "apply migration 2", error)
+                })?;
+        }
+        sqlx::query("INSERT INTO schema_migrations(version) VALUES (2)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::MigrationFailed, "record migration 2", error)
             })?;
     }
     if fault_plan.consume(StoreFaultPoint::BeforeMigrationCommit) {
@@ -4759,4 +4842,98 @@ fn to_u64(value: i64, field: &str) -> Result<u64, StoreError> {
 #[allow(clippy::needless_pass_by_value)]
 fn database_error(code: ErrorCode, operation: &str, error: sqlx::Error) -> StoreError {
     StoreError::new(code, format!("{operation}: {error}"))
+}
+
+impl SqliteStore {
+    /// Store one setting scoped to the continuing task, so a later session in
+    /// that conversation can apply it when its next turn starts.
+    pub async fn set_session_setting(
+        &self,
+        task_id: &TaskId,
+        key: &str,
+        value: &str,
+    ) -> Result<(), StoreError> {
+        let fence = self.fence()?;
+        let mut transaction = self.begin_write(&fence).await?;
+        assert_fence_in_tx(&mut transaction, &fence).await?;
+        sqlx::query(
+            "INSERT INTO session_settings(task_id, setting_key, setting_value) VALUES (?, ?, ?) \
+             ON CONFLICT(task_id, setting_key) DO UPDATE SET setting_value = excluded.setting_value, updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(task_id.as_str())
+        .bind(key)
+        .bind(value)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "write session setting", error))?;
+        transaction.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit session setting",
+                error,
+            )
+        })
+    }
+
+    /// Read a task setting without mutating the store.
+    pub async fn session_setting(
+        &self,
+        task_id: &TaskId,
+        key: &str,
+    ) -> Result<Option<String>, StoreError> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT setting_value FROM session_settings WHERE task_id = ? AND setting_key = ?",
+        )
+        .bind(task_id.as_str())
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(ErrorCode::StorageOpenFailed, "read session setting", error)
+        })
+    }
+}
+
+#[cfg(test)]
+mod g03_session_setting_tests {
+    use harness_types::{HostId, TaskId};
+
+    use super::{SqliteStore, WriterOpenOptions};
+
+    #[tokio::test]
+    async fn g03_model_switch_applies_next_turn_only() {
+        let directory = tempfile::tempdir().expect("temporary store");
+        let task_id = TaskId::generate();
+        let store =
+            SqliteStore::open_writer(WriterOpenOptions::new(directory.path(), HostId::generate()))
+                .await
+                .expect("store migration");
+        store
+            .set_session_setting(&task_id, "model", "next-model")
+            .await
+            .expect("model selection persists");
+        assert_eq!(
+            store
+                .session_setting(&task_id, "model")
+                .await
+                .expect("read selected model")
+                .as_deref(),
+            Some("next-model")
+        );
+        assert_eq!(crate::STORE_SCHEMA_VERSION, 2);
+        store.close().await.expect("close store");
+        let reopened =
+            SqliteStore::open_writer(WriterOpenOptions::new(directory.path(), HostId::generate()))
+                .await
+                .expect("reopened store");
+        assert_eq!(
+            reopened
+                .session_setting(&task_id, "model")
+                .await
+                .expect("read after reopen")
+                .as_deref(),
+            Some("next-model")
+        );
+        reopened.close().await.expect("close reopened store");
+    }
 }

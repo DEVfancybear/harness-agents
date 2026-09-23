@@ -547,7 +547,7 @@ async fn m7_01_source_dependency_is_queryable_and_scoped() {
     let moved = RefreshSource {
         kind: MemorySourceKind::File,
         id: path.to_owned(),
-        observed: ContentHash::from_bytes(b"revision two"),
+        observed: Some(ContentHash::from_bytes(b"revision two")),
     };
     let mine = fixture
         .store
@@ -576,7 +576,7 @@ async fn m7_01_source_dependency_is_queryable_and_scoped() {
     let unchanged = RefreshSource {
         kind: MemorySourceKind::File,
         id: path.to_owned(),
-        observed,
+        observed: Some(observed),
     };
     assert!(
         fixture
@@ -1084,7 +1084,7 @@ async fn a26_memory_provenance() {
     let moved = RefreshSource {
         kind: MemorySourceKind::File,
         id: path.to_owned(),
-        observed: ContentHash::from_bytes(b"the cache is enabled"),
+        observed: Some(ContentHash::from_bytes(b"the cache is enabled")),
     };
     let stale = fixture
         .memory

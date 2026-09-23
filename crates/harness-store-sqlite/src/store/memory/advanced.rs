@@ -20,7 +20,7 @@ async fn load_refresh_table(
         "CREATE TEMP TABLE IF NOT EXISTS refresh_current(
              source_kind TEXT NOT NULL,
              source_id TEXT NOT NULL,
-             observed_digest TEXT NOT NULL,
+             observed_digest TEXT,
              PRIMARY KEY (source_kind, source_id)
          )",
     )
@@ -40,7 +40,7 @@ async fn load_refresh_table(
         )
         .bind(source.kind.as_str())
         .bind(&source.id)
-        .bind(source.observed.as_str())
+        .bind(source.observed.as_ref().map(ContentHash::as_str))
         .execute(&mut **tx)
         .await
         .map_err(|error| {
@@ -86,7 +86,7 @@ impl SqliteStore {
               AND NOT EXISTS (SELECT 1 FROM memory_sources ms
                   JOIN refresh_current rc ON rc.source_kind = ms.source_kind AND rc.source_id = ms.source_id
                   WHERE ms.derived_asset_id = a.memory_asset_id AND ms.derived_version = a.current_version
-                    AND (ms.observed_digest IS NULL OR ms.observed_digest != rc.observed_digest))
+                    AND (rc.observed_digest IS NULL OR ms.observed_digest IS NULL OR ms.observed_digest != rc.observed_digest))
             ORDER BY b.priority DESC, b.binding_id")
             .bind(&principal.principal_id).bind(principal.project_id.as_ref().map(ToString::to_string)).bind(principal.task_id.as_ref().map(ToString::to_string))
             .bind(principal.agent_profile_id.as_ref().map(ToString::to_string)).bind(principal.session_id.as_ref().map(ToString::to_string))
@@ -722,7 +722,7 @@ impl SqliteStore {
                AND NOT EXISTS (SELECT 1 FROM memory_sources ms
                    JOIN refresh_current rc ON rc.source_kind = ms.source_kind AND rc.source_id = ms.source_id
                    WHERE ms.derived_asset_id = a.memory_asset_id AND ms.derived_version = a.current_version
-                     AND (ms.observed_digest IS NULL OR ms.observed_digest != rc.observed_digest))
+                     AND (rc.observed_digest IS NULL OR ms.observed_digest IS NULL OR ms.observed_digest != rc.observed_digest))
              ORDER BY bm25(memory_fts), a.memory_asset_id LIMIT ?7")
             .bind(query).bind(principal.project_id.as_ref().map(ToString::to_string))
             .bind(principal.task_id.as_ref().map(ToString::to_string)).bind(principal.agent_profile_id.as_ref().map(ToString::to_string))

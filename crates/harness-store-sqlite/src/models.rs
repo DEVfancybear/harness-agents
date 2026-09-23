@@ -16,8 +16,8 @@ use serde_json::Value;
 
 use crate::StoreError;
 
-/// The only on-disk database schema revision implemented by P1.
-pub const STORE_SCHEMA_VERSION: i64 = 1;
+/// Additive P1 store schema revision with durable session settings.
+pub const STORE_SCHEMA_VERSION: i64 = 2;
 pub const DATABASE_FILE_NAME: &str = "harness.sqlite3";
 pub const ARTIFACT_DIRECTORY_NAME: &str = "artifacts";
 pub const WRITER_LOCK_FILE_NAME: &str = "writer.lock";
@@ -999,7 +999,9 @@ pub struct MemorySourceRecord {
 pub struct RefreshSource {
     pub kind: MemorySourceKind,
     pub id: String,
-    pub observed: ContentHash,
+    /// `None` means the named source could not be read inside the caller's
+    /// workspace, which is stale for a source that previously had a digest.
+    pub observed: Option<ContentHash>,
 }
 
 /// A maximal run of contiguous committed source-work markers.

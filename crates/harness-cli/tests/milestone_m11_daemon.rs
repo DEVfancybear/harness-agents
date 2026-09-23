@@ -93,6 +93,10 @@ async fn m11_01_daemon_ownership_and_control() {
     let (host, mut runner) = start(&data_dir, Arc::clone(&clock) as Arc<dyn Clock>)
         .await
         .expect("the daemon starts");
+    assert!(
+        harness_cli::daemon::process_is_alive(host.endpoint.pid),
+        "the current process must be recognized as alive before a second start"
+    );
     // Recovery finishes before the daemon is reachable, so a status request
     // reads a settled state rather than a half-recovered one.
     let recovered = runner.recover().await.expect("recovery runs");

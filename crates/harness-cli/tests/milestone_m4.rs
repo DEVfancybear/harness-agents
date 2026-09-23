@@ -1630,6 +1630,7 @@ async fn a16_process_tree_env() {
         stdout,
         stderr,
         tree_cleanup,
+        tree_cleanup_confirmed,
         ..
     } = &view.output
     else {
@@ -1640,7 +1641,11 @@ async fn a16_process_tree_env() {
     };
     assert_eq!(
         tree_cleanup, "reaped_on_exit",
-        "the parent exited by itself and the backend reported the tree empty"
+        "the direct child exited without a backend whole-tree reap signal"
+    );
+    assert!(
+        !*tree_cleanup_confirmed,
+        "a direct-child wait must not claim that every descendant exited"
     );
     let granted = child_environment(&granted_env_out);
     assert_eq!(

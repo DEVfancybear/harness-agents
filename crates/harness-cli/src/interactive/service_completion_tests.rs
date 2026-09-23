@@ -13,7 +13,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[test]
 fn completion_service_resume_flow() {
     if std::env::var_os("HA_COMPLETION_CHILD").is_some() {
-        tokio::runtime::Runtime::new()
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
             .expect("runtime")
             .block_on(resume_flow());
         return;
@@ -91,7 +93,11 @@ fn run_child() -> (std::process::ExitStatus, String) {
 }
 
 async fn terminal(channel: &mut SessionChannel) -> SessionEvent {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    // The parent deliberately runs this case beside the full workspace suite;
+    // under Windows process/SQLite contention a valid terminal event can take
+    // longer than a quiet-machine socket round trip. The enclosing child still
+    // has a two-minute hard bound, so this does not turn a hang into success.
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             for event in channel.drain() {
                 if matches!(

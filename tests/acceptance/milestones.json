@@ -738,6 +738,7 @@
           "status": "implemented_unverified",
           "tests": [
             "a29_integration_acceptance",
+            "a29_integrated_tree_check_failure_is_recorded_against_final_revision",
             "m8_04_cli_reports_stop_reasons_and_unverified_claims"
           ]
         }
@@ -746,6 +747,7 @@
         "a27_child_capacity_budget",
         "a28_child_delivery_recovery",
         "a29_integration_acceptance",
+        "a29_integrated_tree_check_failure_is_recorded_against_final_revision",
         "a30_dirty_workspace_preservation",
         "m8_04_cli_reports_stop_reasons_and_unverified_claims"
       ],
@@ -1046,7 +1048,8 @@
           "status": "implemented_unverified",
           "tests": [
             "a36_strict_confinement",
-            "m12_04_the_cli_refuses_a_profile_this_host_cannot_enforce"
+            "m12_04_the_cli_refuses_a_profile_this_host_cannot_enforce",
+            "m12_04_cli_lease_commands_have_json_contracts"
           ]
         }
       ],
@@ -1060,7 +1063,8 @@
         "milestone_m12::m12_03_a_lease_is_written_before_the_process_and_settled_once",
         "milestone_m12::m12_03_recovery_protects_a_live_owner_and_settles_an_orphan",
         "milestone_m12::m12_03_a_real_execution_records_its_lease_and_artifact",
-        "milestone_m12::m12_04_the_cli_refuses_a_profile_this_host_cannot_enforce"
+        "milestone_m12::m12_04_the_cli_refuses_a_profile_this_host_cannot_enforce",
+        "milestone_m12::m12_04_cli_lease_commands_have_json_contracts"
       ],
       "unit_tests": [],
       "fixtures": [
@@ -1347,8 +1351,11 @@
       "owner_milestones": ["M8"],
       "planned_test": "a29_integration_acceptance",
       "status": "implemented",
-      "selectors": ["milestone_m8::a29_integration_acceptance"],
-      "note": "two branches replace the same function and each passes the declared check on its own committed revision; the integrator then applies one, conflicts on the second, offers no final revision and runs no check on a tree that is not the integration; the refusal is stable across a second attempt; the destination file is byte-for-byte what the user had"
+      "selectors": [
+        "milestone_m8::a29_integration_acceptance",
+        "milestone_m8::a29_integrated_tree_check_failure_is_recorded_against_final_revision"
+      ],
+      "note": "the conflict path verifies branch-local checks do not substitute for integration; a second case merges two independent branches, forces the final integrated check to fail, records the failure against report.final_commit, and leaves the user's checkout untouched"
     },
     {
       "id": "A30",

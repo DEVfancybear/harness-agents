@@ -117,17 +117,31 @@ pub fn process_is_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
+    // This process is necessarily alive, even when the host policy prevents
+    // querying the process table (as it does in some Windows sandboxes).
+    if pid == std::process::id() {
+        return true;
+    }
     #[cfg(windows)]
     {
-        // `tasklist` is the portable check on Windows; a missing tool answers
-        // "alive", which is the safe direction.
+        // `tasklist` is the portable check on Windows. A missing tool, access
+        // denial, failed command, or unrecognized output is unknown and must
+        // answer "alive": deleting an endpoint on an unknown result could
+        // allow a second daemon to race the writer fence.
         let output = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
             .output();
-        match output {
-            Ok(output) => String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()),
-            Err(_) => true,
-        }
+        output
+            .ok()
+            .and_then(|output| {
+                tasklist_pid_status(
+                    pid,
+                    output.status.success(),
+                    &String::from_utf8_lossy(&output.stdout),
+                    &String::from_utf8_lossy(&output.stderr),
+                )
+            })
+            .unwrap_or(true)
     }
     #[cfg(unix)]
     {
@@ -137,6 +151,84 @@ pub fn process_is_alive(pid: u32) -> bool {
     {
         let _ = pid;
         true
+    }
+}
+
+#[cfg(windows)]
+fn tasklist_pid_status(pid: u32, success: bool, stdout: &str, stderr: &str) -> Option<bool> {
+    if !success || !stderr.trim().is_empty() {
+        return None;
+    }
+    for line in stdout.lines() {
+        // CSV rows start with the image name and then the PID. Compare the
+        // complete second field, not a substring that could confuse PID 12
+        // with PID 123.
+        if let Some((_, rest)) = line
+            .trim()
+            .strip_prefix('"')
+            .and_then(|line| line.split_once("\",\""))
+            && let Some((reported_pid, _)) = rest.split_once("\",\"")
+            && reported_pid.parse::<u32>().ok() == Some(pid)
+        {
+            return Some(true);
+        }
+    }
+    let lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    (!lines.is_empty()
+        && lines
+            .iter()
+            .all(|line| line.to_ascii_uppercase().starts_with("INFO:")))
+    .then_some(false)
+}
+
+#[cfg(all(test, windows))]
+mod process_probe_tests {
+    use super::tasklist_pid_status;
+
+    #[test]
+    fn exact_csv_pid_is_alive_and_nonmatching_substrings_are_not_matches() {
+        assert_eq!(
+            tasklist_pid_status(
+                123,
+                true,
+                "\"ha.exe\",\"123\",\"Console\",\"1\",\"10,000 K\"",
+                ""
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            tasklist_pid_status(
+                12,
+                true,
+                "\"ha.exe\",\"123\",\"Console\",\"1\",\"10,000 K\"",
+                ""
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_no_match_is_dead_and_unknown_results_stay_unknown() {
+        assert_eq!(
+            tasklist_pid_status(
+                123,
+                true,
+                "INFO: No tasks are running which match the specified criteria.",
+                ""
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            tasklist_pid_status(123, true, "ERROR: Access denied", ""),
+            None
+        );
+        assert_eq!(tasklist_pid_status(123, true, "", "access denied"), None);
+        assert_eq!(tasklist_pid_status(123, true, "", ""), None);
+        assert_eq!(tasklist_pid_status(123, false, "", ""), None);
     }
 }
 

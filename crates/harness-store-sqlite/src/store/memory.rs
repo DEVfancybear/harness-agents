@@ -1386,6 +1386,103 @@ impl SqliteStore {
         Ok(sources)
     }
 
+    /// Current file sources that this principal is allowed to search.
+    ///
+    /// The caller re-reads these paths before retrieval so stale file-backed
+    /// memory can be filtered before ranking. Only current, active, valid
+    /// versions are returned; source names are never exposed across scope or
+    /// grant boundaries.
+    pub async fn searchable_current_file_sources(
+        &self,
+        principal: &StoreMemoryPrincipal,
+    ) -> Result<Vec<MemorySourceRecord>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "begin searchable memory source read",
+                error,
+            )
+        })?;
+        let rows = sqlx::query(
+            "SELECT DISTINCT a.memory_asset_id, s.source_id, s.observed_digest
+             FROM memory_sources s
+             JOIN memory_assets a
+               ON a.memory_asset_id = s.derived_asset_id
+              AND a.current_version = s.derived_version
+             JOIN memory_versions v
+               ON v.memory_asset_id = s.derived_asset_id
+              AND v.version = s.derived_version
+             WHERE s.source_kind = 'file'
+               AND a.status = 'active'
+               AND json_extract(v.version_json, '$.validity') = 'valid'
+               AND (a.project_id IS NULL OR a.project_id = ?1)
+               AND (a.task_id IS NULL OR a.task_id = ?2)
+               AND (a.agent_profile_id IS NULL OR a.agent_profile_id = ?3)
+               AND (a.session_id IS NULL OR a.session_id = ?4)
+             ORDER BY a.memory_asset_id, s.source_id
+             LIMIT 4097",
+        )
+        .bind(principal.project_id.as_ref().map(ToString::to_string))
+        .bind(principal.task_id.as_ref().map(ToString::to_string))
+        .bind(principal.agent_profile_id.as_ref().map(ToString::to_string))
+        .bind(principal.session_id.as_ref().map(ToString::to_string))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "read searchable memory file sources",
+                error,
+            )
+        })?;
+
+        if rows.len() > 4096 {
+            return Err(StoreError::new(
+                ErrorCode::InvalidPayload,
+                "too many searchable file sources to refresh safely in one recall",
+            ));
+        }
+
+        let mut sources = Vec::new();
+        for row in rows {
+            let asset_id = MemoryAssetId::parse(row.get::<String, _>("memory_asset_id"))
+                .map_err(|error| StoreError::new(error.code(), error.to_string()))?;
+            match assert_authorized(&mut tx, principal, &asset_id, "search").await {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.code(),
+                        ErrorCode::PolicyDenied | ErrorCode::SequenceConflict
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+            {
+                let observed_digest = row
+                    .get::<Option<String>, _>("observed_digest")
+                    .map(ContentHash::parse)
+                    .transpose()
+                    .map_err(|error| StoreError::new(error.code(), error.to_string()))?;
+                sources.push(MemorySourceRecord {
+                    source_kind: MemorySourceKind::File,
+                    source_id: row.get("source_id"),
+                    observed_digest,
+                    source_version: None,
+                });
+            }
+        }
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "close searchable memory source read",
+                error,
+            )
+        })?;
+        Ok(sources)
+    }
+
     /// The current version of every asset whose recorded source no longer matches.
     ///
     /// `scope_project_id` is applied to the source row, which carries the project
@@ -1420,13 +1517,13 @@ impl SqliteStore {
                  WHERE s.source_kind = ?1 AND s.source_id = ?2
                    AND (a.project_id IS NULL OR a.project_id = ?3)
                    AND a.status = 'active'
-                   AND (s.observed_digest IS NULL OR s.observed_digest != ?4)
+                   AND (?4 IS NULL OR s.observed_digest IS NULL OR s.observed_digest != ?4)
                  ORDER BY a.memory_asset_id",
             )
             .bind(candidate.kind.as_str())
             .bind(&candidate.id)
             .bind(principal.project_id.as_ref().map(ToString::to_string))
-            .bind(candidate.observed.as_str())
+            .bind(candidate.observed.as_ref().map(ContentHash::as_str))
             .fetch_all(&mut *tx)
             .await
             .map_err(|error| {

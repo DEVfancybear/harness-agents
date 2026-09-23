@@ -15,7 +15,9 @@
 
 use std::{sync::Arc, time::Duration};
 
-use harness_cli::web::{LIVE_BUFFER_EVENTS, REQUEST_ID_HEADER, SESSION_HEADER, WebConfig};
+use harness_cli::web::{
+    LIVE_BUFFER_EVENTS, MAX_INPUT_BODY_BYTES, REQUEST_ID_HEADER, SESSION_HEADER, WebConfig,
+};
 use harness_store_sqlite::SqliteStore;
 use harness_types::{ErrorCode, ProjectId, SessionId, TaskId};
 use serde_json::json;
@@ -66,6 +68,33 @@ async fn request_labelled(
     body: Option<&str>,
     label: &str,
 ) -> Reply {
+    const TRANSPORT_ATTEMPTS: usize = 3;
+    let mut last_error = String::new();
+    for attempt in 0..TRANSPORT_ATTEMPTS {
+        match request_once(address, method, path, headers, body, label).await {
+            Ok(reply) => return reply,
+            Err(error) if attempt + 1 < TRANSPORT_ATTEMPTS => {
+                last_error = error;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => {
+                panic!(
+                    "no complete response after {TRANSPORT_ATTEMPTS} idempotent transport attempts for {label}: {error}"
+                );
+            }
+        }
+    }
+    panic!("request retry loop ended unexpectedly: {last_error}");
+}
+
+async fn request_once(
+    address: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+    label: &str,
+) -> Result<Reply, String> {
     let mut stream = TcpStream::connect(address)
         .await
         .expect("the server accepts a connection");
@@ -132,6 +161,9 @@ async fn request_labelled(
         }
     }
     let text = String::from_utf8_lossy(&raw).into_owned();
+    if raw.is_empty() {
+        return Err(format!("peer closed before replying to {label}"));
+    }
     let status = text
         .split_whitespace()
         .nth(1)
@@ -142,11 +174,18 @@ async fn request_labelled(
                 raw.len()
             )
         });
+    if head_end.is_some_and(|end| raw.len() < end.saturating_add(declared)) {
+        return Err(format!(
+            "incomplete response to {label}: read {} bytes, expected {}",
+            raw.len(),
+            head_end.unwrap_or_default().saturating_add(declared)
+        ));
+    }
     let body = text
         .split_once("\r\n\r\n")
         .map(|(_, body)| body.to_owned())
         .unwrap_or_default();
-    Reply { status, body }
+    Ok(Reply { status, body })
 }
 
 /// Read the first `count` server-sent frames from a stream, then close it.
@@ -244,6 +283,7 @@ async fn a33_web_replay_gap() {
 
     // A mutation without the session token is refused, and nothing is written.
     let before = store_input_count(&data, &session_id).await;
+    let origin = format!("http://127.0.0.1:{}", address.port());
     let unauthenticated = request(
         address,
         "POST",
@@ -283,12 +323,31 @@ async fn a33_web_replay_gap() {
         "a cross-origin mutation writes nothing"
     );
 
+    // Mutations with a valid token still require both origin checks.
+    let missing_origin = request(
+        address,
+        "POST",
+        &format!("/api/sessions/{}/inputs", session_id.as_str()),
+        &[
+            (SESSION_HEADER, &token),
+            (REQUEST_ID_HEADER, "23232323-2323-7232-8232-232323232323"),
+        ],
+        Some(&json!({"text": "missing origin"}).to_string()),
+    )
+    .await;
+    assert_eq!(missing_origin.status, 403);
+    assert_eq!(
+        store_input_count(&data, &session_id).await,
+        before,
+        "a token without an Origin does not mutate the session"
+    );
+
     // A mutation with no request id is refused: idempotency is not optional.
     let no_request_id = request(
         address,
         "POST",
         &format!("/api/sessions/{}/inputs", session_id.as_str()),
-        &[(SESSION_HEADER, &token)],
+        &[(SESSION_HEADER, &token), ("Origin", &origin)],
         Some(&json!({"text": "no request id"}).to_string()),
     )
     .await;
@@ -296,7 +355,6 @@ async fn a33_web_replay_gap() {
 
     // The real mutation, twice with the same request id and payload.
     let request_id = "33333333-3333-7333-8333-333333333333";
-    let origin = format!("http://127.0.0.1:{}", address.port());
     let first = request(
         address,
         "POST",
@@ -369,6 +427,27 @@ async fn a33_web_replay_gap() {
         store_input_count(&data, &session_id).await,
         before + 1,
         "and it wrote nothing"
+    );
+
+    // Reject oversize bodies before JSON parsing or service admission.
+    let oversized = format!("{{\"text\":\"{}\"}}", "x".repeat(MAX_INPUT_BODY_BYTES + 1));
+    let too_large = request(
+        address,
+        "POST",
+        &format!("/api/sessions/{}/inputs", session_id.as_str()),
+        &[
+            (SESSION_HEADER, &token),
+            ("Origin", &origin),
+            (REQUEST_ID_HEADER, "34343434-3434-7434-8434-343434343434"),
+        ],
+        Some(&oversized),
+    )
+    .await;
+    assert_eq!(too_large.status, 413, "oversize body is rejected");
+    assert_eq!(
+        store_input_count(&data, &session_id).await,
+        before + 1,
+        "an oversize body writes nothing"
     );
 
     // The reload path describes committed state, not a buffer.
@@ -481,6 +560,37 @@ async fn a33_web_replay_gap() {
         .expect("the session still exists");
     assert_eq!(summary.input_count, before + 1);
     store.close().await.expect("the store closes");
+
+    // A connected SSE consumer receives later committed events, not just the
+    // snapshot that existed when it opened the stream.
+    let live_path = format!(
+        "/api/sessions/{}/events?cursor={newest}",
+        session_id.as_str()
+    );
+    let live_stream = tokio::spawn(async move { read_sse(address, &live_path, 1).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let live = request(
+        address,
+        "POST",
+        &format!("/api/sessions/{}/inputs", session_id.as_str()),
+        &[
+            (SESSION_HEADER, &token),
+            ("Origin", &origin),
+            (REQUEST_ID_HEADER, "45454545-4545-7454-8454-454545454545"),
+        ],
+        Some(&json!({"text": "a later live input"}).to_string()),
+    )
+    .await;
+    assert_eq!(live.status, 200, "the live event is committed");
+    let live = live.json();
+    let live_sequence = live["sequence"].as_u64().expect("durable sequence");
+    let streamed_live = live_stream
+        .await
+        .expect("the stream task completes after one event");
+    assert!(
+        streamed_live.contains(&format!("id: {live_sequence}")),
+        "the open stream polls and publishes new journal events: {streamed_live}"
+    );
 }
 
 /// The durable input count of one session, read through a fresh handle.

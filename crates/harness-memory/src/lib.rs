@@ -2,7 +2,11 @@
 
 //! Scoped reusable-memory contracts and services.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    path::{Component, Path},
+    sync::Arc,
+};
 
 use harness_store_sqlite::SqliteStore;
 use harness_store_sqlite::{
@@ -16,6 +20,7 @@ use harness_types::{
     Validity,
 };
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 mod extraction;
@@ -25,7 +30,7 @@ pub use extraction::{
 mod retrieval;
 pub use retrieval::{
     MAX_QUERY_BYTES, MemoryContribution, MemoryIndex, RetrievalResult, RetrievalState,
-    VectorAdapter, normalize_terms,
+    SelectionReason, VectorAdapter, normalize_terms,
 };
 mod maintenance;
 pub use maintenance::{CatchUpReport, MemoryBudget};
@@ -919,6 +924,83 @@ impl MemoryService {
         retired.sort();
         retired.dedup();
         Ok(retired)
+    }
+
+    /// Re-read the current file sources this principal may search.
+    ///
+    /// Missing, unreadable, oversized, or out-of-workspace paths are represented
+    /// with `observed: None`, which makes file-backed versions stale in the SQL
+    /// filter. This keeps the normal recall path from treating an unread file as
+    /// fresh memory.
+    pub async fn refresh_workspace_file_sources(
+        &self,
+        principal: &MemoryPrincipal,
+        workspace_root: &Path,
+    ) -> Result<Vec<RefreshSource>, HarnessError> {
+        const MAX_REFRESH_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+        validate_principal(principal)?;
+        let sources = self
+            .store
+            .searchable_current_file_sources(&store_principal(principal))
+            .await
+            .map_err(to_harness_error)?;
+        let root = tokio::fs::canonicalize(workspace_root).await.ok();
+        let mut refresh = Vec::with_capacity(sources.len());
+        let mut seen = BTreeSet::new();
+        for source in sources {
+            if !seen.insert(source.source_id.clone()) {
+                continue;
+            }
+            let relative = Path::new(&source.source_id);
+            let safe_relative = !relative.as_os_str().is_empty()
+                && relative
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_) | Component::CurDir));
+            let observed = if safe_relative {
+                if let Some(root) = &root {
+                    let path = root.join(relative);
+                    match tokio::fs::canonicalize(&path).await {
+                        Ok(path) if path.starts_with(root) => {
+                            match tokio::fs::File::open(&path).await {
+                                Ok(file) => match file.metadata().await {
+                                    Ok(metadata)
+                                        if metadata.is_file()
+                                            && metadata.len() <= MAX_REFRESH_FILE_BYTES =>
+                                    {
+                                        let mut bytes = Vec::with_capacity(
+                                            usize::try_from(metadata.len()).unwrap_or(0),
+                                        );
+                                        let mut bounded = file.take(MAX_REFRESH_FILE_BYTES + 1);
+                                        match bounded.read_to_end(&mut bytes).await {
+                                            Ok(_)
+                                                if bytes.len() as u64 <= MAX_REFRESH_FILE_BYTES =>
+                                            {
+                                                Some(ContentHash::from_bytes(&bytes))
+                                            }
+                                            _ => None,
+                                        }
+                                    }
+                                    _ => None,
+                                },
+                                Err(_) => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            refresh.push(RefreshSource {
+                kind: MemorySourceKind::File,
+                id: source.source_id,
+                observed,
+            });
+        }
+        Ok(refresh)
     }
 
     /// Confirm a bounded batch of candidate assets at their current version.

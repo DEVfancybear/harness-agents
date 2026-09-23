@@ -391,7 +391,14 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     let mut recall = None;
     let run_request = match &memory_principal {
         Some(principal) => {
-            match memory::recall(Arc::clone(&store), principal, &request.prompt).await {
+            match memory::recall(
+                Arc::clone(&store),
+                principal,
+                &context.project.root,
+                &request.prompt,
+            )
+            .await
+            {
                 Ok(found) => {
                     let request = run_request.with_memory(found.contribution.clone());
                     recall = Some(found);

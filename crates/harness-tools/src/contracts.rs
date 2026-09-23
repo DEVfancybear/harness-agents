@@ -1178,12 +1178,12 @@ pub enum ToolOutput {
         canceled: bool,
         /// Whether the call waited behind another process for the host permit.
         queued: bool,
-        /// True only when the backend confirmed the whole tree is gone; an
-        /// unconfirmed reap is never reported as a settled success.
+        /// True only when the backend confirmed the whole tree is gone. A
+        /// successful wait for the direct child alone leaves this false.
         tree_cleanup_confirmed: bool,
         /// How that confirmation was obtained: `nothing_to_clean`,
-        /// `reaped_on_exit` or `killed_and_reaped`. A bare boolean cannot tell
-        /// an operator whether a kill happened at all.
+        /// `reaped_on_exit` (direct child only) or `killed_and_reaped`. A bare
+        /// boolean cannot tell an operator whether a kill happened at all.
         tree_cleanup: String,
         /// Head preview of stdout, bounded by the spool's head limit.
         stdout: String,

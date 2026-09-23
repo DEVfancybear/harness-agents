@@ -149,7 +149,8 @@ fn same_name(left: &str, right: &str) -> bool {
 pub(crate) enum TreeCleanup {
     /// The call was withdrawn before a process existed.
     NothingToClean,
-    /// The process exited by itself and the backend reported the tree empty.
+    /// The direct process exited. The backend did not report that every
+    /// descendant in its process container is gone.
     ReapedOnExit,
     /// A kill was requested and the backend confirmed the whole tree is gone.
     KilledAndReaped,
@@ -418,9 +419,10 @@ async fn run(
                     format!("cannot confirm process tree completion: {error}"),
                 )
             })?;
-            // `wait` on either backend reaps the whole container (job object /
-            // process group), so its completion is the evidence that nothing
-            // was left behind.
+            // This only proves that the direct child exited. The Windows job
+            // wrapper can report its root process before detached descendants
+            // finish; dropping the wrapper requests kill-on-close, but that is
+            // not a backend confirmation that the job is empty.
             (status, false, false, TreeCleanup::ReapedOnExit)
         }
         WaitSignal::TimedOut => (

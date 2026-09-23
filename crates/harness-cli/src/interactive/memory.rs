@@ -139,6 +139,7 @@ pub struct Recall {
 pub async fn recall(
     store: Arc<SqliteStore>,
     principal: &MemoryPrincipal,
+    workspace_root: &std::path::Path,
     text: &str,
 ) -> Result<Recall, HarnessError> {
     let service = MemoryService::new(store);
@@ -161,11 +162,14 @@ pub async fn recall(
         )
     } else {
         let terms = normalize_terms(text);
+        let refresh = service
+            .refresh_workspace_file_sources(principal, workspace_root)
+            .await?;
         service
-            .search_durable_before_log(principal, &terms, RECALL_HITS, None)
+            .search_durable_before_log_fresh(principal, &terms, RECALL_HITS, None, &refresh)
             .await?
     };
-    let contribution = service.contribute(principal, &result, CONTRIBUTION_TOKENS);
+    let contribution = service.contribute_indexed(principal, &result, CONTRIBUTION_TOKENS, index);
     let hits = result.hits.len();
     let blocks = contribution.blocks.len();
     let message = match result.state {
@@ -589,14 +593,16 @@ mod tests {
     use crate::interactive::project::resolve_project_id;
     use harness_memory::{
         CreateMemoryAsset, EvidenceState, MemoryIndex, MemoryLayer, MemoryPrincipal, MemoryService,
-        normalize_terms,
+        MemorySource, SelectionReason, normalize_terms,
     };
     use harness_providers::MockProvider;
     use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
     use harness_session::{AdmitInputRequest, SessionService};
     use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
     use harness_tools::observe_workspace;
-    use harness_types::{HostId, InputId, ProjectId, SessionId, SourceAuthority, TaskId};
+    use harness_types::{
+        ContentHash, HostId, InputId, MemoryScope, ProjectId, SessionId, SourceAuthority, TaskId,
+    };
     use std::sync::Arc;
 
     /// Unwrap the outcome of remembering an admitted input.
@@ -673,9 +679,14 @@ mod tests {
 
         let later = principal(project_id, task_id, SessionId::generate());
         let asked = "What marker did I ask you to remember? Answer with just the marker.";
-        let recalled = recall(Arc::clone(&fixture.store), &later, asked)
-            .await
-            .expect("recall runs");
+        let recalled = recall(
+            Arc::clone(&fixture.store),
+            &later,
+            &fixture.workspace,
+            asked,
+        )
+        .await
+        .expect("recall runs");
         assert_eq!(
             recalled.state,
             RetrievalState::Found,
@@ -1116,9 +1127,14 @@ mod tests {
 
         let later = principal(project_id, TaskId::generate(), SessionId::generate());
         let question = "which drawer holds the notes";
-        let recalled = recall(Arc::clone(&fixture.store), &later, question)
-            .await
-            .expect("recall runs");
+        let recalled = recall(
+            Arc::clone(&fixture.store),
+            &later,
+            &fixture.workspace,
+            question,
+        )
+        .await
+        .expect("recall runs");
         let joined = recalled
             .contribution
             .blocks
@@ -1518,6 +1534,7 @@ mod tests {
         let recalled = recall(
             Arc::clone(&fixture.store),
             &later,
+            &fixture.workspace,
             "Do I need to run cargo test before I commit?",
         )
         .await
@@ -1670,6 +1687,7 @@ mod tests {
         let recalled = recall(
             Arc::clone(&fixture.store),
             &later,
+            &fixture.workspace,
             "Which deploy marker did you give me for the parser service?",
         )
         .await
@@ -1832,6 +1850,7 @@ mod tests {
         let recalled = recall(
             Arc::clone(&fixture.store),
             &later,
+            &fixture.workspace,
             "session trước tôi hỏi bạn những gì?",
         )
         .await
@@ -1841,6 +1860,15 @@ mod tests {
             RetrievalState::Found,
             "the log holds eight turns: {}",
             recalled.message
+        );
+        assert!(
+            !recalled.contribution.stamps.is_empty()
+                && recalled
+                    .contribution
+                    .stamps
+                    .iter()
+                    .all(|stamp| stamp.reason == SelectionReason::LogFallback),
+            "history results must carry log-fallback provenance"
         );
         let injected = recalled
             .contribution
@@ -2144,9 +2172,14 @@ mod tests {
         assert_eq!(stored.as_str().split('_').next(), Some("memory"));
 
         let later = principal(project_id, task_id, second);
-        let recalled = recall(Arc::clone(store), &later, "dự án dùng Rust nhé?")
-            .await
-            .expect("recall runs");
+        let recalled = recall(
+            Arc::clone(store),
+            &later,
+            &fixture.workspace,
+            "dự án dùng Rust nhé?",
+        )
+        .await
+        .expect("recall runs");
         assert_eq!(
             recalled.state,
             RetrievalState::Found,
@@ -2159,6 +2192,86 @@ mod tests {
             "a contributed block carries the version it came from"
         );
         assert_eq!(recalled.contribution.principal, later);
+    }
+
+    /// Runtime recall re-reads file sources before ranking, so a moved file cannot
+    /// leave its old derived text in the model context.
+    #[tokio::test]
+    async fn memory_recall_excludes_file_backed_assets_after_the_source_moves() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+        let source_path = fixture.workspace.join("policy.md");
+        let original = b"The aurora ledger must remain enabled";
+        std::fs::write(&source_path, original).expect("source file is written");
+        let owner = principal(
+            project_id.clone(),
+            TaskId::generate(),
+            SessionId::generate(),
+        );
+        MemoryService::new(Arc::clone(&fixture.store))
+            .create_asset(
+                &owner,
+                CreateMemoryAsset {
+                    kind: "project_fact".to_owned(),
+                    scope: MemoryScope::Project,
+                    layer: MemoryLayer::L1,
+                    project_id: Some(project_id.clone()),
+                    task_id: None,
+                    agent_profile_id: None,
+                    session_id: None,
+                    visibility: "scoped".to_owned(),
+                    content: "The aurora ledger must remain enabled".to_owned(),
+                    authority: SourceAuthority::RuntimeObserved,
+                    evidence: EvidenceState::VerifiedObservation,
+                    user_confirmed: false,
+                    source_event_refs: Vec::new(),
+                    source_file_hashes: Vec::new(),
+                    source_commit: None,
+                    provenance_kind: "workspace_fact".to_owned(),
+                    sources: vec![MemorySource::file(
+                        "policy.md",
+                        ContentHash::from_bytes(original),
+                    )],
+                },
+            )
+            .await
+            .expect("file-backed memory is stored");
+
+        let reader = principal(project_id, TaskId::generate(), SessionId::generate());
+        let fresh = recall(
+            Arc::clone(&fixture.store),
+            &reader,
+            &fixture.workspace,
+            "what does the aurora ledger require?",
+        )
+        .await
+        .expect("fresh recall runs");
+        assert_eq!(fresh.state, RetrievalState::Found, "{}", fresh.message);
+        assert!(
+            fresh.contribution.blocks[0].text.contains("remain enabled"),
+            "the current source is searchable"
+        );
+
+        std::fs::write(&source_path, b"The aurora ledger is now disabled")
+            .expect("source file changes");
+        let stale = recall(
+            Arc::clone(&fixture.store),
+            &reader,
+            &fixture.workspace,
+            "what does the aurora ledger require?",
+        )
+        .await
+        .expect("stale recall runs");
+        assert!(
+            !stale
+                .contribution
+                .blocks
+                .iter()
+                .any(|block| { block.text.contains("must remain enabled") }),
+            "text derived from an earlier file version must be removed before ranking"
+        );
     }
 
     /// Scope is host-issued: another project identity must not see the asset.
@@ -2189,9 +2302,14 @@ mod tests {
         .expect_stored();
 
         let stranger = principal(ProjectId::generate(), task_id, SessionId::generate());
-        let recalled = recall(Arc::clone(store), &stranger, "cargo test")
-            .await
-            .expect("recall runs");
+        let recalled = recall(
+            Arc::clone(store),
+            &stranger,
+            &fixture.workspace,
+            "cargo test",
+        )
+        .await
+        .expect("recall runs");
         assert_ne!(
             recalled.state,
             RetrievalState::Found,
@@ -2242,9 +2360,14 @@ mod tests {
         let task_id = TaskId::generate();
         let session_id = SessionId::generate();
         let owner = principal(project_id.clone(), task_id.clone(), session_id.clone());
-        let found = recall(Arc::clone(store), &owner, "marker zeta42")
-            .await
-            .expect("recall runs");
+        let found = recall(
+            Arc::clone(store),
+            &owner,
+            &fixture.workspace,
+            "marker zeta42",
+        )
+        .await
+        .expect("recall runs");
         assert_eq!(found.state, RetrievalState::Found, "{}", found.message);
         runtime
             .run(

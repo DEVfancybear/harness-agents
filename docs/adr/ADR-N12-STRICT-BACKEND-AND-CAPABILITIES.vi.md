@@ -11,7 +11,8 @@
 
 M4 đã có một host runner thật: child được tạo `CREATE_SUSPENDED`, gán vào **Job Object** rồi mới resume; `KillOnDrop`
 bật `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; môi trường con bị **clear** rồi chỉ nhận allowlist + binding đã grant; output
-đi vào spool có quota; deadline và cancellation giết cả cây rồi `wait` để xác nhận job rỗng. Đó là containment thật.
+đi vào spool có quota; deadline và cancellation giết cả cây rồi chờ backend. Đó là containment thật. Natural exit chỉ
+xác nhận direct child; `reaped_on_exit` không chứng minh job rỗng.
 
 Nhưng `IsolationMode::Strict` **đã** bị từ chối từ P3 bằng một câu hard-code: *"this host has lifecycle cleanup but no
 verified strict isolation sandbox"*. Câu đó **đúng**, và nó không có bằng chứng. M12 phải trả lời câu hỏi mà không
@@ -61,8 +62,9 @@ Host runner là **containment**, không phải confinement. Mọi receipt, CLI o
 ### D5 — Kiểm soát thật đến từ **assign-trước-resume**, không từ path normalization
 
 Child của một job member tự động thuộc job (backend pinned **không** set `BREAKAWAY_OK`/`SILENT_BREAKAWAY_OK`), và
-`CREATE_SUSPENDED` đóng cửa sổ đua nơi child kịp spawn grandchild **trước** khi bị gán. Đây là lý do một "detached
-grandchild" vẫn bị reaped — và nó **được đo** bằng `P-CONT`, không được suy ra từ việc đọc code.
+`CREATE_SUSPENDED` đóng cửa sổ đua nơi child kịp spawn grandchild **trước** khi bị gán. Một "detached grandchild"
+vẫn bị job kill-on-close dọn — được đo bằng `P-CONT`; thời điểm natural-exit `wait` trả về riêng nó không chứng minh
+job đã rỗng.
 
 Normalize đường dẫn trong `validate_workspace_action` là **policy**, không phải sandbox. M12 không được phép để bất kỳ
 tài liệu nào biến nó thành bằng chứng enforcement.
@@ -150,4 +152,4 @@ chưa được duyệt thành an toàn; nó chỉ bảo đảm vòng đời và 
 | `tool-execution-receipt.v1` | **Không đổi** |
 | CLI | `ha sandbox capabilities\|probe\|leases` — surface của matrix và lease; `ha` vẫn là binary duy nhất |
 | A36 | `planned` + note nêu clause thiếu; không claim accepted |
-| Nền tảng | Bằng chứng M12 là **Windows 10 Pro 19045**. Không có bằng chứng Linux nào tồn tại (không WSL/Docker; CI chưa chạy lần nào) |
+| Nền tảng | Bằng chứng M12 là **Windows 11 Pro 25H2, build 26200.9457**. Linux vẫn pending theo phạm vi hiện tại; chưa có bằng chứng chạy trên Linux |

@@ -76,6 +76,17 @@ ownership/policy/durability vẫn thuộc owner hiện có.
 | Loopback + token | Test A33 khẳng định 401/403 thật, không chỉ đọc code |
 | Buffer bound | Subscriber chậm bị cắt và **được báo** bằng `gap`, không im lặng |
 
+### D8 — Mutation boundary bounded, SSE reads bounded and live
+
+Mutation phải có token hợp lệ, `Host` phải khớp đúng loopback address/port đã bind, và `Origin` phải được allowlist;
+missing Origin bị từ chối như origin không hợp lệ. Body được giữ tối đa 64 KiB; khi vượt mức server drain có giới hạn
+rồi trả 413 mà không admit input. Event replay dùng store queries có limit; stream đang mở poll journal bền để nhận
+event mới, heartbeat không mang cursor, còn client chậm bị ngắt ở giới hạn buffer để resume an toàn. Lỗi đọc store
+không được biến thành state rỗng.
+
+**Bằng chứng:** A33 kiểm missing Origin, body quá cỡ không ghi, stream nhận journal event sau khi đã kết nối và
+request/response path vẫn qua service/store hiện có.
+
 ## 4. Phương án bị bác bỏ
 
 - **Thêm axum.** Một cây dependency mới cho một server loopback; không có yêu cầu nào cần nó.

@@ -1650,7 +1650,7 @@ fn process_output(
         // rather than an assumption about the kill request.
         tree_cleanup_confirmed: matches!(
             output.tree_cleanup,
-            TreeCleanup::NothingToClean | TreeCleanup::ReapedOnExit | TreeCleanup::KilledAndReaped
+            TreeCleanup::NothingToClean | TreeCleanup::KilledAndReaped
         ),
         tree_cleanup: output.tree_cleanup.as_str().to_owned(),
         stdout: redact_text(&output.stdout),

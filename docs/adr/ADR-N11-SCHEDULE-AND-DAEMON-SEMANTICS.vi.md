@@ -66,6 +66,13 @@ cách một pause "đang xếp hàng" được tôn trọng.
 `LaunchGrants.auto_approve_tools` **luôn false** trong release này, và được **lưu** để người đọc thấy đó là quyết
 định chứ không phải thiếu sót. `edit_workspace` cũng không được nới.
 
+### D10 — Endpoint không bị xóa khi probe PID không chắc chắn
+
+PID hiện tại luôn là process sống. Trên Windows, chỉ output `tasklist` nhận dạng được chính xác PID mới xác nhận
+process; chỉ câu trả lời rõ ràng “không có process khớp” mới cho phép dọn endpoint. Access denied, tool lỗi hoặc
+output lạ được coi là **đang sống**. Điều này giữ writer fence làm authority cuối cùng mà không biến một hạn chế
+quyền truy vấn thành stale endpoint giả.
+
 ## 3. Hệ quả
 
 | Hệ quả | Xử lý |
