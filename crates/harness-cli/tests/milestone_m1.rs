@@ -184,9 +184,9 @@ async fn m1_01_store_schema_newer_than_host_is_refused() {
          SET version = (SELECT MAX(version) + 1 FROM schema_migrations)
          WHERE version = (SELECT MAX(version) FROM schema_migrations)",
     )
-        .execute(&pool)
-        .await
-        .expect("newer migration row");
+    .execute(&pool)
+    .await
+    .expect("newer migration row");
     pool.close().await;
 
     let error = SqliteStore::open_writer(WriterOpenOptions::new(&data_dir, HostId::generate()))
