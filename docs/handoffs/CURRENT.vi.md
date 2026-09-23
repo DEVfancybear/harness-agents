@@ -1,6 +1,7 @@
 # CURRENT — bàn giao đang mở
 
-**Cập nhật:** 23/09/2026 · **Assignment:** M7–M12 theo kế hoạch `implementation-next`, tuần tự theo dependency và gate từng checkpoint; commit+push sau mỗi action. **Checkpoint hiện tại:** M7 (`e5ef55c`), M8 (`32c3400`), M9 (`4035f8b`), M10 (`0a1167d`), **M11-01..04 xong** (`90bd0f6`/`3915b5f`/`ada1917`, `9d55914`, `5366b1e`, `71b2b17`) + **gate M11 xanh** (digest `sha256:f461406cc2bb0634553272a39dc96a7cdecf6b7d5dd8ed0030f1ccb13044f8a6`, `396` file, **6 required test**, 9 test trên 4 target). Cộng hai fix ngoài scope nhưng chặn gate: `test(m2)` (`220e687`) và CI matrix thêm M10/M11. **Milestone còn lại: M12** (prerequisites **M4**, acceptance A36 strict confinement).
+**Cập nhật:** 23/09/2026 · **Assignment:** M7–M12 theo kế hoạch `implementation-next`, tuần tự theo dependency và gate từng checkpoint; commit+push sau mỗi action. **Checkpoint hiện tại:** M7 (`e5ef55c`), M8 (`32c3400`), M9 (`4035f8b`), M10 (`0a1167d`), M11 (`9d55914`), **M12-01..04 xong** (`65a084e`/`5985bd0`/`cfb215a`/`56d4f72`/`dd3c3fa`/`3030233`) + **gate M12 xanh** (digest `sha256:b2434902ae5c4c54522dc2c7992dd6c229573361ec60e9e6ad2350754defbeb4`, **411** file, **10 required test**, closure M4/M3/M1/M2/M0). **Milestone còn lại: không còn — M0–M12 đã triển khai xong; việc tiếp theo là reviewer nghiệm thu.**
+
 
 **Quyền (cập nhật 23/09/2026, user cấp trực tiếp):** user cho phép **install ở M9** và nói rõ "cứ làm full goal không cần hỏi". ⇒ Được phép: `Install-Ha.ps1` (cài thật) khi M9 cần. **Vẫn chưa được cấp rõ ràng:** đổi User PATH, paid smoke/live provider, publish/release (release tạo artifact công khai). Nếu M9 chạm tới các mục đó: làm phần install, còn PATH/publish thì ghi lại là cần xác nhận riêng.
 
@@ -101,11 +102,58 @@
 - **Fix ngoài scope M11, có lý do đo được:** `test(m2)` — `a07_401` đỏ trong gate vì loopback response bị mất (đo **5/30** lần) được adapter retry **đúng theo thiết kế**. Nay khẳng định trên **provider attempt record**; stress sau sửa **25/25** xanh, và hai gate M11 cuối không cần retry.
 - **Giới hạn còn lại:** chưa có connector thật (chỉ trait + test double) ⇒ **không** claim đã gửi thông báo ra ngoài; chưa có CLI `ha` cho external job và cho approve/deny; DST chỉ UTC + central European 2026–2027; remote transport chỉ stdio MCP; **chưa có bằng chứng Linux** (M11 đã vào matrix CI `milestone: [M0 … M11]` nhưng workflow chưa chạy lần nào trên revision này).
 
+## 7f. M12 — XONG CẢ BỐN ITEM (milestone vẫn chưa accepted)
+
+- **Xong + gate xanh:** M12-01 (capability spike + backend selection), M12-02 (confinement + execution mapping),
+  M12-03 (ownership leases + orphan recovery), M12-04 (adversarial gates + profile documentation). Registry: cả bốn
+  item `implemented_unverified`; **10 required test** (tất cả bằng qualified selector nên gate tự discover + tự chạy).
+  Gate cuối: `sha256:b2434902…`, **411** file, **10/10 required**, closure M4/M3/M1/M2/M0 xanh, `workspace-tests`
+  passed **sau 1 retry** (flake loopback đã biết `interactive_launch::i13…`, tách ra chạy một mình thì xanh — **không**
+  test M12 nào đỏ). Self-test gate: `MILESTONE_GATE_SELFTEST_OK: M12` (9 negative control).
+- **M12 chứng minh gì:** ma trận capability **đo được** trên host thật (`process_containment`, `process_tree_kill`,
+  `environment_allowlist`, `deadline_enforced`, `output_bounds` = `enforced`; `filesystem_read/write_confinement`,
+  `network_egress_denial`, `credential_socket_denial`, `resource_limit_memory/process_count` = `unsupported` **kèm
+  bằng chứng escape hoặc lý do cấu trúc**); `strict` (= Full) **bị từ chối** với mã `strict_isolation_unavailable`
+  nêu tên 6 capability thiếu và **không** spawn gì; profile `containment` phục vụ được; lease ghi **trước** khi
+  process tồn tại, reconcile chỉ settle lease mà nó **acquire được lock do OS giữ**, owner còn sống ⇒ `still_owned`
+  và row **không** bị sửa; export artifact kiểm digest và từ chối đường dẫn ra ngoài export root; support matrix trong
+  `docs/support` được test **so trực tiếp** với matrix đo được.
+- **Chín bug thật:** (1) `reaped_on_exit` **không** chứng minh job rỗng (probe `spawn-detach`: run trả về sau 106 ms
+  trong khi 4 descendant vẫn ghi; thứ giết cây là việc thả handle job) — **không sửa**, đây là hợp đồng M4;
+  (2) descendant thừa hưởng handle stdio *inheritable* của cha ⇒ đọc tới EOF mất 7.9 s cho cây lifetime 9 s;
+  (3) seam host-env tra tên case-sensitive ⇒ `PATH` không khớp `Path`, **mọi** child tool mất search path (M4 `a16`
+  bắt được); (4) lock lease nằm dưới spool root ⇒ M4 `a17` đỏ; (5) probe M12-01 phụ thuộc tải (sampling không được
+  serialize) ⇒ verdict lật sang `Unsupported`; (6) canary network đua với process permit host-wide; (7) fixture của
+  probe tự sai tham số (chính nó làm lộ bug 1); (8) registry: case `planned` không được có `selectors` (`m0_04` bắt);
+  (9) gate `format` đỏ vì test CLI thêm sau lần fmt cuối.
+- **Giới hạn còn lại:** **A36 vẫn `planned`** — clause "denied filesystem/network/credential-socket" **không** chứng
+  minh được trên host này (không có cơ chế OS nào; probe đo escape), nên strict phải từ chối thay vì giả vờ; **chưa có
+  bằng chứng Linux** (matrix CI nay có M0–M12 nhưng workflow **chưa chạy lần nào**); không có confinement backend
+  (AppContainer cần crate opt-out `unsafe` + ADR — **cần người quyết**); `ha sandbox export|leases|reconcile` chưa có
+  test tự động (logic bên dưới thì có); bộ probe tốn ~60 s và `P-MEM` cấp phát thật 256 MiB.
+
 ## 8. Next action chính xác
-**M11 đã xong cả bốn item và gate xanh ⇒ bước tiếp theo là M12.** Việc cụ thể: (1) đọc `docs/implementation-next/M12.vi.md` + acceptance **A36** + master plan mục 10/16/18; (2) xác minh prereq **M4** trên revision hiện tại (`pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M4`); (3) viết `docs/specs/M12.vi.md` + ADR-N12 (backend chọn, threat model, capability nào **enforce được** trên Windows này, strict profile **fail closed** ở đâu) **trước** khi code; (4) M12-01 capability spike **đo thật** (Job Object limits/AppContainer/token — không pin version từ trí nhớ, không đánh dấu platform pass chưa chạy); (5) M12-02 confinement + execution mapping, M12-03 lease/orphan recovery (store schema + lifecycle), M12-04 adversarial gates + `docs/support` trung thực; (6) registry thêm M12 (prerequisites `["M4"]`) + required test; (7) gate M12; (8) evidence + handoff; (9) commit + push. **Nếu một capability không enforce được trên host này: ghi `unsupported` + lý do và **từ chối** strict profile — không tạo success placeholder.** Ngoài ra còn nợ đã ghi: M11 vào matrix CI (đã thêm, **chưa chạy**), chưa có connector notification thật, chưa có CLI cho external job/approve-deny.
+**M12 đã xong cả bốn item và gate xanh ⇒ M0–M12 đã triển khai hết; không còn milestone nào để chạy tiếp.** Việc tiếp
+theo **không phải** code thêm mà là **nghiệm thu**: (1) đọc `docs/evidence/M12.vi.md` §3 (ma trận đo được), §5 (A36
+chứng minh gì / không gì), §6 (9 bug thật), §9 (gate chưa chạy); (2) quyết ba điểm ở §9 — cách ghi `unsupported` +
+fail-closed có đủ cho A36 không, khiếm khuyết `tree_cleanup_confirmed` (§6.1) có sửa trong một assignment M4 riêng
+không, và có cấp phép cho một crate **opt-out `unsafe`** để làm AppContainer hay không; (3) nếu muốn một host thật sự
+confine: đó là assignment kế tiếp, kèm ADR lật D1/D9 của ADR-N12 và probe mới — **không** sửa tài liệu suông.
+Nợ đã ghi vẫn còn nguyên: chưa có bằng chứng Linux/CI (matrix đã có M0–M12 nhưng workflow **chưa chạy lần nào**), chưa
+có connector notification thật, chưa có CLI cho external job/approve-deny, `ha sandbox export|leases|reconcile` chưa
+có test tự động.
 ## 9. Blocked on
 
-Không có blocker kỹ thuật. Bốn điểm cần người quyết: (1) `accepted` đa nền tảng cần chạy Linux (máy này không có WSL/Docker — CI là đường duy nhất, và workflow **chưa chạy lần nào**); (2) disposition `no_facts` → `filtered` (M7) cần reviewer xác nhận; (3) **A29 chỉ phủ nhánh conflict, chưa phủ nhánh `ChecksFailed`** (evidence M8 §9) — khoảng trống thật của M8; (4) M12 sẽ cần quyết định về backend strict: trên Windows không có WSL/Docker, nên nếu chỉ Job Object + token là enforce được thì phần filesystem/egress phải ghi **unsupported** và strict profile phải **fail closed** — cần reviewer xác nhận cách ghi đó là đủ cho A36.
+Không có blocker kỹ thuật. Năm điểm cần người quyết: (1) `accepted` đa nền tảng cần chạy Linux (máy này không có
+WSL/Docker — CI là đường duy nhất, và workflow **chưa chạy lần nào**); (2) disposition `no_facts` → `filtered` (M7) cần
+reviewer xác nhận; (3) **A29 chỉ phủ nhánh conflict, chưa phủ nhánh `ChecksFailed`** (evidence M8 §9) — khoảng trống
+thật của M8; (4) **M12 đã trả lời câu hỏi cũ** ("chỉ Job Object + token là enforce được thì phần filesystem/egress
+phải ghi unsupported và strict profile phải fail closed"): đo được rồi — containment/tree-kill/env/deadline/output
+`enforced`, filesystem/network/socket/resource-cap `unsupported` **kèm bằng chứng escape**, `strict` bị từ chối theo
+tên capability, và A36 ở `planned` vì hai clause của nó không chứng minh được ở đây. **Reviewer cần xác nhận cách ghi
+đó là đủ cho A36**; (5) `tree_cleanup = reaped_on_exit` **không** chứng minh job rỗng khi direct child thoát trước
+descendant (evidence M12 §6.1, tái hiện được bằng probe P-CONT) — sửa nó là thay đổi hợp đồng M4 nên cần quyết riêng.
+
 
 ## 10. Không lặp lại
 
@@ -131,8 +179,49 @@ Không có blocker kỹ thuật. Bốn điểm cần người quyết: (1) `acce
   - **Không** gộp trạng thái `open` của một approval vào "hết hạn": một câu hỏi còn trong cửa sổ phải ở `Wait`; chỉ khi quá `expires_at` mới `Expire`, và một approval chưa trả lời **không bao giờ** là "đồng ý".
 - Không để secret vào evidence.
 - Không tự đặt `verified_local`/`accepted` trong registry.
+- **Không lặp lại thử nghiệm đã bác bỏ (M12):**
+  - **Không** dùng `reaped_on_exit` như bằng chứng "job rỗng". Đo được: một run mà direct child thoát trước descendant
+    trả về với nhãn đó **trong khi cây vẫn đang ghi**; cái giết cây là `KILL_ON_JOB_CLOSE` lúc thả handle. Nếu cần
+    "đã reap", phải **đo** (tick file ngừng tăng), không đọc nhãn.
+  - **Không** đọc output của một process tới EOF khi cây có thể còn sống: descendant thừa hưởng handle *inheritable*
+    của cha nên write end của pipe vẫn mở (đo: 7.9 s cho cây lifetime 9 s). Giết cây **trước**, drain **sau**, và
+    control thì drain có trần.
+  - **Không** tra tên biến môi trường theo case-sensitive trên Windows: `Path` ≠ `PATH` ⇒ child mất search path. Dùng
+    luật của nền tảng (`same_name`).
+  - **Không** đặt lock/lease dưới spool root: `a17_output_quota` khẳng định spool rỗng sau khi publish capture. Trạng
+    thái vòng đời thuộc data dir của store.
+  - **Không** kết luận một probe từ **một** cặp before/after: execution được serialize nhưng sampling thì không, nên
+    dưới tải song song một writer tới muộn lật verdict. Serialize cả bộ probe theo process **và** chỉ kết luận khi hai
+    cửa sổ liên tiếp đồng ý.
+  - **Không** đua một canary với process permit host-wide: đọc connection **sau** khi run xong (OS đã buffer), thay vì
+    `accept` song song rồi hết hạn.
+  - **Không** set `selectors` cho acceptance case `planned`: `m0_04_milestone_registry_and_gate_self_test` từ chối
+    (danh sách required test của milestone là danh sách khác).
+  - **Không** thêm test sau lần `cargo fmt` cuối: bước `format` của gate sẽ đỏ và phải chạy lại gate.
+  - **Không** hạ cấp `strict` thành containment dù có "thông báo": tên gọi đắt hơn một refusal. Matrix là dữ liệu;
+    thiếu measurement thì **từ chối**, không đoán.
 
-## 11. Checkpoint M11 (lượt này) — tóm tắt
+
+## 11. Checkpoint M12 (lượt này) — tóm tắt
+
+- **Sáu commit:** `65a084e` (SPEC M12 + ADR-N12), `5985bd0` (M12-01: capability probe + từ chối có tên),
+  `cfb215a` (M12-02: execution plan + export có digest), `56d4f72` (M12-03: lease + reconcile + store slice 6),
+  `dd3c3fa` (M12-04: A36 + support matrix + registry), `3030233` (fmt).
+- **Gate cuối:** `-Milestone M12` **passed**, digest `sha256:b2434902…` (**411** file), **10/10 required**, closure
+  M4/M3/M1/M2/M0; `workspace-tests` **1 retry** cho flake loopback đã biết (`interactive_launch::i13…`, isolated →
+  xanh). `-SelfTest`: `MILESTONE_GATE_SELFTEST_OK: M12`.
+- **Hai thay đổi contract của lượt này:** runtime store schema **5 → 6** (`backend_leases`, unique
+  `(host_id, tool_execution_id)`); `IsolationMode::Strict` **giữ** nghĩa Full và **bị từ chối** trên host này (không
+  nới nghĩa, không hạ cấp). `tool-execution-receipt.v1` và `ToolCapabilities` **không** đổi.
+- **Một đính chính nền tảng:** host này là **build 26200 (Windows 11, 25H2)**, không phải `19045`. Đã sửa ở SPEC M12 §2
+  và ghi đính chính vào evidence M9/M10. Matrix **đo** `os_version` ở mỗi lần probe thay vì viết lại chuỗi cũ.
+- **Chín bug thật** (§7f) — trong đó hai bug do **closure M4** bắt (case-sensitive env, spool root), một bug do
+  **gate** bắt (format), một bug do **self-test registry** bắt (selectors của case `planned`).
+- **Giới hạn đã ghi:** A36 `planned` (không chứng minh được clause filesystem/network/socket); chưa có bằng chứng
+  Linux/CI; không có confinement backend (cần quyết định về crate `unsafe` opt-out); `tree_cleanup_confirmed` mạnh hơn
+  bằng chứng (hợp đồng M4, chưa sửa); CLI `export|leases|reconcile` chưa có test tự động.
+
+### Checkpoint trước (tham chiếu M11) — tóm tắt
 
 - **Bốn commit của lượt này:** `5366b1e` (M11-03: driver external task), `c1501dc` (evidence M11-03), `71b2b17` (**M11-04**: policy non-interactive + outbox), `e5ebabd` (evidence M11-04 + CI matrix + SPEC §7). Trước đó trong cùng assignment: `90bd0f6`/`3915b5f`/`ada1917` (M11-01), `9d55914` (M11-02), `220e687` (fix flake M2), `fb85447` (SPEC M11).
 - **Gate cuối:** `-Milestone M11` **passed**, digest `sha256:f461406c…` (**396** file), **6/6 required**, 9 test trên **4** target, closure M9…M0 xanh; `workspace-tests` **passed ngay lần đầu** (gate 6 và gate 7 — lần đầu trong chuỗi M7→M11 không cần retry).
