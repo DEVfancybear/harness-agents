@@ -128,7 +128,8 @@
   (9) gate `format` đỏ vì test CLI thêm sau lần fmt cuối.
 - **Giới hạn còn lại:** **A36 vẫn `planned`** — clause "denied filesystem/network/credential-socket" **không** chứng
   minh được trên host này (không có cơ chế OS nào; probe đo escape), nên strict phải từ chối thay vì giả vờ; **chưa có
-  bằng chứng Linux** (matrix CI nay có M0–M12 nhưng workflow **chưa chạy lần nào**); không có confinement backend
+  bằng chứng Linux** (CI hiện **chỉ chạy Windows** — `504cf95` của session khác thu hẹp phạm vi — và workflow **chưa
+  chạy lần nào** trên revision này); không có confinement backend
   (AppContainer cần crate opt-out `unsafe` + ADR — **cần người quyết**); `ha sandbox export|leases|reconcile` chưa có
   test tự động (logic bên dưới thì có); bộ probe tốn ~60 s và `P-MEM` cấp phát thật 256 MiB.
 
@@ -139,7 +140,7 @@ chứng minh gì / không gì), §6 (9 bug thật), §9 (gate chưa chạy); (2)
 fail-closed có đủ cho A36 không, khiếm khuyết `tree_cleanup_confirmed` (§6.1) có sửa trong một assignment M4 riêng
 không, và có cấp phép cho một crate **opt-out `unsafe`** để làm AppContainer hay không; (3) nếu muốn một host thật sự
 confine: đó là assignment kế tiếp, kèm ADR lật D1/D9 của ADR-N12 và probe mới — **không** sửa tài liệu suông.
-Nợ đã ghi vẫn còn nguyên: chưa có bằng chứng Linux/CI (matrix đã có M0–M12 nhưng workflow **chưa chạy lần nào**), chưa
+Nợ đã ghi vẫn còn nguyên: chưa có bằng chứng Linux (CI hiện **chỉ chạy Windows** — `504cf95` của session khác thu hẹp phạm vi — và workflow **chưa chạy lần nào** trên revision này), chưa
 có connector notification thật, chưa có CLI cho external job/approve-deny, `ha sandbox export|leases|reconcile` chưa
 có test tự động.
 ## 9. Blocked on
