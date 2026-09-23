@@ -153,10 +153,15 @@ pub struct Occurrence {
 #[serde(rename_all = "snake_case")]
 pub enum OccurrenceState {
     Claimed,
+    /// Held for a human decision: claimed, never launched, and durable across a
+    /// restart. A scheduled launch that would edit a workspace waits here.
+    Waiting,
     Launched,
     Skipped,
     /// A pause or delete landed between the claim and the launch.
     Canceled,
+    /// A waiting occurrence whose approval window closed with no answer.
+    Expired,
 }
 
 impl OccurrenceState {
@@ -164,9 +169,11 @@ impl OccurrenceState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Claimed => "claimed",
+            Self::Waiting => "waiting",
             Self::Launched => "launched",
             Self::Skipped => "skipped",
             Self::Canceled => "canceled",
+            Self::Expired => "expired",
         }
     }
 
@@ -175,9 +182,11 @@ impl OccurrenceState {
     pub fn parse(value: &str) -> Result<Self, ScheduleError> {
         match value {
             "claimed" => Ok(Self::Claimed),
+            "waiting" => Ok(Self::Waiting),
             "launched" => Ok(Self::Launched),
             "skipped" => Ok(Self::Skipped),
             "canceled" => Ok(Self::Canceled),
+            "expired" => Ok(Self::Expired),
             _ => Err(ScheduleError::new(
                 "invalid_payload",
                 "stored occurrence state is unsupported",

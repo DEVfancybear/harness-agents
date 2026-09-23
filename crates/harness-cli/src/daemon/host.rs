@@ -23,7 +23,9 @@ use std::{
     time::Duration,
 };
 
-use harness_store_sqlite::{SqliteStore, StoredOccurrenceRecord, WriterOpenOptions};
+use harness_store_sqlite::{
+    OutboxCounts, SqliteStore, StoredApproval, StoredOccurrenceRecord, WriterOpenOptions,
+};
 use harness_types::{ErrorCode, HarnessError, HostId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,8 +36,10 @@ use tokio::{
 };
 
 use crate::daemon::{
-    Clock, ExternalTaskRunner, MisfirePolicy, ScheduleSpec, ScheduleState, SystemClock,
-    TaskRemoteResolver, due_now, occurrence_key,
+    APPROVAL_WINDOW_MS, Clock, ExternalTaskRunner, MisfirePolicy, NotificationConnector,
+    NotificationEvent, NotificationOutbox, ScheduleSpec, ScheduleState, SystemClock,
+    TaskRemoteResolver, WaitingResolution, due_now, occurrence_key, requires_approval,
+    resolve_waiting,
 };
 
 /// The file the running daemon records its control endpoint in.
@@ -265,6 +269,33 @@ pub struct DaemonStatus {
     pub active: usize,
     pub occurrences_launched: u64,
     pub stopping: bool,
+    /// Occurrences held for a human decision, with what is being asked and when
+    /// the window closes. A scheduled run that cannot proceed is visible here
+    /// rather than silent.
+    pub waiting: Vec<WaitingOccurrence>,
+    pub outbox: OutboxCounts,
+}
+
+/// One occurrence the daemon is holding for a decision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitingOccurrence {
+    pub occurrence_key: String,
+    pub schedule_id: String,
+    pub revision: u64,
+    pub due_unix_ms: i64,
+    pub prompt: String,
+    pub expires_at_unix_ms: i64,
+    /// What the daemon will do at the end of the window.
+    pub next_action: String,
+}
+
+/// What resolving one waiting occurrence did.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedWaiting {
+    pub occurrence_key: String,
+    /// `launched`, `skipped`, `expired` or `canceled`.
+    pub outcome: String,
 }
 
 /// Start the daemon: take the store's writer fence, publish an endpoint, and
@@ -353,6 +384,11 @@ pub async fn start(
         stopping: Arc::clone(&stopping),
     };
 
+    let outbox = Arc::new(NotificationOutbox::new(
+        Arc::clone(&store),
+        None,
+        Arc::clone(&clock),
+    ));
     let runner = DaemonRunner {
         store: Arc::clone(&store),
         clock,
@@ -364,6 +400,8 @@ pub async fn start(
         occurrences_launched: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         drained: Vec::new(),
         external: None,
+        outbox,
+        control_tasks: tokio::task::JoinSet::new(),
     };
     Ok((host, runner))
 }
@@ -383,6 +421,13 @@ pub struct DaemonRunner {
     /// remote servers with. Without it, external jobs stay exactly as durable as
     /// they were: recorded, and waiting.
     external: Option<Arc<ExternalTaskRunner>>,
+    /// The notification outbox. It exists from the start and, until a connector
+    /// is attached, it records without sending anything.
+    outbox: Arc<NotificationOutbox>,
+    /// The control connections this daemon is serving. Every one of them holds a
+    /// store handle, so shutdown waits for them instead of leaving the writer
+    /// fence behind.
+    control_tasks: tokio::task::JoinSet<()>,
 }
 
 /// One schedule evaluation, as the loop sees it.
@@ -395,6 +440,172 @@ pub struct LaunchedOccurrence {
 }
 
 impl DaemonRunner {
+    /// Give this daemon somewhere to send notifications.
+    ///
+    /// Until this is called the outbox records and sends nothing, which is the
+    /// honest default: a host that was never told where a notification goes must
+    /// not guess. Returns the outbox, so a caller can also deliver by hand.
+    pub fn attach_notifications(
+        &mut self,
+        connector: Option<Arc<dyn NotificationConnector>>,
+    ) -> Arc<NotificationOutbox> {
+        let outbox = Arc::new(NotificationOutbox::new(
+            Arc::clone(&self.store),
+            connector,
+            Arc::clone(&self.clock),
+        ));
+        self.outbox = Arc::clone(&outbox);
+        outbox
+    }
+
+    #[must_use]
+    pub fn outbox(&self) -> &Arc<NotificationOutbox> {
+        &self.outbox
+    }
+
+    /// Hold one claimed occurrence for a human decision.
+    ///
+    /// The occurrence is already claimed, so nothing can launch it twice; this
+    /// makes the wait durable (an approval row with a window) and visible (a
+    /// notification, and the daemon's own status).
+    async fn hold_for_approval(
+        &self,
+        schedule: &crate::daemon::Schedule,
+        occurrence: &StoredOccurrenceRecord,
+        due_unix_ms: i64,
+        now: i64,
+    ) -> Result<(), HarnessError> {
+        let approval = StoredApproval {
+            approval_id: format!("approval_{}", occurrence.occurrence_key),
+            occurrence_key: occurrence.occurrence_key.clone(),
+            schedule_id: schedule.schedule_id.clone(),
+            revision: schedule.revision,
+            state: "open".to_owned(),
+            prompt: format!(
+                "the schedule {} wants to edit a workspace for the occurrence due at {due_unix_ms}",
+                schedule.schedule_id
+            ),
+            requested_at_unix_ms: now,
+            expires_at_unix_ms: now.saturating_add(APPROVAL_WINDOW_MS),
+            decided_at_unix_ms: None,
+            decided_by: None,
+            reason: None,
+        };
+        self.store
+            .request_approval(&approval)
+            .await
+            .map_err(|error| store_error(&error))?;
+        self.store
+            .settle_occurrence(&occurrence.occurrence_key, "waiting")
+            .await
+            .map_err(|error| store_error(&error))?;
+        self.notify(NotificationEvent {
+            subject_kind: "occurrence".to_owned(),
+            subject_id: occurrence.occurrence_key.clone(),
+            kind: "schedule_approval_requested".to_owned(),
+            payload: json!({
+                "schema_version": 1,
+                "occurrence_key": occurrence.occurrence_key,
+                "schedule_id": schedule.schedule_id,
+                "revision": schedule.revision,
+                "due_unix_ms": due_unix_ms,
+                "expires_at_unix_ms": approval.expires_at_unix_ms,
+                "next_action": "a human approves or denies it; otherwise the window closes",
+            }),
+        })
+        .await
+    }
+
+    /// Resolve every waiting occurrence whose decision or window has arrived.
+    ///
+    /// # Errors
+    /// Fails when the store refuses.
+    pub async fn resolve_approvals(&self) -> Result<Vec<ResolvedWaiting>, HarnessError> {
+        let now = self.clock.now_unix_ms();
+        let mut resolved = Vec::new();
+        for occurrence in self
+            .store
+            .waiting_occurrences()
+            .await
+            .map_err(|error| store_error(&error))?
+        {
+            let Some(approval) = self
+                .store
+                .approval(&occurrence.occurrence_key)
+                .await
+                .map_err(|error| store_error(&error))?
+            else {
+                continue;
+            };
+            let resolution = resolve_waiting(&approval, now);
+            if resolution == WaitingResolution::Wait {
+                continue;
+            }
+            // A pause or delete that landed while the occurrence waited makes it
+            // stale, exactly as it would a claim: the decision is honoured as a
+            // cancellation rather than a launch.
+            let current = self
+                .store
+                .schedule(&occurrence.schedule_id)
+                .await
+                .map_err(|error| store_error(&error))?;
+            let stale = current.is_none_or(|stored| {
+                stored.revision != occurrence.revision
+                    || stored.state != ScheduleState::Active.as_str()
+            });
+            let outcome = match (resolution, stale) {
+                (_, true) => "canceled",
+                (WaitingResolution::Launch, false) => "launched",
+                (WaitingResolution::Skip, false) => "skipped",
+                (WaitingResolution::Expire, false) => "expired",
+                (WaitingResolution::Wait, false) => continue,
+            };
+            if outcome == "expired" {
+                self.store
+                    .expire_approval(&occurrence.occurrence_key, now)
+                    .await
+                    .map_err(|error| store_error(&error))?;
+            }
+            if !self
+                .store
+                .settle_waiting_occurrence(&occurrence.occurrence_key, outcome)
+                .await
+                .map_err(|error| store_error(&error))?
+            {
+                // Something else settled it first; that settlement stands.
+                continue;
+            }
+            if outcome == "launched" {
+                self.occurrences_launched.fetch_add(1, Ordering::SeqCst);
+            }
+            self.notify(NotificationEvent {
+                subject_kind: "occurrence".to_owned(),
+                subject_id: occurrence.occurrence_key.clone(),
+                kind: format!("schedule_approval_{outcome}"),
+                payload: json!({
+                    "schema_version": 1,
+                    "occurrence_key": occurrence.occurrence_key,
+                    "schedule_id": occurrence.schedule_id,
+                    "revision": occurrence.revision,
+                    "due_unix_ms": occurrence.due_unix_ms,
+                    "outcome": outcome,
+                }),
+            })
+            .await?;
+            resolved.push(ResolvedWaiting {
+                occurrence_key: occurrence.occurrence_key,
+                outcome: outcome.to_owned(),
+            });
+        }
+        Ok(resolved)
+    }
+
+    /// Record one meaningful change in the outbox.
+    async fn notify(&self, event: NotificationEvent) -> Result<(), HarnessError> {
+        let _recorded = self.outbox.notify(&event).await?;
+        Ok(())
+    }
+
     /// Give this daemon the transports it needs to drive external jobs.
     ///
     /// The runner is built from the daemon's own store and clock, so external
@@ -475,6 +686,15 @@ impl DaemonRunner {
                     .await
                 {
                     Ok(true) => {
+                        // Claimed is not launched. A launch that would edit a
+                        // workspace has nobody attached to approve it, so it is
+                        // held - durably, and visibly - instead of being run or
+                        // silently skipped.
+                        if requires_approval(&schedule.grants) {
+                            self.hold_for_approval(&schedule, &occurrence, due, now)
+                                .await?;
+                            continue;
+                        }
                         self.occurrences_launched.fetch_add(1, Ordering::SeqCst);
                         launched.push(LaunchedOccurrence {
                             schedule_id: schedule.schedule_id.clone(),
@@ -578,6 +798,40 @@ impl DaemonRunner {
             .iter()
             .filter(|schedule| schedule.state == ScheduleState::Active.as_str())
             .count();
+        // The waiting list is what a client acts on: which run is held, what is
+        // being asked, when the window closes, and what happens if nobody
+        // answers.
+        let mut waiting = Vec::new();
+        for occurrence in self
+            .store
+            .waiting_occurrences()
+            .await
+            .map_err(|error| store_error(&error))?
+        {
+            let approval = self
+                .store
+                .approval(&occurrence.occurrence_key)
+                .await
+                .map_err(|error| store_error(&error))?;
+            let (prompt, expires_at_unix_ms) = approval.map_or_else(
+                || ("waiting for a decision".to_owned(), 0),
+                |approval| (approval.prompt, approval.expires_at_unix_ms),
+            );
+            waiting.push(WaitingOccurrence {
+                occurrence_key: occurrence.occurrence_key,
+                schedule_id: occurrence.schedule_id,
+                revision: occurrence.revision,
+                due_unix_ms: occurrence.due_unix_ms,
+                prompt,
+                expires_at_unix_ms,
+                next_action: "expires at the end of its window unless a human decides".to_owned(),
+            });
+        }
+        let outbox = self
+            .store
+            .outbox_counts()
+            .await
+            .map_err(|error| store_error(&error))?;
         Ok(DaemonStatus {
             pid: self.endpoint.pid,
             started_at_unix_ms: self.endpoint.started_at_unix_ms,
@@ -585,6 +839,8 @@ impl DaemonRunner {
             active,
             occurrences_launched: self.occurrences_launched(),
             stopping: self.stopping.load(Ordering::SeqCst),
+            waiting,
+            outbox,
         })
     }
 
@@ -615,7 +871,12 @@ impl DaemonRunner {
                         let token = self.endpoint.token.clone();
                         let status = self.status().await?;
                         let store = Arc::clone(&self.store);
-                        tokio::spawn(async move {
+                        // Tracked, not detached: a control task holds a store
+                        // handle, and a task that outlived this loop would keep
+                        // the writer lock alive after the daemon stopped - so the
+                        // next host would be refused for as long as the task's
+                        // read timeout lasts.
+                        self.control_tasks.spawn(async move {
                             let _ = serve_control(stream, &token, status, store).await;
                         });
                     }
@@ -623,12 +884,19 @@ impl DaemonRunner {
                 () = self.shutdown.notified() => break,
                 () = tokio::time::sleep(tick) => {
                     self.evaluate_once().await?;
+                    // A waiting occurrence is resolved on the same tick, so an
+                    // approval a human just gave is acted on without a second
+                    // mechanism to keep in step.
+                    self.resolve_approvals().await?;
                     // The external worker is a consumer of the same tick, not a
                     // loop of its own: one clock, one store, one place where the
                     // daemon's work is bounded.
                     if let Some(external) = &self.external {
                         external.poll_due().await?;
                     }
+                    // Notifications are delivered last: a change is recorded
+                    // before anything tries to report it.
+                    self.outbox.deliver_due().await?;
                 }
             }
         }
@@ -640,6 +908,11 @@ impl DaemonRunner {
         // effect happened and must not launch again, so the honest settlement is
         // `canceled` - recorded here, while the daemon still knows it made the
         // claim, rather than left for a later host to guess at.
+        //
+        // Control tasks are stopped first: they hold store handles, and a reply
+        // that is still being written is not worth a writer lock that outlives
+        // the daemon.
+        self.control_tasks.shutdown().await;
         let canceled = self
             .store
             .recover_claimed_occurrences()
@@ -704,51 +977,12 @@ async fn serve_control(
                         "control_unauthorized",
                         "the control token is not this daemon's",
                     ),
-                    Ok(envelope) => match envelope {
-                        ControlEnvelope::Status { .. } => {
-                            more = true;
-                            json!({
-                                "status": "ok",
-                                "daemon": {
-                                    "pid": status.pid,
-                                    "started_at_unix_ms": status.started_at_unix_ms,
-                                    "schedules": status.schedules,
-                                    "active": status.active,
-                                    "occurrences_launched": status.occurrences_launched,
-                                    "stopping": status.stopping,
-                                },
-                            })
-                        }
-                        ControlEnvelope::Trigger { schedule_id, .. } => {
-                            more = true;
-                            let now = SystemClock.now_unix_ms();
-                            let stored = store
-                                .schedule(&schedule_id)
-                                .await
-                                .map_err(|error| store_error(&error));
-                            match stored {
-                                Err(error) => control_error(error.code().as_str(), error.message()),
-                                Ok(None) => control_error("task_not_found", "no such schedule"),
-                                Ok(Some(schedule)) => json!({
-                                    "schema_version": 1,
-                                    "status": "ok",
-                                    "triggered": {
-                                        "schedule_id": schedule_id,
-                                        "revision": schedule.revision,
-                                        "requested_at_unix_ms": now,
-                                        "next_due_unix_ms": schedule.next_due_unix_ms,
-                                    },
-                                }),
-                            }
-                        }
-                        // Asking the daemon to stop ends the conversation: the
-                        // next thing this peer sees is the process stopping.
-                        ControlEnvelope::Shutdown { .. } => json!({
-                            "schema_version": 1,
-                            "status": "ok",
-                            "shutdown": "accepted",
-                        }),
-                    },
+                    Ok(envelope) => {
+                        let (response, keep_going) =
+                            answer_control(envelope, &status, &store).await;
+                        more = keep_going;
+                        response
+                    }
                 }
             }
         };
@@ -766,20 +1000,162 @@ async fn serve_control(
     Ok(())
 }
 
+/// Answer one authenticated control request, and say whether the conversation
+/// continues on the same connection.
+async fn answer_control(
+    envelope: ControlEnvelope,
+    status: &DaemonStatus,
+    store: &SqliteStore,
+) -> (Value, bool) {
+    match envelope {
+        ControlEnvelope::Status { .. } => (
+            json!({
+                "status": "ok",
+                "daemon": {
+                    "pid": status.pid,
+                    "started_at_unix_ms": status.started_at_unix_ms,
+                    "schedules": status.schedules,
+                    "active": status.active,
+                    "occurrences_launched": status.occurrences_launched,
+                    "stopping": status.stopping,
+                    "waiting": status.waiting,
+                    "outbox": {
+                        "pending": status.outbox.pending,
+                        "delivered": status.outbox.delivered,
+                        "failed": status.outbox.failed,
+                        "canceled": status.outbox.canceled,
+                    },
+                },
+            }),
+            true,
+        ),
+        ControlEnvelope::Trigger { schedule_id, .. } => {
+            (answer_trigger(store, &schedule_id).await, true)
+        }
+        // A decision on a waiting occurrence. It goes through the daemon because
+        // the daemon is the only writer: a client asks, and the daemon records
+        // what a human decided.
+        ControlEnvelope::Decide {
+            occurrence_key,
+            decision,
+            ..
+        } => (answer_decide(store, &occurrence_key, &decision).await, true),
+        // Asking the daemon to stop ends the conversation: the next thing this
+        // peer sees is the process stopping.
+        ControlEnvelope::Shutdown { .. } => (
+            json!({
+                "schema_version": 1,
+                "status": "ok",
+                "shutdown": "accepted",
+            }),
+            false,
+        ),
+    }
+}
+
+/// Answer a manual trigger by naming the schedule it would have moved.
+async fn answer_trigger(store: &SqliteStore, schedule_id: &str) -> Value {
+    let now = SystemClock.now_unix_ms();
+    let stored = store
+        .schedule(schedule_id)
+        .await
+        .map_err(|error| store_error(&error));
+    match stored {
+        Err(error) => control_error(error.code().as_str(), error.message()),
+        Ok(None) => control_error("task_not_found", "no such schedule"),
+        Ok(Some(schedule)) => json!({
+            "schema_version": 1,
+            "status": "ok",
+            "triggered": {
+                "schedule_id": schedule_id,
+                "revision": schedule.revision,
+                "requested_at_unix_ms": now,
+                "next_due_unix_ms": schedule.next_due_unix_ms,
+            },
+        }),
+    }
+}
+
+/// Record one decision, or answer that there was nothing left to decide.
+async fn answer_decide(store: &SqliteStore, occurrence_key: &str, decision: &str) -> Value {
+    let now = SystemClock.now_unix_ms();
+    let stored = store
+        .approval(occurrence_key)
+        .await
+        .map_err(|error| store_error(&error));
+    let approval = match stored {
+        Err(error) => return control_error(error.code().as_str(), error.message()),
+        Ok(None) => {
+            return control_error(
+                "task_not_found",
+                "no approval is waiting for that occurrence",
+            );
+        }
+        Ok(Some(approval)) => approval,
+    };
+    let recorded = store
+        .decide_approval(
+            occurrence_key,
+            decision,
+            "control",
+            "decided through the control channel",
+            now,
+        )
+        .await;
+    match recorded {
+        Err(error) => control_error(error.code().as_str(), error.to_string().as_str()),
+        Ok(true) => json!({
+            "schema_version": 1,
+            "status": "ok",
+            "decision": {
+                "occurrence_key": occurrence_key,
+                "schedule_id": approval.schedule_id,
+                "state": decision,
+                "decided_at_unix_ms": now,
+            },
+        }),
+        // The row is answered already, which is not an error: the first decision
+        // stands.
+        Ok(false) => json!({
+            "schema_version": 1,
+            "status": "ok",
+            "decision": {
+                "occurrence_key": occurrence_key,
+                "schedule_id": approval.schedule_id,
+                "state": approval.state,
+                "unchanged": true,
+            },
+        }),
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum ControlEnvelope {
-    Status { token: String },
-    Trigger { token: String, schedule_id: String },
-    Shutdown { token: String },
+    Status {
+        token: String,
+    },
+    Trigger {
+        token: String,
+        schedule_id: String,
+    },
+    Decide {
+        token: String,
+        occurrence_key: String,
+        decision: String,
+    },
+    Shutdown {
+        token: String,
+    },
 }
 
 impl ControlEnvelope {
     fn token(&self) -> &str {
         match self {
-            Self::Status { token } | Self::Trigger { token, .. } | Self::Shutdown { token } => {
-                token
-            }
+            Self::Status { token }
+            | Self::Trigger { token, .. }
+            | Self::Decide { token, .. }
+            | Self::Shutdown { token } => token,
         }
     }
 }
@@ -816,7 +1192,37 @@ pub async fn control(
         }),
         None => json!({ "token": endpoint.token, "command": request }),
     };
-    let mut line = serde_json::to_string(&envelope).map_err(|_| {
+    control_request(endpoint, &envelope).await
+}
+
+/// Decide one waiting occurrence through the daemon that owns it.
+///
+/// The decision goes through the control channel because the daemon holds the
+/// store's writer fence: a second process cannot write a decision, and it should
+/// not be able to. `decision` is `approved` or `denied`.
+///
+/// # Errors
+/// Fails when the daemon cannot be reached, or when the request is refused.
+pub async fn decide(
+    endpoint: &DaemonEndpoint,
+    occurrence_key: &str,
+    decision: &str,
+) -> Result<Value, HarnessError> {
+    let envelope = json!({
+        "token": endpoint.token,
+        "command": "decide",
+        "occurrence_key": occurrence_key,
+        "decision": decision,
+    });
+    control_request(endpoint, &envelope).await
+}
+
+/// Send one prepared envelope and read its reply.
+async fn control_request(
+    endpoint: &DaemonEndpoint,
+    envelope: &Value,
+) -> Result<Value, HarnessError> {
+    let mut line = serde_json::to_string(envelope).map_err(|_| {
         HarnessError::new(
             ErrorCode::InvalidPayload,
             "the control request is not serializable",

@@ -7,10 +7,13 @@
 //! work starts. That is the whole difference, and it is why nothing here opens
 //! its own database authority.
 
+pub mod delivery;
 pub mod external;
 pub mod host;
+pub mod policy;
 pub mod schedule;
 
+pub use delivery::{DeliveryReport, NotificationConnector, NotificationEvent, NotificationOutbox};
 pub use external::{
     AttachedRemotes, CancelReceipt, ExternalTaskRunner, NewExternalJob, PollReport, SubmitReceipt,
     TaskRemoteResolver,
@@ -19,8 +22,11 @@ pub use external::{
 pub use host::{
     CONTROL_READ_TIMEOUT, DaemonEndpoint, DaemonHost, DaemonRunReport, DaemonRunner, DaemonStatus,
     ENDPOINT_FILE, LaunchedOccurrence, MAX_CONTROL_BYTES, MAX_CONTROL_REQUESTS_PER_CONNECTION,
-    StartRefusal, control, process_is_alive, read_endpoint, remove_endpoint, start, write_endpoint,
+    ResolvedWaiting, StartRefusal, WaitingOccurrence, control, decide, process_is_alive,
+    read_endpoint, remove_endpoint, start, write_endpoint,
 };
+
+pub use policy::{APPROVAL_WINDOW_MS, WaitingResolution, requires_approval, resolve_waiting};
 
 pub use schedule::{
     Clock, DueDecision, FixedClock, LaunchGrants, MAX_CATCH_UP_OCCURRENCES, MisfirePolicy,

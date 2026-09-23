@@ -31,11 +31,13 @@ use crate::{
     ToolTaskUpdateCommit, WriterOpenOptions,
 };
 
+pub mod approvals;
 pub mod delegation;
 pub mod external_jobs;
 pub mod history;
 mod maintenance;
 mod memory;
+pub mod notifications;
 pub mod run;
 pub mod schedules;
 
@@ -2989,6 +2991,9 @@ async fn ensure_runtime_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     if current < 4 {
         apply_runtime_slice_4(&mut tx).await?;
     }
+    if current < 5 {
+        apply_runtime_slice_5(&mut tx).await?;
+    }
     if current < RUNTIME_SCHEMA_VERSION {
         sqlx::query("INSERT INTO runtime_schema_migrations(version) VALUES (?)")
             .bind(RUNTIME_SCHEMA_VERSION)
@@ -3088,6 +3093,25 @@ async fn apply_runtime_slice_4(
         "CREATE INDEX IF NOT EXISTS external_job_polls_by_job ON external_job_polls(job_id)",
     ];
     apply_runtime_statements(tx, &STATEMENTS, "apply runtime schema 4").await
+}
+
+/// M11-04: schedule approvals and the notification outbox.
+///
+/// The unique index on `(subject_kind, subject_id, change_digest)` is what makes
+/// a duplicate event one logical delivery, and it is on the *meaningful* change
+/// rather than on the event: the same change reported twice is one row, and a
+/// different change is a different row.
+async fn apply_runtime_slice_5(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StoreError> {
+    const STATEMENTS: [&str; 5] = [
+        "CREATE TABLE IF NOT EXISTS schedule_approvals (approval_id TEXT PRIMARY KEY, occurrence_key TEXT NOT NULL UNIQUE, schedule_id TEXT NOT NULL, revision INTEGER NOT NULL, state TEXT NOT NULL, prompt TEXT NOT NULL, requested_at_unix_ms INTEGER NOT NULL, expires_at_unix_ms INTEGER NOT NULL, decided_at_unix_ms INTEGER, decided_by TEXT, reason TEXT)",
+        "CREATE INDEX IF NOT EXISTS schedule_approvals_by_state ON schedule_approvals(state, expires_at_unix_ms)",
+        "CREATE TABLE IF NOT EXISTS notification_outbox (notification_id TEXT PRIMARY KEY, subject_kind TEXT NOT NULL, subject_id TEXT NOT NULL, change_digest TEXT NOT NULL, kind TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL, next_attempt_unix_ms INTEGER NOT NULL, created_at_unix_ms INTEGER NOT NULL, updated_at_unix_ms INTEGER NOT NULL, delivered_at_unix_ms INTEGER, detail TEXT)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS notification_outbox_logical ON notification_outbox(subject_kind, subject_id, change_digest)",
+        "CREATE INDEX IF NOT EXISTS notification_outbox_due ON notification_outbox(state, next_attempt_unix_ms)",
+    ];
+    apply_runtime_statements(tx, &STATEMENTS, "apply runtime schema 5").await
 }
 
 /// M5 context surface: the rebuildable journal index, the notes table and the

@@ -945,8 +945,11 @@
         {
           "id": "M11-04",
           "title": "Non-interactive policy và notifications",
-          "status": "in_progress",
-          "tests": []
+          "status": "implemented_unverified",
+          "tests": [
+            "m11_04_a_scheduled_launch_without_a_human_waits",
+            "m11_04_the_outbox_is_durable_and_sends_nothing_without_a_connector"
+          ]
         }
       ],
       "required_tests": [
@@ -954,19 +957,25 @@
         "milestone_m11_daemon::m11_01_daemon_ownership_and_control",
         "milestone_m11_daemon::m11_01_a_stale_endpoint_is_cleaned_up",
         "milestone_m11_external::a35_external_task_ambiguity",
-        "milestone_m11_external::m11_03_the_tasks_declaration_is_load_bearing"
+        "milestone_m11_external::m11_03_the_tasks_declaration_is_load_bearing",
+        "milestone_m11_policy::m11_04_a_scheduled_launch_without_a_human_waits"
       ],
       "unit_tests": [],
       "fixtures": [
         "crates/harness-cli/tests/milestone_m11.rs",
         "crates/harness-cli/tests/milestone_m11_daemon.rs",
         "crates/harness-cli/tests/milestone_m11_external.rs",
+        "crates/harness-cli/tests/milestone_m11_policy.rs",
         "crates/harness-cli/src/bin/m11_fixture_task_server.rs",
-        "crates/harness-cli/src/daemon/schedule.rs",
-        "crates/harness-cli/src/daemon/host.rs",
+        "crates/harness-cli/src/daemon/delivery.rs",
         "crates/harness-cli/src/daemon/external.rs",
+        "crates/harness-cli/src/daemon/host.rs",
+        "crates/harness-cli/src/daemon/policy.rs",
+        "crates/harness-cli/src/daemon/schedule.rs",
         "crates/harness-extensions/src/tasks.rs",
+        "crates/harness-store-sqlite/src/store/approvals.rs",
         "crates/harness-store-sqlite/src/store/external_jobs.rs",
+        "crates/harness-store-sqlite/src/store/notifications.rs",
         "docs/adr/ADR-N11-SCHEDULE-AND-DAEMON-SEMANTICS.vi.md",
         "docs/specs/M11.vi.md"
       ],

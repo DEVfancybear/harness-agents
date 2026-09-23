@@ -282,12 +282,15 @@ impl SqliteStore {
     }
 
     /// Mark an occurrence launched, or cancel it because its schedule moved.
+    ///
+    /// `waiting` is the one non-terminal settlement: the occurrence is claimed
+    /// so it can never launch twice, and it is held until a human decides.
     pub async fn settle_occurrence(
         &self,
         occurrence_key: &str,
         state: &str,
     ) -> Result<(), StoreError> {
-        if !matches!(state, "launched" | "skipped" | "canceled") {
+        if !matches!(state, "launched" | "skipped" | "canceled" | "waiting") {
             return Err(StoreError::new(
                 ErrorCode::InvalidPayload,
                 "invalid occurrence settlement",
@@ -320,6 +323,64 @@ impl SqliteStore {
         })
     }
 
+    /// Settle an occurrence that was waiting for a human.
+    ///
+    /// Guarded by `state = 'waiting'`, so a decision cannot act on an occurrence
+    /// that was never waiting, and two decisions cannot both settle it.
+    pub async fn settle_waiting_occurrence(
+        &self,
+        occurrence_key: &str,
+        state: &str,
+    ) -> Result<bool, StoreError> {
+        if !matches!(state, "launched" | "skipped" | "expired") {
+            return Err(StoreError::new(
+                ErrorCode::InvalidPayload,
+                "a waiting occurrence settles as launched, skipped or expired",
+            ));
+        }
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        let updated = sqlx::query(
+            "UPDATE schedule_occurrences SET state = ? WHERE occurrence_key = ? AND state = 'waiting'",
+        )
+        .bind(state)
+        .bind(occurrence_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "settle waiting occurrence",
+                error,
+            )
+        })?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit waiting settlement",
+                error,
+            )
+        })?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// Occurrences held for a human decision, oldest first.
+    pub async fn waiting_occurrences(&self) -> Result<Vec<StoredOccurrenceRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM schedule_occurrences WHERE state = 'waiting' ORDER BY due_unix_ms",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageOpenFailed,
+                "list waiting occurrences",
+                error,
+            )
+        })?;
+        rows.iter().map(decode_occurrence).collect()
+    }
+
     /// Recover occurrences that were claimed by a host that never launched them.
     ///
     /// A claim is durable and a launch is not, so a crash between them leaves a
@@ -327,6 +388,10 @@ impl SqliteStore {
     /// effect happened, and it must not launch again - that is what would double
     /// a side effect. It is marked `canceled` and reported, so an operator sees
     /// the gap instead of a silent re-run.
+    ///
+    /// An occurrence that is `waiting` is deliberately left alone: it never
+    /// launched, its approval is durable, and a restart is not a reason to throw
+    /// away a question the user has not answered yet.
     pub async fn recover_claimed_occurrences(&self) -> Result<Vec<String>, StoreError> {
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;
