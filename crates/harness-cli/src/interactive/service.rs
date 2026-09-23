@@ -6,7 +6,7 @@
 //! A production launch never falls back to the fixture: when provider settings
 //! are missing the service reports exactly what to set.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use harness_providers::anthropic::AnthropicMessagesAdapter;
 use harness_providers::{
-    CancellationToken, CredentialResolver, ModelCapabilities, ModelProvider, OpenAiChatAdapter,
-    OpenAiChatOptions, ProviderError,
+    CancellationToken, CredentialResolver, MessageRole, ModelCapabilities, ModelProvider,
+    OpenAiChatAdapter, OpenAiChatOptions, ProviderError, ProviderMessage, ProviderRequest,
 };
 use harness_runtime::{HumanInputService, RunInbox, RunRequest, RuntimeConfig, RuntimeService};
 use harness_session::{AdmitInputRequest, SessionService};
@@ -31,7 +31,9 @@ use harness_tools::{
     coding_tool_schemas, execute_action_with_approval, observe_workspace, observed_file_hash,
     validate_tool_pattern,
 };
-use harness_types::{ErrorCode, HostId, InputId, QuestionId, SessionId, SourceAuthority, TaskId};
+use harness_types::{
+    ErrorCode, HostId, InputId, QuestionId, RequestId, SessionId, SourceAuthority, TaskId,
+};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
@@ -205,6 +207,31 @@ pub trait SessionPort: Send {
     }
     fn hooks_summary(&self) -> Vec<String> {
         vec!["no hooks are configured".to_owned()]
+    }
+    fn mcp_summary(&self) -> Vec<String> {
+        vec!["MCP status is unavailable".to_owned()]
+    }
+    fn agents_summary(&self) -> Vec<String> {
+        vec!["no delegated workers have run in this session".to_owned()]
+    }
+    fn skills_summary(&self) -> Vec<String> {
+        vec!["skill catalog is unavailable".to_owned()]
+    }
+    fn activate_skill(&mut self, _name: &str) -> Result<String, String> {
+        Err("this backend cannot activate skills".to_owned())
+    }
+    fn reload(&mut self) -> Result<String, String> {
+        Err("this backend cannot reload prompt inputs".to_owned())
+    }
+    fn expand_prompt_command(
+        &self,
+        _name: &str,
+        _arguments: &str,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    fn respond_mcp_elicitation(&mut self, _request_id: &str, _answer: &str) -> Result<(), String> {
+        Err("this backend cannot answer MCP elicitation".to_owned())
     }
     fn cost_summary(&self) -> String {
         "n/a".to_owned()
@@ -529,6 +556,8 @@ pub struct ProviderConfig {
     pub compaction_reserve_tokens: u64,
     pub max_retry_after_seconds: u64,
     pub hooks: Vec<harness_tools::ConfiguredToolHook>,
+    pub mcp_servers: BTreeMap<String, harness_types::McpServerConfigV2>,
+    pub project_trusted: bool,
     pub bell: bool,
     /// Name of the source that holds the key; never the key.
     pub credential: CredentialSource,
@@ -631,6 +660,8 @@ pub(super) fn resolve_provider_with_overrides(
         compaction_reserve_tokens: resolved.compaction_reserve_tokens,
         max_retry_after_seconds,
         hooks: resolved.hooks,
+        mcp_servers: resolved.mcp_servers,
+        project_trusted: resolved.project_trusted,
         bell: resolved.bell,
         credential,
     })
@@ -982,6 +1013,326 @@ pub struct AgentSessionService {
     /// first turn arrives.
     project_id: Arc<Mutex<Option<String>>>,
     context_summary: Arc<Mutex<Vec<String>>>,
+    active_skills: Arc<Mutex<BTreeMap<String, harness_extensions::SkillActivation>>>,
+    pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
+    mcp_status: Arc<Mutex<Vec<String>>>,
+    agents_status: Arc<Mutex<Vec<String>>>,
+}
+
+enum McpElicitationAnswer {
+    Accept(serde_json::Value),
+    Decline,
+    Cancel,
+}
+
+struct PendingMcpElicitationRequest {
+    schema: Option<serde_json::Value>,
+    url: Option<String>,
+    reply: oneshot::Sender<McpElicitationAnswer>,
+}
+
+struct InteractiveMcpCallbacks {
+    server: String,
+    provider: Arc<dyn ModelProvider>,
+    model: String,
+    sender: UnboundedSender<SessionEvent>,
+    pending: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
+    cancellation: CancellationToken,
+}
+
+#[allow(deprecated)]
+impl harness_extensions::McpRequestCallbacks for InteractiveMcpCallbacks {
+    fn sample<'a>(
+        &'a self,
+        request: harness_extensions::rmcp::model::CreateMessageRequestParams,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        harness_extensions::rmcp::model::CreateMessageResult,
+                        harness_extensions::rmcp::model::ErrorData,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            use harness_extensions::rmcp::model::{Role, SamplingMessageContentBlock};
+            const MAX_MESSAGES: usize = 64;
+            const MAX_INPUT_BYTES: usize = 256 * 1024;
+            if request.messages.is_empty() || request.messages.len() > MAX_MESSAGES {
+                return Err(harness_extensions::rmcp::model::ErrorData::invalid_params(
+                    format!("sampling requires 1..={MAX_MESSAGES} messages"),
+                    None,
+                ));
+            }
+            if request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| !tools.is_empty())
+            {
+                return Err(harness_extensions::rmcp::model::ErrorData::invalid_params(
+                    "sampling tools are not available on the text-only callback",
+                    None,
+                ));
+            }
+            let mut messages = Vec::with_capacity(request.messages.len() + 1);
+            if let Some(system) = request.system_prompt.filter(|text| !text.trim().is_empty()) {
+                messages.push(ProviderMessage::new(MessageRole::System, system));
+            }
+            let mut total_bytes = messages
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>();
+            for message in request.messages {
+                let role = match message.role {
+                    Role::User => MessageRole::User,
+                    Role::Assistant => MessageRole::Assistant,
+                };
+                let mut chunks = Vec::new();
+                for block in message.content.into_vec() {
+                    match block {
+                        SamplingMessageContentBlock::Text(text) => chunks.push(text.text),
+                        _ => {
+                            return Err(
+                                harness_extensions::rmcp::model::ErrorData::invalid_params(
+                                    "sampling accepts text messages only",
+                                    None,
+                                ),
+                            );
+                        }
+                    }
+                }
+                let content = chunks.join("\n");
+                total_bytes = total_bytes.saturating_add(content.len());
+                if total_bytes > MAX_INPUT_BYTES {
+                    return Err(harness_extensions::rmcp::model::ErrorData::invalid_params(
+                        "sampling request exceeds the 256 KiB input limit",
+                        None,
+                    ));
+                }
+                messages.push(ProviderMessage::new(role, content));
+            }
+            let max_tokens = request.max_tokens.clamp(1, 4096);
+            let call = self.provider.stream(
+                ProviderRequest::new(RequestId::generate(), self.model.clone(), messages)
+                    .with_max_output_tokens(max_tokens),
+                self.cancellation.clone(),
+            );
+            let events = tokio::select! {
+                () = self.cancellation.cancelled() => return Err(mcp_callback_error("sampling was canceled with its parent turn")),
+                result = tokio::time::timeout(Duration::from_mins(1), call) => match result {
+                    Ok(Ok(events)) => events,
+                    Ok(Err(error)) => return Err(mcp_callback_error(&format!("sampling provider failed: {error}"))),
+                    Err(_) => return Err(mcp_callback_error("sampling exceeded its 60 second deadline")),
+                },
+            };
+            let response = harness_providers::assemble_stream(&events).map_err(|error| {
+                mcp_callback_error(&format!("sampling response was invalid: {error}"))
+            })?;
+            if response.finish_reason.is_none()
+                || response.incomplete_tool_calls
+                || !response.tool_calls.is_empty()
+            {
+                return Err(mcp_callback_error(
+                    "sampling provider did not return a complete text answer",
+                ));
+            }
+            let sampling_message = harness_extensions::rmcp::model::SamplingMessage::new(
+                Role::Assistant,
+                SamplingMessageContentBlock::text(response.text),
+            );
+            Ok(harness_extensions::rmcp::model::CreateMessageResult::new(
+                sampling_message,
+                self.model.clone(),
+            )
+            .with_stop_reason("endTurn"))
+        })
+    }
+
+    fn elicit<'a>(
+        &'a self,
+        request: harness_extensions::rmcp::model::ElicitRequestParams,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        harness_extensions::rmcp::model::ElicitResult,
+                        harness_extensions::rmcp::model::ErrorData,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            use harness_extensions::rmcp::model::{
+                ElicitRequestParams, ElicitResult, ElicitationAction,
+            };
+            let (message, schema, url) = match request {
+                ElicitRequestParams::FormElicitationParams {
+                    message,
+                    requested_schema,
+                    ..
+                } => (
+                    message,
+                    Some(
+                        serde_json::to_value(requested_schema)
+                            .map_err(|error| mcp_callback_error(&error.to_string()))?,
+                    ),
+                    None,
+                ),
+                ElicitRequestParams::UrlElicitationParams { message, url, .. } => {
+                    (message, None, Some(url))
+                }
+                _ => return Err(mcp_callback_error("this elicitation mode is not available")),
+            };
+            if message.len() > 16 * 1024
+                || schema
+                    .as_ref()
+                    .is_some_and(|value| value.to_string().len() > 64 * 1024)
+            {
+                return Err(harness_extensions::rmcp::model::ErrorData::invalid_params(
+                    "elicitation request exceeds the host size limit",
+                    None,
+                ));
+            }
+            let request_id = format!("mcp-{}-{}", self.server, RequestId::generate());
+            let (reply, response) = oneshot::channel();
+            self.pending
+                .lock()
+                .map_err(|_| mcp_callback_error("elicitation state is unavailable"))?
+                .insert(
+                    request_id.clone(),
+                    PendingMcpElicitationRequest {
+                        schema: schema.clone(),
+                        url: url.clone(),
+                        reply,
+                    },
+                );
+            if self
+                .sender
+                .send(SessionEvent::McpElicitationRequired {
+                    request_id: request_id.clone(),
+                    server: self.server.clone(),
+                    message,
+                    requested_schema: schema,
+                    url,
+                })
+                .is_err()
+            {
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.remove(&request_id);
+                }
+                return Err(mcp_callback_error(
+                    "interactive input is no longer available",
+                ));
+            }
+            let answer = tokio::select! {
+                () = self.cancellation.cancelled() => None,
+                result = response => result.ok(),
+            };
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove(&request_id);
+            }
+            match answer {
+                Some(McpElicitationAnswer::Accept(value)) => {
+                    Ok(ElicitResult::new(ElicitationAction::Accept).with_content(value))
+                }
+                Some(McpElicitationAnswer::Decline) => {
+                    Ok(ElicitResult::new(ElicitationAction::Decline))
+                }
+                Some(McpElicitationAnswer::Cancel) | None => {
+                    Ok(ElicitResult::new(ElicitationAction::Cancel))
+                }
+            }
+        })
+    }
+}
+
+fn mcp_callback_error(message: &str) -> harness_extensions::rmcp::model::ErrorData {
+    harness_extensions::rmcp::model::ErrorData::internal_error(message.to_owned(), None)
+}
+
+fn validate_elicitation_response(
+    schema: Option<&serde_json::Value>,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(schema) = schema else {
+        return Err("the MCP server did not provide an input schema".to_owned());
+    };
+    let Some(object) = value.as_object() else {
+        return Err("the elicitation response must be a JSON object".to_owned());
+    };
+    let properties = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "the MCP input schema is invalid".to_owned())?;
+    if let Some(required) = schema.get("required").and_then(serde_json::Value::as_array) {
+        for key in required.iter().filter_map(serde_json::Value::as_str) {
+            if !object.contains_key(key) {
+                return Err(format!("required elicitation field {key:?} is missing"));
+            }
+        }
+    }
+    for (key, input) in object {
+        let Some(definition) = properties.get(key) else {
+            continue;
+        };
+        if let Some(allowed) = definition.get("enum").and_then(serde_json::Value::as_array)
+            && !allowed.contains(input)
+        {
+            return Err(format!(
+                "elicitation field {key:?} must match one of its listed values"
+            ));
+        }
+        let kind = definition
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let matches = match kind {
+            "string" => input.is_string(),
+            "number" => input.is_number(),
+            "integer" => input.as_i64().is_some() || input.as_u64().is_some(),
+            "boolean" => input.is_boolean(),
+            _ => false,
+        };
+        if !matches {
+            return Err(format!("elicitation field {key:?} must have type {kind:?}"));
+        }
+        if let Some(text) = input.as_str()
+            && (definition
+                .get("minLength")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|limit| {
+                    usize::try_from(limit).map_or(true, |limit| text.chars().count() < limit)
+                })
+                || definition
+                    .get("maxLength")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|limit| {
+                        usize::try_from(limit).is_ok_and(|limit| text.chars().count() > limit)
+                    }))
+        {
+            return Err(format!(
+                "elicitation field {key:?} violates its length limit"
+            ));
+        }
+        if let Some(number) = input.as_f64()
+            && (definition
+                .get("minimum")
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|limit| number < limit)
+                || definition
+                    .get("maximum")
+                    .and_then(serde_json::Value::as_f64)
+                    .is_some_and(|limit| number > limit))
+        {
+            return Err(format!(
+                "elicitation field {key:?} is outside its numeric range"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1051,6 +1402,10 @@ impl AgentSessionService {
             limits,
             project_id: Arc::new(Mutex::new(None)),
             context_summary: Arc::new(Mutex::new(Vec::new())),
+            active_skills: Arc::new(Mutex::new(BTreeMap::new())),
+            pending_mcp_elicitations: Arc::new(Mutex::new(HashMap::new())),
+            mcp_status: Arc::new(Mutex::new(Vec::new())),
+            agents_status: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1173,6 +1528,10 @@ impl SessionPort for AgentSessionService {
         let session_mode = self.session_mode.lock().ok().and_then(|mode| *mode);
         let auto_allowed_count = Arc::clone(&self.auto_allowed_count);
         let context_summary = Arc::clone(&self.context_summary);
+        let active_skills = Arc::clone(&self.active_skills);
+        let pending_mcp_elicitations = Arc::clone(&self.pending_mcp_elicitations);
+        let mcp_status = Arc::clone(&self.mcp_status);
+        let agents_status = Arc::clone(&self.agents_status);
         let task_id = self.task_id.clone();
         let previous_session = Arc::clone(&self.previous_session);
         let active_inbox = Arc::clone(&self.active_inbox);
@@ -1197,6 +1556,10 @@ impl SessionPort for AgentSessionService {
                 session_mode,
                 auto_allowed_count,
                 context_summary,
+                active_skills,
+                pending_mcp_elicitations,
+                mcp_status,
+                agents_status,
                 session_id,
                 task_id,
                 previous_session,
@@ -1212,6 +1575,47 @@ impl SessionPort for AgentSessionService {
 
     fn answer(&mut self, request_id: &str, decision: ApprovalDecision) -> bool {
         self.gate.answer(request_id, decision)
+    }
+
+    fn respond_mcp_elicitation(&mut self, request_id: &str, answer: &str) -> Result<(), String> {
+        let (schema, url) = self
+            .pending_mcp_elicitations
+            .lock()
+            .map_err(|_| "MCP elicitation state is unavailable".to_owned())?
+            .get(request_id)
+            .map(|request| (request.schema.clone(), request.url.clone()))
+            .ok_or_else(|| "that MCP request is no longer pending".to_owned())?;
+        let response = if answer.trim().eq_ignore_ascii_case("decline") {
+            McpElicitationAnswer::Decline
+        } else if answer.trim().eq_ignore_ascii_case("cancel") {
+            McpElicitationAnswer::Cancel
+        } else if url.is_some() {
+            if !matches!(
+                answer.trim().to_ascii_lowercase().as_str(),
+                "done" | "yes" | "accept"
+            ) {
+                return Err(
+                    "visit the displayed URL, then enter done, decline, or cancel".to_owned(),
+                );
+            }
+            McpElicitationAnswer::Accept(serde_json::json!({}))
+        } else {
+            let value: serde_json::Value = serde_json::from_str(answer).map_err(|error| {
+                format!("enter the elicitation response as a JSON object: {error}")
+            })?;
+            validate_elicitation_response(schema.as_ref(), &value)?;
+            McpElicitationAnswer::Accept(value)
+        };
+        let request = self
+            .pending_mcp_elicitations
+            .lock()
+            .map_err(|_| "MCP elicitation state is unavailable".to_owned())?
+            .remove(request_id)
+            .ok_or_else(|| "that MCP request was already answered".to_owned())?;
+        request
+            .reply
+            .send(response)
+            .map_err(|_| "the MCP request was canceled before it received the answer".to_owned())
     }
 
     fn grant_run_approval(&mut self) {
@@ -1303,6 +1707,171 @@ impl SessionPort for AgentSessionService {
                 .collect(),
             Err(error) => vec![format!("hooks unavailable: {error}")],
         }
+    }
+
+    fn mcp_summary(&self) -> Vec<String> {
+        let mut lines = match super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        ) {
+            Ok(config) if config.mcp_servers.is_empty() => {
+                vec!["no MCP servers configured".to_owned()]
+            }
+            Ok(config) => config
+                .mcp_servers
+                .iter()
+                .map(|(name, server)| {
+                    format!(
+                        "{name}: configured, lazy start, transport={}, required={}, tool_timeout={}s",
+                        server.transport.as_deref().unwrap_or("stdio"),
+                        server.required,
+                        server.tool_timeout_seconds.unwrap_or(60),
+                    )
+                })
+                .collect(),
+            Err(error) => vec![format!("MCP configuration unavailable: {error}")],
+        };
+        if let Ok(status) = self.mcp_status.lock() {
+            lines.extend(status.iter().cloned());
+        }
+        lines
+    }
+
+    fn agents_summary(&self) -> Vec<String> {
+        self.agents_status.lock().map_or_else(
+            |_| vec!["delegated worker status is unavailable".to_owned()],
+            |status| {
+                if status.is_empty() {
+                    vec!["no delegated workers have run in this session".to_owned()]
+                } else {
+                    status.clone()
+                }
+            },
+        )
+    }
+
+    fn skills_summary(&self) -> Vec<String> {
+        let mut lines = match super::skills::discover(
+            &self.global_config_dir,
+            &self.workspace_root,
+            &self.environment,
+            super::config::resolve_layers(
+                &self.config_file,
+                &self.workspace_root,
+                &self.environment,
+                &self.config_overrides,
+            )
+            .is_ok_and(|config| config.project_trusted),
+        ) {
+            Ok(catalog) => catalog
+                .entries()
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{}@{} — {} [{}]",
+                        entry.name,
+                        entry.version,
+                        entry.description,
+                        entry.source.as_str()
+                    )
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => vec![format!("skill catalog unavailable: {error}")],
+        };
+        if let Ok(active) = self.active_skills.lock() {
+            for activation in active.values() {
+                lines.push(format!(
+                    "active: {} ({})",
+                    activation.entry.version_ref(),
+                    activation.entry.digest.as_str()
+                ));
+            }
+        }
+        if lines.is_empty() {
+            lines.push("no trusted skills found".to_owned());
+        }
+        lines
+    }
+
+    fn activate_skill(&mut self, name: &str) -> Result<String, String> {
+        let trusted = super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .map_err(|error| error.to_string())?
+        .project_trusted;
+        let catalog = super::skills::discover(
+            &self.global_config_dir,
+            &self.workspace_root,
+            &self.environment,
+            trusted,
+        )
+        .map_err(|error| error.to_string())?;
+        let activation =
+            super::skills::activate(&catalog, name, 1).map_err(|error| error.to_string())?;
+        let label = format!(
+            "activated {} ({}) in the Skill context channel",
+            activation.entry.version_ref(),
+            activation.entry.digest.as_str()
+        );
+        self.active_skills
+            .lock()
+            .map_err(|_| "active skills are unavailable".to_owned())?
+            .insert(name.to_owned(), activation);
+        Ok(label)
+    }
+
+    fn reload(&mut self) -> Result<String, String> {
+        let trusted = super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .map_err(|error| error.to_string())?
+        .project_trusted;
+        let skills = super::skills::discover(
+            &self.global_config_dir,
+            &self.workspace_root,
+            &self.environment,
+            trusted,
+        )
+        .map_err(|error| error.to_string())?;
+        let commands =
+            super::skills::commands(&self.global_config_dir, &self.workspace_root, trusted)
+                .map_err(|error| error.to_string())?;
+        let instructions = super::instructions::load(
+            &self.global_config_dir,
+            &self.workspace_root,
+            &self.caller_dir,
+        );
+        Ok(format!(
+            "reloaded {} skill(s), {} prompt command(s), and {} instruction file(s); active skills remain digest-pinned",
+            skills.entries().len(),
+            commands.len(),
+            instructions.files.len()
+        ))
+    }
+
+    fn expand_prompt_command(&self, name: &str, arguments: &str) -> Result<Option<String>, String> {
+        let trusted = super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .map_err(|error| error.to_string())?
+        .project_trusted;
+        let command =
+            super::skills::commands(&self.global_config_dir, &self.workspace_root, trusted)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|command| command.name == name);
+        Ok(command.map(|command| super::skills::expand(&command, arguments)))
     }
 
     fn cost_summary(&self) -> String {
@@ -1789,6 +2358,10 @@ async fn run_turn(
     session_mode: Option<PolicyMode>,
     auto_allowed_count: Arc<AtomicUsize>,
     context_summary: Arc<Mutex<Vec<String>>>,
+    active_skills: Arc<Mutex<BTreeMap<String, harness_extensions::SkillActivation>>>,
+    pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
+    mcp_status: Arc<Mutex<Vec<String>>>,
+    agents_status: Arc<Mutex<Vec<String>>>,
     session_id: SessionId,
     task_id: TaskId,
     previous_session: Arc<Mutex<Option<SessionId>>>,
@@ -2102,9 +2675,25 @@ async fn run_turn(
         }
     };
 
+    let callback_provider = Arc::clone(&provider);
+    let callback_sender = sender.clone();
+    let callback_pending = Arc::clone(&pending_mcp_elicitations);
+    let callback_cancellation = cancellation.clone();
+    let callback_model = config.model.clone();
+    let mcp_callback_factory: super::mcp::McpCallbackFactory = Arc::new(move |server| {
+        Arc::new(InteractiveMcpCallbacks {
+            server: server.to_owned(),
+            provider: Arc::clone(&callback_provider),
+            model: callback_model.clone(),
+            sender: callback_sender.clone(),
+            pending: Arc::clone(&callback_pending),
+            cancellation: callback_cancellation.clone(),
+        })
+    });
+
     let runtime = Arc::new(RuntimeService::new(
         Arc::clone(&store),
-        provider,
+        Arc::clone(&provider),
         RuntimeConfig {
             context_window_tokens: config.context_window_tokens,
             output_reservation_tokens: config.output_reservation_tokens,
@@ -2167,6 +2756,53 @@ async fn run_turn(
     } else {
         None
     };
+    // MCP launch is deferred until an actual model turn. Each server config is
+    // trust-layer resolved above, and every tool it advertises still crosses
+    // ToolExecutionService's policy, approval, intent and receipt path.
+    let active_mcp = if config.mcp_servers.is_empty() {
+        if let Ok(mut status) = mcp_status.lock() {
+            status.clear();
+        }
+        None
+    } else {
+        let notice_sender = sender.clone();
+        let mcp_notice: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |message| {
+            let _ = notice_sender.send(SessionEvent::Notice { message });
+        });
+        match super::mcp::ActiveMcp::connect(
+            config.mcp_servers.clone(),
+            &workspace_root,
+            mcp_callback_factory,
+            mcp_notice,
+        )
+        .await
+        {
+            Ok(active) => {
+                let summary = active.summary();
+                if let Ok(mut status) = mcp_status.lock() {
+                    status.clone_from(&summary);
+                }
+                for line in summary {
+                    send(SessionEvent::Notice {
+                        message: format!("MCP: {line}"),
+                    });
+                }
+                Some(active)
+            }
+            Err(error) => {
+                send(SessionEvent::RecoverableError {
+                    message: format!("MCP setup failed: {error}"),
+                });
+                send(SessionEvent::RunTerminal {
+                    outcome: RunOutcome::Failed("MCP setup failed".to_owned()),
+                });
+                if let Ok(store) = Arc::try_unwrap(store) {
+                    let _ = store.close().await;
+                }
+                return;
+            }
+        }
+    };
     let tool_policy = match super::permissions::build_tool_policy(
         &config.approval,
         &config.allow_rules,
@@ -2178,38 +2814,96 @@ async fn run_turn(
             send(SessionEvent::RecoverableError {
                 message: format!("tool permissions are invalid: {error}"),
             });
+            if let Some(active) = active_mcp {
+                let _ = active.shutdown().await;
+            }
             if let Ok(store) = Arc::try_unwrap(store) {
                 let _ = store.close().await;
             }
             return;
         }
     };
-    let tools = match &active_extensions {
-        Some(active) => ToolExecutionService::new(Arc::clone(&store))
-            .with_policy(tool_policy)
-            .with_hooks(config.hooks.clone())
-            .with_external(active.dispatcher()),
-        None => ToolExecutionService::new(Arc::clone(&store))
-            .with_policy(tool_policy)
-            .with_hooks(config.hooks.clone()),
+    let delegate_host = match super::delegation::DelegateHost::new(
+        &store,
+        Arc::clone(&provider),
+        RuntimeConfig {
+            context_window_tokens: config.context_window_tokens,
+            output_reservation_tokens: config.output_reservation_tokens,
+            compaction_reserve_tokens: config.compaction_reserve_tokens,
+            max_retry_after_seconds: config.max_retry_after_seconds,
+            ..RuntimeConfig::default()
+        },
+        workspace_root.clone(),
+        observation.clone(),
+        data_dir.join("delegation"),
+        config.hooks.clone(),
+        config.deny_rules.clone(),
+        config.model_price,
+        Arc::clone(&gate) as Arc<dyn ApprovalGate>,
+        sender.clone(),
+        cancellation.clone(),
+        Arc::clone(&agents_status),
+    ) {
+        Ok(host) => Some(host),
+        Err(error) => {
+            send(SessionEvent::Notice {
+                message: format!("delegation unavailable: {error}"),
+            });
+            None
+        }
     };
+    let skill_catalog = match super::skills::discover(
+        &global_config_dir,
+        &workspace_root,
+        &environment,
+        config.project_trusted,
+    ) {
+        Ok(catalog) => Some(catalog),
+        Err(error) => {
+            send(SessionEvent::Notice {
+                message: format!("skills: catalog unavailable ({error})"),
+            });
+            None
+        }
+    };
+    let skill_host = skill_catalog
+        .as_ref()
+        .map(|catalog| super::skills::SkillHost::new(catalog.clone(), Arc::clone(&active_skills)));
+    let mut tools = ToolExecutionService::new(Arc::clone(&store))
+        .with_policy(tool_policy)
+        .with_hooks(config.hooks.clone());
+    if let Some(dispatcher) = super::mcp::combined_dispatcher_with_delegate(
+        active_mcp.as_ref(),
+        active_extensions.as_ref(),
+        delegate_host.as_ref(),
+        skill_host.as_ref(),
+    ) {
+        tools = tools.with_external(dispatcher);
+    }
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
-    let driver = match &active_extensions {
-        Some(active) => driver.with_external(active.tools()),
+    let external_tools = super::mcp::combined_tools_with_delegate(
+        active_mcp.as_ref(),
+        active_extensions.as_ref(),
+        delegate_host.as_ref(),
+        skill_host.as_ref(),
+    );
+    let driver = match &external_tools {
+        Some(tools) => driver.with_external(tools.clone()),
         None => driver,
     };
-    let tool_schemas = match &active_extensions {
-        Some(active) => {
-            let mut schemas = coding_tool_schemas();
-            schemas.extend(active.tools().schemas());
-            schemas
-        }
-        None => coding_tool_schemas(),
-    };
+    let mut tool_schemas = coding_tool_schemas();
+    if let Some(tools) = &external_tools {
+        tool_schemas.extend(tools.schemas());
+    }
     // Content the message names rides with it: images as blocks the model is shown, files
     // as text the model reads. A candidate that cannot be attached is said out loud: a
     // reader who is not told why cannot tell it from a bug.
-    let attached = attachments::from_message(&request.text, &workspace_root);
+    let mut attached = attachments::from_message(&request.text, &workspace_root);
+    if let Some(mcp) = &active_mcp {
+        let (mut resource_files, notes) = mcp.attach_mentions(&request.text).await;
+        attached.files.append(&mut resource_files);
+        attached.notes.extend(notes);
+    }
     for note in &attached.notes {
         send(SessionEvent::Notice {
             message: format!("not attached ({note})"),
@@ -2281,7 +2975,19 @@ async fn run_turn(
             }
         })
         .collect::<Vec<_>>();
-    let built_prompt = SystemPromptBuilder::build(&prompt_environment, &prompt_tools);
+    let mut built_prompt = SystemPromptBuilder::build(&prompt_environment, &prompt_tools);
+    if let Some(catalog) = &skill_catalog {
+        built_prompt.text =
+            super::prompt::append_skill_metadata(built_prompt.text, catalog.entries());
+    }
+    let mut project_blocks = loaded_instructions.blocks;
+    if let Ok(active) = active_skills.lock() {
+        project_blocks.extend(
+            active
+                .values()
+                .map(harness_extensions::SkillActivation::block),
+        );
+    }
     let mut run_request = RunRequest::new(
         session_id.clone(),
         task_id,
@@ -2290,7 +2996,7 @@ async fn run_turn(
         observation,
     )
     .with_system_policy(built_prompt.text)
-    .with_project_rules(loaded_instructions.blocks)
+    .with_project_rules(project_blocks)
     .with_tool_schemas(tool_schemas);
     if !attached.is_empty() {
         for notice in attachments::attachment_notices(&attached.images, &attached.files) {
@@ -2361,15 +3067,24 @@ async fn run_turn(
     let outcome = match &source {
         Some(source) => {
             driver
-                .run_turn_continuing(source, run_request, options, observer, cancellation)
+                .run_turn_continuing(source, run_request, options, observer, cancellation.clone())
                 .await
         }
         None => {
             driver
-                .run_turn(run_request, options, observer, cancellation)
+                .run_turn(run_request, options, observer, cancellation.clone())
                 .await
         }
     };
+
+    if let Some(delegate) = &delegate_host {
+        let unknown = delegate.shutdown().await;
+        for item in unknown {
+            send(SessionEvent::Notice {
+                message: format!("delegated worker ended without a settled outcome: {item}"),
+            });
+        }
+    }
 
     if let Some(built) = runtime.context_result(&session_id) {
         let mut lines = vec![
@@ -2464,6 +3179,17 @@ async fn run_turn(
     // Stop the extension processes this turn started, whatever the outcome was.
     if let Some(active) = active_extensions {
         active.shutdown().await;
+    }
+    if let Some(active) = active_mcp {
+        let reports = active.shutdown().await;
+        for report in reports.into_iter().filter(|report| !report.drained) {
+            send(SessionEvent::Notice {
+                message: format!(
+                    "MCP {} unloaded after its {} in-flight call(s) reached the cancel grace",
+                    report.label, report.inflight
+                ),
+            });
+        }
     }
     drop(runtime);
     if let Ok(store) = Arc::try_unwrap(store) {

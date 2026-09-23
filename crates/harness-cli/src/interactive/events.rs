@@ -14,6 +14,7 @@
 use std::time::{Duration, Instant};
 
 use harness_types::InputId;
+use serde_json::Value;
 
 use super::input::SlashCommand;
 
@@ -88,6 +89,8 @@ pub enum AppPhase {
     WaitingApproval,
     /// A durable `ask_user` question awaits a separate user input.
     WaitingInput,
+    /// An MCP server is paused until the operator answers an elicitation.
+    WaitingMcpInput,
     Canceling,
     Closed,
 }
@@ -102,6 +105,7 @@ impl AppPhase {
             Self::Running => "running",
             Self::WaitingApproval => "waiting_approval",
             Self::WaitingInput => "waiting_input",
+            Self::WaitingMcpInput => "waiting_mcp_input",
             Self::Canceling => "canceling",
             Self::Closed => "closed",
         }
@@ -112,7 +116,7 @@ impl AppPhase {
     pub const fn has_active_run(self) -> bool {
         matches!(
             self,
-            Self::Running | Self::WaitingApproval | Self::Canceling
+            Self::Running | Self::WaitingApproval | Self::WaitingMcpInput | Self::Canceling
         )
     }
 }
@@ -343,6 +347,11 @@ pub enum Modal {
         prompt: String,
         options: Vec<String>,
     },
+    /// An MCP server requests form input or user confirmation of a URL action.
+    McpElicitation {
+        message: String,
+        requested_schema: Option<Value>,
+    },
     /// `/help`, `/status`, `/config`, `/model` and `/more` output.
     ///
     /// `scroll` is the row offset from the top, so a panel holding more than it can
@@ -464,6 +473,14 @@ pub enum SessionEvent {
         question_id: String,
         prompt: String,
         options: Vec<String>,
+    },
+    /// A server-to-client MCP request awaiting explicit operator input.
+    McpElicitationRequired {
+        request_id: String,
+        server: String,
+        message: String,
+        requested_schema: Option<Value>,
+        url: Option<String>,
     },
     /// The answer to a resume listing.
     SessionsListed {

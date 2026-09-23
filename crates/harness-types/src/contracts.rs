@@ -649,7 +649,7 @@ pub struct HarnessConfigV2 {
     #[serde(default)]
     pub permissions: Option<PermissionsConfigV2>,
     #[serde(default)]
-    pub mcp_servers: BTreeMap<String, serde_json::Value>,
+    pub mcp_servers: BTreeMap<String, McpServerConfigV2>,
     #[serde(default)]
     pub hooks: BTreeMap<String, Vec<HookConfigV2>>,
     #[serde(default)]
@@ -675,6 +675,9 @@ impl HarnessConfigV2 {
         for model in self.models.values() {
             model.validate()?;
         }
+        for (name, server) in &self.mcp_servers {
+            server.validate(name)?;
+        }
         for (event, hooks) in &self.hooks {
             if !matches!(
                 event.as_str(),
@@ -691,6 +694,112 @@ impl HarnessConfigV2 {
         }
         Ok(())
     }
+}
+
+/// One configured MCP server. Stdio is the default transport; a remote
+/// Streamable HTTP endpoint may instead name an environment variable holding
+/// its bearer token. Secret values are never stored in configuration.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerConfigV2 {
+    #[serde(default)]
+    pub transport: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub enabled_tools: Vec<String>,
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
+    #[serde(default)]
+    pub tool_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub bearer_token_env: Option<String>,
+}
+
+impl McpServerConfigV2 {
+    pub fn validate(&self, name: &str) -> Result<(), HarnessError> {
+        let transport = self.transport.as_deref().unwrap_or("stdio");
+        let bad = match transport {
+            "stdio" => {
+                self.command.as_deref().is_none_or(str::is_empty)
+                    || self.url.is_some()
+                    || self.bearer_token_env.is_some()
+                    || self.args.len() > 64
+                    || self.args.iter().any(|value| value.len() > 4096)
+                    || self.env.iter().any(|(key, value)| {
+                        key.is_empty()
+                            || !key
+                                .chars()
+                                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                            || value.len() > 4096
+                            || (is_secret_env_name(key) && !value.starts_with("secret://"))
+                            || (value.starts_with("secret://")
+                                && (value.len() <= "secret://".len()
+                                    || !value[9..]
+                                        .chars()
+                                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')))
+                    })
+            }
+            "streamable_http" => {
+                self.command.is_some()
+                    || !self.args.is_empty()
+                    || !self.env.is_empty()
+                    || self.cwd.is_some()
+                    || self.url.as_deref().is_none_or(|url| {
+                        !(url.starts_with("https://") || url.starts_with("http://127.0.0.1"))
+                    })
+                    || self.bearer_token_env.as_deref().is_some_and(|env| {
+                        env.is_empty()
+                            || !env
+                                .chars()
+                                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                    })
+            }
+            _ => true,
+        };
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+            || bad
+            || self
+                .tool_timeout_seconds
+                .is_some_and(|seconds| seconds == 0 || seconds > 120)
+            || self.enabled_tools.len() > 256
+            || self.disabled_tools.len() > 256
+            || self
+                .enabled_tools
+                .iter()
+                .chain(&self.disabled_tools)
+                .any(|tool| tool.trim().is_empty() || tool.len() > 256)
+        {
+            return Err(HarnessError::new(
+                ErrorCode::ConfigParseError,
+                format!(
+                    "mcp_servers.{name} has an invalid transport, command, filter, environment, URL, or timeout"
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn is_secret_env_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    ["TOKEN", "SECRET", "PASSWORD", "API_KEY", "PRIVATE_KEY"]
+        .iter()
+        .any(|needle| name.contains(needle))
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

@@ -185,6 +185,15 @@ pub fn hint(state: &UiState) -> String {
                 " TRẢ LỜI · phím số hoặc nhập · Enter ".to_owned()
             }
         }
+        Some(Modal::McpElicitation {
+            requested_schema, ..
+        }) => {
+            if requested_schema.is_some() {
+                " MCP INPUT · JSON · decline · cancel · Enter gửi ".to_owned()
+            } else {
+                " MCP URL · done · decline · cancel · Enter gửi ".to_owned()
+            }
+        }
         Some(Modal::Overlay { .. }) => " THAM KHẢO · PgUp/PgDn · Esc đóng ".to_owned(),
         None => {
             // The menu is what the user is looking at while it is up, so its keys

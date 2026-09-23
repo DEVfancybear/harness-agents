@@ -96,6 +96,9 @@ impl AnthropicMessagesAdapter {
             "messages": messages,
             "stream": true
         });
+        if let Some(max_tokens) = request.max_output_tokens {
+            body["max_tokens"] = json!(max_tokens);
+        }
         if !system.is_empty() {
             body["system"] = json!(system.join("\n\n"));
         }

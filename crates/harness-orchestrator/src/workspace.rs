@@ -476,7 +476,7 @@ pub fn scope_violations(paths: &[String], write_scope: &[String]) -> Vec<ScopeVi
         let normalized = path.replace('\\', "/");
         let allowed = write_scope.iter().any(|scope| {
             let scope = scope.trim_end_matches('/');
-            normalized == scope || normalized.starts_with(&format!("{scope}/"))
+            scope == "." || normalized == scope || normalized.starts_with(&format!("{scope}/"))
         });
         if !allowed {
             violations.push(ScopeViolation {
@@ -577,4 +577,20 @@ fn canonical_key(root: &Path) -> String {
 
 fn git_ok(root: &Path, arguments: &[&str]) -> bool {
     git(root, arguments).is_ok()
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::scope_violations;
+
+    #[test]
+    fn repository_root_scope_allows_every_relative_path() {
+        assert!(
+            scope_violations(
+                &["src/main.rs".to_owned(), "README.md".to_owned()],
+                &[".".to_owned()]
+            )
+            .is_empty()
+        );
+    }
 }

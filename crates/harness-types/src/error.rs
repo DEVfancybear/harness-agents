@@ -64,6 +64,8 @@ pub enum ErrorCode {
     ProcessCanceled,
     ProcessOutcomeUnknown,
     StrictIsolationUnavailable,
+    /// A requested worker role cannot run with the host's current isolation capabilities.
+    RoleUnavailable,
     ProjectIdentityConflict,
     ToolIntentConflict,
     EditNotFound,
@@ -174,6 +176,7 @@ impl ErrorCode {
             Self::ProcessCanceled => "process_canceled",
             Self::ProcessOutcomeUnknown => "process_outcome_unknown",
             Self::StrictIsolationUnavailable => "strict_isolation_unavailable",
+            Self::RoleUnavailable => "role_unavailable",
             Self::ProjectIdentityConflict => "project_identity_conflict",
             Self::ToolIntentConflict => "tool_intent_conflict",
             Self::EditNotFound => "edit_not_found",
@@ -335,6 +338,7 @@ impl ErrorCode {
             | Self::OutputLimitExceeded
             | Self::ProcessCanceled
             | Self::StrictIsolationUnavailable
+            | Self::RoleUnavailable
             | Self::TaskNotFound
             | Self::TaskDependencyFailed
             | Self::DagCycle
@@ -426,6 +430,7 @@ impl ErrorCode {
             | Self::ProcessTimedOut
             | Self::OutputLimitExceeded
             | Self::StrictIsolationUnavailable
+            | Self::RoleUnavailable
             | Self::IntegrationConflict
             | Self::ResultIncomplete
             | Self::InflightLimitExceeded

@@ -8,6 +8,19 @@
 //! This crate adds a transport and a dispatch hook, never a second
 //! authorization path, and it never advertises transport isolation as OS
 //! sandboxing.
+//!
+//! MCP calls made by application code must go through
+//! [`McpToolDispatcher`](crate::McpToolDispatcher), which is attached to the
+//! shared `ToolExecutionService` policy and approval path. The client transport
+//! call is intentionally inaccessible to downstream crates:
+//!
+//! ```compile_fail
+//! use harness_extensions::McpClient;
+//!
+//! fn bypass_dispatcher(client: &McpClient) {
+//!     let _call = client.call_tool("observe", serde_json::json!({"subject": "x"}));
+//! }
+//! ```
 
 pub mod bridges;
 pub mod catalog;
@@ -18,6 +31,9 @@ pub mod mcp;
 pub mod skills;
 pub mod tasks;
 pub mod transport;
+
+/// RMCP request types used by the host callback integration.
+pub use rmcp;
 
 pub use bridges::{ConfigInspection, ExtensionProvider, ExtensionToolDispatcher};
 pub use catalog::{
@@ -41,9 +57,9 @@ pub use host::{ExtensionLease, ExtensionRuntime, LoadOutcome, UnloadReport};
 pub use mcp::{
     MCP_CALL_TIMEOUT_MS, MCP_DISCOVERY_TIMEOUT_MS, MCP_MAX_PAGES, MCP_MAX_RESOURCES, MCP_MAX_TOOLS,
     MCP_READ_TIMEOUT_MS, MCP_SDK_VERSION, MCP_SPEC_REVISION, McpClient, McpFeature,
-    McpMetadataCache, McpResourceContent, McpResourceDescriptor, McpResourceProvenance, McpRuntime,
-    McpSupportMatrix, McpTaskRemote, McpToolDescriptor, McpToolDispatcher, validate_arguments,
-    validate_tool_schema,
+    McpMetadataCache, McpRequestCallbacks, McpResourceContent, McpResourceDescriptor,
+    McpResourceProvenance, McpRuntime, McpSupportMatrix, McpTaskRemote, McpToolDescriptor,
+    McpToolDispatcher, validate_arguments, validate_tool_schema,
 };
 pub use skills::{
     MAX_SKILL_CATALOG_ENTRIES, MAX_SKILL_HEAD_BYTES, SkillActivation, SkillCatalog,

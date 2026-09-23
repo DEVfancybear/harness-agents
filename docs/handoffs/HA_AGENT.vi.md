@@ -1,4 +1,22 @@
-# Handoff — HA_AGENT CP-C (G07–G09) / Bàn giao — HA_AGENT CP-C (G07–G09)
+# Handoff — HA_AGENT CP-D hiện hành / CP-C history
+
+## CP-D — G10–G12 hiện hành (24/09/2026)
+
+Tiếp tục từ CP-C và dừng ở CP-D theo assignment. Không bắt đầu G13–G14 trong lượt này.
+
+- G10 nối MCP stdio và Streamable HTTP bearer từ env vào interactive chat; mọi 9 entry hiện trong `McpSupportMatrix` là supported. SSE/OAuth, MRTR multi-round, sampling có tool/image context, và tự mở rộng resource-template URI vẫn ngoài hỗ trợ. `McpClient::call_tool` là `pub(crate)`; N8-MCP là negative control riêng.
+- G11 discovery `/skills`, `/skill:<name>`, trusted project skill roots, `list_skills` + digest-pinned `activate_skill` và dynamic Skill-channel context; prompt commands có substitution `$ARGUMENTS`/`$1..$9`; `/reload`.
+- G12 dùng WorkerScheduler + WorkerBackend thật với provider/TurnDriver/ToolExecutionService. Explorer chỉ đọc; coder được cấp/persist worktree từ M8-03 nếu repo sạch, chỉnh sửa chỉ ở branch/worktree tách biệt và tool trả lại path/branch. Repo bẩn hoặc M8 manager không tạo được worktree thì lỗi typed `role_unavailable` giải thích điều kiện; không chạy coder trên checkout người dùng.
+- Schema error được regenerate cho `role_unavailable`. `EXTENSION_PROTOCOL_VERSION`, `MCP_SPEC_REVISION`, `CONTEXT_SCHEMA_VERSION` không đổi. Không thêm dependency edge; allowlist vẫn là nguồn kiểm soát và không có `harness-runtime → harness-tools` edge mới.
+- CP-D verification: **passed** trên Windows, Rust stable 1.97.1. `cargo +stable fmt --all`, `cargo +stable clippy --workspace --all-targets --locked -- -D warnings`, `cargo +stable build --workspace --locked`; `milestone_m6` 14/14 (13 required, 14 discovered; A22/A23/A24 giữ xanh), `phase_p6` 15/15, `phase_p5` 28/28; G12 delegation 7/7, G11 skills 3/3, N8-MCP compile-fail doctest 1/1. `cargo +stable tree -i reqwest --locked` chỉ có `reqwest 0.13.4`.
+- `Verify-Milestone.ps1 -Milestone M6` → **passed** trong lần chạy mặc định sau khi sửa các selector cũ: format, clippy, build, workspace tests, dependency allowlist (45 edges), 13 required / 14 discovered, closure M5 15, M4 14, M3 20, M1 11, M2 12, M0 12. Lệnh chạy với `$env:RUSTUP_TOOLCHAIN='stable'` vì rustc của toolchain pin cục bộ thiếu; stable báo Rust 1.97.1. Một lần xác nhận sau khi chỉ cập nhật handoff gặp hai Anthropic fixture test fail trong workspace suite; chạy `harness-providers --lib` riêng pass 32/32. Implementation không đổi sau gate xanh.
+- Allowlist không đổi trong CP-D; không thêm edge `harness-runtime → harness-tools`. `EXTENSION_PROTOCOL_VERSION`, `MCP_SPEC_REVISION`, `CONTEXT_SCHEMA_VERSION` giữ nguyên. Gate-pass digest và digest snapshot sau handoff được ghi tại `docs/evidence/M6.vi.md`.
+
+### Next action
+
+Dừng ở CP-D sau G12. Không bắt đầu CP-E (G13–G14) cho đến assignment tiếp theo.
+
+---
 
 ## Tiếng Việt
 

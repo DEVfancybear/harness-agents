@@ -69,7 +69,7 @@ Từ [SPEC M6 mục 11](specs/M6.vi.md), các SPEC/evidence/handoff M0–M6, H, 
 | # | Giới hạn đã ghi (nguồn) | Đóng ở |
 |---|---|---|
 | L1 | **M6 §11:** nhánh Unix của `process_wrap`/transport không chạy được trên host (không WSL/Docker); A22/A23/A24 chỉ chứng minh trên Windows → `platform pending` Linux. Cùng giới hạn cho A12–A21 (M4/M5 §11) | **G14** — CI ubuntu chạy gate M4–M6 và gate H/T không-PTY |
-| L2 | **M6 §11:** không hỗ trợ remote MCP endpoint, prompts, sampling, elicitation, marketplace, WASM, dynamic ABI; "công bố rõ, không tạo success placeholder" | **G10** nối MCP stdio vào chat; **G10b (tuỳ chọn)** Streamable HTTP client với bearer token env; prompts/sampling/elicitation/marketplace/WASM **vẫn không hỗ trợ**, `McpSupportMatrix` phải nói đúng |
+| L2 | **M6 §11:** một số capability MCP, marketplace, WASM, dynamic ABI chưa được nối vào chat; "công bố rõ, không tạo success placeholder" | **G10** nối MCP stdio + Streamable HTTP vào chat và hỗ trợ mọi entry của `McpSupportMatrix`; SSE/OAuth, multi-round prompts/tool elicitation, sampling kèm tools/ảnh và tự mở rộng resource template URI vẫn là giới hạn tường minh; marketplace/WASM/dynamic ABI vẫn ngoài phạm vi |
 | L3 | **M6 §11:** mock chỉ provider/network ngoài; store/runner/transport thật | Giữ nguyên nguyên tắc ở mọi item G |
 | L4 | Live/paid smoke không chạy trong gate M; capability DeepSeek là fixture (M2 §5.7) | **G03** mở rộng `Smoke-HaProvider.ps1` cho mọi provider trong config; vẫn **không** chạy trong gate, chỉ khi assignment cấp |
 | L5 | `Retry-After` chỉ giây, cap 2 s (evidence M2 §8) | **G03** |
@@ -117,9 +117,9 @@ Các quyết định dưới đây là mặc định của plan; muốn đổi p
 
 **D8 — Extension trong chat qua đúng cổng M6.** MCP: `McpToolDispatcher` là đường duy nhất vào `ToolService`; tool tên `mcp__<server>__<tool>`; approval và policy như tool extension. Skills: `SkillContributor` + `activate` theo digest; model chỉ thấy **metadata** (progressive disclosure), body chỉ nạp khi activate. Không đổi `EXTENSION_PROTOCOL_VERSION`, không đổi `MCP_SPEC_REVISION` trừ khi G10b cần và có số đo.
 
-**D9 — Subagent trong lượt tái dùng orchestrator, không engine mới.** Tool `delegate` chạy `TurnDriver` con với provider thật qua `WorkerBackend` thật (thay `ScriptedWorkerBackend`), depth 1, tối đa 3 song song, role `explorer` read-only không cần worktree; role `coder` dùng worktree của M8-03 — nếu M8 chưa có, G12 chỉ giao `explorer` và ghi rõ.
+**D9 — Subagent trong lượt tái dùng orchestrator, không engine mới.** Tool `delegate` chạy `TurnDriver` con với provider thật qua `WorkerBackend` thật (thay `ScriptedWorkerBackend`), depth 1, tối đa 3 song song, role `explorer` read-only không cần worktree; role `coder` được host cấp worktree bằng `WorkerScheduler`/`WorkspaceManager` M8-03 từ snapshot Git sạch, persist record và giữ lại branch/path. Nếu input bẩn, manager không có hoặc worktree không tạo được thì trả `RoleUnavailable{reason}`; không chạy coder trên checkout người dùng và không tạo stub.
 
-**D10 — Dependency pin đúng, không bịa.** Chỉ dùng crate đã có trong `Cargo.lock` khi có thể: `regex = "=1.13.1"` và `globset = "=0.4.20"` đã nằm trong lockfile (qua `ignore`/`sqlx`) — thêm vào `[workspace.dependencies]` với đúng version đó, `cargo tree -d` không được sinh bản thứ hai. Diff preview: `similar = "=3.2.0"` (Apache-2.0, MSRV 1.85; `cargo info similar` ngày 22/09/2026) — DeepSeek kiểm lại bằng `cargo info` trước khi pin. G10b: bật feature `transport-streamable-http-client-reqwest` của `rmcp =3.4.0` (có trong manifest crate), điều kiện dừng: `cargo tree -i reqwest` vẫn **một** phiên bản `0.12.24`. Không dependency nào khác.
+**D10 — Dependency pin đúng, không bịa.** Chỉ dùng crate đã có trong `Cargo.lock` khi có thể: `regex = "=1.13.1"` và `globset = "=0.4.20"` đã nằm trong lockfile (qua `ignore`/`sqlx`) — thêm vào `[workspace.dependencies]` với đúng version đó, `cargo tree -d` không được sinh bản thứ hai. Diff preview: `similar = "=3.2.0"` (Apache-2.0, MSRV 1.85; `cargo info similar` ngày 22/09/2026) — DeepSeek kiểm lại bằng `cargo info` trước khi pin. G10b: bật feature `transport-streamable-http-client-reqwest` của `rmcp =3.4.0`; điều kiện dừng: `cargo tree -i reqwest` chỉ có **một phiên bản**, version thực tế lấy từ lockfile. Không dependency edge runtime → tools.
 
 **D11 — Kiểm chứng như H/T/M.** Unit `TestBackend` cho TUI; fixture HTTP loopback qua adapter thật cho provider; fixture binary thật cho MCP/hook/subagent; PTY thật cho phím mới; không mock host; không stub-success; test chạy 0 case là gate fail.
 
@@ -276,7 +276,7 @@ Phụ thuộc: G02, G05.
 3. Thông báo: `[ui] bell = true` phát BEL khi cần approval/ask_user/turn end trong lúc terminal không focus (không đo được focus → luôn phát khi cấu hình bật); `notify_command` chạy như hook `notification`.
 4. Test: `g09_pre_tool_use_exit_2_blocks_and_records_the_reason`, `g09_hook_cannot_turn_ask_into_allow`, `g09_hook_timeout_blocks_not_allows`, `g09_untrusted_project_hooks_do_not_run`, `g09_hook_receives_bounded_json_without_secrets`.
 
-### G10 — MCP trong `ha chat` (M) · G10b Streamable HTTP (S, tuỳ chọn)
+### G10 — MCP trong `ha chat` (M) · G10b Streamable HTTP (được chọn theo assignment)
 
 Phụ thuộc: G02, G05.
 
@@ -284,7 +284,7 @@ Phụ thuộc: G02, G05.
 2. Tool `mcp__<server>__<tool>` đăng ký qua `McpToolDispatcher` → `ToolService` (schema validate M6-03, policy + approval G05 như extension tool); resource `@<server>:<uri>` trong composer → `read_resource` → attachment (text only; blob bị từ chối như M6).
 3. `ha mcp add|list|get|remove` ghi user config (hoặc `--project` vào `.harness/config.toml`); `/mcp` overlay: server, trạng thái, số tool, lỗi cuối.
 4. Đóng L20: khi test P6 chuyển sang gọi qua dispatcher, `McpClient::call_tool` → `pub(crate)`; thêm negative control N8 riêng (lease generation) vào `milestone_m6`.
-5. **G10b (tuỳ chọn, chỉ khi assignment nêu):** `transport = "streamable_http"`, `url` https, `bearer_token_env`; bật feature rmcp theo D10; `McpSupportMatrix.remote_transport` → supported **chỉ cho** streamable HTTP không OAuth; SSE cũ, OAuth, sampling, elicitation, prompts vẫn unsupported và được công bố. Fixture: dùng `m6_fixture_mcp_server` chạy chế độ HTTP loopback.
+5. **G10b (assignment chọn mọi entry hiện `unsupported` trong matrix):** `transport = "streamable_http"`, `url` https hoặc loopback, `bearer_token_env`; bật `transport-streamable-http-client-reqwest`; `cargo tree -i reqwest` phải có một phiên bản. Sau triển khai, cả 9 entry trong `McpSupportMatrix` được thực thi và kiểm chứng: tools/resources/resource templates/prompts/sampling/elicitation/subscriptions/remote transport/tasks. SSE/OAuth, sampling kèm tools/ảnh, multi-round và tự mở rộng RFC 6570 URI vẫn là giới hạn tường minh. Fixture: dùng MCP server thật chạy loopback.
 6. Test: `g10_mcp_tool_goes_through_the_dispatcher_and_the_approval_gate`, `g10_required_server_failure_fails_the_turn_loudly`, `g10_disabled_tool_is_not_advertised`, `g10_resource_mention_becomes_a_text_attachment`, `g10_unload_drains_before_exit`, `a23_extension_bounds` giữ xanh; G10b: `g10b_streamable_http_uses_one_reqwest_and_bearer_from_env`.
 
 ### G11 — Skills và prompt template trong chat (M)
@@ -300,10 +300,12 @@ Phụ thuộc: G01, G02.
 Phụ thuộc: G03, G05; phối hợp M8.
 
 1. `WorkerBackend` thật trong `harness-orchestrator`: mỗi worker là một `TurnDriver` + `ToolService` với provider từ config (có thể profile riêng `[profiles.explorer]`), `TaskBrief` bất biến, budget con trừ vào ledger cha (đã có `BudgetLedger`).
-2. Tool `delegate{role: explorer|coder, brief, max_steps?}`: `explorer` chỉ có tool read-only, chạy trên cùng workspace, không worktree; `coder` yêu cầu worktree của M8-03 — nếu chưa có, tool trả lỗi typed `RoleUnavailable{reason}` (không stub). Depth 1 (child không được delegate), tối đa 3 song song, kết quả = `TaskResult` (text + receipts digest) làm tool result; approval của child hiện lên panel cha với nhãn `[child explorer]`.
+2. Tool `delegate{role: explorer|coder, brief, max_steps?}`: `explorer` chỉ có tool read-only, chạy trên cùng workspace, không worktree; `coder` được cấp worktree M8-03 từ snapshot Git sạch, ghi worktree record và giữ lại branch/path để review; input bẩn hoặc không tạo được worktree trả typed `RoleUnavailable{reason}` (không chạy trên checkout người dùng, không stub). Depth 1 (child không được delegate), tối đa 3 song song, kết quả = `TaskResult` (text + receipts digest + worktree metadata) làm tool result; approval của child hiện lên panel cha với nhãn `[child <role>]`.
 3. `/agents` overlay: child đang chạy, bước, chi phí; Ctrl-C cha hủy child (cancel token đã có).
 4. `ha tasks run` bỏ `ScriptedWorkerBackend` khi có provider thật; giữ `--mock` cho fixture.
-5. Test: `g12_explorer_child_cannot_call_mutating_tools`, `g12_child_cannot_delegate_again`, `g12_child_budget_is_charged_to_the_parent_ledger`, `g12_parent_cancel_stops_the_child_within_grace`, `g12_coder_without_worktree_is_a_typed_error`.
+5. Test: `g12_explorer_child_cannot_call_mutating_tools`, `g12_child_cannot_delegate_again`, `g12_child_budget_is_charged_to_the_parent_ledger`, `g12_parent_cancel_stops_the_child_within_grace`, `g12_coder_gets_a_real_m8_worktree_for_a_clean_workspace`, `g12_coder_refuses_a_dirty_parent_without_losing_changes`.
+
+**CP-D implementation note:** `/agents`, explorer và coder backend được nối trong interactive chat bằng `WorkerScheduler` + `WorkspaceManager` M8-03 + `WorkerBackend`/`TurnDriver`/`ToolExecutionService` với provider của lượt cha. Explorer chỉ có read tools; coder chỉ chạy trong worktree do host tạo từ Git snapshot sạch và record được lưu bền vững. `RoleUnavailable` chỉ còn khi workspace bẩn hoặc host không thể cấp worktree an toàn. `/skills`/`/skill:<name>` và model tool `activate_skill` cùng nạp nội dung theo digest vào Skill channel. Gate/test status của CP-D nằm trong `docs/handoffs/HA_AGENT.vi.md` và `docs/evidence/M6.vi.md`.
 
 ### G13 — Headless và automation (S/M)
 

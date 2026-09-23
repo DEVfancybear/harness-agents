@@ -23,13 +23,13 @@ pub use acceptance::{
 pub use contracts::{
     CheckEvidence, CheckOutcome, ChildRunStatus, ChildState, CliOutputFormat,
     CliPresentationConfig, ContextPacket, EventEnvelope, HarnessConfig, HarnessConfigV2,
-    InstructionLedgerEntry, InstructionStatus, LimitsConfigV2, MemoryAsset, MemoryAssetStatus,
-    MemoryScope, MemoryVersion, MemoryVersionRef, ModelConfigV2, NextActionProposal,
-    PendingToolCall, PendingToolState, PermissionsConfigV2, PlanItem, PlanItemStatus,
-    PluginManifest, ProducerIdentity, ProfileConfigV2, ProviderConfigV2, ServiceContract,
-    SourceAuthority, SourceRef, ToolExecutionReceipt, ToolIntentState, ToolOutcomeState,
-    TrustConfigV2, UiConfigV2, Validity, WorkingState, WorkspaceChange, WorkspaceObservation,
-    validate_schema_version,
+    InstructionLedgerEntry, InstructionStatus, LimitsConfigV2, McpServerConfigV2, MemoryAsset,
+    MemoryAssetStatus, MemoryScope, MemoryVersion, MemoryVersionRef, ModelConfigV2,
+    NextActionProposal, PendingToolCall, PendingToolState, PermissionsConfigV2, PlanItem,
+    PlanItemStatus, PluginManifest, ProducerIdentity, ProfileConfigV2, ProviderConfigV2,
+    ServiceContract, SourceAuthority, SourceRef, ToolExecutionReceipt, ToolIntentState,
+    ToolOutcomeState, TrustConfigV2, UiConfigV2, Validity, WorkingState, WorkspaceChange,
+    WorkspaceObservation, validate_schema_version,
 };
 pub use error::{ErrorCode, ErrorReport, HarnessError, RetryClass};
 pub use fixture::{ContinuationFixtureReport, verify_continuation_fixture};

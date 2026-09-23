@@ -14,7 +14,7 @@ harness-tools = { path = "../harness-tools" }
 harness-types = { path = "../harness-types" }
 process-wrap.workspace = true
 schemars.workspace = true
-rmcp = { version = "=3.4.0", default-features = false, features = ["client", "server", "macros", "schemars", "transport-child-process", "transport-io"] }
+rmcp = { version = "=3.4.0", default-features = false, features = ["client", "server", "macros", "schemars", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

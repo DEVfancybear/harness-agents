@@ -859,7 +859,7 @@ mod tests {
             "the panel offers the key that ends the questions: {painted}"
         );
         assert!(
-            painted.contains("a cho phép cả lượt"),
+            painted.contains("a cả lượt"),
             "and the composer's border names the same key: {painted}"
         );
 

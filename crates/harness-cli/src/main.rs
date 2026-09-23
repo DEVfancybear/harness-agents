@@ -5,6 +5,7 @@ mod delegation_cli;
 mod extension_cli;
 mod interactive;
 mod maintenance_cli;
+mod mcp_cli;
 mod memory_cli;
 mod sandbox_cli;
 mod web;
@@ -120,6 +121,8 @@ enum Command {
     Tasks(delegation_cli::TaskCommand),
     /// P6 external extensions: trust inspection, local registration and skills.
     Extensions(extension_cli::ExtensionCommand),
+    /// Configure and inspect MCP servers.
+    Mcp(mcp_cli::McpCommand),
     /// P7 recovery hardening: doctor, backup, restore, retention, GC and release matrix.
     Maintenance(maintenance_cli::MaintenanceCommand),
 }
@@ -614,6 +617,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
         // which grows the future past the size the other arms keep. Boxing one arm is
         // cheaper than reshaping the dispatch.
         Some(Command::Memory(command)) => Box::pin(memory_cli::run(command)).await,
+        Some(Command::Mcp(command)) => mcp_cli::run(command),
         Some(Command::Init { data_dir, json }) => init_store(&data_dir, json).await,
         Some(Command::Config(ConfigCommand {
             command: ConfigSubcommand::Validate { config, json },

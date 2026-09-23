@@ -226,6 +226,8 @@ mod tests {
             compaction_reserve_tokens: 16_384,
             retry_after_max_seconds: 30,
             hooks: Vec::new(),
+            mcp_servers: BTreeMap::new(),
+            project_trusted: false,
             bell: false,
             explain: vec![ConfigExplainEntry {
                 key: "approval".to_owned(),

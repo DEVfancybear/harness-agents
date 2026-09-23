@@ -112,6 +112,15 @@ struct PendingQuestion {
     options: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingMcpElicitation {
+    request_id: String,
+    server: String,
+    message: String,
+    requested_schema: Option<serde_json::Value>,
+    url: Option<String>,
+}
+
 /// Interactive app state and its transitions.
 pub struct InteractiveController {
     phase: AppPhase,
@@ -141,6 +150,7 @@ pub struct InteractiveController {
     pending_newlines: usize,
     pending_approval: Option<PendingApproval>,
     pending_question: Option<PendingQuestion>,
+    pending_mcp_elicitation: Option<PendingMcpElicitation>,
     /// Whether the user allowed every gated action for the run now in flight.
     ///
     /// Mirrored here so the status row can say the gate is open, and cleared by
@@ -213,6 +223,7 @@ impl InteractiveController {
             pending_newlines: 0,
             pending_approval: None,
             pending_question: None,
+            pending_mcp_elicitation: None,
             granted_for_run: false,
             session_candidates: Vec::new(),
             queued_input: None,
@@ -347,6 +358,12 @@ impl InteractiveController {
                 expires_at: pending.expires_at,
                 read_only: pending.read_only,
                 scroll: pending.scroll,
+            });
+        }
+        if let Some(request) = &self.pending_mcp_elicitation {
+            return Some(Modal::McpElicitation {
+                message: format!("{} — {}", request.server, request.message),
+                requested_schema: request.requested_schema.clone(),
             });
         }
         if let Some(question) = &self.pending_question {
@@ -898,6 +915,41 @@ impl InteractiveController {
                     options,
                 });
             }
+            SessionEvent::McpElicitationRequired {
+                request_id,
+                server,
+                message,
+                requested_schema,
+                url,
+            } => {
+                self.flush_stream(effects);
+                if self.pending_mcp_elicitation.is_some() {
+                    self.service.cancel();
+                    self.push_history(effects, HistoryItem::Error {
+                        message: "another MCP elicitation arrived before the current request was answered; the turn was canceled".to_owned(),
+                    });
+                    return;
+                }
+                if self.plain {
+                    let schema = requested_schema
+                        .as_ref()
+                        .map_or_else(String::new, |schema| format!("\nSchema: {schema}"));
+                    let url_line = url
+                        .as_ref()
+                        .map_or_else(String::new, |url| format!("\nURL: {url}"));
+                    self.push_history(effects, HistoryItem::Message {
+                        text: format!("[MCP input from {server}] {message}{url_line}{schema}\nEnter a JSON object, or type decline/cancel."),
+                    });
+                }
+                self.pending_mcp_elicitation = Some(PendingMcpElicitation {
+                    request_id,
+                    server,
+                    message,
+                    requested_schema,
+                    url,
+                });
+                self.phase = AppPhase::WaitingMcpInput;
+            }
             SessionEvent::RunTerminal { outcome } => {
                 self.flush_stream(effects);
                 self.settle_run(Some(outcome.clone()));
@@ -967,6 +1019,9 @@ impl InteractiveController {
         }
         if self.phase == AppPhase::WaitingInput && self.pending_question.is_some() {
             return self.submit_question_answer(text);
+        }
+        if self.phase == AppPhase::WaitingMcpInput && self.pending_mcp_elicitation.is_some() {
+            return self.answer_mcp_elicitation(&text);
         }
         if text.trim_start().starts_with('/') {
             // A leading space must not turn a command into chat text: `/key`
@@ -1315,6 +1370,49 @@ impl InteractiveController {
             "/hooks" => {
                 self.reference("/hooks", self.service.hooks_summary(), &mut effects);
             }
+            "/mcp" => {
+                self.reference("/mcp", self.service.mcp_summary(), &mut effects);
+            }
+            "/agents" => {
+                self.reference("/agents", self.service.agents_summary(), &mut effects);
+            }
+            "/skills" => {
+                self.reference("/skills", self.service.skills_summary(), &mut effects);
+            }
+            "/reload" => {
+                if self.phase.has_active_run() {
+                    self.push_history(&mut effects, HistoryItem::Error {
+                        message: "cannot reload prompt inputs while a run is active".to_owned(),
+                    });
+                } else {
+                    match self.service.reload() {
+                        Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
+                        Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                    }
+                }
+            }
+            skill_command if skill_command.starts_with("/skill:") => {
+                let skill_name = skill_command.trim_start_matches("/skill:");
+                if skill_name.is_empty() {
+                    self.push_history(&mut effects, HistoryItem::Error {
+                        message: "usage: /skill:<name> [task]".to_owned(),
+                    });
+                } else if self.phase.has_active_run() {
+                    self.push_history(&mut effects, HistoryItem::Error {
+                        message: "cannot activate a skill while a run is active".to_owned(),
+                    });
+                } else {
+                    match self.service.activate_skill(skill_name) {
+                        Ok(message) => {
+                            self.push_history(&mut effects, HistoryItem::Notice { message });
+                            if let Some(task) = raw_argument {
+                                return self.submit_prompt_text(task.to_owned(), effects);
+                            }
+                        }
+                        Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                    }
+                }
+            }
             "/mode" => {
                 if self.phase.has_active_run() {
                     self.push_history(
@@ -1654,16 +1752,54 @@ impl InteractiveController {
                 }
             },
             other => {
-                self.push_history(
-                    &mut effects,
-                    HistoryItem::Notice {
-                        message: format!(
-                            "unknown command {other}; /help lists what this revision supports"
-                        ),
-                    },
-                );
+                match self.service.expand_prompt_command(
+                    other.trim_start_matches('/'),
+                    raw_argument.unwrap_or_default(),
+                ) {
+                    Ok(Some(prompt)) => return self.submit_prompt_text(prompt, effects),
+                    Ok(None) => self.push_history(
+                        &mut effects,
+                        HistoryItem::Notice {
+                            message: format!(
+                                "unknown command {other}; /help lists built-in commands and configured prompt commands"
+                            ),
+                        },
+                    ),
+                    Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                }
             }
         }
+        effects.push(Effect::Redraw);
+        effects
+    }
+
+    fn submit_prompt_text(&mut self, text: String, mut effects: Vec<Effect>) -> Vec<Effect> {
+        if self.phase.has_active_run() {
+            self.push_history(
+                &mut effects,
+                HistoryItem::Error {
+                    message: "cannot start a prompt command while a run is active".to_owned(),
+                },
+            );
+            effects.push(Effect::Redraw);
+            return effects;
+        }
+        if let Some(problem) = self.service.provider_problem() {
+            self.push_history(&mut effects, HistoryItem::Error { message: problem });
+            effects.push(Effect::Redraw);
+            return effects;
+        }
+        let text = self.attach_pending_shell_outputs(text);
+        self.continuations = 0;
+        self.fresh_run(Instant::now(), Some(text.clone()));
+        self.service.submit(SubmitRequest {
+            input_id: InputId::generate(),
+            text: text.clone(),
+            answer_question_id: None,
+            shell_prefix: None,
+            compact_guidance: None,
+        });
+        self.push_history(&mut effects, HistoryItem::User { text });
         effects.push(Effect::Redraw);
         effects
     }
@@ -2091,6 +2227,41 @@ impl InteractiveController {
         effects
     }
 
+    fn answer_mcp_elicitation(&mut self, answer: &str) -> Vec<Effect> {
+        let Some(pending) = self.pending_mcp_elicitation.as_ref() else {
+            return Vec::new();
+        };
+        match self
+            .service
+            .respond_mcp_elicitation(&pending.request_id, answer)
+        {
+            Ok(()) => {
+                let pending = self
+                    .pending_mcp_elicitation
+                    .take()
+                    .expect("pending MCP input");
+                self.phase = AppPhase::Running;
+                let result = if answer.trim().eq_ignore_ascii_case("decline") {
+                    "declined"
+                } else if answer.trim().eq_ignore_ascii_case("cancel") {
+                    "canceled"
+                } else {
+                    "accepted"
+                };
+                vec![
+                    Effect::History(HistoryItem::Notice {
+                        message: format!("MCP elicitation from {} {result}", pending.server),
+                    }),
+                    Effect::Redraw,
+                ]
+            }
+            Err(message) => vec![
+                Effect::History(HistoryItem::Error { message }),
+                Effect::Redraw,
+            ],
+        }
+    }
+
     fn propose_always_allow(&mut self) -> Vec<Effect> {
         let Some(pending) = &mut self.pending_approval else {
             return Vec::new();
@@ -2145,6 +2316,7 @@ impl InteractiveController {
 
     fn finish_run(&mut self) {
         self.pending_approval = None;
+        self.pending_mcp_elicitation = None;
         self.open_tool = None;
         self.phase = if self.pending_question.is_some() {
             AppPhase::WaitingInput

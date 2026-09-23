@@ -481,6 +481,9 @@ pub struct ProviderRequest {
     pub request_id: RequestId,
     pub model: String,
     pub messages: Vec<ProviderMessage>,
+    /// Optional per-request output cap, used for bounded nested sampling calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
     #[serde(default)]
     pub tool_schemas: Vec<Value>,
     pub temperature: Option<f32>,
@@ -498,6 +501,7 @@ impl ProviderRequest {
             request_id,
             model: model.into(),
             messages,
+            max_output_tokens: None,
             tool_schemas: Vec::new(),
             temperature: None,
             metadata: json!({}),
@@ -507,6 +511,12 @@ impl ProviderRequest {
     #[must_use]
     pub fn with_tool_schemas(mut self, tool_schemas: Vec<Value>) -> Self {
         self.tool_schemas = tool_schemas;
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_output_tokens(mut self, max_output_tokens: u32) -> Self {
+        self.max_output_tokens = Some(max_output_tokens);
         self
     }
 }
@@ -1104,6 +1114,9 @@ impl ModelProvider for OpenAiChatAdapter {
         Box::pin(async move {
             let token = credentials.resolve()?;
             let mut body = json!({ "model": request.model, "messages": wire_messages(&request.messages), "stream": true, "temperature": request.temperature });
+            if let Some(max_tokens) = request.max_output_tokens {
+                body["max_tokens"] = json!(max_tokens);
+            }
             if let Some(thinking) = &thinking_parameter {
                 body["thinking"] = thinking.clone();
             }

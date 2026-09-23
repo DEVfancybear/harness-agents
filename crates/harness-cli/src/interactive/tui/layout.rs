@@ -206,6 +206,16 @@ fn modal_rows(modal: &Modal, available: u16) -> u16 {
         Modal::Question { prompt, options } => {
             u16::try_from(prompt.lines().count() + options.len() + 3).unwrap_or(u16::MAX)
         }
+        Modal::McpElicitation {
+            message,
+            requested_schema,
+        } => {
+            let schema_lines = requested_schema
+                .as_ref()
+                .and_then(|schema| serde_json::to_string_pretty(schema).ok())
+                .map_or(0, |schema| schema.lines().count());
+            u16::try_from(message.lines().count() + schema_lines + 4).unwrap_or(u16::MAX)
+        }
         Modal::Overlay { lines, .. } => u16::try_from(lines.len() + 2).unwrap_or(u16::MAX),
     };
     content.min(available)

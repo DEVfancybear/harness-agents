@@ -485,7 +485,7 @@ impl TurnDriver {
     async fn run_turn_inner(
         &self,
         source_session_id: Option<&harness_types::SessionId>,
-        request: RunRequest,
+        mut request: RunRequest,
         options: TurnOptions,
         observer: Arc<dyn TurnObserver>,
         cancellation: CancellationToken,
@@ -902,6 +902,12 @@ impl TurnDriver {
                             }
                             _ => None,
                         };
+                        if let ToolOutput::SkillActivated { block } = &view.output {
+                            request
+                                .project_rules
+                                .retain(|existing| existing.id != block.id);
+                            request.project_rules.push(block.clone());
+                        }
                         observer.observe(TurnProgress::ToolSettled {
                             name: name.clone(),
                             ok: blocked.is_none(),
@@ -1655,6 +1661,12 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             operation, output, ..
         } => format!("git {operation}:\n{output}"),
         ToolOutput::TaskUpdate { note } => format!("task_update: {note}"),
+        ToolOutput::SkillActivated { block } => format!(
+            "activated skill {} ({}) on the {} context channel",
+            block.id,
+            block.digest.as_str(),
+            block.channel.as_str()
+        ),
         other => format!("{name}: {other:?}"),
     };
     truncate_text(&body, TOOL_RESULT_LIMIT)

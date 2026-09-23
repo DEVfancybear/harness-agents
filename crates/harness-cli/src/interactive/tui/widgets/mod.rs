@@ -65,6 +65,23 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
                 lines.push("hoặc nhập câu trả lời rồi nhấn Enter".to_owned());
                 help::render(frame, area, "question", &lines, 0, theme);
             }
+            Some(crate::interactive::events::Modal::McpElicitation {
+                message,
+                requested_schema,
+            }) => {
+                let mut lines = vec![message.clone()];
+                if let Some(schema) = requested_schema {
+                    let rendered =
+                        serde_json::to_string_pretty(schema).unwrap_or_else(|_| "{}".to_owned());
+                    lines.push(format!("schema: {rendered}"));
+                    lines.push("enter JSON object · decline · cancel".to_owned());
+                } else {
+                    lines.push(
+                        "complete the URL action, then enter done · decline · cancel".to_owned(),
+                    );
+                }
+                help::render(frame, area, "MCP input", &lines, 0, theme);
+            }
             Some(crate::interactive::events::Modal::Overlay {
                 title,
                 lines,

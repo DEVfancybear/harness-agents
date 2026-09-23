@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use harness_tools::ConfiguredToolHook;
-use harness_types::{ErrorCode, HarnessConfig, HarnessConfigV2, HarnessError, ProviderConfigV2};
+use harness_types::{
+    ErrorCode, HarnessConfig, HarnessConfigV2, HarnessError, McpServerConfigV2, ProviderConfigV2,
+};
 use serde::Serialize;
 
 /// Provider-neutral preset values for the existing default `DeepSeek` connection.
@@ -103,6 +105,8 @@ pub struct ResolvedConfig {
     pub compaction_reserve_tokens: u64,
     pub retry_after_max_seconds: u64,
     pub hooks: Vec<ConfiguredToolHook>,
+    pub mcp_servers: BTreeMap<String, McpServerConfigV2>,
+    pub project_trusted: bool,
     pub bell: bool,
     pub explain: Vec<ConfigExplainEntry>,
     pub project_config_reason: Option<String>,
@@ -130,6 +134,7 @@ pub fn resolve_layers(
     let mut output_reservation_tokens = 1024_u64;
     let mut compaction_reserve_tokens = 16_384_u64;
     let mut hooks = Vec::new();
+    let mut mcp_servers = BTreeMap::new();
     let mut notify_command = None;
     let mut bell = false;
     let mut approval = "ask".to_owned();
@@ -207,6 +212,7 @@ pub fn resolve_layers(
             config,
             ConfigLayer::User,
         )?;
+        mcp_servers.extend(config.mcp_servers.clone());
     }
 
     let canonical_root = project_root
@@ -271,6 +277,7 @@ pub fn resolve_layers(
                 &config,
                 ConfigLayer::Project,
             )?;
+            mcp_servers.extend(config.mcp_servers.clone());
         }
     } else if project_path.exists() {
         project_reason = Some(
@@ -332,6 +339,7 @@ pub fn resolve_layers(
             ConfigLayer::Local,
             &mut entries,
         )?;
+        mcp_servers.extend(config.mcp_servers.clone());
         if let Some(value) = config.ui.as_ref().and_then(|ui| ui.bell) {
             bell = value;
         }
@@ -514,6 +522,8 @@ pub fn resolve_layers(
         compaction_reserve_tokens,
         retry_after_max_seconds,
         hooks,
+        mcp_servers,
+        project_trusted: trusted,
         bell,
         explain,
         project_config_reason: project_reason,

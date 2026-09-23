@@ -933,19 +933,19 @@ async fn m6_02_scope_lease_and_partial_init_cleanup() {
 
 #[tokio::test]
 async fn m6_03_mcp_schema_and_resource_provenance() {
-    // The support matrix never claims a feature the SDK merely offers.
+    // G10 closes every gap that was previously listed as unsupported. The
+    // matrix describes host paths, not just methods present in rmcp.
     assert_eq!(McpSupportMatrix::spec_revision(), "2026-07-28");
     assert_eq!(McpSupportMatrix::sdk_version(), "3.4.0");
-    assert!(McpFeature::Tools.is_supported());
-    assert!(McpFeature::Resources.is_supported());
-    assert!(!McpFeature::Prompts.is_supported());
-    assert!(!McpFeature::Sampling.is_supported());
-    assert!(!McpFeature::RemoteTransport.is_supported());
-    assert!(McpSupportMatrix::unsupported().len() >= 5);
-    assert_code(
-        McpSupportMatrix::require(McpFeature::Sampling),
-        ErrorCode::ExtensionProtocolUnsupported,
+    assert!(
+        McpSupportMatrix::ALL
+            .into_iter()
+            .all(McpFeature::is_supported)
     );
+    assert!(McpSupportMatrix::unsupported().is_empty());
+    for feature in McpSupportMatrix::ALL {
+        assert!(McpSupportMatrix::require(feature).is_ok(), "{feature:?}");
+    }
 
     // A real server process, discovered through the real SDK.
     let client = connect_mcp("normal", 1).await.expect("fixture connects");
@@ -979,11 +979,13 @@ async fn m6_03_mcp_schema_and_resource_provenance() {
     assert_eq!(content.provenance.generation, 1);
     assert!(!content.provenance.server.is_empty());
 
-    // A resource the server never advertised is refused locally.
-    assert_code(
-        client.read_resource("fixture://observations/absent").await,
-        ErrorCode::PolicyDenied,
-    );
+    // Reads route to the MCP server for URIs it serves, even when metadata
+    // did not list them up front.
+    let unlisted = client
+        .read_resource("fixture://observations/absent")
+        .await
+        .expect("server-served resource reads");
+    assert!(unlisted.text.contains("fixture body for"));
 
     // Arguments are validated against the advertised schema before dispatch.
     let schema = &client.tools()["observe"].input_schema;
@@ -1855,22 +1857,17 @@ fn m6_cli_reports_capability_matrix_and_catalog() {
         .expect("supported is an array");
     assert!(supported.iter().any(|value| value == "tools"));
     assert!(supported.iter().any(|value| value == "resources"));
-    assert!(
-        !supported.iter().any(|value| value == "sampling"),
-        "an unsupported feature must never be advertised"
-    );
+    for feature in McpSupportMatrix::ALL {
+        assert!(
+            supported.iter().any(|value| value == feature.as_str()),
+            "supported feature {} is advertised",
+            feature.as_str()
+        );
+    }
     let unsupported = reported["mcp"]["unsupported"]
         .as_array()
         .expect("unsupported is an array");
-    assert!(unsupported.len() >= 5);
-    for entry in unsupported {
-        assert!(
-            entry["reason"]
-                .as_str()
-                .is_some_and(|reason| !reason.is_empty()),
-            "every unsupported feature names a reason: {entry}"
-        );
-    }
+    assert!(unsupported.is_empty(), "all matrix gaps were implemented");
 
     // A skill directory reports what it asks for and grants nothing.
     let directory = tempfile::tempdir().expect("tempdir");

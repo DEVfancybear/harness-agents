@@ -103,6 +103,11 @@
           "type": "string"
         },
         {
+          "const": "role_unavailable",
+          "description": "A requested worker role cannot run with the host's current isolation capabilities.",
+          "type": "string"
+        },
+        {
           "const": "delegation_queue_full",
           "description": "A delegation was refused because the queue already holds as many workers\nas it may. Distinct from `BudgetExhausted`, which says no more requests may\nbe spent: a full queue is backpressure and clears when a worker settles,\nwhere an exhausted budget does not clear at all.",
           "type": "string"

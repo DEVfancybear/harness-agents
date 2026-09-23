@@ -117,10 +117,7 @@ impl SkillDescriptor {
                 format!("skill {} is not valid UTF-8", path.display()),
             )
         })?;
-        let name = path.file_stem().map_or_else(
-            || "unnamed".to_owned(),
-            |stem| stem.to_string_lossy().into_owned(),
-        );
+        let name = front_matter(&content, "name").unwrap_or_else(|| skill_name_from_path(path));
         let version = front_matter(&content, "version").unwrap_or_else(|| "0".to_owned());
         Ok(Self {
             skill_id: SkillId::generate(),
@@ -277,6 +274,11 @@ pub fn discover_skills(
                 .is_some_and(|ext| ext == "md" || ext == "skill")
         {
             paths.push(path);
+        } else if path.is_dir() {
+            let document = path.join("SKILL.md");
+            if document.is_file() {
+                paths.push(document);
+            }
         }
     }
     paths.sort();
@@ -343,11 +345,26 @@ fn front_matter(content: &str, key: &str) -> Option<String> {
     None
 }
 
+fn skill_name_from_path(path: &Path) -> String {
+    if path.file_name().is_some_and(|name| name == "SKILL.md")
+        && let Some(directory) = path.parent().and_then(Path::file_name)
+    {
+        return directory.to_string_lossy().into_owned();
+    }
+    path.file_stem().map_or_else(
+        || "unnamed".to_owned(),
+        |stem| stem.to_string_lossy().into_owned(),
+    )
+}
+
 /// Read a comma-separated front-matter list. Absent is empty; a skill that asks
 /// for nothing is the common case.
 fn front_matter_list(content: &str, key: &str) -> Vec<String> {
     front_matter(content, key).map_or_else(Vec::new, |value| {
         value
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
             .split(',')
             .map(|item| item.trim().trim_matches('"').trim().to_owned())
             .filter(|item| !item.is_empty())
@@ -385,6 +402,7 @@ impl TrustedSkillRoot {
 pub struct SkillCatalogEntry {
     pub skill_id: SkillId,
     pub name: String,
+    pub description: String,
     pub version: String,
     /// Digest of the whole document at scan time. Streaming, so a scan never
     /// holds the body.
@@ -756,12 +774,26 @@ fn skill_files(root: &Path) -> Result<Vec<PathBuf>, ExtensionError> {
             )
         })?;
         let path = entry.path();
-        if path.is_file()
+        let file_type = entry.file_type().map_err(|error| {
+            ExtensionError::new(
+                ErrorCode::SkillUnavailable,
+                format!("cannot inspect skill entry {}: {error}", path.display()),
+            )
+        })?;
+        if file_type.is_file()
             && path
                 .extension()
                 .is_some_and(|ext| ext == "md" || ext == "skill")
         {
             paths.push(path);
+        } else if file_type.is_dir() {
+            // Match the documented agent skill layout: one directory per
+            // skill, with its metadata and body in SKILL.md. Do not recursively
+            // treat arbitrary reference Markdown files as separate skills.
+            let document = path.join("SKILL.md");
+            if document.is_file() {
+                paths.push(document);
+            }
         }
     }
     paths.sort();
@@ -803,19 +835,24 @@ fn scan_entry(path: &Path, source: SkillSource) -> Result<SkillCatalogEntry, Ext
             format!("skill {} cannot be hashed: {error}", path.display()),
         )
     })?;
-    let name = path.file_stem().map_or_else(
-        || "unnamed".to_owned(),
-        |stem| stem.to_string_lossy().into_owned(),
-    );
+    let name = front_matter(&head_text, "name").unwrap_or_else(|| skill_name_from_path(path));
     Ok(SkillCatalogEntry {
         skill_id: SkillId::generate(),
         version: front_matter(&head_text, "version").unwrap_or_else(|| "0".to_owned()),
         name,
+        description: front_matter(&head_text, "description").unwrap_or_default(),
         digest,
         source,
         path: path.to_path_buf(),
         byte_len: metadata.len(),
-        requested_tools: front_matter_list(&head_text, "tools"),
+        requested_tools: {
+            let requested = front_matter_list(&head_text, "requested_tools");
+            if requested.is_empty() {
+                front_matter_list(&head_text, "tools")
+            } else {
+                requested
+            }
+        },
         requested_secrets: front_matter_list(&head_text, "secrets"),
     })
 }

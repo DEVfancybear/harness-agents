@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use harness_extensions::SkillCatalogEntry;
 use harness_tools::TurnLimits;
 
 const SYSTEM_PROMPT_MAX_BYTES: usize = 2 * 1024;
@@ -69,6 +70,25 @@ impl SystemPromptBuilder {
         }
         BuiltPrompt { text }
     }
+}
+
+/// Append only catalogue metadata, leaving skill bodies unread until an
+/// explicit activation. The existing system-policy byte ceiling also bounds
+/// the name/description disclosure block.
+pub fn append_skill_metadata(mut prompt: String, entries: &[SkillCatalogEntry]) -> String {
+    if entries.is_empty() || prompt.len() >= SYSTEM_PROMPT_MAX_BYTES {
+        return prompt;
+    }
+    let heading = "\nAvailable skills (activate with /skill:<name>):\n";
+    let remaining = SYSTEM_PROMPT_MAX_BYTES.saturating_sub(prompt.len());
+    if heading.len() >= remaining {
+        return prompt;
+    }
+    prompt.push_str(heading);
+    let limit = remaining - heading.len();
+    let metadata = super::skills::metadata_lines(entries, limit);
+    prompt.push_str(&metadata);
+    prompt
 }
 
 #[cfg(test)]

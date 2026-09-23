@@ -752,7 +752,7 @@ impl LineEditor {
 /// This table is the **one** source for both: [`crate::interactive::view::help_lines`]
 /// builds the reference page from it and the menu draws its rows from it, so the
 /// list a user sees while typing cannot drift from the list `/help` promises.
-pub const SLASH_COMMANDS: [SlashCommand; 26] = [
+pub const SLASH_COMMANDS: [SlashCommand; 31] = [
     SlashCommand {
         name: "/help",
         arguments: "",
@@ -812,6 +812,31 @@ pub const SLASH_COMMANDS: [SlashCommand; 26] = [
         name: "/hooks",
         arguments: "",
         summary: "list trusted hook commands and their configuration source",
+    },
+    SlashCommand {
+        name: "/mcp",
+        arguments: "",
+        summary: "show configured MCP servers, transport and tool filters",
+    },
+    SlashCommand {
+        name: "/agents",
+        arguments: "",
+        summary: "show delegated workers, steps and current status",
+    },
+    SlashCommand {
+        name: "/skills",
+        arguments: "",
+        summary: "list discovered and active skills",
+    },
+    SlashCommand {
+        name: "/skill:",
+        arguments: "<name> [args]",
+        summary: "activate a skill by name and optionally send a task",
+    },
+    SlashCommand {
+        name: "/reload",
+        arguments: "",
+        summary: "reload skills, prompt commands and instruction files",
     },
     SlashCommand {
         name: "/clear",
@@ -1286,7 +1311,7 @@ mod tests {
         );
 
         type_text(&mut editor, "re");
-        assert_eq!(names(&editor), ["/rename", "/resume"]);
+        assert_eq!(names(&editor), ["/reload", "/rename", "/resume"]);
 
         // A complete command has nothing left to suggest, and an argument means
         // the word is over: neither keeps a menu on screen.
@@ -1434,7 +1459,7 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["/rename", "/resume"]
+            ["/reload", "/rename", "/resume"]
         );
         assert_eq!(
             super::matching("/c")

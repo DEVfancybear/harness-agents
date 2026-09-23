@@ -1561,6 +1561,12 @@ pub enum ToolOutput {
     TaskUpdate {
         note: String,
     },
+    /// A user-authorized skill body to add to the next model request. The
+    /// block is retained as a typed context-channel value instead of being
+    /// reinterpreted as a tool grant.
+    SkillActivated {
+        block: harness_session::ContextBlock,
+    },
     /// Result of a trusted external extension tool. The payload is plugin data;
     /// it is recorded as evidence, never interpreted as host authority.
     ExternalTool {

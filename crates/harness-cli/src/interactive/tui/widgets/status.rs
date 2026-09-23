@@ -107,11 +107,18 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
             }
             push(Span::styled(" · Enter answers", theme.dim));
         }
+        (Some(Modal::McpElicitation { .. }), _) => {
+            push(Span::styled(" MCP input", theme.warning));
+            push(Span::styled(
+                " · JSON · decline · cancel".to_owned(),
+                theme.dim,
+            ));
+        }
         (Some(Modal::Overlay { title, .. }), _) => {
             push(Span::styled(format!(" {title}"), theme.title));
             push(Span::styled(" · Esc đóng".to_owned(), theme.dim));
         }
-        (None, AppPhase::Running | AppPhase::Canceling) => {
+        (None, AppPhase::Running | AppPhase::WaitingMcpInput | AppPhase::Canceling) => {
             let activity = if state.phase == AppPhase::Canceling {
                 "canceling"
             } else {

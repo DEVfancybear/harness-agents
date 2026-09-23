@@ -121,6 +121,89 @@
       },
       "type": "object"
     },
+    "McpServerConfigV2": {
+      "additionalProperties": false,
+      "description": "One configured MCP server. Stdio is the default transport; a remote\nStreamable HTTP endpoint may instead name an environment variable holding\nits bearer token. Secret values are never stored in configuration.",
+      "properties": {
+        "args": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "bearer_token_env": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "command": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "disabled_tools": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "enabled_tools": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "required": {
+          "default": false,
+          "type": "boolean"
+        },
+        "tool_timeout_seconds": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "transport": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "ModelConfigV2": {
       "additionalProperties": false,
       "properties": {
@@ -344,7 +427,9 @@
       "default": null
     },
     "mcp_servers": {
-      "additionalProperties": true,
+      "additionalProperties": {
+        "$ref": "#/$defs/McpServerConfigV2"
+      },
       "default": {},
       "type": "object"
     },
