@@ -132,7 +132,10 @@ async fn m1_01_data_directory_marker_is_versioned() {
             .expect("marker is JSON");
     assert_eq!(marker["schema_version"], 1);
     assert_eq!(marker["kind"], "harness-data");
-    assert_eq!(marker["store_schema_version"], 2);
+    assert_eq!(
+        marker["store_schema_version"],
+        harness_store_sqlite::STORE_SCHEMA_VERSION
+    );
     close(store).await;
 
     // Reopening never rewrites it.
@@ -181,14 +184,11 @@ async fn m1_01_store_schema_newer_than_host_is_refused() {
     let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", database.display()))
         .await
         .expect("fixture database opens");
-    sqlx::query(
-        "UPDATE schema_migrations
-         SET version = (SELECT MAX(version) + 1 FROM schema_migrations)
-         WHERE version = (SELECT MAX(version) FROM schema_migrations)",
-    )
-    .execute(&pool)
-    .await
-    .expect("newer migration row");
+    sqlx::query("INSERT INTO schema_migrations(version) VALUES (?)")
+        .bind(harness_store_sqlite::STORE_SCHEMA_VERSION + 1)
+        .execute(&pool)
+        .await
+        .expect("newer migration row");
     pool.close().await;
 
     let error = SqliteStore::open_writer(WriterOpenOptions::new(&data_dir, HostId::generate()))

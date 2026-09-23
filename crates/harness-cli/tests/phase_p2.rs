@@ -183,10 +183,12 @@ async fn await_loopback_ready(
     }
 }
 
-/// One provider call, retried only for the connection-refused signature.
+/// Retry a local provider call only when reqwest fails while sending it.
 ///
-/// The fixture serves exactly one real request, so the retry stays on the
-/// client side and a genuine protocol failure still fails on the first attempt.
+/// HTTP status, response-body and SSE protocol failures are not retried. The
+/// fixture consumes each complete request and stays available for this bounded
+/// transport retry, so a response reset cannot strand the retrying client. The
+/// adapter removes URLs from transport errors, so match its sanitized message.
 async fn stream_with_loopback_retry(
     adapter: &DeepSeekAdapter,
 ) -> (Vec<harness_providers::ProviderStreamEvent>, usize) {
@@ -200,7 +202,9 @@ async fn stream_with_loopback_retry(
             Ok(events) => return (events, attempts),
             Err(error)
                 if attempts < LOOPBACK_ATTEMPTS
-                    && error.to_string().contains("error sending request for url") =>
+                    && error
+                        .to_string()
+                        .contains("provider request failed: error sending request") =>
             {
                 // Under load the refusal can persist for a few hundred milliseconds.
                 tokio::time::sleep(std::time::Duration::from_millis(
@@ -211,6 +215,51 @@ async fn stream_with_loopback_retry(
             Err(error) => panic!("fixture adapter stream: {error}"),
         }
     }
+}
+
+/// Read one complete JSON HTTP request. The fixture must consume the body too:
+/// closing after only the headers can reset a client's still-pending upload on
+/// Windows, which reqwest reports as a failure to send the request.
+async fn read_provider_fixture_request(socket: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+    const MAX_REQUEST_BYTES: usize = 1_048_576;
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let header_end = loop {
+        match socket.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(read) => {
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+                if request.len() > MAX_REQUEST_BYTES {
+                    return None;
+                }
+            }
+        }
+    };
+    let headers = std::str::from_utf8(&request[..header_end]).ok()?;
+    let content_length = headers
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|value| value.trim().parse::<usize>().ok())
+        })
+        .flatten()
+        .unwrap_or(0);
+    let request_end = header_end.checked_add(content_length)?;
+    if request_end > MAX_REQUEST_BYTES {
+        return None;
+    }
+    while request.len() < request_end {
+        match socket.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(read) => request.extend_from_slice(&chunk[..read]),
+        }
+    }
+    Some(request)
 }
 
 #[tokio::test]
@@ -244,42 +293,24 @@ async fn p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized() {
         .await
         .expect("fixture listener");
     let address = listener.local_addr().expect("fixture address");
-    // Hardening for a loopback flake that is NOT fully explained: under the load of
-    // a full workspace run this test intermittently gets
-    // `provider_protocol ... error sending request for url (http://127.0.0.1:PORT/...)`
-    // while the same binary is green when run alone. Two measures, matching what the
-    // launch-suite fixture already does:
-    //   1. the task signals once it is scheduled, so the client does not race the
-    //      gap between `bind` (socket in listen) and the first `accept` poll;
-    //   2. a connection that closes without sending a request head is discarded and
-    //      accept continues, so a readiness probe cannot consume the single
-    //      response this fixture serves.
-    // Measured: this substantially reduces the failures but does NOT eliminate
-    // them, and `--jobs 1` does not help either, so server readiness is not the
-    // whole cause. Do not read a green run here as proof the flake is gone.
+    // Under workspace load this fixture previously closed after reading only the
+    // request headers. Reqwest was still sending the JSON body, so Windows reset
+    // the socket and reported `error sending request`. The fixture now reads the
+    // declared Content-Length, ignores empty readiness probes and stays available
+    // for the bounded transport retry below.
     let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel::<()>();
+    let (request_sender, mut request_receiver) = tokio::sync::mpsc::unbounded_channel();
     let server = tokio::spawn(async move {
         let _ = ready_sender.send(());
         loop {
             let (mut socket, _peer) = listener.accept().await.expect("fixture accepts");
-            let mut request_bytes = Vec::new();
-            let mut chunk = [0_u8; 1024];
             // A readiness probe connects and closes without sending anything, and
             // Windows reports that as a reset rather than a clean end of stream.
             // Either way it is not a request, so it must not fail the fixture:
             // treat it as empty and accept again.
-            while let Ok(read) = socket.read(&mut chunk).await {
-                if read == 0 {
-                    break;
-                }
-                request_bytes.extend_from_slice(&chunk[..read]);
-                if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            if request_bytes.is_empty() {
+            let Some(request_bytes) = read_provider_fixture_request(&mut socket).await else {
                 continue;
-            }
+            };
             let body = concat!(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
                 "data: [DONE]\n\n"
@@ -289,11 +320,10 @@ async fn p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized() {
                 body.len(),
                 body
             );
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("fixture writes");
-            return request_bytes;
+            let _ = request_sender.send(request_bytes);
+            // A bounded client retry can arrive if a local connection is reset.
+            // Keep serving complete requests until the test has observed success.
+            let _ = socket.write_all(response.as_bytes()).await;
         }
     });
     let adapter = DeepSeekAdapter::new(
@@ -314,9 +344,24 @@ async fn p2_s02_provider_streams_and_deepseek_sse_adapter_are_normalized() {
     );
     let response = assemble_stream(&events).expect("fixture response");
     assert_eq!(response.text, "ok");
-    let request_bytes = server.await.expect("fixture server");
+    server.abort();
+    let _ = server.await;
+    let request_bytes = request_receiver
+        .try_recv()
+        .expect("fixture received a complete request");
     let request_text = String::from_utf8(request_bytes).expect("fixture request UTF-8");
     assert!(request_text.contains("Bearer fixture-secret"));
+    let (_, request_body) = request_text
+        .split_once("\r\n\r\n")
+        .expect("fixture received the request headers");
+    let request_json: Value = serde_json::from_str(request_body)
+        .expect("fixture received the complete JSON request body");
+    assert_eq!(request_json["stream"], json!(true));
+    assert!(
+        request_json["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|content| content == "hello")
+    );
     assert!(
         !serde_json::to_string(&events)
             .unwrap()

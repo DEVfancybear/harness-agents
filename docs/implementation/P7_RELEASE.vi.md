@@ -2,7 +2,7 @@
 
 [English](P7_RELEASE.en.md) | Tiếng Việt
 
-Runbook triển khai; trạng thái: **đã triển khai cục bộ, acceptance chờ CI từ xa**. Dự toán: 8–11 ngày công. Target files, Rust tests và lệnh `ha` dưới đây là output tương lai, trừ khi checkout thật đã có. Riêng tài liệu này không là bằng chứng hoàn tất.
+Runbook triển khai; implementation P0–P7 đã được ghi nhận sau bản kế hoạch này. Dùng [evidence audit P0–P7](../evidence/P0-P7_AUDIT.vi.md) để xem kiểm chứng và giới hạn hiện tại; runbook này không tự là bằng chứng hoàn tất. Dự toán ban đầu: 8–11 ngày công.
 
 ## 1. Kết quả và điều kiện vào phase
 
@@ -48,7 +48,7 @@ Bằng chứng: C27 upgrade hoạt động với backlog/việc chưa xong; migr
 
 Phụ thuộc: P7-S01, P7-S02.
 
-Tách APIs invalidate/archive/forget. Xóa cần target/confirmation rõ, lan tới derived payloads/indexes/caches, thêm tombstones chống trích xuất lại. Pin unfinished work/backups; GC chỉ unreferenced artifacts qua grace period.
+Tách APIs invalidate/archive/forget. Invalidate/archive chỉ tác động lineage nguồn của current version; `forget` quét mọi source/dependency version lịch sử rồi xóa toàn bộ asset versions có thể giữ dữ liệu nguồn đó, cùng payloads/indexes/caches và tombstone chống trích xuất lại. Pin unfinished work/backups; GC chỉ unreferenced artifacts qua grace period.
 
 Bằng chứng: C28 báo evidence phiên cũ giảm, chặn dữ liệu bị xóa xuất hiện lại; công bố external/backup copies còn tồn tại.
 

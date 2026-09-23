@@ -13,6 +13,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+/// Serialize only real loopback-provider acceptance cases. Under host load,
+/// several concurrent child processes can make independent loopback listeners
+/// refuse connections even while each fixture remains available for retries.
+static LOOPBACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn loopback_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    LOOPBACK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// How many times a headless turn is retried for a refused loopback connection.
 ///
 /// This machine intermittently refuses a connection to a listener that is already
@@ -28,6 +39,27 @@ use std::time::{Duration, Instant};
 /// The budget is doubled; the sleep still caps at a few seconds so a broken host
 /// fails the suite instead of stalling it.
 const LOOPBACK_ATTEMPTS: usize = 20;
+
+/// Retry only the transient transport failure measured for child processes on this
+/// Windows host. Protocol errors, malformed responses and all other failures remain
+/// immediate test failures. Fixtures used here stay alive across attempts.
+fn run_with_loopback_retry(mut run_once: impl FnMut() -> CliRun) -> CliRun {
+    for attempt in 1..=LOOPBACK_ATTEMPTS {
+        let run = run_once();
+        if run.code() == 0
+            || !(run.stderr.contains("error sending request")
+                || run.stderr.contains("error decoding response body"))
+            || attempt == LOOPBACK_ATTEMPTS
+        {
+            return run;
+        }
+
+        let backoff_ms = (50_u64 * (1_u64 << attempt.min(4))).min(500);
+        std::thread::sleep(Duration::from_millis(backoff_ms));
+    }
+
+    unreachable!("the bounded loopback retry loop always returns")
+}
 
 /// Resolve the compiled ha executable this crate produced.
 fn cli_binary() -> PathBuf {
@@ -423,38 +455,101 @@ fn finish_fixture_response(socket: &mut std::net::TcpStream, response: &[u8]) {
     }
 }
 
-/// One-shot SSE fixture server on a real socket.
-fn sse_fixture(text: &'static str) -> (String, std::thread::JoinHandle<String>) {
+/// Do not launch a child until its fixture has actually accepted a TCP probe.
+/// Binding creates a listen queue, but under load the accept thread may not have
+/// run yet; waiting for it to consume a probe removes that startup race.
+fn wait_for_loopback_fixture(address: std::net::SocketAddr, ready: &std::sync::mpsc::Receiver<()>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match ready.try_recv() {
+            Ok(()) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("fixture accept loop exited before becoming ready")
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "fixture did not accept a loopback readiness probe"
+        );
+        match std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
+            Ok(probe) => {
+                drop(probe);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+/// Stop a retry-capable SSE fixture after its client process has exited.
+struct SseFixtureServer {
+    stop: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<String>,
+}
+
+impl SseFixtureServer {
+    fn join(self) -> String {
+        let _ = self.stop.send(());
+        self.thread.join().expect("fixture server finishes")
+    }
+}
+
+/// SSE fixture server on a real socket. It stays available for bounded provider
+/// retries until the test client exits; a one-shot listener made a lost loopback
+/// response turn every retry into a second, artificial connection refusal.
+fn sse_fixture(text: &'static str) -> (String, SseFixtureServer) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
     let address = listener.local_addr().expect("fixture address");
+    listener
+        .set_nonblocking(true)
+        .expect("fixture accepts are bounded by the stop signal");
+    let (stop, stop_rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
-        // Accept until a connection actually sends a request.
-        //
-        // A readiness probe connects and closes without sending one, and Windows
-        // reports that as a reset rather than a clean end of stream. A fixture that
-        // served the probe dropped its listener before the real turn arrived, so the
-        // turn was refused by a listener that no longer existed — measured on this
-        // host under workspace load as `service_unavailable: ... error sending
-        // request` with no URL, which is a fixture lifetime artifact and not a
-        // property of the turn under test. The newest fixture in this file already
-        // accepts in a loop; this one now does too.
+        let mut first_request = None;
         loop {
-            let (mut socket, _) = listener.accept().expect("fixture accepts");
-            if let Some(request) = read_http_request(&mut socket) {
-                let body = format!(
-                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
-                );
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                finish_fixture_response(&mut socket, response.as_bytes());
-                break request;
+            match stop_rx.try_recv() {
+                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    if let Some(request) = read_http_request(&mut socket) {
+                        let _ = ready_tx.send(());
+                        if first_request.is_none() {
+                            first_request = Some(request);
+                        }
+                        let body = format!(
+                            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
+                        );
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        finish_fixture_response(&mut socket, response.as_bytes());
+                    } else {
+                        let _ = ready_tx.send(());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("fixture accepts: {error}"),
             }
         }
+        first_request.unwrap_or_default()
     });
-    (format!("http://{address}/chat/completions"), handle)
+    wait_for_loopback_fixture(address, &ready_rx);
+    (
+        format!("http://{address}/chat/completions"),
+        SseFixtureServer {
+            stop,
+            thread: handle,
+        },
+    )
 }
 
 fn attempt_headless_turn() -> (CliRun, String) {
@@ -463,29 +558,32 @@ fn attempt_headless_turn() -> (CliRun, String) {
     let project = sandbox.path().join("project");
     std::fs::create_dir_all(&project).expect("project dir");
 
-    let output = std::process::Command::new(cli_binary())
-        .args([
-            "chat",
-            "--headless",
-            "--prompt",
-            "hello from the headless test",
-            "--json",
-        ])
-        .current_dir(&project)
-        .env("HA_HOME", sandbox.path())
-        .env("HA_PROVIDER_ENDPOINT", &endpoint)
-        .env("HA_PROVIDER_MODEL", "fixture-model")
-        .env("DEEPSEEK_API_KEY", "fixture-secret-value")
-        .stdin(Stdio::null())
-        .output()
-        .expect("ha binary runs");
-    let run = CliRun::from_output(&output);
-    let request = server.join().expect("fixture server finishes");
+    let run = run_with_loopback_retry(|| {
+        let output = std::process::Command::new(cli_binary())
+            .args([
+                "chat",
+                "--headless",
+                "--prompt",
+                "hello from the headless test",
+                "--json",
+            ])
+            .current_dir(&project)
+            .env("HA_HOME", sandbox.path())
+            .env("HA_PROVIDER_ENDPOINT", &endpoint)
+            .env("HA_PROVIDER_MODEL", "fixture-model")
+            .env("DEEPSEEK_API_KEY", "fixture-secret-value")
+            .stdin(Stdio::null())
+            .output()
+            .expect("ha binary runs");
+        CliRun::from_output(&output)
+    });
+    let request = server.join();
     (run, request)
 }
 
 #[test]
 fn i03_headless_turn_runs_through_the_real_adapter_and_keeps_the_key_out_of_output() {
+    let _loopback = loopback_test_guard();
     let (run, request) = attempt_headless_turn();
 
     assert_eq!(run.code(), 0, "stderr was: {}", run.stderr);
@@ -529,8 +627,10 @@ fn i03_headless_turn_runs_through_the_real_adapter_and_keeps_the_key_out_of_outp
 fn read_http_request(socket: &mut std::net::TcpStream) -> Option<String> {
     use std::io::Read;
 
+    const MAX_FIXTURE_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
     socket
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("fixture read timeout");
     let mut request = Vec::new();
     let mut chunk = [0_u8; 8192];
@@ -541,6 +641,9 @@ fn read_http_request(socket: &mut std::net::TcpStream) -> Option<String> {
                 request.extend_from_slice(&chunk[..read]);
                 if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
                     break index + 4;
+                }
+                if request.len() > MAX_FIXTURE_REQUEST_BYTES {
+                    return None;
                 }
             }
         }
@@ -554,9 +657,14 @@ fn read_http_request(socket: &mut std::net::TcpStream) -> Option<String> {
                 .map(|value| value.trim().parse::<usize>().unwrap_or(0))
         })
         .unwrap_or(0);
+    if length > MAX_FIXTURE_REQUEST_BYTES {
+        return None;
+    }
     while request.len() < head_end + length {
         match socket.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            // A dropped client may have sent only a prefix. It cannot consume the
+            // response intended for the next complete attempt.
+            Ok(0) | Err(_) => return None,
             Ok(read) => request.extend_from_slice(&chunk[..read]),
         }
     }
@@ -575,6 +683,7 @@ fn read_http_request(socket: &mut std::net::TcpStream) -> Option<String> {
     reason = "one wire test: fixture, launch, and the asserts"
 )]
 fn i03_a_named_file_reaches_the_model_inside_the_message() {
+    let _loopback = loopback_test_guard();
     // The body is read in full, byte-counted from `Content-Length`: a message carrying a file
     // is longer than one socket read, and half a body is not evidence.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
@@ -583,6 +692,7 @@ fn i03_a_named_file_reaches_the_model_inside_the_message() {
         .set_nonblocking(true)
         .expect("the fixture never blocks a test thread");
     let endpoint = format!("http://{address}/chat/completions");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || -> String {
         let deadline = Instant::now() + Duration::from_mins(1);
         loop {
@@ -590,16 +700,19 @@ fn i03_a_named_file_reaches_the_model_inside_the_message() {
                 Ok((mut socket, _)) => {
                     // A readiness probe connects and closes without sending a request; it is
                     // not the turn, so the fixture accepts again.
-                    if let Some(request) = read_http_request(&mut socket) {
-                        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"fixture read the log\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
-                        finish_fixture_response(&mut socket, response.as_bytes());
-                        return request;
-                    }
+                    let Some(request) = read_http_request(&mut socket) else {
+                        let _ = ready_tx.send(());
+                        continue;
+                    };
+                    let _ = ready_tx.send(());
+                    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"fixture read the log\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    finish_fixture_response(&mut socket, response.as_bytes());
+                    return request;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "no turn reached the fixture");
@@ -609,6 +722,20 @@ fn i03_a_named_file_reaches_the_model_inside_the_message() {
             }
         }
     });
+    wait_for_loopback_fixture(address, &ready_rx);
+    // An interrupted upload is not a complete request and must not consume the
+    // fixture's response. This reproduces the prefix a failed client write can
+    // leave behind under host load.
+    let mut partial = std::net::TcpStream::connect(address).expect("connect partial request");
+    std::io::Write::write_all(
+        &mut partial,
+        b"POST /chat/completions HTTP/1.1\r\nHost: fixture\r\nContent-Length: 64\r\n\r\npartial",
+    )
+    .expect("send partial request body");
+    drop(partial);
+    ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("fixture accepts and discards an incomplete request");
 
     let sandbox = Sandbox::new();
     let project = sandbox.path().join("project");
@@ -621,9 +748,7 @@ fn i03_a_named_file_reaches_the_model_inside_the_message() {
     // A refused loopback connection is a property of this host, not of the file contract, so
     // the turn is retried for that exact signature alone. The fixture keeps accepting, so a
     // retry cannot consume an answer the way a one-shot server would.
-    let mut attempt = 0;
-    let run = loop {
-        attempt += 1;
+    let run = run_with_loopback_retry(|| {
         // `Sandbox::command` starts the child in the state root, which would make the state
         // root the observed workspace. A real launch starts in the project, so this one does
         // too: the store then sits beside the project instead of inside it, which is the
@@ -637,15 +762,8 @@ fn i03_a_named_file_reaches_the_model_inside_the_message() {
             .stdin(Stdio::null())
             .output()
             .expect("ha binary runs");
-        let run = CliRun::from_output(&output);
-        if run.code() == 0
-            || !run.stderr.contains("error sending request")
-            || attempt >= LOOPBACK_ATTEMPTS
-        {
-            break run;
-        }
-        std::thread::sleep(Duration::from_millis(50 * (1 << attempt.min(6))));
-    };
+        CliRun::from_output(&output)
+    });
 
     assert_eq!(run.code(), 0, "stderr was: {}", run.stderr);
     assert!(
@@ -739,73 +857,46 @@ fn sse_fixture_multi(
     text: &'static str,
     requests: usize,
 ) -> (String, std::thread::JoinHandle<Vec<String>>) {
-    use std::io::Read;
-
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
     let address = listener.local_addr().expect("fixture address");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
         let mut bodies = Vec::new();
         // Served requests are counted; a connect that closes without sending a
         // request (the warm-up below) is not one of them.
         while bodies.len() < requests {
             let (mut socket, _) = listener.accept().expect("fixture accepts");
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 1024];
-            // Read the head, then exactly the declared body.
-            // A readiness probe connects and closes without sending a request, and
-            // Windows reports that as a reset rather than a clean end of stream.
-            // Neither is a request, so the fixture accepts again.
-            let head_end = loop {
-                let Ok(read) = socket.read(&mut chunk) else {
-                    break request.len();
-                };
-                if read == 0 {
-                    break request.len();
+            match read_http_request(&mut socket) {
+                Some(request) => {
+                    let _ = ready_tx.send(());
+                    let body = format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    finish_fixture_response(&mut socket, response.as_bytes());
+                    bodies.push(request);
                 }
-                request.extend_from_slice(&chunk[..read]);
-                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                    break index + 4;
+                None => {
+                    // A warm-up probe or an interrupted upload is not a provider
+                    // request. Leave the scripted response for the next complete
+                    // attempt so a transient loopback reset cannot eat an answer.
+                    let _ = ready_tx.send(());
                 }
-            };
-            if request.is_empty() {
-                continue;
             }
-            let head = String::from_utf8_lossy(&request[..head_end]).into_owned();
-            let length = head
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(|value| value.trim().parse::<usize>().unwrap_or(0))
-                })
-                .unwrap_or(0);
-            while request.len() < head_end + length {
-                let Ok(read) = socket.read(&mut chunk) else {
-                    break;
-                };
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&chunk[..read]);
-            }
-            let body = format!(
-                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: [DONE]\n\n"
-            );
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            finish_fixture_response(&mut socket, response.as_bytes());
-            bodies.push(String::from_utf8_lossy(&request).into_owned());
         }
         bodies
     });
+    wait_for_loopback_fixture(address, &ready_rx);
     (format!("http://{address}/chat/completions"), handle)
 }
 
 #[test]
 fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
+    let _loopback = loopback_test_guard();
     let (endpoint, server) = sse_fixture_multi("fixture answer", 2);
     let sandbox = Sandbox::new();
     let project = sandbox.path().join("project");
@@ -829,19 +920,8 @@ fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
     // contract under test, so the turn is retried for that signature alone. The
     // fixture below keeps accepting and counts only real requests, so a retry cannot
     // consume the scripted answer.
-    let run_turn_reliably = |arguments: Vec<&str>| {
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let run = run_turn(arguments.clone());
-            let refused = run.stderr.contains("error sending request");
-            if run.code() == 0 || !refused || attempt >= LOOPBACK_ATTEMPTS {
-                return run;
-            }
-            // Under load the refusal can persist for a few hundred milliseconds.
-            std::thread::sleep(Duration::from_millis(50 * (1 << attempt.min(6))));
-        }
-    };
+    let run_turn_reliably =
+        |arguments: Vec<&str>| run_with_loopback_retry(|| run_turn(arguments.clone()));
 
     let first = run_turn_reliably(vec![
         "chat",
@@ -1193,6 +1273,7 @@ fn session_status(sandbox: &Sandbox, store: &Path, session: &str) -> serde_json:
 
 #[test]
 fn i13_a_hard_kill_mid_turn_leaves_one_admitted_input_and_no_claimed_success() {
+    let _loopback = loopback_test_guard();
     hard_kill_scenario()
         .unwrap_or_else(|stderr| panic!("the killed run never reached the provider: {stderr}"));
 }
@@ -1359,19 +1440,21 @@ fn hard_kill_scenario() -> Result<(), String> {
 /// One successful headless turn with a fresh one-shot fixture.
 fn follow_up_turn(sandbox: &Sandbox, project: &Path) -> Result<CliRun, String> {
     let (endpoint, server) = sse_fixture("handled in a new session");
-    let run = run_headless_raw(
-        sandbox,
-        project,
-        &[
-            "chat",
-            "--headless",
-            "--prompt",
-            "continue after the kill",
-            "--json",
-        ],
-        Some((&endpoint, "fixture-model", "fixture-secret-value")),
-    );
-    let _ = server.join().expect("fixture server finishes");
+    let run = run_with_loopback_retry(|| {
+        run_headless_raw(
+            sandbox,
+            project,
+            &[
+                "chat",
+                "--headless",
+                "--prompt",
+                "continue after the kill",
+                "--json",
+            ],
+            Some((&endpoint, "fixture-model", "fixture-secret-value")),
+        )
+    });
+    let _ = server.join();
     if run.code() == 0 {
         Ok(run)
     } else {
@@ -1385,6 +1468,7 @@ fn follow_up_turn(sandbox: &Sandbox, project: &Path) -> Result<CliRun, String> {
 
 #[test]
 fn i04_the_binary_installed_under_a_unicode_path_follows_the_caller_directory() {
+    let _loopback = loopback_test_guard();
     let sandbox = Sandbox::new();
     // An installed copy outside the build tree, under a path with spaces and
     // Vietnamese characters: this is the artifact an end user runs, not the
@@ -1403,18 +1487,20 @@ fn i04_the_binary_installed_under_a_unicode_path_follows_the_caller_directory() 
         );
 
         let (endpoint, server) = sse_fixture("the installed binary answers");
-        let output = std::process::Command::new(&installed)
-            .args(["chat", "--headless", "--prompt", "hello", "--json"])
-            .current_dir(&caller)
-            .env("HA_HOME", sandbox.path())
-            .env("HA_PROVIDER_ENDPOINT", &endpoint)
-            .env("HA_PROVIDER_MODEL", "fixture-model")
-            .env("DEEPSEEK_API_KEY", "fixture-secret-value")
-            .stdin(Stdio::null())
-            .output()
-            .expect("the installed binary runs");
-        let run = CliRun::from_output(&output);
-        let _ = server.join().expect("fixture server finishes");
+        let run = run_with_loopback_retry(|| {
+            let output = std::process::Command::new(&installed)
+                .args(["chat", "--headless", "--prompt", "hello", "--json"])
+                .current_dir(&caller)
+                .env("HA_HOME", sandbox.path())
+                .env("HA_PROVIDER_ENDPOINT", &endpoint)
+                .env("HA_PROVIDER_MODEL", "fixture-model")
+                .env("DEEPSEEK_API_KEY", "fixture-secret-value")
+                .stdin(Stdio::null())
+                .output()
+                .expect("the installed binary runs");
+            CliRun::from_output(&output)
+        });
+        let _ = server.join();
         assert_eq!(
             run.code(),
             0,

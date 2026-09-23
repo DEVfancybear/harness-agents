@@ -12,8 +12,8 @@ use std::{
 };
 
 use harness_store_sqlite::{SqliteStore, StorePaths, WriterOpenOptions};
-use harness_types::{ContentHash, ErrorCode, HostId};
-use sqlx::{Connection, Row, SqliteConnection};
+use harness_types::{ContentHash, ErrorCode, EventId, HostId};
+use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
 
 use crate::contracts::{
     ArtifactPin, BACKUP_DATABASE_NAME, BACKUP_MANIFEST_NAME, BackupManifest,
@@ -59,20 +59,24 @@ pub async fn create_backup(
         ));
     }
     let backup_dir = backup_dir.as_ref().to_path_buf();
-    if backup_dir.exists() {
-        let manifest = backup_dir.join(BACKUP_MANIFEST_NAME);
-        if manifest.is_file() || backup_dir.join(BACKUP_DATABASE_NAME).is_file() {
-            return Err(MaintenanceError::new(
-                ErrorCode::BackupManifestInvalid,
-                format!(
-                    "{} already holds a backup; refusing to overwrite it",
-                    backup_dir.display()
-                ),
-            ));
-        }
-    }
-    std::fs::create_dir_all(&backup_dir)?;
-    let target = backup_dir.join(BACKUP_DATABASE_NAME);
+    ensure_new_backup_destination(&backup_dir)?;
+    let parent = backup_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    ensure_new_backup_destination(&backup_dir)?;
+
+    // Build beside the final path. Errors at any stage remove the unpublished
+    // snapshot, while the final rename publishes the database, artifacts and
+    // manifest as one complete directory.
+    let staging_path = parent.join(format!(".harness-backup-{}", EventId::generate()));
+    std::fs::create_dir(&staging_path)?;
+    let mut staging = BackupStagingDir {
+        path: staging_path,
+        published: false,
+    };
+    let target = staging.path.join(BACKUP_DATABASE_NAME);
 
     // SQLite's own snapshot support produces a complete, consistent database
     // file, including everything committed from the write-ahead log.
@@ -125,16 +129,30 @@ pub async fn create_backup(
 
     let database_bytes = std::fs::read(&target)?;
     let database_hash = ContentHash::from_bytes(&database_bytes);
-    let database_byte_len = u64::try_from(database_bytes.len()).unwrap_or(u64::MAX);
+    let database_byte_len = u64::try_from(database_bytes.len()).map_err(|_| {
+        MaintenanceError::new(
+            ErrorCode::BackupManifestInvalid,
+            "the backup database is too large to describe",
+        )
+    })?;
 
     // Read the pinned artifacts and schema revisions from the snapshot itself, so
     // the manifest describes the snapshot rather than the live store.
-    let snapshot = SqliteStore::open_read_only(&backup_dir).await?;
+    let snapshot = SqliteStore::open_read_only(&staging.path).await?;
     let artifacts = read_artifact_pins(&snapshot).await?;
     let schema_revisions = read_schema_revisions(&snapshot).await?;
-    let tombstones = read_tombstone_ids(&snapshot).await.unwrap_or_default();
-    let pins = read_retention_pins(&snapshot).await.unwrap_or_default();
-    let total_artifact_bytes = artifacts.iter().map(|pin| pin.byte_len).sum();
+    // These are part of the restore contract, not optional diagnostics. A
+    // damaged or incompatible snapshot must not be certified with empty lists.
+    let tombstones = read_tombstone_ids(&snapshot).await?;
+    let pins = read_retention_pins(&snapshot).await?;
+    let total_artifact_bytes = artifacts.iter().try_fold(0_u64, |total, pin| {
+        total.checked_add(pin.byte_len).ok_or_else(|| {
+            MaintenanceError::new(
+                ErrorCode::BackupManifestInvalid,
+                "the total artifact byte count overflows",
+            )
+        })
+    })?;
     snapshot.close().await?;
 
     // Copy every referenced artifact next to the snapshot and verify the bytes
@@ -142,7 +160,8 @@ pub async fn create_backup(
     let artifact_dir = backup_dir.join("artifacts");
     let mut verified = Vec::with_capacity(artifacts.len());
     for pin in &artifacts {
-        let source = paths.data_dir.join(&pin.relative_path);
+        let source =
+            resolve_contained_file(&paths.data_dir, &pin.relative_path, "source artifact")?;
         let bytes = std::fs::read(&source).map_err(|error| {
             MaintenanceError::new(
                 ErrorCode::BackupManifestInvalid,
@@ -162,7 +181,7 @@ pub async fn create_backup(
                 ),
             ));
         }
-        let destination = backup_dir.join(&pin.relative_path);
+        let destination = staging.path.join(&pin.relative_path);
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -189,11 +208,14 @@ pub async fn create_backup(
         ..manifest
     };
     manifest.validate()?;
-    let manifest_path = backup_dir.join(BACKUP_MANIFEST_NAME);
+    let manifest_path = staging.path.join(BACKUP_MANIFEST_NAME);
     let rendered = serde_json::to_vec_pretty(&manifest).map_err(|_| {
         MaintenanceError::new(ErrorCode::InvalidPayload, "manifest is not serializable")
     })?;
     std::fs::write(&manifest_path, rendered)?;
+    ensure_new_backup_destination(&backup_dir)?;
+    std::fs::rename(&staging.path, &backup_dir)?;
+    staging.published = true;
 
     Ok(BackupOutcome {
         backup_dir: backup_dir.to_string_lossy().into_owned(),
@@ -206,12 +228,45 @@ pub async fn create_backup(
     })
 }
 
+fn ensure_new_backup_destination(destination: &Path) -> Result<(), MaintenanceError> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(_) => Err(MaintenanceError::new(
+            ErrorCode::BackupManifestInvalid,
+            format!(
+                "{} already exists; backup requires a new directory",
+                destination.display()
+            ),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+struct BackupStagingDir {
+    path: PathBuf,
+    published: bool,
+}
+
+impl Drop for BackupStagingDir {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 /// Validate a backup without restoring it. This is what the doctor uses.
 pub async fn verify_backup(
     backup_dir: impl AsRef<Path>,
 ) -> Result<BackupManifest, MaintenanceError> {
     let dir = backup_dir.as_ref();
-    let manifest_path = dir.join(BACKUP_MANIFEST_NAME);
+    let backup_root = std::fs::canonicalize(dir).map_err(|error| {
+        MaintenanceError::new(
+            ErrorCode::BackupManifestInvalid,
+            format!("cannot resolve backup directory {}: {error}", dir.display()),
+        )
+    })?;
+    let manifest_path = resolve_contained_file(&backup_root, BACKUP_MANIFEST_NAME, "manifest")?;
     let bytes = std::fs::read(&manifest_path).map_err(|error| {
         MaintenanceError::new(
             ErrorCode::BackupManifestInvalid,
@@ -226,7 +281,23 @@ pub async fn verify_backup(
     })?;
     manifest.validate()?;
 
-    let database = dir.join(&manifest.database_file);
+    verify_backup_files(&backup_root, &manifest).await?;
+    verify_manifest_snapshot(dir, &manifest).await?;
+    Ok(manifest)
+}
+
+async fn verify_backup_files(
+    backup_root: &Path,
+    manifest: &BackupManifest,
+) -> Result<(), MaintenanceError> {
+    if manifest.database_file != BACKUP_DATABASE_NAME {
+        return Err(MaintenanceError::new(
+            ErrorCode::BackupManifestInvalid,
+            "the backup database must use the supported database file name",
+        ));
+    }
+
+    let database = resolve_contained_file(backup_root, &manifest.database_file, "backup database")?;
     let database_bytes = std::fs::read(&database).map_err(|error| {
         MaintenanceError::new(
             ErrorCode::BackupManifestInvalid,
@@ -239,8 +310,26 @@ pub async fn verify_backup(
             "the backup database does not match its manifest hash",
         ));
     }
+    let database_byte_len = u64::try_from(database_bytes.len()).map_err(|_| {
+        MaintenanceError::new(
+            ErrorCode::BackupManifestInvalid,
+            "the backup database is too large to describe",
+        )
+    })?;
+    if database_byte_len != manifest.database_byte_len {
+        return Err(MaintenanceError::new(
+            ErrorCode::BackupManifestInvalid,
+            "the backup database byte length does not match its manifest",
+        ));
+    }
+    if !verify_snapshot_integrity(&database).await? {
+        return Err(MaintenanceError::new(
+            ErrorCode::SnapshotCorrupt,
+            "the backup database failed SQLite integrity_check",
+        ));
+    }
     for pin in &manifest.artifacts {
-        let path = dir.join(&pin.relative_path);
+        let path = resolve_contained_file(backup_root, &pin.relative_path, "backup artifact")?;
         let bytes = std::fs::read(&path).map_err(|error| {
             MaintenanceError::new(
                 ErrorCode::BackupManifestInvalid,
@@ -256,8 +345,61 @@ pub async fn verify_backup(
                 ),
             ));
         }
+        let byte_len = u64::try_from(bytes.len()).map_err(|_| {
+            MaintenanceError::new(
+                ErrorCode::BackupManifestInvalid,
+                format!(
+                    "backup artifact {} is too large to describe",
+                    pin.relative_path
+                ),
+            )
+        })?;
+        if byte_len != pin.byte_len {
+            return Err(MaintenanceError::new(
+                ErrorCode::BackupManifestInvalid,
+                format!(
+                    "backup artifact {} has a byte length that does not match its manifest",
+                    pin.relative_path
+                ),
+            ));
+        }
     }
-    Ok(manifest)
+    Ok(())
+}
+
+async fn verify_manifest_snapshot(
+    backup_dir: &Path,
+    manifest: &BackupManifest,
+) -> Result<(), MaintenanceError> {
+    // The manifest digest detects accidental changes to the manifest body, but
+    // it is not a signature. Cross-check every operational field against the
+    // snapshot so a self-consistent manifest cannot omit or invent metadata.
+    // StorePaths builds the SQLite URL from this caller path; keep the original
+    // path form here because Windows drive separators are not URL escapes.
+    let snapshot = SqliteStore::open_read_only(backup_dir).await?;
+    let artifacts = read_artifact_pins(&snapshot).await?;
+    let schema_revisions = read_schema_revisions(&snapshot).await?;
+    let tombstones = read_tombstone_ids(&snapshot).await?;
+    let pins = read_retention_pins(&snapshot).await?;
+    snapshot.close().await?;
+
+    for (matches, description) in [
+        (artifacts == manifest.artifacts, "artifact rows"),
+        (
+            schema_revisions == manifest.schema_revisions,
+            "schema revisions",
+        ),
+        (tombstones == manifest.tombstones, "tombstone identities"),
+        (pins == manifest.pins, "retention pins"),
+    ] {
+        if !matches {
+            return Err(MaintenanceError::new(
+                ErrorCode::BackupManifestInvalid,
+                format!("the backup manifest {description} do not match its database snapshot"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Restore a backup into a **new** data directory and validate it.
@@ -268,43 +410,49 @@ pub async fn restore_backup(
     backup_dir: impl AsRef<Path>,
     destination: impl AsRef<Path>,
 ) -> Result<RestoreOutcome, MaintenanceError> {
-    let backup_dir = backup_dir.as_ref();
+    let backup_dir = std::fs::canonicalize(backup_dir.as_ref()).map_err(|error| {
+        MaintenanceError::new(
+            ErrorCode::BackupManifestInvalid,
+            format!("cannot resolve backup directory: {error}"),
+        )
+    })?;
     let destination = destination.as_ref().to_path_buf();
-    let manifest = verify_backup(backup_dir).await?;
+    let manifest = verify_backup(&backup_dir).await?;
+    ensure_new_restore_destination(&destination)?;
 
-    let destination_paths = StorePaths::new(&destination);
-    if destination_paths.database_path.exists() {
-        return Err(MaintenanceError::new(
-            ErrorCode::RestoreTargetConflict,
-            format!(
-                "{} already holds a store; restore requires a fresh directory",
-                destination.display()
-            ),
-        ));
-    }
-    if destination.join(".active").is_file() {
-        return Err(MaintenanceError::new(
-            ErrorCode::RestoreTargetConflict,
-            "the destination is marked active; refusing to overwrite it",
-        ));
-    }
-    std::fs::create_dir_all(&destination)?;
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    ensure_new_restore_destination(&destination)?;
+
+    // Build beside the final path so every failure cleans up its partial copy.
+    // Publishing happens only after SQLite, artifacts, and provenance validate.
+    let staging_path = parent.join(format!(".harness-restore-{}", EventId::generate()));
+    std::fs::create_dir(&staging_path)?;
+    let mut staging = RestoreStagingDir {
+        path: staging_path,
+        published: false,
+    };
+    let staging_paths = StorePaths::new(&staging.path);
 
     // Copy the snapshot, then let SQLite validate it before trusting it.
-    let snapshot_source = backup_dir.join(&manifest.database_file);
-    std::fs::copy(&snapshot_source, &destination_paths.database_path)?;
+    let snapshot_source =
+        resolve_contained_file(&backup_dir, &manifest.database_file, "backup database")?;
+    std::fs::copy(&snapshot_source, &staging_paths.database_path)?;
 
-    let database_verified = verify_snapshot_integrity(&destination_paths.database_path).await?;
+    let database_verified = verify_snapshot_integrity(&staging_paths.database_path).await?;
 
     let mut artifacts_verified = 0usize;
     let mut missing = Vec::new();
     let mut corrupt = Vec::new();
     for pin in &manifest.artifacts {
-        let source = backup_dir.join(&pin.relative_path);
+        let source = resolve_contained_file(&backup_dir, &pin.relative_path, "backup artifact")?;
         match std::fs::read(&source) {
             Ok(bytes) => {
                 if ContentHash::from_bytes(&bytes) == pin.content_hash {
-                    let target = destination.join(&pin.relative_path);
+                    let target = staging.path.join(&pin.relative_path);
                     if let Some(parent) = target.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -345,15 +493,84 @@ pub async fn restore_backup(
         "restored_unix_ms": now_unix_ms(),
         "activated": false,
     });
-    std::fs::write(
-        destination.join("restore.json"),
-        serde_json::to_vec_pretty(&provenance).unwrap_or_default(),
-    )?;
+    let provenance = serde_json::to_vec_pretty(&provenance).map_err(|error| {
+        MaintenanceError::new(
+            ErrorCode::InvalidPayload,
+            format!("cannot serialize restore provenance: {error}"),
+        )
+    })?;
+    std::fs::write(staging.path.join("restore.json"), provenance)?;
+    ensure_new_restore_destination(&destination)?;
+    std::fs::rename(&staging.path, &destination)?;
+    staging.published = true;
 
     Ok(RestoreOutcome {
         destination: destination.to_string_lossy().into_owned(),
         report,
     })
+}
+
+/// Resolve a manifest-controlled relative file only when its canonical target
+/// remains inside the selected directory. Canonicalizing the returned path
+/// prevents a symlink/reparse point from redirecting a later read elsewhere.
+fn resolve_contained_file(
+    directory: &Path,
+    relative_path: &str,
+    description: &str,
+) -> Result<PathBuf, MaintenanceError> {
+    crate::contracts::validate_relative_path(description, relative_path)?;
+    let root = std::fs::canonicalize(directory).map_err(|error| {
+        MaintenanceError::new(
+            ErrorCode::BackupManifestInvalid,
+            format!("cannot resolve {description} root: {error}"),
+        )
+    })?;
+    let candidate = root.join(relative_path);
+    let resolved = std::fs::canonicalize(&candidate).map_err(|error| {
+        MaintenanceError::new(
+            ErrorCode::BackupManifestInvalid,
+            format!(
+                "cannot resolve {description} at {}: {error}",
+                candidate.display()
+            ),
+        )
+    })?;
+    if !resolved.starts_with(&root)
+        || !std::fs::metadata(&resolved).is_ok_and(|metadata| metadata.is_file())
+    {
+        return Err(MaintenanceError::new(
+            ErrorCode::BackupManifestInvalid,
+            format!("{description} must be a regular file inside the selected directory"),
+        ));
+    }
+    Ok(resolved)
+}
+
+fn ensure_new_restore_destination(destination: &Path) -> Result<(), MaintenanceError> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(_) => Err(MaintenanceError::new(
+            ErrorCode::RestoreTargetConflict,
+            format!(
+                "{} already exists; restore requires a new directory",
+                destination.display()
+            ),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+struct RestoreStagingDir {
+    path: PathBuf,
+    published: bool,
+}
+
+impl Drop for RestoreStagingDir {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 /// Open the restored store read-only so the caller can decide whether to
@@ -379,7 +596,11 @@ pub async fn activate_restored(
 }
 
 async fn verify_snapshot_integrity(path: &Path) -> Result<bool, MaintenanceError> {
-    let mut connection = SqliteConnection::connect(&format!("sqlite:{}", path.display()))
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .create_if_missing(false);
+    let mut connection = SqliteConnection::connect_with(&options)
         .await
         .map_err(|error| {
             MaintenanceError::new(

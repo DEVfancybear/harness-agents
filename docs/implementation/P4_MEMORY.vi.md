@@ -2,7 +2,7 @@
 
 [English](P4_MEMORY.en.md) | Tiếng Việt
 
-Runbook triển khai; trạng thái: **chưa bắt đầu**. Dự toán: 7–10 ngày công. Target files, Rust tests và lệnh `ha` dưới đây là output tương lai, trừ khi checkout thật đã có. Riêng tài liệu này không là bằng chứng hoàn tất.
+Runbook triển khai; implementation P0–P7 đã được ghi nhận sau bản kế hoạch này. Dùng [evidence audit P0–P7](../evidence/P0-P7_AUDIT.vi.md) để xem kiểm chứng và giới hạn hiện tại; runbook này không tự là bằng chứng hoàn tất. Dự toán ban đầu: 7–10 ngày công.
 
 ## 1. Kết quả và điều kiện vào phase
 
@@ -64,7 +64,7 @@ Bằng chứng: C05/C26 kiểm tra optional services tắt, rỗng, timeout; res
 
 Phụ thuộc: P4-S04, P4-S05.
 
-Theo transitive sources qua summaries, invalidate blocks phụ thuộc, so policy/asset revisions lại trước dispatch. Phát hiện source files/revisions đổi. Giới hạn calls/tokens/chi phí memory riêng; pause jobs bền vững khi shutdown/hết budget.
+`memory_sources` và `memory_dependencies` gắn với từng derived version. Source freshness/invalidation và descendant cascade chỉ theo `derived_version` hiện hành; source hoặc lineage của version đã supersede không làm asset hiện tại stale. So policy/asset revisions lại trước dispatch. Giới hạn calls/tokens/chi phí memory riêng; pause jobs bền vững khi shutdown/hết budget.
 
 Bằng chứng: C13/C20/C30 kiểm tra reinjection loops, cached summary bị revoke, extraction gián đoạn khi CLI thoát.
 

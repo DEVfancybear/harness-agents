@@ -10,8 +10,10 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use harness_store_sqlite::{SqliteStore, StorePaths, TombstoneRow};
-use harness_types::{ContentHash, ErrorCode, TaskId};
+use harness_store_sqlite::{
+    MemorySourceForget, MemorySourceRetentionUpdate, SqliteStore, StorePaths, TombstoneRow,
+};
+use harness_types::{ContentHash, ErrorCode, MemoryAssetStatus, TaskId};
 
 use crate::contracts::{
     DEFAULT_GC_GRACE_SECONDS, GcCandidate, GcReport, MaintenanceError, RetentionAction,
@@ -20,8 +22,8 @@ use crate::contracts::{
 
 /// Run one retention operation against a store.
 ///
-/// `confirmation` must equal the target for a `forget`, which is the explicit
-/// confirmation token the operator supplies. Anything less is refused.
+/// `confirmation` must equal the complete `source_kind:source_id` target for a
+/// `forget`. Anything less or from another source kind is refused.
 pub async fn run_retention(
     store: &Arc<SqliteStore>,
     action: RetentionAction,
@@ -31,38 +33,99 @@ pub async fn run_retention(
     confirmation: Option<&str>,
     surviving_copies: &[String],
 ) -> Result<RetentionReport, MaintenanceError> {
-    if action.requires_confirmation() && confirmation != Some(source_id) {
-        return Err(MaintenanceError::new(
-            ErrorCode::RetentionRefused,
-            format!("forget requires an explicit confirmation equal to the target {source_id}"),
-        ));
-    }
-    if source_id.trim().is_empty() || source_kind.trim().is_empty() {
+    if source_id.trim().is_empty() || source_kind.trim().is_empty() || reason.trim().is_empty() {
         return Err(MaintenanceError::new(
             ErrorCode::InvalidPayload,
-            "a retention operation requires a source kind and a source identity",
+            "a retention operation requires a source kind, source identity and reason",
+        ));
+    }
+    let target = format!("{source_kind}:{source_id}");
+    if action.requires_confirmation() && confirmation != Some(target.as_str()) {
+        return Err(MaintenanceError::new(
+            ErrorCode::RetentionRefused,
+            format!("forget requires an explicit confirmation equal to the target {target}"),
         ));
     }
 
-    let mut affected_assets = Vec::new();
-    let mut derived_invalidated = 0usize;
-    if action != RetentionAction::Forget {
-        // Invalidate and archive operate on the memory assets that derive from
-        // this source; forget additionally removes the record and tombstones it.
-        let invalidated = harness_memory::MemoryService::new(Arc::clone(store))
-            .invalidate_source(
-                &harness_memory::MemoryPrincipal::user("maintenance"),
-                source_kind,
-                source_id,
-            )
-            .await
-            .map_err(|error| MaintenanceError::new(error.code(), error.to_string()))?;
-        derived_invalidated = invalidated.len();
-        affected_assets = invalidated.iter().map(ToString::to_string).collect();
-    }
+    let (affected, tombstone_id) = apply_retention(
+        store,
+        action,
+        source_kind,
+        source_id,
+        reason,
+        surviving_copies,
+        now_unix_ms(),
+    )
+    .await?;
+    let affected_assets = affected.iter().map(ToString::to_string).collect();
+    let derived_invalidated = if action == RetentionAction::Invalidate {
+        affected.len()
+    } else {
+        0
+    };
 
-    let timestamp = now_unix_ms();
-    let tombstone_id = match action {
+    Ok(RetentionReport {
+        action,
+        target,
+        affected_assets,
+        derived_invalidated,
+        tombstone_id,
+        surviving_copies: surviving_copies.to_vec(),
+    })
+}
+
+async fn apply_retention(
+    store: &SqliteStore,
+    action: RetentionAction,
+    source_kind: &str,
+    source_id: &str,
+    reason: &str,
+    surviving_copies: &[String],
+    timestamp: u64,
+) -> Result<(Vec<harness_types::MemoryAssetId>, Option<String>), MaintenanceError> {
+    let result = match action {
+        RetentionAction::Invalidate => {
+            let detail = serde_json::json!({
+                "action": action.as_str(),
+                "reason": reason,
+            });
+            let affected = store
+                .update_memory_source_retention_and_journal(MemorySourceRetentionUpdate {
+                    source_kind: source_kind.to_owned(),
+                    source_id: source_id.to_owned(),
+                    status: MemoryAssetStatus::Invalidated,
+                    reason: Some(reason.to_owned()),
+                    journal_entry_id: format!(
+                        "journal-{}",
+                        harness_types::EventId::generate().as_str()
+                    ),
+                    journal_detail: detail,
+                    created_unix_ms: timestamp,
+                })
+                .await?;
+            (affected, None)
+        }
+        RetentionAction::Archive => {
+            let detail = serde_json::json!({
+                "action": action.as_str(),
+                "reason": reason,
+            });
+            let affected = store
+                .update_memory_source_retention_and_journal(MemorySourceRetentionUpdate {
+                    source_kind: source_kind.to_owned(),
+                    source_id: source_id.to_owned(),
+                    status: MemoryAssetStatus::Archived,
+                    reason: None,
+                    journal_entry_id: format!(
+                        "journal-{}",
+                        harness_types::EventId::generate().as_str()
+                    ),
+                    journal_detail: detail,
+                    created_unix_ms: timestamp,
+                })
+                .await?;
+            (affected, None)
+        }
         RetentionAction::Forget => {
             let tombstone = TombstoneRow {
                 tombstone_id: format!("tombstone-{}", harness_types::EventId::generate().as_str()),
@@ -75,46 +138,25 @@ pub async fn run_retention(
             let detail = serde_json::json!({
                 "action": action.as_str(),
                 "reason": reason,
-                "affected_assets": affected_assets,
+                "source_kind": source_kind,
+                "source_id": source_id,
                 "surviving_copies": surviving_copies,
             });
-            store
-                .record_tombstone(
-                    &tombstone,
-                    &format!("journal-{}", tombstone.tombstone_id),
-                    action.as_str(),
-                    &detail,
-                )
+            let tombstone_id = tombstone.tombstone_id.clone();
+            let affected = store
+                .forget_memory_source_and_tombstone(MemorySourceForget {
+                    source_kind: source_kind.to_owned(),
+                    source_id: source_id.to_owned(),
+                    journal_entry_id: format!("journal-{tombstone_id}"),
+                    journal_action: action.as_str().to_owned(),
+                    tombstone,
+                    journal_detail: detail,
+                })
                 .await?;
-            Some(tombstone.tombstone_id)
-        }
-        RetentionAction::Invalidate | RetentionAction::Archive => {
-            let detail = serde_json::json!({
-                "action": action.as_str(),
-                "reason": reason,
-                "derived_invalidated": derived_invalidated,
-            });
-            store
-                .record_maintenance_entry(
-                    &format!("journal-{}", harness_types::EventId::generate().as_str()),
-                    action.as_str(),
-                    source_id,
-                    &detail,
-                    timestamp,
-                )
-                .await?;
-            None
+            (affected, Some(tombstone_id))
         }
     };
-
-    Ok(RetentionReport {
-        action,
-        target: format!("{source_kind}:{source_id}"),
-        affected_assets,
-        derived_invalidated,
-        tombstone_id,
-        surviving_copies: surviving_copies.to_vec(),
-    })
+    Ok(result)
 }
 
 /// Forget a source: remove derived content, record a tombstone, and report every
@@ -127,18 +169,7 @@ pub async fn forget_source(
     confirmation: &str,
     surviving_copies: &[String],
 ) -> Result<RetentionReport, MaintenanceError> {
-    // Removing the derived content is what makes the forget real; the tombstone
-    // is what keeps it forgotten.
-    let invalidated = harness_memory::MemoryService::new(Arc::clone(store))
-        .invalidate_source(
-            &harness_memory::MemoryPrincipal::user("maintenance"),
-            source_kind,
-            source_id,
-        )
-        .await
-        .map_err(|error| MaintenanceError::new(error.code(), error.to_string()))?;
-
-    let mut report = run_retention(
+    run_retention(
         store,
         RetentionAction::Forget,
         source_kind,
@@ -147,10 +178,7 @@ pub async fn forget_source(
         Some(confirmation),
         surviving_copies,
     )
-    .await?;
-    report.derived_invalidated = invalidated.len();
-    report.affected_assets = invalidated.iter().map(ToString::to_string).collect();
-    Ok(report)
+    .await
 }
 
 /// Refuse re-extraction from a tombstoned source.
@@ -198,9 +226,9 @@ pub async fn retention_summary(store: &SqliteStore) -> Result<serde_json::Value,
 /// Collect unreferenced artifacts after the grace period.
 ///
 /// An artifact is removed only when it is unreferenced, unpinned and older than
-/// the grace period. A backup/GC race cannot delete a pinned artifact because
-/// the pin check happens before the file is removed and the pin lives in the
-/// same database the GC just read.
+/// the grace period. The candidate snapshot is advisory: collection rechecks
+/// pins and references in the same writer transaction that deletes the row,
+/// quarantines the file until commit, then unlinks the quarantined bytes.
 pub async fn collect_garbage(
     store: &SqliteStore,
     grace_seconds: u64,
@@ -229,20 +257,25 @@ pub async fn collect_garbage(
             continue;
         }
         if !dry_run {
-            // The candidate list is a snapshot; the authoritative pin/reference
-            // check and the unlink happen together inside one writer
-            // transaction, so a pin committed after the snapshot refuses the
-            // sweep instead of losing its bytes.
-            if !store.collect_artifact(&candidate.artifact_id).await? {
-                let pinned = store
-                    .pinned_artifact_ids()
+            // The candidate list is a snapshot. The store rechecks holds and
+            // file age inside its writer transaction, then quarantines bytes
+            // until row deletion commits.
+            if !store
+                .collect_artifact(&candidate.artifact_id, grace_seconds)
+                .await?
+            {
+                if let Some(current) = gc_candidates(store, grace_seconds)
                     .await?
-                    .iter()
-                    .any(|id| id == &candidate.artifact_id);
-                if pinned {
-                    report.retained_pinned.push(candidate.artifact_id);
-                } else {
-                    report.retained_referenced.push(candidate.artifact_id);
+                    .into_iter()
+                    .find(|current| current.artifact_id == candidate.artifact_id)
+                {
+                    if current.pinned {
+                        report.retained_pinned.push(candidate.artifact_id);
+                    } else if !current.unreferenced {
+                        report.retained_referenced.push(candidate.artifact_id);
+                    } else {
+                        report.retained_young.push(candidate.artifact_id);
+                    }
                 }
                 continue;
             }
@@ -266,17 +299,15 @@ pub async fn gc_candidates(
     for (artifact_id, relative_path, content_hash, byte_len) in store.artifact_pins().await? {
         let path = paths.data_dir.join(&relative_path);
         let metadata = std::fs::metadata(&path).ok();
-        let modified = metadata
-            .as_ref()
+        let age_seconds = metadata
             .and_then(|metadata| metadata.modified().ok())
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |duration| {
-                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+                let modified_unix_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                now.saturating_sub(modified_unix_ms) / 1000
             });
-        let age_seconds = now.saturating_sub(modified) / 1000;
         let _ = content_hash;
-        // An artifact is referenced when a receipt, tool scope or intent points
-        // at it, or when the artifact record is genuinely orphaned.
+        // Receipts and tool scopes are the durable rows that hold artifact IDs.
         candidates.push(GcCandidate {
             artifact_id: artifact_id.clone(),
             relative_path,

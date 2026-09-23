@@ -54,7 +54,7 @@ nhưng không đổi Rust source đã test. Hash tổng 10 file Rust/test đã s
 cách tính và phạm vi có trong bản English và script. Sau cập nhật metadata,
 chạy thêm docs self-test cho báo cáo cuối.
 
-## Vấn đề còn lại cần ưu tiên
+## Vấn đề còn lại tại thời điểm review gốc
 
 - **Cao — approval:** chưa gắn invocation/session/task vào binding; grant có
   thể khớp một proposal khác nếu actor/action/workspace giống nhau và chưa dùng.
@@ -62,6 +62,22 @@ chạy thêm docs self-test cho báo cáo cuối.
   nhận candidate cũ khi tail đã thay đổi; cần CAS theo source và rebase có giới hạn.
 - **Vừa — hủy process đang đợi:** đợi mutex rồi spawn trước khi chọn nhánh
   cancellation, nên tác vụ đã hủy vẫn có thể khởi chạy trong thời gian ngắn.
+
+### Follow-up audit — 23/09/2026
+
+Ba finding trên đã được sửa trong source phase sau review và hiện có regression
+độc lập; danh sách cũ là lịch sử, không phải trạng thái còn mở:
+
+- Approval binding kiểm tra session/task/invocation/call/action/workspace và
+  revisions; `milestone_m4::a14_approval_binding`.
+- Compaction chụp source sequence trước khi dựng summary, dùng CAS khi ghi
+  checkpoint và rebase có giới hạn; `milestone_m5::a12_compaction_cas`.
+- Process hủy khi đang đợi lifecycle mutex không spawn sau khi được cấp permit;
+  `milestone_m3::m3_02_canceled_queue_does_not_invoke`.
+
+Đối chiếu source và các test này không làm entry point review đóng băng
+`c9bb106cce67c5f0b7e3c02fafe1484e5f69d379` chạy lại được; audit P0–P7 mới là
+verification trên worktree/revision phù hợp. Các giới hạn trong mục dưới vẫn mở.
 
 ### Sửa sau đó: danh tính tool call trong stream (finding 2 của review này)
 
@@ -91,9 +107,9 @@ vì `crates/harness-tools/src/contracts.rs` (thuộc danh sách owned) đã đi 
 `crates/harness-tools/src/service.rs` của baseline. Entry point review cần baseline mới
 (hoặc danh sách owned rộng hơn) trước khi chạy lại được.
 
-Các mục này chưa sửa trong bộ thay đổi này. Vì vậy chưa thể kết luận toàn bộ
-P0–P3 đáp ứng đầy đủ hợp đồng. Runbook vẫn ghi `not started` vì là bản kế hoạch
-lịch sử; evidence phase và báo cáo review mới phản ánh kết quả triển khai.
+Các mục đã được xử lý trong source sau review, như ghi ở follow-up audit phía trên.
+Các runbook ban đầu vẫn là kế hoạch; trạng thái hiện tại nằm trong evidence phase
+và handoff audit P0–P7.
 
 ## Giới hạn
 

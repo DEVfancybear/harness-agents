@@ -13,7 +13,7 @@
 
 use std::{
     env,
-    io::{self, Write},
+    io::{self, Read, Write},
     net::TcpStream,
     path::PathBuf,
     process::{Command, Stdio},
@@ -235,8 +235,22 @@ fn connect(args: &[String]) -> i32 {
     match TcpStream::connect(("127.0.0.1", port)) {
         Ok(mut stream) => {
             let sent = stream.write_all(nonce.as_bytes()).is_ok();
-            println!("connected={sent}");
-            if sent { 0 } else { REFUSED }
+            // Keep the socket open until the observer confirms it received
+            // the complete token. Without this handshake, the short-lived
+            // child can exit before Windows delivers queued TCP data, making
+            // a successful write look like an egress denial at the listener.
+            let acknowledged = if sent {
+                let mut ack = [0_u8; 1];
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .is_ok()
+                    && stream.read_exact(&mut ack).is_ok()
+                    && ack == [0xA5]
+            } else {
+                false
+            };
+            println!("connected={acknowledged}");
+            if acknowledged { 0 } else { REFUSED }
         }
         Err(error) => {
             println!("error={error}");

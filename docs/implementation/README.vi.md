@@ -2,11 +2,11 @@
 
 [English](README.en.md) | Tiếng Việt
 
-Runbook revision 1 — 10/09/2026. Tách từ kiến trúc revision 2 tại commit `b636208`. Thư mục này đặc tả công việc tương lai; mọi phase hiện **chưa bắt đầu**. Việc viết tài liệu không tạo Rust runtime hay phase test runner.
+Runbook revision 1 — 10/09/2026. Tách từ kiến trúc revision 2 tại commit `b636208`. Tài liệu ban đầu được viết trước implementation; hiện P0–P7 đã có implementation và evidence theo source revision riêng. Bảng bên dưới là trạng thái hiện biết, không phải bằng chứng nghiệm thu tại HEAD hiện tại. P8 chưa bắt đầu.
 
 ## 1. Cách dùng bộ tài liệu
 
-Giao cho coding agent prompt ở mục 9 của phase đã chọn. Bắt đầu P0. Cấp quyền truy cập repo và giao việc rõ ràng; chỉ đọc bộ docs không có nghĩa được chạy phase sau, spawn worker, cài công cụ tùy ý hoặc phát hành release.
+Với P0–P7 đã triển khai, dùng evidence/handoff của phase để kiểm tra revision và việc còn mở; không chạy lại như assignment mới. Dùng prompt ở mục 9 cho phase chưa triển khai. Chỉ đọc bộ docs không cấp quyền spawn worker, cài công cụ tùy ý hoặc phát hành release.
 
 Mỗi phase có bảy work items theo thứ tự, file ownership dự kiến, quyết định contract, tests, demo, exit gate và yêu cầu handoff. 63 step IDs là định danh công việc ổn định. Target paths là file cần tạo/mở rộng sau khi inspect code thật; không dựng scaffold mới đè implementation đã có.
 
@@ -16,21 +16,23 @@ Nguồn chuẩn: [plan kiến trúc](../RUST_HARNESS_PLAN.vi.md), [hợp đồng
 
 | Phase | Runbook | Điều kiện trước | Ngày công | Trạng thái hiện tại |
 |---|---|---|---:|---|
-| P0 | [Nền tảng, contracts và khung kiểm thử](P0_FOUNDATION.vi.md) | — | 3–4 | not_started |
-| P1 | [Plugin kernel và lưu trữ bền vững](P1_KERNEL_STORAGE.vi.md) | P0 | 8–11 | not_started |
-| P2 | [Agent runtime, context và compaction](P2_RUNTIME_CONTEXT.vi.md) | P1 | 7–10 | not_started |
-| P3 | [Coding tools, execution policy và receipts](P3_CODING_TOOLS.vi.md) | P2 | 7–10 | not_started |
-| P4 | [Memory tái sử dụng và extraction phục hồi được](P4_MEMORY.vi.md) | P3 | 7–10 | not_started |
-| P5 | [Giao việc, task DAG và workspace cô lập](P5_MULTI_AGENT.vi.md) | P4 | 8–12 | implemented_local_pending_ci (xem [evidence P5](../evidence/P5.vi.md)) |
-| P6 | [Skills, MCP và protocol plugin bên ngoài](P6_EXTENSIONS.vi.md) | P5 | 5–8 | implemented_local_pending_ci (xem [evidence P6](../evidence/P6.vi.md)) |
-| P7 | [Gia cố recovery và phát hành CLI](P7_RELEASE.vi.md) | P6 | 8–11 | implemented_local_pending_ci (xem [evidence P7](../evidence/P7.vi.md)) |
+| P0 | [Nền tảng, contracts và khung kiểm thử](P0_FOUNDATION.vi.md) | — | 3–4 | implemented; xem [evidence P0](../evidence/P0.vi.md) |
+| P1 | [Plugin kernel và lưu trữ bền vững](P1_KERNEL_STORAGE.vi.md) | P0 | 8–11 | implemented; xem [evidence P1](../evidence/P1.vi.md) |
+| P2 | [Agent runtime, context và compaction](P2_RUNTIME_CONTEXT.vi.md) | P1 | 7–10 | implemented; xem [evidence P2](../evidence/P2.vi.md) |
+| P3 | [Coding tools, execution policy và receipts](P3_CODING_TOOLS.vi.md) | P2 | 7–10 | implemented; xem [evidence P3](../evidence/P3.vi.md) |
+| P4 | [Memory tái sử dụng và extraction phục hồi được](P4_MEMORY.vi.md) | P3 | 7–10 | implemented; kiểm tra trạng thái trong [evidence P4](../evidence/P4.vi.md) |
+| P5 | [Giao việc, task DAG và workspace cô lập](P5_MULTI_AGENT.vi.md) | P4 | 8–12 | implemented; CI lịch sử ở [evidence P5](../evidence/P5.vi.md) |
+| P6 | [Skills, MCP và protocol plugin bên ngoài](P6_EXTENSIONS.vi.md) | P5 | 5–8 | implemented; CI lịch sử ở [evidence P6](../evidence/P6.vi.md) |
+| P7 | [Gia cố recovery và phát hành CLI](P7_RELEASE.vi.md) | P6 | 8–11 | implemented; CI lịch sử ở [evidence P7](../evidence/P7.vi.md) |
 | P8 | [Web UI dùng chung host services](P8_WEB.vi.md) | P7 | 10–15 | not_started |
 
 P0 → P1 → P2 → P3 → P4 → P5 → P6 → P7 → P8 tùy chọn. Chỉ bắt đầu phase khi integration gate của phase trước đã được chấp nhận. Có thể chồng thời gian đọc thiết kế/chuẩn bị fixtures, nhưng không merge code theo interface tiền nhiệm chưa được chốt.
 
 P0–P7 vẫn 53–76 ngày công trước dự phòng; P8 tính thêm. Đây không phải deadline chạy agent. Nhiều agent không đồng nghĩa lấy số tuần chia cho số agent.
 
-`manifest.json` là danh mục kế hoạch chứa dependencies, steps và case ownership. Nó **không** là task database của sản phẩm. Hoàn tất trong tương lai phải có evidence tại source revision, không chỉ sửa status trong JSON.
+`manifest.json` là danh mục kế hoạch chứa dependencies, steps và case ownership. Nó **không** là task database của sản phẩm; các phase trong đó cố ý giữ `not_started` theo contract của docs validator và không phản ánh trạng thái implementation. Hoàn tất trong tương lai phải có evidence tại source revision, không chỉ sửa status trong JSON.
+
+P0–P7 evidence ghi gate trên các revision lịch sử; không suy rằng từng gate đã chạy lại trên source tree audit hiện tại. Linux verification giữ pending theo handoff hiện hành.
 
 ## 3. Quy trình bắt đầu chung cho coding agent
 

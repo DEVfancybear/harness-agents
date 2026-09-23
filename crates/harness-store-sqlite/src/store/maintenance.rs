@@ -4,7 +4,7 @@
 //! retention never becomes a second database authority. Earlier schema
 //! revisions are untouched.
 
-use harness_types::{ContentHash, ErrorCode, TaskId};
+use harness_types::{ContentHash, ErrorCode, EventId, TaskId};
 use sqlx::SqlitePool;
 
 use super::{SqliteStore, assert_fence_in_tx, database_error, row_get, to_i64, to_u64};
@@ -269,11 +269,7 @@ impl SqliteStore {
         sqlx::query(
             "INSERT INTO maintenance_tombstones(
                  tombstone_id, source_kind, source_id, reason, surviving_copies_json, created_unix_ms)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(source_kind, source_id) DO UPDATE SET
-                 reason = excluded.reason,
-                 surviving_copies_json = excluded.surviving_copies_json,
-                 created_unix_ms = excluded.created_unix_ms",
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&tombstone.tombstone_id)
         .bind(&tombstone.source_kind)
@@ -293,13 +289,13 @@ impl SqliteStore {
             )
         })?;
         sqlx::query(
-            "INSERT OR REPLACE INTO maintenance_journal(
+            "INSERT INTO maintenance_journal(
                  entry_id, action, target, detail_json, created_unix_ms)
              VALUES (?, ?, ?, ?, ?)",
         )
         .bind(journal_entry_id)
         .bind(journal_action)
-        .bind(&tombstone.source_id)
+        .bind(format!("{}:{}", tombstone.source_kind, tombstone.source_id))
         .bind(detail)
         .bind(to_i64(tombstone.created_unix_ms, "journal time")?)
         .execute(&mut *tx)
@@ -331,7 +327,7 @@ impl SqliteStore {
             )
         })?;
         sqlx::query(
-            "INSERT OR REPLACE INTO maintenance_journal(
+            "INSERT INTO maintenance_journal(
                  entry_id, action, target, detail_json, created_unix_ms)
              VALUES (?, ?, ?, ?, ?)",
         )
@@ -362,6 +358,27 @@ impl SqliteStore {
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;
         assert_fence_in_tx(&mut tx, &fence).await?;
+        for artifact_id in artifact_ids {
+            let exists = sqlx::query_scalar::<_, i64>(
+                "SELECT EXISTS(SELECT 1 FROM artifacts WHERE artifact_id = ?)",
+            )
+            .bind(artifact_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::StorageWriteFailed,
+                    "validate artifact pin target",
+                    error,
+                )
+            })?;
+            if exists == 0 {
+                return Err(StoreError::new(
+                    ErrorCode::RetentionRefused,
+                    format!("artifact {artifact_id} cannot be pinned because it does not exist"),
+                ));
+            }
+        }
         let mut pinned = 0usize;
         for artifact_id in artifact_ids {
             sqlx::query(
@@ -474,8 +491,8 @@ impl SqliteStore {
         Ok(artifact)
     }
 
-    /// Artifact identities still referenced by a durable record: a receipt, a
-    /// tool artifact scope, or a memory version payload hash.
+    /// Artifact identities referenced by durable receipts and tool scopes.
+    /// Memory version content is stored inline and does not hold artifact IDs.
     pub async fn referenced_artifact_ids(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query(
             "SELECT artifact_id FROM artifacts
@@ -551,16 +568,20 @@ impl SqliteStore {
     /// Reclaim one unreferenced artifact's bytes and record together.
     ///
     /// The pin, receipt and scope checks and the row deletion run inside one
-    /// writer transaction, and the file is unlinked inside it. A backup that
-    /// pins the artifact concurrently either commits before the checks (and this
-    /// refuses) or after this transaction (and the pin then names a record that
-    /// no longer exists, which retention reporting tolerates). A check made
-    /// before the unlink in a separate transaction would leave a window where a
-    /// fresh pin still loses its bytes.
+    /// writer transaction, and the bytes are moved to quarantine until that
+    /// transaction commits. A backup that pins the artifact concurrently either
+    /// commits before the checks (and this refuses) or after this transaction
+    /// (and the pin then names a record that no longer exists, which retention
+    /// reporting tolerates). Checking in a separate transaction would leave a
+    /// window where a fresh pin still loses its bytes.
     ///
     /// Returns `Ok(false)` when the artifact is still pinned or referenced; the
     /// caller decides how to report it.
-    pub async fn collect_artifact(&self, artifact_id: &str) -> Result<bool, StoreError> {
+    pub async fn collect_artifact(
+        &self,
+        artifact_id: &str,
+        grace_seconds: u64,
+    ) -> Result<bool, StoreError> {
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;
         assert_fence_in_tx(&mut tx, &fence).await?;
@@ -610,27 +631,21 @@ impl SqliteStore {
                 return Ok(false);
             }
         }
-        let path = self.paths.data_dir.join(&relative_path);
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tx.rollback().await.map_err(|rollback| {
-                    database_error(
-                        ErrorCode::StorageWriteFailed,
-                        "rollback failed artifact sweep",
-                        rollback,
-                    )
-                })?;
-                return Err(StoreError::new(
-                    ErrorCode::ArtifactWriteFailed,
-                    format!(
-                        "cannot remove artifact bytes at {}: {error}",
-                        path.display()
-                    ),
-                ));
-            }
+        // Move bytes aside rather than unlinking them before the database
+        // commit. The guard restores the original path if SQL fails, the
+        // transaction fails to commit, or this future is cancelled.
+        let path = resolve_gc_artifact_path(&self.paths.data_dir, artifact_id, &relative_path)?;
+        if artifact_age_seconds(&path)? < grace_seconds {
+            tx.rollback().await.map_err(|error| {
+                database_error(
+                    ErrorCode::StorageWriteFailed,
+                    "rollback young artifact sweep",
+                    error,
+                )
+            })?;
+            return Ok(false);
         }
+        let gc_file = ArtifactGcFileGuard::quarantine(&path)?;
         sqlx::query("DELETE FROM artifacts WHERE artifact_id = ?")
             .bind(artifact_id)
             .execute(&mut *tx)
@@ -649,6 +664,160 @@ impl SqliteStore {
                 error,
             )
         })?;
+        gc_file.finalize()?;
         Ok(true)
+    }
+}
+
+fn artifact_age_seconds(path: &std::path::Path) -> Result<u64, StoreError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(StoreError::new(
+                ErrorCode::ArtifactWriteFailed,
+                format!("cannot inspect artifact age at {}: {error}", path.display()),
+            ));
+        }
+    };
+    if !metadata.is_file() {
+        return Err(StoreError::new(
+            ErrorCode::ArtifactWriteFailed,
+            format!("artifact bytes are not a regular file: {}", path.display()),
+        ));
+    }
+    let age = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |modified| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |now| now.as_secs().saturating_sub(modified.as_secs()))
+        });
+    Ok(age)
+}
+
+/// Quarantine an artifact while the database transaction decides whether GC
+/// may remove it. Until `finalize`, dropping this guard restores the original
+/// path, including when an async caller cancels the sweep.
+struct ArtifactGcFileGuard {
+    original: std::path::PathBuf,
+    quarantined: Option<std::path::PathBuf>,
+    finalized: bool,
+}
+
+impl ArtifactGcFileGuard {
+    fn quarantine(path: &std::path::Path) -> Result<Self, StoreError> {
+        let quarantined = match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {
+                let file_name = path.file_name().ok_or_else(|| {
+                    StoreError::new(
+                        ErrorCode::ArtifactWriteFailed,
+                        format!("artifact path has no file name: {}", path.display()),
+                    )
+                })?;
+                let quarantined = path.with_file_name(format!(
+                    ".{}.gc-{}",
+                    file_name.to_string_lossy(),
+                    EventId::generate().as_str()
+                ));
+                std::fs::rename(path, &quarantined).map_err(|error| {
+                    StoreError::new(
+                        ErrorCode::ArtifactWriteFailed,
+                        format!(
+                            "cannot quarantine artifact bytes at {}: {error}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                Some(quarantined)
+            }
+            Ok(_) => {
+                return Err(StoreError::new(
+                    ErrorCode::ArtifactWriteFailed,
+                    format!("artifact bytes are not a regular file: {}", path.display()),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(StoreError::new(
+                    ErrorCode::ArtifactWriteFailed,
+                    format!(
+                        "cannot inspect artifact bytes at {}: {error}",
+                        path.display()
+                    ),
+                ));
+            }
+        };
+        Ok(Self {
+            original: path.to_path_buf(),
+            quarantined,
+            finalized: false,
+        })
+    }
+
+    fn finalize(mut self) -> Result<(), StoreError> {
+        if let Some(path) = self.quarantined.as_ref() {
+            std::fs::remove_file(path).map_err(|error| {
+                StoreError::new(
+                    ErrorCode::ArtifactWriteFailed,
+                    format!(
+                        "cannot remove quarantined artifact bytes at {}: {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+        }
+        self.finalized = true;
+        self.quarantined = None;
+        Ok(())
+    }
+}
+
+/// Resolve only the stable artifact path this store's publisher creates, and
+/// reject a redirected artifact directory before a filesystem mutation.
+fn resolve_gc_artifact_path(
+    data_dir: &std::path::Path,
+    artifact_id: &str,
+    relative_path: &str,
+) -> Result<std::path::PathBuf, StoreError> {
+    let expected = format!("artifacts/{artifact_id}.bin");
+    if relative_path != expected {
+        return Err(StoreError::new(
+            ErrorCode::ArtifactWriteFailed,
+            "artifact record path does not match its stable identity",
+        ));
+    }
+    let root = std::fs::canonicalize(data_dir).map_err(|error| {
+        StoreError::new(
+            ErrorCode::ArtifactWriteFailed,
+            format!("cannot resolve artifact store root: {error}"),
+        )
+    })?;
+    let path = root.join(relative_path);
+    let parent = path.parent().expect("stable artifact path has a parent");
+    match std::fs::canonicalize(parent) {
+        Ok(resolved_parent) if resolved_parent.starts_with(&root) => Ok(path),
+        Ok(_) => Err(StoreError::new(
+            ErrorCode::ArtifactWriteFailed,
+            "artifact path escapes the store directory",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path),
+        Err(error) => Err(StoreError::new(
+            ErrorCode::ArtifactWriteFailed,
+            format!("cannot resolve artifact directory: {error}"),
+        )),
+    }
+}
+
+impl Drop for ArtifactGcFileGuard {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        if let Some(quarantined) = &self.quarantined {
+            let _ = std::fs::rename(quarantined, &self.original);
+        }
     }
 }

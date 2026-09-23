@@ -917,7 +917,10 @@ async fn p3_s04_process_output_timeout_cancel_and_descendant_cleanup_are_bounded
     };
     assert!(stdout_truncated && stderr_truncated);
     assert!(stdout.len() <= 64 * 1024 && stderr.len() <= 64 * 1024);
-    assert!(!tree_cleanup_confirmed);
+    assert!(
+        !tree_cleanup_confirmed,
+        "a naturally reaped direct child is not proof that its whole tree exited"
+    );
     assert_eq!(tree_cleanup, "reaped_on_exit");
 
     let (timeout_prepared, timeout_approval) = prepared_and_approved(

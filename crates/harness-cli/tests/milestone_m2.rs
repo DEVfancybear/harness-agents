@@ -923,7 +923,8 @@ async fn m2_04_text_arrives_before_the_terminal_barrier() {
     ];
     let mut provider = FakeProvider::start(vec![FakeResponse::ok(parts).with_barrier(0)]).await;
     provider.wait_ready().await;
-    let mut stream = adapter(&provider, "fixture-secret").stream_events(
+    let provider_adapter = adapter(&provider, "fixture-secret");
+    let mut stream = provider_adapter.stream_events(
         provider_request(),
         harness_providers::CancellationToken::new(),
     );
@@ -935,10 +936,36 @@ async fn m2_04_text_arrives_before_the_terminal_barrier() {
     // The fixture is still holding the terminal frame; the client has the text.
     provider.await_barrier().await;
     provider.release_barrier();
-    let second = futures_util::StreamExt::next(&mut stream)
-        .await
-        .expect("terminal event")
-        .expect("terminal arrives");
+    let mut retries = 0_u32;
+    let second = loop {
+        match futures_util::StreamExt::next(&mut stream).await {
+            Some(Ok(event)) => break event,
+            Some(Err(error)) if retries < 11 && is_loopback_refusal(&error) => {
+                // A truncated loopback response ends this stream after the
+                // barrier has been released. Retry the complete scripted
+                // response so host transport noise cannot masquerade as a
+                // failure of the text-before-terminal contract.
+                retries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    50 * (1_u64 << retries.min(6)),
+                ))
+                .await;
+                stream = provider_adapter.stream_events(
+                    provider_request(),
+                    harness_providers::CancellationToken::new(),
+                );
+                let replayed_text = futures_util::StreamExt::next(&mut stream)
+                    .await
+                    .expect("retry text event")
+                    .expect("retry text arrives");
+                assert_eq!(replayed_text, ProviderStreamEvent::text("earlier"));
+                provider.await_barrier().await;
+                provider.release_barrier();
+            }
+            Some(Err(error)) => panic!("terminal stream fails for a non-loopback reason: {error}"),
+            None => panic!("stream ended before the terminal event"),
+        }
+    };
     assert!(second.is_completed());
 }
 

@@ -159,7 +159,7 @@ ha maintenance retain --data-dir <DATA_DIR> --action archive \
     --source-kind file --source-id src/lib.rs --reason "kept for audit" --json
 ha maintenance retain --data-dir <DATA_DIR> --action forget \
     --source-kind file --source-id src/lib.rs --reason "operator request" \
-    --confirm src/lib.rs --surviving-copy backup-2026-01 --json
+    --confirm file:src/lib.rs --surviving-copy backup-2026-01 --json
 ha maintenance tombstones --data-dir <DATA_DIR> --json
 ```
 
@@ -175,8 +175,12 @@ These are three different operations, and the difference matters:
 while its record — and the fact that it existed and changed — is retained. Only
 `forget` removes content.
 
-`forget` requires `--confirm` to equal `--source-id` exactly. A mismatch or an
-empty value is refused with `retention_refused`, and nothing is recorded.
+`forget` requires `--confirm` to equal the full target
+`--source-kind:--source-id` (for example, `file:src/lib.rs`). An ID-only token,
+the wrong kind/ID or an empty value is refused with `retention_refused`, and
+nothing is recorded. Retention applies across all projects in the store that use
+the same kind/ID pair; file source identities are currently workspace-relative
+paths.
 
 A `tombstone` is the durable record that a source was deliberately forgotten. It
 is written in the same transaction as the forget, it survives backup and restore,
@@ -210,11 +214,13 @@ The report names exactly why each survivor survived: `retained_pinned`,
 `retained_referenced` or `retained_young`. Use `--dry-run` first; it reports the
 same analysis and deletes nothing.
 
-The pin exists to close one specific race: a backup promises to keep an artifact,
-and a concurrent collection would otherwise delete it between the promise and the
-copy. Because the pin is checked before any file is removed, and the pin lives in
-the same database the collection just read, a pinned artifact survives. Backups
-record their pins in the manifest, so the promise is auditable afterwards.
+The pin exists to close one specific race: a backup promises to keep an artifact
+while collection wants to remove it. The candidate list is only a snapshot; before
+quarantining bytes, the store rechecks pins, references and mtime in the writer
+transaction. An unreadable mtime keeps the artifact inside the grace period.
+`pin_artifacts` accepts only IDs with an existing artifact row and refuses the
+whole batch if any ID is missing. Backups record their pins in the manifest for
+later audit.
 
 ## 8. The release matrix
 
@@ -265,7 +271,7 @@ platform is green.
 | `ha maintenance backup` | Snapshot into a new directory | The backup directory exists; the source has no store |
 | `ha maintenance verify-backup` | Validate a backup and its artifacts | The manifest, database or any artifact fails its hash |
 | `ha maintenance restore` | Restore into a new directory, without activating | The destination holds a store or is active; the snapshot is incomplete |
-| `ha maintenance retain` | `invalidate`, `archive` or `forget` a source | `forget` without `--confirm` equal to `--source-id` |
+| `ha maintenance retain` | `invalidate`, `archive` or `forget` a source | `forget` without `--confirm` equal to `--source-kind:--source-id` |
 | `ha maintenance tombstones` | List forgotten sources and surviving copies | Never |
 | `ha maintenance gc` | Collect unreferenced, unpinned, old artifacts | Never; it reports what it retained and why |
 | `ha maintenance migrate-copy` | Migrate a store on a copy | The destination is occupied; the source has no store |

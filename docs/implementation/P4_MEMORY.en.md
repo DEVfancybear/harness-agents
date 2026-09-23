@@ -2,7 +2,7 @@
 
 English | [Tiếng Việt](P4_MEMORY.vi.md)
 
-Implementation runbook; status: **not started**. Estimate: 7–10 person-days. All target files, Rust tests and `ha` commands below are future outputs unless already present in the checkout. This document alone is not completion evidence.
+Implementation runbook; P0–P7 implementation was delivered after this plan was written. See [P0–P7 audit evidence](../evidence/P0-P7_AUDIT.en.md) for verification and current limits; this runbook is not completion evidence. Original estimate: 7–10 person-days.
 
 ## 1. Outcome and entry gate
 
@@ -64,7 +64,7 @@ Evidence: C05/C26 cover disabled optional services, empty hits and timeouts; jou
 
 Depends on: P4-S04, P4-S05.
 
-Track transitive sources through summaries, invalidate affected blocks and compare policy/asset revisions again before dispatch. Detect changed source files/revisions. Limit memory calls/tokens/cost independently; pause jobs durably on shutdown or exhausted budget.
+`memory_sources` and `memory_dependencies` are recorded per derived version. Source freshness/invalidation and descendant traversal follow only the current `derived_version`; a superseded source or lineage cannot stale current memory. Compare policy/asset revisions again before dispatch. Limit memory calls/tokens/cost independently; pause jobs durably on shutdown or exhausted budget.
 
 Evidence: C13/C20/C30 cover reinjection loops, revoked cached summaries and extraction interrupted by CLI exit.
 
