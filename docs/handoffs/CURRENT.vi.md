@@ -1,6 +1,6 @@
 # CURRENT — bàn giao đang mở
 
-**Cập nhật:** 23/09/2026 · **Assignment:** M7–M12 theo kế hoạch `implementation-next`, tuần tự theo dependency và gate từng checkpoint; commit+push sau mỗi action. **Checkpoint hiện tại:** M7 (`e5ef55c`), M8 (`32c3400`), M9 (`4035f8b`), M10 (`0a1167d`), M11 (`9d55914`), **M12-01..04 xong** (`65a084e`/`5985bd0`/`cfb215a`/`56d4f72`/`dd3c3fa`/`3030233`) + **gate M12 xanh** (digest `sha256:b2434902ae5c4c54522dc2c7992dd6c229573361ec60e9e6ad2350754defbeb4`, **411** file, **10 required test**, closure M4/M3/M1/M2/M0). **Milestone còn lại: không còn — M0–M12 đã triển khai xong; việc tiếp theo là reviewer nghiệm thu.**
+**Cập nhật:** 23/09/2026 · **Assignment:** M7–M12 theo kế hoạch `implementation-next`, tuần tự theo dependency và gate từng checkpoint; commit+push sau mỗi action. **Checkpoint hiện tại:** M7 (`e5ef55c`), M8 (`32c3400`), M9 (`4035f8b`), M10 (`0a1167d`), M11 (`9d55914`), **M12-01..04 xong** (`65a084e`/`5985bd0`/`cfb215a`/`56d4f72`/`dd3c3fa`/`3030233`) + **gate M12 xanh hai lần** (cây cuối: digest `sha256:65b41f72400c58378c0f8ceeb6849a7b7c895e9cf741c0ceacfb4672c9a03cf5`, **411** file, **10 required test**, closure M4/M3/M1/M2/M0). **Milestone còn lại: không còn — M0–M12 đã triển khai xong; việc tiếp theo là reviewer nghiệm thu.**
 
 
 **Quyền (cập nhật 23/09/2026, user cấp trực tiếp):** user cho phép **install ở M9** và nói rõ "cứ làm full goal không cần hỏi". ⇒ Được phép: `Install-Ha.ps1` (cài thật) khi M9 cần. **Vẫn chưa được cấp rõ ràng:** đổi User PATH, paid smoke/live provider, publish/release (release tạo artifact công khai). Nếu M9 chạm tới các mục đó: làm phần install, còn PATH/publish thì ghi lại là cần xác nhận riêng.
@@ -107,7 +107,7 @@
 - **Xong + gate xanh:** M12-01 (capability spike + backend selection), M12-02 (confinement + execution mapping),
   M12-03 (ownership leases + orphan recovery), M12-04 (adversarial gates + profile documentation). Registry: cả bốn
   item `implemented_unverified`; **10 required test** (tất cả bằng qualified selector nên gate tự discover + tự chạy).
-  Gate cuối: `sha256:b2434902…`, **411** file, **10/10 required**, closure M4/M3/M1/M2/M0 xanh, `workspace-tests`
+  Gate cuối: `sha256:65b41f72…`, **411** file, **10/10 required**, closure M4/M3/M1/M2/M0 xanh, `workspace-tests`
   passed **sau 1 retry** (flake loopback đã biết `interactive_launch::i13…`, tách ra chạy một mình thì xanh — **không**
   test M12 nào đỏ). Self-test gate: `MILESTONE_GATE_SELFTEST_OK: M12` (9 negative control).
 - **M12 chứng minh gì:** ma trận capability **đo được** trên host thật (`process_containment`, `process_tree_kill`,
@@ -207,9 +207,10 @@ descendant (evidence M12 §6.1, tái hiện được bằng probe P-CONT) — s�
 - **Sáu commit:** `65a084e` (SPEC M12 + ADR-N12), `5985bd0` (M12-01: capability probe + từ chối có tên),
   `cfb215a` (M12-02: execution plan + export có digest), `56d4f72` (M12-03: lease + reconcile + store slice 6),
   `dd3c3fa` (M12-04: A36 + support matrix + registry), `3030233` (fmt).
-- **Gate cuối:** `-Milestone M12` **passed**, digest `sha256:b2434902…` (**411** file), **10/10 required**, closure
-  M4/M3/M1/M2/M0; `workspace-tests` **1 retry** cho flake loopback đã biết (`interactive_launch::i13…`, isolated →
-  xanh). `-SelfTest`: `MILESTONE_GATE_SELFTEST_OK: M12`.
+- **Gate cuối:** `-Milestone M12` **passed hai lần** (digest cây cuối `sha256:65b41f72…`, **411** file), **10/10
+  required**, closure M4/M3/M1/M2/M0; mỗi lần `workspace-tests` **1 retry** cho flake loopback đã biết, ở hai test khác
+  nhau cùng họ `interactive_launch` (`i13`, rồi `i03`), cả hai xanh khi chạy một mình. `-SelfTest`:
+  `MILESTONE_GATE_SELFTEST_OK: M12`.
 - **Hai thay đổi contract của lượt này:** runtime store schema **5 → 6** (`backend_leases`, unique
   `(host_id, tool_execution_id)`); `IsolationMode::Strict` **giữ** nghĩa Full và **bị từ chối** trên host này (không
   nới nghĩa, không hạ cấp). `tool-execution-receipt.v1` và `ToolCapabilities` **không** đổi.
