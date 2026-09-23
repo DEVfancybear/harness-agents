@@ -4,7 +4,7 @@
 
 ### Assignment and constraints
 
-Continue the HA_AGENT assignment only through G06 in docs/HA_AGENT_PLAN.vi.md. Stop at CP-B; do not begin G07. Preserve one admitted input per session, fail-closed approval, protected-path rejection before the panel, no ANSI in headless output, and existing exit codes. Use the root workspace and single ha binary. No new crate, second engine, paid API, user install, manual migration, or user/shared-project config.local.toml write. G05 persistence tests write only under disposable temporary roots. No commit or push was made in this continuation.
+Continue the HA_AGENT assignment only through G06 in docs/HA_AGENT_PLAN.vi.md. Stop at CP-B; do not begin G07. Preserve one admitted input per session, fail-closed approval, protected-path rejection before the panel, no ANSI in headless output, and existing exit codes. Use the root workspace and single ha binary. No new crate, second engine, paid API, user install, manual migration, or user/shared-project config.local.toml write. G05 persistence tests write only under disposable temporary roots. The user authorized committing and pushing CP-B. Implementation commit `bb03559f42b5d5efd9b7009ad9c651e4ad8f0ef1` and this metadata follow-up are pushed to `origin/master`.
 
 ### Current status
 
@@ -14,8 +14,8 @@ CP-B is implemented_unverified because the final Verify-HaLaunch gate still has 
 
 ### Source and evidence
 
-- Branch master; HEAD at closeout: c1b4b6730f57c541f090516f9100d5cfcf9811bd.
-- Worktree remains dirty; 48 paths were changed before the final evidence and handoff updates, and 50 paths after those metadata edits. No commit or push was made.
+- Branch master; CP-B implementation commit: bb03559f42b5d5efd9b7009ad9c651e4ad8f0ef1.
+- CP-B implementation, tests, and SPEC are committed. This bilingual evidence/handoff update is a documentation follow-up; both commits are pushed to origin/master.
 - Source digest: sha256:7b59aa4dfedbcc26d92dac100b22ac046020d17517001e0aedb58497ef817d00 (420 tracked and non-ignored untracked files; excludes only the CP-B evidence and this handoff). Cargo.lock SHA-256: 193d2574da4a994777bf8961780e264a123c1397d04d7e66f7bf49d33d919876.
 - The generated schema files were regenerated with cargo run -p harness-types --bin generate_schemas --locked. Do not edit them by hand.
 - Current SPEC: docs/specs/HA_AGENT.vi.md; evidence: docs/evidence/HA_AGENT.vi.md.
@@ -51,7 +51,7 @@ Stop at CP-B. Do not start G07. Before any further loopback test, inspect the ex
 
 ### Assignment và ràng buộc
 
-Tiếp tục assignment HA_AGENT đến hết G06 trong docs/HA_AGENT_PLAN.vi.md. Dừng ở CP-B; không bắt đầu G07. Giữ một input được nhận mỗi session, approval fail-closed, protected path bị chặn trước panel, headless không ANSI và exit code hiện hữu. Dùng root workspace và binary ha duy nhất. Không crate mới, engine thứ hai, API trả phí, cài lên máy user, chạy migration thủ công hoặc ghi config.local.toml của project user/workspace dùng chung. Test lưu G05 chỉ ghi trong thư mục tạm có thể xóa. Lượt này không commit/push.
+Tiếp tục assignment HA_AGENT đến hết G06 trong docs/HA_AGENT_PLAN.vi.md. Dừng ở CP-B; không bắt đầu G07. Giữ một input được nhận mỗi session, approval fail-closed, protected path bị chặn trước panel, headless không ANSI và exit code hiện hữu. Dùng root workspace và binary ha duy nhất. Không crate mới, engine thứ hai, API trả phí, cài lên máy user, chạy migration thủ công hoặc ghi config.local.toml của project user/workspace dùng chung. Test lưu G05 chỉ ghi trong thư mục tạm có thể xóa. User đã cho phép commit/push CP-B; commit implementation `bb03559f42b5d5efd9b7009ad9c651e4ad8f0ef1` và bản cập nhật tài liệu này đã được push lên origin/master.
 
 ### Trạng thái hiện tại
 
@@ -61,8 +61,8 @@ CP-B ở trạng thái implemented_unverified vì Verify-HaLaunch cuối vẫn l
 
 ### Source và evidence
 
-- Branch master; HEAD khi chốt: c1b4b6730f57c541f090516f9100d5cfcf9811bd.
-- Worktree còn dirty; có 48 path thay đổi trước khi cập nhật evidence và handoff cuối, 50 path sau cập nhật metadata. Không commit/push.
+- Branch master; commit implementation CP-B: bb03559f42b5d5efd9b7009ad9c651e4ad8f0ef1.
+- Implementation và test CP-B đã commit. Bản cập nhật evidence/handoff song ngữ này là commit tài liệu tiếp nối; cả hai commit đã được push lên origin/master.
 - Digest source: sha256:7b59aa4dfedbcc26d92dac100b22ac046020d17517001e0aedb58497ef817d00 (420 file tracked và untracked không ignore; chỉ loại evidence CP-B và handoff này). SHA-256 Cargo.lock: 193d2574da4a994777bf8961780e264a123c1397d04d7e66f7bf49d33d919876.
 - Đã sinh lại schema bằng cargo run -p harness-types --bin generate_schemas --locked. Không sửa schema JSON bằng tay.
 - SPEC hiện tại: docs/specs/HA_AGENT.vi.md; evidence: docs/evidence/HA_AGENT.vi.md.

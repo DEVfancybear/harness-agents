@@ -10,13 +10,13 @@ SPEC: [HA_AGENT.vi.md](../specs/HA_AGENT.vi.md) · Plan: [HA_AGENT_PLAN.vi.md](.
 
 | Field / Trường | Value / Giá trị |
 |---|---|
-| Branch and HEAD / Branch và HEAD | `master`, `c1b4b6730f57c541f090516f9100d5cfcf9811bd` |
-| Worktree / Worktree | Dirty; **48 changed paths** before the final evidence/handoff edits and **50 paths** after them, including CP-B implementation, SPEC/TUI updates, generated schemas, and related shared-worktree changes. / Bẩn; **48 path thay đổi** trước khi cập nhật evidence/handoff cuối và **50 path** sau cập nhật; gồm implementation CP-B, SPEC/TUI, schema sinh và thay đổi workspace dùng chung. |
+| Branch and implementation commit / Branch và commit implementation | `master`, `bb03559f42b5d5efd9b7009ad9c651e4ad8f0ef1` |
+| Worktree / Worktree | CP-B implementation is committed; this bilingual evidence/handoff update is the documentation follow-up commit. Both are pushed to `origin/master`. / Implementation CP-B đã commit; bản cập nhật evidence/handoff song ngữ này là commit tài liệu tiếp nối. Cả hai đã được push lên `origin/master`. |
 | Source digest / Digest source | `sha256:7b59aa4dfedbcc26d92dac100b22ac046020d17517001e0aedb58497ef817d00`; **420 files**. Hash is SHA-256 over each sorted repo-relative path encoded UTF-8 + NUL, file bytes, then NUL, for tracked and non-ignored untracked files; excludes only this evidence and docs/handoffs/HA_AGENT.vi.md. / **420 file**; SHA-256 trên path repo-relative đã sắp xếp (UTF-8 + NUL), bytes file rồi NUL; gồm file tracked và untracked không ignore; chỉ loại evidence này và docs/handoffs/HA_AGENT.vi.md. |
 | `Cargo.lock` SHA-256 | `193d2574da4a994777bf8961780e264a123c1397d04d7e66f7bf49d33d919876` |
 | OS / Hệ điều hành | Windows 11 Pro, `10.0.26200.0`, x64 |
 | Toolchain | `rustc 1.97.1 (8bab26f4f 2026-07-14)` with `RUSTUP_HOME=C:\Users\duong\.rustup-ha-agent-2026-09-23`; commands used `--locked`. / Chọn toolchain qua Rustup home riêng; lệnh Cargo dùng `--locked`. |
-| Commit/push / Ghi commit/push | None in this CP-B continuation. / Lượt CP-B này không commit/push. |
+| Commit/push / Ghi commit/push | Implementation: `bb03559f42b5d5efd9b7009ad9c651e4ad8f0ef1`; this evidence/handoff follow-up is pushed with it to `origin/master`. / Implementation: `bb03559f42b5d5efd9b7009ad9c651e4ad8f0ef1`; bản evidence/handoff tiếp nối được push cùng lên `origin/master`. |
 
 G05 is present in the single existing `ToolPolicy`: modes, ordered deny/allow/mode decisions, confirmed persistent rule save, `/permissions`, `/mode`, audit transcript entries, and fail-closed headless defaults all have tests. This continuation did not find a missing G05 feature. / G05 hiện diện trong `ToolPolicy` duy nhất: mode, thứ tự deny/allow/mode, lưu rule dài hạn sau xác nhận, `/permissions`, `/mode`, audit transcript và headless fail-closed đều có test. Lượt này không phát hiện thiếu tính năng G05.
 
