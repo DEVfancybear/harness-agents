@@ -111,6 +111,39 @@ impl GoalSpec {
             .map(|criterion| criterion.id.clone())
             .collect()
     }
+
+    /// Validate the host-owned acceptance contract before a run is admitted.
+    /// A goal with no required criteria is not evidence that work is complete.
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if self.objective.trim().is_empty() {
+            return Err(RuntimeError::new(
+                ErrorCode::InvalidPayload,
+                "a goal needs a non-empty objective",
+            ));
+        }
+        if self.criteria.is_empty() || !self.criteria.iter().any(|criterion| criterion.required) {
+            return Err(RuntimeError::new(
+                ErrorCode::InvalidPayload,
+                "a goal needs at least one required criterion",
+            ));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for criterion in &self.criteria {
+            if criterion.id.trim().is_empty() || criterion.description.trim().is_empty() {
+                return Err(RuntimeError::new(
+                    ErrorCode::InvalidPayload,
+                    "goal criteria need non-empty IDs and descriptions",
+                ));
+            }
+            if !ids.insert(criterion.id.as_str()) {
+                return Err(RuntimeError::new(
+                    ErrorCode::InvalidPayload,
+                    format!("goal criterion ID {:?} is duplicated", criterion.id),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One check that ran, with the workspace it observed.
@@ -310,6 +343,7 @@ pub struct HostGoalEvaluator;
 
 impl GoalEvaluator for HostGoalEvaluator {
     fn evaluate(&self, input: &GoalEvaluationInput<'_>) -> Result<GoalEvaluation, RuntimeError> {
+        input.spec.validate()?;
         let evidence = input.evidence;
         let signature = evidence.progress_signature();
         if evidence.response.trim().is_empty() {
@@ -386,8 +420,56 @@ pub fn default_evaluator() -> std::sync::Arc<dyn GoalEvaluator> {
 }
 
 /// Reject an evaluator result that is not a verdict the driver can act on.
-pub fn validate_evaluation(evaluation: &GoalEvaluation) -> Result<(), RuntimeError> {
+pub fn validate_evaluation(
+    spec: &GoalSpec,
+    evidence: &GoalEvidence,
+    evaluation: &GoalEvaluation,
+) -> Result<(), RuntimeError> {
+    spec.validate()?;
+    if evaluation.progress_signature != evidence.progress_signature() {
+        return Err(RuntimeError::new(
+            ErrorCode::InvalidPayload,
+            "goal evaluator returned a progress signature that does not match its evidence",
+        ));
+    }
     match &evaluation.verdict {
+        GoalVerdict::Satisfied { satisfied } => {
+            let mut reported = std::collections::BTreeSet::new();
+            for id in satisfied {
+                if !reported.insert(id.as_str()) {
+                    return Err(RuntimeError::new(
+                        ErrorCode::InvalidPayload,
+                        format!("goal evaluator repeated satisfied criterion {id:?}"),
+                    ));
+                }
+                let Some(criterion) = spec.criteria.iter().find(|item| item.id == *id) else {
+                    return Err(RuntimeError::new(
+                        ErrorCode::InvalidPayload,
+                        format!("goal evaluator reported unknown criterion {id:?}"),
+                    ));
+                };
+                if !evidence.satisfies(criterion.evidence) {
+                    return Err(RuntimeError::new(
+                        ErrorCode::InvalidPayload,
+                        format!("goal evaluator marked unsupported evidence for {id:?} satisfied"),
+                    ));
+                }
+            }
+            for criterion in spec.criteria.iter().filter(|item| item.required) {
+                if !evidence.satisfies(criterion.evidence)
+                    || !reported.contains(criterion.id.as_str())
+                {
+                    return Err(RuntimeError::new(
+                        ErrorCode::InvalidPayload,
+                        format!(
+                            "goal evaluator accepted without required evidence for {:?}",
+                            criterion.id
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        }
         GoalVerdict::NeedsWork { next_action, .. } if next_action.trim().is_empty() => {
             Err(RuntimeError::new(
                 ErrorCode::InvalidPayload,

@@ -187,6 +187,30 @@ impl WorkerBackend for ScriptedWorkerBackend {
             } else {
                 expected.retain(|artifact| !artifact.starts_with("edit:"));
             }
+            let mut checked_revisions = Vec::new();
+            let mut check_receipts = Vec::new();
+            let mut outcome = DelegatedOutcome::Completed;
+            if role == AgentRole::Verifier {
+                let Some(record) = worktree.as_ref() else {
+                    return WorkerOutcome::Failed {
+                        error: OrchestratorError::new(
+                            ErrorCode::ScopeAuthorityDenied,
+                            "the verifier requires the host-owned dependency worktree",
+                        ),
+                    };
+                };
+                match verify_worktree_revision(record, &base_commit, &task_id) {
+                    Ok((revision, receipt)) => {
+                        result_revision.clone_from(&revision.revision);
+                        if !revision.passed {
+                            outcome = DelegatedOutcome::Failed;
+                        }
+                        checked_revisions.push(revision);
+                        check_receipts.push(receipt);
+                    }
+                    Err(error) => return WorkerOutcome::Failed { error },
+                }
+            }
             let report = DelegatedResult {
                 schema_version: harness_orchestrator::DELEGATION_CONTRACT_VERSION,
                 result_id: format!("{}-result", task_id.as_str()),
@@ -197,7 +221,7 @@ impl WorkerBackend for ScriptedWorkerBackend {
                     role,
                     generation: 1,
                 },
-                outcome: DelegatedOutcome::Completed,
+                outcome,
                 summary: format!(
                     "{} completed against {result_revision}: {}",
                     role.as_str(),
@@ -206,32 +230,8 @@ impl WorkerBackend for ScriptedWorkerBackend {
                 artifact_refs: expected,
                 base_revision: base_commit,
                 result_revision: result_revision.clone(),
-                checked_revisions: vec![harness_orchestrator::CheckedRevision {
-                    command: format!("{}-self-check", role.as_str()),
-                    revision: result_revision.clone(),
-                    passed: true,
-                    artifact_id: None,
-                }],
-                // The worker ran a real check against the revision it produced,
-                // so it reports a real runner receipt rather than prose.
-                check_receipts: vec![RunnerReceipt {
-                    schema_version: 1,
-                    tool_execution_id: ToolExecutionId::generate(),
-                    task_id: task_id.clone(),
-                    invocation_id: format!("{}-self-check", role.as_str()),
-                    call_id: None,
-                    input_hash: ContentHash::from_bytes(result_revision.as_bytes()),
-                    policy_revision: 1,
-                    approval_id: None,
-                    intent_state: ToolIntentState::IntentRecorded,
-                    outcome_state: ToolOutcomeState::Settled,
-                    before_fingerprint: None,
-                    after_fingerprint: Some(ContentHash::from_bytes(result_revision.as_bytes())),
-                    before_hash: None,
-                    after_hash: None,
-                    artifact_id: None,
-                    observed_at_seq: 1,
-                }],
+                checked_revisions,
+                check_receipts,
                 usage: harness_orchestrator::BudgetUsage {
                     model_requests: 1,
                     retries: 0,
@@ -314,6 +314,93 @@ fn git_commit(worktree: &str, scope: &str) -> Result<String, OrchestratorError> 
     git(&["add", "--", scope])?;
     git(&["commit", "--quiet", "-m", "p5 delegated scoped change"])?;
     Ok(git(&["rev-parse", "HEAD"])?.trim().to_owned())
+}
+
+fn verify_worktree_revision(
+    record: &harness_orchestrator::WorktreeRecord,
+    base_commit: &str,
+    task_id: &TaskId,
+) -> Result<(harness_orchestrator::CheckedRevision, RunnerReceipt), OrchestratorError> {
+    if record.base_commit != base_commit || record.path.trim().is_empty() {
+        return Err(OrchestratorError::new(
+            ErrorCode::ScopeAuthorityDenied,
+            "the verifier worktree does not match the task's declared base revision",
+        ));
+    }
+    let run_git = |arguments: &[&str]| -> Result<std::process::Output, OrchestratorError> {
+        std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(&record.path)
+            .output()
+            .map_err(|error| {
+                OrchestratorError::new(
+                    ErrorCode::ProcessCanceled,
+                    format!("cannot run verifier command: {error}"),
+                )
+            })
+    };
+    let head = run_git(&["rev-parse", "HEAD"])?;
+    if !head.status.success() {
+        return Err(OrchestratorError::new(
+            ErrorCode::StorageWriteFailed,
+            format!(
+                "cannot resolve verifier revision: {}",
+                String::from_utf8_lossy(&head.stderr).trim()
+            ),
+        ));
+    }
+    let revision = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+    let tree = run_git(&["rev-parse", "HEAD^{tree}"])?;
+    if !tree.status.success() {
+        return Err(OrchestratorError::new(
+            ErrorCode::StorageWriteFailed,
+            format!(
+                "cannot fingerprint verifier worktree: {}",
+                String::from_utf8_lossy(&tree.stderr).trim()
+            ),
+        ));
+    }
+    let workspace_digest =
+        ContentHash::from_bytes(String::from_utf8_lossy(&tree.stdout).trim().as_bytes());
+    let command = format!("git diff --check {base_commit}..{revision}");
+    let check = run_git(&["diff", "--check", &format!("{base_commit}..{revision}")])?;
+    let exit_code = check.status.code();
+    let passed = check.status.success();
+    let receipt = RunnerReceipt {
+        schema_version: 1,
+        tool_execution_id: ToolExecutionId::generate(),
+        task_id: task_id.clone(),
+        invocation_id: format!("integration-check:{}", task_id.as_str()),
+        call_id: None,
+        input_hash: ContentHash::from_canonical_json(&json!({
+            "command": &command,
+            "base_commit": base_commit,
+            "revision": &revision,
+        }))
+        .map_err(|error| OrchestratorError::new(error.code(), error.to_string()))?,
+        policy_revision: 1,
+        approval_id: None,
+        intent_state: ToolIntentState::Validated,
+        outcome_state: ToolOutcomeState::Settled,
+        before_fingerprint: Some(ContentHash::from_bytes(base_commit.as_bytes())),
+        after_fingerprint: Some(workspace_digest.clone()),
+        before_hash: None,
+        after_hash: None,
+        exit_code,
+        artifact_id: None,
+        observed_at_seq: 1,
+    };
+    Ok((
+        harness_orchestrator::CheckedRevision {
+            command,
+            revision,
+            passed,
+            workspace_digest: Some(workspace_digest),
+            exit_code,
+            artifact_id: None,
+        },
+        receipt,
+    ))
 }
 
 async fn open_writer(data_dir: &PathBuf) -> Result<Arc<SqliteStore>, HarnessError> {
@@ -507,6 +594,7 @@ async fn dispatch_plan(
         })?;
     let coordinator = DelegationCoordinator::new(Arc::clone(store), Arc::clone(scheduler), 1);
     let mut dispatched: Vec<TaskId> = Vec::new();
+    let mut task_worktrees = BTreeMap::new();
     for task_id in &plan.topological_order {
         let node = plan
             .node(task_id)
@@ -540,7 +628,13 @@ async fn dispatch_plan(
                 .await
                 .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
             upsert_worktree(store, &record).await?;
+            task_worktrees.insert(task_id.clone(), record.clone());
             worktree = Some(record);
+        } else if node.role == AgentRole::Verifier {
+            worktree = node
+                .depends_on
+                .iter()
+                .find_map(|dependency| task_worktrees.get(dependency).cloned());
         }
         coordinator
             .claim(task_id, &worker, &coordinator_session)

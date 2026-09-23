@@ -43,8 +43,39 @@ impl ExtensionToolDispatcher {
 }
 
 impl ExternalToolDispatcher for ExtensionToolDispatcher {
+    fn validate_external<'a>(
+        &'a self,
+        plugin_id: &'a str,
+        tool_name: &'a str,
+        _arguments: &'a Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), HarnessError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if tool_name.trim().is_empty() {
+                return Err(HarnessError::new(
+                    ErrorCode::InvalidPayload,
+                    "extension tool name must not be empty",
+                ));
+            }
+            let Some(transport) = self.runtime.transport(plugin_id).await else {
+                return Err(HarnessError::new(
+                    ErrorCode::ExtensionNotFound,
+                    format!("extension {plugin_id} is not active"),
+                ));
+            };
+            if !transport.session().provides(ExtensionCapability::Tools) {
+                return Err(HarnessError::new(
+                    ErrorCode::ExtensionCapabilityMismatch,
+                    format!("extension {plugin_id} did not negotiate the tools capability"),
+                ));
+            }
+            Ok(())
+        })
+    }
+
     fn dispatch_external<'a>(
         &'a self,
+        _authorization: &'a harness_tools::ToolDispatchAuthorization,
         plugin_id: &'a str,
         tool_name: &'a str,
         arguments: &'a Value,

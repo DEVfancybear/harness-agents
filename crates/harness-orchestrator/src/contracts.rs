@@ -932,6 +932,12 @@ pub struct CheckedRevision {
     pub command: String,
     pub revision: String,
     pub passed: bool,
+    /// Fingerprint of the workspace the check actually observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_digest: Option<ContentHash>,
+    /// Exit status recorded by the runner receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
     pub artifact_id: Option<ArtifactId>,
 }
 
@@ -997,10 +1003,10 @@ impl DelegatedResult {
             }
         }
         for revision in &self.checked_revisions {
-            if revision.revision.trim().is_empty() {
+            if revision.revision.trim().is_empty() || revision.revision != self.result_revision {
                 return Err(OrchestratorError::new(
                     ErrorCode::ResultIncomplete,
-                    "a checked revision requires the revision it ran against",
+                    "every check must run against the delegated result revision",
                 ));
             }
         }
@@ -1009,6 +1015,33 @@ impl DelegatedResult {
                 ErrorCode::ResultIncomplete,
                 "every checked revision requires a matching runner receipt",
             ));
+        }
+        for (check, receipt) in self.checked_revisions.iter().zip(&self.check_receipts) {
+            let expected_input_hash = ContentHash::from_canonical_json(&serde_json::json!({
+                "command": &check.command,
+                "base_commit": &self.base_revision,
+                "revision": &check.revision,
+            }))
+            .map_err(|error| OrchestratorError::new(error.code(), error.to_string()))?;
+            if check.command.trim().is_empty()
+                || check.workspace_digest.is_none()
+                || check.passed != (check.exit_code == Some(0))
+                || receipt.task_id != self.task_id
+                || !matches!(
+                    receipt.intent_state,
+                    harness_types::ToolIntentState::Validated
+                        | harness_types::ToolIntentState::IntentRecorded
+                )
+                || receipt.outcome_state != harness_types::ToolOutcomeState::Settled
+                || receipt.exit_code != check.exit_code
+                || receipt.after_fingerprint != check.workspace_digest
+                || receipt.input_hash != expected_input_hash
+            {
+                return Err(OrchestratorError::new(
+                    ErrorCode::ResultIncomplete,
+                    "a checked revision must match a settled runner receipt, command input hash, workspace digest, and exit code",
+                ));
+            }
         }
         // A report of completion must carry real evidence. A human-readable
         // "done" without artifacts or receipts is not accepted work.
@@ -1042,9 +1075,17 @@ impl DelegatedResult {
             .apply(AcceptanceCommand::Evaluate {
                 criteria: self.acceptance_criteria(),
                 pending_effects: 0,
-                evidence_fingerprint: None,
+                evidence_fingerprint: self.acceptance_fingerprint(),
             })
             .is_ok_and(|transition| transition.next.is_accepted())
+    }
+
+    fn acceptance_fingerprint(&self) -> Option<ContentHash> {
+        let mut checks = self.checked_revisions.iter();
+        let first = checks.next()?.workspace_digest.clone()?;
+        checks
+            .all(|check| check.workspace_digest.as_ref() == Some(&first))
+            .then_some(first)
     }
 
     /// The criteria the host checks before accepting this report.
@@ -1077,9 +1118,9 @@ impl DelegatedResult {
         evidence.extend(self.checked_revisions.iter().zip(&self.check_receipts).map(
             |(revision, receipt)| CriterionEvidence::CheckExecuted {
                 command: revision.command.clone(),
-                workspace_digest: None,
-                exit_code: None,
-                outcome: if revision.passed {
+                workspace_digest: revision.workspace_digest.clone(),
+                exit_code: revision.exit_code,
+                outcome: if revision.passed && revision.exit_code == Some(0) {
                     CheckOutcome::Passed
                 } else {
                     CheckOutcome::Failed

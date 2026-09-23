@@ -347,6 +347,54 @@ async fn p5_s02_task_transitions_and_delivery_commit_atomically() {
     support::close(store).await;
 }
 
+#[tokio::test]
+async fn p5_check_evidence_from_a_stale_revision_is_rejected() {
+    let repo = test_repo();
+    let manager = workspace_for(&repo);
+    let snapshot = repo.snapshot(&manager).await;
+    let store = Arc::new(open_store(&repo).await);
+    let (session, root) = support::coordinator_root(&store).await;
+    let (task_id, plan) = single_task_plan(
+        &root,
+        AgentRole::Explorer,
+        &snapshot,
+        2,
+        &["observe:x"],
+        Vec::new(),
+    );
+    let coordinator = support::coordinator(&store, Arc::new(ScriptedWorker::explorer()), 1);
+    coordinator.admit(&plan).await.expect("admit");
+    let worker = support::worker_ref(AgentRole::Explorer, 1);
+    coordinator
+        .claim(&task_id, &worker, &session)
+        .await
+        .expect("claim");
+
+    let mut report =
+        support::explorer_report(&task_id, &worker, &snapshot.base_commit, "observe:x");
+    let mut forged = report.clone();
+    forged.checked_revisions[0].command = "different-command".to_owned();
+    let validation = forged
+        .validate(&plan.node(&task_id).expect("task node").brief)
+        .expect_err("the durable runner receipt is bound to its exact command");
+    assert_eq!(validation.code(), ErrorCode::ResultIncomplete);
+
+    report.checked_revisions[0].revision = format!("{}-stale", snapshot.base_commit);
+    let step = coordinator
+        .settle(&plan, &task_id, WorkerOutcome::Reported(Box::new(report)))
+        .await
+        .expect("reject stale evidence as a durable blocked outcome");
+
+    assert!(!step.accepted);
+    assert_eq!(step.status, TaskStatus::Blocked);
+    assert!(
+        step.detail
+            .contains("every check must run against the delegated result revision")
+    );
+    assert!(store.task_result(&task_id).await.unwrap().is_none());
+    support::close(store).await;
+}
+
 async fn session_task(store: &Arc<SqliteStore>, session: &SessionId) -> TaskId {
     store
         .session_task(session)
@@ -1265,16 +1313,14 @@ async fn p5_s07_cli_run_agents_reports_ownership_and_result_revisions() {
         let result = &task["result"];
         assert!(result["base_revision"].is_string());
         assert!(result["result_revision"].is_string());
-        // An editing worker reports the revision it produced, which must differ
-        // from the revision it started from. Non-editing workers report the
-        // revision they observed.
-        if task["role"] == "coder" {
-            assert_ne!(
-                result["base_revision"], result["result_revision"],
-                "the coder must report the revision it committed"
-            );
-        } else {
-            assert_eq!(result["base_revision"], result["result_revision"]);
+        // The coder reports its commit; the verifier reports the exact
+        // dependency revision it checked; the explorer reports its base.
+        match task["role"].as_str() {
+            Some("coder" | "verifier") => {
+                assert_ne!(result["base_revision"], result["result_revision"]);
+            }
+            Some("explorer") => assert_eq!(result["base_revision"], result["result_revision"]),
+            role => panic!("unexpected delegated role: {role:?}"),
         }
     }
 

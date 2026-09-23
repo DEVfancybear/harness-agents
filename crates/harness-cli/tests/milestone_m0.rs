@@ -15,12 +15,14 @@ use std::{
 use harness_orchestrator::{BudgetUsage, DelegatedOutcome, DelegatedResult, WorkerRef};
 use harness_runtime::{AgentState, RunCommand};
 use harness_session::{AdmitInputRequest, SessionService};
-use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
+use harness_store_sqlite::{
+    RuntimeCommandRecord, RuntimeCommandState, SqliteStore, WriterOpenOptions,
+};
 use harness_types::{
     AcceptanceActor, AcceptanceCommand, AcceptanceRecord, ContentHash, CriterionEvidence,
     CriterionState, CriterionStatus, ErrorCode, EventId, FixedIdSource, HostId, InputId, ProjectId,
-    SessionId, SourceAuthority, TaskId, VersionedDocument, WorkspaceObservation,
-    known_document_kinds,
+    RuntimeCommandId, SessionId, SourceAuthority, StorePort, TaskId, VersionedDocument,
+    WorkspaceObservation, known_document_kinds,
 };
 use serde_json::Value;
 
@@ -251,7 +253,7 @@ fn satisfied_criterion(id: &str) -> CriterionState {
         status: CriterionStatus::Satisfied,
         evidence: vec![CriterionEvidence::CheckExecuted {
             command: "cargo test -p harness-types".to_owned(),
-            workspace_digest: Some(ContentHash::from_bytes(b"workspace")),
+            workspace_digest: Some(ContentHash::from_bytes(b"evidence")),
             exit_code: Some(0),
             outcome: harness_types::CheckOutcome::Passed,
             receipt_ref: Some("tool_execution_fixture".to_owned()),
@@ -416,10 +418,11 @@ fn m0_02_versioned_envelope_golden_fixtures() {
 }
 
 #[test]
-fn m0_02_store_port_contract_is_declared_without_fake_implementation() {
+fn m0_02_store_port_is_declared_and_implemented_by_sqlite() {
     // Compile-time proof that the port trait exists and can bound a generic.
     #[allow(dead_code, reason = "compile-time bound proof")]
     fn store_port_bound<T: harness_types::StorePort>() {}
+    store_port_bound::<SqliteStore>();
     // Documented capability names are stable strings.
     let capabilities = harness_types::documented_capabilities();
     assert_eq!(capabilities.len(), 3);
@@ -432,10 +435,11 @@ fn m0_02_store_port_contract_is_declared_without_fake_implementation() {
     for method in [
         "admit_input",
         "claim_run",
-        "append_domain_change",
         "freeze_step",
+        "record_synthetic_receipt",
         "admit_invocation",
         "settle_invocation",
+        "commit_task_update",
         "settle_child",
         "recover_readonly",
     ] {
@@ -449,8 +453,9 @@ fn m0_02_store_port_contract_is_declared_without_fake_implementation() {
         "the only implementation double must stay test-only"
     );
 
-    // No production source implements the port before M1. The only
-    // implementation is the cfg(test) double in harness-types.
+    // There is exactly one durable adapter, plus the explicit test-only
+    // unsupported double. An accidental second adapter would create competing
+    // transaction semantics.
     let mut implementations = Vec::new();
     for entry in fs::read_dir(repository_root().join("crates"))
         .expect("crates directory")
@@ -463,9 +468,111 @@ fn m0_02_store_port_contract_is_declared_without_fake_implementation() {
     }
     assert_eq!(
         implementations,
-        vec![PathBuf::from("harness-types/src/ports.rs")],
-        "a StorePort implementation outside the test double must wait for M1"
+        vec![
+            PathBuf::from("harness-store-sqlite/src/store/port.rs"),
+            PathBuf::from("harness-types/src/ports.rs"),
+        ],
+        "production StorePort implementations must remain explicit and singular"
     );
+}
+
+#[tokio::test]
+async fn m0_02_session_service_uses_sqlite_port_for_atomic_admission() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let store = Arc::new(
+        SqliteStore::open_writer(WriterOpenOptions::new(temp.path(), HostId::generate()))
+            .await
+            .expect("writer opens"),
+    );
+    let service = SessionService::new(Arc::clone(&store));
+    let session_id = SessionId::generate();
+    let task_id = TaskId::generate();
+    let input_id = InputId::generate();
+    let workspace = fixture_workspace();
+    let first = service
+        .admit_input(AdmitInputRequest {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            input_id: input_id.clone(),
+            expected_sequence: 1,
+            authority: SourceAuthority::User,
+            raw_text: "port-backed admission".to_owned(),
+            workspace: workspace.clone(),
+            initial_plan_items: Vec::new(),
+        })
+        .await
+        .expect("first admission commits");
+    let duplicate = service
+        .admit_input(AdmitInputRequest {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            input_id: input_id.clone(),
+            expected_sequence: 1,
+            authority: SourceAuthority::User,
+            raw_text: "port-backed admission".to_owned(),
+            workspace: workspace.clone(),
+            initial_plan_items: Vec::new(),
+        })
+        .await
+        .expect("identical input replays");
+    assert_eq!(duplicate.event_id, first.event_id);
+    assert_eq!(duplicate.sequence, first.sequence);
+
+    let conflict = service
+        .admit_input(AdmitInputRequest {
+            session_id: session_id.clone(),
+            task_id,
+            input_id,
+            expected_sequence: 1,
+            authority: SourceAuthority::User,
+            raw_text: "different payload".to_owned(),
+            workspace,
+            initial_plan_items: Vec::new(),
+        })
+        .await
+        .expect_err("same input ID cannot overwrite a different payload");
+    assert_eq!(conflict.code(), ErrorCode::IdempotencyConflict);
+    let summary = store
+        .session_summary(&session_id)
+        .await
+        .expect("read summary")
+        .expect("session remains admitted");
+    assert_eq!(summary.input_count, 1);
+    assert_eq!(summary.next_sequence, 2);
+    let clear_recovery = StorePort::recover_readonly(store.as_ref(), session_id.clone())
+        .await
+        .expect("recovery reads a consistent snapshot");
+    assert_eq!(clear_recovery.replayed_through_sequence, 1);
+    assert_eq!(clear_recovery.pending_effects, 0);
+    assert!(clear_recovery.blocked_reason.is_none());
+
+    store
+        .enqueue_runtime_command(RuntimeCommandRecord {
+            command_id: RuntimeCommandId::generate(),
+            session_id: session_id.clone(),
+            task_id: summary.task_id,
+            state: RuntimeCommandState::Pending,
+            attempts: 0,
+            owner_generation: 0,
+            payload: serde_json::json!({"kind": "recovery-test"}),
+            last_error: None,
+        })
+        .await
+        .expect("pending command commits");
+    let blocked_recovery = StorePort::recover_readonly(store.as_ref(), session_id.clone())
+        .await
+        .expect("pending command is visible to recovery");
+    assert_eq!(blocked_recovery.pending_effects, 1);
+    assert_eq!(
+        blocked_recovery.blocked_reason.as_deref(),
+        Some("unsettled external effects require reconciliation")
+    );
+    drop(service);
+    Arc::try_unwrap(store)
+        .expect("store consumers released")
+        .close()
+        .await
+        .expect("writer closes");
 }
 
 fn collect_store_port_implementations(directory: &Path, found: &mut Vec<PathBuf>) {
@@ -686,7 +793,7 @@ fn m0_04_milestone_registry_and_gate_self_test() {
         .iter()
         .map(|value| value.as_str().expect("a selector").to_owned())
         .collect::<Vec<_>>();
-    assert_eq!(required.len(), 11);
+    assert_eq!(required.len(), 12);
     let source = fs::read_to_string(root.join("crates/harness-cli/tests/milestone_m0.rs"))
         .expect("milestone target source");
     for selector in &required {

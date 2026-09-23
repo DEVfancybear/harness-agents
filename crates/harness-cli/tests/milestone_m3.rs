@@ -22,15 +22,17 @@ use harness_runtime::{
 };
 use harness_session::{AdmitInputRequest, SessionService};
 use harness_store_sqlite::{
-    BudgetReservationState, QuestionOutcome, QuestionState, RunState, SqliteStore, StoreFaultPlan,
-    StoreFaultPoint, WriterOpenOptions,
+    BudgetReservationState, QuestionOutcome, QuestionState, RunState, RunStepRecord, SqliteStore,
+    StoreFaultPlan, StoreFaultPoint, WriterOpenOptions,
 };
 use harness_tools::{
     ApprovalMode, ToolExecutionService, TurnDriver, TurnLimits, TurnObserver, TurnOptions,
     TurnProgress, TurnStop, coding_tool_schemas, observe_workspace,
 };
 use harness_types::{
-    AgentRunId, BudgetId, ContentHash, ErrorCode, HostId, InputId, ProjectId, SessionId, TaskId,
+    AgentRunId, BudgetId, ContentHash, ContextPacketId, ErrorCode, HostId, InputId, ProjectId,
+    RequestId, RunStartRequest, SessionId, SourceAuthority, StepId, StorePort, TaskId,
+    WorkspaceObservation,
 };
 use serde_json::json;
 
@@ -194,6 +196,73 @@ fn bench() -> Bench {
     }
 }
 
+async fn assert_budget_parent_links_are_valid(ledger: &BudgetLedger) {
+    let parent = BudgetId::generate();
+    let child = BudgetId::generate();
+    ledger
+        .ensure_account(&parent, None, 50)
+        .await
+        .expect("parent");
+    ledger
+        .ensure_account(&child, Some(&parent), 500)
+        .await
+        .expect("child");
+
+    let missing_parent = BudgetId::generate();
+    let missing_parent_error = ledger
+        .ensure_account(&BudgetId::generate(), Some(&missing_parent), 20)
+        .await
+        .expect_err("a child cannot be created before its parent");
+    assert_eq!(missing_parent_error.code(), ErrorCode::InvalidPayload);
+
+    let self_parent = BudgetId::generate();
+    let self_parent_error = ledger
+        .ensure_account(&self_parent, Some(&self_parent), 20)
+        .await
+        .expect_err("an account cannot parent itself");
+    assert_eq!(self_parent_error.code(), ErrorCode::InvalidPayload);
+
+    ledger
+        .reserve(&child, "child-a", "provider_attempt", 30)
+        .await
+        .expect("child reservation inside the parent");
+    let over = ledger
+        .reserve(&child, "child-b", "provider_attempt", 30)
+        .await
+        .expect_err("the parent limit refuses the second child reservation");
+    assert_eq!(over.code(), ErrorCode::BudgetExhausted);
+}
+
+async fn assert_empty_goal_fails_before_provider_dispatch() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let provider = Arc::new(ScriptedProvider::text("looks done"));
+    let (runtime, _) = runtime_for(&store, provider.clone(), None, None).await;
+    let run_request = request(
+        &bench.workspace,
+        SessionId::generate(),
+        TaskId::generate(),
+        "fix it",
+    );
+    let input_id = run_request.input_id.clone();
+    let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)))
+        .with_goal(GoalSpec::new("", Vec::new()));
+    let error = driver
+        .run_turn(
+            run_request,
+            options(&bench.workspace),
+            Arc::new(RecordingObserver::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("an empty goal is invalid");
+    assert_eq!(error.code(), ErrorCode::InvalidPayload);
+    assert_eq!(provider.calls(), 0, "invalid goals must not dispatch");
+    assert!(store.run_by_input(&input_id).await.unwrap().is_none());
+    drop(driver);
+    close(store).await;
+}
+
 fn options(workspace: &std::path::Path) -> TurnOptions {
     TurnOptions {
         workspace_root: workspace.to_path_buf(),
@@ -266,6 +335,101 @@ fn run_cli(arguments: &[&str], home: &std::path::Path) -> std::process::Output {
         .env("HA_HOME", home)
         .output()
         .expect("cli runs")
+}
+
+#[tokio::test]
+async fn m3_01_run_reclaim_fences_old_generation_before_freeze() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let session_id = SessionId::generate();
+    let task_id = TaskId::generate();
+    let input_id = InputId::generate();
+    let session = SessionService::new(Arc::clone(&store));
+    session
+        .admit_input(AdmitInputRequest {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            input_id: input_id.clone(),
+            expected_sequence: 1,
+            authority: SourceAuthority::User,
+            raw_text: "resume this run after writer takeover".to_owned(),
+            workspace: WorkspaceObservation {
+                project_id: ProjectId::generate(),
+                worktree_id: "m3-run-reclaim".to_owned(),
+                base_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                observed_fingerprint: ContentHash::from_bytes(b"m3 run reclaim"),
+            },
+            initial_plan_items: Vec::new(),
+        })
+        .await
+        .expect("input admission succeeds");
+    let first_generation = store.fence().expect("first fence").generation;
+    let original = store
+        .start_run(&session_id, &task_id, &input_id, None)
+        .await
+        .expect("run starts");
+    assert_eq!(original.owner_generation, first_generation);
+    drop(session);
+    close(store).await;
+
+    let store = bench.open_store().await;
+    let current_generation = store.fence().expect("new fence").generation;
+    assert!(current_generation > first_generation);
+    let stale_step = RunStepRecord {
+        step_id: StepId::generate(),
+        run_id: original.run_id.clone(),
+        step_index: 0,
+        request_id: RequestId::generate(),
+        packet_id: ContextPacketId::generate(),
+        manifest_hash: ContentHash::from_bytes(b"stale step"),
+        source_sequence: 1,
+        state: "frozen".to_owned(),
+        stop_reason: None,
+    };
+    let error = store
+        .freeze_run_step(&original.run_id, original.revision, stale_step, None)
+        .await
+        .expect_err("the prior generation must not freeze after takeover");
+    assert_eq!(error.code(), ErrorCode::StaleWriter);
+
+    let lease = StorePort::claim_run(
+        store.as_ref(),
+        RunStartRequest {
+            session_id: session_id.clone(),
+            task_id,
+            input_id,
+            budget_id: None,
+            expected_owner_generation: current_generation,
+        },
+    )
+    .await
+    .expect("current generation reclaims the existing run");
+    assert_eq!(lease.run_id, original.run_id);
+    assert_eq!(lease.owner_generation, current_generation);
+    let frozen = StorePort::freeze_step(
+        store.as_ref(),
+        harness_types::FreezeStepCommit {
+            run_id: lease.run_id.clone(),
+            expected_owner_generation: lease.owner_generation,
+            expected_revision: lease.revision,
+            step: harness_types::FrozenRunStep {
+                step_id: StepId::generate(),
+                run_id: lease.run_id.clone(),
+                step_index: 0,
+                request_id: RequestId::generate(),
+                packet_id: ContextPacketId::generate(),
+                manifest_hash: ContentHash::from_bytes(b"reclaimed step"),
+                source_sequence: 1,
+                state: "frozen".to_owned(),
+                stop_reason: None,
+            },
+            reservation: None,
+        },
+    )
+    .await
+    .expect("reclaimed owner may freeze the next step");
+    assert_eq!(frozen.revision, lease.revision + 1);
+    close(store).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -847,26 +1011,8 @@ async fn m3_03_budget_reservation_atomicity() {
         68
     );
 
-    // Hierarchical limits: the child has room, the parent does not.
-    let parent = BudgetId::generate();
-    let child = BudgetId::generate();
-    ledger
-        .ensure_account(&parent, None, 50)
-        .await
-        .expect("parent");
-    ledger
-        .ensure_account(&child, Some(&parent), 500)
-        .await
-        .expect("child");
-    ledger
-        .reserve(&child, "child-a", "provider_attempt", 30)
-        .await
-        .expect("child reservation inside the parent");
-    let over = ledger
-        .reserve(&child, "child-b", "provider_attempt", 30)
-        .await
-        .expect_err("the parent limit refuses the second child reservation");
-    assert_eq!(over.code(), ErrorCode::BudgetExhausted);
+    // Hierarchical limits and parent-link validation share one real ledger.
+    assert_budget_parent_links_are_valid(&ledger).await;
     drop(ledger);
     close(store).await;
 }
@@ -1019,9 +1165,12 @@ fn goal_with(kind: EvidenceKind, max_continuations: u32, max_no_progress: u32) -
 
 #[tokio::test]
 async fn a09_terminal_acceptance() {
-    let bench = bench();
+    // A goal without required criteria cannot pass by vacuous truth, and the
+    // invalid contract is rejected before a run or provider request is created.
+    assert_empty_goal_fails_before_provider_dispatch().await;
 
     // Variant 1: an empty final is terminal but unverifiable, and it is not retried.
+    let bench = bench();
     let store = bench.open_store().await;
     let provider = Arc::new(ScriptedProvider::new(vec![ScriptStep::Events(vec![
         ProviderStreamEvent::started(),
@@ -1243,6 +1392,41 @@ async fn a10_goal_no_progress() {
     assert_eq!(run.state, RunState::Failed);
     assert_eq!(run.acceptance.as_deref(), Some("unverified"));
     assert_ne!(run.acceptance.as_deref(), Some("satisfied"));
+    drop(driver);
+    close(store).await;
+
+    // An evaluator is a proposer, not an authority: it cannot satisfy a Check
+    // criterion when the host has no check receipt bound to the final digest.
+    let store = bench.open_store().await;
+    let provider = Arc::new(ScriptedProvider::text("trust me"));
+    let evaluator = Arc::new(FixedEvaluator {
+        verdict: GoalVerdict::Satisfied {
+            satisfied: vec!["criterion-1".to_owned()],
+        },
+    });
+    let (runtime, _) = runtime_for(&store, provider, Some(evaluator), None).await;
+    let run_request = request(
+        &bench.workspace,
+        SessionId::generate(),
+        TaskId::generate(),
+        "fix it",
+    );
+    let input_id = run_request.input_id.clone();
+    let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)))
+        .with_goal(goal_with(EvidenceKind::Check, 4, 1));
+    let error = driver
+        .run_turn(
+            run_request,
+            options(&bench.workspace),
+            Arc::new(RecordingObserver::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a custom evaluator cannot invent check evidence");
+    assert_eq!(error.code(), ErrorCode::InvalidPayload);
+    let run = store.run_by_input(&input_id).await.unwrap().unwrap();
+    assert_eq!(run.state, RunState::Failed);
+    assert_eq!(run.acceptance.as_deref(), Some("unverified"));
     drop(driver);
     close(store).await;
 }

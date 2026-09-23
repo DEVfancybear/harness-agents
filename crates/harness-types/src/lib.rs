@@ -13,6 +13,7 @@ mod ids;
 mod ports;
 mod schema;
 mod scope;
+mod store_transactions;
 mod version;
 
 pub use acceptance::{
@@ -41,13 +42,19 @@ pub use ids::{
     SystemIdSource, TaskId, ToolApprovalId, ToolExecutionId, ToolInvocationId,
 };
 pub use ports::{
-    AdmissionOutcome, AdmittedInput, BudgetReservation, CAPABILITY_MEMORY_READ,
-    CAPABILITY_TOOLS_READ, CAPABILITY_TOOLS_WRITE, ChildResultRef, CommitRef, DeliveryRef,
-    DomainChange, FrozenStepRef, IntentRef, InvocationGrant, InvocationProposal,
-    InvocationReceiptRef, PortRecoveryView, RunLease, StorePort, documented_capabilities,
+    AdmissionOutcome, CAPABILITY_MEMORY_READ, CAPABILITY_TOOLS_READ, CAPABILITY_TOOLS_WRITE,
+    StoreFuture, StorePort, documented_capabilities,
 };
 pub use schema::{SchemaDocument, generated_schema_documents};
 pub use scope::{ScopeContext, ScopeTarget};
+pub use store_transactions::{
+    AdmissionAck, AdmissionCommit, BudgetUsageRecord, CommitRef, DeliveryCommit, FreezeStepCommit,
+    FrozenBudgetReservation, FrozenRunStep, InvocationReceiptRef, ParentDeliveryRecord,
+    PortRecoveryView, PublishedArtifact, ReceiptAck, ReceiptCommit, RunLease, RunStartRequest,
+    SourceWorkMarker, StoredDelegatedResultRecord, StoredTaskNodeRecord, ToolApprovalBinding,
+    ToolIntentCommit, ToolIntentRecord, ToolIntentStatus, ToolSettlementCommit,
+    ToolTaskUpdateCommit,
+};
 pub use version::{VersionedDocument, known_document_kinds};
 
 /// The only schema revision accepted by P0 contracts.

@@ -174,7 +174,14 @@ impl BudgetLedger {
     pub async fn remaining(&self, budget_id: &BudgetId) -> Result<u64, RuntimeError> {
         let mut remaining = u64::MAX;
         let mut current = Some(budget_id.clone());
+        let mut visited = std::collections::BTreeSet::new();
         while let Some(account_id) = current {
+            if !visited.insert(account_id.as_str().to_owned()) {
+                return Err(RuntimeError::new(
+                    ErrorCode::StorageWriteFailed,
+                    "budget account hierarchy contains a cycle",
+                ));
+            }
             let account = self
                 .store
                 .budget_account(&account_id)

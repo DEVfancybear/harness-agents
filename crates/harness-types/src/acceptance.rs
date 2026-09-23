@@ -231,8 +231,69 @@ impl AcceptanceRecord {
                 "a human acceptance requires the source it was recorded from",
             ));
         }
-        for criterion in &self.criteria {
-            criterion.validate()?;
+        validate_criteria(&self.criteria)?;
+        if matches!(self.decided_by, AcceptanceActor::Automatic) && self.decision_source.is_some() {
+            return Err(HarnessError::new(
+                ErrorCode::InvalidPayload,
+                "an automatic acceptance cannot name a human decision source",
+            ));
+        }
+        if matches!(self.decision, AcceptanceDecision::Accepted) && self.pending_effects != 0 {
+            return Err(HarnessError::new(
+                ErrorCode::InvalidStateTransition,
+                "acceptance is blocked while effects are pending",
+            ));
+        }
+        if matches!(self.decision, AcceptanceDecision::Accepted)
+            && matches!(self.decided_by, AcceptanceActor::Automatic)
+        {
+            let required = self
+                .criteria
+                .iter()
+                .filter(|item| item.required)
+                .collect::<Vec<_>>();
+            if required.is_empty()
+                || self.pending_effects != 0
+                || required
+                    .iter()
+                    .any(|item| !matches!(item.status, CriterionStatus::Satisfied))
+            {
+                return Err(HarnessError::new(
+                    ErrorCode::InvalidStateTransition,
+                    "automatic acceptance requires satisfied required criteria and no pending effects",
+                ));
+            }
+            for criterion in required {
+                for evidence in &criterion.evidence {
+                    if let CriterionEvidence::CheckExecuted {
+                        workspace_digest,
+                        exit_code,
+                        outcome,
+                        ..
+                    } = evidence
+                        && (*outcome != CheckOutcome::Passed
+                            || *exit_code != Some(0)
+                            || workspace_digest.is_none()
+                            || workspace_digest.as_ref() != self.evidence_fingerprint.as_ref())
+                    {
+                        return Err(HarnessError::new(
+                            ErrorCode::InvalidPayload,
+                            format!(
+                                "accepted check evidence for {} must pass with exit code 0 at the accepted workspace fingerprint",
+                                criterion.criterion_id
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        if matches!(self.decided_by, AcceptanceActor::Human { .. })
+            && !matches!(self.decision, AcceptanceDecision::Accepted)
+        {
+            return Err(HarnessError::new(
+                ErrorCode::InvalidStateTransition,
+                "a human decision source is only valid for an accepted override",
+            ));
         }
         Ok(())
     }
@@ -258,6 +319,12 @@ impl AcceptanceRecord {
                     .iter()
                     .filter(|criterion| criterion.required)
                     .count();
+                if required == 0 {
+                    return Err(HarnessError::new(
+                        ErrorCode::InvalidPayload,
+                        "automatic acceptance requires at least one required criterion",
+                    ));
+                }
                 let satisfied = criteria
                     .iter()
                     .filter(|criterion| {
@@ -275,23 +342,22 @@ impl AcceptanceRecord {
                         actor: AcceptanceActor::Automatic,
                     });
                 }
-                Ok(AcceptanceTransition {
-                    next: Self {
-                        schema_version: P0_SCHEMA_VERSION,
-                        task_id: self.task_id.clone(),
-                        criteria,
-                        pending_effects,
-                        evidence_fingerprint,
-                        decision: if accepted {
-                            AcceptanceDecision::Accepted
-                        } else {
-                            AcceptanceDecision::NotAccepted
-                        },
-                        decided_by: AcceptanceActor::Automatic,
-                        decision_source: None,
+                let next = Self {
+                    schema_version: P0_SCHEMA_VERSION,
+                    task_id: self.task_id.clone(),
+                    criteria,
+                    pending_effects,
+                    evidence_fingerprint,
+                    decision: if accepted {
+                        AcceptanceDecision::Accepted
+                    } else {
+                        AcceptanceDecision::NotAccepted
                     },
-                    events,
-                })
+                    decided_by: AcceptanceActor::Automatic,
+                    decision_source: None,
+                };
+                next.validate()?;
+                Ok(AcceptanceTransition { next, events })
             }
             AcceptanceCommand::HumanAccept { actor_id, source } => {
                 if actor_id.trim().is_empty() {
@@ -301,21 +367,23 @@ impl AcceptanceRecord {
                     ));
                 }
                 source.validate()?;
-                Ok(AcceptanceTransition {
-                    next: Self {
-                        schema_version: P0_SCHEMA_VERSION,
-                        task_id: self.task_id.clone(),
-                        // Criteria are deliberately untouched: an override is a
-                        // recorded human decision, not fabricated test evidence.
-                        criteria: self.criteria.clone(),
-                        pending_effects: self.pending_effects,
-                        evidence_fingerprint: self.evidence_fingerprint.clone(),
-                        decision: AcceptanceDecision::Accepted,
-                        decided_by: AcceptanceActor::Human {
-                            actor_id: actor_id.clone(),
-                        },
-                        decision_source: Some(source),
+                let next = Self {
+                    schema_version: P0_SCHEMA_VERSION,
+                    task_id: self.task_id.clone(),
+                    // Criteria are deliberately untouched: an override is a
+                    // recorded human decision, not fabricated test evidence.
+                    criteria: self.criteria.clone(),
+                    pending_effects: self.pending_effects,
+                    evidence_fingerprint: self.evidence_fingerprint.clone(),
+                    decision: AcceptanceDecision::Accepted,
+                    decided_by: AcceptanceActor::Human {
+                        actor_id: actor_id.clone(),
                     },
+                    decision_source: Some(source),
+                };
+                next.validate()?;
+                Ok(AcceptanceTransition {
+                    next,
                     events: vec![
                         AcceptanceEvent::HumanOverride {
                             actor_id: actor_id.clone(),
@@ -350,7 +418,9 @@ mod tests {
         AcceptanceActor, AcceptanceCommand, AcceptanceDecision, AcceptanceEvent, AcceptanceRecord,
         CriterionEvidence, CriterionState, CriterionStatus,
     };
-    use crate::{CheckOutcome, ContentHash, ErrorCode, EventId, SourceRef, TaskId};
+    use crate::{
+        CheckOutcome, ContentHash, ErrorCode, EventId, P0_SCHEMA_VERSION, SourceRef, TaskId,
+    };
 
     fn source() -> SourceRef {
         SourceRef {
@@ -368,7 +438,7 @@ mod tests {
             evidence: if matches!(status, CriterionStatus::Satisfied) {
                 vec![CriterionEvidence::CheckExecuted {
                     command: "cargo test -p harness-types".to_owned(),
-                    workspace_digest: Some(ContentHash::from_bytes(b"workspace")),
+                    workspace_digest: Some(ContentHash::from_bytes(b"evidence")),
                     exit_code: Some(0),
                     outcome: CheckOutcome::Passed,
                     receipt_ref: Some("tool_execution_fixture".to_owned()),
@@ -415,6 +485,17 @@ mod tests {
             })
             .expect("evaluation is allowed");
         assert_eq!(transition.next.decision, AcceptanceDecision::NotAccepted);
+        assert_eq!(
+            transition
+                .next
+                .apply(AcceptanceCommand::HumanAccept {
+                    actor_id: "operator".to_owned(),
+                    source: source(),
+                })
+                .expect_err("human override cannot accept unresolved effects")
+                .code(),
+            ErrorCode::InvalidStateTransition
+        );
     }
 
     #[test]
@@ -516,6 +597,81 @@ mod tests {
                 evidence_fingerprint: None,
             })
             .expect_err("satisfied without evidence is not recordable");
+        assert_eq!(error.code(), ErrorCode::InvalidPayload);
+    }
+
+    #[test]
+    fn automatic_acceptance_cannot_be_vacuous_or_forged() {
+        let record = AcceptanceRecord::initial(TaskId::generate());
+        let empty = record
+            .apply(AcceptanceCommand::Evaluate {
+                criteria: Vec::new(),
+                pending_effects: 0,
+                evidence_fingerprint: None,
+            })
+            .expect_err("empty criteria must not satisfy by vacuous truth");
+        assert_eq!(empty.code(), ErrorCode::InvalidPayload);
+
+        let forged = AcceptanceRecord {
+            schema_version: P0_SCHEMA_VERSION,
+            task_id: TaskId::generate(),
+            criteria: vec![criterion("tests-pass", true, CriterionStatus::Pending)],
+            pending_effects: 0,
+            evidence_fingerprint: None,
+            decision: AcceptanceDecision::Accepted,
+            decided_by: AcceptanceActor::Automatic,
+            decision_source: None,
+        };
+        assert_eq!(
+            forged
+                .validate()
+                .expect_err("stored acceptance is inconsistent")
+                .code(),
+            ErrorCode::InvalidStateTransition
+        );
+    }
+
+    #[test]
+    fn accepted_check_evidence_must_match_the_final_workspace_fingerprint() {
+        let record = AcceptanceRecord::initial(TaskId::generate());
+        let error = record
+            .apply(AcceptanceCommand::Evaluate {
+                criteria: vec![CriterionState {
+                    criterion_id: "tests-pass".to_owned(),
+                    required: true,
+                    status: CriterionStatus::Satisfied,
+                    evidence: vec![CriterionEvidence::CheckExecuted {
+                        command: "cargo test".to_owned(),
+                        workspace_digest: Some(ContentHash::from_bytes(b"old-workspace")),
+                        exit_code: Some(0),
+                        outcome: CheckOutcome::Passed,
+                        receipt_ref: Some("receipt:check-1".to_owned()),
+                    }],
+                }],
+                pending_effects: 0,
+                evidence_fingerprint: Some(ContentHash::from_bytes(b"new-workspace")),
+            })
+            .expect_err("a check before the final edit cannot accept the task");
+        assert_eq!(error.code(), ErrorCode::InvalidPayload);
+
+        let error = record
+            .apply(AcceptanceCommand::Evaluate {
+                criteria: vec![CriterionState {
+                    criterion_id: "tests-pass".to_owned(),
+                    required: true,
+                    status: CriterionStatus::Satisfied,
+                    evidence: vec![CriterionEvidence::CheckExecuted {
+                        command: "cargo test".to_owned(),
+                        workspace_digest: None,
+                        exit_code: Some(0),
+                        outcome: CheckOutcome::Passed,
+                        receipt_ref: Some("receipt:check-1".to_owned()),
+                    }],
+                }],
+                pending_effects: 0,
+                evidence_fingerprint: None,
+            })
+            .expect_err("a check without a workspace digest cannot accept the task");
         assert_eq!(error.code(), ErrorCode::InvalidPayload);
     }
 }

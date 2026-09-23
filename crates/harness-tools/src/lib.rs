@@ -56,7 +56,9 @@ pub use process::{HostEnvironment, PROCESS_ENVIRONMENT_ALLOWLIST};
 // place the driver writes it.
 pub use harness_runtime::AcceptanceState;
 pub use secrets::{HostEnvironmentSecrets, SecretResolver};
-pub use service::{ExternalToolDispatcher, ToolExecutionService, ToolObserver};
+pub use service::{
+    ExternalToolDispatcher, ToolDispatchAuthorization, ToolExecutionService, ToolObserver,
+};
 pub use turn_driver::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ExternalToolCatalog,
     ExternalTools, GoalReport, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnOutcome,

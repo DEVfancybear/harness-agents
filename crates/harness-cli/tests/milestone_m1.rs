@@ -88,6 +88,7 @@ fn receipt(task_id: TaskId, sequence: u64) -> ToolExecutionReceipt {
         after_fingerprint: None,
         before_hash: None,
         after_hash: None,
+        exit_code: None,
         artifact_id: None,
         observed_at_seq: sequence,
     }

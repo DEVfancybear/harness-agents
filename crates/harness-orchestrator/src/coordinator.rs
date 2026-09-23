@@ -10,7 +10,7 @@ use harness_providers::CancellationToken;
 use harness_store_sqlite::{
     SqliteStore, StoredDelegatedResultRecord, StoredTaskNodeRecord, TaskAdmission, TaskOwnerRecord,
 };
-use harness_types::{AgentRunId, ContentHash, ErrorCode, SessionId, TaskId};
+use harness_types::{AgentRunId, ContentHash, ErrorCode, SessionId, StorePort, TaskId};
 use serde_json::json;
 
 use crate::contracts::{
@@ -470,8 +470,9 @@ impl DelegationCoordinator {
         let recipient = Self::recipient_task_id(plan, task_id);
         let parent = recipient.unwrap_or_else(|| task_id.clone());
         let recipient_session_id = self.recipient_session(&parent).await?;
-        self.store
-            .commit_delivery(harness_store_sqlite::DeliveryCommit {
+        StorePort::settle_child(
+            self.store.as_ref(),
+            harness_types::DeliveryCommit {
                 task_transition: StoredTaskNodeRecord {
                     task_id: task_id.clone(),
                     parent_task_id: stored.parent_task_id.clone(),
@@ -510,8 +511,10 @@ impl DelegationCoordinator {
                     retries: usage.retries,
                     cost_units: 0,
                 }),
-            })
-            .await?;
+            },
+        )
+        .await
+        .map_err(|error| OrchestratorError::new(error.code(), error.message().to_owned()))?;
         Ok(())
     }
 
@@ -543,8 +546,9 @@ impl DelegationCoordinator {
             task_id.as_str().rsplit('-').next().unwrap_or("task"),
             revision
         );
-        self.store
-            .commit_delivery(harness_store_sqlite::DeliveryCommit {
+        StorePort::settle_child(
+            self.store.as_ref(),
+            harness_types::DeliveryCommit {
                 task_transition: StoredTaskNodeRecord {
                     task_id: task_id.clone(),
                     parent_task_id: stored.parent_task_id.clone(),
@@ -569,8 +573,10 @@ impl DelegationCoordinator {
                     consumed_by: None,
                 },
                 usage: None,
-            })
-            .await?;
+            },
+        )
+        .await
+        .map_err(|error| OrchestratorError::new(error.code(), error.message().to_owned()))?;
         Ok(())
     }
 

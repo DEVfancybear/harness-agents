@@ -9,11 +9,11 @@ use harness_store_sqlite::{
     ReceiptCommit, SnapshotRecord, SourceWorkMarker, SqliteStore, StoreError,
 };
 use harness_types::{
-    CheckEvidence, ContentHash, EventEnvelope, EventId, InputId, InstructionId,
+    AdmissionOutcome, CheckEvidence, ContentHash, EventEnvelope, EventId, InputId, InstructionId,
     InstructionLedgerEntry, InstructionStatus, NextActionProposal, P0_SCHEMA_VERSION,
     PendingToolCall, PendingToolState, PlanItem, ProducerIdentity, SessionId, SnapshotId,
-    SourceAuthority, SourceRef, TaskId, ToolExecutionId, ToolExecutionReceipt, ToolOutcomeState,
-    WorkingState, WorkspaceObservation,
+    SourceAuthority, SourceRef, StorePort, TaskId, ToolExecutionId, ToolExecutionReceipt,
+    ToolOutcomeState, WorkingState, WorkspaceObservation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -183,8 +183,9 @@ impl SessionService {
             kind: "input_admission".to_owned(),
             status: "committed".to_owned(),
         };
-        self.store
-            .commit_admission(AdmissionCommit {
+        let outcome = StorePort::admit_input(
+            self.store.as_ref(),
+            AdmissionCommit {
                 session_id: request.session_id,
                 task_id: request.task_id,
                 input_id: request.input_id,
@@ -195,8 +196,13 @@ impl SessionService {
                 instruction,
                 working_state: state,
                 marker,
-            })
-            .await
+            },
+        )
+        .await
+        .map_err(|error| StoreError::new(error.code(), error.message().to_owned()))?;
+        Ok(match outcome {
+            AdmissionOutcome::Admitted(ack) | AdmissionOutcome::Duplicate(ack) => ack,
+        })
     }
 
     /// Record a synthetic, immutable receipt without performing a side effect.
@@ -264,8 +270,9 @@ impl SessionService {
             kind: "synthetic_receipt".to_owned(),
             status: "committed".to_owned(),
         };
-        self.store
-            .commit_receipt(ReceiptCommit {
+        StorePort::record_synthetic_receipt(
+            self.store.as_ref(),
+            ReceiptCommit {
                 session_id: request.session_id,
                 task_id: request.task_id,
                 expected_sequence: request.expected_sequence,
@@ -274,8 +281,10 @@ impl SessionService {
                 working_state: state,
                 marker,
                 artifact: request.artifact,
-            })
-            .await
+            },
+        )
+        .await
+        .map_err(|error| StoreError::new(error.code(), error.message().to_owned()))
     }
 
     /// Persist the complete recovery view at the latest committed sequence.

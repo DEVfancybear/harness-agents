@@ -502,8 +502,8 @@ async fn p6_s03_external_tools_cross_the_same_policy_gate() {
         harness_types::ToolOutcomeState::Denied
     );
 
-    // An unloaded extension is a typed denial, never a silent success.
-    extension_host.shutdown_all().await;
+    // If the extension unloads after approval, the committed dispatch intent is
+    // uncertain; the gate never reports a silent success.
     let after_unload = harness_tools::ToolRequest {
         session_id: session.clone(),
         task_id: task.clone(),
@@ -522,8 +522,9 @@ async fn p6_s03_external_tools_cross_the_same_policy_gate() {
     let prepared = service
         .prepare(after_unload)
         .await
-        .expect("gate still prepares");
+        .expect("active extension validates before approval");
     let approval = service.approve(&prepared).await.expect("approval");
+    extension_host.shutdown_all().await;
     let executed = service
         .execute(prepared, Some(approval))
         .await
@@ -595,22 +596,9 @@ async fn p6_s04_mcp_client_registers_scoped_tools_and_renegotiates() {
     assert_eq!(client.generation(), 1);
     assert_eq!(client.scope_id(), &scope);
 
-    // A real tool call crosses the SDK and returns a real result.
-    let result = client
-        .call_tool("observe", json!({"subject": "src/lib.rs"}))
-        .await
-        .expect("tool call");
-    assert_eq!(result["isError"], json!(false));
-    assert!(
-        result["content"][0]["text"]
-            .as_str()
-            .expect("text content")
-            .contains("observed src/lib.rs")
-    );
-
-    // A tool the server never advertised is refused locally.
-    let error = client.call_tool("not_a_tool", json!({})).await.unwrap_err();
-    assert_eq!(error.code(), ErrorCode::PolicyDenied);
+    // The client exposes metadata and registration; executable calls stay
+    // behind the shared ToolExecutionService gate. M6 tests the approved and
+    // denied calls end to end with durable intents and receipts.
 
     // Discovery is scoped registration: the tools land in the MCP scope, and a
     // duplicate registration in the same layer is refused.

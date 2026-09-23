@@ -21,6 +21,6 @@ P1 đã có store `SQLite` với writer lock, host epoch và transaction cho inp
 ## 3. Hệ quả
 
 - M3 thêm bảng runs/steps/attempts bằng migration riêng, không đổi `STORE_SCHEMA_VERSION`.
-- M4 thêm approvals/intents/receipts (đã có từ P3) và **khi đó** implement `StorePort` cho `SqliteStore`/`SessionService` với proposal/grant/receipt thật.
+- M4 thêm approvals/intents/receipts (đã có từ P3). StorePort được hoãn ở M1 vì contract khi đó thiếu transaction inputs; audit M0–M6 sau này chuẩn hóa DTO đầy đủ rồi implement adapter production `SqliteStore` cho admission, run lease/freeze, intent/settlement, task update, receipt và child delivery. Adapter gọi atomic operations hiện hữu, kiểm generation/revision và không tạo success placeholder.
 - M9 backup/restore phải copy cả `harness-data.json`; restore vào directory có marker mới hơn phải từ chối.
 - Mọi thay đổi pragma durability phải cập nhật `diagnostics()` và test P1 tương ứng.

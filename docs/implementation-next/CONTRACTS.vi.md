@@ -27,20 +27,24 @@ Một `SessionRevision(u64)` tăng khi journal append thành công. Không dùng
 ## 3. StorePort và transaction boundaries
 
 ```text
-admit_input(scope, input_id, payload_hash, expected_seq, content)
-  -> Admitted { event_id, seq, state_revision } | Duplicate(same_result)
-     | IdempotencyConflict | RevisionConflict
-claim_run(scope, command_id, expected_owner_generation) -> RunLease
-append_domain_change(lease, expected_seq, validated_change) -> CommitRef
-freeze_step(lease, source_seq, packet, provider_request, budget_reservation)
-  -> FrozenStepRef | RevisionConflict
-admit_invocation(lease, proposal, grant, expected_workspace) -> IntentRef
-settle_invocation(lease, intent_id, receipt, projection_change) -> CommitRef
-settle_child(lease, child_result, parent_delivery) -> CommitRef
+admit_input(AdmissionCommit) -> Admitted(Ack) | Duplicate(Ack)
+claim_run(RunStartRequest{session, task, input, budget, expected_owner_generation})
+  -> RunLease{run, session, task, input, owner_generation, revision}
+freeze_step(FreezeStepCommit{run, expected_owner_generation, expected_revision,
+                             frozen_step, optional_budget_reservation}) -> RunLease
+record_synthetic_receipt(ReceiptCommit{event, receipt, projection, marker, artifact?})
+  -> ReceiptAck
+admit_invocation(ToolIntentCommit{event, intent, projection, marker}) -> CommitRef
+settle_invocation(ToolSettlementCommit{event, receipt, projection, marker, artifact?, status})
+  -> ReceiptAck
+commit_task_update(ToolTaskUpdateCommit{event, projection, marker, approval}) -> CommitRef
+settle_child(DeliveryCommit{child_result, parent_delivery}) -> ()
 recover_readonly(session_id) -> RecoveryView
 ```
 
 Duplicate cùng ID + payload hash trả kết quả cũ; cùng ID khác payload reject, không overwrite. Claim phải conditional update/unique transaction, không read-then-write race. Receipt immutable; correction/reconciliation là event mới tham chiếu receipt cũ. `outcome_unknown` không đồng nghĩa failed/no side effect.
+
+`StorePort` đã có adapter production `SqliteStore` từ lượt audit M0–M6. Mỗi DTO mang đủ dữ liệu cho transaction sở hữu tương ứng: admission gồm raw input/event/projection/instruction/marker; tool intent gồm binding approval đã consume; settlement gồm receipt/projection/artifact/status; delivery gồm child result và parent inbox. Caller không được tách thành các lần ghi nhỏ. `claim_run` reclaim run chưa terminal theo generation mới trong cùng transaction; freeze/finish kiểm tra generation và revision. `recover_readonly` đọc sequence, tool intents và runtime commands trên cùng một SQLite snapshot, và báo block nếu còn bất kỳ external effect nào. Future được box tại biên port để chi phí kích thước của transaction adapter không làm phình future điều khiển cả turn.
 
 M1 kiểm kê schema/constraints/migration runner hiện có trước; tái sử dụng tables và chỉ thêm migration cho gap. Logical core tables cần đối chiếu: metadata/migrations, ownership, projects/workspaces, tasks/sessions, inputs, events, projections/checkpoints, commands/inbox/outbox, artifact metadata/references. Minimum unique constraints: `(session_id, seq)`, event ID, `(scope,input_id)`, delivery dedupe key. Các table run/step có thể được M3 thêm; public IDs/types tồn tại từ M0.
 

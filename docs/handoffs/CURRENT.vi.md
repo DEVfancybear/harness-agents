@@ -1,6 +1,19 @@
 # CURRENT — bàn giao đang mở
 
-## Audit đang thực hiện — P0–P7 code review và sửa defects
+## Audit M0–M6 — đã sửa và gate xanh trên Windows
+
+**Cập nhật:** 24/09/2026 · **Branch/worktree:** `codex/m0-m6-audit` tại
+`C:\Users\duong\AppData\Local\Temp\harness-agents-p0-p7-audit` · **Base:**
+`b36253c` (`origin/master` tại thời điểm bắt đầu; đã gồm P0–P7 audit). Linux giữ **pending** theo chỉ dẫn.
+
+- **Production defects đã sửa:** goal/evaluator fail-closed theo criteria, evidence và progress signature; acceptance không vacuous/forged và không thể override pending effects; budget ancestry cycle bị từ chối; external tool preflight, approval và dispatch dùng authority token của shared gate; MCP schema fail-closed, call-once và từ chối response rounds chưa hỗ trợ; M8 runner/check receipts bound theo result revision, command hash, workspace digest và exit code; HTTP test harness parse Content-Length/chunked/close framing.
+- **StorePort debt đã đóng:** transaction DTOs đầy đủ và adapter `SqliteStore`; session admission, run claim/freeze, synthetic/tool receipts, intent/settlement, task update và child delivery gọi qua port. Recovery dùng một SQLite snapshot, đếm effects trực tiếp và block cả pending runtime commands. Writer takeover atomically reclaims run; stale generation không freeze/finish.
+- **Gate chính thức:** `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M6 -Json` **passed**. Digest `sha256:f1d52e52a49fbd50d989f273c0d61fa13691c7cbe6cf37d30c925fde29851b49` trên 426 file; M6 **13 required / 14 discovered**, closure M5/M4/M3/M1/M2/M0 đều passed; format, clippy, build, workspace tests, dependency allowlist (**45 edges**) và discovery đều xanh.
+- **Regression mục tiêu:** M0 **12/12**, M3 **20/20**; docs self-test 174 Markdown và `git diff --check` sạch. Test interactive terminal có 90s window dưới tải, child vẫn hard bound 2 phút.
+- **Giới hạn còn đúng:** Linux/Unix verification pending; chưa chạy paid/live provider; strict OS confinement và MCP advanced capabilities vẫn là explicit unsupported/non-goals. Không publish/release.
+- **Tiếp theo:** fetch và so sánh `origin/master`; nếu không có commit mới cần merge thì commit toàn bộ audit M0–M6, push nhánh `codex/m0-m6-audit`, rồi cập nhật trạng thái push. Không chạy Linux.
+
+## Checkpoint trước — P0–P7 code review và sửa defects, đã merge vào master
 
 **Cập nhật:** 23/09/2026 · **Branch/worktree:** `codex/p0-p7-audit` tại
 `C:\Users\duong\AppData\Local\Temp\harness-agents-p0-p7-audit` · **Base:**

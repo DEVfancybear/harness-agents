@@ -4,13 +4,18 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+pub use harness_types::{
+    AdmissionAck, AdmissionCommit, BudgetUsageRecord, DeliveryCommit, ParentDeliveryRecord,
+    PublishedArtifact, ReceiptAck, ReceiptCommit, SourceWorkMarker, StoredDelegatedResultRecord,
+    StoredTaskNodeRecord, ToolApprovalBinding, ToolIntentCommit, ToolIntentRecord,
+    ToolIntentStatus, ToolSettlementCommit, ToolTaskUpdateCommit,
+};
 use harness_types::{
-    AgentProfileId, AgentRunId, ArtifactId, BudgetId, BudgetReservationId, CompositionSnapshotId,
-    ContentHash, ContextPacket, ContextPacketId, ErrorCode, EventEnvelope, EventId, HostId,
-    InputId, InstructionLedgerEntry, MemoryAsset, MemoryAssetId, MemoryAssetStatus, MemoryVersion,
-    PluginManifest, ProjectId, ProviderAttemptId, QuestionId, RequestId, RuntimeCommandId,
-    SessionId, SnapshotId, StepId, TaskId, ToolApprovalId, ToolExecutionId, ToolExecutionReceipt,
-    WorkingState,
+    AgentProfileId, AgentRunId, BudgetId, BudgetReservationId, CompositionSnapshotId, ContentHash,
+    ContextPacket, ContextPacketId, ErrorCode, EventEnvelope, EventId, HostId, InputId,
+    MemoryAsset, MemoryAssetId, MemoryAssetStatus, MemoryVersion, PluginManifest, ProjectId,
+    ProviderAttemptId, QuestionId, RequestId, RuntimeCommandId, SessionId, SnapshotId, StepId,
+    TaskId, ToolApprovalId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -246,61 +251,6 @@ impl DataDirectoryMarker {
     }
 }
 
-/// A durable marker proving which source work produced a projection update.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct SourceWorkMarker {
-    pub marker_id: String,
-    pub event_id: EventId,
-    pub sequence: u64,
-    pub kind: String,
-    pub status: String,
-}
-
-/// All records that must commit together to admit a user input.
-#[derive(Clone, Debug)]
-pub struct AdmissionCommit {
-    pub session_id: SessionId,
-    pub task_id: TaskId,
-    pub input_id: InputId,
-    pub input_hash: ContentHash,
-    pub raw_text: String,
-    pub expected_sequence: u64,
-    pub event: EventEnvelope,
-    pub instruction: InstructionLedgerEntry,
-    pub working_state: WorkingState,
-    pub marker: SourceWorkMarker,
-}
-
-/// The sole result that may become an input ACK.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdmissionAck {
-    pub input_id: InputId,
-    pub event_id: EventId,
-    pub sequence: u64,
-    pub idempotent_replay: bool,
-}
-
-/// All records that must commit together to record a settled synthetic receipt.
-#[derive(Clone, Debug)]
-pub struct ReceiptCommit {
-    pub session_id: SessionId,
-    pub task_id: TaskId,
-    pub expected_sequence: u64,
-    pub event: EventEnvelope,
-    pub receipt: ToolExecutionReceipt,
-    pub working_state: WorkingState,
-    pub marker: SourceWorkMarker,
-    pub artifact: Option<PublishedArtifact>,
-}
-
-/// The durable result of recording a receipt.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReceiptAck {
-    pub event_id: EventId,
-    pub sequence: u64,
-    pub idempotent_replay: bool,
-}
-
 /// Lifecycle state of a durable P3 tool approval.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolApprovalState {
@@ -354,74 +304,6 @@ pub struct ToolApprovalRecord {
     pub approval_json: Value,
 }
 
-/// The durable action binding referenced by an intent or task update.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ToolApprovalBinding {
-    pub approval_id: ToolApprovalId,
-    pub session_id: SessionId,
-    pub task_id: TaskId,
-    pub invocation_id: String,
-    pub call_id: Option<String>,
-    pub actor_id: String,
-    pub action_hash: ContentHash,
-    pub workspace_root: String,
-    pub workspace_fingerprint: ContentHash,
-    pub policy_revision: u64,
-    pub tool_revision: u64,
-}
-
-/// State stored for an execution that has crossed the side-effect boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ToolIntentStatus {
-    Recorded,
-    Settled,
-    OutcomeUnknown,
-}
-
-impl ToolIntentStatus {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Recorded => "recorded",
-            Self::Settled => "settled",
-            Self::OutcomeUnknown => "outcome_unknown",
-        }
-    }
-
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "recorded" => Some(Self::Recorded),
-            "settled" => Some(Self::Settled),
-            "outcome_unknown" => Some(Self::OutcomeUnknown),
-            _ => None,
-        }
-    }
-}
-
-/// The record committed before a coding-tool side effect begins.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ToolIntentRecord {
-    pub tool_execution_id: ToolExecutionId,
-    pub session_id: SessionId,
-    pub task_id: TaskId,
-    pub invocation_id: String,
-    /// The provider's `call_id`, when the intent came from a model call.
-    pub call_id: Option<String>,
-    pub actor_id: String,
-    pub tool_name: String,
-    pub action_json: Value,
-    pub action_hash: ContentHash,
-    pub workspace_root: String,
-    pub workspace_fingerprint: ContentHash,
-    pub before_fingerprint: Option<ContentHash>,
-    pub policy_revision: u64,
-    pub tool_revision: u64,
-    pub approval: ToolApprovalBinding,
-    pub status: ToolIntentStatus,
-    pub intent_sequence: u64,
-}
-
 /// One committed tool result a later step can replay after a crash.
 ///
 /// The text is the same bounded, redacted view the model was given; it is
@@ -432,41 +314,6 @@ pub struct RecoveredToolResult {
     pub seq: u64,
     pub call_id: Option<String>,
     pub text: String,
-}
-
-/// Everything required to durably consume an approval and record an intent.
-#[derive(Clone, Debug)]
-pub struct ToolIntentCommit {
-    pub expected_sequence: u64,
-    pub event: EventEnvelope,
-    pub intent: ToolIntentRecord,
-    pub working_state: WorkingState,
-    pub marker: SourceWorkMarker,
-}
-
-/// Everything required to settle a previously committed P3 intent.
-#[derive(Clone, Debug)]
-pub struct ToolSettlementCommit {
-    pub expected_sequence: u64,
-    pub event: EventEnvelope,
-    pub receipt: ToolExecutionReceipt,
-    pub working_state: WorkingState,
-    pub marker: SourceWorkMarker,
-    pub artifact: Option<PublishedArtifact>,
-    pub final_status: ToolIntentStatus,
-}
-
-/// An atomic task update that consumes a tool approval but never fabricates a
-/// process runner receipt.
-#[derive(Clone, Debug)]
-pub struct ToolTaskUpdateCommit {
-    pub session_id: SessionId,
-    pub task_id: TaskId,
-    pub expected_sequence: u64,
-    pub event: EventEnvelope,
-    pub working_state: WorkingState,
-    pub marker: SourceWorkMarker,
-    pub approval: ToolApprovalBinding,
 }
 
 /// Durable root/Git identity used to prevent accidental project conflation.
@@ -488,16 +335,6 @@ pub struct SnapshotRecord {
     pub schema_version: u16,
     pub content: Value,
     pub content_hash: ContentHash,
-}
-
-/// Bytes that have been flushed and atomically published before a database
-/// transaction is allowed to reference them.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PublishedArtifact {
-    pub artifact_id: ArtifactId,
-    pub content_hash: ContentHash,
-    pub byte_len: u64,
-    pub relative_path: String,
 }
 
 /// One bounded page of a published artifact, with the record's own length and
@@ -1087,20 +924,6 @@ pub struct StoredExtractionLeaseRecord {
     pub generation: u64,
 }
 
-/// One durable delegation task node, including its host-authored brief.
-#[derive(Clone, Debug, PartialEq)]
-pub struct StoredTaskNodeRecord {
-    pub task_id: TaskId,
-    pub parent_task_id: Option<TaskId>,
-    pub role: String,
-    pub status: String,
-    pub revision: u64,
-    pub depth: u32,
-    pub depends_on: Vec<TaskId>,
-    pub brief_json: Value,
-    pub node_json: Value,
-}
-
 /// The single durable owner of a task, fenced by ownership generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskOwnerRecord {
@@ -1110,53 +933,6 @@ pub struct TaskOwnerRecord {
     pub role: String,
     pub generation: u64,
     pub lease_revision: u64,
-}
-
-/// A task state transition together with the durable parent message it makes
-/// visible. Both commit inside one transaction.
-#[derive(Clone, Debug)]
-pub struct DeliveryCommit {
-    pub task_transition: StoredTaskNodeRecord,
-    pub result: Option<StoredDelegatedResultRecord>,
-    pub delivery: ParentDeliveryRecord,
-    pub usage: Option<BudgetUsageRecord>,
-}
-
-/// The durable worker report.
-#[derive(Clone, Debug, PartialEq)]
-pub struct StoredDelegatedResultRecord {
-    pub result_id: String,
-    pub task_id: TaskId,
-    pub worker_run_id: AgentRunId,
-    pub outcome: String,
-    pub base_revision: String,
-    pub result_revision: String,
-    pub artifact_refs: Vec<String>,
-    pub report_json: Value,
-    pub result_hash: ContentHash,
-}
-
-/// A durable parent message. `message_id` is the logical delivery identity.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ParentDeliveryRecord {
-    pub message_id: String,
-    pub sender_task_id: TaskId,
-    pub recipient_task_id: TaskId,
-    pub recipient_session_id: SessionId,
-    pub result_id: Option<String>,
-    pub payload_hash: ContentHash,
-    pub payload: Value,
-    pub state: String,
-    pub consumed_by: Option<String>,
-}
-
-/// Observed usage charged against a delegation budget. The charged task is
-/// implied by the write that carried it, so this stays a plain value record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BudgetUsageRecord {
-    pub model_requests: u32,
-    pub retries: u32,
-    pub cost_units: u64,
 }
 
 /// A host-issued memory binding for one delegated worker. The binding pins the

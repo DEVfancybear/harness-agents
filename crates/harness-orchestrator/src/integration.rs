@@ -173,20 +173,7 @@ impl ResultIntegrator {
         // `fingerprint_locked` is called directly: `integrate` already holds the
         // shared Git lock, and taking it again would deadlock.
         report.final_fingerprint = fingerprint_locked(&root)?;
-        let mut failures = Vec::new();
-        for check in checks {
-            let outcome = run_check(&root, check);
-            let passed = outcome.is_ok();
-            report.checks.push(CheckedRevision {
-                command: check.clone(),
-                revision: report.final_commit.clone(),
-                passed,
-                artifact_id: None,
-            });
-            if let Err(error) = outcome {
-                failures.push(format!("{check}: {error}"));
-            }
-        }
+        let failures = run_final_checks(&root, &mut report, checks)?;
         if !failures.is_empty() {
             return Ok(IntegrationOutcome::ChecksFailed {
                 report: Box::new(report),
@@ -301,7 +288,7 @@ fn abort(root: &Path) {
 fn head(root: &Path) -> Result<String, OrchestratorError> {
     Ok(git(root, &["rev-parse", "HEAD"])?.trim().to_owned())
 }
-fn run_check(root: &Path, command: &str) -> Result<(), OrchestratorError> {
+fn run_check(root: &Path, command: &str) -> Result<std::process::Output, OrchestratorError> {
     let (program, arguments) = split_command(command);
     if program.is_empty() {
         return Err(OrchestratorError::new(
@@ -319,17 +306,47 @@ fn run_check(root: &Path, command: &str) -> Result<(), OrchestratorError> {
                 format!("cannot run check {command}: {error}"),
             )
         })?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(OrchestratorError::new(
-            ErrorCode::ProcessOutcomeUnknown,
-            format!(
-                "check {command} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        ))
+    Ok(output)
+}
+
+fn run_final_checks(
+    root: &Path,
+    report: &mut IntegrationReport,
+    checks: &[String],
+) -> Result<Vec<String>, OrchestratorError> {
+    let mut failures = Vec::new();
+    for check in checks {
+        let execution = run_check(root, check);
+        let exit_code = execution
+            .as_ref()
+            .ok()
+            .and_then(|output| output.status.code());
+        let passed = execution
+            .as_ref()
+            .is_ok_and(|output| output.status.success());
+        if !passed {
+            let detail = match execution {
+                Ok(output) => format!(
+                    "exited with status {:?}: {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                Err(error) => error.to_string(),
+            };
+            failures.push(format!("{check}: {detail}"));
+        }
+        let workspace_digest = fingerprint_locked(root)?;
+        report.final_fingerprint = workspace_digest.clone();
+        report.checks.push(CheckedRevision {
+            command: check.clone(),
+            revision: report.final_commit.clone(),
+            passed,
+            workspace_digest: Some(workspace_digest),
+            exit_code,
+            artifact_id: None,
+        });
     }
+    Ok(failures)
 }
 
 /// Split a check string into a program and arguments without a shell.

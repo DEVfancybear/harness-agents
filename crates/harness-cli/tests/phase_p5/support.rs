@@ -413,6 +413,7 @@ pub fn explorer_report(
     artifact: &str,
 ) -> DelegatedResult {
     let revision = format!("{base_commit}-observed");
+    let workspace_digest = ContentHash::from_bytes(revision.as_bytes());
     DelegatedResult {
         schema_version: DELEGATION_CONTRACT_VERSION,
         result_id: format!("{}-result", task_id.as_str()),
@@ -427,6 +428,8 @@ pub fn explorer_report(
             command: "fixture-check".to_owned(),
             revision: revision.clone(),
             passed: true,
+            workspace_digest: Some(workspace_digest.clone()),
+            exit_code: Some(0),
             artifact_id: None,
         }],
         check_receipts: vec![ToolExecutionReceipt {
@@ -435,15 +438,21 @@ pub fn explorer_report(
             task_id: task_id.clone(),
             invocation_id: "fixture-check".to_owned(),
             call_id: None,
-            input_hash: ContentHash::from_bytes(revision.as_bytes()),
+            input_hash: ContentHash::from_canonical_json(&serde_json::json!({
+                "command": "fixture-check",
+                "base_commit": base_commit,
+                "revision": &revision,
+            }))
+            .expect("fixture check input is canonical"),
             policy_revision: 1,
             approval_id: None,
             intent_state: ToolIntentState::IntentRecorded,
             outcome_state: ToolOutcomeState::Settled,
             before_fingerprint: None,
-            after_fingerprint: Some(ContentHash::from_bytes(revision.as_bytes())),
+            after_fingerprint: Some(workspace_digest),
             before_hash: None,
             after_hash: None,
+            exit_code: Some(0),
             artifact_id: None,
             observed_at_seq: 1,
         }],
