@@ -23,6 +23,10 @@ use serde_json::{Value, json};
 use thiserror::Error;
 pub use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+pub(crate) static LOOPBACK_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub mod anthropic;
 mod streaming;
 pub use streaming::{ProviderEventStream, collect_events};
 
@@ -516,6 +520,11 @@ pub enum ProviderStreamEvent {
     TextDelta {
         text: String,
     },
+    /// Private reasoning delta. It is display-only and must not be appended to a
+    /// plain transcript or durable conversation text.
+    ThinkingDelta {
+        text: String,
+    },
     ToolCallDelta {
         call_id: String,
         name: String,
@@ -545,6 +554,10 @@ impl ProviderStreamEvent {
     #[must_use]
     pub fn text(text: impl Into<String>) -> Self {
         Self::TextDelta { text: text.into() }
+    }
+    #[must_use]
+    pub fn thinking(text: impl Into<String>) -> Self {
+        Self::ThinkingDelta { text: text.into() }
     }
     #[must_use]
     pub fn tool_delta(
@@ -614,7 +627,9 @@ pub fn assemble_stream(events: &[ProviderStreamEvent]) -> Result<ProviderRespons
             ProviderStreamEvent::TextDelta { text: delta } => text.push_str(delta),
             // Token accounting is durable in the event log; it does not change the
             // assembled answer, and `Started` was never part of one.
-            ProviderStreamEvent::Usage { .. } | ProviderStreamEvent::Started { .. } => {}
+            ProviderStreamEvent::ThinkingDelta { .. }
+            | ProviderStreamEvent::Usage { .. }
+            | ProviderStreamEvent::Started { .. } => {}
             ProviderStreamEvent::ToolCallDelta {
                 call_id,
                 name,
@@ -883,23 +898,47 @@ pub const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 10;
 /// Default seconds allowed for one provider call end to end.
 pub const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 
-pub struct DeepSeekAdapter {
+pub struct OpenAiChatAdapter {
     endpoint: String,
     credentials: Arc<dyn CredentialResolver>,
     capabilities: ModelCapabilities,
+    thinking_parameter: Option<Value>,
     client: Client,
 }
 
-impl DeepSeekAdapter {
+/// Optional provider extension sent alongside the otherwise generic `OpenAI` Chat
+/// request. Provider-specific defaults live in config presets; the adapter only
+/// serializes the resolved value.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OpenAiChatOptions {
+    pub thinking_parameter: Option<Value>,
+}
+
+impl OpenAiChatAdapter {
     pub fn new(
         endpoint: impl Into<String>,
         credentials: Arc<dyn CredentialResolver>,
         capabilities: ModelCapabilities,
     ) -> Result<Self, ProviderError> {
-        Self::with_timeouts(
+        Self::with_options(
             endpoint,
             credentials,
             capabilities,
+            OpenAiChatOptions::default(),
+        )
+    }
+
+    pub fn with_options(
+        endpoint: impl Into<String>,
+        credentials: Arc<dyn CredentialResolver>,
+        capabilities: ModelCapabilities,
+        options: OpenAiChatOptions,
+    ) -> Result<Self, ProviderError> {
+        Self::with_options_and_timeouts(
+            endpoint,
+            credentials,
+            capabilities,
+            options,
             Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECONDS),
             Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECONDS),
         )
@@ -913,6 +952,25 @@ impl DeepSeekAdapter {
         endpoint: impl Into<String>,
         credentials: Arc<dyn CredentialResolver>,
         capabilities: ModelCapabilities,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self, ProviderError> {
+        Self::with_options_and_timeouts(
+            endpoint,
+            credentials,
+            capabilities,
+            OpenAiChatOptions::default(),
+            connect_timeout,
+            request_timeout,
+        )
+    }
+
+    /// Build the adapter with explicit provider options and transport timeouts.
+    pub fn with_options_and_timeouts(
+        endpoint: impl Into<String>,
+        credentials: Arc<dyn CredentialResolver>,
+        capabilities: ModelCapabilities,
+        options: OpenAiChatOptions,
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, ProviderError> {
@@ -942,6 +1000,7 @@ impl DeepSeekAdapter {
             endpoint,
             credentials,
             capabilities,
+            thinking_parameter: options.thinking_parameter,
             client,
         })
     }
@@ -950,11 +1009,37 @@ impl DeepSeekAdapter {
 /// The wait a `Retry-After` header asks for, in seconds; other forms are ignored.
 #[must_use]
 pub fn retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
+    retry_after_bounded(headers, Duration::from_secs(30))
+}
+
+/// Parse delta-seconds or an RFC 7231 HTTP-date and bound the result.
+#[must_use]
+pub fn retry_after_bounded(
+    headers: &reqwest::header::HeaderMap,
+    cap: Duration,
+) -> Option<Duration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    let wait = if let Ok(seconds) = value.parse::<u64>() {
+        Duration::from_secs(seconds)
+    } else {
+        let target = chrono::DateTime::parse_from_rfc2822(value)
+            .map(|date| date.with_timezone(&chrono::Utc))
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(value, "%a, %d %b %Y %H:%M:%S GMT")
+                    .map(|date| date.and_utc())
+            })
+            .ok()?;
+        let now = chrono::Utc::now();
+        target
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or(Duration::ZERO)
+    };
+    Some(wait.min(cap))
 }
 
 /// Refuse an endpoint that would send the API key in cleartext to a remote host.
@@ -999,7 +1084,7 @@ fn is_loopback_host(url: &reqwest::Url) -> bool {
     }
 }
 
-impl ModelProvider for DeepSeekAdapter {
+impl ModelProvider for OpenAiChatAdapter {
     fn capabilities(&self) -> ModelCapabilities {
         self.capabilities.clone()
     }
@@ -1015,9 +1100,13 @@ impl ModelProvider for DeepSeekAdapter {
         let endpoint = self.endpoint.clone();
         let credentials = Arc::clone(&self.credentials);
         let client = self.client.clone();
+        let thinking_parameter = self.thinking_parameter.clone();
         Box::pin(async move {
             let token = credentials.resolve()?;
-            let mut body = json!({ "model": request.model, "messages": wire_messages(&request.messages), "stream": true, "temperature": request.temperature, "thinking": thinking_disabled() });
+            let mut body = json!({ "model": request.model, "messages": wire_messages(&request.messages), "stream": true, "temperature": request.temperature });
+            if let Some(thinking) = &thinking_parameter {
+                body["thinking"] = thinking.clone();
+            }
             if !request.tool_schemas.is_empty()
                 && let Some(object) = body.as_object_mut()
             {
@@ -1063,6 +1152,9 @@ impl ModelProvider for DeepSeekAdapter {
         })
     }
 }
+
+/// Source-compatible name retained for M2 fixtures.
+pub type DeepSeekAdapter = OpenAiChatAdapter;
 
 /// Identity a fragment gets when the stream never announced one.
 const DEFAULT_TOOL_CALL_ID: &str = "tool-call";
@@ -1944,6 +2036,102 @@ mod endpoint_tests {
             .err()
             .expect("ftp is refused");
         assert_eq!(error.code(), ErrorCode::ProviderProtocol);
+    }
+}
+
+#[cfg(test)]
+mod g03_openai_wire_snapshot_tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    use super::{
+        MessageRole, ModelCapabilities, ModelProvider, OpenAiChatAdapter, ProviderMessage,
+        ProviderRequest, StaticCredentialResolver,
+    };
+    use harness_types::RequestId;
+
+    #[tokio::test]
+    async fn g03_openai_chat_adapter_keeps_m2_wire_format() {
+        let _fixture_lock = crate::LOOPBACK_FIXTURE_LOCK.lock().await;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let fixture = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("adapter connection");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let mut header_end = None;
+            let mut content_length = 0_usize;
+            loop {
+                let count = stream.read(&mut buffer).expect("request bytes");
+                assert_ne!(count, 0, "request body completes");
+                request.extend_from_slice(&buffer[..count]);
+                if header_end.is_none()
+                    && let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                {
+                    header_end = Some(end + 4);
+                    let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    content_length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse().ok())
+                        .expect("content length");
+                }
+                if let Some(end) = header_end
+                    && request.len() >= end + content_length
+                {
+                    break;
+                }
+            }
+            let end = header_end.expect("request headers");
+            sender
+                .send(request[end..end + content_length].to_vec())
+                .expect("snapshot delivery");
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("fixture response");
+        });
+
+        let provider = OpenAiChatAdapter::with_options(
+            format!("http://{address}/chat/completions"),
+            Arc::new(StaticCredentialResolver::new("fixture-token")),
+            ModelCapabilities {
+                provider_id: "generic-openai".to_owned(),
+                model: "fixture-model".to_owned(),
+                supports_streaming: true,
+                supports_tools: true,
+                fixture: false,
+            },
+            super::OpenAiChatOptions {
+                thinking_parameter: Some(super::thinking_disabled()),
+            },
+        )
+        .expect("generic OpenAI Chat adapter");
+        let request = ProviderRequest::new(
+            RequestId::generate(),
+            "fixture-model",
+            vec![ProviderMessage::new(MessageRole::User, "hello")],
+        );
+        let result = provider
+            .stream(request, super::CancellationToken::new())
+            .await;
+        fixture.join().expect("fixture thread");
+        let events = result.expect("fixture stream");
+        assert!(!events.is_empty());
+        let body = receiver.recv().expect("captured request body");
+        assert_eq!(
+            String::from_utf8(body).expect("UTF-8 body"),
+            r#"{"messages":[{"content":"hello","role":"user"}],"model":"fixture-model","stream":true,"temperature":null,"thinking":{"type":"disabled"}}"#
+        );
     }
 }
 

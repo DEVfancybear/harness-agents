@@ -24,6 +24,8 @@ scrolling-regions = ["ratatui/scrolling-regions"]
 
 [dependencies]
 clap.workspace = true
+# G06 file mention traversal respects Git ignore rules and is capped by the controller.
+ignore = "=0.4.25"
 # A pasted screenshot lives in the clipboard as a bitmap, which no terminal sends
 # as text; the app reads it itself and turns it into a PNG the model can be shown.
 arboard.workspace = true

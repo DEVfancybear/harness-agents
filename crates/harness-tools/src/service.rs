@@ -19,15 +19,16 @@ use harness_types::{
 use serde_json::{Map, Value, json};
 
 use crate::{
-    ApprovalGrant, CaptureStream, CodingToolAction, GIT_LOG_DEFAULT_LIMIT, HISTORY_READ_MAX_BYTES,
-    HISTORY_SEARCH_DEFAULT_LIMIT, IsolationMode, PROCESS_OUTPUT_PAGE_MAX_BYTES,
-    PreparedToolRequest, TOOL_CONTRACT_VERSION, ToolCapabilities, ToolExecutionView, ToolOutput,
-    ToolPolicy, ToolRequest, capture, coding_tool_names,
+    ApprovalGrant, CaptureStream, CodingToolAction, Decision, GIT_LOG_DEFAULT_LIMIT,
+    HISTORY_READ_MAX_BYTES, HISTORY_SEARCH_DEFAULT_LIMIT, IsolationMode,
+    PROCESS_OUTPUT_PAGE_MAX_BYTES, PreparedToolRequest, TOOL_CONTRACT_VERSION, ToolCapabilities,
+    ToolExecutionView, ToolOutput, ToolPolicy, ToolRequest, capture, coding_tool_names,
     process::{self, ProcessResult, TreeCleanup},
     secrets::{HostEnvironmentSecrets, ProcessEnvironment, SecretResolver},
     workspace::{
-        apply_text_patch, inspect_workspace, list_files, read_text, read_text_output, redact_text,
-        resolve_relative, search_text,
+        apply_text_patch, edit_text, glob_files, inspect_workspace, list_files, plan_edit_text,
+        read_file_range, read_text, redact_text, resolve_relative, search_text, validate_glob,
+        validate_search, write_text_checked,
     },
 };
 use harness_store_sqlite::HistoryScope;
@@ -133,6 +134,17 @@ impl ToolExecutionService {
         self
     }
 
+    /// Explain whether an already prepared action is denied, allowed without a
+    /// prompt, or still needs an approval answer.
+    #[must_use]
+    pub fn decision(&self, prepared: &PreparedToolRequest) -> Decision {
+        if let Some(reason) = &prepared.policy_denial {
+            Decision::Deny(reason.clone())
+        } else {
+            self.policy.decide(prepared.action())
+        }
+    }
+
     /// Replace how `secret://` references are resolved for this host.
     #[must_use]
     pub fn with_secrets(mut self, secrets: Arc<dyn SecretResolver>) -> Self {
@@ -180,6 +192,62 @@ impl ToolExecutionService {
             shell_requires_explicit_action: true,
             filesystem_network_sandbox: false,
         }
+    }
+
+    /// Build a bounded, redacted unified preview before an approval panel opens.
+    pub(crate) fn approval_diff(
+        prepared: &PreparedToolRequest,
+    ) -> Result<Option<String>, HarnessError> {
+        use similar::TextDiff;
+
+        let root = prepared.workspace_root.as_path();
+        let (path, before, after) = match prepared.action() {
+            CodingToolAction::ApplyPatch {
+                path, replacement, ..
+            }
+            | CodingToolAction::WriteFile {
+                path,
+                content: replacement,
+                ..
+            } => {
+                let target = resolve_relative(root, path, false)?;
+                let before = if target.exists() {
+                    read_text(&target)?
+                } else {
+                    String::new()
+                };
+                (path.as_str(), before, replacement.clone())
+            }
+            CodingToolAction::EditFile {
+                path,
+                old_string,
+                new_string,
+                replace_all,
+            } => {
+                let target = resolve_relative(root, path, false)?;
+                let before = read_text(&target)?;
+                let (after, _) = plan_edit_text(&before, old_string, new_string, *replace_all)?;
+                (path.as_str(), before, after)
+            }
+            _ => return Ok(None),
+        };
+        let old_name = format!("a/{path}");
+        let new_name = format!("b/{path}");
+        let diff = TextDiff::from_lines(&before, &after)
+            .unified_diff()
+            .header(&old_name, &new_name)
+            .to_string();
+        let lines = diff.lines().collect::<Vec<_>>();
+        let truncated = lines.len() > 39;
+        let mut preview = lines
+            .iter()
+            .take(if truncated { 38 } else { 39 })
+            .map(|line| redact_text(line).trim_end_matches('\n').to_owned())
+            .collect::<Vec<_>>();
+        if truncated {
+            preview.push("... [diff truncated]".to_owned());
+        }
+        Ok(Some(format!("[diff]\n{}", preview.join("\n"))))
     }
 
     /// Validate identity and original arguments, apply deterministic policy
@@ -714,18 +782,31 @@ impl ToolExecutionService {
             .map_err(store_error)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the central workspace guard applies containment and typed bounds before approval"
+    )]
     fn validate_workspace_action(
         root: &Path,
         action: &CodingToolAction,
     ) -> Result<(), HarnessError> {
         match action {
-            CodingToolAction::ReadFile { path } | CodingToolAction::ApplyPatch { path, .. } => {
+            CodingToolAction::ReadFile { path, .. }
+            | CodingToolAction::ApplyPatch { path, .. }
+            | CodingToolAction::WriteFile { path, .. }
+            | CodingToolAction::EditFile { path, .. } => {
                 let _ = resolve_relative(root, path, false)?;
             }
             CodingToolAction::ListFiles { path }
             | CodingToolAction::SearchText { path, .. }
             | CodingToolAction::GitDiff { path }
             | CodingToolAction::GitLog { path, .. } => {
+                if let Some(path) = path {
+                    let _ = resolve_relative(root, path, true)?;
+                }
+            }
+            CodingToolAction::Glob { pattern, path } => {
+                validate_glob(pattern)?;
                 if let Some(path) = path {
                     let _ = resolve_relative(root, path, true)?;
                 }
@@ -739,6 +820,77 @@ impl ToolExecutionService {
             | CodingToolAction::TaskUpdate { .. }
             | CodingToolAction::ExternalTool { .. } => {}
         }
+        match action {
+            CodingToolAction::SearchText {
+                query,
+                regex,
+                case_insensitive,
+                glob,
+                context_lines,
+                ..
+            } => {
+                validate_search(query, *regex, *case_insensitive)?;
+                if let Some(glob) = glob {
+                    validate_glob(glob)?;
+                }
+                if context_lines
+                    .is_some_and(|lines| lines > crate::contracts::SEARCH_CONTEXT_MAX_LINES)
+                {
+                    return Err(HarnessError::new(
+                        ErrorCode::InvalidPayload,
+                        "search context exceeds the configured line bound",
+                    ));
+                }
+            }
+            CodingToolAction::WriteFile {
+                path,
+                content,
+                expected_hash,
+            } => {
+                if content.len() > crate::workspace::MAX_TEXT_FILE_BYTES {
+                    return Err(HarnessError::new(
+                        ErrorCode::OutputLimitExceeded,
+                        "workspace write exceeds the 1 MiB text limit",
+                    ));
+                }
+                let target = resolve_relative(root, path, false)?;
+                if target.exists() {
+                    let current = read_text(&target)?;
+                    let current_hash = ContentHash::from_bytes(current.as_bytes());
+                    if expected_hash.as_ref() != Some(&current_hash) {
+                        return Err(HarnessError::new(
+                            ErrorCode::StaleWorkspace,
+                            "overwriting an existing file requires its matching expected_hash",
+                        ));
+                    }
+                } else if expected_hash.is_some() {
+                    return Err(HarnessError::new(
+                        ErrorCode::StaleWorkspace,
+                        "expected_hash was supplied but the target file does not exist",
+                    ));
+                }
+                let parent = target.parent().ok_or_else(|| {
+                    HarnessError::new(ErrorCode::WorkspaceEscape, "write path has no parent")
+                })?;
+                if !parent.is_dir() {
+                    return Err(HarnessError::new(
+                        ErrorCode::InvalidPayload,
+                        "write_file parent directory does not exist",
+                    ));
+                }
+            }
+            CodingToolAction::EditFile {
+                path,
+                old_string,
+                new_string,
+                replace_all,
+            } => {
+                let target = resolve_relative(root, path, false)?;
+                let current = read_text(&target)?;
+                let _ = plan_edit_text(&current, old_string, new_string, *replace_all)?;
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -748,6 +900,10 @@ impl ToolExecutionService {
     /// still treating a race after intent conservatively. A paged capture read
     /// is checked here too: a page that cannot exist is a refusal, not an
     /// unknown outcome that implies a side effect might have happened.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "operation preconditions stay ordered before durable intent and dispatch"
+    )]
     async fn validate_dispatch_preconditions(
         &self,
         prepared: &PreparedToolRequest,
@@ -755,13 +911,35 @@ impl ToolExecutionService {
     ) -> Result<(), HarnessError> {
         let root = prepared.workspace_root.as_path();
         match action {
-            CodingToolAction::ReadFile { path } => {
+            CodingToolAction::ReadFile {
+                path,
+                offset,
+                limit,
+            } => {
                 // Deterministic content-policy failures (binary or unsupported
                 // encoding) are denied before an intent is created. A later
                 // disappearance/race remains an ordinary settled/unknown
                 // dispatch result, never an unsafe success.
                 let target = resolve_relative(root, path, false)?;
                 let _ = read_text(&target)?;
+                let _ = read_file_range(
+                    &target,
+                    offset.unwrap_or(0),
+                    limit.unwrap_or(crate::contracts::READ_FILE_DEFAULT_LINES),
+                )?;
+            }
+            CodingToolAction::Glob { pattern, .. } => validate_glob(pattern)?,
+            CodingToolAction::SearchText {
+                query,
+                regex,
+                case_insensitive,
+                glob,
+                ..
+            } => {
+                validate_search(query, *regex, *case_insensitive)?;
+                if let Some(glob) = glob {
+                    validate_glob(glob)?;
+                }
             }
             CodingToolAction::ApplyPatch {
                 path,
@@ -776,6 +954,43 @@ impl ToolExecutionService {
                         "patch expected hash does not match current file content",
                     ));
                 }
+            }
+            CodingToolAction::WriteFile {
+                path,
+                expected_hash,
+                ..
+            } => {
+                let target = resolve_relative(root, path, false)?;
+                match read_text(&target) {
+                    Ok(current) => {
+                        let current_hash = ContentHash::from_bytes(current.as_bytes());
+                        if expected_hash.as_ref() != Some(&current_hash) {
+                            return Err(HarnessError::new(
+                                ErrorCode::StaleWorkspace,
+                                "write_file expected_hash does not match current file content",
+                            ));
+                        }
+                    }
+                    Err(error) if error.code() == ErrorCode::InvalidPayload && !target.exists() => {
+                        if expected_hash.is_some() {
+                            return Err(HarnessError::new(
+                                ErrorCode::StaleWorkspace,
+                                "write_file expected_hash was supplied for a missing file",
+                            ));
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            CodingToolAction::EditFile {
+                path,
+                old_string,
+                new_string,
+                replace_all,
+            } => {
+                let target = resolve_relative(root, path, false)?;
+                let current = read_text(&target)?;
+                let _ = plan_edit_text(&current, old_string, new_string, *replace_all)?;
             }
             CodingToolAction::ReadProcessOutput {
                 artifact_id,
@@ -909,9 +1124,17 @@ impl ToolExecutionService {
                 ErrorCode::PolicyDenied,
                 "external tool actions are dispatched by the configured dispatcher, not directly",
             )),
-            CodingToolAction::ReadFile { path } => {
+            CodingToolAction::ReadFile {
+                path,
+                offset,
+                limit,
+            } => {
                 let target = resolve_relative(root, path, false)?;
-                let output = read_text_output(&target)?;
+                let output = read_file_range(
+                    &target,
+                    offset.unwrap_or(0),
+                    limit.unwrap_or(crate::contracts::READ_FILE_DEFAULT_LINES),
+                )?;
                 Ok(Dispatched::plain(ToolOutput::ReadFile {
                     path: path.replace('\\', "/"),
                     content: output.text,
@@ -925,8 +1148,23 @@ impl ToolExecutionService {
                     truncated,
                 }))
             }
-            CodingToolAction::SearchText { query, path } => {
-                let output = search_text(root, query, path.as_deref())?;
+            CodingToolAction::SearchText {
+                query,
+                path,
+                regex,
+                case_insensitive,
+                glob,
+                context_lines,
+            } => {
+                let output = search_text(
+                    root,
+                    query,
+                    path.as_deref(),
+                    *regex,
+                    *case_insensitive,
+                    glob.as_deref(),
+                    context_lines.unwrap_or(0),
+                )?;
                 Ok(Dispatched::plain(ToolOutput::SearchText {
                     matches: output.matches,
                     truncated: output.truncated,
@@ -938,13 +1176,57 @@ impl ToolExecutionService {
                 replacement,
             } => {
                 let target = resolve_relative(root, path, false)?;
-                let (before_hash, after_hash) =
-                    apply_text_patch(&target, expected_hash, replacement)?;
-                Ok(Dispatched::plain(ToolOutput::ApplyPatch {
+                let before = read_text(&target)?;
+                let artifact = self.publish_before_content(Some(&before))?;
+                let mutation = apply_text_patch(&target, expected_hash, replacement)?;
+                let output = ToolOutput::ApplyPatch {
                     path: path.replace('\\', "/"),
-                    before_hash,
-                    after_hash,
-                }))
+                    before_hash: mutation.before_hash.clone(),
+                    after_hash: mutation.after_hash.clone(),
+                };
+                Ok(Dispatched { output, artifact })
+            }
+            CodingToolAction::WriteFile {
+                path,
+                content,
+                expected_hash,
+            } => {
+                let target = resolve_relative(root, path, false)?;
+                let before = if target.exists() {
+                    Some(read_text(&target)?)
+                } else {
+                    None
+                };
+                let artifact = self.publish_before_content(before.as_deref())?;
+                let mutation = write_text_checked(&target, expected_hash.as_ref(), content)?;
+                let output = ToolOutput::WriteFile {
+                    path: path.replace('\\', "/"),
+                    before_hash: mutation.before_hash.clone(),
+                    after_hash: mutation.after_hash.clone(),
+                };
+                Ok(Dispatched { output, artifact })
+            }
+            CodingToolAction::EditFile {
+                path,
+                old_string,
+                new_string,
+                replace_all,
+            } => {
+                let target = resolve_relative(root, path, false)?;
+                let before = read_text(&target)?;
+                let artifact = self.publish_before_content(Some(&before))?;
+                let mutation = edit_text(&target, old_string, new_string, *replace_all)?;
+                let output = ToolOutput::EditFile {
+                    path: path.replace('\\', "/"),
+                    before_hash: mutation.before_hash.clone(),
+                    after_hash: mutation.after_hash.clone(),
+                    replacements: mutation.replacements,
+                };
+                Ok(Dispatched { output, artifact })
+            }
+            CodingToolAction::Glob { pattern, path } => {
+                let (paths, truncated) = glob_files(root, path.as_deref(), pattern)?;
+                Ok(Dispatched::plain(ToolOutput::Glob { paths, truncated }))
             }
             CodingToolAction::ReadProcessOutput {
                 artifact_id,
@@ -1336,7 +1618,11 @@ impl ToolExecutionService {
         })
     }
 
-    #[allow(clippy::too_many_arguments)] // the settlement of one invocation
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the receipt, artifact, event, and intent settle in one durable transaction"
+    )]
     async fn settle(
         &self,
         prepared: &PreparedToolRequest,
@@ -1373,6 +1659,24 @@ impl ToolExecutionService {
             Some(artifact) => Some(artifact),
             None => self.publish_output_artifact(&output)?,
         };
+        let (before_hash, after_hash) = match &output {
+            ToolOutput::ApplyPatch {
+                before_hash,
+                after_hash,
+                ..
+            }
+            | ToolOutput::EditFile {
+                before_hash,
+                after_hash,
+                ..
+            }
+            | ToolOutput::WriteFile {
+                before_hash,
+                after_hash,
+                ..
+            } => (Some(before_hash.clone()), Some(after_hash.clone())),
+            _ => (None, None),
+        };
         let receipt = ToolExecutionReceipt {
             schema_version: P0_SCHEMA_VERSION,
             tool_execution_id: execution_id.clone(),
@@ -1386,6 +1690,8 @@ impl ToolExecutionService {
             outcome_state,
             before_fingerprint: Some(prepared.workspace_fingerprint.clone()),
             after_fingerprint: Some(after_fingerprint),
+            before_hash,
+            after_hash,
             artifact_id: artifact
                 .as_ref()
                 .map(|artifact| artifact.artifact_id.clone()),
@@ -1471,6 +1777,8 @@ impl ToolExecutionService {
             outcome_state: ToolOutcomeState::Denied,
             before_fingerprint: Some(prepared.workspace_fingerprint.clone()),
             after_fingerprint: None,
+            before_hash: None,
+            after_hash: None,
             artifact_id: None,
             observed_at_seq: sequence,
         };
@@ -1526,6 +1834,25 @@ impl ToolExecutionService {
         })?;
         self.store
             .publish_artifact(&bytes)
+            .map(Some)
+            .map_err(store_error)
+    }
+
+    fn publish_before_content(
+        &self,
+        before: Option<&str>,
+    ) -> Result<Option<PublishedArtifact>, HarnessError> {
+        let Some(before) = before else {
+            return Ok(None);
+        };
+        if before.len() > crate::workspace::MAX_TEXT_FILE_BYTES {
+            return Err(HarnessError::new(
+                ErrorCode::OutputLimitExceeded,
+                "pre-edit artifact exceeds the 1 MiB limit",
+            ));
+        }
+        self.store
+            .publish_artifact(before.as_bytes())
             .map(Some)
             .map_err(store_error)
     }
@@ -1850,9 +2177,11 @@ fn store_error(error: StoreError) -> HarnessError {
 #[cfg(test)]
 mod tests {
     use super::ToolExecutionService;
-    use crate::{CodingToolAction, ToolRequest};
+    use crate::{
+        CodingToolAction, PolicyMode, ToolPatternRule, ToolPolicy, ToolRequest, observe_workspace,
+    };
     use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
-    use harness_types::{ErrorCode, HostId, ProjectId, SessionId, TaskId};
+    use harness_types::{ErrorCode, HostId, InputId, ProjectId, SessionId, TaskId};
     use std::sync::Arc;
 
     /// A malformed action is refused by the cheap check, not by the workspace walk.
@@ -1927,6 +2256,7 @@ mod tests {
             ToolKind::ReadFile,
             ToolKind::ListFiles,
             ToolKind::SearchText,
+            ToolKind::Glob,
             ToolKind::GitStatus,
             ToolKind::GitDiff,
             ToolKind::GitLog,
@@ -1939,6 +2269,8 @@ mod tests {
         }
         for kind in [
             ToolKind::ApplyPatch,
+            ToolKind::WriteFile,
+            ToolKind::EditFile,
             ToolKind::RunProcess,
             ToolKind::RunShell,
             ToolKind::TaskUpdate,
@@ -2018,6 +2350,8 @@ mod tests {
                     workspace.clone(),
                     CodingToolAction::ReadFile {
                         path: path.to_owned(),
+                        offset: None,
+                        limit: None,
                     },
                 ))
                 .await
@@ -2039,6 +2373,8 @@ mod tests {
                 workspace.clone(),
                 CodingToolAction::ReadFile {
                     path: "src/main.rs".to_owned(),
+                    offset: None,
+                    limit: None,
                 },
             ))
             .await
@@ -2047,6 +2383,76 @@ mod tests {
         drop(service);
         Arc::try_unwrap(store)
             .expect("single owner")
+            .close()
+            .await
+            .expect("store closes");
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn g05_protected_path_beats_every_allow_rule_and_mode() {
+        use harness_session::{AdmitInputRequest, SessionService};
+        use harness_types::SourceAuthority;
+
+        let temp = std::env::temp_dir().join(format!(
+            "harness-tools-g05-protected-{}",
+            harness_types::InputId::generate()
+        ));
+        let workspace = temp.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(temp.join("store")).expect("store directory");
+        std::fs::write(workspace.join(".env"), "TOKEN=not-a-secret\n").expect("protected fixture");
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                temp.join("store"),
+                HostId::generate(),
+            ))
+            .await
+            .expect("store opens"),
+        );
+        let session_id = SessionId::generate();
+        let task_id = TaskId::generate();
+        SessionService::new(Arc::clone(&store))
+            .admit_input(AdmitInputRequest {
+                session_id: session_id.clone(),
+                task_id: task_id.clone(),
+                input_id: InputId::generate(),
+                expected_sequence: 1,
+                authority: SourceAuthority::User,
+                raw_text: "inspect config".to_owned(),
+                workspace: observe_workspace(ProjectId::generate(), &workspace)
+                    .expect("workspace observation"),
+                initial_plan_items: Vec::new(),
+            })
+            .await
+            .expect("input is admitted");
+
+        let tools = ToolExecutionService::new(Arc::clone(&store)).with_policy(
+            ToolPolicy::default()
+                .with_tool_rules(vec![ToolPatternRule::allow(
+                    "read_file(.env)",
+                    "test allow must not bypass protection",
+                )])
+                .with_mode(PolicyMode::FullAuto),
+        );
+        let error = tools
+            .prepare(ToolRequest::new(
+                session_id,
+                task_id,
+                "test.actor",
+                workspace,
+                CodingToolAction::ReadFile {
+                    path: ".env".to_owned(),
+                    offset: None,
+                    limit: None,
+                },
+            ))
+            .await
+            .expect_err("protected path is rejected before a rule or mode can allow it");
+        assert_eq!(error.code(), ErrorCode::SensitivePathDenied);
+        drop(tools);
+        Arc::try_unwrap(store)
+            .expect("single store owner")
             .close()
             .await
             .expect("store closes");

@@ -31,6 +31,7 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme) -> Vec<Line<'static
         // own words, in the same dim style the plain renderer prints `[auto] `.
         HistoryItem::Automatic { text } => marker_rows("[auto] ", text, width, theme.dim, theme),
         HistoryItem::Assistant { text } => markdown::render(text, width, theme),
+        HistoryItem::Thinking { text } => vec![Line::from(Span::styled(text.clone(), theme.dim))],
         HistoryItem::Tool {
             name,
             summary,

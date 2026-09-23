@@ -205,13 +205,6 @@ impl AgentState {
     }
 }
 
-/// Longest backoff this runtime will honour from a provider's `Retry-After`.
-///
-/// A provider is free to ask for minutes; a turn is not. Bounding the wait keeps
-/// a hostile or confused header from parking the run, and the attempt cap still
-/// limits the total work.
-const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
-
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub context_window_tokens: u64,
@@ -220,6 +213,7 @@ pub struct RuntimeConfig {
     pub safety_margin_tokens: u64,
     pub optional_token_budget: u64,
     pub max_attempts: u32,
+    pub max_retry_after_seconds: u64,
     pub config_revision: u64,
 }
 
@@ -232,6 +226,7 @@ impl Default for RuntimeConfig {
             safety_margin_tokens: 128,
             optional_token_budget: 2048,
             max_attempts: 3,
+            max_retry_after_seconds: 30,
             config_revision: 1,
         }
     }
@@ -284,6 +279,8 @@ pub struct RunRequest {
     pub text: String,
     pub workspace: WorkspaceObservation,
     pub system_policy: String,
+    /// Host-loaded project guidance, refreshed for every admitted input.
+    pub project_rules: Vec<ContextBlock>,
     pub continuation_context: Option<String>,
     pub tool_schemas: Vec<Value>,
     pub memory: Option<harness_memory::MemoryContribution>,
@@ -316,6 +313,7 @@ impl RunRequest {
             text: text.into(),
             workspace,
             system_policy: "You are a careful coding agent.".to_owned(),
+            project_rules: Vec::new(),
             continuation_context: None,
             tool_schemas: Vec::new(),
             memory: None,
@@ -326,6 +324,12 @@ impl RunRequest {
     #[must_use]
     pub fn with_system_policy(mut self, policy: impl Into<String>) -> Self {
         self.system_policy = policy.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_project_rules(mut self, project_rules: Vec<ContextBlock>) -> Self {
+        self.project_rules = project_rules;
         self
     }
 
@@ -676,6 +680,15 @@ fn provider_usage(events: &[ProviderStreamEvent]) -> Option<u64> {
         }
         _ => None,
     })
+}
+
+/// Private reasoning is a live TUI-only signal and is never committed to a
+/// provider attempt transcript.
+fn durable_provider_events(events: &[ProviderStreamEvent]) -> Vec<&ProviderStreamEvent> {
+    events
+        .iter()
+        .filter(|event| !matches!(event, ProviderStreamEvent::ThinkingDelta { .. }))
+        .collect()
 }
 
 #[derive(Clone)]
@@ -1140,7 +1153,8 @@ impl RuntimeService {
                             task_id: request.task_id.clone(),
                             attempt_number,
                             state: "completed".to_owned(),
-                            events: serde_json::to_value(&events).unwrap_or_else(|_| json!([])),
+                            events: serde_json::to_value(durable_provider_events(&events))
+                                .unwrap_or_else(|_| json!([])),
                             response_hash: Some(response_hash),
                             error: None,
                         })
@@ -1186,7 +1200,9 @@ impl RuntimeService {
                         break;
                     }
                     if let Some(wait) = retry_after {
-                        let wait = wait.min(MAX_RETRY_AFTER);
+                        let wait = wait.min(std::time::Duration::from_secs(
+                            config.max_retry_after_seconds.min(30),
+                        ));
                         if !wait.is_zero() {
                             tokio::select! {
                                 () = tokio::time::sleep(wait) => {}
@@ -2098,7 +2114,7 @@ impl RuntimeService {
                 checkpoint_id,
                 through_event_seq: recovery.replayed_through_sequence,
                 recovery,
-                project_rules: Vec::<ContextBlock>::new(),
+                project_rules: request.project_rules.clone(),
                 optional_blocks: request
                     .memory
                     .as_ref()

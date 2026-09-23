@@ -174,6 +174,14 @@ pub fn hint(state: &UiState) -> String {
             " panel duyệt đang chờ · y chạy · a cho phép cả lượt · n từ chối ".to_owned()
         }
         Some(Modal::Picker { .. }) => " chọn phiên · ↑↓ · Enter · Esc đóng ".to_owned(),
+        Some(Modal::FilePicker { .. }) => " chọn file · ↑↓ · Enter · Esc đóng ".to_owned(),
+        Some(Modal::Question { options, .. }) => {
+            if options.is_empty() {
+                " nhập câu trả lời · Enter gửi ".to_owned()
+            } else {
+                " phím số chọn · hoặc nhập câu trả lời · Enter ".to_owned()
+            }
+        }
         Some(Modal::Overlay { .. }) => {
             " panel đang mở · PgUp/PgDn · Home/End · Esc đóng ".to_owned()
         }
@@ -236,6 +244,7 @@ mod tests {
             open_tool: None,
             modal: None,
             granted_for_run: false,
+            queued_input: false,
             last_request: None,
             run_started_at: None,
             last_run_elapsed: Duration::ZERO,
@@ -338,6 +347,7 @@ mod tests {
             scope: "once".to_owned(),
             expires_at: std::time::Instant::now(),
             read_only: false,
+            scroll: 0,
         });
         let approval = hint(&asking);
         assert!(

@@ -3,9 +3,9 @@ use serde_json::Value;
 
 use crate::{
     AgentProfileId, AgentRunId, ArtifactId, ContextPacket, ContextPacketId, EventEnvelope, EventId,
-    HarnessConfig, InstructionId, InstructionLedgerEntry, MemoryAsset, MemoryAssetId,
-    MemoryVersion, P0_SCHEMA_VERSION, PlanItemId, PluginInstanceId, PluginManifest, ProjectId,
-    ScopeId, SessionId, TaskId, ToolExecutionId, ToolExecutionReceipt, WorkingState,
+    HarnessConfig, HarnessConfigV2, InstructionId, InstructionLedgerEntry, MemoryAsset,
+    MemoryAssetId, MemoryVersion, P0_SCHEMA_VERSION, PlanItemId, PluginInstanceId, PluginManifest,
+    ProjectId, ScopeId, SessionId, TaskId, ToolExecutionId, ToolExecutionReceipt, WorkingState,
 };
 
 /// A committed JSON Schema document generated from a contract type.
@@ -38,6 +38,11 @@ pub fn generated_schema_documents() -> Vec<SchemaDocument> {
         ),
         schema_document("context-packet.v1.schema.json", schema_for!(ContextPacket)),
         schema_document("harness-config.v1.schema.json", schema_for!(HarnessConfig)),
+        schema_document_versioned(
+            "harness-config.v2.schema.json",
+            schema_for!(HarnessConfigV2),
+            2,
+        ),
         schema_document(
             "error-report.v1.schema.json",
             schema_for!(crate::ErrorReport),
@@ -60,6 +65,42 @@ fn schema_document(file_name: &'static str, schema: schemars::Schema) -> SchemaD
     );
     apply_contract_constraints(&mut value);
     SchemaDocument { file_name, value }
+}
+
+fn schema_document_versioned(
+    file_name: &'static str,
+    schema: schemars::Schema,
+    version: u16,
+) -> SchemaDocument {
+    let mut document = schema_document(file_name, schema);
+    let root = document
+        .value
+        .as_object_mut()
+        .expect("schema root is an object");
+    root.insert("x-harness-schema-version".to_owned(), Value::from(version));
+    set_schema_version(&mut document.value, version);
+    document
+}
+
+fn set_schema_version(value: &mut Value, version: u16) {
+    match value {
+        Value::Object(object) => {
+            if let Some(Value::Object(properties)) = object.get_mut("properties")
+                && let Some(Value::Object(schema_version)) = properties.get_mut("schema_version")
+            {
+                schema_version.insert("const".to_owned(), Value::from(version));
+            }
+            for nested in object.values_mut() {
+                set_schema_version(nested, version);
+            }
+        }
+        Value::Array(values) => {
+            for nested in values {
+                set_schema_version(nested, version);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 fn apply_contract_constraints(value: &mut Value) {

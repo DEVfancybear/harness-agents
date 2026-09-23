@@ -12,11 +12,14 @@ harness-runtime = { path = "../harness-runtime" }
 harness-session = { path = "../harness-session" }
 harness-store-sqlite = { path = "../harness-store-sqlite" }
 harness-types = { path = "../harness-types" }
+globset.workspace = true
 ignore.workspace = true
 process-wrap.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+similar.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

@@ -199,8 +199,13 @@ fn modal_rows(modal: &Modal, available: u16) -> u16 {
     let content = match modal {
         // The panel owns its own height: a row added to it without raising the
         // reservation would be clipped off the bottom of the viewport instead.
-        Modal::Approval { .. } => super::widgets::approval::PANEL_ROWS,
-        Modal::Picker { items, .. } => u16::try_from(items.len() + 2).unwrap_or(u16::MAX),
+        Modal::Approval { summary, .. } => super::widgets::approval::requested_rows(summary),
+        Modal::Picker { items, .. } | Modal::FilePicker { items, .. } => {
+            u16::try_from(items.len() + 2).unwrap_or(u16::MAX)
+        }
+        Modal::Question { prompt, options } => {
+            u16::try_from(prompt.lines().count() + options.len() + 3).unwrap_or(u16::MAX)
+        }
         Modal::Overlay { lines, .. } => u16::try_from(lines.len() + 2).unwrap_or(u16::MAX),
     };
     content.min(available)
@@ -256,6 +261,7 @@ mod tests {
             open_tool: None,
             modal: None,
             granted_for_run: false,
+            queued_input: false,
             last_request: None,
             run_started_at: None,
             last_run_elapsed: Duration::ZERO,
@@ -357,6 +363,7 @@ mod tests {
             scope: "once".to_owned(),
             expires_at: std::time::Instant::now(),
             read_only: false,
+            scroll: 0,
         });
         let outline = plan(Rect::new(0, 0, 80, 12), &state, &Theme::plain());
         assert!(outline.modal.is_some(), "the modal takes the upper region");

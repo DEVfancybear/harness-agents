@@ -64,6 +64,8 @@ fn receipt(task_id: TaskId, sequence: u64) -> ToolExecutionReceipt {
         outcome_state: ToolOutcomeState::Settled,
         before_fingerprint: None,
         after_fingerprint: None,
+        before_hash: None,
+        after_hash: None,
         artifact_id: None,
         observed_at_seq: sequence,
     }
@@ -923,7 +925,17 @@ async fn p1_s07_cli_inspects_persisted_recovery_state_without_runtime() {
     ]);
     assert!(explain.status.success());
     let explain_json: Value = serde_json::from_slice(&explain.stdout).unwrap();
-    assert_eq!(explain_json["runtime"], "not_available_in_p1");
+    assert_eq!(explain_json["schema_version"], 2);
+    assert_eq!(
+        explain_json["effective_config"]["provider"]["id"],
+        "deepseek"
+    );
+    assert_eq!(explain_json["effective_config"]["approval"], "ask");
+    assert!(explain_json["sources"].as_array().is_some_and(|sources| {
+        sources
+            .iter()
+            .any(|entry| entry["key"] == "provider.model" && entry["layer"] == "default")
+    }));
 }
 
 proptest! {

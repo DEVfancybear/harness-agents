@@ -5,12 +5,681 @@
 //! file is a first run rather than an error, and a corrupt file is reported with
 //! its location instead of being silently replaced by defaults.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use harness_types::{ErrorCode, HarnessConfig, HarnessError};
+use harness_types::{ErrorCode, HarnessConfig, HarnessConfigV2, HarnessError, ProviderConfigV2};
+use serde::Serialize;
+
+/// Provider-neutral preset values for the existing default `DeepSeek` connection.
+/// Adapter code consumes the resolved fields; it does not know these defaults.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderPreset {
+    pub id: &'static str,
+    pub protocol: &'static str,
+    pub endpoint: &'static str,
+    pub model: &'static str,
+    pub api_key_env: &'static str,
+    pub thinking: &'static str,
+}
+
+pub const DEEPSEEK_PRESET: ProviderPreset = ProviderPreset {
+    id: "deepseek",
+    protocol: "openai_chat",
+    endpoint: "https://api.deepseek.com/chat/completions",
+    model: "deepseek-flash",
+    api_key_env: "DEEPSEEK_API_KEY",
+    thinking: "off",
+};
+#[cfg(test)]
+pub const DEEPSEEK_ENDPOINT: &str = DEEPSEEK_PRESET.endpoint;
+#[cfg(test)]
+pub const DEEPSEEK_MODEL: &str = DEEPSEEK_PRESET.model;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigLayer {
+    Default,
+    User,
+    Project,
+    Local,
+    Environment,
+    Cli,
+}
+
+impl ConfigLayer {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::User => "user",
+            Self::Project => "project(trust)",
+            Self::Local => "project(local)",
+            Self::Environment => "env",
+            Self::Cli => "cli",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ConfigOverrides {
+    pub model: Option<String>,
+    pub profile: Option<String>,
+    pub approval: Option<String>,
+    pub allowed_tools: Vec<String>,
+    pub disallowed_tools: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ResolvedProviderConfig {
+    pub id: String,
+    pub protocol: String,
+    pub endpoint: String,
+    pub model: String,
+    pub api_key_env: String,
+    pub thinking: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ConfigExplainEntry {
+    pub key: String,
+    pub value: String,
+    pub layer: ConfigLayer,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedConfig {
+    pub provider: ResolvedProviderConfig,
+    pub profile: Option<String>,
+    pub approval: String,
+    pub allow_rules: Vec<String>,
+    pub deny_rules: Vec<String>,
+    pub model_prices: BTreeMap<String, super::cost::ModelPrice>,
+    pub retry_after_max_seconds: u64,
+    pub explain: Vec<ConfigExplainEntry>,
+    pub project_config_reason: Option<String>,
+}
+
+#[allow(clippy::too_many_lines)] // Keeps the explicit layer precedence auditable in one place.
+pub fn resolve_layers(
+    user_path: &Path,
+    project_root: &Path,
+    environment: &super::paths::LaunchEnvironment,
+    overrides: &ConfigOverrides,
+) -> Result<ResolvedConfig, HarnessError> {
+    let mut provider = ResolvedProviderConfig {
+        id: DEEPSEEK_PRESET.id.to_owned(),
+        protocol: DEEPSEEK_PRESET.protocol.to_owned(),
+        endpoint: DEEPSEEK_PRESET.endpoint.to_owned(),
+        model: DEEPSEEK_PRESET.model.to_owned(),
+        api_key_env: DEEPSEEK_PRESET.api_key_env.to_owned(),
+        thinking: DEEPSEEK_PRESET.thinking.to_owned(),
+    };
+    let mut entries = BTreeMap::new();
+    let mut model_prices = BTreeMap::new();
+    let mut retry_after_max_seconds = 30_u64;
+    let mut approval = "ask".to_owned();
+    let mut approval_layer = ConfigLayer::Default;
+    let mut allow_rules = Vec::new();
+    let mut deny_rules = Vec::new();
+    explain_provider(&mut entries, &provider, ConfigLayer::Default, None);
+    set_explain(&mut entries, "profile", "none", ConfigLayer::Default, None);
+    set_explain(&mut entries, "approval", "ask", ConfigLayer::Default, None);
+    set_explain(
+        &mut entries,
+        "limits.max_retry_after_seconds",
+        "30",
+        ConfigLayer::Default,
+        None,
+    );
+
+    let user = load_v2_layer(user_path)?;
+    if let Some(config) = &user {
+        if let Some(provider_patch) = &config.provider {
+            apply_provider_patch(
+                &mut provider,
+                provider_patch,
+                ConfigLayer::User,
+                &mut entries,
+            );
+        }
+        apply_models(&mut model_prices, config, ConfigLayer::User, &mut entries);
+        apply_retry_limit(
+            &mut retry_after_max_seconds,
+            config,
+            ConfigLayer::User,
+            &mut entries,
+        );
+        apply_permissions(
+            &mut approval,
+            &mut approval_layer,
+            &mut allow_rules,
+            &mut deny_rules,
+            config,
+            ConfigLayer::User,
+            &mut entries,
+        )?;
+    }
+
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let trusted = user
+        .as_ref()
+        .and_then(|config| config.trust.as_ref())
+        .is_some_and(|trust| {
+            trust.projects.iter().any(|trusted| {
+                PathBuf::from(trusted)
+                    .canonicalize()
+                    .is_ok_and(|path| same_path(&path, &canonical_root))
+            })
+        });
+    let project_path = project_root.join(".harness").join("config.toml");
+    let local_path = project_root.join(".harness").join("config.local.toml");
+    let mut project_reason = None;
+    if trusted {
+        if let Some(config) = load_v2_layer(&project_path)? {
+            if let Some(provider_patch) = &config.provider {
+                apply_provider_patch(
+                    &mut provider,
+                    provider_patch,
+                    ConfigLayer::Project,
+                    &mut entries,
+                );
+            }
+            apply_models(
+                &mut model_prices,
+                &config,
+                ConfigLayer::Project,
+                &mut entries,
+            );
+            apply_retry_limit(
+                &mut retry_after_max_seconds,
+                &config,
+                ConfigLayer::Project,
+                &mut entries,
+            );
+            apply_permissions(
+                &mut approval,
+                &mut approval_layer,
+                &mut allow_rules,
+                &mut deny_rules,
+                &config,
+                ConfigLayer::Project,
+                &mut entries,
+            )?;
+        }
+    } else if project_path.exists() {
+        project_reason = Some(
+            "ignored project config because this canonical root is not in trust.projects"
+                .to_owned(),
+        );
+        for key in [
+            "provider.id",
+            "provider.protocol",
+            "provider.endpoint",
+            "provider.model",
+            "provider.api_key_env",
+            "provider.thinking",
+        ] {
+            if let Some(entry) = entries.get_mut(key) {
+                entry.reason.clone_from(&project_reason);
+            }
+        }
+    }
+
+    // `config.local.toml` is an explicit per-user file inside this checkout.
+    // Shared `config.toml` remains gated by trust; local choices are loaded
+    // regardless so a confirmed always-allow rule works on the next turn.
+    if let Some(config) = load_v2_layer(&local_path)? {
+        if let Some(provider_patch) = &config.provider {
+            apply_provider_patch(
+                &mut provider,
+                provider_patch,
+                ConfigLayer::Local,
+                &mut entries,
+            );
+        }
+        apply_models(&mut model_prices, &config, ConfigLayer::Local, &mut entries);
+        apply_retry_limit(
+            &mut retry_after_max_seconds,
+            &config,
+            ConfigLayer::Local,
+            &mut entries,
+        );
+        apply_permissions(
+            &mut approval,
+            &mut approval_layer,
+            &mut allow_rules,
+            &mut deny_rules,
+            &config,
+            ConfigLayer::Local,
+            &mut entries,
+        )?;
+    }
+
+    let mut profile = overrides.profile.clone().or_else(|| {
+        environment
+            .value("HA_PROFILE")
+            .map(|value| value.to_string_lossy().into_owned())
+    });
+    if let Some(selected) = &profile {
+        let mut profile_patch = None;
+        if let Some(config) = &user {
+            profile_patch = config.profiles.get(selected).cloned();
+        }
+        let mut profile_layer = ConfigLayer::User;
+        if trusted
+            && let Some(config) = load_v2_layer(&project_path)?
+            && let Some(value) = config.profiles.get(selected)
+        {
+            profile_patch = Some(value.clone());
+            profile_layer = ConfigLayer::Project;
+        }
+        if let Some(config) = load_v2_layer(&local_path)?
+            && let Some(value) = config.profiles.get(selected)
+        {
+            profile_patch = Some(value.clone());
+            profile_layer = ConfigLayer::Local;
+        }
+        if let Some(patch) = profile_patch
+            && let Some(provider_patch) = patch.provider
+        {
+            apply_provider_patch(&mut provider, &provider_patch, profile_layer, &mut entries);
+        }
+        set_explain(
+            &mut entries,
+            "profile",
+            selected,
+            if overrides.profile.is_some() {
+                ConfigLayer::Cli
+            } else if environment.value("HA_PROFILE").is_some() {
+                ConfigLayer::Environment
+            } else {
+                profile_layer
+            },
+            None,
+        );
+    } else {
+        profile = None;
+    }
+
+    apply_environment_provider(&mut provider, environment, &mut entries);
+    if let Some(seconds) = environment
+        .value("HA_MAX_RETRY_AFTER_SECONDS")
+        .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
+    {
+        retry_after_max_seconds = seconds.min(30);
+        set_explain(
+            &mut entries,
+            "limits.max_retry_after_seconds",
+            &retry_after_max_seconds.to_string(),
+            ConfigLayer::Environment,
+            None,
+        );
+    }
+    if let Some(model) = &overrides.model {
+        provider.model.clone_from(model);
+        set_explain(
+            &mut entries,
+            "provider.model",
+            model,
+            ConfigLayer::Cli,
+            None,
+        );
+    }
+    let env_approval = environment
+        .value("HA_APPROVAL")
+        .map(|value| value.to_string_lossy().into_owned());
+    if let Some(value) = env_approval {
+        approval = value;
+        approval_layer = ConfigLayer::Environment;
+    }
+    if let Some(value) = &overrides.approval {
+        approval.clone_from(value);
+        approval_layer = ConfigLayer::Cli;
+    }
+    if !matches!(approval.as_str(), "ask" | "auto-edit" | "full-auto") {
+        return Err(HarnessError::new(
+            ErrorCode::ConfigParseError,
+            "approval mode must be ask, auto-edit, or full-auto",
+        ));
+    }
+    set_explain(&mut entries, "approval", &approval, approval_layer, None);
+    if !overrides.allowed_tools.is_empty() {
+        allow_rules.extend(overrides.allowed_tools.iter().cloned());
+        explain_permission_rules(
+            &mut entries,
+            "permissions.allow",
+            &overrides.allowed_tools,
+            ConfigLayer::Cli,
+        );
+        set_explain(
+            &mut entries,
+            "permissions.allow",
+            &format!("{} (CLI temporary)", overrides.allowed_tools.join(", ")),
+            ConfigLayer::Cli,
+            None,
+        );
+    }
+    if !overrides.disallowed_tools.is_empty() {
+        deny_rules.extend(overrides.disallowed_tools.iter().cloned());
+        explain_permission_rules(
+            &mut entries,
+            "permissions.deny",
+            &overrides.disallowed_tools,
+            ConfigLayer::Cli,
+        );
+        set_explain(
+            &mut entries,
+            "permissions.deny",
+            &format!("{} (CLI temporary)", overrides.disallowed_tools.join(", ")),
+            ConfigLayer::Cli,
+            None,
+        );
+    }
+
+    let explain = entries.into_values().collect();
+    Ok(ResolvedConfig {
+        provider,
+        profile,
+        approval,
+        allow_rules,
+        deny_rules,
+        model_prices,
+        retry_after_max_seconds,
+        explain,
+        project_config_reason: project_reason,
+    })
+}
+
+fn apply_permissions(
+    approval: &mut String,
+    approval_layer: &mut ConfigLayer,
+    allow_rules: &mut Vec<String>,
+    deny_rules: &mut Vec<String>,
+    config: &HarnessConfigV2,
+    layer: ConfigLayer,
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+) -> Result<(), HarnessError> {
+    let Some(permissions) = &config.permissions else {
+        return Ok(());
+    };
+    if let Some(mode) = &permissions.mode {
+        if !matches!(mode.as_str(), "ask" | "auto-edit" | "full-auto") {
+            return Err(HarnessError::new(
+                ErrorCode::ConfigParseError,
+                "permissions.mode must be ask, auto-edit, or full-auto",
+            ));
+        }
+        approval.clone_from(mode);
+        *approval_layer = layer;
+        set_explain(entries, "permissions.mode", mode, layer, None);
+    }
+    allow_rules.extend(
+        permissions
+            .allow
+            .iter()
+            .filter(|rule| !rule.trim().is_empty())
+            .cloned(),
+    );
+    deny_rules.extend(
+        permissions
+            .deny
+            .iter()
+            .filter(|rule| !rule.trim().is_empty())
+            .cloned(),
+    );
+    if !permissions.allow.is_empty() {
+        set_explain(
+            entries,
+            "permissions.allow",
+            &allow_rules.join(", "),
+            layer,
+            None,
+        );
+    }
+    explain_permission_rules(entries, "permissions.allow", &permissions.allow, layer);
+    if !permissions.deny.is_empty() {
+        set_explain(
+            entries,
+            "permissions.deny",
+            &deny_rules.join(", "),
+            layer,
+            None,
+        );
+    }
+    explain_permission_rules(entries, "permissions.deny", &permissions.deny, layer);
+    Ok(())
+}
+
+fn explain_permission_rules(
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+    key: &str,
+    rules: &[String],
+    layer: ConfigLayer,
+) {
+    let prefix = format!("{key}.rule.");
+    let first_index = entries
+        .keys()
+        .filter(|key| key.starts_with(&prefix))
+        .count();
+    for (offset, rule) in rules
+        .iter()
+        .filter(|rule| !rule.trim().is_empty())
+        .enumerate()
+    {
+        let index = first_index + offset;
+        set_explain(entries, &format!("{prefix}{index:04}"), rule, layer, None);
+    }
+}
+
+fn load_v2_layer(path: &Path) -> Result<Option<HarnessConfigV2>, HarnessError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    match load(path)? {
+        ConfigState::LoadedV2 { config, .. } => Ok(Some(*config)),
+        ConfigState::Loaded { .. } | ConfigState::FirstRun { .. } => Ok(None),
+    }
+}
+
+fn apply_models(
+    prices: &mut BTreeMap<String, super::cost::ModelPrice>,
+    config: &HarnessConfigV2,
+    layer: ConfigLayer,
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+) {
+    for (model, value) in &config.models {
+        if let (Some(input), Some(output)) =
+            (value.input_price_per_mtok, value.output_price_per_mtok)
+        {
+            prices.insert(
+                model.clone(),
+                super::cost::ModelPrice {
+                    input_per_mtok: input,
+                    output_per_mtok: output,
+                },
+            );
+            set_explain(
+                entries,
+                &format!("models.{model}.input_price_per_mtok"),
+                &input.to_string(),
+                layer,
+                None,
+            );
+            set_explain(
+                entries,
+                &format!("models.{model}.output_price_per_mtok"),
+                &output.to_string(),
+                layer,
+                None,
+            );
+        }
+    }
+}
+
+fn apply_retry_limit(
+    seconds: &mut u64,
+    config: &HarnessConfigV2,
+    layer: ConfigLayer,
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+) {
+    if let Some(value) = config
+        .limits
+        .as_ref()
+        .and_then(|limits| limits.max_retry_after_seconds)
+    {
+        *seconds = value.min(30);
+        set_explain(
+            entries,
+            "limits.max_retry_after_seconds",
+            &seconds.to_string(),
+            layer,
+            None,
+        );
+    }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn apply_provider_patch(
+    provider: &mut ResolvedProviderConfig,
+    patch: &ProviderConfigV2,
+    layer: ConfigLayer,
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+) {
+    macro_rules! apply {
+        ($field:ident, $key:literal) => {
+            if let Some(value) = &patch.$field {
+                provider.$field.clone_from(value);
+                set_explain(entries, $key, value, layer, None);
+            }
+        };
+    }
+    apply!(id, "provider.id");
+    apply!(protocol, "provider.protocol");
+    apply!(endpoint, "provider.endpoint");
+    apply!(model, "provider.model");
+    apply!(api_key_env, "provider.api_key_env");
+    apply!(thinking, "provider.thinking");
+}
+
+fn apply_environment_provider(
+    provider: &mut ResolvedProviderConfig,
+    environment: &super::paths::LaunchEnvironment,
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+) {
+    for (variable, field, key) in [
+        ("HA_PROVIDER_ID", &mut provider.id, "provider.id"),
+        (
+            "HA_PROVIDER_PROTOCOL",
+            &mut provider.protocol,
+            "provider.protocol",
+        ),
+        (
+            "HA_PROVIDER_ENDPOINT",
+            &mut provider.endpoint,
+            "provider.endpoint",
+        ),
+        ("HA_PROVIDER_MODEL", &mut provider.model, "provider.model"),
+        (
+            "HA_PROVIDER_API_KEY_ENV",
+            &mut provider.api_key_env,
+            "provider.api_key_env",
+        ),
+        (
+            "HA_PROVIDER_THINKING",
+            &mut provider.thinking,
+            "provider.thinking",
+        ),
+    ] {
+        if let Some(value) = environment
+            .value(variable)
+            .filter(|value| !value.is_empty())
+        {
+            let value = value.to_string_lossy().into_owned();
+            field.clone_from(&value);
+            set_explain(entries, key, &value, ConfigLayer::Environment, None);
+        }
+    }
+}
+
+fn explain_provider(
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+    provider: &ResolvedProviderConfig,
+    layer: ConfigLayer,
+    reason: Option<String>,
+) {
+    set_explain(entries, "provider.id", &provider.id, layer, reason.clone());
+    set_explain(
+        entries,
+        "provider.protocol",
+        &provider.protocol,
+        layer,
+        reason.clone(),
+    );
+    set_explain(
+        entries,
+        "provider.endpoint",
+        &provider.endpoint,
+        layer,
+        reason.clone(),
+    );
+    set_explain(
+        entries,
+        "provider.model",
+        &provider.model,
+        layer,
+        reason.clone(),
+    );
+    set_explain(
+        entries,
+        "provider.api_key_env",
+        &provider.api_key_env,
+        layer,
+        reason.clone(),
+    );
+    set_explain(
+        entries,
+        "provider.thinking",
+        &provider.thinking,
+        layer,
+        reason,
+    );
+}
+
+fn set_explain(
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+    key: &str,
+    value: &str,
+    layer: ConfigLayer,
+    reason: Option<String>,
+) {
+    entries.insert(
+        key.to_owned(),
+        ConfigExplainEntry {
+            key: key.to_owned(),
+            value: value.to_owned(),
+            layer,
+            reason,
+        },
+    );
+}
 
 /// Configuration state visible to the app before the first request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ConfigState {
     /// No file yet: defaults apply and the app opens in setup state.
     FirstRun { path: PathBuf },
@@ -18,6 +687,11 @@ pub enum ConfigState {
     Loaded {
         path: PathBuf,
         config: HarnessConfig,
+    },
+    /// Parsed schema v2 agent configuration.
+    LoadedV2 {
+        path: PathBuf,
+        config: Box<HarnessConfigV2>,
     },
 }
 
@@ -33,6 +707,13 @@ impl ConfigState {
         match self {
             Self::FirstRun { path } => format!("first run, defaults ({})", path.display()),
             Self::Loaded { path, config } => {
+                format!(
+                    "schema_version={} ({})",
+                    config.schema_version,
+                    path.display()
+                )
+            }
+            Self::LoadedV2 { path, config } => {
                 format!(
                     "schema_version={} ({})",
                     config.schema_version,
@@ -63,8 +744,33 @@ pub fn load(path: &Path) -> Result<ConfigState, HarnessError> {
         }
     };
 
-    let config: HarnessConfig = toml::from_str(&contents)
+    let document: toml::Value = toml::from_str(&contents)
         .map_err(|error| invalid(path, error.to_string().contains("unknown field")))?;
+    let version = document
+        .get("schema_version")
+        .and_then(toml::Value::as_integer)
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or_else(|| invalid(path, false))?;
+    if version == 2 {
+        let config: HarnessConfigV2 =
+            toml::Value::try_into(document).map_err(|error: toml::de::Error| {
+                invalid(path, error.to_string().contains("unknown field"))
+            })?;
+        config.validate().map_err(|error| {
+            HarnessError::new(
+                error.code(),
+                format!("configuration file {} is invalid: {error}", path.display()),
+            )
+        })?;
+        return Ok(ConfigState::LoadedV2 {
+            path: path.to_path_buf(),
+            config: Box::new(config),
+        });
+    }
+    let config: HarnessConfig =
+        toml::Value::try_into(document).map_err(|error: toml::de::Error| {
+            invalid(path, error.to_string().contains("unknown field"))
+        })?;
     if let Err(error) = config.validate() {
         return Err(HarnessError::new(
             error.code(),
@@ -106,7 +812,7 @@ fn invalid(path: &Path, unknown_field: bool) -> HarnessError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigState, load};
+    use super::{ConfigOverrides, ConfigState, DEEPSEEK_MODEL, load, resolve_layers};
     use harness_types::ErrorCode;
     use std::path::PathBuf;
 
@@ -168,5 +874,188 @@ mod tests {
             "schema_version = \"not-a-number\"\n",
             "a corrupt file is never overwritten"
         );
+    }
+
+    #[test]
+    fn g02_v1_config_still_loads_unchanged() {
+        let state =
+            load(&fixture("tests/fixtures/p0/config/valid.toml")).expect("v1 remains valid");
+        let ConfigState::Loaded { config, .. } = state else {
+            panic!("v1 must keep its original load shape");
+        };
+        assert_eq!(config.schema_version, 1);
+        assert_eq!(config.cli.output, harness_types::CliOutputFormat::Json);
+    }
+
+    #[test]
+    fn g02_precedence_cli_over_env_over_project_over_user() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join(".harness")).expect("project config dir");
+        let user = temp.path().join("user.toml");
+        let trusted =
+            serde_json::to_string(&root.to_string_lossy().to_string()).expect("path serializes");
+        std::fs::write(
+            &user,
+            format!("schema_version = 2\n[provider]\nmodel = 'user-model'\n[trust]\nprojects = [{trusted}]\n"),
+        )
+        .expect("user config");
+        std::fs::write(
+            root.join(".harness/config.toml"),
+            "schema_version = 2\n[provider]\nmodel = 'project-model'\n",
+        )
+        .expect("project config");
+        let env = super::super::paths::LaunchEnvironment::from_pairs([(
+            "HA_PROVIDER_MODEL",
+            "env-model",
+        )]);
+        let resolved = resolve_layers(
+            &user,
+            &root,
+            &env,
+            &ConfigOverrides {
+                model: Some("cli-model".to_owned()),
+                ..ConfigOverrides::default()
+            },
+        )
+        .expect("configuration resolves");
+        assert_eq!(resolved.provider.model, "cli-model");
+        assert_eq!(
+            resolved
+                .explain
+                .iter()
+                .find(|entry| entry.key == "provider.model")
+                .map(|entry| entry.layer),
+            Some(super::ConfigLayer::Cli)
+        );
+        let env_only = resolve_layers(&user, &root, &env, &ConfigOverrides::default())
+            .expect("environment layer resolves");
+        assert_eq!(env_only.provider.model, "env-model");
+        let project_only = resolve_layers(
+            &user,
+            &root,
+            &super::super::paths::LaunchEnvironment::default(),
+            &ConfigOverrides::default(),
+        )
+        .expect("project layer resolves");
+        assert_eq!(project_only.provider.model, "project-model");
+    }
+
+    #[test]
+    fn g02_untrusted_project_config_is_ignored_with_reason() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join(".harness")).expect("project config dir");
+        let user = temp.path().join("user.toml");
+        std::fs::write(&user, "schema_version = 2\n").expect("user config");
+        std::fs::write(
+            root.join(".harness/config.toml"),
+            "schema_version = 2\n[provider]\nmodel = 'untrusted-model'\n",
+        )
+        .expect("project config");
+        let resolved = resolve_layers(
+            &user,
+            &root,
+            &super::super::paths::LaunchEnvironment::default(),
+            &ConfigOverrides::default(),
+        )
+        .expect("untrusted project is ignored");
+        assert_eq!(resolved.provider.model, DEEPSEEK_MODEL);
+        assert!(
+            resolved
+                .project_config_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("trust"))
+        );
+    }
+
+    #[test]
+    fn g05_local_permission_rules_load_without_project_trust_and_explain_the_layer() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join(".harness")).expect("project config dir");
+        let user = temp.path().join("user.toml");
+        std::fs::write(&user, "schema_version = 2\n").expect("user config");
+        std::fs::write(
+            root.join(".harness/config.toml"),
+            "schema_version = 2\n[permissions]\nallow = ['run_shell(never trusted)']\n",
+        )
+        .expect("untrusted shared config");
+        std::fs::write(
+            root.join(".harness/config.local.toml"),
+            "schema_version = 2\n[permissions]\nallow = ['run_shell(cargo test *)']\n",
+        )
+        .expect("local per-user config");
+
+        let resolved = resolve_layers(
+            &user,
+            &root,
+            &super::super::paths::LaunchEnvironment::default(),
+            &ConfigOverrides::default(),
+        )
+        .expect("local preferences load without trusting shared project config");
+        assert_eq!(resolved.allow_rules, ["run_shell(cargo test *)"]);
+        assert!(
+            resolved.explain.iter().any(|entry| {
+                entry.key.starts_with("permissions.allow.rule.")
+                    && entry.value == "run_shell(cargo test *)"
+                    && entry.layer == super::ConfigLayer::Local
+            }),
+            "the overlay can show the rule's true source layer: {:?}",
+            resolved.explain
+        );
+        assert!(
+            !resolved
+                .allow_rules
+                .iter()
+                .any(|rule| rule.contains("never trusted")),
+            "an untrusted shared config never contributes allow rules"
+        );
+    }
+
+    #[test]
+    fn g02_config_explain_names_the_layer_for_every_key() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(&root).expect("project root");
+        let resolved = resolve_layers(
+            &temp.path().join("missing.toml"),
+            &root,
+            &super::super::paths::LaunchEnvironment::default(),
+            &ConfigOverrides::default(),
+        )
+        .expect("defaults explain");
+        assert!(
+            !resolved.explain.is_empty(),
+            "all effective keys have explain entries"
+        );
+        assert!(
+            resolved
+                .explain
+                .iter()
+                .all(|entry| !entry.layer.as_str().is_empty())
+        );
+    }
+
+    #[test]
+    fn g02_unknown_key_is_rejected_with_path() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(&root).expect("project root");
+        let user = temp.path().join("config.toml");
+        std::fs::write(
+            &user,
+            "schema_version = 2\nunknown_secret_key = 'do-not-echo'\n",
+        )
+        .expect("bad config");
+        let error = resolve_layers(
+            &user,
+            &root,
+            &super::super::paths::LaunchEnvironment::default(),
+            &ConfigOverrides::default(),
+        )
+        .expect_err("unknown field is rejected");
+        assert!(error.to_string().contains("config.toml"), "{error}");
+        assert!(!error.to_string().contains("do-not-echo"), "{error}");
     }
 }

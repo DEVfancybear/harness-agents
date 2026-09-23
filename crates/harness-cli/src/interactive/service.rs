@@ -11,35 +11,85 @@ use std::future::Future;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use harness_providers::anthropic::AnthropicMessagesAdapter;
 use harness_providers::{
-    CancellationToken, CredentialResolver, DeepSeekAdapter, ModelCapabilities, ModelProvider,
-    ProviderError,
+    CancellationToken, CredentialResolver, ModelCapabilities, ModelProvider, OpenAiChatAdapter,
+    OpenAiChatOptions, ProviderError,
 };
-use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
+use harness_runtime::{HumanInputService, RunInbox, RunRequest, RuntimeConfig, RuntimeService};
+use harness_session::{AdmitInputRequest, SessionService};
 use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
 use harness_tools::{
-    ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ToolExecutionService, TurnDriver,
-    TurnLimits, TurnObserver, TurnOptions, TurnProgress, TurnStop, coding_tool_schemas,
-    observe_workspace,
+    ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CodingToolAction, IsolationMode,
+    PolicyMode, ToolExecutionService, ToolOutput, ToolPatternRule, ToolPolicyRules, TurnDriver,
+    TurnLimits, TurnObserver, TurnOptions, TurnProgress, TurnStop, coding_tool_names,
+    coding_tool_schemas, execute_action_with_approval, observe_workspace, validate_tool_pattern,
 };
-use harness_types::{ErrorCode, HostId, InputId, SessionId, TaskId};
+use harness_types::{ErrorCode, HostId, InputId, QuestionId, SessionId, SourceAuthority, TaskId};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use super::attachments;
-use super::bootstrap::{CREDENTIAL_VARIABLES, DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL, LaunchContext};
+use super::bootstrap::{CREDENTIAL_VARIABLES, LaunchContext};
 use super::bounds;
+use super::config::ConfigOverrides;
+#[cfg(test)]
+use super::config::{DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL};
 use super::controller::{DEFAULT_APPROVAL_TIMEOUT, TurnBounds};
+use super::cost::{CostTracker, ModelPrice, Usage as CostUsage};
 use super::credentials::{self, CredentialSource};
-use super::events::{PauseReason, RunOutcome, SessionCandidate, SessionEvent};
+use super::events::{PauseReason, RunOutcome, SessionCandidate, SessionEvent, ShellPrefixMode};
 use super::extensions;
 use super::memory;
 use super::paths::LaunchEnvironment;
 use super::project;
+use super::prompt::{PromptEnvironment, PromptTool, SystemPromptBuilder};
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TurnModelSelection {
+    active_model: Option<String>,
+    pending_model: Option<String>,
+}
+
+impl TurnModelSelection {
+    fn with_initial(model: Option<String>) -> Self {
+        Self {
+            active_model: model,
+            pending_model: None,
+        }
+    }
+
+    fn select_for_next_turn(&mut self, model: String) {
+        self.pending_model = Some(model);
+    }
+
+    fn begin_turn(&mut self) -> Option<String> {
+        if let Some(model) = self.pending_model.take() {
+            self.active_model = Some(model);
+        }
+        self.active_model.clone()
+    }
+}
+
+#[cfg(test)]
+mod g03_model_selection_tests {
+    use super::TurnModelSelection;
+
+    #[test]
+    fn g03_model_switch_applies_next_turn_only() {
+        let mut selection = TurnModelSelection::with_initial(Some("active-model".to_owned()));
+        let running_turn = selection.begin_turn().expect("active model");
+        selection.select_for_next_turn("next-model".to_owned());
+        assert_eq!(selection.active_model.as_deref(), Some("active-model"));
+        assert_eq!(running_turn, "active-model");
+        assert_eq!(selection.begin_turn().as_deref(), Some("next-model"));
+    }
+}
 
 #[cfg(test)]
 #[path = "service_completion_tests.rs"]
@@ -55,6 +105,16 @@ pub const MODEL_VARIABLE: &str = "HA_PROVIDER_MODEL";
 pub struct SubmitRequest {
     pub input_id: InputId,
     pub text: String,
+    /// Durable question answered by this new session, when this is an answer turn.
+    pub answer_question_id: Option<String>,
+    /// Host-initiated shell action represented by this admitted input, when set.
+    pub shell_prefix: Option<ShellPrefix>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShellPrefix {
+    pub command: String,
+    pub mode: ShellPrefixMode,
 }
 
 /// The user's decision on one gated action.
@@ -85,6 +145,10 @@ pub trait SessionPort: Send {
     fn label(&self) -> String;
     fn submit(&mut self, request: SubmitRequest);
     fn cancel(&mut self);
+    /// Deliver an immediate correction to the run currently in progress.
+    fn steer(&mut self, _text: &str) -> Result<(), String> {
+        Err("this backend does not support steering an active run".to_owned())
+    }
     /// Answer one pending approval request; false when the id is not pending.
     fn answer(&mut self, _request_id: &str, _decision: ApprovalDecision) -> bool {
         false
@@ -131,6 +195,31 @@ pub trait SessionPort: Send {
     /// environment or from the defaults, and whether the endpoint answers.
     fn provider_diagnostics(&self) -> Vec<String> {
         Vec::new()
+    }
+    fn config_explain(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn cost_summary(&self) -> String {
+        "n/a".to_owned()
+    }
+    fn set_model(&mut self, _model: &str) -> Result<String, String> {
+        Err("this backend does not support model switching".to_owned())
+    }
+    fn set_mode(&mut self, _mode: &str) -> Result<String, String> {
+        Err("this backend does not support session permission modes".to_owned())
+    }
+    fn permissions_summary(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    fn confirm_always_allow(
+        &mut self,
+        _request_id: &str,
+        _pattern: &str,
+    ) -> Result<String, String> {
+        Err("this backend cannot save permission rules".to_owned())
+    }
+    fn trust_project(&mut self) -> Result<String, String> {
+        Err("this backend cannot update project trust".to_owned())
     }
     /// Why a real dispatch is impossible right now, or `None` when it is possible.
     ///
@@ -183,6 +272,8 @@ pub struct ChannelApprovalGate {
     timeout: Duration,
     /// Whether the user allowed every action for the run now in flight.
     granted_for_run: Arc<AtomicBool>,
+    confirmed_rules: Mutex<HashMap<String, ToolPatternRule>>,
+    turn_rules: ToolPolicyRules,
 }
 
 impl ChannelApprovalGate {
@@ -193,7 +284,38 @@ impl ChannelApprovalGate {
             pending: Mutex::new(HashMap::new()),
             timeout,
             granted_for_run: Arc::new(AtomicBool::new(false)),
+            confirmed_rules: Mutex::new(HashMap::new()),
+            turn_rules: ToolPolicyRules::default(),
         }
+    }
+
+    /// The rule set shared with this turn's existing `ToolPolicy`.
+    #[must_use]
+    pub fn turn_rules(&self) -> ToolPolicyRules {
+        self.turn_rules.clone()
+    }
+
+    /// Clear ephemeral confirmations at the start of a new user input.
+    pub fn clear_turn_rules(&self) {
+        self.turn_rules.clear();
+        if let Ok(mut rules) = self.confirmed_rules.lock() {
+            rules.clear();
+        }
+    }
+
+    fn stage_always_allow(&self, request_id: &str, pattern: &str) -> Result<(), String> {
+        if !self.is_pending(request_id) {
+            return Err("approval is no longer pending; the rule was not staged".to_owned());
+        }
+        validate_tool_pattern(pattern).map_err(|error| error.to_string())?;
+        self.confirmed_rules
+            .lock()
+            .map_err(|_| "confirmed permission rules are unavailable".to_owned())?
+            .insert(
+                request_id.to_owned(),
+                ToolPatternRule::allow(pattern, "user-confirmed rule"),
+            );
+        Ok(())
     }
 
     /// Allow every gated action without asking, until the run ends.
@@ -240,6 +362,30 @@ impl ChannelApprovalGate {
             None => false,
         }
     }
+
+    fn is_pending(&self, request_id: &str) -> bool {
+        self.pending
+            .lock()
+            .is_ok_and(|pending| pending.contains_key(request_id))
+    }
+
+    fn action_completed(&self, request_id: &str) {
+        let rule = self
+            .confirmed_rules
+            .lock()
+            .ok()
+            .and_then(|mut rules| rules.remove(request_id));
+        if let Some(rule) = rule
+            && self.turn_rules.add(rule.clone()).is_err()
+        {
+            let _ = self.sender.send(SessionEvent::Notice {
+                message: format!(
+                    "[permissions] {} was saved and will apply on the next turn",
+                    rule.pattern
+                ),
+            });
+        }
+    }
 }
 
 impl ApprovalGate for ChannelApprovalGate {
@@ -254,13 +400,13 @@ impl ApprovalGate for ChannelApprovalGate {
         if self.granted_for_run() {
             let _ = self.sender.send(SessionEvent::Notice {
                 message: format!(
-                    "{}allowed for this turn: {}",
+                    "[info] allowed by mode turn-grant: {}{}",
+                    proposal.summary,
                     if proposal.read_only {
-                        "read-only, "
+                        " (read-only)"
                     } else {
                         ""
-                    },
-                    proposal.summary
+                    }
                 ),
             });
             return Box::pin(async { ApprovalAnswer::Granted });
@@ -273,6 +419,7 @@ impl ApprovalGate for ChannelApprovalGate {
             request_id: proposal.request_id.clone(),
             action: proposal.action,
             summary: proposal.summary,
+            rule_pattern: proposal.rule_pattern,
             workspace: proposal.workspace.display().to_string(),
             scope: proposal.scope,
             // The deadline travels with the proposal: the panel counts down to
@@ -296,6 +443,10 @@ impl ApprovalGate for ChannelApprovalGate {
                 }
             }
         })
+    }
+
+    fn action_completed(&self, request_id: &str) {
+        Self::action_completed(self, request_id);
     }
 }
 
@@ -335,10 +486,19 @@ impl Default for SessionChannel {
 }
 
 /// Provider settings for a real model call.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProviderConfig {
+    pub provider_id: String,
+    pub protocol: String,
     pub endpoint: String,
     pub model: String,
+    pub api_key_env: String,
+    pub thinking: String,
+    pub approval: String,
+    pub allow_rules: Vec<String>,
+    pub deny_rules: Vec<String>,
+    pub model_price: Option<ModelPrice>,
+    pub max_retry_after_seconds: u64,
     /// Name of the source that holds the key; never the key.
     pub credential: CredentialSource,
 }
@@ -354,7 +514,7 @@ impl ProviderConfig {
     pub fn credential_variable(&self) -> String {
         match &self.credential {
             CredentialSource::Environment { variable } => variable.clone(),
-            CredentialSource::File { .. } => CREDENTIAL_VARIABLES[0].to_owned(),
+            CredentialSource::File { .. } => self.api_key_env.clone(),
         }
     }
 }
@@ -366,32 +526,75 @@ impl ProviderConfig {
 /// fall back to `DeepSeek`'s documented values, so one `DEEPSEEK_API_KEY` is a complete
 /// setup; an explicit variable still overrides either one, which is what another
 /// provider or another model needs.
+#[cfg(test)]
 pub fn resolve_provider(
     environment: &LaunchEnvironment,
     data_dir: &Path,
 ) -> Result<ProviderConfig, String> {
-    let explicit_endpoint = environment
-        .value(ENDPOINT_VARIABLE)
-        .filter(|value| !value.is_empty());
-    let explicit_model = environment
-        .value(MODEL_VARIABLE)
-        .filter(|value| !value.is_empty());
+    resolve_provider_with_config(
+        Path::new(".ha-no-user-config.toml"),
+        Path::new("."),
+        environment,
+        data_dir,
+    )
+}
 
-    let Some(credential) = credentials::source(environment, data_dir) else {
+#[cfg(test)]
+fn resolve_provider_with_config(
+    user_path: &Path,
+    project_root: &Path,
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+) -> Result<ProviderConfig, String> {
+    resolve_provider_with_overrides(
+        user_path,
+        project_root,
+        environment,
+        data_dir,
+        &ConfigOverrides::default(),
+    )
+}
+
+pub(super) fn resolve_provider_with_overrides(
+    user_path: &Path,
+    project_root: &Path,
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+    overrides: &ConfigOverrides,
+) -> Result<ProviderConfig, String> {
+    let resolved = super::config::resolve_layers(user_path, project_root, environment, overrides)
+        .map_err(|error| error.to_string())?;
+    if !matches!(
+        resolved.provider.protocol.as_str(),
+        "openai_chat" | "anthropic_messages"
+    ) {
+        return Err(format!(
+            "unsupported provider protocol {:?}",
+            resolved.provider.protocol
+        ));
+    }
+    let credential = credentials::source_for(environment, data_dir, &resolved.provider.api_key_env)
+        .or_else(|| credentials::source(environment, data_dir));
+    let Some(credential) = credential else {
         return Err(format!(
             "provider setup is incomplete: set {} or save the key in the app with /key (API key). Nothing was sent and no fixture answer was substituted.",
-            credentials::CREDENTIAL_VARIABLES.join(" or ")
+            resolved.provider.api_key_env
         ));
     };
+    let model_price = resolved.model_prices.get(&resolved.provider.model).copied();
+    let max_retry_after_seconds = resolved.retry_after_max_seconds;
     Ok(ProviderConfig {
-        endpoint: explicit_endpoint.map_or_else(
-            || DEEPSEEK_ENDPOINT.to_owned(),
-            |value| value.to_string_lossy().into_owned(),
-        ),
-        model: explicit_model.map_or_else(
-            || DEEPSEEK_MODEL.to_owned(),
-            |value| value.to_string_lossy().into_owned(),
-        ),
+        provider_id: resolved.provider.id,
+        protocol: resolved.provider.protocol,
+        endpoint: resolved.provider.endpoint,
+        model: resolved.provider.model,
+        api_key_env: resolved.provider.api_key_env,
+        thinking: resolved.provider.thinking,
+        approval: resolved.approval,
+        allow_rules: resolved.allow_rules,
+        deny_rules: resolved.deny_rules,
+        model_price,
+        max_retry_after_seconds,
         credential,
     })
 }
@@ -435,9 +638,38 @@ pub fn validate_credential_file(
 /// where from, which endpoint and model will be used and why, and is that endpoint
 /// answering. The credential **value** never appears.
 #[must_use]
+#[cfg(test)]
 pub fn provider_diagnostics(environment: &LaunchEnvironment, data_dir: &Path) -> Vec<String> {
-    let mut lines = Vec::new();
-    match credentials::source(environment, data_dir) {
+    provider_diagnostics_with_config(
+        Path::new(".ha-no-user-config.toml"),
+        Path::new("."),
+        environment,
+        data_dir,
+    )
+}
+
+fn provider_diagnostics_with_config(
+    user_path: &Path,
+    project_root: &Path,
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+) -> Vec<String> {
+    let resolved = match super::config::resolve_layers(
+        user_path,
+        project_root,
+        environment,
+        &super::config::ConfigOverrides::default(),
+    ) {
+        Ok(config) => config,
+        Err(error) => return vec![format!("Provider: configuration unavailable ({error})")],
+    };
+    let mut lines = vec![format!(
+        "Provider: {} ({})",
+        resolved.provider.id, resolved.provider.protocol
+    )];
+    match credentials::source_for(environment, data_dir, &resolved.provider.api_key_env)
+        .or_else(|| credentials::source(environment, data_dir))
+    {
         Some(source) => {
             lines.push(format!(
                 "Provider: credential from {} (value hidden)",
@@ -455,39 +687,51 @@ pub fn provider_diagnostics(environment: &LaunchEnvironment, data_dir: &Path) ->
             CREDENTIAL_VARIABLES.join(", ")
         )),
     }
-    match environment
-        .value(ENDPOINT_VARIABLE)
-        .filter(|value| !value.is_empty())
-    {
-        Some(value) => lines.push(format!(
-            "Provider: endpoint {ENDPOINT_VARIABLE}={}",
-            value.to_string_lossy()
-        )),
-        None => lines.push(format!(
-            "Provider: endpoint not set, using the default {DEEPSEEK_ENDPOINT}"
-        )),
+    for key in ["provider.endpoint", "provider.model"] {
+        if let Some(entry) = resolved.explain.iter().find(|entry| entry.key == key) {
+            if entry.layer == super::config::ConfigLayer::Default {
+                lines.push(format!(
+                    "Provider: {} not set, using the default {}",
+                    key, entry.value
+                ));
+            } else if entry.layer == super::config::ConfigLayer::Environment {
+                let (label, variable) = match key {
+                    "provider.endpoint" => ("endpoint", ENDPOINT_VARIABLE),
+                    "provider.model" => ("model", MODEL_VARIABLE),
+                    _ => (key, "unknown"),
+                };
+                lines.push(format!(
+                    "Provider: {label} {variable}={} ({})",
+                    entry.value,
+                    entry.layer.as_str()
+                ));
+            } else {
+                lines.push(format!(
+                    "Provider: {}={} ({})",
+                    key,
+                    entry.value,
+                    entry.layer.as_str()
+                ));
+            }
+        }
     }
-    match environment
-        .value(MODEL_VARIABLE)
-        .filter(|value| !value.is_empty())
+    match credentials::source_for(environment, data_dir, &resolved.provider.api_key_env)
+        .or_else(|| credentials::source(environment, data_dir))
     {
-        Some(value) => lines.push(format!(
-            "Provider: model {MODEL_VARIABLE}={}",
-            value.to_string_lossy()
-        )),
-        None => lines.push(format!(
-            "Provider: model not set, using the default {DEEPSEEK_MODEL}"
-        )),
-    }
-    match resolve_provider(environment, data_dir) {
-        Ok(config) => {
-            lines.push(format!("Provider: ready, would call {}", config.model));
-            lines.push(match endpoint_reachability(&config.endpoint) {
+        Some(_) => {
+            lines.push(format!(
+                "Provider: ready, would call {}",
+                resolved.provider.model
+            ));
+            lines.push(match endpoint_reachability(&resolved.provider.endpoint) {
                 Ok(()) => "Provider: endpoint answered a TCP connection".to_owned(),
                 Err(reason) => format!("Provider: endpoint did not answer ({reason})"),
             });
         }
-        Err(message) => lines.push(format!("Provider: not ready ({message})")),
+        None => lines.push(format!(
+            "Provider: not ready (set {} or save a key with /key)",
+            resolved.provider.api_key_env
+        )),
     }
     lines
 }
@@ -593,6 +837,9 @@ impl CredentialResolver for EnvironmentCredential {
 /// Maps turn progress onto the UI vocabulary.
 struct ChannelObserver {
     sender: UnboundedSender<SessionEvent>,
+    cost_tracker: Arc<Mutex<CostTracker>>,
+    model_price: Option<ModelPrice>,
+    auto_allowed_count: Arc<AtomicUsize>,
     /// Calls are executed serially by the turn driver. Keeping the current
     /// boundary here makes duration delivery O(1) and avoids a process-lifetime
     /// map keyed by a non-unique tool name.
@@ -602,14 +849,37 @@ struct ChannelObserver {
 impl TurnObserver for ChannelObserver {
     fn observe(&self, progress: TurnProgress) {
         let event = match progress {
-            TurnProgress::TextDelta(text) => SessionEvent::TextDelta { text },
+            TurnProgress::TextDelta(text) => Some(SessionEvent::TextDelta { text }),
+            TurnProgress::ThinkingDelta(text) => Some(SessionEvent::ThinkingDelta { text }),
+            TurnProgress::Info(message) => {
+                self.auto_allowed_count.fetch_add(1, Ordering::Relaxed);
+                Some(SessionEvent::Notice { message })
+            }
+            TurnProgress::Usage {
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                let label = if let Ok(mut tracker) = self.cost_tracker.lock() {
+                    tracker.record(
+                        self.model_price,
+                        CostUsage {
+                            input_tokens: prompt_tokens,
+                            output_tokens: completion_tokens,
+                        },
+                    );
+                    tracker.display()
+                } else {
+                    "n/a".to_owned()
+                };
+                Some(SessionEvent::CostUpdated { label })
+            }
             // Step boundaries are what the status bar counts (`step 2/8`).
-            TurnProgress::StepStarted { step } => SessionEvent::StepStarted { step },
+            TurnProgress::StepStarted { step } => Some(SessionEvent::StepStarted { step }),
             TurnProgress::ToolStarted { name, summary } => {
                 if let Ok(mut started) = self.tool_started.lock() {
                     *started = Some((name.clone(), Instant::now()));
                 }
-                SessionEvent::ToolStarted { name, summary }
+                Some(SessionEvent::ToolStarted { name, summary })
             }
             TurnProgress::ToolSettled { name, ok, detail } => {
                 let elapsed = self
@@ -619,15 +889,17 @@ impl TurnObserver for ChannelObserver {
                     .and_then(|mut started| started.take())
                     .filter(|(started_name, _)| started_name == &name)
                     .map_or(Duration::ZERO, |(_, started)| started.elapsed());
-                SessionEvent::ToolSettled {
+                Some(SessionEvent::ToolSettled {
                     name,
                     ok,
                     elapsed,
                     detail: detail.unwrap_or_default(),
-                }
+                })
             }
         };
-        let _ = self.sender.send(event);
+        if let Some(event) = event {
+            let _ = self.sender.send(event);
+        }
     }
 }
 
@@ -642,10 +914,20 @@ pub struct AgentSessionService {
     store_dir: PathBuf,
     /// Root that owns the credential file `/key` writes.
     data_dir: PathBuf,
+    config_file: PathBuf,
     workspace_root: PathBuf,
+    caller_dir: PathBuf,
+    global_config_dir: PathBuf,
     environment: LaunchEnvironment,
+    config_overrides: ConfigOverrides,
+    model_selection: Arc<Mutex<TurnModelSelection>>,
+    cost_tracker: Arc<Mutex<CostTracker>>,
+    session_mode: Arc<Mutex<Option<PolicyMode>>>,
+    auto_allowed_count: Arc<AtomicUsize>,
     task_id: TaskId,
     previous_session: Arc<Mutex<Option<SessionId>>>,
+    /// Current run's durable inbox, exposed only while its driver is active.
+    active_inbox: Arc<Mutex<Option<ActiveTurnInbox>>>,
     /// Asks the user for every gated action; never grants on its own.
     gate: Arc<ChannelApprovalGate>,
     cancellation: Option<CancellationToken>,
@@ -659,31 +941,68 @@ pub struct AgentSessionService {
     project_id: Arc<Mutex<Option<String>>>,
 }
 
+#[derive(Clone)]
+struct ActiveTurnInbox {
+    inbox: RunInbox,
+    store: Arc<SqliteStore>,
+    session_id: SessionId,
+}
+
 /// How long a gated action waits for the user before it expires.
 const APPROVAL_TIMEOUT: Duration = DEFAULT_APPROVAL_TIMEOUT;
+const SHELL_PREFIX_OUTPUT_LIMIT: usize = 64 * 1024;
+const SHELL_PREFIX_OUTPUT_TRUNCATION: &str = "\n[output truncated at 64 KiB]";
 
 /// Upper bound on the resume list, newest first.
 const RESUME_LIST_LIMIT: usize = 20;
 
 impl AgentSessionService {
     #[must_use]
+    #[cfg(test)]
     pub fn new(
         context: &LaunchContext,
         environment: LaunchEnvironment,
         sender: UnboundedSender<SessionEvent>,
     ) -> Self {
+        Self::new_with_overrides(context, environment, sender, ConfigOverrides::default())
+    }
+
+    #[must_use]
+    pub fn new_with_overrides(
+        context: &LaunchContext,
+        environment: LaunchEnvironment,
+        sender: UnboundedSender<SessionEvent>,
+        config_overrides: ConfigOverrides,
+    ) -> Self {
         let gate = Arc::new(ChannelApprovalGate::new(sender.clone(), APPROVAL_TIMEOUT));
         // The bounds are the environment's, not a constant here: a long task needs a
         // real way to raise them, and `/status` reports what is in force.
         let limits = bounds::limits_from_environment(&environment);
+        let model_selection = Arc::new(Mutex::new(TurnModelSelection::with_initial(
+            config_overrides.model.clone(),
+        )));
         Self {
             sender,
             store_dir: context.project_store_dir(),
             data_dir: context.paths.data_dir.clone(),
+            config_file: context.paths.config_file.clone(),
             workspace_root: context.project.root.clone(),
+            caller_dir: context.caller_dir.clone(),
+            global_config_dir: context
+                .paths
+                .config_file
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
             environment,
+            config_overrides,
+            model_selection,
+            cost_tracker: Arc::new(Mutex::new(CostTracker::default())),
+            session_mode: Arc::new(Mutex::new(None)),
+            auto_allowed_count: Arc::new(AtomicUsize::new(0)),
             task_id: TaskId::generate(),
             previous_session: Arc::new(Mutex::new(None)),
+            active_inbox: Arc::new(Mutex::new(None)),
             gate,
             cancellation: None,
             limits,
@@ -727,7 +1046,19 @@ impl AgentSessionService {
     }
 
     fn configured(&self) -> Result<ProviderConfig, String> {
-        resolve_provider(&self.environment, &self.data_dir)
+        let mut overrides = self.config_overrides.clone();
+        if let Ok(selection) = self.model_selection.lock()
+            && let Some(model) = &selection.active_model
+        {
+            overrides.model = Some(model.clone());
+        }
+        resolve_provider_with_overrides(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.data_dir,
+            &overrides,
+        )
     }
 }
 
@@ -740,6 +1071,7 @@ impl SessionPort for AgentSessionService {
     }
 
     fn submit(&mut self, request: SubmitRequest) {
+        self.gate.clear_turn_rules();
         let cancellation = CancellationToken::new();
         self.cancellation = Some(cancellation.clone());
         // A turn must run on an async runtime. In the app it always does; this
@@ -753,10 +1085,23 @@ impl SessionPort for AgentSessionService {
         let sender = self.sender.clone();
         let store_dir = self.store_dir.clone();
         let data_dir = self.data_dir.clone();
+        let config_file = self.config_file.clone();
         let workspace_root = self.workspace_root.clone();
+        let caller_dir = self.caller_dir.clone();
+        let global_config_dir = self.global_config_dir.clone();
         let environment = self.environment.clone();
+        let config_overrides = self.config_overrides.clone();
+        let selected_model = self
+            .model_selection
+            .lock()
+            .ok()
+            .and_then(|mut selection| selection.begin_turn());
+        let cost_tracker = Arc::clone(&self.cost_tracker);
+        let session_mode = self.session_mode.lock().ok().and_then(|mode| *mode);
+        let auto_allowed_count = Arc::clone(&self.auto_allowed_count);
         let task_id = self.task_id.clone();
         let previous_session = Arc::clone(&self.previous_session);
+        let active_inbox = Arc::clone(&self.active_inbox);
         let gate = Arc::clone(&self.gate);
         let limits = self.limits;
         // Every user input opens its own session; the conversation is the chain of
@@ -767,11 +1112,20 @@ impl SessionPort for AgentSessionService {
                 sender,
                 store_dir,
                 data_dir,
+                config_file,
                 workspace_root,
+                caller_dir,
+                global_config_dir,
                 environment,
+                config_overrides,
+                selected_model,
+                cost_tracker,
+                session_mode,
+                auto_allowed_count,
                 session_id,
                 task_id,
                 previous_session,
+                active_inbox,
                 gate,
                 limits,
                 request,
@@ -805,7 +1159,155 @@ impl SessionPort for AgentSessionService {
     }
 
     fn provider_diagnostics(&self) -> Vec<String> {
-        provider_diagnostics(&self.environment, &self.data_dir)
+        provider_diagnostics_with_config(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.data_dir,
+        )
+    }
+
+    fn config_explain(&self) -> Vec<String> {
+        let mut overrides = self.config_overrides.clone();
+        if let Ok(selection) = self.model_selection.lock()
+            && let Some(model) = &selection.active_model
+        {
+            overrides.model = Some(model.clone());
+        }
+        super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &overrides,
+        )
+        .map_or_else(
+            |error| vec![format!("configuration unavailable: {error}")],
+            |resolved| {
+                resolved
+                    .explain
+                    .into_iter()
+                    .map(|entry| {
+                        format!(
+                            "{} = {} [{}]{}",
+                            entry.key,
+                            entry.value,
+                            entry.layer.as_str(),
+                            entry
+                                .reason
+                                .map_or_else(String::new, |reason| format!(" — {reason}")),
+                        )
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    fn cost_summary(&self) -> String {
+        self.cost_tracker
+            .lock()
+            .map_or_else(|_| "n/a".to_owned(), |tracker| tracker.display())
+    }
+
+    fn set_model(&mut self, model: &str) -> Result<String, String> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err("model name must not be empty".to_owned());
+        }
+        self.model_selection
+            .lock()
+            .map_err(|_| "model selection is unavailable".to_owned())?
+            .select_for_next_turn(model.to_owned());
+        Ok(format!("model {model} selected for the next turn"))
+    }
+
+    fn set_mode(&mut self, mode: &str) -> Result<String, String> {
+        let mode = mode
+            .parse::<PolicyMode>()
+            .map_err(|error| error.to_string())?;
+        *self
+            .session_mode
+            .lock()
+            .map_err(|_| "session permission mode is unavailable".to_owned())? = Some(mode);
+        Ok(format!(
+            "permission mode set to {} for this session",
+            mode.as_str()
+        ))
+    }
+
+    fn permissions_summary(&mut self) -> Vec<String> {
+        let mut overrides = self.config_overrides.clone();
+        if let Ok(selection) = self.model_selection.lock()
+            && let Some(model) = &selection.active_model
+        {
+            overrides.model = Some(model.clone());
+        }
+        match super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &overrides,
+        ) {
+            Ok(config) => {
+                let mode = self
+                    .session_mode
+                    .lock()
+                    .ok()
+                    .and_then(|mode| *mode)
+                    .map_or(config.approval, |mode| mode.as_str().to_owned());
+                let mut lines = vec![format!("mode: {mode}")];
+                lines.extend(config.explain.iter().filter_map(|entry| {
+                    let permission = if entry.key.starts_with("permissions.allow.rule.") {
+                        Some("allow")
+                    } else if entry.key.starts_with("permissions.deny.rule.") {
+                        Some("deny")
+                    } else {
+                        None
+                    }?;
+                    Some(format!(
+                        "{permission} ({}): {}",
+                        entry.layer.as_str(),
+                        entry.value
+                    ))
+                }));
+                lines.push(format!(
+                    "actions auto-allowed this session: {}",
+                    self.auto_allowed_count.load(Ordering::Relaxed)
+                ));
+                lines
+            }
+            Err(error) => vec![format!("permissions unavailable: {error}")],
+        }
+    }
+
+    fn confirm_always_allow(&mut self, request_id: &str, pattern: &str) -> Result<String, String> {
+        if !self.gate.is_pending(request_id) {
+            return Err("approval is no longer pending; the rule was not saved".to_owned());
+        }
+        super::permissions::persist_allow_rule(&self.workspace_root, pattern)
+            .map_err(|error| error.to_string())?;
+        self.gate.stage_always_allow(request_id, pattern)?;
+        if !self.gate.answer(request_id, ApprovalDecision::Granted) {
+            if let Ok(mut rules) = self.gate.confirmed_rules.lock() {
+                rules.remove(request_id);
+            }
+            return Err(
+                "approval expired while saving; the rule was saved but this action was not run"
+                    .to_owned(),
+            );
+        }
+        Ok(format!("always-allow rule saved: {pattern}"))
+    }
+
+    fn trust_project(&mut self) -> Result<String, String> {
+        let canonical = self
+            .workspace_root
+            .canonicalize()
+            .map_err(|error| format!("project root cannot be canonicalized: {error}"))?;
+        trust_project_config(&self.config_file, &canonical)?;
+        Ok(format!(
+            "trusted project config for {}",
+            canonical.display()
+        ))
     }
 
     fn provider_problem(&self) -> Option<String> {
@@ -889,6 +1391,126 @@ impl SessionPort for AgentSessionService {
             token.cancel();
         }
     }
+
+    fn steer(&mut self, text: &str) -> Result<(), String> {
+        if text.trim().is_empty() {
+            return Err("usage: /steer <text>".to_owned());
+        }
+        let active = self
+            .active_inbox
+            .lock()
+            .map_err(|_| "the active run inbox is unavailable".to_owned())?
+            .clone()
+            .ok_or_else(|| "no active run inbox is available".to_owned())?;
+        let sender = self.sender.clone();
+        let text = text.to_owned();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            let result = async {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let run = loop {
+                    match active.store.latest_run(&active.session_id).await {
+                        Ok(Some(run)) => break run,
+                        Ok(None) if Instant::now() < deadline => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Ok(None) => {
+                            return Err("the active run did not open its inbox within two seconds"
+                                .to_owned());
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
+                };
+                active
+                    .inbox
+                    .steer(&run, text, harness_runtime::now_unix_ms())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<(), String>(())
+            }
+            .await;
+            if let Err(error) = result {
+                let _ = sender.send(SessionEvent::Notice {
+                    message: format!("steering note was not queued: {error}"),
+                });
+            }
+        });
+        Ok(())
+    }
+}
+
+fn trust_project_config(user_path: &Path, canonical_root: &Path) -> Result<(), String> {
+    if user_path.exists() {
+        super::config::load(user_path).map_err(|error| error.to_string())?;
+    }
+    let mut document = if user_path.exists() {
+        let contents = std::fs::read_to_string(user_path)
+            .map_err(|error| format!("user config cannot be read: {error}"))?;
+        toml::from_str::<toml::Value>(&contents)
+            .map_err(|_| "user config is not valid TOML".to_owned())?
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+    let root_table = document
+        .as_table_mut()
+        .ok_or_else(|| "user config must be a TOML table".to_owned())?;
+    root_table.insert("schema_version".to_owned(), toml::Value::Integer(2));
+    let trust = root_table
+        .entry("trust")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let trust_table = trust
+        .as_table_mut()
+        .ok_or_else(|| "trust config must be a TOML table".to_owned())?;
+    let projects = trust_table
+        .entry("projects")
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let projects = projects
+        .as_array_mut()
+        .ok_or_else(|| "trust.projects must be an array".to_owned())?;
+    let canonical_text = canonical_root.to_string_lossy().into_owned();
+    if !projects.iter().any(|value| {
+        value.as_str().is_some_and(|path| {
+            Path::new(path)
+                .canonicalize()
+                .is_ok_and(|existing| same_canonical_path(&existing, canonical_root))
+        })
+    }) {
+        projects.push(toml::Value::String(canonical_text));
+    }
+    projects.sort_by_key(toml::Value::to_string);
+    let v2: harness_types::HarnessConfigV2 = document
+        .clone()
+        .try_into()
+        .map_err(|_| "user config cannot be upgraded to schema v2 safely".to_owned())?;
+    v2.validate().map_err(|error| error.to_string())?;
+    let rendered = toml::to_string_pretty(&document)
+        .map_err(|_| "user config cannot be serialized".to_owned())?;
+    if let Some(parent) = user_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("user config directory cannot be created: {error}"))?;
+    }
+    let mut output = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(user_path)
+        .map_err(|error| format!("user config cannot be written: {error}"))?;
+    std::io::Write::write_all(&mut output, rendered.as_bytes())
+        .and_then(|()| output.sync_all())
+        .map_err(|error| format!("user config cannot be flushed: {error}"))
+}
+
+fn same_canonical_path(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
 }
 
 /// Report what one attempt to remember did, in words a reader can act on.
@@ -932,11 +1554,20 @@ async fn run_turn(
     sender: UnboundedSender<SessionEvent>,
     store_dir: PathBuf,
     data_dir: PathBuf,
+    config_file: PathBuf,
     workspace_root: PathBuf,
+    caller_dir: PathBuf,
+    global_config_dir: PathBuf,
     environment: LaunchEnvironment,
+    config_overrides: ConfigOverrides,
+    selected_model: Option<String>,
+    cost_tracker: Arc<Mutex<CostTracker>>,
+    session_mode: Option<PolicyMode>,
+    auto_allowed_count: Arc<AtomicUsize>,
     session_id: SessionId,
     task_id: TaskId,
     previous_session: Arc<Mutex<Option<SessionId>>>,
+    active_inbox: Arc<Mutex<Option<ActiveTurnInbox>>>,
     gate: Arc<ChannelApprovalGate>,
     limits: TurnLimits,
     request: SubmitRequest,
@@ -948,14 +1579,6 @@ async fn run_turn(
     send(SessionEvent::Accepted {
         input_id: request.input_id.clone(),
     });
-
-    let config = match resolve_provider(&environment, &data_dir) {
-        Ok(config) => config,
-        Err(message) => {
-            send(SessionEvent::RecoverableError { message });
-            return;
-        }
-    };
 
     let store = match SqliteStore::open_writer(WriterOpenOptions::new(
         store_dir.clone(),
@@ -1004,6 +1627,111 @@ async fn run_turn(
         None => task_id,
     };
 
+    if let Some(shell_prefix) = request.shell_prefix.clone() {
+        run_shell_prefix_turn(
+            sender,
+            store,
+            config_file,
+            workspace_root,
+            environment,
+            config_overrides,
+            session_mode,
+            session_id,
+            task_id,
+            source,
+            previous_session,
+            gate,
+            cost_tracker,
+            auto_allowed_count,
+            limits,
+            request,
+            shell_prefix,
+            cancellation,
+        )
+        .await;
+        return;
+    }
+
+    if let Some(question_id) = request.answer_question_id.as_deref() {
+        let answer_result = async {
+            let question_id = QuestionId::parse(question_id.to_owned())
+                .map_err(|error| format!("question id is invalid: {error}"))?;
+            let service = HumanInputService::new(Arc::clone(&store));
+            let question = service
+                .question(&question_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "the pending question no longer exists".to_owned())?;
+            if question.task_id != task_id || source.as_ref() != Some(&question.session_id) {
+                return Err("the pending question belongs to another task or session".to_owned());
+            }
+            service
+                .answer(
+                    &question.scope_key,
+                    &serde_json::Value::String(request.text.clone()),
+                    "interactive.user",
+                    harness_runtime::now_unix_ms(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(message) = answer_result {
+            send(SessionEvent::RecoverableError {
+                message: format!("question answer was not accepted: {message}"),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
+        }
+    }
+
+    let persisted_model = if selected_model.is_none() && config_overrides.model.is_none() {
+        store
+            .session_setting(&task_id, "model")
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let selected_model = selected_model
+        .or_else(|| config_overrides.model.clone())
+        .or(persisted_model);
+    let mut turn_overrides = config_overrides;
+    if let Some(model) = &selected_model {
+        turn_overrides.model = Some(model.clone());
+        if let Err(error) = store.set_session_setting(&task_id, "model", model).await {
+            send(SessionEvent::RecoverableError {
+                message: format!(
+                    "model selection could not be persisted; nothing was sent: {error}"
+                ),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
+        }
+    }
+    let config = match resolve_provider_with_overrides(
+        &config_file,
+        &workspace_root,
+        &environment,
+        &data_dir,
+        &turn_overrides,
+    ) {
+        Ok(config) => config,
+        Err(message) => {
+            send(SessionEvent::RecoverableError { message });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
+        }
+    };
+
     // A workspace root keeps one project identity, whether or not memory is on: a
     // generated id per turn would put every project-scoped record this turn writes
     // out of reach of the next one.
@@ -1021,7 +1749,7 @@ async fn run_turn(
         .then(|| memory::principal(project_id.clone(), task_id.clone(), session_id.clone()));
 
     let capabilities = ModelCapabilities {
-        provider_id: "deepseek".to_owned(),
+        provider_id: config.provider_id.clone(),
         model: config.model.clone(),
         supports_streaming: true,
         supports_tools: true,
@@ -1032,16 +1760,39 @@ async fn run_turn(
         config.credential_variable(),
         data_dir.clone(),
     ));
-    let provider: Arc<dyn ModelProvider> =
-        match DeepSeekAdapter::new(config.endpoint.clone(), credentials, capabilities) {
-            Ok(adapter) => Arc::new(adapter),
-            Err(error) => {
-                send(SessionEvent::RecoverableError {
-                    message: format!("provider configuration is invalid: {error}"),
-                });
-                return;
+    let provider: Result<Arc<dyn ModelProvider>, ProviderError> = match config.protocol.as_str() {
+        "openai_chat" => {
+            let thinking_parameter = (config.provider_id == "deepseek" && config.thinking == "off")
+                .then(harness_providers::thinking_disabled);
+            OpenAiChatAdapter::with_options(
+                config.endpoint.clone(),
+                credentials,
+                capabilities,
+                OpenAiChatOptions { thinking_parameter },
+            )
+            .map(|adapter| Arc::new(adapter) as Arc<dyn ModelProvider>)
+        }
+        "anthropic_messages" => {
+            AnthropicMessagesAdapter::new(config.endpoint.clone(), credentials, capabilities)
+                .map(|adapter| Arc::new(adapter) as Arc<dyn ModelProvider>)
+        }
+        _ => Err(ProviderError::new(
+            ErrorCode::ProviderProtocol,
+            "provider protocol is unsupported",
+        )),
+    };
+    let provider = match provider {
+        Ok(provider) => provider,
+        Err(error) => {
+            send(SessionEvent::RecoverableError {
+                message: format!("provider configuration is invalid: {error}"),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
             }
-        };
+            return;
+        }
+    };
 
     let observation = match observe_workspace(project_id, &workspace_root) {
         Ok(observation) => observation,
@@ -1059,7 +1810,10 @@ async fn run_turn(
     let runtime = Arc::new(RuntimeService::new(
         Arc::clone(&store),
         provider,
-        RuntimeConfig::default(),
+        RuntimeConfig {
+            max_retry_after_seconds: config.max_retry_after_seconds,
+            ..RuntimeConfig::default()
+        },
     ));
     // Local extensions are explicit opt-in, loaded for this turn and stopped when it
     // ends: a chat turn never leaves an extension process behind.
@@ -1082,11 +1836,28 @@ async fn run_turn(
     } else {
         None
     };
-    let tools = match &active_extensions {
-        Some(active) => {
-            ToolExecutionService::new(Arc::clone(&store)).with_external(active.dispatcher())
+    let tool_policy = match super::permissions::build_tool_policy(
+        &config.approval,
+        &config.allow_rules,
+        &config.deny_rules,
+        session_mode,
+    ) {
+        Ok(policy) => policy.with_turn_rules(gate.turn_rules()),
+        Err(error) => {
+            send(SessionEvent::RecoverableError {
+                message: format!("tool permissions are invalid: {error}"),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
         }
-        None => ToolExecutionService::new(Arc::clone(&store)),
+    };
+    let tools = match &active_extensions {
+        Some(active) => ToolExecutionService::new(Arc::clone(&store))
+            .with_policy(tool_policy)
+            .with_external(active.dispatcher()),
+        None => ToolExecutionService::new(Arc::clone(&store)).with_policy(tool_policy),
     };
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
     let driver = match &active_extensions {
@@ -1117,6 +1888,66 @@ async fn run_turn(
         request.text,
         attachments::attachment_blocks(&attached.files)
     );
+    let loaded_instructions =
+        super::instructions::load(&global_config_dir, &workspace_root, &caller_dir);
+    for notice in &loaded_instructions.notices {
+        send(SessionEvent::Notice {
+            message: notice.clone(),
+        });
+    }
+    send(SessionEvent::Notice {
+        message: format!("AGENTS.md: {} files", loaded_instructions.files.len()),
+    });
+    let (git_branch, changed_files) = prompt_git_facts(&workspace_root);
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let shell = if cfg!(windows) {
+        "PowerShell".to_owned()
+    } else {
+        std::env::var("SHELL")
+            .ok()
+            .and_then(|value| {
+                Path::new(&value)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "sh".to_owned())
+    };
+    let prompt_environment = PromptEnvironment {
+        os: std::env::consts::OS,
+        shell: &shell,
+        cwd: &caller_dir,
+        project_root: &workspace_root,
+        git_branch: git_branch.as_deref(),
+        changed_files,
+        date_iso: &today,
+        limits,
+    };
+    let prompt_tools = coding_tool_names()
+        .iter()
+        .map(|name| {
+            let name = *name;
+            PromptTool {
+                name,
+                effect: if matches!(
+                    name,
+                    "read_file"
+                        | "list_files"
+                        | "search_text"
+                        | "glob"
+                        | "git_status"
+                        | "git_diff"
+                        | "git_log"
+                ) {
+                    "read only"
+                } else if name == "ask_user" {
+                    "interactive input; no approval"
+                } else {
+                    "subject to host policy and approval"
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    let built_prompt = SystemPromptBuilder::build(&prompt_environment, &prompt_tools);
     let mut run_request = RunRequest::new(
         session_id.clone(),
         task_id,
@@ -1124,6 +1955,8 @@ async fn run_turn(
         prompt,
         observation,
     )
+    .with_system_policy(built_prompt.text)
+    .with_project_rules(loaded_instructions.blocks)
     .with_tool_schemas(tool_schemas);
     if !attached.is_empty() {
         for notice in attachments::attachment_notices(&attached.images, &attached.files) {
@@ -1173,8 +2006,21 @@ async fn run_turn(
     };
     let observer: Arc<dyn TurnObserver> = Arc::new(ChannelObserver {
         sender: sender.clone(),
+        cost_tracker,
+        model_price: config.model_price,
+        auto_allowed_count,
         tool_started: Mutex::new(None),
     });
+
+    let run_inbox = RunInbox::new(Arc::clone(&store));
+    if let Ok(mut active) = active_inbox.lock() {
+        *active = Some(ActiveTurnInbox {
+            inbox: run_inbox.clone(),
+            store: Arc::clone(&store),
+            session_id: session_id.clone(),
+        });
+    }
+    let driver = driver.with_inbox(run_inbox);
 
     // A follow-up turn continues the previous session; the first turn starts one.
     let outcome = match &source {
@@ -1189,6 +2035,35 @@ async fn run_turn(
                 .await
         }
     };
+
+    if let Ok(turn) = &outcome
+        && let Some(question_id) = turn.pending_question.as_ref()
+    {
+        match HumanInputService::new(Arc::clone(&store))
+            .question(question_id)
+            .await
+        {
+            Ok(Some(question)) => send(SessionEvent::QuestionRequired {
+                question_id: question.question_id.as_str().to_owned(),
+                prompt: question.prompt,
+                options: question.payload["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect(),
+            }),
+            Ok(None) | Err(_) => send(SessionEvent::RecoverableError {
+                message: "the model asked a question, but the durable question could not be read"
+                    .to_owned(),
+            }),
+        }
+    }
+
+    if let Ok(mut active) = active_inbox.lock() {
+        *active = None;
+    }
 
     // Release the writer before announcing the terminal event: the next turn takes
     // a newer generation of the task lease, and it must not race this one.
@@ -1267,6 +2142,315 @@ async fn run_turn(
     send(SessionEvent::RunTerminal { outcome: terminal });
 }
 
+#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the direct shell route keeps admission, shared policy, approval, receipt, and output in order"
+)]
+async fn run_shell_prefix_turn(
+    sender: UnboundedSender<SessionEvent>,
+    store: Arc<SqliteStore>,
+    config_file: PathBuf,
+    workspace_root: PathBuf,
+    environment: LaunchEnvironment,
+    config_overrides: ConfigOverrides,
+    session_mode: Option<PolicyMode>,
+    session_id: SessionId,
+    task_id: TaskId,
+    source: Option<SessionId>,
+    previous_session: Arc<Mutex<Option<SessionId>>>,
+    gate: Arc<ChannelApprovalGate>,
+    cost_tracker: Arc<Mutex<CostTracker>>,
+    auto_allowed_count: Arc<AtomicUsize>,
+    limits: TurnLimits,
+    request: SubmitRequest,
+    shell_prefix: ShellPrefix,
+    cancellation: CancellationToken,
+) {
+    let send = |event| {
+        let _ = sender.send(event);
+    };
+    let config = match super::config::resolve_layers(
+        &config_file,
+        &workspace_root,
+        &environment,
+        &config_overrides,
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            send(SessionEvent::RecoverableError {
+                message: error.to_string(),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
+        }
+    };
+    let project_id = match project::resolve_project_id(&store, &workspace_root).await {
+        Ok(project_id) => project_id,
+        Err(error) => {
+            send(SessionEvent::RecoverableError {
+                message: format!("project identity is unavailable: {error}"),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
+        }
+    };
+    let observation = match observe_workspace(project_id, &workspace_root) {
+        Ok(observation) => observation,
+        Err(error) => {
+            send(SessionEvent::RecoverableError {
+                message: format!("workspace cannot be observed: {error}"),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
+        }
+    };
+    let expected_sequence = match store.session_summary(&session_id).await {
+        Ok(summary) => summary.map_or(1, |summary| summary.next_sequence),
+        Err(error) => {
+            send(SessionEvent::RecoverableError {
+                message: format!("shell input sequence could not be read: {error}"),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
+        }
+    };
+    if let Err(error) = SessionService::new(Arc::clone(&store))
+        .admit_input(AdmitInputRequest {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            input_id: request.input_id.clone(),
+            expected_sequence,
+            authority: SourceAuthority::User,
+            raw_text: request.text,
+            workspace: observation,
+            initial_plan_items: Vec::new(),
+        })
+        .await
+    {
+        send(SessionEvent::RecoverableError {
+            message: format!("shell input was not admitted: {error}"),
+        });
+        if let Ok(store) = Arc::try_unwrap(store) {
+            let _ = store.close().await;
+        }
+        return;
+    }
+    if let Some(source) = source
+        && let Err(error) = store
+            .record_continuation_link(&source, &session_id, &task_id)
+            .await
+    {
+        send(SessionEvent::RecoverableError {
+            message: format!("shell session link could not be recorded: {error}"),
+        });
+        if let Ok(store) = Arc::try_unwrap(store) {
+            let _ = store.close().await;
+        }
+        return;
+    }
+    if let Ok(mut previous) = previous_session.lock() {
+        *previous = Some(session_id.clone());
+    }
+
+    let policy = match super::permissions::build_tool_policy(
+        &config.approval,
+        &config.allow_rules,
+        &config.deny_rules,
+        session_mode,
+    ) {
+        Ok(policy) => policy.with_turn_rules(gate.turn_rules()),
+        Err(error) => {
+            send(SessionEvent::RecoverableError {
+                message: format!("tool permissions are invalid: {error}"),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
+        }
+    };
+    let tools = ToolExecutionService::new(Arc::clone(&store)).with_policy(policy);
+    let options = TurnOptions {
+        workspace_root: workspace_root.clone(),
+        actor_id: "interactive.user".to_owned(),
+        approvals: ApprovalMode::Ask(gate as Arc<dyn ApprovalGate>),
+        limits,
+    };
+    let observer: Arc<dyn TurnObserver> = Arc::new(ChannelObserver {
+        sender: sender.clone(),
+        cost_tracker,
+        model_price: config.model_prices.get(&config.provider.model).copied(),
+        auto_allowed_count,
+        tool_started: Mutex::new(None),
+    });
+    observer.observe(TurnProgress::StepStarted { step: 1 });
+    observer.observe(TurnProgress::ToolStarted {
+        name: "run_shell".to_owned(),
+        summary: format!("shell: {}", shell_prefix.command),
+    });
+    let tool_request = harness_tools::ToolRequest::new(
+        session_id,
+        task_id,
+        "interactive.user",
+        &workspace_root,
+        CodingToolAction::RunShell {
+            command: shell_prefix.command.clone(),
+            timeout_ms: 60_000,
+            isolation: IsolationMode::BestEffort,
+            env: Vec::new(),
+        },
+    );
+    let result =
+        execute_action_with_approval(&tools, tool_request, &options, 1, &observer, &cancellation)
+            .await;
+    let (output, attachable, outcome) = match result {
+        Ok(view) => {
+            let settled = view.receipt.as_ref().is_some_and(|receipt| {
+                receipt.outcome_state == harness_types::ToolOutcomeState::Settled
+            });
+            let (output, process_result) = shell_output(&view.output);
+            let outcome = if settled {
+                RunOutcome::Done
+            } else {
+                RunOutcome::Blocked(output.clone())
+            };
+            observer.observe(TurnProgress::ToolSettled {
+                name: "run_shell".to_owned(),
+                ok: settled && process_result,
+                detail: (!settled || !process_result).then(|| output.clone()),
+            });
+            (output, settled, outcome)
+        }
+        Err(error) => {
+            let output = format!("not run: {error}");
+            observer.observe(TurnProgress::ToolSettled {
+                name: "run_shell".to_owned(),
+                ok: false,
+                detail: Some(output.clone()),
+            });
+            (output.clone(), false, RunOutcome::Blocked(output))
+        }
+    };
+    send(SessionEvent::ShellPrefixCompleted {
+        command: shell_prefix.command,
+        output,
+        attach_to_next_message: attachable
+            && shell_prefix.mode == ShellPrefixMode::AttachToNextMessage,
+    });
+    drop(tools);
+    if let Ok(store) = Arc::try_unwrap(store) {
+        let _ = store.close().await;
+    }
+    send(SessionEvent::RunTerminal { outcome });
+}
+
+fn shell_output(output: &ToolOutput) -> (String, bool) {
+    use std::fmt::Write as _;
+
+    let (mut text, successful) = match output {
+        ToolOutput::Process {
+            exit_code,
+            timed_out,
+            canceled,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+            capture_truncated,
+            capture_tail,
+            ..
+        } => {
+            let mut text = String::new();
+            if !stdout.is_empty() {
+                text.push_str(stdout);
+            }
+            if !stderr.is_empty() {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str("[stderr]\n");
+                text.push_str(stderr);
+            }
+            if let Some(exit_code) = exit_code {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                let _ = write!(text, "[exit code {exit_code}]");
+            }
+            if *timed_out {
+                text.push_str("\n[command timed out]");
+            }
+            if *canceled {
+                text.push_str("\n[command canceled]");
+            }
+            if *stdout_truncated {
+                text.push_str("\n[stdout preview truncated]");
+            }
+            if *stderr_truncated {
+                text.push_str("\n[stderr preview truncated]");
+            }
+            if *capture_truncated {
+                text.push_str("\n[capture truncated at quota]");
+                if !capture_tail.is_empty() {
+                    text.push_str("\n[capture tail]\n");
+                    text.push_str(capture_tail);
+                }
+            }
+            (
+                text,
+                exit_code.is_some_and(|code| code == 0) && !timed_out && !canceled,
+            )
+        }
+        ToolOutput::Denied { reason, .. } => (format!("not run: {reason}"), false),
+        ToolOutput::OutcomeUnknown { reason } => (format!("outcome unknown: {reason}"), false),
+        _ => (
+            "run_shell returned an unexpected output type".to_owned(),
+            false,
+        ),
+    };
+    if text.len() > SHELL_PREFIX_OUTPUT_LIMIT {
+        let max_content =
+            SHELL_PREFIX_OUTPUT_LIMIT.saturating_sub(SHELL_PREFIX_OUTPUT_TRUNCATION.len());
+        let mut boundary = max_content.min(text.len());
+        while !text.is_char_boundary(boundary) {
+            boundary = boundary.saturating_sub(1);
+        }
+        text.truncate(boundary);
+        text.push_str(SHELL_PREFIX_OUTPUT_TRUNCATION);
+    }
+    (text, successful)
+}
+
+fn prompt_git_facts(root: &Path) -> (Option<String>, Option<usize>) {
+    let branch = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|output| output.trim().to_owned())
+        .filter(|branch| !branch.is_empty());
+    let changed = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|output| output.lines().count());
+    (branch, changed)
+}
+
 /// Deterministic labelled fixture used by tests and explicit demos.
 #[derive(Debug)]
 pub struct FixtureService {
@@ -1326,6 +2510,7 @@ impl SessionPort for FixtureService {
                 request_id,
                 action: "fixture_action".to_owned(),
                 summary: "prove the terminal approval path".to_owned(),
+                rule_pattern: "fixture_action()".to_owned(),
                 workspace: "fixture workspace (no mutation)".to_owned(),
                 scope: "once".to_owned(),
                 expires_at: Instant::now() + DEFAULT_APPROVAL_TIMEOUT,
@@ -1423,6 +2608,8 @@ mod tests {
         SubmitRequest {
             input_id: InputId::generate(),
             text: "fix the parser".to_owned(),
+            answer_question_id: None,
+            shell_prefix: None,
         }
     }
 
@@ -1514,6 +2701,7 @@ mod tests {
             request_id: request_id.to_owned(),
             action: "ApplyPatch".to_owned(),
             summary: "patch src/parser.rs".to_owned(),
+            rule_pattern: "apply_patch(src/parser.rs)".to_owned(),
             workspace: std::path::PathBuf::from("C:/work/repo"),
             scope: "one action, this turn only".to_owned(),
             read_only: false,
@@ -1683,8 +2871,8 @@ mod tests {
             "no panel opens while the grant is open: {announced:?}"
         );
         for summary in [
-            "allowed for this turn: run git log -1 --stat --format=fuller",
-            "allowed for this turn: patch src/parser.rs",
+            "[info] allowed by mode turn-grant: run git log -1 --stat --format=fuller",
+            "[info] allowed by mode turn-grant: patch src/parser.rs",
         ] {
             assert!(
                 announced.iter().any(|event| matches!(
@@ -1694,6 +2882,111 @@ mod tests {
                 "every auto-allowed action is recorded, not invisible: {announced:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn g05_transcript_records_every_auto_allowed_action() {
+        let mut channel = SessionChannel::new();
+        let gate = ChannelApprovalGate::new(channel.sender(), Duration::from_millis(30));
+        gate.grant_for_run();
+
+        for proposal in [
+            ApprovalProposal {
+                action: "RunProcess".to_owned(),
+                summary: "run cargo test --locked".to_owned(),
+                ..proposal("g05-auto-1")
+            },
+            proposal("g05-auto-2"),
+        ] {
+            assert_eq!(
+                ApprovalGate::request(&gate, proposal).await,
+                ApprovalAnswer::Granted,
+                "the explicit per-turn grant handles each action"
+            );
+        }
+
+        let notices = channel
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                SessionEvent::Notice { message } => Some(message),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notices.len(),
+            2,
+            "one info row is recorded per allowed action"
+        );
+        assert!(
+            notices.iter().all(|message| {
+                message.starts_with("[info] allowed by mode ")
+                    && (message.contains("cargo test --locked")
+                        || message.contains("patch src/parser.rs"))
+            }),
+            "{notices:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn g05_confirmed_rule_is_applied_after_the_approved_action_settles() {
+        use harness_tools::{CodingToolAction, Decision, ToolPolicy};
+
+        let mut channel = SessionChannel::new();
+        let gate = Arc::new(ChannelApprovalGate::new(
+            channel.sender(),
+            Duration::from_secs(5),
+        ));
+        let policy = ToolPolicy::default().with_turn_rules(gate.turn_rules());
+        let action = CodingToolAction::RunProcess {
+            executable: "cargo".to_owned(),
+            args: vec!["test".to_owned(), "--locked".to_owned()],
+            timeout_ms: 5_000,
+            isolation: harness_tools::IsolationMode::BestEffort,
+            env: Vec::new(),
+        };
+        assert_eq!(policy.decide(&action), Decision::Ask);
+
+        let asking = Arc::clone(&gate);
+        let mut proposed = proposal("g05-delayed-rule");
+        proposed.action = "RunProcess".to_owned();
+        proposed.summary = "run cargo test --locked".to_owned();
+        proposed.rule_pattern = "run_process(cargo test --locked)".to_owned();
+        let handle =
+            tokio::spawn(async move { ApprovalGate::request(asking.as_ref(), proposed).await });
+        let mut request_id = None;
+        for _ in 0..200 {
+            if let Some(id) = channel.drain().into_iter().find_map(|event| match event {
+                SessionEvent::ApprovalRequired { request_id, .. } => Some(request_id),
+                _ => None,
+            }) {
+                request_id = Some(id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let request_id = request_id.expect("the proposed tool reaches the approval panel");
+        gate.stage_always_allow(&request_id, "run_process(cargo test --locked)")
+            .expect("the displayed rule is staged after confirmation");
+        assert!(gate.answer(&request_id, ApprovalDecision::Granted));
+        assert_eq!(
+            handle.await.expect("approval request"),
+            ApprovalAnswer::Granted
+        );
+        assert_eq!(
+            policy.decide(&action),
+            Decision::Ask,
+            "do not stale the pending grant"
+        );
+
+        ApprovalGate::action_completed(gate.as_ref(), &request_id);
+        assert_eq!(
+            policy.decide(&action),
+            Decision::Allow {
+                reason: "rule run_process(cargo test --locked)".to_owned()
+            },
+            "the confirmed pattern takes effect for later calls in the same turn"
+        );
     }
 
     /// Before the user says so, a read keeps its panel - the grant is opt-in, not a

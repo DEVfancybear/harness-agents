@@ -38,6 +38,17 @@
         }
       ]
     },
+    "after_hash": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ContentHash"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Content digest immediately after a mutating workspace action.\nOptional so receipts written before G04 still deserialize unchanged."
+    },
     "approval_id": {
       "type": [
         "string",
@@ -60,6 +71,17 @@
           "type": "null"
         }
       ]
+    },
+    "before_hash": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ContentHash"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Content digest immediately before a mutating workspace action.\nOptional so receipts written before G04 still deserialize unchanged."
     },
     "call_id": {
       "default": null,

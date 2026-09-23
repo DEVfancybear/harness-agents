@@ -34,8 +34,14 @@ quả của nhánh audit này.
   lỗi transport sau khi URL được sanitize; `phase_p2` **17/17 PASS**. Những lần gate
   đầu dừng ở test/fixture được liệt kê cùng kết quả thật trong
   [evidence P0–P7](../evidence/P0-P7_AUDIT.vi.md). `Verify-Docs.ps1 -SelfTest` pass
-  sau cập nhật evidence/handoff cuối: 171 Markdown, 15 cặp ngôn ngữ, đủ 12 negative
-  controls, 63 bước P0–P8.
+  sau merge master: 174 Markdown, 15 cặp ngôn ngữ, đủ 12 negative controls,
+  63 bước P0–P8.
+- Đã merge `origin/master` tại `e3f55d4` (G04–G06). Bốn conflict ở migration/schema
+  tests được giải bằng assertion schema-version động, fixture nâng revision mới nhất
+  mà không phá uniqueness, và giữ nguyên assertion audit về process-tree semantics.
+  Sau merge, `cargo test --workspace --all-targets --locked -- --skip
+  m9_04_release_candidate_has_checksums_and_is_not_published` **PASS**; full Clippy,
+  fmt và docs self-test **PASS**. ConPTY acceptance tests cần terminal thật vẫn ignored.
 - Có regression symlink artifact root chỉ biên dịch trên Unix; Windows hiện tại không
   chạy ca đó. Linux giữ **pending** theo yêu cầu. Retention target là kind:id global
   trong store; file ID hiện là path tương đối workspace. Backup manifest không có chữ ký.

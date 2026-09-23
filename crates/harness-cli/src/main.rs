@@ -9,7 +9,7 @@ mod memory_cli;
 mod sandbox_cli;
 mod web;
 
-use std::{fs, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{path::PathBuf, process::ExitCode, sync::Arc};
 
 use clap::{Args, Parser, Subcommand};
 use harness_providers::{MockProvider, ProviderStreamEvent};
@@ -21,9 +21,8 @@ use harness_tools::{
     observed_file_hash,
 };
 use harness_types::{
-    AgentRunId, ContentHash, ErrorCode, HarnessConfig, HarnessError, HostId, InputId,
-    PluginInstanceId, PluginManifest, ProjectId, ScopeId, ServiceContract, SessionId, TaskId,
-    WorkspaceObservation,
+    AgentRunId, ContentHash, ErrorCode, HarnessError, HostId, InputId, PluginInstanceId,
+    PluginManifest, ProjectId, ScopeId, ServiceContract, SessionId, TaskId, WorkspaceObservation,
 };
 
 /// Personal coding-agent harness.
@@ -134,6 +133,21 @@ struct ChatArgs {
     /// Resume one persisted session inside the interactive app.
     #[arg(long)]
     resume: Option<String>,
+    /// Select the model for this conversation; `/model` switches subsequent turns.
+    #[arg(long)]
+    model: Option<String>,
+    /// Select a named config profile.
+    #[arg(long)]
+    profile: Option<String>,
+    /// Approval mode: ask, auto-edit or full-auto.
+    #[arg(long, value_parser = ["ask", "auto-edit", "full-auto"])]
+    approval: Option<String>,
+    /// Temporary tool allow pattern for one headless turn; repeatable.
+    #[arg(long = "allowed-tools", requires = "headless")]
+    allowed_tools: Vec<String>,
+    /// Temporary tool deny pattern for one headless turn; repeatable.
+    #[arg(long = "disallowed-tools", requires = "headless")]
+    disallowed_tools: Vec<String>,
     /// Use the labelled local fixture backend instead of a model; no provider is
     /// called and the header says so.
     #[arg(long)]
@@ -175,7 +189,7 @@ struct ChatArgs {
 
 impl ChatArgs {
     fn mode(&self) -> Result<interactive::LaunchMode, interactive::UsageError> {
-        interactive::mode_from_args(
+        let mut mode = interactive::mode_from_args(
             self.cwd.clone(),
             self.resume.clone(),
             self.fixture,
@@ -189,8 +203,35 @@ impl ChatArgs {
                 criteria: self.criteria.clone(),
                 max_continuations: self.max_continuations,
                 budget_tokens: self.budget,
+                approval: self.approval.clone(),
+                allowed_tools: self.allowed_tools.clone(),
+                disallowed_tools: self.disallowed_tools.clone(),
             },
-        )
+        )?;
+        match &mut mode {
+            interactive::LaunchMode::Interactive {
+                config_overrides, ..
+            } => {
+                config_overrides.model.clone_from(&self.model);
+                config_overrides.profile.clone_from(&self.profile);
+                config_overrides.approval.clone_from(&self.approval);
+                config_overrides
+                    .allowed_tools
+                    .clone_from(&self.allowed_tools);
+                config_overrides
+                    .disallowed_tools
+                    .clone_from(&self.disallowed_tools);
+            }
+            interactive::LaunchMode::Headless { .. }
+                if self.model.is_some() || self.profile.is_some() =>
+            {
+                return Err(interactive::UsageError::new(
+                    "--model and --profile apply to interactive chat only",
+                ));
+            }
+            interactive::LaunchMode::Headless { .. } => {}
+        }
+        Ok(mode)
     }
 }
 
@@ -290,11 +331,20 @@ enum ConfigSubcommand {
         #[arg(long)]
         json: bool,
     },
-    /// Explain effective P0 configuration and the source of every value.
+    /// Explain effective user, trusted project, environment and CLI configuration.
     Explain {
-        /// Path to the TOML configuration file.
+        /// Optional user config override; defaults to the platform config path.
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
+        /// Show the effective configuration with this one-turn model override.
+        #[arg(long)]
+        model: Option<String>,
+        /// Select a named profile while explaining.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Explain the requested approval policy.
+        #[arg(long)]
+        approval: Option<String>,
         /// Emit a versioned JSON result to stdout.
         #[arg(long)]
         json: bool,
@@ -486,6 +536,7 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
                 resume: None,
                 fixture: false,
                 plain: interactive::plain_requested_from_environment(),
+                config_overrides: interactive::config::ConfigOverrides::default(),
             }))
             .await
         }
@@ -551,37 +602,95 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
         Some(Command::Config(ConfigCommand {
             command: ConfigSubcommand::Validate { config, json },
         })) => {
-            let config = read_config(&config)?;
+            let config = interactive::config::load(&config)?;
+            let (version, value) = match config {
+                interactive::config::ConfigState::Loaded { config, .. } => (
+                    1,
+                    serde_json::to_value(config).unwrap_or(serde_json::Value::Null),
+                ),
+                interactive::config::ConfigState::LoadedV2 { config, .. } => (
+                    2,
+                    serde_json::to_value(config).unwrap_or(serde_json::Value::Null),
+                ),
+                interactive::config::ConfigState::FirstRun { .. } => (1, serde_json::json!({})),
+            };
             if json {
                 let result = serde_json::json!({
                     "schema_version": 1,
                     "valid": true,
-                    "config": config,
+                    "config_schema_version": version,
+                    "config": value,
                 });
                 println!("{result}");
             } else {
-                println!("config valid: schema_version={}", config.schema_version);
+                println!("config valid: schema_version={version}");
             }
             Ok(())
         }
         Some(Command::Config(ConfigCommand {
-            command: ConfigSubcommand::Explain { config, json },
-        })) => {
-            let effective = read_config(&config)?;
-            let result = serde_json::json!({
-                "schema_version": 1,
-                "effective_config": effective,
-                "sources": {
-                    "schema_version": "file",
-                    "cli.output": "file_or_default"
+            command:
+                ConfigSubcommand::Explain {
+                    config,
+                    model,
+                    profile,
+                    approval,
+                    json,
                 },
-                "runtime": "not_available_in_p1"
+        })) => {
+            let environment = interactive::paths::LaunchEnvironment::capture();
+            let caller_dir = std::env::current_dir().map_err(|error| {
+                HarnessError::new(
+                    ErrorCode::ConfigReadError,
+                    format!("current directory is unavailable: {error}"),
+                )
+            })?;
+            let defaults = interactive::paths::resolve(&interactive::paths::PathRequest {
+                platform: interactive::paths::HostPlatform::current(),
+                environment: &environment,
+                explicit_data_dir: None,
+            })?;
+            let user_config = config.unwrap_or(defaults.config_file);
+            let effective = interactive::config::resolve_layers(
+                &user_config,
+                &caller_dir,
+                &environment,
+                &interactive::config::ConfigOverrides {
+                    model,
+                    profile,
+                    approval,
+                    ..interactive::config::ConfigOverrides::default()
+                },
+            )
+            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+            let result = serde_json::json!({
+                "schema_version": 2,
+                "effective_config": {
+                    "provider": effective.provider,
+                    "profile": effective.profile,
+                    "approval": effective.approval,
+                    "permissions": {
+                        "allow": effective.allow_rules,
+                        "deny": effective.deny_rules
+                    }
+                },
+                "sources": effective.explain,
+                "project_config_reason": effective.project_config_reason
             });
             if json {
                 println!("{result}");
             } else {
-                println!("config source: {}", config.display());
-                println!("runtime: not_available_in_p1");
+                println!("config source: {}", user_config.display());
+                for entry in effective.explain {
+                    println!(
+                        "{} = {} [{}]{}",
+                        entry.key,
+                        entry.value,
+                        entry.layer.as_str(),
+                        entry
+                            .reason
+                            .map_or_else(String::new, |reason| format!(" — {reason}"))
+                    );
+                }
             }
             Ok(())
         }
@@ -1520,23 +1629,4 @@ fn diagnostics_json(diagnostics: &StoreDiagnostics) -> serde_json::Value {
 
 fn store_error(error: StoreError) -> HarnessError {
     error.into_harness_error()
-}
-
-fn read_config(path: &PathBuf) -> Result<HarnessConfig, HarnessError> {
-    let contents = fs::read_to_string(path).map_err(|_| {
-        HarnessError::new(
-            ErrorCode::ConfigReadError,
-            "configuration file could not be read",
-        )
-    })?;
-    let config: HarnessConfig = toml::from_str(&contents).map_err(|error| {
-        let code = if error.to_string().contains("unknown field") {
-            ErrorCode::ConfigUnknownField
-        } else {
-            ErrorCode::ConfigParseError
-        };
-        HarnessError::new(code, "configuration file is invalid")
-    })?;
-    config.validate()?;
-    Ok(config)
 }

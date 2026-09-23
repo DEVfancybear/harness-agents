@@ -919,11 +919,8 @@ async fn bump_store_revision(data_dir: &std::path::Path) {
     let mut connection = SqliteConnection::connect(&format!("sqlite:{}", path.display()))
         .await
         .expect("open sqlite directly");
-    // Preserve the migration ledger's primary-key uniqueness while presenting
-    // one future current revision to the compatibility check.
     sqlx::query(
-        "UPDATE schema_migrations SET version = 99
-         WHERE version = (SELECT MAX(version) FROM schema_migrations)",
+        "UPDATE schema_migrations SET version = 99 WHERE version = (SELECT MAX(version) FROM schema_migrations)",
     )
     .execute(&mut connection)
     .await

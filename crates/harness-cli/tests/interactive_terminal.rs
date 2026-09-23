@@ -699,6 +699,62 @@ fn t06_pty_approval_y_key() {
 
 #[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
 #[test]
+fn h05_pty_approval_denial_is_fail_closed() {
+    let (temp, project) = sandbox();
+    let source = "fn parse() { todo!() }\n";
+    std::fs::create_dir_all(project.join("src")).expect("source directory");
+    let path = project.join("src/parser.rs");
+    std::fs::write(&path, source).expect("source file");
+    let expected_hash = harness_types::ContentHash::from_bytes(source.as_bytes())
+        .as_str()
+        .to_owned();
+    let replacement = "fn parse() { println!(\"should not run\"); }\n";
+    let (endpoint, second_request, server) =
+        patch_then_answer_endpoint(expected_hash, replacement.to_owned());
+    warm_up_loopback(&endpoint);
+
+    let mut session = PtySession::spawn(&project, &provider_env(&temp, &endpoint));
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+    session.send("fix the parser\r");
+    session.wait_for("[approval] ApplyPatch", Duration::from_secs(40));
+
+    // Escape leaves approval pending. It neither grants nor denies the action.
+    session.send("\u{1b}");
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(session.is_alive(), "the TUI remains at approval");
+    assert!(
+        !second_request.load(Ordering::SeqCst),
+        "Escape must not answer approval or advance the model"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("source remains readable"),
+        source,
+        "Escape must not execute the write"
+    );
+
+    session.send("n\r");
+    let denied = wait_for_normalized(&session, "[approval] denied", Duration::from_secs(30));
+    assert!(
+        denied.contains("[tool] apply_patch") || denied.contains("[run] done"),
+        "the real host reports the denied tool result:\n{denied}"
+    );
+    session.wait_for("[run] done", Duration::from_secs(30));
+    assert!(
+        second_request.load(Ordering::SeqCst),
+        "the denial result reaches the provider continuation"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("source remains readable"),
+        source,
+        "a denied mutating action leaves the workspace unchanged"
+    );
+    session.send("/exit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+    server.join().expect("the denial fixture completes");
+}
+
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
 fn t07_pty_plain_flag() {
     let (temp, project) = sandbox();
     let mut session =
@@ -1288,6 +1344,64 @@ fn patch_then_stall_endpoint(
     )
 }
 
+/// Real provider fixture for the H05 fail-closed approval case: the first answer
+/// requests a patch, and the second acknowledges the result after the user denies it.
+fn patch_then_answer_endpoint(
+    expected_hash: String,
+    replacement: String,
+) -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+    let address = listener.local_addr().expect("fixture address");
+    let second_request = Arc::new(AtomicBool::new(false));
+    let second_flag = Arc::clone(&second_request);
+    let server = std::thread::spawn(move || {
+        let arguments = serde_json::json!({
+            "path": "src/parser.rs",
+            "expected_hash": expected_hash,
+            "replacement": replacement,
+        })
+        .to_string();
+        let tool_call = [
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "choices": [{
+                        "delta": {"tool_calls": [{
+                            "id": "deny-patch",
+                            "function": {
+                                "name": "apply_patch",
+                                "arguments": serde_json::Value::String(arguments),
+                            },
+                        }]},
+                        "finish_reason": null,
+                    }],
+                })
+            ),
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+                })
+            ),
+            "data: [DONE]\n\n".to_owned(),
+        ]
+        .concat();
+        let mut first = accept_complete_request(&listener);
+        write_sse(&mut first, &tool_call);
+        let mut second = accept_complete_request(&listener);
+        second_flag.store(true, Ordering::SeqCst);
+        write_sse(
+            &mut second,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"The patch was denied; the file is unchanged.\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
+    });
+    (
+        format!("http://{address}/chat/completions"),
+        second_request,
+        server,
+    )
+}
+
 #[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
 #[test]
 #[allow(clippy::too_many_lines)] // One kill-then-resume sequence; splitting it hides the order.
@@ -1431,6 +1545,17 @@ fn i13_a_settled_tool_receipt_survives_a_hard_kill_mid_turn() {
         serde_json::json!(1),
         "no second receipt was written for the settled action: {still}"
     );
+}
+
+/// Accept a complete provider request before replying. CP-B advertises larger
+/// tool schemas, so one socket read may contain only part of the request body.
+fn accept_complete_request(listener: &std::net::TcpListener) -> std::net::TcpStream {
+    loop {
+        let (mut socket, _) = listener.accept().expect("the model call arrives");
+        if read_http_request(&mut socket).is_ok_and(|request| !request.is_empty()) {
+            return socket;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

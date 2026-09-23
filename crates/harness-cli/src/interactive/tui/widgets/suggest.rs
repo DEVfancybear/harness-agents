@@ -85,6 +85,7 @@ mod tests {
             open_tool: None,
             modal: None,
             granted_for_run: false,
+            queued_input: false,
             last_request: None,
             run_started_at: None,
             last_run_elapsed: Duration::ZERO,

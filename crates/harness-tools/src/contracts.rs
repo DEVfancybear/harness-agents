@@ -149,6 +149,12 @@ pub const HISTORY_READ_MAX_BYTES: u32 = 64 * 1024;
 
 /// Page size used when a caller names no length.
 pub const HISTORY_READ_DEFAULT_BYTES: u32 = 16 * 1024;
+/// Maximum lines one `read_file` range may return.
+pub const READ_FILE_MAX_LINES: u32 = 500;
+/// Default lines returned when a `read_file` range has no explicit limit.
+pub const READ_FILE_DEFAULT_LINES: u32 = 200;
+/// Maximum number of lines included on either side of one search match.
+pub const SEARCH_CONTEXT_MAX_LINES: u32 = 3;
 /// Hard ceiling for `git_log`: a model may ask for fewer, never for unbounded
 /// history. The provider schema and the typed action both carry this bound.
 pub const GIT_LOG_MAX_LIMIT: u32 = 100;
@@ -161,6 +167,9 @@ pub enum ToolKind {
     ListFiles,
     SearchText,
     ApplyPatch,
+    WriteFile,
+    EditFile,
+    Glob,
     RunProcess,
     RunShell,
     ReadProcessOutput,
@@ -184,6 +193,9 @@ impl ToolKind {
             Self::ListFiles => "list_files",
             Self::SearchText => "search_text",
             Self::ApplyPatch => "apply_patch",
+            Self::WriteFile => "write_file",
+            Self::EditFile => "edit_file",
+            Self::Glob => "glob",
             Self::RunProcess => "run_process",
             Self::RunShell => "run_shell",
             Self::ReadProcessOutput => "read_process_output",
@@ -217,6 +229,7 @@ impl ToolKind {
             Self::ReadFile
                 | Self::ListFiles
                 | Self::SearchText
+                | Self::Glob
                 | Self::ReadProcessOutput
                 | Self::HistorySearch
                 | Self::HistoryRead
@@ -238,6 +251,9 @@ pub const fn coding_tool_names() -> &'static [&'static str] {
         "list_files",
         "search_text",
         "apply_patch",
+        "write_file",
+        "edit_file",
+        "glob",
         "run_process",
         "run_shell",
         "read_process_output",
@@ -247,6 +263,7 @@ pub const fn coding_tool_names() -> &'static [&'static str] {
         "git_diff",
         "git_log",
         "task_update",
+        "ask_user",
     ]
 }
 
@@ -255,11 +272,32 @@ pub const fn coding_tool_names() -> &'static [&'static str] {
 /// typed execution gate and its policy/approval checks.
 #[must_use]
 pub fn coding_tool_schemas() -> Vec<Value> {
-    let mut schemas = vec![
+    let mut schemas = workspace_tool_schemas();
+    schemas.extend(process_tool_schemas());
+    schemas.extend(git_tool_schemas());
+    schemas.extend(history_tool_schemas());
+    schemas.push(function_schema(
+        "ask_user",
+        "Pause the turn and ask the user for a decision. This interactive tool never grants tool permissions.",
+        json!({
+            "question": string_schema(),
+            "options": {"type": "array", "items": string_schema(), "maxItems": 9}
+        }),
+        &["question"],
+    ));
+    schemas
+}
+
+fn workspace_tool_schemas() -> Vec<Value> {
+    vec![
         function_schema(
             "read_file",
-            "Read one bounded UTF-8 text file rooted in the registered workspace.",
-            json!({"path": string_schema()}),
+            "Read bounded UTF-8 text. Optional offset is zero-based lines; a ranged read returns line numbers.",
+            json!({
+                "path": string_schema(),
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": READ_FILE_MAX_LINES}
+            }),
             &["path"],
         ),
         function_schema(
@@ -270,8 +308,15 @@ pub fn coding_tool_schemas() -> Vec<Value> {
         ),
         function_schema(
             "search_text",
-            "Search bounded UTF-8 workspace text without following links.",
-            json!({"query": string_schema(), "path": nullable_string_schema()}),
+            "Search bounded UTF-8 workspace text without following links. Regex and context are bounded.",
+            json!({
+                "query": string_schema(),
+                "path": nullable_string_schema(),
+                "regex": {"type": "boolean"},
+                "case_insensitive": {"type": "boolean"},
+                "glob": nullable_string_schema(),
+                "context_lines": {"type": "integer", "minimum": 0, "maximum": SEARCH_CONTEXT_MAX_LINES}
+            }),
             &["query"],
         ),
         function_schema(
@@ -284,6 +329,38 @@ pub fn coding_tool_schemas() -> Vec<Value> {
             }),
             &["path", "expected_hash", "replacement"],
         ),
+        function_schema(
+            "write_file",
+            "Create a UTF-8 file, or overwrite it only when expected_hash matches its current content.",
+            json!({
+                "path": string_schema(),
+                "content": string_schema(),
+                "expected_hash": string_schema()
+            }),
+            &["path", "content"],
+        ),
+        function_schema(
+            "edit_file",
+            "Replace one exact old_string occurrence; set replace_all only when every occurrence should change.",
+            json!({
+                "path": string_schema(),
+                "old_string": string_schema(),
+                "new_string": string_schema(),
+                "replace_all": {"type": "boolean"}
+            }),
+            &["path", "old_string", "new_string"],
+        ),
+        function_schema(
+            "glob",
+            "List workspace-relative file paths matching a bounded glob, respecting .gitignore.",
+            json!({"pattern": string_schema(), "path": nullable_string_schema()}),
+            &["pattern"],
+        ),
+    ]
+}
+
+fn process_tool_schemas() -> Vec<Value> {
+    vec![
         function_schema(
             "run_process",
             "Run an explicitly structured executable and argv in the workspace.",
@@ -318,6 +395,11 @@ pub fn coding_tool_schemas() -> Vec<Value> {
             }),
             &["artifact_id"],
         ),
+    ]
+}
+
+fn git_tool_schemas() -> Vec<Value> {
+    vec![
         function_schema(
             "git_status",
             "Inspect Git status without changing the workspace.",
@@ -345,9 +427,47 @@ pub fn coding_tool_schemas() -> Vec<Value> {
             json!({"note": string_schema()}),
             &["note"],
         ),
-    ];
-    schemas.extend(history_tool_schemas());
-    schemas
+    ]
+}
+
+/// A user-facing question emitted by the model. It is handled by
+/// `HumanInputService`, outside workspace mutation approval.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AskUserInput {
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
+impl AskUserInput {
+    /// Parse the strict public provider schema and bound what the panel renders.
+    pub fn parse(arguments: &str) -> Result<Self, harness_types::HarnessError> {
+        let input: Self = serde_json::from_str(arguments).map_err(|_| {
+            harness_types::HarnessError::new(
+                harness_types::ErrorCode::InvalidPayload,
+                "ask_user arguments must be a complete object with a question",
+            )
+        })?;
+        if input.question.trim().is_empty() || input.question.chars().count() > 4096 {
+            return Err(harness_types::HarnessError::new(
+                harness_types::ErrorCode::InvalidPayload,
+                "ask_user question must contain 1 to 4096 characters",
+            ));
+        }
+        if input.options.len() > 9
+            || input
+                .options
+                .iter()
+                .any(|option| option.trim().is_empty() || option.chars().count() > 256)
+        {
+            return Err(harness_types::HarnessError::new(
+                harness_types::ErrorCode::InvalidPayload,
+                "ask_user options must be non-empty and at most 256 characters each (maximum 9)",
+            ));
+        }
+        Ok(input)
+    }
 }
 
 /// The two read-only history tools.
@@ -437,6 +557,10 @@ pub enum IsolationMode {
 pub enum CodingToolAction {
     ReadFile {
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
     },
     ListFiles {
         path: Option<String>,
@@ -444,11 +568,36 @@ pub enum CodingToolAction {
     SearchText {
         query: String,
         path: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        regex: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        case_insensitive: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        glob: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_lines: Option<u32>,
     },
     ApplyPatch {
         path: String,
         expected_hash: ContentHash,
         replacement: String,
+    },
+    WriteFile {
+        path: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_hash: Option<ContentHash>,
+    },
+    EditFile {
+        path: String,
+        old_string: String,
+        new_string: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        replace_all: bool,
+    },
+    Glob {
+        pattern: String,
+        path: Option<String>,
     },
     RunProcess {
         executable: String,
@@ -524,6 +673,9 @@ impl CodingToolAction {
             Self::ListFiles { .. } => ToolKind::ListFiles,
             Self::SearchText { .. } => ToolKind::SearchText,
             Self::ApplyPatch { .. } => ToolKind::ApplyPatch,
+            Self::WriteFile { .. } => ToolKind::WriteFile,
+            Self::EditFile { .. } => ToolKind::EditFile,
+            Self::Glob { .. } => ToolKind::Glob,
             Self::RunProcess { .. } => ToolKind::RunProcess,
             Self::RunShell { .. } => ToolKind::RunShell,
             Self::ReadProcessOutput { .. } => ToolKind::ReadProcessOutput,
@@ -540,11 +692,15 @@ impl CodingToolAction {
     #[must_use]
     pub fn path_hint(&self) -> Option<&str> {
         match self {
-            Self::ReadFile { path } | Self::ApplyPatch { path, .. } => Some(path),
-            Self::ListFiles { path } | Self::SearchText { path, .. } | Self::GitDiff { path } => {
-                path.as_deref()
-            }
-            Self::GitLog { path, .. } => path.as_deref(),
+            Self::ReadFile { path, .. }
+            | Self::ApplyPatch { path, .. }
+            | Self::WriteFile { path, .. }
+            | Self::EditFile { path, .. } => Some(path),
+            Self::ListFiles { path }
+            | Self::SearchText { path, .. }
+            | Self::Glob { path, .. }
+            | Self::GitDiff { path }
+            | Self::GitLog { path, .. } => path.as_deref(),
             Self::RunProcess { .. }
             | Self::RunShell { .. }
             | Self::ReadProcessOutput { .. }
@@ -561,6 +717,8 @@ impl CodingToolAction {
         matches!(
             self,
             Self::ApplyPatch { .. }
+                | Self::WriteFile { .. }
+                | Self::EditFile { .. }
                 | Self::RunProcess { .. }
                 | Self::RunShell { .. }
                 | Self::ExternalTool { .. }
@@ -601,9 +759,20 @@ impl CodingToolAction {
             )
         })?;
         let allowed: &[&str] = match name {
-            "read_file" | "list_files" | "git_diff" => &["path"],
-            "search_text" => &["query", "path"],
+            "read_file" => &["path", "offset", "limit"],
+            "list_files" | "git_diff" => &["path"],
+            "search_text" => &[
+                "query",
+                "path",
+                "regex",
+                "case_insensitive",
+                "glob",
+                "context_lines",
+            ],
             "apply_patch" => &["path", "expected_hash", "replacement"],
+            "write_file" => &["path", "content", "expected_hash"],
+            "edit_file" => &["path", "old_string", "new_string", "replace_all"],
+            "glob" => &["pattern", "path"],
             "run_process" => &["executable", "args", "timeout_ms", "isolation", "env"],
             "run_shell" => &["command", "timeout_ms", "isolation", "env"],
             "git_status" => &[],
@@ -625,20 +794,48 @@ impl CodingToolAction {
                 "provider tool arguments contain an unknown field",
             ));
         }
-        if matches!(name, "list_files" | "search_text" | "git_diff" | "git_log")
-            && object
-                .get("path")
-                .is_some_and(|value| !value.is_null() && !value.is_string())
+        if matches!(
+            name,
+            "list_files" | "search_text" | "glob" | "git_diff" | "git_log"
+        ) && object
+            .get("path")
+            .is_some_and(|value| !value.is_null() && !value.is_string())
         {
             return Err(harness_types::HarnessError::new(
                 harness_types::ErrorCode::InvalidPayload,
                 "provider tool path must be a string or null",
             ));
         }
+        if matches!(name, "search_text")
+            && object
+                .get("glob")
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            return Err(harness_types::HarnessError::new(
+                harness_types::ErrorCode::InvalidPayload,
+                "provider tool field glob must be a string or null",
+            ));
+        }
+        if matches!(name, "write_file")
+            && object
+                .get("expected_hash")
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            return Err(harness_types::HarnessError::new(
+                harness_types::ErrorCode::InvalidPayload,
+                "provider tool field expected_hash must be a string or null",
+            ));
+        }
         match name {
-            "read_file" => Ok(Self::ReadFile {
-                path: required_string(object, "path")?,
-            }),
+            "read_file" => {
+                let offset = parse_optional_u64(object, "offset")?;
+                let limit = parse_optional_bounded_u32(object, "limit", 1, READ_FILE_MAX_LINES)?;
+                Ok(Self::ReadFile {
+                    path: required_string(object, "path")?,
+                    offset,
+                    limit,
+                })
+            }
             "list_files" => Ok(Self::ListFiles {
                 path: object
                     .get("path")
@@ -651,11 +848,41 @@ impl CodingToolAction {
                     .get("path")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
+                regex: parse_optional_bool(object, "regex")?.unwrap_or(false),
+                case_insensitive: parse_optional_bool(object, "case_insensitive")?.unwrap_or(false),
+                glob: parse_optional_string(object, "glob")?,
+                context_lines: parse_optional_bounded_u32(
+                    object,
+                    "context_lines",
+                    0,
+                    SEARCH_CONTEXT_MAX_LINES,
+                )?,
             }),
             "apply_patch" => Ok(Self::ApplyPatch {
                 path: required_string(object, "path")?,
                 expected_hash: ContentHash::parse(required_string(object, "expected_hash")?)?,
                 replacement: required_string(object, "replacement")?,
+            }),
+            "write_file" => Ok(Self::WriteFile {
+                path: required_string(object, "path")?,
+                content: required_string(object, "content")?,
+                expected_hash: parse_optional_string(object, "expected_hash")?
+                    .as_deref()
+                    .map(ContentHash::parse)
+                    .transpose()?,
+            }),
+            "edit_file" => Ok(Self::EditFile {
+                path: required_string(object, "path")?,
+                old_string: required_string(object, "old_string")?,
+                new_string: required_string(object, "new_string")?,
+                replace_all: parse_optional_bool(object, "replace_all")?.unwrap_or(false),
+            }),
+            "glob" => Ok(Self::Glob {
+                pattern: required_string(object, "pattern")?,
+                path: object
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
             }),
             "run_process" => {
                 let args = object
@@ -877,6 +1104,81 @@ fn required_string(
         })
 }
 
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "Serde skip_serializing_if predicates take a reference"
+)]
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn parse_optional_bool(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<bool>, harness_types::HarnessError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(harness_types::HarnessError::new(
+            harness_types::ErrorCode::InvalidPayload,
+            format!("provider tool field {key} must be a boolean"),
+        )),
+    }
+}
+
+fn parse_optional_string(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, harness_types::HarnessError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(harness_types::HarnessError::new(
+            harness_types::ErrorCode::InvalidPayload,
+            format!("provider tool field {key} must be a string"),
+        )),
+    }
+}
+
+fn parse_optional_u64(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<u64>, harness_types::HarnessError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            harness_types::HarnessError::new(
+                harness_types::ErrorCode::InvalidPayload,
+                format!("provider tool field {key} must be a non-negative integer"),
+            )
+        }),
+    }
+}
+
+fn parse_optional_bounded_u32(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    minimum: u32,
+    maximum: u32,
+) -> Result<Option<u32>, harness_types::HarnessError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| (minimum..=maximum).contains(value))
+            .map(Some)
+            .ok_or_else(|| {
+                harness_types::HarnessError::new(
+                    harness_types::ErrorCode::InvalidPayload,
+                    format!(
+                        "provider tool field {key} must be an integer between {minimum} and {maximum}"
+                    ),
+                )
+            }),
+    }
+}
+
 /// Parse the optional `env` object of a process call. It is a name → reference
 /// map; a non-string or malformed reference never reaches the gate.
 fn parse_env_bindings(
@@ -983,6 +1285,8 @@ pub enum EffectClass {
     Mutating,
     /// Starts a process or an external tool with host privileges.
     External,
+    /// Pauses the turn to ask the user for information; no approval is granted.
+    Interactive,
 }
 
 impl EffectClass {
@@ -992,6 +1296,7 @@ impl EffectClass {
             Self::ReadOnly => "read_only",
             Self::Mutating => "mutating",
             Self::External => "external",
+            Self::Interactive => "interactive",
         }
     }
 }
@@ -1037,6 +1342,7 @@ pub fn coding_tool_descriptors() -> Vec<ToolDescriptor> {
                     "process.spawn".to_owned(),
                     "network.none".to_owned(),
                 ],
+                EffectClass::Interactive => vec!["user.input".to_owned()],
             };
             Some(ToolDescriptor {
                 id: (*name).to_owned(),
@@ -1065,8 +1371,10 @@ pub fn effect_class_for(name: &str) -> EffectClass {
         | "git_log"
         | "read_process_output"
         | "history_search"
-        | "history_read" => EffectClass::ReadOnly,
-        "apply_patch" => EffectClass::Mutating,
+        | "history_read"
+        | "glob" => EffectClass::ReadOnly,
+        "apply_patch" | "write_file" | "edit_file" => EffectClass::Mutating,
+        "ask_user" => EffectClass::Interactive,
         _ => EffectClass::External,
     }
 }
@@ -1166,10 +1474,25 @@ pub enum ToolOutput {
         matches: Vec<SearchMatch>,
         truncated: bool,
     },
+    Glob {
+        paths: Vec<String>,
+        truncated: bool,
+    },
     ApplyPatch {
         path: String,
         before_hash: ContentHash,
         after_hash: ContentHash,
+    },
+    WriteFile {
+        path: String,
+        before_hash: ContentHash,
+        after_hash: ContentHash,
+    },
+    EditFile {
+        path: String,
+        before_hash: ContentHash,
+        after_hash: ContentHash,
+        replacements: u64,
     },
     Process {
         executable: String,
@@ -1262,6 +1585,8 @@ pub struct SearchMatch {
     pub line: u64,
     pub column: u64,
     pub preview: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<String>,
 }
 
 /// One journal hit as the model sees it. The preview is for orientation; the

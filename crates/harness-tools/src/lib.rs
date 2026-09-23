@@ -22,12 +22,12 @@ pub use capture::{
     DEFAULT_TAIL_PREVIEW_BYTES, ProcessSpoolConfig, SpoolLimits, parse_capture_header,
 };
 pub use contracts::{
-    ApprovalGrant, CaptureStream, CodingToolAction, ENV_REFERENCE_PREFIX, EffectClass, EnvBinding,
-    GIT_LOG_DEFAULT_LIMIT, GIT_LOG_MAX_LIMIT, HISTORY_READ_DEFAULT_BYTES, HISTORY_READ_MAX_BYTES,
-    HISTORY_SEARCH_DEFAULT_LIMIT, HISTORY_SEARCH_MAX_LIMIT, HistoryHitView, IsolationMode,
-    MAX_ENV_BINDINGS, PROCESS_OUTPUT_PAGE_DEFAULT_BYTES, PROCESS_OUTPUT_PAGE_MAX_BYTES,
-    PreparedToolRequest, TOOL_CONTRACT_VERSION, ToolCapabilities, ToolDescriptor,
-    ToolExecutionView, ToolKind, ToolOutput, ToolRequest, coding_tool_descriptors,
+    ApprovalGrant, AskUserInput, CaptureStream, CodingToolAction, ENV_REFERENCE_PREFIX,
+    EffectClass, EnvBinding, GIT_LOG_DEFAULT_LIMIT, GIT_LOG_MAX_LIMIT, HISTORY_READ_DEFAULT_BYTES,
+    HISTORY_READ_MAX_BYTES, HISTORY_SEARCH_DEFAULT_LIMIT, HISTORY_SEARCH_MAX_LIMIT, HistoryHitView,
+    IsolationMode, MAX_ENV_BINDINGS, PROCESS_OUTPUT_PAGE_DEFAULT_BYTES,
+    PROCESS_OUTPUT_PAGE_MAX_BYTES, PreparedToolRequest, TOOL_CONTRACT_VERSION, ToolCapabilities,
+    ToolDescriptor, ToolExecutionView, ToolKind, ToolOutput, ToolRequest, coding_tool_descriptors,
     coding_tool_names, coding_tool_schemas, effect_class_for, normalize_env_bindings,
 };
 pub use loop_service::{CodingLoopResult, CodingLoopService};
@@ -44,7 +44,10 @@ pub use execution::{
     ScopeGrant, StrictProfile, UnmappedControl, export_artifact, export_destination,
     reconcile_backend_leases, resolve_within,
 };
-pub use policy::{PolicyEffect, PolicyRule, ToolPolicy};
+pub use policy::{
+    Decision, PolicyEffect, PolicyMode, PolicyRule, ToolPatternRule, ToolPolicy, ToolPolicyRules,
+    tool_pattern_for_action, validate_tool_pattern,
+};
 // The environment a tool process may inherit is an operator-facing contract:
 // it is published so a host can state what it exposes instead of implying a
 // sandbox it does not have.
@@ -57,6 +60,8 @@ pub use service::{ExternalToolDispatcher, ToolExecutionService, ToolObserver};
 pub use turn_driver::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ExternalToolCatalog,
     ExternalTools, GoalReport, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnOutcome,
-    TurnProgress, TurnStop,
+    TurnProgress, TurnStop, execute_action_with_approval,
 };
-pub use workspace::{observe_workspace, observed_file_hash, workspace_registration};
+pub use workspace::{
+    is_sensitive_workspace_path, observe_workspace, observed_file_hash, workspace_registration,
+};

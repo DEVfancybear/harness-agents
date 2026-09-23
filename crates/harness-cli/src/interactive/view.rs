@@ -21,6 +21,7 @@ pub fn plain_lines(item: &HistoryItem) -> Vec<String> {
         // able to tell what they asked for from what the app said on their behalf.
         HistoryItem::Automatic { text } => vec![format!("[auto] {text}")],
         HistoryItem::Assistant { text } | HistoryItem::Message { text } => vec![text.clone()],
+        HistoryItem::Thinking { .. } => Vec::new(),
         HistoryItem::Tool {
             name,
             summary,
@@ -183,13 +184,21 @@ pub fn approval_lines(
     scope: &str,
     request_id: &str,
 ) -> Vec<String> {
-    vec![
+    let (summary, diff) = summary
+        .split_once("\n[diff]\n")
+        .map_or((summary, None), |(summary, diff)| (summary, Some(diff)));
+    let mut lines = vec![
         format!("[approval] {action}: {summary}"),
         format!("           workspace: {workspace}"),
         format!("           scope: {scope} (request {request_id})"),
         "           answer y to run it once, a to allow every action for this turn, or n to refuse"
             .to_owned(),
-    ]
+    ];
+    if let Some(diff) = diff {
+        lines.push("           [diff]".to_owned());
+        lines.extend(diff.lines().map(|line| format!("           {line}")));
+    }
+    lines
 }
 
 #[must_use]
@@ -214,6 +223,14 @@ mod tests {
     use crate::interactive::events::{AppPhase, HistoryItem, PauseReason, RunOutcome, ToolState};
     use crate::interactive::input::SLASH_COMMANDS;
     use std::time::Duration;
+
+    #[test]
+    fn g03_thinking_delta_never_enters_plain_transcript() {
+        let item = HistoryItem::Thinking {
+            text: "private reasoning".to_owned(),
+        };
+        assert!(plain_lines(&item).is_empty());
+    }
 
     /// A bound is a pause, not a break: the measured turn printed
     /// `[run] failed: step limit reached · 8 steps · 8 tool calls`, which reads as if the

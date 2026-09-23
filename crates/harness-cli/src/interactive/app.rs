@@ -29,6 +29,7 @@ pub struct AppLaunch {
     pub fixture: bool,
     /// Force the plain renderer instead of the TUI (`--plain` or `HA_UI=plain`).
     pub plain: bool,
+    pub config_overrides: super::config::ConfigOverrides,
 }
 
 /// How long the render loop waits for a key before draining session events.
@@ -82,7 +83,14 @@ pub async fn run(launch: AppLaunch) -> Result<ExitCode, HarnessError> {
         }
         Err(error) => {
             eprintln!("ha: raw mode is unavailable ({error}); using plain line input");
-            run_line_mode(&context, &environment, source, launch.fixture).await
+            run_line_mode(
+                &context,
+                &environment,
+                source,
+                launch.fixture,
+                launch.config_overrides.clone(),
+            )
+            .await
         }
     }
 }
@@ -122,7 +130,13 @@ fn run_terminal(
     let fallback = tui_fallback_reason(launch.plain, environment, size.0, size.1);
     // The plain renderer is the pre-T02 host and stays authoritative: the TUI is
     // chosen only when the console can hold it, and every refusal says why.
-    let mut controller = controller_for(context, environment, launch.fixture, fallback.is_some());
+    let mut controller = controller_for_with_overrides(
+        context,
+        environment,
+        launch.fixture,
+        fallback.is_some(),
+        launch.config_overrides.clone(),
+    );
     if let Some(reason) = &fallback {
         eprintln!("ha: using the plain renderer because {reason}");
         controller.set_fallback_reason(reason.clone());
@@ -137,20 +151,38 @@ fn run_terminal(
 /// service. An unconfigured provider is reported as a setup error naming the
 /// variables to set: a production launch never silently falls back to a fixture
 /// or a mock.
+#[cfg(test)]
 fn controller_for(
     context: &LaunchContext,
     environment: &LaunchEnvironment,
     fixture: bool,
     plain: bool,
 ) -> InteractiveController {
+    controller_for_with_overrides(
+        context,
+        environment,
+        fixture,
+        plain,
+        super::config::ConfigOverrides::default(),
+    )
+}
+
+fn controller_for_with_overrides(
+    context: &LaunchContext,
+    environment: &LaunchEnvironment,
+    fixture: bool,
+    plain: bool,
+    config_overrides: super::config::ConfigOverrides,
+) -> InteractiveController {
     let channel = SessionChannel::new();
     let service: Box<dyn SessionPort> = if fixture {
         Box::new(FixtureService::new(channel.sender()))
     } else {
-        Box::new(AgentSessionService::new(
+        Box::new(AgentSessionService::new_with_overrides(
             context,
             environment.clone(),
             channel.sender(),
+            config_overrides,
         ))
     };
     InteractiveController::new(context, service, channel, plain)
@@ -260,6 +292,7 @@ fn step(
                     .map_err(|error| terminal_error(&error))?;
                 cursor.at_line_start = false;
             }
+            Effect::Thinking(_) => {}
             Effect::Redraw => redraw = true,
             Effect::Exit(code) => exit = Some(code),
         }
@@ -375,7 +408,10 @@ fn clear_prompt(
 
 fn terminal_error(error: &std::io::Error) -> HarnessError {
     HarnessError::new(
-        ErrorCode::StorageWriteFailed,
+        // The terminal is a required host service for this interactive path.
+        // Keep its legacy generic-failure exit code (1); storage failures remain
+        // execution errors (4) and use StorageWriteFailed at their call sites.
+        ErrorCode::MissingRequiredService,
         format!("terminal input/output failed: {error}"),
     )
 }
@@ -389,8 +425,10 @@ async fn run_line_mode(
     environment: &LaunchEnvironment,
     notice: Option<&str>,
     fixture: bool,
+    config_overrides: super::config::ConfigOverrides,
 ) -> Result<ExitCode, HarnessError> {
-    let mut controller = controller_for(context, environment, fixture, true);
+    let mut controller =
+        controller_for_with_overrides(context, environment, fixture, true, config_overrides);
     if let Some(source) = notice {
         controller
             .resume_source(source)
@@ -483,6 +521,7 @@ fn render_line_mode(
             Effect::Stream(text) => {
                 write!(output, "{}", terminal_safe(&text)).map_err(|error| io_error(&error))?;
             }
+            Effect::Thinking(_) => {}
             Effect::Redraw => redraw = true,
             Effect::Exit(code) => exit = Some(code),
         }
@@ -507,7 +546,7 @@ fn terminal_safe(text: &str) -> String {
 
 fn io_error(error: &std::io::Error) -> HarnessError {
     HarnessError::new(
-        ErrorCode::StorageWriteFailed,
+        ErrorCode::MissingRequiredService,
         format!("interactive output could not be written: {error}"),
     )
 }

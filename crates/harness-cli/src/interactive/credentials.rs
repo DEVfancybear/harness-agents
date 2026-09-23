@@ -212,6 +212,24 @@ pub fn source(environment: &LaunchEnvironment, data_dir: &Path) -> Option<Creden
             variable: (*variable).to_owned(),
         });
     }
+    source_for(environment, data_dir, CREDENTIAL_VARIABLES[0])
+}
+
+/// Resolve a configured credential variable before the app-owned file fallback.
+#[must_use]
+pub fn source_for(
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+    variable: &str,
+) -> Option<CredentialSource> {
+    if environment
+        .value(variable)
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Some(CredentialSource::Environment {
+            variable: variable.to_owned(),
+        });
+    }
     let path = resolve_file(environment, data_dir);
     match std::fs::metadata(&path) {
         Ok(metadata) if metadata.is_file() => Some(CredentialSource::File {

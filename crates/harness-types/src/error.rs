@@ -64,6 +64,8 @@ pub enum ErrorCode {
     StrictIsolationUnavailable,
     ProjectIdentityConflict,
     ToolIntentConflict,
+    EditNotFound,
+    EditAmbiguous,
     TaskNotFound,
     TaskNotReady,
     TaskDependencyFailed,
@@ -170,6 +172,8 @@ impl ErrorCode {
             Self::StrictIsolationUnavailable => "strict_isolation_unavailable",
             Self::ProjectIdentityConflict => "project_identity_conflict",
             Self::ToolIntentConflict => "tool_intent_conflict",
+            Self::EditNotFound => "edit_not_found",
+            Self::EditAmbiguous => "edit_ambiguous",
             Self::TaskNotFound => "task_not_found",
             Self::TaskNotReady => "task_not_ready",
             Self::TaskDependencyFailed => "task_dependency_failed",
@@ -343,6 +347,8 @@ impl ErrorCode {
             | Self::FrameLimitExceeded
             | Self::SkillUnavailable
             | Self::SourceUnavailable
+            | Self::EditNotFound
+            | Self::EditAmbiguous
             | Self::BackupManifestInvalid => RetryClass::Never,
         }
     }
@@ -443,7 +449,9 @@ impl ErrorCode {
             | Self::EnvironmentDenied
             | Self::FrameLimitExceeded
             | Self::SkillUnavailable
-            | Self::SourceUnavailable => 1,
+            | Self::SourceUnavailable
+            | Self::EditNotFound
+            | Self::EditAmbiguous => 1,
         }
     }
 }
