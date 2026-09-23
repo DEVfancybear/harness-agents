@@ -304,7 +304,10 @@ try {
     foreach ($step in @(
         @{ Name = 'format'; File = 'cargo'; Arguments = @('fmt', '--all', '--', '--check') },
         @{ Name = 'clippy'; File = 'cargo'; Arguments = @('clippy', '--workspace', '--all-targets', '--locked', '--', '-D', 'warnings') },
-        @{ Name = 'workspace-tests'; File = 'cargo'; Arguments = @('test', '--workspace', '--all-targets', '--locked') }
+        # This case consumes the release candidate prepared by the dedicated M9
+        # job. Phase gates run the broad suite without building that artifact;
+        # the M9 milestone gate runs this case explicitly after preparing it.
+        @{ Name = 'workspace-tests'; File = 'cargo'; Arguments = @('test', '--workspace', '--all-targets', '--locked', '--', '--skip', 'm9_04_release_candidate_has_checksums_and_is_not_published') }
     )) {
         $result = Invoke-CheckedCommand -Name $step.Name -FilePath $step.File -Arguments $step.Arguments
         $results.Add([pscustomobject]@{ name = $step.Name; result = 'passed' })

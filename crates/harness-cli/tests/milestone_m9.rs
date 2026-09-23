@@ -699,11 +699,19 @@ async fn m9_04_install_smoke_preserves_existing_data() {
     let owned = manifest["owned_files"]
         .as_array()
         .expect("the manifest lists what it owns");
+    // PowerShell may write ordinary paths while Rust's canonicalized Windows
+    // paths carry the `\\?\` prefix. Compare filesystem paths after canonicalizing
+    // both sides instead of comparing their display strings.
+    let canonical_destination =
+        std::fs::canonicalize(&destination).expect("the installation destination resolves");
     assert!(
-        owned.iter().all(|path| path
-            .as_str()
-            .is_some_and(|text| text.starts_with(&destination.to_string_lossy().into_owned()))),
-        "every owned file is inside the destination: {owned:?}"
+        owned.iter().all(|path| {
+            path.as_str()
+                .and_then(|text| std::fs::canonicalize(text).ok())
+                .is_some_and(|path| path.starts_with(&canonical_destination))
+        }),
+        "every owned file is inside the destination {}: {owned:?}",
+        canonical_destination.display()
     );
 
     // The subcommand this milestone added is present in the artefact. This is the

@@ -593,7 +593,10 @@ try {
         @{ Name = 'format'; File = 'cargo'; Arguments = @('fmt', '--all', '--', '--check') },
         @{ Name = 'clippy'; File = 'cargo'; Arguments = @('clippy', '--workspace', '--all-targets', '--locked', '--', '-D', 'warnings') },
         @{ Name = 'build'; File = 'cargo'; Arguments = @('build', '--workspace', '--locked') },
-        @{ Name = 'workspace-tests'; File = 'cargo'; Arguments = @('test', '--workspace', '--all-targets', '--locked') }
+        # The release-candidate acceptance case depends on an artifact created by
+        # the dedicated M9 job. Keep it out of broad regression runs; M9 executes
+        # it below as a required test after the artifact-preparation step.
+        @{ Name = 'workspace-tests'; File = 'cargo'; Arguments = @('test', '--workspace', '--all-targets', '--locked', '--', '--skip', 'm9_04_release_candidate_has_checksums_and_is_not_published') }
     )) {
         if ($step.Name -ceq 'workspace-tests') {
             # The whole-workspace regression run is retried only for the exact host
