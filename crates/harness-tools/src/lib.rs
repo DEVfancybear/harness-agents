@@ -59,4 +59,6 @@ pub use turn_driver::{
     ExternalTools, GoalReport, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnOutcome,
     TurnProgress, TurnStop,
 };
-pub use workspace::{observe_workspace, observed_file_hash, workspace_registration};
+pub use workspace::{
+    is_sensitive_workspace_path, observe_workspace, observed_file_hash, workspace_registration,
+};

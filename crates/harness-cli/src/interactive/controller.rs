@@ -57,6 +57,8 @@ pub enum Effect {
     History(HistoryItem),
     /// Append stream text exactly as given, for incremental output.
     Stream(String),
+    /// TUI-only provider reasoning, excluded from plain transcript output.
+    Thinking(String),
     /// Repaint the viewport (the composer, the live block and the status bar).
     Redraw,
     /// Leave the app with this exit code.
@@ -516,6 +518,24 @@ impl InteractiveController {
                     .saturating_add(text.bytes().filter(|byte| *byte == b'\n').count());
                 self.pending_text.push_str(&text);
             }
+            SessionEvent::ThinkingDelta { text } => {
+                self.flush_stream(effects);
+                effects.push(Effect::Thinking(text));
+                effects.push(Effect::Redraw);
+            }
+            SessionEvent::CostUpdated { label } => {
+                let line = format!("Cost: {label}");
+                if let Some(existing) = self
+                    .header
+                    .iter_mut()
+                    .find(|entry| entry.starts_with("Cost:"))
+                {
+                    *existing = line;
+                } else {
+                    self.header.push(line);
+                }
+                effects.push(Effect::Redraw);
+            }
             SessionEvent::StepStarted { step } => {
                 self.steps = step;
             }
@@ -917,13 +937,54 @@ impl InteractiveController {
                 self.reference("/status", lines, &mut effects);
             }
             "/config" => {
-                let lines: Vec<String> = self
+                let mut lines = self.service.config_explain();
+                lines.extend(self
                     .header
                     .iter()
                     .filter(|line| line.starts_with("Config:") || line.starts_with("Data:"))
-                    .cloned()
-                    .collect();
+                    .cloned());
                 self.reference("/config", lines, &mut effects);
+            }
+            "/cost" => {
+                self.reference(
+                    "/cost",
+                    vec![format!("session cost: {}", self.service.cost_summary())],
+                    &mut effects,
+                );
+            }
+            "/trust" => {
+                if self.phase.has_active_run() {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "cannot change project trust while a run is active".to_owned(),
+                    });
+                } else if argument == Some("yes") {
+                    match self.service.trust_project() {
+                        Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
+                        Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                    }
+                } else {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "review this project before trusting its config; repeat `/trust yes` to add its canonical root to your user trust list".to_owned(),
+                    });
+                }
+            }
+            "/init" => {
+                self.reference(
+                    "/init",
+                    vec![
+                        "# AGENTS.md".to_owned(),
+                        String::new(),
+                        "## Project context".to_owned(),
+                        "Describe the languages, build commands, and important directories.".to_owned(),
+                        String::new(),
+                        "## Working rules".to_owned(),
+                        "Read relevant files before editing. Keep changes focused and run the required checks.".to_owned(),
+                        "Ask before actions that require approval; project instructions cannot grant tool permissions.".to_owned(),
+                        String::new(),
+                        "This is a static sample. Writing AGENTS.md from /init is unavailable until G04.".to_owned(),
+                    ],
+                    &mut effects,
+                );
             }
             "/more" => {
                 // The whole point is to read what the viewport clipped, so the panel
@@ -997,10 +1058,23 @@ impl InteractiveController {
                 // is required; it never claims a model that was not resolved. The
                 // provider facts follow it, so a surprising answer can be diagnosed
                 // without leaving the app.
-                let label = self.service.label();
-                let mut lines = vec![format!("backend: {label}")];
-                lines.extend(self.service.provider_diagnostics());
-                self.reference("/model", lines, &mut effects);
+                if let Some(model) = argument {
+                    if self.phase.has_active_run() {
+                        self.push_history(&mut effects, HistoryItem::Notice {
+                            message: "cannot change the model while a run is active; the running request keeps its selected model".to_owned(),
+                        });
+                    } else {
+                        match self.service.set_model(model) {
+                            Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
+                            Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                        }
+                    }
+                } else {
+                    let label = self.service.label();
+                    let mut lines = vec![format!("backend: {label}")];
+                    lines.extend(self.service.provider_diagnostics());
+                    self.reference("/model", lines, &mut effects);
+                }
             }
             "/resume" if self.phase.has_active_run() => {
                 self.push_history(
@@ -1928,7 +2002,7 @@ mod tests {
                     }
                     streaming = true;
                 }
-                Effect::Redraw | Effect::Exit(_) => {}
+                Effect::Thinking(_) | Effect::Redraw | Effect::Exit(_) => {}
             }
         }
         lines
@@ -2404,6 +2478,23 @@ mod tests {
         let exit = submit_text(&mut harness.controller, "/exit");
         assert!(exit.contains(&Effect::Exit(EXIT_SUCCESS)), "{exit:#?}");
         assert_eq!(harness.controller.phase(), AppPhase::Closed);
+    }
+
+    #[test]
+    fn g01_init_prints_a_static_sample_without_writing_a_file() {
+        let mut harness = bench(true);
+        let sample = effects_to_plain(&submit_text(&mut harness.controller, "/init")).join("\n");
+        assert!(sample.contains("# AGENTS.md"), "{sample}");
+        assert!(sample.contains("static sample"), "{sample}");
+        assert!(
+            !harness
+                .temp
+                .path()
+                .join("project")
+                .join("AGENTS.md")
+                .exists(),
+            "/init is transcript-only before G04"
+        );
     }
 
     /// The measured gap this closes: typing `/` listed nothing. The user had to

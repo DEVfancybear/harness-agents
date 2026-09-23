@@ -17,7 +17,7 @@ use harness_maintenance::{
     collect_garbage, create_backup, forget_source, list_tombstones, migrate_copy, restore_backup,
     run_retention, verify_backup,
 };
-use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
+use harness_store_sqlite::{STORE_SCHEMA_VERSION, SqliteStore, WriterOpenOptions};
 use harness_types::{ErrorCode, HostId};
 use serde_json::json;
 
@@ -397,7 +397,10 @@ async fn p7_s02_backup_manifest_pins_every_artifact() {
         harness_maintenance::BACKUP_DATABASE_NAME
     );
     // The manifest describes the snapshot, not the live store.
-    assert_eq!(manifest.schema_revisions.get("store").copied(), Some(1));
+    assert_eq!(
+        manifest.schema_revisions.get("store").copied(),
+        Some(STORE_SCHEMA_VERSION)
+    );
     assert_eq!(
         manifest.schema_revisions.get("maintenance").copied(),
         Some(1)
@@ -628,7 +631,10 @@ async fn p7_s03_migration_runs_on_a_copy_and_refuses_newer_writes() {
     assert!(outcome.migrated);
     assert_eq!(outcome.source, data.to_string_lossy());
     assert_eq!(outcome.destination, copy.to_string_lossy());
-    assert_eq!(outcome.revisions.get("store").copied(), Some(1));
+    assert_eq!(
+        outcome.revisions.get("store").copied(),
+        Some(STORE_SCHEMA_VERSION)
+    );
     assert_eq!(outcome.revisions.get("maintenance").copied(), Some(1));
     let source_after = std::fs::read(&database).expect("read source database");
     assert_eq!(
@@ -700,7 +706,7 @@ async fn refuses_writes_to_a_newer_store(root: &std::path::Path, database: &std:
             surface,
         } => {
             assert_eq!(*recorded, 99);
-            assert_eq!(*supported, 1);
+            assert_eq!(*supported, STORE_SCHEMA_VERSION);
             assert_eq!(surface, "store");
         }
         other => panic!("a newer store must be reported as too new, got {other:?}"),
@@ -742,7 +748,9 @@ async fn bump_store_revision(data_dir: &std::path::Path) {
     let mut connection = SqliteConnection::connect(&format!("sqlite:{}", path.display()))
         .await
         .expect("open sqlite directly");
-    sqlx::query("UPDATE schema_migrations SET version = 99")
+    sqlx::query(
+        "UPDATE schema_migrations SET version = 99 WHERE version = (SELECT MAX(version) FROM schema_migrations)",
+    )
         .execute(&mut connection)
         .await
         .expect("bump the recorded revision");
@@ -1191,7 +1199,10 @@ fn assert_doctor_is_honest(data: &std::path::Path) {
     assert_eq!(parsed["writable"], json!(true));
     assert_eq!(parsed["sessions"], json!(1));
     assert_eq!(parsed["artifacts"], json!(1));
-    assert_eq!(parsed["schema_revisions"]["store"], json!(1));
+    assert_eq!(
+        parsed["schema_revisions"]["store"],
+        json!(STORE_SCHEMA_VERSION)
+    );
     assert_eq!(parsed["retention"]["tombstones"], json!(0));
     let not_verified = parsed["not_verified"]
         .as_array()
@@ -1444,7 +1455,10 @@ async fn p7_doctor_accepts_an_uninitialized_data_directory() {
     assert_eq!(parsed["writable"], json!(true));
     assert_eq!(parsed["sessions"], json!(0));
     assert_eq!(parsed["artifacts"], json!(0));
-    assert_eq!(parsed["schema_revisions"]["store"], json!(1));
+    assert_eq!(
+        parsed["schema_revisions"]["store"],
+        json!(STORE_SCHEMA_VERSION)
+    );
     assert!(
         parsed["not_verified"]
             .as_array()
@@ -1568,7 +1582,7 @@ async fn p7_writer_options_open_a_fresh_directory() {
         .await
         .expect("open a fresh store");
     let revisions = store.all_schema_revisions().await.expect("revisions");
-    assert_eq!(revisions.get("store").copied(), Some(1));
+    assert_eq!(revisions.get("store").copied(), Some(STORE_SCHEMA_VERSION));
     assert_eq!(revisions.get("maintenance").copied(), Some(1));
     // M3 added the durable run/step, budget and human-input tables, so the
     // runtime surface advances to 2. The change is additive; older databases

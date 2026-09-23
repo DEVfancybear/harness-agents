@@ -16,7 +16,7 @@ use harness_types::ErrorCode;
 use tokio::sync::mpsc;
 
 use crate::{
-    CancellationToken, DeepSeekAdapter, MockProvider, ProviderError, ProviderFuture,
+    CancellationToken, MockProvider, OpenAiChatAdapter, ProviderError, ProviderFuture,
     ProviderRequest, ProviderStreamEvent, SseDecoder,
 };
 
@@ -127,13 +127,14 @@ pub(crate) fn mock_stream(
 /// long but has no branching business logic.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn adapter_stream(
-    provider: &DeepSeekAdapter,
+    provider: &OpenAiChatAdapter,
     request: ProviderRequest,
     cancellation: CancellationToken,
 ) -> ProviderEventStream {
     {
         let endpoint = provider.endpoint.clone();
         let credentials = Arc::clone(&provider.credentials);
+        let thinking_parameter = provider.thinking_parameter.clone();
         let client = provider.client.clone();
         let (sender, mut receiver) =
             mpsc::channel::<Result<ProviderStreamEvent, ProviderError>>(16);
@@ -159,8 +160,10 @@ pub(crate) fn adapter_stream(
                 "messages": crate::wire_messages(&request.messages),
                 "stream": true,
                 "temperature": request.temperature,
-                "thinking": crate::thinking_disabled(),
             });
+            if let Some(thinking) = &thinking_parameter {
+                body["thinking"] = thinking.clone();
+            }
             if !request.tool_schemas.is_empty()
                 && let Some(object) = body.as_object_mut()
             {

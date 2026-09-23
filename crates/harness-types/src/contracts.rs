@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -614,4 +614,180 @@ impl HarnessConfig {
     pub fn validate(&self) -> Result<(), HarnessError> {
         validate_schema_version(self.schema_version)
     }
+}
+
+/// Additive user configuration contract for the interactive agent.
+///
+/// The v1 [`HarnessConfig`] remains frozen for P0 consumers and keeps generating
+/// `harness-config.v1.schema.json`; this v2 contract is emitted separately.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessConfigV2 {
+    pub schema_version: u16,
+    #[serde(default)]
+    pub cli: CliPresentationConfig,
+    #[serde(default)]
+    pub provider: Option<ProviderConfigV2>,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, ProfileConfigV2>,
+    #[serde(default)]
+    pub models: BTreeMap<String, ModelConfigV2>,
+    #[serde(default)]
+    pub limits: Option<LimitsConfigV2>,
+    #[serde(default)]
+    pub permissions: Option<PermissionsConfigV2>,
+    #[serde(default)]
+    pub mcp_servers: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub hooks: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub ui: Option<UiConfigV2>,
+    #[serde(default)]
+    pub trust: Option<TrustConfigV2>,
+}
+
+impl HarnessConfigV2 {
+    pub fn validate(&self) -> Result<(), HarnessError> {
+        if self.schema_version != 2 {
+            return Err(HarnessError::new(
+                ErrorCode::UnsupportedSchemaVersion,
+                format!(
+                    "unsupported harness config schema_version {}",
+                    self.schema_version
+                ),
+            ));
+        }
+        if let Some(provider) = &self.provider {
+            provider.validate()?;
+        }
+        for model in self.models.values() {
+            model.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderConfigV2 {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub thinking: Option<String>,
+}
+
+impl ProviderConfigV2 {
+    pub fn validate(&self) -> Result<(), HarnessError> {
+        if let Some(protocol) = &self.protocol
+            && !matches!(protocol.as_str(), "openai_chat" | "anthropic_messages")
+        {
+            return Err(HarnessError::new(
+                ErrorCode::ConfigParseError,
+                "provider.protocol must be openai_chat or anthropic_messages",
+            ));
+        }
+        if let Some(thinking) = &self.thinking
+            && !matches!(thinking.as_str(), "off" | "on")
+        {
+            return Err(HarnessError::new(
+                ErrorCode::ConfigParseError,
+                "provider.thinking must be off or on",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileConfigV2 {
+    #[serde(default)]
+    pub provider: Option<ProviderConfigV2>,
+    #[serde(default)]
+    pub limits: Option<LimitsConfigV2>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelConfigV2 {
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub input_price_per_mtok: Option<f64>,
+    #[serde(default)]
+    pub output_price_per_mtok: Option<f64>,
+    #[serde(default)]
+    pub supports_images: Option<bool>,
+}
+
+impl ModelConfigV2 {
+    fn validate(&self) -> Result<(), HarnessError> {
+        if self
+            .input_price_per_mtok
+            .is_some_and(|price| !price.is_finite() || price < 0.0)
+            || self
+                .output_price_per_mtok
+                .is_some_and(|price| !price.is_finite() || price < 0.0)
+        {
+            return Err(HarnessError::new(
+                ErrorCode::ConfigParseError,
+                "model prices must be finite and non-negative",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsConfigV2 {
+    #[serde(default)]
+    pub max_steps: Option<u32>,
+    #[serde(default)]
+    pub max_tool_calls: Option<u32>,
+    #[serde(default)]
+    pub deadline_seconds: Option<u64>,
+    #[serde(default)]
+    pub continuations: Option<u32>,
+    #[serde(default)]
+    pub output_reservation_tokens: Option<u64>,
+    #[serde(default)]
+    pub compaction_reserve_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_retry_after_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionsConfigV2 {
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiConfigV2 {
+    #[serde(default)]
+    pub renderer: Option<String>,
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustConfigV2 {
+    #[serde(default)]
+    pub projects: Vec<String>,
 }

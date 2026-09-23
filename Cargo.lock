@@ -1192,6 +1192,7 @@ dependencies = [
 name = "harness-providers"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "futures-util",
  "harness-types",
  "reqwest",

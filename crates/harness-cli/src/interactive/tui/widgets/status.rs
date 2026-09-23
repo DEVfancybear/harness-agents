@@ -130,6 +130,13 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
             if state.granted_for_run {
                 push(Span::styled(" · tự động cả lượt", theme.tool_ok), 18);
             }
+            if let Some(cost) = cost_label(state) {
+                let label = format!(" · cost {cost}");
+                push(
+                    Span::styled(label.clone(), theme.dim),
+                    super::composer::display_width(&label),
+                );
+            }
             push(Span::styled(" · Ctrl-C hủy".to_owned(), theme.dim), 14);
         }
         (None, AppPhase::SetupRequired) => {
@@ -148,6 +155,13 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
                 let cost = super::composer::display_width(&model) + 3;
                 push(Span::styled(format!(" · {model}"), theme.dim), cost);
             }
+            if let Some(cost) = cost_label(state) {
+                let label = format!(" · cost {cost}");
+                push(
+                    Span::styled(label.clone(), theme.dim),
+                    super::composer::display_width(&label),
+                );
+            }
             push(Span::styled(" · /help".to_owned(), theme.dim), 8);
         }
     }
@@ -160,6 +174,13 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
     }
 
     Line::from(spans)
+}
+
+fn cost_label(state: &UiState) -> Option<String> {
+    state
+        .header
+        .iter()
+        .find_map(|line| line.strip_prefix("Cost: ").map(str::to_owned))
 }
 
 /// The model label, when the header names one.

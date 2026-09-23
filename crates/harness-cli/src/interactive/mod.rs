@@ -11,15 +11,18 @@ pub mod bootstrap;
 pub mod bounds;
 pub mod config;
 pub mod controller;
+pub mod cost;
 pub mod credentials;
 pub mod detector;
 pub mod events;
 pub mod extensions;
 pub mod headless;
 pub mod input;
+pub mod instructions;
 pub mod memory;
 pub mod paths;
 pub mod project;
+pub mod prompt;
 pub mod service;
 pub mod terminal;
 pub mod tui;
@@ -70,6 +73,7 @@ pub enum LaunchMode {
         /// Set by `ha chat --plain` or by `HA_UI=plain`; the TUI is the default on
         /// a console that can hold it.
         plain: bool,
+        config_overrides: config::ConfigOverrides,
     },
     /// Run exactly one turn without a terminal.
     Headless {
@@ -146,6 +150,7 @@ pub fn mode_from_args(
             // Clap already rejects `--plain --headless`; the typed backstop keeps
             // a headless run from ever being routed through the TUI.
             plain,
+            config_overrides: config::ConfigOverrides::default(),
         });
     }
     if fixture {
@@ -305,6 +310,7 @@ pub async fn launch(mode: LaunchMode) -> Result<ExitCode, HarnessError> {
             resume,
             fixture,
             plain,
+            config_overrides,
         } => {
             launch_interactive_with(
                 &detector::SystemTerminalDetector,
@@ -312,6 +318,7 @@ pub async fn launch(mode: LaunchMode) -> Result<ExitCode, HarnessError> {
                 resume,
                 fixture,
                 plain,
+                config_overrides,
             )
             .await
         }
@@ -325,6 +332,7 @@ pub async fn launch_interactive_with(
     resume: Option<String>,
     fixture: bool,
     plain: bool,
+    config_overrides: config::ConfigOverrides,
 ) -> Result<ExitCode, HarnessError> {
     let capability = detector.capability();
     if !capability.is_interactive() {
@@ -336,6 +344,7 @@ pub async fn launch_interactive_with(
         resume,
         fixture,
         plain,
+        config_overrides,
     })
     .await
 }
@@ -380,6 +389,7 @@ mod tests {
                 resume: None,
                 fixture: false,
                 plain: false,
+                config_overrides: super::config::ConfigOverrides::default(),
             }
         );
         assert_eq!(
@@ -399,6 +409,7 @@ mod tests {
                 resume: Some("session_1".to_owned()),
                 fixture: true,
                 plain: true,
+                config_overrides: super::config::ConfigOverrides::default(),
             }
         );
     }

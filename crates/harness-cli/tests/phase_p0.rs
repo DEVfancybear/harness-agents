@@ -99,9 +99,9 @@ fn p0_f03_contract_schemas_are_generated_from_real_types() {
         "generated schemas must retain LF in every checkout"
     );
     let documents = generated_schema_documents();
-    // M0 added the serializable error report to the committed schema set; the
-    // drift check below is unchanged and covers every document.
-    assert_eq!(documents.len(), 10);
+    // M0 added the serializable error report. G02 adds the additive v2
+    // configuration schema while preserving every v1 schema document.
+    assert_eq!(documents.len(), 11);
     for document in documents {
         let mut expected =
             serde_json::to_string_pretty(&document.value).expect("schema serializes");
@@ -109,7 +109,12 @@ fn p0_f03_contract_schemas_are_generated_from_real_types() {
         let committed = fs::read_to_string(schema_root.join(document.file_name))
             .expect("committed schema must exist");
         assert_eq!(committed, expected, "schema drift: {}", document.file_name);
-        assert_eq!(document.value["x-harness-schema-version"], 1);
+        let expected_version = if document.file_name == "harness-config.v2.schema.json" {
+            2
+        } else {
+            1
+        };
+        assert_eq!(document.value["x-harness-schema-version"], expected_version);
     }
 }
 

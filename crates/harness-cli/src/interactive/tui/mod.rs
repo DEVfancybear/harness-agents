@@ -475,6 +475,9 @@ fn apply(renderer: &mut impl TuiRenderer, effects: Vec<Effect>) -> Result<Step, 
             Effect::Stream(text) => renderer
                 .insert_history(&HistoryItem::Assistant { text })
                 .map_err(|error| terminal_error(&error))?,
+            Effect::Thinking(text) => renderer
+                .insert_history(&HistoryItem::Thinking { text })
+                .map_err(|error| terminal_error(&error))?,
             Effect::Redraw => {}
             Effect::Exit(code) => {
                 renderer.finish().map_err(|error| terminal_error(&error))?;
@@ -487,7 +490,9 @@ fn apply(renderer: &mut impl TuiRenderer, effects: Vec<Effect>) -> Result<Step, 
 
 fn terminal_error(error: &io::Error) -> HarnessError {
     HarnessError::new(
-        ErrorCode::StorageWriteFailed,
+        // Terminal I/O failures keep the interactive CLI's generic-failure
+        // exit code (1), unlike durable storage write failures (4).
+        ErrorCode::MissingRequiredService,
         format!("terminal input/output failed: {error}"),
     )
 }

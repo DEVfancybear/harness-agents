@@ -20,21 +20,10 @@ use super::paths::{self, HostPlatform, LaunchEnvironment, PathRequest, ResolvedP
 /// owns the order the variables are probed in.
 pub const CREDENTIAL_VARIABLES: [&str; 2] = credentials::CREDENTIAL_VARIABLES;
 
-/// `DeepSeek`'s documented base URL, and the chat resource this app posts to.
-///
-/// Defaulting here is not guessing: these are the values the provider publishes
-/// (<https://api-docs.deepseek.com/>). A bare `DEEPSEEK_API_KEY` is therefore a
-/// complete setup, while an explicit `HA_PROVIDER_ENDPOINT` or `HA_PROVIDER_MODEL`
-/// still wins for another provider or another model.
-///
-/// The resource path is part of the default on purpose: posting to the bare host
-/// asks for `/`, and the API answers **404**, which reads like a wrong model or a
-/// wrong key when it is neither. The adapter also completes a base URL handed to
-/// it, so `HA_PROVIDER_ENDPOINT=https://api.deepseek.com` works as well.
-pub const DEEPSEEK_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
-
-/// The model `DeepSeek`'s documentation recommends for new callers.
-pub const DEEPSEEK_MODEL: &str = "deepseek-flash";
+/// Compatibility re-exports; the actual provider preset is owned by config.
+#[cfg(test)]
+#[allow(unused_imports, reason = "kept for provider fixture compatibility")]
+pub use super::config::{DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL};
 
 /// Inputs for the launch context.
 #[derive(Clone, Debug)]
@@ -87,7 +76,7 @@ impl ProviderState {
 }
 
 /// Everything the app needs to render its header and open lazily.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LaunchContext {
     pub project: ProjectIdentity,
     pub caller_dir: PathBuf,
@@ -115,6 +104,16 @@ impl LaunchContext {
             Some(root) => format!("repository at {}", root.display()),
             None => "not a Git repository, Git features unavailable".to_owned(),
         };
+        let instruction_count = super::instructions::load(
+            self.paths
+                .config_file
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+            &self.project.root,
+            &self.caller_dir,
+        )
+        .files
+        .len();
         vec![
             format!("Harness Agents {}", env!("CARGO_PKG_VERSION")),
             format!(
@@ -123,6 +122,7 @@ impl LaunchContext {
             ),
             "Session: new    Mode: trusted host".to_owned(),
             format!("Git:     {git}"),
+            format!("AGENTS.md: {instruction_count} files"),
             format!(
                 "Config:  {} [{}]",
                 self.config.describe(),

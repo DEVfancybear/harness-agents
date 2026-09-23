@@ -54,6 +54,11 @@ impl Default for TurnLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TurnProgress {
     TextDelta(String),
+    ThinkingDelta(String),
+    Usage {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    },
     StepStarted {
         step: u32,
     },
@@ -1119,10 +1124,22 @@ fn summarize_action(action: &CodingToolAction) -> String {
 
 fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
     let observer = Arc::clone(observer);
-    Arc::new(move |event: ProviderStreamEvent| {
-        if let ProviderStreamEvent::TextDelta { text } = event {
-            observer.observe(TurnProgress::TextDelta(text));
+    Arc::new(move |event: ProviderStreamEvent| match event {
+        ProviderStreamEvent::TextDelta { text } => observer.observe(TurnProgress::TextDelta(text)),
+        ProviderStreamEvent::ThinkingDelta { text } => {
+            observer.observe(TurnProgress::ThinkingDelta(text));
         }
+        ProviderStreamEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            ..
+        } => {
+            observer.observe(TurnProgress::Usage {
+                prompt_tokens,
+                completion_tokens,
+            });
+        }
+        _ => {}
     })
 }
 

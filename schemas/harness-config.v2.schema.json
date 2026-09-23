@@ -1,0 +1,369 @@
+{
+  "$defs": {
+    "CliOutputFormat": {
+      "enum": [
+        "text",
+        "json"
+      ],
+      "type": "string"
+    },
+    "CliPresentationConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "output": {
+          "$ref": "#/$defs/CliOutputFormat",
+          "default": "text"
+        }
+      },
+      "type": "object"
+    },
+    "LimitsConfigV2": {
+      "additionalProperties": false,
+      "properties": {
+        "compaction_reserve_tokens": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "continuations": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "deadline_seconds": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_retry_after_seconds": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_steps": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_tool_calls": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "output_reservation_tokens": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ModelConfigV2": {
+      "additionalProperties": false,
+      "properties": {
+        "context_window": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "input_price_per_mtok": {
+          "default": null,
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "output_price_per_mtok": {
+          "default": null,
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "supports_images": {
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "PermissionsConfigV2": {
+      "additionalProperties": false,
+      "properties": {
+        "allow": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "deny": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ProfileConfigV2": {
+      "additionalProperties": false,
+      "properties": {
+        "limits": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LimitsConfigV2"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderConfigV2"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "type": "object"
+    },
+    "ProviderConfigV2": {
+      "additionalProperties": false,
+      "properties": {
+        "api_key_env": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endpoint": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "default": null,
+          "pattern": "^plan_item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "protocol": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thinking": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "TrustConfigV2": {
+      "additionalProperties": false,
+      "properties": {
+        "projects": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "UiConfigV2": {
+      "additionalProperties": false,
+      "properties": {
+        "color": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "renderer": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$id": "https://harness-agents.local/schemas/harness-config.v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Additive user configuration contract for the interactive agent.\n\nThe v1 [`HarnessConfig`] remains frozen for P0 consumers and keeps generating\n`harness-config.v1.schema.json`; this v2 contract is emitted separately.",
+  "properties": {
+    "cli": {
+      "$ref": "#/$defs/CliPresentationConfig",
+      "default": {
+        "output": "text"
+      }
+    },
+    "hooks": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "limits": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LimitsConfigV2"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "mcp_servers": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "models": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ModelConfigV2"
+      },
+      "default": {},
+      "type": "object"
+    },
+    "permissions": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PermissionsConfigV2"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "profiles": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ProfileConfigV2"
+      },
+      "default": {},
+      "type": "object"
+    },
+    "provider": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProviderConfigV2"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "schema_version": {
+      "const": 2,
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "trust": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TrustConfigV2"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "ui": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UiConfigV2"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "schema_version"
+  ],
+  "title": "HarnessConfigV2",
+  "type": "object",
+  "x-harness-schema-version": 2
+}

@@ -456,6 +456,7 @@ async fn m3_01_manifest_and_overflow() {
             safety_margin_tokens: 10,
             optional_token_budget: 0,
             max_attempts: 3,
+            max_retry_after_seconds: 30,
             config_revision: 1,
         },
     ));

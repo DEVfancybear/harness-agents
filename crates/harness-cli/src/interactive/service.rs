@@ -11,35 +11,83 @@ use std::future::Future;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use harness_providers::anthropic::AnthropicMessagesAdapter;
 use harness_providers::{
-    CancellationToken, CredentialResolver, DeepSeekAdapter, ModelCapabilities, ModelProvider,
-    ProviderError,
+    CancellationToken, CredentialResolver, ModelCapabilities, ModelProvider, OpenAiChatAdapter,
+    OpenAiChatOptions, ProviderError,
 };
 use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
 use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
 use harness_tools::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ToolExecutionService, TurnDriver,
-    TurnLimits, TurnObserver, TurnOptions, TurnProgress, TurnStop, coding_tool_schemas,
-    observe_workspace,
+    TurnLimits, TurnObserver, TurnOptions, TurnProgress, TurnStop, coding_tool_names,
+    coding_tool_schemas, observe_workspace,
 };
 use harness_types::{ErrorCode, HostId, InputId, SessionId, TaskId};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use super::attachments;
-use super::bootstrap::{CREDENTIAL_VARIABLES, DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL, LaunchContext};
+use super::bootstrap::{CREDENTIAL_VARIABLES, LaunchContext};
 use super::bounds;
+use super::config::ConfigOverrides;
+#[cfg(test)]
+use super::config::{DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL};
 use super::controller::{DEFAULT_APPROVAL_TIMEOUT, TurnBounds};
+use super::cost::{CostTracker, ModelPrice, Usage as CostUsage};
 use super::credentials::{self, CredentialSource};
 use super::events::{PauseReason, RunOutcome, SessionCandidate, SessionEvent};
 use super::extensions;
 use super::memory;
 use super::paths::LaunchEnvironment;
 use super::project;
+use super::prompt::{PromptEnvironment, PromptTool, SystemPromptBuilder};
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TurnModelSelection {
+    active_model: Option<String>,
+    pending_model: Option<String>,
+}
+
+impl TurnModelSelection {
+    fn with_initial(model: Option<String>) -> Self {
+        Self {
+            active_model: model,
+            pending_model: None,
+        }
+    }
+
+    fn select_for_next_turn(&mut self, model: String) {
+        self.pending_model = Some(model);
+    }
+
+    fn begin_turn(&mut self) -> Option<String> {
+        if let Some(model) = self.pending_model.take() {
+            self.active_model = Some(model);
+        }
+        self.active_model.clone()
+    }
+}
+
+#[cfg(test)]
+mod g03_model_selection_tests {
+    use super::TurnModelSelection;
+
+    #[test]
+    fn g03_model_switch_applies_next_turn_only() {
+        let mut selection = TurnModelSelection::with_initial(Some("active-model".to_owned()));
+        let running_turn = selection.begin_turn().expect("active model");
+        selection.select_for_next_turn("next-model".to_owned());
+        assert_eq!(selection.active_model.as_deref(), Some("active-model"));
+        assert_eq!(running_turn, "active-model");
+        assert_eq!(selection.begin_turn().as_deref(), Some("next-model"));
+    }
+}
 
 #[cfg(test)]
 #[path = "service_completion_tests.rs"]
@@ -131,6 +179,18 @@ pub trait SessionPort: Send {
     /// environment or from the defaults, and whether the endpoint answers.
     fn provider_diagnostics(&self) -> Vec<String> {
         Vec::new()
+    }
+    fn config_explain(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn cost_summary(&self) -> String {
+        "n/a".to_owned()
+    }
+    fn set_model(&mut self, _model: &str) -> Result<String, String> {
+        Err("this backend does not support model switching".to_owned())
+    }
+    fn trust_project(&mut self) -> Result<String, String> {
+        Err("this backend cannot update project trust".to_owned())
     }
     /// Why a real dispatch is impossible right now, or `None` when it is possible.
     ///
@@ -335,10 +395,16 @@ impl Default for SessionChannel {
 }
 
 /// Provider settings for a real model call.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProviderConfig {
+    pub provider_id: String,
+    pub protocol: String,
     pub endpoint: String,
     pub model: String,
+    pub api_key_env: String,
+    pub thinking: String,
+    pub model_price: Option<ModelPrice>,
+    pub max_retry_after_seconds: u64,
     /// Name of the source that holds the key; never the key.
     pub credential: CredentialSource,
 }
@@ -354,7 +420,7 @@ impl ProviderConfig {
     pub fn credential_variable(&self) -> String {
         match &self.credential {
             CredentialSource::Environment { variable } => variable.clone(),
-            CredentialSource::File { .. } => CREDENTIAL_VARIABLES[0].to_owned(),
+            CredentialSource::File { .. } => self.api_key_env.clone(),
         }
     }
 }
@@ -370,28 +436,66 @@ pub fn resolve_provider(
     environment: &LaunchEnvironment,
     data_dir: &Path,
 ) -> Result<ProviderConfig, String> {
-    let explicit_endpoint = environment
-        .value(ENDPOINT_VARIABLE)
-        .filter(|value| !value.is_empty());
-    let explicit_model = environment
-        .value(MODEL_VARIABLE)
-        .filter(|value| !value.is_empty());
+    resolve_provider_with_config(
+        Path::new(".ha-no-user-config.toml"),
+        Path::new("."),
+        environment,
+        data_dir,
+    )
+}
 
-    let Some(credential) = credentials::source(environment, data_dir) else {
+fn resolve_provider_with_config(
+    user_path: &Path,
+    project_root: &Path,
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+) -> Result<ProviderConfig, String> {
+    resolve_provider_with_overrides(
+        user_path,
+        project_root,
+        environment,
+        data_dir,
+        &ConfigOverrides::default(),
+    )
+}
+
+fn resolve_provider_with_overrides(
+    user_path: &Path,
+    project_root: &Path,
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+    overrides: &ConfigOverrides,
+) -> Result<ProviderConfig, String> {
+    let resolved = super::config::resolve_layers(user_path, project_root, environment, overrides)
+        .map_err(|error| error.to_string())?;
+    if !matches!(
+        resolved.provider.protocol.as_str(),
+        "openai_chat" | "anthropic_messages"
+    ) {
+        return Err(format!(
+            "unsupported provider protocol {:?}",
+            resolved.provider.protocol
+        ));
+    }
+    let credential = credentials::source_for(environment, data_dir, &resolved.provider.api_key_env)
+        .or_else(|| credentials::source(environment, data_dir));
+    let Some(credential) = credential else {
         return Err(format!(
             "provider setup is incomplete: set {} or save the key in the app with /key (API key). Nothing was sent and no fixture answer was substituted.",
-            credentials::CREDENTIAL_VARIABLES.join(" or ")
+            resolved.provider.api_key_env
         ));
     };
+    let model_price = resolved.model_prices.get(&resolved.provider.model).copied();
+    let max_retry_after_seconds = resolved.retry_after_max_seconds;
     Ok(ProviderConfig {
-        endpoint: explicit_endpoint.map_or_else(
-            || DEEPSEEK_ENDPOINT.to_owned(),
-            |value| value.to_string_lossy().into_owned(),
-        ),
-        model: explicit_model.map_or_else(
-            || DEEPSEEK_MODEL.to_owned(),
-            |value| value.to_string_lossy().into_owned(),
-        ),
+        provider_id: resolved.provider.id,
+        protocol: resolved.provider.protocol,
+        endpoint: resolved.provider.endpoint,
+        model: resolved.provider.model,
+        api_key_env: resolved.provider.api_key_env,
+        thinking: resolved.provider.thinking,
+        model_price,
+        max_retry_after_seconds,
         credential,
     })
 }
@@ -435,9 +539,38 @@ pub fn validate_credential_file(
 /// where from, which endpoint and model will be used and why, and is that endpoint
 /// answering. The credential **value** never appears.
 #[must_use]
+#[cfg(test)]
 pub fn provider_diagnostics(environment: &LaunchEnvironment, data_dir: &Path) -> Vec<String> {
-    let mut lines = Vec::new();
-    match credentials::source(environment, data_dir) {
+    provider_diagnostics_with_config(
+        Path::new(".ha-no-user-config.toml"),
+        Path::new("."),
+        environment,
+        data_dir,
+    )
+}
+
+fn provider_diagnostics_with_config(
+    user_path: &Path,
+    project_root: &Path,
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+) -> Vec<String> {
+    let resolved = match super::config::resolve_layers(
+        user_path,
+        project_root,
+        environment,
+        &super::config::ConfigOverrides::default(),
+    ) {
+        Ok(config) => config,
+        Err(error) => return vec![format!("Provider: configuration unavailable ({error})")],
+    };
+    let mut lines = vec![format!(
+        "Provider: {} ({})",
+        resolved.provider.id, resolved.provider.protocol
+    )];
+    match credentials::source_for(environment, data_dir, &resolved.provider.api_key_env)
+        .or_else(|| credentials::source(environment, data_dir))
+    {
         Some(source) => {
             lines.push(format!(
                 "Provider: credential from {} (value hidden)",
@@ -455,39 +588,51 @@ pub fn provider_diagnostics(environment: &LaunchEnvironment, data_dir: &Path) ->
             CREDENTIAL_VARIABLES.join(", ")
         )),
     }
-    match environment
-        .value(ENDPOINT_VARIABLE)
-        .filter(|value| !value.is_empty())
-    {
-        Some(value) => lines.push(format!(
-            "Provider: endpoint {ENDPOINT_VARIABLE}={}",
-            value.to_string_lossy()
-        )),
-        None => lines.push(format!(
-            "Provider: endpoint not set, using the default {DEEPSEEK_ENDPOINT}"
-        )),
+    for key in ["provider.endpoint", "provider.model"] {
+        if let Some(entry) = resolved.explain.iter().find(|entry| entry.key == key) {
+            if entry.layer == super::config::ConfigLayer::Default {
+                lines.push(format!(
+                    "Provider: {} not set, using the default {}",
+                    key, entry.value
+                ));
+            } else if entry.layer == super::config::ConfigLayer::Environment {
+                let (label, variable) = match key {
+                    "provider.endpoint" => ("endpoint", ENDPOINT_VARIABLE),
+                    "provider.model" => ("model", MODEL_VARIABLE),
+                    _ => (key, "unknown"),
+                };
+                lines.push(format!(
+                    "Provider: {label} {variable}={} ({})",
+                    entry.value,
+                    entry.layer.as_str()
+                ));
+            } else {
+                lines.push(format!(
+                    "Provider: {}={} ({})",
+                    key,
+                    entry.value,
+                    entry.layer.as_str()
+                ));
+            }
+        }
     }
-    match environment
-        .value(MODEL_VARIABLE)
-        .filter(|value| !value.is_empty())
+    match credentials::source_for(environment, data_dir, &resolved.provider.api_key_env)
+        .or_else(|| credentials::source(environment, data_dir))
     {
-        Some(value) => lines.push(format!(
-            "Provider: model {MODEL_VARIABLE}={}",
-            value.to_string_lossy()
-        )),
-        None => lines.push(format!(
-            "Provider: model not set, using the default {DEEPSEEK_MODEL}"
-        )),
-    }
-    match resolve_provider(environment, data_dir) {
-        Ok(config) => {
-            lines.push(format!("Provider: ready, would call {}", config.model));
-            lines.push(match endpoint_reachability(&config.endpoint) {
+        Some(_) => {
+            lines.push(format!(
+                "Provider: ready, would call {}",
+                resolved.provider.model
+            ));
+            lines.push(match endpoint_reachability(&resolved.provider.endpoint) {
                 Ok(()) => "Provider: endpoint answered a TCP connection".to_owned(),
                 Err(reason) => format!("Provider: endpoint did not answer ({reason})"),
             });
         }
-        Err(message) => lines.push(format!("Provider: not ready ({message})")),
+        None => lines.push(format!(
+            "Provider: not ready (set {} or save a key with /key)",
+            resolved.provider.api_key_env
+        )),
     }
     lines
 }
@@ -593,6 +738,8 @@ impl CredentialResolver for EnvironmentCredential {
 /// Maps turn progress onto the UI vocabulary.
 struct ChannelObserver {
     sender: UnboundedSender<SessionEvent>,
+    cost_tracker: Arc<Mutex<CostTracker>>,
+    model_price: Option<ModelPrice>,
     /// Calls are executed serially by the turn driver. Keeping the current
     /// boundary here makes duration delivery O(1) and avoids a process-lifetime
     /// map keyed by a non-unique tool name.
@@ -602,14 +749,33 @@ struct ChannelObserver {
 impl TurnObserver for ChannelObserver {
     fn observe(&self, progress: TurnProgress) {
         let event = match progress {
-            TurnProgress::TextDelta(text) => SessionEvent::TextDelta { text },
+            TurnProgress::TextDelta(text) => Some(SessionEvent::TextDelta { text }),
+            TurnProgress::ThinkingDelta(text) => Some(SessionEvent::ThinkingDelta { text }),
+            TurnProgress::Usage {
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                let label = if let Ok(mut tracker) = self.cost_tracker.lock() {
+                    tracker.record(
+                        self.model_price,
+                        CostUsage {
+                            input_tokens: prompt_tokens,
+                            output_tokens: completion_tokens,
+                        },
+                    );
+                    tracker.display()
+                } else {
+                    "n/a".to_owned()
+                };
+                Some(SessionEvent::CostUpdated { label })
+            }
             // Step boundaries are what the status bar counts (`step 2/8`).
-            TurnProgress::StepStarted { step } => SessionEvent::StepStarted { step },
+            TurnProgress::StepStarted { step } => Some(SessionEvent::StepStarted { step }),
             TurnProgress::ToolStarted { name, summary } => {
                 if let Ok(mut started) = self.tool_started.lock() {
                     *started = Some((name.clone(), Instant::now()));
                 }
-                SessionEvent::ToolStarted { name, summary }
+                Some(SessionEvent::ToolStarted { name, summary })
             }
             TurnProgress::ToolSettled { name, ok, detail } => {
                 let elapsed = self
@@ -619,15 +785,17 @@ impl TurnObserver for ChannelObserver {
                     .and_then(|mut started| started.take())
                     .filter(|(started_name, _)| started_name == &name)
                     .map_or(Duration::ZERO, |(_, started)| started.elapsed());
-                SessionEvent::ToolSettled {
+                Some(SessionEvent::ToolSettled {
                     name,
                     ok,
                     elapsed,
                     detail: detail.unwrap_or_default(),
-                }
+                })
             }
         };
-        let _ = self.sender.send(event);
+        if let Some(event) = event {
+            let _ = self.sender.send(event);
+        }
     }
 }
 
@@ -642,8 +810,14 @@ pub struct AgentSessionService {
     store_dir: PathBuf,
     /// Root that owns the credential file `/key` writes.
     data_dir: PathBuf,
+    config_file: PathBuf,
     workspace_root: PathBuf,
+    caller_dir: PathBuf,
+    global_config_dir: PathBuf,
     environment: LaunchEnvironment,
+    config_overrides: ConfigOverrides,
+    model_selection: Arc<Mutex<TurnModelSelection>>,
+    cost_tracker: Arc<Mutex<CostTracker>>,
     task_id: TaskId,
     previous_session: Arc<Mutex<Option<SessionId>>>,
     /// Asks the user for every gated action; never grants on its own.
@@ -667,21 +841,46 @@ const RESUME_LIST_LIMIT: usize = 20;
 
 impl AgentSessionService {
     #[must_use]
+    #[cfg(test)]
     pub fn new(
         context: &LaunchContext,
         environment: LaunchEnvironment,
         sender: UnboundedSender<SessionEvent>,
     ) -> Self {
+        Self::new_with_overrides(context, environment, sender, ConfigOverrides::default())
+    }
+
+    #[must_use]
+    pub fn new_with_overrides(
+        context: &LaunchContext,
+        environment: LaunchEnvironment,
+        sender: UnboundedSender<SessionEvent>,
+        config_overrides: ConfigOverrides,
+    ) -> Self {
         let gate = Arc::new(ChannelApprovalGate::new(sender.clone(), APPROVAL_TIMEOUT));
         // The bounds are the environment's, not a constant here: a long task needs a
         // real way to raise them, and `/status` reports what is in force.
         let limits = bounds::limits_from_environment(&environment);
+        let model_selection = Arc::new(Mutex::new(TurnModelSelection::with_initial(
+            config_overrides.model.clone(),
+        )));
         Self {
             sender,
             store_dir: context.project_store_dir(),
             data_dir: context.paths.data_dir.clone(),
+            config_file: context.paths.config_file.clone(),
             workspace_root: context.project.root.clone(),
+            caller_dir: context.caller_dir.clone(),
+            global_config_dir: context
+                .paths
+                .config_file
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
             environment,
+            config_overrides,
+            model_selection,
+            cost_tracker: Arc::new(Mutex::new(CostTracker::default())),
             task_id: TaskId::generate(),
             previous_session: Arc::new(Mutex::new(None)),
             gate,
@@ -727,7 +926,19 @@ impl AgentSessionService {
     }
 
     fn configured(&self) -> Result<ProviderConfig, String> {
-        resolve_provider(&self.environment, &self.data_dir)
+        let mut overrides = self.config_overrides.clone();
+        if let Ok(selection) = self.model_selection.lock()
+            && let Some(model) = &selection.active_model
+        {
+            overrides.model = Some(model.clone());
+        }
+        resolve_provider_with_overrides(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.data_dir,
+            &overrides,
+        )
     }
 }
 
@@ -753,8 +964,18 @@ impl SessionPort for AgentSessionService {
         let sender = self.sender.clone();
         let store_dir = self.store_dir.clone();
         let data_dir = self.data_dir.clone();
+        let config_file = self.config_file.clone();
         let workspace_root = self.workspace_root.clone();
+        let caller_dir = self.caller_dir.clone();
+        let global_config_dir = self.global_config_dir.clone();
         let environment = self.environment.clone();
+        let config_overrides = self.config_overrides.clone();
+        let selected_model = self
+            .model_selection
+            .lock()
+            .ok()
+            .and_then(|mut selection| selection.begin_turn());
+        let cost_tracker = Arc::clone(&self.cost_tracker);
         let task_id = self.task_id.clone();
         let previous_session = Arc::clone(&self.previous_session);
         let gate = Arc::clone(&self.gate);
@@ -767,8 +988,14 @@ impl SessionPort for AgentSessionService {
                 sender,
                 store_dir,
                 data_dir,
+                config_file,
                 workspace_root,
+                caller_dir,
+                global_config_dir,
                 environment,
+                config_overrides,
+                selected_model,
+                cost_tracker,
                 session_id,
                 task_id,
                 previous_session,
@@ -805,7 +1032,77 @@ impl SessionPort for AgentSessionService {
     }
 
     fn provider_diagnostics(&self) -> Vec<String> {
-        provider_diagnostics(&self.environment, &self.data_dir)
+        provider_diagnostics_with_config(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.data_dir,
+        )
+    }
+
+    fn config_explain(&self) -> Vec<String> {
+        let mut overrides = self.config_overrides.clone();
+        if let Ok(selection) = self.model_selection.lock()
+            && let Some(model) = &selection.active_model
+        {
+            overrides.model = Some(model.clone());
+        }
+        super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &overrides,
+        )
+        .map_or_else(
+            |error| vec![format!("configuration unavailable: {error}")],
+            |resolved| {
+                resolved
+                    .explain
+                    .into_iter()
+                    .map(|entry| {
+                        format!(
+                            "{} = {} [{}]{}",
+                            entry.key,
+                            entry.value,
+                            entry.layer.as_str(),
+                            entry
+                                .reason
+                                .map_or_else(String::new, |reason| format!(" — {reason}")),
+                        )
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    fn cost_summary(&self) -> String {
+        self.cost_tracker
+            .lock()
+            .map_or_else(|_| "n/a".to_owned(), |tracker| tracker.display())
+    }
+
+    fn set_model(&mut self, model: &str) -> Result<String, String> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err("model name must not be empty".to_owned());
+        }
+        self.model_selection
+            .lock()
+            .map_err(|_| "model selection is unavailable".to_owned())?
+            .select_for_next_turn(model.to_owned());
+        Ok(format!("model {model} selected for the next turn"))
+    }
+
+    fn trust_project(&mut self) -> Result<String, String> {
+        let canonical = self
+            .workspace_root
+            .canonicalize()
+            .map_err(|error| format!("project root cannot be canonicalized: {error}"))?;
+        trust_project_config(&self.config_file, &canonical)?;
+        Ok(format!(
+            "trusted project config for {}",
+            canonical.display()
+        ))
     }
 
     fn provider_problem(&self) -> Option<String> {
@@ -891,6 +1188,79 @@ impl SessionPort for AgentSessionService {
     }
 }
 
+fn trust_project_config(user_path: &Path, canonical_root: &Path) -> Result<(), String> {
+    if user_path.exists() {
+        super::config::load(user_path).map_err(|error| error.to_string())?;
+    }
+    let mut document = if user_path.exists() {
+        let contents = std::fs::read_to_string(user_path)
+            .map_err(|error| format!("user config cannot be read: {error}"))?;
+        toml::from_str::<toml::Value>(&contents)
+            .map_err(|_| "user config is not valid TOML".to_owned())?
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+    let root_table = document
+        .as_table_mut()
+        .ok_or_else(|| "user config must be a TOML table".to_owned())?;
+    root_table.insert("schema_version".to_owned(), toml::Value::Integer(2));
+    let trust = root_table
+        .entry("trust")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let trust_table = trust
+        .as_table_mut()
+        .ok_or_else(|| "trust config must be a TOML table".to_owned())?;
+    let projects = trust_table
+        .entry("projects")
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let projects = projects
+        .as_array_mut()
+        .ok_or_else(|| "trust.projects must be an array".to_owned())?;
+    let canonical_text = canonical_root.to_string_lossy().into_owned();
+    if !projects.iter().any(|value| {
+        value.as_str().is_some_and(|path| {
+            Path::new(path)
+                .canonicalize()
+                .is_ok_and(|existing| same_canonical_path(&existing, canonical_root))
+        })
+    }) {
+        projects.push(toml::Value::String(canonical_text));
+    }
+    projects.sort_by_key(toml::Value::to_string);
+    let v2: harness_types::HarnessConfigV2 = document
+        .clone()
+        .try_into()
+        .map_err(|_| "user config cannot be upgraded to schema v2 safely".to_owned())?;
+    v2.validate().map_err(|error| error.to_string())?;
+    let rendered = toml::to_string_pretty(&document)
+        .map_err(|_| "user config cannot be serialized".to_owned())?;
+    if let Some(parent) = user_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("user config directory cannot be created: {error}"))?;
+    }
+    let mut output = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(user_path)
+        .map_err(|error| format!("user config cannot be written: {error}"))?;
+    std::io::Write::write_all(&mut output, rendered.as_bytes())
+        .and_then(|()| output.sync_all())
+        .map_err(|error| format!("user config cannot be flushed: {error}"))
+}
+
+fn same_canonical_path(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
 /// Report what one attempt to remember did, in words a reader can act on.
 ///
 /// A skipped input and a stored one look the same in a transcript that stays silent,
@@ -932,8 +1302,14 @@ async fn run_turn(
     sender: UnboundedSender<SessionEvent>,
     store_dir: PathBuf,
     data_dir: PathBuf,
+    config_file: PathBuf,
     workspace_root: PathBuf,
+    caller_dir: PathBuf,
+    global_config_dir: PathBuf,
     environment: LaunchEnvironment,
+    config_overrides: ConfigOverrides,
+    selected_model: Option<String>,
+    cost_tracker: Arc<Mutex<CostTracker>>,
     session_id: SessionId,
     task_id: TaskId,
     previous_session: Arc<Mutex<Option<SessionId>>>,
@@ -948,14 +1324,6 @@ async fn run_turn(
     send(SessionEvent::Accepted {
         input_id: request.input_id.clone(),
     });
-
-    let config = match resolve_provider(&environment, &data_dir) {
-        Ok(config) => config,
-        Err(message) => {
-            send(SessionEvent::RecoverableError { message });
-            return;
-        }
-    };
 
     let store = match SqliteStore::open_writer(WriterOpenOptions::new(
         store_dir.clone(),
@@ -1004,6 +1372,50 @@ async fn run_turn(
         None => task_id,
     };
 
+    let persisted_model = if selected_model.is_none() && config_overrides.model.is_none() {
+        store
+            .session_setting(&task_id, "model")
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let selected_model = selected_model
+        .or_else(|| config_overrides.model.clone())
+        .or(persisted_model);
+    let mut turn_overrides = config_overrides;
+    if let Some(model) = &selected_model {
+        turn_overrides.model = Some(model.clone());
+        if let Err(error) = store.set_session_setting(&task_id, "model", model).await {
+            send(SessionEvent::RecoverableError {
+                message: format!(
+                    "model selection could not be persisted; nothing was sent: {error}"
+                ),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
+        }
+    }
+    let config = match resolve_provider_with_overrides(
+        &config_file,
+        &workspace_root,
+        &environment,
+        &data_dir,
+        &turn_overrides,
+    ) {
+        Ok(config) => config,
+        Err(message) => {
+            send(SessionEvent::RecoverableError { message });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
+        }
+    };
+
     // A workspace root keeps one project identity, whether or not memory is on: a
     // generated id per turn would put every project-scoped record this turn writes
     // out of reach of the next one.
@@ -1021,7 +1433,7 @@ async fn run_turn(
         .then(|| memory::principal(project_id.clone(), task_id.clone(), session_id.clone()));
 
     let capabilities = ModelCapabilities {
-        provider_id: "deepseek".to_owned(),
+        provider_id: config.provider_id.clone(),
         model: config.model.clone(),
         supports_streaming: true,
         supports_tools: true,
@@ -1032,16 +1444,39 @@ async fn run_turn(
         config.credential_variable(),
         data_dir.clone(),
     ));
-    let provider: Arc<dyn ModelProvider> =
-        match DeepSeekAdapter::new(config.endpoint.clone(), credentials, capabilities) {
-            Ok(adapter) => Arc::new(adapter),
-            Err(error) => {
-                send(SessionEvent::RecoverableError {
-                    message: format!("provider configuration is invalid: {error}"),
-                });
-                return;
+    let provider: Result<Arc<dyn ModelProvider>, ProviderError> = match config.protocol.as_str() {
+        "openai_chat" => {
+            let thinking_parameter = (config.provider_id == "deepseek" && config.thinking == "off")
+                .then(harness_providers::thinking_disabled);
+            OpenAiChatAdapter::with_options(
+                config.endpoint.clone(),
+                credentials,
+                capabilities,
+                OpenAiChatOptions { thinking_parameter },
+            )
+            .map(|adapter| Arc::new(adapter) as Arc<dyn ModelProvider>)
+        }
+        "anthropic_messages" => {
+            AnthropicMessagesAdapter::new(config.endpoint.clone(), credentials, capabilities)
+                .map(|adapter| Arc::new(adapter) as Arc<dyn ModelProvider>)
+        }
+        _ => Err(ProviderError::new(
+            ErrorCode::ProviderProtocol,
+            "provider protocol is unsupported",
+        )),
+    };
+    let provider = match provider {
+        Ok(provider) => provider,
+        Err(error) => {
+            send(SessionEvent::RecoverableError {
+                message: format!("provider configuration is invalid: {error}"),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
             }
-        };
+            return;
+        }
+    };
 
     let observation = match observe_workspace(project_id, &workspace_root) {
         Ok(observation) => observation,
@@ -1059,7 +1494,10 @@ async fn run_turn(
     let runtime = Arc::new(RuntimeService::new(
         Arc::clone(&store),
         provider,
-        RuntimeConfig::default(),
+        RuntimeConfig {
+            max_retry_after_seconds: config.max_retry_after_seconds,
+            ..RuntimeConfig::default()
+        },
     ));
     // Local extensions are explicit opt-in, loaded for this turn and stopped when it
     // ends: a chat turn never leaves an extension process behind.
@@ -1117,6 +1555,63 @@ async fn run_turn(
         request.text,
         attachments::attachment_blocks(&attached.files)
     );
+    let loaded_instructions =
+        super::instructions::load(&global_config_dir, &workspace_root, &caller_dir);
+    for notice in &loaded_instructions.notices {
+        send(SessionEvent::Notice {
+            message: notice.clone(),
+        });
+    }
+    send(SessionEvent::Notice {
+        message: format!("AGENTS.md: {} files", loaded_instructions.files.len()),
+    });
+    let (git_branch, changed_files) = prompt_git_facts(&workspace_root);
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let shell = if cfg!(windows) {
+        "PowerShell".to_owned()
+    } else {
+        std::env::var("SHELL")
+            .ok()
+            .and_then(|value| {
+                Path::new(&value)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "sh".to_owned())
+    };
+    let prompt_environment = PromptEnvironment {
+        os: std::env::consts::OS,
+        shell: &shell,
+        cwd: &caller_dir,
+        project_root: &workspace_root,
+        git_branch: git_branch.as_deref(),
+        changed_files,
+        date_iso: &today,
+        limits,
+    };
+    let prompt_tools = coding_tool_names()
+        .iter()
+        .map(|name| {
+            let name = *name;
+            PromptTool {
+                name,
+                effect: if matches!(
+                    name,
+                    "read_file"
+                        | "list_files"
+                        | "search_text"
+                        | "git_status"
+                        | "git_diff"
+                        | "git_log"
+                ) {
+                    "read only"
+                } else {
+                    "subject to host policy and approval"
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    let built_prompt = SystemPromptBuilder::build(&prompt_environment, &prompt_tools);
     let mut run_request = RunRequest::new(
         session_id.clone(),
         task_id,
@@ -1124,6 +1619,8 @@ async fn run_turn(
         prompt,
         observation,
     )
+    .with_system_policy(built_prompt.text)
+    .with_project_rules(loaded_instructions.blocks)
     .with_tool_schemas(tool_schemas);
     if !attached.is_empty() {
         for notice in attachments::attachment_notices(&attached.images, &attached.files) {
@@ -1173,6 +1670,8 @@ async fn run_turn(
     };
     let observer: Arc<dyn TurnObserver> = Arc::new(ChannelObserver {
         sender: sender.clone(),
+        cost_tracker,
+        model_price: config.model_price,
         tool_started: Mutex::new(None),
     });
 
@@ -1265,6 +1764,27 @@ async fn run_turn(
         Err(error) => RunOutcome::Failed(error.to_string()),
     };
     send(SessionEvent::RunTerminal { outcome: terminal });
+}
+
+fn prompt_git_facts(root: &Path) -> (Option<String>, Option<usize>) {
+    let branch = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|output| output.trim().to_owned())
+        .filter(|branch| !branch.is_empty());
+    let changed = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|output| output.lines().count());
+    (branch, changed)
 }
 
 /// Deterministic labelled fixture used by tests and explicit demos.

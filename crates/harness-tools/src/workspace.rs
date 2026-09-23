@@ -800,6 +800,10 @@ fn is_link_or_reparse(path: &Path) -> Result<bool, HarnessError> {
     }
 }
 
+pub fn is_sensitive_workspace_path(path: &Path) -> bool {
+    is_sensitive_relative(path)
+}
+
 fn is_sensitive_relative(path: &Path) -> bool {
     let mut last = None;
     for component in path.components() {

@@ -166,7 +166,7 @@ async fn close_writer(store: Arc<SqliteStore>) {
 
 #[test]
 fn p1_s01_contracts_are_available_and_versioned() {
-    assert_eq!(harness_store_sqlite::STORE_SCHEMA_VERSION, 1);
+    assert_eq!(harness_store_sqlite::STORE_SCHEMA_VERSION, 2);
     assert_eq!(harness_types::P0_SCHEMA_VERSION, 1);
     assert!(HostId::generate().as_str().starts_with("host_"));
     assert!(InputId::generate().as_str().starts_with("input_"));
@@ -921,7 +921,17 @@ async fn p1_s07_cli_inspects_persisted_recovery_state_without_runtime() {
     ]);
     assert!(explain.status.success());
     let explain_json: Value = serde_json::from_slice(&explain.stdout).unwrap();
-    assert_eq!(explain_json["runtime"], "not_available_in_p1");
+    assert_eq!(explain_json["schema_version"], 2);
+    assert_eq!(
+        explain_json["effective_config"]["provider"]["id"],
+        "deepseek"
+    );
+    assert_eq!(explain_json["effective_config"]["approval"], "ask");
+    assert!(explain_json["sources"].as_array().is_some_and(|sources| {
+        sources
+            .iter()
+            .any(|entry| entry["key"] == "provider.model" && entry["layer"] == "default")
+    }));
 }
 
 proptest! {

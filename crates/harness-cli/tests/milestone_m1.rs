@@ -130,7 +130,7 @@ async fn m1_01_data_directory_marker_is_versioned() {
             .expect("marker is JSON");
     assert_eq!(marker["schema_version"], 1);
     assert_eq!(marker["kind"], "harness-data");
-    assert_eq!(marker["store_schema_version"], 1);
+    assert_eq!(marker["store_schema_version"], 2);
     close(store).await;
 
     // Reopening never rewrites it.

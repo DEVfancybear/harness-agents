@@ -752,7 +752,7 @@ impl LineEditor {
 /// This table is the **one** source for both: [`crate::interactive::view::help_lines`]
 /// builds the reference page from it and the menu draws its rows from it, so the
 /// list a user sees while typing cannot drift from the list `/help` promises.
-pub const SLASH_COMMANDS: [SlashCommand; 11] = [
+pub const SLASH_COMMANDS: [SlashCommand; 14] = [
     SlashCommand {
         name: "/help",
         arguments: "",
@@ -780,13 +780,28 @@ pub const SLASH_COMMANDS: [SlashCommand; 11] = [
     },
     SlashCommand {
         name: "/model",
-        arguments: "",
-        summary: "show which model the next run would use",
+        arguments: "<name>",
+        summary: "show or select the model for the next turn",
     },
     SlashCommand {
         name: "/config",
         arguments: "",
         summary: "show the resolved configuration and data files",
+    },
+    SlashCommand {
+        name: "/cost",
+        arguments: "",
+        summary: "show the session cost from configured model prices",
+    },
+    SlashCommand {
+        name: "/trust",
+        arguments: "[yes]",
+        summary: "trust this project config after explicit confirmation",
+    },
+    SlashCommand {
+        name: "/init",
+        arguments: "",
+        summary: "print a starter AGENTS.md sample",
     },
     SlashCommand {
         name: "/image",
@@ -1366,7 +1381,7 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["/config"]
+            ["/config", "/cost"]
         );
         assert!(super::matching("/zzz").is_empty());
         assert!(super::matching("hello").is_empty());

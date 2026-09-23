@@ -262,6 +262,9 @@ pub enum HistoryItem {
     /// to the scrollback through `Effect::Stream`.
     #[allow(dead_code, reason = "T04 commits streamed text as an item")]
     Assistant { text: String },
+    /// Provider reasoning shown only in the dim TUI surface; plain transcript
+    /// renderers deliberately have no representation for this item.
+    Thinking { text: String },
     /// A tool card: started, then settled with a duration.
     Tool {
         name: String,
@@ -389,6 +392,12 @@ pub enum SessionEvent {
     },
     TextDelta {
         text: String,
+    },
+    ThinkingDelta {
+        text: String,
+    },
+    CostUpdated {
+        label: String,
     },
     /// A model step started; the status bar counts these.
     StepStarted {
