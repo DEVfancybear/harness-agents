@@ -122,3 +122,10 @@ path = "src/bin/m0_fixture_host.rs"
 [[bin]]
 name = "m11_fixture_task_server"
 path = "src/bin/m11_fixture_task_server.rs"
+
+# M12 probe fixture: the process a capability probe drives. A capability is
+# decided by watching a real process try the thing a boundary is supposed to
+# stop, so the fixture ships as a real binary the way the others do.
+[[bin]]
+name = "m12_probe_child"
+path = "src/bin/m12_probe_child.rs"

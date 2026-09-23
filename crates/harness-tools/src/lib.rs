@@ -8,6 +8,7 @@
 
 mod capture;
 mod contracts;
+mod execution;
 mod loop_service;
 mod policy;
 mod process;
@@ -30,11 +31,20 @@ pub use contracts::{
     coding_tool_names, coding_tool_schemas, effect_class_for, normalize_env_bindings,
 };
 pub use loop_service::{CodingLoopResult, CodingLoopService};
+// M12: the measured capability set, the probe that produces it, and the profile
+// a strict request is answered against. The vocabulary is exported because an
+// operator has to be able to read the evidence, not just the verdict.
+pub use execution::{
+    BoundaryBreakObservation, CAPABILITY_MATRIX_SCHEMA_VERSION, CONTAINMENT_BACKEND,
+    CONTAINMENT_BACKEND_VERSION, Capability, CapabilityEvidence, CapabilityFinding,
+    CapabilityMatrix, CapabilityProbe, CapabilityVerdict, HostIdentity, PROBE_CANARY_NAME,
+    ProbeChild, StrictProfile,
+};
 pub use policy::{PolicyEffect, PolicyRule, ToolPolicy};
 // The environment a tool process may inherit is an operator-facing contract:
 // it is published so a host can state what it exposes instead of implying a
 // sandbox it does not have.
-pub use process::PROCESS_ENVIRONMENT_ALLOWLIST;
+pub use process::{HostEnvironment, PROCESS_ENVIRONMENT_ALLOWLIST};
 // Re-exported so a CLI that drives the loop reads acceptance from the same
 // place the driver writes it.
 pub use harness_runtime::AcceptanceState;

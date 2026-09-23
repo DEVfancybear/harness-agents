@@ -67,6 +67,63 @@ pub const PROCESS_ENVIRONMENT_ALLOWLIST: &[&str] = &[
     "RUSTUP_HOME",
 ];
 
+/// The host environment a child may inherit from, as a snapshot.
+///
+/// It exists as a value rather than as a direct `std::env` read so that the M12
+/// capability probe can measure the allowlist against a *known* host
+/// environment instead of whatever the test process happens to carry. The
+/// production snapshot is [`HostEnvironment::from_process`]; nothing else about
+/// the spawn path changes, and the allowlist is still applied at spawn time.
+#[derive(Clone, Debug, Default)]
+pub struct HostEnvironment {
+    values: Vec<(String, String)>,
+}
+
+impl HostEnvironment {
+    /// The real environment of this process.
+    #[must_use]
+    pub fn from_process() -> Self {
+        Self {
+            values: std::env::vars().collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_pairs(values: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self {
+            values: values.into_iter().collect(),
+        }
+    }
+
+    /// This snapshot plus the named values, replacing any value with that name.
+    #[must_use]
+    pub fn with_values(mut self, extra: impl IntoIterator<Item = (String, String)>) -> Self {
+        for (name, value) in extra {
+            self.values.retain(|(existing, _)| *existing != name);
+            self.values.push((name, value));
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn lookup(&self, name: &str) -> Option<&str> {
+        self.values
+            .iter()
+            .find(|(existing, _)| existing == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
 /// How the process tree's cleanup was established.
 ///
 /// This is recorded instead of a bare boolean because "the kill request
@@ -134,6 +191,31 @@ pub(crate) async fn run_structured(
     environment: &ProcessEnvironment,
     spool: &ProcessSpoolConfig,
 ) -> Result<ProcessResult, HarnessError> {
+    run_structured_with_host(
+        root,
+        executable,
+        args,
+        timeout_ms,
+        cancellation,
+        environment,
+        spool,
+        &HostEnvironment::from_process(),
+    )
+    .await
+}
+
+/// The same run, against an explicit host-environment snapshot.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_structured_with_host(
+    root: &Path,
+    executable: &str,
+    args: &[String],
+    timeout_ms: u64,
+    cancellation: CancellationToken,
+    environment: &ProcessEnvironment,
+    spool: &ProcessSpoolConfig,
+    host: &HostEnvironment,
+) -> Result<ProcessResult, HarnessError> {
     run(
         root,
         executable,
@@ -142,6 +224,7 @@ pub(crate) async fn run_structured(
         cancellation,
         environment,
         spool,
+        host,
     )
     .await
 }
@@ -153,6 +236,28 @@ pub(crate) async fn run_shell(
     cancellation: CancellationToken,
     environment: &ProcessEnvironment,
     spool: &ProcessSpoolConfig,
+) -> Result<ProcessResult, HarnessError> {
+    run_shell_with_host(
+        root,
+        command,
+        timeout_ms,
+        cancellation,
+        environment,
+        spool,
+        &HostEnvironment::from_process(),
+    )
+    .await
+}
+
+/// The same explicit shell run, against an explicit host-environment snapshot.
+pub(crate) async fn run_shell_with_host(
+    root: &Path,
+    command: &str,
+    timeout_ms: u64,
+    cancellation: CancellationToken,
+    environment: &ProcessEnvironment,
+    spool: &ProcessSpoolConfig,
+    host: &HostEnvironment,
 ) -> Result<ProcessResult, HarnessError> {
     #[cfg(windows)]
     let (executable, args) = (
@@ -174,11 +279,12 @@ pub(crate) async fn run_shell(
         cancellation,
         environment,
         spool,
+        host,
     )
     .await
 }
 
-#[allow(clippy::too_many_lines)] // one process lifecycle, told in order
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // one process lifecycle, told in order
 async fn run(
     root: &Path,
     executable: &str,
@@ -187,6 +293,7 @@ async fn run(
     cancellation: CancellationToken,
     environment: &ProcessEnvironment,
     spool: &ProcessSpoolConfig,
+    host: &HostEnvironment,
 ) -> Result<ProcessResult, HarnessError> {
     // Windows Job Object completion ports are process-lifecycle resources. A
     // single host-wide runner permit makes concurrent tool calls deterministic
@@ -223,10 +330,11 @@ async fn run(
         // The host environment is not inherited: only the allowlist, plus the
         // values this call's grants resolved. A child that dumps its own
         // environment therefore shows the host's credentials only if the
-        // operator exposed them for this exact action.
+        // operator exposed them for this exact action. The allowlist is applied
+        // here, at spawn, to the snapshot the caller passed in.
         child_command.env_clear();
         for name in PROCESS_ENVIRONMENT_ALLOWLIST {
-            if let Ok(value) = std::env::var(name) {
+            if let Some(value) = host.lookup(name) {
                 child_command.env(name, value);
             }
         }

@@ -67,6 +67,12 @@ pub struct ToolExecutionService {
     external: Option<Arc<dyn ExternalToolDispatcher>>,
     secrets: Arc<dyn SecretResolver>,
     spool: crate::capture::ProcessSpoolConfig,
+    /// What this host has actually been measured to enforce (M12).
+    ///
+    /// It is `None` until a caller supplies a measured matrix, and `None` means
+    /// "refuse": a strict request is never served against capabilities nobody
+    /// measured.
+    capabilities: Option<Arc<crate::CapabilityMatrix>>,
 }
 
 impl ToolExecutionService {
@@ -79,6 +85,45 @@ impl ToolExecutionService {
             external: None,
             secrets: Arc::new(HostEnvironmentSecrets),
             spool: crate::capture::ProcessSpoolConfig::default(),
+            capabilities: None,
+        }
+    }
+
+    /// Supply the capability matrix measured on this host (M12).
+    ///
+    /// The matrix is a measurement, so it is passed in rather than guessed: a
+    /// service that was never handed one refuses every strict request, and a
+    /// service handed a matrix refuses exactly the capabilities that matrix
+    /// does not report as enforced.
+    #[must_use]
+    pub fn with_capability_matrix(mut self, matrix: Arc<crate::CapabilityMatrix>) -> Self {
+        self.capabilities = Some(matrix);
+        self
+    }
+
+    /// What this host has been measured to enforce, when it has been measured.
+    #[must_use]
+    pub fn capability_matrix(&self) -> Option<&Arc<crate::CapabilityMatrix>> {
+        self.capabilities.as_ref()
+    }
+
+    /// The reason a strict action is refused here, in terms of what was
+    /// measured rather than in terms of what was assumed.
+    fn strict_refusal_reason(&self) -> String {
+        match &self.capabilities {
+            Some(matrix) => match crate::StrictProfile::Full.refusal(matrix) {
+                Some(refusal) => refusal.message().to_owned(),
+                // A matrix that claims full confinement still meets a revision
+                // with no confinement adapter. Refusing is the only honest
+                // answer; running it as containment would be a silent
+                // downgrade wearing a green verdict.
+                None => format!(
+                    "the measured capability matrix for this host claims full confinement, but this revision implements no confinement adapter; refusing rather than executing the request as containment ({})",
+                    matrix.summary()
+                ),
+            },
+            None => "strict isolation requires confinement capabilities that have not been measured on this host; run `ha sandbox probe` to measure them. A strict request is never downgraded to the host runner."
+                .to_owned(),
         }
     }
 
@@ -356,13 +401,14 @@ impl ToolExecutionService {
                 .await;
         }
         if action_requests_strict_isolation(&transformed) {
+            let reason = self.strict_refusal_reason();
             return self
                 .record_denied(
                     &prepared,
                     execution_id,
                     approval.as_ref(),
                     ErrorCode::StrictIsolationUnavailable,
-                    "this host has lifecycle cleanup but no verified strict isolation sandbox",
+                    &reason,
                 )
                 .await;
         }

@@ -6,6 +6,7 @@ mod extension_cli;
 mod interactive;
 mod maintenance_cli;
 mod memory_cli;
+mod sandbox_cli;
 mod web;
 
 use std::{fs, path::PathBuf, process::ExitCode, sync::Arc};
@@ -114,6 +115,8 @@ enum Command {
     Session(SessionCommand),
     /// P3 coding-tool capabilities and a deterministic local fixture.
     Code(CodingCommand),
+    /// M12 strict execution: measure what this host can enforce, and what it refuses.
+    Sandbox(sandbox_cli::SandboxCommand),
     /// P5 delegation: coordinator/worker runs and durable task views.
     Tasks(delegation_cli::TaskCommand),
     /// P6 external extensions: trust inspection, local registration and skills.
@@ -655,6 +658,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
         })) => {
             run_coding_fixture(&data_dir, &workspace, &path, &find, &replace, approve, json).await
         }
+        Some(Command::Sandbox(command)) => sandbox_cli::run(command).await,
         Some(Command::Tasks(command)) => delegation_cli::run(command).await,
         Some(Command::Extensions(command)) => extension_cli::run(command).await,
         Some(Command::Maintenance(command)) => maintenance_cli::run(command).await,
