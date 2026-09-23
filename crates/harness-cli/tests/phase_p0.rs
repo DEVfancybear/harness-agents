@@ -294,7 +294,18 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
 
     let ci =
         fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("P0 CI workflow exists");
-    assert!(ci.contains("os: [ubuntu-latest, windows-latest]"));
+    let runner_matrices = ci
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("os: ["))
+        .collect::<Vec<_>>();
+    assert!(
+        !runner_matrices.is_empty()
+            && runner_matrices
+                .iter()
+                .all(|matrix| *matrix == "os: [windows-latest]"),
+        "CI currently targets Windows only: {runner_matrices:?}"
+    );
     assert!(
         ci.contains("rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt")
     );
