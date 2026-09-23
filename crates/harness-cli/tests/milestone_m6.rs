@@ -1004,6 +1004,16 @@ async fn m6_03_mcp_schema_and_resource_provenance() {
         validate_arguments("observe", schema, &json!("not an object")),
         ErrorCode::InvalidPayload,
     );
+    for unsupported in [
+        json!({"type":"object","properties":{"subject":{"type":"mystery"}}}),
+        json!({"type":"object","properties":{"subject":{"type":"string","minLength":1}}}),
+        json!({"type":"object","properties":{"subject":{"type":"string"}},"additionalProperties":{"type":"string"}}),
+    ] {
+        assert_code(
+            validate_arguments("observe", &unsupported, &json!({"subject":"a"})),
+            ErrorCode::ExtensionProtocolError,
+        );
+    }
     client.close().await;
 
     // A malformed catalogue fails discovery closed rather than registering the
@@ -1263,11 +1273,12 @@ async fn a23_extension_bounds() {
 
     // An invalid argument set is refused by the adapter before the server sees
     // it, so the log does not grow.
+    let bad_invocation = ToolInvocationId::generate();
     let bad_request = harness_tools::ToolRequest {
         session_id: session.clone(),
         task_id: task.clone(),
         actor_id: "m6-acceptance".to_owned(),
-        invocation_id: ToolInvocationId::generate(),
+        invocation_id: bad_invocation.clone(),
         call_id: None,
         workspace_root: workspace.clone(),
         action: harness_tools::CodingToolAction::ExternalTool {
@@ -1278,26 +1289,79 @@ async fn a23_extension_bounds() {
             timeout_ms: 10_000,
         },
     };
-    let prepared = service.prepare(bad_request).await.expect("prepares");
-    let approval = service.approve(&prepared).await.expect("approval");
-    let refused = service.execute(prepared, Some(approval)).await;
-    match refused {
-        Ok(result) => {
-            let receipt = result.receipt.expect("receipt");
-            assert_ne!(
-                receipt.outcome_state,
-                harness_types::ToolOutcomeState::Settled,
-                "an unvalidated argument set must not be reported as settled"
-            );
-        }
-        Err(error) => assert_eq!(error.code(), ErrorCode::InvalidPayload),
-    }
+    let error = service
+        .prepare(bad_request)
+        .await
+        .expect_err("invalid MCP arguments are rejected during preflight");
+    assert_eq!(error.code(), ErrorCode::InvalidPayload);
+    assert!(
+        store
+            .pending_tool_intents(&session)
+            .await
+            .expect("pending intents")
+            .iter()
+            .all(|intent| intent.invocation_id != bad_invocation.as_str()),
+        "invalid MCP arguments must fail before a durable intent exists"
+    );
     assert_eq!(
         std::fs::read_to_string(&log).expect("log").trim(),
         "observe",
         "an argument set the adapter refused never reached the server"
     );
 
+    // A server that requests another protocol round is an unknown outcome on
+    // this M6 tool path. The SDK's high-level helper would resend the request;
+    // the adapter must stop after the first send and let reconciliation decide.
+    let input_log_dir = tempfile::tempdir().expect("tempdir");
+    let input_log = input_log_dir.path().join("mcp-input-required.log");
+    let input_runtime = Arc::new(McpRuntime::new());
+    let input_client = connect_mcp_logging("input_required", 8, &input_log)
+        .await
+        .expect("connects to input-required fixture");
+    input_runtime
+        .attach("m6.fixture.mcp.input", input_client)
+        .await
+        .expect("attaches input-required server");
+    let input_service = harness_tools::ToolExecutionService::new(Arc::clone(&store))
+        .with_external(Arc::new(McpToolDispatcher::new(Arc::clone(&input_runtime))));
+    let input_request = harness_tools::ToolRequest {
+        session_id: session.clone(),
+        task_id: task.clone(),
+        actor_id: "m6-acceptance".to_owned(),
+        invocation_id: ToolInvocationId::generate(),
+        call_id: None,
+        workspace_root: workspace.clone(),
+        action: harness_tools::CodingToolAction::ExternalTool {
+            plugin_id: "m6.fixture.mcp.input".to_owned(),
+            tool_name: "observe".to_owned(),
+            arguments: json!({"subject": "src/lib.rs"}),
+            parent_invocation_id: None,
+            timeout_ms: 10_000,
+        },
+    };
+    let prepared = input_service
+        .prepare(input_request)
+        .await
+        .expect("input-required call prepares through the normal gate");
+    let approval = input_service.approve(&prepared).await.expect("approval");
+    let uncertain = input_service
+        .execute(prepared, Some(approval))
+        .await
+        .expect("uncertainty is recorded with a receipt");
+    assert_eq!(
+        uncertain.receipt.as_ref().expect("receipt").outcome_state,
+        harness_types::ToolOutcomeState::OutcomeUnknown
+    );
+    assert_eq!(
+        std::fs::read_to_string(&input_log)
+            .expect("input-required log")
+            .lines()
+            .count(),
+        1,
+        "an input-required response must not trigger a hidden SDK resend"
+    );
+
+    input_runtime.close_all().await;
     mcp_runtime.close_all().await;
 }
 

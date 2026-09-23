@@ -235,7 +235,14 @@ async fn charge_chain(
     delta: i64,
 ) -> Result<(), StoreError> {
     let mut current = Some(budget_id.clone());
+    let mut visited = std::collections::BTreeSet::new();
     while let Some(account_id) = current {
+        if !visited.insert(account_id.as_str().to_owned()) {
+            return Err(StoreError::new(
+                ErrorCode::StorageWriteFailed,
+                "budget account hierarchy contains a cycle",
+            ));
+        }
         let row = sqlx::query("SELECT parent_budget_id, limit_tokens, spent_tokens, revision FROM budget_accounts WHERE budget_id = ?")
             .bind(account_id.as_str())
             .fetch_optional(&mut **tx)
@@ -314,12 +321,32 @@ impl SqliteStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read run", error))?;
-        let record = run_from_row(&row)?;
+        let mut record = run_from_row(&row)?;
         if &record.session_id != session_id || &record.task_id != task_id {
             return Err(StoreError::new(
                 ErrorCode::IdempotencyConflict,
                 "input already belongs to a different run scope",
             ));
+        }
+        if matches!(record.state, RunState::Running | RunState::Paused)
+            && record.owner_generation != fence.generation
+        {
+            let updated = sqlx::query(
+                "UPDATE runs SET owner_generation = ? WHERE run_id = ? AND owner_generation = ?",
+            )
+            .bind(to_i64(fence.generation, "run generation")?)
+            .bind(record.run_id.as_str())
+            .bind(to_i64(record.owner_generation, "previous run generation")?)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "reclaim run", error))?;
+            if updated.rows_affected() != 1 {
+                return Err(StoreError::new(
+                    ErrorCode::StaleWriter,
+                    "run ownership changed while reclaiming it",
+                ));
+            }
+            record.owner_generation = fence.generation;
         }
         tx.commit().await.map_err(|error| {
             database_error(ErrorCode::StorageWriteFailed, "commit run start", error)
@@ -397,6 +424,12 @@ impl SqliteStore {
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read run for freeze", error))?
         .ok_or_else(|| StoreError::new(ErrorCode::InvalidPayload, "run does not exist"))?;
         let mut current = run_from_row(&row)?;
+        if current.owner_generation != fence.generation {
+            return Err(StoreError::new(
+                ErrorCode::StaleWriter,
+                "run is owned by a different host generation",
+            ));
+        }
         if current.state != RunState::Running {
             return Err(StoreError::new(
                 ErrorCode::InvalidStateTransition,
@@ -577,6 +610,12 @@ impl SqliteStore {
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read run to finish", error))?
         .ok_or_else(|| StoreError::new(ErrorCode::InvalidPayload, "run does not exist"))?;
         let current = run_from_row(&row)?;
+        if current.owner_generation != fence.generation {
+            return Err(StoreError::new(
+                ErrorCode::StaleWriter,
+                "run is owned by a different host generation",
+            ));
+        }
         if current.revision != expected_revision {
             return Err(StoreError::new(
                 ErrorCode::SequenceConflict,
@@ -624,6 +663,41 @@ impl SqliteStore {
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;
         assert_fence_in_tx(&mut tx, &fence).await?;
+        if let Some(parent_id) = &record.parent_budget_id {
+            let mut visited =
+                std::collections::BTreeSet::from([record.budget_id.as_str().to_owned()]);
+            let mut current = Some(parent_id.clone());
+            while let Some(account_id) = current {
+                if !visited.insert(account_id.as_str().to_owned()) {
+                    return Err(StoreError::new(
+                        ErrorCode::InvalidPayload,
+                        "budget account parent would create a cycle",
+                    ));
+                }
+                let row =
+                    sqlx::query("SELECT parent_budget_id FROM budget_accounts WHERE budget_id = ?")
+                        .bind(account_id.as_str())
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(|error| {
+                            database_error(
+                                ErrorCode::StorageWriteFailed,
+                                "validate budget parent",
+                                error,
+                            )
+                        })?
+                        .ok_or_else(|| {
+                            StoreError::new(
+                                ErrorCode::InvalidPayload,
+                                "budget parent account does not exist",
+                            )
+                        })?;
+                current = row
+                    .get::<Option<String>, _>("parent_budget_id")
+                    .map(parse_budget_id)
+                    .transpose()?;
+            }
+        }
         sqlx::query("INSERT INTO budget_accounts(budget_id, parent_budget_id, limit_tokens, spent_tokens, revision) VALUES (?, ?, ?, 0, 1) ON CONFLICT(budget_id) DO NOTHING")
             .bind(record.budget_id.as_str())
             .bind(record.parent_budget_id.as_ref().map(BudgetId::as_str))

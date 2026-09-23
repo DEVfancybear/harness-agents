@@ -13,6 +13,7 @@
 //! - `flood`: `tools/list` pages forever, so the client's page bound must stop it.
 //! - `read_failure`: `resources/read` returns a protocol error.
 //! - `blob_resource`: the resource body is binary, which the host must refuse.
+//! - `input_required`: a tool asks for another round; the host must not resend it implicitly.
 //!
 //! Every tool call is appended to the file named by `--log <path>`, when that
 //! argument is given. That file is how the acceptance target proves a call the
@@ -28,9 +29,10 @@ use std::{io::Write, sync::Arc};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ListResourcesResult,
-        ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
-        ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerConfig, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, InputRequiredResult,
+        ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
+        ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
+        ServerConfig, Tool,
     },
     transport::io::stdio,
 };
@@ -202,6 +204,11 @@ impl ServerHandler for FixtureServer {
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         self.record(&request.name);
+        if self.mode.as_str() == "input_required" {
+            return Ok(CallToolResponse::InputRequired(
+                InputRequiredResult::from_request_state("m6-fixture-state"),
+            ));
+        }
         let arguments = request.arguments.map_or(Value::Null, Value::Object);
         Ok(CallToolResponse::Complete(CallToolResult::structured(
             json!({

@@ -717,19 +717,18 @@ impl McpClient {
     /// request leaves the host, and an unknown tool is refused locally rather
     /// than forwarded. This is the transport call: authority is decided by the
     /// tool gate that reaches it, never here.
-    pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, ExtensionError> {
-        let descriptor = self.tools.get(name).ok_or_else(|| {
-            ExtensionError::new(
-                ErrorCode::PolicyDenied,
-                format!("MCP server did not advertise a tool named {name}"),
-            )
-        })?;
-        validate_arguments(name, &descriptor.input_schema, &arguments)?;
+    pub(crate) async fn call_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, ExtensionError> {
+        self.validate_tool_arguments(name, &arguments)?;
         let arguments = arguments.as_object().cloned().unwrap_or_default();
-        let result = timeout(
+        let response = timeout(
             Duration::from_millis(MCP_CALL_TIMEOUT_MS),
-            self.running
-                .call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(arguments)),
+            self.running.call_tool_once(
+                CallToolRequestParams::new(name.to_owned()).with_arguments(arguments),
+            ),
         )
         .await
         .map_err(|_| {
@@ -744,12 +743,44 @@ impl McpClient {
                 format!("MCP call_tool failed: {error}"),
             )
         })?;
+        let result = match response {
+            CallToolResponse::Complete(result) => result,
+            CallToolResponse::InputRequired(_) => {
+                return Err(ExtensionError::new(
+                    ErrorCode::ExtensionProtocolUnsupported,
+                    "MCP input-required rounds are unsupported; the host sent the tool request once and will not retry it",
+                ));
+            }
+            CallToolResponse::Task(_) => {
+                return Err(ExtensionError::new(
+                    ErrorCode::ExtensionProtocolUnsupported,
+                    "MCP task responses are unsupported on the tool-dispatch path; reconcile the remote task explicitly",
+                ));
+            }
+            _ => {
+                return Err(ExtensionError::new(
+                    ErrorCode::ExtensionProtocolUnsupported,
+                    "the MCP server returned a tool response this host does not support",
+                ));
+            }
+        };
         serde_json::to_value(&result).map_err(|_| {
             ExtensionError::new(
                 ErrorCode::InvalidPayload,
                 "MCP tool result is not serializable",
             )
         })
+    }
+
+    fn validate_tool_arguments(&self, name: &str, arguments: &Value) -> Result<(), ExtensionError> {
+        let descriptor = self.tools.get(name).ok_or_else(|| {
+            ExtensionError::new(
+                ErrorCode::PolicyDenied,
+                format!("MCP server did not advertise a tool named {name}"),
+            )
+        })?;
+        validate_arguments(name, &descriptor.input_schema, arguments)?;
+        Ok(())
     }
 
     /// Whether the server declared the tasks extension in the handshake.
@@ -1078,34 +1109,61 @@ impl TaskRemote for McpTaskRemote {
 /// A tool whose schema the host cannot understand is refused at discovery time,
 /// which is the only moment where refusing it is free.
 pub fn validate_tool_schema(descriptor: &McpToolDescriptor) -> Result<(), ExtensionError> {
-    let schema = &descriptor.input_schema;
+    validate_supported_object_schema(&descriptor.name, &descriptor.input_schema)
+}
+
+fn validate_supported_object_schema(tool: &str, schema: &Value) -> Result<(), ExtensionError> {
     let object = schema.as_object().ok_or_else(|| {
         ExtensionError::new(
             ErrorCode::ExtensionProtocolError,
-            format!(
-                "MCP tool {} advertised a schema that is not an object",
-                descriptor.name
-            ),
+            format!("MCP tool {tool} advertised a schema that is not an object"),
         )
     })?;
+    validate_schema_keys(
+        tool,
+        object,
+        &[
+            "type",
+            "properties",
+            "required",
+            "additionalProperties",
+            "title",
+            "description",
+            "default",
+            "examples",
+            "deprecated",
+            "readOnly",
+            "writeOnly",
+            "$schema",
+            "$id",
+            "$comment",
+        ],
+    )?;
+    validate_object_schema_type(tool, object)?;
+    validate_object_properties(tool, object)?;
+    validate_required_properties(tool, object)?;
+    validate_additional_properties(tool, object)?;
+    Ok(())
+}
+
+fn validate_object_schema_type(
+    tool: &str,
+    object: &Map<String, Value>,
+) -> Result<(), ExtensionError> {
     match object.get("type") {
         Some(Value::String(kind)) if kind == "object" => {}
         Some(Value::String(kind)) => {
             return Err(ExtensionError::new(
                 ErrorCode::ExtensionProtocolError,
                 format!(
-                    "MCP tool {} advertised schema type {kind}; only object arguments are supported",
-                    descriptor.name
+                    "MCP tool {tool} advertised schema type {kind}; only object arguments are supported"
                 ),
             ));
         }
         Some(_) => {
             return Err(ExtensionError::new(
                 ErrorCode::ExtensionProtocolError,
-                format!(
-                    "MCP tool {} advertised a non-string schema type",
-                    descriptor.name
-                ),
+                format!("MCP tool {tool} advertised a non-string schema type"),
             ));
         }
         // A schema without `type` is accepted only when it declares properties:
@@ -1115,24 +1173,39 @@ pub fn validate_tool_schema(descriptor: &McpToolDescriptor) -> Result<(), Extens
                 return Err(ExtensionError::new(
                     ErrorCode::ExtensionProtocolError,
                     format!(
-                        "MCP tool {} advertised a schema with neither a type nor properties",
-                        descriptor.name
+                        "MCP tool {tool} advertised a schema with neither a type nor properties"
                     ),
                 ));
             }
         }
     }
+    Ok(())
+}
+
+fn validate_object_properties(
+    tool: &str,
+    object: &Map<String, Value>,
+) -> Result<(), ExtensionError> {
     if let Some(properties) = object.get("properties")
         && !properties.is_object()
     {
         return Err(ExtensionError::new(
             ErrorCode::ExtensionProtocolError,
-            format!(
-                "MCP tool {} advertised non-object properties",
-                descriptor.name
-            ),
+            format!("MCP tool {tool} advertised non-object properties"),
         ));
     }
+    if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+        for (name, property_schema) in properties {
+            validate_property_schema(tool, name, property_schema)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_required_properties(
+    tool: &str,
+    object: &Map<String, Value>,
+) -> Result<(), ExtensionError> {
     let declared = object
         .get("properties")
         .and_then(Value::as_object)
@@ -1142,34 +1215,109 @@ pub fn validate_tool_schema(descriptor: &McpToolDescriptor) -> Result<(), Extens
         let Some(names) = required.as_array() else {
             return Err(ExtensionError::new(
                 ErrorCode::ExtensionProtocolError,
-                format!(
-                    "MCP tool {} advertised a non-array required list",
-                    descriptor.name
-                ),
+                format!("MCP tool {tool} advertised a non-array required list"),
             ));
         };
+        let mut seen = std::collections::BTreeSet::new();
         for name in names {
             let Some(name) = name.as_str() else {
                 return Err(ExtensionError::new(
                     ErrorCode::ExtensionProtocolError,
-                    format!(
-                        "MCP tool {} required a non-string property",
-                        descriptor.name
-                    ),
+                    format!("MCP tool {tool} required a non-string property"),
                 ));
             };
+            if !seen.insert(name) {
+                return Err(ExtensionError::new(
+                    ErrorCode::ExtensionProtocolError,
+                    format!("MCP tool {tool} repeated required property {name}"),
+                ));
+            }
             if !declared.iter().any(|declared| declared == name) {
                 return Err(ExtensionError::new(
                     ErrorCode::ExtensionProtocolError,
-                    format!(
-                        "MCP tool {} requires {name}, which it does not declare",
-                        descriptor.name
-                    ),
+                    format!("MCP tool {tool} requires {name}, which it does not declare"),
                 ));
             }
         }
     }
     Ok(())
+}
+
+fn validate_additional_properties(
+    tool: &str,
+    object: &Map<String, Value>,
+) -> Result<(), ExtensionError> {
+    if let Some(additional) = object.get("additionalProperties")
+        && !additional.is_boolean()
+    {
+        return Err(unsupported_schema(
+            tool,
+            "additionalProperties must be a boolean",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_schema_keys(
+    tool: &str,
+    schema: &Map<String, Value>,
+    allowed: &[&str],
+) -> Result<(), ExtensionError> {
+    if let Some(keyword) = schema.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(unsupported_schema(
+            tool,
+            &format!("schema keyword {keyword:?} is not supported"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_property_schema(tool: &str, name: &str, schema: &Value) -> Result<(), ExtensionError> {
+    let Some(schema) = schema.as_object() else {
+        return Err(unsupported_schema(
+            tool,
+            &format!("property {name:?} does not have an object schema"),
+        ));
+    };
+    validate_schema_keys(
+        tool,
+        schema,
+        &[
+            "type",
+            "title",
+            "description",
+            "default",
+            "examples",
+            "deprecated",
+            "readOnly",
+            "writeOnly",
+        ],
+    )?;
+    if let Some(kind) = schema.get("type") {
+        let Some(kind) = kind.as_str() else {
+            return Err(unsupported_schema(
+                tool,
+                &format!("property {name:?} has a non-string type"),
+            ));
+        };
+        if !matches!(
+            kind,
+            "string" | "number" | "integer" | "boolean" | "object" | "array" | "null"
+        ) {
+            return Err(unsupported_schema(
+                tool,
+                &format!("property {name:?} has unsupported type {kind:?}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn unsupported_schema(tool: &str, detail: &str) -> ExtensionError {
+    ExtensionError::new(
+        ErrorCode::ExtensionProtocolError,
+        format!("MCP tool {tool} advertised a schema the host cannot validate: {detail}"),
+    )
 }
 
 /// Validate call arguments against an advertised schema.
@@ -1183,6 +1331,7 @@ pub fn validate_arguments(
     schema: &Value,
     arguments: &Value,
 ) -> Result<(), ExtensionError> {
+    validate_supported_object_schema(tool, schema)?;
     let Some(arguments) = arguments.as_object() else {
         return Err(ExtensionError::new(
             ErrorCode::InvalidPayload,
@@ -1243,7 +1392,7 @@ fn value_matches(kind: &str, value: &Value) -> bool {
         "object" => value.is_object(),
         "array" => value.is_array(),
         "null" => value.is_null(),
-        _ => true,
+        _ => false,
     }
 }
 
@@ -1283,8 +1432,23 @@ impl McpRuntime {
         Ok(())
     }
 
-    pub async fn client(&self, label: &str) -> Option<Arc<McpClient>> {
+    async fn client(&self, label: &str) -> Option<Arc<McpClient>> {
         self.servers.lock().await.get(label).cloned()
+    }
+
+    async fn validate_tool(
+        &self,
+        label: &str,
+        tool: &str,
+        arguments: &Value,
+    ) -> Result<(), ExtensionError> {
+        let client = self.client(label).await.ok_or_else(|| {
+            ExtensionError::new(
+                ErrorCode::ExtensionNotFound,
+                format!("no MCP server is attached as {label}"),
+            )
+        })?;
+        client.validate_tool_arguments(tool, arguments)
     }
 
     /// The read-only metadata cache of one attached server.
@@ -1312,7 +1476,7 @@ impl McpRuntime {
     }
 
     /// Invoke one tool on one attached server, with argument validation.
-    pub async fn call(
+    async fn call(
         &self,
         label: &str,
         tool: &str,
@@ -1383,8 +1547,24 @@ impl McpToolDispatcher {
 }
 
 impl ExternalToolDispatcher for McpToolDispatcher {
+    fn validate_external<'a>(
+        &'a self,
+        plugin_id: &'a str,
+        tool_name: &'a str,
+        arguments: &'a Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), HarnessError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.runtime
+                .validate_tool(plugin_id, tool_name, arguments)
+                .await
+                .map_err(|error| HarnessError::new(error.code(), error.to_string()))
+        })
+    }
+
     fn dispatch_external<'a>(
         &'a self,
+        _authorization: &'a harness_tools::ToolDispatchAuthorization,
         plugin_id: &'a str,
         tool_name: &'a str,
         arguments: &'a Value,

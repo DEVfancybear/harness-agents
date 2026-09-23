@@ -454,6 +454,10 @@ impl TurnDriver {
         observer: Arc<dyn TurnObserver>,
         cancellation: CancellationToken,
     ) -> Result<TurnOutcome, HarnessError> {
+        if let Some(goal) = &self.goal {
+            goal.validate()
+                .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+        }
         let started = Instant::now();
         let session_id = request.session_id.clone();
         let task_id = request.task_id.clone();
@@ -543,7 +547,9 @@ impl TurnDriver {
                             return Err(HarnessError::new(error.code(), error.to_string()));
                         }
                     };
-                    if let Err(error) = harness_runtime::validate_evaluation(&evaluation) {
+                    if let Err(error) =
+                        harness_runtime::validate_evaluation(goal, &evidence, &evaluation)
+                    {
                         let _ = self
                             .runtime
                             .finish_run_record(

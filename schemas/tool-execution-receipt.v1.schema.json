@@ -91,6 +91,14 @@
         "null"
       ]
     },
+    "exit_code": {
+      "description": "Process exit status, when this receipt represents a process execution.\nOlder receipts and non-process tools do not carry this field.",
+      "format": "int32",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
     "input_hash": {
       "$ref": "#/$defs/ContentHash"
     },

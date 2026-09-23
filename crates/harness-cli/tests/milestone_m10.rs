@@ -126,19 +126,33 @@ async fn request_once(
     let mut buffer = [0_u8; 4096];
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut head_end: Option<usize> = None;
-    let mut declared = 0_usize;
+    let mut framing: Option<ResponseBodyFraming> = None;
+    let mut response_body = None;
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buffer)).await {
-            Ok(Ok(0)) => break,
+            Ok(Ok(0)) => {
+                if let (Some(end), Some(ResponseBodyFraming::CloseDelimited)) = (head_end, framing)
+                {
+                    response_body = Some(raw[end..].to_vec());
+                }
+                break;
+            }
             Ok(Ok(read)) => raw.extend_from_slice(&buffer[..read]),
             Ok(Err(_)) => {
-                // Reset: if the reply is already complete, this is the peer
-                // closing; if it is not, the bytes may still be in flight.
-                if head_end.is_some_and(|end| raw.len() >= end + declared) {
+                // A reset after a fully framed reply is equivalent to the peer
+                // closing; never mistake a partial Content-Length/chunked body
+                // for a complete response.
+                if response_body.is_some() {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                continue;
+                if let (Some(end), Some(ResponseBodyFraming::CloseDelimited)) = (head_end, framing)
+                {
+                    response_body = Some(raw[end..].to_vec());
+                    break;
+                }
+                return Err(format!(
+                    "connection reset during incomplete response to {label}"
+                ));
             }
             Err(_) => continue,
         }
@@ -148,19 +162,37 @@ async fn request_once(
                 .position(|window| window == b"\r\n\r\n")
                 .map(|index| index + 4);
             if let Some(end) = head_end {
-                let head_text = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
-                declared = head_text
-                    .lines()
-                    .find_map(|line| line.strip_prefix("content-length:"))
-                    .and_then(|value| value.trim().parse::<usize>().ok())
-                    .unwrap_or(0);
+                framing = Some(parse_response_framing(&raw[..end])?);
             }
         }
-        if head_end.is_some_and(|end| raw.len() >= end + declared) {
-            break;
+        if let (Some(end), Some(body_framing)) = (head_end, framing) {
+            match body_framing {
+                ResponseBodyFraming::ContentLength(length) => {
+                    if raw.len() >= end.saturating_add(length) {
+                        response_body = Some(raw[end..end + length].to_vec());
+                        break;
+                    }
+                }
+                ResponseBodyFraming::Chunked => {
+                    if let Some((body, _consumed)) = decode_chunked(&raw[end..])? {
+                        response_body = Some(body);
+                        break;
+                    }
+                }
+                ResponseBodyFraming::CloseDelimited => {}
+            }
         }
     }
-    let text = String::from_utf8_lossy(&raw).into_owned();
+    finish_reply(&raw, framing, response_body, label)
+}
+
+fn finish_reply(
+    raw: &[u8],
+    framing: Option<ResponseBodyFraming>,
+    response_body: Option<Vec<u8>>,
+    label: &str,
+) -> Result<Reply, String> {
+    let text = String::from_utf8_lossy(raw).into_owned();
     if raw.is_empty() {
         return Err(format!("peer closed before replying to {label}"));
     }
@@ -174,18 +206,116 @@ async fn request_once(
                 raw.len()
             )
         });
-    if head_end.is_some_and(|end| raw.len() < end.saturating_add(declared)) {
-        return Err(format!(
-            "incomplete response to {label}: read {} bytes, expected {}",
-            raw.len(),
-            head_end.unwrap_or_default().saturating_add(declared)
-        ));
-    }
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_owned())
-        .unwrap_or_default();
+    let body = response_body.ok_or_else(|| {
+        let framing = framing.map_or_else(|| "headers".to_owned(), |value| format!("{value:?}"));
+        format!(
+            "incomplete {framing} response to {label}: read {} bytes",
+            raw.len()
+        )
+    })?;
+    let body = String::from_utf8_lossy(&body).into_owned();
     Ok(Reply { status, body })
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResponseBodyFraming {
+    ContentLength(usize),
+    Chunked,
+    CloseDelimited,
+}
+
+fn parse_response_framing(head: &[u8]) -> Result<ResponseBodyFraming, String> {
+    let text = String::from_utf8_lossy(head);
+    let mut content_length = None;
+    let mut is_chunked = false;
+    for line in text.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| "invalid Content-Length in HTTP response".to_owned())?,
+            );
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            is_chunked = value
+                .split(',')
+                .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"));
+        }
+    }
+    if is_chunked {
+        Ok(ResponseBodyFraming::Chunked)
+    } else if let Some(length) = content_length {
+        Ok(ResponseBodyFraming::ContentLength(length))
+    } else {
+        Ok(ResponseBodyFraming::CloseDelimited)
+    }
+}
+
+/// Decode a complete chunked body, or return `None` while more bytes are due.
+fn decode_chunked(bytes: &[u8]) -> Result<Option<(Vec<u8>, usize)>, String> {
+    let mut cursor = 0_usize;
+    let mut body = Vec::new();
+    loop {
+        let Some(line_length) = bytes[cursor..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+        else {
+            return Ok(None);
+        };
+        let line = String::from_utf8_lossy(&bytes[cursor..cursor + line_length]);
+        let size = line.split(';').next().unwrap_or_default().trim();
+        let size = usize::from_str_radix(size, 16)
+            .map_err(|_| "invalid chunk size in HTTP response".to_owned())?;
+        cursor = cursor.saturating_add(line_length).saturating_add(2);
+        if size == 0 {
+            if bytes.get(cursor..cursor + 2) == Some(b"\r\n") {
+                return Ok(Some((body, cursor + 2)));
+            }
+            let Some(trailer_length) = bytes[cursor..]
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+            else {
+                return Ok(None);
+            };
+            return Ok(Some((body, cursor + trailer_length + 4)));
+        }
+        let Some(chunk_end) = cursor.checked_add(size) else {
+            return Err("chunk size overflows the response buffer".to_owned());
+        };
+        let Some(chunk_with_ending) = chunk_end.checked_add(2) else {
+            return Err("chunk size overflows the response buffer".to_owned());
+        };
+        if bytes.len() < chunk_with_ending {
+            return Ok(None);
+        }
+        if bytes.get(chunk_end..chunk_with_ending) != Some(b"\r\n") {
+            return Err("HTTP chunk has no terminating CRLF".to_owned());
+        }
+        body.extend_from_slice(&bytes[cursor..chunk_end]);
+        cursor = chunk_with_ending;
+    }
+}
+
+#[test]
+fn m10_raw_http_helper_decodes_chunked_body_and_trailers() {
+    let response = b"4;ext=x\r\nWiki\r\n5\r\npedia\r\n0\r\nX-End: yes\r\n\r\n";
+    let (body, consumed) = decode_chunked(response)
+        .expect("valid chunk framing")
+        .expect("the terminal chunk completes the response");
+
+    assert_eq!(body, b"Wikipedia");
+    assert_eq!(consumed, response.len());
+}
+
+#[test]
+fn m10_raw_http_helper_waits_for_a_partial_chunk() {
+    assert_eq!(
+        decode_chunked(b"4\r\nWi").expect("partial data is not malformed"),
+        None
+    );
 }
 
 /// Read the first `count` server-sent frames from a stream, then close it.
