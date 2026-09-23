@@ -64,9 +64,9 @@ Requires PowerShell 7; no additional packages. / Cần PowerShell 7, không cầ
 pwsh -NoProfile -File scripts/Verify-Docs.ps1 -SelfTest
 ```
 
-Checks local links, paired sections, acceptance IDs/ownership, phase dependencies and steps, milestone estimates, fixed source revisions and fenced blocks. Includes in-memory negative controls. It does **not** execute the 30 continuity, 14 plugin or six optional Web cases; those are future runtime acceptance specifications. The GitHub workflow runs Rust phase gates and predecessor regressions on Ubuntu and Windows.
+Checks local links, paired sections, acceptance IDs/ownership, phase dependencies and steps, milestone estimates, fixed source revisions and fenced blocks. Includes in-memory negative controls. It does **not** execute the 30 continuity, 14 plugin or six optional Web cases; those are future runtime acceptance specifications. The GitHub workflows currently run documentation, Rust phase and M0-M12 milestone gates on Windows. Linux jobs are deferred until Linux support is in scope; the M12 A36 test rejects platforms whose support matrix has not been measured.
 
-Kiểm tra links local, sections hai ngôn ngữ, acceptance IDs/ownership, dependencies và steps của phase, dự toán mốc, revision nguồn cố định, code fences; có negative controls trong RAM. **Không** chạy 30 ca continuity, 14 ca plugin hay sáu ca Web tùy chọn: đó là đặc tả nghiệm thu runtime tương lai. GitHub workflow chạy Rust phase gates và regressions tiền nhiệm trên Ubuntu và Windows.
+Kiểm tra links local, sections hai ngôn ngữ, acceptance IDs/ownership, dependencies và steps của phase, dự toán mốc, revision nguồn cố định, code fences; có negative controls trong RAM. **Không** chạy 30 ca continuity, 14 ca plugin hay sáu ca Web tùy chọn: đó là đặc tả nghiệm thu runtime tương lai. GitHub workflows hiện chạy kiểm tra tài liệu, Rust phase và milestone M0-M12 trên Windows. Job Linux được hoãn tới khi cần hỗ trợ Linux; test A36 của M12 từ chối nền tảng chưa được đo support matrix.
 
 ## Research references / Nguồn khảo sát
 

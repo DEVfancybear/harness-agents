@@ -79,10 +79,10 @@ strict_profile_full=refused
 <!-- support-matrix:end -->
 ```
 
-**Linux chưa được đo lần nào.** Máy này không có WSL/Docker, và workflow CI `verify-milestones` **chưa chạy lần
-nào**, nên không tồn tại bằng chứng Linux nào trong dự án. Cho tới khi có một lần probe thật trên Linux, mọi
+**Linux chưa được đo lần nào và chưa thuộc phạm vi CI hiện tại.** Cho tới khi có một lần probe thật trên Linux, mọi
 capability ở đó được coi là `unsupported` và strict bị từ chối. Test A36 **cố ý đỏ** nếu nó chạy trên một nền tảng
-có khối `measured=false`: chạy được probe ở đâu thì phải ghi kết quả ở đó.
+có khối `measured=false`: chạy được probe ở đâu thì phải ghi kết quả ở đó. Các GitHub workflows hiện chỉ chạy trên
+Windows; nếu Linux support được đưa vào phạm vi sau này, hãy đo probe và cập nhật ma trận trước khi bật runner Linux.
 
 `posix_process_session` (process group + `kill`) là cơ chế containment tương ứng trên Unix và đã nằm trong đường chạy
 từ M4, nhưng **chưa** được đo trên host Unix nào — nên nó không được ghi là `enforced` ở đâu cả.
