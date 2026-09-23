@@ -11,7 +11,7 @@
 - **Gate chính thức:** `pwsh -NoProfile -File scripts/Verify-Milestone.ps1 -Milestone M6 -Json` **passed**. Digest `sha256:f1d52e52a49fbd50d989f273c0d61fa13691c7cbe6cf37d30c925fde29851b49` trên 426 file; M6 **13 required / 14 discovered**, closure M5/M4/M3/M1/M2/M0 đều passed; format, clippy, build, workspace tests, dependency allowlist (**45 edges**) và discovery đều xanh.
 - **Regression mục tiêu:** M0 **12/12**, M3 **20/20**; docs self-test 174 Markdown và `git diff --check` sạch. Test interactive terminal có 90s window dưới tải, child vẫn hard bound 2 phút.
 - **Giới hạn còn đúng:** Linux/Unix verification pending; chưa chạy paid/live provider; strict OS confinement và MCP advanced capabilities vẫn là explicit unsupported/non-goals. Không publish/release.
-- **Tiếp theo:** fetch và so sánh `origin/master`; nếu không có commit mới cần merge thì commit toàn bộ audit M0–M6, push nhánh `codex/m0-m6-audit`, rồi cập nhật trạng thái push. Không chạy Linux.
+- **Commit/push:** `de89cd6` (`fix: close M0-M6 audit defects`) đã push thành công lên `origin/codex/m0-m6-audit`; `origin/master` vẫn là ancestor `b36253c`, không phát sinh conflict. Linux không chạy và tiếp tục pending.
 
 ## Checkpoint trước — P0–P7 code review và sửa defects, đã merge vào master
 
