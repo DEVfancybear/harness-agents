@@ -1,78 +1,87 @@
 # Harness Agents
 
-**Plan: hoàn thiện `ha` thành CLI coding agent đầy đủ (track G01–G14) — 22/09/2026:** [Feature plan HA_AGENT](docs/HA_AGENT_PLAN.vi.md) và [prompt giao DeepSeek](docs/HA_AGENT_PROMPT.vi.md). Đối chiếu code tại `9bc7d49` với Codex CLI, Claude Code và pi, gom 93 giới hạn docs đã ghi (kể cả [SPEC M6 §11](docs/specs/M6.vi.md)) thành 14 work item: system prompt + `AGENTS.md`, config v2 có precedence, provider OpenAI-chat tổng quát + Anthropic, tools write/edit/glob/regex, chế độ quyền + rule, `ask_user`/queue/`@`/`!`, compaction thật, `/undo`/`/diff`/`/cost`, hooks, MCP + skills trong chat, subagent, headless stream-json, gate Linux trên CI. Planning only; chưa có code G nào.
+**A coding agent that can pick up where it left off.** / **Coding agent có thể tiếp tục công việc đang dang dở.**
 
-**File trong một yêu cầu — không chỉ ảnh — 21/09/2026:** một đường dẫn không phải ảnh giờ là **nội dung**: file text được đọc và đặt thẳng vào message của lượt đó (trần 256 KiB mỗi file, 1 MiB và 4 file mỗi lượt), file binary bị từ chối kèm lý do, và đường dẫn vào nơi chứa credential không bao giờ được gửi. Bốn đường vào: gõ path trong tin nhắn, kéo file từ Explorer, dán path (`Ctrl-V`/`/image`), hoặc `/attach <path>` — lệnh chạy ở mọi terminal kể cả terminal giữ `Ctrl-V`. Lượt headless báo ở khoá `files` (`path`, `label`, `bytes`). Hợp đồng và số đo ở [SPEC HA_TUI §3h](docs/specs/HA_TUI.vi.md); cách dùng ở [OPERATOR_GUIDE §12.9](docs/OPERATOR_GUIDE.vi.md); một khiếm khuyết bắt được nhưng **chưa sửa** (workspace hash gặp file bị khoá) ghi ở §3h.4 và `crates/harness-cli/tests/known_defects.rs`.
+Harness Agents is a coding-agent project written in Rust and designed to run locally. Its single `ha` CLI brings conversations, coding tools, durable sessions, memory, and delegated tasks into one workflow. The goal is simple: make development with an agent easier to continue, inspect, and control.
 
-**TUI terminal cho `ha` (track T01–T08) — 20/09/2026:** [Feature plan HA_TUI](docs/HA_TUI_PLAN.vi.md), [SPEC triển khai](docs/specs/HA_TUI.vi.md), [evidence](docs/evidence/HA_TUI.vi.md) và [handoff](docs/handoffs/HA_TUI.vi.md). `ha` vẽ inline viewport kiểu Codex/Claude Code ở đáy màn hình (ô soạn thảo nhiều dòng, thanh trạng thái, panel approval/picker/help) và giữ hội thoại trong scrollback của terminal; ratatui + crossterm đã pin, plain mode vẫn là fallback có lý do ra stderr. Số đo quyết định (chiều cao viewport, Alt+Enter, `scrolling-regions`) ở mục 2 của SPEC.
+Harness Agents là dự án coding agent chạy ưu tiên trên máy cá nhân, được viết bằng Rust. Một CLI `ha` kết hợp hội thoại, công cụ lập trình, phiên làm việc bền vững, bộ nhớ và giao việc cho agent khác trong cùng một quy trình. Mục tiêu của dự án là giúp việc phát triển cùng agent dễ tiếp tục, dễ kiểm tra và dễ kiểm soát hơn.
 
-**Plan: gõ `ha` để mở CLI tương tác:** [Feature plan H01–H08](docs/HA_LAUNCH_PLAN.vi.md) và [prompt giao DeepSeek](docs/HA_LAUNCH_PROMPT.vi.md). Phân biệt cài/PATH với interactive startup; triển khai feature này trên CLI hiện tại, chưa phải tính năng đã hoàn thành.
+**Language / Ngôn ngữ:** [English](#english) · [Tiếng Việt](#tiếng-việt)
 
-**Coding handoff / Giao DeepSeek code — 19/09/2026:** Read the [implementation pack](docs/implementation-next/README.vi.md) and use the [ready-to-copy M0-01 prompt](docs/implementation-next/PROMPTS.vi.md). Includes M0–M12 runbooks, concrete contracts, acceptance oracles and restart handoffs. / Bộ hướng dẫn chi tiết để DeepSeek code từng phần, bắt đầu M0-01; chưa triển khai runtime mới.
+## English
 
-**New development plan / Kế hoạch phát triển mới — 15/09/2026:** Start with the [new master plan (Tiếng Việt)](docs/HARNESS_MASTER_PLAN.vi.md), [English overview](docs/HARNESS_MASTER_PLAN.en.md), [implementation roadmap](docs/HARNESS_ROADMAP.vi.md), and [DeerFlow research](docs/research/DEERFLOW_RESEARCH_2026-09-15.md). Develop every M/H feature in the existing root workspace and the single `ha` CLI. Reuse and adapt the current implementation and its P/H evidence; see the [integration map](docs/implementation-next/INTEGRATION_MAP.vi.md). / Mọi chức năng M/H phải nối vào source hiện tại và cùng CLI `ha`; đối chiếu code/test/evidence đã có, chỉ bổ sung hoặc refactor phần thiếu. Bộ tài liệu mới không tạo codebase/CLI thứ hai.
+### The idea
 
-Personal coding-agent harness planned in Rust: CLI first, multiple delegated agents, Web UI later.
+Coding work rarely fits into one prompt. A useful agent needs to remember the task, show what it actually did, and recover when a session stops midway. Harness Agents treats those needs as part of the product: work is recorded as it happens, decisions stay visible, and a new session can continue from durable state.
 
-Harness coding agent cá nhân dự kiến viết bằng Rust: CLI trước, giao việc cho nhiều agent, bổ sung Web UI sau.
+### What you can do
 
-**Status / Trạng thái:** P0–P3 are accepted; P4 adds scoped reusable memory, SQLite FTS5 and explicit bounded extraction catch-up. Final P4 verification and delivery state are recorded in the [English evidence](docs/evidence/P4.en.md) / [evidence tiếng Việt](docs/evidence/P4.vi.md). P5 multi-agent orchestration and later phases have not started. / P0–P3 đã được chấp nhận; P4 bổ sung memory có scope, SQLite FTS5 và extraction catch-up hữu hạn. Trạng thái kiểm chứng và bàn giao P4 nằm trong evidence; chưa bắt đầu P5 hoặc phase sau.
+- **Work in the terminal.** Start `ha` for an interactive coding session, or run a bounded turn in headless mode for scripts and automation.
+- **Keep your place.** Resume sessions with persisted history, checkpoints, and structured working context.
+- **Use tools deliberately.** Coding actions go through host-controlled permissions, approvals, and execution records.
+- **Reuse useful context.** Search scoped memory and keep reusable knowledge separate from the record of what happened.
+- **Delegate work.** Split tasks across agents and bring their results back through a checked integration path.
+- **Grow the workflow.** Add local skills and MCP integrations; use the local Web surface and operational commands where they fit.
 
-## Documentation / Tài liệu
+The project favors durable state, explicit limits, and evidence from actual execution. Its Rust CLI is the primary experience; the Web surface and broader agent experience are still evolving.
 
-| Read in order / Thứ tự đọc | Tiếng Việt | English |
-|---|---|---|
-| 1. Architecture review and decisions / Rà soát và quyết định | [Rà soát](docs/ARCHITECTURE_REVIEW.vi.md) | [Review](docs/ARCHITECTURE_REVIEW.en.md) |
-| 2. Architecture and delivery plan / Kiến trúc và lộ trình | [Kế hoạch](docs/RUST_HARNESS_PLAN.vi.md) | [Plan](docs/RUST_HARNESS_PLAN.en.md) |
-| 3. Plugin contracts / Hợp đồng plugin | [Plugin](docs/PLUGIN_ARCHITECTURE.vi.md) | [Plugins](docs/PLUGIN_ARCHITECTURE.en.md) |
-| 4. Memory and work continuity / Memory và tiếp tục công việc | [Memory](docs/MEMORY_AND_CONTINUITY.vi.md) | [Memory](docs/MEMORY_AND_CONTINUITY.en.md) |
-| 5. Phase-by-phase implementation / Triển khai từng phase | [Sổ tay giao việc](docs/implementation/README.vi.md) | [Implementation handbook](docs/implementation/README.en.md) |
-| 6. Acceptance ownership / Phân công nghiệm thu | [Bảng nghiệm thu](docs/implementation/ACCEPTANCE_MAP.vi.md) | [Acceptance map](docs/implementation/ACCEPTANCE_MAP.en.md) |
-| 7. P0 implementation record / Hồ sơ triển khai P0 | [Evidence](docs/evidence/P0.vi.md), [bàn giao](docs/handoffs/P0.vi.md) | [Evidence](docs/evidence/P0.en.md), [handoff](docs/handoffs/P0.en.md) |
+### Try it locally
 
-The central design separates an execution journal, structured WorkingState and reusable memory. Resuming work must not depend on a final LLM summary or a live extraction worker.
-
-Thiết kế tách journal thực thi, WorkingState có cấu trúc và memory tái sử dụng. Phục hồi công việc không được phụ thuộc bản tóm tắt LLM cuối phiên hoặc extractor còn chạy.
-
-## Start implementation / Bắt đầu triển khai
-
-Use the [P4 SPEC](docs/specs/P4.en.md) and [restart handoff](docs/handoffs/P4.en.md) for the current phase. The nine-phase plan preserves CLI-first delivery; Web is optional P8.
-
-Đọc [SPEC P4](docs/specs/P4.vi.md) và [bàn giao khởi động lại](docs/handoffs/P4.vi.md) cho phase hiện tại. Kế hoạch chín phase giữ CLI trước; Web là P8 tùy chọn.
+Install the Rust toolchain specified by [`rust-toolchain.toml`](rust-toolchain.toml), then run these commands in PowerShell on Windows:
 
 ```powershell
-pwsh -NoProfile -File scripts/Install-Ha.ps1        # put `ha` on your PATH
-ha --version
-ha memory --data-dir <data-dir> --session-id <session-id> catch-up --budget 4 --extractor mock
-ha memory --data-dir <data-dir> --session-id <session-id> jobs --json
-pwsh -NoProfile -File scripts/Verify-P4Gauntlet.ps1
+cargo build -p harness-cli --bin ha --locked
+.\target\debug\ha.exe --version
+.\target\debug\ha.exe chat --headless --mock --prompt "Hello" --json
+.\target\debug\ha.exe chat --fixture
 ```
 
-`scripts/Install-Ha.ps1` builds the release binary and installs it into `$HOME/.cargo/bin`; add `-Profile Debug` for a fast local build or `-UseCargoInstall` to install through Cargo. See [the operator guide](docs/OPERATOR_GUIDE.en.md) / [hướng dẫn vận hành](docs/OPERATOR_GUIDE.vi.md) for both routes, the PATH notes and how to uninstall. Without installing, use `cargo build -p harness-cli --bin ha --locked` and `target/debug/ha`.
+The last two commands use deterministic local fixtures, so you can explore the interface without configuring a model provider. For installation, provider setup, and everyday commands, see the [operator guide](docs/OPERATOR_GUIDE.en.md).
 
-`scripts/Install-Ha.ps1` build binary release rồi cài vào `$HOME/.cargo/bin`; thêm `-Profile Debug` để build nhanh khi phát triển, hoặc `-UseCargoInstall` để cài qua Cargo. Xem [hướng dẫn vận hành](docs/OPERATOR_GUIDE.vi.md) để biết cả hai đường, lưu ý về PATH và cách gỡ cài đặt. Nếu không cài, dùng `cargo build -p harness-cli --bin ha --locked` rồi chạy `target/debug/ha`.
+### Where the project stands
 
-The extractor defaults to disabled. The explicit mock is a deterministic local fixture; inferred memories stay candidates until manual confirmation. See `ha memory --help` for search/read/inspect, versioned publication, summaries and invalidation. Host CLI identity options are trusted local user input and must never be populated directly from model arguments.
+Harness Agents is under active development. The core CLI and its supporting workflows are available in the repository. The Web experience and Linux verification are still in progress. Full strict isolation is unavailable on the measured Windows backend, so `ha` refuses requests that require it. The [current handoff](docs/handoffs/CURRENT.vi.md) records the latest status and known gaps.
 
-Extractor mặc định tắt. Mock là fixture local xác định; memory suy luận giữ candidate đến khi được xác nhận thủ công. `ha memory --help` liệt kê search/read/inspect, publication có version, summary và invalidation. Các option identity CLI thuộc host/user local, không lấy trực tiếp từ model arguments.
+The next product track focuses on a more complete coding-agent experience, including richer tools, configuration, interaction, and automation. See the [product plan](docs/HA_AGENT_PLAN.vi.md) for that direction.
 
-## Documentation checks / Kiểm tra tài liệu
+## Tiếng Việt
 
-Requires PowerShell 7; no additional packages. / Cần PowerShell 7, không cần package bổ sung.
+### Ý tưởng
+
+Công việc lập trình hiếm khi gói gọn trong một prompt. Một agent hữu ích cần nhớ tác vụ, cho thấy nó đã thực sự làm gì và phục hồi khi phiên làm việc dừng giữa chừng. Harness Agents coi đó là chức năng cốt lõi: công việc được ghi lại trong lúc thực hiện, các quyết định có thể kiểm tra và phiên mới có thể tiếp tục từ trạng thái đã lưu.
+
+### Bạn có thể làm gì
+
+- **Làm việc trong terminal.** Mở `ha` để dùng giao diện tương tác, hoặc chạy một lượt có giới hạn ở chế độ headless cho script và tự động hóa.
+- **Tiếp tục đúng chỗ.** Khôi phục phiên từ lịch sử, checkpoint và ngữ cảnh làm việc có cấu trúc.
+- **Dùng công cụ có chủ đích.** Các thao tác lập trình đi qua quyền hạn, bước phê duyệt và bản ghi thực thi do host kiểm soát.
+- **Tái sử dụng ngữ cảnh hữu ích.** Tìm kiếm memory theo phạm vi, tách tri thức dùng lại khỏi bản ghi những gì đã xảy ra.
+- **Giao việc cho agent khác.** Chia tác vụ và đưa kết quả trở lại qua bước kiểm tra tích hợp.
+- **Mở rộng quy trình.** Thêm skill cục bộ và tích hợp MCP; sử dụng giao diện Web cục bộ cùng các lệnh vận hành khi cần.
+
+Dự án ưu tiên trạng thái bền vững, giới hạn tường minh và bằng chứng từ việc thực thi thật. CLI viết bằng Rust là trải nghiệm chính; giao diện Web và trải nghiệm agent đầy đủ hơn đang tiếp tục phát triển.
+
+### Chạy thử trên máy
+
+Cài Rust toolchain được chỉ định trong [`rust-toolchain.toml`](rust-toolchain.toml), rồi chạy các lệnh sau bằng PowerShell trên Windows:
 
 ```powershell
-pwsh -NoProfile -File scripts/Verify-Docs.ps1 -SelfTest
+cargo build -p harness-cli --bin ha --locked
+.\target\debug\ha.exe --version
+.\target\debug\ha.exe chat --headless --mock --prompt "Hello" --json
+.\target\debug\ha.exe chat --fixture
 ```
 
-Checks local links, paired sections, acceptance IDs/ownership, phase dependencies and steps, milestone estimates, fixed source revisions and fenced blocks. Includes in-memory negative controls. It does **not** execute the 30 continuity, 14 plugin or six optional Web cases; those are future runtime acceptance specifications. The GitHub workflows currently run documentation, Rust phase and M0-M12 milestone gates on Windows. Linux jobs are deferred until Linux support is in scope; the M12 A36 test rejects platforms whose support matrix has not been measured.
+Hai lệnh cuối dùng fixture cục bộ có kết quả xác định, nên bạn có thể thử giao diện mà chưa cần cấu hình model provider. Xem [hướng dẫn vận hành](docs/OPERATOR_GUIDE.vi.md) để cài đặt, cấu hình provider và sử dụng hằng ngày.
 
-Kiểm tra links local, sections hai ngôn ngữ, acceptance IDs/ownership, dependencies và steps của phase, dự toán mốc, revision nguồn cố định, code fences; có negative controls trong RAM. **Không** chạy 30 ca continuity, 14 ca plugin hay sáu ca Web tùy chọn: đó là đặc tả nghiệm thu runtime tương lai. GitHub workflows hiện chạy kiểm tra tài liệu, Rust phase và milestone M0-M12 trên Windows. Job Linux được hoãn tới khi cần hỗ trợ Linux; test A36 của M12 từ chối nền tảng chưa được đo support matrix.
+### Dự án đang ở đâu
 
-## Research references / Nguồn khảo sát
+Harness Agents đang được phát triển tích cực. CLI cốt lõi và các quy trình hỗ trợ đã có trong repo. Trải nghiệm Web và việc xác minh trên Linux vẫn đang hoàn thiện. Backend Windows đã đo chưa hỗ trợ cách ly strict đầy đủ, nên `ha` sẽ từ chối yêu cầu cần chế độ này. [Handoff hiện tại](docs/handoffs/CURRENT.vi.md) ghi trạng thái và các điểm còn mở mới nhất.
 
-Source inspection at fixed commits, not vendored runtime code / Đọc source tại commit cố định, không đưa runtime của dự án khác vào repo:
+Track sản phẩm tiếp theo hướng tới trải nghiệm coding agent hoàn chỉnh hơn, gồm công cụ, cấu hình, tương tác và tự động hóa phong phú hơn. Xem [kế hoạch sản phẩm](docs/HA_AGENT_PLAN.vi.md) để biết định hướng này.
 
-- [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness/tree/2377c272a8e839e0a84c9f0e623b867a1dce2014) and [architecture overview](https://deepseek.com/harness/en/).
-- [TencentDB Agent Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory/tree/906b5823b5106eed8f842b62f16d23228838149a).
+---
 
-Research date / Ngày khảo sát: 2026-09-10. Upstream snapshots inform the design; compatibility with their plugins or guarantees is not implied.
+**Built for work that continues. / Xây dựng cho công việc cần được tiếp nối.**
+
+Design references / Nguồn tham khảo thiết kế: [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness/tree/2377c272a8e839e0a84c9f0e623b867a1dce2014) · [TencentDB Agent Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory/tree/906b5823b5106eed8f842b62f16d23228838149a).
