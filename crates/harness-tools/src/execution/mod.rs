@@ -17,6 +17,7 @@
 
 mod capability;
 mod export;
+mod lease;
 mod plan;
 mod probe;
 mod probe_control;
@@ -29,6 +30,10 @@ pub use capability::{
 pub use export::{
     ARTIFACT_EXPORT_SCHEMA_VERSION, ArtifactExport, ExportProvenance, MAX_EXPORT_BYTES,
     export_artifact, export_destination,
+};
+pub use lease::{
+    LEASE_GRACE_MS, LEASE_LOCK_SUFFIX, LEASE_SCHEMA_VERSION, LeaseOutcome, LeaseOwner,
+    LeaseRequest, ReconcileReport, reconcile_backend_leases,
 };
 pub use plan::{
     EXECUTION_PLAN_SCHEMA_VERSION, EnvironmentPlan, ExecutionPlan, ScopeAccess, ScopeGrant,

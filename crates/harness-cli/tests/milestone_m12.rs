@@ -18,9 +18,10 @@ use harness_tools::{
     ARTIFACT_EXPORT_SCHEMA_VERSION, CAPABILITY_MATRIX_SCHEMA_VERSION, Capability,
     CapabilityEvidence, CapabilityFinding, CapabilityMatrix, CapabilityProbe, CapabilityVerdict,
     CodingToolAction, EXECUTION_PLAN_SCHEMA_VERSION, ExecutionPlan, ExportProvenance, HostIdentity,
-    IsolationMode, PROCESS_ENVIRONMENT_ALLOWLIST, PROCESS_OUTPUT_PAGE_MAX_BYTES, ProbeChild,
-    StrictProfile, ToolExecutionService, ToolOutput, ToolRequest, export_artifact,
-    export_destination, observe_workspace,
+    IsolationMode, LEASE_GRACE_MS, LeaseOutcome, LeaseOwner, LeaseRequest,
+    PROCESS_ENVIRONMENT_ALLOWLIST, PROCESS_OUTPUT_PAGE_MAX_BYTES, ProbeChild, StrictProfile,
+    ToolExecutionService, ToolOutput, ToolRequest, export_artifact, export_destination,
+    observe_workspace, reconcile_backend_leases,
 };
 use harness_types::{
     ContentHash, ErrorCode, HostId, InputId, SessionId, SourceAuthority, TaskId, ToolIntentState,
@@ -630,6 +631,340 @@ async fn m12_02_artifact_export_is_bounded_and_digest_bound() {
         "the refusal has to say the digest disagreed: {}",
         refusal.message()
     );
+
+    drop(tools);
+    close(store).await;
+}
+
+// ---------------------------------------------------------------------------
+// M12-03 — leases: written before exposure, released once, and never taken
+// from a live owner
+// ---------------------------------------------------------------------------
+
+/// The lifecycle: a row exists before the process, moves once, and settles once.
+#[tokio::test]
+async fn m12_03_a_lease_is_written_before_the_process_and_settled_once() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let matrix = CapabilityMatrix::new(
+        HostIdentity::observed("test"),
+        Capability::ALL
+            .into_iter()
+            .map(|capability| {
+                CapabilityFinding::enforced(
+                    capability,
+                    CapabilityEvidence::new("P-TEST", "a verdict for this test", "enforced"),
+                )
+            })
+            .collect(),
+    );
+    let plan = ExecutionPlan::for_process_action(
+        &CodingToolAction::RunShell {
+            command: "echo hi".to_owned(),
+            timeout_ms: 1_000,
+            isolation: IsolationMode::BestEffort,
+            env: Vec::new(),
+        },
+        &bench.workspace,
+        &matrix,
+        StrictProfile::Containment,
+        1_000,
+        65_536,
+    );
+    let lock_root = bench.data_dir.join("leases");
+    let request = LeaseRequest::from_plan(
+        &plan,
+        "session.m12",
+        "task.m12",
+        "execution.m12-03",
+        &lock_root,
+    );
+    let owner = LeaseOwner::open(&store, &request)
+        .await
+        .expect("lease opens");
+    let lease_id = owner.lease_id().to_owned();
+    let stored = store
+        .backend_lease(&lease_id)
+        .await
+        .expect("read")
+        .expect("the row exists before any process does");
+    assert_eq!(stored.state, "acquiring");
+    assert!(stored.pid.is_none(), "no process exists yet");
+    assert!(stored.released_at_unix_ms.is_none());
+    assert_eq!(stored.backend, plan.backend);
+    assert_eq!(stored.profile, "containment");
+    assert!(
+        owner.lock_path().is_file(),
+        "the lock file is the ownership proof"
+    );
+
+    // One execution cannot hold two live leases: that pair is the resource.
+    let second = LeaseOwner::open(&store, &request).await;
+    assert!(
+        second.is_err(),
+        "a second lease for the same execution must be refused"
+    );
+
+    owner.acquired(&store).await.expect("acquired");
+    assert_eq!(
+        store
+            .backend_lease(&lease_id)
+            .await
+            .expect("read")
+            .expect("row")
+            .state,
+        "acquired"
+    );
+
+    assert!(
+        owner
+            .release(&store, Some(("artifact_fixture", "sha256:fixture")))
+            .await
+            .expect("released"),
+        "the first release settles the lease"
+    );
+    let released = store
+        .backend_lease(&lease_id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(released.state, "released");
+    assert!(released.released_at_unix_ms.is_some());
+    assert_eq!(released.artifact_id.as_deref(), Some("artifact_fixture"));
+
+    // Repeating the settling statement is a no-op that says so.
+    assert!(
+        !store
+            .release_backend_lease(&lease_id, "released", 1, None, None, None)
+            .await
+            .expect("second release is not an error"),
+        "a settled lease is never settled twice"
+    );
+
+    close(store).await;
+}
+
+/// A live owner is never destroyed; an orphan is only settled once its lock is
+/// free.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one recovery story: live owner, orphan, second pass, crash during acquire
+async fn m12_03_recovery_protects_a_live_owner_and_settles_an_orphan() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let lock_root = bench.data_dir.join("leases");
+    let plan = ExecutionPlan::for_process_action(
+        &CodingToolAction::RunShell {
+            command: "echo hi".to_owned(),
+            timeout_ms: 1_000,
+            isolation: IsolationMode::BestEffort,
+            env: Vec::new(),
+        },
+        &bench.workspace,
+        &CapabilityMatrix::new(
+            HostIdentity::observed("test"),
+            Capability::ALL
+                .into_iter()
+                .map(|capability| {
+                    CapabilityFinding::enforced(
+                        capability,
+                        CapabilityEvidence::new("P-TEST", "a verdict for this test", "enforced"),
+                    )
+                })
+                .collect(),
+        ),
+        StrictProfile::Containment,
+        1_000,
+        65_536,
+    );
+
+    // A live owner: this test process holds the lock.
+    let live = LeaseOwner::open(
+        &store,
+        &LeaseRequest::from_plan(&plan, "s", "t", "execution.live", &lock_root),
+    )
+    .await
+    .expect("live lease");
+    live.acquired(&store).await.expect("acquired");
+    let live_id = live.lease_id().to_owned();
+
+    // An orphan: the owner was killed, so its lock went with the process while
+    // the row stayed behind. Dropping the owner without releasing is exactly
+    // that, and it is what a crash looks like from the store's side.
+    let orphan = LeaseOwner::open(
+        &store,
+        &LeaseRequest::from_plan(&plan, "s", "t", "execution.orphan", &lock_root),
+    )
+    .await
+    .expect("orphan lease");
+    orphan.acquired(&store).await.expect("acquired");
+    let orphan_id = orphan.lease_id().to_owned();
+    drop(orphan);
+
+    // Everything is old enough to be a candidate: the grace window only narrows
+    // the field, and the lock is what decides.
+    // The grace window is a filter, not a decision: a lease written a moment ago
+    // is not even a candidate.
+    let fresh = reconcile_backend_leases(&store, 1, 1_800_000_000_000)
+        .await
+        .expect("reconcile runs");
+    assert!(
+        fresh.outcome_for(&live_id).is_none() && fresh.outcome_for(&orphan_id).is_none(),
+        "a lease inside the {LEASE_GRACE_MS} ms grace window is not a candidate: {fresh:?}"
+    );
+
+    let report = reconcile_backend_leases(&store, u64::MAX, 1_800_000_000_000)
+        .await
+        .expect("reconcile runs");
+    assert_eq!(
+        report.outcome_for(&live_id),
+        Some(LeaseOutcome::StillOwned),
+        "a live owner must be left alone: {report:?}"
+    );
+    assert_eq!(
+        report.outcome_for(&orphan_id),
+        Some(LeaseOutcome::Recovered)
+    );
+
+    let live_row = store
+        .backend_lease(&live_id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(live_row.state, "acquired");
+    assert!(
+        live_row.released_at_unix_ms.is_none(),
+        "reconciliation touched a live owner's lease"
+    );
+
+    let orphan_row = store
+        .backend_lease(&orphan_id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(orphan_row.state, "recovered");
+    assert!(orphan_row.released_at_unix_ms.is_some());
+    let recovery = orphan_row.recovery_json.expect("a recovery note");
+    assert!(
+        recovery.contains("terminated when its job handle closed"),
+        "the note has to say what was assumed: {recovery}"
+    );
+
+    // A second pass has nothing left to do: the settled row is not a candidate.
+    let again = reconcile_backend_leases(&store, u64::MAX, 1_800_000_000_001)
+        .await
+        .expect("reconcile runs");
+    assert!(again.outcome_for(&orphan_id).is_none());
+    assert_eq!(again.outcome_for(&live_id), Some(LeaseOutcome::StillOwned));
+
+    // A crash during acquire is settled as nothing-to-clean, not as a cleanup of
+    // a resource that never existed.
+    let acquiring = LeaseOwner::open(
+        &store,
+        &LeaseRequest::from_plan(&plan, "s", "t", "execution.acquiring", &lock_root),
+    )
+    .await
+    .expect("acquiring lease");
+    let acquiring_id = acquiring.lease_id().to_owned();
+    drop(acquiring);
+    let report = reconcile_backend_leases(&store, u64::MAX, 1_800_000_000_002)
+        .await
+        .expect("reconcile runs");
+    assert_eq!(
+        report.outcome_for(&acquiring_id),
+        Some(LeaseOutcome::Recovered)
+    );
+    let note = store
+        .backend_lease(&acquiring_id)
+        .await
+        .expect("read")
+        .expect("row")
+        .recovery_json
+        .expect("a recovery note");
+    assert!(
+        note.contains("nothing_to_clean"),
+        "a lease that never exposed a resource says so: {note}"
+    );
+
+    live.release(&store, None).await.expect("live release");
+    close(store).await;
+}
+
+/// A real execution writes its lease, records the artifact, and settles.
+#[tokio::test]
+async fn m12_03_a_real_execution_records_its_lease_and_artifact() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let (session, task) = admit(&store, &bench).await;
+    // The provenance a lease records is what the host was *measured* to
+    // enforce, so this execution runs against a measured matrix.
+    let probe_root = tempfile::tempdir().expect("probe root");
+    let child = probe_child();
+    let matrix = Arc::new(
+        CapabilityProbe::new(probe_root.path(), child.clone())
+            .run()
+            .await
+            .expect("the probes run"),
+    );
+    let tools =
+        ToolExecutionService::new(Arc::clone(&store)).with_capability_matrix(Arc::clone(&matrix));
+    let execution_id = {
+        let prepared = tools
+            .prepare(ToolRequest::new(
+                session.clone(),
+                task.clone(),
+                "actor.m12",
+                &bench.workspace,
+                CodingToolAction::RunProcess {
+                    executable: child.executable().to_string_lossy().into_owned(),
+                    args: vec![
+                        "write".to_owned(),
+                        "lease-marker.txt".to_owned(),
+                        "ok".to_owned(),
+                    ],
+                    timeout_ms: 20_000,
+                    isolation: IsolationMode::BestEffort,
+                    env: Vec::new(),
+                },
+            ))
+            .await
+            .expect("prepares");
+        let grant = tools.approve(&prepared).await.expect("approval");
+        let view = tools.execute(prepared, Some(grant)).await.expect("runs");
+        assert!(
+            matches!(view.output, ToolOutput::Process { .. }),
+            "the fixture writes a file inside the workspace: {:?}",
+            view.output
+        );
+        view.receipt
+            .as_ref()
+            .expect("a receipt")
+            .tool_execution_id
+            .as_str()
+            .to_owned()
+    };
+
+    let host_id = store.fence().expect("fence").host_id.as_str().to_owned();
+    let lease = store
+        .backend_lease_for_execution(&host_id, &execution_id)
+        .await
+        .expect("read")
+        .expect("every process execution writes a lease");
+    assert_eq!(lease.state, "released");
+    assert!(lease.released_at_unix_ms.is_some());
+    assert_eq!(lease.profile, "containment");
+    assert!(
+        lease.artifact_digest.is_some(),
+        "the lease records the digest an export must check"
+    );
+    let enforced: Vec<String> = serde_json::from_str(&lease.enforced_json).expect("enforced list");
+    let not_claimed: Vec<String> =
+        serde_json::from_str(&lease.not_claimed_json).expect("not-claimed list");
+    assert!(enforced.contains(&"process_containment".to_owned()));
+    assert!(
+        not_claimed.contains(&"network_egress_denial".to_owned()),
+        "the record says what was not promised: {not_claimed:?}"
+    );
+    assert!(std::path::Path::new(&lease.lock_path).is_file());
 
     drop(tools);
     close(store).await;

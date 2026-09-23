@@ -559,7 +559,7 @@ impl ToolExecutionService {
                 );
                 match environment {
                     Ok(environment) => {
-                        self.dispatch(&prepared, other, cancellation, &environment)
+                        self.dispatch(&prepared, other, cancellation, &environment, &execution_id)
                             .await
                     }
                     Err(error) => Err(error),
@@ -901,6 +901,7 @@ impl ToolExecutionService {
         action: &CodingToolAction,
         cancellation: CancellationToken,
         environment: &ProcessEnvironment,
+        execution_id: &ToolExecutionId,
     ) -> Result<Dispatched, HarnessError> {
         let root = prepared.workspace_root.as_path();
         match action {
@@ -974,8 +975,12 @@ impl ToolExecutionService {
                 executable,
                 args,
                 timeout_ms,
+                isolation,
                 ..
             } => {
+                let lease = self
+                    .begin_backend_lease(prepared, action, *timeout_ms, *isolation, execution_id)
+                    .await?;
                 let output = process::run_structured(
                     root,
                     executable,
@@ -985,14 +990,18 @@ impl ToolExecutionService {
                     environment,
                     &self.spool,
                 )
-                .await?;
-                self.dispatched_process(output)
+                .await;
+                self.finish_backend_lease(lease, output).await
             }
             CodingToolAction::RunShell {
                 command,
                 timeout_ms,
+                isolation,
                 ..
             } => {
+                let lease = self
+                    .begin_backend_lease(prepared, action, *timeout_ms, *isolation, execution_id)
+                    .await?;
                 let output = process::run_shell(
                     root,
                     command,
@@ -1001,8 +1010,8 @@ impl ToolExecutionService {
                     environment,
                     &self.spool,
                 )
-                .await?;
-                self.dispatched_process(output)
+                .await;
+                self.finish_backend_lease(lease, output).await
             }
             CodingToolAction::GitStatus => {
                 let output = process::run_structured(
@@ -1145,6 +1154,98 @@ impl ToolExecutionService {
             total_bytes: page.total_bytes,
             text: String::from_utf8_lossy(&page.bytes).into_owned(),
         })
+    }
+
+    /// Persist a lease for a process execution before the process exists (M12-03).
+    ///
+    /// A lease that cannot be written stops the call: an execution whose
+    /// lifecycle is not recorded is exactly the resource a later host cannot
+    /// reconcile.
+    async fn begin_backend_lease(
+        &self,
+        prepared: &PreparedToolRequest,
+        action: &CodingToolAction,
+        timeout_ms: u64,
+        isolation: IsolationMode,
+        execution_id: &ToolExecutionId,
+    ) -> Result<crate::LeaseOwner, HarnessError> {
+        let plan = crate::ExecutionPlan::for_process_action(
+            action,
+            &prepared.workspace_root,
+            &self.measured_capabilities(),
+            Self::strict_profile(isolation),
+            timeout_ms,
+            self.spool.limits().max_capture_bytes,
+        );
+        let request = crate::LeaseRequest::from_plan(
+            &plan,
+            prepared.request.session_id.as_str(),
+            prepared.request.task_id.as_str(),
+            execution_id.as_str(),
+            // Lease locks live with the store, not with the capture staging
+            // directory: they are durable lifecycle state, and the spool is
+            // emptied as soon as a capture is published.
+            self.store.paths().data_dir.join("leases"),
+        );
+        crate::LeaseOwner::open(&self.store, &request).await
+    }
+
+    /// Close the lease after the capture is published, and keep the artifact
+    /// digest in the record: export is what happens next, and it must be able to
+    /// check the digest the execution recorded.
+    async fn finish_backend_lease(
+        &self,
+        lease: crate::LeaseOwner,
+        output: Result<ProcessResult, HarnessError>,
+    ) -> Result<Dispatched, HarnessError> {
+        let output = output?;
+        let dispatched = self.dispatched_process(output)?;
+        let artifact = dispatched.artifact.as_ref().map(|artifact| {
+            (
+                artifact.artifact_id.as_str(),
+                artifact.content_hash.as_str(),
+            )
+        });
+        lease.release(&self.store, artifact).await?;
+        Ok(dispatched)
+    }
+
+    /// The matrix this host was measured against, or the unmeasured one.
+    ///
+    /// A host nobody probed enforces nothing *as far as this process knows*, so
+    /// the substitute matrix is complete and every verdict in it is
+    /// `unsupported` with that reason attached. It is never a silent default: a
+    /// plan built from it claims nothing, and a strict request against it is
+    /// refused for want of a measurement.
+    fn measured_capabilities(&self) -> crate::CapabilityMatrix {
+        match &self.capabilities {
+            Some(matrix) => (**matrix).clone(),
+            None => crate::CapabilityMatrix::new(
+                crate::HostIdentity::observed("unmeasured"),
+                crate::Capability::ALL
+                    .into_iter()
+                    .map(|capability| {
+                        crate::CapabilityFinding::unsupported(
+                            capability,
+                            crate::CapabilityEvidence::new(
+                                "P-UNMEASURED",
+                                "no probe has been run in this process",
+                                "unsupported: this host has not been measured; run `ha sandbox probe`",
+                            ),
+                        )
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The profile a call runs under. `strict` is Full, and Full is refused
+    /// before this point on a host that cannot enforce it.
+    fn strict_profile(isolation: IsolationMode) -> crate::StrictProfile {
+        match isolation {
+            IsolationMode::Strict => crate::StrictProfile::Full,
+            IsolationMode::BestEffort => crate::StrictProfile::Containment,
+        }
     }
 
     /// Publish a finished process capture as the durable artifact the receipt

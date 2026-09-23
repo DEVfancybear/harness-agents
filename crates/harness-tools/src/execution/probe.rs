@@ -54,6 +54,13 @@ const CONTROL_LIFETIME_MS: u64 = 4_000;
 /// How long the containment probe lets the tree run before the cancel.
 const CONTAIN_TIME: Duration = Duration::from_millis(1500);
 
+/// Sampling windows used to decide whether a tree stopped writing.
+///
+/// Four windows of 400 ms tolerate a late write from a terminating process while
+/// still calling a file that keeps growing for 1.6 s "still being written".
+const QUIESCENCE_WINDOWS: u32 = 4;
+const QUIESCENCE_WINDOW: Duration = Duration::from_millis(400);
+
 /// Bound on how long an escape may be waited for before it is called absent.
 const ESCAPE_WINDOW: Duration = Duration::from_secs(4);
 
@@ -218,6 +225,10 @@ impl CapabilityProbe {
 
     /// Measure every capability on this host.
     pub async fn run(&self) -> Result<CapabilityMatrix, HarnessError> {
+        // One probe suite at a time inside this process: the sampling windows are
+        // wall-clock, and a diagnostic may not report a boundary that only holds
+        // on an idle machine.
+        let _serial = probe_serial_lock().lock().await;
         self.prepare_roots()?;
         let version = probe_control::observe_platform_version(&self.run_root()).await?;
         let findings = vec![
@@ -258,11 +269,11 @@ impl CapabilityProbe {
         result
     }
 
-    /// A canceled run of four writers, and the tick file they share.
+    /// A canceled run of four writers, and what the tick file did afterwards.
     async fn canceled_tree(
         &self,
         ticks: PathBuf,
-    ) -> Result<(ProcessResult, u64, u64, u128), HarnessError> {
+    ) -> Result<(ProcessResult, Quiescence, u128), HarnessError> {
         let file = ticks.to_string_lossy().into_owned();
         let lifetime = TICK_LIFETIME_MS.to_string();
         let descendants = DESCENDANTS.to_string();
@@ -274,8 +285,8 @@ impl CapabilityProbe {
             )
             .await?;
         let elapsed = started.elapsed().as_millis();
-        let (before, after) = tick_pair(&ticks).await;
-        Ok((result, before, after, elapsed))
+        let watched = watch_until_quiet(&ticks).await;
+        Ok((result, watched, elapsed))
     }
 
     /// A run whose direct child exits at once while its descendants keep
@@ -284,7 +295,7 @@ impl CapabilityProbe {
     async fn detached_tree(
         &self,
         ticks: PathBuf,
-    ) -> Result<(ProcessResult, u64, u64, u128), HarnessError> {
+    ) -> Result<(ProcessResult, Quiescence, u128), HarnessError> {
         let file = ticks.to_string_lossy().into_owned();
         let lifetime = TICK_LIFETIME_MS.to_string();
         let descendants = DESCENDANTS.to_string();
@@ -293,8 +304,8 @@ impl CapabilityProbe {
             .run_fixture(&["spawn-detach", &file, &descendants, &lifetime], None)
             .await?;
         let elapsed = started.elapsed().as_millis();
-        let (before, after) = tick_pair(&ticks).await;
-        Ok((result, before, after, elapsed))
+        let watched = watch_until_quiet(&ticks).await;
+        Ok((result, watched, elapsed))
     }
 
     async fn probe_containment(&self) -> Result<CapabilityFinding, HarnessError> {
@@ -304,21 +315,22 @@ impl CapabilityProbe {
         let detached = self
             .detached_tree(self.run_root().join("detach-ticks.txt"))
             .await?;
-        let cancel_stopped = canceled.1 == canceled.2 && canceled.1 > 0;
-        let detach_stopped = detached.1 == detached.2 && detached.1 > 0;
-        let method = "run a real child with detached descendants that write a tick file every 100 ms, end the run two ways (cancel, and a direct child that exits at once), then sample the tick file twice 800 ms apart after each run returned";
+        let cancel_stopped = canceled.1.tree_is_gone();
+        let detach_stopped = detached.1.tree_is_gone();
+        let method = "run a real child with detached descendants that write a tick file every 100 ms, end the run two ways (cancel, and a direct child that exits at once), then watch the tick file until two consecutive windows agree";
         let observation = format!(
-            "cancel path: run {} ms, canceled={}, cleanup={}, ticks {} -> {}; natural-exit path: run {} ms, cleanup={}, ticks {} -> {} (tick lifetime {} ms, so no descendant can have exited on its own); the natural-exit run labels its tree {} while descendants were still writing, which is why the post-run sample and not the label is the evidence",
-            canceled.3,
+            "cancel path: run {} ms, canceled={}, cleanup={}, ticks {} -> {} (settled in {} windows); natural-exit path: run {} ms, cleanup={}, ticks {} -> {} (settled in {} windows); tick lifetime {TICK_LIFETIME_MS} ms, so no descendant can have exited on its own; the natural-exit run labels its tree {} while descendants were still writing, which is why the post-run observation and not the label is the evidence",
+            canceled.2,
             canceled.0.canceled,
             canceled.0.tree_cleanup.as_str(),
-            canceled.1,
-            canceled.2,
-            detached.3,
-            detached.0.tree_cleanup.as_str(),
-            detached.1,
+            canceled.1.first,
+            canceled.1.last,
+            canceled.1.windows,
             detached.2,
-            TICK_LIFETIME_MS,
+            detached.0.tree_cleanup.as_str(),
+            detached.1.first,
+            detached.1.last,
+            detached.1.windows,
             detached.0.tree_cleanup.as_str(),
         );
         if cancel_stopped && detach_stopped {
@@ -342,14 +354,13 @@ impl CapabilityProbe {
         let canceled = self
             .canceled_tree(self.run_root().join("tree-ticks.txt"))
             .await?;
-        let (result, before, after, elapsed) = canceled;
+        let (result, watched, elapsed) = canceled;
         let spawn_marker = result.stdout.contains("spawned=");
-        let stopped = before == after && before > 0;
-        let method = "cancel a real tree of four writers and require a reaped tree, a canceled run, and no writer still writing after the run returns";
+        let method = "cancel a real tree of four writers and require a reaped tree, a canceled run, and a tick file that stops growing within the sampling windows";
         if result.canceled
             && result.tree_cleanup.as_str() == "killed_and_reaped"
             && spawn_marker
-            && stopped
+            && watched.tree_is_gone()
         {
             Ok(CapabilityFinding::enforced(
                 Capability::ProcessTreeKill,
@@ -357,7 +368,8 @@ impl CapabilityProbe {
                     "P-TREE",
                     method,
                     format!(
-                        "the cancel landed {elapsed} ms in, {DESCENDANTS} descendants were live, the runner reported killed_and_reaped, and the tick file held at {before} across the sampling window"
+                        "the cancel landed {elapsed} ms in, {DESCENDANTS} descendants were live, the runner reported killed_and_reaped, and the tick file held at {} across {} consecutive windows",
+                        watched.first, watched.windows
                     ),
                 ),
             ))
@@ -368,9 +380,13 @@ impl CapabilityProbe {
                     "P-TREE",
                     method,
                     format!(
-                        "the tree kill was not confirmed: canceled={} cleanup={} ticks {before} -> {after} marker={spawn_marker} run={elapsed} ms",
+                        "the tree kill was not confirmed: canceled={} cleanup={} ticks {} -> {} quiescent={} windows={} marker={spawn_marker} run={elapsed} ms",
                         result.canceled,
-                        result.tree_cleanup.as_str()
+                        result.tree_cleanup.as_str(),
+                        watched.first,
+                        watched.last,
+                        watched.quiescent,
+                        watched.windows
                     ),
                 ),
             ))
@@ -797,6 +813,7 @@ impl CapabilityProbe {
     /// expected to leave it running. A probe that returned "enforced" here
     /// would be measuring nothing at all.
     pub async fn boundary_break_control(&self) -> Result<BoundaryBreakObservation, HarnessError> {
+        let _serial = probe_serial_lock().lock().await;
         self.prepare_roots()?;
         let ticks = self.run_root().join("control-ticks.txt");
         let command = ControlCommand::new(self.child.executable(), self.run_root()).with_args(
@@ -809,17 +826,17 @@ impl CapabilityProbe {
         );
         let observation =
             probe_control::run_then_kill_direct_child(&command, &[], CONTROL_RUN).await?;
-        let baseline = tick_count(&ticks);
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        let after = tick_count(&ticks);
+        let watched = watch_until_quiet(&ticks).await;
+        let baseline = watched.first;
+        let after = watched.last;
+        // The control expects growth, so "quiet" is the failure it must not see.
         let escaped = after > baseline;
         // The escape is the finding; the leak it created is this control's to
         // bound, and it does that by pid, never by image name.
         let leaked = read_pids(&ticks);
         let ended = probe_control::terminate_pids(&self.run_root(), &leaked).await;
-        let remaining = tick_count(&ticks);
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let settled = tick_count(&ticks) == remaining;
+        let after_cleanup = watch_until_quiet(&ticks).await;
+        let settled = after_cleanup.quiescent;
         Ok(BoundaryBreakObservation {
             detail: format!(
                 "direct child killed={} exit={:?} after {} ms; ticks {baseline} -> {after} with no job object; {} of {} leaked descendants terminated, writes stopped afterwards={settled}; stdout={:?}",
@@ -837,6 +854,7 @@ impl CapabilityProbe {
 
     /// Run the environment fixture with no allowlist: the canary must leak.
     pub async fn environment_inheritance_control(&self) -> Result<bool, HarnessError> {
+        let _serial = probe_serial_lock().lock().await;
         self.prepare_roots()?;
         let command = ControlCommand::new(self.child.executable(), self.run_root())
             .with_args(self.child.argv(&["env"]));
@@ -858,6 +876,68 @@ impl CapabilityProbe {
     }
 }
 
+/// Serialises whole probe suites inside one process.
+///
+/// `process::run` already serialises *execution*, but a measurement is
+/// run-plus-sampling, and the sampling window is wall-clock. Under a loaded
+/// machine (five tests in one target each running the suite) a probe's sampling
+/// window can overlap another probe's `alloc`/`flood`, and a late tick would
+/// flip a verdict. A probe is a diagnostic, so it pays for determinism with
+/// time.
+fn probe_serial_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// What a tick file did while it was watched.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Quiescence {
+    first: u64,
+    last: u64,
+    /// True when two consecutive windows saw the same count.
+    quiescent: bool,
+    windows: u32,
+}
+
+impl Quiescence {
+    /// A tree is gone when writers were observed and then stopped.
+    fn tree_is_gone(self) -> bool {
+        self.quiescent && self.first > 0
+    }
+}
+
+/// Watch a tick file until it stops growing, with a bounded retry.
+///
+/// A single before/after pair is not a measurement under load: the last write of
+/// a terminating process can land after the run returned. Retrying until two
+/// consecutive windows agree distinguishes "the tree is gone" from "a writer was
+/// merely delayed", while a file that never settles is still reported as
+/// growing.
+async fn watch_until_quiet(path: &Path) -> Quiescence {
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let first = tick_count(path);
+    let mut previous = first;
+    for window in 1..=QUIESCENCE_WINDOWS {
+        tokio::time::sleep(QUIESCENCE_WINDOW).await;
+        let current = tick_count(path);
+        if current == previous {
+            return Quiescence {
+                first,
+                last: current,
+                quiescent: true,
+                windows: window,
+            };
+        }
+        previous = current;
+    }
+    Quiescence {
+        first,
+        last: previous,
+        quiescent: false,
+        windows: QUIESCENCE_WINDOWS,
+    }
+}
+
 fn tick_count(path: &Path) -> u64 {
     std::fs::read_to_string(path).map_or(0, |text| text.lines().count() as u64)
 }
@@ -873,13 +953,4 @@ fn read_pids(ticks: &Path) -> Vec<u32> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Sample the tick file, wait, and sample it again.
-async fn tick_pair(path: &Path) -> (u64, u64) {
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    let before = tick_count(path);
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    let after = tick_count(path);
-    (before, after)
 }

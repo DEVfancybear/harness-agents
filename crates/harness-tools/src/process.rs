@@ -99,7 +99,8 @@ impl HostEnvironment {
     #[must_use]
     pub fn with_values(mut self, extra: impl IntoIterator<Item = (String, String)>) -> Self {
         for (name, value) in extra {
-            self.values.retain(|(existing, _)| *existing != name);
+            self.values
+                .retain(|(existing, _)| !same_name(existing, &name));
             self.values.push((name, value));
         }
         self
@@ -109,7 +110,7 @@ impl HostEnvironment {
     pub fn lookup(&self, name: &str) -> Option<&str> {
         self.values
             .iter()
-            .find(|(existing, _)| existing == name)
+            .find(|(existing, _)| same_name(existing, name))
             .map(|(_, value)| value.as_str())
     }
 
@@ -121,6 +122,22 @@ impl HostEnvironment {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
+    }
+}
+
+/// Whether two environment names are the same variable.
+///
+/// Windows environment blocks are case-insensitive — the platform itself spells
+/// the search path `Path` — so an allowlist entry of `PATH` has to match it.
+/// Unix names are case-sensitive and are compared as such.
+fn same_name(left: &str, right: &str) -> bool {
+    #[cfg(windows)]
+    {
+        left.eq_ignore_ascii_case(right)
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
     }
 }
 

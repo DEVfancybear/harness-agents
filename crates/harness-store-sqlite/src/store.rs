@@ -32,6 +32,7 @@ use crate::{
 };
 
 pub mod approvals;
+pub mod backend_leases;
 pub mod delegation;
 pub mod external_jobs;
 pub mod history;
@@ -2994,6 +2995,9 @@ async fn ensure_runtime_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     if current < 5 {
         apply_runtime_slice_5(&mut tx).await?;
     }
+    if current < 6 {
+        apply_runtime_slice_6(&mut tx).await?;
+    }
     if current < RUNTIME_SCHEMA_VERSION {
         sqlx::query("INSERT INTO runtime_schema_migrations(version) VALUES (?)")
             .bind(RUNTIME_SCHEMA_VERSION)
@@ -3112,6 +3116,26 @@ async fn apply_runtime_slice_5(
         "CREATE INDEX IF NOT EXISTS notification_outbox_due ON notification_outbox(state, next_attempt_unix_ms)",
     ];
     apply_runtime_statements(tx, &STATEMENTS, "apply runtime schema 5").await
+}
+
+/// M12: the backend leases that give an execution's resource an owner.
+///
+/// The unique index over `(host_id, tool_execution_id)` is the load-bearing
+/// constraint: one execution cannot hold two live leases, so a repeated release
+/// and a repeated reconcile are properties of the schema rather than of the code
+/// that calls them. `released_at_unix_ms` is the second half of that: every
+/// settling statement is guarded on it being null, so a late writer cannot
+/// reopen a closed lifecycle.
+async fn apply_runtime_slice_6(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StoreError> {
+    const STATEMENTS: [&str; 4] = [
+        "CREATE TABLE IF NOT EXISTS backend_leases (lease_id TEXT PRIMARY KEY, owner_generation INTEGER NOT NULL, host_id TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT NOT NULL, tool_execution_id TEXT NOT NULL, backend TEXT NOT NULL, profile TEXT NOT NULL, pid INTEGER, lock_path TEXT NOT NULL, state TEXT NOT NULL, enforced_json TEXT NOT NULL, not_claimed_json TEXT NOT NULL, artifact_id TEXT, artifact_digest TEXT, created_at_unix_ms INTEGER NOT NULL, heartbeat_at_unix_ms INTEGER NOT NULL, released_at_unix_ms INTEGER, recovery_json TEXT)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS backend_leases_by_execution ON backend_leases(host_id, tool_execution_id)",
+        "CREATE INDEX IF NOT EXISTS backend_leases_unsettled ON backend_leases(state, heartbeat_at_unix_ms)",
+        "CREATE INDEX IF NOT EXISTS backend_leases_by_task ON backend_leases(task_id, created_at_unix_ms)",
+    ];
+    apply_runtime_statements(tx, &STATEMENTS, "apply runtime schema 6").await
 }
 
 /// M5 context surface: the rebuildable journal index, the notes table and the

@@ -1700,6 +1700,33 @@ async fn m3_01_runtime_schema_upgrade() {
         })
         .await
         .expect("M11 tables exist after the upgrade");
+    // And the M12 lease table, for the same reason: every slice runs from
+    // whatever revision the database was at, so an old database gains the new
+    // table without losing a row.
+    store
+        .create_backend_lease(&harness_store_sqlite::StoredBackendLease {
+            lease_id: "m3-upgrade-lease".to_owned(),
+            owner_generation: 1,
+            host_id: "host_m3_upgrade".to_owned(),
+            session_id: session.as_str().to_owned(),
+            task_id: task.as_str().to_owned(),
+            tool_execution_id: "execution.m3-upgrade".to_owned(),
+            backend: "fixture".to_owned(),
+            profile: "containment".to_owned(),
+            pid: None,
+            lock_path: "leases/m3-upgrade.owner.lock".to_owned(),
+            state: "acquiring".to_owned(),
+            enforced_json: "[]".to_owned(),
+            not_claimed_json: "[]".to_owned(),
+            artifact_id: None,
+            artifact_digest: None,
+            created_at_unix_ms: 1_700_000_000_000,
+            heartbeat_at_unix_ms: 1_700_000_000_000,
+            released_at_unix_ms: None,
+            recovery_json: None,
+        })
+        .await
+        .expect("M12 tables exist after the upgrade");
     assert_eq!(
         store
             .session_summary(&session)

@@ -31,6 +31,7 @@ pub use models::{
 };
 pub use store::SqliteStore;
 pub use store::approvals::{APPROVAL_STATES, StoredApproval};
+pub use store::backend_leases::{LEASE_STATES, StoredBackendLease};
 pub use store::delegation::TaskAdmission;
 pub use store::external_jobs::{
     EXTERNAL_JOB_STATES, EXTERNAL_JOB_TERMINAL_STATES, ExternalJobSettlement,

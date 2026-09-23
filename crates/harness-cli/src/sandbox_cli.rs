@@ -51,6 +51,34 @@ enum SandboxSubcommand {
         #[arg(long)]
         json: bool,
     },
+    /// List the backend leases this data directory has not settled.
+    Leases {
+        /// Local `SQLite` data directory owned by this harness.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Only leases whose owner has not written a heartbeat since this many
+        /// milliseconds ago. Defaults to the lease grace window.
+        #[arg(long)]
+        older_than_ms: Option<u64>,
+        /// Emit the leases as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Settle the leases whose owner is provably gone.
+    ///
+    /// A lease whose owner still holds its lock is reported and left untouched;
+    /// nothing here deletes a resource that has a live owner.
+    Reconcile {
+        /// Local `SQLite` data directory owned by this harness.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Grace window before a lease is even a candidate.
+        #[arg(long)]
+        grace_ms: Option<u64>,
+        /// Emit the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub async fn run(command: SandboxCommand) -> Result<(), HarnessError> {
@@ -67,7 +95,111 @@ pub async fn run(command: SandboxCommand) -> Result<(), HarnessError> {
             to,
             json,
         } => export(&data_dir, &artifact_id, &to, json).await,
+        SandboxSubcommand::Leases {
+            data_dir,
+            older_than_ms,
+            json,
+        } => leases(&data_dir, older_than_ms, json).await,
+        SandboxSubcommand::Reconcile {
+            data_dir,
+            grace_ms,
+            json,
+        } => reconcile(&data_dir, grace_ms, json).await,
     }
+}
+
+/// List the leases nobody has settled. This is a read: it cannot change an
+/// owner's state.
+async fn leases(
+    data_dir: &Path,
+    older_than_ms: Option<u64>,
+    json_output: bool,
+) -> Result<(), HarnessError> {
+    let store = harness_store_sqlite::SqliteStore::open_read_only(data_dir.to_owned())
+        .await
+        .map_err(harness_store_sqlite::StoreError::into_harness_error)?;
+    let grace = older_than_ms.unwrap_or(harness_tools::LEASE_GRACE_MS);
+    let cutoff = now_unix_ms().saturating_sub(grace);
+    let rows = store
+        .unsettled_backend_leases(i64::try_from(cutoff).unwrap_or(i64::MAX))
+        .await
+        .map_err(harness_store_sqlite::StoreError::into_harness_error)?;
+    if json_output {
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "grace_ms": grace,
+            "unsettled": rows.iter().map(|lease| serde_json::json!({
+                "lease_id": lease.lease_id,
+                "state": lease.state,
+                "profile": lease.profile,
+                "backend": lease.backend,
+                "tool_execution_id": lease.tool_execution_id,
+                "lock_path": lease.lock_path,
+                "heartbeat_at_unix_ms": lease.heartbeat_at_unix_ms,
+                "owner_generation": lease.owner_generation,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{value}");
+        return Ok(());
+    }
+    println!("{} unsettled lease(s) older than {grace} ms", rows.len());
+    for lease in rows {
+        println!(
+            "{} {} profile={} execution={} lock={}",
+            lease.lease_id, lease.state, lease.profile, lease.tool_execution_id, lease.lock_path
+        );
+    }
+    Ok(())
+}
+
+/// Settle what can be proven orphaned. This writes, so it needs the writer
+/// fence: reconciliation is a change to durable state, not a report.
+async fn reconcile(
+    data_dir: &Path,
+    grace_ms: Option<u64>,
+    json_output: bool,
+) -> Result<(), HarnessError> {
+    let store = harness_store_sqlite::SqliteStore::open_writer(
+        harness_store_sqlite::WriterOpenOptions::new(
+            data_dir.to_owned(),
+            harness_types::HostId::generate(),
+        ),
+    )
+    .await
+    .map_err(harness_store_sqlite::StoreError::into_harness_error)?;
+    let grace = grace_ms.unwrap_or(harness_tools::LEASE_GRACE_MS);
+    let now = now_unix_ms();
+    let report =
+        harness_tools::reconcile_backend_leases(&store, now.saturating_sub(grace), now).await?;
+    store
+        .close()
+        .await
+        .map_err(harness_store_sqlite::StoreError::into_harness_error)?;
+    if json_output {
+        let value = serde_json::to_value(&report).map_err(|_| {
+            HarnessError::new(ErrorCode::InvalidPayload, "report is not serializable")
+        })?;
+        println!("{value}");
+    } else {
+        println!(
+            "recovered {} · still owned {} · already settled {}",
+            report.recovered.len(),
+            report.still_owned.len(),
+            report.already_settled.len()
+        );
+        for lease_id in &report.still_owned {
+            println!("still owned (untouched): {lease_id}");
+        }
+    }
+    Ok(())
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Export one artifact. The store is opened read-only: an export must not be
