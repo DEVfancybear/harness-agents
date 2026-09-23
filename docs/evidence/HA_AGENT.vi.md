@@ -1,0 +1,58 @@
+# Evidence — HA_AGENT CP-A (G01–G03) / Bằng chứng — HA_AGENT CP-A (G01–G03)
+
+**Status / Trạng thái:** `implemented_unverified`. G01–G03 are implemented; CP-A remains unaccepted because the final HA launch gate had one provider loopback failure. Clippy passed with a clean Rust 1.97.1 toolchain installed in a task-specific Rustup home after the default toolchain registration proved inconsistent. No G04+ work was started. / Đã triển khai G01–G03; CP-A chưa được nghiệm thu vì gate HA cuối có một test provider loopback thất bại. Clippy đã đạt với toolchain Rust 1.97.1 sạch trong Rustup home riêng cho assignment sau khi đăng ký toolchain mặc định không nhất quán. Không làm G04 trở đi.
+
+SPEC: [HA_AGENT.vi.md](../specs/HA_AGENT.vi.md) · Plan: [HA_AGENT_PLAN.vi.md](../HA_AGENT_PLAN.vi.md) · Assignment handoff: [HA_AGENT.vi.md](../handoffs/HA_AGENT.vi.md)
+
+## 1. Tested source / Source đã kiểm tra
+
+| Field / Trường | Value / Giá trị |
+|---|---|
+| Assignment baseline / Revision gốc | `37e355dc2cc22a381c7e86ae3231b14c0c354be0` |
+| HA_AGENT implementation commit / Commit triển khai HA_AGENT | `0b6d19da17a3387ddbe46daca91ab5f81e66f9d3` (`master`; pushed to `origin/master`) |
+| Working-tree source digest / Digest source working tree | `sha256:b9fc76caf88fff2f8eba2a229f7082d3ff10c91104f894e46952b52a95b3a137` |
+| Files hashed / Số file | **419**; includes the bilingual SPEC and generated config schema; excludes only this evidence and the assignment handoff |
+| `Cargo.lock` SHA-256 | `9a778b3745b5ae8e1c954ad1128abb12c9807e1148b7237653a9c1be61a825a6` |
+| OS / architecture | Windows `10.0.26200.0`, x64 |
+| Toolchain | `rustc 1.97.1 (8bab26f4f 2026-07-14)`; commands used `--locked` |
+| Clippy/toolchain | `cargo clippy` passed under `RUSTUP_HOME=C:\Users\duong\.rustup-ha-agent-2026-09-23`, Rust `1.97.1`. The default Rustup home was inconsistent: it reported Clippy installed while the driver was absent; a repair attempt met a locked `rustc_driver` DLL used by Rust Analyzer and left the default pinned toolchain without `rustc.exe`/`cargo.exe`. No repository files were changed by this toolchain repair. |
+
+HEAD moved from `37f4035` to `5498f74` while the gates were running because another M7–M12 audit commit landed in the shared workspace. That commit was preserved. The reviewed HA_AGENT implementation was committed as `0b6d19d` (40 files) and pushed to `origin/master`; this evidence/handoff update is a separate documentation follow-up. / HEAD đổi từ `37f4035` sang `5498f74` trong lúc chạy gate do commit audit M7–M12 khác được ghi vào workspace chung. Commit đó được giữ nguyên. Implementation HA_AGENT đã review được commit thành `0b6d19d` (40 file) và push lên `origin/master`; evidence/handoff này được cập nhật riêng sau đó.
+
+## 2. Commands and measured results / Lệnh và kết quả đo được
+
+| Command / Lệnh | Result / Kết quả |
+|---|---|
+| `cargo fmt --all -- --check` | Pass / Đạt |
+| `cargo test -p harness-cli --bin ha --locked` | **278 passed, 0 failed, 1 ignored** (manual clipboard test). Latest exact run passed. / Lần chạy exact cuối đạt **278/0/1 ignored** (clipboard cần thao tác tay). |
+| `cargo test -p harness-cli --bin ha --locked g01_` | **5/5** |
+| `cargo test -p harness-cli --bin ha --locked g02_` | **5/5** |
+| `cargo test -p harness-cli --bin ha --locked g03_` | **3/3** (CLI-side model, cost, and thinking tests) |
+| `cargo test -p harness-store-sqlite --locked g03_model_switch_applies_next_turn_only` | **1/1**; persisted setting applies from the next turn and survives reopen. / Cài đặt model áp dụng từ lượt kế tiếp và còn sau reopen. |
+| `cargo test -p harness-cli --test milestone_m2 --locked -- --test-threads=1` | **10/10** |
+| `cargo test -p harness-cli --test interactive_session --locked -- --test-threads=1` | **14/14** |
+| `cargo test -p harness-cli --test interactive_launch --locked -- --test-threads=1` | **19/19** |
+| `cargo test -p harness-cli --test phase_p0` through `phase_p7` (Verify-HaLaunch attempt 3, serial) | **8, 21, 17, 21, 26, 27, 15, 15** passed respectively. / Lần lượt đạt **8, 21, 17, 21, 26, 27, 15, 15**. |
+| `cargo test -p harness-cli --test phase_p0 --locked p0_f03_contract_schemas_are_generated_from_real_types` | **1/1**; schema was generated with `cargo run -p harness-types --bin generate_schemas --locked`, not edited by hand. / Schema được sinh bằng generator, không sửa tay. |
+| `cargo test -p harness-cli --test milestone_m6 --locked -- --test-threads=1` | **13/13** (ConfigExplain and adjacent M6 checks). / **13/13**. |
+| `pwsh -NoProfile -File scripts/Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 900` | Final run on the current tree: **17/17**. Transcript: `target/pty-acceptance/pty-all.txt` (ignored build output). / Lượt cuối trên cây hiện tại đạt **17/17**. |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | **Pass** with the isolated Rust 1.97.1 toolchain at `C:\Users\duong\.rustup-ha-agent-2026-09-23`. / **Đạt** với toolchain Rust 1.97.1 cô lập tại đường dẫn trên. |
+| `pwsh -NoProfile -File scripts/Verify-HaLaunch.ps1 -Json` | Attempt 4: **failed only at `providers-streaming`**. Format, Clippy, discovery, `ha` **278 passed / 0 failed / 1 ignored**, `interactive_launch` **19/19**, `interactive_session` **14/14**, P0–P7 **8/21/17/21/26/27/15/15**, installer/release self-tests, and docs self-test passed. Provider suite was **31 passed / 1 failed**: `anthropic::tests::g03_anthropic_429_http_date_is_bounded`. The verifier retains only the last three output lines, so the assertion detail was not captured. / Lượt 4 chỉ thất bại ở `providers-streaming`; các gate còn lại đạt như số liệu bên trái. Provider suite **31 đạt / 1 lỗi** tại test HTTP-date nêu trên; verifier chỉ giữ ba dòng cuối nên không lưu chi tiết assertion. |
+
+## 3. Flake and regression log / Nhật ký flake và regression
+
+- **I08 exit-code regression:** the PTY test first observed exit 4 because terminal I/O used `StorageWriteFailed`; terminal failures are specified to keep generic exit 1. The terminal paths now use the existing exit-1 class while real storage write errors remain exit 4. The I08 selector and final full PTY suite passed. The test was not changed. / **Regression I08:** lần đầu test PTY thấy exit 4 do lỗi terminal bị phân loại thành `StorageWriteFailed`; đặc tả yêu cầu exit 1. Đường lỗi terminal nay dùng nhóm exit 1 hiện có, lỗi ghi storage thật vẫn exit 4. Selector I08 và PTY suite cuối đều đạt; không sửa test.
+- **Unit tests / Windows ACL:** one parallel `ha` run had three credential-file tests fail with `Access is denied` while writing separate temp directories. The serial full unit run and two later exact default runs passed (**278/0/1 ignored**). This transient was recorded; no assertion was removed or weakened. / Một lượt unit chạy song song có ba test credential tạm lỗi ACL; cả lượt serial và hai lượt exact sau đều đạt.
+- **G03 Anthropic loopback:** one filtered provider run was 3/4; the truncated-stream assertion received `service_unavailable: provider request failed: error sending request` before reaching the decoder contract. Two isolated diagnostic runs reproduced it. A complete provider suite in Verify-HaLaunch attempt 3 passed on the unchanged fixture. A temporary fixture transport edit was tried and two 4/4 runs passed, but it was reverted; those passes are excluded. The final Verify-HaLaunch attempt 4 then had 31/32 provider tests pass and failed `g03_anthropic_429_http_date_is_bounded`; the verifier did not preserve the assertion detail. No test was edited and no further loopback rerun was made after the retry limit. / Một lượt lọc provider đạt 3/4; test stream bị cắt nhận `service_unavailable: provider request failed: error sending request` trước khi tới decoder. Hai lượt cô lập cũng tái hiện lỗi. Provider suite đầy đủ ở Verify-HaLaunch lượt 3 đạt với fixture nguyên trạng. Từng thử chỉnh transport fixture tạm thời và có hai lượt 4/4 đạt, nhưng đã hoàn tác; không tính hai lượt đó. Verify-HaLaunch cuối lượt 4 có 31/32 provider test đạt, thất bại tại `g03_anthropic_429_http_date_is_bounded`; verifier không giữ assertion detail. Không sửa test và không chạy thêm loopback sau khi hết giới hạn retry.
+- **PTY I05 loopback:** one full PTY run was 16/17 because the follow-up local provider request returned `error sending request`; the I05 selector then passed 1/1, and the next full PTY run passed 17/17. The test stayed unchanged. / Một lượt PTY đạt 16/17 vì request provider loopback ở bước follow-up lỗi; selector I05 đạt 1/1 và full PTY kế tiếp đạt 17/17. Không sửa test.
+- Verify-HaLaunch attempts 1–2 exposed stale assertions after config/store contract changes plus a transient phase-P2 failure; those assertions were aligned to the implemented contracts without weakening them, and P2 passed in isolation and later gates. Attempt 3 failed only at Clippy startup; attempt 4 passed Clippy and every step except `providers-streaming`. / Hai lượt Verify đầu phát hiện assertion cũ sau thay đổi contract config/store và một lỗi P2 thoáng qua; assertion được sửa theo contract, không nới, P2 đạt ở lượt cô lập và các gate sau. Lượt 3 chỉ lỗi khởi chạy Clippy; lượt 4 đạt Clippy và mọi bước trừ `providers-streaming`.
+
+## 4. Scope, dependencies, and not run / Phạm vi, dependency và chưa chạy
+
+- G01–G03 only. No G04+, no new crate or product binary, and DeepSeek remains a separate preset on the generic OpenAI Chat adapter. `/init` prints a static sample and writes nothing. / Chỉ G01–G03; không thêm crate/binary sản phẩm; DeepSeek là preset riêng trên adapter OpenAI Chat tổng quát; `/init` chỉ in mẫu tĩnh.
+- `chrono =0.4.45` (MIT OR Apache-2.0) is an exact workspace pin used for HTTP-date parsing; `reqwest =0.12.24` (MIT OR Apache-2.0) remains the transport. No new crate was added. Both are listed in the SPEC. / `chrono =0.4.45` (MIT OR Apache-2.0) là pin exact dùng parse HTTP-date; `reqwest =0.12.24` (MIT OR Apache-2.0) dùng transport; không thêm crate.
+- No paid/live API call; no `config.local.toml` write; no HA user app install. The user authorized installing Clippy and committing/pushing this assignment; implementation commit `0b6d19d` is on `origin/master`. The additive SQLite migration was exercised by its tests; do not manually rerun or reset user data. / Không gọi API trả phí, không ghi `config.local.toml`, không cài HA lên máy user. User đã cho phép cài Clippy và commit/push assignment này; commit implementation `0b6d19d` đã có trên `origin/master`. Migration SQLite additive đã được test; không chạy migration thủ công hoặc reset dữ liệu user.
+- **Not run / Chưa chạy:** Linux verification; paid provider smoke; real HA install/PATH mutation; repairing the default Rustup home while Rust Analyzer still holds the pinned toolchain DLL. / Chưa chạy xác minh Linux, smoke provider trả phí, cài HA/PATH thật; chưa phục hồi Rustup home mặc định khi Rust Analyzer còn giữ DLL của toolchain.
+- `pwsh -NoProfile -File scripts/Verify-Docs.ps1 -SelfTest` after saving both metadata files: passed; **170 Markdown files**, 15 language pairs, all structural negative controls passed. / Chạy sau khi lưu hai file metadata: đạt; **170 file Markdown**, 15 cặp ngôn ngữ, toàn bộ negative control cấu trúc đạt.
+
+**Acceptance conclusion / Kết luận nghiệm thu:** implementation remains `implemented_unverified`; Clippy is green on the isolated exact toolchain, but the final HA launch gate is red on one G03 loopback test. The loopback retry budget is exhausted, so CP-A is not marked green. / Phần triển khai vẫn `implemented_unverified`; Clippy xanh với toolchain chính xác được cô lập, nhưng gate HA cuối đỏ ở một test G03 loopback. Đã hết lượt retry loopback nên chưa chốt CP-A xanh.
