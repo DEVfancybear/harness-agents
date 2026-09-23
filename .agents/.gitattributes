@@ -1,0 +1,2 @@
+# Keep imported skill files, including executable scripts, on LF across checkouts.
+skills/** text eol=lf
