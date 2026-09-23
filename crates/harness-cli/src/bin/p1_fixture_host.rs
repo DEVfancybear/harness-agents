@@ -113,6 +113,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 after_fingerprint: None,
                 before_hash: None,
                 after_hash: None,
+                exit_code: None,
                 artifact_id: None,
                 observed_at_seq: 2,
             };

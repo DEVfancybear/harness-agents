@@ -14,7 +14,8 @@ use harness_store_sqlite::{
 use harness_types::{
     ContentHash, ErrorCode, EventEnvelope, EventId, HarnessError, NextActionProposal,
     P0_SCHEMA_VERSION, PendingToolCall, PendingToolState, ProducerIdentity, SourceAuthority,
-    TaskId, ToolExecutionId, ToolExecutionReceipt, ToolIntentState, ToolOutcomeState, WorkingState,
+    StorePort, TaskId, ToolExecutionId, ToolExecutionReceipt, ToolIntentState, ToolOutcomeState,
+    WorkingState,
 };
 use serde_json::{Map, Value, json};
 
@@ -215,8 +216,21 @@ pub async fn git_diff_from(root: &Path, base_commit: &str) -> Result<String, Har
 /// durable intent is committed. A returned error is treated exactly like any
 /// other dispatch failure: the outcome becomes uncertain, never a success.
 pub trait ExternalToolDispatcher: Send + Sync {
+    /// Validate the target and arguments without performing a remote call.
+    /// Implementations must reject anything they can prove will fail before
+    /// dispatch so an approval is never requested for a locally invalid call.
+    fn validate_external<'a>(
+        &'a self,
+        plugin_id: &'a str,
+        tool_name: &'a str,
+        arguments: &'a serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), harness_types::HarnessError>> + Send + 'a>,
+    >;
+
     fn dispatch_external<'a>(
         &'a self,
+        authorization: &'a ToolDispatchAuthorization,
         plugin_id: &'a str,
         tool_name: &'a str,
         arguments: &'a serde_json::Value,
@@ -228,6 +242,19 @@ pub trait ExternalToolDispatcher: Send + Sync {
                 + 'a,
         >,
     >;
+}
+
+/// Unforgeable proof that the shared tool gate committed this invocation's
+/// approval and intent before asking an external dispatcher to perform it.
+/// Only `ToolExecutionService` can construct this value.
+pub struct ToolDispatchAuthorization {
+    _sealed: (),
+}
+
+impl ToolDispatchAuthorization {
+    const fn after_gate_commit() -> Self {
+        Self { _sealed: () }
+    }
 }
 
 /// An optional presentation observer. It is deliberately invoked only after a
@@ -544,6 +571,23 @@ impl ToolExecutionService {
                 ),
             ));
         }
+        if let CodingToolAction::ExternalTool {
+            plugin_id,
+            tool_name,
+            arguments,
+            ..
+        } = &final_action
+        {
+            let external = self.external.as_ref().ok_or_else(|| {
+                HarnessError::new(
+                    ErrorCode::PolicyDenied,
+                    "external tool requested without a configured dispatcher",
+                )
+            })?;
+            external
+                .validate_external(plugin_id, tool_name, arguments)
+                .await?;
+        }
         let state = self
             .current_state(&request.session_id, &request.task_id)
             .await?;
@@ -846,8 +890,9 @@ impl ToolExecutionService {
             intent_sequence,
         };
         let intent_event = event_for_intent(&intent)?;
-        self.store
-            .commit_tool_intent(ToolIntentCommit {
+        StorePort::admit_invocation(
+            self.store.as_ref(),
+            ToolIntentCommit {
                 expected_sequence: intent_sequence,
                 event: intent_event.clone(),
                 intent,
@@ -859,9 +904,9 @@ impl ToolExecutionService {
                     kind: "tool_intent".to_owned(),
                     status: "committed".to_owned(),
                 },
-            })
-            .await
-            .map_err(store_error)?;
+            },
+        )
+        .await?;
 
         let dispatched = match &transformed {
             CodingToolAction::ExternalTool {
@@ -872,7 +917,13 @@ impl ToolExecutionService {
                 ..
             } => match &self.external {
                 Some(external) => external
-                    .dispatch_external(plugin_id, tool_name, arguments, *timeout_ms)
+                    .dispatch_external(
+                        &ToolDispatchAuthorization::after_gate_commit(),
+                        plugin_id,
+                        tool_name,
+                        arguments,
+                        *timeout_ms,
+                    )
                     .await
                     .map(Dispatched::plain),
                 None => Err(HarnessError::new(
@@ -1344,8 +1395,9 @@ impl ToolExecutionService {
         state.revision = sequence;
         state.through_event_seq = sequence;
         let event = event_for_task_update(&prepared.request.session_id, sequence, &note)?;
-        self.store
-            .commit_tool_task_update(ToolTaskUpdateCommit {
+        StorePort::commit_task_update(
+            self.store.as_ref(),
+            ToolTaskUpdateCommit {
                 session_id: prepared.request.session_id,
                 task_id: prepared.request.task_id,
                 expected_sequence: sequence,
@@ -1359,9 +1411,9 @@ impl ToolExecutionService {
                     status: "committed".to_owned(),
                 },
                 approval: binding_from_grant(&approval),
-            })
-            .await
-            .map_err(store_error)?;
+            },
+        )
+        .await?;
         let mut view = ToolExecutionView {
             schema_version: TOOL_CONTRACT_VERSION,
             execution_id: None,
@@ -1956,6 +2008,10 @@ impl ToolExecutionService {
             after_fingerprint: Some(after_fingerprint),
             before_hash,
             after_hash,
+            exit_code: match &output {
+                ToolOutput::Process { exit_code, .. } => *exit_code,
+                _ => None,
+            },
             artifact_id: artifact
                 .as_ref()
                 .map(|artifact| artifact.artifact_id.clone()),
@@ -1975,8 +2031,9 @@ impl ToolExecutionService {
             "p3",
             Some(&model_view),
         )?;
-        self.store
-            .commit_tool_settlement(ToolSettlementCommit {
+        StorePort::settle_invocation(
+            self.store.as_ref(),
+            ToolSettlementCommit {
                 expected_sequence: sequence,
                 event: event.clone(),
                 receipt: receipt.clone(),
@@ -1996,9 +2053,9 @@ impl ToolExecutionService {
                 },
                 artifact,
                 final_status,
-            })
-            .await
-            .map_err(store_error)?;
+            },
+        )
+        .await?;
         let mut view = ToolExecutionView {
             schema_version: TOOL_CONTRACT_VERSION,
             execution_id: Some(execution_id),
@@ -2043,6 +2100,7 @@ impl ToolExecutionService {
             after_fingerprint: None,
             before_hash: None,
             after_hash: None,
+            exit_code: None,
             artifact_id: None,
             observed_at_seq: sequence,
         };
@@ -2060,8 +2118,9 @@ impl ToolExecutionService {
             "p3_denied",
             denied_view.as_ref(),
         )?;
-        self.store
-            .commit_receipt(harness_store_sqlite::ReceiptCommit {
+        StorePort::record_synthetic_receipt(
+            self.store.as_ref(),
+            harness_types::ReceiptCommit {
                 session_id: prepared.request.session_id.clone(),
                 task_id: prepared.request.task_id.clone(),
                 expected_sequence: sequence,
@@ -2076,9 +2135,9 @@ impl ToolExecutionService {
                     status: code.as_str().to_owned(),
                 },
                 artifact: None,
-            })
-            .await
-            .map_err(store_error)?;
+            },
+        )
+        .await?;
         let mut view = ToolExecutionView {
             schema_version: TOOL_CONTRACT_VERSION,
             execution_id: Some(execution_id),

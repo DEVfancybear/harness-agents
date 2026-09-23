@@ -60,8 +60,8 @@ pub use process::{
 pub use harness_runtime::AcceptanceState;
 pub use secrets::{HostEnvironmentSecrets, SecretResolver};
 pub use service::{
-    ConfiguredToolHook, ExternalToolDispatcher, ToolExecutionService, ToolObserver, git_diff_from,
-    git_head_commit,
+    ConfiguredToolHook, ExternalToolDispatcher, ToolDispatchAuthorization, ToolExecutionService,
+    ToolObserver, git_diff_from, git_head_commit,
 };
 pub use turn_driver::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ExternalToolCatalog,

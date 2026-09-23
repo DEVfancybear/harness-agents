@@ -20,14 +20,15 @@ use harness_session::{
     SessionService,
 };
 use harness_store_sqlite::{
-    AgentStateRecord, BudgetReservationRecord, BudgetReservationState, CompositionSnapshotRecord,
-    ContextCheckpointRecord, ContextPacketRecord, FrozenRequestRecord, ProviderAttemptRecord,
-    RunRecord, RunState, RunStepRecord, RuntimeCommandRecord, RuntimeCommandState, SqliteStore,
-    StoreError,
+    AgentStateRecord, CompositionSnapshotRecord, ContextCheckpointRecord, ContextPacketRecord,
+    FrozenRequestRecord, ProviderAttemptRecord, RunRecord, RunState, RuntimeCommandRecord,
+    RuntimeCommandState, SqliteStore, StoreError,
 };
 use harness_types::{
-    AgentRunId, BudgetId, BudgetReservationId, ContentHash, ErrorCode, InputId, ProducerIdentity,
-    ScopeContext, ScopeTarget, SessionId, SourceAuthority, StepId, TaskId, WorkspaceObservation,
+    AgentRunId, BudgetId, BudgetReservationId, ContentHash, ErrorCode, FreezeStepCommit,
+    FrozenBudgetReservation, FrozenRunStep, InputId, ProducerIdentity, RunStartRequest,
+    ScopeContext, ScopeTarget, SessionId, SourceAuthority, StepId, StorePort, TaskId,
+    WorkspaceObservation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -1043,15 +1044,22 @@ impl RuntimeService {
             .await?;
         // One admitted input owns one durable run, whether this is the first
         // step or a continuation: the identity was fixed at admission.
-        let run = self
-            .store
-            .start_run(
-                &request.session_id,
-                &request.task_id,
-                &request.input_id,
-                self.budget.as_ref().map(|(_, budget_id)| budget_id),
-            )
-            .await?;
+        let run = StorePort::claim_run(
+            self.store.as_ref(),
+            RunStartRequest {
+                session_id: request.session_id.clone(),
+                task_id: request.task_id.clone(),
+                input_id: request.input_id.clone(),
+                budget_id: self.budget.as_ref().map(|(_, budget_id)| budget_id.clone()),
+                expected_owner_generation: self
+                    .store
+                    .fence()
+                    .map_err(|error| RuntimeError::new(error.code(), error.to_string()))?
+                    .generation,
+            },
+        )
+        .await
+        .map_err(|error| RuntimeError::new(error.code(), error.message().to_owned()))?;
         let command_id = harness_types::RuntimeCommandId::generate();
         self.store
             .enqueue_runtime_command(RuntimeCommandRecord {
@@ -1267,25 +1275,23 @@ impl RuntimeService {
         let first_reservation =
             self.budget
                 .as_ref()
-                .map(|(_, budget_id)| BudgetReservationRecord {
+                .map(|(_, budget_id)| FrozenBudgetReservation {
                     reservation_id: BudgetReservationId::generate(),
                     budget_id: budget_id.clone(),
                     operation_id: format!("attempt:{}:{step_index}:1", run.run_id),
                     origin: "provider_attempt".to_owned(),
                     upper_bound_tokens: attempt_bound,
-                    settled_tokens: None,
-                    state: BudgetReservationState::Reserved,
-                    revision: 1,
                 });
         let first_reservation_id = first_reservation
             .as_ref()
             .map(|reservation| reservation.reservation_id.clone());
-        let run = self
-            .store
-            .freeze_run_step(
-                &run.run_id,
-                run.revision,
-                RunStepRecord {
+        let run = StorePort::freeze_step(
+            self.store.as_ref(),
+            FreezeStepCommit {
+                run_id: run.run_id.clone(),
+                expected_owner_generation: run.owner_generation,
+                expected_revision: run.revision,
+                step: FrozenRunStep {
                     step_id: step_id.clone(),
                     run_id: run.run_id.clone(),
                     step_index,
@@ -1296,9 +1302,11 @@ impl RuntimeService {
                     state: "frozen".to_owned(),
                     stop_reason: None,
                 },
-                first_reservation,
-            )
-            .await?;
+                reservation: first_reservation,
+            },
+        )
+        .await
+        .map_err(|error| RuntimeError::new(error.code(), error.message().to_owned()))?;
         // The reservation this attempt will settle. A retry gets its own
         // reservation before it dispatches, so retries are counted by origin
         // instead of hiding inside one bound.

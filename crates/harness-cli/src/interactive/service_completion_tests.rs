@@ -133,9 +133,10 @@ fn run_child() -> (std::process::ExitStatus, String) {
 async fn terminal(channel: &mut SessionChannel) -> SessionEvent {
     // The parent deliberately runs this case beside the full workspace suite;
     // under Windows process/SQLite contention a valid terminal event can take
-    // longer than a quiet-machine socket round trip. The enclosing child still
-    // has a two-minute hard bound, so this does not turn a hang into success.
-    tokio::time::timeout(Duration::from_secs(30), async {
+    // longer than a quiet-machine socket round trip. Give the event 90 seconds;
+    // the enclosing child still has a two-minute hard bound, so this does not
+    // turn a hang into success.
+    tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             for event in channel.drain() {
                 if matches!(

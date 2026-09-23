@@ -383,6 +383,10 @@ pub struct ToolExecutionReceipt {
     /// Optional so receipts written before G04 still deserialize unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_hash: Option<ContentHash>,
+    /// Process exit status, when this receipt represents a process execution.
+    /// Older receipts and non-process tools do not carry this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
     pub artifact_id: Option<ArtifactId>,
     pub observed_at_seq: u64,
 }
