@@ -17,10 +17,14 @@ pub struct Theme {
     pub assistant: Style,
     pub tool_ok: Style,
     pub tool_failed: Style,
+    pub warning: Style,
     pub dim: Style,
     pub error: Style,
     pub border: Style,
     pub title: Style,
+    pub status: Style,
+    pub composer_border: Style,
+    pub selection: Style,
 }
 
 impl Theme {
@@ -29,15 +33,23 @@ impl Theme {
     pub const fn colored() -> Self {
         Self {
             color: true,
-            accent: Style::new().fg(Color::Cyan),
-            user: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            accent: Style::new().fg(Color::LightCyan),
+            user: Style::new()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
             assistant: Style::new(),
-            tool_ok: Style::new().fg(Color::Green),
-            tool_failed: Style::new().fg(Color::Red),
-            dim: Style::new().fg(Color::DarkGray),
-            error: Style::new().fg(Color::Red),
+            tool_ok: Style::new().fg(Color::LightGreen),
+            tool_failed: Style::new().fg(Color::LightRed),
+            warning: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            dim: Style::new().fg(Color::Gray),
+            error: Style::new().fg(Color::LightRed),
             border: Style::new().fg(Color::DarkGray),
-            title: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            title: Style::new()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+            status: Style::new().fg(Color::White).bg(Color::DarkGray),
+            composer_border: Style::new().fg(Color::Cyan),
+            selection: Style::new().fg(Color::Black).bg(Color::LightCyan),
         }
     }
 
@@ -51,10 +63,14 @@ impl Theme {
             assistant: Style::new(),
             tool_ok: Style::new(),
             tool_failed: Style::new().add_modifier(Modifier::BOLD),
+            warning: Style::new().add_modifier(Modifier::BOLD),
             dim: Style::new(),
             error: Style::new().add_modifier(Modifier::BOLD),
             border: Style::new(),
             title: Style::new().add_modifier(Modifier::BOLD),
+            status: Style::new(),
+            composer_border: Style::new(),
+            selection: Style::new().add_modifier(Modifier::BOLD),
         }
     }
 
@@ -93,19 +109,6 @@ impl Theme {
         )]
         let index = (tick % FRAMES.len() as u64) as usize;
         FRAMES[index]
-    }
-
-    /// The style for one banner row.
-    ///
-    /// The app name is the only row that is emphasised; the rest of the header is
-    /// information the user reads once.
-    #[must_use]
-    pub fn banner(&self, line: &str) -> Style {
-        if line.starts_with("Harness Agents") {
-            self.title
-        } else {
-            self.dim
-        }
     }
 }
 

@@ -152,10 +152,15 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
             lines.push(Line::from(body));
         }
     }
+    let border_style = if state.modal.is_some() {
+        theme.border
+    } else {
+        theme.composer_border
+    };
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(theme.border)
-        .title(Span::styled(title, theme.dim));
+        .border_style(border_style)
+        .title(Span::styled(title, theme.title));
     frame.render_widget(Paragraph::new(lines).block(block), plan.composer);
 }
 
@@ -170,35 +175,31 @@ pub fn hint(state: &UiState) -> String {
         // Every panel offers the same three answers, because `a` now covers every
         // kind: naming it only where it used to work would hide the very key that
         // ends the interruptions.
-        Some(Modal::Approval { .. }) => {
-            " panel duyệt đang chờ · y chạy · a cho phép cả lượt · n từ chối ".to_owned()
-        }
-        Some(Modal::Picker { .. }) => " chọn phiên · ↑↓ · Enter · Esc đóng ".to_owned(),
-        Some(Modal::FilePicker { .. }) => " chọn file · ↑↓ · Enter · Esc đóng ".to_owned(),
+        Some(Modal::Approval { .. }) => " DUYỆT · y chạy · a cả lượt · n từ chối ".to_owned(),
+        Some(Modal::Picker { .. }) => " PHIÊN · ↑↓ chọn · Enter · Esc ".to_owned(),
+        Some(Modal::FilePicker { .. }) => " TỆP · ↑↓ chọn · Enter · Esc ".to_owned(),
         Some(Modal::Question { options, .. }) => {
             if options.is_empty() {
-                " nhập câu trả lời · Enter gửi ".to_owned()
+                " TRẢ LỜI · Enter gửi ".to_owned()
             } else {
-                " phím số chọn · hoặc nhập câu trả lời · Enter ".to_owned()
+                " TRẢ LỜI · phím số hoặc nhập · Enter ".to_owned()
             }
         }
-        Some(Modal::Overlay { .. }) => {
-            " panel đang mở · PgUp/PgDn · Home/End · Esc đóng ".to_owned()
-        }
+        Some(Modal::Overlay { .. }) => " THAM KHẢO · PgUp/PgDn · Esc đóng ".to_owned(),
         None => {
             // The menu is what the user is looking at while it is up, so its keys
             // are what the border names - even during a run, where the run's own
             // keys would otherwise be the only thing the border said.
             if !state.suggestions.is_empty() {
                 return format!(
-                    " ↑↓ chọn · Tab/Enter nhận · Esc đóng · {} lệnh ",
+                    " LỆNH · ↑↓ chọn · Tab/Enter nhận · Esc · {} mục ",
                     state.suggestions.len()
                 );
             }
             if state.phase.has_active_run() {
-                return " run đang chạy · Ctrl-C hủy · gõ trước rồi Enter sau ".to_owned();
+                return " ĐANG CHẠY · Ctrl-C hủy · nhập để xếp hàng ".to_owned();
             }
-            " Enter gửi · Ctrl-J xuống dòng · /help ".to_owned()
+            " SOẠN THẢO · Enter gửi · Ctrl-J xuống dòng · /help ".to_owned()
         }
     }
 }

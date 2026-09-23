@@ -22,10 +22,7 @@ use crate::interactive::view;
 #[must_use]
 pub fn render(item: &HistoryItem, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     match item {
-        HistoryItem::Banner { lines } => lines
-            .iter()
-            .map(|line| Line::from(vec![Span::styled(line.clone(), theme.banner(line))]))
-            .collect(),
+        HistoryItem::Banner { lines } => banner_rows(lines, width, theme),
         HistoryItem::User { text } => marker_rows("> ", text, width, theme.user, theme),
         // The app's own continuation keeps the marker a reader can tell apart from their
         // own words, in the same dim style the plain renderer prints `[auto] `.
@@ -82,6 +79,45 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme) -> Vec<Line<'static
             .map(|line| Line::from(Span::raw(line.clone())))
             .collect(),
     }
+}
+
+/// A compact welcome card in scrollback. Keep every original header value visible
+/// and wrap long paths before inserting rows; the left rail is only decoration.
+fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    let rule_width = usize::from(width.saturating_sub(2).min(48));
+    if rule_width > 0 {
+        rows.push(Line::from(Span::styled(
+            format!("  {}", "─".repeat(rule_width)),
+            theme.border,
+        )));
+    }
+    for (index, line) in lines.iter().enumerate() {
+        let mut spans = vec![Span::styled(
+            if index == 0 { "  ◆  " } else { "  │  " },
+            if index == 0 {
+                theme.accent
+            } else {
+                theme.border
+            },
+        )];
+        if index == 0 {
+            spans.push(Span::styled(line.clone(), theme.title));
+        } else if let Some((label, value)) = line.split_once(':') {
+            spans.push(Span::styled(format!("{label}:"), theme.accent));
+            spans.push(Span::styled(value.to_owned(), theme.dim));
+        } else {
+            spans.push(Span::styled(line.clone(), theme.dim));
+        }
+        rows.extend(wrap_spans(spans, width));
+    }
+    if rule_width > 0 {
+        rows.push(Line::from(Span::styled(
+            format!("  {}", "─".repeat(rule_width)),
+            theme.border,
+        )));
+    }
+    rows
 }
 
 /// The plain user rows: the marker only precedes the first row.

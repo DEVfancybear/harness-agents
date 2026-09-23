@@ -49,7 +49,7 @@ pub fn rows(items: &[String], selected: usize, theme: &Theme) -> Vec<Line<'stati
     for (index, item) in items.iter().enumerate() {
         let marker = if index == selected { "❯ " } else { "  " };
         let style = if index == selected {
-            theme.accent
+            theme.selection
         } else {
             theme.dim
         };

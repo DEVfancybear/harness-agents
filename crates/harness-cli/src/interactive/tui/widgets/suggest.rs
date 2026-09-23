@@ -29,12 +29,12 @@ pub fn rows(state: &UiState, theme: &Theme) -> Vec<Line<'static>> {
     for index in start..end {
         let command = state.suggestions[index];
         let selected = index == state.suggestion_selected;
-        let style = if selected { theme.accent } else { theme.dim };
+        let style = if selected { theme.selection } else { theme.dim };
         let marker = if selected { "❯ " } else { "  " };
         lines.push(Line::from(vec![
             Span::styled(marker.to_owned(), style),
             Span::styled(format!("{:<NAME_COLUMN$}", command.usage()), style),
-            Span::styled(command.summary.to_owned(), theme.dim),
+            Span::styled(command.summary.to_owned(), style),
         ]));
     }
     lines

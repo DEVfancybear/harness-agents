@@ -40,13 +40,29 @@ pub struct Proposal<'a> {
 /// Draw the panel.
 pub fn render(frame: &mut Frame, area: Rect, request: Proposal<'_>, theme: &Theme) {
     let lines = rows(&request, theme);
+    // At the minimum supported console height the inline viewport gives this
+    // panel only two rows. A full box would consume both with borders and hide
+    // the proposed action entirely; the composer and status bar still show the
+    // decision keys and countdown below this compact form.
+    if area.height <= 3 {
+        frame.render_widget(
+            Paragraph::new(
+                lines
+                    .into_iter()
+                    .take(usize::from(area.height))
+                    .collect::<Vec<_>>(),
+            ),
+            area,
+        );
+        return;
+    }
     let visible_rows = usize::from(area.height.saturating_sub(2));
     let max_scroll = lines.len().saturating_sub(visible_rows);
     let scroll = request.scroll.min(max_scroll);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme.tool_ok)
-        .title(Span::styled(" approval ", theme.title));
+        .border_style(theme.warning)
+        .title(Span::styled(" DUYỆT HÀNH ĐỘNG ", theme.warning));
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -82,7 +98,7 @@ pub fn rows(request: &Proposal<'_>, theme: &Theme) -> Vec<Line<'static>> {
         };
     let mut header = vec![Span::styled(
         format!("[approval] {}: {summary}", request.action),
-        theme.tool_ok,
+        theme.warning,
     )];
     if request.read_only {
         header.push(Span::styled(" · chỉ đọc".to_owned(), theme.dim));

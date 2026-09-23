@@ -18,7 +18,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
         return;
     }
     let line = row(state, theme, area.width);
-    frame.render_widget(ratatui::widgets::Paragraph::new(line), area);
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(line).style(theme.status),
+        area,
+    );
 }
 
 /// Build the one status row.
@@ -30,7 +33,8 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
     let mut used = 0_usize;
     // A span that does not fit is truncated, never dropped: a narrow console must
     // still say which model is selected.
-    let mut push = |mut span: Span<'static>, cost: usize| {
+    let mut push = |mut span: Span<'static>| {
+        let cost = super::composer::display_width(&span.content);
         if used >= budget {
             return;
         }
@@ -61,142 +65,120 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
         used += cost;
     };
 
+    push(Span::styled(" HA ", theme.title));
+    push(Span::styled("│", theme.dim));
+
     match (&state.modal, state.phase) {
         (Some(Modal::Approval { expires_at, .. }), _) => {
             let remaining = expires_at.saturating_duration_since(std::time::Instant::now());
-            push(
-                Span::styled(
-                    format!(" approval · còn {}", view::clock_label(remaining)),
-                    theme.tool_ok,
-                ),
-                22,
-            );
-            push(
-                Span::styled(" · y chạy · n từ chối".to_owned(), theme.dim),
-                22,
-            );
+            push(Span::styled(
+                format!(" approval · còn {}", view::clock_label(remaining)),
+                theme.warning,
+            ));
+            push(Span::styled(" · y chạy · n từ chối".to_owned(), theme.dim));
         }
         (Some(Modal::Picker { items, selected }), _) => {
-            push(
-                Span::styled(
-                    format!(" sessions {}/{}", selected + 1, items.len().max(1)),
-                    theme.accent,
-                ),
-                16,
-            );
-            push(
-                Span::styled(" · ↑↓ chọn · Enter · Esc".to_owned(), theme.dim),
-                26,
-            );
+            push(Span::styled(
+                format!(" sessions {}/{}", selected + 1, items.len().max(1)),
+                theme.accent,
+            ));
+            push(Span::styled(
+                " · ↑↓ chọn · Enter · Esc".to_owned(),
+                theme.dim,
+            ));
         }
         (Some(Modal::FilePicker { items, selected }), _) => {
-            push(
-                Span::styled(
-                    format!(" files {}/{}", selected + 1, items.len().max(1)),
-                    theme.accent,
-                ),
-                14,
-            );
-            push(
-                Span::styled(" · gõ lọc · ↑↓ · Enter · Esc".to_owned(), theme.dim),
-                30,
-            );
+            push(Span::styled(
+                format!(" files {}/{}", selected + 1, items.len().max(1)),
+                theme.accent,
+            ));
+            push(Span::styled(
+                " · gõ lọc · ↑↓ · Enter · Esc".to_owned(),
+                theme.dim,
+            ));
         }
         (Some(Modal::Question { options, .. }), _) => {
-            push(Span::styled(" question", theme.accent), 10);
+            push(Span::styled(" question", theme.accent));
             if !options.is_empty() {
-                push(
-                    Span::styled(format!(" · {} numbered options", options.len()), theme.dim),
-                    24,
-                );
+                push(Span::styled(
+                    format!(" · {} numbered options", options.len()),
+                    theme.dim,
+                ));
             }
-            push(Span::styled(" · Enter answers", theme.dim), 16);
+            push(Span::styled(" · Enter answers", theme.dim));
         }
         (Some(Modal::Overlay { title, .. }), _) => {
-            push(Span::styled(format!(" {title}"), theme.title), 12);
-            push(Span::styled(" · Esc đóng".to_owned(), theme.dim), 12);
+            push(Span::styled(format!(" {title}"), theme.title));
+            push(Span::styled(" · Esc đóng".to_owned(), theme.dim));
         }
         (None, AppPhase::Running | AppPhase::Canceling) => {
-            push(
-                Span::styled(
-                    format!(" {} running", Theme::spinner(state.tick)),
-                    theme.accent,
-                ),
-                12,
-            );
-            push(
-                Span::styled(
-                    format!(" · step {}/{}", state.steps, state.max_steps),
-                    theme.dim,
-                ),
-                16,
-            );
-            push(
-                Span::styled(
-                    format!(" · tools {}/{}", state.tool_calls, state.max_tool_calls),
-                    theme.dim,
-                ),
-                16,
-            );
-            if let Some(started) = state.run_started_at {
-                push(
-                    Span::styled(
-                        format!(" · {}", view::clock_label(started.elapsed())),
-                        theme.dim,
-                    ),
-                    8,
-                );
-            }
-            // An open gate is state the operator has to be able to see: after the
-            // panel closes there is nothing else on screen that says actions -
-            // including writes and commands - are running without being asked about.
+            let activity = if state.phase == AppPhase::Canceling {
+                "canceling"
+            } else {
+                "running"
+            };
+            push(Span::styled(
+                format!(" {} {activity}", Theme::spinner(state.tick)),
+                if state.phase == AppPhase::Canceling {
+                    theme.warning
+                } else {
+                    theme.accent
+                },
+            ));
+            push(Span::styled(" · Ctrl-C hủy".to_owned(), theme.dim));
+            // Put decisions and queued work before progress counters. At 60 cells
+            // the right edge may be clipped, but the operator must still see when
+            // the approval gate is open for the rest of this turn.
             if state.granted_for_run {
-                push(Span::styled(" · tự động cả lượt", theme.tool_ok), 18);
+                push(Span::styled(" · tự động cả lượt", theme.warning));
             }
             if state.queued_input {
-                push(Span::styled(" · queued (1)", theme.accent), 13);
+                push(Span::styled(" · queued (1)", theme.accent));
+            }
+            push(Span::styled(
+                format!(" · step {}/{}", state.steps, state.max_steps),
+                theme.dim,
+            ));
+            push(Span::styled(
+                format!(" · tools {}/{}", state.tool_calls, state.max_tool_calls),
+                theme.dim,
+            ));
+            if let Some(started) = state.run_started_at {
+                push(Span::styled(
+                    format!(" · {}", view::clock_label(started.elapsed())),
+                    theme.dim,
+                ));
             }
             if let Some(cost) = cost_label(state) {
                 let label = format!(" · cost {cost}");
-                push(
-                    Span::styled(label.clone(), theme.dim),
-                    super::composer::display_width(&label),
-                );
+                push(Span::styled(label, theme.dim));
             }
-            push(Span::styled(" · Ctrl-C hủy".to_owned(), theme.dim), 14);
         }
         (None, AppPhase::SetupRequired) => {
-            push(Span::styled(" setup required".to_owned(), theme.error), 18);
+            push(Span::styled(" setup required".to_owned(), theme.error));
             if let Some(hint) = &state.setup_hint {
                 let label = format!(" · {hint}");
-                let cost = super::composer::display_width(&label);
-                push(Span::raw(label), cost);
+                push(Span::raw(label));
             }
         }
         (None, _) => {
-            push(Span::styled(" ready".to_owned(), theme.tool_ok), 8);
+            push(Span::styled(" ● ready".to_owned(), theme.tool_ok));
             if let Some(model) = model_label(state) {
-                // The cost is measured in cells, not bytes: the separator is a
-                // multi-byte character and a Vietnamese label is not ASCII.
-                let cost = super::composer::display_width(&model) + 3;
-                push(Span::styled(format!(" · {model}"), theme.dim), cost);
+                let model = model
+                    .split_once(" via ")
+                    .map_or(model.as_str(), |(name, _)| name);
+                push(Span::styled(format!(" · {model}"), theme.dim));
             }
             if let Some(cost) = cost_label(state) {
                 let label = format!(" · cost {cost}");
-                push(
-                    Span::styled(label.clone(), theme.dim),
-                    super::composer::display_width(&label),
-                );
+                push(Span::styled(label, theme.dim));
             }
-            push(Span::styled(" · /help".to_owned(), theme.dim), 8);
+            push(Span::styled(" · /help".to_owned(), theme.dim));
         }
     }
 
     if let Some(reason) = &state.fallback_reason {
-        push(
-            Span::styled(format!(" · {reason}"), theme.error),
-            reason.len() + 3,
-        );
+        push(Span::styled(format!(" · {reason}"), theme.error));
     }
 
     Line::from(spans)
