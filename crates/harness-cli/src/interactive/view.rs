@@ -184,13 +184,21 @@ pub fn approval_lines(
     scope: &str,
     request_id: &str,
 ) -> Vec<String> {
-    vec![
+    let (summary, diff) = summary
+        .split_once("\n[diff]\n")
+        .map_or((summary, None), |(summary, diff)| (summary, Some(diff)));
+    let mut lines = vec![
         format!("[approval] {action}: {summary}"),
         format!("           workspace: {workspace}"),
         format!("           scope: {scope} (request {request_id})"),
         "           answer y to run it once, a to allow every action for this turn, or n to refuse"
             .to_owned(),
-    ]
+    ];
+    if let Some(diff) = diff {
+        lines.push("           [diff]".to_owned());
+        lines.extend(diff.lines().map(|line| format!("           {line}")));
+    }
+    lines
 }
 
 #[must_use]

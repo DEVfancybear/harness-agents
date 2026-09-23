@@ -48,6 +48,9 @@ tokio-util = { version = "=0.7.16", features = ["rt"] }
 uuid = { version = "=1.26.1", features = ["serde", "v7"] }
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std", "serde"] }
 ignore = "=0.4.25"
+globset = "=0.4.20"
+regex = "=1.13.1"
+similar = "=3.2.0"
 process-wrap = { version = "=10.0.0", default-features = false, features = ["tokio1", "job-object", "process-session", "kill-on-drop"] }
 unicode-normalization = "=0.1.25"
 # HA_TUI T01 decision D1: the inline-viewport TUI is drawn with ratatui, pinned

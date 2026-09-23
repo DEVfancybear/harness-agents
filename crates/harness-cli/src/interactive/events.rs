@@ -43,7 +43,7 @@ pub enum Key {
     EraseWord,
     /// Tab: complete a slash command.
     Tab,
-    /// Escape: dismiss a suggestion or close a modal. Never cancels a run.
+    /// Escape: dismiss a suggestion or close a modal; during a run it cancels it.
     Esc,
     /// Ctrl-L: repaint the viewport without touching the scrollback.
     Redraw,
@@ -86,6 +86,8 @@ pub enum AppPhase {
     Running,
     /// A gated action is waiting for the user's answer; the run is still active.
     WaitingApproval,
+    /// A durable `ask_user` question awaits a separate user input.
+    WaitingInput,
     Canceling,
     Closed,
 }
@@ -99,6 +101,7 @@ impl AppPhase {
             Self::SetupRequired => "setup_required",
             Self::Running => "running",
             Self::WaitingApproval => "waiting_approval",
+            Self::WaitingInput => "waiting_input",
             Self::Canceling => "canceling",
             Self::Closed => "closed",
         }
@@ -178,6 +181,14 @@ pub enum RunOutcome {
     Blocked(String),
     Failed(String),
     Canceled,
+}
+
+/// Whether output from an interactive shell prefix is sent with the next
+/// message or stays visible only in the local transcript.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellPrefixMode {
+    AttachToNextMessage,
+    DisplayOnly,
 }
 
 impl RunOutcome {
@@ -320,9 +331,18 @@ pub enum Modal {
         /// Whether the action only reads, so the panel offers the wider grant only
         /// where it would cover something.
         read_only: bool,
+        /// Vertical scroll offset while a bounded diff preview is open.
+        scroll: usize,
     },
     /// The session picker opened by `/resume` with no argument.
     Picker { items: Vec<String>, selected: usize },
+    /// Git-aware workspace file picker opened by `@` in the composer.
+    FilePicker { items: Vec<String>, selected: usize },
+    /// A model question; numbered options select a value, and free text is accepted.
+    Question {
+        prompt: String,
+        options: Vec<String>,
+    },
     /// `/help`, `/status`, `/config`, `/model` and `/more` output.
     ///
     /// `scroll` is the row offset from the top, so a panel holding more than it can
@@ -360,6 +380,8 @@ pub struct UiState {
     /// status row can say the gate is open instead of leaving a silent widening of
     /// what runs without asking.
     pub granted_for_run: bool,
+    /// One next user input held until the active run releases its session writer.
+    pub queued_input: bool,
     /// The last submitted request, so the status bar can name it.
     pub last_request: Option<String>,
     /// When the active run started, for the elapsed clock.
@@ -422,6 +444,7 @@ pub enum SessionEvent {
         request_id: String,
         action: String,
         summary: String,
+        rule_pattern: String,
         workspace: String,
         scope: String,
         /// When the gate stops waiting, so the panel can count down from the real
@@ -437,6 +460,11 @@ pub enum SessionEvent {
     ApprovalExpired {
         request_id: String,
     },
+    QuestionRequired {
+        question_id: String,
+        prompt: String,
+        options: Vec<String>,
+    },
     /// The answer to a resume listing.
     SessionsListed {
         sessions: Vec<SessionCandidate>,
@@ -444,6 +472,11 @@ pub enum SessionEvent {
     /// Something the user should know that is not an error.
     Notice {
         message: String,
+    },
+    ShellPrefixCompleted {
+        command: String,
+        output: String,
+        attach_to_next_message: bool,
     },
     RunTerminal {
         outcome: RunOutcome,

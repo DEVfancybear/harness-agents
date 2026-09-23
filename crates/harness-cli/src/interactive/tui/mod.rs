@@ -530,6 +530,7 @@ mod tests {
             open_tool: None,
             modal: None,
             granted_for_run: false,
+            queued_input: false,
             last_request: None,
             run_started_at: None,
             last_run_elapsed: Duration::ZERO,
@@ -542,6 +543,51 @@ mod tests {
             fallback_reason: None,
             tick: 0,
         }
+    }
+
+    #[test]
+    fn g06_file_picker_renders_workspace_paths_through_test_backend() {
+        let backend = ScriptedBackend::new(Vec::new());
+        let mut renderer = ScriptedRenderer::open(backend, 100, 30).expect("renderer opens");
+        let mut picking = state(AppPhase::Ready);
+        picking.modal = Some(crate::interactive::events::Modal::FilePicker {
+            items: vec!["src/lib.rs".to_owned(), "docs/guide.md".to_owned()],
+            selected: 0,
+        });
+        renderer.draw_state(&picking).expect("file picker draws");
+        let painted = renderer.painted().join("\n");
+        assert!(
+            painted.contains("chọn file"),
+            "file picker title: {painted}"
+        );
+        assert!(painted.contains("src/lib.rs"), "workspace entry: {painted}");
+        assert!(
+            painted.contains("gõ lọc") && painted.contains("Esc"),
+            "keys: {painted}"
+        );
+    }
+
+    #[test]
+    fn g06_ask_user_panel_renders_question_and_numbered_options() {
+        let backend = ScriptedBackend::new(Vec::new());
+        let mut renderer = ScriptedRenderer::open(backend, 100, 30).expect("renderer opens");
+        let mut asking = state(AppPhase::WaitingInput);
+        asking.live_text.clear();
+        asking.modal = Some(crate::interactive::events::Modal::Question {
+            prompt: "Which color should I use?".to_owned(),
+            options: vec!["blue".to_owned(), "green".to_owned()],
+        });
+        renderer.draw_state(&asking).expect("question panel draws");
+        let painted = renderer.painted().join("\n");
+        assert!(
+            painted.contains("Which color should I use?"),
+            "prompt: {painted}"
+        );
+        assert!(
+            painted.contains("1. blue") && painted.contains("2. green"),
+            "options: {painted}"
+        );
+        assert!(painted.contains("nhấn Enter"), "free-text hint: {painted}");
     }
 
     /// K01: a masked buffer reaches the screen as a mask, never as the key.
@@ -606,6 +652,7 @@ mod tests {
             scope: "once".to_owned(),
             expires_at: std::time::Instant::now() + Duration::from_mins(5),
             read_only: false,
+            scroll: 0,
         });
         renderer.draw_state(&asking).expect("frame draws");
         let painted = renderer.painted().join("\n");
@@ -628,6 +675,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn g04_approval_panel_shows_diff() {
+        let backend = ScriptedBackend::new(Vec::new());
+        let mut renderer = ScriptedRenderer::open(backend, 100, 40).expect("renderer opens");
+        let mut asking = state(AppPhase::WaitingApproval);
+        asking.modal = Some(crate::interactive::events::Modal::Approval {
+            request_id: "req-g04".to_owned(),
+            action: "edit_file".to_owned(),
+            summary: format!(
+                "path=src/parser.rs\n[diff]\n{}",
+                (0..18)
+                    .map(|index| format!(" line {index}"))
+                    .chain(["-old".to_owned(), "+new-tail".to_owned()])
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            workspace: "C:/work/project".to_owned(),
+            scope: "once".to_owned(),
+            expires_at: std::time::Instant::now() + Duration::from_mins(5),
+            read_only: false,
+            scroll: 0,
+        });
+        renderer.draw_state(&asking).expect("frame draws");
+        let painted = renderer.painted().join("\n");
+        assert!(
+            painted.contains("[diff]"),
+            "diff heading is visible: {painted}"
+        );
+        assert!(
+            painted.lines().any(|line| line.contains(" line 0")),
+            "diff context is laid out as real rows: {painted:?}"
+        );
+        if let Some(crate::interactive::events::Modal::Approval { scroll, .. }) = &mut asking.modal
+        {
+            *scroll = usize::MAX;
+        }
+        renderer.draw_state(&asking).expect("scrolled frame draws");
+        let painted = renderer.painted().join("\n");
+        assert!(
+            painted.contains("-old"),
+            "removed line is visible: {painted}"
+        );
+        assert!(
+            painted.contains("+new-tail"),
+            "added line is visible: {painted}"
+        );
+        assert!(
+            painted.lines().any(|line| line.contains("+new-tail")),
+            "the diff line remains a real panel row after scrolling: {painted:?}"
+        );
+    }
+
     /// The measured complaint, seen on the screen the user was looking at: a turn of
     /// shell commands asked about each one, and the panel named no key that ended the
     /// questions. This asserts the painted frame: the panel offers `a` and says what
@@ -647,6 +746,7 @@ mod tests {
             scope: "one action, this turn only".to_owned(),
             expires_at: std::time::Instant::now() + Duration::from_mins(5),
             read_only: false,
+            scroll: 0,
         });
         renderer.draw_state(&asking).expect("frame draws");
         let painted = renderer.painted().join("\n");

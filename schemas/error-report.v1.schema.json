@@ -61,6 +61,8 @@
             "strict_isolation_unavailable",
             "project_identity_conflict",
             "tool_intent_conflict",
+            "edit_not_found",
+            "edit_ambiguous",
             "task_not_found",
             "task_not_ready",
             "task_dependency_failed",

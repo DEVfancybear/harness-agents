@@ -8,6 +8,44 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[test]
+fn g06_shell_prefix_marks_process_capture_truncation() {
+    let output = ToolOutput::Process {
+        executable: "fixture-shell".to_owned(),
+        exit_code: Some(0),
+        timed_out: false,
+        canceled: false,
+        queued: false,
+        tree_cleanup_confirmed: true,
+        tree_cleanup: "reaped_on_exit".to_owned(),
+        stdout: "head output".to_owned(),
+        stderr: String::new(),
+        stdout_truncated: true,
+        stderr_truncated: false,
+        artifact_id: Some("artifact-g06".to_owned()),
+        captured_bytes: 4096,
+        capture_hash: None,
+        capture_truncated: true,
+        capture_tail: "tail output".to_owned(),
+    };
+
+    let (rendered, successful) = super::shell_output(&output);
+
+    assert!(successful);
+    assert!(
+        rendered.contains("[stdout preview truncated]"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("[capture truncated at quota]"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("[capture tail]\ntail output"),
+        "{rendered}"
+    );
+}
+
 // EnvironmentCredential reads process state. Run this case in a child instead
 // of mutating global environment variables under parallel Rust tests.
 #[test]
@@ -214,6 +252,8 @@ async fn resume_flow() {
     service.submit(SubmitRequest {
         input_id: InputId::generate(),
         text: "continue source".to_owned(),
+        answer_question_id: None,
+        shell_prefix: None,
     });
     // The accept loop must be listening before the service connects: this
     // environment refuses a connection to a fresh loopback listener that nobody is
@@ -291,6 +331,8 @@ async fn resume_flow() {
     service.submit(SubmitRequest {
         input_id: InputId::generate(),
         text: "must not start fresh".to_owned(),
+        answer_question_id: None,
+        shell_prefix: None,
     });
     let outcome = terminal(&mut channel).await;
     assert!(
@@ -312,4 +354,110 @@ async fn resume_flow() {
         "invalid resume does not silently admit fresh work"
     );
     store.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn g06_bang_prefix_uses_interactive_approval_and_attaches_output() {
+    let temp = tempfile::tempdir().expect("temp root");
+    let project = temp.path().join("project");
+    std::fs::create_dir(&project).expect("project");
+    let environment =
+        LaunchEnvironment::from_pairs([("HA_HOME", temp.path().join("home").into_os_string())]);
+    let context = bootstrap::resolve(LaunchRequest {
+        cwd: None,
+        caller_dir: project,
+        platform: HostPlatform::current(),
+        environment: environment.clone(),
+        explicit_data_dir: None,
+    })
+    .expect("context");
+    let mut channel = SessionChannel::new();
+    let mut service = AgentSessionService::new(&context, environment, channel.sender());
+    service.submit(SubmitRequest {
+        input_id: InputId::generate(),
+        text: "! echo HA_AGENT_G06_SERVICE".to_owned(),
+        answer_question_id: None,
+        shell_prefix: Some(ShellPrefix {
+            command: "echo HA_AGENT_G06_SERVICE".to_owned(),
+            mode: ShellPrefixMode::AttachToNextMessage,
+        }),
+    });
+
+    let approval = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            for event in channel.drain() {
+                match event {
+                    SessionEvent::ApprovalRequired { .. } => return event,
+                    SessionEvent::RecoverableError { message } => {
+                        panic!("shell prefix failed before approval: {message}");
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the shell prefix reaches the normal approval gate");
+    let SessionEvent::ApprovalRequired {
+        request_id,
+        action,
+        rule_pattern,
+        ..
+    } = approval
+    else {
+        unreachable!("the wait returns only an approval")
+    };
+    assert_eq!(action, "RunShell");
+    assert_eq!(rule_pattern, "run_shell(echo HA_AGENT_G06_SERVICE)");
+    assert!(service.answer(&request_id, ApprovalDecision::Granted));
+
+    let (shell, terminal) = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut shell = None;
+        let mut terminal = None;
+        while shell.is_none() || terminal.is_none() {
+            for event in channel.drain() {
+                match event {
+                    event @ SessionEvent::ShellPrefixCompleted { .. } => shell = Some(event),
+                    event @ SessionEvent::RunTerminal { .. } => terminal = Some(event),
+                    SessionEvent::RecoverableError { message } => {
+                        panic!("shell prefix failed after approval: {message}");
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        (
+            shell.expect("shell output"),
+            terminal.expect("terminal event"),
+        )
+    })
+    .await
+    .expect("the approved shell prefix settles");
+    assert!(matches!(
+        shell,
+        SessionEvent::ShellPrefixCompleted {
+            ref output,
+            attach_to_next_message: true,
+            ..
+        } if output.contains("HA_AGENT_G06_SERVICE")
+    ));
+    assert!(matches!(
+        terminal,
+        SessionEvent::RunTerminal {
+            outcome: RunOutcome::Done
+        }
+    ));
+
+    let store = SqliteStore::open_read_only(context.project_store_dir())
+        .await
+        .expect("read shell-prefix session");
+    let sessions = store.list_sessions().await.expect("list sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions[0].input_count, 1,
+        "one bang input is admitted once"
+    );
+    store.close().await.expect("close shell-prefix store");
 }

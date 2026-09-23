@@ -375,6 +375,14 @@ pub struct ToolExecutionReceipt {
     pub outcome_state: ToolOutcomeState,
     pub before_fingerprint: Option<ContentHash>,
     pub after_fingerprint: Option<ContentHash>,
+    /// Content digest immediately before a mutating workspace action.
+    /// Optional so receipts written before G04 still deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_hash: Option<ContentHash>,
+    /// Content digest immediately after a mutating workspace action.
+    /// Optional so receipts written before G04 still deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_hash: Option<ContentHash>,
     pub artifact_id: Option<ArtifactId>,
     pub observed_at_seq: u64,
 }

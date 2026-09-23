@@ -40,7 +40,11 @@ fn review_p3_policy_cannot_be_bypassed_by_path_spelling_or_ancestor() {
     ] {
         assert!(
             policy
-                .denial_for(&CodingToolAction::ReadFile { path: path.into() })
+                .denial_for(&CodingToolAction::ReadFile {
+                    path: path.into(),
+                    offset: None,
+                    limit: None
+                })
                 .is_some(),
             "policy bypass: {path}"
         );
@@ -49,7 +53,9 @@ fn review_p3_policy_cannot_be_bypassed_by_path_spelling_or_ancestor() {
     assert!(
         policy
             .denial_for(&CodingToolAction::ReadFile {
-                path: "SRC\\PRIVATE\\file.txt".into()
+                path: "SRC\\PRIVATE\\file.txt".into(),
+                offset: None,
+                limit: None,
             })
             .is_some()
     );
@@ -58,6 +64,10 @@ fn review_p3_policy_cannot_be_bypassed_by_path_spelling_or_ancestor() {
         CodingToolAction::SearchText {
             query: "x".into(),
             path: Some("src".into()),
+            regex: false,
+            case_insensitive: false,
+            glob: None,
+            context_lines: None,
         },
         CodingToolAction::GitDiff { path: None },
     ] {
@@ -69,7 +79,9 @@ fn review_p3_policy_cannot_be_bypassed_by_path_spelling_or_ancestor() {
     assert!(
         policy
             .denial_for(&CodingToolAction::ReadFile {
-                path: "src/private-other/file.txt".into()
+                path: "src/private-other/file.txt".into(),
+                offset: None,
+                limit: None,
             })
             .is_none()
     );
@@ -119,6 +131,8 @@ async fn review_p3_large_invalid_utf8_is_not_silently_repaired() {
         &root,
         CodingToolAction::ReadFile {
             path: "invalid.txt".into(),
+            offset: None,
+            limit: None,
         },
     )
     .await;
@@ -148,6 +162,10 @@ async fn review_p3_search_redacts_before_truncation() {
         CodingToolAction::SearchText {
             query: "FAKE_VALUE_ONLY_FOR_TEST".into(),
             path: None,
+            regex: false,
+            case_insensitive: false,
+            glob: None,
+            context_lines: None,
         },
     )
     .await;
@@ -416,11 +434,10 @@ fn make_escape_link(_link: &Path, _target: &Path) {
 async fn p3_s01_tool_contracts_are_versioned_and_receipts_are_immutable() {
     assert_eq!(ToolExecutionService::contract_version(), 1);
     let schemas = coding_tool_schemas();
-    // M4-02 added `git_log` and M4-03 added `read_process_output`; the schema
-    // set, not the contract version, is what grows when a tool is added, and
-    // each tool's own digest is versioned. M5-03 added the two read-only
-    // history tools the same way.
-    assert_eq!(schemas.len(), 13);
+    // The schema set grows additively when tools are added, while the tool
+    // contract version stays stable. M4/M5 added six tools; CP-B adds the
+    // write/edit/glob and ask_user tools without changing old tool digests.
+    assert_eq!(schemas.len(), 17);
     let names = schemas
         .iter()
         .map(|schema| {
@@ -465,6 +482,8 @@ async fn p3_s01_tool_contracts_are_versioned_and_receipts_are_immutable() {
         &root,
         CodingToolAction::ReadFile {
             path: "src/parser.txt".to_owned(),
+            offset: None,
+            limit: None,
         },
     )
     .await;
@@ -524,6 +543,8 @@ async fn p3_k08_parent_deny_cannot_be_overridden() {
             "fixture.actor",
             CodingToolAction::ReadFile {
                 path: "src/parser.txt".to_owned(),
+                offset: None,
+                limit: None,
             },
         ))
         .await
@@ -563,6 +584,8 @@ async fn p3_s02_every_tool_path_uses_one_gate_and_approval_binds_final_action() 
         &root,
         CodingToolAction::ReadFile {
             path: "src/parser.txt".to_owned(),
+            offset: None,
+            limit: None,
         },
     )
     .await;
@@ -574,6 +597,8 @@ async fn p3_s02_every_tool_path_uses_one_gate_and_approval_binds_final_action() 
             "different.actor",
             CodingToolAction::ReadFile {
                 path: "src/parser.txt".to_owned(),
+                offset: None,
+                limit: None,
             },
         ))
         .await
@@ -605,6 +630,8 @@ async fn p3_s02_every_tool_path_uses_one_gate_and_approval_binds_final_action() 
         &root,
         CodingToolAction::ReadFile {
             path: "src/parser.txt".to_owned(),
+            offset: None,
+            limit: None,
         },
     )
     .await;
@@ -626,6 +653,8 @@ async fn p3_s02_every_tool_path_uses_one_gate_and_approval_binds_final_action() 
         &root,
         CodingToolAction::ReadFile {
             path: "src/parser.txt".to_owned(),
+            offset: None,
+            limit: None,
         },
     )
     .await;
@@ -689,6 +718,10 @@ async fn p3_s03_rooted_files_search_and_patch_handle_crlf_unicode_and_stale_edit
         CodingToolAction::SearchText {
             query: "bánh".to_owned(),
             path: Some("src".to_owned()),
+            regex: false,
+            case_insensitive: false,
+            glob: None,
+            context_lines: None,
         },
     )
     .await;
@@ -752,6 +785,8 @@ async fn p3_s03_rooted_files_search_and_patch_handle_crlf_unicode_and_stale_edit
             "fixture.actor",
             CodingToolAction::ReadFile {
                 path: "../outside/outside.txt".to_owned(),
+                offset: None,
+                limit: None,
             },
         ))
         .await
@@ -765,6 +800,8 @@ async fn p3_s03_rooted_files_search_and_patch_handle_crlf_unicode_and_stale_edit
             "fixture.actor",
             CodingToolAction::ReadFile {
                 path: "src/escape/outside.txt".to_owned(),
+                offset: None,
+                limit: None,
             },
         ))
         .await
@@ -778,6 +815,8 @@ async fn p3_s03_rooted_files_search_and_patch_handle_crlf_unicode_and_stale_edit
             "fixture.actor",
             CodingToolAction::ReadFile {
                 path: ".env".to_owned(),
+                offset: None,
+                limit: None,
             },
         ))
         .await
@@ -790,6 +829,8 @@ async fn p3_s03_rooted_files_search_and_patch_handle_crlf_unicode_and_stale_edit
         &root,
         CodingToolAction::ReadFile {
             path: "src/binary.bin".to_owned(),
+            offset: None,
+            limit: None,
         },
     )
     .await;
@@ -819,6 +860,8 @@ async fn p3_c10_external_workspace_change_invalidates_approved_execution() {
         &root,
         CodingToolAction::ReadFile {
             path: "src/parser.txt".to_owned(),
+            offset: None,
+            limit: None,
         },
     )
     .await;
@@ -1106,6 +1149,8 @@ async fn p3_s05_git_identity_fingerprint_and_task_update_are_scoped() {
             "fixture.actor",
             CodingToolAction::ReadFile {
                 path: "src/parser.txt".to_owned(),
+                offset: None,
+                limit: None,
             },
         ))
         .await
@@ -1113,7 +1158,9 @@ async fn p3_s05_git_identity_fingerprint_and_task_update_are_scoped() {
     assert_eq!(
         linked_prepared.action(),
         &CodingToolAction::ReadFile {
-            path: "src/parser.txt".to_owned()
+            path: "src/parser.txt".to_owned(),
+            offset: None,
+            limit: None,
         }
     );
     drop(tools);
@@ -1146,6 +1193,8 @@ async fn p3_c23_project_identity_requires_explicit_reassociation() {
         &root,
         CodingToolAction::ReadFile {
             path: "src/parser.txt".to_owned(),
+            offset: None,
+            limit: None,
         },
     )
     .await;
@@ -1161,6 +1210,8 @@ async fn p3_c23_project_identity_requires_explicit_reassociation() {
             "fixture.actor",
             CodingToolAction::ReadFile {
                 path: "src/parser.txt".to_owned(),
+                offset: None,
+                limit: None,
             },
         ))
         .await
@@ -1183,6 +1234,8 @@ async fn p3_c23_project_identity_requires_explicit_reassociation() {
             "fixture.actor",
             CodingToolAction::ReadFile {
                 path: "src/parser.txt".to_owned(),
+                offset: None,
+                limit: None,
             },
         ))
         .await
@@ -1210,6 +1263,8 @@ async fn p3_c29_secret_output_is_redacted_and_artifact_scope_is_enforced() {
         &root,
         CodingToolAction::ReadFile {
             path: "notes.txt".to_owned(),
+            offset: None,
+            limit: None,
         },
     )
     .await;
@@ -1436,6 +1491,8 @@ async fn p3_k09_observer_failure_cannot_rewrite_receipt() {
             "fixture.actor",
             CodingToolAction::ReadFile {
                 path: "src/parser.txt".to_owned(),
+                offset: None,
+                limit: None,
             },
         ))
         .await
@@ -1533,9 +1590,9 @@ async fn p3_s07_cli_fixture_runs_p2_response_through_p3_tools_and_recovers_after
     let capabilities: Value =
         serde_json::from_slice(&capability.stdout).expect("capabilities JSON");
     assert_eq!(capabilities["tool_contract_version"], 1);
-    // M4-02 added `git_log`, M4-03 added `read_process_output` and M5-03 added
-    // `history_search`/`history_read` to the advertised schemas.
-    assert_eq!(capabilities["tool_schema_count"], 13);
+    // M4/M5 tools and the CP-B write/edit/glob/ask_user tools are advertised
+    // additively without changing the tool contract version.
+    assert_eq!(capabilities["tool_schema_count"], 17);
 
     let fixture = run_ha(&[
         "code",

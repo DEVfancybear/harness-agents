@@ -40,9 +40,9 @@ pub const DATA_DIRECTORY_KIND: &str = "harness-data";
 /// outbox, and 6 the M12 backend leases. All three are additive.
 pub const RUNTIME_SCHEMA_VERSION: i64 = 6;
 /// Additive P3 tool tables. 2 adds the M4 approval scope (session/task/
-/// invocation/call correlation) and the provider call id on intents; both are
-/// additive columns so a version 1 database upgrades in place.
-pub const TOOLS_SCHEMA_VERSION: i64 = 2;
+/// invocation/call correlation) and the provider call id on intents. 3 adds
+/// optional content hashes to JSON receipts; the SQL layout remains unchanged.
+pub const TOOLS_SCHEMA_VERSION: i64 = 3;
 /// Additive P4 memory tables retain all earlier schema revisions.
 ///
 /// 2 adds `memory_sources` (M7): the keyed source dependency of one version, so

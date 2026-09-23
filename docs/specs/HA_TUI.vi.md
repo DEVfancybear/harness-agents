@@ -264,7 +264,16 @@ hết flake **trước** khi thêm ca PTY mới của T08 — không được n�
 - Panel phê duyệt đọc `expires_at` **từ event** (gate phát kèm hạn thật), nên không có
   timeout thứ hai trong UI; `y`/`n` trả lời ngay trong TUI, gõ chữ rồi Enter vẫn dùng được
   như trước.
-- `Esc` đóng panel/picker/overlay và **không** bao giờ trả lời hay huỷ lượt.
+- `Esc` đóng picker/overlay. **Quyết định CP-B theo G06:** khi một lượt đang
+  chạy, `Esc` huỷ lượt đó theo cùng đường cancel đã có cho Ctrl-C; ở approval,
+  `Esc` không trả lời (không grant, không deny) và request vẫn chờ user. Lý do:
+  đây là hành vi table-stakes chung cả ba tham chiếu coding-agent đã nêu trong
+  assignment HA_AGENT; trạng thái Running không có modal nào cần Esc đóng.
+  / `Esc` đóng picker/overlay. **CP-B decision theo G06:** lúc run đang chạy,
+  `Esc` huỷ qua cùng đường Ctrl-C; tại approval, `Esc` không trả lời (không
+  cấp cũng không từ chối) và request tiếp tục chờ. Lý do: hành vi này là
+  table-stakes ở cả ba tham chiếu coding agent trong assignment; trạng thái
+  Running không có modal để Esc đóng.
 - Overlay (`/help`, `/status`, `/config`, `/model`) không ghi vào history khi đóng; plain
   mode vẫn in dòng như cũ.
 

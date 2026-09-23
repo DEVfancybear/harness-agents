@@ -21,6 +21,7 @@ pub mod input;
 pub mod instructions;
 pub mod memory;
 pub mod paths;
+pub mod permissions;
 pub mod project;
 pub mod prompt;
 pub mod service;
@@ -100,6 +101,12 @@ pub struct HeadlessOptions {
     pub max_continuations: Option<u32>,
     /// Token budget for the run, when the caller wants one.
     pub budget_tokens: Option<u64>,
+    /// Approval mode; omission remains fail-closed `ask`.
+    pub approval: Option<String>,
+    /// Temporary tool allow patterns for this one run.
+    pub allowed_tools: Vec<String>,
+    /// Temporary tool deny patterns for this one run.
+    pub disallowed_tools: Vec<String>,
 }
 
 /// Validate parser output into a launch mode.
@@ -138,9 +145,12 @@ pub fn mode_from_args(
             || !options.criteria.is_empty()
             || options.max_continuations.is_some()
             || options.budget_tokens.is_some()
+            || options.approval.is_some()
+            || !options.allowed_tools.is_empty()
+            || !options.disallowed_tools.is_empty()
         {
             return Err(UsageError::new(
-                "--mock, --goal, --criteria, --max-continuations and --budget are only valid with --headless",
+                "--mock, --goal, --criteria, --max-continuations, --budget, --allowed-tools and --disallowed-tools are only valid with --headless",
             ));
         }
         return Ok(LaunchMode::Interactive {
@@ -368,6 +378,7 @@ mod tests {
     use crate::interactive::bootstrap;
     use crate::interactive::detector::TerminalCapability;
     use crate::interactive::paths::{self, LaunchEnvironment};
+    use harness_tools::{ApprovalMode, CodingToolAction, Decision, ToolPolicy};
     use std::path::PathBuf;
 
     #[test]
@@ -411,6 +422,26 @@ mod tests {
                 plain: true,
                 config_overrides: super::config::ConfigOverrides::default(),
             }
+        );
+    }
+
+    #[test]
+    fn g05_headless_default_still_fails_closed() {
+        let options = HeadlessOptions::default();
+        assert_eq!(options.approval, None, "omission preserves ask mode");
+        assert!(matches!(
+            super::headless::headless_approval_mode(),
+            ApprovalMode::None
+        ));
+        let action = CodingToolAction::WriteFile {
+            path: "src/main.rs".to_owned(),
+            content: "fn main() {}\n".to_owned(),
+            expected_hash: None,
+        };
+        assert_eq!(
+            ToolPolicy::default().decide(&action),
+            Decision::Ask,
+            "headless has no gate to answer, so a default action is never auto-approved"
         );
     }
 

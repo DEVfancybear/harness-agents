@@ -42,6 +42,7 @@ pub enum ConfigLayer {
     Default,
     User,
     Project,
+    Local,
     Environment,
     Cli,
 }
@@ -53,6 +54,7 @@ impl ConfigLayer {
             Self::Default => "default",
             Self::User => "user",
             Self::Project => "project(trust)",
+            Self::Local => "project(local)",
             Self::Environment => "env",
             Self::Cli => "cli",
         }
@@ -64,6 +66,8 @@ pub struct ConfigOverrides {
     pub model: Option<String>,
     pub profile: Option<String>,
     pub approval: Option<String>,
+    pub allowed_tools: Vec<String>,
+    pub disallowed_tools: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -89,6 +93,8 @@ pub struct ResolvedConfig {
     pub provider: ResolvedProviderConfig,
     pub profile: Option<String>,
     pub approval: String,
+    pub allow_rules: Vec<String>,
+    pub deny_rules: Vec<String>,
     pub model_prices: BTreeMap<String, super::cost::ModelPrice>,
     pub retry_after_max_seconds: u64,
     pub explain: Vec<ConfigExplainEntry>,
@@ -113,6 +119,10 @@ pub fn resolve_layers(
     let mut entries = BTreeMap::new();
     let mut model_prices = BTreeMap::new();
     let mut retry_after_max_seconds = 30_u64;
+    let mut approval = "ask".to_owned();
+    let mut approval_layer = ConfigLayer::Default;
+    let mut allow_rules = Vec::new();
+    let mut deny_rules = Vec::new();
     explain_provider(&mut entries, &provider, ConfigLayer::Default, None);
     set_explain(&mut entries, "profile", "none", ConfigLayer::Default, None);
     set_explain(&mut entries, "approval", "ask", ConfigLayer::Default, None);
@@ -141,6 +151,15 @@ pub fn resolve_layers(
             ConfigLayer::User,
             &mut entries,
         );
+        apply_permissions(
+            &mut approval,
+            &mut approval_layer,
+            &mut allow_rules,
+            &mut deny_rules,
+            config,
+            ConfigLayer::User,
+            &mut entries,
+        )?;
     }
 
     let canonical_root = project_root
@@ -181,30 +200,17 @@ pub fn resolve_layers(
                 ConfigLayer::Project,
                 &mut entries,
             );
-        }
-        if let Some(config) = load_v2_layer(&local_path)? {
-            if let Some(provider_patch) = &config.provider {
-                apply_provider_patch(
-                    &mut provider,
-                    provider_patch,
-                    ConfigLayer::Project,
-                    &mut entries,
-                );
-            }
-            apply_models(
-                &mut model_prices,
+            apply_permissions(
+                &mut approval,
+                &mut approval_layer,
+                &mut allow_rules,
+                &mut deny_rules,
                 &config,
                 ConfigLayer::Project,
                 &mut entries,
-            );
-            apply_retry_limit(
-                &mut retry_after_max_seconds,
-                &config,
-                ConfigLayer::Project,
-                &mut entries,
-            );
+            )?;
         }
-    } else if project_path.exists() || local_path.exists() {
+    } else if project_path.exists() {
         project_reason = Some(
             "ignored project config because this canonical root is not in trust.projects"
                 .to_owned(),
@@ -223,6 +229,36 @@ pub fn resolve_layers(
         }
     }
 
+    // `config.local.toml` is an explicit per-user file inside this checkout.
+    // Shared `config.toml` remains gated by trust; local choices are loaded
+    // regardless so a confirmed always-allow rule works on the next turn.
+    if let Some(config) = load_v2_layer(&local_path)? {
+        if let Some(provider_patch) = &config.provider {
+            apply_provider_patch(
+                &mut provider,
+                provider_patch,
+                ConfigLayer::Local,
+                &mut entries,
+            );
+        }
+        apply_models(&mut model_prices, &config, ConfigLayer::Local, &mut entries);
+        apply_retry_limit(
+            &mut retry_after_max_seconds,
+            &config,
+            ConfigLayer::Local,
+            &mut entries,
+        );
+        apply_permissions(
+            &mut approval,
+            &mut approval_layer,
+            &mut allow_rules,
+            &mut deny_rules,
+            &config,
+            ConfigLayer::Local,
+            &mut entries,
+        )?;
+    }
+
     let mut profile = overrides.profile.clone().or_else(|| {
         environment
             .value("HA_PROFILE")
@@ -234,19 +270,18 @@ pub fn resolve_layers(
             profile_patch = config.profiles.get(selected).cloned();
         }
         let mut profile_layer = ConfigLayer::User;
-        if trusted {
-            if let Some(config) = load_v2_layer(&project_path)?
-                && let Some(value) = config.profiles.get(selected)
-            {
-                profile_patch = Some(value.clone());
-                profile_layer = ConfigLayer::Project;
-            }
-            if let Some(config) = load_v2_layer(&local_path)?
-                && let Some(value) = config.profiles.get(selected)
-            {
-                profile_patch = Some(value.clone());
-                profile_layer = ConfigLayer::Project;
-            }
+        if trusted
+            && let Some(config) = load_v2_layer(&project_path)?
+            && let Some(value) = config.profiles.get(selected)
+        {
+            profile_patch = Some(value.clone());
+            profile_layer = ConfigLayer::Project;
+        }
+        if let Some(config) = load_v2_layer(&local_path)?
+            && let Some(value) = config.profiles.get(selected)
+        {
+            profile_patch = Some(value.clone());
+            profile_layer = ConfigLayer::Local;
         }
         if let Some(patch) = profile_patch
             && let Some(provider_patch) = patch.provider
@@ -297,36 +332,147 @@ pub fn resolve_layers(
     let env_approval = environment
         .value("HA_APPROVAL")
         .map(|value| value.to_string_lossy().into_owned());
-    let approval = overrides
-        .approval
-        .clone()
-        .or(env_approval)
-        .unwrap_or_else(|| "ask".to_owned());
-    if approval != "ask" {
+    if let Some(value) = env_approval {
+        approval = value;
+        approval_layer = ConfigLayer::Environment;
+    }
+    if let Some(value) = &overrides.approval {
+        approval.clone_from(value);
+        approval_layer = ConfigLayer::Cli;
+    }
+    if !matches!(approval.as_str(), "ask" | "auto-edit" | "full-auto") {
         return Err(HarnessError::new(
             ErrorCode::ConfigParseError,
-            "only approval mode 'ask' is available before G05",
+            "approval mode must be ask, auto-edit, or full-auto",
         ));
     }
-    let approval_layer = if overrides.approval.is_some() {
-        ConfigLayer::Cli
-    } else if environment.value("HA_APPROVAL").is_some() {
-        ConfigLayer::Environment
-    } else {
-        ConfigLayer::Default
-    };
     set_explain(&mut entries, "approval", &approval, approval_layer, None);
+    if !overrides.allowed_tools.is_empty() {
+        allow_rules.extend(overrides.allowed_tools.iter().cloned());
+        explain_permission_rules(
+            &mut entries,
+            "permissions.allow",
+            &overrides.allowed_tools,
+            ConfigLayer::Cli,
+        );
+        set_explain(
+            &mut entries,
+            "permissions.allow",
+            &format!("{} (CLI temporary)", overrides.allowed_tools.join(", ")),
+            ConfigLayer::Cli,
+            None,
+        );
+    }
+    if !overrides.disallowed_tools.is_empty() {
+        deny_rules.extend(overrides.disallowed_tools.iter().cloned());
+        explain_permission_rules(
+            &mut entries,
+            "permissions.deny",
+            &overrides.disallowed_tools,
+            ConfigLayer::Cli,
+        );
+        set_explain(
+            &mut entries,
+            "permissions.deny",
+            &format!("{} (CLI temporary)", overrides.disallowed_tools.join(", ")),
+            ConfigLayer::Cli,
+            None,
+        );
+    }
 
     let explain = entries.into_values().collect();
     Ok(ResolvedConfig {
         provider,
         profile,
         approval,
+        allow_rules,
+        deny_rules,
         model_prices,
         retry_after_max_seconds,
         explain,
         project_config_reason: project_reason,
     })
+}
+
+fn apply_permissions(
+    approval: &mut String,
+    approval_layer: &mut ConfigLayer,
+    allow_rules: &mut Vec<String>,
+    deny_rules: &mut Vec<String>,
+    config: &HarnessConfigV2,
+    layer: ConfigLayer,
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+) -> Result<(), HarnessError> {
+    let Some(permissions) = &config.permissions else {
+        return Ok(());
+    };
+    if let Some(mode) = &permissions.mode {
+        if !matches!(mode.as_str(), "ask" | "auto-edit" | "full-auto") {
+            return Err(HarnessError::new(
+                ErrorCode::ConfigParseError,
+                "permissions.mode must be ask, auto-edit, or full-auto",
+            ));
+        }
+        approval.clone_from(mode);
+        *approval_layer = layer;
+        set_explain(entries, "permissions.mode", mode, layer, None);
+    }
+    allow_rules.extend(
+        permissions
+            .allow
+            .iter()
+            .filter(|rule| !rule.trim().is_empty())
+            .cloned(),
+    );
+    deny_rules.extend(
+        permissions
+            .deny
+            .iter()
+            .filter(|rule| !rule.trim().is_empty())
+            .cloned(),
+    );
+    if !permissions.allow.is_empty() {
+        set_explain(
+            entries,
+            "permissions.allow",
+            &allow_rules.join(", "),
+            layer,
+            None,
+        );
+    }
+    explain_permission_rules(entries, "permissions.allow", &permissions.allow, layer);
+    if !permissions.deny.is_empty() {
+        set_explain(
+            entries,
+            "permissions.deny",
+            &deny_rules.join(", "),
+            layer,
+            None,
+        );
+    }
+    explain_permission_rules(entries, "permissions.deny", &permissions.deny, layer);
+    Ok(())
+}
+
+fn explain_permission_rules(
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+    key: &str,
+    rules: &[String],
+    layer: ConfigLayer,
+) {
+    let prefix = format!("{key}.rule.");
+    let first_index = entries
+        .keys()
+        .filter(|key| key.starts_with(&prefix))
+        .count();
+    for (offset, rule) in rules
+        .iter()
+        .filter(|rule| !rule.trim().is_empty())
+        .enumerate()
+    {
+        let index = first_index + offset;
+        set_explain(entries, &format!("{prefix}{index:04}"), rule, layer, None);
+    }
 }
 
 fn load_v2_layer(path: &Path) -> Result<Option<HarnessConfigV2>, HarnessError> {
@@ -820,6 +966,50 @@ mod tests {
                 .project_config_reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("trust"))
+        );
+    }
+
+    #[test]
+    fn g05_local_permission_rules_load_without_project_trust_and_explain_the_layer() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join(".harness")).expect("project config dir");
+        let user = temp.path().join("user.toml");
+        std::fs::write(&user, "schema_version = 2\n").expect("user config");
+        std::fs::write(
+            root.join(".harness/config.toml"),
+            "schema_version = 2\n[permissions]\nallow = ['run_shell(never trusted)']\n",
+        )
+        .expect("untrusted shared config");
+        std::fs::write(
+            root.join(".harness/config.local.toml"),
+            "schema_version = 2\n[permissions]\nallow = ['run_shell(cargo test *)']\n",
+        )
+        .expect("local per-user config");
+
+        let resolved = resolve_layers(
+            &user,
+            &root,
+            &super::super::paths::LaunchEnvironment::default(),
+            &ConfigOverrides::default(),
+        )
+        .expect("local preferences load without trusting shared project config");
+        assert_eq!(resolved.allow_rules, ["run_shell(cargo test *)"]);
+        assert!(
+            resolved.explain.iter().any(|entry| {
+                entry.key.starts_with("permissions.allow.rule.")
+                    && entry.value == "run_shell(cargo test *)"
+                    && entry.layer == super::ConfigLayer::Local
+            }),
+            "the overlay can show the rule's true source layer: {:?}",
+            resolved.explain
+        );
+        assert!(
+            !resolved
+                .allow_rules
+                .iter()
+                .any(|rule| rule.contains("never trusted")),
+            "an untrusted shared config never contributes allow rules"
         );
     }
 

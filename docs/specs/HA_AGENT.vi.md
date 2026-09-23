@@ -1,4 +1,8 @@
-# SPEC HA_AGENT — checkpoint CP-A (G01–G03) / Đặc tả HA_AGENT — checkpoint CP-A
+# SPEC HA_AGENT — CP-A record and CP-B addendum / Đặc tả HA_AGENT — hồ sơ CP-A và bổ sung CP-B
+
+**Current assignment / Assignment hiện tại:** G04–G06, checkpoint CP-B; G07+ is out of scope. The CP-A material below is retained as the original pre-implementation specification. / Thực hiện G04–G06, checkpoint CP-B; G07 trở đi ngoài phạm vi. Nội dung CP-A bên dưới được giữ làm đặc tả gốc trước triển khai.
+
+## CP-A original baseline (historical) / Baseline CP-A ban đầu (lịch sử)
 
 Assignment: G01–G03 from docs/HA_AGENT_PLAN.vi.md; no G04 or later.
 Source/base: HEAD 37e355dc2cc22a381c7e86ae3231b14c0c354be0, branch master.
@@ -403,12 +407,245 @@ dependency version, từng lần gate, tình trạng chưa có duyệt riêng ch
 Trạng thái: SPEC được lập trước code. CP-A chỉ hoàn tất khi toàn bộ gate G01–G03
 xanh; sau đó dừng.
 
+## CP-B assignment / Assignment CP-B (SPEC trước RED)
+
+**English.** The current assignment is G04–G06 only. CP-A is retained as historical
+evidence; its old “do not start G04” handoff is superseded by the user's new
+assignment. Keep one root workspace/binary/engine; preserve one admitted input per
+session, fail-closed approval, protected/escape rejection before a panel, ANSI-free
+headless output, existing exit codes, and all D1–D11 decisions. Stop after CP-B.
+
+**Tiếng Việt.** Assignment hiện tại chỉ gồm G04–G06. CP-A được giữ làm lịch sử;
+handoff cũ “không bắt đầu G04” đã được assignment mới của user thay thế. Giữ một
+workspace/binary/engine; bảo toàn một input được nhận mỗi session, approval
+fail-closed, chặn protected/escape trước panel, headless không ANSI, exit code cũ
+và toàn bộ quyết định D1–D11. Dừng sau CP-B.
+
+### Preflight verification / Kiểm chứng trước khi sửa
+
+- `HEAD = origin/master = 0bf6f40bf24832da7f61f45e026c8556fc94159e`; branch
+  `master`, worktree sạch. The code graph MCP tools were not exposed, so source
+  discovery used the repo-prescribed `rg` and targeted reads. / Công cụ graph MCP
+  không khả dụng; đã dùng `rg` và đọc source có mục tiêu theo fallback của repo.
+- G01–G03 source checked before edits: `SystemPromptBuilder` enforces a 2 KiB
+  cap; `instructions::load` emits digest-bearing `ProjectRule` blocks and
+  `service.rs` passes them into `RunRequest`; config resolver and v1/preference
+  tests exist; the OpenAI/Anthropic adapters and DeepSeek config are separate;
+  model switching is persisted through `session_settings`; cost/thinking tests
+  exist. / Đã đọc symbol G01–G03: prompt có trần 2 KiB; loader tạo block
+  `ProjectRule` có digest và service truyền vào `RunRequest`; config v1/precedence
+  có test; adapter OpenAI/Anthropic tách riêng, DeepSeek là config; đổi model được
+  lưu ở `session_settings`; có test cost/thinking.
+- Before-edit tests: `cargo test -p harness-cli --bin ha --locked` = **278
+  passed, 0 failed, 1 ignored**; `g01_` = **5/5**; `g02_` = **5/5**;
+  `g01_agents_md_cannot_grant_tools` = **1/1**; `g03_` in `harness-cli` = **3/3**;
+  store model-switch migration selector = **1/1**; provider G03 selectors excluding
+  the previously exhausted `g03_anthropic_429_http_date_is_bounded` = **3/3**.
+  The known loopback test is not part of this preflight rerun. / Kiểm thử trước sửa:
+  tổng `ha` **278 đạt, 0 lỗi, 1 ignored**; G01 **5/5**, G02 **5/5**, test rule
+  **1/1**, G03 CLI **3/3**, migration selector **1/1**, provider G03 (bỏ test
+  loopback đã hết retry) **3/3**. Không chạy lại test loopback đã biết lỗi ở CP-A.
+- D10 check: lockfile has `globset 0.4.20`, `regex 1.13.1`, and `ignore 0.4.25`;
+  `cargo info similar@3.2.0` reports version **3.2.0**, Apache-2.0, MSRV 1.85.
+  Pin only these three approved dependencies exactly; keep `TOOL_CONTRACT_VERSION`
+  and unrelated schema versions unchanged. / Lockfile có đúng các bản `globset`,
+  `regex`, `ignore`; `cargo info similar@3.2.0` xác nhận `similar 3.2.0`, Apache-2.0,
+  MSRV 1.85. Chỉ pin ba dependency D10 cho phép; giữ `TOOL_CONTRACT_VERSION` và
+  schema không liên quan.
+
+### Requirement inventory / Kiểm kê requirement
+
+Disposition is evidence-based: `reuse_verified`, `adapt`, `missing`, or
+`incompatible`. Each row names the current source/test and the CP-B action.
+Disposition dựa trên bằng chứng: `reuse_verified`, `adapt`, `missing`, hoặc
+`incompatible`. Mỗi dòng nêu source/test hiện có và việc CP-B sẽ làm.
+
+| Requirement / Yêu cầu | Current source and tests / Source và test hiện có | Disposition and action / Nhãn và việc làm |
+|---|---|---|
+| G04 write/edit contracts; unique old-string rule; typed `EditNotFound`/`EditAmbiguous` / Hợp đồng write/edit, old string duy nhất, lỗi typed | `CodingToolAction`, `from_provider_call`, `ToolKind`, and `coding_tool_schemas()` in `harness-tools/src/contracts.rs`; `apply_patch` is the only workspace mutation; existing `a15_path_patch_safety` | `adapt`: add additive action variants, parser/schema and typed error codes; preserve `apply_patch` / thêm variant/parser/schema/error, giữ `apply_patch` |
+| G04 glob with `.gitignore`, bounded at 4096 / Glob theo `.gitignore`, trần 4096 | `workspace::walk_files` already uses `ignore::WalkBuilder`, rejects links/protected paths, and caps entries at 4096; no glob filter or glob contract | `adapt`: reuse walker and apply pinned `globset` matcher within the same cap / tái dùng walker, thêm matcher `globset` |
+| G04 regex/case/glob/context search, max 512; line-range read with line numbers / Search regex/case/glob/context, tối đa 512; read range có số dòng | `workspace::search_text` is substring-only and caps 512; `read_text_output` is bounded but `read_file` has no line range; no G04 tests | `adapt`: optional schema fields, regex compile errors typed, bounded context previews, line-numbered ranges / thêm field optional, lỗi regex typed, context và số dòng |
+| G04 tools schema v2→v3 additive; central workspace validation; retain patch / Schema tools v2→v3 additive; validation tập trung; giữ patch | `TOOLS_SCHEMA_VERSION=2` and `migrate_tools_schema`; `ToolExecutionService::validate_workspace_action` checks containment/protection before proposals; existing `a15_path_patch_safety` | `adapt`: bump tools DB marker through its additive migration and validate every new path action before approval / bump marker bằng migration additive, validate mọi path mới trước approval |
+| G04 mutating hashes and ≤1 MiB preimage artifact / Hash mutation và artifact preimage ≤1 MiB | `ApplyPatch` output has before/after hashes; receipts and artifact publication exist, but no write/edit preimage is captured | `adapt`: record file hashes with receipt evidence; publish bounded preimage in task-scoped artifact for future `/undo` / ghi hash, artifact preimage scoped theo task |
+| G04 unified diff in approval panel and plain `[diff]` / Diff unified trong panel và plain `[diff]` | Current `ApprovalProposal` has action/summary only; TestBackend and plain transcript renderers exist | `missing`: attach bounded diff preview to proposal; add TestBackend and plain-mode assertions / thêm diff preview và test cả hai renderer |
+| G04 prompt prefers edit over patch / Prompt ưu tiên edit hơn patch | `SystemPromptBuilder` lists available tools; existing prompt bound test | `adapt`: add explicit preference while preserving ≤2 KiB / thêm chỉ dẫn, giữ trần 2 KiB |
+| G05 `PolicyMode` and `tool(pattern)` inside `ToolPolicy`; protected→deny→allow→mode→panel / `PolicyMode` và rule trong `ToolPolicy`; thứ tự protected→deny→allow→mode→panel | `ToolPolicy` owns path deny rules; workspace validation precedes `ApprovalGate`, which otherwise always asks/denies; G01 hostile-rule test proves project text does not grant tools | `adapt`: extend the existing policy source of truth and its prepared-action decision; no parallel policy class / mở rộng `ToolPolicy`, không tạo lớp policy thứ hai |
+| G05 confirmed `A` rule persistence, `/permissions`, `/mode` / Lưu rule sau xác nhận `A`, `/permissions`, `/mode` | Controller has `y/a/n` turn-wide approval, `config.local.toml` exists, but `A` and the commands do not persist policy rules | `missing`: show proposed pattern, require explicit Enter, persist only afterward, apply it for the current session / hiện pattern, đòi Enter xác nhận rồi mới lưu và áp dụng |
+| G05 transcript trace for each rule/mode auto-allow; headless flags default ask / Transcript ghi mọi auto-allow; cờ headless mặc định ask | Current grant-for-run logs every covered action; headless currently uses `ApprovalMode::None` and has no allow/deny flags | `adapt`: retain per-action visibility, add ask/auto-edit/full-auto plus temporary patterns; default stays fail-closed / ghi từng action, thêm mode/rule tạm, mặc định vẫn fail-closed |
+| G06 `ask_user` through `HumanInputService` and `TurnStop::NeedsInput`, interactive answer and continuation / `ask_user` qua HumanInputService/NeedsInput, panel trả lời và tiếp tục | `HumanInputService`, durable question store, and `TurnStop::NeedsInput` exist for goal evaluation; interactive has no model-call question tool or answer panel | `adapt`: route the new interactive tool to the existing service, stop cleanly, answer and admit continuation in the same task / nối vào service hiện có, dừng, nhận câu trả lời và tiếp tục cùng task |
+| G06 Enter queue and `/steer` via `RunInbox::steer` / Enter xếp hàng, `/steer` qua inbox | Controller currently refuses second input while active; `RunInbox::steer` and driver boundary consumption exist; interactive does not attach inbox | `incompatible`: current “one active input” UI behavior conflicts with this assignment; implement a bounded one-item pending queue and wire the inbox without creating another driver / thay hành vi từ chối bằng queue một item và nối inbox hiện có |
+| G06 Esc cancels a running turn; Esc in approval does not answer / Esc hủy turn đang chạy; approval không bị trả lời | T06 currently documents Escape as non-cancel; controller preserves approval modal on Esc; Ctrl-C cancellation and `i07b` PTY exist | `incompatible`: update T06 in `HA_TUI.vi.md` with the user's “table stakes across all three references” rationale; only running Esc cancels, approval Esc remains non-answer / sửa T06 theo lý do user yêu cầu; chỉ Esc lúc chạy mới hủy |
+| G06 `@` ignore walker picker; `!` shell through approval; `!!` display-only / Picker `@`; `!` qua approval; `!!` chỉ hiển thị | Attachments resolve explicitly named paths; `run_shell` already crosses `TurnDriver` approval; no picker/prefix syntax | `adapt`: add bounded visible picker and route single-bang through `run_shell`; double-bang stays local display / thêm picker có giới hạn, một `!` dùng run_shell; `!!` không gửi model |
+
+### Ordered slices, compatibility, and acceptance / Trình tự, tương thích, acceptance
+
+1. G04 contracts + exact RED selectors, then workspace read/write/search/glob and
+   receipt preimages, then diff approval panel. / Hợp đồng + test RED chính xác,
+   sau đó workspace và receipt, cuối cùng diff panel.
+2. G05 policy extension + exact RED selectors, persistence only after explicit
+   pattern confirmation, then commands/headless arguments and audit transcript.
+   / Mở rộng policy + test RED, chỉ lưu sau khi xác nhận pattern, rồi commands/
+   cờ headless và transcript.
+3. G06 ask-user, queue/steer, Esc, picker and shell prefixes; test with the real
+   existing TurnDriver/store/host. / Làm ask-user, queue/steer, Esc, picker và
+   shell; dùng TurnDriver/store/host hiện có.
+
+Required exact names include the G04 selectors in plan §6; G05
+`g05_protected_path_beats_every_allow_rule_and_mode`,
+`g05_deny_rule_beats_allow_rule`, `g05_auto_edit_never_auto_runs_process_or_shell`,
+`g05_always_allow_writes_a_rule_only_after_confirmation`,
+`g05_rule_pattern_matches_args_not_tool_name_only`,
+`g05_headless_default_still_fails_closed`,
+`g05_transcript_records_every_auto_allowed_action`; and G06
+`g06_ask_user_stops_the_turn_and_answer_resumes_it`,
+`g06_enter_while_running_queues_and_sends_after_terminal`,
+`g06_steer_reaches_the_driver_mid_run`,
+`g06_esc_cancels_a_running_turn_but_not_an_approval`,
+`g06_at_picker_inserts_a_workspace_relative_path`,
+`g06_bang_prefix_goes_through_the_same_approval_gate`.
+TestBackend must cover diff and picker; real-console PTY selectors i05/i06/i07/h05
+run through `Invoke-HaPtyAcceptance.ps1`. Run `milestone_m4`, `phase_p3`, and all
+`interactive_*` with one test thread; final HA launch gate must have a green run
+with `failures: []`. / Dùng đúng tên test theo plan; TestBackend kiểm diff/picker;
+PTY thật chạy i05/i06/i07/h05 qua script; chạy milestone_m4, phase_p3 và mọi
+interactive_* tuần tự; launch gate phải có một lượt `failures: []`.
+
+No D1–D11 change is warranted by preflight measurements. The T06 Escape change is
+the explicit G06 assignment and will be recorded separately in `HA_TUI.vi.md`.
+Không có số đo nào buộc đổi D1–D11. Thay đổi Esc ở T06 được G06 giao rõ và sẽ ghi
+riêng trong `HA_TUI.vi.md`.
+
 ## Preflight observation (before RED)
 
-The M6 prerequisite gate was attempted on the current working tree and stopped at
-its format step (exit 1), before running milestone tests. Rustfmt reported existing
-format differences in crates/harness-cli/src/web/mod.rs,
+The M6 prerequisite gate was attempted on the then-current working tree and stopped
+at its format step (exit 1), before running milestone tests. Rustfmt reported
+existing format differences in crates/harness-cli/src/web/mod.rs,
 crates/harness-cli/src/interactive/memory.rs,
 crates/harness-cli/tests/milestone_m10.rs, crates/harness-memory/src/lib.rs, and
-crates/harness-store-sqlite/src/store.rs. These are baseline formatting findings,
+crates/harness-store-sqlite/src/store.rs. These were baseline formatting findings,
 not G01–G03 failures. No test or implementation file had been changed at that point.
+This is a historical CP-A observation; CP-B formatting and Clippy results are below.
+
+## CP-B implementation record and acceptance / Kết quả triển khai và acceptance CP-B
+
+### Scope and preserved decisions / Phạm vi và quyết định được giữ
+
+G04–G06 are implemented in the existing root workspace and `ha` binary. No crate,
+product binary, or second engine was added. G07 and later were not started. D1–D11
+remain unchanged because the measured CP-B results did not contradict them. The
+Escape behavior change is the explicit G06 assignment and is recorded in
+`docs/specs/HA_TUI.vi.md` T06 with the requested rationale. / Đã triển khai G04–G06
+trong workspace gốc và binary `ha`; không thêm crate, binary sản phẩm hay engine
+thứ hai. Chưa bắt đầu G07 trở đi. Giữ D1–D11 vì số đo CP-B không mâu thuẫn. Thay
+đổi phím Esc là yêu cầu rõ của G06, đã ghi ở T06 trong `docs/specs/HA_TUI.vi.md`
+cùng lý do user yêu cầu.
+
+The CP-B source preserves one admitted input per session, fail-closed approval,
+protected-path rejection before the panel, ANSI-free headless output, and existing
+exit codes. No paid API call, user install, manual migration run, or user/shared
+project `config.local.toml` write was performed. G05 persistence tests use disposable
+temporary roots. / Source CP-B giữ một input được nhận mỗi session, approval
+fail-closed, chặn protected path trước panel, headless không ANSI và exit code hiện
+hữu. Không gọi API trả phí, cài lên máy user, chạy migration thủ công hoặc ghi
+`config.local.toml` của project user/workspace dùng chung. Test G05 chỉ ghi file
+trong thư mục tạm có thể xóa.
+
+### Implemented requirement inventory / Kiểm kê requirement đã triển khai
+
+| Group / Nhóm | Result and source / Kết quả và source | Verification / Kiểm chứng |
+|---|---|---|
+| G04 contracts, write/edit, typed errors, glob/search/read ranges, schema 2→3 / Contract, write/edit, lỗi typed, glob/search/read range, schema 2→3 | Additive tool actions and schemas in `harness-tools/src/contracts.rs`; all path actions use `validate_workspace_action`; mutating receipts include hashes and bounded preimage artifacts; approval panel and plain transcript show bounded diff. / Thêm action/schema additive; mọi path action qua validate tập trung; receipt mutation có hash và preimage artifact có giới hạn; panel và transcript plain hiện diff có giới hạn. | Exact `g04_*` selectors plus `milestone_m4` **23/23**. The TestBackend diff case passed. / Selector `g04_*` và `milestone_m4` **23/23**; TestBackend diff đạt. |
+| G05 policy, rules, persistent `A`, commands, audit, headless / Policy, rule, `A` dài hạn, command, audit, headless | `PolicyMode` and `ToolPolicy::decide` remain in the existing policy source; order is protected → deny → allow → mode → panel. Pattern persistence happens only after explicit Enter. `/permissions`, `/mode`, transcript audit, and headless flags are wired. / `PolicyMode` và `ToolPolicy::decide` nằm trong policy hiện có; thứ tự protected → deny → allow → mode → panel. Chỉ lưu pattern sau Enter xác nhận. Đã nối `/permissions`, `/mode`, audit transcript và cờ headless. | CLI G05 selectors **9/9** and `harness-tools` G05 selectors **5/5**. `/mode`, confirmation-only persistence, deny/allow precedence, default ask, and per-action audit are covered. / G05 CLI **9/9**, G05 `harness-tools` **5/5**; có test mode, xác nhận lưu, precedence deny/allow, mặc định ask và audit từng action. |
+| G06 ask-user, queue/steer, Esc, picker, shell prefixes / ask-user, queue/steer, Esc, picker, shell | `ask_user` uses `HumanInputService`; a queued Enter becomes the next input after terminal; `/steer` uses the attached inbox; Esc cancels a running turn but does not answer approval; `@`, `!`, and `!!` use the existing workspace/tool paths. / `ask_user` dùng `HumanInputService`; Enter được xếp hàng thành input kế tiếp sau terminal; `/steer` dùng inbox đã nối; Esc hủy lượt đang chạy nhưng không trả lời approval; `@`, `!`, `!!` dùng đường workspace/tool hiện có. | Controller/service G06 tests, `milestone_m4` **23/23**, TestBackend picker, and PTY selectors below. / Test controller/service G06, `milestone_m4` **23/23**, picker TestBackend và PTY bên dưới. |
+
+The three earlier assertions that expected a running input to be refused or an
+expired `y` to be refused were updated to assert the G06 queue contract and to
+prove that a stale approval is never answered. The approval panel test now asserts
+the turn grant and the separate Enter confirmation for a persistent rule. These
+tests were run RED/GREEN; no test was deleted or weakened. / Ba assertion cũ chờ
+từ chối input khi run đang chạy hoặc từ chối `y` hết hạn đã được đổi để kiểm tra
+queue G06 và chứng minh approval cũ không nhận câu trả lời. Test panel nay kiểm tra
+grant trong lượt và xác nhận Enter riêng cho rule dài hạn. Đã chạy RED/GREEN; không
+xóa hoặc nới test.
+
+### Exact dependency pins / Pin dependency chính xác
+
+| Crate | Exact version | License | Use / Công dụng |
+|---|---:|---|---|
+| `globset` | `0.4.20` | Unlicense OR MIT | G04 glob matcher / matcher glob G04 |
+| `regex` | `1.13.1` | MIT OR Apache-2.0 | G04 regex search / search regex G04 |
+| `ignore` | `0.4.25` | Unlicense OR MIT | `.gitignore`-aware traversal / walker theo `.gitignore` |
+| `similar` | `3.2.0` | Apache-2.0 | G04 unified diff / unified diff G04 |
+
+All four versions are exact pins in the root workspace and represented in the
+same `Cargo.lock`. No crate was added. The `similar 3.2.0` metadata was checked
+before pinning; its reported MSRV is 1.85. / Cả bốn version được pin exact ở
+workspace gốc và ghi trong cùng `Cargo.lock`. Không thêm crate. Đã kiểm tra
+metadata `similar 3.2.0` trước khi pin; MSRV được báo là 1.85.
+
+### Verification ledger / Nhật ký kiểm chứng
+
+| Command / Lệnh | Result / Kết quả |
+|---|---|
+| `cargo fmt --all` and `cargo fmt --all -- --check` / chạy và kiểm tra rustfmt | Pass / Đạt |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Pass, including final Verify-HaLaunch attempts / Đạt, kể cả trong các lượt Verify cuối |
+| `cargo test -p harness-cli --bin ha --locked` | Attempt 1: **297 passed, 1 failed, 1 ignored**; loopback `completion_service_resume_flow` timed out. Attempt 2: **298 passed, 0 failed, 1 ignored**. / Lượt 1: **297 đạt, 1 lỗi, 1 ignored**, timeout loopback `completion_service_resume_flow`; lượt 2: **298 đạt, 0 lỗi, 1 ignored**. |
+| Focused updated `h03`, `h05`, `t06` tests / Test đã chỉnh | **1/1 each**; queued message dispatch, stale approval remains unanswered, panel describes persistent-rule confirmation. / Mỗi test **1/1**; queue được dispatch, approval cũ không nhận câu trả lời, panel nêu xác nhận rule dài hạn. |
+| `milestone_m4` / `phase_p3` / `interactive_session` (serial) | **23/23**, **21/21**, **14/14**. / Đạt lần lượt **23/23**, **21/21**, **14/14**. |
+| `interactive_terminal` normal cargo run (serial) | **0 passed; 18 ignored** by design because these require a real console; the requested cases were run with the PTY script. / **0 đạt; 18 ignored** theo thiết kế vì cần console thật; các case yêu cầu đã chạy bằng PTY script. |
+| PTY real-console cases `h05`, `i05`, `i06`, `i07a`, `i07b` / PTY console thật | `h05` attempt 1 exposed a partial-read fixture issue; after making the fixture consume the declared request body, attempt 2 passed **1/1**. `i05`, `i06`, `i07a`, `i07b` each passed **1/1**. Transcripts are under `target/pty-acceptance-cpb/`. / `h05` lượt 1 phát hiện fixture đọc thiếu body; sau khi fixture đọc đủ theo Content-Length, lượt 2 đạt **1/1**. `i05`, `i06`, `i07a`, `i07b` mỗi case đạt **1/1**. Transcript ở `target/pty-acceptance-cpb/`. |
+| `cargo run -p harness-types --bin generate_schemas --locked` and focused `p0_f03` | Generator rewrote the two drifted schemas; focused test **1/1**. The full P0 suite passed **8/8** in both later Verify runs. / Generator tạo lại hai schema lệch; test riêng **1/1**. P0 đầy đủ đạt **8/8** trong hai lượt Verify sau. |
+
+### HA launch gate attempts / Các lượt gate HA launch
+
+The assignment's standalone `interactive_launch` retries before the final verifier
+were **17 passed / 2 failed** (I04 and I13), **18/1 failed** (`i03_a_named_file...`),
+then **19/19 passed**. The final verifier was then run three times, without editing
+loopback tests: attempt 1 failed only `regression-phase_p0` because the generated
+receipt schema was stale; attempt 2 had **18/19** launch tests and failed
+`i03_a_named_file_reaches_the_model_inside_the_message`; attempt 3 had **18/19**
+and failed `i13_resume_continues_the_task_with_recovered_context_and_no_rerun`.
+After regeneration, `p0_f03` and the full P0–P7 suite passed. Every other reported
+step in the last two verifier runs passed: format, Clippy, discovery, unit tests,
+acceptance-session, providers-streaming, P0–P7, installer, release, and docs.
+The verifier's summary captures only the final three command-output lines, so it
+does not preserve the inner loopback assertion detail. The bounded retry budget is
+exhausted; no further loopback run was made. / Các lượt `interactive_launch` độc
+lập trước verifier lần lượt **17 đạt / 2 lỗi** (I04, I13), **18/1 lỗi**
+(`i03_a_named_file...`), rồi **19/19 đạt**. Sau đó chạy verifier đúng ba lần,
+không sửa test loopback: lượt 1 chỉ lỗi `regression-phase_p0` do schema receipt
+chưa sinh lại; lượt 2 launch **18/19**, lỗi
+`i03_a_named_file_reaches_the_model_inside_the_message`; lượt 3 **18/19**, lỗi
+`i13_resume_continues_the_task_with_recovered_context_and_no_rerun`. Sau khi sinh
+lại schema, `p0_f03` và P0–P7 đầy đủ đều đạt. Các bước còn lại ở hai lượt Verify
+cuối đều đạt: format, Clippy, discovery, unit, acceptance-session,
+providers-streaming, P0–P7, installer, release và docs. Verifier chỉ giữ ba dòng
+cuối output mỗi lệnh nên không lưu assertion bên trong của loopback. Đã hết retry
+budget; không chạy loopback thêm.
+
+Consequently, CP-B source is implemented but acceptance remains
+`implemented_unverified`: the required final verifier report had
+`failures: ["acceptance-launch"]` on attempts 2 and 3. Do not mark CP-B accepted
+or start G07. / Vì vậy source CP-B đã triển khai nhưng acceptance còn ở trạng thái
+`implemented_unverified`: báo cáo Verify cuối có
+`failures: ["acceptance-launch"]` ở lượt 2 và 3. Không đánh dấu CP-B accepted và
+không bắt đầu G07.
+
+### CP-B source snapshot and not run / Snapshot source và mục chưa chạy
+
+At closeout the branch is `master`, HEAD is
+`c1b4b6730f57c541f090516f9100d5cfcf9811bd`, and the worktree is dirty with CP-B
+implementation, the generated schemas, and **48 changed paths** before the final
+metadata updates. No commit or push was made. The system is Windows 11 Pro x64;
+`rustc 1.97.1 (8bab26f4f 2026-07-14)` was selected through the task Rustup home.
+The exact source digest and `Cargo.lock` digest are recorded in the evidence file.
+Paid/live provider smoke, Linux verification, real user installation/PATH changes,
+manual migration, user project config write, and G07+ were not run. G05 config
+persistence tests wrote only inside disposable temp roots. / Khi chốt, branch
+`master`, HEAD là `c1b4b6730f57c541f090516f9100d5cfcf9811bd`, worktree bẩn với
+implementation CP-B, schema được sinh lại và **48 path thay đổi** trước cập nhật
+metadata cuối. Không commit/push. Hệ thống Windows 11 Pro x64; chọn
+`rustc 1.97.1 (8bab26f4f 2026-07-14)` qua Rustup home riêng. Digest source và
+`Cargo.lock` ghi trong evidence. Chưa chạy smoke provider trả phí/live, kiểm chứng
+Linux, cài/PATH thật, migration thủ công, ghi config project user hoặc G07 trở đi.
+Test lưu config G05 chỉ ghi trong thư mục tạm có thể xóa.

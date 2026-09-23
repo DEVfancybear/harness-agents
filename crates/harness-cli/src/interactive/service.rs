@@ -12,7 +12,7 @@ use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,14 +21,16 @@ use harness_providers::{
     CancellationToken, CredentialResolver, ModelCapabilities, ModelProvider, OpenAiChatAdapter,
     OpenAiChatOptions, ProviderError,
 };
-use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
+use harness_runtime::{HumanInputService, RunInbox, RunRequest, RuntimeConfig, RuntimeService};
+use harness_session::{AdmitInputRequest, SessionService};
 use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
 use harness_tools::{
-    ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ToolExecutionService, TurnDriver,
+    ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CodingToolAction, IsolationMode,
+    PolicyMode, ToolExecutionService, ToolOutput, ToolPatternRule, ToolPolicyRules, TurnDriver,
     TurnLimits, TurnObserver, TurnOptions, TurnProgress, TurnStop, coding_tool_names,
-    coding_tool_schemas, observe_workspace,
+    coding_tool_schemas, execute_action_with_approval, observe_workspace, validate_tool_pattern,
 };
-use harness_types::{ErrorCode, HostId, InputId, SessionId, TaskId};
+use harness_types::{ErrorCode, HostId, InputId, QuestionId, SessionId, SourceAuthority, TaskId};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
@@ -41,7 +43,7 @@ use super::config::{DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL};
 use super::controller::{DEFAULT_APPROVAL_TIMEOUT, TurnBounds};
 use super::cost::{CostTracker, ModelPrice, Usage as CostUsage};
 use super::credentials::{self, CredentialSource};
-use super::events::{PauseReason, RunOutcome, SessionCandidate, SessionEvent};
+use super::events::{PauseReason, RunOutcome, SessionCandidate, SessionEvent, ShellPrefixMode};
 use super::extensions;
 use super::memory;
 use super::paths::LaunchEnvironment;
@@ -103,6 +105,16 @@ pub const MODEL_VARIABLE: &str = "HA_PROVIDER_MODEL";
 pub struct SubmitRequest {
     pub input_id: InputId,
     pub text: String,
+    /// Durable question answered by this new session, when this is an answer turn.
+    pub answer_question_id: Option<String>,
+    /// Host-initiated shell action represented by this admitted input, when set.
+    pub shell_prefix: Option<ShellPrefix>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShellPrefix {
+    pub command: String,
+    pub mode: ShellPrefixMode,
 }
 
 /// The user's decision on one gated action.
@@ -133,6 +145,10 @@ pub trait SessionPort: Send {
     fn label(&self) -> String;
     fn submit(&mut self, request: SubmitRequest);
     fn cancel(&mut self);
+    /// Deliver an immediate correction to the run currently in progress.
+    fn steer(&mut self, _text: &str) -> Result<(), String> {
+        Err("this backend does not support steering an active run".to_owned())
+    }
     /// Answer one pending approval request; false when the id is not pending.
     fn answer(&mut self, _request_id: &str, _decision: ApprovalDecision) -> bool {
         false
@@ -189,6 +205,19 @@ pub trait SessionPort: Send {
     fn set_model(&mut self, _model: &str) -> Result<String, String> {
         Err("this backend does not support model switching".to_owned())
     }
+    fn set_mode(&mut self, _mode: &str) -> Result<String, String> {
+        Err("this backend does not support session permission modes".to_owned())
+    }
+    fn permissions_summary(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    fn confirm_always_allow(
+        &mut self,
+        _request_id: &str,
+        _pattern: &str,
+    ) -> Result<String, String> {
+        Err("this backend cannot save permission rules".to_owned())
+    }
     fn trust_project(&mut self) -> Result<String, String> {
         Err("this backend cannot update project trust".to_owned())
     }
@@ -243,6 +272,8 @@ pub struct ChannelApprovalGate {
     timeout: Duration,
     /// Whether the user allowed every action for the run now in flight.
     granted_for_run: Arc<AtomicBool>,
+    confirmed_rules: Mutex<HashMap<String, ToolPatternRule>>,
+    turn_rules: ToolPolicyRules,
 }
 
 impl ChannelApprovalGate {
@@ -253,7 +284,38 @@ impl ChannelApprovalGate {
             pending: Mutex::new(HashMap::new()),
             timeout,
             granted_for_run: Arc::new(AtomicBool::new(false)),
+            confirmed_rules: Mutex::new(HashMap::new()),
+            turn_rules: ToolPolicyRules::default(),
         }
+    }
+
+    /// The rule set shared with this turn's existing `ToolPolicy`.
+    #[must_use]
+    pub fn turn_rules(&self) -> ToolPolicyRules {
+        self.turn_rules.clone()
+    }
+
+    /// Clear ephemeral confirmations at the start of a new user input.
+    pub fn clear_turn_rules(&self) {
+        self.turn_rules.clear();
+        if let Ok(mut rules) = self.confirmed_rules.lock() {
+            rules.clear();
+        }
+    }
+
+    fn stage_always_allow(&self, request_id: &str, pattern: &str) -> Result<(), String> {
+        if !self.is_pending(request_id) {
+            return Err("approval is no longer pending; the rule was not staged".to_owned());
+        }
+        validate_tool_pattern(pattern).map_err(|error| error.to_string())?;
+        self.confirmed_rules
+            .lock()
+            .map_err(|_| "confirmed permission rules are unavailable".to_owned())?
+            .insert(
+                request_id.to_owned(),
+                ToolPatternRule::allow(pattern, "user-confirmed rule"),
+            );
+        Ok(())
     }
 
     /// Allow every gated action without asking, until the run ends.
@@ -300,6 +362,30 @@ impl ChannelApprovalGate {
             None => false,
         }
     }
+
+    fn is_pending(&self, request_id: &str) -> bool {
+        self.pending
+            .lock()
+            .is_ok_and(|pending| pending.contains_key(request_id))
+    }
+
+    fn action_completed(&self, request_id: &str) {
+        let rule = self
+            .confirmed_rules
+            .lock()
+            .ok()
+            .and_then(|mut rules| rules.remove(request_id));
+        if let Some(rule) = rule
+            && self.turn_rules.add(rule.clone()).is_err()
+        {
+            let _ = self.sender.send(SessionEvent::Notice {
+                message: format!(
+                    "[permissions] {} was saved and will apply on the next turn",
+                    rule.pattern
+                ),
+            });
+        }
+    }
 }
 
 impl ApprovalGate for ChannelApprovalGate {
@@ -314,13 +400,13 @@ impl ApprovalGate for ChannelApprovalGate {
         if self.granted_for_run() {
             let _ = self.sender.send(SessionEvent::Notice {
                 message: format!(
-                    "{}allowed for this turn: {}",
+                    "[info] allowed by mode turn-grant: {}{}",
+                    proposal.summary,
                     if proposal.read_only {
-                        "read-only, "
+                        " (read-only)"
                     } else {
                         ""
-                    },
-                    proposal.summary
+                    }
                 ),
             });
             return Box::pin(async { ApprovalAnswer::Granted });
@@ -333,6 +419,7 @@ impl ApprovalGate for ChannelApprovalGate {
             request_id: proposal.request_id.clone(),
             action: proposal.action,
             summary: proposal.summary,
+            rule_pattern: proposal.rule_pattern,
             workspace: proposal.workspace.display().to_string(),
             scope: proposal.scope,
             // The deadline travels with the proposal: the panel counts down to
@@ -356,6 +443,10 @@ impl ApprovalGate for ChannelApprovalGate {
                 }
             }
         })
+    }
+
+    fn action_completed(&self, request_id: &str) {
+        Self::action_completed(self, request_id);
     }
 }
 
@@ -403,6 +494,9 @@ pub struct ProviderConfig {
     pub model: String,
     pub api_key_env: String,
     pub thinking: String,
+    pub approval: String,
+    pub allow_rules: Vec<String>,
+    pub deny_rules: Vec<String>,
     pub model_price: Option<ModelPrice>,
     pub max_retry_after_seconds: u64,
     /// Name of the source that holds the key; never the key.
@@ -432,6 +526,7 @@ impl ProviderConfig {
 /// fall back to `DeepSeek`'s documented values, so one `DEEPSEEK_API_KEY` is a complete
 /// setup; an explicit variable still overrides either one, which is what another
 /// provider or another model needs.
+#[cfg(test)]
 pub fn resolve_provider(
     environment: &LaunchEnvironment,
     data_dir: &Path,
@@ -444,6 +539,7 @@ pub fn resolve_provider(
     )
 }
 
+#[cfg(test)]
 fn resolve_provider_with_config(
     user_path: &Path,
     project_root: &Path,
@@ -459,7 +555,7 @@ fn resolve_provider_with_config(
     )
 }
 
-fn resolve_provider_with_overrides(
+pub(super) fn resolve_provider_with_overrides(
     user_path: &Path,
     project_root: &Path,
     environment: &LaunchEnvironment,
@@ -494,6 +590,9 @@ fn resolve_provider_with_overrides(
         model: resolved.provider.model,
         api_key_env: resolved.provider.api_key_env,
         thinking: resolved.provider.thinking,
+        approval: resolved.approval,
+        allow_rules: resolved.allow_rules,
+        deny_rules: resolved.deny_rules,
         model_price,
         max_retry_after_seconds,
         credential,
@@ -740,6 +839,7 @@ struct ChannelObserver {
     sender: UnboundedSender<SessionEvent>,
     cost_tracker: Arc<Mutex<CostTracker>>,
     model_price: Option<ModelPrice>,
+    auto_allowed_count: Arc<AtomicUsize>,
     /// Calls are executed serially by the turn driver. Keeping the current
     /// boundary here makes duration delivery O(1) and avoids a process-lifetime
     /// map keyed by a non-unique tool name.
@@ -751,6 +851,10 @@ impl TurnObserver for ChannelObserver {
         let event = match progress {
             TurnProgress::TextDelta(text) => Some(SessionEvent::TextDelta { text }),
             TurnProgress::ThinkingDelta(text) => Some(SessionEvent::ThinkingDelta { text }),
+            TurnProgress::Info(message) => {
+                self.auto_allowed_count.fetch_add(1, Ordering::Relaxed);
+                Some(SessionEvent::Notice { message })
+            }
             TurnProgress::Usage {
                 prompt_tokens,
                 completion_tokens,
@@ -818,8 +922,12 @@ pub struct AgentSessionService {
     config_overrides: ConfigOverrides,
     model_selection: Arc<Mutex<TurnModelSelection>>,
     cost_tracker: Arc<Mutex<CostTracker>>,
+    session_mode: Arc<Mutex<Option<PolicyMode>>>,
+    auto_allowed_count: Arc<AtomicUsize>,
     task_id: TaskId,
     previous_session: Arc<Mutex<Option<SessionId>>>,
+    /// Current run's durable inbox, exposed only while its driver is active.
+    active_inbox: Arc<Mutex<Option<ActiveTurnInbox>>>,
     /// Asks the user for every gated action; never grants on its own.
     gate: Arc<ChannelApprovalGate>,
     cancellation: Option<CancellationToken>,
@@ -833,8 +941,17 @@ pub struct AgentSessionService {
     project_id: Arc<Mutex<Option<String>>>,
 }
 
+#[derive(Clone)]
+struct ActiveTurnInbox {
+    inbox: RunInbox,
+    store: Arc<SqliteStore>,
+    session_id: SessionId,
+}
+
 /// How long a gated action waits for the user before it expires.
 const APPROVAL_TIMEOUT: Duration = DEFAULT_APPROVAL_TIMEOUT;
+const SHELL_PREFIX_OUTPUT_LIMIT: usize = 64 * 1024;
+const SHELL_PREFIX_OUTPUT_TRUNCATION: &str = "\n[output truncated at 64 KiB]";
 
 /// Upper bound on the resume list, newest first.
 const RESUME_LIST_LIMIT: usize = 20;
@@ -881,8 +998,11 @@ impl AgentSessionService {
             config_overrides,
             model_selection,
             cost_tracker: Arc::new(Mutex::new(CostTracker::default())),
+            session_mode: Arc::new(Mutex::new(None)),
+            auto_allowed_count: Arc::new(AtomicUsize::new(0)),
             task_id: TaskId::generate(),
             previous_session: Arc::new(Mutex::new(None)),
+            active_inbox: Arc::new(Mutex::new(None)),
             gate,
             cancellation: None,
             limits,
@@ -951,6 +1071,7 @@ impl SessionPort for AgentSessionService {
     }
 
     fn submit(&mut self, request: SubmitRequest) {
+        self.gate.clear_turn_rules();
         let cancellation = CancellationToken::new();
         self.cancellation = Some(cancellation.clone());
         // A turn must run on an async runtime. In the app it always does; this
@@ -976,8 +1097,11 @@ impl SessionPort for AgentSessionService {
             .ok()
             .and_then(|mut selection| selection.begin_turn());
         let cost_tracker = Arc::clone(&self.cost_tracker);
+        let session_mode = self.session_mode.lock().ok().and_then(|mode| *mode);
+        let auto_allowed_count = Arc::clone(&self.auto_allowed_count);
         let task_id = self.task_id.clone();
         let previous_session = Arc::clone(&self.previous_session);
+        let active_inbox = Arc::clone(&self.active_inbox);
         let gate = Arc::clone(&self.gate);
         let limits = self.limits;
         // Every user input opens its own session; the conversation is the chain of
@@ -996,9 +1120,12 @@ impl SessionPort for AgentSessionService {
                 config_overrides,
                 selected_model,
                 cost_tracker,
+                session_mode,
+                auto_allowed_count,
                 session_id,
                 task_id,
                 previous_session,
+                active_inbox,
                 gate,
                 limits,
                 request,
@@ -1093,6 +1220,84 @@ impl SessionPort for AgentSessionService {
         Ok(format!("model {model} selected for the next turn"))
     }
 
+    fn set_mode(&mut self, mode: &str) -> Result<String, String> {
+        let mode = mode
+            .parse::<PolicyMode>()
+            .map_err(|error| error.to_string())?;
+        *self
+            .session_mode
+            .lock()
+            .map_err(|_| "session permission mode is unavailable".to_owned())? = Some(mode);
+        Ok(format!(
+            "permission mode set to {} for this session",
+            mode.as_str()
+        ))
+    }
+
+    fn permissions_summary(&mut self) -> Vec<String> {
+        let mut overrides = self.config_overrides.clone();
+        if let Ok(selection) = self.model_selection.lock()
+            && let Some(model) = &selection.active_model
+        {
+            overrides.model = Some(model.clone());
+        }
+        match super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &overrides,
+        ) {
+            Ok(config) => {
+                let mode = self
+                    .session_mode
+                    .lock()
+                    .ok()
+                    .and_then(|mode| *mode)
+                    .map_or(config.approval, |mode| mode.as_str().to_owned());
+                let mut lines = vec![format!("mode: {mode}")];
+                lines.extend(config.explain.iter().filter_map(|entry| {
+                    let permission = if entry.key.starts_with("permissions.allow.rule.") {
+                        Some("allow")
+                    } else if entry.key.starts_with("permissions.deny.rule.") {
+                        Some("deny")
+                    } else {
+                        None
+                    }?;
+                    Some(format!(
+                        "{permission} ({}): {}",
+                        entry.layer.as_str(),
+                        entry.value
+                    ))
+                }));
+                lines.push(format!(
+                    "actions auto-allowed this session: {}",
+                    self.auto_allowed_count.load(Ordering::Relaxed)
+                ));
+                lines
+            }
+            Err(error) => vec![format!("permissions unavailable: {error}")],
+        }
+    }
+
+    fn confirm_always_allow(&mut self, request_id: &str, pattern: &str) -> Result<String, String> {
+        if !self.gate.is_pending(request_id) {
+            return Err("approval is no longer pending; the rule was not saved".to_owned());
+        }
+        super::permissions::persist_allow_rule(&self.workspace_root, pattern)
+            .map_err(|error| error.to_string())?;
+        self.gate.stage_always_allow(request_id, pattern)?;
+        if !self.gate.answer(request_id, ApprovalDecision::Granted) {
+            if let Ok(mut rules) = self.gate.confirmed_rules.lock() {
+                rules.remove(request_id);
+            }
+            return Err(
+                "approval expired while saving; the rule was saved but this action was not run"
+                    .to_owned(),
+            );
+        }
+        Ok(format!("always-allow rule saved: {pattern}"))
+    }
+
     fn trust_project(&mut self) -> Result<String, String> {
         let canonical = self
             .workspace_root
@@ -1185,6 +1390,53 @@ impl SessionPort for AgentSessionService {
         if let Some(token) = self.cancellation.take() {
             token.cancel();
         }
+    }
+
+    fn steer(&mut self, text: &str) -> Result<(), String> {
+        if text.trim().is_empty() {
+            return Err("usage: /steer <text>".to_owned());
+        }
+        let active = self
+            .active_inbox
+            .lock()
+            .map_err(|_| "the active run inbox is unavailable".to_owned())?
+            .clone()
+            .ok_or_else(|| "no active run inbox is available".to_owned())?;
+        let sender = self.sender.clone();
+        let text = text.to_owned();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            let result = async {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let run = loop {
+                    match active.store.latest_run(&active.session_id).await {
+                        Ok(Some(run)) => break run,
+                        Ok(None) if Instant::now() < deadline => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Ok(None) => {
+                            return Err("the active run did not open its inbox within two seconds"
+                                .to_owned());
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
+                };
+                active
+                    .inbox
+                    .steer(&run, text, harness_runtime::now_unix_ms())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<(), String>(())
+            }
+            .await;
+            if let Err(error) = result {
+                let _ = sender.send(SessionEvent::Notice {
+                    message: format!("steering note was not queued: {error}"),
+                });
+            }
+        });
+        Ok(())
     }
 }
 
@@ -1310,9 +1562,12 @@ async fn run_turn(
     config_overrides: ConfigOverrides,
     selected_model: Option<String>,
     cost_tracker: Arc<Mutex<CostTracker>>,
+    session_mode: Option<PolicyMode>,
+    auto_allowed_count: Arc<AtomicUsize>,
     session_id: SessionId,
     task_id: TaskId,
     previous_session: Arc<Mutex<Option<SessionId>>>,
+    active_inbox: Arc<Mutex<Option<ActiveTurnInbox>>>,
     gate: Arc<ChannelApprovalGate>,
     limits: TurnLimits,
     request: SubmitRequest,
@@ -1371,6 +1626,67 @@ async fn run_turn(
         },
         None => task_id,
     };
+
+    if let Some(shell_prefix) = request.shell_prefix.clone() {
+        run_shell_prefix_turn(
+            sender,
+            store,
+            config_file,
+            workspace_root,
+            environment,
+            config_overrides,
+            session_mode,
+            session_id,
+            task_id,
+            source,
+            previous_session,
+            gate,
+            cost_tracker,
+            auto_allowed_count,
+            limits,
+            request,
+            shell_prefix,
+            cancellation,
+        )
+        .await;
+        return;
+    }
+
+    if let Some(question_id) = request.answer_question_id.as_deref() {
+        let answer_result = async {
+            let question_id = QuestionId::parse(question_id.to_owned())
+                .map_err(|error| format!("question id is invalid: {error}"))?;
+            let service = HumanInputService::new(Arc::clone(&store));
+            let question = service
+                .question(&question_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "the pending question no longer exists".to_owned())?;
+            if question.task_id != task_id || source.as_ref() != Some(&question.session_id) {
+                return Err("the pending question belongs to another task or session".to_owned());
+            }
+            service
+                .answer(
+                    &question.scope_key,
+                    &serde_json::Value::String(request.text.clone()),
+                    "interactive.user",
+                    harness_runtime::now_unix_ms(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(message) = answer_result {
+            send(SessionEvent::RecoverableError {
+                message: format!("question answer was not accepted: {message}"),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
+        }
+    }
 
     let persisted_model = if selected_model.is_none() && config_overrides.model.is_none() {
         store
@@ -1520,11 +1836,28 @@ async fn run_turn(
     } else {
         None
     };
-    let tools = match &active_extensions {
-        Some(active) => {
-            ToolExecutionService::new(Arc::clone(&store)).with_external(active.dispatcher())
+    let tool_policy = match super::permissions::build_tool_policy(
+        &config.approval,
+        &config.allow_rules,
+        &config.deny_rules,
+        session_mode,
+    ) {
+        Ok(policy) => policy.with_turn_rules(gate.turn_rules()),
+        Err(error) => {
+            send(SessionEvent::RecoverableError {
+                message: format!("tool permissions are invalid: {error}"),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
         }
-        None => ToolExecutionService::new(Arc::clone(&store)),
+    };
+    let tools = match &active_extensions {
+        Some(active) => ToolExecutionService::new(Arc::clone(&store))
+            .with_policy(tool_policy)
+            .with_external(active.dispatcher()),
+        None => ToolExecutionService::new(Arc::clone(&store)).with_policy(tool_policy),
     };
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
     let driver = match &active_extensions {
@@ -1600,11 +1933,14 @@ async fn run_turn(
                     "read_file"
                         | "list_files"
                         | "search_text"
+                        | "glob"
                         | "git_status"
                         | "git_diff"
                         | "git_log"
                 ) {
                     "read only"
+                } else if name == "ask_user" {
+                    "interactive input; no approval"
                 } else {
                     "subject to host policy and approval"
                 },
@@ -1672,8 +2008,19 @@ async fn run_turn(
         sender: sender.clone(),
         cost_tracker,
         model_price: config.model_price,
+        auto_allowed_count,
         tool_started: Mutex::new(None),
     });
+
+    let run_inbox = RunInbox::new(Arc::clone(&store));
+    if let Ok(mut active) = active_inbox.lock() {
+        *active = Some(ActiveTurnInbox {
+            inbox: run_inbox.clone(),
+            store: Arc::clone(&store),
+            session_id: session_id.clone(),
+        });
+    }
+    let driver = driver.with_inbox(run_inbox);
 
     // A follow-up turn continues the previous session; the first turn starts one.
     let outcome = match &source {
@@ -1688,6 +2035,35 @@ async fn run_turn(
                 .await
         }
     };
+
+    if let Ok(turn) = &outcome
+        && let Some(question_id) = turn.pending_question.as_ref()
+    {
+        match HumanInputService::new(Arc::clone(&store))
+            .question(question_id)
+            .await
+        {
+            Ok(Some(question)) => send(SessionEvent::QuestionRequired {
+                question_id: question.question_id.as_str().to_owned(),
+                prompt: question.prompt,
+                options: question.payload["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect(),
+            }),
+            Ok(None) | Err(_) => send(SessionEvent::RecoverableError {
+                message: "the model asked a question, but the durable question could not be read"
+                    .to_owned(),
+            }),
+        }
+    }
+
+    if let Ok(mut active) = active_inbox.lock() {
+        *active = None;
+    }
 
     // Release the writer before announcing the terminal event: the next turn takes
     // a newer generation of the task lease, and it must not race this one.
@@ -1764,6 +2140,294 @@ async fn run_turn(
         Err(error) => RunOutcome::Failed(error.to_string()),
     };
     send(SessionEvent::RunTerminal { outcome: terminal });
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the direct shell route keeps admission, shared policy, approval, receipt, and output in order"
+)]
+async fn run_shell_prefix_turn(
+    sender: UnboundedSender<SessionEvent>,
+    store: Arc<SqliteStore>,
+    config_file: PathBuf,
+    workspace_root: PathBuf,
+    environment: LaunchEnvironment,
+    config_overrides: ConfigOverrides,
+    session_mode: Option<PolicyMode>,
+    session_id: SessionId,
+    task_id: TaskId,
+    source: Option<SessionId>,
+    previous_session: Arc<Mutex<Option<SessionId>>>,
+    gate: Arc<ChannelApprovalGate>,
+    cost_tracker: Arc<Mutex<CostTracker>>,
+    auto_allowed_count: Arc<AtomicUsize>,
+    limits: TurnLimits,
+    request: SubmitRequest,
+    shell_prefix: ShellPrefix,
+    cancellation: CancellationToken,
+) {
+    let send = |event| {
+        let _ = sender.send(event);
+    };
+    let config = match super::config::resolve_layers(
+        &config_file,
+        &workspace_root,
+        &environment,
+        &config_overrides,
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            send(SessionEvent::RecoverableError {
+                message: error.to_string(),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
+        }
+    };
+    let project_id = match project::resolve_project_id(&store, &workspace_root).await {
+        Ok(project_id) => project_id,
+        Err(error) => {
+            send(SessionEvent::RecoverableError {
+                message: format!("project identity is unavailable: {error}"),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
+        }
+    };
+    let observation = match observe_workspace(project_id, &workspace_root) {
+        Ok(observation) => observation,
+        Err(error) => {
+            send(SessionEvent::RecoverableError {
+                message: format!("workspace cannot be observed: {error}"),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
+        }
+    };
+    let expected_sequence = match store.session_summary(&session_id).await {
+        Ok(summary) => summary.map_or(1, |summary| summary.next_sequence),
+        Err(error) => {
+            send(SessionEvent::RecoverableError {
+                message: format!("shell input sequence could not be read: {error}"),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
+        }
+    };
+    if let Err(error) = SessionService::new(Arc::clone(&store))
+        .admit_input(AdmitInputRequest {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            input_id: request.input_id.clone(),
+            expected_sequence,
+            authority: SourceAuthority::User,
+            raw_text: request.text,
+            workspace: observation,
+            initial_plan_items: Vec::new(),
+        })
+        .await
+    {
+        send(SessionEvent::RecoverableError {
+            message: format!("shell input was not admitted: {error}"),
+        });
+        if let Ok(store) = Arc::try_unwrap(store) {
+            let _ = store.close().await;
+        }
+        return;
+    }
+    if let Some(source) = source
+        && let Err(error) = store
+            .record_continuation_link(&source, &session_id, &task_id)
+            .await
+    {
+        send(SessionEvent::RecoverableError {
+            message: format!("shell session link could not be recorded: {error}"),
+        });
+        if let Ok(store) = Arc::try_unwrap(store) {
+            let _ = store.close().await;
+        }
+        return;
+    }
+    if let Ok(mut previous) = previous_session.lock() {
+        *previous = Some(session_id.clone());
+    }
+
+    let policy = match super::permissions::build_tool_policy(
+        &config.approval,
+        &config.allow_rules,
+        &config.deny_rules,
+        session_mode,
+    ) {
+        Ok(policy) => policy.with_turn_rules(gate.turn_rules()),
+        Err(error) => {
+            send(SessionEvent::RecoverableError {
+                message: format!("tool permissions are invalid: {error}"),
+            });
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            return;
+        }
+    };
+    let tools = ToolExecutionService::new(Arc::clone(&store)).with_policy(policy);
+    let options = TurnOptions {
+        workspace_root: workspace_root.clone(),
+        actor_id: "interactive.user".to_owned(),
+        approvals: ApprovalMode::Ask(gate as Arc<dyn ApprovalGate>),
+        limits,
+    };
+    let observer: Arc<dyn TurnObserver> = Arc::new(ChannelObserver {
+        sender: sender.clone(),
+        cost_tracker,
+        model_price: config.model_prices.get(&config.provider.model).copied(),
+        auto_allowed_count,
+        tool_started: Mutex::new(None),
+    });
+    observer.observe(TurnProgress::StepStarted { step: 1 });
+    observer.observe(TurnProgress::ToolStarted {
+        name: "run_shell".to_owned(),
+        summary: format!("shell: {}", shell_prefix.command),
+    });
+    let tool_request = harness_tools::ToolRequest::new(
+        session_id,
+        task_id,
+        "interactive.user",
+        &workspace_root,
+        CodingToolAction::RunShell {
+            command: shell_prefix.command.clone(),
+            timeout_ms: 60_000,
+            isolation: IsolationMode::BestEffort,
+            env: Vec::new(),
+        },
+    );
+    let result =
+        execute_action_with_approval(&tools, tool_request, &options, 1, &observer, &cancellation)
+            .await;
+    let (output, attachable, outcome) = match result {
+        Ok(view) => {
+            let settled = view.receipt.as_ref().is_some_and(|receipt| {
+                receipt.outcome_state == harness_types::ToolOutcomeState::Settled
+            });
+            let (output, process_result) = shell_output(&view.output);
+            let outcome = if settled {
+                RunOutcome::Done
+            } else {
+                RunOutcome::Blocked(output.clone())
+            };
+            observer.observe(TurnProgress::ToolSettled {
+                name: "run_shell".to_owned(),
+                ok: settled && process_result,
+                detail: (!settled || !process_result).then(|| output.clone()),
+            });
+            (output, settled, outcome)
+        }
+        Err(error) => {
+            let output = format!("not run: {error}");
+            observer.observe(TurnProgress::ToolSettled {
+                name: "run_shell".to_owned(),
+                ok: false,
+                detail: Some(output.clone()),
+            });
+            (output.clone(), false, RunOutcome::Blocked(output))
+        }
+    };
+    send(SessionEvent::ShellPrefixCompleted {
+        command: shell_prefix.command,
+        output,
+        attach_to_next_message: attachable
+            && shell_prefix.mode == ShellPrefixMode::AttachToNextMessage,
+    });
+    drop(tools);
+    if let Ok(store) = Arc::try_unwrap(store) {
+        let _ = store.close().await;
+    }
+    send(SessionEvent::RunTerminal { outcome });
+}
+
+fn shell_output(output: &ToolOutput) -> (String, bool) {
+    use std::fmt::Write as _;
+
+    let (mut text, successful) = match output {
+        ToolOutput::Process {
+            exit_code,
+            timed_out,
+            canceled,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+            capture_truncated,
+            capture_tail,
+            ..
+        } => {
+            let mut text = String::new();
+            if !stdout.is_empty() {
+                text.push_str(stdout);
+            }
+            if !stderr.is_empty() {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str("[stderr]\n");
+                text.push_str(stderr);
+            }
+            if let Some(exit_code) = exit_code {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                let _ = write!(text, "[exit code {exit_code}]");
+            }
+            if *timed_out {
+                text.push_str("\n[command timed out]");
+            }
+            if *canceled {
+                text.push_str("\n[command canceled]");
+            }
+            if *stdout_truncated {
+                text.push_str("\n[stdout preview truncated]");
+            }
+            if *stderr_truncated {
+                text.push_str("\n[stderr preview truncated]");
+            }
+            if *capture_truncated {
+                text.push_str("\n[capture truncated at quota]");
+                if !capture_tail.is_empty() {
+                    text.push_str("\n[capture tail]\n");
+                    text.push_str(capture_tail);
+                }
+            }
+            (
+                text,
+                exit_code.is_some_and(|code| code == 0) && !timed_out && !canceled,
+            )
+        }
+        ToolOutput::Denied { reason, .. } => (format!("not run: {reason}"), false),
+        ToolOutput::OutcomeUnknown { reason } => (format!("outcome unknown: {reason}"), false),
+        _ => (
+            "run_shell returned an unexpected output type".to_owned(),
+            false,
+        ),
+    };
+    if text.len() > SHELL_PREFIX_OUTPUT_LIMIT {
+        let max_content =
+            SHELL_PREFIX_OUTPUT_LIMIT.saturating_sub(SHELL_PREFIX_OUTPUT_TRUNCATION.len());
+        let mut boundary = max_content.min(text.len());
+        while !text.is_char_boundary(boundary) {
+            boundary = boundary.saturating_sub(1);
+        }
+        text.truncate(boundary);
+        text.push_str(SHELL_PREFIX_OUTPUT_TRUNCATION);
+    }
+    (text, successful)
 }
 
 fn prompt_git_facts(root: &Path) -> (Option<String>, Option<usize>) {
@@ -1846,6 +2510,7 @@ impl SessionPort for FixtureService {
                 request_id,
                 action: "fixture_action".to_owned(),
                 summary: "prove the terminal approval path".to_owned(),
+                rule_pattern: "fixture_action()".to_owned(),
                 workspace: "fixture workspace (no mutation)".to_owned(),
                 scope: "once".to_owned(),
                 expires_at: Instant::now() + DEFAULT_APPROVAL_TIMEOUT,
@@ -1943,6 +2608,8 @@ mod tests {
         SubmitRequest {
             input_id: InputId::generate(),
             text: "fix the parser".to_owned(),
+            answer_question_id: None,
+            shell_prefix: None,
         }
     }
 
@@ -2034,6 +2701,7 @@ mod tests {
             request_id: request_id.to_owned(),
             action: "ApplyPatch".to_owned(),
             summary: "patch src/parser.rs".to_owned(),
+            rule_pattern: "apply_patch(src/parser.rs)".to_owned(),
             workspace: std::path::PathBuf::from("C:/work/repo"),
             scope: "one action, this turn only".to_owned(),
             read_only: false,
@@ -2203,8 +2871,8 @@ mod tests {
             "no panel opens while the grant is open: {announced:?}"
         );
         for summary in [
-            "allowed for this turn: run git log -1 --stat --format=fuller",
-            "allowed for this turn: patch src/parser.rs",
+            "[info] allowed by mode turn-grant: run git log -1 --stat --format=fuller",
+            "[info] allowed by mode turn-grant: patch src/parser.rs",
         ] {
             assert!(
                 announced.iter().any(|event| matches!(
@@ -2214,6 +2882,111 @@ mod tests {
                 "every auto-allowed action is recorded, not invisible: {announced:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn g05_transcript_records_every_auto_allowed_action() {
+        let mut channel = SessionChannel::new();
+        let gate = ChannelApprovalGate::new(channel.sender(), Duration::from_millis(30));
+        gate.grant_for_run();
+
+        for proposal in [
+            ApprovalProposal {
+                action: "RunProcess".to_owned(),
+                summary: "run cargo test --locked".to_owned(),
+                ..proposal("g05-auto-1")
+            },
+            proposal("g05-auto-2"),
+        ] {
+            assert_eq!(
+                ApprovalGate::request(&gate, proposal).await,
+                ApprovalAnswer::Granted,
+                "the explicit per-turn grant handles each action"
+            );
+        }
+
+        let notices = channel
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                SessionEvent::Notice { message } => Some(message),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            notices.len(),
+            2,
+            "one info row is recorded per allowed action"
+        );
+        assert!(
+            notices.iter().all(|message| {
+                message.starts_with("[info] allowed by mode ")
+                    && (message.contains("cargo test --locked")
+                        || message.contains("patch src/parser.rs"))
+            }),
+            "{notices:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn g05_confirmed_rule_is_applied_after_the_approved_action_settles() {
+        use harness_tools::{CodingToolAction, Decision, ToolPolicy};
+
+        let mut channel = SessionChannel::new();
+        let gate = Arc::new(ChannelApprovalGate::new(
+            channel.sender(),
+            Duration::from_secs(5),
+        ));
+        let policy = ToolPolicy::default().with_turn_rules(gate.turn_rules());
+        let action = CodingToolAction::RunProcess {
+            executable: "cargo".to_owned(),
+            args: vec!["test".to_owned(), "--locked".to_owned()],
+            timeout_ms: 5_000,
+            isolation: harness_tools::IsolationMode::BestEffort,
+            env: Vec::new(),
+        };
+        assert_eq!(policy.decide(&action), Decision::Ask);
+
+        let asking = Arc::clone(&gate);
+        let mut proposed = proposal("g05-delayed-rule");
+        proposed.action = "RunProcess".to_owned();
+        proposed.summary = "run cargo test --locked".to_owned();
+        proposed.rule_pattern = "run_process(cargo test --locked)".to_owned();
+        let handle =
+            tokio::spawn(async move { ApprovalGate::request(asking.as_ref(), proposed).await });
+        let mut request_id = None;
+        for _ in 0..200 {
+            if let Some(id) = channel.drain().into_iter().find_map(|event| match event {
+                SessionEvent::ApprovalRequired { request_id, .. } => Some(request_id),
+                _ => None,
+            }) {
+                request_id = Some(id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let request_id = request_id.expect("the proposed tool reaches the approval panel");
+        gate.stage_always_allow(&request_id, "run_process(cargo test --locked)")
+            .expect("the displayed rule is staged after confirmation");
+        assert!(gate.answer(&request_id, ApprovalDecision::Granted));
+        assert_eq!(
+            handle.await.expect("approval request"),
+            ApprovalAnswer::Granted
+        );
+        assert_eq!(
+            policy.decide(&action),
+            Decision::Ask,
+            "do not stale the pending grant"
+        );
+
+        ApprovalGate::action_completed(gate.as_ref(), &request_id);
+        assert_eq!(
+            policy.decide(&action),
+            Decision::Allow {
+                reason: "rule run_process(cargo test --locked)".to_owned()
+            },
+            "the confirmed pattern takes effect for later calls in the same turn"
+        );
     }
 
     /// Before the user says so, a read keeps its panel - the grant is opt-in, not a

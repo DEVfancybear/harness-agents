@@ -6,7 +6,9 @@
 //! scope, expiry/revoke, the descriptor registry and the provider `call_id`
 //! correlation; later items extend this file for A03/A04/A08/A13/A16/A17.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,17 +19,18 @@ use harness_providers::{
     ProviderRequest, ProviderStreamEvent,
 };
 use harness_runtime::{
-    EvidenceKind, GoalCriterion, GoalSpec, RunRequest, RuntimeConfig, RuntimeService,
+    EvidenceKind, GoalCriterion, GoalSpec, HumanInputService, RunInbox, RunRequest, RuntimeConfig,
+    RuntimeService,
 };
 use harness_session::{AdmitInputRequest, SessionService};
 use harness_store_sqlite::{SqliteStore, ToolIntentStatus, WriterOpenOptions};
 use harness_tools::{
-    AcceptanceState, ApprovalMode, CaptureStream, CodingToolAction, EffectClass, EnvBinding,
-    IsolationMode, PROCESS_ENVIRONMENT_ALLOWLIST, ProcessSpoolConfig, SecretResolver, SpoolLimits,
-    ToolExecutionService, ToolOutput, ToolPolicy, ToolRequest, TurnDriver, TurnLimits,
-    TurnObserver, TurnOptions, TurnOutcome, TurnProgress, TurnStop, coding_tool_descriptors,
-    coding_tool_names, coding_tool_schemas, effect_class_for, observe_workspace,
-    observed_file_hash, parse_capture_header,
+    AcceptanceState, ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CaptureStream,
+    CodingToolAction, EffectClass, EnvBinding, IsolationMode, PROCESS_ENVIRONMENT_ALLOWLIST,
+    ProcessSpoolConfig, SecretResolver, SpoolLimits, ToolExecutionService, ToolOutput, ToolPolicy,
+    ToolRequest, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnOutcome, TurnProgress,
+    TurnStop, coding_tool_descriptors, coding_tool_names, coding_tool_schemas, effect_class_for,
+    observe_workspace, observed_file_hash, parse_capture_header,
 };
 use harness_types::{
     ContentHash, ErrorCode, HarnessError, HostId, InputId, ProjectId, SessionId, SourceAuthority,
@@ -182,11 +185,98 @@ impl ModelProvider for ScriptedProvider {
     }
 }
 
+/// Holds the first provider response until a durable inbox command is queued.
+/// This exercises the same boundary the interactive service relies on.
+struct SteeringProvider {
+    calls: AtomicUsize,
+    first_call_started: Arc<tokio::sync::Notify>,
+    release_first_call: Arc<tokio::sync::Notify>,
+    seen: Mutex<Vec<ProviderRequest>>,
+}
+
+impl SteeringProvider {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            first_call_started: Arc::new(tokio::sync::Notify::new()),
+            release_first_call: Arc::new(tokio::sync::Notify::new()),
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl ModelProvider for SteeringProvider {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::deepseek_fixture()
+    }
+
+    fn stream(&self, request: ProviderRequest, _cancellation: CancellationToken) -> ProviderFuture {
+        self.seen.lock().expect("request log").push(request.clone());
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let request_id = request.request_id.clone();
+        let started = Arc::clone(&self.first_call_started);
+        let release = Arc::clone(&self.release_first_call);
+        Box::pin(async move {
+            if call == 0 {
+                started.notify_one();
+                release.notified().await;
+                let mut events = vec![
+                    ProviderStreamEvent::started(),
+                    ProviderStreamEvent::tool_delta(
+                        "steer-read",
+                        "read_file",
+                        serde_json::json!({"path": "src/parser.txt"}).to_string(),
+                    ),
+                    ProviderStreamEvent::completed("tool_calls"),
+                ];
+                if let Some(ProviderStreamEvent::Started {
+                    request_id: started_id,
+                }) = events.first_mut()
+                {
+                    *started_id = request_id;
+                }
+                Ok(events)
+            } else {
+                let mut events = vec![
+                    ProviderStreamEvent::started(),
+                    ProviderStreamEvent::text("finished after the correction"),
+                    ProviderStreamEvent::completed("stop"),
+                ];
+                if let Some(ProviderStreamEvent::Started {
+                    request_id: started_id,
+                }) = events.first_mut()
+                {
+                    *started_id = request_id;
+                }
+                Ok(events)
+            }
+        })
+    }
+}
+
 #[derive(Default)]
 struct SilentObserver;
 
 impl TurnObserver for SilentObserver {
     fn observe(&self, _progress: TurnProgress) {}
+}
+
+#[derive(Default)]
+struct GrantingApprovalGate {
+    proposals: Mutex<Vec<ApprovalProposal>>,
+}
+
+impl ApprovalGate for GrantingApprovalGate {
+    fn request(
+        &self,
+        proposal: ApprovalProposal,
+    ) -> Pin<Box<dyn Future<Output = ApprovalAnswer> + Send>> {
+        self.proposals
+            .lock()
+            .expect("approval proposals")
+            .push(proposal);
+        Box::pin(async { ApprovalAnswer::Granted })
+    }
 }
 
 /// The process permit is host-wide, which is the behavior under test: a call in
@@ -270,6 +360,10 @@ async fn a14_approval_binding() {
             CodingToolAction::SearchText {
                 query: "FIXED".to_owned(),
                 path: None,
+                regex: false,
+                case_insensitive: false,
+                glob: None,
+                context_lines: None,
             },
         ))
         .await
@@ -547,10 +641,10 @@ async fn m4_01_tools_schema_upgrade() {
     pool.close().await;
 
     // Opening a writer upgrades the database in place: the new columns exist,
-    // the marker is 2, and a fresh approval can carry the new scope.
+    // the marker is 3, and a fresh approval can carry the new scope.
     let store = bench.open_store().await;
     let revisions = store.all_schema_revisions().await.expect("revisions");
-    assert_eq!(revisions.get("tools").copied(), Some(2));
+    assert_eq!(revisions.get("tools").copied(), Some(3));
     let tools = ToolExecutionService::new(Arc::clone(&store));
     let prepared = tools
         .prepare(
@@ -764,6 +858,8 @@ async fn a15_path_patch_safety() {
                 &bench.workspace,
                 CodingToolAction::ReadFile {
                     path: path.to_owned(),
+                    offset: None,
+                    limit: None,
                 },
             ))
             .await
@@ -786,6 +882,8 @@ async fn a15_path_patch_safety() {
             &bench.workspace,
             CodingToolAction::ReadFile {
                 path: "linked/secret.txt".to_owned(),
+                offset: None,
+                limit: None,
             },
         ))
         .await
@@ -806,6 +904,8 @@ async fn a15_path_patch_safety() {
             &bench.workspace,
             CodingToolAction::ReadFile {
                 path: ".env".to_owned(),
+                offset: None,
+                limit: None,
             },
         ))
         .await
@@ -2544,5 +2644,578 @@ async fn a17_output_quota() {
     );
     drop(tools);
     drop(broken);
+    close(store).await;
+}
+
+async fn g04_execute_provider_tool(
+    tools: &ToolExecutionService,
+    bench: &Bench,
+    session: &SessionId,
+    task: &TaskId,
+    name: &str,
+    arguments: serde_json::Value,
+) -> Result<harness_tools::ToolExecutionView, HarnessError> {
+    let action = CodingToolAction::from_provider_call(name, &arguments.to_string())?;
+    let prepared = tools
+        .prepare(ToolRequest::new(
+            session.clone(),
+            task.clone(),
+            "actor.g04",
+            &bench.workspace,
+            action,
+        ))
+        .await?;
+    let approval = tools.approve(&prepared).await?;
+    tools.execute(prepared, Some(approval)).await
+}
+
+#[tokio::test]
+async fn g04_edit_file_requires_a_unique_match() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let (session, task) = admit(&store, &bench).await;
+
+    let view = g04_execute_provider_tool(
+        &tools,
+        &bench,
+        &session,
+        &task,
+        "edit_file",
+        serde_json::json!({
+            "path": "src/parser.txt",
+            "old_string": "BUG",
+            "new_string": "FIXED"
+        }),
+    )
+    .await
+    .expect("one exact match is edited");
+    assert_eq!(file_text(&bench.workspace), "FIXED parser\r\n");
+    assert_eq!(
+        serde_json::to_value(&view.output).unwrap()["kind"],
+        "edit_file"
+    );
+
+    std::fs::write(bench.workspace.join("src/parser.txt"), "same same\n")
+        .expect("ambiguous fixture");
+    let ambiguous = g04_execute_provider_tool(
+        &tools,
+        &bench,
+        &session,
+        &task,
+        "edit_file",
+        serde_json::json!({
+            "path": "src/parser.txt",
+            "old_string": "same",
+            "new_string": "different"
+        }),
+    )
+    .await
+    .expect_err("ambiguous old text must refuse");
+    assert_eq!(ambiguous.code().as_str(), "edit_ambiguous");
+
+    let missing = g04_execute_provider_tool(
+        &tools,
+        &bench,
+        &session,
+        &task,
+        "edit_file",
+        serde_json::json!({
+            "path": "src/parser.txt",
+            "old_string": "absent",
+            "new_string": "different"
+        }),
+    )
+    .await
+    .expect_err("missing old text must refuse");
+    assert_eq!(missing.code().as_str(), "edit_not_found");
+    drop(tools);
+    close(store).await;
+}
+
+#[tokio::test]
+async fn g04_write_file_new_needs_no_hash_but_overwrite_does() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let (session, task) = admit(&store, &bench).await;
+    let path = "src/new-file.txt";
+
+    g04_execute_provider_tool(
+        &tools,
+        &bench,
+        &session,
+        &task,
+        "write_file",
+        serde_json::json!({"path": path, "content": "first\n"}),
+    )
+    .await
+    .expect("a new file does not need an expected hash");
+    assert_eq!(
+        std::fs::read_to_string(bench.workspace.join(path)).unwrap(),
+        "first\n"
+    );
+
+    let stale = g04_execute_provider_tool(
+        &tools,
+        &bench,
+        &session,
+        &task,
+        "write_file",
+        serde_json::json!({"path": path, "content": "overwrite without hash\n"}),
+    )
+    .await
+    .expect_err("an existing file cannot be overwritten without a matching hash");
+    assert_eq!(stale.code(), ErrorCode::StaleWorkspace);
+    assert_eq!(
+        std::fs::read_to_string(bench.workspace.join(path)).unwrap(),
+        "first\n"
+    );
+
+    let expected_hash = observed_file_hash(&bench.workspace, path).expect("current hash");
+    g04_execute_provider_tool(
+        &tools,
+        &bench,
+        &session,
+        &task,
+        "write_file",
+        serde_json::json!({
+            "path": path,
+            "content": "second\n",
+            "expected_hash": expected_hash
+        }),
+    )
+    .await
+    .expect("the matching hash permits overwrite");
+    assert_eq!(
+        std::fs::read_to_string(bench.workspace.join(path)).unwrap(),
+        "second\n"
+    );
+    drop(tools);
+    close(store).await;
+}
+
+#[tokio::test]
+async fn g04_glob_respects_gitignore_and_cap() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let (session, task) = admit(&store, &bench).await;
+    std::fs::write(bench.workspace.join(".gitignore"), "ignored/\n").expect("gitignore fixture");
+    let many = bench.workspace.join("many");
+    std::fs::create_dir_all(&many).expect("many directory");
+    // The existing parser file plus this ignore file and 4094 entries stay at
+    // the shared walk bound. Ignored entries do not consume the 4096 result cap.
+    for index in 0..4094 {
+        std::fs::write(many.join(format!("{index:04}.txt")), "x").expect("bounded visible file");
+    }
+    let ignored = bench.workspace.join("ignored");
+    std::fs::create_dir_all(&ignored).expect("ignored directory");
+    std::fs::write(ignored.join("hidden.txt"), "hidden").expect("ignored file");
+
+    let view = g04_execute_provider_tool(
+        &tools,
+        &bench,
+        &session,
+        &task,
+        "glob",
+        serde_json::json!({"pattern": "**/*.txt"}),
+    )
+    .await
+    .expect("bounded glob succeeds");
+    let output = serde_json::to_value(view.output).expect("glob output serializes");
+    let paths = output["paths"].as_array().expect("glob paths");
+    assert!(paths.len() <= 4096, "{} results", paths.len());
+    assert!(paths.iter().any(|path| path == "many/0000.txt"));
+    assert!(!paths.iter().any(|path| path == "ignored/hidden.txt"));
+    drop(tools);
+    close(store).await;
+}
+
+#[tokio::test]
+async fn g04_regex_search_is_bounded() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let (session, task) = admit(&store, &bench).await;
+    let file = bench.workspace.join("src/regex.txt");
+    std::fs::write(
+        &file,
+        (0..520).map(|_| "Error: match\n").collect::<String>(),
+    )
+    .expect("regex fixture");
+
+    let view = g04_execute_provider_tool(
+        &tools,
+        &bench,
+        &session,
+        &task,
+        "search_text",
+        serde_json::json!({
+            "query": "error: match",
+            "regex": true,
+            "case_insensitive": true,
+            "glob": "*.txt",
+            "context_lines": 1
+        }),
+    )
+    .await
+    .expect("bounded regex search succeeds");
+    let output = serde_json::to_value(view.output).expect("search output serializes");
+    assert_eq!(output["matches"].as_array().unwrap().len(), 512);
+    assert_eq!(output["truncated"], true);
+    assert!(output["matches"][0]["context"].is_array());
+    drop(tools);
+    close(store).await;
+}
+
+#[tokio::test]
+async fn g04_read_file_range_has_line_numbers() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let (session, task) = admit(&store, &bench).await;
+    let path = bench.workspace.join("src/range.txt");
+    std::fs::write(&path, "first\nsecond\nthird\n").expect("line range fixture");
+
+    let view = g04_execute_provider_tool(
+        &tools,
+        &bench,
+        &session,
+        &task,
+        "read_file",
+        serde_json::json!({"path": "src/range.txt", "offset": 1, "limit": 1}),
+    )
+    .await
+    .expect("bounded range reads");
+    let output = serde_json::to_value(view.output).expect("read output serializes");
+    assert_eq!(output["content"], "2: second");
+    assert_eq!(output["truncated"], true);
+    drop(tools);
+    close(store).await;
+}
+
+#[tokio::test]
+async fn g04_mutating_receipt_has_before_after_hash() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let (session, task) = admit(&store, &bench).await;
+    let before = b"BUG parser\r\n";
+    let view = g04_execute_provider_tool(
+        &tools,
+        &bench,
+        &session,
+        &task,
+        "edit_file",
+        serde_json::json!({
+            "path": "src/parser.txt",
+            "old_string": "BUG",
+            "new_string": "FIXED"
+        }),
+    )
+    .await
+    .expect("edit is committed");
+    let receipt = view.receipt.expect("receipt");
+    let receipt_json = serde_json::to_value(&receipt).expect("receipt serializes");
+    assert!(receipt_json["before_hash"].as_str().is_some());
+    assert!(receipt_json["after_hash"].as_str().is_some());
+    let artifact = receipt.artifact_id.expect("preimage artifact");
+    let page = store
+        .read_artifact_page(artifact.as_str(), 0, 1024 * 1024)
+        .await
+        .expect("artifact read")
+        .expect("artifact exists");
+    assert_eq!(
+        page.bytes, before,
+        "artifact stores the exact preimage bytes"
+    );
+    drop(tools);
+    close(store).await;
+}
+
+#[tokio::test]
+async fn g06_steer_reaches_the_driver_mid_run() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let provider = Arc::new(SteeringProvider::new());
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let inbox = RunInbox::new(Arc::clone(&store));
+    let driver = TurnDriver::new(
+        Arc::clone(&runtime),
+        ToolExecutionService::new(Arc::clone(&store)),
+    )
+    .with_inbox(inbox.clone());
+    let session = SessionId::generate();
+    let task = TaskId::generate();
+    let request = RunRequest::new(
+        session.clone(),
+        task,
+        InputId::generate(),
+        "inspect the parser",
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("workspace"),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    let options = TurnOptions {
+        workspace_root: bench.workspace.clone(),
+        actor_id: "g06.test".to_owned(),
+        approvals: ApprovalMode::Auto,
+        limits: TurnLimits::default(),
+    };
+    let started = Arc::clone(&provider.first_call_started);
+    let driver_task = tokio::spawn(async move {
+        driver
+            .run_turn(
+                request,
+                options,
+                Arc::new(SilentObserver),
+                CancellationToken::new(),
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("the first model call starts");
+    let run = store
+        .latest_run(&session)
+        .await
+        .expect("latest run query")
+        .expect("run is persisted before provider dispatch");
+    inbox
+        .steer(
+            &run,
+            "Keep the existing parser format",
+            harness_runtime::now_unix_ms(),
+        )
+        .await
+        .expect("steering command is durably queued");
+    provider.release_first_call.notify_one();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(30), driver_task)
+        .await
+        .expect("driver finishes within the bound")
+        .expect("driver task joins")
+        .expect("turn succeeds");
+    assert_eq!(outcome.stop, TurnStop::Final);
+    let requests = provider.seen.lock().expect("request log").clone();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the read action advances to another step"
+    );
+    assert!(
+        requests[1].messages.iter().any(|message| {
+            message
+                .content
+                .contains("[steering correction from the user]\nKeep the existing parser format")
+        }),
+        "the real driver must include the inbox correction in the next provider request: {:?}",
+        requests[1].messages
+    );
+    drop(requests);
+
+    drop(inbox);
+    drop(runtime);
+    drop(provider);
+    close(store).await;
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end test proves durable ask, writer release, and same-task continuation"
+)]
+async fn g06_ask_user_stops_the_turn_and_answer_resumes_it() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                "ask-color",
+                "ask_user",
+                serde_json::json!({
+                    "question": "Which color should I use?",
+                    "options": ["blue", "green"]
+                })
+                .to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("I will use blue."),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let driver = TurnDriver::new(
+        Arc::clone(&runtime),
+        ToolExecutionService::new(Arc::clone(&store)),
+    );
+    let task = TaskId::generate();
+    let first_session = SessionId::generate();
+    let first = RunRequest::new(
+        first_session.clone(),
+        task.clone(),
+        InputId::generate(),
+        "choose a color".to_owned(),
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("observation"),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    let first_outcome = driver
+        .run_turn(
+            first,
+            TurnOptions {
+                workspace_root: bench.workspace.clone(),
+                actor_id: "g06.test".to_owned(),
+                approvals: ApprovalMode::Auto,
+                limits: TurnLimits::default(),
+            },
+            Arc::new(SilentObserver),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("question turn settles");
+    assert_eq!(first_outcome.stop, TurnStop::NeedsInput);
+    assert_eq!(first_outcome.tool_calls, 1);
+    let question_id = first_outcome.pending_question.expect("pending question");
+    let input = HumanInputService::new(Arc::clone(&store));
+    let question = input
+        .question(&question_id)
+        .await
+        .expect("question is readable")
+        .expect("question is durable");
+    assert_eq!(question.prompt, "Which color should I use?");
+    assert_eq!(
+        question.payload["options"],
+        serde_json::json!(["blue", "green"])
+    );
+    input
+        .answer(
+            &question.scope_key,
+            &serde_json::json!("blue"),
+            "g06.test",
+            harness_runtime::now_unix_ms(),
+        )
+        .await
+        .expect("the answer is persisted");
+
+    drop(input);
+    drop(driver);
+    drop(runtime);
+    close(store).await;
+
+    // Interactive turns release and reacquire the project writer between sessions;
+    // the new generation is what safely transfers the task lease to the answer turn.
+    let store = bench.open_store().await;
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let driver = TurnDriver::new(
+        Arc::clone(&runtime),
+        ToolExecutionService::new(Arc::clone(&store)),
+    );
+    let second_session = SessionId::generate();
+    let second = RunRequest::new(
+        second_session,
+        task,
+        InputId::generate(),
+        "blue".to_owned(),
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("observation"),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    let resumed = driver
+        .run_turn_continuing(
+            &first_session,
+            second,
+            TurnOptions {
+                workspace_root: bench.workspace.clone(),
+                actor_id: "g06.test".to_owned(),
+                approvals: ApprovalMode::Auto,
+                limits: TurnLimits::default(),
+            },
+            Arc::new(SilentObserver),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("answer resumes the task");
+    assert_eq!(resumed.stop, TurnStop::Final);
+    let seen = provider.seen();
+    assert!(
+        seen[1]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("blue"))
+    );
+    drop(driver);
+    drop(runtime);
+    close(store).await;
+}
+
+#[tokio::test]
+async fn g06_bang_prefix_goes_through_the_same_approval_gate() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let (session, task) = admit(&store, &bench).await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let gate = Arc::new(GrantingApprovalGate::default());
+    let options = TurnOptions {
+        workspace_root: bench.workspace.clone(),
+        actor_id: "g06.test".to_owned(),
+        approvals: ApprovalMode::Ask(gate.clone()),
+        limits: TurnLimits::default(),
+    };
+    let request = ToolRequest::new(
+        session.clone(),
+        task,
+        "g06.test",
+        &bench.workspace,
+        CodingToolAction::RunShell {
+            command: "echo HA_AGENT_G06".to_owned(),
+            timeout_ms: 15_000,
+            isolation: IsolationMode::BestEffort,
+            env: Vec::new(),
+        },
+    );
+    let observer: Arc<dyn TurnObserver> = Arc::new(SilentObserver);
+    let view = harness_tools::execute_action_with_approval(
+        &tools,
+        request,
+        &options,
+        1,
+        &observer,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("approved prefix action executes");
+
+    let proposals = gate.proposals.lock().expect("approval proposals").clone();
+    assert_eq!(
+        proposals.len(),
+        1,
+        "the shell prefix uses the normal ask gate"
+    );
+    assert_eq!(proposals[0].action, "RunShell");
+    assert_eq!(proposals[0].rule_pattern, "run_shell(echo HA_AGENT_G06)");
+    let receipt = view.receipt.expect("the standard gate writes a receipt");
+    assert_eq!(receipt.outcome_state, ToolOutcomeState::Settled);
+    let ToolOutput::Process { stdout, .. } = view.output else {
+        panic!("run_shell returns captured process output");
+    };
+    assert!(stdout.contains("HA_AGENT_G06"), "captured output: {stdout}");
+
+    drop(tools);
     close(store).await;
 }

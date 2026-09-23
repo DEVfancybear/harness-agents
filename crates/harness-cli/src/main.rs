@@ -139,9 +139,15 @@ struct ChatArgs {
     /// Select a named config profile.
     #[arg(long)]
     profile: Option<String>,
-    /// Approval policy override (G01-G03 support `ask`).
-    #[arg(long)]
+    /// Approval mode: ask, auto-edit or full-auto.
+    #[arg(long, value_parser = ["ask", "auto-edit", "full-auto"])]
     approval: Option<String>,
+    /// Temporary tool allow pattern for one headless turn; repeatable.
+    #[arg(long = "allowed-tools", requires = "headless")]
+    allowed_tools: Vec<String>,
+    /// Temporary tool deny pattern for one headless turn; repeatable.
+    #[arg(long = "disallowed-tools", requires = "headless")]
+    disallowed_tools: Vec<String>,
     /// Use the labelled local fixture backend instead of a model; no provider is
     /// called and the header says so.
     #[arg(long)]
@@ -197,6 +203,9 @@ impl ChatArgs {
                 criteria: self.criteria.clone(),
                 max_continuations: self.max_continuations,
                 budget_tokens: self.budget,
+                approval: self.approval.clone(),
+                allowed_tools: self.allowed_tools.clone(),
+                disallowed_tools: self.disallowed_tools.clone(),
             },
         )?;
         match &mut mode {
@@ -206,12 +215,18 @@ impl ChatArgs {
                 config_overrides.model.clone_from(&self.model);
                 config_overrides.profile.clone_from(&self.profile);
                 config_overrides.approval.clone_from(&self.approval);
+                config_overrides
+                    .allowed_tools
+                    .clone_from(&self.allowed_tools);
+                config_overrides
+                    .disallowed_tools
+                    .clone_from(&self.disallowed_tools);
             }
             interactive::LaunchMode::Headless { .. }
-                if self.model.is_some() || self.profile.is_some() || self.approval.is_some() =>
+                if self.model.is_some() || self.profile.is_some() =>
             {
                 return Err(interactive::UsageError::new(
-                    "--model, --profile and --approval apply to interactive chat only",
+                    "--model and --profile apply to interactive chat only",
                 ));
             }
             interactive::LaunchMode::Headless { .. } => {}
@@ -643,6 +658,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
                     model,
                     profile,
                     approval,
+                    ..interactive::config::ConfigOverrides::default()
                 },
             )
             .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
@@ -651,7 +667,11 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
                 "effective_config": {
                     "provider": effective.provider,
                     "profile": effective.profile,
-                    "approval": effective.approval
+                    "approval": effective.approval,
+                    "permissions": {
+                        "allow": effective.allow_rules,
+                        "deny": effective.deny_rules
+                    }
                 },
                 "sources": effective.explain,
                 "project_config_reason": effective.project_config_reason

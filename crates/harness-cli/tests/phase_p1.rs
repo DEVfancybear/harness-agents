@@ -64,6 +64,8 @@ fn receipt(task_id: TaskId, sequence: u64) -> ToolExecutionReceipt {
         outcome_state: ToolOutcomeState::Settled,
         before_fingerprint: None,
         after_fingerprint: None,
+        before_hash: None,
+        after_hash: None,
         artifact_id: None,
         observed_at_seq: sequence,
     }

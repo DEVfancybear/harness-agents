@@ -19,7 +19,7 @@ use crate::interactive::view;
 ///
 /// The layout reserves exactly this, so a row added here without updating it would
 /// be clipped off the bottom of the viewport instead of wrapping into view.
-pub const PANEL_ROWS: u16 = 7;
+pub const PANEL_ROWS: u16 = 48;
 
 /// Everything the panel shows about one pending request.
 #[derive(Clone, Copy, Debug)]
@@ -34,11 +34,15 @@ pub struct Proposal<'a> {
     /// longer decides which keys are offered - `a` covers every kind - but a reader
     /// still has the right to know whether the thing in front of them can write.
     pub read_only: bool,
+    pub scroll: usize,
 }
 
 /// Draw the panel.
 pub fn render(frame: &mut Frame, area: Rect, request: Proposal<'_>, theme: &Theme) {
     let lines = rows(&request, theme);
+    let visible_rows = usize::from(area.height.saturating_sub(2));
+    let max_scroll = lines.len().saturating_sub(visible_rows);
+    let scroll = request.scroll.min(max_scroll);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.tool_ok)
@@ -46,6 +50,7 @@ pub fn render(frame: &mut Frame, area: Rect, request: Proposal<'_>, theme: &Them
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -58,8 +63,25 @@ pub fn render(frame: &mut Frame, area: Rect, request: Proposal<'_>, theme: &Them
 #[must_use]
 pub fn rows(request: &Proposal<'_>, theme: &Theme) -> Vec<Line<'static>> {
     let remaining = request.expires_at.saturating_duration_since(Instant::now());
+    let (summary, confirmation, diff) =
+        if let Some((summary, rest)) = request.summary.split_once("\n[always-allow]\n") {
+            let (confirmation, diff) = rest
+                .split_once("\n[diff]\n")
+                .map_or((rest, None), |(confirmation, diff)| {
+                    (confirmation, Some(diff))
+                });
+            (summary, Some(confirmation), diff)
+        } else {
+            let (summary, diff) = request
+                .summary
+                .split_once("\n[diff]\n")
+                .map_or((request.summary, None), |(summary, diff)| {
+                    (summary, Some(diff))
+                });
+            (summary, None, diff)
+        };
     let mut header = vec![Span::styled(
-        format!("[approval] {}: {}", request.action, request.summary),
+        format!("[approval] {}: {summary}", request.action),
         theme.tool_ok,
     )];
     if request.read_only {
@@ -90,10 +112,54 @@ pub fn rows(request: &Proposal<'_>, theme: &Theme) -> Vec<Line<'static>> {
     // and commands. A key whose text promised less than it did would be worse than
     // no key at all.
     lines.push(Line::from(vec![Span::styled(
-        "a cho phép mọi thao tác trong lượt này (kể cả ghi file và chạy lệnh)".to_owned(),
+        "a cho phép mọi thao tác trong lượt này · A đề xuất rule lâu dài, Enter để xác nhận"
+            .to_owned(),
         theme.dim,
     )]));
+    if let Some(confirmation) = confirmation {
+        lines.extend(
+            confirmation
+                .lines()
+                .map(|line| Line::from(Span::styled(line.to_owned(), theme.dim))),
+        );
+    }
+    if let Some(diff) = diff {
+        lines.push(Line::from(Span::styled("[diff]".to_owned(), theme.dim)));
+        lines.extend(diff.lines().map(|line| {
+            let style = if line.starts_with('+') {
+                theme.tool_ok
+            } else if line.starts_with('-') {
+                theme.tool_failed
+            } else {
+                theme.dim
+            };
+            Line::from(Span::styled(line.to_owned(), style))
+        }));
+    }
     lines
+}
+
+/// Height requested by the panel, including its border and fixed approval rows.
+#[must_use]
+pub fn requested_rows(summary: &str) -> u16 {
+    let confirmation_lines = summary
+        .split_once("\n[always-allow]\n")
+        .map_or(0, |(_, rest)| {
+            rest.split_once("\n[diff]\n")
+                .map_or(rest.lines().count(), |(confirmation, _)| {
+                    confirmation.lines().count()
+                })
+        });
+    let diff_lines = summary
+        .rsplit_once("\n[diff]\n")
+        .map_or(0, |(_, diff)| diff.lines().count().saturating_add(1));
+    u16::try_from(
+        7_usize
+            .saturating_add(confirmation_lines)
+            .saturating_add(diff_lines),
+    )
+    .unwrap_or(PANEL_ROWS)
+    .min(PANEL_ROWS)
 }
 
 #[cfg(test)]
@@ -112,6 +178,7 @@ mod tests {
             scope: "once",
             expires_at: Instant::now() + expires_in,
             read_only: false,
+            scroll: 0,
         }
     }
 
@@ -136,16 +203,18 @@ mod tests {
         );
     }
 
-    /// Measured complaint: a turn of `git log`, `git status`, `git diff` asked about
-    /// every command, and the panel offered no key that ended the questions. The `a`
-    /// row is now on every panel, and it says how far it reaches - including writes
-    /// and commands - so the key cannot do more than its own text promises.
+    /// The panel distinguishes a grant for this turn from a persistent rule, and
+    /// tells the user that Enter confirms the proposed long-term pattern.
     #[test]
-    fn t06_every_panel_offers_the_turn_grant_and_says_how_far_it_reaches() {
+    fn t06_every_panel_offers_turn_and_persistent_grants_with_confirmation() {
         let text = plain_text(&rows(&request(Duration::from_mins(5)), &Theme::plain()));
         assert!(
-            text.contains("a cho phép mọi thao tác trong lượt này (kể cả ghi file và chạy lệnh)"),
-            "a write panel offers the turn grant and names what it covers: {text}"
+            text.contains("a cho phép mọi thao tác trong lượt này"),
+            "a write panel offers the turn grant: {text}"
+        );
+        assert!(
+            text.contains("A đề xuất rule lâu dài, Enter để xác nhận"),
+            "the persistent rule requires explicit confirmation: {text}"
         );
 
         let read = plain_text(&rows(
@@ -158,6 +227,10 @@ mod tests {
         assert!(
             read.contains("a cho phép mọi thao tác trong lượt này"),
             "and so does a read panel: {read}"
+        );
+        assert!(
+            read.contains("A đề xuất rule lâu dài, Enter để xác nhận"),
+            "the read panel describes the same confirmation step: {read}"
         );
         assert!(
             read.contains("· chỉ đọc"),

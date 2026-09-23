@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use harness_providers::{
     CancellationToken, DeepSeekAdapter, MockProvider, ModelCapabilities, ModelProvider,
@@ -27,11 +27,14 @@ use super::HeadlessOptions;
 use super::attachments;
 use super::bootstrap::{self, LaunchRequest};
 use super::bounds;
+use super::config::ConfigOverrides;
 use super::extensions;
 use super::memory;
 use super::paths::{HostPlatform, LaunchEnvironment};
 use super::project;
-use super::service::{EnvironmentCredential, resolve_provider, validate_credential_file};
+use super::service::{
+    EnvironmentCredential, resolve_provider_with_overrides, validate_credential_file,
+};
 
 /// A validated single-turn headless request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,11 +46,20 @@ pub struct HeadlessRequest {
     pub options: HeadlessOptions,
 }
 
-/// Progress is not rendered in headless mode; the final answer is printed once.
-struct SilentObserver;
+/// Auto-allowed actions remain visible in headless JSON and plain output.
+#[derive(Default)]
+struct HeadlessObserver {
+    auto_allowed: Mutex<Vec<String>>,
+}
 
-impl TurnObserver for SilentObserver {
-    fn observe(&self, _progress: TurnProgress) {}
+impl TurnObserver for HeadlessObserver {
+    fn observe(&self, progress: TurnProgress) {
+        if let TurnProgress::Info(message) = progress
+            && let Ok(mut messages) = self.auto_allowed.lock()
+        {
+            messages.push(message);
+        }
+    }
 }
 
 /// Debug-only acceptance trace for a child that is killed at a hard deadline.
@@ -163,11 +175,35 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     // must fail fast with instructions and must not create state. The explicit
     // mock profile skips the provider configuration entirely, and the JSON
     // result labels it as a fixture.
+    let config_overrides = ConfigOverrides {
+        approval: request.options.approval.clone(),
+        allowed_tools: request.options.allowed_tools.clone(),
+        disallowed_tools: request.options.disallowed_tools.clone(),
+        ..ConfigOverrides::default()
+    };
+    let resolved_config = super::config::resolve_layers(
+        &context.paths.config_file,
+        &context.project.root,
+        &environment,
+        &config_overrides,
+    )?;
+    let tool_policy = super::permissions::build_tool_policy(
+        &resolved_config.approval,
+        &resolved_config.allow_rules,
+        &resolved_config.deny_rules,
+        None,
+    )?;
     let provider_config = if request.options.mock {
         None
     } else {
-        let config = resolve_provider(&environment, &context.paths.data_dir)
-            .map_err(|message| HarnessError::new(ErrorCode::ServiceUnavailable, message))?;
+        let config = resolve_provider_with_overrides(
+            &context.paths.config_file,
+            &context.project.root,
+            &environment,
+            &context.paths.data_dir,
+            &config_overrides,
+        )
+        .map_err(|message| HarnessError::new(ErrorCode::ServiceUnavailable, message))?;
         // A key the app saved is read by the resolver at call time. Prove that here,
         // before a store is opened or a turn is admitted, so a saved-but-unreadable
         // key fails with an actionable message instead of mid-turn.
@@ -300,10 +336,10 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         None
     };
     let tools = match &active_extensions {
-        Some(active) => {
-            ToolExecutionService::new(Arc::clone(&store)).with_external(active.dispatcher())
-        }
-        None => ToolExecutionService::new(Arc::clone(&store)),
+        Some(active) => ToolExecutionService::new(Arc::clone(&store))
+            .with_policy(tool_policy)
+            .with_external(active.dispatcher()),
+        None => ToolExecutionService::new(Arc::clone(&store)).with_policy(tool_policy),
     };
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
     let driver = match &active_extensions {
@@ -416,12 +452,14 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         workspace_root: context.project.root.clone(),
         actor_id: "headless.user".to_owned(),
         // There is nobody to ask: a gated action fails closed.
-        approvals: ApprovalMode::None,
+        approvals: headless_approval_mode(),
         // One turn, bounded as the environment asks: a script reads `stop` in the JSON
         // and resumes with `--resume` when it wants more, so the app never continues
         // silently in the middle of somebody's pipeline.
         limits: bounds::limits_from_environment(&environment),
     };
+    let observer = Arc::new(HeadlessObserver::default());
+    let turn_observer: Arc<dyn TurnObserver> = observer.clone();
     let outcome = match &resumed_from {
         Some((source, _)) => {
             driver
@@ -429,7 +467,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
                     source,
                     run_request,
                     options,
-                    Arc::new(SilentObserver),
+                    Arc::clone(&turn_observer),
                     CancellationToken::new(),
                 )
                 .await?
@@ -439,12 +477,16 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
                 .run_turn(
                     run_request,
                     options,
-                    Arc::new(SilentObserver),
+                    Arc::clone(&turn_observer),
                     CancellationToken::new(),
                 )
                 .await?
         }
     };
+    let auto_allowed = observer
+        .auto_allowed
+        .lock()
+        .map_or_else(|_| Vec::new(), |messages| messages.clone());
     acceptance_trace("turn_finished");
     // Stored before the writer is released, exactly like the interactive turn: the
     // admitted text comes back from the journal and is committed as reusable memory.
@@ -558,6 +600,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         "goal": goal_report,
         "pending_question": pending_question,
         "approvals": "none",
+        "auto_allowed": auto_allowed,
         "fixture": request.options.mock,
         "memory": memory_report,
         "extensions": extensions_report,
@@ -589,7 +632,15 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     if request.json {
         println!("{output}");
     } else {
+        for message in auto_allowed {
+            println!("[info] {message}");
+        }
         println!("{}", output["response"].as_str().unwrap_or_default());
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// An absent user cannot answer a gate, so every `Ask` decision must refuse.
+pub(super) fn headless_approval_mode() -> ApprovalMode {
+    ApprovalMode::None
 }

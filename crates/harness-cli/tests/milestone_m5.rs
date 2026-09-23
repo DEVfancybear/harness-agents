@@ -729,6 +729,10 @@ async fn m5_02_compaction_tail_carries_pairs_not_orphans() {
             CodingToolAction::SearchText {
                 query: "BUG".to_owned(),
                 path: Some("src".to_owned()),
+                regex: false,
+                case_insensitive: false,
+                glob: None,
+                context_lines: None,
             },
         ))
         .await

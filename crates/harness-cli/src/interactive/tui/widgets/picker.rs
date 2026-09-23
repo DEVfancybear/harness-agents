@@ -12,11 +12,33 @@ use super::super::theme::Theme;
 
 /// Draw the picker with the highlighted row marked.
 pub fn render(frame: &mut Frame, area: Rect, items: &[String], selected: usize, theme: &Theme) {
+    render_named(frame, area, items, selected, theme, " chọn session ");
+}
+
+/// Draw the workspace file picker opened by `@`.
+pub fn render_files(
+    frame: &mut Frame,
+    area: Rect,
+    items: &[String],
+    selected: usize,
+    theme: &Theme,
+) {
+    render_named(frame, area, items, selected, theme, " chọn file ");
+}
+
+fn render_named(
+    frame: &mut Frame,
+    area: Rect,
+    items: &[String],
+    selected: usize,
+    theme: &Theme,
+    title: &'static str,
+) {
     let lines = rows(items, selected, theme);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.border)
-        .title(Span::styled(" chọn session ", theme.title));
+        .title(Span::styled(title, theme.title));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 

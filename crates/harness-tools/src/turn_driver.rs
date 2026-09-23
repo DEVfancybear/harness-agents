@@ -25,11 +25,12 @@ use harness_runtime::{
 };
 use harness_store_sqlite::{RunCommandKind, RunState};
 use harness_types::{ErrorCode, HarnessError, QuestionId};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
-    CodingToolAction, GIT_LOG_DEFAULT_LIMIT, HISTORY_SEARCH_DEFAULT_LIMIT, PreparedToolRequest,
-    ToolExecutionService, ToolExecutionView, ToolOutput, ToolRequest, coding_tool_names,
+    AskUserInput, CodingToolAction, Decision, GIT_LOG_DEFAULT_LIMIT, HISTORY_SEARCH_DEFAULT_LIMIT,
+    PreparedToolRequest, ToolExecutionService, ToolExecutionView, ToolOutput, ToolRequest,
+    coding_tool_names, tool_pattern_for_action,
 };
 
 /// Limits that bound one user turn.
@@ -76,6 +77,9 @@ pub enum TurnProgress {
         /// unable to tell a malformed call from a policy denial.
         detail: Option<String>,
     },
+    /// An action ran without opening the approval panel; this reason is part of
+    /// the user-visible transcript.
+    Info(String),
 }
 
 /// Receives progress; the interactive service maps it to display events.
@@ -157,6 +161,8 @@ pub struct ApprovalProposal {
     pub action: String,
     /// The concrete target: path, command or query.
     pub summary: String,
+    /// Exact, action-scoped rule suggested by uppercase `A` in the panel.
+    pub rule_pattern: String,
     /// Directory the action would act on.
     pub workspace: PathBuf,
     /// How far the grant reaches.
@@ -195,6 +201,10 @@ pub trait ApprovalGate: Send + Sync {
         &self,
         proposal: ApprovalProposal,
     ) -> Pin<Box<dyn Future<Output = ApprovalAnswer> + Send>>;
+
+    /// Called after a granted action has settled, so a host may activate a
+    /// separately confirmed pattern for the remaining actions in this turn.
+    fn action_completed(&self, _request_id: &str) {}
 }
 
 /// How tool approvals are handled inside this turn.
@@ -788,8 +798,40 @@ impl TurnDriver {
                     ));
                     continue;
                 }
+                if name == "ask_user" {
+                    match self.ask_user(&result, &call).await {
+                        Ok(question_id) => {
+                            pending_question = Some(question_id);
+                            observer.observe(TurnProgress::ToolSettled {
+                                name,
+                                ok: true,
+                                detail: None,
+                            });
+                            break 'turn TurnStop::NeedsInput;
+                        }
+                        Err(error) => {
+                            observer.observe(TurnProgress::ToolSettled {
+                                name: name.clone(),
+                                ok: false,
+                                detail: Some(error.to_string()),
+                            });
+                            appended.push(ProviderMessage::tool_result(
+                                call.call_id.clone(),
+                                format!("ask_user failed: {error}"),
+                            ));
+                            continue;
+                        }
+                    }
+                }
                 match self
-                    .execute_call(&result, &call, &options, tool_calls)
+                    .execute_call(
+                        &result,
+                        &call,
+                        &options,
+                        tool_calls,
+                        &observer,
+                        &cancellation,
+                    )
                     .await
                 {
                     Ok(view) => {
@@ -971,12 +1013,41 @@ impl TurnDriver {
             .await
     }
 
+    async fn ask_user(
+        &self,
+        result: &RunResult,
+        call: &NormalizedToolCall,
+    ) -> Result<QuestionId, HarnessError> {
+        let input = AskUserInput::parse(&call.arguments)?;
+        let request_id = if call.call_id.trim().is_empty() {
+            result.step_id.as_str()
+        } else {
+            call.call_id.as_str()
+        };
+        let mut request = AskRequest::for_request(
+            result.session_id.clone(),
+            result.task_id.clone(),
+            &result.run_id,
+            request_id,
+            input.question,
+        );
+        "ask_user".clone_into(&mut request.kind);
+        request.payload = json!({"options": input.options});
+        let record = HumanInputService::new(Arc::clone(self.runtime.store()))
+            .ask(request, now_unix_ms())
+            .await
+            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+        Ok(record.question_id)
+    }
+
     async fn execute_call(
         &self,
         result: &RunResult,
         call: &NormalizedToolCall,
         options: &TurnOptions,
         sequence: u32,
+        observer: &Arc<dyn TurnObserver>,
+        cancellation: &CancellationToken,
     ) -> Result<ToolExecutionView, HarnessError> {
         let action = self.resolve_action(call)?;
         let request = ToolRequest::new(
@@ -993,31 +1064,15 @@ impl TurnDriver {
         } else {
             request.with_call_id(call.call_id.clone())
         };
-        let prepared = self.tools.prepare(request).await?;
-        let approval = match &options.approvals {
-            ApprovalMode::Auto => Some(self.tools.approve(&prepared).await?),
-            ApprovalMode::None => None,
-            ApprovalMode::Ask(gate) => {
-                let proposal = proposal_for(sequence, &prepared, &options.workspace_root);
-                let answered = gate.request(proposal).await;
-                match answered {
-                    ApprovalAnswer::Granted => Some(self.tools.approve(&prepared).await?),
-                    ApprovalAnswer::Denied => {
-                        return Err(HarnessError::new(
-                            ErrorCode::PolicyDenied,
-                            "denied by the user; the action was not executed",
-                        ));
-                    }
-                    ApprovalAnswer::Expired => {
-                        return Err(HarnessError::new(
-                            ErrorCode::ApprovalStale,
-                            "the approval request expired before an answer arrived; the action was not executed",
-                        ));
-                    }
-                }
-            }
-        };
-        self.tools.execute(prepared, approval).await
+        execute_action_with_approval(
+            &self.tools,
+            request,
+            options,
+            sequence,
+            observer,
+            cancellation,
+        )
+        .await
     }
 
     /// Resolve one streamed call into an action.
@@ -1047,21 +1102,105 @@ impl TurnDriver {
     }
 }
 
+/// Execute a host-initiated action through the same policy, approval and receipt
+/// path used for a model tool call.
+///
+/// Interactive input prefixes such as `!cmd` are still proposals. Sharing this
+/// function keeps protected-path validation, deny/allow ordering, approval
+/// panels, and durable receipts identical to the model-tool path.
+pub async fn execute_action_with_approval(
+    tools: &ToolExecutionService,
+    request: ToolRequest,
+    options: &TurnOptions,
+    sequence: u32,
+    observer: &Arc<dyn TurnObserver>,
+    cancellation: &CancellationToken,
+) -> Result<ToolExecutionView, HarnessError> {
+    let prepared = tools.prepare(request).await?;
+    let decision = match (tools.decision(&prepared), &options.approvals) {
+        (Decision::Ask, ApprovalMode::Auto) => Decision::Allow {
+            reason: "explicit auto approval".to_owned(),
+        },
+        (decision, _) => decision,
+    };
+    let mut granted_gate = None;
+    let approval = match decision {
+        Decision::Blocked(_) | Decision::Deny(_) => {
+            return tools
+                .execute_with_cancellation(prepared, None, cancellation.clone())
+                .await;
+        }
+        Decision::Allow { reason } => {
+            observer.observe(TurnProgress::Info(format!(
+                "allowed by {reason}: {}",
+                summarize_action(prepared.action())
+            )));
+            Some(tools.approve(&prepared).await?)
+        }
+        Decision::Ask => match &options.approvals {
+            // An explicit fixture approval was translated into Decision::Allow.
+            ApprovalMode::Auto => unreachable!("auto is an allow decision"),
+            ApprovalMode::None => None,
+            ApprovalMode::Ask(gate) => {
+                let proposal = proposal_for(
+                    sequence,
+                    &prepared,
+                    &options.workspace_root,
+                    ToolExecutionService::approval_diff(&prepared)?,
+                );
+                let request_id = proposal.request_id.clone();
+                match gate.request(proposal).await {
+                    ApprovalAnswer::Granted => {
+                        granted_gate = Some((Arc::clone(gate), request_id));
+                        Some(tools.approve(&prepared).await?)
+                    }
+                    ApprovalAnswer::Denied => {
+                        return Err(HarnessError::new(
+                            ErrorCode::PolicyDenied,
+                            "denied by the user; the action was not executed",
+                        ));
+                    }
+                    ApprovalAnswer::Expired => {
+                        return Err(HarnessError::new(
+                            ErrorCode::ApprovalStale,
+                            "the approval request expired before an answer arrived; the action was not executed",
+                        ));
+                    }
+                }
+            }
+        },
+    };
+    let execution = tools
+        .execute_with_cancellation(prepared, approval, cancellation.clone())
+        .await;
+    if let Some((gate, request_id)) = granted_gate {
+        gate.action_completed(&request_id);
+    }
+    execution
+}
+
 /// Build the proposal the user answers.
 fn proposal_for(
     sequence: u32,
     prepared: &PreparedToolRequest,
     workspace_root: &std::path::Path,
+    diff: Option<String>,
 ) -> ApprovalProposal {
     let action = prepared.action();
     let kind = action.kind();
+    let mut summary = summarize_action(action);
+    if let Some(diff) = diff {
+        summary.push('\n');
+        summary.push_str(&diff);
+    }
     ApprovalProposal {
         request_id: format!(
             "approval-{sequence}-{}",
             short_hash(prepared.action_hash().as_str())
         ),
         action: format!("{kind:?}"),
-        summary: summarize_action(action),
+        summary,
+        rule_pattern: tool_pattern_for_action(action),
         workspace: workspace_root.to_path_buf(),
         scope: APPROVAL_SCOPE.to_owned(),
         read_only: kind.is_read_only(),
@@ -1076,14 +1215,29 @@ fn short_hash(hash: &str) -> String {
 /// One-line, secret-free description of the exact action being approved.
 fn summarize_action(action: &CodingToolAction) -> String {
     match action {
-        CodingToolAction::ReadFile { path } => format!("read {path}"),
+        CodingToolAction::ReadFile {
+            path,
+            offset,
+            limit,
+        } => format!(
+            "read {path} (lines {}–{})",
+            offset.unwrap_or(0).saturating_add(1),
+            offset.unwrap_or(0).saturating_add(u64::from(
+                limit.unwrap_or(crate::contracts::READ_FILE_DEFAULT_LINES)
+            ))
+        ),
         CodingToolAction::ListFiles { path } => {
             format!("list {}", path.as_deref().unwrap_or("."))
         }
-        CodingToolAction::SearchText { query, path } => {
+        CodingToolAction::SearchText { query, path, .. } => {
             format!("search {query:?} in {}", path.as_deref().unwrap_or("."))
         }
         CodingToolAction::ApplyPatch { path, .. } => format!("patch {path}"),
+        CodingToolAction::WriteFile { path, .. } => format!("write {path}"),
+        CodingToolAction::EditFile { path, .. } => format!("edit {path}"),
+        CodingToolAction::Glob { pattern, path } => {
+            format!("glob {pattern:?} in {}", path.as_deref().unwrap_or("."))
+        }
         CodingToolAction::RunProcess {
             executable, args, ..
         } => format!("run {executable} {}", args.join(" ")),
@@ -1193,7 +1347,9 @@ fn goal_evidence(result: &RunResult, executions: &[ToolExecutionView]) -> GoalEv
             evidence.workspace_digest = Some(after);
         }
         match &view.output {
-            ToolOutput::ApplyPatch { .. } => evidence.file_changes += 1,
+            ToolOutput::ApplyPatch { .. }
+            | ToolOutput::WriteFile { .. }
+            | ToolOutput::EditFile { .. } => evidence.file_changes += 1,
             ToolOutput::Process {
                 exit_code,
                 timed_out: false,
@@ -1239,6 +1395,10 @@ fn malformed_call(call: &NormalizedToolCall) -> Option<&'static str> {
 }
 
 /// Render a bounded tool result as the message the model receives next.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive output mapping keeps every tool result visible to the model"
+)]
 pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
     let body = match output {
         ToolOutput::ReadFile {
@@ -1260,6 +1420,11 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             if *truncated { " (truncated)" } else { "" },
             matches.len()
         ),
+        ToolOutput::Glob { paths, truncated } => format!(
+            "glob{}: {} path(s)",
+            if *truncated { " (truncated)" } else { "" },
+            paths.len()
+        ),
         ToolOutput::ApplyPatch {
             path,
             before_hash,
@@ -1268,6 +1433,26 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             "apply_patch {path}: {} -> {}",
             before_hash.as_str(),
             after_hash.as_str()
+        ),
+        ToolOutput::WriteFile {
+            path,
+            before_hash,
+            after_hash,
+        } => format!(
+            "write_file {path}: {} -> {}",
+            before_hash.as_str(),
+            after_hash.as_str()
+        ),
+        ToolOutput::EditFile {
+            path,
+            before_hash,
+            after_hash,
+            replacements,
+        } => format!(
+            "edit_file {path}: {} -> {} ({} replacement(s))",
+            before_hash.as_str(),
+            after_hash.as_str(),
+            replacements
         ),
         ToolOutput::Process {
             executable,

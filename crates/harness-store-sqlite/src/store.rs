@@ -3348,6 +3348,8 @@ async fn ensure_tools_schema(pool: &SqlitePool) -> Result<(), StoreError> {
             ensure_column(&mut tx, table, column, definition).await?;
         }
     }
+    // Revision 3 is additive at the serialized receipt boundary: before/after
+    // content hashes are optional JSON fields and need no SQL column migration.
     if current < TOOLS_SCHEMA_VERSION {
         sqlx::query("INSERT INTO tools_schema_migrations(version) VALUES (?)")
             .bind(TOOLS_SCHEMA_VERSION)

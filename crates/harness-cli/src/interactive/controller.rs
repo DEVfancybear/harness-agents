@@ -18,12 +18,13 @@ use super::attachments::{self, paths_touched};
 use super::bootstrap::LaunchContext;
 use super::bounds::{self, DEFAULT_CONTINUATIONS};
 use super::credentials::CredentialSource;
+use super::events::ShellPrefixMode;
 use super::events::{
     AppPhase, HistoryItem, Key, Modal, RunOutcome, SessionCandidate, SessionEvent, ToolState,
     UiState,
 };
 use super::input::{InputOutcome, LineEditor};
-use super::service::{ApprovalDecision, SessionChannel, SessionPort, SubmitRequest};
+use super::service::{ApprovalDecision, SessionChannel, SessionPort, ShellPrefix, SubmitRequest};
 use super::view;
 
 /// Exit code for a normal quit.
@@ -87,12 +88,22 @@ struct PendingApproval {
     request_id: String,
     action: String,
     summary: String,
+    rule_pattern: String,
+    always_allow_confirm: bool,
     workspace: String,
     scope: String,
     expires_at: Instant,
     /// Whether the action only reads, so the panel offers the wider grant only
     /// where granting it means something.
     read_only: bool,
+    scroll: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingQuestion {
+    question_id: String,
+    prompt: String,
+    options: Vec<String>,
 }
 
 /// Interactive app state and its transitions.
@@ -121,6 +132,7 @@ pub struct InteractiveController {
     /// buffer on every token.
     pending_newlines: usize,
     pending_approval: Option<PendingApproval>,
+    pending_question: Option<PendingQuestion>,
     /// Whether the user allowed every gated action for the run now in flight.
     ///
     /// Mirrored here so the status row can say the gate is open, and cleared by
@@ -129,6 +141,14 @@ pub struct InteractiveController {
     granted_for_run: bool,
     /// Last resume listing, so a number can select from it.
     session_candidates: Vec<SessionCandidate>,
+    /// At most one input waits for the active run to release its session writer.
+    queued_input: Option<String>,
+    /// Bounded shell output blocks waiting to ride with the next model message.
+    pending_shell_outputs: Vec<String>,
+    /// The shared editor picker is showing files instead of persisted sessions.
+    file_picker_active: bool,
+    file_picker_query: String,
+    file_picker_candidates: Vec<String>,
     /// The plain renderer prints slash-command output; the TUI opens an overlay.
     plain: bool,
     /// The tool card that is still open, so it settles in place.
@@ -183,8 +203,14 @@ impl InteractiveController {
             pending_text: String::new(),
             pending_newlines: 0,
             pending_approval: None,
+            pending_question: None,
             granted_for_run: false,
             session_candidates: Vec::new(),
+            queued_input: None,
+            pending_shell_outputs: Vec::new(),
+            file_picker_active: false,
+            file_picker_query: String::new(),
+            file_picker_candidates: Vec::new(),
             plain,
             open_tool: None,
             steps: 0,
@@ -285,6 +311,7 @@ impl InteractiveController {
             open_tool: self.open_tool.clone(),
             modal: self.modal(),
             granted_for_run: self.granted_for_run,
+            queued_input: self.queued_input.is_some(),
             last_request: self.last_request.clone(),
             run_started_at: self.run_started_at,
             last_run_elapsed: self.last_run_elapsed,
@@ -310,9 +337,28 @@ impl InteractiveController {
                 scope: pending.scope.clone(),
                 expires_at: pending.expires_at,
                 read_only: pending.read_only,
+                scroll: pending.scroll,
+            });
+        }
+        if let Some(question) = &self.pending_question {
+            return Some(Modal::Question {
+                prompt: question.prompt.clone(),
+                options: question.options.clone(),
+            });
+        }
+        if let Some(question) = &self.pending_question {
+            return Some(Modal::Question {
+                prompt: question.prompt.clone(),
+                options: question.options.clone(),
             });
         }
         if let Some(picker) = self.editor.picker() {
+            if self.file_picker_active {
+                return Some(Modal::FilePicker {
+                    items: picker.items().to_vec(),
+                    selected: picker.selected(),
+                });
+            }
             return Some(Modal::Picker {
                 items: picker.items().to_vec(),
                 selected: picker.selected(),
@@ -359,6 +405,10 @@ impl InteractiveController {
     }
 
     /// Apply one key.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "this is the single ordered keyboard state machine for modal, running, and composer input"
+    )]
     pub fn handle_key(&mut self, key: Key) -> Vec<Effect> {
         if key == Key::Redraw {
             return vec![Effect::Redraw];
@@ -368,16 +418,74 @@ impl InteractiveController {
         if self.pending_approval.is_some() {
             match key {
                 Key::EndOfInput => return self.command("/exit"),
-                Key::Esc => return Vec::new(),
+                Key::Esc => {
+                    if let Some(pending) = &mut self.pending_approval
+                        && pending.always_allow_confirm
+                    {
+                        pending.always_allow_confirm = false;
+                        pending.summary = without_rule_confirmation(&pending.summary);
+                        return vec![Effect::Redraw];
+                    }
+                    return Vec::new();
+                }
+                Key::Enter
+                    if self
+                        .pending_approval
+                        .as_ref()
+                        .is_some_and(|p| p.always_allow_confirm) =>
+                {
+                    return self.confirm_always_allow();
+                }
+                Key::PageUp => {
+                    if let Some(pending) = &mut self.pending_approval {
+                        pending.scroll = pending.scroll.saturating_sub(8);
+                    }
+                    return vec![Effect::Redraw];
+                }
+                Key::PageDown => {
+                    if let Some(pending) = &mut self.pending_approval {
+                        pending.scroll = pending.scroll.saturating_add(8);
+                    }
+                    return vec![Effect::Redraw];
+                }
+                Key::Home => {
+                    if let Some(pending) = &mut self.pending_approval {
+                        pending.scroll = 0;
+                    }
+                    return vec![Effect::Redraw];
+                }
+                Key::End => {
+                    if let Some(pending) = &mut self.pending_approval {
+                        pending.scroll = usize::MAX;
+                    }
+                    return vec![Effect::Redraw];
+                }
                 // In the TUI the panel says `y chạy · a cho phép cả lượt · n từ
                 // chối`, so a single y, a or n answers immediately; anything else is
                 // typed and answered with Enter, which is what plain mode has always
                 // done. `a` is offered on every panel, because the grant it gives
                 // covers every kind - including the command in front of the user.
                 Key::Char('y' | 'Y') if !self.plain => return self.answer("y"),
-                Key::Char('a' | 'A') if !self.plain => return self.answer("a"),
+                Key::Char('A') if !self.plain => return self.propose_always_allow(),
+                Key::Char('a') if !self.plain => return self.answer("a"),
                 Key::Char('n' | 'N') if !self.plain => return self.answer("n"),
                 Key::Char(character) => return self.handle_key(Key::Paste(character.to_string())),
+                _ => {}
+            }
+        } else if self.pending_question.is_some() && self.phase == AppPhase::WaitingInput {
+            match key {
+                Key::Esc => return Vec::new(),
+                Key::Char(character @ '1'..='9') => {
+                    let index = usize::from(character as u8 - b'1');
+                    if let Some(option) = self
+                        .pending_question
+                        .as_ref()
+                        .and_then(|question| question.options.get(index))
+                    {
+                        return self.submit_question_answer(option.clone());
+                    }
+                }
+                Key::EndOfInput => return self.command("/exit"),
                 _ => {}
             }
         } else if self.editor.overlay().is_some() {
@@ -408,15 +516,42 @@ impl InteractiveController {
                 }
                 Key::Esc => {
                     self.editor.close_picker();
+                    self.file_picker_active = false;
+                    self.file_picker_query.clear();
                     return vec![Effect::Redraw];
                 }
                 Key::Enter => {
+                    if self.file_picker_active {
+                        let chosen = self
+                            .editor
+                            .picker()
+                            .and_then(|picker| picker.items().get(picker.selected()))
+                            .cloned();
+                        self.editor.close_picker();
+                        self.file_picker_active = false;
+                        self.file_picker_query.clear();
+                        if let Some(path) = chosen {
+                            let _ = self.editor.handle(Key::Backspace);
+                            let _ = self.editor.handle(Key::Paste(quote_for_composer(&path)));
+                        }
+                        return vec![Effect::Redraw];
+                    }
                     let chosen = self.selected_candidate();
                     self.editor.close_picker();
                     return match chosen {
                         Some(session_id) => self.continue_session(&session_id),
                         None => vec![Effect::Redraw],
                     };
+                }
+                Key::Char(character) if self.file_picker_active && !character.is_control() => {
+                    self.file_picker_query.push(character);
+                    self.refresh_file_picker();
+                    return vec![Effect::Redraw];
+                }
+                Key::Backspace if self.file_picker_active => {
+                    self.file_picker_query.pop();
+                    self.refresh_file_picker();
+                    return vec![Effect::Redraw];
                 }
                 Key::EndOfInput => return self.command("/exit"),
                 _ => {}
@@ -443,12 +578,22 @@ impl InteractiveController {
                 _ => {}
             }
         }
+        if key == Key::Esc && self.phase == AppPhase::Running {
+            return self.interrupt();
+        }
         // A pasted screenshot: the key is handled here rather than by the editor
         // because there is no text to insert until the clipboard has been read.
         if key == Key::PasteImage {
             let mut effects = Vec::new();
             self.paste_image(&mut effects);
             return effects;
+        }
+        if key == Key::Char('@')
+            && !self.plain
+            && matches!(self.editor.handle(Key::Char('@')), InputOutcome::Redraw)
+        {
+            self.open_file_picker();
+            return vec![Effect::Redraw];
         }
         match self.editor.handle(key) {
             InputOutcome::Unchanged => Vec::new(),
@@ -588,6 +733,7 @@ impl InteractiveController {
                 request_id,
                 action,
                 summary,
+                rule_pattern,
                 workspace,
                 scope,
                 expires_at,
@@ -615,10 +761,13 @@ impl InteractiveController {
                     request_id,
                     action,
                     summary,
+                    rule_pattern,
+                    always_allow_confirm: false,
                     workspace,
                     scope,
                     expires_at,
                     read_only,
+                    scroll: 0,
                 });
                 self.phase = AppPhase::WaitingApproval;
             }
@@ -686,6 +835,55 @@ impl InteractiveController {
                 self.flush_stream(effects);
                 self.push_history(effects, HistoryItem::Notice { message });
             }
+            SessionEvent::ShellPrefixCompleted {
+                command,
+                output,
+                attach_to_next_message,
+            } => {
+                self.flush_stream(effects);
+                if attach_to_next_message {
+                    self.push_shell_output(&command, &output);
+                }
+                self.push_history(
+                    effects,
+                    HistoryItem::Message {
+                        text: format!("[shell] {command}\n{output}"),
+                    },
+                );
+            }
+            SessionEvent::QuestionRequired {
+                question_id,
+                prompt,
+                options,
+            } => {
+                self.flush_stream(effects);
+                if self.plain {
+                    let choices = options
+                        .iter()
+                        .enumerate()
+                        .map(|(index, option)| format!("{}. {option}", index + 1))
+                        .collect::<Vec<_>>();
+                    self.push_history(
+                        effects,
+                        HistoryItem::Message {
+                            text: format!(
+                                "[question] {}{}",
+                                prompt,
+                                if choices.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("\n{}", choices.join("\n"))
+                                }
+                            ),
+                        },
+                    );
+                }
+                self.pending_question = Some(PendingQuestion {
+                    question_id,
+                    prompt,
+                    options,
+                });
+            }
             SessionEvent::RunTerminal { outcome } => {
                 self.flush_stream(effects);
                 self.settle_run(Some(outcome.clone()));
@@ -699,6 +897,11 @@ impl InteractiveController {
                     },
                 );
                 self.finish_run();
+                if let Some(text) = self.queued_input.take() {
+                    self.close_run_grant();
+                    effects.extend(self.dispatch(text, false));
+                    return;
+                }
                 // After `finish_run`: a continuation is a new request, and the phase has
                 // to be idle again before the service will accept one.
                 effects.extend(self.maybe_continue(&outcome));
@@ -740,10 +943,16 @@ impl InteractiveController {
         if matches!(text.split_whitespace().next(), Some("/exit" | "/quit")) {
             return self.command(&text);
         }
+        if text.trim_start().starts_with("/steer") {
+            return self.command(&text);
+        }
         // While a gated action waits, the next line is the answer — never a new
         // request that would run beside the pending one.
         if self.phase == AppPhase::WaitingApproval {
             return self.answer(&text);
+        }
+        if self.phase == AppPhase::WaitingInput && self.pending_question.is_some() {
+            return self.submit_question_answer(text);
         }
         if text.trim_start().starts_with('/') {
             // A leading space must not turn a command into chat text: `/key`
@@ -751,13 +960,37 @@ impl InteractiveController {
             return self.command(&text);
         }
         if self.phase.has_active_run() {
+            if self.phase == AppPhase::Running && self.queued_input.is_none() {
+                self.queued_input = Some(text);
+                return vec![
+                    Effect::History(HistoryItem::Notice {
+                        message: "queued (1): sent after the active run finishes".to_owned(),
+                    }),
+                    Effect::Redraw,
+                ];
+            }
             return vec![
                 Effect::History(HistoryItem::Notice {
-                    message: "a run is already active; wait for it or press Ctrl-C to cancel"
-                        .to_owned(),
+                    message: if self.queued_input.is_some() {
+                        "one input is already queued; wait for the active run to finish".to_owned()
+                    } else {
+                        "a run is already active; wait for it or press Ctrl-C to cancel".to_owned()
+                    },
                 }),
                 Effect::Redraw,
             ];
+        }
+        let shell_prefix = match parse_shell_prefix(&text) {
+            Ok(prefix) => prefix,
+            Err(message) => {
+                return vec![
+                    Effect::History(HistoryItem::Error { message }),
+                    Effect::Redraw,
+                ];
+            }
+        };
+        if let Some(shell_prefix) = shell_prefix {
+            return self.dispatch_shell_prefix(text, shell_prefix);
         }
         // Ask the port at submission time, not at boot: the answer changes the
         // moment `/key` saves a credential, and a stale "setup required" would
@@ -768,11 +1001,14 @@ impl InteractiveController {
                 Effect::Redraw,
             ];
         }
+        let text = self.attach_pending_shell_outputs(text);
         let input_id = InputId::generate();
         self.fresh_run(Instant::now(), Some(text.clone()));
         self.service.submit(SubmitRequest {
             input_id,
             text: text.clone(),
+            answer_question_id: None,
+            shell_prefix: None,
         });
         let mut effects = Vec::new();
         let item = if automatic {
@@ -783,6 +1019,83 @@ impl InteractiveController {
         self.push_history(&mut effects, item);
         effects.push(Effect::Redraw);
         effects
+    }
+
+    fn submit_question_answer(&mut self, text: String) -> Vec<Effect> {
+        if text.trim().is_empty() {
+            return vec![
+                Effect::History(HistoryItem::Error {
+                    message: "answer the question with text or choose one of its numbered options"
+                        .to_owned(),
+                }),
+                Effect::Redraw,
+            ];
+        }
+        let Some(question) = self.pending_question.take() else {
+            return Vec::new();
+        };
+        self.continuations = 0;
+        self.fresh_run(Instant::now(), Some(text.clone()));
+        self.service.submit(SubmitRequest {
+            input_id: InputId::generate(),
+            text: text.clone(),
+            answer_question_id: Some(question.question_id),
+            shell_prefix: None,
+        });
+        vec![Effect::History(HistoryItem::User { text }), Effect::Redraw]
+    }
+
+    fn dispatch_shell_prefix(&mut self, text: String, shell_prefix: ShellPrefix) -> Vec<Effect> {
+        self.continuations = 0;
+        self.fresh_run(Instant::now(), Some(text.clone()));
+        self.service.submit(SubmitRequest {
+            input_id: InputId::generate(),
+            text: text.clone(),
+            answer_question_id: None,
+            shell_prefix: Some(shell_prefix),
+        });
+        let mut effects = Vec::new();
+        self.push_history(&mut effects, HistoryItem::User { text });
+        effects.push(Effect::Redraw);
+        effects
+    }
+
+    fn push_shell_output(&mut self, command: &str, output: &str) {
+        const MAX_PENDING_BYTES: usize = 64 * 1024;
+        let mut block = format!("[shell] {command}\n{output}");
+        let pending_bytes = self
+            .pending_shell_outputs
+            .iter()
+            .map(String::len)
+            .sum::<usize>();
+        let remaining = MAX_PENDING_BYTES.saturating_sub(pending_bytes);
+        if block.len() > remaining {
+            const TRUNCATION: &str = "\n[attachment truncated: 64 KiB session limit]";
+            let max_content = remaining.saturating_sub(TRUNCATION.len());
+            let mut boundary = max_content.min(block.len());
+            while !block.is_char_boundary(boundary) {
+                boundary = boundary.saturating_sub(1);
+            }
+            block.truncate(boundary);
+            if remaining >= TRUNCATION.len() {
+                block.push_str(TRUNCATION);
+            }
+        }
+        if !block.is_empty() {
+            self.pending_shell_outputs.push(block);
+        }
+    }
+
+    fn attach_pending_shell_outputs(&mut self, mut text: String) -> String {
+        if self.pending_shell_outputs.is_empty() {
+            return text;
+        }
+        let blocks = std::mem::take(&mut self.pending_shell_outputs).join("\n\n");
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&blocks);
+        text
     }
 
     /// Continue a turn a bound stopped, while the continuation budget lasts.
@@ -838,6 +1151,16 @@ impl InteractiveController {
 
     fn interrupt(&mut self) -> Vec<Effect> {
         if self.phase.has_active_run() {
+            if self.queued_input.take().is_some() {
+                return vec![
+                    Effect::History(HistoryItem::Notice {
+                        message:
+                            "queued input cleared; press Ctrl-C again to cancel the active run"
+                                .to_owned(),
+                    }),
+                    Effect::Redraw,
+                ];
+            }
             self.service.cancel();
             // Ctrl-C also means "do not start another one": the budget is spent, so the
             // bound that ends the canceled turn is a real stop until the user speaks.
@@ -857,6 +1180,28 @@ impl InteractiveController {
             }),
             Effect::Redraw,
         ]
+    }
+
+    fn open_file_picker(&mut self) {
+        self.file_picker_candidates = file_picker_candidates(&self.context.project.root);
+        self.file_picker_query.clear();
+        self.file_picker_active = true;
+        self.editor.open_picker(self.file_picker_candidates.clone());
+        self.refresh_file_picker();
+    }
+
+    fn refresh_file_picker(&mut self) {
+        if !self.file_picker_active {
+            return;
+        }
+        let query = self.file_picker_query.to_lowercase();
+        let items = self
+            .file_picker_candidates
+            .iter()
+            .filter(|path| path.to_lowercase().contains(&query))
+            .cloned()
+            .collect();
+        self.editor.open_picker(items);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -944,6 +1289,62 @@ impl InteractiveController {
                     .filter(|line| line.starts_with("Config:") || line.starts_with("Data:"))
                     .cloned());
                 self.reference("/config", lines, &mut effects);
+            }
+            "/permissions" => {
+                let lines = self.service.permissions_summary();
+                self.reference("/permissions", lines, &mut effects);
+            }
+            "/mode" => {
+                if self.phase.has_active_run() {
+                    self.push_history(
+                        &mut effects,
+                        HistoryItem::Notice {
+                            message: "permission mode changes apply between turns; wait for this run to finish".to_owned(),
+                        },
+                    );
+                } else if let Some(mode) = argument {
+                    if raw_argument.is_some_and(|raw| raw.split_whitespace().count() != 1) {
+                        self.push_history(
+                            &mut effects,
+                            HistoryItem::Error {
+                                message: "usage: /mode ask|auto-edit|full-auto".to_owned(),
+                            },
+                        );
+                    } else {
+                        match self.service.set_mode(mode) {
+                            Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
+                            Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                        }
+                    }
+                } else {
+                    self.reference(
+                        "/mode",
+                        vec![
+                            "ask: prompt for each gated action".to_owned(),
+                            "auto-edit: workspace reads and edits run without a prompt; process, shell and extension tools still ask".to_owned(),
+                            "full-auto: built-in workspace tools run without a prompt; extension tools still ask".to_owned(),
+                        ],
+                        &mut effects,
+                    );
+                }
+            }
+            "/steer" => {
+                if !self.phase.has_active_run() {
+                    self.push_history(&mut effects, HistoryItem::Error {
+                        message: "/steer is available only while a run is active".to_owned(),
+                    });
+                } else if let Some(text) = raw_argument {
+                    match self.service.steer(text) {
+                        Ok(()) => self.push_history(&mut effects, HistoryItem::Notice {
+                            message: "steering note queued for the next safe step".to_owned(),
+                        }),
+                        Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                    }
+                } else {
+                    self.push_history(&mut effects, HistoryItem::Error {
+                        message: "usage: /steer <text>".to_owned(),
+                    });
+                }
             }
             "/cost" => {
                 self.reference(
@@ -1479,6 +1880,12 @@ impl InteractiveController {
             // No pending request: fall through to a normal submission.
             return Vec::new();
         };
+        if line.trim() == "A" {
+            return self.propose_always_allow();
+        }
+        if pending.always_allow_confirm && line.trim().is_empty() {
+            return self.confirm_always_allow();
+        }
         let decision = match line.trim().to_ascii_lowercase().as_str() {
             "y" | "yes" | "grant" | "/approve" => Some(ApprovalDecision::Granted),
             "a" | "all" | "/approve-all" => Some(ApprovalDecision::GrantForRun),
@@ -1533,10 +1940,64 @@ impl InteractiveController {
         effects
     }
 
+    fn propose_always_allow(&mut self) -> Vec<Effect> {
+        let Some(pending) = &mut self.pending_approval else {
+            return Vec::new();
+        };
+        if pending.always_allow_confirm {
+            return vec![Effect::Redraw];
+        }
+        let pattern = pending.rule_pattern.clone();
+        pending.always_allow_confirm = true;
+        pending.summary = with_rule_confirmation(&pending.summary, &pending.rule_pattern);
+        let mut effects = Vec::new();
+        if self.plain {
+            self.push_history(
+                &mut effects,
+                HistoryItem::Notice {
+                    message: format!(
+                        "proposed rule {pattern} — press Enter to save and run, Esc to cancel"
+                    ),
+                },
+            );
+        }
+        effects.push(Effect::Redraw);
+        effects
+    }
+
+    fn confirm_always_allow(&mut self) -> Vec<Effect> {
+        let Some(pending) = self.pending_approval.clone() else {
+            return Vec::new();
+        };
+        match self
+            .service
+            .confirm_always_allow(&pending.request_id, &pending.rule_pattern)
+        {
+            Ok(message) => {
+                self.pending_approval = None;
+                self.phase = AppPhase::Running;
+                vec![
+                    Effect::History(HistoryItem::Notice { message }),
+                    Effect::History(HistoryItem::ApprovalResolution {
+                        label: "always allowed".to_owned(),
+                        request_id: pending.request_id,
+                    }),
+                    Effect::Redraw,
+                ]
+            }
+            Err(message) => vec![
+                Effect::History(HistoryItem::Error { message }),
+                Effect::Redraw,
+            ],
+        }
+    }
+
     fn finish_run(&mut self) {
         self.pending_approval = None;
         self.open_tool = None;
-        self.phase = if self.setup_required {
+        self.phase = if self.pending_question.is_some() {
+            AppPhase::WaitingInput
+        } else if self.setup_required {
             AppPhase::SetupRequired
         } else {
             AppPhase::Ready
@@ -1579,18 +2040,81 @@ fn quote_for_composer(path: &str) -> String {
     format!("\"{path}\"")
 }
 
+/// Collect at most 4096 Git-aware workspace entries for `@` completion.
+fn file_picker_candidates(root: &std::path::Path) -> Vec<String> {
+    let mut paths = Vec::new();
+    for entry in ignore::WalkBuilder::new(root)
+        .standard_filters(true)
+        .follow_links(false)
+        .build()
+        .take(4096)
+        .flatten()
+    {
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        let path = relative.to_string_lossy().replace('\\', "/");
+        paths.push(path);
+    }
+    paths.sort();
+    paths
+}
+
+fn with_rule_confirmation(summary: &str, pattern: &str) -> String {
+    let prompt = format!(
+        "[always-allow]\nproposed rule: {pattern}\nPress Enter to save and run; Esc cancels."
+    );
+    if let Some((summary, diff)) = summary.split_once("\n[diff]\n") {
+        format!("{summary}\n{prompt}\n[diff]\n{diff}")
+    } else {
+        format!("{summary}\n{prompt}")
+    }
+}
+
+fn without_rule_confirmation(summary: &str) -> String {
+    let Some((summary, remainder)) = summary.split_once("\n[always-allow]\n") else {
+        return summary.to_owned();
+    };
+    remainder.split_once("\n[diff]\n").map_or_else(
+        || summary.to_owned(),
+        |(_, diff)| format!("{summary}\n[diff]\n{diff}"),
+    )
+}
+
+fn parse_shell_prefix(text: &str) -> Result<Option<ShellPrefix>, String> {
+    let text = text.trim_start();
+    let (command, mode) = if let Some(command) = text.strip_prefix("!!") {
+        (command, ShellPrefixMode::DisplayOnly)
+    } else if let Some(command) = text.strip_prefix('!') {
+        (command, ShellPrefixMode::AttachToNextMessage)
+    } else {
+        return Ok(None);
+    };
+    let command = command.trim();
+    if command.is_empty() {
+        return Err("usage: !<command> runs shell output into the next message; !!<command> only displays it".to_owned());
+    }
+    Ok(Some(ShellPrefix {
+        command: command.to_owned(),
+        mode,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_CONTINUATIONS, EXIT_SUCCESS, Effect, InteractiveController, TurnBounds};
     use crate::interactive::bootstrap::{self, LaunchContext, LaunchRequest};
     use crate::interactive::events::{
         AppPhase, HistoryItem, Key, Modal, PauseReason, RunOutcome, SessionCandidate, SessionEvent,
-        ToolState,
+        ShellPrefixMode, ToolState,
     };
     use crate::interactive::input::SLASH_COMMANDS;
     use crate::interactive::paths::{HostPlatform, LaunchEnvironment};
     use crate::interactive::service::{
-        ApprovalDecision, FixtureService, SessionChannel, SessionPort, SubmitRequest,
+        ApprovalDecision, FixtureService, SessionChannel, SessionPort, ShellPrefix, SubmitRequest,
     };
     use crate::interactive::view;
     use harness_types::InputId;
@@ -1601,12 +2125,19 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingPort {
         submissions: Arc<Mutex<Vec<String>>>,
+        shell_prefixes: Arc<Mutex<Vec<Option<ShellPrefix>>>>,
+        answer_questions: Arc<Mutex<Vec<Option<String>>>>,
         cancels: Arc<Mutex<u32>>,
         answers: Arc<Mutex<Vec<(String, ApprovalDecision)>>>,
+        steers: Arc<Mutex<Vec<String>>>,
         resumes: Arc<Mutex<Vec<Option<String>>>>,
         /// Every turn-wide grant the controller handed to the port, and every
         /// revocation, so a test can assert the grant is scoped to one turn.
         run_grants: Arc<Mutex<Vec<bool>>>,
+        always_allowed: Arc<Mutex<Vec<(String, String)>>>,
+        mode_updates: Arc<Mutex<Vec<String>>>,
+        permission_lines: Arc<Mutex<Vec<String>>>,
+        allow_root: Arc<Mutex<Option<std::path::PathBuf>>>,
         limits: TurnBounds,
     }
 
@@ -1616,14 +2147,29 @@ mod tests {
         }
 
         fn submit(&mut self, request: SubmitRequest) {
+            let shell_prefix = request.shell_prefix.clone();
+            let answer_question = request.answer_question_id.clone();
             self.submissions
                 .lock()
                 .expect("submission log")
                 .push(request.text);
+            self.shell_prefixes
+                .lock()
+                .expect("shell prefix log")
+                .push(shell_prefix);
+            self.answer_questions
+                .lock()
+                .expect("question answer log")
+                .push(answer_question);
         }
 
         fn cancel(&mut self) {
             *self.cancels.lock().expect("cancel log") += 1;
+        }
+
+        fn steer(&mut self, text: &str) -> Result<(), String> {
+            self.steers.lock().expect("steer log").push(text.to_owned());
+            Ok(())
         }
 
         fn answer(&mut self, request_id: &str, decision: ApprovalDecision) -> bool {
@@ -1642,6 +2188,22 @@ mod tests {
             self.run_grants.lock().expect("run grant log").push(false);
         }
 
+        fn confirm_always_allow(
+            &mut self,
+            request_id: &str,
+            pattern: &str,
+        ) -> Result<String, String> {
+            if let Some(root) = self.allow_root.lock().expect("allow root").as_ref() {
+                crate::interactive::permissions::persist_allow_rule(root, pattern)
+                    .map_err(|error| error.to_string())?;
+            }
+            self.always_allowed
+                .lock()
+                .expect("always-allow log")
+                .push((request_id.to_owned(), pattern.to_owned()));
+            Ok("permission rule saved".to_owned())
+        }
+
         fn resume(&mut self, session_id: Option<String>) -> Result<(), String> {
             self.resumes.lock().expect("resume log").push(session_id);
             Ok(())
@@ -1649,6 +2211,21 @@ mod tests {
 
         fn limits(&self) -> TurnBounds {
             self.limits
+        }
+
+        fn set_mode(&mut self, mode: &str) -> Result<String, String> {
+            self.mode_updates
+                .lock()
+                .expect("mode updates")
+                .push(mode.to_owned());
+            Ok(format!("permission mode set to {mode} for this session"))
+        }
+
+        fn permissions_summary(&mut self) -> Vec<String> {
+            self.permission_lines
+                .lock()
+                .expect("permission lines")
+                .clone()
         }
     }
 
@@ -1789,6 +2366,212 @@ mod tests {
         for character in text.chars() {
             let _ = controller.handle_key(Key::Char(character));
         }
+    }
+
+    #[test]
+    fn g06_enter_while_running_queues_and_sends_after_terminal() {
+        let mut harness = bench(true);
+        submit_text(&mut harness.controller, "first input");
+        submit_text(&mut harness.controller, "queued input");
+        assert_eq!(
+            *harness.port.submissions.lock().expect("submissions"),
+            ["first input"],
+            "a queued input is not admitted while the current session is active"
+        );
+        assert!(harness.controller.ui_state().queued_input);
+
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("terminal event");
+        let _ = harness.controller.pump_events();
+        assert_eq!(
+            *harness.port.submissions.lock().expect("submissions"),
+            ["first input", "queued input"]
+        );
+        assert_eq!(harness.controller.phase(), AppPhase::Running);
+    }
+
+    #[test]
+    fn g06_steer_reaches_the_driver_mid_run() {
+        let mut harness = bench(true);
+        submit_text(&mut harness.controller, "start");
+        submit_text(&mut harness.controller, "/steer keep the current change");
+        assert_eq!(
+            *harness.port.steers.lock().expect("steers"),
+            ["keep the current change"]
+        );
+        assert_eq!(harness.controller.phase(), AppPhase::Running);
+    }
+
+    #[test]
+    fn g06_esc_cancels_a_running_turn_but_not_an_approval() {
+        let mut harness = bench(true);
+        submit_text(&mut harness.controller, "start");
+        let _ = harness.controller.handle_key(Key::Esc);
+        assert_eq!(*harness.port.cancels.lock().expect("cancels"), 1);
+        assert_eq!(harness.controller.phase(), AppPhase::Canceling);
+
+        let mut approval = tui_bench(true);
+        let _ = submit_text(&mut approval.controller, "start");
+        approval
+            .events
+            .send(approval_event("g06-approval"))
+            .expect("approval event");
+        let _ = approval.controller.pump_events();
+        let _ = approval.controller.handle_key(Key::Esc);
+        assert_eq!(approval.controller.phase(), AppPhase::WaitingApproval);
+        assert_eq!(*approval.port.cancels.lock().expect("cancels"), 0);
+        assert!(approval.controller.ui_state().modal.is_some());
+    }
+
+    #[test]
+    fn g06_at_picker_inserts_a_workspace_relative_path() {
+        let mut harness = tui_bench(true);
+        let file = harness.temp.path().join("project").join("notes.txt");
+        std::fs::write(&file, "attachment").expect("fixture file");
+        let _ = harness.controller.handle_key(Key::Char('@'));
+        assert!(
+            matches!(
+                harness.controller.ui_state().modal,
+                Some(Modal::FilePicker { items, .. }) if items.contains(&"notes.txt".to_owned())
+            ),
+            "@ opens a file picker"
+        );
+        let _ = harness.controller.handle_key(Key::Enter);
+        assert!(harness.controller.prompt().ends_with("notes.txt"));
+    }
+
+    #[test]
+    fn g06_bang_prefix_routes_through_shell_and_only_single_bang_attaches_output() {
+        let mut harness = bench(true);
+        let _ = submit_text(&mut harness.controller, "! echo ATTACHED_OUTPUT");
+        assert_eq!(
+            harness
+                .port
+                .shell_prefixes
+                .lock()
+                .expect("shell prefix log")[0],
+            Some(ShellPrefix {
+                command: "echo ATTACHED_OUTPUT".to_owned(),
+                mode: ShellPrefixMode::AttachToNextMessage,
+            })
+        );
+        harness
+            .events
+            .send(SessionEvent::ShellPrefixCompleted {
+                command: "echo ATTACHED_OUTPUT".to_owned(),
+                output: "ATTACHED_OUTPUT".to_owned(),
+                attach_to_next_message: true,
+            })
+            .expect("shell result");
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("shell terminal");
+        let _ = harness.controller.pump_events();
+        let _ = submit_text(&mut harness.controller, "summarize this output");
+        let sent = harness.port.submissions.lock().expect("submissions");
+        assert!(sent[1].contains("[shell] echo ATTACHED_OUTPUT\nATTACHED_OUTPUT"));
+        drop(sent);
+        let _ = harness.controller.handle_key(Key::Esc);
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("chat terminal");
+        let _ = harness.controller.pump_events();
+
+        let _ = submit_text(&mut harness.controller, "!! echo LOCAL_ONLY");
+        assert_eq!(
+            harness
+                .port
+                .shell_prefixes
+                .lock()
+                .expect("shell prefix log")[2],
+            Some(ShellPrefix {
+                command: "echo LOCAL_ONLY".to_owned(),
+                mode: ShellPrefixMode::DisplayOnly,
+            })
+        );
+        harness
+            .events
+            .send(SessionEvent::ShellPrefixCompleted {
+                command: "echo LOCAL_ONLY".to_owned(),
+                output: "LOCAL_ONLY".to_owned(),
+                attach_to_next_message: false,
+            })
+            .expect("display-only shell result");
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("display-only terminal");
+        let _ = harness.controller.pump_events();
+        let _ = submit_text(&mut harness.controller, "do not include local output");
+        let sent = harness.port.submissions.lock().expect("submissions");
+        assert_eq!(sent[3], "do not include local output");
+        assert!(
+            harness
+                .controller
+                .transcript()
+                .iter()
+                .any(|line| line.contains("[shell] echo LOCAL_ONLY\nLOCAL_ONLY"))
+        );
+    }
+
+    #[test]
+    fn g06_question_panel_numbered_answer_resumes_the_same_question() {
+        let mut harness = tui_bench(true);
+        let _ = submit_text(&mut harness.controller, "choose a color");
+        harness
+            .events
+            .send(SessionEvent::QuestionRequired {
+                question_id: "question-g06".to_owned(),
+                prompt: "Which color should I use?".to_owned(),
+                options: vec!["blue".to_owned(), "green".to_owned()],
+            })
+            .expect("question event");
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::WaitingInput {
+                    question_id: Some("question-g06".to_owned()),
+                },
+            })
+            .expect("question turn ends");
+        let _ = harness.controller.pump_events();
+        assert_eq!(harness.controller.phase(), AppPhase::WaitingInput);
+        assert!(matches!(
+            harness.controller.ui_state().modal,
+            Some(Modal::Question { ref prompt, ref options })
+                if prompt == "Which color should I use?" && options.len() == 2
+        ));
+        let _ = harness.controller.handle_key(Key::Char('2'));
+        assert_eq!(
+            harness
+                .port
+                .submissions
+                .lock()
+                .expect("submissions")
+                .as_slice(),
+            ["choose a color", "green"]
+        );
+        assert_eq!(
+            harness
+                .port
+                .answer_questions
+                .lock()
+                .expect("question answer log")
+                .as_slice(),
+            [None, Some("question-g06".to_owned())]
+        );
     }
 
     fn saved_credential_path(context: &LaunchContext) -> std::path::PathBuf {
@@ -2028,6 +2811,7 @@ mod tests {
             request_id: request_id.to_owned(),
             action: "apply_patch".to_owned(),
             summary: "path=src/parser.rs".to_owned(),
+            rule_pattern: "apply_patch(src/parser.rs)".to_owned(),
             workspace: "C:/work/project".to_owned(),
             scope: "once".to_owned(),
             expires_at: Instant::now() + Duration::from_mins(5),
@@ -2041,6 +2825,7 @@ mod tests {
             request_id: request_id.to_owned(),
             action: "ListFiles".to_owned(),
             summary: "list .".to_owned(),
+            rule_pattern: "list_files(.)".to_owned(),
             workspace: "C:/work/project".to_owned(),
             scope: "once".to_owned(),
             expires_at: Instant::now() + Duration::from_mins(5),
@@ -2049,7 +2834,7 @@ mod tests {
     }
 
     #[test]
-    fn h03_one_admission_per_message_and_a_running_run_refuses_a_second() {
+    fn h03_one_admission_per_message_and_a_running_run_queues_a_second() {
         let mut harness = bench(true);
         let _ = harness.controller.boot_lines();
         let effects = submit_text(&mut harness.controller, "first request");
@@ -2071,12 +2856,28 @@ mod tests {
 
         let effects = submit_text(&mut harness.controller, "second request");
         let plain = effects_to_plain(&effects).join("\n");
-        assert!(plain.contains("a run is already active"), "{plain}");
+        assert!(plain.contains("queued (1)"), "{plain}");
         assert_eq!(
             harness.port.submissions.lock().expect("submissions").len(),
             1,
-            "a second input is never admitted while a run is active"
+            "the second input waits until the active run releases the session"
         );
+        assert!(harness.controller.ui_state().queued_input);
+
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("terminal event");
+        let _ = harness.controller.pump_events();
+        assert_eq!(
+            *harness.port.submissions.lock().expect("submissions"),
+            ["first request", "second request"],
+            "the queued message is admitted once, after the first run terminates"
+        );
+        assert!(!harness.controller.ui_state().queued_input);
+        assert_eq!(harness.controller.phase(), AppPhase::Running);
     }
 
     #[test]
@@ -2702,6 +3503,126 @@ mod tests {
             "the panel closed"
         );
         assert_eq!(harness.controller.phase(), AppPhase::Running);
+    }
+
+    #[test]
+    fn g05_always_allow_writes_a_rule_only_after_confirmation() {
+        let mut harness = tui_bench(true);
+        let root = harness.temp.path().join("project");
+        *harness.port.allow_root.lock().expect("allow root") = Some(root.clone());
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "work");
+        harness
+            .events
+            .send(approval_event("g05-confirm-rule"))
+            .expect("approval");
+        let _ = harness.controller.pump_events();
+
+        let _ = harness.controller.handle_key(Key::Char('A'));
+        assert!(
+            harness
+                .port
+                .always_allowed
+                .lock()
+                .expect("rule log")
+                .is_empty(),
+            "A only proposes the exact pattern; it must not write configuration"
+        );
+        assert!(
+            !root.join(".harness/config.local.toml").exists(),
+            "the proposed pattern is not written before Enter"
+        );
+        assert!(
+            harness.controller.ui_state().modal.is_some(),
+            "the pending approval remains open while confirmation is outstanding"
+        );
+
+        let _ = harness.controller.handle_key(Key::Esc);
+        assert!(
+            harness
+                .port
+                .always_allowed
+                .lock()
+                .expect("rule log")
+                .is_empty(),
+            "Escape cancels saving and does not persist the proposal"
+        );
+        assert!(
+            !root.join(".harness/config.local.toml").exists(),
+            "Escape leaves configuration untouched"
+        );
+        assert!(
+            harness.controller.ui_state().modal.is_some(),
+            "cancelling the rule proposal does not deny or close the approval"
+        );
+
+        let _ = harness.controller.handle_key(Key::Char('A'));
+        let _ = harness.controller.handle_key(Key::Enter);
+        assert_eq!(
+            harness
+                .port
+                .always_allowed
+                .lock()
+                .expect("rule log")
+                .as_slice(),
+            [(
+                "g05-confirm-rule".to_owned(),
+                "apply_patch(src/parser.rs)".to_owned()
+            )],
+            "only the explicit Enter confirmation may persist the displayed pattern"
+        );
+        let local = std::fs::read_to_string(root.join(".harness/config.local.toml"))
+            .expect("confirmed local rule is written");
+        assert!(local.contains("apply_patch(src/parser.rs)"), "{local}");
+        assert!(root.join(".harness/.gitignore").exists());
+    }
+
+    #[test]
+    fn g05_mode_changes_are_session_scoped_and_permissions_show_rule_layers() {
+        let port = RecordingPort::default();
+        port.permission_lines
+            .lock()
+            .expect("permission lines")
+            .extend([
+                "mode: ask".to_owned(),
+                "allow (project(local)): run_shell(cargo test *)".to_owned(),
+                "actions auto-allowed this session: 0".to_owned(),
+            ]);
+        let mut harness = bench_with(true, port, true);
+        let _ = harness.controller.boot_lines();
+
+        let changed =
+            effects_to_plain(&submit_text(&mut harness.controller, "/mode auto-edit")).join("\n");
+        assert!(changed.contains("permission mode set to auto-edit for this session"));
+        assert_eq!(
+            harness
+                .port
+                .mode_updates
+                .lock()
+                .expect("mode updates")
+                .as_slice(),
+            ["auto-edit"]
+        );
+
+        let permissions =
+            effects_to_plain(&submit_text(&mut harness.controller, "/permissions")).join("\n");
+        assert!(permissions.contains("allow (project(local)): run_shell(cargo test *)"));
+        assert!(permissions.contains("actions auto-allowed this session: 0"));
+
+        let _ = submit_text(&mut harness.controller, "running request");
+        let blocked =
+            effects_to_plain(&submit_text(&mut harness.controller, "/mode ask")).join("\n");
+        assert!(blocked.contains("permission mode changes apply between turns"));
+        assert_eq!(
+            harness
+                .port
+                .mode_updates
+                .lock()
+                .expect("mode updates")
+                .as_slice(),
+            ["auto-edit"],
+            "a running turn's policy cannot change midway through an action"
+        );
     }
 
     /// Seen on a real screen: the proposal was printed in the scrollback *and* drawn
@@ -3495,14 +4416,15 @@ mod tests {
     fn h05_a_stale_approval_answer_is_not_claimed() {
         let mut harness = bench(true);
         let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "active request");
         harness
             .events
             .send(approval_event("req-4"))
             .expect("approval");
         let _ = harness.controller.pump_events();
         // Expire it behind the controller's back. The panel closes and the run is
-        // active again, so a late "y" is a normal submission and the second-input
-        // guard refuses it: it never reaches the gate as an answer.
+        // active again, so a late "y" queues as ordinary text; it never reaches the
+        // gate as an answer.
         harness
             .events
             .send(SessionEvent::ApprovalExpired {
@@ -3513,13 +4435,28 @@ mod tests {
         let effects = submit_text(&mut harness.controller, "y");
         let plain = effects_to_plain(&effects).join("\n");
         assert!(
-            plain.contains("a run is already active"),
-            "a late answer is refused as a second input, not sent to the gate: {effects:#?}"
+            plain.contains("queued (1)"),
+            "a late answer becomes queued text, not an answer to the expired gate: {effects:#?}"
         );
+        assert!(harness.controller.ui_state().queued_input);
         assert!(
             harness.port.answers.lock().expect("answers").is_empty(),
             "the gate is never told about a request that already expired"
         );
+
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("terminal event");
+        let _ = harness.controller.pump_events();
+        assert_eq!(
+            *harness.port.submissions.lock().expect("submissions"),
+            ["active request", "y"],
+            "the expired answer is delivered only later as ordinary user input"
+        );
+        assert!(harness.port.answers.lock().expect("answers").is_empty());
     }
 
     #[test]

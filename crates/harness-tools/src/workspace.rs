@@ -6,9 +6,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use globset::Glob;
 use harness_store_sqlite::ProjectRegistrationRecord;
 use harness_types::{ContentHash, ErrorCode, HarnessError, ProjectId, WorkspaceObservation};
 use ignore::WalkBuilder;
+use regex::RegexBuilder;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -52,6 +54,14 @@ pub(crate) struct TextOutput {
 pub(crate) struct SearchOutput {
     pub matches: Vec<SearchMatch>,
     pub truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceMutation {
+    /// Hash of the actual prior content, or of the canonical absent-file marker.
+    pub before_hash: ContentHash,
+    pub after_hash: ContentHash,
+    pub replacements: u64,
 }
 
 /// Produce the P2 workspace observation used when a P3 CLI flow starts a
@@ -313,6 +323,7 @@ pub(crate) fn read_text(path: &Path) -> Result<String, HarnessError> {
     decode_utf8(&bytes)
 }
 
+#[cfg(test)]
 pub(crate) fn read_text_output(path: &Path) -> Result<TextOutput, HarnessError> {
     let mut file = File::open(path).map_err(|error| {
         HarnessError::new(
@@ -381,11 +392,92 @@ pub(crate) fn list_files(
     Ok((paths, truncated))
 }
 
+pub(crate) fn glob_files(
+    root: &Path,
+    requested: Option<&str>,
+    pattern: &str,
+) -> Result<(Vec<String>, bool), HarnessError> {
+    let matcher = Glob::new(pattern)
+        .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error.to_string()))?
+        .compile_matcher();
+    let base = match requested {
+        Some(path) => resolve_relative(root, path, true)?,
+        None => root.to_owned(),
+    };
+    if !base.is_dir() {
+        return Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            "glob path must be a directory",
+        ));
+    }
+    let files = walk_files(&base)?;
+    let mut paths = Vec::new();
+    for file in files {
+        if matcher.is_match(Path::new(&file.relative)) {
+            let relative = file.absolute.strip_prefix(root).map_err(|_| {
+                HarnessError::new(ErrorCode::WorkspaceEscape, "glob path escaped workspace")
+            })?;
+            paths.push(relative_text(relative));
+        }
+    }
+    Ok((paths, false))
+}
+
+pub(crate) fn validate_glob(pattern: &str) -> Result<(), HarnessError> {
+    Glob::new(pattern)
+        .map(|_| ())
+        .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error.to_string()))
+}
+
+pub(crate) fn validate_search(
+    query: &str,
+    use_regex: bool,
+    case_insensitive: bool,
+) -> Result<(), HarnessError> {
+    if query.is_empty() {
+        return Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            "search_text query must not be empty",
+        ));
+    }
+    let pattern = if use_regex {
+        query.to_owned()
+    } else {
+        regex::escape(query)
+    };
+    RegexBuilder::new(&pattern)
+        .case_insensitive(case_insensitive)
+        .build()
+        .map(|_| ())
+        .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error.to_string()))
+}
+
 pub(crate) fn search_text(
     root: &Path,
     query: &str,
     requested: Option<&str>,
+    use_regex: bool,
+    case_insensitive: bool,
+    glob: Option<&str>,
+    context_lines: u32,
 ) -> Result<SearchOutput, HarnessError> {
+    validate_search(query, use_regex, case_insensitive)?;
+    let pattern = if use_regex {
+        query.to_owned()
+    } else {
+        regex::escape(query)
+    };
+    let matcher = RegexBuilder::new(&pattern)
+        .case_insensitive(case_insensitive)
+        .build()
+        .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error.to_string()))?;
+    let file_matcher = glob
+        .map(|pattern| {
+            Glob::new(pattern)
+                .map(|glob| glob.compile_matcher())
+                .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error.to_string()))
+        })
+        .transpose()?;
     let base = match requested {
         Some(path) => resolve_relative(root, path, true)?,
         None => root.to_owned(),
@@ -396,29 +488,65 @@ pub(crate) fn search_text(
             "search_text path must be a directory",
         ));
     }
-    let mut matches = Vec::new();
+    let mut found_matches = Vec::new();
     let mut truncated = false;
+    let mut output_bytes = 0_usize;
     for file in walk_files(&base)? {
+        if file_matcher
+            .as_ref()
+            .is_some_and(|matcher| !matcher.is_match(Path::new(&file.relative)))
+        {
+            continue;
+        }
         let Ok(text) = read_text(&file.absolute) else {
             continue;
         };
-        for (line_index, line) in text.lines().enumerate() {
-            for (column, _) in line.match_indices(query) {
-                if matches.len() == MAX_SEARCH_MATCHES {
+        let lines = text.lines().collect::<Vec<_>>();
+        for (line_index, line) in lines.iter().enumerate() {
+            for found in matcher.find_iter(line) {
+                if found_matches.len() == MAX_SEARCH_MATCHES {
                     truncated = true;
                     break;
                 }
+                let start = line_index.saturating_sub(usize::try_from(context_lines).unwrap_or(0));
+                let end = line_index
+                    .saturating_add(usize::try_from(context_lines).unwrap_or(0))
+                    .saturating_add(1)
+                    .min(lines.len());
+                let context = lines[start..end]
+                    .iter()
+                    .enumerate()
+                    .filter(|(offset, _)| start + *offset != line_index)
+                    .map(|(_, context_line)| truncate_text(&redact_text(context_line), 160))
+                    .collect::<Vec<_>>();
+                let preview = truncate_text(&redact_text(line), 240);
                 let relative = file.absolute.strip_prefix(root).map_err(|_| {
                     HarnessError::new(
                         ErrorCode::WorkspaceEscape,
                         "searched path escaped workspace root",
                     )
                 })?;
-                matches.push(SearchMatch {
-                    path: relative_text(relative),
+                let path = relative_text(relative);
+                let context_bytes = context.iter().map(String::len).sum::<usize>();
+                if output_bytes
+                    .saturating_add(preview.len())
+                    .saturating_add(context_bytes)
+                    .saturating_add(path.len())
+                    > MAX_OUTPUT_BYTES
+                {
+                    truncated = true;
+                    break;
+                }
+                output_bytes = output_bytes
+                    .saturating_add(preview.len())
+                    .saturating_add(context_bytes)
+                    .saturating_add(path.len());
+                found_matches.push(SearchMatch {
+                    path,
                     line: u64::try_from(line_index.saturating_add(1)).unwrap_or(u64::MAX),
-                    column: u64::try_from(column.saturating_add(1)).unwrap_or(u64::MAX),
-                    preview: truncate_text(&redact_text(line), 240),
+                    column: u64::try_from(found.start().saturating_add(1)).unwrap_or(u64::MAX),
+                    preview,
+                    context,
                 });
             }
             if truncated {
@@ -429,32 +557,166 @@ pub(crate) fn search_text(
             break;
         }
     }
-    Ok(SearchOutput { matches, truncated })
+    Ok(SearchOutput {
+        matches: found_matches,
+        truncated,
+    })
+}
+
+pub(crate) fn read_file_range(
+    path: &Path,
+    offset: u64,
+    limit: u32,
+) -> Result<TextOutput, HarnessError> {
+    use std::fmt::Write as _;
+
+    let text = read_text(path)?;
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(lines.len());
+    let count = usize::try_from(limit).unwrap_or(usize::MAX);
+    let end = start.saturating_add(count).min(lines.len());
+    let mut numbered = String::new();
+    for (index, line) in lines[start..end].iter().enumerate() {
+        if numbered.len() >= MAX_OUTPUT_BYTES {
+            return Ok(TextOutput {
+                text: numbered,
+                truncated: true,
+            });
+        }
+        let number = start.saturating_add(index).saturating_add(1);
+        let _ = write!(numbered, "{number}: {}", redact_text(line));
+        if index + start + 1 < end {
+            numbered.push('\n');
+        }
+    }
+    Ok(TextOutput {
+        text: truncate_text(&numbered, MAX_OUTPUT_BYTES),
+        truncated: end < lines.len() || numbered.len() > MAX_OUTPUT_BYTES,
+    })
 }
 
 pub(crate) fn apply_text_patch(
     path: &Path,
     expected_hash: &ContentHash,
     replacement: &str,
-) -> Result<(ContentHash, ContentHash), HarnessError> {
-    let current = read_text(path)?;
-    let before_hash = ContentHash::from_bytes(current.as_bytes());
-    if &before_hash != expected_hash {
+) -> Result<WorkspaceMutation, HarnessError> {
+    write_text_checked(path, Some(expected_hash), replacement)
+}
+
+pub(crate) fn write_text_checked(
+    path: &Path,
+    expected_hash: Option<&ContentHash>,
+    replacement: &str,
+) -> Result<WorkspaceMutation, HarnessError> {
+    if replacement.len() > MAX_TEXT_FILE_BYTES {
         return Err(HarnessError::new(
-            ErrorCode::StaleWorkspace,
-            "patch expected hash does not match current file content",
+            ErrorCode::OutputLimitExceeded,
+            "workspace write exceeds the 1 MiB text limit",
         ));
     }
-    write_text_atomically(path, replacement)?;
+    let existed = path.exists();
+    let before_hash = if existed {
+        let current = read_text(path)?;
+        let hash = ContentHash::from_bytes(current.as_bytes());
+        let Some(expected_hash) = expected_hash else {
+            return Err(HarnessError::new(
+                ErrorCode::StaleWorkspace,
+                "expected_hash is required to overwrite an existing file",
+            ));
+        };
+        if &hash != expected_hash {
+            return Err(HarnessError::new(
+                ErrorCode::StaleWorkspace,
+                "expected_hash does not match current file content",
+            ));
+        }
+        hash
+    } else {
+        if expected_hash.is_some() {
+            return Err(HarnessError::new(
+                ErrorCode::StaleWorkspace,
+                "expected_hash was supplied but the target file does not exist",
+            ));
+        }
+        ContentHash::from_canonical_json(&serde_json::json!({"exists": false}))?
+    };
+    if existed {
+        // Close the ordinary stale-edit case immediately before the atomic
+        // replacement. A changed or unreadable preimage is never overwritten.
+        let current = read_text(path)?;
+        let current_hash = ContentHash::from_bytes(current.as_bytes());
+        if Some(&current_hash) != expected_hash {
+            return Err(HarnessError::new(
+                ErrorCode::StaleWorkspace,
+                "expected_hash changed immediately before file replacement",
+            ));
+        }
+        write_text_atomically(path, replacement)?;
+    } else {
+        create_text_atomically(path, replacement)?;
+    }
     let after = read_text(path)?;
-    let after_hash = ContentHash::from_bytes(after.as_bytes());
     if after != replacement {
         return Err(HarnessError::new(
             ErrorCode::ProcessOutcomeUnknown,
-            "atomic patch replacement cannot be verified",
+            "workspace replacement cannot be verified",
         ));
     }
-    Ok((before_hash, after_hash))
+    Ok(WorkspaceMutation {
+        before_hash,
+        after_hash: ContentHash::from_bytes(after.as_bytes()),
+        replacements: 1,
+    })
+}
+
+pub(crate) fn edit_text(
+    path: &Path,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> Result<WorkspaceMutation, HarnessError> {
+    let current = read_text(path)?;
+    let (replacement, replacements) =
+        plan_edit_text(&current, old_string, new_string, replace_all)?;
+    let expected = ContentHash::from_bytes(current.as_bytes());
+    let mut mutation = write_text_checked(path, Some(&expected), &replacement)?;
+    mutation.replacements = replacements;
+    Ok(mutation)
+}
+
+pub(crate) fn plan_edit_text(
+    current: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> Result<(String, u64), HarnessError> {
+    if old_string.is_empty() {
+        return Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            "edit_file old_string must not be empty",
+        ));
+    }
+    let count = current.matches(old_string).count();
+    if count == 0 {
+        return Err(HarnessError::new(
+            ErrorCode::EditNotFound,
+            "edit_file old_string was not found",
+        ));
+    }
+    if !replace_all && count != 1 {
+        return Err(HarnessError::new(
+            ErrorCode::EditAmbiguous,
+            format!("edit_file old_string matched {count} times"),
+        ));
+    }
+    let replacement = if replace_all {
+        current.replace(old_string, new_string)
+    } else {
+        current.replacen(old_string, new_string, 1)
+    };
+    Ok((replacement, u64::try_from(count).unwrap_or(u64::MAX)))
 }
 
 pub(crate) fn redact_text(text: &str) -> String {
@@ -585,6 +847,85 @@ fn walk_files(root: &Path) -> Result<Vec<WalkFile>, HarnessError> {
 struct WalkFile {
     absolute: PathBuf,
     relative: String,
+}
+
+fn create_text_atomically(path: &Path, content: &str) -> Result<(), HarnessError> {
+    let parent = path.parent().ok_or_else(|| {
+        HarnessError::new(
+            ErrorCode::WorkspaceEscape,
+            "write path has no parent directory",
+        )
+    })?;
+    let started = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| HarnessError::new(ErrorCode::StorageWriteFailed, "system clock is invalid"))?
+        .as_nanos();
+    let mut temporary = None;
+    for attempt in 0_u8..32 {
+        let candidate = parent.join(format!(
+            ".harness-write-{started}-{}-{attempt}.tmp",
+            std::process::id()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                if let Err(error) = file
+                    .write_all(content.as_bytes())
+                    .and_then(|()| file.sync_all())
+                {
+                    drop(file);
+                    let _ = fs::remove_file(&candidate);
+                    return Err(HarnessError::new(
+                        ErrorCode::StorageWriteFailed,
+                        format!("cannot write new workspace file: {error}"),
+                    ));
+                }
+                temporary = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(HarnessError::new(
+                    ErrorCode::StorageWriteFailed,
+                    format!("cannot create workspace temporary file: {error}"),
+                ));
+            }
+        }
+    }
+    let temporary = temporary.ok_or_else(|| {
+        HarnessError::new(
+            ErrorCode::StorageWriteFailed,
+            "cannot allocate a unique workspace temporary file",
+        )
+    })?;
+    match fs::hard_link(&temporary, path) {
+        Ok(()) => {
+            fs::remove_file(&temporary).map_err(|error| {
+                HarnessError::new(
+                    ErrorCode::ProcessOutcomeUnknown,
+                    format!("new file was created but its temporary link remains: {error}"),
+                )
+            })?;
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&temporary);
+            Err(HarnessError::new(
+                ErrorCode::StaleWorkspace,
+                "target file appeared before the create operation",
+            ))
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(HarnessError::new(
+                ErrorCode::StorageWriteFailed,
+                format!("cannot publish new workspace file: {error}"),
+            ))
+        }
+    }
 }
 
 fn write_text_atomically(path: &Path, replacement: &str) -> Result<(), HarnessError> {

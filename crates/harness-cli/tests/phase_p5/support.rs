@@ -442,6 +442,8 @@ pub fn explorer_report(
             outcome_state: ToolOutcomeState::Settled,
             before_fingerprint: None,
             after_fingerprint: Some(ContentHash::from_bytes(revision.as_bytes())),
+            before_hash: None,
+            after_hash: None,
             artifact_id: None,
             observed_at_seq: 1,
         }],

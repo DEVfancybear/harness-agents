@@ -89,6 +89,29 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
                 26,
             );
         }
+        (Some(Modal::FilePicker { items, selected }), _) => {
+            push(
+                Span::styled(
+                    format!(" files {}/{}", selected + 1, items.len().max(1)),
+                    theme.accent,
+                ),
+                14,
+            );
+            push(
+                Span::styled(" · gõ lọc · ↑↓ · Enter · Esc".to_owned(), theme.dim),
+                30,
+            );
+        }
+        (Some(Modal::Question { options, .. }), _) => {
+            push(Span::styled(" question", theme.accent), 10);
+            if !options.is_empty() {
+                push(
+                    Span::styled(format!(" · {} numbered options", options.len()), theme.dim),
+                    24,
+                );
+            }
+            push(Span::styled(" · Enter answers", theme.dim), 16);
+        }
         (Some(Modal::Overlay { title, .. }), _) => {
             push(Span::styled(format!(" {title}"), theme.title), 12);
             push(Span::styled(" · Esc đóng".to_owned(), theme.dim), 12);
@@ -129,6 +152,9 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
             // including writes and commands - are running without being asked about.
             if state.granted_for_run {
                 push(Span::styled(" · tự động cả lượt", theme.tool_ok), 18);
+            }
+            if state.queued_input {
+                push(Span::styled(" · queued (1)", theme.accent), 13);
             }
             if let Some(cost) = cost_label(state) {
                 let label = format!(" · cost {cost}");
@@ -223,6 +249,7 @@ mod tests {
             open_tool: None,
             modal: None,
             granted_for_run: false,
+            queued_input: false,
             last_request: None,
             run_started_at: None,
             last_run_elapsed: Duration::ZERO,
@@ -300,6 +327,7 @@ mod tests {
             scope: "once".to_owned(),
             expires_at: Instant::now() + Duration::from_mins(5),
             read_only: false,
+            scroll: 0,
         });
         let text = plain_text(&[row(&state, &Theme::plain(), 200)]);
         assert!(text.contains("approval"), "{text}");
