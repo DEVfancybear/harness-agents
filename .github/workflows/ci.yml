@@ -148,7 +148,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        milestone: [M0, M1, M2, M3, M4, M5, M6, M7, M8, M9]
+        milestone: [M0, M1, M2, M3, M4, M5, M6, M7, M8, M9, M10, M11]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
