@@ -134,7 +134,7 @@ Không có blocker kỹ thuật. Bốn điểm cần người quyết: (1) `acce
 
 ## 11. Checkpoint M11 (lượt này) — tóm tắt
 
-- **Bốn commit của lượt này:** `5366b1e` (M11-03: driver external task), `c1501dc` (evidence M11-03), `71b2b17` (**M11-04**: policy non-interactive + outbox), `GATE_PLACEHOLDER_COMMIT` (evidence M11-04 + CI matrix + SPEC §7). Trước đó trong cùng assignment: `90bd0f6`/`3915b5f`/`ada1917` (M11-01), `9d55914` (M11-02), `220e687` (fix flake M2), `fb85447` (SPEC M11).
+- **Bốn commit của lượt này:** `5366b1e` (M11-03: driver external task), `c1501dc` (evidence M11-03), `71b2b17` (**M11-04**: policy non-interactive + outbox), `e5ebabd` (evidence M11-04 + CI matrix + SPEC §7). Trước đó trong cùng assignment: `90bd0f6`/`3915b5f`/`ada1917` (M11-01), `9d55914` (M11-02), `220e687` (fix flake M2), `fb85447` (SPEC M11).
 - **Gate cuối:** `-Milestone M11` **passed**, digest `sha256:f461406c…` (**396** file), **6/6 required**, 9 test trên **4** target, closure M9…M0 xanh; `workspace-tests` **passed ngay lần đầu** (gate 6 và gate 7 — lần đầu trong chuỗi M7→M11 không cần retry).
 - **Bảy bug thật của M11** (đánh số 1–14 trong evidence §5/§5c): DST/UTC walk, hằng số DST sai năm, change-detector schema, control envelope flatten, daemon chưa mở socket, claim treo khi shutdown, RST hai đầu, fixture đua evaluator, recovery không báo job `ambiguous` cũ, phân loại `Definite` sai, assertion `a07_401` đếm request, writer lock sống sót sau shutdown, quyết định không ghi được từ ngoài, `resolve_waiting` thiếu "vẫn chờ".
 - **Hai thay đổi contract của lượt này:** runtime store schema **3 → 4 → 5** (external jobs; approvals + outbox); `OccurrenceState::{Waiting, Expired}` + control command `decide` + `status.waiting[]`/`status.outbox`.
