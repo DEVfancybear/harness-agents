@@ -8,23 +8,23 @@ Hoàn thành source G07–G09 theo `docs/HA_AGENT_PLAN.vi.md`, dừng ở CP-C; 
 
 ### Trạng thái
 
-Source và test selector đã triển khai. Trạng thái `implemented_unverified`: `Verify-Milestone.ps1 -Milestone M5 -Json` pass (15/15 required, closure M0–M5). `Verify-HaLaunch.ps1 -Json` chạy lượt đầu và ba lượt retry; không lượt nào có `failures: []`. Kết quả lượt cuối: `providers-streaming` và `regression-phase_p2` fail. Lỗi thay đổi giữa các lượt; providers 32/32 và P2 18/18 pass trong các lần retry riêng, G03 wire snapshot và `p2_s02` đều pass khi chạy selector/suite riêng; i04 Unicode-path cũng pass riêng. Đây là bằng chứng host/loopback chập chờn, nhưng không được tính thành gate pass. Không sửa/nới test.
+Source và test selector đã triển khai. Trạng thái `implemented_unverified`: `Verify-Milestone.ps1 -Milestone M5 -Json` pass (15/15 required, closure M0–M5). Trước upstream merge, H đã hết ngân sách lượt đầu + ba retry mà chưa có `failures: []`. Sau tích hợp lên HEAD `5db5b139e73166412acdb873ec3de355429cd244`, H lượt 1 lỗi providers ở Anthropic Retry-After fixture (31/32), còn launch 19/19 và P0–P7 pass. H lượt 2 lỗi i13 resume timeout sau 190,11 giây (18/19); providers 32/32 và P0–P7 pass. Selector Anthropic retry và i13 đều pass khi chạy riêng. Chưa có gate H nào trả `failures: []`; giữ trạng thái chưa accepted. Không sửa/nới test.
 
 ### Kiểm chứng và bằng chứng
 
 - CLI unit: 320 pass, 0 fail, 1 ignored. `interactive_session`: 14/14. `interactive_launch`: 19/19 ở lượt H1 và H4; lượt H2 lỗi i13 resume, lượt H3 lỗi i04, cả hai selector pass khi retry riêng.
-- `phase_p2`: 18/18 ở các lần chạy xanh; P0–P7: 8/8, 21/21, 18/18, 21/21, 26/26, 27/27, 15/15, 15/15 ở các lượt xanh. Providers: 32/32 ở các lượt xanh.
+- `phase_p2`: 18/18 ở các lần chạy xanh; P0–P7 trên HEAD đã tích hợp: 8/8, 21/21, 18/18, 21/21, 28/28, 27/27, 15/15, 30/30. Providers 32/32 ở H lượt 2; H lượt 1 là 31/32 do Anthropic loopback. i13 selector riêng pass 1/1 trong 1,35 giây sau timeout gate.
 - Format, Clippy `-D warnings`, schema generator, installer self-test, release self-test, docs self-test và hai negative controls V23/V25 pass. Gate H cuối vẫn đỏ như trên.
 - Chi tiết từng lượt gate, digest source, Cargo.lock, OS/toolchain và `not_run` nằm trong [evidence](../evidence/HA_AGENT.vi.md). Thiết kế/requirement inventory nằm trong [SPEC](../specs/HA_AGENT.vi.md).
 - PTY thật, paid/live provider, Linux, user PATH/install, G10+ chưa chạy.
 
 ### Repository
 
-Base `master`: `e3f55d435a2267deac040c0f31d07fe9bded519e`. Source digest: `sha256:51542466e75e522f54d646ca89a268801e725939ee7e66cc105e8497e6906056` (420 files). `Cargo.lock` SHA-256: `193d2574da4a994777bf8961780e264a123c1397d04d7e66f7bf49d33d919876`. Windows 11 Pro `10.0.26200.0` x64; `rustc 1.97.1 (8bab26f4f 2026-07-14)`, `cargo 1.97.1 (c980f4866 2026-06-30)`. Closeout commit/push đang chờ hoàn tất sau khi cập nhật evidence này. Worktree changes chỉ thuộc G07–G09 và tài liệu CP-C. Thuật toán digest được ghi trong evidence.
+CP-C implementation commit `b37b75b` hiện có trong `origin/master`; integrated HEAD là `5db5b139e73166412acdb873ec3de355429cd244`. Digest source: `sha256:6b20f2a75a8256c45631d8dc638dbbe0c45551be05fa3978a4c1f7702f15aa1d` (**426 files**, committed HEAD với SPEC CP-C bản cuối chồng lên; loại evidence/handoff và các sửa đổi chưa stage ngoài assignment). Digest `Cargo.lock` tại HEAD: `d24222134934bf555bea489948038d7ceb3719a69dbe212475482240c8b9f27d`. Windows 11 Pro `10.0.26200.0` x64; `rustc 1.97.1 (8bab26f4f 2026-07-14)`, `cargo 1.97.1 (c980f4866 2026-06-30)`. Worktree đang có sửa đổi đồng thời chưa stage ở `Cargo.toml`, `Cargo.lock`, `crates/harness-cli/src/interactive/config.rs`, `crates/harness-extensions/Cargo.toml`, `crates/harness-extensions/src/mcp.rs`, `crates/harness-types/src/contracts.rs`, `crates/harness-types/src/lib.rs`; đã giữ nguyên, không đưa vào commit CP-C. Commit triển khai đã được push; evidence/SPEC/handoff song ngữ được commit và push cùng closeout.
 
 ### Tiếp tục
 
-Giữ phạm vi CP-C. Gate retry budget đã dùng hết (lượt đầu + ba lần chạy lại); không tiếp tục retry hoặc mở G10 theo handoff này. Nếu nối assignment, xử lý nguyên nhân loopback trên runner ổn định hoặc xin giới hạn retry mới rồi mới đánh giá lại CP-C.
+Giữ phạm vi CP-C. Không có quyền retry loopback thêm trong assignment hiện tại; không mở G10. Nếu tiếp tục sau này, xử lý fixture/runner ổn định hoặc được giao retry budget mới trước khi đánh giá lại CP-C.
 
 ## English
 
@@ -34,20 +34,20 @@ Implemented G07–G09 from `docs/HA_AGENT_PLAN.vi.md` and stop at CP-C; do not s
 
 ### Status
 
-Source and required selectors are implemented. Status is `implemented_unverified`: `Verify-Milestone.ps1 -Milestone M5 -Json` passed (15/15 required, closure M0–M5). `Verify-HaLaunch.ps1 -Json` ran once plus three retries; no run returned `failures: []`. The final report failed `providers-streaming` and `regression-phase_p2`. Failures moved between runs; providers 32/32 and phase P2 18/18 passed in focused reruns, as did the G03 wire snapshot, `p2_s02`, and i04 Unicode-path selector. This points to unstable host/loopback fixtures, but does not count as a gate pass. No tests were weakened or changed.
+Source and required selectors are implemented. Status is `implemented_unverified`: `Verify-Milestone.ps1 -Milestone M5 -Json` passed (15/15 required, closure M0–M5). Before upstream integration, the initial H run plus three retries never returned `failures: []`. On integrated HEAD `5db5b139e73166412acdb873ec3de355429cd244`, H run 1 failed the Anthropic Retry-After loopback fixture (providers 31/32) while launch 19/19 and P0–P7 passed. H run 2 failed i13 resume after a 190.11 s timeout (launch 18/19), while providers 32/32 and P0–P7 passed. The Anthropic and i13 selectors passed alone. No whole-gate run returned `failures: []`; do not mark CP-C accepted. No tests were weakened or changed.
 
 ### Verification and evidence
 
-- CLI unit: 320 passed, 0 failed, 1 ignored. `interactive_session`: 14/14. `interactive_launch`: 19/19 on H1 and H4; H2 failed i13 resume and H3 failed i04, both passed when rerun alone.
-- `phase_p2`: 18/18 on clean runs; P0–P7: 8/8, 21/21, 18/18, 21/21, 26/26, 27/27, 15/15, and 15/15 on clean runs. Providers: 32/32 on clean runs.
+- CLI unit: 320 passed, 0 failed, 1 ignored. `interactive_session`: 14/14. On integrated HEAD, `interactive_launch` passed 19/19 on H run 1 and failed i13 on H run 2; isolated i13 passed 1/1 in 1.35 s.
+- `phase_p2`: 18/18. P0–P7 on integrated HEAD: 8/8, 21/21, 18/18, 21/21, 28/28, 27/27, 15/15, 30/30. Providers: 32/32 on H run 2; H run 1 was 31/32 due the Anthropic loopback fixture.
 - Format, Clippy `-D warnings`, schema generation, installer self-test, release self-test, docs self-test, and V23/V25 negative controls passed. Final H report remains red as noted above.
 - Per-run gate details, source digest, Cargo.lock digest, OS/toolchain, and `not_run` are in [evidence](../evidence/HA_AGENT.vi.md). Design and requirement inventory are in the [SPEC](../specs/HA_AGENT.vi.md).
 - Real-console PTY, paid/live provider, Linux, user PATH/install, and G10+ were not run.
 
 ### Repository
 
-Base `master`: `e3f55d435a2267deac040c0f31d07fe9bded519e`. Source digest: `sha256:51542466e75e522f54d646ca89a268801e725939ee7e66cc105e8497e6906056` (420 files). `Cargo.lock` SHA-256: `193d2574da4a994777bf8961780e264a123c1397d04d7e66f7bf49d33d919876`. Windows 11 Pro `10.0.26200.0` x64; `rustc 1.97.1 (8bab26f4f 2026-07-14)`, `cargo 1.97.1 (c980f4866 2026-06-30)`. Closeout commit/push is pending until this evidence update is complete. Worktree changes are limited to G07–G09 and CP-C documentation. The source digest uses the algorithm recorded in evidence.
+CP-C implementation commit `b37b75b` is already on `origin/master`; integrated HEAD is `5db5b139e73166412acdb873ec3de355429cd244`. Source digest: `sha256:6b20f2a75a8256c45631d8dc638dbbe0c45551be05fa3978a4c1f7702f15aa1d` (426 files, committed HEAD with the final CP-C SPEC overlaid; evidence/handoff and unrelated unstaged edits are excluded). Committed `Cargo.lock` SHA-256: `d24222134934bf555bea489948038d7ceb3719a69dbe212475482240c8b9f27d`. Windows 11 Pro `10.0.26200.0` x64; `rustc 1.97.1 (8bab26f4f 2026-07-14)`, `cargo 1.97.1 (c980f4866 2026-06-30)`. The shared worktree has untouched unstaged edits in `Cargo.toml`, `Cargo.lock`, `crates/harness-cli/src/interactive/config.rs`, `crates/harness-extensions/Cargo.toml`, `crates/harness-extensions/src/mcp.rs`, `crates/harness-types/src/contracts.rs`, and `crates/harness-types/src/lib.rs`; those concurrent MCP changes are excluded from the source digest and CP-C commit. The implementation is pushed; this bilingual documentation closeout is included in the accompanying commit.
 
 ### Continuation
 
-Keep the CP-C scope. The gate retry budget is exhausted (initial run plus three retries); do not retry again or start G10 under this handoff. A future continuation must stabilize the loopback runner or obtain a new retry limit before reassessing CP-C.
+Keep the CP-C scope. Do not spend more loopback retries under this assignment and do not start G10. A future continuation needs a stable fixture runner or a newly assigned retry budget before reassessing CP-C.
