@@ -448,10 +448,15 @@ mod windows_shell_tests {
             ("PATH".to_owned(), shell_dir.display().to_string()),
             ("SystemRoot".to_owned(), root),
         ]);
+        // Measured on the GitHub windows-latest runner (24/09/2026): the first
+        // Windows PowerShell 5.1 start there is cold and took the whole 10 s this
+        // test used to allow, so the run was killed (TerminateProcess reports exit
+        // code 1) and the test failed in every job while passing on a warm desktop.
+        // The bound is for a hang, not for start-up time.
         let result = run_shell_with_host(
             workspace.path(),
             "Write-Output 'shell-fallback-ok'",
-            10_000,
+            60_000,
             CancellationToken::new(),
             &ProcessEnvironment::empty(),
             &ProcessSpoolConfig::default(),
@@ -459,7 +464,12 @@ mod windows_shell_tests {
         )
         .await
         .expect("fallback starts");
-        assert_eq!(result.exit_code, Some(0));
+        assert!(
+            !result.timed_out,
+            "Windows PowerShell did not finish within the bound; stderr: {}",
+            result.stderr
+        );
+        assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
         assert_eq!(
             result.shell.as_deref(),
             Some("powershell-5.1 (pwsh not found)")
