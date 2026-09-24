@@ -865,6 +865,26 @@ fn durable_provider_events(events: &[ProviderStreamEvent]) -> Vec<&ProviderStrea
         .collect()
 }
 
+/// How many bytes of request a set of canonical messages costs.
+///
+/// A tool call is content the provider is sent even though it does not live in
+/// `content`: its name and arguments are part of the assistant message, and a
+/// long argument blob is exactly the thing that pushes a turn over the window.
+fn message_bytes(messages: &[ProviderMessage]) -> usize {
+    messages
+        .iter()
+        .map(|message| {
+            message.content.len()
+                + message
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.call_id.len() + call.name.len() + call.arguments.len())
+                    .sum::<usize>()
+                + message.tool_call_id.as_ref().map_or(0, String::len)
+        })
+        .sum()
+}
+
 #[derive(Clone)]
 pub struct RuntimeService {
     store: Arc<SqliteStore>,
@@ -1126,7 +1146,8 @@ impl RuntimeService {
         if request.continuation_context.is_some() {
             build_recovery.instruction_texts = vec![request.text.clone()];
         }
-        let initial_build = self.build_context(&request, build_recovery, checkpoint_id.clone());
+        let initial_build =
+            self.build_context(&request, build_recovery, checkpoint_id.clone(), &appended);
         let threshold = compaction_threshold(&config);
         let built = match initial_build {
             Ok(built) if built.packet.token_estimate > threshold => {
@@ -1142,7 +1163,7 @@ impl RuntimeService {
                 let mut compacted_recovery = session.recover(&request.session_id).await?;
                 compacted_recovery.instruction_texts = vec![request.text.clone()];
                 let rebuilt = self
-                    .build_context(&request, compacted_recovery, checkpoint_id)
+                    .build_context(&request, compacted_recovery, checkpoint_id, &appended)
                     .map_err(|error| {
                         if error.code() == ErrorCode::MandatoryContextOverflow {
                             context_overflow(built.packet.token_estimate, threshold)
@@ -1787,7 +1808,7 @@ impl RuntimeService {
                 context_text.push_str(&tail);
             }
             let request = request.with_continuation_context(context_text);
-            let built = self.build_context(&request, recovery, checkpoint_id.clone())?;
+            let built = self.build_context(&request, recovery, checkpoint_id.clone(), &[])?;
             let manifest_json = serde_json::to_value(&built.manifest).map_err(|_| {
                 RuntimeError::new(
                     ErrorCode::InvalidPayload,
@@ -2317,6 +2338,7 @@ impl RuntimeService {
         request: &RunRequest,
         recovery: RecoveryView,
         checkpoint_id: String,
+        appended: &[ProviderMessage],
     ) -> Result<harness_session::ContextBuildResult, RuntimeError> {
         let config = self
             .config
@@ -2363,11 +2385,11 @@ impl RuntimeService {
                 .iter()
                 .map(|image| serde_json::to_string(image).map_or(0, |rendered| rendered.len()))
                 .sum::<usize>()
-            + request
-                .recovered_messages
-                .iter()
-                .map(|message| message.content.len())
-                .sum::<usize>();
+            + message_bytes(&request.recovered_messages)
+            // The continuation transcript is sent with every step of a turn and
+            // grows with it. A budget that counts only the packet would let a
+            // long turn overflow the window without the threshold ever noticing.
+            + message_bytes(appended);
         let capabilities = self.provider.capabilities();
         let model_capabilities_digest = ContentHash::from_canonical_json(
             &serde_json::to_value(&capabilities).map_err(|_| {
