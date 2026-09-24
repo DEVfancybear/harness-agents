@@ -451,3 +451,28 @@ Mục này ghi lại lỗi đã đo với `/resume` và hợp đồng thay thế
 ### 20.3. Quan hệ với nhật ký hội thoại
 
 Mục 19 trả lời "ta đã nói gì ở các phiên khác" bằng memory có trích đoạn và retention. Mục này trả lời "đang tiếp tục cuộc nào" bằng dữ liệu run gốc của đúng chuỗi session đó. Hai đường không thay thế nhau. Replay không ghi gì vào memory, và nhật ký không được dùng để dựng lại hội thoại đang tiếp tục.
+
+## 21. Memory tự học từ hội thoại: hợp đồng đã triển khai
+
+Mục này ghi lại hai lỗi đã đo và hợp đồng thay thế, theo hướng của TencentDB-Agent-Memory (L0 → L1) và deer-flow (updater sau mỗi lượt, fact có confidence).
+
+### 21.1. Lỗi đã đo
+
+- Mọi input không phải câu hỏi đều được lưu thành `user_instruction` `UserConfirmed` và không bao giờ hết hạn. Các yêu cầu làm một lần ("hãy sửa lỗi X cho tôi") tích lũy thành quy tắc thường trực và bị inject vào lượt sau.
+- Tiếng Việt được index theo âm tiết, và không có stopword. "hãy … cho tôi" trùng ba term với mọi yêu cầu lịch sự, nên ngưỡng trùng hai term bị vượt chỉ nhờ ngữ pháp.
+
+### 21.2. Hợp đồng
+
+- **Lưu nguyên văn chỉ khi được yêu cầu rõ.** Input mở đầu bằng "ghi nhớ", "hãy nhớ", "nhớ rằng", "remember that"… hoặc là một quy tắc thường trực ("từ giờ", "luôn", "đừng bao giờ", "from now on", "always", "never"…) được lưu nguyên văn như trước. Input khác không được lưu thành chỉ dẫn, và cũng không có thông báo.
+- **Stopword ở phía truy vấn.** Các từ chức năng tiếng Việt (dạng đã bỏ dấu) và tiếng Anh bị loại khỏi term truy vấn. Âm tiết cũng là nửa của một từ mang nghĩa phổ biến (`an` trong "dự án", `ban` trong "phiên bản", `de` trong "vấn đề", `anh` trong "hình ảnh") được giữ lại.
+- **Trích xuất fact sau mỗi lượt kết thúc bằng câu trả lời.** Chính model đang chạy đọc lượt đó và trả JSON `{facts:[{content, category, confidence, replaces}]}`.
+  - `category` thuộc tập đóng: `preference`, `knowledge`, `context`, `behavior`, `goal`, `correction`.
+  - Tối đa 8 fact mỗi lượt, mỗi fact tối đa 400 ký tự. Fact trông như credential bị từ chối. Fact trùng nguyên văn chỉ ghi thêm nguồn.
+- **Tự áp dụng theo confidence.** Fact có `confidence ≥ 0.7` được ghi `Active` và dùng ngay ở lượt sau. Fact thấp hơn được ghi `Candidate`, xem bằng `ha memory candidates`. Đây là đường duy nhất cho phép suy luận của model thành `Active` mà không qua người: `PublicationPolicy::classify_inferred`. Confidence được lưu trên version (`confidence_annotation`) và hiện trong khối memory gửi cho model.
+- **Thay thế có giới hạn.** Model được xem tối đa 12 fact đã biết liên quan đến lượt. Một fact mới chỉ được thay (invalidate) một fact nằm trong danh sách đó, và chỉ khi fact mới là `Active`. Id do model tự bịa ra bị bỏ qua.
+- **Không bao giờ làm hỏng lượt.** Model lỗi, quá 20 giây, hoặc không trả JSON thì extraction bị bỏ qua và ghi lý do. Chỉ lỗi store mới là lỗi, và được báo bằng notice.
+
+### 21.3. Giới hạn đã biết
+
+- Extraction chạy đồng bộ ở cuối lượt, trước khi writer được trả lại, nên lượt kết thúc chậm hơn tối đa 20 giây. deer-flow chạy nền có debounce; ở đây writer lease theo từng lượt làm việc đó phức tạp hơn, và được để lại cho bước sau.
+- Provider fixture không chạy extraction, giống compaction bằng model.

@@ -451,3 +451,28 @@ What they share: continuing a conversation uses that conversation's own messages
 ### 20.3. Relation to the conversation log
 
 Section 19 answers "what did we say in other sessions" from memory, with excerpts and retention. This section answers "which conversation is being continued" from the original run data of that exact session chain. Neither path replaces the other. Replay writes nothing to memory, and the log is never used to rebuild the conversation being continued.
+
+## 21. Memory that learns from the conversation: the contract as implemented
+
+This section records two measured defects and the contract that replaced them, following TencentDB-Agent-Memory (L0 → L1) and deer-flow (a post-turn updater, facts with confidence).
+
+### 21.1. Measured defects
+
+- Every input that was not a question was stored as a `UserConfirmed` `user_instruction` that never expires. One-off requests ("fix bug X for me") accumulated into standing rules and were injected into later turns.
+- Vietnamese is indexed per syllable, and there were no stopwords. "hãy … cho tôi" shares three terms with any polite request, so grammar alone cleared the two-term overlap floor.
+
+### 21.2. Contract
+
+- **Verbatim storage only on explicit request.** An input that opens with "ghi nhớ", "hãy nhớ", "nhớ rằng", "remember that"…, or that is a standing rule ("từ giờ", "luôn", "đừng bao giờ", "from now on", "always", "never"…), is stored verbatim as before. Any other input is not stored as an instruction, and no notice is printed.
+- **Stopwords on the query side.** Vietnamese function words (in folded form) and English ones are removed from query terms. A syllable that is also half of a common content word (`an` in "dự án", `ban` in "phiên bản", `de` in "vấn đề", `anh` in "hình ảnh") is kept.
+- **Fact extraction after every turn that ended with an answer.** The model that just answered reads the turn and replies with JSON `{facts:[{content, category, confidence, replaces}]}`.
+  - `category` is from a closed set: `preference`, `knowledge`, `context`, `behavior`, `goal`, `correction`.
+  - At most 8 facts per turn, each at most 400 characters. A credential-like fact is refused. An exact duplicate only gains a source.
+- **Applied by confidence.** A fact with `confidence ≥ 0.7` is written `Active` and used on the next turn. A lower one is written `Candidate`, reviewable with `ha memory candidates`. This is the only path on which model inference becomes `Active` without a human: `PublicationPolicy::classify_inferred`. The confidence is kept on the version (`confidence_annotation`) and shown in the memory block the model reads.
+- **Bounded replacement.** The model is shown at most 12 known facts related to the turn. A new fact may replace (invalidate) only a fact from that list, and only when the new fact is `Active`. An id the model makes up is ignored.
+- **Never fails the turn.** A model that errors, takes longer than 20 seconds or does not answer with JSON is a skipped extraction with a stated reason. Only a store failure is an error, and it is reported as a notice.
+
+### 21.3. Known limits
+
+- Extraction runs synchronously at the end of the turn, before the writer is released, so a turn can end up to 20 seconds later. deer-flow runs it in the background with a debounce; the per-turn writer lease makes that harder here, and it is left for a later step.
+- Fixture providers do not extract, as with model compaction.

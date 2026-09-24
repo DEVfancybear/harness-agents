@@ -405,3 +405,8 @@ ha exec "Continue the task" --continue --goal "Task complete" --max-turns 4 --ou
 ### 12.5. Giới hạn và kiểm tra
 
 `run_shell` dùng `pwsh` trên Windows và `powershell.exe` khi thiếu `pwsh`; receipt ghi shell được chọn. Strict isolation chỉ được báo khi backend đã đo hỗ trợ. `/status` và `/config` là điểm bắt đầu khi provider hoặc quyền không như dự kiến. Các gate M0–M6, H và PTY có evidence riêng; Linux chỉ được coi là đã kiểm khi job CI Ubuntu xanh.
+
+### 12.6. Memory và `/resume`
+
+Memory mặc định bật; `HA_MEMORY=off` (hoặc `0`, `false`, `no`) để tắt. Sau một lượt kết thúc bằng câu trả lời, model trích ra các fact đáng giữ (sở thích, quyết định, quy ước, chỉnh sửa): confidence ≥ 0.7 được dùng từ lượt sau, thấp hơn thì chờ trong `ha memory candidates`. Input của bạn chỉ được lưu nguyên văn khi bạn yêu cầu ("ghi nhớ …", "từ giờ …", "remember that …"). `/resume` vẫn hoạt động khi tắt memory: nó phát lại chính các lượt của hội thoại cho model và hiện chúng trên màn hình. Xem mục 20 và 21 của `MEMORY_AND_CONTINUITY`.
+

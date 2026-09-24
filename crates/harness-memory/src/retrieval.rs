@@ -713,8 +713,17 @@ fn estimate_tokens(text: &str) -> u64 {
 fn render_memory_block(hit: &StoredMemoryAsset, share: u64, reason: SelectionReason) -> String {
     let head = format!("{MEMORY_BLOCK_HEADING}\n");
     let digest = hit.current.record.content_hash.as_str();
+    // A fact a model extracted says how sure it was: the reader weighs a 0.72 guess
+    // differently from something the user typed.
+    let confidence = hit
+        .current
+        .record
+        .confidence_annotation
+        .as_deref()
+        .map(|confidence| format!(", confidence={confidence}"))
+        .unwrap_or_default();
     let tail = format!(
-        "\n(source: authority={:?}, validity={:?}, v{} {} {})",
+        "\n(source: authority={:?}, validity={:?}{confidence}, v{} {} {})",
         hit.asset.created_by,
         hit.current.record.validity,
         hit.asset.current_version,
@@ -757,11 +766,34 @@ pub fn normalize_terms(query: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     normalized
         .split_whitespace()
+        .filter(|term| !STOPWORDS.contains(term))
         .filter(|term| seen.insert((*term).to_owned()))
         .take(MAX_QUERY_TERMS)
         .map(str::to_owned)
         .collect()
 }
+
+/// Function words left out of a query, in their folded spelling.
+///
+/// Vietnamese is indexed one syllable at a time, and its function syllables are in
+/// almost every sentence: "hãy ... cho tôi" shares three terms with any other request
+/// phrased politely. The overlap floor of two terms was therefore met by grammar alone,
+/// and an unrelated old input was injected as memory. Only words that carry no subject
+/// are listed; a syllable that is also half of a content word in common use (`an` in
+/// "dự án", `du` in "dữ liệu") is kept, because dropping it would lose the subject.
+const STOPWORDS: &[&str] = &[
+    // Vietnamese, diacritics folded
+    // ("ban", "anh", "de", "chu", "tu" are left out: they fold together with "bản",
+    // "ảnh", "đề", "chủ", "từ", which name subjects.)
+    "hay", "cho", "toi", "minh", "la", "cua", "va", "voi", "cac", "nhung", "mot", "nay", "do",
+    "thi", "ma", "duoc", "co", "khong", "se", "da", "dang", "rat", "cung", "nhu", "trong", "tren",
+    "ve", "gi", "nao", "sao", "the", "vay", "nhe", "a", "oi", "giup", "xin", "em", "chi", "nhi",
+    "roi", "con", "neu", "khi", // English
+    "i", "me", "my", "you", "your", "we", "our", "it", "its", "this", "that", "these", "those",
+    "is", "are", "was", "were", "be", "been", "am", "to", "of", "and", "or", "in", "on", "at",
+    "for", "with", "by", "from", "as", "please", "can", "could", "would", "should", "will", "do",
+    "does", "did", "what", "how", "why", "when", "where", "which", "who", "about",
+];
 
 /// One FTS5 term, quoted. Quoting is what keeps a term from becoming syntax.
 fn quote_term(term: &str) -> String {

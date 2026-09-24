@@ -402,3 +402,8 @@ ha exec "Continue the task" --continue --goal "Task complete" --max-turns 4 --ou
 ### 12.5. Limits and checks
 
 On Windows `run_shell` uses `pwsh`, falling back to `powershell.exe` when pwsh is missing; the receipt records the selected shell. Strict isolation is claimed only where a measured backend supports it. Start with `/status` and `/config` when provider or permissions differ from expectations. M0–M6, H, and PTY gates have separate evidence; Linux is verified only after a green Ubuntu CI job.
+
+### 12.6. Memory and `/resume`
+
+Memory is on by default; `HA_MEMORY=off` (or `0`, `false`, `no`) turns it off. After a turn that ended with an answer, the model extracts facts worth keeping (preferences, decisions, conventions, corrections): confidence ≥ 0.7 is used from the next turn, lower waits in `ha memory candidates`. Your input is stored verbatim only when you ask ("remember that …", "ghi nhớ …", "from now on …"). `/resume` works with memory off as well: it replays the conversation's own turns to the model and shows them on screen. See `MEMORY_AND_CONTINUITY` sections 20 and 21.
+

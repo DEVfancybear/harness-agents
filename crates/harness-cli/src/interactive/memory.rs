@@ -1,26 +1,34 @@
-//! Optional chat memory: what the user already said, recalled into the next turn.
+//! Chat memory: what the user already said, recalled into the next turn.
 //!
-//! Memory is off unless `HA_MEMORY=on`, because a launch never turns durable
-//! retention on by itself. With it on, one turn does two bounded things:
+//! Memory is on unless `HA_MEMORY` is set to `off` (or `0`, `false`, `no`). It used to be
+//! off unless asked for, and in practice that meant it was off: the conversation was
+//! never learned from, and the feature existed only for whoever knew the variable. With
+//! it on, one turn does two bounded things:
 //!
 //! - **before dispatch** the user's text is the retrieval query; matching scoped
 //!   assets are contributed as optional context blocks together with the exact
 //!   memory versions they came from;
-//! - **after the turn** the admitted input text is stored once as an active,
-//!   user-confirmed, project-scoped L1 asset. Creating an asset also binds it to
-//!   its owner, which is what makes the next turn able to find it.
+//! - **after the turn** three things are written: the turn itself (the conversation
+//!   log), the input as a user-confirmed asset *only when the user asked for it to be
+//!   remembered*, and the facts a model extracts from the turn. A confident fact is
+//!   applied at once; a less certain one waits for review as a candidate.
 //!
 //! Scope is host-issued: the principal carries the project identity the workspace
 //! root was registered under, so a later process that opens the same workspace
 //! resolves the same identity and sees the same memory. The model never chooses
-//! scope, and only text the user sent — never model output — is promoted to an
-//! active asset.
+//! scope. Model output reaches durable memory only through fact extraction, where
+//! every fact carries the confidence it was applied with.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use harness_memory::{
-    CreateMemoryAsset, EvidenceState, MemoryContribution, MemoryIndex, MemoryLayer,
-    MemoryPrincipal, MemoryService, RetrievalState, normalize_terms, sanitize_memory_text,
+    CreateMemoryAsset, EvidenceState, FACT_CATEGORIES, FACT_KIND, InferredFact, MemoryContribution,
+    MemoryIndex, MemoryLayer, MemoryPrincipal, MemoryService, RetrievalState, normalize_terms,
+    sanitize_memory_text,
+};
+use harness_providers::{
+    CancellationToken, MessageRole, ModelProvider, ProviderMessage, ProviderRequest,
 };
 use harness_store_sqlite::{SqliteStore, StoreError};
 use harness_types::{
@@ -29,7 +37,7 @@ use harness_types::{
 
 use super::paths::LaunchEnvironment;
 
-/// Environment variable that switches chat memory on; only the value `on` counts.
+/// Environment variable that switches chat memory off.
 pub const MEMORY_VARIABLE: &str = "HA_MEMORY";
 
 /// Host principal every interactive turn runs as.
@@ -86,13 +94,20 @@ const PRUNE_PER_TURN: usize = 8;
 /// what pruning uses to find the log entries it may retire.
 const TURN_PROVENANCE: &str = harness_memory::TURN_PROVENANCE_KIND;
 
-/// Whether the environment asks for chat memory.
+/// Whether chat memory runs, given the value of [`MEMORY_VARIABLE`].
 ///
-/// Only the exact value `on` counts: an unknown or misspelled value must not
-/// silently start writing durable memory.
+/// Memory is on by default. Only a value that plainly means "off" turns it off; any
+/// other value, including a misspelling, leaves the default, because a switch that
+/// cannot be read is not a request to stop. The words that do mean off are the ones a
+/// shell user reaches for: `off`, `0`, `false`, `no`.
 #[must_use]
 pub fn memory_requested(value: Option<&str>) -> bool {
-    matches!(value, Some(value) if value.eq_ignore_ascii_case("on"))
+    !matches!(
+        value
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("off" | "0" | "false" | "no")
+    )
 }
 
 /// Read [`MEMORY_VARIABLE`] from the injected launch environment.
@@ -238,6 +253,11 @@ pub enum RememberOutcome {
     },
     /// The turn admitted no input, or the input was blank.
     NothingAdmitted,
+    /// The user did not ask for this input to be remembered.
+    ///
+    /// Silent on purpose: it is what happens on almost every turn. Whatever in the
+    /// turn is worth keeping reaches memory through fact extraction instead.
+    NotRequested,
 }
 
 /// Words that open a question. Kept at module scope because they are a vocabulary,
@@ -359,6 +379,13 @@ pub async fn remember_input(
     if let Some(reason) = classify_input(&text) {
         return Ok(RememberOutcome::NotKnowledge { reason });
     }
+    // Only what the user asked to be remembered is kept verbatim. Every other input
+    // used to be stored as a confirmed instruction that never expires, so one-off
+    // requests ("fix this bug for me") piled up as standing rules and were injected
+    // into later turns. The durable part of an ordinary turn is extracted as facts.
+    let Some(text) = explicit_memory(&text) else {
+        return Ok(RememberOutcome::NotRequested);
+    };
     // A project-scoped asset needs the project the principal carries; a principal
     // without one can still store what the user typed, at user scope.
     let (scope, project_id) = match principal.project_id.clone() {
@@ -405,6 +432,365 @@ pub async fn remember_input(
         )
         .await?;
     Ok(RememberOutcome::Stored(asset.asset.memory_asset_id))
+}
+
+/// Words that open a request to remember something.
+const REMEMBER_OPENINGS: &[&str] = &[
+    "hãy ghi nhớ rằng",
+    "hãy ghi nhớ là",
+    "hãy ghi nhớ",
+    "ghi nhớ rằng",
+    "ghi nhớ là",
+    "ghi nhớ",
+    "hãy nhớ rằng",
+    "hãy nhớ là",
+    "hãy nhớ",
+    "nhớ rằng",
+    "nhớ là",
+    "please remember that",
+    "please remember",
+    "remember that",
+    "remember",
+    "note that",
+];
+
+/// Words that open a standing instruction, kept as part of what is stored.
+const STANDING_OPENINGS: &[&str] = &[
+    "từ giờ",
+    "từ nay",
+    "từ bây giờ",
+    "luôn luôn",
+    "luôn",
+    "đừng bao giờ",
+    "không bao giờ",
+    "from now on",
+    "always",
+    "never",
+    "going forward",
+];
+
+/// The input, if the user asked for it to be remembered.
+///
+/// Two shapes count: "ghi nhớ: X" / "remember that X", and a standing rule such as
+/// "từ giờ luôn X" / "from now on, X". Anything else is not a request to remember,
+/// however imperative it sounds.
+///
+/// The text is kept whole, opening included. The opening is the word a later question
+/// uses to find it - "what did I ask you to remember?" - and cutting it off left the
+/// question one shared term short of the overlap floor.
+fn explicit_memory(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let lowered = trimmed.to_lowercase();
+    let starts_with_word = |opening: &str| {
+        lowered.starts_with(opening)
+            && lowered[opening.len()..]
+                .chars()
+                .next()
+                .is_none_or(|next| !next.is_alphanumeric())
+    };
+    let asked = REMEMBER_OPENINGS.iter().any(|opening| {
+        starts_with_word(opening)
+            // "Remember" alone asks for nothing to be kept.
+            && lowered[opening.len()..]
+                .trim_matches(|character: char| !character.is_alphanumeric())
+                .chars()
+                .next()
+                .is_some()
+    });
+    let standing = STANDING_OPENINGS
+        .iter()
+        .any(|opening| starts_with_word(opening));
+    (asked || standing).then(|| trimmed.to_owned())
+}
+
+/// The extractor version recorded on every fact it writes.
+pub const EXTRACTOR_VERSION: &str = "turn-facts-v1";
+
+/// How long one extraction may take before the turn stops waiting for it.
+const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The output bound of one extraction call.
+const EXTRACTION_MAX_OUTPUT_TOKENS: u32 = 800;
+
+/// How many facts one turn may add.
+const EXTRACTION_MAX_FACTS: usize = 8;
+
+/// The longest fact accepted, in characters. A fact is one sentence; a paragraph
+/// is the model restating the answer.
+const FACT_MAX_CHARS: usize = 400;
+
+/// How many known facts the extractor is shown so it can skip or replace them.
+const KNOWN_FACTS: usize = 12;
+
+/// How much of each side of the turn the extractor reads.
+const EXTRACTION_TURN_CHARS: usize = 4000;
+
+/// What one extraction did.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExtractionReport {
+    /// Facts written as active: they reach the next turn.
+    pub applied: usize,
+    /// Facts written as candidates: below the auto-apply confidence.
+    pub candidates: usize,
+    /// Facts memory already held; the new source was recorded on them.
+    pub duplicates: usize,
+    /// Known facts retired because a new fact replaced them.
+    pub replaced: usize,
+    /// Facts refused: malformed, unknown category, too long or credential-like.
+    pub refused: usize,
+    /// Why nothing ran, when nothing ran.
+    pub skipped: Option<&'static str>,
+}
+
+impl ExtractionReport {
+    /// One transcript line, or none when there is nothing worth saying.
+    #[must_use]
+    pub fn message(&self) -> Option<String> {
+        if self.applied + self.candidates + self.replaced + self.refused == 0 {
+            return None;
+        }
+        let mut parts = vec![format!("learned {} fact(s)", self.applied)];
+        if self.candidates > 0 {
+            parts.push(format!(
+                "{} kept for review (`ha memory candidates`)",
+                self.candidates
+            ));
+        }
+        if self.replaced > 0 {
+            parts.push(format!("{} outdated fact(s) replaced", self.replaced));
+        }
+        if self.refused > 0 {
+            parts.push(format!("{} refused", self.refused));
+        }
+        Some(format!("memory: {}", parts.join(", ")))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ExtractionReply {
+    #[serde(default)]
+    facts: Vec<ReplyFact>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReplyFact {
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    confidence: f64,
+    #[serde(default)]
+    replaces: Option<String>,
+}
+
+/// Extract the facts one turn established and write them to memory.
+///
+/// This is the L0 → L1 step TencentDB-Agent-Memory runs on every conversation and
+/// deer-flow runs after every turn: the model that just answered reads the turn and
+/// states what is worth knowing next time - a preference, a decision, a convention, a
+/// correction - with how sure it is. A fact at or above the auto-apply confidence is
+/// active at once; one below it is a candidate the user can confirm or reject.
+///
+/// The model is shown the facts memory already holds that relate to this turn, so it
+/// can leave a known fact out or name the one a new fact replaces. It can only replace
+/// a fact it was shown: an id it invents is ignored, so extraction can never retire
+/// memory it did not read.
+///
+/// # Errors
+/// Fails when the store cannot be read or written. A model that is unavailable, slow
+/// or answers with something other than the requested JSON is a skipped extraction,
+/// reported in the result, not an error: the turn it follows already succeeded.
+pub async fn extract_facts(
+    provider: Arc<dyn ModelProvider>,
+    store: Arc<SqliteStore>,
+    principal: &MemoryPrincipal,
+    session_id: &SessionId,
+    answer: &str,
+) -> Result<ExtractionReport, HarnessError> {
+    let mut report = ExtractionReport::default();
+    if provider.capabilities().fixture {
+        report.skipped = Some("fixture providers do not extract");
+        return Ok(report);
+    }
+    let Some((input_event, question)) = store
+        .session_admitted_input(session_id)
+        .await
+        .map_err(StoreError::into_harness_error)?
+    else {
+        report.skipped = Some("no admitted input");
+        return Ok(report);
+    };
+    let question = question.trim();
+    if question.is_empty() || answer.trim().is_empty() {
+        report.skipped = Some("nothing was said");
+        return Ok(report);
+    }
+    let service = MemoryService::new(Arc::clone(&store));
+    let known = known_facts(&service, principal, question).await?;
+    let prompt = extraction_prompt(&known, question, answer);
+    let reply = match ask_extractor(provider.as_ref(), prompt).await {
+        Ok(reply) => reply,
+        Err(reason) => {
+            report.skipped = Some(reason);
+            return Ok(report);
+        }
+    };
+    let Some(parsed) = parse_reply(&reply) else {
+        report.skipped = Some("the model did not answer with the requested JSON");
+        return Ok(report);
+    };
+    let (scope, project_id) = match principal.project_id.clone() {
+        Some(project_id) => (MemoryScope::Project, Some(project_id)),
+        None => (MemoryScope::User, None),
+    };
+    for fact in parsed.facts.into_iter().take(EXTRACTION_MAX_FACTS) {
+        let content = fact.content.trim().to_owned();
+        let category = fact.category.trim().to_lowercase();
+        if content.is_empty()
+            || content.chars().count() > FACT_MAX_CHARS
+            || !FACT_CATEGORIES.contains(&category.as_str())
+            || !fact.confidence.is_finite()
+            || !(0.0..=1.0).contains(&fact.confidence)
+            // A fact the store would redact is a fact about a credential; keeping the
+            // redacted stub would remember nothing.
+            || sanitize_memory_text(&content) != content
+        {
+            report.refused += 1;
+            continue;
+        }
+        let stored_text = format!("[{category}] {content}");
+        if let Some(existing) = service.find_any_by_content(principal, &stored_text).await? {
+            service
+                .append_version_source(principal, &existing, &input_event)
+                .await?;
+            report.duplicates += 1;
+            continue;
+        }
+        let written = service
+            .apply_inferred_fact(
+                principal,
+                InferredFact {
+                    content,
+                    category,
+                    confidence: fact.confidence,
+                    scope,
+                    project_id: project_id.clone(),
+                    source_event_refs: vec![input_event.clone()],
+                    extractor_version: EXTRACTOR_VERSION.to_owned(),
+                },
+            )
+            .await?;
+        let active = written.asset.status == harness_types::MemoryAssetStatus::Active;
+        if active {
+            report.applied += 1;
+        } else {
+            report.candidates += 1;
+        }
+        // Only an active fact replaces one: a candidate is a guess, and a guess must
+        // not retire something memory is using.
+        if active
+            && let Some(replaced) = fact
+                .replaces
+                .as_deref()
+                .and_then(|id| known.iter().find(|(known_id, _)| known_id.as_str() == id))
+        {
+            service
+                .invalidate(
+                    principal,
+                    &replaced.0,
+                    &format!("replaced by {}", written.asset.memory_asset_id),
+                )
+                .await?;
+            report.replaced += 1;
+        }
+    }
+    Ok(report)
+}
+
+/// One bounded extraction call; the error is the reason it was skipped.
+async fn ask_extractor(
+    provider: &dyn ModelProvider,
+    prompt: String,
+) -> Result<String, &'static str> {
+    let request = ProviderRequest::new(
+        harness_types::RequestId::generate(),
+        provider.capabilities().model,
+        vec![ProviderMessage::new(MessageRole::User, prompt)],
+    )
+    .with_max_output_tokens(EXTRACTION_MAX_OUTPUT_TOKENS);
+    let events = tokio::time::timeout(
+        EXTRACTION_TIMEOUT,
+        provider.stream(request, CancellationToken::new()),
+    )
+    .await
+    .map_err(|_| "the model did not answer in time")?
+    .map_err(|_| "the model was unavailable")?;
+    harness_providers::assemble_stream(&events)
+        .map(|response| response.text)
+        .map_err(|_| "the extraction reply could not be read")
+}
+
+/// Facts memory already holds that relate to this turn, as (id, content).
+async fn known_facts(
+    service: &MemoryService,
+    principal: &MemoryPrincipal,
+    question: &str,
+) -> Result<Vec<(MemoryAssetId, String)>, HarnessError> {
+    let terms = normalize_terms(question);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let result = service
+        .search_terms(principal, &terms, KNOWN_FACTS, None)
+        .await?;
+    Ok(result
+        .hits
+        .into_iter()
+        .filter(|hit| hit.asset.kind == FACT_KIND)
+        .map(|hit| (hit.asset.memory_asset_id, hit.current.content))
+        .collect())
+}
+
+fn extraction_prompt(known: &[(MemoryAssetId, String)], question: &str, answer: &str) -> String {
+    let known = if known.is_empty() {
+        "(none)".to_owned()
+    } else {
+        known
+            .iter()
+            .map(|(id, content)| format!("- {id}: {content}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "You maintain long-term memory for a coding assistant. Read the conversation turn \
+         below and extract the facts worth knowing in FUTURE conversations about this user \
+         or this project: stable preferences, conventions, decisions, environment details, \
+         goals, and corrections the user made.\n\
+         Do NOT extract: one-off task requests, a restatement of the answer, anything only \
+         true for this turn, guesses, secrets or credentials.\n\
+         Each fact is one self-contained sentence in the user's language.\n\
+         confidence: 0.9-1.0 the user stated it explicitly; 0.7-0.9 clearly implied; below \
+         0.7 uncertain.\n\
+         category: one of {categories}.\n\
+         If a fact is already known, leave it out. If a fact updates or contradicts a known \
+         fact, set \"replaces\" to that fact's id; otherwise null.\n\
+         Reply with JSON only, no prose: \
+         {{\"facts\":[{{\"content\":\"...\",\"category\":\"preference\",\"confidence\":0.9,\"replaces\":null}}]}}. \
+         Reply {{\"facts\":[]}} when nothing qualifies.\n\n\
+         Known facts:\n{known}\n\n\
+         Turn:\nUser: {question}\nAssistant: {answer}",
+        categories = FACT_CATEGORIES.join(", "),
+        question = clip(question, EXTRACTION_TURN_CHARS),
+        answer = clip(answer, EXTRACTION_TURN_CHARS),
+    )
+}
+
+/// The JSON object in a reply, tolerating a code fence or a sentence around it.
+fn parse_reply(reply: &str) -> Option<ExtractionReply> {
+    let start = reply.find('{')?;
+    let end = reply.rfind('}')?;
+    serde_json::from_str(reply.get(start..=end)?).ok()
 }
 
 /// Store one completed turn: what was asked, and the beginning of what was answered.
@@ -1108,9 +1494,9 @@ mod tests {
             .expect("project identity");
         for text in [
             // Shares one term with the question: `deploy`.
-            "the deploy script is kept beside the fireplace",
+            "remember that the deploy script is kept beside the fireplace",
             // Shares two: `notes` and `drawer`.
-            "the notes are kept in the bottom drawer",
+            "remember that the notes are kept in the bottom drawer",
         ] {
             let task_id = TaskId::generate();
             let session = SessionId::generate();
@@ -1228,18 +1614,22 @@ mod tests {
     }
 
     #[test]
-    fn memory_is_off_unless_the_exact_value_asks_for_it() {
+    fn memory_is_on_unless_a_value_plainly_turns_it_off() {
+        assert!(memory_requested(None), "on by default");
         assert!(memory_requested(Some("on")));
-        assert!(memory_requested(Some("ON")));
-        assert!(!memory_requested(Some("off")));
-        assert!(!memory_requested(Some("true")));
-        assert!(!memory_requested(Some("")));
-        assert!(!memory_requested(None));
+        assert!(memory_requested(Some("")));
+        assert!(
+            memory_requested(Some("of")),
+            "a misspelling is not a request to stop"
+        );
+        for off in ["off", "OFF", " off ", "0", "false", "no"] {
+            assert!(!memory_requested(Some(off)), "{off:?} turns memory off");
+        }
 
-        let environment = LaunchEnvironment::from_pairs([(MEMORY_VARIABLE, "on")]);
-        assert!(memory_requested_from_environment(&environment));
         let unrelated = LaunchEnvironment::from_pairs([("HA_UI", "plain")]);
-        assert!(!memory_requested_from_environment(&unrelated));
+        assert!(memory_requested_from_environment(&unrelated));
+        let off = LaunchEnvironment::from_pairs([(MEMORY_VARIABLE, "off")]);
+        assert!(!memory_requested_from_environment(&off));
     }
 
     #[test]
@@ -1284,11 +1674,10 @@ mod tests {
                 "dung".to_owned(),
                 "ngon".to_owned(),
                 "ngu".to_owned(),
-                "gi".to_owned(),
                 "ha".to_owned(),
                 "ban".to_owned(),
             ],
-            "every word is a term; the union is what finds the instruction"
+            "every word that can carry the subject is a term; a function word such as              \"gì\" is not, because it matches any other question"
         );
         assert!(
             terms.len() > 4,
@@ -2137,6 +2526,269 @@ mod tests {
             .expect("input admitted");
     }
 
+    /// A provider that answers every call with one fixed text, and is not a fixture.
+    struct ReplyProvider {
+        reply: String,
+    }
+
+    impl harness_providers::ModelProvider for ReplyProvider {
+        fn capabilities(&self) -> harness_providers::ModelCapabilities {
+            harness_providers::ModelCapabilities {
+                fixture: false,
+                ..harness_providers::ModelCapabilities::deepseek_fixture()
+            }
+        }
+
+        fn stream(
+            &self,
+            request: harness_providers::ProviderRequest,
+            _cancellation: harness_providers::CancellationToken,
+        ) -> harness_providers::ProviderFuture {
+            let events = vec![
+                harness_providers::ProviderStreamEvent::Started {
+                    request_id: request.request_id,
+                },
+                harness_providers::ProviderStreamEvent::text(self.reply.clone()),
+                harness_providers::ProviderStreamEvent::completed("stop"),
+            ];
+            Box::pin(async move { Ok(events) })
+        }
+    }
+
+    fn reply(text: &str) -> Arc<dyn harness_providers::ModelProvider> {
+        Arc::new(ReplyProvider {
+            reply: text.to_owned(),
+        })
+    }
+
+    #[test]
+    fn only_an_explicit_request_is_remembered_verbatim() {
+        for asked in [
+            "ghi nhớ: dự án dùng pnpm",
+            "Hãy nhớ rằng CI chạy trên Windows",
+            "Remember that the staging DB is read-only",
+            "từ giờ luôn trả lời bằng tiếng Việt",
+            "From now on, run cargo fmt before committing",
+            "never push to master directly",
+        ] {
+            assert_eq!(
+                super::explicit_memory(asked).as_deref(),
+                Some(asked),
+                "{asked:?} asks to be remembered and is kept whole"
+            );
+        }
+        for ordinary in [
+            "hãy sửa lỗi build cho tôi",
+            "hãy mô tả cho tôi memory dự án này",
+            "fix the failing test",
+            "remember",
+            "remembering the old API, port it",
+            "luonvan is a word that only starts like one",
+        ] {
+            assert_eq!(
+                super::explicit_memory(ordinary),
+                None,
+                "{ordinary:?} is a request, not something to remember"
+            );
+        }
+    }
+
+    /// Measured on a real project: "hãy mô tả cho tôi memory dự án này" shares "hay",
+    /// "cho" and "toi" with any polite request, so an unrelated old input cleared the
+    /// two-term overlap floor on grammar alone and was injected as memory.
+    #[tokio::test]
+    async fn memory_function_words_alone_do_not_make_a_match() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+        let task_id = TaskId::generate();
+        let first = SessionId::generate();
+        admit(
+            &fixture,
+            &project_id,
+            &first,
+            &task_id,
+            "từ giờ hãy sửa lỗi cho tôi trước khi commit",
+        )
+        .await;
+        remember_input(
+            Arc::clone(&fixture.store),
+            &principal(project_id.clone(), task_id.clone(), first.clone()),
+            &first,
+        )
+        .await
+        .expect("remember runs")
+        .expect_stored();
+        let recalled = recall(
+            Arc::clone(&fixture.store),
+            &principal(project_id, task_id, SessionId::generate()),
+            &fixture.workspace,
+            "hãy mô tả cho tôi memory dự án này",
+        )
+        .await
+        .expect("recall runs");
+        assert_ne!(
+            recalled.state,
+            RetrievalState::Found,
+            "an unrelated request must not be injected: {}",
+            recalled.message
+        );
+    }
+
+    /// The L0 -> L1 step: a turn's confident facts are applied, the uncertain one waits
+    /// for review, a malformed one is refused, and a later fact can replace an earlier
+    /// one it was shown.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // two extractions and what each left behind, in order
+    async fn memory_extracted_facts_are_applied_by_confidence_and_can_be_replaced() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+        let task_id = TaskId::generate();
+        let first = SessionId::generate();
+        admit(
+            &fixture,
+            &project_id,
+            &first,
+            &task_id,
+            "project build uses pnpm and deploys to staging on fridays",
+        )
+        .await;
+        let owner = principal(project_id.clone(), task_id.clone(), first.clone());
+        let report = super::extract_facts(
+            reply(
+                "```json\n{\"facts\":[\
+                 {\"content\":\"The project build uses pnpm.\",\"category\":\"preference\",\"confidence\":0.95,\"replaces\":null},\
+                 {\"content\":\"Staging deploys may happen on fridays.\",\"category\":\"context\",\"confidence\":0.5,\"replaces\":null},\
+                 {\"content\":\"Something\",\"category\":\"gossip\",\"confidence\":0.9}\
+                 ]}\n```",
+            ),
+            Arc::clone(&fixture.store),
+            &owner,
+            &first,
+            "Noted: pnpm for builds.",
+        )
+        .await
+        .expect("extraction runs");
+        assert_eq!(
+            (report.applied, report.candidates, report.refused),
+            (1, 1, 1),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .message()
+                .is_some_and(|message| message.contains("learned 1 fact(s)")),
+            "{report:?}"
+        );
+
+        let later = principal(project_id.clone(), task_id.clone(), SessionId::generate());
+        let recalled = recall(
+            Arc::clone(&fixture.store),
+            &later,
+            &fixture.workspace,
+            "which package manager does the project build use",
+        )
+        .await
+        .expect("recall runs");
+        let injected = recalled
+            .contribution
+            .blocks
+            .iter()
+            .map(|block| block.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            injected.contains("The project build uses pnpm.")
+                && injected.contains("confidence=0.95"),
+            "the applied fact reaches the next turn with its confidence: {injected}"
+        );
+        assert!(
+            !injected.contains("fridays"),
+            "a candidate is not injected: {injected}"
+        );
+
+        // The next turn changes the fact; the extractor is shown the known one and
+        // names it, so the old fact is retired instead of contradicting the new one.
+        let service = MemoryService::new(Arc::clone(&fixture.store));
+        let known = super::known_facts(&service, &later, "project build package manager")
+            .await
+            .expect("known facts");
+        let (old_id, _) = known
+            .iter()
+            .find(|(_, content)| content.contains("pnpm"))
+            .expect("the applied fact is known")
+            .clone();
+        // Facts are project-scoped, so the next conversation (another task) sees them.
+        let task_id = TaskId::generate();
+        let second = SessionId::generate();
+        admit(
+            &fixture,
+            &project_id,
+            &second,
+            &task_id,
+            "we switched the project build from pnpm to bun",
+        )
+        .await;
+        let report = super::extract_facts(
+            reply(&format!(
+                "{{\"facts\":[{{\"content\":\"The project build uses bun instead of pnpm.\",\"category\":\"correction\",\"confidence\":0.9,\"replaces\":\"{old_id}\"}},\
+                 {{\"content\":\"Unrelated guess.\",\"category\":\"context\",\"confidence\":0.9,\"replaces\":\"memory_asset_not_shown\"}}]}}"
+            )),
+            Arc::clone(&fixture.store),
+            &principal(project_id.clone(), task_id.clone(), second.clone()),
+            &second,
+            "Understood, bun from now on.",
+        )
+        .await
+        .expect("extraction runs");
+        assert_eq!((report.applied, report.replaced), (2, 1), "{report:?}");
+        let recalled = recall(
+            Arc::clone(&fixture.store),
+            &principal(project_id, task_id, SessionId::generate()),
+            &fixture.workspace,
+            "which package manager does the project build use",
+        )
+        .await
+        .expect("recall runs");
+        let injected = recalled
+            .contribution
+            .blocks
+            .iter()
+            .map(|block| block.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(injected.contains("bun instead of pnpm"), "{injected}");
+        assert!(
+            !injected.contains("The project build uses pnpm."),
+            "the replaced fact is retired: {injected}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_an_unreadable_extraction_is_skipped_not_an_error() {
+        let fixture = fixture().await;
+        let project_id = resolve_project_id(&fixture.store, &fixture.workspace)
+            .await
+            .expect("project identity");
+        let task_id = TaskId::generate();
+        let session = SessionId::generate();
+        admit(&fixture, &project_id, &session, &task_id, "anything").await;
+        let report = super::extract_facts(
+            reply("I could not find any facts, sorry."),
+            Arc::clone(&fixture.store),
+            &principal(project_id, task_id, session.clone()),
+            &session,
+            "an answer",
+        )
+        .await
+        .expect("a reply that is not JSON is not a failure");
+        assert!(report.skipped.is_some(), "{report:?}");
+        assert_eq!(report.message(), None);
+    }
+
     /// The end-to-end promise: what one turn stored, a later turn can recall.
     #[tokio::test]
     async fn a_stored_instruction_is_recalled_by_a_later_session() {
@@ -2162,7 +2814,7 @@ mod tests {
             &project_id,
             &first,
             &task_id,
-            "dự án này dùng Rust nhé",
+            "ghi nhớ: dự án này dùng Rust nhé",
         )
         .await;
         let stored = remember_input(Arc::clone(store), &owner, &first)
@@ -2289,7 +2941,7 @@ mod tests {
             &project_id,
             &session_id,
             &task_id,
-            "chỉ dùng cargo test",
+            "từ giờ chỉ dùng cargo test",
         )
         .await;
         remember_input(

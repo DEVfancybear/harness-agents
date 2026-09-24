@@ -239,6 +239,10 @@ async fn resume_flow() {
         ),
         (MODEL_VARIABLE, "fixture-model".to_owned()),
         ("HA_API_KEY", "completion-fixture-only".to_owned()),
+        // The loopback fixture answers the turns this flow sends and nothing else.
+        // Memory is on by default and asks the model for facts after a turn, which
+        // is a call this fixture never answers; this case is about resuming.
+        ("HA_MEMORY", "off".to_owned()),
     ]);
     let mut channel = SessionChannel::new();
     let mut service = AgentSessionService::new(&context, environment, channel.sender());

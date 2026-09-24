@@ -2449,7 +2449,7 @@ fn report_memory(
         Ok(memory::RememberOutcome::NotKnowledge { reason }) => send(SessionEvent::Notice {
             message: format!("memory: not stored ({reason})"),
         }),
-        Ok(memory::RememberOutcome::NothingAdmitted) => {}
+        Ok(memory::RememberOutcome::NothingAdmitted | memory::RememberOutcome::NotRequested) => {}
         Err(error) => send(SessionEvent::Notice {
             message: format!("memory: nothing was stored ({error})"),
         }),
@@ -3291,6 +3291,30 @@ async fn run_turn(
         };
         for result in directive.into_iter().chain(std::iter::once(answered)) {
             report_memory(&send, result);
+        }
+        // Facts are extracted from a turn that finished with an answer; a turn that
+        // stopped at a bound or was canceled has no settled answer to learn from.
+        if let Ok(turn) = &outcome
+            && turn.stop == TurnStop::Final
+        {
+            match memory::extract_facts(
+                Arc::clone(&provider),
+                Arc::clone(&store),
+                principal,
+                &session_id,
+                &turn.final_text,
+            )
+            .await
+            {
+                Ok(report) => {
+                    if let Some(message) = report.message() {
+                        send(SessionEvent::Notice { message });
+                    }
+                }
+                Err(error) => send(SessionEvent::Notice {
+                    message: format!("memory: facts were not extracted ({error})"),
+                }),
+            }
         }
     }
     drop(driver);
