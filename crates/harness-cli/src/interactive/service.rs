@@ -1350,6 +1350,80 @@ const SHELL_PREFIX_OUTPUT_TRUNCATION: &str = "\n[output truncated at 64 KiB]";
 /// Upper bound on the resume list, newest first.
 const RESUME_LIST_LIMIT: usize = 20;
 
+#[cfg(test)]
+mod resume_list_tests {
+    use super::conversation_heads;
+    use harness_store_sqlite::SessionSummary;
+    use harness_types::{SessionId, TaskId};
+
+    fn summary(task: &TaskId, created_at: &str) -> SessionSummary {
+        SessionSummary {
+            session_id: SessionId::generate(),
+            task_id: task.clone(),
+            next_sequence: 3,
+            input_count: 1,
+            latest_snapshot_sequence: None,
+            created_at: created_at.to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_resume_list_has_one_row_per_conversation_and_it_is_the_newest_turn() {
+        let long = TaskId::generate();
+        let short = TaskId::generate();
+        // Three turns of one conversation in the same second, then another one.
+        let first = summary(&long, "2026-09-24 10:00:00");
+        let second = summary(&long, "2026-09-24 10:00:00");
+        let third = summary(&long, "2026-09-24 10:00:00");
+        let other = summary(&short, "2026-09-24 09:00:00");
+        let (heads, turns) =
+            conversation_heads(vec![second.clone(), other.clone(), third.clone(), first]);
+        let ids = heads
+            .iter()
+            .map(|head| head.session_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![third.session_id, other.session_id]);
+        assert_eq!(turns.get(long.as_str()), Some(&3));
+        assert_eq!(turns.get(short.as_str()), Some(&1));
+    }
+}
+
+/// Newest first. `created_at` has one-second resolution, so turns taken in the same
+/// second tie on it; session ids are time-ordered and break the tie the right way.
+fn sort_newest_first(sessions: &mut [harness_store_sqlite::SessionSummary]) {
+    sessions.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.session_id.as_str().cmp(left.session_id.as_str()))
+    });
+}
+
+/// One entry per conversation: its newest session, with how many turns it has.
+///
+/// Every turn is stored as its own session linked to the one before, and the picker
+/// used to list each of them. A ten-turn conversation filled half the list with ten
+/// rows of the same title, and choosing any row but the newest resumed the
+/// conversation from the middle, as if the later turns had never happened. A
+/// conversation is a task, so the list keeps the newest session of each task.
+fn conversation_heads(
+    mut sessions: Vec<harness_store_sqlite::SessionSummary>,
+) -> (
+    Vec<harness_store_sqlite::SessionSummary>,
+    std::collections::HashMap<String, usize>,
+) {
+    sort_newest_first(&mut sessions);
+    let mut turns = std::collections::HashMap::<String, usize>::new();
+    for session in &sessions {
+        *turns
+            .entry(session.task_id.as_str().to_owned())
+            .or_default() += 1;
+    }
+    let mut seen = std::collections::HashSet::new();
+    sessions.retain(|session| seen.insert(session.task_id.as_str().to_owned()));
+    (sessions, turns)
+}
+
 impl AgentSessionService {
     #[must_use]
     #[cfg(test)]
@@ -1460,6 +1534,46 @@ impl AgentSessionService {
         )
     }
 
+    /// Show the user the conversation a resumed session continues.
+    ///
+    /// Resuming used to print one line and nothing else, so the user could not see
+    /// what they were continuing and had no way to tell whether the model could. What
+    /// is shown here is read with the same function the runtime uses to build the next
+    /// request, so the screen and the model agree on what the conversation was.
+    fn show_conversation(&self, source: SessionId) {
+        let sender = self.sender.clone();
+        let store_dir = self.store_dir.clone();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            let store = match SqliteStore::open_read_only(store_dir).await {
+                Ok(store) => store,
+                Err(error) => {
+                    let _ = sender.send(SessionEvent::RecoverableError {
+                        message: format!("the resumed conversation could not be read: {error}"),
+                    });
+                    return;
+                }
+            };
+            match harness_runtime::conversation_history(&store, &source).await {
+                Ok(history) => {
+                    let _ = sender.send(SessionEvent::ConversationRestored {
+                        turns: history.turns(),
+                        omitted: history.omitted,
+                        summarized: history.summary.is_some(),
+                    });
+                }
+                Err(error) => {
+                    let _ = sender.send(SessionEvent::RecoverableError {
+                        message: format!("the resumed conversation could not be read: {error}"),
+                    });
+                }
+            }
+            let _ = store.close().await;
+        });
+    }
+
     fn newest_project_session(&self) -> Result<SessionId, String> {
         let store_dir = self.store_dir.clone();
         std::thread::spawn(move || {
@@ -1475,7 +1589,7 @@ impl AgentSessionService {
                     .list_sessions()
                     .await
                     .map_err(|error| format!("project sessions could not be listed: {error}"))?;
-                sessions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+                sort_newest_first(&mut sessions);
                 let latest = sessions
                     .into_iter()
                     .next()
@@ -2105,10 +2219,13 @@ impl SessionPort for AgentSessionService {
                 Ok(store) => match store.list_sessions().await {
                     Ok(summaries) => {
                         // Newest first, bounded: a resume list is a menu, not a dump.
-                        let mut summaries = summaries;
-                        summaries.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+                        let (summaries, turns_per_task) = conversation_heads(summaries);
                         let mut sessions = Vec::new();
                         for summary in summaries.into_iter().take(RESUME_LIST_LIMIT) {
+                            let turns = turns_per_task
+                                .get(summary.task_id.as_str())
+                                .copied()
+                                .unwrap_or(1);
                             let title = store
                                 .session_setting(&summary.task_id, "title")
                                 .await
@@ -2132,10 +2249,7 @@ impl SessionPort for AgentSessionService {
                             sessions.push(SessionCandidate {
                                 session_id: summary.session_id.as_str().to_owned(),
                                 task_id: summary.task_id.as_str().to_owned(),
-                                detail: format!(
-                                    "{title} · {model} · {created} · {} input(s), {} event(s)",
-                                    summary.input_count, summary.next_sequence
-                                ),
+                                detail: format!("{title} · {model} · {created} · {turns} turn(s)"),
                             });
                         }
                         let _ = sender.send(SessionEvent::SessionsListed { sessions });
@@ -2175,7 +2289,11 @@ impl SessionPort for AgentSessionService {
         if source.is_none() {
             self.task_id = TaskId::generate();
         }
-        *previous = source;
+        previous.clone_from(&source);
+        drop(previous);
+        if let Some(source) = source {
+            self.show_conversation(source);
+        }
         Ok(())
     }
 

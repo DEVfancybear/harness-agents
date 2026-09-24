@@ -627,7 +627,13 @@ async fn g3_a_second_input_in_the_same_session_carries_real_context() {
 
     let seen = provider.seen();
     assert_eq!(seen.len(), 2, "one provider call per input");
-    let second_packet = &seen[1].messages[1].content;
+    // The new input is the last user message; the earlier turn comes before it.
+    let messages = &seen[1].messages;
+    let second_packet = &messages
+        .iter()
+        .rfind(|message| message.role == MessageRole::User)
+        .expect("a user message")
+        .content;
     assert!(
         second_packet.contains("second user message"),
         "the new input reaches the model: {second_packet}"
@@ -635,6 +641,13 @@ async fn g3_a_second_input_in_the_same_session_carries_real_context() {
     assert_ne!(
         &seen[0].messages[1].content, second_packet,
         "the second turn must rebuild context from the session journal, not start empty"
+    );
+    // Real context includes what the model answered, not only what it was asked.
+    assert!(
+        messages.iter().any(|message| {
+            message.role == MessageRole::Assistant && message.content == "first answer"
+        }),
+        "the earlier answer is part of the conversation: {messages:?}"
     );
 }
 

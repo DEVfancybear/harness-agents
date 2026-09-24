@@ -427,3 +427,27 @@ A turn record is the one asset guaranteed to be retired, and derived memory dies
 ### 19.4. Consequence for acceptance
 
 C30 and the anti-forgetting acceptance suite in section 12 read under this contract: "does not forget" means a question about the past is answered from the log, while a question about a subject is answered from durable memory. A suite that checks only durable memory misses half of it, and a suite that checks only the log mistakes a record for knowledge - two different defects, needing two different assertions.
+
+## 20. Conversation continuation: the contract as implemented
+
+This section records a failure measured with `/resume` and the contract that replaced it. Each chat turn is its own session, linked to the previous turn through `session_lineage`. A continued session used to carry only the previous turn's **request packet** as `continuation_context`: the question and the state around it, never the model's answer. Measured consequence: after `/resume` the model knew what it had been asked but not what it had answered. Each packet also contained the one before it, so every turn re-sent all earlier packets nested inside each other. The picker listed every turn as a separate session, and picking any row other than the newest continued from the middle of the conversation.
+
+### 20.1. Three references, one direction
+
+- pi: a session is a tree of entries. The active branch supplies the history for the next request; compaction adds a summary and keeps the most recent messages ("summary + kept messages"). `/resume` reopens that exact conversation.
+- deer-flow: a thread continues from LangGraph's full-message checkpoint. Long-term memory (facts with confidence, context summaries) is injected into the prompt separately, within a token budget.
+- TencentDB-Agent-Memory: L0 is the raw conversation, kept with full context. L1-L3 are derived layers and do not replace L0 when the exact wording is needed.
+
+What they share: continuing a conversation uses that conversation's own messages. Long-term memory is an additional channel, not a substitute.
+
+### 20.2. Contract
+
+- `conversation_history(store, session)` walks the `session_lineage` chain back from the newest session. Each session contributes one turn: the admitted input and the last text the model sent (the newest `completed` attempt that has text; attempt ids are UUIDv7, so they sort by time).
+- The walk stops at the first session that holds a compaction checkpoint. That checkpoint's summary becomes `continuation_context` and stands for everything before it; folded turns are not replayed a second time.
+- The replay is bounded: at most 20 turns and 48 KiB, and each question or answer at most 4000 characters (a cut is marked `[truncated]`). Older turns are dropped and **stated** in a system message rather than silently disappearing. Replay bytes count toward the context budget, so the compaction threshold sees them.
+- The turns are sent as real `user`/`assistant` messages between the system policy and the new user message. The old request packet is no longer nested.
+- `/resume <n>` shows those turns through the same function, so the screen and the model see the same conversation. The picker lists one row per conversation (task): its newest session, with its turn count.
+
+### 20.3. Relation to the conversation log
+
+Section 19 answers "what did we say in other sessions" from memory, with excerpts and retention. This section answers "which conversation is being continued" from the original run data of that exact session chain. Neither path replaces the other. Replay writes nothing to memory, and the log is never used to rebuild the conversation being continued.

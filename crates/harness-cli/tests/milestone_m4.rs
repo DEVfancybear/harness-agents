@@ -775,6 +775,128 @@ async fn m4_01_discovery_results_reach_the_model_and_a_blank_path_is_the_root() 
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // three linked turns and one replay, told in order
+async fn m4_01_a_continued_conversation_replays_what_the_model_answered() {
+    // Measured with /resume: the continued session carried the previous request
+    // packet - the question - and never the reply, so the model knew what it had
+    // been asked and not what it had said. Three turns, each its own session linked
+    // to the one before, the way the interactive app runs them.
+    let bench = bench();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("Noted: the code word is AZURE."),
+            ProviderStreamEvent::completed("stop"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("The parser lives in src/parser.txt."),
+            ProviderStreamEvent::completed("stop"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("AZURE"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let task = TaskId::generate();
+    let workspace = {
+        let store = bench.open_store().await;
+        let workspace = observe_workspace(bench.project_id.clone(), &bench.workspace).unwrap();
+        close(store).await;
+        workspace
+    };
+    // Each turn opens the store as its own writer generation and releases it, as
+    // the interactive app does; that is what lets the next session take the task.
+    let mut previous: Option<SessionId> = None;
+    let mut sessions = Vec::new();
+    for text in [
+        "remember the code word AZURE",
+        "where is the parser?",
+        "what was the code word?",
+    ] {
+        let store = bench.open_store().await;
+        let runtime = RuntimeService::new(
+            Arc::clone(&store),
+            provider.clone(),
+            RuntimeConfig::default(),
+        );
+        let session = SessionId::generate();
+        let request = RunRequest::new(
+            session.clone(),
+            task.clone(),
+            InputId::generate(),
+            text,
+            workspace.clone(),
+        );
+        match &previous {
+            Some(source) => runtime.continue_task(source, request).await,
+            None => runtime.run(request).await,
+        }
+        .expect("turn runs");
+        drop(runtime);
+        close(store).await;
+        previous = Some(session.clone());
+        sessions.push(session);
+    }
+    let third = sessions.last().expect("three sessions").clone();
+    let store = bench.open_store().await;
+
+    let seen = provider.seen();
+    let last = &seen.get(2).expect("third request").messages;
+    let roles_and_text = last
+        .iter()
+        .map(|message| (message.role, message.content.as_str()))
+        .collect::<Vec<_>>();
+    // Speaking order: both earlier turns, question then answer, before the new one.
+    let position = |role: MessageRole, needle: &str| {
+        roles_and_text
+            .iter()
+            .position(|(r, text)| *r == role && text.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} as {role:?} is missing: {roles_and_text:#?}"))
+    };
+    let asked_first = position(MessageRole::User, "remember the code word AZURE");
+    let answered_first = position(MessageRole::Assistant, "the code word is AZURE");
+    let asked_second = position(MessageRole::User, "where is the parser?");
+    let answered_second = position(MessageRole::Assistant, "src/parser.txt");
+    let asked_now = position(MessageRole::User, "what was the code word?");
+    assert!(
+        asked_first < answered_first
+            && answered_first < asked_second
+            && asked_second < answered_second
+            && answered_second < asked_now,
+        "earlier turns come first, in the order they were said: {roles_and_text:#?}"
+    );
+    // The previous packet is not nested into the new one any more: the first
+    // question appears once, as its own message.
+    let mentions = last
+        .iter()
+        .filter(|message| message.content.contains("remember the code word AZURE"))
+        .count();
+    assert_eq!(mentions, 1, "{roles_and_text:#?}");
+
+    // The same turns are what a host shows when the user resumes the session.
+    let history = harness_runtime::conversation_history(&store, &third)
+        .await
+        .expect("history reads");
+    assert_eq!(
+        history.turns(),
+        vec![
+            (
+                "remember the code word AZURE".to_owned(),
+                "Noted: the code word is AZURE.".to_owned()
+            ),
+            (
+                "where is the parser?".to_owned(),
+                "The parser lives in src/parser.txt.".to_owned()
+            ),
+            ("what was the code word?".to_owned(), "AZURE".to_owned()),
+        ]
+    );
+    close(store).await;
+}
+
+#[tokio::test]
 async fn m4_01_tools_schema_upgrade() {
     let bench = bench();
     let store = bench.open_store().await;

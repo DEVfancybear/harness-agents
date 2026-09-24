@@ -486,6 +486,15 @@ pub enum SessionEvent {
     SessionsListed {
         sessions: Vec<SessionCandidate>,
     },
+    /// The conversation a resumed session continues, as the model will be sent it.
+    ConversationRestored {
+        /// (question, answer) pairs, oldest first.
+        turns: Vec<(String, String)>,
+        /// Turns older than the replay bound, which the model does not see.
+        omitted: usize,
+        /// Whether a compaction summary stands for turns before these.
+        summarized: bool,
+    },
     /// Read-only session diff result for the reference overlay.
     Reference {
         title: String,

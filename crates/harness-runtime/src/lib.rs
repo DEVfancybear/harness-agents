@@ -318,6 +318,16 @@ pub struct RunRequest {
     /// paired results) so a resumed turn sees what already executed instead of
     /// rerunning it.
     pub recovered_messages: Vec<ProviderMessage>,
+    /// The earlier turns of the conversation this input continues, oldest first,
+    /// as the user and assistant messages they were.
+    ///
+    /// A continued session used to carry only the previous *request* packet: the
+    /// question that was asked and the state around it, never what the model
+    /// answered. Resuming a conversation then reached a model that knew what it had
+    /// been asked and not what it had said, so "continue" and "what did you tell
+    /// me" had nothing to work from. These messages sit between the system policy
+    /// and the new user message, the same place a live conversation keeps them.
+    pub conversation: Vec<ProviderMessage>,
     /// Shared across cloned continuation requests so one admitted input cannot
     /// start more than one automatic compaction.
     auto_compaction_attempted: Arc<AtomicBool>,
@@ -345,6 +355,7 @@ impl RunRequest {
             memory: None,
             images: Vec::new(),
             recovered_messages: Vec::new(),
+            conversation: Vec::new(),
             auto_compaction_attempted: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -388,6 +399,13 @@ impl RunRequest {
     #[must_use]
     pub fn with_recovered_messages(mut self, messages: Vec<ProviderMessage>) -> Self {
         self.recovered_messages = messages;
+        self
+    }
+
+    /// Attach the earlier turns of the conversation this input continues.
+    #[must_use]
+    pub fn with_conversation(mut self, messages: Vec<ProviderMessage>) -> Self {
+        self.conversation = messages;
         self
     }
 }
@@ -865,6 +883,173 @@ fn durable_provider_events(events: &[ProviderStreamEvent]) -> Vec<&ProviderStrea
         .collect()
 }
 
+/// How many earlier turns a continued conversation replays at most.
+const CONVERSATION_MAX_TURNS: usize = 20;
+/// How many bytes of earlier turns a continued conversation replays at most.
+///
+/// About 12k tokens: enough for a real working conversation, and a fixed cost once
+/// the conversation is longer than that.
+const CONVERSATION_MAX_BYTES: usize = 48 * 1024;
+/// How many linked sessions the conversation walk follows before it stops.
+const CONVERSATION_MAX_SESSIONS: usize = 200;
+/// How much of one question or answer is replayed; the same bound the
+/// conversation journal keeps for an answer.
+const CONVERSATION_TURN_CHARS: usize = 4000;
+
+/// The earlier turns of a continued conversation.
+#[derive(Clone, Debug, Default)]
+pub struct ConversationHistory {
+    /// User and assistant messages, oldest first, possibly led by a note that
+    /// older turns were left out.
+    pub messages: Vec<ProviderMessage>,
+    /// The compaction summary that stands for turns before the replayed ones.
+    pub summary: Option<String>,
+    /// How many turns fell outside the replay bound.
+    pub omitted: usize,
+}
+
+impl ConversationHistory {
+    /// The replayed turns as (question, answer) pairs, oldest first.
+    #[must_use]
+    pub fn turns(&self) -> Vec<(String, String)> {
+        self.messages
+            .iter()
+            .filter(|message| message.role != MessageRole::System)
+            .collect::<Vec<_>>()
+            .chunks(2)
+            .filter_map(|pair| match pair {
+                [question, answer] => Some((question.content.clone(), answer.content.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// One question or answer, cut to the replay bound and saying so when cut.
+fn clip_turn(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().count() <= CONVERSATION_TURN_CHARS {
+        return text.to_owned();
+    }
+    let mut clipped = text
+        .chars()
+        .take(CONVERSATION_TURN_CHARS)
+        .collect::<String>();
+    clipped.push_str("\n[truncated]");
+    clipped
+}
+
+/// The conversation a continued session belongs to, rebuilt from the store.
+///
+/// Every interactive turn is its own session linked to the one before it, so the
+/// conversation is that chain of links. It is walked from the newest session back
+/// and each session contributes one turn: the input it admitted and the last text
+/// the model sent. The walk stops at the first session that holds a compaction
+/// checkpoint, whose summary then stands for everything before it - the turns it
+/// folded away are not replayed a second time.
+///
+/// The replay is bounded, newest turns first, so a long conversation costs the
+/// same as a short one once it passes the bound; how many turns fell outside it
+/// is said rather than hidden.
+///
+/// # Errors
+/// Fails only when the store cannot be read.
+pub async fn conversation_history(
+    store: &SqliteStore,
+    session_id: &SessionId,
+) -> Result<ConversationHistory, RuntimeError> {
+    let mut turns = Vec::new();
+    let mut summary = None;
+    let mut visited = std::collections::BTreeSet::new();
+    let mut current = Some(session_id.clone());
+    while let Some(session) = current.take() {
+        // A link cycle is a damaged store, not a longer conversation.
+        if !visited.insert(session.as_str().to_owned()) || visited.len() > CONVERSATION_MAX_SESSIONS
+        {
+            break;
+        }
+        if let Some(checkpoint) = store.latest_context_checkpoint(&session).await?
+            && let Some(text) = checkpoint.content.get("packet").and_then(Value::as_str)
+        {
+            summary = Some(text.to_owned());
+            break;
+        }
+        if let Some((_, question)) = store.session_admitted_input(&session).await? {
+            let answer = final_answer(store, &session).await?;
+            turns.push((question, answer));
+        }
+        current = store
+            .continuation_link(&session)
+            .await?
+            .map(|link| link.source_session_id);
+    }
+    // `turns` is newest first; keep what fits, then restore speaking order.
+    let mut kept = Vec::new();
+    let mut used = 0_usize;
+    for (question, answer) in &turns {
+        let question = clip_turn(question);
+        let answer = answer.as_deref().map_or_else(
+            || "(no reply was recorded for this turn)".to_owned(),
+            clip_turn,
+        );
+        let cost = question.len() + answer.len();
+        if kept.len() == CONVERSATION_MAX_TURNS
+            || (!kept.is_empty() && used + cost > CONVERSATION_MAX_BYTES)
+        {
+            break;
+        }
+        used += cost;
+        kept.push((question, answer));
+    }
+    let omitted = turns.len() - kept.len();
+    let mut messages = Vec::new();
+    if omitted > 0 {
+        messages.push(ProviderMessage::new(
+            MessageRole::System,
+            format!(
+                "{omitted} earlier turn(s) of this conversation are not shown; only the most recent ones follow."
+            ),
+        ));
+    }
+    for (question, answer) in kept.into_iter().rev() {
+        messages.push(ProviderMessage::new(MessageRole::User, question));
+        messages.push(ProviderMessage::new(MessageRole::Assistant, answer));
+    }
+    Ok(ConversationHistory {
+        messages,
+        summary,
+        omitted,
+    })
+}
+
+/// The last text the model sent in one session, if it sent any.
+///
+/// Attempt ids are time-ordered, so the newest completed attempt is the one the
+/// turn ended on. When that attempt only asked for tools and the turn stopped
+/// there, the newest attempt that did say something is what the user last read.
+async fn final_answer(
+    store: &SqliteStore,
+    session_id: &SessionId,
+) -> Result<Option<String>, RuntimeError> {
+    let mut attempts = store.list_provider_attempts(session_id).await?;
+    attempts.retain(|attempt| attempt.state == "completed");
+    attempts.sort_by(|left, right| left.attempt_id.as_str().cmp(right.attempt_id.as_str()));
+    for attempt in attempts.iter().rev() {
+        let Ok(events) = serde_json::from_value::<Vec<ProviderStreamEvent>>(attempt.events.clone())
+        else {
+            continue;
+        };
+        let Ok(response) = harness_providers::assemble_stream(&events) else {
+            continue;
+        };
+        let text = response.text.trim();
+        if !text.is_empty() {
+            return Ok(Some(text.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
 /// How many bytes of request a set of canonical messages costs.
 ///
 /// A tool call is content the provider is sent even though it does not live in
@@ -1210,10 +1395,14 @@ impl RuntimeService {
                 request.images.clone(),
             )
         };
-        let mut conversation = vec![
-            ProviderMessage::new(MessageRole::System, request.system_policy.clone()),
-            user_message,
-        ];
+        let mut conversation = vec![ProviderMessage::new(
+            MessageRole::System,
+            request.system_policy.clone(),
+        )];
+        // Earlier turns come before the new question, as they did when they were
+        // said; the packet that follows is this turn's own input.
+        conversation.extend(request.conversation.clone());
+        conversation.push(user_message);
         // A resumed turn replays committed tool results before this step's own
         // appended messages, so the model sees what already executed exactly
         // once and the pairing stays valid.
@@ -2220,18 +2409,34 @@ impl RuntimeService {
         source_session_id: &SessionId,
         request: RunRequest,
     ) -> Result<RunRequest, RuntimeError> {
-        let request =
-            if let Some(packet) = self.store.latest_context_packet(source_session_id).await? {
-                request.with_continuation_context(packet.packet.content)
-            } else {
-                request
-            };
+        let history = self.conversation_history(source_session_id).await?;
+        // The previous request packet is no longer the carrier of the conversation.
+        // It held the question and never the answer, and because each packet also
+        // held the one before it, every turn re-sent every earlier packet nested
+        // inside the next. What does carry forward is the summary of history a
+        // compaction already folded away, since those turns are not replayed.
+        let request = match history.summary {
+            Some(summary) => request.with_continuation_context(summary),
+            None => request,
+        };
+        let request = request.with_conversation(history.messages);
         let recovered = self.recovered_messages(source_session_id).await?;
         Ok(if recovered.is_empty() {
             request
         } else {
             request.with_recovered_messages(recovered)
         })
+    }
+
+    /// The conversation a continued session belongs to; see [`conversation_history`].
+    ///
+    /// # Errors
+    /// Fails only when the store cannot be read.
+    pub async fn conversation_history(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<ConversationHistory, RuntimeError> {
+        conversation_history(&self.store, session_id).await
     }
 
     /// Rebuild the paired assistant call and tool results of the interrupted
@@ -2386,6 +2591,7 @@ impl RuntimeService {
                 .map(|image| serde_json::to_string(image).map_or(0, |rendered| rendered.len()))
                 .sum::<usize>()
             + message_bytes(&request.recovered_messages)
+            + message_bytes(&request.conversation)
             // The continuation transcript is sent with every step of a turn and
             // grows with it. A budget that counts only the packet would let a
             // long turn overflow the window without the threshold ever noticing.

@@ -427,3 +427,27 @@ Bản ghi lượt là asset duy nhất chắc chắn sẽ bị thu hồi, và me
 ### 19.4. Hệ quả cho acceptance
 
 C30 và bộ nghiệm thu chống quên ở mục 12 phải đọc theo hợp đồng này: "không quên" nghĩa là câu hỏi về quá khứ được trả lời từ nhật ký, còn câu hỏi về chủ đề được trả lời từ durable memory. Một chương trình chỉ kiểm tra durable memory sẽ bỏ sót nửa còn lại, và một chương trình chỉ kiểm tra nhật ký sẽ coi bản ghi là tri thức - hai lỗi khác nhau, cần hai assertion khác nhau.
+
+## 20. Tiếp tục hội thoại: hợp đồng đã triển khai
+
+Mục này ghi lại lỗi đã đo với `/resume` và hợp đồng thay thế. Mỗi lượt chat là một session riêng, nối với lượt trước bằng `session_lineage`. Trước đây session tiếp nối chỉ mang theo **packet request** của lượt trước làm `continuation_context`: câu hỏi và trạng thái quanh nó, không bao giờ có câu trả lời của model. Hệ quả đo được: sau `/resume`, model biết mình đã được hỏi gì nhưng không biết mình đã trả lời gì. Ngoài ra mỗi packet chứa packet trước nó, nên mỗi lượt gửi lại toàn bộ packet cũ lồng nhau. Picker cũng liệt kê từng lượt như một session riêng: chọn dòng nào khác dòng mới nhất thì tiếp tục từ giữa hội thoại.
+
+### 20.1. Ba tham chiếu cùng một hướng
+
+- pi: session là cây entry. Nhánh đang hoạt động cung cấp lịch sử cho request tiếp theo; compaction thêm một summary và giữ nguyên các message gần nhất ("summary + kept messages"). `/resume` mở lại đúng hội thoại đó.
+- deer-flow: một thread tiếp tục từ checkpoint đầy đủ message của LangGraph. Memory dài hạn (facts có confidence, tóm tắt ngữ cảnh) được inject riêng vào prompt, trong giới hạn token.
+- TencentDB-Agent-Memory: L0 là hội thoại gốc, giữ đủ ngữ cảnh. L1-L3 là các tầng dẫn xuất và không thay thế L0 khi cần đúng nguyên văn.
+
+Điểm chung: tiếp tục một hội thoại thì dùng chính các message của hội thoại đó. Memory dài hạn là kênh bổ sung, không thay thế.
+
+### 20.2. Hợp đồng
+
+- `conversation_history(store, session)` đi ngược chuỗi `session_lineage` từ session mới nhất. Mỗi session đóng góp một lượt: input đã admit và đoạn text cuối cùng model gửi (attempt `completed` mới nhất có text; id attempt là UUIDv7 nên sắp theo thời gian).
+- Chuỗi dừng tại session đầu tiên có compaction checkpoint. Summary của checkpoint trở thành `continuation_context` và đại diện cho mọi thứ trước đó; các lượt đã được fold không phát lại lần hai.
+- Replay có giới hạn: tối đa 20 lượt, 48 KiB, mỗi câu hỏi/trả lời tối đa 4000 ký tự (cắt thì ghi `[truncated]`). Lượt cũ hơn bị bỏ và được **nói ra** bằng một message system, không lặng lẽ biến mất. Byte của replay được tính vào ngân sách context, nên ngưỡng compaction thấy chúng.
+- Các lượt được gửi dưới dạng message `user`/`assistant` thật, đặt giữa system policy và message user mới. Packet request cũ không còn được lồng vào.
+- `/resume <n>` hiển thị lại các lượt đó bằng chính hàm này, nên màn hình và model thấy cùng một hội thoại. Picker liệt kê mỗi hội thoại (task) một dòng, là session mới nhất của nó, kèm số lượt.
+
+### 20.3. Quan hệ với nhật ký hội thoại
+
+Mục 19 trả lời "ta đã nói gì ở các phiên khác" bằng memory có trích đoạn và retention. Mục này trả lời "đang tiếp tục cuộc nào" bằng dữ liệu run gốc của đúng chuỗi session đó. Hai đường không thay thế nhau. Replay không ghi gì vào memory, và nhật ký không được dùng để dựng lại hội thoại đang tiếp tục.

@@ -857,6 +857,44 @@ impl InteractiveController {
                 }
                 self.session_candidates = sessions;
             }
+            SessionEvent::ConversationRestored {
+                turns,
+                omitted,
+                summarized,
+            } => {
+                self.flush_stream(effects);
+                if summarized {
+                    self.push_history(
+                        effects,
+                        HistoryItem::Notice {
+                            message: "earlier turns were compacted; the model continues from their summary".to_owned(),
+                        },
+                    );
+                }
+                if omitted > 0 {
+                    self.push_history(
+                        effects,
+                        HistoryItem::Notice {
+                            message: format!(
+                                "{omitted} older turn(s) are not shown and are not sent to the model"
+                            ),
+                        },
+                    );
+                }
+                let count = turns.len();
+                for (question, answer) in turns {
+                    self.push_history(effects, HistoryItem::User { text: question });
+                    self.push_history(effects, HistoryItem::Assistant { text: answer });
+                }
+                self.push_history(
+                    effects,
+                    HistoryItem::Notice {
+                        message: format!(
+                            "resumed {count} turn(s); the next message continues this conversation"
+                        ),
+                    },
+                );
+            }
             SessionEvent::Reference { title, lines } => {
                 self.flush_stream(effects);
                 self.reference(&title, lines, effects);
@@ -3554,6 +3592,46 @@ mod tests {
         assert!(
             plain.contains("ssion_b"),
             "and it names the chosen session: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn a_resumed_conversation_is_shown_before_the_next_message() {
+        // Measured: /resume printed "continuing from session ..." and nothing else,
+        // so the user could not see what they were continuing.
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        harness
+            .events
+            .send(SessionEvent::ConversationRestored {
+                turns: vec![
+                    (
+                        "mô tả memory dự án".to_owned(),
+                        "Memory có hai đường cập nhật.".to_owned(),
+                    ),
+                    ("còn resume?".to_owned(), "Resume đọc snapshot.".to_owned()),
+                ],
+                omitted: 3,
+                summarized: false,
+            })
+            .expect("restored");
+        let plain = effects_to_plain(&harness.controller.pump_events()).join("\n");
+        let order = [
+            "3 older turn(s) are not shown",
+            "mô tả memory dự án",
+            "Memory có hai đường cập nhật.",
+            "còn resume?",
+            "Resume đọc snapshot.",
+            "resumed 2 turn(s)",
+        ]
+        .map(|needle| {
+            plain
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} is missing: {plain}"))
+        });
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "the conversation is shown in the order it was said: {plain}"
         );
     }
 
