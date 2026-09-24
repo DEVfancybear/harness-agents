@@ -1,6 +1,7 @@
 use std::{
     env,
     error::Error,
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
 };
@@ -28,20 +29,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         digest.update([0]);
         digest.update(&bytes);
         digest.update([0]);
-        source.push_str(&format!(
-            "    ({relative:?}, include_bytes!({:?})),\n",
+        writeln!(
+            source,
+            "    ({relative:?}, include_bytes!({:?})),",
             path.display().to_string()
-        ));
+        )?;
     }
     source.push_str("];\n");
-    let bundle_digest = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    source.push_str(&format!(
-        "pub const BUNDLED_SKILL_DIGEST: &str = {bundle_digest:?};\n"
-    ));
+    let mut bundle_digest = String::with_capacity(64);
+    for byte in digest.finalize() {
+        write!(bundle_digest, "{byte:02x}")?;
+    }
+    writeln!(
+        source,
+        "pub const BUNDLED_SKILL_DIGEST: &str = {bundle_digest:?};"
+    )?;
     source.push_str("pub const BUNDLED_NOTICES: &[(&str, &[u8])] = &[\n");
     for name in [
         "LICENSE-superpowers",
@@ -51,10 +53,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     ] {
         let path = notices.join(name);
         println!("cargo:rerun-if-changed={}", path.display());
-        source.push_str(&format!(
-            "    ({name:?}, include_bytes!({:?})),\n",
+        writeln!(
+            source,
+            "    ({name:?}, include_bytes!({:?})),",
             path.display().to_string()
-        ));
+        )?;
     }
     source.push_str("];\n");
     fs::write(

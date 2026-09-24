@@ -100,19 +100,19 @@ fn install_bundled_file(path: &Path, bytes: &[u8]) -> Result<(), HarnessError> {
                     ),
                 ));
             }
-            if std::fs::read(path).map_err(bundled_io_error)? == bytes {
+            if std::fs::read(path).map_err(|error| bundled_io_error(&error))? == bytes {
                 return Ok(());
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(bundled_io_error(error)),
+        Err(error) => return Err(bundled_io_error(&error)),
     }
     std::fs::create_dir_all(path.parent().expect("bundled file has a parent"))
-        .map_err(bundled_io_error)?;
-    std::fs::write(path, bytes).map_err(bundled_io_error)
+        .map_err(|error| bundled_io_error(&error))?;
+    std::fs::write(path, bytes).map_err(|error| bundled_io_error(&error))
 }
 
-fn bundled_io_error(error: std::io::Error) -> HarnessError {
+fn bundled_io_error(error: &std::io::Error) -> HarnessError {
     HarnessError::new(
         ErrorCode::SkillUnavailable,
         format!("bundled skills cannot be prepared: {error}"),
