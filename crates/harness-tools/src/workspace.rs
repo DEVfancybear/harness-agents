@@ -1215,6 +1215,16 @@ mod tests {
         assert_eq!(output.text, prefix);
     }
 
+    #[test]
+    fn review_permission_denial_maps_to_a_read_failure_with_the_path() {
+        let path = Path::new("locked");
+        let io_error = std::io::Error::from(ErrorKind::PermissionDenied);
+        let error = entry_failure(path, &io_error);
+
+        assert_eq!(error.code(), ErrorCode::StorageOpenFailed);
+        assert!(error.to_string().contains("locked"));
+    }
+
     /// Restores the ACL of a denied directory when the test ends, so a failing
     /// assertion cannot leave an unreadable temporary tree behind.
     struct DeniedRead {
@@ -1284,6 +1294,25 @@ mod tests {
         fs::write(locked.join("hidden.txt"), "inside a locked directory").unwrap();
 
         let denial = DeniedRead::apply(&locked);
+        let denied = match fs::read_dir(&locked)
+            .and_then(|mut entries| entries.next().transpose().map(|_| ()))
+        {
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => true,
+            Ok(()) => false,
+            Err(error) => panic!(
+                "ACL probe failed with an unexpected error for {}: {error}",
+                locked.display()
+            ),
+        };
+        if !denied {
+            drop(denial);
+            fs::remove_dir_all(&root).unwrap();
+            eprintln!(
+                "read-denial fixture skipped: the current Windows token can still list {} after icacls",
+                locked.display()
+            );
+            return;
+        }
         let result = walk_files(&root);
         let error = result.expect_err("an unreadable directory must not be skipped silently");
         drop(denial);

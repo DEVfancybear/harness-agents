@@ -2,13 +2,13 @@
 
 ## CP-E working evidence — G13–G14 (24/09/2026)
 
-**Status / Trạng thái:** `implemented_unverified`. Source đang ở worktree chưa commit; chưa có H `passed:true, failures:[]`, M6 gate trên source CP-E, PTY toàn bộ một lượt xanh, hay CI Ubuntu run id. Không chuyển registry acceptance sang `accepted`. / Source remains uncommitted and CP-E is not accepted.
+**Status / Trạng thái:** `implemented_unverified`. G13–G14 main source đã push tại `aad8960`; M6 local gate đã xanh sau fixture correction ghi dưới đây, nhưng chưa có H `passed:true, failures:[]` trên source cuối hay CI Ubuntu xanh. Không chuyển registry acceptance sang `accepted`. / M6 is locally verified; CP-E is not accepted.
 
 | Field / Trường | Value / Giá trị |
 | --- | --- |
 | Assignment base | `ffc93fe08b082a53216a26f4f2a5476222dec847` on `master`, initially clean |
-| Upstream during work | `febae6ff9dc7d59c58b1127537c68cde7d7a29a1` merged PR #4 and became `origin/master`; CP-E diff remains unstaged |
-| Platform/toolchain | Windows NT 10.0.26200.0 x64; `rustc 1.97.1 (8bab26f4f 2026-07-14)` via `RUSTUP_TOOLCHAIN=stable` |
+| Upstream during work | `aad8960dd9b1aff5000e29ff01e66bd67cdf3a48` pushed G13–G14 after rebase on `728a4b4`; the ACL-fixture correction and this evidence delta are the only later CP-E changes |
+| Platform/toolchain | Windows NT 10.0.26200.0 x64; isolated `RUSTUP_HOME=C:\\Users\\duong\\.rustup-ha-agent-2026-09-23`, `RUSTUP_TOOLCHAIN=1.97.1-x86_64-pc-windows-msvc`, Rust 1.97.1 |
 | Cargo.lock SHA-256 | `38315c57cbfb563d37de95c778d52562ac3798f58224fc2517617e9289e7a859` |
 | Fixture/scope | `g13_headless` mock and loopback; M2 fresh `FakeProvider` per attempt; PTY temporary projects, no paid/live API or user install |
 | StorePort decision | `impl StorePort for SqliteStore` already exists in `crates/harness-store-sqlite/src/store/port.rs`; port is used, so no ADR-N12 removal |
@@ -25,18 +25,21 @@
 | `cargo test -p harness-cli --test g13_headless --locked` | 6/6 passed |
 | `cargo test -p harness-cli --test interactive_launch --locked i03` | 5/5 passed |
 | `cargo test -p harness-cli --test milestone_m3 --locked` | 20/20 passed after preserving legacy headless goal-stop exit behavior |
-| `cargo test -p harness-cli --test milestone_m2 --locked -- --test-threads=1` | First run 10/10; required ten consecutive runs pending |
+| `cargo test -p harness-cli --test milestone_m2 --locked -- --test-threads=1` | Ten consecutive runs, each 10/10; logs `target/verification-cpe/m2-1.log` through `m2-10.log` |
 | `cargo test -p harness-cli --test milestone_m6 --locked g10_mcp_tool_goes_through_the_dispatcher_and_the_approval_gate -- --exact` | 1/1 passed; A23's approved/denied dispatcher walk remains intact |
 | `cargo test -p harness-cli --bin ha --locked interactive::controller::tests::k01_inline_key_uses_the_full_remainder_and_is_not_recallable -- --exact` | 1/1 passed, including leading/trailing spaces |
 | `Verify-HaLaunch.ps1 -SelfTest` | `GATE_SELFTEST_OK` after eight G selectors and unit-agent step |
 | `Verify-Docs.ps1 -SelfTest` | `DOCS_OK`; 174 Markdown files, 15 language pairs, 12 named negative controls |
+| `cargo test -p harness-tools --lib --locked -- --test-threads=1` | 20/20 passed after the ACL fixture preflight and deterministic `PermissionDenied` mapping test |
+| `Verify-Milestone.ps1 -Milestone M6 -Json` | `passed`; source digest `sha256:13cfc509eb654436e0f030e97e3a97f0be80bf5a8e10f56ded6ac4659822ee55`, 13 required / 15 discovered; workspace, format, Clippy, build, 45 allowlist edges, and M0–M5 closure passed |
 | PTY full run 1 | 18/25; new fixture races and old i13/i14/t01 instability recorded in `target/pty-acceptance-cpe/pty-all.*` |
 | PTY full run 2 | 21/25; g06 loopback, g08 premature approval input, i01 trailing terminal escape, t_more frame assertion; `target/pty-acceptance-cpe2/pty-all.*` |
 | PTY run 3 | Linker exit 1140 before tests because C: had ~54 MiB free. Recursive cache delete was rejected by automatic approval review; `cargo clean -p harness-cli` completed, removing 196598 generated files (148.7 GiB). This did not touch source, user config or runtime databases. |
+| PTY full final | 25/25 passed in 37.75 s; caller emitted `PTY_EXIT: 0`; transcript `target/pty-acceptance-cpe-final/pty-all.txt`, SHA-256 `EB8AA719D7F2E16BA9E363EE309360F62FB10C4977855057D17268C673222C03` |
 
 **Negative controls / Đối chứng âm:** G13 stdin literal dash/overflow and no ANSI, exit 3 for question, M3 legacy compatibility, M6 MCP denied path with no server log; docs self-test deliberately rejects missing translation/link/case and other invalid inputs. Historical `a5ac2e2` compile failure is a separate negative control, not an H gate result.
 
-**Not run / Chưa chạy:** paid/live smoke, clean VM, user PATH/install, acceptance registry promotion; `cargo audit`/`cargo deny` absent from PATH and no pinned install/version is recorded in this SPEC, so conditional CI checks are not run. CI Ubuntu Linux evidence is pending; platform must be labelled `linux via CI` only after a green run id. Source digest, final gate logs and PTY transcript hashes will be recorded after CP-E verification, not invented here.
+**Not run / Chưa chạy:** final H rerun on the ACL-fixture revision; paid/live smoke, clean VM, user PATH/install, acceptance registry promotion; `cargo audit`/`cargo deny` absent from PATH and no pinned install/version is recorded in this SPEC, so conditional CI checks are not run. Rust CI run `36017440342` for `aad8960` was queued when observed; Linux evidence remains pending and must be labelled `linux via CI` only after a green run id.
 
 ---
 
