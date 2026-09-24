@@ -9,10 +9,16 @@
 //!
 //! | Variable | Default | What it bounds |
 //! | --- | --- | --- |
-//! | `HA_TURN_MAX_STEPS` | 8 | Model calls in one turn. |
-//! | `HA_TURN_MAX_TOOL_CALLS` | 16 | Tool calls in one turn. |
-//! | `HA_TURN_DEADLINE_SECONDS` | 600 | Wall-clock seconds in one turn. |
-//! | `HA_TURN_CONTINUATIONS` | 4 | Turns the app may continue on its own after a step or tool-call bound. |
+//! | `HA_TURN_MAX_STEPS` | 30 | Model calls in one turn. |
+//! | `HA_TURN_MAX_TOOL_CALLS` | 80 | Tool calls in one turn. |
+//! | `HA_TURN_DEADLINE_SECONDS` | 900 | Wall-clock seconds in one turn. |
+//! | `HA_TURN_CONTINUATIONS` | 2 | Turns the app may continue on its own after a step or tool-call bound. |
+//!
+//! The app's defaults are its own, not the driver's. The driver keeps 8 steps and 16
+//! tool calls as the conservative bound for callers that name none; the app used the
+//! same numbers, and measured in real use a turn that only had to read a repository
+//! and describe it paused at "step limit reached" before it answered - eight model
+//! calls is less than one orientation pass over a project.
 //!
 //! Only a positive integer counts for the three bounds. Anything else keeps the
 //! default, because a misspelled value must not silently remove the bound that keeps an
@@ -37,11 +43,20 @@ pub const DEADLINE_VARIABLE: &str = "HA_TURN_DEADLINE_SECONDS";
 /// Turns the app may continue by itself after a step or tool-call bound.
 pub const CONTINUATIONS_VARIABLE: &str = "HA_TURN_CONTINUATIONS";
 
+/// Model calls one turn of the app may make before it pauses.
+pub const DEFAULT_MAX_STEPS: u32 = 30;
+
+/// Tool calls one turn of the app may make before it pauses.
+pub const DEFAULT_MAX_TOOL_CALLS: u32 = 80;
+
+/// Wall-clock seconds one turn of the app may take before it pauses.
+pub const DEFAULT_DEADLINE_SECONDS: u32 = 900;
+
 /// How many times one request is continued automatically.
 ///
-/// Four continuations of the default eight steps is thirty-two model calls: enough for
-/// real agentic work, still bounded, and the pause after them is a real pause.
-pub const DEFAULT_CONTINUATIONS: u32 = 4;
+/// Two continuations of thirty steps is ninety model calls: enough for real agentic
+/// work, still bounded, and the pause after them is a real pause.
+pub const DEFAULT_CONTINUATIONS: u32 = 2;
 
 /// A positive integer, or the default when the value is absent or unusable.
 ///
@@ -68,25 +83,24 @@ fn count(value: Option<&str>, fallback: u32) -> u32 {
 /// The bounds one turn runs under, as the environment asks for them.
 #[must_use]
 pub fn limits_from_environment(environment: &LaunchEnvironment) -> TurnLimits {
-    let defaults = TurnLimits::default();
     let deadline_seconds = positive(
         environment
             .value(DEADLINE_VARIABLE)
             .and_then(|value| value.to_str()),
-        defaults.deadline.as_secs().try_into().unwrap_or(u32::MAX),
+        DEFAULT_DEADLINE_SECONDS,
     );
     TurnLimits {
         max_steps: positive(
             environment
                 .value(MAX_STEPS_VARIABLE)
                 .and_then(|value| value.to_str()),
-            defaults.max_steps,
+            DEFAULT_MAX_STEPS,
         ),
         max_tool_calls: positive(
             environment
                 .value(MAX_TOOL_CALLS_VARIABLE)
                 .and_then(|value| value.to_str()),
-            defaults.max_tool_calls,
+            DEFAULT_MAX_TOOL_CALLS,
         ),
         deadline: Duration::from_secs(u64::from(deadline_seconds)),
     }
@@ -134,9 +148,9 @@ mod tests {
     #[test]
     fn the_defaults_are_the_documented_ones() {
         let limits = limits_from_environment(&environment(&[]));
-        assert_eq!(limits.max_steps, 8);
-        assert_eq!(limits.max_tool_calls, 16);
-        assert_eq!(limits.deadline.as_secs(), 600);
+        assert_eq!(limits.max_steps, 30);
+        assert_eq!(limits.max_tool_calls, 80);
+        assert_eq!(limits.deadline.as_secs(), 900);
         assert_eq!(
             continuations_from_environment(&environment(&[])),
             DEFAULT_CONTINUATIONS
@@ -168,11 +182,11 @@ mod tests {
                 (MAX_TOOL_CALLS_VARIABLE, value),
                 (DEADLINE_VARIABLE, value),
             ]));
-            assert_eq!(limits.max_steps, 8, "HA_TURN_MAX_STEPS={value}");
-            assert_eq!(limits.max_tool_calls, 16, "HA_TURN_MAX_TOOL_CALLS={value}");
+            assert_eq!(limits.max_steps, 30, "HA_TURN_MAX_STEPS={value}");
+            assert_eq!(limits.max_tool_calls, 80, "HA_TURN_MAX_TOOL_CALLS={value}");
             assert_eq!(
                 limits.deadline.as_secs(),
-                600,
+                900,
                 "{DEADLINE_VARIABLE}={value}"
             );
         }
@@ -202,10 +216,10 @@ mod tests {
     #[test]
     fn the_status_line_names_every_bound() {
         let limits = limits_from_environment(&environment(&[]));
-        let line = describe(&limits, 4);
-        assert!(line.contains("8 steps"), "{line}");
-        assert!(line.contains("16 tool calls"), "{line}");
-        assert!(line.contains("600 s"), "{line}");
-        assert!(line.contains("4 automatic continuation"), "{line}");
+        let line = describe(&limits, 2);
+        assert!(line.contains("30 steps"), "{line}");
+        assert!(line.contains("80 tool calls"), "{line}");
+        assert!(line.contains("900 s"), "{line}");
+        assert!(line.contains("2 automatic continuation"), "{line}");
     }
 }

@@ -10,6 +10,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'GateTestIsolation.ps1')
 
 function New-GateError {
     param(
@@ -309,7 +310,13 @@ try {
         # the M9 milestone gate runs this case explicitly after preparing it.
         @{ Name = 'workspace-tests'; File = 'cargo'; Arguments = @('test', '--workspace', '--all-targets', '--locked', '--', '--skip', 'm9_04_release_candidate_has_checksums_and_is_not_published') }
     )) {
-        $result = Invoke-CheckedCommand -Name $step.Name -FilePath $step.File -Arguments $step.Arguments
+        # The broad suite re-runs a failure alone before calling it one; see
+        # GateTestIsolation.ps1 for why and for what still fails the gate.
+        $result = if ($step.Name -ceq 'workspace-tests') {
+            Invoke-WorkspaceTestsIsolating -Name $step.Name -Arguments $step.Arguments
+        } else {
+            Invoke-CheckedCommand -Name $step.Name -FilePath $step.File -Arguments $step.Arguments
+        }
         $results.Add([pscustomobject]@{ name = $step.Name; result = 'passed' })
         if (-not $Json) { Write-Output "GATE_STEP_OK: $($step.Name)" }
     }

@@ -247,6 +247,27 @@ function Get-CopyFailureKind {
     return 'other'
 }
 
+# A sharing violation right after a file was written is usually not another `ha`:
+# an antivirus scanner (Windows Defender on CI runners, measured 24/09/2026 in
+# `m9_04_install_smoke_preserves_existing_data`) holds the new file for a moment.
+# A short, bounded retry absorbs that; a binary that really is running keeps
+# failing and is reported as `in_use` exactly as before.
+function Invoke-FileStepWithRetry {
+    param([scriptblock] $Step, [int] $Attempts = 6)
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            & $Step
+            return
+        }
+        catch {
+            if ($attempt -ge $Attempts -or (Get-CopyFailureKind -Exception $_.Exception) -ne 'in_use') {
+                throw
+            }
+            Start-Sleep -Milliseconds (250 * $attempt)
+        }
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Install flow
 # ---------------------------------------------------------------------------
@@ -467,7 +488,7 @@ function Install-VerifiedBinary {
     Remove-Item -LiteralPath $stagingBinary -Force -ErrorAction SilentlyContinue
 
     try {
-        Copy-Item -LiteralPath $SourceBinary -Destination $stagingBinary -Force
+        Invoke-FileStepWithRetry { Copy-Item -LiteralPath $SourceBinary -Destination $stagingBinary -Force }
     }
     catch {
         return [pscustomobject]@{
@@ -523,7 +544,7 @@ function Install-VerifiedBinary {
             }
         }
         try {
-            Move-Item -LiteralPath $TargetBinary -Destination $backupBinary -Force
+            Invoke-FileStepWithRetry { Move-Item -LiteralPath $TargetBinary -Destination $backupBinary -Force }
         }
         catch {
             Remove-Item -LiteralPath $stagingBinary -Force -ErrorAction SilentlyContinue
@@ -535,7 +556,7 @@ function Install-VerifiedBinary {
         }
     }
     try {
-        Move-Item -LiteralPath $stagingBinary -Destination $TargetBinary -Force
+        Invoke-FileStepWithRetry { Move-Item -LiteralPath $stagingBinary -Destination $TargetBinary -Force }
     }
     catch {
         if ($hadExisting) {

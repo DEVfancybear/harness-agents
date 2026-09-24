@@ -228,6 +228,9 @@ async fn run_and_read(
     Ok(format!("{} {}", observation.stdout, observation.stderr))
 }
 
+// Only the Windows probes read tagged output; on other hosts it has no caller, and
+// the CI clippy gate (`-D warnings`) failed the Linux job on the dead code.
+#[cfg(windows)]
 fn extract_between(text: &str, start: &str, end: &str) -> Option<String> {
     let (_, rest) = text.split_once(start)?;
     let (value, _) = rest.split_once(end)?;

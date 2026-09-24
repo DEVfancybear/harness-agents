@@ -689,9 +689,12 @@ pub fn release_matrix(retrieval_p95_ms: Option<u64>, restore_ms: Option<u64>) ->
                 os: "linux".to_owned(),
                 target_triple: "x86_64-unknown-linux-gnu".to_owned(),
                 toolchain: "1.97.1".to_owned(),
-                status: PlatformStatus::Verified,
+                // Linux support is pending: the ubuntu-latest CI job still runs, for
+                // visibility, but it does not gate a push, so a green Windows run is
+                // not a Linux claim.
+                status: PlatformStatus::Unverified,
                 evidence:
-                    "P0-P7 gates run in the GitHub Actions ubuntu-latest job recorded in the evidence"
+                    "support pending: the ubuntu-latest CI job runs for visibility and does not gate a release"
                         .to_owned(),
             },
         ],

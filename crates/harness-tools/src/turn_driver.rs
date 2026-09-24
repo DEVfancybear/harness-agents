@@ -1497,8 +1497,37 @@ fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
 }
 
 /// Short, non-secret summary of the requested arguments for the transcript.
+///
+/// A JSON object is shown as `key=value` pairs - `list_files path=.`,
+/// `search_text query=parser path=src` - instead of the raw `{"path": "."}` the card
+/// used to carry, which made every row of a read-heavy turn look like a protocol dump.
+/// Long values (file contents, patches) are cut, and anything that is not an object is
+/// shown as it came.
 fn summarize_arguments(arguments: &str) -> String {
-    truncate_text(&arguments.replace(['\n', '\r'], " "), 160)
+    const VALUE_CHARS: usize = 60;
+    let summary = match serde_json::from_str::<Value>(arguments) {
+        Ok(Value::Object(fields)) => fields
+            .iter()
+            .filter(|(_, value)| !value.is_null())
+            .map(|(key, value)| {
+                let value = match value {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                let value = value.replace(['\n', '\r'], " ");
+                let value = if value.chars().count() > VALUE_CHARS {
+                    let cut = value.chars().take(VALUE_CHARS).collect::<String>();
+                    format!("{cut}…")
+                } else {
+                    value
+                };
+                format!("{key}={value}")
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => arguments.replace(['\n', '\r'], " "),
+    };
+    truncate_text(&summary, 160)
 }
 
 /// A stable signature of one requested tool call.

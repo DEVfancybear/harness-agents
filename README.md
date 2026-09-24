@@ -1,87 +1,187 @@
 # Harness Agents
 
-**A coding agent that can pick up where it left off.** / **Coding agent có thể tiếp tục công việc đang dang dở.**
+**A local coding agent that remembers what it did and picks up where it left off.** / **Coding agent chạy trên máy, nhớ việc đã làm và tiếp tục đúng chỗ đã dừng.**
 
-Harness Agents is a coding-agent project written in Rust and designed to run locally. Its single `ha` CLI brings conversations, coding tools, durable sessions, memory, and delegated tasks into one workflow. The goal is simple: make development with an agent easier to continue, inspect, and control.
-
-Harness Agents là dự án coding agent chạy ưu tiên trên máy cá nhân, được viết bằng Rust. Một CLI `ha` kết hợp hội thoại, công cụ lập trình, phiên làm việc bền vững, bộ nhớ và giao việc cho agent khác trong cùng một quy trình. Mục tiêu của dự án là giúp việc phát triển cùng agent dễ tiếp tục, dễ kiểm tra và dễ kiểm soát hơn.
+`ha` is a coding agent written in Rust. It runs in your terminal against your project, calls a model provider (DeepSeek by default), reads and edits code through approval-gated tools, and keeps every conversation, tool result and learned fact in a local SQLite store, so a session can be resumed, inspected or continued later.
 
 **Language / Ngôn ngữ:** [English](#english) · [Tiếng Việt](#tiếng-việt)
 
 ## English
 
-### The idea
+### What it does
 
-Coding work rarely fits into one prompt. A useful agent needs to remember the task, show what it actually did, and recover when a session stops midway. Harness Agents treats those needs as part of the product: work is recorded as it happens, decisions stay visible, and a new session can continue from durable state.
+- **Chat in the terminal.** `ha` opens an interactive app (TUI, or plain line mode). `ha exec "…"` runs one prompt for scripts and CI, with `text`, `json` or `stream-json` output.
+- **Works on your code with guarded tools.** Read, search, glob, patch/edit/write files, run processes and shell commands, inspect Git, ask you a question, delegate to a sub-agent. Every action goes through the host policy: `y` runs once, `a` allows the rest of the turn, `n` refuses; `/mode` sets `ask`, `auto-edit` or `full-auto`.
+- **Resumes conversations.** `/resume` lists your conversations (one row each) and replays the chosen one's questions and answers to the model and on screen.
+- **Learns from the conversation.** Memory is on by default: after a turn, the model extracts durable facts (preferences, decisions, conventions, corrections) in the background; facts with confidence ≥ 0.7 are used from then on, the rest wait for review in `ha memory candidates`. Say "remember that …" / "ghi nhớ …" to store something verbatim.
+- **Extends.** Built-in and project skills (`/skills`, `/skill:<name>`), MCP servers (`ha mcp add`), prompt templates, hooks, and a local web surface (`ha web`).
 
-### What you can do
+### Platform status
 
-- **Work in the terminal.** Start `ha` for an interactive coding session, or run a bounded turn in headless mode for scripts and automation.
-- **Keep your place.** Resume sessions with persisted history, checkpoints, and structured working context.
-- **Use tools deliberately.** Coding actions go through host-controlled permissions, approvals, and execution records.
-- **Reuse useful context.** Search scoped memory and keep reusable knowledge separate from the record of what happened.
-- **Delegate work.** Split tasks across agents and bring their results back through a checked integration path.
-- **Grow the workflow.** Add local skills and MCP integrations; use the local Web surface and operational commands where they fit.
+| Platform | Status |
+| --- | --- |
+| Windows 10/11 x64 | Supported; all CI gates run here |
+| Linux | **Pending support.** It builds and its CI job runs for visibility, but it is not a supported platform yet and does not block CI |
+| macOS | Not tested |
 
-The project favors durable state, explicit limits, and evidence from actual execution. Its Rust CLI is the primary experience; the Web surface and broader agent experience are still evolving.
+### Quick start (Windows, PowerShell 7)
 
-### Try it locally
+Prerequisites: [Rust](https://rustup.rs) (the toolchain in [`rust-toolchain.toml`](rust-toolchain.toml) is installed automatically), Git, and PowerShell 7 (`pwsh`).
 
-Install the Rust toolchain specified by [`rust-toolchain.toml`](rust-toolchain.toml), then run these commands in PowerShell on Windows:
+```powershell
+git clone https://github.com/DEVfancybear/harness-agents.git
+cd harness-agents
+pwsh -NoProfile -File scripts/Install-Ha.ps1        # release build, installed to %USERPROFILE%\.cargo\bin
+ha --version
+$env:DEEPSEEK_API_KEY = "sk-..."                     # or type /key inside the app
+ha                                                   # open the app in the current project
+```
+
+**Updating:** pull, then run `scripts/Install-Ha.ps1` again. Building with `cargo build --release` alone does **not** update the `ha` you type: that command runs the copy in `.cargo\bin`. If the app behaves like an older version, check which binary runs:
+
+```powershell
+Get-Command ha -All | Select-Object Source
+```
+
+To try the interface without a provider or a key: `ha chat --fixture`, or `ha exec --mock "hello" --output-format json`.
+
+Building a release package (checksums, manifest) is described in [docs/BUILD_AND_RELEASE.md](docs/BUILD_AND_RELEASE.md).
+
+### Everyday use
+
+| You want to | Type |
+| --- | --- |
+| See every command | `/help` (grouped card), `/help all` (full table), or `/` to open the menu |
+| Continue an earlier conversation | `/resume`, then pick one |
+| Start over | `/new` |
+| Attach a file or image | `@` (file picker), `/attach <path>`, `/image` |
+| Run a shell command | `!command` (goes through approval) |
+| Correct a running turn | `/steer <text>` |
+| Shrink a long conversation | `/compact [what to keep]` |
+| See cost, context, permissions | `/cost`, `/context`, `/permissions` |
+
+Keys: Enter sends, Ctrl-J or Alt+Enter adds a line, ↑↓ recall history or move in a menu, Esc closes a panel, Ctrl-C cancels a run, Ctrl-D on an empty line exits.
+
+### Configuration
+
+Settings merge default → user `config.toml` → trusted project `.harness/config.toml` → environment → command line; `/config` shows where each value came from. The most used environment variables:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DEEPSEEK_API_KEY` | — | Provider key (also settable with `/key`, stored in the credentials file) |
+| `HA_PROVIDER_ENDPOINT` | `https://api.deepseek.com/chat/completions` | Any OpenAI-compatible chat endpoint |
+| `HA_PROVIDER_MODEL` | `deepseek-flash` | Model name |
+| `HA_MEMORY` | on | `off` (or `0`, `false`, `no`) disables memory |
+| `HA_TURN_MAX_STEPS` / `HA_TURN_MAX_TOOL_CALLS` | 30 / 80 | Model calls and tool calls per turn before it pauses |
+| `HA_TURN_DEADLINE_SECONDS` / `HA_TURN_CONTINUATIONS` | 900 / 2 | Time per turn; automatic continuations after a bound |
+| `HA_UI` | auto | `plain` forces line mode |
+
+### Development
 
 ```powershell
 cargo build -p harness-cli --bin ha --locked
-.\target\debug\ha.exe --version
-.\target\debug\ha.exe chat --headless --mock --prompt "Hello" --json
-.\target\debug\ha.exe chat --fixture
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+pwsh -NoProfile -File scripts/Verify-Docs.ps1
 ```
 
-The last two commands use deterministic local fixtures, so you can explore the interface without configuring a model provider. For installation, provider setup, and everyday commands, see the [operator guide](docs/OPERATOR_GUIDE.en.md).
+CI (`.github/workflows/ci.yml`) runs the phase gates (`scripts/Verify-Phase.ps1`) and milestone gates (`scripts/Verify-Milestone.ps1`) on Windows. A test that fails in the crowded full-suite run is re-run alone before the gate fails; the log names it with `GATE_TEST_FAILED` / `GATE_TEST_RETRIED`.
 
-The `ha` executable includes the 18 skills in `.agents/skills`, including their supporting scripts and references. In a normal chat, `/skills` lists them as `builtin`; `/skill:<name>` activates one. The agent can also call `list_skills` and `activate_skill` when a task matches. Skill bodies load on activation, while skills supplied by another project still follow that project's trust setting. The executable prepares its bundled files in the user's configuration directory on first use.
+### Documentation
 
-### Where the project stands
-
-Harness Agents is under active development. M0–M6 milestone gates passed in their recorded Windows evidence; the G13–G14 headless, platform and documentation work is being verified for CP-E. Linux verification requires a green Ubuntu CI run and is not claimed from a Windows run. Full strict isolation is unavailable on the measured Windows backend, so `ha` refuses requests that require it. The [HA_AGENT handoff](docs/handoffs/HA_AGENT.vi.md) records the current assignment and remaining gates; the [product plan](docs/HA_AGENT_PLAN.vi.md) defines its scope.
+- [Operator guide](docs/OPERATOR_GUIDE.en.md) — installing, configuring and running `ha`
+- [Build and release](docs/BUILD_AND_RELEASE.md) — building, installing and packaging a release candidate
+- [Memory and continuity](docs/MEMORY_AND_CONTINUITY.en.md) — how sessions resume and what memory keeps (sections 19–21 describe the current behaviour)
+- [Architecture review](docs/ARCHITECTURE_REVIEW.en.md) · [Plugin architecture](docs/PLUGIN_ARCHITECTURE.en.md) · [Rust harness plan](docs/RUST_HARNESS_PLAN.en.md)
 
 ## Tiếng Việt
 
-### Ý tưởng
+### `ha` làm được gì
 
-Công việc lập trình hiếm khi gói gọn trong một prompt. Một agent hữu ích cần nhớ tác vụ, cho thấy nó đã thực sự làm gì và phục hồi khi phiên làm việc dừng giữa chừng. Harness Agents coi đó là chức năng cốt lõi: công việc được ghi lại trong lúc thực hiện, các quyết định có thể kiểm tra và phiên mới có thể tiếp tục từ trạng thái đã lưu.
+- **Chat trong terminal.** `ha` mở ứng dụng tương tác (TUI, hoặc chế độ dòng lệnh thuần). `ha exec "…"` chạy một prompt cho script và CI, xuất `text`, `json` hoặc `stream-json`.
+- **Làm việc với code qua công cụ có kiểm soát.** Đọc, tìm kiếm, glob, sửa/ghi file, chạy tiến trình và lệnh shell, xem Git, hỏi lại bạn, giao việc cho agent con. Mọi thao tác đi qua chính sách của host: `y` chạy một lần, `a` cho phép đến hết lượt, `n` từ chối; `/mode` chọn `ask`, `auto-edit` hoặc `full-auto`.
+- **Tiếp tục hội thoại.** `/resume` liệt kê các hội thoại (mỗi hội thoại một dòng) và phát lại các câu hỏi, câu trả lời của hội thoại được chọn cho model và trên màn hình.
+- **Học từ hội thoại.** Memory mặc định bật: sau mỗi lượt, model trích ra ở chế độ nền các fact bền (sở thích, quyết định, quy ước, chỉnh sửa); fact có confidence ≥ 0.7 được dùng từ đó, phần còn lại chờ duyệt trong `ha memory candidates`. Nói "ghi nhớ …" / "remember that …" để lưu nguyên văn.
+- **Mở rộng.** Skill tích hợp và skill của project (`/skills`, `/skill:<name>`), MCP server (`ha mcp add`), prompt template, hook, và giao diện web cục bộ (`ha web`).
 
-### Bạn có thể làm gì
+### Nền tảng
 
-- **Làm việc trong terminal.** Mở `ha` để dùng giao diện tương tác, hoặc chạy một lượt có giới hạn ở chế độ headless cho script và tự động hóa.
-- **Tiếp tục đúng chỗ.** Khôi phục phiên từ lịch sử, checkpoint và ngữ cảnh làm việc có cấu trúc.
-- **Dùng công cụ có chủ đích.** Các thao tác lập trình đi qua quyền hạn, bước phê duyệt và bản ghi thực thi do host kiểm soát.
-- **Tái sử dụng ngữ cảnh hữu ích.** Tìm kiếm memory theo phạm vi, tách tri thức dùng lại khỏi bản ghi những gì đã xảy ra.
-- **Giao việc cho agent khác.** Chia tác vụ và đưa kết quả trở lại qua bước kiểm tra tích hợp.
-- **Mở rộng quy trình.** Thêm skill cục bộ và tích hợp MCP; sử dụng giao diện Web cục bộ cùng các lệnh vận hành khi cần.
+| Nền tảng | Trạng thái |
+| --- | --- |
+| Windows 10/11 x64 | Hỗ trợ; mọi gate CI chạy trên Windows |
+| Linux | **Đang chờ hỗ trợ.** Vẫn build được và job CI vẫn chạy để theo dõi, nhưng chưa phải nền tảng được hỗ trợ và không chặn CI |
+| macOS | Chưa kiểm thử |
 
-Dự án ưu tiên trạng thái bền vững, giới hạn tường minh và bằng chứng từ việc thực thi thật. CLI viết bằng Rust là trải nghiệm chính; giao diện Web và trải nghiệm agent đầy đủ hơn đang tiếp tục phát triển.
+### Bắt đầu nhanh (Windows, PowerShell 7)
 
-### Chạy thử trên máy
+Cần có: [Rust](https://rustup.rs) (toolchain trong [`rust-toolchain.toml`](rust-toolchain.toml) được cài tự động), Git và PowerShell 7 (`pwsh`).
 
-Cài Rust toolchain được chỉ định trong [`rust-toolchain.toml`](rust-toolchain.toml), rồi chạy các lệnh sau bằng PowerShell trên Windows:
+```powershell
+git clone https://github.com/DEVfancybear/harness-agents.git
+cd harness-agents
+pwsh -NoProfile -File scripts/Install-Ha.ps1        # build release, cài vào %USERPROFILE%\.cargo\bin
+ha --version
+$env:DEEPSEEK_API_KEY = "sk-..."                     # hoặc gõ /key trong app
+ha                                                   # mở app trong project hiện tại
+```
+
+**Cập nhật:** `git pull` rồi chạy lại `scripts/Install-Ha.ps1`. Chỉ chạy `cargo build --release` thì **không** cập nhật lệnh `ha` bạn gõ, vì lệnh đó chạy bản trong `.cargo\bin`. Nếu app vẫn chạy như bản cũ, kiểm tra xem đang chạy file nào:
+
+```powershell
+Get-Command ha -All | Select-Object Source
+```
+
+Thử giao diện mà không cần provider hay key: `ha chat --fixture`, hoặc `ha exec --mock "hello" --output-format json`.
+
+Cách build gói release (checksum, manifest) nằm trong [docs/BUILD_AND_RELEASE.md](docs/BUILD_AND_RELEASE.md).
+
+### Dùng hằng ngày
+
+| Bạn muốn | Gõ |
+| --- | --- |
+| Xem mọi lệnh | `/help` (bảng gọn theo nhóm), `/help all` (bảng đầy đủ), hoặc `/` để mở menu |
+| Tiếp tục hội thoại cũ | `/resume` rồi chọn |
+| Bắt đầu lại | `/new` |
+| Đính kèm file hoặc ảnh | `@` (chọn file), `/attach <path>`, `/image` |
+| Chạy lệnh shell | `!command` (đi qua bước phê duyệt) |
+| Chỉnh hướng một lượt đang chạy | `/steer <text>` |
+| Rút gọn hội thoại dài | `/compact [điều cần giữ]` |
+| Xem chi phí, context, quyền | `/cost`, `/context`, `/permissions` |
+
+Phím: Enter gửi, Ctrl-J hoặc Alt+Enter xuống dòng, ↑↓ gọi lại lịch sử hoặc di chuyển trong menu, Esc đóng panel, Ctrl-C hủy lượt đang chạy, Ctrl-D trên dòng trống để thoát.
+
+### Cấu hình
+
+Cấu hình được gộp theo thứ tự mặc định → `config.toml` của người dùng → `.harness/config.toml` của project đã trust → biến môi trường → dòng lệnh; `/config` cho biết mỗi giá trị đến từ đâu. Các biến môi trường hay dùng:
+
+| Biến | Mặc định | Ý nghĩa |
+| --- | --- | --- |
+| `DEEPSEEK_API_KEY` | — | Khóa provider (cũng đặt được bằng `/key`, lưu trong file credentials) |
+| `HA_PROVIDER_ENDPOINT` | `https://api.deepseek.com/chat/completions` | Bất kỳ endpoint chat tương thích OpenAI |
+| `HA_PROVIDER_MODEL` | `deepseek-flash` | Tên model |
+| `HA_MEMORY` | bật | `off` (hoặc `0`, `false`, `no`) để tắt memory |
+| `HA_TURN_MAX_STEPS` / `HA_TURN_MAX_TOOL_CALLS` | 30 / 80 | Số lời gọi model và tool mỗi lượt trước khi tạm dừng |
+| `HA_TURN_DEADLINE_SECONDS` / `HA_TURN_CONTINUATIONS` | 900 / 2 | Thời gian mỗi lượt; số lần tự tiếp tục sau khi chạm giới hạn |
+| `HA_UI` | tự động | `plain` để ép chế độ dòng lệnh |
+
+### Phát triển
 
 ```powershell
 cargo build -p harness-cli --bin ha --locked
-.\target\debug\ha.exe --version
-.\target\debug\ha.exe chat --headless --mock --prompt "Hello" --json
-.\target\debug\ha.exe chat --fixture
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+pwsh -NoProfile -File scripts/Verify-Docs.ps1
 ```
 
-Hai lệnh cuối dùng fixture cục bộ có kết quả xác định, nên bạn có thể thử giao diện mà chưa cần cấu hình model provider. Xem [hướng dẫn vận hành](docs/OPERATOR_GUIDE.vi.md) để cài đặt, cấu hình provider và sử dụng hằng ngày.
+CI (`.github/workflows/ci.yml`) chạy các gate phase (`scripts/Verify-Phase.ps1`) và milestone (`scripts/Verify-Milestone.ps1`) trên Windows. Test nào fail trong lượt chạy toàn bộ sẽ được chạy lại riêng trước khi gate báo đỏ; log ghi rõ bằng `GATE_TEST_FAILED` / `GATE_TEST_RETRIED`.
 
-File `ha.exe` tích hợp 18 skill trong `.agents/skills`, gồm cả script và tài liệu đi kèm. Trong chat thông thường, `/skills` liệt kê chúng với nguồn `builtin`; `/skill:<name>` kích hoạt một skill. Agent cũng có thể gọi `list_skills` và `activate_skill` khi tác vụ phù hợp. Nội dung skill chỉ được nạp lúc kích hoạt; skill do một project khác cung cấp vẫn theo thiết lập trust của project đó. Lần dùng đầu, ứng dụng chuẩn bị các tệp tích hợp trong thư mục cấu hình người dùng.
+### Tài liệu
 
-### Dự án đang ở đâu
-
-Harness Agents đang được phát triển tích cực. Các gate milestone M0–M6 đã xanh trong evidence Windows đã ghi; phần headless, nền tảng và tài liệu G13–G14 đang được kiểm chứng cho CP-E. Chỉ công nhận Linux khi job CI Ubuntu xanh, không suy ra từ lượt chạy Windows. Backend Windows đã đo chưa hỗ trợ cách ly strict đầy đủ, nên `ha` từ chối yêu cầu cần chế độ này. [Handoff HA_AGENT](docs/handoffs/HA_AGENT.vi.md) ghi assignment và gate còn lại; [kế hoạch sản phẩm](docs/HA_AGENT_PLAN.vi.md) xác định phạm vi.
+- [Hướng dẫn vận hành](docs/OPERATOR_GUIDE.vi.md) — cài đặt, cấu hình và chạy `ha`
+- [Build và release](docs/BUILD_AND_RELEASE.md) — build, cài đặt và đóng gói bản release
+- [Memory và tính liên tục](docs/MEMORY_AND_CONTINUITY.vi.md) — cách tiếp tục phiên và những gì memory giữ lại (mục 19–21 mô tả hành vi hiện tại)
+- [Đánh giá kiến trúc](docs/ARCHITECTURE_REVIEW.vi.md) · [Kiến trúc plugin](docs/PLUGIN_ARCHITECTURE.vi.md) · [Kế hoạch Rust harness](docs/RUST_HARNESS_PLAN.vi.md)
 
 ---
 
-**Built for work that continues. / Xây dựng cho công việc cần được tiếp nối.**
-
-Design references / Nguồn tham khảo thiết kế: [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness/tree/2377c272a8e839e0a84c9f0e623b867a1dce2014) · [TencentDB Agent Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory/tree/906b5823b5106eed8f842b62f16d23228838149a).
+Design references / Nguồn tham khảo thiết kế: [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness/tree/2377c272a8e839e0a84c9f0e623b867a1dce2014) · [TencentDB Agent Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory/tree/906b5823b5106eed8f842b62f16d23228838149a) · [pi](https://github.com/earendil-works/pi/tree/d5629e20489ccf770ed90b5a33941cb3b7ef24d0) · [deer-flow](https://github.com/bytedance/deer-flow/tree/29dbce45a12cffe4ce7c395dde6e4b913748596b).

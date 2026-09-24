@@ -23,8 +23,12 @@ phải một dịch vụ mạng.
 - **Không có server để kết nối.** Endpoint MCP từ xa và sandbox cấp hệ điều hành
   được công bố là không hỗ trợ trong ma trận phát hành; cô lập transport không
   phải là sandbox.
-- **Không có artifact phát hành nào được công bố.** Bản dựng Linux và Windows đều
-  được phase gate chạy, nhưng không có gì được đóng gói, ký hay phát hành.
+- **Không có artifact phát hành nào được công bố.** Bản dựng Windows được phase
+  gate chạy; `scripts/New-HaRelease.ps1` build một bản candidate cục bộ kèm
+  checksum ([BUILD_AND_RELEASE.md](BUILD_AND_RELEASE.md)), nhưng không có gì được ký
+  hay phát hành.
+- **Linux đang chờ hỗ trợ.** Job CI của Linux vẫn chạy để theo dõi nhưng không chặn
+  push; ma trận phát hành báo Linux là `unverified`.
 - **Thông tin xác thực provider không được kiểm chứng.** Các gate không gọi API
   mô hình trả phí, nên không có tuyên bố phát hành nào phụ thuộc vào nó.
 
@@ -404,7 +408,7 @@ ha exec "Continue the task" --continue --goal "Task complete" --max-turns 4 --ou
 
 ### 12.5. Giới hạn và kiểm tra
 
-`run_shell` dùng `pwsh` trên Windows và `powershell.exe` khi thiếu `pwsh`; receipt ghi shell được chọn. Strict isolation chỉ được báo khi backend đã đo hỗ trợ. `/status` và `/config` là điểm bắt đầu khi provider hoặc quyền không như dự kiến. Các gate M0–M6, H và PTY có evidence riêng; Linux chỉ được coi là đã kiểm khi job CI Ubuntu xanh.
+`run_shell` dùng `pwsh` trên Windows và `powershell.exe` khi thiếu `pwsh`; receipt ghi shell được chọn. Strict isolation chỉ được báo khi backend đã đo hỗ trợ. `/status` và `/config` là điểm bắt đầu khi provider hoặc quyền không như dự kiến. Một lượt tạm dừng sau 30 lời gọi model hoặc 80 tool call (`HA_TURN_MAX_STEPS`, `HA_TURN_MAX_TOOL_CALLS`) và được tự tiếp tục tối đa hai lần (`HA_TURN_CONTINUATIONS`). Nếu `ha` chạy như bản cũ, `Get-Command ha -All` cho biết file thực thi nào đang chạy; cài lại bằng `scripts/Install-Ha.ps1`. Các gate M0–M6, H và PTY có evidence riêng. Linux đang chờ hỗ trợ: job CI của Linux không chặn push, và không có tuyên bố nào về Linux được suy ra từ nó.
 
 ### 12.6. Memory và `/resume`
 

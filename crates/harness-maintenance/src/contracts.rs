@@ -270,7 +270,15 @@ impl ReleaseMatrix {
             return format!("not release-ready: {failing} platform(s) failing");
         }
         if unverified > 0 {
-            return format!("partially verified: {unverified} platform(s) unverified");
+            // Both facts are stated: an unverified platform must not hide that the
+            // benchmark targets were not measured either.
+            return if unmeasured > 0 {
+                format!(
+                    "partially verified: {unverified} platform(s) unverified; {unmeasured} benchmark(s) unmeasured"
+                )
+            } else {
+                format!("partially verified: {unverified} platform(s) unverified")
+            };
         }
         if unmeasured > 0 {
             return format!("verified on all platforms; {unmeasured} benchmark(s) unmeasured");

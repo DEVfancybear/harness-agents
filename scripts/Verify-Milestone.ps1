@@ -20,6 +20,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'GateTestIsolation.ps1')
 
 # Retry notices from the flake-tolerant step, forwarded to the log by its caller
 # so a green run still says whether it needed a retry.
@@ -599,58 +600,14 @@ try {
         @{ Name = 'workspace-tests'; File = 'cargo'; Arguments = @('test', '--workspace', '--all-targets', '--locked', '--', '--skip', 'm9_04_release_candidate_has_checksums_and_is_not_published') }
     )) {
         if ($step.Name -ceq 'workspace-tests') {
-            # The whole-workspace regression run is retried only for the exact host
-            # flake signatures; required milestone tests below stay single-shot.
-            #
-            # 23/09/2026 (M7): rerunning the whole workspace suite to absorb a
-            # per-test loopback refusal costs ~12 minutes and, measured on this
-            # host, can miss twice in a row (two retries of the full suite both
-            # hit the same refusal in `interactive_launch::i04`, while that test
-            # passed alone). When the tolerant run is exhausted, the failing
-            # integration tests are now identified from cargo's own output and
-            # re-run one at a time. A failure that is not the known transport
-            # signature never reaches this path: `Invoke-FlakeTolerantCommand`
-            # rethrows it at once, and the per-test retry below matches the same
-            # signature again, so an assertion failure cannot be retried away.
-            $tolerant = $null
-            $lastFailure = $null
-            $script:GateLastFailureOutput = @()
-            try {
-                $tolerant = Invoke-FlakeTolerantCommand -Name $step.Name -FilePath $step.File -Arguments $step.Arguments -MaxAttempts 2
-            } catch {
-                $lastFailure = $_.Exception.Message
-            } finally {
-                # Forwarded whether the step passed or gave up, so the log always
-                # says how many attempts a result cost.
-                Write-GateRetryNotices
-            }
-            if ($null -eq $tolerant) {
-                # The stream is used, not the formatted message: PowerShell's error
-                # rendering truncates a long failure and collapses its whitespace,
-                # and both of those hid the failing test names from this step.
-                $output = @($script:GateLastFailureOutput)
-                $dump = Join-Path $repoRoot 'target/verification/workspace-tests-failure.log'
-                [void] (New-Item -ItemType Directory -Path (Split-Path -Parent $dump) -Force)
-                Set-Content -LiteralPath $dump -Value $output -Encoding utf8
-                if ($null -eq (Get-FlakeSignature -Output $output)) { throw $lastFailure }
-                $failed = @(Get-FailedIntegrationTests -Output $output)
-                if ($failed.Count -eq 0) {
-                    throw (New-GateError -Code 'gate_configuration_error' -Message "workspace-tests hit the host flake but no failing integration test could be isolated; the captured output is at $dump`n$lastFailure")
-                }
-                foreach ($failure in $failed) {
-                    $isolated = $null
-                    try {
-                        $isolated = Invoke-FlakeTolerantCommand -Name "isolated-test:$($failure.Target)::$($failure.TestName)" -FilePath 'cargo' `
-                            -Arguments @('test', '-p', 'harness-cli', '--test', $failure.Target, '--locked', $failure.TestName, '--', '--exact') `
-                            -MaxAttempts 2
-                    } finally {
-                        Write-GateRetryNotices
-                    }
-                    Assert-RequiredTestResult -TestName $failure.TestName -Output $isolated.Command.Output
-                    Write-Output "GATE_STEP_RETRIED: workspace-tests tolerated $($failure.Target)::$($failure.TestName) alone after the suite hit the host flake"
-                }
-            } elseif ($tolerant.Attempts -gt 1) {
-                Write-Output "GATE_STEP_RETRIED: $($step.Name) needed $($tolerant.Attempts) attempts"
+            # 24/09/2026: the transport-signature retry above absorbed only
+            # loopback refusals, and the CI suite went red for 30 pushes on other
+            # load failures that pass alone. Every failure is now re-run by itself
+            # first; see GateTestIsolation.ps1. A test that also fails alone still
+            # fails the gate, with its own output.
+            $isolated = Invoke-WorkspaceTestsIsolating -Name $step.Name -Arguments $step.Arguments
+            foreach ($label in $isolated.Retried) {
+                Write-Output "GATE_STEP_RETRIED: workspace-tests tolerated $label alone after the full run failed it"
             }
         } else {
             [void] (Invoke-CheckedCommand -Name $step.Name -FilePath $step.File -Arguments $step.Arguments)

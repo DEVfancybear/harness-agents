@@ -171,6 +171,8 @@ pub struct InteractiveController {
     plain: bool,
     /// The tool card that is still open, so it settles in place.
     open_tool: Option<(String, String)>,
+    /// Why the next tool runs without a panel, shown on its card in the TUI.
+    pending_allowance: Option<String>,
     // Progress accounting for the status bar.
     steps: u32,
     tool_calls: u32,
@@ -233,6 +235,7 @@ impl InteractiveController {
             file_picker_candidates: Vec::new(),
             plain,
             open_tool: None,
+            pending_allowance: None,
             steps: 0,
             tool_calls: 0,
             bounds,
@@ -742,6 +745,15 @@ impl InteractiveController {
                 } else {
                     ToolState::Failed { elapsed, detail }
                 };
+                let summary = if self.plain {
+                    String::new()
+                } else {
+                    match self.pending_allowance.take() {
+                        Some(reason) if summary.is_empty() => reason,
+                        Some(reason) => format!("{summary} · {reason}"),
+                        None => summary,
+                    }
+                };
                 self.push_history(
                     effects,
                     HistoryItem::Tool {
@@ -750,7 +762,7 @@ impl InteractiveController {
                         // region into scrollback. Plain mode already printed the
                         // summary on the Started row, so its settled row remains
                         // byte-identical to H03.
-                        summary: if self.plain { String::new() } else { summary },
+                        summary,
                         state,
                     },
                 );
@@ -901,7 +913,21 @@ impl InteractiveController {
             }
             SessionEvent::Notice { message } => {
                 self.flush_stream(effects);
-                self.push_history(effects, HistoryItem::Notice { message });
+                // An action that ran without a panel is announced before it runs. In
+                // the TUI that was one `[info] allowed by ...` row above every tool
+                // card - half the transcript of a read-heavy turn. The reason now rides
+                // on the card it belongs to; the plain transcript keeps the row, since
+                // it is a log.
+                if !self.plain && message.starts_with("allowed by ") {
+                    let reason = message
+                        .split_once(':')
+                        .map_or(message.as_str(), |(reason, _)| reason)
+                        .trim()
+                        .to_owned();
+                    self.pending_allowance = Some(reason);
+                } else {
+                    self.push_history(effects, HistoryItem::Notice { message });
+                }
             }
             SessionEvent::Bell => effects.push(Effect::Bell),
             SessionEvent::ShellPrefixCompleted {
@@ -1358,7 +1384,12 @@ impl InteractiveController {
                 return effects;
             }
             "/help" => {
-                self.reference("/help", view::help_lines(), &mut effects);
+                let lines = if self.plain || argument == Some("all") {
+                    view::help_lines()
+                } else {
+                    view::help_card_lines()
+                };
+                self.reference("/help", lines, &mut effects);
             }
             "/image" => {
                 self.paste_image(&mut effects);
@@ -3818,6 +3849,90 @@ mod tests {
             ),
             "the second Enter ran the completed command: {:?}",
             harness.controller.ui_state().modal
+        );
+    }
+
+    /// Measured: `/help` opened on seven of thirty-three commands and "còn 26 dòng",
+    /// because the inline viewport gives a panel about eight rows. The TUI card names
+    /// every command in its group and fits; `/help all` still opens the full table.
+    #[test]
+    fn help_in_the_tui_is_a_card_that_fits_and_all_opens_the_table() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "/help");
+        let Some(Modal::Overlay { title, lines, .. }) = harness.controller.ui_state().modal else {
+            panic!("no overlay: {:?}", harness.controller.ui_state().modal);
+        };
+        assert_eq!(title, "/help");
+        assert!(lines.len() <= 8, "the card fits a small panel: {lines:#?}");
+        let card = lines.join("\n");
+        for command in crate::interactive::input::SLASH_COMMANDS {
+            let name = command.name.trim_end_matches(':');
+            assert!(card.contains(name), "{name} is on the card:\n{card}");
+        }
+        let _ = harness.controller.handle_key(Key::Esc);
+        let _ = submit_text(&mut harness.controller, "/help all");
+        let Some(Modal::Overlay { lines, .. }) = harness.controller.ui_state().modal else {
+            panic!("no overlay for /help all");
+        };
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("/help") && line.contains("list these commands")),
+            "the full table: {lines:#?}"
+        );
+    }
+
+    /// Measured: every auto-allowed read printed an `[info] allowed by ...` row above
+    /// its card, half the transcript of a read-heavy turn. In the TUI the reason rides
+    /// on the card; nothing is hidden, and no separate row is added.
+    #[test]
+    fn an_auto_allowed_tool_carries_its_reason_on_the_card_in_the_tui() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        harness
+            .events
+            .send(SessionEvent::Notice {
+                message: "allowed by mode turn-grant: list . (read-only)".to_owned(),
+            })
+            .expect("notice");
+        harness
+            .events
+            .send(SessionEvent::ToolStarted {
+                name: "list_files".to_owned(),
+                summary: "path=.".to_owned(),
+            })
+            .expect("started");
+        harness
+            .events
+            .send(SessionEvent::ToolSettled {
+                name: "list_files".to_owned(),
+                ok: true,
+                elapsed: Duration::from_millis(900),
+                detail: String::new(),
+            })
+            .expect("settled");
+        let effects = harness.controller.pump_events();
+        let items = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::History(item) => Some(item.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, HistoryItem::Notice { .. })),
+            "no separate row: {items:#?}"
+        );
+        assert!(
+            items.iter().any(|item| matches!(
+                item,
+                HistoryItem::Tool { name, summary, .. }
+                    if name == "list_files" && summary == "path=. · allowed by mode turn-grant"
+            )),
+            "the card says why it ran without a panel: {items:#?}"
         );
     }
 

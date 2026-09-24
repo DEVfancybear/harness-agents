@@ -472,7 +472,11 @@ Mục này ghi lại hai lỗi đã đo và hợp đồng thay thế, theo hư�
 - **Thay thế có giới hạn.** Model được xem tối đa 12 fact đã biết liên quan đến lượt. Một fact mới chỉ được thay (invalidate) một fact nằm trong danh sách đó, và chỉ khi fact mới là `Active`. Id do model tự bịa ra bị bỏ qua.
 - **Không bao giờ làm hỏng lượt.** Model lỗi, quá 20 giây, hoặc không trả JSON thì extraction bị bỏ qua và ghi lý do. Chỉ lỗi store mới là lỗi, và được báo bằng notice.
 
-### 21.3. Giới hạn đã biết
+### 21.3. Chạy nền, theo kiểu deer-flow
 
-- Extraction chạy đồng bộ ở cuối lượt, trước khi writer được trả lại, nên lượt kết thúc chậm hơn tối đa 20 giây. deer-flow chạy nền có debounce; ở đây writer lease theo từng lượt làm việc đó phức tạp hơn, và được để lại cho bước sau.
+- Trong app tương tác, lượt chat chỉ **đưa lượt vào hàng đợi** (câu hỏi, câu trả lời, event nguồn, principal) khi store còn mở, rồi kết thúc ngay. Không còn lời gọi model nào trên đường trả lời.
+- Worker chờ hội thoại im lặng 8 giây (deer-flow: 30 giây), rồi đọc tối đa 5 lượt trong **một** lời gọi model. Mỗi fact ghi `turn` để biết nó thuộc lượt nào, và nguồn của fact là event của đúng lượt đó.
+- Đọc fact đã biết dùng store read-only. Lời gọi model không giữ gì. Việc ghi lấy **cùng cổng ghi** mà lượt chat và `/rename` dùng, nên worker không bao giờ giữ writer đúng lúc bạn gửi câu mới; một tiến trình khác đang giữ writer thì worker thử lại vài lần.
+- Khi thoát app, hàng đợi được xử lý ngay, không chờ debounce, và việc thoát chờ tối đa 12 giây.
+- `ha exec` / headless chạy một lượt rồi thoát, nên trích xuất đồng bộ trước khi trả writer, và báo trong envelope ở `memory.facts`.
 - Provider fixture không chạy extraction, giống compaction bằng model.

@@ -472,7 +472,11 @@ This section records two measured defects and the contract that replaced them, f
 - **Bounded replacement.** The model is shown at most 12 known facts related to the turn. A new fact may replace (invalidate) only a fact from that list, and only when the new fact is `Active`. An id the model makes up is ignored.
 - **Never fails the turn.** A model that errors, takes longer than 20 seconds or does not answer with JSON is a skipped extraction with a stated reason. Only a store failure is an error, and it is reported as a notice.
 
-### 21.3. Known limits
+### 21.3. Background extraction, deer-flow style
 
-- Extraction runs synchronously at the end of the turn, before the writer is released, so a turn can end up to 20 seconds later. deer-flow runs it in the background with a debounce; the per-turn writer lease makes that harder here, and it is left for a later step.
+- In the interactive app a turn only **queues** itself (question, answer, source event, principal) while its store is open, then ends. No model call sits on the answer's path any more.
+- The worker waits for the conversation to be quiet for 8 seconds (deer-flow: 30), then reads up to 5 turns in **one** model call. Each fact names its `turn`, and its source is that turn's event.
+- Known facts are read through a read-only store. The model call holds nothing. The write takes the **same writer gate** turns and `/rename` take, so the worker never holds the writer when you send the next message; another process holding the writer is retried a few times.
+- On exit the queue is processed at once, without the debounce, and the exit waits at most 12 seconds.
+- `ha exec` / headless runs one turn and exits, so it extracts synchronously before releasing the writer and reports it in the envelope under `memory.facts`.
 - Fixture providers do not extract, as with model compaction.

@@ -388,7 +388,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     };
     let mut runtime = RuntimeService::new(
         Arc::clone(&store),
-        provider,
+        Arc::clone(&provider),
         RuntimeConfig {
             context_window_tokens: resolved_config.context_window_tokens,
             output_reservation_tokens: resolved_config.output_reservation_tokens,
@@ -667,6 +667,33 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         .map(Some),
         None => Ok(None),
     };
+    // A headless run exits right after its one turn, so the background queue the
+    // interactive app uses would lose the work: facts are extracted here, before the
+    // writer is released, and reported in the envelope.
+    let facts = match &memory_principal {
+        Some(principal) if outcome.stop == harness_tools::TurnStop::Final => Some(
+            memory::extract_facts(
+                Arc::clone(&provider),
+                Arc::clone(&store),
+                principal,
+                &session_id,
+                outcome.final_text.as_str(),
+            )
+            .await,
+        ),
+        _ => None,
+    };
+    let facts_report = facts.as_ref().map(|result| match result {
+        Ok(report) => serde_json::json!({
+            "applied": report.applied,
+            "candidates": report.candidates,
+            "duplicates": report.duplicates,
+            "replaced": report.replaced,
+            "refused": report.refused,
+            "skipped": report.skipped,
+        }),
+        Err(error) => serde_json::json!({"error": error.to_string()}),
+    });
     let stored = memory_asset_of(&remembered);
     let stored_turn = memory_asset_of(&turn);
     // A headless run reports what it did not keep as well: a caller scripting this
@@ -691,6 +718,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
             // write order.
             "turn_asset_id": stored_turn.clone(),
             "turn_disposition": turn_disposition,
+            "facts": facts_report,
             "error": remembered
                 .as_ref()
                 .err()

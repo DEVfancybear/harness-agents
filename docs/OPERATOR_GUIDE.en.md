@@ -22,8 +22,12 @@ What that means in practice:
 - **There is no server to connect to.** Remote MCP endpoints and OS-level
   sandboxing are declared unsupported in the release matrix; transport isolation
   is not a sandbox.
-- **There is no published release artifact.** Linux and Windows builds are
-  exercised by the phase gates, but nothing was packaged, signed or published.
+- **There is no published release artifact.** Windows builds are exercised by
+  the phase gates; `scripts/New-HaRelease.ps1` builds a local candidate with
+  checksums ([BUILD_AND_RELEASE.md](BUILD_AND_RELEASE.md)), but nothing was signed
+  or published.
+- **Linux support is pending.** Its CI job runs for visibility and does not gate a
+  push; the release matrix reports Linux as `unverified`.
 - **Provider credentials are not exercised.** The gates never call a paid model
   API, so no release claim depends on one.
 
@@ -401,7 +405,7 @@ ha exec "Continue the task" --continue --goal "Task complete" --max-turns 4 --ou
 
 ### 12.5. Limits and checks
 
-On Windows `run_shell` uses `pwsh`, falling back to `powershell.exe` when pwsh is missing; the receipt records the selected shell. Strict isolation is claimed only where a measured backend supports it. Start with `/status` and `/config` when provider or permissions differ from expectations. M0–M6, H, and PTY gates have separate evidence; Linux is verified only after a green Ubuntu CI job.
+On Windows `run_shell` uses `pwsh`, falling back to `powershell.exe` when pwsh is missing; the receipt records the selected shell. Strict isolation is claimed only where a measured backend supports it. Start with `/status` and `/config` when provider or permissions differ from expectations. A turn pauses after 30 model calls or 80 tool calls (`HA_TURN_MAX_STEPS`, `HA_TURN_MAX_TOOL_CALLS`) and is continued automatically up to twice (`HA_TURN_CONTINUATIONS`). If `ha` behaves like an older build, `Get-Command ha -All` shows which executable runs; reinstall with `scripts/Install-Ha.ps1`. M0–M6, H, and PTY gates have separate evidence. Linux support is pending: its CI job does not gate a push, and no Linux claim is made from it.
 
 ### 12.6. Memory and `/resume`
 

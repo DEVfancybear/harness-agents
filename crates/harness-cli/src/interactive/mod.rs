@@ -22,6 +22,7 @@ pub mod input;
 pub mod instructions;
 pub mod mcp;
 pub mod memory;
+pub mod memory_worker;
 pub mod paths;
 pub mod permissions;
 pub mod project;

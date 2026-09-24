@@ -449,7 +449,7 @@ impl ApprovalGate for ChannelApprovalGate {
         if self.granted_for_run() {
             let _ = self.sender.send(SessionEvent::Notice {
                 message: format!(
-                    "[info] allowed by mode turn-grant: {}{}",
+                    "allowed by mode turn-grant: {}{}",
                     proposal.summary,
                     if proposal.read_only {
                         " (read-only)"
@@ -1017,6 +1017,21 @@ pub struct AgentSessionService {
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
     agents_status: Arc<Mutex<Vec<String>>>,
+    /// Held by a turn for as long as it owns the project store, and by the memory
+    /// worker while it writes, so the two never want the writer at the same time.
+    writer_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Extracts facts from finished turns in the background.
+    extraction: super::memory_worker::ExtractionWorker,
+}
+
+impl Drop for AgentSessionService {
+    /// Leaving the app must not lose what the last turns taught memory: the queue is
+    /// extracted now, without its quiet period, and the exit waits for it - bounded.
+    fn drop(&mut self) {
+        let _ = self
+            .extraction
+            .flush_blocking(super::memory_worker::EXIT_FLUSH);
+    }
 }
 
 enum McpElicitationAnswer {
@@ -1449,6 +1464,12 @@ impl AgentSessionService {
         let model_selection = Arc::new(Mutex::new(TurnModelSelection::with_initial(
             config_overrides.model.clone(),
         )));
+        let writer_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let extraction = super::memory_worker::ExtractionWorker::new(
+            context.project_store_dir(),
+            Arc::clone(&writer_gate),
+            sender.clone(),
+        );
         Self {
             sender,
             store_dir: context.project_store_dir(),
@@ -1480,6 +1501,8 @@ impl AgentSessionService {
             pending_mcp_elicitations: Arc::new(Mutex::new(HashMap::new())),
             mcp_status: Arc::new(Mutex::new(Vec::new())),
             agents_status: Arc::new(Mutex::new(Vec::new())),
+            writer_gate,
+            extraction,
         }
     }
 
@@ -1651,6 +1674,8 @@ impl SessionPort for AgentSessionService {
         let active_inbox = Arc::clone(&self.active_inbox);
         let gate = Arc::clone(&self.gate);
         let limits = self.limits;
+        let writer_gate = Arc::clone(&self.writer_gate);
+        let extraction = self.extraction.clone();
         // Every user input opens its own session; the conversation is the chain of
         // sessions linked to the same task.
         let session_id = SessionId::generate();
@@ -1682,6 +1707,8 @@ impl SessionPort for AgentSessionService {
                 limits,
                 request,
                 cancellation,
+                writer_gate,
+                extraction,
             ))
             .await;
         });
@@ -2065,10 +2092,12 @@ impl SessionPort for AgentSessionService {
         let store_dir = self.store_dir.clone();
         let sender = self.sender.clone();
         let title_for_write = title.clone();
+        let writer_gate = Arc::clone(&self.writer_gate);
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| "the application service needs an async runtime".to_owned())?;
         handle.spawn(async move {
             let result = async {
+                let _writer = writer_gate.lock().await;
                 let store =
                     SqliteStore::open_writer(WriterOpenOptions::new(store_dir, HostId::generate()))
                         .await
@@ -2488,6 +2517,8 @@ async fn run_turn(
     limits: TurnLimits,
     request: SubmitRequest,
     cancellation: CancellationToken,
+    writer_gate: Arc<tokio::sync::Mutex<()>>,
+    extraction: super::memory_worker::ExtractionWorker,
 ) {
     let send = |event| {
         let _ = sender.send(event);
@@ -2496,6 +2527,9 @@ async fn run_turn(
         input_id: request.input_id.clone(),
     });
 
+    // The memory worker writes between turns under this gate; a turn waits the moment
+    // it takes to finish rather than failing to open the store.
+    let _writer_turn = writer_gate.lock().await;
     let store = match SqliteStore::open_writer(WriterOpenOptions::new(
         store_dir.clone(),
         HostId::generate(),
@@ -3293,26 +3327,17 @@ async fn run_turn(
             report_memory(&send, result);
         }
         // Facts are extracted from a turn that finished with an answer; a turn that
-        // stopped at a bound or was canceled has no settled answer to learn from.
+        // stopped at a bound or was canceled has no settled answer to learn from. The
+        // turn only queues what it said: the model call runs in the background, after
+        // this turn has released the store.
         if let Ok(turn) = &outcome
             && turn.stop == TurnStop::Final
         {
-            match memory::extract_facts(
-                Arc::clone(&provider),
-                Arc::clone(&store),
-                principal,
-                &session_id,
-                &turn.final_text,
-            )
-            .await
-            {
-                Ok(report) => {
-                    if let Some(message) = report.message() {
-                        send(SessionEvent::Notice { message });
-                    }
-                }
+            match memory::queued_turn(&store, principal, &session_id, &turn.final_text).await {
+                Ok(Some(queued)) => extraction.enqueue(queued, Arc::clone(&provider)),
+                Ok(None) => {}
                 Err(error) => send(SessionEvent::Notice {
-                    message: format!("memory: facts were not extracted ({error})"),
+                    message: format!("memory: the turn was not queued for extraction ({error})"),
                 }),
             }
         }
@@ -5626,8 +5651,10 @@ mod tests {
             "no panel opens while the grant is open: {announced:?}"
         );
         for summary in [
-            "[info] allowed by mode turn-grant: run git log -1 --stat --format=fuller",
-            "[info] allowed by mode turn-grant: patch src/parser.rs",
+            // The renderer adds the `[info] ` marker; a message that carried its own
+            // was shown as `[info] [info] allowed by ...`.
+            "allowed by mode turn-grant: run git log -1 --stat --format=fuller",
+            "allowed by mode turn-grant: patch src/parser.rs",
         ] {
             assert!(
                 announced.iter().any(|event| matches!(
@@ -5675,7 +5702,7 @@ mod tests {
         );
         assert!(
             notices.iter().all(|message| {
-                message.starts_with("[info] allowed by mode ")
+                message.starts_with("allowed by mode ")
                     && (message.contains("cargo test --locked")
                         || message.contains("patch src/parser.rs"))
             }),

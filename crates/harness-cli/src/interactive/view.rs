@@ -158,6 +158,72 @@ pub fn help_lines() -> Vec<String> {
     lines
 }
 
+/// The `/help` card the TUI shows: every command, grouped, on one screen.
+///
+/// The full table is 33 rows and the inline viewport gives a panel about eight, so
+/// `/help` used to open on seven commands and "còn 26 dòng" - measured as the reason
+/// the app felt hard to find one's way in. The card lists every command by name in
+/// its group, which fits without scrolling; the suggestion menu shows what each one
+/// does while typing `/`, and `/help all` still opens the full table.
+#[must_use]
+pub fn help_card_lines() -> Vec<String> {
+    let groups: [(&str, &[&str]); 6] = [
+        (
+            "Chat",
+            &[
+                "/new", "/resume", "/rename", "/clear", "/compact", "/context", "/undo", "/copy",
+                "/export",
+            ],
+        ),
+        (
+            "Run",
+            &["/steer", "/mode", "/permissions", "/cost", "/model"],
+        ),
+        (
+            "Project",
+            &["/status", "/config", "/diff", "/init", "/trust", "/more"],
+        ),
+        (
+            "Tools",
+            &[
+                "/skills",
+                "/skill:<name>",
+                "/mcp",
+                "/agents",
+                "/hooks",
+                "/reload",
+            ],
+        ),
+        (
+            "Input",
+            &[
+                "/image",
+                "/attach <path>",
+                "@file",
+                "!command",
+                "/key",
+                "/exit",
+            ],
+        ),
+        (
+            "Keys",
+            &[
+                "Enter gửi",
+                "Ctrl-J xuống dòng",
+                "↑↓ lịch sử",
+                "Esc/Ctrl-C hủy",
+                "Ctrl-D thoát",
+            ],
+        ),
+    ];
+    let mut lines = groups
+        .iter()
+        .map(|(group, items)| format!("{group:<9}{}", items.join("  ")))
+        .collect::<Vec<_>>();
+    lines.push("Gõ / để xem mô tả từng lệnh · /help all để xem bảng đầy đủ".to_owned());
+    lines
+}
+
 /// One help row: the command in a fixed column, then what it does.
 fn usage_line(usage: &str, summary: &str) -> String {
     format!("{usage:<HELP_COLUMN$}{summary}")

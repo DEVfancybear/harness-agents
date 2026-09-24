@@ -180,7 +180,10 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
                 let label = format!(" · cost {cost}");
                 push(Span::styled(label, theme.dim));
             }
-            push(Span::styled(" · /help".to_owned(), theme.dim));
+            push(Span::styled(
+                " · / lệnh · @ file · ! shell · /help".to_owned(),
+                theme.dim,
+            ));
         }
     }
 

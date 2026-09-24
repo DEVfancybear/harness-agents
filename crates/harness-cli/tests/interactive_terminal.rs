@@ -2022,12 +2022,7 @@ fn g4_a_step_bound_continues_the_turn_by_itself() {
     // answer a panel that is no longer there.
     wait_for_occurrences(&session, "[approval] ListFiles", 1, Duration::from_secs(40));
     session.send("y\r");
-    wait_for_occurrences(
-        &session,
-        "list_files {\"path\": \".\"} ok",
-        1,
-        Duration::from_secs(40),
-    );
+    wait_for_occurrences(&session, "list_files path=. ok", 1, Duration::from_secs(40));
 
     let continued = wait_for_normalized(
         &session,
@@ -2046,12 +2041,7 @@ fn g4_a_step_bound_continues_the_turn_by_itself() {
     // The continuation runs, and this time the budget is spent: the pause stands.
     wait_for_occurrences(&session, "[approval] ListFiles", 2, Duration::from_secs(40));
     session.send("y\r");
-    wait_for_occurrences(
-        &session,
-        "list_files {\"path\": \".\"} ok",
-        2,
-        Duration::from_secs(40),
-    );
+    wait_for_occurrences(&session, "list_files path=. ok", 2, Duration::from_secs(40));
     let paused = wait_for_occurrences(
         &session,
         "[run] paused: step limit reached",

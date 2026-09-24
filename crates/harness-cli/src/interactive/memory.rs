@@ -32,7 +32,8 @@ use harness_providers::{
 };
 use harness_store_sqlite::{SqliteStore, StoreError};
 use harness_types::{
-    HarnessError, MemoryAssetId, MemoryScope, ProjectId, SessionId, SourceAuthority, TaskId,
+    EventId, HarnessError, MemoryAssetId, MemoryScope, ProjectId, SessionId, SourceAuthority,
+    TaskId,
 };
 
 use super::paths::LaunchEnvironment;
@@ -572,8 +573,9 @@ struct ExtractionReply {
     facts: Vec<ReplyFact>,
 }
 
-#[derive(serde::Deserialize)]
-struct ReplyFact {
+/// One fact as the extractor wrote it.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ReplyFact {
     #[serde(default)]
     content: String,
     #[serde(default)]
@@ -582,6 +584,55 @@ struct ReplyFact {
     confidence: f64,
     #[serde(default)]
     replaces: Option<String>,
+    /// Which turn of the batch it came from, 1-based; the last one when absent.
+    #[serde(default)]
+    turn: Option<usize>,
+}
+
+/// One finished turn waiting for extraction, captured while its store was open.
+///
+/// Everything the extractor needs from the turn is copied here, so the work can run
+/// after the turn has released the store and the next turn has taken it.
+#[derive(Clone, Debug)]
+pub struct QueuedTurn {
+    /// Who the facts from this turn belong to.
+    pub principal: MemoryPrincipal,
+    /// The admitted input the facts are sourced from.
+    pub input_event: EventId,
+    /// What the user asked.
+    pub question: String,
+    /// What the model answered.
+    pub answer: String,
+}
+
+/// Capture one finished turn for extraction, or `None` when there is nothing to learn.
+///
+/// # Errors
+/// Fails when the store cannot be read.
+pub async fn queued_turn(
+    store: &SqliteStore,
+    principal: &MemoryPrincipal,
+    session_id: &SessionId,
+    answer: &str,
+) -> Result<Option<QueuedTurn>, HarnessError> {
+    let Some((input_event, question)) = store
+        .session_admitted_input(session_id)
+        .await
+        .map_err(StoreError::into_harness_error)?
+    else {
+        return Ok(None);
+    };
+    let question = question.trim();
+    let answer = answer.trim();
+    if question.is_empty() || answer.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(QueuedTurn {
+        principal: principal.clone(),
+        input_event,
+        question: question.to_owned(),
+        answer: answer.to_owned(),
+    }))
 }
 
 /// Extract the facts one turn established and write them to memory.
@@ -592,10 +643,11 @@ struct ReplyFact {
 /// correction - with how sure it is. A fact at or above the auto-apply confidence is
 /// active at once; one below it is a candidate the user can confirm or reject.
 ///
-/// The model is shown the facts memory already holds that relate to this turn, so it
-/// can leave a known fact out or name the one a new fact replaces. It can only replace
-/// a fact it was shown: an id it invents is ignored, so extraction can never retire
-/// memory it did not read.
+/// The interactive app does not call this on the turn's path: it queues the turn for
+/// [`super::memory_worker::ExtractionWorker`], which runs the same three phases -
+/// [`known_facts_for`], [`ask_for_facts`], [`apply_facts`] - in the background and for
+/// several turns at once. This single-turn form is what a caller that already holds a
+/// writer, such as a test, uses.
 ///
 /// # Errors
 /// Fails when the store cannot be read or written. A model that is unavailable, slow
@@ -608,45 +660,95 @@ pub async fn extract_facts(
     session_id: &SessionId,
     answer: &str,
 ) -> Result<ExtractionReport, HarnessError> {
-    let mut report = ExtractionReport::default();
+    let Some(turn) = queued_turn(&store, principal, session_id, answer).await? else {
+        return Ok(ExtractionReport {
+            skipped: Some("nothing was said"),
+            ..ExtractionReport::default()
+        });
+    };
+    let turns = [turn];
+    let known = known_facts_for(Arc::clone(&store), &turns).await?;
+    match ask_for_facts(provider.as_ref(), &known, &turns).await {
+        Ok(facts) => apply_facts(store, &turns, &known, facts).await,
+        Err(reason) => Ok(ExtractionReport {
+            skipped: Some(reason),
+            ..ExtractionReport::default()
+        }),
+    }
+}
+
+/// Facts memory already holds that relate to these turns, as (id, content).
+///
+/// The model is shown them so it can leave a known fact out or name the one a new
+/// fact replaces. It can only replace a fact from this list.
+///
+/// # Errors
+/// Fails when the store cannot be searched.
+pub async fn known_facts_for(
+    store: Arc<SqliteStore>,
+    turns: &[QueuedTurn],
+) -> Result<Vec<(MemoryAssetId, String)>, HarnessError> {
+    let Some(last) = turns.last() else {
+        return Ok(Vec::new());
+    };
+    let questions = turns
+        .iter()
+        .map(|turn| turn.question.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    known_facts(&MemoryService::new(store), &last.principal, &questions).await
+}
+
+/// Ask the model for the facts these turns established.
+///
+/// # Errors
+/// The error is the reason the extraction was skipped: a fixture provider, a model
+/// that failed or took too long, or a reply that is not the requested JSON.
+pub async fn ask_for_facts(
+    provider: &dyn ModelProvider,
+    known: &[(MemoryAssetId, String)],
+    turns: &[QueuedTurn],
+) -> Result<Vec<ReplyFact>, &'static str> {
     if provider.capabilities().fixture {
-        report.skipped = Some("fixture providers do not extract");
-        return Ok(report);
+        return Err("fixture providers do not extract");
     }
-    let Some((input_event, question)) = store
-        .session_admitted_input(session_id)
-        .await
-        .map_err(StoreError::into_harness_error)?
-    else {
-        report.skipped = Some("no admitted input");
-        return Ok(report);
-    };
-    let question = question.trim();
-    if question.is_empty() || answer.trim().is_empty() {
-        report.skipped = Some("nothing was said");
-        return Ok(report);
+    if turns.is_empty() {
+        return Err("nothing was said");
     }
-    let service = MemoryService::new(Arc::clone(&store));
-    let known = known_facts(&service, principal, question).await?;
-    let prompt = extraction_prompt(&known, question, answer);
-    let reply = match ask_extractor(provider.as_ref(), prompt).await {
-        Ok(reply) => reply,
-        Err(reason) => {
-            report.skipped = Some(reason);
-            return Ok(report);
-        }
-    };
-    let Some(parsed) = parse_reply(&reply) else {
-        report.skipped = Some("the model did not answer with the requested JSON");
-        return Ok(report);
-    };
-    let (scope, project_id) = match principal.project_id.clone() {
-        Some(project_id) => (MemoryScope::Project, Some(project_id)),
-        None => (MemoryScope::User, None),
-    };
-    for fact in parsed.facts.into_iter().take(EXTRACTION_MAX_FACTS) {
+    let reply = ask_extractor(provider, extraction_prompt(known, turns)).await?;
+    parse_reply(&reply)
+        .map(|reply| reply.facts)
+        .ok_or("the model did not answer with the requested JSON")
+}
+
+/// Write the facts the model returned for these turns.
+///
+/// # Errors
+/// Fails when the store cannot be written.
+pub async fn apply_facts(
+    store: Arc<SqliteStore>,
+    turns: &[QueuedTurn],
+    known: &[(MemoryAssetId, String)],
+    facts: Vec<ReplyFact>,
+) -> Result<ExtractionReport, HarnessError> {
+    let mut report = ExtractionReport::default();
+    let service = MemoryService::new(store);
+    for fact in facts
+        .into_iter()
+        .take(EXTRACTION_MAX_FACTS * turns.len().max(1))
+    {
         let content = fact.content.trim().to_owned();
         let category = fact.category.trim().to_lowercase();
+        // A fact names its turn by number; an absent or impossible number is the
+        // last turn, which is the one the batch was flushed for.
+        let Some(turn) = fact
+            .turn
+            .and_then(|turn| turn.checked_sub(1))
+            .and_then(|index| turns.get(index))
+            .or_else(|| turns.last())
+        else {
+            break;
+        };
         if content.is_empty()
             || content.chars().count() > FACT_MAX_CHARS
             || !FACT_CATEGORIES.contains(&category.as_str())
@@ -659,14 +761,19 @@ pub async fn extract_facts(
             report.refused += 1;
             continue;
         }
+        let principal = &turn.principal;
         let stored_text = format!("[{category}] {content}");
         if let Some(existing) = service.find_any_by_content(principal, &stored_text).await? {
             service
-                .append_version_source(principal, &existing, &input_event)
+                .append_version_source(principal, &existing, &turn.input_event)
                 .await?;
             report.duplicates += 1;
             continue;
         }
+        let (scope, project_id) = match principal.project_id.clone() {
+            Some(project_id) => (MemoryScope::Project, Some(project_id)),
+            None => (MemoryScope::User, None),
+        };
         let written = service
             .apply_inferred_fact(
                 principal,
@@ -675,8 +782,8 @@ pub async fn extract_facts(
                     category,
                     confidence: fact.confidence,
                     scope,
-                    project_id: project_id.clone(),
-                    source_event_refs: vec![input_event.clone()],
+                    project_id,
+                    source_event_refs: vec![turn.input_event.clone()],
                     extractor_version: EXTRACTOR_VERSION.to_owned(),
                 },
             )
@@ -731,7 +838,7 @@ async fn ask_extractor(
         .map_err(|_| "the extraction reply could not be read")
 }
 
-/// Facts memory already holds that relate to this turn, as (id, content).
+/// Facts memory already holds that relate to this text, as (id, content).
 async fn known_facts(
     service: &MemoryService,
     principal: &MemoryPrincipal,
@@ -752,7 +859,7 @@ async fn known_facts(
         .collect())
 }
 
-fn extraction_prompt(known: &[(MemoryAssetId, String)], question: &str, answer: &str) -> String {
+fn extraction_prompt(known: &[(MemoryAssetId, String)], turns: &[QueuedTurn]) -> String {
     let known = if known.is_empty() {
         "(none)".to_owned()
     } else {
@@ -762,27 +869,40 @@ fn extraction_prompt(known: &[(MemoryAssetId, String)], question: &str, answer: 
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let conversation = turns
+        .iter()
+        .enumerate()
+        .map(|(index, turn)| {
+            format!(
+                "Turn {number}:\nUser: {question}\nAssistant: {answer}",
+                number = index + 1,
+                question = clip(&turn.question, EXTRACTION_TURN_CHARS),
+                answer = clip(&turn.answer, EXTRACTION_TURN_CHARS),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
     format!(
-        "You maintain long-term memory for a coding assistant. Read the conversation turn \
+        "You maintain long-term memory for a coding assistant. Read the conversation turns \
          below and extract the facts worth knowing in FUTURE conversations about this user \
          or this project: stable preferences, conventions, decisions, environment details, \
          goals, and corrections the user made.\n\
-         Do NOT extract: one-off task requests, a restatement of the answer, anything only \
-         true for this turn, guesses, secrets or credentials.\n\
+         Do NOT extract: one-off task requests, a restatement of an answer, anything only \
+         true for one turn, guesses, secrets or credentials.\n\
          Each fact is one self-contained sentence in the user's language.\n\
          confidence: 0.9-1.0 the user stated it explicitly; 0.7-0.9 clearly implied; below \
          0.7 uncertain.\n\
          category: one of {categories}.\n\
+         turn: the number of the turn the fact comes from.\n\
          If a fact is already known, leave it out. If a fact updates or contradicts a known \
-         fact, set \"replaces\" to that fact's id; otherwise null.\n\
+         fact, set \"replaces\" to that fact's id; otherwise null. If a later turn corrects \
+         an earlier one, keep only the corrected fact.\n\
          Reply with JSON only, no prose: \
-         {{\"facts\":[{{\"content\":\"...\",\"category\":\"preference\",\"confidence\":0.9,\"replaces\":null}}]}}. \
+         {{\"facts\":[{{\"content\":\"...\",\"category\":\"preference\",\"confidence\":0.9,\"turn\":1,\"replaces\":null}}]}}. \
          Reply {{\"facts\":[]}} when nothing qualifies.\n\n\
          Known facts:\n{known}\n\n\
-         Turn:\nUser: {question}\nAssistant: {answer}",
+         {conversation}",
         categories = FACT_CATEGORIES.join(", "),
-        question = clip(question, EXTRACTION_TURN_CHARS),
-        answer = clip(answer, EXTRACTION_TURN_CHARS),
     )
 }
 

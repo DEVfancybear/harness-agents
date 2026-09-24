@@ -175,6 +175,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # Linux support is pending. The Ubuntu job still runs, so a Linux regression is
+    # visible in its own log, but it does not fail the workflow until Linux is a
+    # supported platform. Windows stays blocking.
+    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
