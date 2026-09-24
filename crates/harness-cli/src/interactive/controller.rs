@@ -1326,6 +1326,16 @@ impl InteractiveController {
             .get(name.len()..)
             .map(str::trim)
             .filter(|rest| !rest.is_empty());
+        let key_argument = line
+            .trim_start()
+            .get(name.len()..)
+            .and_then(|rest| {
+                let separator = rest.chars().next()?;
+                separator
+                    .is_whitespace()
+                    .then_some(&rest[separator.len_utf8()..])
+            })
+            .filter(|rest| !rest.trim().is_empty());
         let argument = raw_argument.and_then(|rest| rest.split_whitespace().next());
         let mut effects = Vec::new();
         match name {
@@ -1641,7 +1651,7 @@ impl InteractiveController {
                 // beginning is exactly the problem this command exists to fix.
                 self.reference("/more", self.recall_lines(), &mut effects);
             }
-            "/key" => match raw_argument {
+            "/key" => match key_argument {
                 Some(value) => {
                     // `line` is the raw submitted buffer, which is what the
                     // editor stored: forgetting the trimmed form would leave the
@@ -1861,8 +1871,7 @@ impl InteractiveController {
     /// the same step, so the next message is dispatched for real instead of being
     /// refused — a saved key that still needed a restart would be a trap.
     fn save_key(&mut self, value: &str) -> Vec<Effect> {
-        let key = value.trim();
-        if key.is_empty() {
+        if value.trim().is_empty() {
             return vec![
                 Effect::History(HistoryItem::Notice {
                     message: "no key was entered; nothing was saved".to_owned(),
@@ -1870,7 +1879,7 @@ impl InteractiveController {
                 Effect::Redraw,
             ];
         }
-        let source = match self.service.save_credential(key) {
+        let source = match self.service.save_credential(value) {
             Ok(source) => source,
             Err(message) => {
                 self.editor.cancel_secret();
@@ -3092,7 +3101,7 @@ mod tests {
         let mut controller = InteractiveController::new(&context, Box::new(port), channel, true);
         controller.boot_lines();
 
-        let command = "/key sk-with an intentional space";
+        let command = "/key  sk-with an intentional space ";
         let effects = submit_text(&mut controller, command);
         assert!(
             effects_to_plain(&effects)
@@ -3102,7 +3111,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(saved_credential_path(&context)).expect("credential file"),
-            "DEEPSEEK_API_KEY=\"sk-with an intentional space\"\n"
+            "DEEPSEEK_API_KEY=\" sk-with an intentional space \"\n"
         );
 
         let _ = controller.handle_key(Key::Up);

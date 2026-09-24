@@ -42,9 +42,7 @@ The `ha` executable includes the 18 skills in `.agents/skills`, including their 
 
 ### Where the project stands
 
-Harness Agents is under active development. The core CLI and its supporting workflows are available in the repository. The Web experience and Linux verification are still in progress. Full strict isolation is unavailable on the measured Windows backend, so `ha` refuses requests that require it. The [current handoff](docs/handoffs/CURRENT.vi.md) records the latest status and known gaps.
-
-The next product track focuses on a more complete coding-agent experience, including richer tools, configuration, interaction, and automation. See the [product plan](docs/HA_AGENT_PLAN.vi.md) for that direction.
+Harness Agents is under active development. M0–M6 milestone gates passed in their recorded Windows evidence; the G13–G14 headless, platform and documentation work is being verified for CP-E. Linux verification requires a green Ubuntu CI run and is not claimed from a Windows run. Full strict isolation is unavailable on the measured Windows backend, so `ha` refuses requests that require it. The [HA_AGENT handoff](docs/handoffs/HA_AGENT.vi.md) records the current assignment and remaining gates; the [product plan](docs/HA_AGENT_PLAN.vi.md) defines its scope.
 
 ## Tiếng Việt
 
@@ -80,9 +78,7 @@ File `ha.exe` tích hợp 18 skill trong `.agents/skills`, gồm cả script và
 
 ### Dự án đang ở đâu
 
-Harness Agents đang được phát triển tích cực. CLI cốt lõi và các quy trình hỗ trợ đã có trong repo. Trải nghiệm Web và việc xác minh trên Linux vẫn đang hoàn thiện. Backend Windows đã đo chưa hỗ trợ cách ly strict đầy đủ, nên `ha` sẽ từ chối yêu cầu cần chế độ này. [Handoff hiện tại](docs/handoffs/CURRENT.vi.md) ghi trạng thái và các điểm còn mở mới nhất.
-
-Track sản phẩm tiếp theo hướng tới trải nghiệm coding agent hoàn chỉnh hơn, gồm công cụ, cấu hình, tương tác và tự động hóa phong phú hơn. Xem [kế hoạch sản phẩm](docs/HA_AGENT_PLAN.vi.md) để biết định hướng này.
+Harness Agents đang được phát triển tích cực. Các gate milestone M0–M6 đã xanh trong evidence Windows đã ghi; phần headless, nền tảng và tài liệu G13–G14 đang được kiểm chứng cho CP-E. Chỉ công nhận Linux khi job CI Ubuntu xanh, không suy ra từ lượt chạy Windows. Backend Windows đã đo chưa hỗ trợ cách ly strict đầy đủ, nên `ha` từ chối yêu cầu cần chế độ này. [Handoff HA_AGENT](docs/handoffs/HA_AGENT.vi.md) ghi assignment và gate còn lại; [kế hoạch sản phẩm](docs/HA_AGENT_PLAN.vi.md) xác định phạm vi.
 
 ---
 

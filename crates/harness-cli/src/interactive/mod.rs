@@ -92,6 +92,8 @@ pub enum LaunchMode {
 /// Optional headless-run inputs that shape the goal, budget and backend.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HeadlessOptions {
+    /// Output protocol for automation. `None` keeps the original --json behavior.
+    pub output_format: Option<headless::OutputFormat>,
     /// Explicit deterministic mock backend; never a default and never a silent
     /// production fallback. The JSON result labels it.
     pub mock: bool,

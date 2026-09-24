@@ -1773,6 +1773,21 @@ impl SqliteStore {
         row.map(|row| session_summary_from_row(&row)).transpose()
     }
 
+    /// Newest admitted session in this project store, ordered by insertion.
+    pub async fn newest_session_id(&self) -> Result<Option<SessionId>, StoreError> {
+        let id: Option<String> =
+            sqlx::query_scalar("SELECT session_id FROM sessions ORDER BY rowid DESC LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|error| {
+                    database_error(ErrorCode::StorageWriteFailed, "read newest session", error)
+                })?;
+        id.map(|id| {
+            SessionId::parse(id).map_err(|error| StoreError::new(error.code(), error.to_string()))
+        })
+        .transpose()
+    }
+
     pub async fn session_task(&self, session_id: &SessionId) -> Result<Option<TaskId>, StoreError> {
         let task_id =
             sqlx::query_scalar::<_, String>("SELECT task_id FROM sessions WHERE session_id = ?")
@@ -3082,6 +3097,10 @@ async fn ensure_runtime_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     if current < 6 {
         apply_runtime_slice_6(&mut tx).await?;
     }
+
+    if current < 7 {
+        apply_runtime_slice_7(&mut tx).await?;
+    }
     if current < RUNTIME_SCHEMA_VERSION {
         sqlx::query("INSERT INTO runtime_schema_migrations(version) VALUES (?)")
             .bind(RUNTIME_SCHEMA_VERSION)
@@ -3220,6 +3239,17 @@ async fn apply_runtime_slice_6(
         "CREATE INDEX IF NOT EXISTS backend_leases_by_task ON backend_leases(task_id, created_at_unix_ms)",
     ];
     apply_runtime_statements(tx, &STATEMENTS, "apply runtime schema 6").await
+}
+
+/// G13: a satisfied goal emits one durable M0 acceptance evaluation command.
+async fn apply_runtime_slice_7(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StoreError> {
+    const STATEMENTS: [&str; 2] = [
+        "CREATE TABLE IF NOT EXISTS acceptance_commands (command_id TEXT PRIMARY KEY, task_id TEXT NOT NULL UNIQUE, run_id TEXT NOT NULL, command_json TEXT NOT NULL, record_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+        "CREATE INDEX IF NOT EXISTS acceptance_commands_by_run ON acceptance_commands(run_id)",
+    ];
+    apply_runtime_statements(tx, &STATEMENTS, "apply runtime schema 7").await
 }
 
 /// M5 context surface: the rebuildable journal index, the notes table and the

@@ -152,7 +152,7 @@ pub fn help_lines() -> Vec<String> {
         }
     }
     lines.push(
-        "Ctrl-C cancels an active run or clears an idle prompt; Ctrl-D on an empty line exits."
+        "↑↓ recall prompts or choose a menu item; Ctrl-C cancels a run or clears an idle prompt; Ctrl-D exits on an empty line."
             .to_owned(),
     );
     lines
@@ -398,7 +398,7 @@ mod tests {
         // Nothing else names a command: the footer is the only row that is not one.
         for line in &help {
             let first = line.split_whitespace().next().unwrap_or_default();
-            if first.starts_with("Ctrl-") {
+            if first.starts_with("Ctrl-") || first == "↑↓" {
                 continue;
             }
             assert!(

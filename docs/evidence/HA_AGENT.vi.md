@@ -1,6 +1,46 @@
-# Evidence — HA_AGENT CP-C current; CP-A/CP-B archive / Bằng chứng — CP-C hiện tại; lưu trữ CP-A/CP-B
+# Evidence — HA_AGENT CP-E current; CP-A–CP-D archive / Bằng chứng — CP-E hiện tại; lưu trữ CP-A–CP-D
 
-**Current status / Trạng thái hiện tại:** `implemented_unverified` at CP-C. G07–G09 source and selectors are implemented. M5 passed 15/15. On the integrated HEAD below, the latest Verify-HaLaunch run failed `acceptance-launch` because i13 timed out after 190 s; the providers suite and P0–P7 all passed. The exact i13 selector passed alone (1/1). Earlier loopback runs also alternated between provider and launch failures; no whole-gate run returned `failures: []`, so CP-C is not accepted. No G10 work started. / `implemented_unverified` tại CP-C. Source G07–G09 và selector đã triển khai. M5 pass 15/15. Trên HEAD đã tích hợp bên dưới, Verify-HaLaunch mới nhất fail `acceptance-launch` do i13 timeout sau 190 giây; providers và P0–P7 đều pass. Selector i13 chạy riêng pass (1/1). Các lượt loopback trước cũng luân phiên lỗi provider/launch; chưa có gate tổng thể nào trả `failures: []`, nên CP-C chưa accepted. Chưa làm G10.
+## CP-E working evidence — G13–G14 (24/09/2026)
+
+**Status / Trạng thái:** `implemented_unverified`. Source đang ở worktree chưa commit; chưa có H `passed:true, failures:[]`, M6 gate trên source CP-E, PTY toàn bộ một lượt xanh, hay CI Ubuntu run id. Không chuyển registry acceptance sang `accepted`. / Source remains uncommitted and CP-E is not accepted.
+
+| Field / Trường | Value / Giá trị |
+| --- | --- |
+| Assignment base | `ffc93fe08b082a53216a26f4f2a5476222dec847` on `master`, initially clean |
+| Upstream during work | `febae6ff9dc7d59c58b1127537c68cde7d7a29a1` merged PR #4 and became `origin/master`; CP-E diff remains unstaged |
+| Platform/toolchain | Windows NT 10.0.26200.0 x64; `rustc 1.97.1 (8bab26f4f 2026-07-14)` via `RUSTUP_TOOLCHAIN=stable` |
+| Cargo.lock SHA-256 | `38315c57cbfb563d37de95c778d52562ac3798f58224fc2517617e9289e7a859` |
+| Fixture/scope | `g13_headless` mock and loopback; M2 fresh `FakeProvider` per attempt; PTY temporary projects, no paid/live API or user install |
+| StorePort decision | `impl StorePort for SqliteStore` already exists in `crates/harness-store-sqlite/src/store/port.rs`; port is used, so no ADR-N12 removal |
+
+### G14 step 0 — baseline and historical negative control
+
+- On original HEAD `ffc93fe`, before CP-E source edits, `Verify-HaLaunch.ps1 -Json` returned `passed:false`, `failures:["acceptance-launch","providers-streaming"]`. Launch was 18/19 (i04 installed Unicode path), Anthropic provider fixture 31/32; other listed predecessor steps passed. The requested green baseline did **not** exist; no result was reclassified.
+- `a5ac2e2` is an ancestor of `origin/master`. Isolated `target/verify-a5ac2e2` worktree ran `cargo check -p harness-cli --locked` and failed with 12 compile errors involving obsolete `GrantReadsForRun`/`approve_reads_for_run` versus `GrantForRun`. `gh run list --commit a5ac2e2` returned no CI runs. The historical commit remains broken; current HEAD is a later revision.
+
+### Commands and observed results / Lệnh và kết quả đã thấy
+
+| Command / Lệnh | Result / Kết quả |
+| --- | --- |
+| `cargo test -p harness-cli --test g13_headless --locked` | 6/6 passed |
+| `cargo test -p harness-cli --test interactive_launch --locked i03` | 5/5 passed |
+| `cargo test -p harness-cli --test milestone_m3 --locked` | 20/20 passed after preserving legacy headless goal-stop exit behavior |
+| `cargo test -p harness-cli --test milestone_m2 --locked -- --test-threads=1` | First run 10/10; required ten consecutive runs pending |
+| `cargo test -p harness-cli --test milestone_m6 --locked g10_mcp_tool_goes_through_the_dispatcher_and_the_approval_gate -- --exact` | 1/1 passed; A23's approved/denied dispatcher walk remains intact |
+| `cargo test -p harness-cli --bin ha --locked interactive::controller::tests::k01_inline_key_uses_the_full_remainder_and_is_not_recallable -- --exact` | 1/1 passed, including leading/trailing spaces |
+| `Verify-HaLaunch.ps1 -SelfTest` | `GATE_SELFTEST_OK` after eight G selectors and unit-agent step |
+| `Verify-Docs.ps1 -SelfTest` | `DOCS_OK`; 174 Markdown files, 15 language pairs, 12 named negative controls |
+| PTY full run 1 | 18/25; new fixture races and old i13/i14/t01 instability recorded in `target/pty-acceptance-cpe/pty-all.*` |
+| PTY full run 2 | 21/25; g06 loopback, g08 premature approval input, i01 trailing terminal escape, t_more frame assertion; `target/pty-acceptance-cpe2/pty-all.*` |
+| PTY run 3 | Linker exit 1140 before tests because C: had ~54 MiB free. Recursive cache delete was rejected by automatic approval review; `cargo clean -p harness-cli` completed, removing 196598 generated files (148.7 GiB). This did not touch source, user config or runtime databases. |
+
+**Negative controls / Đối chứng âm:** G13 stdin literal dash/overflow and no ANSI, exit 3 for question, M3 legacy compatibility, M6 MCP denied path with no server log; docs self-test deliberately rejects missing translation/link/case and other invalid inputs. Historical `a5ac2e2` compile failure is a separate negative control, not an H gate result.
+
+**Not run / Chưa chạy:** paid/live smoke, clean VM, user PATH/install, acceptance registry promotion; `cargo audit`/`cargo deny` absent from PATH and no pinned install/version is recorded in this SPEC, so conditional CI checks are not run. CI Ubuntu Linux evidence is pending; platform must be labelled `linux via CI` only after a green run id. Source digest, final gate logs and PTY transcript hashes will be recorded after CP-E verification, not invented here.
+
+---
+
+**Historical CP-C status / Trạng thái CP-C lịch sử:** `implemented_unverified` at CP-C. G07–G09 source and selectors were implemented. M5 passed 15/15. No whole H gate returned `failures: []` in that checkpoint. / CP-C là hồ sơ cũ; xem phần bên dưới để biết kết quả từng lượt.
 
 SPEC: [HA_AGENT.vi.md](../specs/HA_AGENT.vi.md) · Plan: [HA_AGENT_PLAN.vi.md](../HA_AGENT_PLAN.vi.md) · Assignment handoff: [HA_AGENT.vi.md](../handoffs/HA_AGENT.vi.md)
 

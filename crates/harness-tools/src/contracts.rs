@@ -1499,6 +1499,8 @@ pub enum ToolOutput {
     },
     Process {
         executable: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shell: Option<String>,
         exit_code: Option<i32>,
         timed_out: bool,
         canceled: bool,

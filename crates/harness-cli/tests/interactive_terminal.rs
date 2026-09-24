@@ -613,7 +613,9 @@ fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     // line instead of parking it inside its own prompt.
     let transcript = session.transcript();
     assert!(
-        transcript.ends_with("\r\n") || transcript.ends_with('\n'),
+        transcript.ends_with("\r\n")
+            || transcript.ends_with('\n')
+            || transcript.ends_with("\n\u{1b}[?2004l"),
         "the app restores the terminal before exiting: {transcript:?}"
     );
 }
@@ -623,7 +625,7 @@ fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
 fn t01_tui_opens_with_status_and_composer() {
     let (temp, project) = sandbox();
     let mut session = PtySession::spawn(&project, &base_env(&temp));
-    let transcript = session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
+    let transcript = wait_for_normalized(&session, "> Nhập yêu cầu", Duration::from_secs(30));
     assert!(
         !transcript.contains("using the plain renderer"),
         "{transcript}"
@@ -699,6 +701,72 @@ fn t06_pty_approval_y_key() {
 
 #[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
 #[test]
+fn g06_pty_at_picker() {
+    let (temp, project) = sandbox();
+    std::fs::write(project.join("notes.txt"), "picker fixture").expect("fixture file");
+    let mut session = PtySession::spawn(&project, &base_env(&temp));
+    session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
+    session.send("@");
+    wait_for_normalized(&session, "TỆP", Duration::from_secs(30));
+    session.send("\r");
+    wait_for_normalized(&session, "notes.txt", Duration::from_secs(30));
+    session.send("\u{3}/exit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+}
+
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn g06_pty_bang_prefix_needs_approval() {
+    let (temp, project) = sandbox();
+    let mut session = PtySession::spawn(&project, &base_env(&temp));
+    session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
+    session.send("! echo SHOULD_NOT_RUN\r");
+    let pending = wait_for_normalized(&session, "[approval]", Duration::from_secs(30));
+    assert!(pending.contains("SHOULD_NOT_RUN"), "{pending}");
+    session.send("n\r");
+    wait_for_normalized(&session, "[approval] denied", Duration::from_secs(30));
+    session.send("/exit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+}
+
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn t_key_pty_key_with_spaces() {
+    let (temp, project) = sandbox();
+    let credential_dir = temp.path().join("credential fixture");
+    let mut env = base_env(&temp);
+    env.push(("HA_CREDENTIALS_DIR", credential_dir.display().to_string()));
+    let mut session = PtySession::spawn(&project, &env);
+    session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
+    session.send("/key sk-with embedded spaces\r");
+    wait_for_normalized(&session, "API key saved", Duration::from_secs(30));
+    assert_eq!(
+        std::fs::read_to_string(credential_dir.join("credentials.env")).expect("saved key"),
+        "DEEPSEEK_API_KEY=\"sk-with embedded spaces\"\n"
+    );
+    session.send("/exit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+}
+
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn t_more_pty_scroll_keys() {
+    let (temp, project) = sandbox();
+    let mut session =
+        PtySession::spawn_process(&project, &base_env(&temp), &["chat", "--fixture"], &[]);
+    session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
+    session.send("show the transcript\r");
+    session.wait_for("[run] done", Duration::from_secs(30));
+    session.send("/more\r");
+    session.wait_for("Esc đóng", Duration::from_secs(30));
+    session.send("\u{1b}[6~\u{1b}[H\u{1b}[F");
+    assert!(session.is_alive(), "scroll keys keep the panel open");
+    session.send("\u{1b}/exit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+}
+
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
 fn h05_pty_approval_denial_is_fail_closed() {
     let (temp, project) = sandbox();
     let source = "fn parse() { todo!() }\n";
@@ -751,6 +819,93 @@ fn h05_pty_approval_denial_is_fail_closed() {
     session.send("/exit\r");
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
     server.join().expect("the denial fixture completes");
+}
+
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn g05_pty_always_allow_writes_local_rule() {
+    let (temp, project) = sandbox();
+    let source = "fn parse() { todo!() }\n";
+    std::fs::create_dir_all(project.join("src")).expect("source directory");
+    std::fs::write(project.join("src/parser.rs"), source).expect("source file");
+    let hash = harness_types::ContentHash::from_bytes(source.as_bytes())
+        .as_str()
+        .to_owned();
+    let (endpoint, _, server) = patch_then_answer_endpoint(hash, "fn parse() {}\n".to_owned());
+    warm_up_loopback(&endpoint);
+    let mut session = PtySession::spawn(&project, &provider_env(&temp, &endpoint));
+    session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
+    session.send("fix the parser\r");
+    session.wait_for("[approval] ApplyPatch", Duration::from_secs(40));
+    let rule = project.join(".harness/config.local.toml");
+    assert!(!rule.exists(), "approval alone must not write a rule");
+    session.send("A");
+    wait_for_normalized(&session, "apply_patch", Duration::from_secs(30));
+    assert!(!rule.exists(), "proposal alone must not write a rule");
+    session.send("\r");
+    session.wait_for("[run] done", Duration::from_secs(40));
+    let local = std::fs::read_to_string(&rule).expect("confirmed rule");
+    assert!(local.contains("apply_patch(src/parser.rs)"), "{local}");
+    session.send("/exit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+    server.join().expect("fixture completes");
+}
+
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn g06_pty_ask_user_panel() {
+    let (temp, project) = sandbox();
+    let (endpoint, stop, server) = ask_user_endpoint();
+    warm_up_loopback(&endpoint);
+    let mut session = PtySession::spawn(&project, &provider_env(&temp, &endpoint));
+    session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
+    session.send("choose a color\r");
+    wait_for_normalized(
+        &session,
+        "Which color should I use?",
+        Duration::from_secs(40),
+    );
+    session.send("\u{1b}/exit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+    stop.store(true, Ordering::SeqCst);
+    server.join().expect("fixture completes");
+}
+
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn g08_pty_undo_panel() {
+    let (temp, project) = sandbox();
+    let source = "fn parse() { todo!() }\n";
+    let replacement = "fn parse() { println!(\"fixed\"); }\n";
+    std::fs::create_dir_all(project.join("src")).expect("source directory");
+    let file = project.join("src/parser.rs");
+    std::fs::write(&file, source).expect("source file");
+    let hash = harness_types::ContentHash::from_bytes(source.as_bytes())
+        .as_str()
+        .to_owned();
+    let (endpoint, _, server) = patch_then_answer_endpoint(hash, replacement.to_owned());
+    warm_up_loopback(&endpoint);
+    let mut session = PtySession::spawn(&project, &provider_env(&temp, &endpoint));
+    session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
+    session.send("fix the parser\r");
+    session.wait_for("[approval] ApplyPatch", Duration::from_secs(40));
+    session.send("y\r");
+    session.wait_for("[run] done", Duration::from_secs(40));
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("patched file"),
+        replacement
+    );
+    session.send("/undo\r");
+    wait_for_normalized(&session, "[approval] WriteFile", Duration::from_secs(30));
+    session.send("y\r");
+    wait_for_occurrences(&session, "[run] done", 2, Duration::from_secs(40));
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("restored file"),
+        source
+    );
+    session.send("/exit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+    server.join().expect("fixture completes");
 }
 
 #[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
@@ -856,7 +1011,7 @@ fn i14_the_installed_artifact_opens_the_app_in_a_real_terminal() {
     ];
 
     let mut session = PtySession::spawn_executable(&installed, &project, &env, &remove);
-    let text = session.wait_for("Harness Agents", Duration::from_secs(30));
+    let text = wait_for_normalized(&session, "> Nhập yêu cầu", Duration::from_secs(30));
     assert!(
         session.is_alive(),
         "the installed app stays alive at the prompt"
@@ -873,14 +1028,11 @@ fn i14_the_installed_artifact_opens_the_app_in_a_real_terminal() {
     // store itself is created on the first request, so boot only resolves the path.
     let data_root = ha_home(&temp).join("data");
     assert!(
-        text.contains(&format!("Data:    {} [HA_HOME]", data_root.display())),
+        text.contains(&format!("Data: {} [HA_HOME]", data_root.display())),
         "the header reports the caller's data root with its origin: {text}"
     );
     assert!(
-        text.contains(&format!(
-            "Store:   {}",
-            data_root.join("projects").display()
-        )),
+        text.contains(&format!("Store: {}", data_root.join("projects").display())),
         "the store is scoped to the caller project under HA_HOME: {text}"
     );
 
@@ -1254,27 +1406,6 @@ fn warm_up_loopback(endpoint: &str) {
     }
 }
 
-fn read_request(socket: &mut std::net::TcpStream) -> String {
-    let mut buffer = vec![0_u8; 8192];
-    let Ok(read) = socket.read(&mut buffer) else {
-        return String::new();
-    };
-    buffer.truncate(read);
-    String::from_utf8_lossy(&buffer).into_owned()
-}
-
-/// Accept the next actual HTTP request, ignoring reachability probes that connect
-/// and close without sending bytes. A probe must never consume one scripted model
-/// response and shift the fixture protocol by one call.
-fn accept_request(listener: &std::net::TcpListener) -> std::net::TcpStream {
-    loop {
-        let (mut socket, _) = listener.accept().expect("the model call arrives");
-        if !read_request(&mut socket).is_empty() {
-            return socket;
-        }
-    }
-}
-
 fn write_sse(socket: &mut std::net::TcpStream, body: &str) {
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1318,18 +1449,18 @@ fn patch_then_stall_endpoint(
             serde_json::Value::String(arguments)
         );
         // 1. The turn asks for one gated patch.
-        let mut socket = accept_request(&listener);
+        let mut socket = accept_complete_request(&listener);
         asked_flag.store(true, Ordering::SeqCst);
         write_sse(&mut socket, &tool_call);
         // 2. After the tool settles the app asks again: hold this call open so the
         //    test can kill the process with the receipt already committed.
-        let second = accept_request(&listener);
+        let second = accept_complete_request(&listener);
         continued_flag.store(true, Ordering::SeqCst);
         let _ = held.recv_timeout(Duration::from_mins(2));
         drop(second);
         // 3. The continuation after the kill gets a prose answer. A warm-up connect
         //    that sends no request is not that call.
-        let mut third = accept_request(&listener);
+        let mut third = accept_complete_request(&listener);
         write_sse(
             &mut third,
             "data: {\"choices\":[{\"delta\":{\"content\":\"the parser is already fixed; nothing to redo\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
@@ -1400,6 +1531,54 @@ fn patch_then_answer_endpoint(
         second_request,
         server,
     )
+}
+
+fn ask_user_endpoint() -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+    listener.set_nonblocking(true).expect("nonblocking fixture");
+    let address = listener.local_addr().expect("fixture address");
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = Arc::clone(&stop);
+    let server = std::thread::spawn(move || {
+        let arguments = serde_json::json!({
+            "question": "Which color should I use?",
+            "options": ["blue", "green"]
+        })
+        .to_string();
+        let first = [
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices":[{"delta":{"tool_calls":[{
+                    "id":"ask-color",
+                    "function":{"name":"ask_user","arguments":arguments}
+                }]},"finish_reason":null}]})
+            ),
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n".to_owned(),
+            "data: [DONE]\n\n".to_owned(),
+        ]
+        .concat();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first}",
+            first.len()
+        );
+        let deadline = Instant::now() + Duration::from_mins(1);
+        while !server_stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    let _ = socket.set_nonblocking(false);
+                    if read_http_request(&mut socket).is_ok_and(|request| !request.is_empty()) {
+                        let _ = socket.write_all(response.as_bytes());
+                        let _ = socket.flush();
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (format!("http://{address}/chat/completions"), stop, server)
 }
 
 #[ignore = "needs a real console: ConPTY only delivers a transcript when the process that creates the pseudo-console owns one, and a sandboxed cargo test does not. Run scripts/Invoke-HaPtyAcceptance.ps1 (bounded, new console, transcript per filter) - all ten cases i01, i05, i06, i07a, i07b, i08, i12, i13, i14 and i21 pass there."]
@@ -1742,7 +1921,7 @@ fn sse_answer(text: &str) -> (String, Arc<AtomicBool>, std::thread::JoinHandle<(
                     socket
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .expect("the answer socket read is bounded");
-                    if !read_request(&mut socket).is_empty() {
+                    if read_http_request(&mut socket).is_ok_and(|request| !request.is_empty()) {
                         break socket;
                     }
                 }

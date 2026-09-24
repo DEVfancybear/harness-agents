@@ -44,7 +44,7 @@ pub const DATA_DIRECTORY_KIND: &str = "harness-data";
 /// additive, so a version 2 database upgrades in place.
 /// 4 adds the external-job tables, 5 the schedule approvals and the notification
 /// outbox, and 6 the M12 backend leases. All three are additive.
-pub const RUNTIME_SCHEMA_VERSION: i64 = 6;
+pub const RUNTIME_SCHEMA_VERSION: i64 = 7;
 /// Additive P3 tool tables. 2 adds the M4 approval scope (session/task/
 /// invocation/call correlation) and the provider call id on intents. 3 adds
 /// optional content hashes to JSON receipts; the SQL layout remains unchanged.

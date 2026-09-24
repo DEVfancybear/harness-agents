@@ -7,8 +7,8 @@
 //! reserved, cannot be observed after a crash.
 
 use harness_types::{
-    AgentRunId, BudgetId, BudgetReservationId, ContentHash, ContextPacketId, ErrorCode, InputId,
-    QuestionId, RequestId, RuntimeCommandId, SessionId, StepId, TaskId,
+    AcceptanceRecord, AgentRunId, BudgetId, BudgetReservationId, ContentHash, ContextPacketId,
+    ErrorCode, InputId, QuestionId, RequestId, RuntimeCommandId, SessionId, StepId, TaskId,
 };
 use serde_json::Value;
 use sqlx::Row;
@@ -289,6 +289,77 @@ async fn charge_chain(
 }
 
 impl SqliteStore {
+    /// Persist an already validated M0 acceptance transition with its command id.
+    /// One task can receive one terminal acceptance command.
+    pub async fn record_acceptance_command(
+        &self,
+        command_id: &RuntimeCommandId,
+        run_id: &AgentRunId,
+        record: &AcceptanceRecord,
+        command: &Value,
+    ) -> Result<(), StoreError> {
+        record
+            .validate()
+            .map_err(|error| StoreError::new(error.code(), error.to_string()))?;
+        if !record.is_accepted() {
+            return Err(StoreError::new(
+                ErrorCode::InvalidPayload,
+                "acceptance command did not accept the task",
+            ));
+        }
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        assert_fence_in_tx(&mut tx, &fence).await?;
+        let command_json = to_json(command, "serialize acceptance command")?;
+        let record_json = to_json(record, "serialize acceptance record")?;
+        sqlx::query("INSERT INTO acceptance_commands(command_id, task_id, run_id, command_json, record_json) VALUES (?, ?, ?, ?, ?)")
+            .bind(command_id.as_str())
+            .bind(record.task_id.as_str())
+            .bind(run_id.as_str())
+            .bind(command_json)
+            .bind(record_json)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| database_error(ErrorCode::IdempotencyConflict, "record acceptance command", error))?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit acceptance command",
+                error,
+            )
+        })
+    }
+
+    /// Read the durable accepted decision for one task.
+    pub async fn task_acceptance(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<(RuntimeCommandId, AcceptanceRecord)>, StoreError> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT command_id, record_json FROM acceptance_commands WHERE task_id = ?",
+        )
+        .bind(task_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "read task acceptance", error)
+        })?;
+        row.map(|(id, json)| {
+            let command_id = RuntimeCommandId::parse(id)
+                .map_err(|error| StoreError::new(error.code(), error.to_string()))?;
+            let record: AcceptanceRecord = serde_json::from_str(&json).map_err(|error| {
+                StoreError::new(
+                    ErrorCode::StorageWriteFailed,
+                    format!("invalid acceptance record: {error}"),
+                )
+            })?;
+            record
+                .validate()
+                .map_err(|error| StoreError::new(error.code(), error.to_string()))?;
+            Ok((command_id, record))
+        })
+        .transpose()
+    }
     /// Open the durable run for an admitted input, or return the existing one.
     ///
     /// One admitted input owns exactly one run; calling this twice with the same

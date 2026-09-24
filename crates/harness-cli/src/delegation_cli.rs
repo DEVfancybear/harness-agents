@@ -32,6 +32,9 @@ const DELEGATION_BUDGET_REQUESTS: u32 = 12;
 
 #[derive(Debug, Args)]
 pub struct TaskCommand {
+    /// Resolve the project store from this workspace, as `ha chat` does.
+    #[arg(long, global = true)]
+    cwd: Option<PathBuf>,
     #[command(subcommand)]
     command: TaskSubcommand,
 }
@@ -41,7 +44,7 @@ enum TaskSubcommand {
     /// Run one delegated task with a coordinator and up to three worker slots.
     Run {
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         /// The delegated objective.
         #[arg(long)]
         text: String,
@@ -57,7 +60,7 @@ enum TaskSubcommand {
     /// Show durable task, ownership, result and delivery state without running work.
     Status {
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         #[arg(long)]
         task_id: Option<String>,
         #[arg(long)]
@@ -66,7 +69,7 @@ enum TaskSubcommand {
     /// Inspect the recorded result for one task, including its exact revisions.
     Result {
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         #[arg(long)]
         task_id: String,
         #[arg(long)]
@@ -75,7 +78,7 @@ enum TaskSubcommand {
     /// Cancel a task. Cancel cascades to descendants; a pause would not.
     Cancel {
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         #[arg(long)]
         task_id: String,
         #[arg(long)]
@@ -85,6 +88,22 @@ enum TaskSubcommand {
 
 /// Run one `ha tasks` subcommand.
 pub async fn run(command: TaskCommand) -> Result<(), HarnessError> {
+    let data_dir = match &command.cwd {
+        Some(root) => Some(
+            crate::interactive::registered_project(root)
+                .await?
+                .store_dir,
+        ),
+        None => None,
+    };
+    let resolve = |explicit: Option<PathBuf>| -> Result<PathBuf, HarnessError> {
+        explicit.or_else(|| data_dir.clone()).ok_or_else(|| {
+            HarnessError::new(
+                ErrorCode::InvalidPayload,
+                "ha tasks needs --cwd or --data-dir",
+            )
+        })
+    };
     match command.command {
         TaskSubcommand::Run {
             data_dir,
@@ -92,22 +111,31 @@ pub async fn run(command: TaskCommand) -> Result<(), HarnessError> {
             agents,
             workspace,
             json,
-        } => run_delegation(&data_dir, &text, agents, workspace, json).await,
+        } => {
+            run_delegation(
+                &resolve(data_dir)?,
+                &text,
+                agents,
+                workspace.or(command.cwd.clone()),
+                json,
+            )
+            .await
+        }
         TaskSubcommand::Status {
             data_dir,
             task_id,
             json,
-        } => show_tasks(&data_dir, task_id.as_deref(), json).await,
+        } => show_tasks(&resolve(data_dir)?, task_id.as_deref(), json).await,
         TaskSubcommand::Result {
             data_dir,
             task_id,
             json,
-        } => show_result(&data_dir, &task_id, json).await,
+        } => show_result(&resolve(data_dir)?, &task_id, json).await,
         TaskSubcommand::Cancel {
             data_dir,
             task_id,
             json,
-        } => cancel_task(&data_dir, &task_id, json).await,
+        } => cancel_task(&resolve(data_dir)?, &task_id, json).await,
     }
 }
 

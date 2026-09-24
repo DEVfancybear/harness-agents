@@ -305,11 +305,13 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
         .filter(|line| line.starts_with("os: ["))
         .collect::<Vec<_>>();
     assert!(
-        !runner_matrices.is_empty()
-            && runner_matrices
-                .iter()
-                .all(|matrix| *matrix == "os: [windows-latest]"),
-        "CI currently targets Windows only: {runner_matrices:?}"
+        runner_matrices.contains(&"os: [windows-latest]"),
+        "CI must retain a Windows matrix for prior phase coverage: {runner_matrices:?}"
+    );
+    assert!(
+        ci.contains("verify-ha-agent:")
+            && runner_matrices.contains(&"os: [ubuntu-latest, windows-latest]"),
+        "CP-E must add its two-platform gate without changing prior Windows coverage: {runner_matrices:?}"
     );
     assert!(
         ci.contains("rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt")

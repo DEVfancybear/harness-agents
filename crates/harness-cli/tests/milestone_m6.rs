@@ -1051,8 +1051,19 @@ async fn m6_03_mcp_schema_and_resource_provenance() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)] // One acceptance walk: discovery, gate, denial, crash.
+async fn g10_mcp_tool_goes_through_the_dispatcher_and_the_approval_gate() {
+    // A23 exercises both the denied and approved paths through ToolService,
+    // including the server-side call log and durable receipts.
+    a23_extension_bounds_impl().await;
+}
+
+#[tokio::test]
 async fn a23_extension_bounds() {
+    a23_extension_bounds_impl().await;
+}
+
+#[allow(clippy::too_many_lines)] // One acceptance walk: discovery, gate, denial, crash.
+async fn a23_extension_bounds_impl() {
     // A server that pages forever is stopped by the client's page bound.
     let started = std::time::Instant::now();
     let client = connect_mcp("flood", 1).await;

@@ -350,439 +350,55 @@ Building from source stays available for development:
 `cargo run -p harness-cli --bin ha -- <args>` runs it without installing anything.
 
 
-## 12. Starting the interactive app with `ha`
+## 12. Interactive and headless `ha`
 
-Typing bare `ha` in a terminal opens the interactive app instead of exiting: the header
-shows the project, the provider and the setup state, then the prompt appears.
+`ha` or `ha chat` opens chat in a terminal. `ha chat --cwd <project>` selects a workspace; if stdin/stdout is not a terminal, interactive launch exits 2 rather than waiting. `ha chat --plain` uses line output, and `ha chat --fixture` uses a local fixture. `/status` shows the project, provider, data and setup state. A key may come from the environment or `/key`; its value is absent from status and transcript. Bare `/key` opens masked entry; `/key <value>` is visible while typed.
 
-**Behaviour change worth knowing (migration):** bare `ha` used to exit 0 silently. It now:
+### 12.1. Agent tools
 
-| Situation | Behaviour |
-| --- | --- |
-| `ha` in a real terminal | Opens the app; exits only on `/exit`, Ctrl-D on an empty line, or Ctrl-C while waiting |
-| `ha` with redirected stdin/stdout (pipe, CI, script) | Does **not** wait for input: prints short guidance on stderr and exits with code **2** |
-| `ha --help`, `ha --version`, the existing subcommands | Unchanged; the app is not started |
+The 18 core tools cross the host policy and receipt gate. Skill tools (`list_skills`, `activate_skill`) and `mcp__<server>__<tool>` appear when available.
 
-| Command | What it does |
-| --- | --- |
-| `ha chat` | Same entrypoint as bare `ha` |
-| `ha chat --cwd <path>` | Opens that project instead of the current directory |
-| `ha chat --resume <session-id>` | Continues from a persisted session (the app also has `/resume`) |
-| `ha chat --headless --prompt "<text>" [--json]` | One turn without a terminal; result on stdout, logs on stderr |
-| `ha chat --fixture` | Labelled fixture backend for trying the UI; no model is called |
-
-**Behaviour change worth knowing (identity):** a turn used to generate a new project
-identity every time, so anything scoped to the project — tool artifacts, approvals,
-memory — belonged to an identity the next turn could not name again. A workspace root now
-registers **one** project identity in its store, and every later turn, in this process or
-a later one, resolves that same identity.
-
-Inside the app: `/help`, `/status`, `/config`, `/model`, `/new`, `/resume [number|id]`,
-`/exit`. A gated action prints the action, working directory and scope, then waits for
-`y` (run it once), `a` (allow every action for this turn) or `n` (refuse); there is no
-implicit approval and no answer in time counts as a refusal. A real model call needs
-`HA_PROVIDER_ENDPOINT`, `HA_PROVIDER_MODEL`
-and a credential (`DEEPSEEK_API_KEY` or `HA_API_KEY`); without them the app still opens
-in setup state and says what is missing, and it never fabricates an answer.
-
-**Approval: every panel offers the same three answers, and `a` ends the questions for the
-turn.** It is the answer to a measured complaint: a turn of `git log`, `git status`,
-`git diff` asked about every single command, because `run_process` is not a read-only action
-and the older read-only grant could not cover it.
-
-| Key | Meaning | How long it lasts |
+| Group | Tools | Purpose |
 | --- | --- | --- |
-| `y` | run this action once | this action only |
-| `a` | run this action **and** allow **every** action for **this turn** - including file writes and commands | until the turn ends |
-| `n` | refuse | the action does not run |
+| Workspace | `read_file`, `list_files`, `search_text`, `glob` | Bounded reads and searches within the workspace |
+| File edits | `apply_patch`, `write_file`, `edit_file` | Writes with hash or match conditions and approval |
+| Process | `run_process`, `run_shell`, `read_process_output` | Run commands and read bounded output artifacts |
+| Git | `git_status`, `git_diff`, `git_log` | Observe the repository |
+| Task | `task_update`, `delegate` | Record a next action; delegate to explorer or coder |
+| History | `history_search`, `history_read` | Search and read the task journal |
+| Human | `ask_user` | Pause to ask; does not grant tool permission |
 
-After `a`, the status row shows `· tự động cả lượt` (automatic for this turn) so an open gate
-is never silent, and the transcript records one `[info] allowed for this turn: <action>` line
-per action it covered (reads add `read-only, `). The grant dies with the turn - a later
-request asks again from the first action - and it never bypasses the checks that run *before*
-a panel exists: a path inside a protected file (`.env`, `.git`, `.harness`, `*credential*`,
-`*.pem`…) or outside the workspace is refused outright, so there is nothing for `a` to allow.
-There is currently **no** permanent trust mode for a workspace.
+`delegate` has depth one and at most three concurrent children. Explorer is read only in the same workspace; coder works in a host provisioned clean Git worktree. If a worktree cannot be provisioned, the tool returns `role_unavailable`. `/agents` shows progress; parent Ctrl-C cancels children.
 
-**One API key is enough.** `DEEPSEEK_API_KEY` (or `HA_API_KEY`) is the whole
-credential: the endpoint and the model default to the values `DeepSeek` publishes -
-`https://api.deepseek.com` and `deepseek-flash` (see <https://api-docs.deepseek.com/>).
-Set `HA_PROVIDER_ENDPOINT` or `HA_PROVIDER_MODEL` for another provider or model; a
-variable you set always wins over the default.
+### 12.2. Chat commands and keys
 
-```powershell
-$env:DEEPSEEK_API_KEY = '<your key>'   # this line is the whole setup
-ha                                     # opens the TUI; the status bar names the model
-
-# optional, only for another model or provider:
-$env:HA_PROVIDER_MODEL = 'deepseek-v4-pro'
-```
-
-**When the provider answers with an error, run `/model` or `/status` inside the
-app.** They print which variable the credential came from (never its value), whether the
-endpoint and the model are yours or the defaults, and whether the endpoint is reachable. If
-the last line says `endpoint did not answer`, the problem is the network or a proxy; if it
-says `no credential; set one of ...`, the key was not set **in the shell that launched
-`ha`** (an environment variable only reaches processes started after you set it).
-
-To check the real provider before opening the app (costs one paid call):
-
-```powershell
-pwsh -NoProfile -File scripts/Smoke-HaProvider.ps1
-```
-
-### 12.1. The TUI (HA_TUI track)
-
-The interactive app draws an **inline viewport** at the bottom of the console: the
-conversation still flows into the terminal's own scrollback (scroll it with the terminal),
-while the bottom of the screen is a fixed area holding the composer, the status bar and the
-temporary panels. It is **not** a full-screen app.
-
-Bàn phím / keys (only the combinations measured on a real console):
-
-| Key | What it does |
+| Group | Commands |
 | --- | --- |
-| `Enter` | Submit the request (an empty buffer is not submitted). With the command menu open: **complete** the half-typed command; the next Enter runs it |
-| `Ctrl-J` | Insert a line break in the composer |
-| `Alt+Enter` | Insert a line break (measured on this Windows Terminal's ConPTY; see the limits below) |
-| Multi-line paste | Keeps its newlines and never submits; the whole block is **one** request |
-| `↑` / `↓` | Command menu open: move the highlight · single-line buffer: history; multi-line buffer: move by row |
-| `←` `→` `Home` `End` | Move by character |
-| `Ctrl-A` / `Ctrl-E` | Start / end of the current row |
-| `Ctrl-U` / `Ctrl-W` | Erase to the row start / erase one word |
-| `Tab` | Accept the highlighted row of the command menu; with no menu, complete a slash command when there is exactly one candidate |
-| `Esc` | Close a panel, an overlay or the command menu; it never cancels a running turn |
-| `Ctrl-C` | Running: cancel the turn · idle: clear the buffer |
-| `Ctrl-D` | Empty buffer: leave |
-| `Ctrl-L` | Repaint the bottom area without clearing the scrollback |
-| `y` / `n` | Answer the approval panel (or type `yes`/`no` and press Enter) |
-| `a` | Run this action and allow **every** action for **this turn** (including file writes and commands); the turn ends it (or type `all` and press Enter) |
+| Help and state | `/help`, `/status`, `/config`, `/model <name>`, `/cost`, `/context`, `/permissions`, `/hooks`, `/mcp`, `/agents`, `/skills` |
+| Session and answer | `/new`, `/clear`, `/resume <id>`, `/rename <name>`, `/more`, `/compact [guidance]`, `/export [path]`, `/copy`, `/exit` |
+| Workspace and control | `/diff`, `/undo`, `/trust [yes]`, `/init`, `/mode <ask|auto-edit|full-auto>`, `/steer <text>` |
+| Content and extensions | `/key`, `/image`, `/attach <path>`, `/skill:<name> [args]`, `/reload`; templates in `.harness/commands` or `<config-dir>/commands` run as `/name` |
 
-**Typing `/` lists the commands.** The menu appears directly above the composer and narrows with every
-character. It is **not** a modal window: the cursor stays in the composer and the draft is untouched.
+`@` opens the file picker; `@<server>:<uri>` attaches an MCP text resource. `!cmd` runs shell through approval; `!!cmd` only displays output. Enter submits, Ctrl-J inserts a newline, ↑↓ chooses a menu entry or history item, PgUp/PgDn and Home/End scroll the `/more` panel, Esc closes a panel, Ctrl-C cancels the turn, and Ctrl-D on an empty line exits. TUI history remains in terminal scrollback; plain mode prints lines.
+
+### 12.3. Config v2, permissions and hooks
+
+Config v2 merges default → user (`<config-dir>/config.toml`) → trusted project (`.harness/config.toml`, then `.harness/config.local.toml` for local permissions) → environment → CLI. `/config` identifies each value's source. Untrusted projects cannot load project config, hooks or skills. `/trust` requires confirmation. Profiles and models can be selected for the next turn.
+
+`[permissions]` supports `mode = "ask" | "auto-edit" | "full-auto"`, `allow`, and `deny`; deny and protected paths take priority. Approval uses `y` (one action), `a` (the turn), and `n` (deny). `A` proposes a persistent rule, written to `.harness/config.local.toml` only after separate confirmation. Headless does not grant approval implicitly. `--allowed-tools`, `--disallowed-tools`, and `--approval` use the same policy. `[hooks]` accepts `pre_tool_use`, `post_tool_use`, and `stop`; hooks load only from trusted layers, have a timeout, and cannot turn ask into allow. `/hooks` shows effective hooks.
+
+`[mcp_servers.<name>]` configures stdio or Streamable HTTP. Stdio uses `command`, `args`, `cwd`, and `env` secret references; HTTP bearer comes from an environment variable. `enabled_tools`, `disabled_tools`, `tool_timeout` (maximum 120 seconds), and `required` constrain a server. Servers start on demand; `ha mcp add|list|get|remove` manages configuration, while `/mcp` inspects it in chat. MCP tools cross the same policy/approval gate and leave receipts. Skills are discovered in `<config-dir>/skills`, `~/.agents/skills`, and trusted project roots (`.agents/skills`, `.harness/skills`). The initial prompt carries names and descriptions only; activation loads content by digest.
+
+### 12.4. Automation
 
 ```text
-❯ /help            list these commands
-  /status          show project, config, data and provider state
-  /key             save the provider API key; the value is masked and never kept in history
-  /more            reopen the recent transcript in a scrollable panel (PgUp/PgDn, Home/End)
-  /new             start a new session when nothing is running
-  /model           show which model the next run would use
- ↑↓ chọn · Tab/Enter nhận · Esc đóng · 11 lệnh ─────────────
-> /_
+ha exec "Summarize the changed files" --output-format text
+ha exec --prompt - --output-format json < prompt.txt
+ha exec "Continue the task" --continue --goal "Task complete" --max-turns 4 --output-format stream-json
 ```
 
-When more than **6** commands match, the list is a **window that follows the highlight**: the selected
-row is always visible instead of being cut off. A row shows the arguments a command takes
-(`/attach <path>`, `/resume <id>`), so it reads as the thing to type. Accepting a suggestion does
-**not** append a space, deliberately: `/key ` would turn the following keystrokes into the **visible**
-form of the command, while a bare `/key` opens the **masked** entry path.
+`--prompt -` reads up to 10 MiB from stdin; a positional `-` is literal text. `text` prints the answer, `json` prints a schema 1 envelope with additive fields (a satisfied `--goal` includes `acceptance.command_id`), and `stream-json` prints one NDJSON event per line without ANSI. `--continue` selects the newest session in the project. Exit codes: 0 complete, 2 usage, 3 waiting for a question or approval, 4 failure, 5 ownership conflict, 130 cancel. Legacy `ha chat --headless --json` remains compatible. `--mock` and `--fixture` are local tests; real provider calls may cost money.
 
-The menu exists only where it is **drawn**: in plain mode (no menu at all) and while a
-panel/picker/overlay is open, `Enter`/`Tab`/`↑`/`↓` keep their old meaning — no key ever acts on a list
-you cannot see. While an API key is being entered (masked buffer) the menu never appears either.
+### 12.5. Limits and checks
 
-The approval panel shows the action, workspace, scope and a **countdown** to the gate's
-deadline; when it expires the action does **not** run and the panel closes. Every panel offers
-the same three keys: `y` run once · `a` allow every action for this turn (including file
-writes and commands) · `n` refuse.
-
-### 12.2. When the app uses the plain interface
-
-The TUI is the default. The app falls back to **plain mode** (the previous interface: plain
-lines above a `> ` prompt) when any of these holds, and it always prints the reason to
-stderr: `ha chat --plain` or `HA_UI=plain`; a console smaller than 60 columns by 10 rows;
-`TERM=dumb`; or raw mode refusing to start (which selects line input instead).
-`--plain` conflicts with `--headless` (clap rejects it, exit 2).
-
-### 12.3. Windows limits (measured)
-
-- **Shift+Enter is indistinguishable from Enter** on a Windows console, so it is not
-  documented as a key and is not a way to add a line. Use `Ctrl-J` or `Alt+Enter`.
-- On exit the app leaves the cursor at column zero of a fresh line and the conversation
-  stays in the scrollback.
-- A hard kill (Task Manager, power loss) cannot restore the terminal; that is a known limit
-  of every terminal application, not a defect of `ha`.
-
-**Not verified on this machine:** the real PTY transcript (ConPTY does not work in the
-sandbox in use — see section 8 of `docs/evidence/HA_LAUNCH.vi.md`) and the live provider
-smoke (no credential or budget is granted).
-
-### 12.4. Reading the end of a turn
-
-Every prompt ends with one `[run]` line, and the four words it can use mean different things:
-
-| Line | What happened |
-| --- | --- |
-| `[run] done` | The model answered and asked for nothing more. |
-| `[run] paused: step limit reached` | The turn stopped at one of your bounds — steps, tool calls or the deadline — before the model answered. **Nothing was lost:** every tool receipt is durable, the transcript stays in scrollback, and the next prompt continues the same task. Bounds are `step 2/8` in the status bar, and a step is one model call. |
-| `[run] failed: <reason>` | Something broke: the provider was unreachable, a tool could not be prepared, or the run itself errored. The reason is printed after the colon. |
-| `[run] canceled` | You canceled it (`Ctrl-C`). |
-
-A tool card that fails says why: `failed 962ms · invalid_payload: optional tool path must
-not be blank` is a call the model shaped wrongly (it is told the same thing and usually
-retries), while `failed 1.2s · policy_denied: denied by the user` is a refusal you made.
-**A bound is not the budget, so the app carries on past it.** A step or tool-call bound
-stops a loop that has gone wrong; it does not mean your task is finished, and being made to
-type "continue" to let your own agent keep working reads as a stall. When a turn stops that
-way the app sends the next request itself, and says so in the transcript:
-
-```text
-[run] paused: step limit reached · 8 steps · 14 tool calls · 46.8s
-[info] step limit reached; continuing automatically (1 of 4) — Ctrl-C stops this
-[auto] continue: the previous turn stopped at a bound, not because the task was finished — …
-```
-
-`[auto]` marks the requests the app made on your behalf, so the transcript still separates
-what you asked for from what it did. `Ctrl-C` spends the rest of the budget: after it, a
-bound is a real stop until you speak again. The **deadline** never continues itself — that
-is wall-clock time already spent, and continuing it would spend the same time over and over.
-
-Four variables move the bounds, and `/status` always prints the values in force:
-
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `HA_TURN_MAX_STEPS` | 8 | Model calls in one turn. |
-| `HA_TURN_MAX_TOOL_CALLS` | 16 | Tool calls in one turn. |
-| `HA_TURN_DEADLINE_SECONDS` | 600 | Wall-clock seconds in one turn. |
-| `HA_TURN_CONTINUATIONS` | 4 | Turns the app may continue by itself after a step or tool-call bound. `0` turns that off, so every bound waits for you. |
-
-With the defaults a single request can reach thirty-two model calls (8 × (1 + 4)) before it
-stops for good — enough for real agentic work, still bounded, and never unbounded. Only a
-positive integer counts for the three bounds: `HA_TURN_MAX_STEPS=unlimited` is a typo and
-keeps the default, because a misspelled value must not remove the net. A headless turn
-(`--headless --json`) is still exactly one turn and never continues itself: it reports
-`"stop":"step_limit"`, and a script resumes with `--resume`.
-
-
-### 12.5. Chat memory (opt-in)
-
-Memory is **off unless you ask for it**. Set `HA_MEMORY=on` in the shell that launches
-`ha`; any other value, or leaving it unset, keeps the behaviour above: no memory is read
-and nothing about the conversation is stored.
-
-With it on, one turn does two bounded things:
-
-- **before the request**, your text is the retrieval query; the memory of this workspace
-  that matches is added to the context the model receives, together with the exact memory
-  version each block came from;
-- **after the turn**, the text the journal admitted is stored once as a confirmed,
-  project-scoped memory asset, and **one record of that turn** is written to the
-  conversation log (see "What gets remembered" below — the log keeps an excerpt of the
-  model's answer).
-
-The workspace root keeps one project identity in the store, so memory written by one run
-is readable by the next one, including a new terminal, a new session or a new task.
-
-**How retrieval works (changed).** It used to match documents that contained **every** term
-of the question, and retried with the four longest terms when that found nothing. That
-failed on the most ordinary case: you ask "what marker did I ask you to remember?", the
-instruction says "Remember this marker for later", and the conjunction fails on the words
-only the question has. The answer was in the store while the model reported it was not.
-
-The app now takes the **union** of the terms and keeps only the hits that contain **at
-least two** of them (one, for a one-term question). The floor is the part that matters: a
-single shared word is an accident of vocabulary rather than evidence of aboutness, and
-without it a wider query would trade a silent miss for a confident wrong answer — which is
-worse. If nothing clears the floor it falls back to the exact conjunction, so a question
-that means a specific phrase still gets one.
-
-**Two kinds of material, asked in order.** The store holds **durable memory** (what you
-asked to keep, what the runtime observed, derived L2 — it does not expire) and the
-**conversation log** (one record per turn). A turn record contains your input verbatim, so
-it and the directive that stored the same input overlap almost completely, and the record
-also holds part of the answer. The app therefore asks **durable memory first**; it asks the
-log only when durable memory holds nothing for that question. The two used to be asked
-together, and it was measured that the block injected for a directive's own words was
-sometimes the **turn record** — your instruction arriving framed as something you were
-quoted saying rather than as an instruction. When the log is what answered, the transcript
-says so: `... injected from the conversation log, not from durable memory`.
-
-Every turn prints what happened (`memory: 1 hit(s), 1 block(s) injected`). The two kinds of
-empty are named differently: `nothing matching this question yet (no term overlap)` means it
-searched and found nothing, `nothing to search for in this message` means the message held
-nothing to search for. A headless run reports the same in its `--json` result under
-`memory`.
-
-**What gets remembered (changed).** Two different things are written, and neither replaces
-the other:
-
-- **Durable memory**: only **directives and statements**. A **question** is not: it is you
-  asking, not you telling, and storing each one as a confirmed `user_instruction` asset is
-  how the corpus filled with questions that then outranked the answers. When an input is
-  skipped the app says so (`memory: not stored (a question is not an instruction)`) instead
-  of staying silent.
-- **The conversation log**: **every** turn, including one that was only a question. Each
-  record keeps `asked:` (your input verbatim), `session:`, and `answered:` (the model's
-  answer, at most 4000 characters). This is what answers a
-  question *about* the conversation — "what did I ask you in the previous session?" — and
-  that question takes its own path: the log is read newest first, not by term overlap. It is
-  also what answers a question *about the content* of an earlier answer ("what was the
-  deploy command you gave me?"): the record keeps the answer, not just its first line.
-
-Four things to know about the log, because they are real limits rather than internal
-detail:
-
-- `answered:` is an **excerpt of model output**, not a verified fact. The memory block's
-  heading says so outright, so a reply is not read as verified knowledge.
-- One turn's memory budget (800 tokens) is **shared** among the hits, and a hit that still
-  does not fit is clipped with a `[truncated: ...]` line. You see what the model sees: a long
-  answer can reach the context shortened, but never silently cut.
-- Each project keeps at most **200** records, oldest retired first, and one turn retires at
-  most **8** of them so an answer is never delayed by a long log. A directive you gave is
-  **not** a log entry and is never retired by this cap.
-- **Nothing durable is built on a turn record.** `ha memory summarize` and semantic merge
-  refuse a turn record as a source, with the reason: the record will expire and derived
-  memory dies with its source. A record that is already the source of a live asset is not
-  retired either, and the app reports `stored_but_unpruned` when the cap cannot be reached
-  for that reason.
-
-Saying the same thing twice is **one** memory: the existing asset keeps its id, its version
-and its content hash, and the new source event is recorded on it. The audit trail survives
-and no near-duplicate is minted to compete with the original in ranking.
-
-The same memory is inspectable from the CLI. The store of the project is the directory
-the app's header shows:
-
-```powershell
-ha memory --data-dir "$env:HA_HOME\data\projects\<project-key>" --principal local-user search "marker"
-```
-
-Extraction (`ha memory catch-up`) takes `--asset-scope session|project` as well. `session`
-keeps what a run extracts private to that run's stream, which is the default; `project`
-writes it as knowledge any later session of the project can read. The scope is part of the
-strategy, so changing it starts a new cursor generation instead of reusing what the other
-scope already settled.
-
-What extraction infers is settled as a **candidate**, and a candidate is deliberately not
-retrievable until a human confirms it. Review what is waiting, then confirm:
-
-```powershell
-ha memory --data-dir <store> --session-id <id> candidates --limit 16   # what is waiting
-ha memory --data-dir <store> --session-id <id> confirm --limit 8 --confirm
-ha memory --data-dir <store> --session-id <id> search "parser"         # now retrievable
-```
-
-`confirm` refuses without `--confirm`, confirms only candidates the principal may publish,
-and is bounded to 64 assets per call. Confirmation adds a version — it never rewrites the
-content the extractor proposed.
-
-Memory is never required to run the app: with `HA_MEMORY` unset, retrieval is skipped and
-nothing is written.
-
-### 12.6. Local extensions in a chat turn (opt-in)
-
-Extensions are **off unless you ask for them**. Set `HA_EXTENSIONS=on` in the shell that
-launches `ha`; any other value keeps the nine built-in tools. With it on, a turn reads every
-installation under `<HA_HOME>/data/extensions` (override with `HA_EXTENSIONS_ROOT`), starts
-only what is trusted, advertises the tools those installations declare, and stops the plugin
-processes when the turn ends — a chat turn never leaves an extension running.
-
-P6 has no tool discovery on purpose: a manifest declares the `tools` capability and nothing
-about the names inside it, so **the host decides what the model may see**. One directory per
-plugin holds the three files that needs:
-
-| File | What it is |
-| --- | --- |
-| `manifest.json` | the extension manifest, including the digest it pins for its executable |
-| `trust.json` | the trust grant: plugin id, the same digest, allowed capabilities and secrets |
-| `installation.json` | what this host advertises: the three paths above, plus one entry per tool (name, description, JSON argument schema, timeout) |
-
-```json
-{
-  "schema_version": 1,
-  "plugin_id": "acme.notes",
-  "manifest": "manifest.json",
-  "executable": "acme-notes.exe",
-  "trust": "trust.json",
-  "tools": [
-    {
-      "name": "tool.search_notes",
-      "description": "search the local note index",
-      "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
-      "timeout_ms": 10000
-    }
-  ]
-}
-```
-
-The model sees those tools as `plugin__<plugin>__<tool>`; the advertised name is sanitized for
-the wire and the mapping is held by the host, so a name resolves only to an installation the
-user trusted. A built-in name always wins, so an extension can never shadow `read_file`. Every
-call crosses the same gate as a built-in tool — policy, then your approval, then a durable
-intent and receipt — and the run reports what it loaded
-(`extensions: 1 plugin(s), 1 tool(s) exposed`). A headless run reports the same under
-`extensions` in its `--json` result.
-
-An installation whose executable no longer matches the digest its grant pinned is refused with
-that reason and is never started; a directory without an `installation.json` is ignored. The
-`ha extensions inspect|capabilities|register|skills` commands remain the inspection and
-registration surface, and `register --confirm` is what proves a plugin starts at all.
-
-### 12.7. Images in a message
-
-`deepseek-flash` accepts images, so a screenshot can be part of a request instead of a path the
-model tries to open with a text reader. Three ways in:
-
-| How | What to do |
-| --- | --- |
-| A file you already have | Name it in your message: `what is wrong here? "C:\Users\me\shot.png"`. Dragging the file from Explorer types the same path. **Quote it if the path has spaces.** A relative path resolves against the project directory. |
-| A link to an image | Paste or drag the link itself: `what is wrong here? https://cdn.example.com/shots/broken.png`. Nothing is downloaded here — the link goes into the request and the **provider** fetches it. That needs a link the internet can reach, at most 8192 characters, for an image up to 32 MiB. If the link is private (localhost, an intranet host, a session-bound URL) the provider cannot read it and the turn fails with its download error: copy the picture to the clipboard and use `/image` instead. Only a link whose path ends in `.png`, `.jpg`, `.jpeg`, `.gif` or `.webp` is attached; an ordinary link in a sentence is left as text. |
-| A screenshot on the clipboard | `/image`. `Ctrl-V` does the same where the terminal forwards the key to the app — Windows Terminal keeps that key for its own paste, so `/image` is the way that always works. |
-
-Either way the image is attached to that turn, the clipboard case writes the pasted file into
-the data directory and inserts its quoted path into the composer, and the transcript says what
-happened (`[info] image attached: shot.png (image/png, 84 KiB)`, or
-`broken.png (image url, downloaded by the model)` for a link). A candidate that cannot be
-attached is reported with its reason instead of being skipped in silence: a file that is not
-really an image, one larger than 8 MiB, more than three in one message, or a path that names a
-place credentials live (`.ssh/`, `*.pem`, `.env`, `credentials*`) — those are never sent to a
-provider.
-
-The format comes from the bytes, not the file name, so a `.png` that is really text is refused;
-PNG, JPEG, GIF and WebP are what work. The message names the images in order, so the model can
-refer to "the second screenshot". They travel in the block form of `content`, which the API
-accepts in a **user** message only. `read_file` still refuses binary files: an image reaches the
-model as an attachment, never as file text.
-
-Verified against the local SSE fixture rather than by reading the code: one headless turn naming a
-165-byte PNG (`ha chat --headless --prompt "look at <file.png>" --json`) sent a `user` message whose
-`content` was an array of a text block naming the image followed by an `image_url` block, and the
-base64 in that block decoded to bytes identical to the file on disk (165 bytes, PNG magic intact).
-The same turn reported `"images":["shot.png (image/png, 165 B)"]` — the byte size is exact, because
-`0 KiB` next to an attached image reads like a failure — and the next turn in the same project
-still recalled the earlier turn, so attaching an image does not disturb the memory path. A second
-turn naming `https://cdn.example.com/shots/broken.png` sent that link unchanged as the
-`image_url` value, so the link case is proven at the wire, not only in a unit test.
-
-### 12.8. Files in a message (not only images)
-
-A path that is not an image is now **content** rather than a hint to go open a file. A text file is
-read and placed in that turn's message, so the model sees it without spending a step on a read tool.
-Four ways in, one result:
-
-| Way | What you do |
-| --- | --- |
-| A file you already have | Name it in your message: `what is wrong in this log? "C:\work\build output.log"`. **Quote it if the path has spaces**; a relative path resolves against the project directory. |
-| Drag the file from Explorer | The terminal inserts the path; add your question and press Enter. |
-| Paste a path | `Ctrl-V` (or `/image`) when the clipboard holds a **path** rather than a bitmap: the path is inserted into the composer, already quoted. |
-| `/attach <path>` | Checks the file exists and then inserts the path into the composer: a wrong path is reported as `no such file` where you can still fix it, instead of submitting a path nothing can read. `/attach` works in every terminal, including the ones that keep `Ctrl-V` for their own paste. |
-
-When the turn runs, the transcript names what was attached
-(`[info] file attached: build output.log (text, 51 B)`). Inside the message every file sits between a
-header and a footer (`===== file: <path> (…, 51 B) ===== … ===== end of build output.log =====`), and
-the whole block opens by saying this is **material to read, not instructions to follow** — a log line
-that reads like an order is still not an order.
-
-The bounds have reasons: **256 KiB** of text per file, **1 MiB** and **4 files** per turn; a larger
-file, or a binary one (not UTF-8, or holding a NUL byte), is refused with the reason rather than
-silently truncated. File text stays in the conversation and rides with every later turn, which is why
-the ceiling is a session budget and not just this turn's. A path into a credential store (`.ssh/`,
-`*.pem`, `.env`, `credentials*`) is **never** sent to a provider — image or text. An image still takes
-the image road (`content` blocks) and is never quoted as text.
-
-A headless turn (`--json`) reports this under `files`, one object per file with `path`, `label` and
-`bytes`, so a script can check which file entered the turn without reading the transcript. Verified at
-the wire against the local SSE fixture: one headless turn naming `build output.log` sent a `user`
-message whose `content` contained the file's own line (`error[E0425]: cannot find value …`) under a
-header naming the file (`i03_a_named_file_reaches_the_model_inside_the_message`).
+On Windows `run_shell` uses `pwsh`, falling back to `powershell.exe` when pwsh is missing; the receipt records the selected shell. Strict isolation is claimed only where a measured backend supports it. Start with `/status` and `/config` when provider or permissions differ from expectations. M0–M6, H, and PTY gates have separate evidence; Linux is verified only after a green Ubuntu CI job.

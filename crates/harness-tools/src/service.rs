@@ -2297,6 +2297,7 @@ fn process_output(
 ) -> ToolOutput {
     ToolOutput::Process {
         executable: output.executable,
+        shell: output.shell,
         exit_code: output.exit_code,
         timed_out: output.timed_out,
         canceled: output.canceled,

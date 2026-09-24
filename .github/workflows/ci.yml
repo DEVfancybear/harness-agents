@@ -12,6 +12,7 @@ on:
       - 'scripts/**'
       - '.github/workflows/ci.yml'
       - 'docs/**'
+      - 'README.md'
   pull_request:
     paths:
       - 'Cargo.toml'
@@ -23,6 +24,7 @@ on:
       - 'scripts/**'
       - '.github/workflows/ci.yml'
       - 'docs/**'
+      - 'README.md'
   workflow_dispatch:
 
 permissions:
@@ -165,3 +167,47 @@ jobs:
       - name: Run the ${{ matrix.milestone }} milestone gate
         shell: pwsh
         run: ./scripts/Verify-Milestone.ps1 -Milestone ${{ matrix.milestone }}
+
+  verify-ha-agent:
+    name: HA_AGENT CP-E (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+      - name: Verify M4, M5, M6 and HA_LAUNCH without PTY
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path target/ha-agent-ci -Force | Out-Null
+          $failed = $false
+          foreach ($milestone in @('M4', 'M5', 'M6')) {
+            & ./scripts/Verify-Milestone.ps1 -Milestone $milestone -Json *>&1 | Tee-Object -FilePath "target/ha-agent-ci/$milestone.log"
+            if ($LASTEXITCODE -ne 0) { $failed = $true }
+          }
+          & ./scripts/Verify-HaLaunch.ps1 -Json *>&1 | Tee-Object -FilePath target/ha-agent-ci/HA_LAUNCH.log
+          if ($LASTEXITCODE -ne 0) { $failed = $true }
+          if ($failed) { exit 1 }
+      - name: Upload gate logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ha-agent-gates-${{ matrix.os }}
+          path: target/ha-agent-ci/*.log
+          if-no-files-found: warn
+      - name: Build Linux x64 release bundle
+        if: matrix.os == 'ubuntu-latest'
+        shell: pwsh
+        run: cargo build --release -p harness-cli --locked
+      - name: Upload Linux x64 binary
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ha-linux-x64
+          path: target/release/ha
+          if-no-files-found: error

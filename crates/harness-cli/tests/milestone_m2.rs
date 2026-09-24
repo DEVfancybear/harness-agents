@@ -385,17 +385,15 @@ fn is_loopback_refusal(error: &harness_providers::ProviderError) -> bool {
     text.contains("error sending request") || text.contains("error decoding response body")
 }
 
-async fn collect(adapter: &DeepSeekAdapter) -> Vec<ProviderStreamEvent> {
-    // Retry only a refused or truncated loopback connection: this Windows host
-    // intermittently refuses a connection to a listener that is already bound and
-    // accepting, even when this exact test runs alone in the milestone closure
-    // (measured 21-22/09/2026). The refusal never reaches the fixture, so a retry
-    // cannot consume a scripted response, and every other error still fails at
-    // once.
+async fn collect_fixture(response: FakeResponse) -> Vec<ProviderStreamEvent> {
+    // Each attempt owns a fresh listener and the exact response it expects. A
+    // truncated connection cannot consume or poison the next attempt's script.
     let mut attempt = 0_u32;
     loop {
         attempt += 1;
-        let result = collect_events(adapter.stream_events(
+        let mut provider = FakeProvider::start(vec![response.clone()]).await;
+        provider.wait_ready().await;
+        let result = collect_events(adapter(&provider, "fixture-secret").stream_events(
             provider_request(),
             harness_providers::CancellationToken::new(),
         ))
@@ -418,11 +416,13 @@ async fn collect(adapter: &DeepSeekAdapter) -> Vec<ProviderStreamEvent> {
 /// Like [`collect`], only a refused or truncated loopback connection is retried;
 /// every other error is returned so the test's own assertion decides. The refusal
 /// never reaches the fixture, so a retry cannot consume a scripted response.
-async fn stream_error(adapter: &DeepSeekAdapter) -> harness_providers::ProviderError {
+async fn stream_error_fixture(response: FakeResponse) -> harness_providers::ProviderError {
     let mut attempt = 0_u32;
     loop {
         attempt += 1;
-        let result = collect_events(adapter.stream_events(
+        let mut provider = FakeProvider::start(vec![response.clone()]).await;
+        provider.wait_ready().await;
+        let result = collect_events(adapter(&provider, "fixture-secret").stream_events(
             provider_request(),
             harness_providers::CancellationToken::new(),
         ))
@@ -466,9 +466,7 @@ async fn writer() -> (tempfile::TempDir, Arc<SqliteStore>) {
 #[tokio::test]
 async fn a06_sse_multicall_and_usage_survive_chunk_boundaries() {
     // Every part is written as its own socket write, so frames arrive split.
-    let mut provider = FakeProvider::start(vec![FakeResponse::ok(multicall_parts())]).await;
-    provider.wait_ready().await;
-    let events = collect(&adapter(&provider, "fixture-secret")).await;
+    let events = collect_fixture(FakeResponse::ok(multicall_parts())).await;
 
     let response = assemble_stream(&events).expect("assembly");
     assert_eq!(response.text, "hello");
@@ -508,10 +506,8 @@ async fn a06_missing_terminal_and_truncated_arguments_are_not_dispatchable() {
         )
         .to_owned(),
     ];
-    let mut provider = FakeProvider::start(vec![FakeResponse::ok(parts)]).await;
-    provider.wait_ready().await;
     let response =
-        assemble_stream(&collect(&adapter(&provider, "fixture-secret")).await).expect("assembly");
+        assemble_stream(&collect_fixture(FakeResponse::ok(parts)).await).expect("assembly");
     assert_eq!(response.finish_reason, None);
     assert!(
         !response.is_dispatchable(),
@@ -528,10 +524,8 @@ async fn a06_missing_terminal_and_truncated_arguments_are_not_dispatchable() {
         .to_owned(),
         "data: [DONE]\n\n".to_owned(),
     ];
-    let mut provider = FakeProvider::start(vec![FakeResponse::ok(truncated)]).await;
-    provider.wait_ready().await;
     let response =
-        assemble_stream(&collect(&adapter(&provider, "fixture-secret")).await).expect("assembly");
+        assemble_stream(&collect_fixture(FakeResponse::ok(truncated)).await).expect("assembly");
     assert!(response.incomplete_tool_calls);
     assert!(!response.is_dispatchable());
 }
@@ -552,9 +546,7 @@ async fn a06_id_conflict_is_typed_and_never_dispatched() {
         )
         .to_owned(),
     ];
-    let mut provider = FakeProvider::start(vec![FakeResponse::ok(parts)]).await;
-    provider.wait_ready().await;
-    let error = stream_error(&adapter(&provider, "fixture-secret")).await;
+    let error = stream_error_fixture(FakeResponse::ok(parts)).await;
     assert_eq!(error.code(), ErrorCode::ProviderProtocol);
     assert!(error.to_string().contains("call slot"), "{error}");
 }
@@ -972,9 +964,7 @@ async fn m2_04_text_arrives_before_the_terminal_barrier() {
 #[tokio::test]
 async fn m2_04_conformance_mock_and_adapter_agree() {
     let parts = multicall_parts();
-    let mut provider = FakeProvider::start(vec![FakeResponse::ok(parts.clone())]).await;
-    provider.wait_ready().await;
-    let over_http = collect(&adapter(&provider, "fixture-secret")).await;
+    let over_http = collect_fixture(FakeResponse::ok(parts.clone())).await;
 
     // The same script as a scripted mock: the normalizer must agree.
     let mock_events = harness_providers::collect_events(

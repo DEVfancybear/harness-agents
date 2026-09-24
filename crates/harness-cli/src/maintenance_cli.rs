@@ -22,6 +22,9 @@ use serde_json::json;
 /// Everything the `ha maintenance` command group can do.
 #[derive(Debug, Args)]
 pub struct MaintenanceCommand {
+    /// Resolve the project store from this workspace, as `ha chat` does.
+    #[arg(long, global = true)]
+    cwd: Option<PathBuf>,
     #[command(subcommand)]
     command: MaintenanceSubcommand,
 }
@@ -31,14 +34,14 @@ enum MaintenanceSubcommand {
     /// Report store health, schema revisions, retention state and limitations.
     Doctor {
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
     /// Take a consistent backup of a data directory into a new directory.
     Backup {
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         #[arg(long)]
         into: PathBuf,
         #[arg(long)]
@@ -63,7 +66,7 @@ enum MaintenanceSubcommand {
     /// Apply a retention action. Forget requires --confirm equal to kind:id.
     Retain {
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         /// invalidate | archive | forget
         #[arg(long)]
         action: String,
@@ -85,14 +88,14 @@ enum MaintenanceSubcommand {
     /// Report tombstones and which copies may still hold forgotten data.
     Tombstones {
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
     /// Collect unreferenced artifacts after the grace period.
     Gc {
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         #[arg(long, default_value_t = DEFAULT_GC_GRACE_SECONDS)]
         grace_seconds: u64,
         #[arg(long, default_value_t = true)]
@@ -103,7 +106,7 @@ enum MaintenanceSubcommand {
     /// Migrate a store into a new directory, leaving the source untouched.
     MigrateCopy {
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         #[arg(long)]
         into: PathBuf,
         #[arg(long)]
@@ -128,7 +131,7 @@ enum MaintenanceSubcommand {
     /// can see that it happened instead of trusting that it did.
     SupportBundle {
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
         /// Directory to write the bundle into; must not already hold files.
         #[arg(long)]
         into: PathBuf,
@@ -143,13 +146,31 @@ enum MaintenanceSubcommand {
 /// Run one `ha maintenance` subcommand.
 #[allow(clippy::too_many_lines)] // One explicit subcommand table.
 pub async fn run(command: MaintenanceCommand) -> Result<(), HarnessError> {
+    let project_data_dir = match &command.cwd {
+        Some(root) => Some(
+            crate::interactive::registered_project(root)
+                .await?
+                .store_dir,
+        ),
+        None => None,
+    };
+    let resolve = |explicit: Option<PathBuf>| -> Result<PathBuf, HarnessError> {
+        explicit
+            .or_else(|| project_data_dir.clone())
+            .ok_or_else(|| {
+                HarnessError::new(
+                    ErrorCode::InvalidPayload,
+                    "ha maintenance needs --cwd or --data-dir",
+                )
+            })
+    };
     match command.command {
-        MaintenanceSubcommand::Doctor { data_dir, json } => doctor(&data_dir, json).await,
+        MaintenanceSubcommand::Doctor { data_dir, json } => doctor(&resolve(data_dir)?, json).await,
         MaintenanceSubcommand::Backup {
             data_dir,
             into,
             json,
-        } => backup(&data_dir, &into, json).await,
+        } => backup(&resolve(data_dir)?, &into, json).await,
         MaintenanceSubcommand::VerifyBackup { backup, json } => verify(&backup, json).await,
         MaintenanceSubcommand::Restore { backup, into, json } => {
             restore(&backup, &into, json).await
@@ -165,7 +186,7 @@ pub async fn run(command: MaintenanceCommand) -> Result<(), HarnessError> {
             json,
         } => {
             retain(
-                &data_dir,
+                &resolve(data_dir)?,
                 &action,
                 &source_kind,
                 &source_id,
@@ -176,18 +197,20 @@ pub async fn run(command: MaintenanceCommand) -> Result<(), HarnessError> {
             )
             .await
         }
-        MaintenanceSubcommand::Tombstones { data_dir, json } => tombstones(&data_dir, json).await,
+        MaintenanceSubcommand::Tombstones { data_dir, json } => {
+            tombstones(&resolve(data_dir)?, json).await
+        }
         MaintenanceSubcommand::Gc {
             data_dir,
             grace_seconds,
             dry_run,
             json,
-        } => gc(&data_dir, grace_seconds, dry_run, json).await,
+        } => gc(&resolve(data_dir)?, grace_seconds, dry_run, json).await,
         MaintenanceSubcommand::MigrateCopy {
             data_dir,
             into,
             json,
-        } => migrate(&data_dir, &into, json).await,
+        } => migrate(&resolve(data_dir)?, &into, json).await,
         MaintenanceSubcommand::ReleaseMatrix {
             retrieval_p95_ms,
             restore_ms,
@@ -245,7 +268,7 @@ pub async fn run(command: MaintenanceCommand) -> Result<(), HarnessError> {
             into,
             config,
             json,
-        } => support_bundle(&data_dir, &into, config.as_deref(), json).await,
+        } => support_bundle(&resolve(data_dir)?, &into, config.as_deref(), json).await,
     }
 }
 

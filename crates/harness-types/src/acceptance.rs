@@ -10,8 +10,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ArtifactId, CheckOutcome, ContentHash, ErrorCode, HarnessError, P0_SCHEMA_VERSION, SourceRef,
-    TaskId,
+    AgentRunId, ArtifactId, CheckOutcome, ContentHash, ErrorCode, HarnessError, P0_SCHEMA_VERSION,
+    SourceRef, TaskId,
 };
 
 /// Whether one criterion is satisfied.
@@ -27,6 +27,14 @@ pub enum CriterionStatus {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum CriterionEvidence {
+    /// Typed evidence already verified by the host goal evaluator and committed
+    /// with a run. The source names the run response or a settled tool receipt.
+    RunObserved {
+        run_id: AgentRunId,
+        evidence_kind: String,
+        source: String,
+        content_hash: ContentHash,
+    },
     FileChanged {
         path: String,
         before: Option<ContentHash>,
@@ -50,6 +58,7 @@ impl CriterionEvidence {
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
+            Self::RunObserved { .. } => "run_observed",
             Self::FileChanged { .. } => "file_changed",
             Self::CheckExecuted { .. } => "check_executed",
             Self::ArtifactProduced { .. } => "artifact_produced",
@@ -58,6 +67,22 @@ impl CriterionEvidence {
 
     pub fn validate(&self) -> Result<(), HarnessError> {
         let (reference, label) = match self {
+            Self::RunObserved {
+                evidence_kind,
+                source,
+                ..
+            } => {
+                if !matches!(
+                    evidence_kind.as_str(),
+                    "response" | "tool_execution" | "file_change" | "check" | "artifact"
+                ) {
+                    return Err(HarnessError::new(
+                        ErrorCode::InvalidPayload,
+                        "run_observed.kind is invalid",
+                    ));
+                }
+                (source.as_str(), "run_observed.source")
+            }
             Self::FileChanged { path, .. } => (path.as_str(), "file_changed.path"),
             Self::CheckExecuted { command, .. } => (command.as_str(), "check_executed.command"),
             Self::ArtifactProduced { reference, .. } => {

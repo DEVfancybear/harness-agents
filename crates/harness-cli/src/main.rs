@@ -10,7 +10,7 @@ mod memory_cli;
 mod sandbox_cli;
 mod web;
 
-use std::{path::PathBuf, process::ExitCode, sync::Arc};
+use std::{io::Read, path::PathBuf, process::ExitCode, sync::Arc};
 
 use clap::{Args, Parser, Subcommand};
 use harness_providers::{MockProvider, ProviderStreamEvent};
@@ -40,6 +40,8 @@ struct Cli {
 enum Command {
     /// Open the interactive Harness app; the same entrypoint as bare ha.
     Chat(ChatArgs),
+    /// Run one prompt without a terminal, for scripts and automation.
+    Exec(ExecArgs),
     /// Search, inspect and maintain scoped reusable memory.
     Memory(memory_cli::MemoryCommand),
     /// Serve the loopback web surface: an authenticated API and the local UI.
@@ -167,6 +169,9 @@ struct ChatArgs {
     /// Emit a versioned JSON result; only valid with --headless.
     #[arg(long, requires = "headless")]
     json: bool,
+    /// Output protocol for a headless turn.
+    #[arg(long = "output-format", value_parser = ["text", "json", "stream-json"], requires = "headless")]
+    output_format: Option<String>,
     /// Draw the app with the plain renderer instead of the TUI.
     ///
     /// The same renderer the app falls back to when the console is too small, is
@@ -188,16 +193,93 @@ struct ChatArgs {
     /// Host continuations one headless run may spend on its goal.
     #[arg(long, requires = "goal")]
     max_continuations: Option<u32>,
+    /// Maximum model turns including the first turn.
+    #[arg(long = "max-turns", requires = "goal")]
+    max_turns: Option<u32>,
     /// Token budget for a headless run; the run reserves against it.
     #[arg(long, requires = "headless")]
     budget: Option<u64>,
 }
 
+/// `ha exec` shares the headless runner with `ha chat --headless`.
+#[derive(Debug, Args)]
+struct ExecArgs {
+    #[arg(value_name = "PROMPT", conflicts_with = "prompt")]
+    text: Option<String>,
+    /// Use `-` to read up to 10 MiB from stdin.
+    #[arg(long)]
+    prompt: Option<String>,
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    #[arg(long = "continue", conflicts_with = "resume")]
+    continue_session: bool,
+    #[arg(long)]
+    resume: Option<String>,
+    #[arg(long = "output-format", default_value = "text", value_parser = ["text", "json", "stream-json"])]
+    output_format: String,
+    #[arg(long, value_parser = ["ask", "auto-edit", "full-auto"])]
+    approval: Option<String>,
+    #[arg(long = "allowed-tools")]
+    allowed_tools: Vec<String>,
+    #[arg(long = "disallowed-tools")]
+    disallowed_tools: Vec<String>,
+    #[arg(long)]
+    goal: Option<String>,
+    #[arg(long = "criteria", requires = "goal")]
+    criteria: Vec<String>,
+    #[arg(long = "max-turns", requires = "goal")]
+    max_turns: Option<u32>,
+    #[arg(long)]
+    budget: Option<u64>,
+    /// Deterministic fixture provider, labelled in machine output.
+    #[arg(long)]
+    mock: bool,
+}
+
+impl From<ExecArgs> for ChatArgs {
+    fn from(args: ExecArgs) -> Self {
+        Self {
+            cwd: args.cwd,
+            resume: args.resume,
+            continue_session: args.continue_session,
+            model: None,
+            profile: None,
+            approval: args.approval,
+            allowed_tools: args.allowed_tools,
+            disallowed_tools: args.disallowed_tools,
+            fixture: false,
+            headless: true,
+            prompt: args.prompt.or(args.text),
+            json: false,
+            output_format: Some(args.output_format),
+            plain: false,
+            mock: args.mock,
+            goal: args.goal,
+            criteria: args.criteria,
+            max_continuations: None,
+            max_turns: args.max_turns,
+            budget: args.budget,
+        }
+    }
+}
+
 impl ChatArgs {
     fn mode(&self) -> Result<interactive::LaunchMode, interactive::UsageError> {
-        if self.continue_session && self.headless {
+        let output_format = match self.output_format.as_deref() {
+            Some(value) => Some(
+                interactive::headless::OutputFormat::parse(value)
+                    .ok_or_else(|| interactive::UsageError::new("invalid --output-format"))?,
+            ),
+            None => None,
+        };
+        if self.max_turns == Some(0) {
             return Err(interactive::UsageError::new(
-                "--continue applies to interactive chat only",
+                "--max-turns must be at least 1",
+            ));
+        }
+        if self.max_turns.is_some() && self.max_continuations.is_some() {
+            return Err(interactive::UsageError::new(
+                "--max-turns conflicts with --max-continuations",
             ));
         }
         let resume = if self.continue_session {
@@ -214,10 +296,14 @@ impl ChatArgs {
             self.json,
             self.plain,
             interactive::HeadlessOptions {
+                output_format,
                 mock: self.mock,
                 goal: self.goal.clone(),
                 criteria: self.criteria.clone(),
-                max_continuations: self.max_continuations,
+                max_continuations: self
+                    .max_turns
+                    .map(|turns| turns - 1)
+                    .or(self.max_continuations),
                 budget_tokens: self.budget,
                 approval: self.approval.clone(),
                 allowed_tools: self.allowed_tools.clone(),
@@ -529,7 +615,47 @@ fn json_requested() -> bool {
 /// (`HA_LAUNCH` H01-I03), so the typed JSON error report is for the legacy
 /// subcommands that already write JSON.
 fn legacy_command(cli: &Cli) -> bool {
-    !matches!(cli.command, None | Some(Command::Chat(_)))
+    !matches!(
+        cli.command,
+        None | Some(Command::Chat(_) | Command::Exec(_))
+    )
+}
+
+fn resolve_stdin_prompt(
+    args: &mut ChatArgs,
+    stdin_dash: bool,
+) -> Result<(), interactive::UsageError> {
+    const MAX_PROMPT_BYTES: u64 = 10 * 1024 * 1024;
+    if !stdin_dash {
+        return Ok(());
+    }
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take(MAX_PROMPT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| interactive::UsageError::new(format!("cannot read stdin: {error}")))?;
+    if bytes.len() as u64 > MAX_PROMPT_BYTES {
+        return Err(interactive::UsageError::new(
+            "stdin prompt exceeds the 10 MiB limit",
+        ));
+    }
+    args.prompt = Some(
+        String::from_utf8(bytes)
+            .map_err(|_| interactive::UsageError::new("stdin prompt must be UTF-8"))?,
+    );
+    Ok(())
+}
+
+async fn run_chat(mut args: ChatArgs, stdin_dash: bool) -> Result<ExitCode, HarnessError> {
+    let mode = resolve_stdin_prompt(&mut args, stdin_dash).and_then(|()| args.mode());
+    match mode {
+        Ok(mode) => Box::pin(interactive::launch(mode)).await,
+        Err(usage) => {
+            eprintln!("{usage}");
+            Ok(ExitCode::from(interactive::USAGE_EXIT_CODE))
+        }
+    }
 }
 
 /// The versioned error envelope: `schema_version`, `status`, `exit_code` and
@@ -559,13 +685,14 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
             }))
             .await
         }
-        Some(Command::Chat(args)) => match args.mode() {
-            Ok(mode) => Box::pin(interactive::launch(mode)).await,
-            Err(usage) => {
-                eprintln!("{usage}");
-                Ok(ExitCode::from(interactive::USAGE_EXIT_CODE))
-            }
-        },
+        Some(Command::Chat(args)) => {
+            let stdin_dash = args.prompt.as_deref() == Some("-");
+            run_chat(args, stdin_dash).await
+        }
+        Some(Command::Exec(args)) => {
+            let stdin_dash = args.prompt.as_deref() == Some("-");
+            run_chat(args.into(), stdin_dash).await
+        }
         Some(command) => {
             Box::pin(legacy_run(Cli {
                 command: Some(command),
@@ -801,7 +928,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
         Some(Command::Maintenance(command)) => maintenance_cli::run(command).await,
         // The interactive entrypoint is routed by run() before legacy dispatch;
         // reaching this arm would mean the launch contract was bypassed.
-        Some(Command::Chat(_)) => Err(HarnessError::new(
+        Some(Command::Chat(_) | Command::Exec(_)) => Err(HarnessError::new(
             ErrorCode::InvalidStateTransition,
             "interactive chat must be routed by run()",
         )),

@@ -1,6 +1,36 @@
-# SPEC HA_AGENT — CP-A record and CP-B addendum / Đặc tả HA_AGENT — hồ sơ CP-A và bổ sung CP-B
+# SPEC HA_AGENT — CP-E current; CP-A–CP-D archive / Đặc tả HA_AGENT — CP-E hiện tại; lưu trữ CP-A–CP-D
 
-**Current assignment / Assignment hiện tại:** G07–G09, checkpoint CP-C. CP-A and CP-B below are historical specifications and implementation records. / Thực hiện G07–G09, checkpoint CP-C. Nội dung CP-A và CP-B bên dưới là đặc tả cùng hồ sơ triển khai lịch sử.
+## CP-E — G13–G14 (24/09/2026)
+
+**Assignment:** triển khai G13–G14 theo `docs/HA_AGENT_PLAN.vi.md`, dừng tại CP-E. Không sửa registry acceptance sang `accepted`, không publish/cài đặt/call trả phí. Baseline khi bắt đầu: `ffc93fe08b082a53216a26f4f2a5476222dec847`, worktree sạch; trong lúc triển khai upstream tiến tới `febae6ff9dc7d59c58b1127537c68cde7d7a29a1` qua PR #4 về bundled skills. D1–D11 của plan giữ nguyên; không có số đo nào yêu cầu đổi quyết định. / The CP-E assignment implements only G13–G14; no acceptance-registry promotion, publication, installation or paid call. D1–D11 remain unchanged.
+
+### Inventory and integration / Kiểm kê và tích hợp
+
+| Requirement | Disposition | Existing path → change → oracle |
+| --- | --- | --- |
+| G13 headless entry, format, continuation | adapt | `main.rs::Command` / `interactive::headless` → `ha exec`, `--prompt -`, text/json/NDJSON, latest session → `g13_headless` and i03 |
+| G13 exit and acceptance | missing | `TurnDriver` stop and M0 `AcceptanceCommand` → typed exits, persisted command id and additive JSON → G13 and M3 |
+| G14 baseline L26/H | reuse_verified | `Verify-HaLaunch.ps1 -Json` on baseline and isolated `a5ac2e2` check; result recorded in evidence |
+| G14 CI and Linux | missing | `.github/workflows/ci.yml` → Ubuntu/Windows M4–M6 and H, Linux x64 release artifact, logs → CI run id |
+| Windows shell | adapt | `harness-tools::process::run_shell_with_host` → `pwsh`/PowerShell 5.1 selection and shell in receipt → PATH-free fallback test |
+| M2 fixture stability | adapt | `milestone_m2::FakeProvider` → fresh listener/response per transport attempt → ten full runs |
+| StorePort | reuse_verified | `store/port.rs: impl StorePort for SqliteStore` already exists and is used; no ADR-N12 or duplicate adapter |
+| CLI and TUI polish | adapt | `maintenance_cli`, `delegation_cli`, `controller`, `view` → `--cwd`, raw `/key`, help footer → affected CLI/TUI tests |
+| PTY, H gate, docs | missing/adapt | seven named PTY cases, eight G selectors + unit-agent, operator guides, evidence/handoff → one full PTY run and gates |
+
+### Contracts, compatibility and failure / Hợp đồng, tương thích và lỗi
+
+- `ha exec "<prompt>"` shares the headless chat path. Only explicit `--prompt -` reads stdin; at most 10 MiB. `--output-format stream-json` emits exactly one JSON event per line without ANSI. `--continue` chooses the newest session in the selected project. `--max-turns` maps to continuations and needs a goal. G05 approval/allow/deny options use the same policy. Exit codes follow CONTRACTS §9: 0/2/3/4/5/130.
+- Legacy `ha chat --headless --json` retains its envelope and legacy goal-stop exit behavior for M3; new `ha exec --output-format json` adds a nested `acceptance.command_id` when a goal is satisfied. A satisfied goal emits and persists an M0 `AcceptanceCommand::Evaluate` with run-observed evidence. The SQLite runtime schema moves 6→7 additively with `acceptance_commands`; no user database migration was invoked manually. Schema constants `EXTENSION_PROTOCOL_VERSION`, `MCP_SPEC_REVISION`, `CONTEXT_SCHEMA_VERSION` remain unchanged.
+- Config/data and older JSON fixtures remain readable. A missing shell executable yields a typed process failure; the fallback shell label is `powershell-5.1 (pwsh not found)`. Protected paths, deny rules, trust restrictions, receipt ordering, child cancellation and non-ANSI headless output keep their existing precedence.
+- External provider boundary is mocked with loopback or `MockProvider`; PTY uses temporary projects; CI uses no credentials. No runtime→tools dependency edge is added. If a new edge is discovered by the allowlist gate, add it to `schemas/dependency-allowlist.v1.json` in the implementation commit.
+- Negative controls: stdin overflow and literal positional dash, policy denial with no MCP dispatch, permission precedence, and schema/selector discovery. Tests/registry state remain reviewer-owned. Cargo audit/deny run in CI only if a pinned `--locked` install and version can be recorded; otherwise evidence marks `not_run` with the reason.
+
+### Ordered verification / Thứ tự kiểm chứng
+
+G13 and i03 → M3 compatibility → M2 ten runs → shell/CLI and PTY selectors → full PTY once (all old and new) → schema generator and docs self-test → M6 gate and H `passed:true, failures:[]` → Ubuntu/Windows CI run, Linux artifact and log → evidence/handoff. A gate failure is recorded rather than reclassified as acceptance. No side-effecting migration, user `config.local.toml` write or paid call is part of this verification.
+
+**Historical assignment below / Assignment cũ bên dưới:** G07–G09, checkpoint CP-C. CP-A and CP-B below are historical specifications and implementation records. / G07–G09, checkpoint CP-C; nội dung CP-A và CP-B bên dưới là hồ sơ lịch sử.
 
 ## CP-A original baseline (historical) / Baseline CP-A ban đầu (lịch sử)
 

@@ -7,7 +7,10 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use harness_providers::{
     CancellationToken, DeepSeekAdapter, MockProvider, ModelCapabilities, ModelProvider,
@@ -18,10 +21,14 @@ use harness_runtime::{
 };
 use harness_store_sqlite::{SqliteStore, StoreError, WriterOpenOptions};
 use harness_tools::{
-    ApprovalMode, ToolExecutionService, TurnDriver, TurnObserver, TurnOptions, TurnProgress,
-    coding_tool_schemas, observe_workspace,
+    ApprovalMode, ToolExecutionService, ToolOutput, TurnDriver, TurnObserver, TurnOptions,
+    TurnOutcome, TurnProgress, coding_tool_schemas, observe_workspace,
 };
-use harness_types::{BudgetId, ErrorCode, HarnessError, HostId, InputId, SessionId, TaskId};
+use harness_types::{
+    AcceptanceCommand, AcceptanceRecord, BudgetId, ContentHash, CriterionEvidence, CriterionState,
+    CriterionStatus, ErrorCode, HarnessError, HostId, InputId, RuntimeCommandId, SessionId, TaskId,
+    ToolOutcomeState,
+};
 
 use super::HeadlessOptions;
 use super::attachments;
@@ -46,15 +53,58 @@ pub struct HeadlessRequest {
     pub options: HeadlessOptions,
 }
 
+/// Machine output stays line-oriented and contains no terminal control codes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputFormat {
+    Text,
+    Json,
+    StreamJson,
+}
+
+impl OutputFormat {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "text" => Some(Self::Text),
+            "json" => Some(Self::Json),
+            "stream-json" => Some(Self::StreamJson),
+            _ => None,
+        }
+    }
+}
+
 /// Auto-allowed actions remain visible in headless JSON and plain output.
 #[derive(Default)]
 struct HeadlessObserver {
     auto_allowed: Mutex<Vec<String>>,
     notices: Mutex<Vec<String>>,
+    stream_json: bool,
+    approval_blocked: AtomicBool,
+}
+
+impl HeadlessObserver {
+    fn stream_event(&self, kind: &str, fields: &serde_json::Value) {
+        if self.stream_json {
+            println!("{}", serde_json::json!({"type": kind, "data": fields}));
+        }
+    }
 }
 
 impl TurnObserver for HeadlessObserver {
     fn observe(&self, progress: TurnProgress) {
+        match &progress {
+            TurnProgress::TextDelta(text) => self.stream_event("text.delta", &serde_json::json!({"text": text})),
+            TurnProgress::ThinkingDelta(text) => self.stream_event("thinking.delta", &serde_json::json!({"text": text})),
+            TurnProgress::Usage { prompt_tokens, completion_tokens } => self.stream_event("usage", &serde_json::json!({"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens})),
+            TurnProgress::ToolStarted { name, summary } => self.stream_event("tool.started", &serde_json::json!({"name": name, "summary": summary})),
+            TurnProgress::ToolSettled { name, ok, detail } => {
+                self.stream_event("tool.settled", &serde_json::json!({"name": name, "ok": ok, "detail": detail}));
+                if !ok && detail.as_deref().is_some_and(|text| text.contains("approval") || text.contains("denied by the user")) {
+                    self.approval_blocked.store(true, Ordering::SeqCst);
+                    self.stream_event("approval.blocked", &serde_json::json!({"name": name, "reason": detail}));
+                }
+            }
+            _ => {}
+        }
         match progress {
             TurnProgress::Info(message) => {
                 if let Ok(mut messages) = self.auto_allowed.lock() {
@@ -164,6 +214,11 @@ fn memory_disposition_of(
 /// long because it wires real components, not because it branches.
 #[allow(clippy::too_many_lines)]
 pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
+    let format = request.options.output_format.unwrap_or(if request.json {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Text
+    });
     acceptance_trace("start");
     let caller_dir = std::env::current_dir().map_err(|error| {
         HarnessError::new(
@@ -245,6 +300,21 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     // fresh session linked to it, exactly like a follow-up in the interactive app.
     let resumed_from = match &request.resume {
         Some(session_text) => {
+            let session_text = if session_text == "latest" {
+                store
+                    .newest_session_id()
+                    .await
+                    .map_err(StoreError::into_harness_error)?
+                    .map(|id| id.as_str().to_owned())
+                    .ok_or_else(|| {
+                        HarnessError::new(
+                            ErrorCode::InvalidPayload,
+                            "this project has no session to continue",
+                        )
+                    })?
+            } else {
+                session_text.clone()
+            };
             let parsed = SessionId::parse(session_text.clone()).map_err(|error| {
                 HarnessError::new(
                     error.code(),
@@ -370,9 +440,15 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     // The goal, when the caller attached one, is host policy: typed criteria
     // and bounded continuations. An unknown criterion kind is a usage error,
     // not a silently ignored requirement.
+    let goal_criteria = request
+        .options
+        .goal
+        .as_ref()
+        .map(|_| parse_criteria(&request.options.criteria))
+        .transpose()?;
     let driver = match &request.options.goal {
         Some(objective) => {
-            let criteria = parse_criteria(&request.options.criteria)?;
+            let criteria = goal_criteria.clone().unwrap_or_default();
             let spec = GoalSpec::new(objective.clone(), criteria);
             let no_progress = spec.max_no_progress;
             let goal = match request.options.max_continuations {
@@ -410,7 +486,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     );
     let run_request = RunRequest::new(
         session_id.clone(),
-        task_id,
+        task_id.clone(),
         InputId::generate(),
         prompt,
         observation,
@@ -479,8 +555,22 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         // silently in the middle of somebody's pipeline.
         limits: bounds::limits_from_environment(&environment),
     };
-    let observer = Arc::new(HeadlessObserver::default());
+    let observer = Arc::new(HeadlessObserver {
+        stream_json: format == OutputFormat::StreamJson,
+        ..HeadlessObserver::default()
+    });
+    observer.stream_event(
+        "turn.started",
+        &serde_json::json!({"session_id": session_id, "task_id": task_id}),
+    );
     let turn_observer: Arc<dyn TurnObserver> = observer.clone();
+    let cancellation = CancellationToken::new();
+    let signal_cancellation = cancellation.clone();
+    let signal_listener = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_cancellation.cancel();
+        }
+    });
     let outcome = match &resumed_from {
         Some((source, _)) => {
             driver
@@ -489,7 +579,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
                     run_request,
                     options,
                     Arc::clone(&turn_observer),
-                    CancellationToken::new(),
+                    cancellation.clone(),
                 )
                 .await?
         }
@@ -499,10 +589,48 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
                     run_request,
                     options,
                     Arc::clone(&turn_observer),
-                    CancellationToken::new(),
+                    cancellation,
                 )
                 .await?
         }
+    };
+    signal_listener.abort();
+    if let Some(question_id) = &outcome.pending_question {
+        observer.stream_event("ask_user", &serde_json::json!({"question_id": question_id}));
+    }
+    let acceptance_command_id = if outcome.acceptance == harness_runtime::AcceptanceState::Satisfied
+    {
+        let criteria = accepted_criteria(goal_criteria.as_deref().unwrap_or_default(), &outcome)?;
+        let command = AcceptanceCommand::Evaluate {
+            criteria: criteria.clone(),
+            pending_effects: 0,
+            evidence_fingerprint: outcome.executions.iter().rev().find_map(|view| {
+                view.receipt
+                    .as_ref()
+                    .and_then(|receipt| receipt.after_fingerprint.clone())
+            }),
+        };
+        let transition = AcceptanceRecord::initial(outcome.task_id.clone())
+            .apply(command)
+            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+        let command_id = RuntimeCommandId::generate();
+        store
+            .record_acceptance_command(
+                &command_id,
+                &outcome.run_id,
+                &transition.next,
+                &serde_json::json!({
+                    "kind": "evaluate",
+                    "criteria": criteria,
+                    "pending_effects": 0,
+                    "evidence_fingerprint": transition.next.evidence_fingerprint,
+                }),
+            )
+            .await
+            .map_err(StoreError::into_harness_error)?;
+        Some(command_id)
+    } else {
+        None
     };
     let auto_allowed = observer
         .auto_allowed
@@ -614,7 +742,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         }
         None => serde_json::Value::Null,
     };
-    let output = serde_json::json!({
+    let mut output = serde_json::json!({
         "schema_version": 1,
         "session_id": outcome.session_id,
         "task_id": outcome.task_id,
@@ -625,6 +753,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         "stop": outcome.stop.as_str(),
         "run": run_report,
         "acceptance": outcome.acceptance.as_str(),
+        "acceptance_command_id": acceptance_command_id,
         "goal": goal_report,
         "pending_question": pending_question,
         "approvals": "none",
@@ -639,6 +768,12 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
             .as_ref()
             .map(|(source, _)| source.as_str().to_owned()),
     });
+    if request.options.output_format.is_some() {
+        output["acceptance"] = serde_json::json!({
+            "state": outcome.acceptance.as_str(),
+            "command_id": acceptance_command_id,
+        });
+    }
 
     drop(driver);
     // Stop the extension processes this turn started, before the writer is released.
@@ -658,8 +793,10 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         .map_err(StoreError::into_harness_error)?;
     acceptance_trace("writer_closed");
 
-    if request.json {
+    if format == OutputFormat::Json {
         println!("{output}");
+    } else if format == OutputFormat::StreamJson {
+        observer.stream_event("run.terminal", &output);
     } else {
         for message in notices {
             println!("[info] {message}");
@@ -669,7 +806,111 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         }
         println!("{}", output["response"].as_str().unwrap_or_default());
     }
-    Ok(ExitCode::SUCCESS)
+    let exit = match outcome.stop {
+        _ if request.options.output_format.is_none() => 0,
+        harness_tools::TurnStop::Canceled => 130,
+        harness_tools::TurnStop::NeedsInput | harness_tools::TurnStop::ExternalWait => 3,
+        _ if observer.approval_blocked.load(Ordering::SeqCst) => 3,
+        harness_tools::TurnStop::Final
+            if outcome.goal.as_ref().is_none_or(|goal| {
+                goal.acceptance == harness_runtime::AcceptanceState::Satisfied
+            }) =>
+        {
+            0
+        }
+        _ => 4,
+    };
+    Ok(ExitCode::from(exit))
+}
+
+/// Convert the goal evaluator's proven evidence into M0's durable command input.
+fn accepted_criteria(
+    criteria: &[GoalCriterion],
+    outcome: &TurnOutcome,
+) -> Result<Vec<CriterionState>, HarnessError> {
+    criteria
+        .iter()
+        .map(|criterion| {
+            let (source, bytes) = if criterion.evidence == EvidenceKind::Response {
+                (
+                    format!("run:{}:response", outcome.run_id),
+                    outcome.final_text.as_bytes().to_vec(),
+                )
+            } else {
+                let final_digest = outcome.executions.iter().rev().find_map(|view| {
+                    view.receipt
+                        .as_ref()
+                        .and_then(|receipt| receipt.after_fingerprint.as_ref())
+                });
+                let view = outcome
+                    .executions
+                    .iter()
+                    .find(|view| {
+                        let receipt = view.receipt.as_ref();
+                        match criterion.evidence {
+                            EvidenceKind::Response => false,
+                            EvidenceKind::ToolExecution => receipt.is_some_and(|receipt| {
+                                receipt.outcome_state == ToolOutcomeState::Settled
+                            }),
+                            EvidenceKind::FileChange => matches!(
+                                view.output,
+                                ToolOutput::ApplyPatch { .. }
+                                    | ToolOutput::WriteFile { .. }
+                                    | ToolOutput::EditFile { .. }
+                            ),
+                            EvidenceKind::Check => {
+                                matches!(
+                                    view.output,
+                                    ToolOutput::Process {
+                                        exit_code: Some(0),
+                                        timed_out: false,
+                                        canceled: false,
+                                        ..
+                                    }
+                                ) && receipt.and_then(|receipt| receipt.after_fingerprint.as_ref())
+                                    == final_digest
+                            }
+                            EvidenceKind::Artifact => {
+                                receipt.is_some_and(|receipt| receipt.artifact_id.is_some())
+                            }
+                        }
+                    })
+                    .ok_or_else(|| {
+                        HarnessError::new(
+                            ErrorCode::InvalidStateTransition,
+                            format!(
+                                "satisfied goal lacks committed {} evidence",
+                                criterion.evidence.as_str()
+                            ),
+                        )
+                    })?;
+                let receipt = view.receipt.as_ref().ok_or_else(|| {
+                    HarnessError::new(
+                        ErrorCode::InvalidStateTransition,
+                        "accepted tool evidence has no receipt",
+                    )
+                })?;
+                let bytes = serde_json::to_vec(receipt).map_err(|error| {
+                    HarnessError::new(
+                        ErrorCode::StorageWriteFailed,
+                        format!("serialize evidence receipt: {error}"),
+                    )
+                })?;
+                (format!("tool_receipt:{}", receipt.tool_execution_id), bytes)
+            };
+            Ok(CriterionState {
+                criterion_id: criterion.id.clone(),
+                required: criterion.required,
+                status: CriterionStatus::Satisfied,
+                evidence: vec![CriterionEvidence::RunObserved {
+                    run_id: outcome.run_id.clone(),
+                    evidence_kind: criterion.evidence.as_str().to_owned(),
+                    source,
+                    content_hash: ContentHash::from_bytes(&bytes),
+                }],
+            })
+        })
+        .collect()
 }
 
 /// An absent user cannot answer a gate, so every `Ask` decision must refuse.

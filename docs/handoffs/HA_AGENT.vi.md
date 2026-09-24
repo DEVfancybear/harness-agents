@@ -1,6 +1,28 @@
-# Handoff — HA_AGENT CP-D hiện hành / CP-C history
+# Handoff — HA_AGENT CP-E đang triển khai / CP-D và trước đó là lịch sử
 
-## CP-D — G10–G12 hiện hành (24/09/2026)
+## CP-E — G13–G14 current assignment (24/09/2026)
+
+**Phạm vi:** Làm G13–G14 theo `docs/HA_AGENT_PLAN.vi.md`, dừng ở CP-E; giữ D1–D11. Không promote `tests/acceptance` sang accepted, không publish/cài lên máy user, không paid smoke, không chạy lại migration hay ghi config.local.toml của workspace thật. User yêu cầu đối chiếu Git/SPEC/evidence/plan, inspect symbol/test, affected tests và gate, cập nhật handoff. / Continue G13–G14 only and stop at CP-E.
+
+**Branch/base:** `master`; bắt đầu ở `ffc93fe08b082a53216a26f4f2a5476222dec847` với worktree sạch. Upstream PR #4 tiến `origin/master` tới `febae6ff9dc7d59c58b1127537c68cde7d7a29a1` trong lúc triển khai; các file G13–G14 hiện unstaged trên HEAD mới. Source digest và commit/push chỉ ghi sau khi gate đủ. `Cargo.lock` SHA-256 `38315c57cbfb563d37de95c778d52562ac3798f58224fc2517617e9289e7a859`. Windows NT 10.0.26200.0 x64, Rust stable 1.97.1.
+
+**Completed boundary / Ranh giới đã xong:** G13 code + sáu selector pass, i03 5/5, M3 20/20. G14 baseline H/L26 đã đo và ghi trong [evidence](../evidence/HA_AGENT.vi.md): baseline H đỏ; `a5ac2e2` còn lỗi compile lịch sử. CI job hai OS, shell fallback/receipt, `--cwd` tasks/maintenance, raw `/key`, footer ↑↓, M2 fixture per attempt, eight G selectors + unit-agent, bảy ca PTY và operator guide vi/en đã được sửa ở source. `StorePort for SqliteStore` có sẵn trong `store/port.rs`; không tạo adapter/ADR trùng. `Verify-Docs.ps1 -SelfTest` xanh. Chưa có gate H/M6 trên source cuối, PTY xanh một lượt hay Linux CI id; trạng thái vẫn `implemented_unverified`.
+
+**Current in-progress / Đang dở:** ổ C thiếu chỗ làm linker lỗi 1140 trước PTY run 3; bộ duyệt tự động chặn `Remove-Item -Recurse` cache. Đã dùng `cargo clean -p harness-cli` thành công (196598 generated files, 148.7 GiB) và khởi động lại PTY selector `g0` qua `Invoke-HaPtyAcceptance.ps1 -Filter g0 -OutputDirectory target/pty-acceptance-cpe4`. Session process id từ shell tool: `63455`; kiểm tra kết quả bằng `write_stdin` nếu còn sống. Source sau build sạch vẫn cần chạy format, clippy, shell fallback test, toàn PTY, M2 10 lần, M6/H.
+
+**Changed files and reasons / File đã đổi:** `main.rs`, `interactive/headless.rs`, `interactive/mod.rs`, `g13_headless.rs`, `harness-types/acceptance.rs`, SQLite `models.rs`/`store.rs`/`store/run.rs` cho G13 CLI, NDJSON, acceptance command và migration additive; `harness-tools/contracts.rs`/`process.rs`/`service.rs` cho shell receipt; `delegation_cli.rs`, `maintenance_cli.rs`, `interactive/controller.rs`/`view.rs`, `service_completion_tests.rs` cho CLI/TUI; `milestone_m2.rs` cho fresh fixture, `milestone_m6.rs` cho G10 selector, `interactive_terminal.rs` và PTY script cho ca G14; `Verify-HaLaunch.ps1`, `ci.yml`, README, SPEC/evidence/handoff, OPERATOR_GUIDE vi/en cho gate/CI/docs. Không thêm Cargo dependency edge hay đổi ba protocol/context constants.
+
+**Latest failures / Lỗi gần nhất:** PTY run 1 = 18/25; run 2 = 21/25. Run 2: g06 ask_user loopback response mất; g08 test gửi `y` khi `/undo` còn chạy (đếm approval cũ), i01 assert newline không chấp nhận escape tắt bracketed paste sau newline, t_more tìm fragment TUI bị ConPTY chia. Đã sửa fixture g06 trả lời nhiều attempt cho đến stop, g08 chờ `[approval] WriteFile`, i01 chấp nhận escape sau newline, t_more chờ overlay `Esc đóng`; các sửa này đang được chạy ở PTY `g0`/lượt tiếp. i13 cũ từng fail do fixture đọc thiếu request khi resume, đã đổi sang `accept_complete_request`; run 2 sau sửa pass. Không nới policy/tool assertion để giấu lỗi.
+
+**Contracts/decisions:** SPEC CP-E ở [SPEC](../specs/HA_AGENT.vi.md). G13 new JSON nested `acceptance.command_id`; legacy chat JSON/exit giữ M3. Runtime schema 6→7 chỉ additive; không migration dữ liệu thật. D1–D11 giữ nguyên. Conditional cargo audit/deny chưa cài/pin, ghi `not_run`; Linux chỉ `via CI` khi job xanh. Không tự ghi acceptance registry.
+
+**Exact next action / Bước kế tiếp:** nhận kết quả session PTY `63455`; nếu `g0` chưa xanh, inspect transcript và symbol/test tương ứng, sửa fixture hoặc hành vi rồi chạy affected selector; sau đó chạy **một** PTY full pass 25/25, `milestone_m2` 10 lần, shell/CLI selector, schema generator, M6 và H gate, docs self-test, CI Ubuntu/Windows; cập nhật evidence/handoff với log/hash/run id. Dừng ở CP-E, không sang item/checkpoint khác.
+
+**Do not repeat / Không lặp:** baseline H trên `ffc93fe`, compile kiểm `a5ac2e2`, user config/migration/paid calls; `cargo clean -p harness-cli` đã xong và chỉ cần build lại. Không có side effect ngoài temp fixtures/build cache đã biết.
+
+---
+
+## CP-D — G10–G12 historical (24/09/2026)
 
 Tiếp tục từ CP-C và dừng ở CP-D theo assignment. Không bắt đầu G13–G14 trong lượt này.
 

@@ -182,6 +182,8 @@ fn process_execution_lock() -> &'static tokio::sync::Mutex<()> {
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessResult {
     pub executable: String,
+    /// Shell selection for `run_shell`; structured process calls leave this absent.
+    pub shell: Option<String>,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub canceled: bool,
@@ -368,18 +370,17 @@ pub(crate) async fn run_shell_with_host(
     host: &HostEnvironment,
 ) -> Result<ProcessResult, HarnessError> {
     #[cfg(windows)]
-    let (executable, args) = (
-        "pwsh".to_owned(),
-        vec![
-            "-NoProfile".to_owned(),
-            "-NonInteractive".to_owned(),
-            "-Command".to_owned(),
-            command.to_owned(),
-        ],
-    );
+    let (executable, shell) = windows_shell(host);
+    #[cfg(windows)]
+    let args = vec![
+        "-NoProfile".to_owned(),
+        "-NonInteractive".to_owned(),
+        "-Command".to_owned(),
+        command.to_owned(),
+    ];
     #[cfg(not(windows))]
     let (executable, args) = ("sh".to_owned(), vec!["-c".to_owned(), command.to_owned()]);
-    run(
+    let mut result = run(
         root,
         &executable,
         &args,
@@ -390,7 +391,81 @@ pub(crate) async fn run_shell_with_host(
         host,
         None,
     )
-    .await
+    .await?;
+    #[cfg(windows)]
+    {
+        result.shell = Some(shell);
+    }
+    #[cfg(not(windows))]
+    {
+        result.shell = Some("sh".to_owned());
+    }
+    Ok(result)
+}
+
+#[cfg(windows)]
+fn windows_shell(host: &HostEnvironment) -> (String, String) {
+    if host.lookup("PATH").is_some_and(|path| {
+        path.split(';').any(|directory| {
+            let directory = directory.trim_matches('"');
+            Path::new(directory).join("pwsh.exe").is_file()
+        })
+    }) {
+        ("pwsh".to_owned(), "powershell-7".to_owned())
+    } else {
+        (
+            "powershell.exe".to_owned(),
+            "powershell-5.1 (pwsh not found)".to_owned(),
+        )
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_shell_tests {
+    use super::{HostEnvironment, run_shell_with_host, windows_shell};
+    use crate::{capture::ProcessSpoolConfig, secrets::ProcessEnvironment};
+    use harness_providers::CancellationToken;
+
+    #[test]
+    fn g14_run_shell_falls_back_when_path_has_no_pwsh() {
+        let host = HostEnvironment::from_pairs([("PATH".to_owned(), "C:\\missing".to_owned())]);
+        assert_eq!(
+            windows_shell(&host),
+            (
+                "powershell.exe".to_owned(),
+                "powershell-5.1 (pwsh not found)".to_owned()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn g14_fallback_receipt_names_powershell_51() {
+        let root = std::env::var("SystemRoot").expect("Windows system root");
+        let shell_dir = std::path::Path::new(&root).join("System32/WindowsPowerShell/v1.0");
+        assert!(shell_dir.join("powershell.exe").is_file());
+        let workspace = tempfile::tempdir().expect("workspace");
+        let host = HostEnvironment::from_pairs([
+            ("PATH".to_owned(), shell_dir.display().to_string()),
+            ("SystemRoot".to_owned(), root),
+        ]);
+        let result = run_shell_with_host(
+            workspace.path(),
+            "Write-Output 'shell-fallback-ok'",
+            10_000,
+            CancellationToken::new(),
+            &ProcessEnvironment::empty(),
+            &ProcessSpoolConfig::default(),
+            &host,
+        )
+        .await
+        .expect("fallback starts");
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            result.shell.as_deref(),
+            Some("powershell-5.1 (pwsh not found)")
+        );
+        assert!(result.stdout.contains("shell-fallback-ok"));
+    }
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)] // one process lifecycle, told in order
@@ -564,6 +639,7 @@ async fn run(
     let capture = finalize_capture(stdout, stderr, limits)?;
     Ok(ProcessResult {
         executable: executable.to_owned(),
+        shell: None,
         exit_code: status.code(),
         timed_out,
         canceled,
@@ -585,6 +661,7 @@ async fn run(
 fn canceled_before_spawn(executable: &str, queued: bool) -> ProcessResult {
     ProcessResult {
         executable: executable.to_owned(),
+        shell: None,
         exit_code: None,
         timed_out: false,
         canceled: true,

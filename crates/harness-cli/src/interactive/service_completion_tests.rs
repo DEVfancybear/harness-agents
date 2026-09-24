@@ -12,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 fn g06_shell_prefix_marks_process_capture_truncation() {
     let output = ToolOutput::Process {
         executable: "fixture-shell".to_owned(),
+        shell: Some("sh".to_owned()),
         exit_code: Some(0),
         timed_out: false,
         canceled: false,
@@ -250,13 +251,6 @@ async fn resume_flow() {
         Some(source.clone()),
         "selection must happen before submit, without an async lookup race"
     );
-    service.submit(SubmitRequest {
-        input_id: InputId::generate(),
-        text: "continue source".to_owned(),
-        answer_question_id: None,
-        shell_prefix: None,
-        compact_guidance: None,
-    });
     // The accept loop must be listening before the service connects: this
     // environment refuses a connection to a fresh loopback listener that nobody is
     // accepting on yet, which is the flake the gate reports for this case. The
@@ -285,8 +279,18 @@ async fn resume_flow() {
     });
     // The bound is generous on purpose: under a full-workspace run this child can be
     // starved of a worker thread, and a short bound turned that into a red gate.
+    tokio::time::timeout(Duration::from_secs(5), is_listening)
+        .await
+        .expect("fixture accept task starts")
+        .expect("the fixture is listening");
+    service.submit(SubmitRequest {
+        input_id: InputId::generate(),
+        text: "continue source".to_owned(),
+        answer_question_id: None,
+        shell_prefix: None,
+        compact_guidance: None,
+    });
     let (request, outcome) = tokio::time::timeout(Duration::from_mins(1), async {
-        is_listening.await.expect("the fixture is listening");
         tokio::join!(
             async { provider.await.expect("fixture task") },
             terminal(&mut channel)

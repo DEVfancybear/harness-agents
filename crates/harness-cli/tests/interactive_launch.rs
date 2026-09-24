@@ -516,6 +516,12 @@ fn sse_fixture(text: &'static str) -> (String, SseFixtureServer) {
             }
             match listener.accept() {
                 Ok((mut socket, _)) => {
+                    // Accepted sockets inherit the listener's nonblocking mode on
+                    // Windows. `read_http_request` expects a blocking stream so it
+                    // can wait for the request bytes after accept.
+                    socket
+                        .set_nonblocking(false)
+                        .expect("fixture reads a complete HTTP request");
                     if let Some(request) = read_http_request(&mut socket) {
                         let _ = ready_tx.send(());
                         if first_request.is_none() {
@@ -586,7 +592,13 @@ fn i03_headless_turn_runs_through_the_real_adapter_and_keeps_the_key_out_of_outp
     let _loopback = loopback_test_guard();
     let (run, request) = attempt_headless_turn();
 
-    assert_eq!(run.code(), 0, "stderr was: {}", run.stderr);
+    assert_eq!(
+        run.code(),
+        0,
+        "stderr was: {}; fixture received {} bytes",
+        run.stderr,
+        request.len()
+    );
     let parsed: serde_json::Value =
         serde_json::from_str(&run.stdout).expect("headless output is JSON");
     assert_eq!(

@@ -13,8 +13,9 @@ regressions P0-P7, the installer self test and the documentation checker with it
 negative controls.
 
 Items the gate deliberately reports as NOT RUN instead of counting them as passes:
-the 16 PTY transcript cases in a real terminal, the live provider smoke, Linux, and
-any real mutation of the user's PATH or profile.
+the PTY transcript cases in a real terminal, the live provider smoke, any real
+mutation of the user's PATH or profile, and the Windows CMD installer check when
+the gate runs on a non-Windows host.
 
 A required selector that disappeared fails the gate instead of silently reducing
 coverage.
@@ -137,12 +138,28 @@ $requiredTuiSelectors = @(
     'interactive::controller::tests::t06_y_key_grants_exactly_the_pending_request'
 )
 
+$requiredGSelectors = @(
+    @{ Selector = 'g01_agents_md_cannot_grant_tools'; Target = @('-p', 'harness-cli', '--test', 'interactive_session') },
+    @{ Selector = 'interactive::config::tests::g02_precedence_cli_over_env_over_project_over_user'; Target = @('-p', 'harness-cli', '--bin', 'ha') },
+    @{ Selector = 'g04_edit_file_requires_a_unique_match'; Target = @('-p', 'harness-cli', '--test', 'milestone_m4') },
+    @{ Selector = 'service::tests::g05_protected_path_beats_every_allow_rule_and_mode'; Target = @('-p', 'harness-tools', '--lib') },
+    @{ Selector = 'g06_bang_prefix_goes_through_the_same_approval_gate'; Target = @('-p', 'harness-cli', '--test', 'milestone_m4') },
+    @{ Selector = 'g07_auto_compaction_triggers_at_threshold_and_never_loops'; Target = @('-p', 'harness-cli', '--test', 'milestone_m5') },
+    @{ Selector = 'interactive::service::tests::g09_hook_cannot_turn_ask_into_allow'; Target = @('-p', 'harness-cli', '--bin', 'ha') },
+    @{ Selector = 'g10_mcp_tool_goes_through_the_dispatcher_and_the_approval_gate'; Target = @('-p', 'harness-cli', '--test', 'milestone_m6') }
+)
+
 $notRun = @(
     'PTY cases need a real console, which a sandboxed cargo test does not have. Run scripts/Invoke-HaPtyAcceptance.ps1 and keep its transcripts; this gate does not count them as passes.',
     'Live provider smoke (paid model call): no credential or budget is granted for this assignment.',
-    'Linux build and run: this session only has Windows x64.',
     'Real User PATH mutation and install into the user profile: not authorized in this assignment.'
 )
+if (-not $IsLinux) {
+    $notRun += 'Linux build and run: this local Windows gate does not establish Linux support; use the Ubuntu CI job.'
+}
+if (-not $IsWindows) {
+    $notRun += 'Windows installer self-test: it verifies CMD PATH resolution and runs on the Windows CI leg; this non-Windows gate does not count it as a pass.'
+}
 
 function Invoke-GateSelfTest {
     $failures = [System.Collections.Generic.List[string]]::new()
@@ -155,6 +172,7 @@ function Invoke-GateSelfTest {
     if (-not ($parsed -contains 'interactive_launch::i03_thing')) { $failures.Add('discovery parsing dropped a selector') }
     if ($requiredSelectors.Count -lt 6) { $failures.Add('the required selector list shrank unexpectedly') }
     if ($requiredTuiSelectors.Count -lt 4) { $failures.Add('the required TUI selector list shrank unexpectedly') }
+    if ($requiredGSelectors.Count -lt 8) { $failures.Add('the required G selector list shrank unexpectedly') }
     foreach ($item in $requiredSelectors) {
         if ([string]::IsNullOrWhiteSpace($item.Selector) -or [string]::IsNullOrWhiteSpace($item.Target)) {
             $failures.Add('a required selector entry is incomplete')
@@ -207,7 +225,25 @@ foreach ($selector in $requiredTuiSelectors) {
     }
 }
 
+foreach ($requirement in $requiredGSelectors) {
+    $target = @('test') + $requirement.Target + @('--locked')
+    try {
+        $count = Assert-Selector -File 'cargo' -DiscoveryArguments ($target + @('--', '--list')) -Selector $requirement.Selector
+        Write-Host "== discovery G: $count tests, selector present: $($requirement.Selector)"
+        $script:Steps.Add([pscustomobject]@{ Name = "discovery:$($requirement.Selector)"; ExitCode = 0; Seconds = 0; Detail = "$count discovered" })
+    }
+    catch {
+        Write-Host "   FAILED: $($_.Exception.Message)"
+        $failures.Add("discovery:$($requirement.Selector)")
+        $script:Steps.Add([pscustomobject]@{ Name = "discovery:$($requirement.Selector)"; ExitCode = 1; Seconds = 0; Detail = $_.Exception.Message })
+    }
+    if ((Invoke-GateStep -Name "selector:$($requirement.Selector)" -File 'cargo' -Arguments ($target + @('--', '--exact', $requirement.Selector))) -ne 0) {
+        $failures.Add("selector:$($requirement.Selector)")
+    }
+}
+
 if ((Invoke-GateStep -Name 'unit-interactive' -File 'cargo' -Arguments @('test', '-p', 'harness-cli', '--bin', 'ha', '--locked')) -ne 0) { $failures.Add('unit-interactive') }
+if ((Invoke-GateStep -Name 'unit-agent' -File 'cargo' -Arguments @('test', '-p', 'harness-orchestrator', '--lib', '--locked')) -ne 0) { $failures.Add('unit-agent') }
 if ((Invoke-GateStep -Name 'acceptance-launch' -File 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', 'interactive_launch', '--locked', '--', '--test-threads=1')) -ne 0) { $failures.Add('acceptance-launch') }
 if ((Invoke-GateStep -Name 'acceptance-session' -File 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', 'interactive_session', '--locked', '--', '--test-threads=1')) -ne 0) { $failures.Add('acceptance-session') }
 # Serial like every other suite: the streaming fixture binds a loopback port inside the
@@ -220,7 +256,12 @@ foreach ($phase in @('phase_p0', 'phase_p1', 'phase_p2', 'phase_p3', 'phase_p4',
     if ((Invoke-GateStep -Name "regression-$phase" -File 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $phase, '--locked', '--', '--test-threads=1')) -ne 0) { $failures.Add("regression-$phase") }
 }
 
-if ((Invoke-GateStep -Name 'installer-selftest' -File 'pwsh' -Arguments @('-NoProfile', '-File', (Join-Path $repositoryRoot 'scripts/Install-Ha.ps1'), '-SelfTest')) -ne 0) { $failures.Add('installer-selftest') }
+if ($IsWindows) {
+    if ((Invoke-GateStep -Name 'installer-selftest' -File 'pwsh' -Arguments @('-NoProfile', '-File', (Join-Path $repositoryRoot 'scripts/Install-Ha.ps1'), '-SelfTest')) -ne 0) { $failures.Add('installer-selftest') }
+}
+else {
+    Write-Host '== installer-selftest (not run: Windows CMD installer coverage belongs to the Windows CI leg)'
+}
 if ((Invoke-GateStep -Name 'release-selftest' -File 'pwsh' -Arguments @('-NoProfile', '-File', (Join-Path $repositoryRoot 'scripts/New-HaRelease.ps1'), '-SelfTest')) -ne 0) { $failures.Add('release-selftest') }
 if ((Invoke-GateStep -Name 'docs' -File 'pwsh' -Arguments @('-NoProfile', '-File', (Join-Path $repositoryRoot 'scripts/Verify-Docs.ps1'), '-SelfTest')) -ne 0) { $failures.Add('docs') }
 
@@ -232,6 +273,7 @@ $report = [pscustomobject]@{
     not_run        = $notRun
     required_tests = @($requiredSelectors | ForEach-Object { "$($_.Target)::$($_.Selector)" })
     required_tui_tests = @($requiredTuiSelectors)
+    required_g_tests = @($requiredGSelectors | ForEach-Object { $_.Selector })
 }
 
 if ($Json) {
