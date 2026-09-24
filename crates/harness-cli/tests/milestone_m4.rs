@@ -605,6 +605,94 @@ async fn m4_01_call_id_is_bound_to_intent_and_receipt() {
 }
 
 #[tokio::test]
+async fn m4_01_turn_keeps_its_own_history_across_steps() {
+    // A continuation that carries only the newest tool result leaves the model
+    // without a record of what it already did, so it explores the same files
+    // again until a bound stops the turn and nothing is ever answered.
+    let bench = bench();
+    let store = bench.open_store().await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("first I list the workspace"),
+            ProviderStreamEvent::tool_delta(
+                "call-1",
+                "list_files",
+                serde_json::json!({"path": "."}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                "call-2",
+                "search_text",
+                serde_json::json!({"query": "BUG", "path": "src"}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("here is the answer"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)));
+    let request = RunRequest::new(
+        SessionId::generate(),
+        TaskId::generate(),
+        InputId::generate(),
+        "describe this project".to_owned(),
+        observe_workspace(bench.project_id.clone(), &bench.workspace).unwrap(),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    let outcome = driver
+        .run_turn(
+            request,
+            TurnOptions {
+                workspace_root: bench.workspace.clone(),
+                actor_id: "m4.test".to_owned(),
+                approvals: ApprovalMode::Auto,
+                limits: TurnLimits::default(),
+            },
+            Arc::new(SilentObserver),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn runs");
+    assert_eq!(outcome.stop, TurnStop::Final);
+    assert_eq!(outcome.tool_calls, 2_u32);
+
+    let seen = provider.seen();
+    let third = seen.get(2).expect("third request");
+    for call_id in ["call-1", "call-2"] {
+        assert!(
+            third.messages.iter().any(|message| {
+                message.role == MessageRole::Tool
+                    && message.tool_call_id.as_deref() == Some(call_id)
+            }),
+            "step {call_id} must still be in the transcript: {:?}",
+            third.messages
+        );
+    }
+    assert!(
+        third.messages.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.content.contains("first I list the workspace")
+        }),
+        "the model's own words are kept, not replaced by a list of tool names: {:?}",
+        third.messages
+    );
+    drop(driver);
+    close(store).await;
+}
+
+#[tokio::test]
 async fn m4_01_tools_schema_upgrade() {
     let bench = bench();
     let store = bench.open_store().await;

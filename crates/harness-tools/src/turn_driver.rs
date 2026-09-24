@@ -515,6 +515,15 @@ impl TurnDriver {
         let mut pending_question: Option<QuestionId> = None;
         // Recent tool signatures for the loop detector.
         let mut loop_signatures: Vec<String> = Vec::new();
+        // Everything this turn has already said and executed. Each continuation
+        // sends the whole transcript, not just the newest step: a model that is
+        // handed back only the last tool result has no record of what it already
+        // looked at, so it starts over every step and the turn burns its bounds
+        // re-reading the same files instead of answering.
+        let mut transcript: Vec<ProviderMessage> = Vec::new();
+        // Every call id already announced in that transcript.
+        let mut announced_call_ids: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
 
         let first_step = match source_session_id {
             Some(source) => {
@@ -686,19 +695,29 @@ impl TurnDriver {
                             continuations += 1;
                             steps += 1;
                             observer.observe(TurnProgress::StepStarted { step: steps });
+                            // The answer the evaluator judged is part of the
+                            // record too, otherwise the continuation reads as if
+                            // the model had never replied.
+                            if !result.response.trim().is_empty() {
+                                transcript.push(ProviderMessage::new(
+                                    MessageRole::Assistant,
+                                    result.response.clone(),
+                                ));
+                            }
                             // The continuation instruction is host policy, not
                             // user text: the input was admitted once and this
                             // never creates a second input identity.
+                            transcript.push(ProviderMessage::new(
+                                MessageRole::System,
+                                format!(
+                                    "The goal is not complete yet. Next action: {next_action}. Produce the missing evidence, then answer again."
+                                ),
+                            ));
                             result = self
                                 .runtime
                                 .continue_run(
                                     request.clone(),
-                                    vec![ProviderMessage::new(
-                                        MessageRole::System,
-                                        format!(
-                                            "The goal is not complete yet. Next action: {next_action}. Produce the missing evidence, then answer again."
-                                        ),
-                                    )],
+                                    transcript.clone(),
                                     cancellation.clone(),
                                     Some(sink_for(&observer)),
                                 )
@@ -802,23 +821,50 @@ impl TurnDriver {
                 .iter()
                 .map(|call| call.name.clone())
                 .collect();
-            // The assistant turn keeps its typed calls, so every result below can
-            // be correlated with the call that asked for it.
+            // The assistant turn keeps its own words as well as its typed calls:
+            // the text is where the model states what it is doing and why, and
+            // replacing it with a list of tool names throws away the only record
+            // of its plan. The list is the fallback for a call-only response,
+            // which still needs non-empty content.
+            let assistant_text = if result.response.trim().is_empty() {
+                format!("requested tool calls: {}", names.join(", "))
+            } else {
+                result.response.clone()
+            };
+            // A transcript that keeps every step can meet the same call id
+            // twice, because a provider only promises an id is unique inside one
+            // response. Two announcements of one id is an invalid transcript, so
+            // the repeat is renamed for the wire while the durable intent and the
+            // receipt keep the id the provider actually sent.
+            let transcript_ids: Vec<String> = result
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    let mut id = call.call_id.clone();
+                    let mut suffix = 1_u32;
+                    while !announced_call_ids.insert(id.clone()) {
+                        id = format!("{}#{suffix}", call.call_id);
+                        suffix += 1;
+                    }
+                    id
+                })
+                .collect();
             appended.push(ProviderMessage::assistant_with_calls(
-                format!("requested tool calls: {}", names.join(", ")),
+                assistant_text,
                 result
                     .tool_calls
                     .iter()
-                    .map(|call| {
+                    .zip(transcript_ids.iter())
+                    .map(|(call, transcript_id)| {
                         ProviderToolCall::new(
-                            call.call_id.clone(),
+                            transcript_id.clone(),
                             call.name.clone(),
                             call.arguments.clone(),
                         )
                     })
                     .collect(),
             ));
-            for call in result.tool_calls.clone() {
+            for (call, transcript_id) in result.tool_calls.clone().into_iter().zip(transcript_ids) {
                 tool_calls += 1;
                 let name = call.name.clone();
                 observer.observe(TurnProgress::ToolStarted {
@@ -836,7 +882,7 @@ impl TurnDriver {
                         detail: Some(reason.to_owned()),
                     });
                     appended.push(ProviderMessage::tool_result(
-                        call.call_id.clone(),
+                        transcript_id.clone(),
                         format!(
                             "tool call {name:?} was not executed: {reason}; re-issue it with a function name and complete JSON arguments"
                         ),
@@ -877,7 +923,7 @@ impl TurnDriver {
                                 detail: Some(error.to_string()),
                             });
                             appended.push(ProviderMessage::tool_result(
-                                call.call_id.clone(),
+                                transcript_id.clone(),
                                 format!("ask_user failed: {error}"),
                             ));
                             continue;
@@ -914,7 +960,7 @@ impl TurnDriver {
                             detail: blocked,
                         });
                         appended.push(ProviderMessage::tool_result(
-                            call.call_id.clone(),
+                            transcript_id.clone(),
                             render_tool_output(&name, &view.output),
                         ));
                         executions.push(view);
@@ -928,7 +974,7 @@ impl TurnDriver {
                             detail: Some(error.to_string()),
                         });
                         appended.push(ProviderMessage::tool_result(
-                            call.call_id.clone(),
+                            transcript_id.clone(),
                             format!("tool {name} failed: {error}"),
                         ));
                     }
@@ -940,11 +986,12 @@ impl TurnDriver {
                 break TurnStop::Deadline;
             }
             observer.observe(TurnProgress::StepStarted { step: steps });
+            transcript.extend(appended);
             result = self
                 .runtime
                 .continue_run(
                     request.clone(),
-                    appended,
+                    transcript.clone(),
                     cancellation.clone(),
                     Some(sink_for(&observer)),
                 )
