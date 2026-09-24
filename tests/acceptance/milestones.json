@@ -88,7 +88,7 @@
         },
         {
           "package": "harness-types",
-          "test_name": "ports::tests::the_declared_shape_is_implementable_and_never_returns_fake_success"
+          "test_name": "ports::tests::the_test_double_never_returns_fake_success"
         },
         {
           "package": "harness-runtime",
