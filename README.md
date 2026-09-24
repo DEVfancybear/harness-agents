@@ -38,6 +38,8 @@ cargo build -p harness-cli --bin ha --locked
 
 The last two commands use deterministic local fixtures, so you can explore the interface without configuring a model provider. For installation, provider setup, and everyday commands, see the [operator guide](docs/OPERATOR_GUIDE.en.md).
 
+The `ha` executable includes the 18 skills in [`.agents/skills`](.agents/skills), including their supporting scripts and references. In a normal chat, `/skills` lists them as `builtin`; `/skill:<name>` activates one. The agent can also call `list_skills` and `activate_skill` when a task matches. Skill bodies load on activation, while skills supplied by another project still follow that project's trust setting. The executable prepares its bundled files in the user's configuration directory on first use.
+
 ### Where the project stands
 
 Harness Agents is under active development. The core CLI and its supporting workflows are available in the repository. The Web experience and Linux verification are still in progress. Full strict isolation is unavailable on the measured Windows backend, so `ha` refuses requests that require it. The [current handoff](docs/handoffs/CURRENT.vi.md) records the latest status and known gaps.
@@ -73,6 +75,8 @@ cargo build -p harness-cli --bin ha --locked
 ```
 
 Hai lệnh cuối dùng fixture cục bộ có kết quả xác định, nên bạn có thể thử giao diện mà chưa cần cấu hình model provider. Xem [hướng dẫn vận hành](docs/OPERATOR_GUIDE.vi.md) để cài đặt, cấu hình provider và sử dụng hằng ngày.
+
+File `ha.exe` tích hợp 18 skill trong [`.agents/skills`](.agents/skills), gồm cả script và tài liệu đi kèm. Trong chat thông thường, `/skills` liệt kê chúng với nguồn `builtin`; `/skill:<name>` kích hoạt một skill. Agent cũng có thể gọi `list_skills` và `activate_skill` khi tác vụ phù hợp. Nội dung skill chỉ được nạp lúc kích hoạt; skill do một project khác cung cấp vẫn theo thiết lập trust của project đó. Lần dùng đầu, ứng dụng chuẩn bị các tệp tích hợp trong thư mục cấu hình người dùng.
 
 ### Dự án đang ở đâu
 

@@ -19,6 +19,8 @@ use serde_json::{Value, json};
 
 use super::paths::LaunchEnvironment;
 
+include!(concat!(env!("OUT_DIR"), "/bundled_skills.rs"));
+
 const MAX_COMMANDS: usize = 256;
 const MAX_COMMAND_BYTES: u64 = 256 * 1024;
 
@@ -62,9 +64,59 @@ pub fn discover(
     environment: &LaunchEnvironment,
     project_trusted: bool,
 ) -> Result<SkillCatalog, HarnessError> {
-    let roots = roots(config_dir, workspace, environment, project_trusted);
+    let bundled = materialize_bundled_skills(config_dir)?;
+    let mut roots = vec![TrustedSkillRoot::new(bundled, SkillSource::Builtin)];
+    roots.extend(self::roots(
+        config_dir,
+        workspace,
+        environment,
+        project_trusted,
+    ));
     SkillCatalog::discover(&roots)
         .map_err(|error| HarnessError::new(error.code(), error.to_string()))
+}
+
+fn materialize_bundled_skills(config_dir: &Path) -> Result<PathBuf, HarnessError> {
+    let bundle_root = config_dir.join("bundled-skills").join(BUNDLED_SKILL_DIGEST);
+    let skills_root = bundle_root.join("skills");
+    for &(relative, bytes) in BUNDLED_SKILL_FILES {
+        install_bundled_file(&skills_root.join(relative), bytes)?;
+    }
+    for &(name, bytes) in BUNDLED_NOTICES {
+        install_bundled_file(&bundle_root.join(name), bytes)?;
+    }
+    Ok(skills_root)
+}
+
+fn install_bundled_file(path: &Path, bytes: &[u8]) -> Result<(), HarnessError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(HarnessError::new(
+                    ErrorCode::SkillUnavailable,
+                    format!(
+                        "bundled skill path is not a regular file: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            if std::fs::read(path).map_err(bundled_io_error)? == bytes {
+                return Ok(());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(bundled_io_error(error)),
+    }
+    std::fs::create_dir_all(path.parent().expect("bundled file has a parent"))
+        .map_err(bundled_io_error)?;
+    std::fs::write(path, bytes).map_err(bundled_io_error)
+}
+
+fn bundled_io_error(error: std::io::Error) -> HarnessError {
+    HarnessError::new(
+        ErrorCode::SkillUnavailable,
+        format!("bundled skills cannot be prepared: {error}"),
+    )
 }
 
 pub fn activate(
@@ -121,7 +173,7 @@ impl ExternalToolCatalog for SkillToolCatalog {
                 "type": "function",
                 "function": {
                     "name": "list_skills",
-                    "description": "List trusted skills and their exact version digests without loading their bodies.",
+                    "description": "When a task may match a skill, list available skills and exact version digests before activating one. Bodies stay unloaded.",
                     "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
                 }
             }),
@@ -129,7 +181,7 @@ impl ExternalToolCatalog for SkillToolCatalog {
                 "type": "function",
                 "function": {
                     "name": "activate_skill",
-                    "description": "Activate one trusted skill only when its name and exact catalog digest match.",
+                    "description": "Load one matching skill using its name and exact digest from list_skills before following its instructions.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -307,7 +359,7 @@ mod tests {
     use harness_session::ContextChannel;
     use harness_types::ErrorCode;
 
-    use super::{SkillHost, SkillToolDispatcher, commands, expand, metadata_lines};
+    use super::{SkillHost, SkillToolDispatcher, commands, discover, expand, metadata_lines};
 
     fn skill_catalog(root: &std::path::Path) -> SkillCatalog {
         let skill = root.join("review");
@@ -319,6 +371,67 @@ mod tests {
         .expect("skill body");
         SkillCatalog::discover(&[TrustedSkillRoot::new(root, SkillSource::User)])
             .expect("catalog scans metadata")
+    }
+
+    #[test]
+    fn release_skills_are_available_without_trusting_a_project_checkout() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = temporary.path().join("config");
+        let workspace = temporary.path().join("unrelated-project");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let catalog = discover(
+            &config,
+            &workspace,
+            &super::LaunchEnvironment::default(),
+            false,
+        )
+        .expect("built-in skills must be discoverable without project trust");
+        for name in [
+            "brainstorming",
+            "deep-research",
+            "find-skills",
+            "github-deep-research",
+        ] {
+            let entry = catalog.entry(name).expect("bundled skill");
+            assert_eq!(entry.source, SkillSource::Builtin);
+            assert!(catalog.activate(name, None, 1).is_ok());
+        }
+        assert!(catalog.entries().len() >= 18);
+        assert!(
+            catalog
+                .entry("github-deep-research")
+                .expect("research skill")
+                .path
+                .parent()
+                .expect("skill directory")
+                .join("scripts/github_api.py")
+                .is_file()
+        );
+        let bundled_document = catalog
+            .entry("find-skills")
+            .expect("bundled skill")
+            .path
+            .clone();
+        let original = std::fs::read(&bundled_document).expect("bundled document");
+        std::fs::write(&bundled_document, "corrupted cache").expect("tamper test cache");
+        let rediscovered = discover(
+            &config,
+            &workspace,
+            &super::LaunchEnvironment::default(),
+            false,
+        )
+        .expect("repair bundled cache");
+        assert_eq!(
+            rediscovered
+                .entry("find-skills")
+                .expect("repaired skill")
+                .source,
+            SkillSource::Builtin
+        );
+        assert_eq!(
+            std::fs::read(&bundled_document).expect("repaired document"),
+            original
+        );
     }
 
     #[test]
