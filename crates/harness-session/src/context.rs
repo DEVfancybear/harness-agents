@@ -471,17 +471,14 @@ impl ContextBuilder {
                 text.clone(),
             ));
         }
-        let state_text = serde_json::to_string(&request.recovery.working_state).map_err(|_| {
-            ContextError::new(
-                harness_types::ErrorCode::InvalidPayload,
-                "working state cannot be rendered",
-            )
-        })?;
-        mandatory.push(ContextBlock::mandatory(
-            "working-state",
-            ContextBlockKind::WorkingState,
-            state_text,
-        ));
+        let state_text = render_working_state(&request.recovery.working_state);
+        if !state_text.is_empty() {
+            mandatory.push(ContextBlock::mandatory(
+                "working-state",
+                ContextBlockKind::WorkingState,
+                state_text,
+            ));
+        }
         for block in request.recent_tail {
             let mut block = block;
             block.mandatory = block.mandatory && block.channel.may_be_mandatory();
@@ -685,7 +682,11 @@ impl ContextBuilder {
 /// 2 drops the duplicated system-policy block and labels every block in words, so the
 /// user's own instruction reads as an instruction rather than as a quoted tag. A
 /// packet rendered by an older version is not comparable byte-for-byte with this one.
-pub(crate) const RENDERING_VERSION: u16 = 2;
+///
+/// 3 renders the working state as facts the model can act on instead of the raw
+/// projection JSON, whose refs it cannot resolve, and omits the block when there
+/// is nothing in it yet.
+pub(crate) const RENDERING_VERSION: u16 = 3;
 
 impl ContextBlock {
     /// The words the model reads before the block's text.
@@ -715,6 +716,88 @@ impl ContextBlock {
     }
 }
 
+/// The working state the model is shown, as facts instead of bookkeeping.
+///
+/// The durable projection is keyed by refs - `objective_ref`, instruction ids,
+/// decision refs - because that is how the host proves where each field came
+/// from. The model cannot resolve any of them: there is no tool that turns an
+/// event id into text. Sending the raw JSON made a run open with a wall of
+/// identifiers and a model that went looking for them, grepping the workspace
+/// for `instruction_01a0...` instead of answering the question it was asked.
+/// The refs stay in the packet's source manifest, where provenance belongs;
+/// what the model reads is what it can act on, and nothing when there is
+/// nothing yet - a fresh turn has no plan, no changes and no checks, and an
+/// empty skeleton is noise that competes with the user's own words.
+fn render_working_state(state: &harness_types::WorkingState) -> String {
+    let mut lines = Vec::new();
+    if !state.workspace.base_commit.is_empty() {
+        lines.push(format!(
+            "workspace: worktree {} at commit {}",
+            state.workspace.worktree_id, state.workspace.base_commit
+        ));
+    }
+    for item in &state.plan_items {
+        lines.push(format!(
+            "plan {}: {}",
+            item.id.as_str(),
+            enum_word(&item.status)
+        ));
+    }
+    for change in &state.changes {
+        lines.push(format!("changed: {}", change.path));
+    }
+    for check in &state.checks {
+        lines.push(format!(
+            "check {:?} -> {} (at {})",
+            check.command,
+            enum_word(&check.outcome),
+            check.tested_revision
+        ));
+    }
+    // An execution whose outcome is unknown is the one thing here the model
+    // must not guess about, so it is spelled out with the hint that says how to
+    // settle it.
+    for pending in &state.pending_tool_calls {
+        lines.push(format!(
+            "unsettled tool call ({}): {}",
+            enum_word(&pending.state),
+            pending.reconciliation_hint
+        ));
+    }
+    for child in &state.children {
+        lines.push(format!(
+            "child run for task {}: {}",
+            child.task_id.as_str(),
+            enum_word(&child.status)
+        ));
+    }
+    for blocker in &state.blockers {
+        lines.push(format!("blocker: {blocker}"));
+    }
+    for question in &state.pending_questions {
+        lines.push(format!("unanswered question: {question}"));
+    }
+    for proposal in &state.next_action_proposals {
+        lines.push(format!(
+            "proposed next action ({}): {}",
+            enum_word(&proposal.authority),
+            proposal.description
+        ));
+    }
+    lines.join(
+        "
+",
+    )
+}
+
+/// The serde spelling of one enum value, without its JSON quotes.
+fn enum_word<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).map_or_else(
+        |_| "unknown".to_owned(),
+        |rendered| rendered.trim_matches('"').to_owned(),
+    )
+}
+
 fn render_block(block: &ContextBlock) -> String {
     format!("[{}]\n{}", block.label(), block.text)
 }
@@ -735,7 +818,9 @@ fn _memory_marker(id: MemoryAssetId, version: u64) -> MemoryVersionRef {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContextBlock, ContextBlockKind, RENDERING_VERSION, render_block};
+    use super::{
+        ContextBlock, ContextBlockKind, RENDERING_VERSION, render_block, render_working_state,
+    };
 
     /// The measured failure: the model was sent `[instruction:instruction-0]` and told
     /// the user its instruction "isn't shown here", because the request looked like a
@@ -766,6 +851,63 @@ mod tests {
         assert!(render_block(&memory).contains("memory_asset_01a0@2"));
         let rule = ContextBlock::mandatory("rule-no-api", ContextBlockKind::ProjectRule, "keep");
         assert!(render_block(&rule).contains("project rule rule-no-api"));
-        assert_eq!(RENDERING_VERSION, 2);
+        assert_eq!(RENDERING_VERSION, 3);
+    }
+    /// The measured failure: the packet carried the working state as JSON full of
+    /// `objective_ref` and `instruction_01a0...` ids, the model said "the working
+    /// state references an objective I haven't seen yet", and it spent the turn
+    /// grepping the workspace for an event id instead of answering.
+    #[test]
+    fn the_working_state_is_rendered_without_refs_the_model_cannot_resolve() {
+        let state: harness_types::WorkingState = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "session_id": "session_01a0d25b-22ca-762c-8f13-fffd33d30f10",
+            "task_id": "task_01a0d25b-22ca-762c-8f13-fffe7b5b4468",
+            "revision": 7,
+            "through_event_seq": 7,
+            "objective_ref": {
+                "event_id": "event_01a0d25b-234f-7357-806a-ae68859b94e0",
+                "sequence": 1,
+                "content_hash": "sha256:3eb1bde86a1acbb65d48497f780b438baeea646acbe6bb360192bd74e6ea49f8"
+            },
+            "acceptance_criteria_refs": [],
+            "active_instruction_refs": ["instruction_01a0d25b-234f-7357-806a-ae69db7c3b7c"],
+            "decision_refs": [],
+            "superseded_decision_refs": [],
+            "plan_items": [],
+            "workspace": {
+                "project_id": "project_01a0d25b-1ebd-7274-be25-b24a75108689",
+                "worktree_id": "p3-fa3f15bbec1b0f58",
+                "base_commit": "cf66c8343883f2791df2733097f4027e61f82558",
+                "observed_fingerprint": "sha256:36fb6d09aad6d463d7ceeafd293ea80d77eb6f703ed714aa3402495fbe42e4e8"
+            },
+            "changes": [{"path": "src/parser.rs", "before_hash": null, "after_hash": null, "tool_execution_id": null}],
+            "checks": [],
+            "pending_tool_calls": [],
+            "children": [],
+            "blockers": ["waiting for the fixture"],
+            "pending_questions": [],
+            "next_action_proposals": []
+        }))
+        .expect("fixture working state");
+        let rendered = render_working_state(&state);
+        for opaque in [
+            "objective_ref",
+            "instruction_01a0",
+            "event_01a0",
+            "sha256:",
+            "session_01a0",
+        ] {
+            assert!(
+                !rendered.contains(opaque),
+                "{opaque} is bookkeeping the model cannot resolve: {rendered}"
+            );
+        }
+        assert!(rendered.contains("changed: src/parser.rs"), "{rendered}");
+        assert!(
+            rendered.contains("blocker: waiting for the fixture"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("cf66c8343883"), "{rendered}");
     }
 }

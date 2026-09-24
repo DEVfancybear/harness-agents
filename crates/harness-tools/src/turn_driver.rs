@@ -1614,15 +1614,54 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             if *truncated { " (truncated)" } else { "" },
             paths.join(", ")
         ),
-        ToolOutput::SearchText { matches, truncated } => format!(
-            "search_text{}: {} match(es)",
-            if *truncated { " (truncated)" } else { "" },
-            matches.len()
-        ),
+        // A count is not a result. `search_text: 1 match(es)` tells the model
+        // nothing it can act on, so it searches again with another query and
+        // the turn spends its bounds rediscovering what it already found. The
+        // hits are already capped and redacted where they are produced, so the
+        // rendering here is the same bound the tool applied.
+        ToolOutput::SearchText { matches, truncated } => {
+            let hits = matches
+                .iter()
+                .map(|hit| {
+                    format!(
+                        "{}:{}:{}: {}",
+                        hit.path,
+                        hit.line,
+                        hit.column,
+                        hit.preview.trim()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                );
+            format!(
+                "search_text{}: {} match(es){}{hits}",
+                if *truncated { " (truncated)" } else { "" },
+                matches.len(),
+                if matches.is_empty() {
+                    ""
+                } else {
+                    "
+"
+                }
+            )
+        }
         ToolOutput::Glob { paths, truncated } => format!(
-            "glob{}: {} path(s)",
+            "glob{}: {} path(s){}{}",
             if *truncated { " (truncated)" } else { "" },
-            paths.len()
+            paths.len(),
+            if paths.is_empty() {
+                ""
+            } else {
+                "
+"
+            },
+            paths.join(
+                "
+"
+            )
         ),
         ToolOutput::ApplyPatch {
             path,

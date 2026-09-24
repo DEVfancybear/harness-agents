@@ -693,6 +693,88 @@ async fn m4_01_turn_keeps_its_own_history_across_steps() {
 }
 
 #[tokio::test]
+async fn m4_01_discovery_results_reach_the_model_and_a_blank_path_is_the_root() {
+    // Measured in a real run: `list_files {"path": ""}` was refused as a blank
+    // path, and `search_text` came back as `1 match(es)` with no file or line,
+    // so the model searched and listed again until the step bound stopped it.
+    let bench = bench();
+    let store = bench.open_store().await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                "call-list",
+                "list_files",
+                serde_json::json!({"path": ""}).to_string(),
+            ),
+            ProviderStreamEvent::tool_delta(
+                "call-search",
+                "search_text",
+                serde_json::json!({"query": "BUG"}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("the bug is in src/parser.txt"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)));
+    let request = RunRequest::new(
+        SessionId::generate(),
+        TaskId::generate(),
+        InputId::generate(),
+        "where is the bug".to_owned(),
+        observe_workspace(bench.project_id.clone(), &bench.workspace).unwrap(),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    let outcome = driver
+        .run_turn(
+            request,
+            TurnOptions {
+                workspace_root: bench.workspace.clone(),
+                actor_id: "m4.test".to_owned(),
+                approvals: ApprovalMode::Auto,
+                limits: TurnLimits::default(),
+            },
+            Arc::new(SilentObserver),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn runs");
+    assert_eq!(outcome.stop, TurnStop::Final);
+
+    let seen = provider.seen();
+    let second = seen.get(1).expect("second request");
+    let result_for = |call_id: &str| {
+        second
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(call_id))
+            .map(|message| message.content.clone())
+            .unwrap_or_default()
+    };
+    let listing = result_for("call-list");
+    assert!(
+        listing.starts_with("list_files") && listing.contains("src"),
+        "a blank path lists the workspace root instead of failing: {listing}"
+    );
+    let search = result_for("call-search");
+    assert!(
+        search.contains("src/parser.txt:1:1: BUG parser"),
+        "a search result names the file, line and text it found: {search}"
+    );
+    drop(driver);
+    close(store).await;
+}
+
+#[tokio::test]
 async fn m4_01_tools_schema_upgrade() {
     let bench = bench();
     let store = bench.open_store().await;

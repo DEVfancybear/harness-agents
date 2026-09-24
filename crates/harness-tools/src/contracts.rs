@@ -837,17 +837,11 @@ impl CodingToolAction {
                 })
             }
             "list_files" => Ok(Self::ListFiles {
-                path: object
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
+                path: optional_path(object),
             }),
             "search_text" => Ok(Self::SearchText {
                 query: required_string(object, "query")?,
-                path: object
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
+                path: optional_path(object),
                 regex: parse_optional_bool(object, "regex")?.unwrap_or(false),
                 case_insensitive: parse_optional_bool(object, "case_insensitive")?.unwrap_or(false),
                 glob: parse_optional_string(object, "glob")?,
@@ -879,10 +873,7 @@ impl CodingToolAction {
             }),
             "glob" => Ok(Self::Glob {
                 pattern: required_string(object, "pattern")?,
-                path: object
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
+                path: optional_path(object),
             }),
             "run_process" => {
                 let args = object
@@ -1046,10 +1037,7 @@ impl CodingToolAction {
                 })
             }
             "git_diff" => Ok(Self::GitDiff {
-                path: object
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
+                path: optional_path(object),
             }),
             "git_log" => {
                 let limit = match object.get("limit") {
@@ -1070,10 +1058,7 @@ impl CodingToolAction {
                     ),
                 };
                 Ok(Self::GitLog {
-                    path: object
-                        .get("path")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
+                    path: optional_path(object),
                     limit,
                 })
             }
@@ -1124,6 +1109,24 @@ fn parse_optional_bool(
             format!("provider tool field {key} must be a boolean"),
         )),
     }
+}
+
+/// The optional `path` of a listing or search call, with a blank one read as
+/// "not given".
+///
+/// `""` is how a model spells "the whole workspace" often enough that refusing
+/// it is a pure dead end: the call is unambiguous, nothing is at stake, and the
+/// refusal cost a step that then repeated the same mistake. An absent path
+/// already means the workspace root, so a blank one is normalized to it here
+/// and the policy invariant - a path that reaches the gate is never blank -
+/// still holds.
+fn optional_path(object: &serde_json::Map<String, Value>) -> Option<String> {
+    object
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn parse_optional_string(
