@@ -378,6 +378,14 @@ impl ProviderMessage {
         }
     }
 
+    /// Show the model these images with this message. Only a user message or a tool
+    /// result (sent as one) carries them.
+    #[must_use]
+    pub fn with_attachments(mut self, images: Vec<ImageAttachment>) -> Self {
+        self.attachments = images;
+        self
+    }
+
     /// Attach the reasoning this assistant message came with.
     #[must_use]
     pub fn with_reasoning(mut self, reasoning: Option<Reasoning>) -> Self {
@@ -414,7 +422,11 @@ impl ProviderMessage {
                 self.content.clone()
             }
         };
-        if !self.attachments.is_empty() && self.role == MessageRole::User {
+        // A tool result is sent as a user message, so the images a tool returned (the
+        // `attach_image` skill's) ride with it the same way.
+        if !self.attachments.is_empty()
+            && matches!(self.role, MessageRole::User | MessageRole::Tool)
+        {
             let mut blocks = vec![json!({ "type": "text", "text": text })];
             for image in &self.attachments {
                 blocks.push(json!({
@@ -2313,6 +2325,24 @@ mod wire_tests {
             !stored.to_string().contains("look at src first"),
             "{stored}"
         );
+    }
+
+    /// A tool result is sent as a user message, so the images a tool returned ride
+    /// with it in the same block shape.
+    #[test]
+    fn a_tool_result_with_images_uses_content_blocks() {
+        let image = super::ImageAttachment::inline("image/png", "iVBORw0KGgo=", "shot.png");
+        let wire = ProviderMessage::tool_result("call-1", "loaded")
+            .with_attachments(vec![image])
+            .to_wire();
+        assert_eq!(wire["role"], "user");
+        let blocks = wire["content"].as_array().expect("blocks");
+        assert!(
+            blocks[0]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("[tool result]"))
+        );
+        assert_eq!(blocks[1]["type"], "image_url");
     }
 
     /// An image turns the message into the block shape the API reads images from.

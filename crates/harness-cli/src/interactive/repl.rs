@@ -71,6 +71,16 @@ const RUNTIME_FILES: [(&str, &str); 5] = [
     ("harness.py", include_str!("../../python/rlm/harness.py")),
 ];
 
+/// prime-agent's `ATTACHMENT_DISPLAY_MIME`: `{mime_type, data, path}` for one image.
+const ATTACHMENT_DISPLAY_MIME: &str = "application/vnd.prime-agent.attachment+json";
+
+/// What one cell returned: its text and the images it loaded for the model.
+#[derive(Debug, Default)]
+pub struct CellOutput {
+    pub text: String,
+    pub images: Vec<Value>,
+}
+
 /// Code every new kernel runs first, as prime-agent's bootstrap cell does: the
 /// `rlm` namespace and `bash` are globals, and output has no colour codes.
 const BOOTSTRAP_CODE: &str = "import asyncio\n\
@@ -406,7 +416,7 @@ impl ReplShared {
         timeout: Duration,
         host: &dyn HostRequests,
         harness: Option<&KernelContext>,
-    ) -> Result<String, HarnessError> {
+    ) -> Result<CellOutput, HarnessError> {
         let (python, setup) = self.kernel_python().await;
         let python = python.ok_or_else(|| {
             HarnessError::new(
@@ -461,6 +471,7 @@ impl ReplShared {
             }
         }
         let outcome = kernel.execute(code, timeout, host).await;
+        let images = std::mem::take(&mut kernel.images);
         let text = match outcome {
             Ok(cell) => cell,
             Err(dead) => {
@@ -474,13 +485,14 @@ impl ReplShared {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-        Ok(if notes.is_empty() {
+        let text = if notes.is_empty() {
             text
         } else if text.is_empty() {
             notes.join("\n")
         } else {
             format!("{}\n\n{text}", notes.join("\n"))
-        })
+        };
+        Ok(CellOutput { text, images })
     }
 }
 
@@ -494,6 +506,8 @@ struct Kernel {
     in_flight: Option<String>,
     /// The memory directories this kernel was last pointed at.
     harness: Option<KernelContext>,
+    /// The images the last cell loaded.
+    images: Vec<Value>,
 }
 
 impl Kernel {
@@ -551,6 +565,7 @@ impl Kernel {
             next: 0,
             in_flight: None,
             harness: None,
+            images: Vec::new(),
         };
         let ready = tokio::time::timeout(READY_TIMEOUT, kernel.events.recv())
             .await
@@ -620,6 +635,7 @@ impl Kernel {
             .await?
         {
             self.in_flight = None;
+            self.images = std::mem::take(&mut text.images);
             return Ok(text.render());
         }
         // Out of time: interrupt, as Ctrl-C does in prime-agent, and give it a moment.
@@ -633,6 +649,7 @@ impl Kernel {
             .await?
         {
             self.in_flight = None;
+            self.images = std::mem::take(&mut text.images);
             return Ok(text.render());
         }
         text.note(&format!(
@@ -669,6 +686,12 @@ impl Kernel {
                         (true, _) => text.stderr.push_str(chunk),
                         (false, _) if owner.is_none() => text.background.push_str(chunk),
                         _ => {}
+                    }
+                }
+                // prime-agent's attachment display: an image the model is to see.
+                "display" if ours => {
+                    if let Some(attachment) = event["data"][ATTACHMENT_DISPLAY_MIME].as_object() {
+                        text.images.push(Value::Object(attachment.clone()));
                     }
                 }
                 "result" if ours => {
@@ -730,6 +753,8 @@ struct CellText {
     error: String,
     background: String,
     notes: Vec<String>,
+    /// Images the cell loaded for the model (`attach_image`).
+    images: Vec<Value>,
 }
 
 impl CellText {
@@ -1139,7 +1164,7 @@ impl ExternalToolDispatcher for ReplHost {
                 ));
             }
             let code = Self::code(arguments)?;
-            let text = self
+            let CellOutput { text, images } = self
                 .shared
                 .execute(
                     code,
@@ -1151,7 +1176,13 @@ impl ExternalToolDispatcher for ReplHost {
             Ok(ToolOutput::ExternalTool {
                 plugin_id: "repl".to_owned(),
                 tool_name: "ipython".to_owned(),
-                payload: json!({ "text": if text.is_empty() { "(no output)".to_owned() } else { text } }),
+                payload: {
+                    let mut payload = json!({ "text": if text.is_empty() { "(no output)".to_owned() } else { text } });
+                    if !images.is_empty() {
+                        payload["images"] = Value::Array(images);
+                    }
+                    payload
+                },
                 inflight: 1,
             })
         })
@@ -1173,6 +1204,7 @@ mod tests {
             error: String::new(),
             background: "late".to_owned(),
             notes: vec!["[note]".to_owned()],
+            images: Vec::new(),
         };
         assert_eq!(
             text.render(),
@@ -1210,6 +1242,7 @@ mod tests {
     /// across cells, `bash()` runs, a host request is answered instead of hanging,
     /// and a cell past its time is interrupted without losing the kernel.
     #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "one kernel, exercised in order")]
     async fn the_kernel_keeps_state_and_answers_host_requests() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let shared = Arc::new(ReplShared {
@@ -1259,6 +1292,7 @@ mod tests {
                     )
                     .await
                     .expect("cell")
+                    .text
             }
         };
         let first = run("x = 41\nprint('hi')\nx + 1", 60).await;
@@ -1285,6 +1319,20 @@ mod tests {
             "41",
             "the kernel survived the interrupt"
         );
+        // An image the cell loads for the model (prime-agent's attachment display, as
+        // `attach_image` emits it) comes back beside the text.
+        let loaded = shared
+            .execute(
+                "from rlm import emit\nemit({'application/vnd.prime-agent.attachment+json': {'mime_type': 'image/png', 'data': 'iVBORw0KGgo=', 'path': 'shot.png'}, 'text/plain': 'loaded'})\n'done'",
+                Duration::from_mins(1),
+                &NoHostRequests,
+                Some(&dirs),
+            )
+            .await
+            .expect("cell");
+        assert_eq!(loaded.text, "'done'");
+        assert_eq!(loaded.images.len(), 1);
+        assert_eq!(loaded.images[0]["mime_type"], "image/png");
         // Memory written through `rlm.harness` lands in the conversation's files, where
         // the host reads its digest from.
         let created = run(

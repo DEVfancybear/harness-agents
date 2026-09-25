@@ -196,6 +196,8 @@ pub struct InteractiveController {
     /// A compaction the `compact` skill asked for (with its guidance, possibly empty),
     /// run when the turn ends.
     pending_compact: Option<String>,
+    /// Heartbeats that came due while the session was busy, sent when it is free.
+    pending_heartbeats: std::collections::VecDeque<String>,
 }
 
 impl InteractiveController {
@@ -255,6 +257,7 @@ impl InteractiveController {
             exit_after_run: false,
             goal: None,
             pending_compact: None,
+            pending_heartbeats: std::collections::VecDeque::new(),
         }
     }
 
@@ -644,9 +647,12 @@ impl InteractiveController {
 
     /// Move everything the session port produced into effects.
     pub fn pump_events(&mut self) -> Vec<Effect> {
-        let mut effects = Vec::new();
+        let mut effects = self.deliver_heartbeats();
         let events = self.channel.drain();
         if events.is_empty() {
+            if !effects.is_empty() {
+                effects.push(Effect::Redraw);
+            }
             return effects;
         }
         for event in events {
@@ -662,6 +668,31 @@ impl InteractiveController {
             self.flush_stream_overflow(&mut effects);
         }
         effects.push(Effect::Redraw);
+        effects
+    }
+
+    /// Send the agent's heartbeats that came due (prime-agent's RLM heartbeats): a
+    /// free session runs one at once; a running turn gets a `steer` heartbeat through
+    /// the `/steer` inbox, and a `follow_up` one waits for the turn to end.
+    fn deliver_heartbeats(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        for due in self.service.due_heartbeats() {
+            let free = !self.phase.has_active_run()
+                && self.pending_approval.is_none()
+                && self.pending_question.is_none();
+            if free && self.pending_heartbeats.is_empty() {
+                effects.extend(self.dispatch(due.text, true));
+            } else if self.phase.has_active_run()
+                && due.delivery == super::heartbeat::Delivery::Steer
+                && self.service.steer(&due.text).is_ok()
+            {
+                effects.push(Effect::History(HistoryItem::Notice {
+                    message: "heartbeat steered into the running turn".to_owned(),
+                }));
+            } else {
+                self.pending_heartbeats.push_back(due.text);
+            }
+        }
         effects
     }
 
@@ -1085,6 +1116,12 @@ impl InteractiveController {
                 if let Some(text) = self.queued_input.take() {
                     self.close_run_grant();
                     effects.extend(self.dispatch(text, false));
+                    return;
+                }
+                // A heartbeat that waited for this turn runs now.
+                if let Some(text) = self.pending_heartbeats.pop_front() {
+                    effects.extend(self.dispatch(text, true));
+                    self.finish_pending_exit(effects);
                     return;
                 }
                 // The `compact` skill's request runs now that the turn is over; the goal,
@@ -2785,6 +2822,8 @@ mod tests {
         limits: TurnBounds,
         /// Every goal handed to the port; `Some("")` records a forgotten goal.
         goals: Arc<Mutex<Vec<Option<String>>>>,
+        /// Heartbeats the next pump finds due.
+        heartbeats_due: Arc<Mutex<Vec<crate::interactive::heartbeat::Due>>>,
     }
 
     impl SessionPort for RecordingPort {
@@ -2811,6 +2850,10 @@ mod tests {
 
         fn cancel(&mut self) {
             *self.cancels.lock().expect("cancel log") += 1;
+        }
+
+        fn due_heartbeats(&mut self) -> Vec<crate::interactive::heartbeat::Due> {
+            std::mem::take(&mut *self.heartbeats_due.lock().expect("heartbeats"))
         }
 
         fn set_goal(&mut self, objective: Option<String>) {
@@ -5723,6 +5766,60 @@ mod tests {
                 .is_some_and(|text| text.contains("goal_complete")),
             "then the goal continues: {:?}",
             submissions(&harness)
+        );
+    }
+
+    /// prime-agent's RLM heartbeats: one that comes due while the app is idle runs
+    /// at once; while a turn runs, a `steer` heartbeat goes through the steer inbox
+    /// and a `follow_up` one waits for the turn to end.
+    #[test]
+    fn heartbeats_run_when_due_and_respect_their_delivery_mode() {
+        use crate::interactive::heartbeat::{Delivery, Due};
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let due = |text: &str, delivery| Due {
+            text: text.to_owned(),
+            delivery,
+        };
+        harness
+            .port
+            .heartbeats_due
+            .lock()
+            .expect("heartbeats")
+            .push(due(
+                "[heartbeat: every 5m run#1]\n\ncheck ci",
+                Delivery::Steer,
+            ));
+        let _ = harness.controller.pump_events();
+        assert_eq!(
+            submissions(&harness).len(),
+            1,
+            "an idle app runs it at once"
+        );
+
+        harness
+            .port
+            .heartbeats_due
+            .lock()
+            .expect("heartbeats")
+            .extend([
+                due("steer me", Delivery::Steer),
+                due("after the turn", Delivery::FollowUp),
+            ]);
+        let plain = effects_to_plain(&harness.controller.pump_events());
+        assert_eq!(
+            harness.port.steers.lock().expect("steers").as_slice(),
+            ["steer me".to_owned()]
+        );
+        assert!(
+            plain.iter().any(|line| line.contains("heartbeat steered")),
+            "{plain:#?}"
+        );
+        assert_eq!(submissions(&harness).len(), 1, "the follow-up waits");
+        let _ = end_done(&mut harness);
+        assert_eq!(
+            submissions(&harness).last().map(String::as_str),
+            Some("after the turn")
         );
     }
 

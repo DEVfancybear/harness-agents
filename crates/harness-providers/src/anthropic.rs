@@ -70,12 +70,12 @@ impl AnthropicMessagesAdapter {
                     "content": [{
                         "type": "tool_result",
                         "tool_use_id": message.tool_call_id.as_deref().unwrap_or("missing-call-id"),
-                        "content": message.content
+                        "content": content_with_images(&message.content, &message.attachments)
                     }]
                 })),
                 super::MessageRole::User => messages.push(json!({
                     "role": "user",
-                    "content": message.content
+                    "content": content_with_images(&message.content, &message.attachments)
                 })),
                 super::MessageRole::Assistant => {
                     let mut blocks = Vec::new();
@@ -136,6 +136,31 @@ impl AnthropicMessagesAdapter {
         }
         body
     }
+}
+
+/// Text alone as a string; text with images as the block list the API reads images
+/// from.
+fn content_with_images(text: &str, images: &[crate::ImageAttachment]) -> Value {
+    if images.is_empty() {
+        return json!(text);
+    }
+    let mut blocks = vec![json!({"type": "text", "text": text})];
+    for image in images {
+        blocks.push(match &image.source {
+            crate::ImageSource::Inline {
+                media_type,
+                data_base64,
+            } => json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": data_base64}
+            }),
+            crate::ImageSource::Remote { url } => json!({
+                "type": "image",
+                "source": {"type": "url", "url": url}
+            }),
+        });
+    }
+    Value::Array(blocks)
 }
 
 fn anthropic_tool_schema(schema: &Value) -> Option<Value> {

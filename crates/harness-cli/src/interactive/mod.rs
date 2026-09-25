@@ -20,6 +20,7 @@ pub mod extensions;
 pub mod goal;
 pub mod harness;
 pub mod headless;
+pub mod heartbeat;
 pub mod input;
 pub mod instructions;
 pub mod mcp;

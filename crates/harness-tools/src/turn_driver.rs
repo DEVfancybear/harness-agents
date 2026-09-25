@@ -1032,10 +1032,13 @@ impl TurnDriver {
                             ok: blocked.is_none(),
                             detail: blocked,
                         });
-                        appended.push(ProviderMessage::tool_result(
-                            transcript_id.clone(),
-                            render_tool_output(&name, &view.output),
-                        ));
+                        appended.push(
+                            ProviderMessage::tool_result(
+                                transcript_id.clone(),
+                                render_tool_output(&name, &view.output),
+                            )
+                            .with_attachments(tool_output_images(&view.output)),
+                        );
                         executions.push(view);
                     }
                     Err(error) => {
@@ -1577,6 +1580,32 @@ fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
         }
         _ => {}
     })
+}
+
+/// The images a tool returned for the model to see: an external tool's payload may
+/// carry `images` as `{mime_type, data}` (base64), which is how the Python REPL hands
+/// back what prime-agent's `attach_image` skill loaded.
+fn tool_output_images(output: &ToolOutput) -> Vec<harness_providers::ImageAttachment> {
+    let ToolOutput::ExternalTool { payload, .. } = output else {
+        return Vec::new();
+    };
+    payload
+        .get("images")
+        .and_then(Value::as_array)
+        .map(|images| {
+            images
+                .iter()
+                .filter_map(|image| {
+                    let mime = image.get("mime_type")?.as_str()?;
+                    let data = image.get("data")?.as_str()?;
+                    let label = image.get("path").and_then(Value::as_str).unwrap_or(mime);
+                    Some(harness_providers::ImageAttachment::inline(
+                        mime, data, label,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Short, non-secret summary of the requested arguments for the transcript.

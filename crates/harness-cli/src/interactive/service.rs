@@ -252,6 +252,10 @@ pub trait SessionPort: Send {
     fn set_model(&mut self, _model: &str) -> Result<String, String> {
         Err("this backend does not support model switching".to_owned())
     }
+    /// The agent's heartbeats whose time has come, advanced to their next run.
+    fn due_heartbeats(&mut self) -> Vec<super::heartbeat::Due> {
+        Vec::new()
+    }
     /// Choose the thinking level for the next turns.
     fn set_thinking(&mut self, _level: &str) -> Result<String, String> {
         Err("this backend does not support thinking levels".to_owned())
@@ -1042,6 +1046,8 @@ pub struct AgentSessionService {
     thinking: Option<harness_providers::ThinkingLevel>,
     /// Turns since the last automatic refine review.
     turns_since_review: Arc<std::sync::atomic::AtomicU32>,
+    /// The agent's own recurring prompts (`rlm_heartbeat`), for the whole session.
+    heartbeats: Arc<super::heartbeat::Heartbeats>,
     /// `HA_AUTO_REFINE=off` turns the automatic review off (prime-agent's
     /// `autoRefine.enabled`, on by default).
     auto_refine: bool,
@@ -1529,6 +1535,7 @@ impl AgentSessionService {
             repl,
             thinking: None,
             turns_since_review: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            heartbeats: Arc::new(super::heartbeat::Heartbeats::default()),
             auto_refine,
         }
     }
@@ -1722,6 +1729,7 @@ impl SessionPort for AgentSessionService {
         let repl = self.repl.clone();
         let thinking = self.thinking;
         let turns_since_review = Arc::clone(&self.turns_since_review);
+        let heartbeats = Arc::clone(&self.heartbeats);
         let auto_refine = self.auto_refine;
         // Every user input opens its own session; the conversation is the chain of
         // sessions linked to the same task.
@@ -1760,6 +1768,7 @@ impl SessionPort for AgentSessionService {
                 thinking,
                 turns_since_review,
                 auto_refine,
+                heartbeats,
             ))
             .await;
         });
@@ -2192,6 +2201,10 @@ impl SessionPort for AgentSessionService {
         Ok(format!("model {model} selected for the next turn"))
     }
 
+    fn due_heartbeats(&mut self) -> Vec<super::heartbeat::Due> {
+        self.heartbeats.due(std::time::Instant::now())
+    }
+
     fn set_thinking(&mut self, level: &str) -> Result<String, String> {
         let requested = harness_providers::ThinkingLevel::parse(level).ok_or_else(|| {
             format!(
@@ -2607,6 +2620,7 @@ async fn run_turn(
     thinking: Option<harness_providers::ThinkingLevel>,
     turns_since_review: Arc<std::sync::atomic::AtomicU32>,
     auto_refine: bool,
+    heartbeats: Arc<super::heartbeat::Heartbeats>,
 ) {
     let send = |event| {
         let _ = sender.send(event);
@@ -3243,7 +3257,10 @@ async fn run_turn(
                     },
                     goal_host.clone(),
                 ));
-            let mut chain = vec![skills];
+            let mut chain: Vec<Arc<dyn super::repl::HostRequests>> = vec![
+                skills,
+                Arc::clone(&heartbeats) as Arc<dyn super::repl::HostRequests>,
+            ];
             if let Some(host) = &delegate_host {
                 chain.push(host.rlm_requests(config.model.clone()));
             }
