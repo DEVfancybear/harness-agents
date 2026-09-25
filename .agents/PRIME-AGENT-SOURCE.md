@@ -2,7 +2,7 @@
 
 - Upstream: https://github.com/PrimeIntellect-ai/prime-agent/tree/e260085dd8f742e0def3d871860c9a888b114851/packages/coding-agent/skills
 - Source commit: `e260085dd8f742e0def3d871860c9a888b114851`
-- Imported: `agent-message`, `agent-observe`, `attach-image`, `compact`, `edit`, `goal`, `mcp`, `prime-intellect`, `refine`, `rlm-heartbeat`, `skill-creator`, and `websearch`, with their Python packages and references.
+- Imported: `agent-message`, `agent-observe`, `attach-image`, `compact`, `edit`, `goal`, `mcp`, `refine`, `rlm-heartbeat`, `skill-creator`, and `websearch`, with their Python packages and references.
 - License: MIT; see [LICENSE-prime-agent](LICENSE-prime-agent).
 
 Project adaptations:

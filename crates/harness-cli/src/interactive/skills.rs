@@ -514,17 +514,20 @@ mod tests {
             false,
         )
         .expect("built-in skills must be discoverable without project trust");
-        for name in [
-            "brainstorming",
-            "deep-research",
-            "find-skills",
-            "github-deep-research",
-        ] {
+        for name in ["brainstorming", "find-skills", "github-deep-research"] {
             let entry = catalog.entry(name).expect("bundled skill");
             assert_eq!(entry.source, SkillSource::Builtin);
             assert!(catalog.activate(name, None, 1).is_ok());
         }
         assert!(catalog.entries().len() >= 18);
+        assert!(
+            catalog.entry("deep-research").is_none(),
+            "the release must not ship deep-research"
+        );
+        assert!(
+            catalog.entry("prime-intellect").is_none(),
+            "the release must not ship prime-intellect"
+        );
         assert!(
             catalog
                 .entry("github-deep-research")
