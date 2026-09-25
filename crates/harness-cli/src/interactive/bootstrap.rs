@@ -178,6 +178,15 @@ impl LaunchContext {
     /// Only a **missing** file is written. A corrupt one is left exactly as it is:
     /// it is never silently replaced by defaults, and this returns the error the
     /// normal load reports so the app can say what is wrong with it.
+    /// The same launch after `/logout` left the provider without a credential.
+    #[must_use]
+    pub fn credential_removed(&self, reason: String) -> Self {
+        let mut updated = self.clone();
+        updated.provider = ProviderState::SetupRequired { reason };
+        updated.setup_required = true;
+        updated
+    }
+
     pub fn credential_saved(&self, source: CredentialSource) -> Result<Self, HarnessError> {
         let config = match std::fs::read_to_string(&self.paths.config_file) {
             Ok(_) => config::load(&self.paths.config_file)?,

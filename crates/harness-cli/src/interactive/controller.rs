@@ -2420,11 +2420,19 @@ impl InteractiveController {
             super::providers::Login::OAuth => match self.service.begin_sign_in(provider.id) {
                 Ok(url) => {
                     self.signing_in = Some(provider.id.to_owned());
+                    // The URL is long and wraps; copying it is what makes it usable
+                    // when the browser did not open.
+                    let copied = if self.plain {
+                        ""
+                    } else {
+                        effects.push(Effect::Copy(url.clone()));
+                        " (copied to the clipboard)"
+                    };
                     self.push_history(
                         effects,
                         HistoryItem::Notice {
                             message: format!(
-                                "Complete the {} sign-in in your browser. If it did not open, visit:\n{url}\nIf the browser is on another machine, paste the final redirect URL here. Esc cancels.",
+                                "Complete the {} sign-in in your browser. If it did not open, visit{copied}:\n{url}\nIf the browser is on another machine, paste the final redirect URL here. Esc cancels.",
                                 provider.name
                             ),
                         },
@@ -2457,14 +2465,17 @@ impl InteractiveController {
         };
         let name = super::providers::provider(provider).map_or(provider, |entry| entry.name);
         match self.service.remove_credential(provider) {
-            Ok(true) => self.push_history(
-                effects,
-                HistoryItem::Notice {
-                    message: format!(
-                        "Removed stored credential for {name}. Environment variables and config files are unchanged."
-                    ),
-                },
-            ),
+            Ok(true) => {
+                self.push_history(
+                    effects,
+                    HistoryItem::Notice {
+                        message: format!(
+                            "Removed stored credential for {name}. Environment variables and config files are unchanged."
+                        ),
+                    },
+                );
+                self.after_logout(effects);
+            }
             Ok(false) => self.push_history(
                 effects,
                 HistoryItem::Notice {
@@ -2474,6 +2485,39 @@ impl InteractiveController {
             Err(message) => self.push_history(effects, HistoryItem::Error { message }),
         }
         self.refresh_menu();
+    }
+
+    /// After a logout: when the model in use has lost its credential, move to a
+    /// provider that still has one, or return to setup so the status says so
+    /// instead of failing on the next message.
+    fn after_logout(&mut self, effects: &mut Vec<Effect>) {
+        let Some(problem) = self.service.provider_problem() else {
+            return;
+        };
+        let fallback = self
+            .service
+            .stored_credentials()
+            .into_iter()
+            .find_map(|(id, _)| super::providers::provider(&id));
+        if let Some(entry) = fallback {
+            match self
+                .service
+                .set_model(&format!("{}/{}", entry.id, entry.default_model))
+            {
+                Ok(message) => self.push_history(effects, HistoryItem::Notice { message }),
+                Err(message) => self.push_history(effects, HistoryItem::Error { message }),
+            }
+        } else {
+            self.context = self.context.credential_removed(problem);
+            self.setup_required = true;
+            self.setup_hint = self.context.setup_hint();
+            if !self.phase.has_active_run() {
+                self.phase = AppPhase::SetupRequired;
+            }
+        }
+        self.header = self.context.header_lines();
+        self.header
+            .push(format!("Service: {}", self.service.label()));
     }
 
     /// After a login, as prime-agent's `prepareForModelSelectionAfterLogin`: the

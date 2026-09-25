@@ -213,7 +213,27 @@ fn notice_rows(message: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     {
         vec![Span::styled(format!("⚠ {message}"), theme.warning)]
     } else {
-        vec![Span::styled(message.to_owned(), theme.dim)]
+        // A notice can span lines (a sign-in shows its URL on a line of its own),
+        // and a URL is drawn as a link so it stands out from the text around it.
+        return message
+            .lines()
+            .flat_map(|line| {
+                let spans = line
+                    .split_inclusive(' ')
+                    .map(|word| {
+                        if word.starts_with("https://") || word.starts_with("http://") {
+                            Span::styled(
+                                word.to_owned(),
+                                theme.md_link.add_modifier(Modifier::UNDERLINED),
+                            )
+                        } else {
+                            Span::styled(word.to_owned(), theme.dim)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                wrap_spans(spans, width)
+            })
+            .collect();
     };
     wrap_spans(spans, width)
 }
@@ -444,6 +464,7 @@ mod tests {
     use crate::interactive::events::{Detail, HistoryItem, RunOutcome, ToolState};
     use crate::interactive::tui::markdown::plain_text;
     use crate::interactive::tui::theme::Theme;
+    use ratatui::style::Modifier;
     use ratatui::text::{Line, Span};
     use std::time::Duration;
 
@@ -587,6 +608,29 @@ mod tests {
         assert!(
             row.starts_with("done · 3 steps · 2 tool calls · 14.2s"),
             "{row}"
+        );
+    }
+
+    /// A sign-in notice keeps its lines, and the URL is its own, underlined row.
+    #[test]
+    fn a_notice_keeps_its_lines_and_draws_a_url_as_a_link() {
+        let theme = Theme::colored();
+        let rows = render(
+            &HistoryItem::Notice {
+                message: "Sign in:\nhttps://auth.example/authorize?x=1\nEsc cancels.".to_owned(),
+            },
+            80,
+            &theme,
+            Detail::Collapsed,
+        );
+        assert_eq!(
+            plain_text(&rows),
+            "Sign in:\nhttps://auth.example/authorize?x=1\nEsc cancels."
+        );
+        let link = &rows[1].spans[0];
+        assert!(
+            link.style.add_modifier.contains(Modifier::UNDERLINED),
+            "{link:?}"
         );
     }
 

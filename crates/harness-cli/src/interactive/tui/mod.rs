@@ -552,7 +552,7 @@ fn apply(renderer: &mut impl TuiRenderer, effects: Vec<Effect>) -> Result<Step, 
                     .map_err(|error| terminal_error(&error))?;
                 renderer
                     .insert_history(&HistoryItem::Notice {
-                        message: "assistant answer copied to clipboard".to_owned(),
+                        message: "copied to clipboard".to_owned(),
                     })
                     .map_err(|error| terminal_error(&error))?;
             }
