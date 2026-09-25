@@ -1167,6 +1167,7 @@ dependencies = [
  "portable-pty",
  "proptest",
  "ratatui",
+ "reqwest",
  "rmcp",
  "schemars",
  "serde",

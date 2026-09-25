@@ -12,6 +12,7 @@
 
 - **Chat in the terminal.** `ha` opens an interactive app (TUI, or plain line mode). `ha exec "…"` runs one prompt for scripts and CI, with `text`, `json` or `stream-json` output.
 - **Works on your code with guarded tools.** Read, search, glob, patch/edit/write files, run processes and shell commands, inspect Git, ask you a question, delegate to a sub-agent. Every action goes through the host policy: `y` runs once, `a` allows the rest of the turn, `n` refuses; `/mode` sets `ask`, `auto-edit` or `full-auto`.
+- **Reads the web.** `web_search` (Google via Serper with `SERPER_API_KEY`, DuckDuckGo without a key) and `web_fetch` (a page as readable text with its links), so research skills such as `deep-research` have something to search with. Local and private addresses are refused.
 - **Resumes conversations.** `/resume` lists your conversations (one row each) and replays the chosen one's questions and answers to the model and on screen.
 - **Learns from the conversation.** Memory is on by default: after a turn, the model extracts durable facts (preferences, decisions, conventions, corrections) in the background; facts with confidence ≥ 0.7 are used from then on, the rest wait for review in `ha memory candidates`. Say "remember that …" / "ghi nhớ …" to store something verbatim.
 - **Uses skills.** Agent Skills directories (`SKILL.md` plus references and scripts) from the bundled set, `~/.agents/skills`, a trusted project's `.agents/skills`, or any folder in `HA_SKILL_PATHS` (e.g. `~/.claude/skills`). The model activates a matching skill by name and reads its files with `read_skill_file`; `/skills` lists them, `/skill:<name>` runs one.
@@ -76,6 +77,8 @@ Settings merge default → user `config.toml` → trusted project `.harness/conf
 | `HA_TURN_MAX_STEPS` / `HA_TURN_MAX_TOOL_CALLS` | 30 / 80 | Model calls and tool calls per turn before it pauses |
 | `HA_TURN_DEADLINE_SECONDS` / `HA_TURN_CONTINUATIONS` | 900 / 2 | Time per turn; automatic continuations after a bound |
 | `HA_SKILL_PATHS` | — | Extra skill directories, separated like `PATH` |
+| `SERPER_API_KEY` | — | Google results for `web_search` (without it: DuckDuckGo) |
+| `HA_WEB` | on | `off` removes `web_search` and `web_fetch` |
 | `HA_UI` | auto | `plain` forces line mode |
 
 ### Development
@@ -102,6 +105,7 @@ CI (`.github/workflows/ci.yml`) runs the phase gates (`scripts/Verify-Phase.ps1`
 
 - **Chat trong terminal.** `ha` mở ứng dụng tương tác (TUI, hoặc chế độ dòng lệnh thuần). `ha exec "…"` chạy một prompt cho script và CI, xuất `text`, `json` hoặc `stream-json`.
 - **Làm việc với code qua công cụ có kiểm soát.** Đọc, tìm kiếm, glob, sửa/ghi file, chạy tiến trình và lệnh shell, xem Git, hỏi lại bạn, giao việc cho agent con. Mọi thao tác đi qua chính sách của host: `y` chạy một lần, `a` cho phép đến hết lượt, `n` từ chối; `/mode` chọn `ask`, `auto-edit` hoặc `full-auto`.
+- **Đọc web.** `web_search` (Google qua Serper khi có `SERPER_API_KEY`, DuckDuckGo khi không có key) và `web_fetch` (một trang dưới dạng văn bản kèm link), để các skill nghiên cứu như `deep-research` có công cụ tìm kiếm. Địa chỉ local và mạng nội bộ bị từ chối.
 - **Tiếp tục hội thoại.** `/resume` liệt kê các hội thoại (mỗi hội thoại một dòng) và phát lại các câu hỏi, câu trả lời của hội thoại được chọn cho model và trên màn hình.
 - **Học từ hội thoại.** Memory mặc định bật: sau mỗi lượt, model trích ra ở chế độ nền các fact bền (sở thích, quyết định, quy ước, chỉnh sửa); fact có confidence ≥ 0.7 được dùng từ đó, phần còn lại chờ duyệt trong `ha memory candidates`. Nói "ghi nhớ …" / "remember that …" để lưu nguyên văn.
 - **Dùng skill.** Thư mục Agent Skills (`SKILL.md` cùng references và scripts) từ bộ tích hợp sẵn, `~/.agents/skills`, `.agents/skills` của project đã trust, hoặc bất kỳ thư mục nào trong `HA_SKILL_PATHS` (ví dụ `~/.claude/skills`). Model kích hoạt skill phù hợp theo tên và đọc file của skill bằng `read_skill_file`; `/skills` liệt kê, `/skill:<name>` chạy một skill.
@@ -166,6 +170,8 @@ Cấu hình được gộp theo thứ tự mặc định → `config.toml` của
 | `HA_TURN_MAX_STEPS` / `HA_TURN_MAX_TOOL_CALLS` | 30 / 80 | Số lời gọi model và tool mỗi lượt trước khi tạm dừng |
 | `HA_TURN_DEADLINE_SECONDS` / `HA_TURN_CONTINUATIONS` | 900 / 2 | Thời gian mỗi lượt; số lần tự tiếp tục sau khi chạm giới hạn |
 | `HA_SKILL_PATHS` | — | Thư mục skill bổ sung, phân tách như `PATH` |
+| `SERPER_API_KEY` | — | Kết quả Google cho `web_search` (không có thì dùng DuckDuckGo) |
+| `HA_WEB` | bật | `off` để gỡ `web_search` và `web_fetch` |
 | `HA_UI` | tự động | `plain` để ép chế độ dòng lệnh |
 
 ### Phát triển

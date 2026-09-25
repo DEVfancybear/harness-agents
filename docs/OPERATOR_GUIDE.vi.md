@@ -363,7 +363,9 @@ Build từ source vẫn dùng được cho phát triển:
 
 ### 12.1. Công cụ của agent
 
-18 công cụ cốt lõi đi qua host, policy và receipt. Các tool skill (`list_skills`, `activate_skill`, `read_skill_file`) và `mcp__<server>__<tool>` được thêm khi khả dụng.
+18 công cụ cốt lõi đi qua host, policy và receipt. Các tool skill (`list_skills`, `activate_skill`, `read_skill_file`), tool web (`web_search`, `web_fetch`) và `mcp__<server>__<tool>` được thêm khi khả dụng.
+
+**Web.** `web_search` tìm kiếm trên web: dùng Google qua Serper khi có `SERPER_API_KEY` (key miễn phí tại serper.dev), nếu không thì dùng DuckDuckGo, không cần key. `web_fetch` mở một trang http(s) và trả về văn bản đọc được kèm danh sách link, chia theo từng đoạn và đọc tiếp bằng `start_index`. Địa chỉ local và mạng nội bộ bị từ chối, kể cả khi bị redirect tới; file nhị phân bị từ chối. `web_search` chạy không cần bảng phê duyệt (chỉ gửi câu truy vấn); `web_fetch` phải hỏi, vì URL có thể mang dữ liệu ra ngoài - trả lời `a` để cho phép cả lượt, hoặc dùng `full-auto`. `HA_WEB=off` gỡ cả hai tool.
 
 **Skill** theo cấu trúc Agent Skills (một thư mục có `SKILL.md` cùng các file đi kèm). Skill được tìm trong bộ tích hợp sẵn, `<config-dir>/skills`, `~/.agents/skills`, mọi thư mục liệt kê trong `HA_SKILL_PATHS` (phân tách như `PATH`, ví dụ `~/.claude/skills`), và - với project đã trust - `.harness/skills` cùng `.agents/skills` ở workspace và từng thư mục cha tới Git root. System prompt liệt kê tên và mô tả từng skill; model kích hoạt skill theo tên (digest từ `list_skills` là tùy chọn để ghim phiên bản, chấp nhận có hoặc không có `sha256:`). Khi kích hoạt, model nhận hướng dẫn cùng thư mục và danh sách file của skill, và `read_skill_file` đọc các file đó - chỉ trong phạm vi skill. Ba tool skill chỉ đọc catalogue đã trust nên chạy không cần bảng phê duyệt; deny rule vẫn chặn được. `disable-model-invocation: true` trong front matter ẩn skill khỏi model; `/skill:<name>` vẫn chạy được.
 

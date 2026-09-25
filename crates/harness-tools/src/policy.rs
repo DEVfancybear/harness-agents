@@ -323,12 +323,25 @@ impl ToolPolicy {
                 reason: "skill catalogue (read-only)".to_owned(),
             };
         }
+        // A web search sends a query to the search provider and nothing else, like the
+        // prompt sent to the model provider. Opening a URL is different: the URL itself
+        // can carry data out, so web_fetch asks unless the mode or a rule allows it.
+        let web = matches!(action, CodingToolAction::ExternalTool { plugin_id, .. } if plugin_id == "web");
+        if web
+            && matches!(action, CodingToolAction::ExternalTool { tool_name, .. } if tool_name == "web_search")
+        {
+            return Decision::Allow {
+                reason: "web search (query only)".to_owned(),
+            };
+        }
 
         match self.mode {
             PolicyMode::AutoEdit if auto_edit_action(action) => Decision::Allow {
                 reason: "mode auto-edit".to_owned(),
             },
-            PolicyMode::FullAuto if !matches!(action, CodingToolAction::ExternalTool { .. }) => {
+            PolicyMode::FullAuto
+                if web || !matches!(action, CodingToolAction::ExternalTool { .. }) =>
+            {
                 Decision::Allow {
                     reason: "mode full-auto".to_owned(),
                 }
@@ -736,6 +749,18 @@ mod g05_policy_tests {
             policy.decide(&external("mcp", "list_skills")),
             Decision::Ask
         );
+        // Search sends a query only; opening a URL asks, unless the mode allows it.
+        assert!(matches!(
+            policy.decide(&external("web", "web_search")),
+            Decision::Allow { .. }
+        ));
+        assert_eq!(policy.decide(&external("web", "web_fetch")), Decision::Ask);
+        assert!(matches!(
+            ToolPolicy::new(1, Vec::new())
+                .with_mode(PolicyMode::FullAuto)
+                .decide(&external("web", "web_fetch")),
+            Decision::Allow { .. }
+        ));
         assert_eq!(
             policy.decide(&external("skill", "write_anything")),
             Decision::Ask

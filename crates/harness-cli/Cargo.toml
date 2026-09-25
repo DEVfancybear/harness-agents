@@ -71,6 +71,7 @@ rmcp = { version = "=3.4.0", default-features = false, features = ["client", "se
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+reqwest.workspace = true
 sha2.workspace = true
 toml.workspace = true
 tokio.workspace = true

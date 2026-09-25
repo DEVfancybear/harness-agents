@@ -32,6 +32,7 @@ pub mod skills;
 pub mod terminal;
 pub mod tui;
 pub mod view;
+pub mod web;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

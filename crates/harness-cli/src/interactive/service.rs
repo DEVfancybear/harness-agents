@@ -3021,6 +3021,7 @@ async fn run_turn(
     let skill_host = skill_catalog
         .as_ref()
         .map(|catalog| super::skills::SkillHost::new(catalog.clone(), Arc::clone(&active_skills)));
+    let web_host = super::web::WebHost::from_environment(&environment);
     let mut tools = ToolExecutionService::new(Arc::clone(&store))
         .with_policy(tool_policy)
         .with_hooks(config.hooks.clone());
@@ -3029,6 +3030,7 @@ async fn run_turn(
         active_extensions.as_ref(),
         delegate_host.as_ref(),
         skill_host.as_ref(),
+        web_host.as_ref(),
     ) {
         tools = tools.with_external(dispatcher);
     }
@@ -3038,6 +3040,7 @@ async fn run_turn(
         active_extensions.as_ref(),
         delegate_host.as_ref(),
         skill_host.as_ref(),
+        web_host.as_ref(),
     );
     let driver = match &external_tools {
         Some(tools) => driver.with_external(tools.clone()),
