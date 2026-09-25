@@ -174,6 +174,30 @@ pub fn python_skills_block(imports: &[String]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// prime-agent's `formatGenericMcpGuidance`: MCP servers are reached through the
+/// kernel's `mcp` object, not as native tools.
+#[must_use]
+pub fn generic_mcp_block(servers: &[String]) -> Option<String> {
+    if servers.is_empty() {
+        return None;
+    }
+    let mut lines = vec![
+        "# Generic MCP Connections".to_owned(),
+        String::new(),
+        "Generic MCP connections are accessed through the pre-imported Python `mcp` object in the Python REPL, not as top-level native tool namespaces or installed Python skills.".to_owned(),
+        format!(
+            "Enabled generic MCP servers: {}.",
+            servers.iter().map(|server| format!("`{server}`")).collect::<Vec<_>>().join(", ")
+        ),
+    ];
+    for server in servers {
+        lines.push(format!(
+            "For `{server}`, first discover its tools with `await mcp.list_tools(\"{server}\")`, then call one with `await mcp.call_tool(\"{server}\", \"<tool>\", arguments)`."
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
 /// ha's own guidelines, prime-agent's `promptGuidelines` slot: each one a rule that
 /// measurably cost turns here, shown only when its tool is present.
 fn additional_guidance(has: &dyn Fn(&str) -> bool) -> Vec<&'static str> {

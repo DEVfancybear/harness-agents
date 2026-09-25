@@ -363,7 +363,9 @@ Build từ source vẫn dùng được cho phát triển:
 
 ### 12.1. Công cụ của agent
 
-18 công cụ cốt lõi đi qua host, policy và receipt. Các tool skill (`list_skills`, `activate_skill`, `read_skill_file`), tool web (`web_search`, `web_fetch`), Python REPL (`ipython`) và `mcp__<server>__<tool>` được thêm khi khả dụng.
+18 công cụ cốt lõi đi qua host, policy và receipt. Các tool skill (`list_skills`, `activate_skill`, `read_skill_file`), tool web (`web_search`, `web_fetch`), Python REPL (`ipython`) và, khi không có REPL, `mcp__<server>__<tool>` được thêm khi khả dụng.
+
+**MCP theo cách của prime-agent.** Khi có Python REPL, MCP server không còn là tool native: object `mcp` được import sẵn trong kernel (`rlm.mcp` của prime-agent, đã vendor) tự mở server đã cấu hình - `await mcp.list_tools("<server>")`, `await mcp.call_tool("<server>", "<tool>", arguments)`, `await mcp.list_connections()` - và prompt liệt kê các server đang bật. Server là những server `ha mcp add` đã cấu hình; host đưa cấu hình từng server cho kernel theo định dạng của prime-agent (`secret://NAME` thành tham chiếu `{"env": "NAME"}`; `streamable_http` thành `http` kèm `bearerTokenEnvVar`). Package Python `mcp` có sẵn trong kernel venv. Catalog dịch vụ và đăng nhập OAuth của prime-agent chưa được port: danh sách plugin rỗng và yêu cầu làm mới credential bị từ chối. Khi không có REPL, hoặc khi tin nhắn đính kèm resource của server bằng `@server:uri`, server được kết nối native như trước; `/mcp` cho biết mỗi server đi theo đường nào.
 
 **Web.** `web_search` tìm kiếm trên web: dùng Google qua Serper khi có `SERPER_API_KEY` (key miễn phí tại serper.dev), nếu không thì dùng DuckDuckGo, không cần key. `web_fetch` mở một trang http(s) và trả về văn bản đọc được kèm danh sách link, chia theo từng đoạn và đọc tiếp bằng `start_index`. Địa chỉ local và mạng nội bộ bị từ chối, kể cả khi bị redirect tới; file nhị phân bị từ chối. `web_search` chạy không cần bảng phê duyệt (chỉ gửi câu truy vấn); `web_fetch` phải hỏi, vì URL có thể mang dữ liệu ra ngoài - trả lời `a` để cho phép cả lượt, hoặc dùng `full-auto`. `HA_WEB=off` gỡ cả hai tool.
 

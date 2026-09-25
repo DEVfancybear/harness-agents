@@ -360,7 +360,9 @@ Building from source stays available for development:
 
 ### 12.1. Agent tools
 
-The 18 core tools cross the host policy and receipt gate. Skill tools (`list_skills`, `activate_skill`, `read_skill_file`), web tools (`web_search`, `web_fetch`), the Python REPL (`ipython`) and `mcp__<server>__<tool>` appear when available.
+The 18 core tools cross the host policy and receipt gate. Skill tools (`list_skills`, `activate_skill`, `read_skill_file`), web tools (`web_search`, `web_fetch`), the Python REPL (`ipython`) and, without the REPL, `mcp__<server>__<tool>` appear when available.
+
+**MCP, as prime-agent reaches it.** With the Python REPL available, MCP servers are not native tools: the kernel's pre-imported `mcp` object (prime-agent's `rlm.mcp`, vendored) opens a configured server itself - `await mcp.list_tools("<server>")`, `await mcp.call_tool("<server>", "<tool>", arguments)`, `await mcp.list_connections()` - and the prompt lists the enabled servers. The servers are the ones `ha mcp add` configures; the host hands the kernel each server's configuration in prime-agent's shape (`secret://NAME` becomes an `{"env": "NAME"}` reference; `streamable_http` becomes `http` with `bearerTokenEnvVar`). The `mcp` Python package comes with the kernel venv. prime-agent's service catalog and OAuth login are not ported: plugin listings are empty and a credential refresh is refused. Without the REPL, or when a message attaches a server's resource with `@server:uri`, the servers are connected natively as before; `/mcp` says which route each server takes.
 
 **Web.** `web_search` searches the web: Google through Serper when `SERPER_API_KEY` is set (a free key at serper.dev), otherwise DuckDuckGo, which needs no key. `web_fetch` opens one http(s) page and returns readable text plus its links, in windows continued with `start_index`. Local and private addresses are refused, including as a redirect target; binary files are refused. `web_search` runs without a panel (it sends only the query); `web_fetch` asks, because a URL can carry data out - answer `a` to allow it for the turn, or use `full-auto`. `HA_WEB=off` removes both tools.
 

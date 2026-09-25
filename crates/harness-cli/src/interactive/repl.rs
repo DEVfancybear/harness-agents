@@ -63,12 +63,14 @@ const KERNEL_RESTART_NOTICE: &str =
     "[The Python kernel was restarted; variables and imports from earlier cells are gone.]";
 
 /// The vendored runtime, embedded so a single binary carries it.
-const RUNTIME_FILES: [(&str, &str); 5] = [
+const RUNTIME_FILES: [(&str, &str); 7] = [
     ("__init__.py", include_str!("../../python/rlm/__init__.py")),
     ("repl.py", include_str!("../../python/rlm/repl.py")),
     ("bash.py", include_str!("../../python/rlm/bash.py")),
     ("_winjob.py", include_str!("../../python/rlm/_winjob.py")),
     ("harness.py", include_str!("../../python/rlm/harness.py")),
+    ("mcp.py", include_str!("../../python/rlm/mcp.py")),
+    ("mcp_base.py", include_str!("../../python/rlm/mcp_base.py")),
 ];
 
 /// prime-agent's `ATTACHMENT_DISPLAY_MIME`: `{mime_type, data, path}` for one image.
@@ -89,6 +91,7 @@ _ha_os.environ[\"NO_COLOR\"] = \"1\"\n\
 import rlm as _ha_rlm_module\n\
 rlm = _ha_rlm_module.rlm\n\
 bash = _ha_rlm_module.bash\n\
+import rlm.mcp as mcp\n\
 del _ha_os";
 
 /// The answer to one host request: `None` when the type has no handler.
@@ -834,7 +837,7 @@ mod venv {
     const PYTHON_VERSION: &str = "3.11";
     /// `dill` for state snapshots, prime-agent's `DEFAULT_RLM_EXTRA_PACKAGES`, and
     /// the packages the bundled skills import (`pillow` for `attach_image`).
-    pub const PACKAGES: [&str; 14] = [
+    pub const PACKAGES: [&str; 15] = [
         "dill",
         "requests",
         "httpx",
@@ -849,6 +852,8 @@ mod venv {
         "pydantic",
         "tyro",
         "pillow",
+        // prime-agent-runtime's own dependency, for `rlm.mcp`.
+        "mcp>=2,<3",
     ];
     const MARKER: &str = "ha-kernel.json";
     const STEP_TIMEOUT: Duration = Duration::from_mins(15);
@@ -1333,6 +1338,30 @@ mod tests {
         assert_eq!(loaded.text, "'done'");
         assert_eq!(loaded.images.len(), 1);
         assert_eq!(loaded.images[0]["mime_type"], "image/png");
+        // prime-agent's `mcp` object is pre-imported and asks the host for the user's
+        // connections.
+        let mut servers = std::collections::BTreeMap::new();
+        servers.insert(
+            "files".to_owned(),
+            harness_types::McpServerConfigV2 {
+                command: Some("node".to_owned()),
+                ..harness_types::McpServerConfigV2::default()
+            },
+        );
+        let mcp_host = crate::interactive::skill_requests::McpRequests::new(
+            servers,
+            directory.path().to_path_buf(),
+        );
+        let connections = shared
+            .execute(
+                "[c['connectionId'] for c in await mcp.list_connections()]",
+                Duration::from_mins(1),
+                &mcp_host,
+                Some(&dirs),
+            )
+            .await
+            .expect("cell");
+        assert_eq!(connections.text, "['files']");
         // Memory written through `rlm.harness` lands in the conversation's files, where
         // the host reads its digest from.
         let created = run(

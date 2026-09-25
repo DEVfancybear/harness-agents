@@ -3106,9 +3106,34 @@ async fn run_turn(
     // MCP launch is deferred until an actual model turn. Each server config is
     // trust-layer resolved above, and every tool it advertises still crosses
     // ToolExecutionService's policy, approval, intent and receipt path.
+    // prime-agent reaches MCP servers through the kernel's `mcp` object, not as native
+    // tools. With the REPL available the servers are left to it; they are connected
+    // natively only when there is no REPL, or when the message attaches one of their
+    // resources with `@server:uri`, which only the native client can read.
+    let repl_available = match &repl {
+        Some(shared) => shared.available().await,
+        None => false,
+    };
+    let attaches_mcp_resource = config
+        .mcp_servers
+        .keys()
+        .any(|server| request.text.contains(&format!("@{server}:")));
     let active_mcp = if config.mcp_servers.is_empty() {
         if let Ok(mut status) = mcp_status.lock() {
             status.clear();
+        }
+        None
+    } else if repl_available && !attaches_mcp_resource {
+        if let Ok(mut status) = mcp_status.lock() {
+            *status = config
+                .mcp_servers
+                .keys()
+                .map(|server| {
+                    format!(
+                        "{server}: reached through the Python REPL `mcp` object, as in prime-agent"
+                    )
+                })
+                .collect();
         }
         None
     } else {
@@ -3264,6 +3289,12 @@ async fn run_turn(
             if let Some(host) = &delegate_host {
                 chain.push(host.rlm_requests(config.model.clone()));
             }
+            if !config.mcp_servers.is_empty() {
+                chain.push(Arc::new(super::skill_requests::McpRequests::new(
+                    config.mcp_servers.clone(),
+                    workspace_root.clone(),
+                )));
+            }
             let requests: Arc<dyn super::repl::HostRequests> =
                 Arc::new(super::skill_requests::ChainedRequests(chain));
             super::repl::ReplHost::for_turn(
@@ -3379,6 +3410,14 @@ async fn run_turn(
     let mut built_prompt = SystemPromptBuilder::build(&prompt_environment, &prompt_tools);
     if repl_host.is_some()
         && let Some(block) = super::prompt::python_skills_block(&kernel_skill_imports)
+    {
+        built_prompt.text.push_str("\n\n");
+        built_prompt.text.push_str(&block);
+    }
+    if repl_host.is_some()
+        && let Some(block) = super::prompt::generic_mcp_block(
+            &config.mcp_servers.keys().cloned().collect::<Vec<_>>(),
+        )
     {
         built_prompt.text.push_str("\n\n");
         built_prompt.text.push_str(&block);

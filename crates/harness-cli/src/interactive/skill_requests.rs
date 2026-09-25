@@ -32,6 +32,128 @@ impl HostRequests for ChainedRequests {
     }
 }
 
+/// prime-agent's generic MCP connections, served from ha's configured servers.
+///
+/// prime-agent does not give the model MCP tools as native tool namespaces: the
+/// kernel's `mcp` object (`rlm.mcp`) opens a configured server itself and calls its
+/// tools, asking the host only for the server's configuration (`mcp.config`) and the
+/// user's connections (`mcp.list_connections`), as `McpManager.hostHandlers` answers.
+/// ha has no MCP service catalog or OAuth login, so the plugin listings are empty and
+/// a refresh is refused.
+pub struct McpRequests {
+    servers: std::collections::BTreeMap<String, harness_types::McpServerConfigV2>,
+    workspace: std::path::PathBuf,
+}
+
+impl McpRequests {
+    #[must_use]
+    pub fn new(
+        servers: std::collections::BTreeMap<String, harness_types::McpServerConfigV2>,
+        workspace: std::path::PathBuf,
+    ) -> Self {
+        Self { servers, workspace }
+    }
+
+    /// ha's server configuration in prime-agent's `McpServerConfig` shape. A
+    /// `secret://NAME` value becomes prime-agent's `{"env": "NAME"}` reference; a
+    /// configuration with literal values is passed the way prime-agent passes an ACP
+    /// server's, with `credentialSource: "acp"`.
+    #[must_use]
+    pub fn prime_config(&self, name: &str) -> Value {
+        let Some(server) = self.servers.get(name) else {
+            return json!({});
+        };
+        let mut config = serde_json::Map::new();
+        let transport = server.transport.as_deref().unwrap_or("stdio");
+        if transport == "stdio" {
+            config.insert("type".to_owned(), json!("stdio"));
+            config.insert("command".to_owned(), json!(server.command));
+            config.insert("args".to_owned(), json!(server.args));
+            if let Some(cwd) = &server.cwd {
+                let path = std::path::Path::new(cwd);
+                let path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    self.workspace.join(path)
+                };
+                config.insert("cwd".to_owned(), json!(path.display().to_string()));
+            }
+            let literal = server
+                .env
+                .values()
+                .any(|value| !value.starts_with("secret://"));
+            let env = server
+                .env
+                .iter()
+                .map(|(key, value)| {
+                    let entry = match value.strip_prefix("secret://") {
+                        Some(variable) if literal => {
+                            json!(std::env::var(variable).unwrap_or_default())
+                        }
+                        Some(variable) => json!({ "env": variable }),
+                        None => json!(value),
+                    };
+                    (key.clone(), entry)
+                })
+                .collect::<serde_json::Map<_, _>>();
+            config.insert("env".to_owned(), Value::Object(env));
+            if literal {
+                config.insert("credentialSource".to_owned(), json!("acp"));
+            }
+        } else {
+            config.insert("type".to_owned(), json!("http"));
+            config.insert("url".to_owned(), json!(server.url));
+            if let Some(variable) = &server.bearer_token_env {
+                config.insert("bearerTokenEnvVar".to_owned(), json!(variable));
+            }
+        }
+        if !server.enabled_tools.is_empty() {
+            config.insert("enabledTools".to_owned(), json!(server.enabled_tools));
+        }
+        if !server.disabled_tools.is_empty() {
+            config.insert("disabledTools".to_owned(), json!(server.disabled_tools));
+        }
+        if let Some(seconds) = server.tool_timeout_seconds {
+            config.insert(
+                "callTimeoutMs".to_owned(),
+                json!(seconds.saturating_mul(1000)),
+            );
+        }
+        config.insert("enabled".to_owned(), json!(true));
+        Value::Object(config)
+    }
+}
+
+impl HostRequests for McpRequests {
+    fn handle<'a>(&'a self, request: &'a Value) -> HostReply<'a> {
+        Box::pin(async move {
+            let kind = request["type"].as_str().unwrap_or_default();
+            let server = request["server"].as_str().unwrap_or_default();
+            Some(match kind {
+                "mcp.config" if server.is_empty() => Err("mcp.config requires a server".to_owned()),
+                "mcp.config" => Ok(self.prime_config(server)),
+                "mcp.list_connections" => Ok(json!({
+                    "connections": self.servers.iter().map(|(name, server)| json!({
+                        "connectionId": name,
+                        "label": name,
+                        "service": name,
+                        "transport": server.transport.as_deref().unwrap_or("stdio"),
+                        "status": "configured",
+                        "source": "ha config",
+                    })).collect::<Vec<_>>(),
+                })),
+                "mcp.list_plugins" | "mcp.search_plugins" => {
+                    Ok(json!({ "plugins": [], "nextCursor": null }))
+                }
+                "mcp.refresh" | "mcp.begin_login" | "mcp.connect" => Err(format!(
+                    "{kind} is not available in ha: MCP servers are configured in ha's config, and credentials come from the environment"
+                )),
+                _ => return None,
+            })
+        })
+    }
+}
+
 /// The model a turn runs on, as `model.info` reports it.
 #[derive(Clone, Debug)]
 pub struct ModelInfo {
@@ -323,6 +445,70 @@ mod tests {
             events.try_recv(),
             Ok(SessionEvent::GoalCompleted { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn mcp_servers_are_served_in_prime_agents_shape() {
+        use super::McpRequests;
+        let mut servers = std::collections::BTreeMap::new();
+        servers.insert(
+            "files".to_owned(),
+            harness_types::McpServerConfigV2 {
+                command: Some("node".to_owned()),
+                args: vec!["server.js".to_owned()],
+                env: [("TOKEN".to_owned(), "secret://FILES_TOKEN".to_owned())].into(),
+                cwd: Some("tools".to_owned()),
+                ..harness_types::McpServerConfigV2::default()
+            },
+        );
+        servers.insert(
+            "remote".to_owned(),
+            harness_types::McpServerConfigV2 {
+                transport: Some("streamable_http".to_owned()),
+                url: Some("https://mcp.example.com/mcp".to_owned()),
+                bearer_token_env: Some("REMOTE_TOKEN".to_owned()),
+                ..harness_types::McpServerConfigV2::default()
+            },
+        );
+        let host = McpRequests::new(servers, std::path::PathBuf::from("/work"));
+        let files = host
+            .handle(&json!({"type": "mcp.config", "server": "files"}))
+            .await
+            .expect("known")
+            .expect("ok");
+        assert_eq!(files["type"], "stdio");
+        assert_eq!(files["env"]["TOKEN"], json!({"env": "FILES_TOKEN"}));
+        assert!(files.get("credentialSource").is_none());
+        assert!(
+            files["cwd"]
+                .as_str()
+                .is_some_and(|cwd| cwd.ends_with("tools"))
+        );
+        let remote = host
+            .handle(&json!({"type": "mcp.config", "server": "remote"}))
+            .await
+            .expect("known")
+            .expect("ok");
+        assert_eq!(remote["type"], "http");
+        assert_eq!(remote["bearerTokenEnvVar"], "REMOTE_TOKEN");
+        let unknown = host
+            .handle(&json!({"type": "mcp.config", "server": "nope"}))
+            .await
+            .expect("known")
+            .expect("ok");
+        assert_eq!(unknown, json!({}), "an undeclared server has no config");
+        let connections = host
+            .handle(&json!({"type": "mcp.list_connections"}))
+            .await
+            .expect("known")
+            .expect("ok");
+        assert_eq!(connections["connections"].as_array().map(Vec::len), Some(2));
+        assert!(
+            host.handle(&json!({"type": "mcp.refresh", "server": "remote"}))
+                .await
+                .expect("known")
+                .is_err()
+        );
     }
 
     #[tokio::test]
