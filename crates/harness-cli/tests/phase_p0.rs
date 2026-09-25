@@ -251,7 +251,8 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
                 .is_some_and(|id| id.starts_with('C') || id.starts_with('K'))
         })
         .collect::<Vec<_>>();
-    assert_eq!(future_cases.len(), 44);
+    // C01-C30 and K01-K14, minus the twelve cases retired with scoped memory.
+    assert_eq!(future_cases.len(), 32);
     let p1_cases = future_cases
         .iter()
         .filter(|case| case["phase"] == "P1")
@@ -317,18 +318,10 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
         ci.contains("rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt")
     );
     assert!(ci.contains("scripts/Verify-Phase.ps1 -Phase P0"));
-    assert!(ci.contains("scripts/Verify-Phase.ps1 -Phase P4"));
+    assert!(!ci.contains("scripts/Verify-Phase.ps1 -Phase P4"));
     assert!(ci.contains("scripts/Verify-Phase.ps1 -Phase P5"));
-    let p4_cases = future_cases
-        .iter()
-        .filter(|case| case["phase"] == "P4")
-        .collect::<Vec<_>>();
-    assert_eq!(p4_cases.len(), 11);
-    assert!(
-        p4_cases
-            .iter()
-            .all(|case| case["readiness"] == "implemented" && case["required"] == true)
-    );
+    // P4 was the scoped-memory phase; its cases were retired with the subsystem.
+    assert!(cases.iter().all(|case| case["phase"] != "P4"));
     // P5 owns two continuity cases; its seven steps and its strengthening cases
     // must all be real, required and named.
     let p5_cases = future_cases
@@ -385,14 +378,14 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
                 .expect("test names")
                 .is_empty()
     }));
-    // P7 is the release gate: it owns the last two continuity cases and seven
+    // P7 is the release gate: it owns the last continuity case and seven
     // steps, and it retains every earlier case as a regression.
     assert!(ci.contains("scripts/Verify-Phase.ps1 -Phase P7"));
     let p7_cases = future_cases
         .iter()
         .filter(|case| case["phase"] == "P7")
         .collect::<Vec<_>>();
-    assert_eq!(p7_cases.len(), 2);
+    assert_eq!(p7_cases.len(), 1);
     assert!(
         p7_cases
             .iter()
@@ -414,7 +407,7 @@ fn p0_f08_registry_and_ci_preserve_prior_phase_contracts() {
                 .expect("test names")
                 .is_empty()
     }));
-    // Every one of the 44 continuity and plugin cases now has an executable
+    // Every one of the 32 continuity and plugin cases now has an executable
     // acceptance test, which is the state the release gate asserts.
     assert!(future_cases.iter().all(|case| {
         case["readiness"] == "implemented"

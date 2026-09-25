@@ -151,48 +151,17 @@ dựng đang chạy, `doctor` báo `writable: false`, ghi thất bại với l�
 việc đọc chỉ vẫn hoạt động. Cách khắc phục là binary mới hơn, không bao giờ là sửa
 tay một dòng schema.
 
-## 6. Retention: invalidate, archive và forget
+## 6. Tombstone
 
 ```console
-ha maintenance retain --data-dir <DATA_DIR> --action invalidate \
-    --source-kind file --source-id src/lib.rs --reason "nội dung đã đổi" --json
-ha maintenance retain --data-dir <DATA_DIR> --action archive \
-    --source-kind file --source-id src/lib.rs --reason "giữ để kiểm toán" --json
-ha maintenance retain --data-dir <DATA_DIR> --action forget \
-    --source-kind file --source-id src/lib.rs --reason "yêu cầu của người vận hành" \
-    --confirm file:src/lib.rs --surviving-copy backup-2026-01 --json
 ha maintenance tombstones --data-dir <DATA_DIR> --json
 ```
 
-Đây là ba thao tác khác nhau, và khác biệt này quan trọng:
-
-| Hành động | Việc nó làm | Có xóa nội dung? | Cần xác nhận? |
-| --- | --- | --- | --- |
-| `invalidate` | Đánh dấu tri thức dẫn xuất là không dùng được, giữ lịch sử | Không | Không |
-| `archive` | Đưa nội dung ra khỏi dùng đang hoạt động, vẫn phục hồi được | Không | Không |
-| `forget` | Xóa nội dung và ghi một tombstone | **Có** | **Có** |
-
-**`invalidate` không bao giờ là `delete`.** Một mục bị invalidate sẽ bị từ chối cho
-việc dùng tiếp trong khi bản ghi của nó — cùng sự thật rằng nó từng tồn tại và đã
-đổi — vẫn được giữ. Chỉ `forget` mới xóa nội dung.
-
-`forget` yêu cầu `--confirm` bằng đủ target `--source-kind:--source-id` (ví dụ
-`file:src/lib.rs`). Chỉ source ID, sai kind/ID hoặc để rỗng đều bị từ chối với
-`retention_refused`, và không có gì được ghi. Retention áp dụng cho mọi project
-trong store có cùng cặp kind/ID; file source identity hiện là path tương đối với
-workspace.
-
-`tombstone` là bản ghi bền vững rằng một nguồn đã bị cố ý quên. Nó được ghi trong
-cùng giao dịch với thao tác forget, tồn tại qua sao lưu và phục hồi, và chặn việc
-trích xuất lại: mọi lượt về sau định đọc lại nguồn đó đều bị từ chối, nên dữ liệu
-đã quên không thể âm thầm quay lại. `ha maintenance tombstones` liệt kê chúng.
-
-**Tombstone không thể vươn ra ngoài thư mục dữ liệu này.** Việc xóa là cục bộ; những
-bản sao bạn đã tạo ở nơi khác không bị động tới. Vì vậy `forget` nhận
-`--surviving-copy` (lặp lại được) và báo lại: tombstone ghi mọi bản sao bên ngoài
-hoặc bản sao lưu có thể còn chứa dữ liệu, để người vận hành có danh sách tường minh
-mà xử lý. Truyền danh sách rỗng là hợp lệ, và nghĩa là bạn khẳng định không còn bản
-sao nào khác — công cụ sẽ không tự bịa ra, và cũng không giả vờ rằng việc xóa là toàn cầu.
+`tombstone` là bản ghi bền vững rằng một nguồn đã bị cố ý quên, kèm mọi bản sao bên
+ngoài hoặc bản sao lưu có thể còn chứa dữ liệu của nó. Các thao tác retention theo
+nguồn `invalidate`/`archive`/`forget` đã bị gỡ cùng hệ thống memory có phạm vi, nên
+bản này không còn ghi tombstone mới; những tombstone mà store cũ đang giữ vẫn tồn tại
+nguyên vẹn qua sao lưu và phục hồi, và `ha maintenance tombstones` liệt kê chúng.
 
 ## 7. Thu gom rác
 
@@ -203,7 +172,7 @@ ha maintenance gc --data-dir <DATA_DIR> --grace-seconds 604800 --json
 
 Thu gom rác xóa byte của artifact, và chỉ xóa artifact đồng thời:
 
-1. **không được tham chiếu** — không receipt, tool artifact scope hay memory version nào trỏ tới;
+1. **không được tham chiếu** — không receipt hay tool artifact scope nào trỏ tới;
 2. **không bị pin** — không bản sao lưu hay task dở dang nào giữ retention pin trên nó; và
 3. **cũ hơn thời gian ân hạn** — mặc định là 604800 giây (7 ngày).
 
@@ -235,7 +204,7 @@ Ma trận báo cáo bốn thứ riêng biệt và từ chối làm mờ chúng:
 - **benchmarks** — một `target` đã nêu với giá trị `measured` là `null` cho tới khi
   có lượt chạy thật. `met` là `null` khi `measured` là `null`. Mục tiêu là mục tiêu;
   nó không bao giờ được báo là đạt chỉ vì đã được viết ra.
-- **verified_cases**, **unverified_checks**, **out_of_scope** — 44 ca liên tục và
+- **verified_cases**, **unverified_checks**, **out_of_scope** — 32 ca liên tục và
   plugin mà bản phát hành này chạy, những kiểm tra chưa chạy cùng lý do, và những gì
   bản phát hành này dứt khoát không làm.
 
@@ -249,7 +218,7 @@ benchmark chưa đo vẫn được nêu là chưa đo ngay cả khi mọi nền 
   được thu gom; nếu bạn không chạy `backup`, không gì được bảo vệ.
 - Phục hồi không phải một công tắc. Nó tạo ra một thư mục ứng viên; kích hoạt nó là
   quyết định của người vận hành với hệ quả riêng.
-- Forget là cục bộ và bền vững, không phải toàn cầu. Hãy đọc `surviving_copies` trước
+- Tombstone là cục bộ và bền vững, không phải toàn cầu. Hãy đọc `surviving_copies` trước
   khi nói với ai rằng dữ liệu đã biến mất.
 - Một bản sao lưu chỉ được coi là đã kiểm chứng khi `verify-backup` nói vậy trên đúng
   phương tiện bạn đang giữ.
@@ -267,7 +236,6 @@ benchmark chưa đo vẫn được nêu là chưa đo ngay cả khi mọi nền 
 | `ha maintenance backup` | Ảnh chụp vào một thư mục mới | Thư mục sao lưu đã tồn tại; nguồn không có store |
 | `ha maintenance verify-backup` | Kiểm tra một bản sao lưu và các artifact của nó | Manifest, cơ sở dữ liệu hay bất kỳ artifact nào sai hash |
 | `ha maintenance restore` | Phục hồi vào thư mục mới, không kích hoạt | Đích đã có store hoặc đang active; ảnh chụp không đầy đủ |
-| `ha maintenance retain` | `invalidate`, `archive` hay `forget` một nguồn | `forget` thiếu `--confirm` bằng `--source-kind:--source-id` |
 | `ha maintenance tombstones` | Liệt kê nguồn đã quên và các bản sao còn lại | Không bao giờ |
 | `ha maintenance gc` | Thu gom artifact không tham chiếu, không pin, đã cũ | Không bao giờ; nó báo những gì được giữ và vì sao |
 | `ha maintenance migrate-copy` | Chuyển đổi store trên một bản sao | Đích đã có dữ liệu; nguồn không có store |

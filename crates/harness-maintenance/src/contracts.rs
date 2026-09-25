@@ -7,7 +7,6 @@
 //! `delete`.
 
 use std::collections::BTreeMap;
-use std::fmt;
 
 use harness_types::{ContentHash, ErrorCode, TaskId};
 use serde::{Deserialize, Serialize};
@@ -430,42 +429,6 @@ impl RestoreReport {
     }
 }
 
-/// The retention class applied to content. They are deliberately separate
-/// operations: invalidation keeps the record, forgetting removes it.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RetentionAction {
-    /// Mark derived knowledge unusable while retaining history.
-    Invalidate,
-    /// Move content out of active use while keeping it restorable.
-    Archive,
-    /// Remove content and record a tombstone.
-    Forget,
-}
-
-impl RetentionAction {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Invalidate => "invalidate",
-            Self::Archive => "archive",
-            Self::Forget => "forget",
-        }
-    }
-
-    /// Only forgetting removes content, so only forgetting needs confirmation.
-    #[must_use]
-    pub const fn requires_confirmation(self) -> bool {
-        matches!(self, Self::Forget)
-    }
-}
-
-impl fmt::Display for RetentionAction {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
 /// A durable tombstone. It records that a source was deliberately forgotten and
 /// blocks a later extraction pass from bringing the content back.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -477,17 +440,6 @@ pub struct Tombstone {
     pub reason: String,
     pub created_unix_ms: u64,
     /// External or backup copies that may still contain the data.
-    pub surviving_copies: Vec<String>,
-}
-
-/// The outcome of a retention operation, including what the operator must know.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RetentionReport {
-    pub action: RetentionAction,
-    pub target: String,
-    pub affected_assets: Vec<String>,
-    pub derived_invalidated: usize,
-    pub tombstone_id: Option<String>,
     pub surviving_copies: Vec<String>,
 }
 

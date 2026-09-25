@@ -392,7 +392,7 @@ Gate P1/P2 on durable reconstruction, P3 on actual tool evidence, P4 on extracti
 
 ## 19. Memory: prime-agent's continual harness state
 
-The app's memory follows prime-agent (`core/refinement/refinement.ts`, `prime-agent-runtime/src/rlm/harness.py`). It replaced an earlier design - a keyword-matched "remember that" path, a turn log, a background fact extractor and keyword recall from the SQLite memory store - which is removed. The `harness-memory` crate and `ha memory` remain as a maintenance tool over data written before; turns no longer read or write it.
+The app's memory follows prime-agent (`core/refinement/refinement.ts`, `prime-agent-runtime/src/rlm/harness.py`). It replaced an earlier design - a keyword-matched "remember that" path, a turn log, a background fact extractor and keyword recall from the SQLite memory store - which is removed. The `harness-memory` crate and the `ha memory` command have since been removed as well; stores written before keep their old memory tables, which nothing reads.
 
 ### 19.1. The model owns its memory
 

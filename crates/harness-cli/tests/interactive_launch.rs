@@ -276,11 +276,7 @@ fn i02_help_and_version_stay_fast_paths_that_write_nothing() {
         version.stdout
     );
 
-    for arguments in [
-        vec!["memory", "--help"],
-        vec!["maintenance", "--help"],
-        vec!["chat", "--help"],
-    ] {
+    for arguments in [vec!["maintenance", "--help"], vec!["chat", "--help"]] {
         let run = sandbox.run(&arguments);
         assert_eq!(run.code(), 0, "{arguments:?} failed: {}", run.stderr);
     }

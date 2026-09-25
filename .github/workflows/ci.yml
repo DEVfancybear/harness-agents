@@ -70,23 +70,6 @@ jobs:
         shell: pwsh
         run: ./scripts/Verify-Phase.ps1 -Phase P3
 
-  verify-p4:
-    name: P4 (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
-      - name: Install pinned Rust toolchain
-        shell: pwsh
-        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
-      - name: Run P4 gate and predecessor regressions without credentials
-        shell: pwsh
-        run: ./scripts/Verify-Phase.ps1 -Phase P4
-
   verify-p5:
     name: P5 (${{ matrix.os }})
     strategy:
@@ -147,7 +130,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest]
-        milestone: [M0, M1, M2, M3, M4, M5, M6, M7, M8, M9, M10, M11, M12]
+        milestone: [M0, M1, M2, M3, M4, M5, M6, M8, M9, M10, M11, M12]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:

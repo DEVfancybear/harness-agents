@@ -9,9 +9,8 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use super::{SqliteStore, assert_fence_in_tx, database_error, row_get, to_i64, to_u64};
 use crate::{
-    DELEGATION_SCHEMA_VERSION, DeliveryCommit, MemoryBindingRow, ParentDeliveryRecord, StoreError,
-    StoreFaultPoint, StoredDelegatedResultRecord, StoredTaskNodeRecord, TaskOwnerRecord,
-    WorktreeRecordRow,
+    DELEGATION_SCHEMA_VERSION, DeliveryCommit, ParentDeliveryRecord, StoreError, StoreFaultPoint,
+    StoredDelegatedResultRecord, StoredTaskNodeRecord, TaskOwnerRecord, WorktreeRecordRow,
 };
 
 const DELEGATION_SCHEMA: &[&str] = &[
@@ -106,18 +105,6 @@ const DELEGATION_SCHEMA: &[&str] = &[
         final_fingerprint TEXT NOT NULL,
         report_json TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )",
-    "CREATE TABLE IF NOT EXISTS delegation_memory_bindings (
-        binding_id TEXT PRIMARY KEY,
-        task_id TEXT NOT NULL,
-        agent_profile_id TEXT NOT NULL,
-        memory_asset_id TEXT NOT NULL,
-        version INTEGER NOT NULL CHECK (version >= 1),
-        injection_mode TEXT NOT NULL,
-        priority INTEGER NOT NULL,
-        actions_json TEXT NOT NULL,
-        revision INTEGER NOT NULL CHECK (revision >= 1),
-        logged_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )",
 ];
 
@@ -504,60 +491,6 @@ impl SqliteStore {
         })?;
         tx.commit().await.map_err(|error| {
             database_error(ErrorCode::StorageWriteFailed, "commit worktree", error)
-        })
-    }
-
-    /// Bind one host-issued memory version to a delegated worker.
-    pub async fn bind_delegation_memory(
-        &self,
-        binding: &MemoryBindingRow,
-    ) -> Result<(), StoreError> {
-        let fence = self.fence()?;
-        let mut tx = self.begin_write(&fence).await?;
-        assert_fence_in_tx(&mut tx, &fence).await?;
-        let actions_json = serde_json::to_string(&binding.actions).map_err(|_| {
-            StoreError::new(
-                ErrorCode::InvalidPayload,
-                "binding actions are not serializable",
-            )
-        })?;
-        sqlx::query(
-            "INSERT INTO delegation_memory_bindings(
-                 binding_id, task_id, agent_profile_id, memory_asset_id, version,
-                 injection_mode, priority, actions_json, revision)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(binding_id) DO UPDATE SET
-                 version = excluded.version,
-                 injection_mode = excluded.injection_mode,
-                 priority = excluded.priority,
-                 actions_json = excluded.actions_json,
-                 revision = excluded.revision,
-                 logged_at = CURRENT_TIMESTAMP",
-        )
-        .bind(&binding.binding_id)
-        .bind(binding.task_id.as_str())
-        .bind(binding.profile_id.as_str())
-        .bind(binding.memory_asset_id.as_str())
-        .bind(to_i64(binding.version, "binding version")?)
-        .bind(&binding.injection_mode)
-        .bind(binding.priority)
-        .bind(actions_json)
-        .bind(to_i64(binding.revision, "binding revision")?)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| {
-            database_error(
-                ErrorCode::StorageWriteFailed,
-                "persist memory binding",
-                error,
-            )
-        })?;
-        tx.commit().await.map_err(|error| {
-            database_error(
-                ErrorCode::StorageWriteFailed,
-                "commit memory binding",
-                error,
-            )
         })
     }
 

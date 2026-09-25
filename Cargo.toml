@@ -8,7 +8,6 @@ members = [
     "crates/harness-providers",
     "crates/harness-runtime",
     "crates/harness-tools",
-    "crates/harness-memory",
     "crates/harness-orchestrator",
     "crates/harness-extensions",
     "crates/harness-maintenance",

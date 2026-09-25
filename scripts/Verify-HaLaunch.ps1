@@ -252,7 +252,7 @@ if ((Invoke-GateStep -Name 'acceptance-session' -File 'cargo' -Arguments @('test
 # with --test-threads=1 on the same binary).
 if ((Invoke-GateStep -Name 'providers-streaming' -File 'cargo' -Arguments @('test', '-p', 'harness-providers', '--locked', '--', '--test-threads=1')) -ne 0) { $failures.Add('providers-streaming') }
 
-foreach ($phase in @('phase_p0', 'phase_p1', 'phase_p2', 'phase_p3', 'phase_p4', 'phase_p5', 'phase_p6', 'phase_p7')) {
+foreach ($phase in @('phase_p0', 'phase_p1', 'phase_p2', 'phase_p3', 'phase_p5', 'phase_p6', 'phase_p7')) {
     if ((Invoke-GateStep -Name "regression-$phase" -File 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $phase, '--locked', '--', '--test-threads=1')) -ne 0) { $failures.Add("regression-$phase") }
 }
 

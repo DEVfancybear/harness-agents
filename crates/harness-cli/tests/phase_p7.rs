@@ -1,5 +1,5 @@
 //! P7 acceptance: recovery hardening, backup and restore, upgrade safeguards,
-//! retention classes and release honesty, exercised through real components.
+//! tombstones and release honesty, exercised through real components.
 //!
 //! Only external boundaries are absent: no live provider credential is supplied
 //! and no remote backup target exists. Every store, artifact, tombstone, backup
@@ -13,61 +13,17 @@ use std::sync::Arc;
 
 use harness_maintenance::{
     BenchmarkTarget, CapabilityStatus, CapabilitySupport, MaintenanceError, PlatformStatus,
-    PlatformSupport, ReleaseMatrix, RetentionAction, StoreCompatibility, check_store_compatibility,
-    collect_garbage, create_backup, forget_source, list_tombstones, migrate_copy, restore_backup,
-    run_retention, verify_backup,
-};
-use harness_memory::{
-    CreateMemoryAsset, EvidenceState, MemoryLayer, MemoryPrincipal, MemoryService, MemorySource,
+    PlatformSupport, ReleaseMatrix, StoreCompatibility, check_store_compatibility, collect_garbage,
+    create_backup, migrate_copy, restore_backup, verify_backup,
 };
 use harness_store_sqlite::{SqliteStore, TombstoneRow, WriterOpenOptions};
-use harness_types::{ContentHash, ErrorCode, HostId, MemoryScope, ProjectId, SourceAuthority};
+use harness_types::{ErrorCode, HostId};
 use serde_json::json;
 
 use support::{
     FIXTURE_ARTIFACT, assert_code, fixture_store, open_writer, registry_cases, repository_root,
     run_cli, seed, temp_root,
 };
-
-async fn create_retention_memory_asset(
-    memory: &MemoryService,
-    principal: &MemoryPrincipal,
-    source_id: &str,
-    content: &str,
-) -> harness_memory::StoredMemoryAsset {
-    memory
-        .create_asset(
-            principal,
-            CreateMemoryAsset {
-                kind: "project_fact".to_owned(),
-                scope: MemoryScope::Project,
-                layer: MemoryLayer::L1,
-                project_id: principal.project_id.clone(),
-                task_id: None,
-                agent_profile_id: None,
-                session_id: None,
-                visibility: "scoped".to_owned(),
-                content: content.to_owned(),
-                authority: SourceAuthority::RuntimeObserved,
-                evidence: EvidenceState::VerifiedObservation,
-                user_confirmed: false,
-                source_event_refs: Vec::new(),
-                source_file_hashes: Vec::new(),
-                source_commit: None,
-                provenance_kind: "runtime_observation".to_owned(),
-                sources: vec![MemorySource::file(
-                    source_id,
-                    ContentHash::from_bytes(source_id.as_bytes()),
-                )],
-            },
-        )
-        .await
-        .expect("create retention fixture asset")
-}
-
-// ---------------------------------------------------------------------------
-// P7-S01
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn p7_s01_release_matrix_is_complete_and_honest() {
@@ -149,10 +105,10 @@ async fn p7_s01_release_matrix_is_complete_and_honest() {
     assert!(failing.verdict().contains("partially verified"));
     assert_eq!(failing.not_green().len(), 1);
 
-    // The 44 continuity and plugin cases are expanded, not summarised by one row.
-    assert_eq!(matrix.verified_cases.len(), 44);
+    // The 32 continuity and plugin cases are expanded, not summarised by one row.
+    assert_eq!(matrix.verified_cases.len(), 32);
     assert!(matrix.verified_cases.contains(&"C27".to_owned()));
-    assert!(matrix.verified_cases.contains(&"C28".to_owned()));
+    assert!(!matrix.verified_cases.contains(&"C28".to_owned()));
     assert!(matrix.verified_cases.contains(&"K14".to_owned()));
     assert!(!matrix.unverified_checks.is_empty());
     assert!(!matrix.out_of_scope.is_empty());
@@ -210,7 +166,6 @@ fn matrix_with(retrieval_p95_ms: Option<u64>, restore_ms: Option<u64>) -> Releas
         ],
         capabilities: vec![
             capability("backup_restore", CapabilityStatus::Supported),
-            capability("retention", CapabilityStatus::Supported),
             capability("packaged_linux_artifact", CapabilityStatus::ComponentOnly),
             capability("remote_mcp_endpoints", CapabilityStatus::Unsupported),
             capability("os_sandboxing", CapabilityStatus::Unsupported),
@@ -297,11 +252,11 @@ fn assert_install_is_documented(root: &std::path::Path, bodies: &[(&str, String)
     }
 }
 
-/// Every one of the 44 continuity and plugin cases is registered as implemented
+/// Every one of the 32 continuity and plugin cases is registered as implemented
 /// and required, and names a test that really exists in a real target.
 fn assert_case_matrix_is_complete() {
     let cases = support::all_case_ids();
-    assert_eq!(cases.len(), 44);
+    assert_eq!(cases.len(), 32);
     assert_eq!(
         cases.first().map(String::as_str),
         Some("C01"),
@@ -371,7 +326,7 @@ fn assert_case_matrix_is_complete() {
             }
         }
     }
-    // The registry holds exactly the 44 cases and no duplicates.
+    // The registry holds exactly the 32 cases and no duplicates.
     let mut ids = registry
         .iter()
         .filter_map(|entry| entry["id"].as_str())
@@ -384,7 +339,7 @@ fn assert_case_matrix_is_complete() {
         .collect::<Vec<_>>();
     ids.sort();
     ids.dedup();
-    assert_eq!(ids.len(), 44, "the registry holds every case exactly once");
+    assert_eq!(ids.len(), 32, "the registry holds every case exactly once");
 }
 
 // ---------------------------------------------------------------------------
@@ -527,16 +482,22 @@ async fn p7_s02_backup_manifest_metadata_matches_snapshot() {
         )
         .await
         .expect("pin artifact");
-    forget_source(
-        &store,
-        "file",
-        "src/forgotten-before-backup.rs",
-        "fixture tombstone",
-        "file:src/forgotten-before-backup.rs",
-        &[],
-    )
-    .await
-    .expect("record tombstone");
+    store
+        .record_tombstone(
+            &TombstoneRow {
+                tombstone_id: "tombstone-before-backup".to_owned(),
+                source_kind: "file".to_owned(),
+                source_id: "src/forgotten-before-backup.rs".to_owned(),
+                reason: "fixture tombstone".to_owned(),
+                surviving_copies: Vec::new(),
+                created_unix_ms: harness_maintenance::now_unix_ms(),
+            },
+            "journal-tombstone-before-backup",
+            "forget",
+            &json!({"reason": "fixture tombstone"}),
+        )
+        .await
+        .expect("record tombstone");
     Arc::try_unwrap(store)
         .expect("maintenance store released")
         .close()
@@ -929,441 +890,6 @@ async fn bump_store_revision(data_dir: &std::path::Path) {
 }
 
 // ---------------------------------------------------------------------------
-// P7-S04
-// ---------------------------------------------------------------------------
-
-async fn assert_retention_requires_reason(
-    store: &Arc<SqliteStore>,
-    memory: &MemoryService,
-    principal: &MemoryPrincipal,
-    asset: &harness_memory::StoredMemoryAsset,
-) {
-    let missing_reason = run_retention(
-        store,
-        RetentionAction::Archive,
-        "file",
-        "src/lib.rs",
-        "  ",
-        None,
-        &[],
-    )
-    .await
-    .expect_err("retention requires a non-empty audit reason");
-    assert_eq!(missing_reason.code(), ErrorCode::InvalidPayload);
-    assert_eq!(
-        memory
-            .read(principal, &asset.asset.memory_asset_id)
-            .await
-            .expect("read after blank-reason refusal")
-            .expect("asset remains")
-            .asset
-            .status,
-        harness_types::MemoryAssetStatus::Active
-    );
-}
-
-async fn assert_retention_statuses_and_journal(
-    store: &Arc<SqliteStore>,
-    memory: &MemoryService,
-    principal: &MemoryPrincipal,
-    asset: &harness_memory::StoredMemoryAsset,
-    data: &std::path::Path,
-) {
-    use sqlx::{Connection, SqliteConnection};
-
-    assert!(!RetentionAction::Invalidate.requires_confirmation());
-    assert!(!RetentionAction::Archive.requires_confirmation());
-    for action in [RetentionAction::Invalidate, RetentionAction::Archive] {
-        let report = run_retention(
-            store,
-            action,
-            "file",
-            "src/lib.rs",
-            "fixture reason",
-            None,
-            &[],
-        )
-        .await
-        .expect("retention runs without a confirmation");
-        assert_eq!(report.action, action);
-        assert_eq!(report.target, "file:src/lib.rs");
-        assert_eq!(
-            report.affected_assets,
-            vec![asset.asset.memory_asset_id.to_string()]
-        );
-        assert!(
-            report.tombstone_id.is_none(),
-            "{action} must not tombstone: only forgetting removes content"
-        );
-        let current = memory
-            .read(principal, &asset.asset.memory_asset_id)
-            .await
-            .expect("read retained asset")
-            .expect("invalidation and archive preserve their record");
-        let expected_status = match action {
-            RetentionAction::Invalidate => harness_types::MemoryAssetStatus::Invalidated,
-            RetentionAction::Archive => harness_types::MemoryAssetStatus::Archived,
-            RetentionAction::Forget => unreachable!("forget is tested separately"),
-        };
-        assert_eq!(current.asset.status, expected_status);
-    }
-    let database = data.join("harness.sqlite3");
-    let mut connection = SqliteConnection::connect(&format!("sqlite:{}", database.display()))
-        .await
-        .expect("open journal database");
-    for action in ["invalidate", "archive"] {
-        let target: String = sqlx::query_scalar(
-            "SELECT target FROM maintenance_journal WHERE action = ? ORDER BY created_unix_ms DESC LIMIT 1",
-        )
-        .bind(action)
-        .fetch_one(&mut connection)
-        .await
-        .expect("read retention journal target");
-        assert_eq!(target, "file:src/lib.rs", "{action} journal target");
-    }
-    connection.close().await.expect("close journal database");
-}
-
-async fn assert_forget_confirmation_refused(
-    store: &Arc<SqliteStore>,
-    memory: &MemoryService,
-    principal: &MemoryPrincipal,
-    asset: &harness_memory::StoredMemoryAsset,
-) {
-    assert!(RetentionAction::Forget.requires_confirmation());
-    let refused = forget_source(
-        store,
-        "file",
-        "src/secret.rs",
-        "operator asked",
-        "wrong-token",
-        &[],
-    )
-    .await
-    .expect_err("a mismatched confirmation must be refused");
-    assert_eq!(refused.code(), ErrorCode::RetentionRefused);
-    let still_present = memory
-        .read(principal, &asset.asset.memory_asset_id)
-        .await
-        .expect("read after refused forget")
-        .expect("a refused forget must leave its content present");
-    assert_eq!(
-        still_present.current.content,
-        "sensitive derived text that must be forgotten"
-    );
-    assert_eq!(
-        still_present.asset.status,
-        harness_types::MemoryAssetStatus::Active
-    );
-    let refused = forget_source(store, "file", "src/secret.rs", "operator asked", "", &[])
-        .await
-        .expect_err("an empty confirmation must be refused");
-    assert_eq!(refused.code(), ErrorCode::RetentionRefused);
-    assert!(
-        memory
-            .read(principal, &asset.asset.memory_asset_id)
-            .await
-            .expect("read after empty confirmation")
-            .is_some(),
-        "an empty confirmation must not mutate derived content"
-    );
-    // A refused forget leaves nothing behind.
-    assert!(list_tombstones(store).await.expect("tombstones").is_empty());
-}
-
-async fn assert_failed_forget_rolls_back(
-    store: &Arc<SqliteStore>,
-    memory: &MemoryService,
-    principal: &MemoryPrincipal,
-    asset: &harness_memory::StoredMemoryAsset,
-    data: &std::path::Path,
-) {
-    use sqlx::{Connection, SqliteConnection};
-
-    let database = data.join("harness.sqlite3");
-    let mut connection = SqliteConnection::connect(&format!("sqlite:{}", database.display()))
-        .await
-        .expect("open fixture database");
-    sqlx::query(
-        "CREATE TRIGGER reject_forget_journal BEFORE INSERT ON maintenance_journal
-         WHEN NEW.action = 'forget'
-         BEGIN SELECT RAISE(ABORT, 'forced journal failure'); END",
-    )
-    .execute(&mut connection)
-    .await
-    .expect("install forget failure trigger");
-    connection.close().await.expect("close fixture database");
-    let failed = forget_source(
-        store,
-        "file",
-        "src/secret.rs",
-        "operator asked",
-        "file:src/secret.rs",
-        &[],
-    )
-    .await
-    .expect_err("a journal failure must abort the forget");
-    assert_eq!(failed.code(), ErrorCode::StorageWriteFailed);
-    assert!(
-        memory
-            .read(principal, &asset.asset.memory_asset_id)
-            .await
-            .expect("read after transaction rollback")
-            .is_some(),
-        "the failed transaction must restore the derived content"
-    );
-    assert!(
-        !store
-            .is_tombstoned("file", "src/secret.rs")
-            .await
-            .expect("check tombstone after rollback"),
-        "the failed transaction must not leave a tombstone by itself"
-    );
-    let mut connection = SqliteConnection::connect(&format!("sqlite:{}", database.display()))
-        .await
-        .expect("reopen fixture database");
-    sqlx::query("DROP TRIGGER reject_forget_journal")
-        .execute(&mut connection)
-        .await
-        .expect("remove forget failure trigger");
-    connection.close().await.expect("close fixture database");
-}
-
-async fn assert_confirmed_forget(
-    store: &Arc<SqliteStore>,
-    memory: &MemoryService,
-    principal: &MemoryPrincipal,
-    asset: &harness_memory::StoredMemoryAsset,
-    data: &std::path::Path,
-) {
-    use sqlx::{Connection, SqliteConnection};
-
-    let database = data.join("harness.sqlite3");
-    let report = forget_source(
-        store,
-        "file",
-        "src/secret.rs",
-        "operator asked",
-        "file:src/secret.rs",
-        &["an external backup taken last week".to_owned()],
-    )
-    .await
-    .expect("a confirmed forget runs");
-    assert_eq!(report.action, RetentionAction::Forget);
-    assert_eq!(report.target, "file:src/secret.rs");
-    assert!(report.tombstone_id.is_some());
-    assert_eq!(report.surviving_copies.len(), 1);
-    assert_eq!(
-        report.affected_assets,
-        vec![asset.asset.memory_asset_id.to_string()]
-    );
-    assert!(
-        memory
-            .read(principal, &asset.asset.memory_asset_id)
-            .await
-            .expect("read forgotten memory")
-            .is_none(),
-        "forget physically removes the derived asset and its payload"
-    );
-    let mut connection = SqliteConnection::connect(&format!("sqlite:{}", database.display()))
-        .await
-        .expect("reopen journal database");
-    let journal_target: String =
-        sqlx::query_scalar("SELECT target FROM maintenance_journal WHERE action = 'forget'")
-            .fetch_one(&mut connection)
-            .await
-            .expect("read forget journal target");
-    assert_eq!(journal_target, "file:src/secret.rs");
-    connection.close().await.expect("close journal database");
-    let tombstones = list_tombstones(store).await.expect("tombstones");
-    assert_eq!(tombstones.len(), 1);
-    assert_eq!(tombstones[0].source_id, "src/secret.rs");
-    assert_eq!(tombstones[0].surviving_copies.len(), 1);
-    assert!(
-        !store
-            .is_tombstoned("file", "src/lib.rs")
-            .await
-            .expect("check unrelated source"),
-        "an archived source is not a forgotten one"
-    );
-}
-
-async fn assert_empty_retention_target_refused(store: &Arc<SqliteStore>) {
-    let error = run_retention(
-        store,
-        RetentionAction::Invalidate,
-        "file",
-        "   ",
-        "reason",
-        None,
-        &[],
-    )
-    .await
-    .expect_err("an empty target must be refused");
-    assert_eq!(error.code(), ErrorCode::InvalidPayload);
-}
-
-#[tokio::test]
-async fn p7_s04_retention_classes_are_separate_and_confirmed() {
-    let root = temp_root();
-    let data = root.path().join("data");
-    let (store, _artifact) = fixture_store(&data).await;
-    let store = Arc::new(store);
-    let memory = MemoryService::new(Arc::clone(&store));
-    let principal = MemoryPrincipal::user("maintenance").with_project(ProjectId::generate());
-    let lib_asset = create_retention_memory_asset(
-        &memory,
-        &principal,
-        "src/lib.rs",
-        "retained historical fact",
-    )
-    .await;
-    let secret_asset = create_retention_memory_asset(
-        &memory,
-        &principal,
-        "src/secret.rs",
-        "sensitive derived text that must be forgotten",
-    )
-    .await;
-
-    assert_retention_requires_reason(&store, &memory, &principal, &lib_asset).await;
-    assert_retention_statuses_and_journal(&store, &memory, &principal, &lib_asset, &data).await;
-    assert_forget_confirmation_refused(&store, &memory, &principal, &secret_asset).await;
-    assert_failed_forget_rolls_back(&store, &memory, &principal, &secret_asset, &data).await;
-    assert_confirmed_forget(&store, &memory, &principal, &secret_asset, &data).await;
-    assert_empty_retention_target_refused(&store).await;
-
-    drop(memory);
-    Arc::try_unwrap(store)
-        .expect("store released")
-        .close()
-        .await
-        .expect("close");
-}
-
-// ---------------------------------------------------------------------------
-// P7-C28
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn p7_c28_forget_blocks_reextraction_and_reports_survivors() {
-    let root = temp_root();
-    let data = root.path().join("data");
-    let (store, _artifact) = fixture_store(&data).await;
-    let store = Arc::new(store);
-
-    // A source that was never forgotten may be extracted from.
-    harness_maintenance::retention::assert_not_tombstoned(&store, "file", "src/lib.rs")
-        .await
-        .expect("an unforgotten source is extractable");
-
-    let report = forget_source(
-        &store,
-        "file",
-        "src/lib.rs",
-        "operator request under retention policy",
-        "file:src/lib.rs",
-        &["backup-2026-01".to_owned(), "external archive".to_owned()],
-    )
-    .await
-    .expect("forget");
-    assert!(report.tombstone_id.is_some());
-
-    // Re-extraction is now refused, so forgotten content cannot reappear.
-    let error = harness_maintenance::retention::assert_not_tombstoned(&store, "file", "src/lib.rs")
-        .await
-        .expect_err("a tombstoned source must refuse re-extraction");
-    assert_eq!(error.code(), ErrorCode::RetentionRefused);
-    assert!(error.to_string().contains("re-extraction is refused"));
-    assert!(
-        store
-            .is_tombstoned("file", "src/lib.rs")
-            .await
-            .expect("check")
-    );
-
-    // The tombstone names every copy that may still hold the data.
-    let tombstones = list_tombstones(&store).await.expect("tombstones");
-    assert_eq!(tombstones.len(), 1);
-    assert_eq!(
-        tombstones[0].surviving_copies,
-        vec!["backup-2026-01".to_owned(), "external archive".to_owned()]
-    );
-    assert!(tombstones[0].reason.contains("operator request"));
-    assert!(tombstones[0].created_unix_ms > 0);
-
-    // The retention summary an operator reads agrees with the records.
-    let summary = harness_maintenance::retention_summary(&store)
-        .await
-        .expect("summary");
-    assert_eq!(summary["tombstones"], json!(1));
-    assert_eq!(
-        summary["surviving_copies"],
-        json!(["backup-2026-01", "external archive"])
-    );
-
-    // A different source is unaffected by another source's tombstone.
-    assert!(
-        !store
-            .is_tombstoned("file", "src/other.rs")
-            .await
-            .expect("check")
-    );
-    harness_maintenance::retention::assert_not_tombstoned(&store, "file", "src/other.rs")
-        .await
-        .expect("an unrelated source stays extractable");
-
-    Arc::try_unwrap(store)
-        .expect("store released")
-        .close()
-        .await
-        .expect("close");
-
-    // A tombstone survives a backup and a restore, so a forget is durable.
-    let backup_dir = root.path().join("backup");
-    let outcome = create_backup(&data, &backup_dir).await.expect("backup");
-    assert_eq!(outcome.tombstones, 1, "the tombstone is in the manifest");
-    let manifest = verify_backup(&backup_dir).await.expect("verify");
-    assert_eq!(
-        manifest.tombstones,
-        vec!["file:src/lib.rs".to_owned()],
-        "the manifest names the tombstoned source"
-    );
-    let destination = root.path().join("restored");
-    let restored = restore_backup(&backup_dir, &destination)
-        .await
-        .expect("restore");
-    assert_eq!(restored.report.tombstones_restored, 1);
-
-    let restored_store = SqliteStore::open_read_only(&destination)
-        .await
-        .expect("open restored store");
-    assert!(
-        restored_store
-            .is_tombstoned("file", "src/lib.rs")
-            .await
-            .expect("check"),
-        "a restore must preserve tombstones"
-    );
-    let error = harness_maintenance::retention::assert_not_tombstoned(
-        &restored_store,
-        "file",
-        "src/lib.rs",
-    )
-    .await
-    .expect_err("a restored tombstone still refuses re-extraction");
-    assert_eq!(error.code(), ErrorCode::RetentionRefused);
-    let restored_tombstones = list_tombstones(&restored_store).await.expect("tombstones");
-    assert_eq!(restored_tombstones.len(), 1);
-    assert_eq!(
-        restored_tombstones[0].surviving_copies,
-        vec!["backup-2026-01".to_owned(), "external archive".to_owned()],
-        "a restore must not lose the surviving-copy disclosure"
-    );
-    restored_store.close().await.expect("close restored store");
-}
-
-// ---------------------------------------------------------------------------
 // P7 garbage collection
 // ---------------------------------------------------------------------------
 
@@ -1468,89 +994,6 @@ async fn p7_s05_gc_unknown_artifact_age_respects_grace_period() {
 }
 
 // ---------------------------------------------------------------------------
-#[tokio::test]
-async fn p7_s04_retention_status_and_journal_commit_together() {
-    use sqlx::{Connection, Row, SqliteConnection};
-
-    let root = temp_root();
-    let data = root.path().join("data");
-    let (store, _artifact) = fixture_store(&data).await;
-    let store = Arc::new(store);
-    let memory = MemoryService::new(Arc::clone(&store));
-    let principal = MemoryPrincipal::user("maintenance").with_project(ProjectId::generate());
-
-    for (action, source_id) in [
-        (RetentionAction::Invalidate, "src/invalidate.rs"),
-        (RetentionAction::Archive, "src/archive.rs"),
-    ] {
-        let asset = create_retention_memory_asset(
-            &memory,
-            &principal,
-            source_id,
-            "retention must roll back if its journal fails",
-        )
-        .await;
-        let database = data.join("harness.sqlite3");
-        let mut connection = SqliteConnection::connect(&format!("sqlite:{}", database.display()))
-            .await
-            .expect("open fixture database");
-        sqlx::query(
-            "CREATE TRIGGER reject_retention_journal BEFORE INSERT ON maintenance_journal
-             WHEN NEW.action IN ('invalidate', 'archive')
-             BEGIN SELECT RAISE(ABORT, 'forced journal failure'); END",
-        )
-        .execute(&mut connection)
-        .await
-        .expect("install journal failure trigger");
-        connection.close().await.expect("close fixture database");
-
-        let error = run_retention(
-            &store,
-            action,
-            "file",
-            source_id,
-            "fixture reason",
-            None,
-            &[],
-        )
-        .await
-        .expect_err("a journal failure must abort the retention operation");
-        assert_eq!(error.code(), ErrorCode::StorageWriteFailed);
-
-        let current = memory
-            .read(&principal, &asset.asset.memory_asset_id)
-            .await
-            .expect("read after failed retention")
-            .expect("failed retention must retain the asset");
-        assert_eq!(
-            current.asset.status,
-            harness_types::MemoryAssetStatus::Active,
-            "failed {action} must roll back the status change"
-        );
-
-        let mut connection = SqliteConnection::connect(&format!("sqlite:{}", database.display()))
-            .await
-            .expect("reopen fixture database");
-        let journal_count: i64 = sqlx::query(
-            "SELECT COUNT(*) AS count FROM maintenance_journal
-             WHERE action = ? AND target = ?",
-        )
-        .bind(action.as_str())
-        .bind(source_id)
-        .fetch_one(&mut connection)
-        .await
-        .expect("read journal count")
-        .try_get("count")
-        .expect("journal count column");
-        assert_eq!(journal_count, 0, "failed {action} leaves no journal entry");
-        sqlx::query("DROP TRIGGER reject_retention_journal")
-            .execute(&mut connection)
-            .await
-            .expect("remove journal failure trigger");
-        connection.close().await.expect("close fixture database");
-    }
-}
-
 #[tokio::test]
 async fn p7_s05_gc_database_failure_preserves_artifact_bytes() {
     use sqlx::{Connection, SqliteConnection};
@@ -1744,82 +1187,6 @@ async fn p7_s02_backup_refuses_artifact_symlink_escape() {
 }
 
 #[tokio::test]
-async fn p7_s04_tombstone_blocks_memory_source_writes() {
-    let root = temp_root();
-    let data = root.path().join("data");
-    let (store, _artifact) = fixture_store(&data).await;
-    let store = Arc::new(store);
-    let memory = MemoryService::new(Arc::clone(&store));
-    let principal = MemoryPrincipal::user("maintenance").with_project(ProjectId::generate());
-    let source_id = "src/forgotten.rs";
-    let first_forget = forget_source(
-        &store,
-        "file",
-        source_id,
-        "operator requested deletion",
-        "file:src/forgotten.rs",
-        &[],
-    )
-    .await
-    .expect("forget records a tombstone even when no derived asset exists");
-    let repeated = forget_source(
-        &store,
-        "file",
-        source_id,
-        "a second reason must not rewrite the record",
-        "file:src/forgotten.rs",
-        &["newly claimed backup".to_owned()],
-    )
-    .await
-    .expect_err("a repeated forget cannot rewrite an existing tombstone");
-    assert_eq!(repeated.code(), ErrorCode::RetentionRefused);
-    let tombstones = list_tombstones(&store).await.expect("list tombstones");
-    assert_eq!(tombstones.len(), 1);
-    assert_eq!(
-        tombstones[0].tombstone_id,
-        first_forget.tombstone_id.unwrap()
-    );
-    assert_eq!(tombstones[0].reason, "operator requested deletion");
-    assert!(tombstones[0].surviving_copies.is_empty());
-
-    let result = memory
-        .create_asset(
-            &principal,
-            CreateMemoryAsset {
-                kind: "project_fact".to_owned(),
-                scope: MemoryScope::Project,
-                layer: MemoryLayer::L1,
-                project_id: principal.project_id.clone(),
-                task_id: None,
-                agent_profile_id: None,
-                session_id: None,
-                visibility: "scoped".to_owned(),
-                content: "this must stay forgotten".to_owned(),
-                authority: SourceAuthority::RuntimeObserved,
-                evidence: EvidenceState::VerifiedObservation,
-                user_confirmed: false,
-                source_event_refs: Vec::new(),
-                source_file_hashes: Vec::new(),
-                source_commit: None,
-                provenance_kind: "runtime_observation".to_owned(),
-                sources: vec![MemorySource::file(
-                    source_id,
-                    ContentHash::from_bytes(b"forgotten source"),
-                )],
-            },
-        )
-        .await;
-    let error = result.expect_err("a tombstoned source cannot be written again");
-    assert_eq!(error.code(), ErrorCode::RetentionRefused);
-    drop(memory);
-    Arc::try_unwrap(store)
-        .expect("memory service released the store")
-        .close()
-        .await
-        .expect("close store");
-}
-
-#[tokio::test]
 async fn p7_s04_store_tombstone_api_preserves_existing_audit_rows() {
     let root = temp_root();
     let data = root.path().join("data");
@@ -1865,77 +1232,14 @@ async fn p7_s04_store_tombstone_api_preserves_existing_audit_rows() {
     store.close().await.expect("close store");
 }
 
-#[tokio::test]
-async fn p7_s04_forget_deletion_advances_memory_revision() {
-    use sqlx::{Connection, Row, SqliteConnection};
-
-    let root = temp_root();
-    let data = root.path().join("data");
-    let (store, _artifact) = fixture_store(&data).await;
-    let store = Arc::new(store);
-    let memory = MemoryService::new(Arc::clone(&store));
-    let principal = MemoryPrincipal::user("maintenance").with_project(ProjectId::generate());
-    let source_id = "src/revisioned-delete.rs";
-    create_retention_memory_asset(
-        &memory,
-        &principal,
-        source_id,
-        "deleting this asset changes memory state",
-    )
-    .await;
-
-    let database = data.join("harness.sqlite3");
-    let mut connection = SqliteConnection::connect(&format!("sqlite:{}", database.display()))
-        .await
-        .expect("open fixture database");
-    let before: i64 = sqlx::query("SELECT revision FROM memory_revision WHERE id = 1")
-        .fetch_one(&mut connection)
-        .await
-        .expect("read memory revision")
-        .try_get("revision")
-        .expect("memory revision column");
-    connection.close().await.expect("close fixture database");
-
-    forget_source(
-        &store,
-        "file",
-        source_id,
-        "operator requested deletion",
-        "file:src/revisioned-delete.rs",
-        &[],
-    )
-    .await
-    .expect("forget commits");
-
-    let mut connection = SqliteConnection::connect(&format!("sqlite:{}", database.display()))
-        .await
-        .expect("reopen fixture database");
-    let after: i64 = sqlx::query("SELECT revision FROM memory_revision WHERE id = 1")
-        .fetch_one(&mut connection)
-        .await
-        .expect("read memory revision after forget")
-        .try_get("revision")
-        .expect("memory revision column");
-    assert!(
-        after > before,
-        "deleting memory records must invalidate cached revision {before}, got {after}"
-    );
-    connection.close().await.expect("close fixture database");
-    drop(memory);
-    Arc::try_unwrap(store)
-        .expect("memory service released the store")
-        .close()
-        .await
-        .expect("close store");
-}
-
+// ---------------------------------------------------------------------------
 // P7-S05
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn p7_s05_full_case_matrix_runs_end_to_end() {
     // Every continuity and plugin case is exercised by a real acceptance target
-    // in this workspace. The matrix must cover all 44, and each one must be
+    // in this workspace. The matrix must cover all 32, and each one must be
     // registered as implemented and required, which is what the phase gate
     // enforces before it runs anything.
     assert_case_matrix_is_complete();
@@ -2029,7 +1333,6 @@ fn assert_maintenance_surface() {
         "backup",
         "verify-backup",
         "restore",
-        "retain",
         "tombstones",
         "gc",
         "migrate-copy",
@@ -2085,7 +1388,7 @@ fn assert_release_matrix_is_honest() {
         2,
         "both platforms are listed"
     );
-    assert_eq!(parsed["verified_cases"], json!(44));
+    assert_eq!(parsed["verified_cases"], json!(32));
     let benchmarks = parsed["benchmarks"].as_array().expect("benchmarks");
     assert_eq!(benchmarks.len(), 2);
     assert!(
@@ -2166,7 +1469,6 @@ async fn p7_s07_operator_docs_and_release_record_are_consistent() {
             "ha maintenance backup",
             "ha maintenance verify-backup",
             "ha maintenance restore",
-            "ha maintenance retain",
             "ha maintenance tombstones",
             "ha maintenance gc",
             "ha maintenance migrate-copy",
@@ -2199,7 +1501,6 @@ async fn p7_s07_operator_docs_and_release_record_are_consistent() {
         "backup",
         "verify-backup",
         "restore",
-        "retain",
         "tombstones",
         "gc",
         "migrate-copy",
@@ -2541,44 +1842,4 @@ async fn p7_s02_backup_failure_cleans_up_unpublished_snapshot() {
         !backup_dir.exists(),
         "failed snapshot construction must not leave a partial destination"
     );
-}
-
-#[tokio::test]
-async fn p7_s04_forget_confirmation_binds_to_the_full_target() {
-    let root = temp_root();
-    let data = root.path().join("data");
-    let (store, _artifact) = fixture_store(&data).await;
-    let store = Arc::new(store);
-    let source_id = "src/shared.rs";
-
-    let id_only = forget_source(
-        &store,
-        "file",
-        source_id,
-        "operator requested deletion",
-        source_id,
-        &[],
-    )
-    .await
-    .expect_err("an ID without its source kind must not confirm a forget");
-    assert_eq!(id_only.code(), ErrorCode::RetentionRefused);
-    assert!(
-        list_tombstones(&store)
-            .await
-            .expect("list tombstones after refused confirmation")
-            .is_empty(),
-        "a partial target confirmation must not write a tombstone"
-    );
-
-    let report = forget_source(
-        &store,
-        "file",
-        source_id,
-        "operator requested deletion",
-        "file:src/shared.rs",
-        &[],
-    )
-    .await
-    .expect("the complete target confirms the forget");
-    assert_eq!(report.target, "file:src/shared.rs");
 }

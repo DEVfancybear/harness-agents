@@ -309,10 +309,10 @@ pub trait SessionPort: Send {
     }
     /// The project identity this workspace is scoped to, for `/status`.
     ///
-    /// Memory is scoped by this id, and the app otherwise never shows it: the
-    /// projects directory is named after a digest, so an operator who wants to
-    /// inspect what a turn stored has nothing to pass to `ha memory`. This is the
-    /// missing link, answered on demand because resolving it needs the store.
+    /// The app otherwise never shows it: the projects directory is named after a
+    /// digest, so an operator who wants to inspect what a turn stored has no other
+    /// way to name the project. This is the missing link, answered on demand
+    /// because resolving it needs the store.
     fn project_id(&mut self) -> Option<String> {
         None
     }
@@ -5954,10 +5954,10 @@ mod tests {
         }
     }
 
-    /// K05: `/status` can name the project scope memory is keyed by.
+    /// K05: `/status` can name the project scope the store is keyed by.
     ///
-    /// The app shows this id nowhere else, and memory is scoped by it, so without
-    /// this line an operator has nothing to pass to `ha memory --project-id`. It also
+    /// The app shows this id nowhere else, so without this line an operator has no
+    /// way to name the project a turn wrote. It also
     /// has to stay honest before the first turn: no store means no identity yet, and
     /// inventing one would point later lookups at the wrong place.
     #[tokio::test]

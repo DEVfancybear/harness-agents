@@ -1428,19 +1428,6 @@ impl DirtyReason {
     }
 }
 
-/// Host-created memory binding handed to one worker at spawn. Later changes
-/// enter only at a logged boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaskMemoryBinding {
-    pub profile_id: AgentProfileId,
-    pub task_id: TaskId,
-    pub asset_id: harness_types::MemoryAssetId,
-    pub version: u64,
-    pub injection_mode: String,
-    pub priority: i64,
-    pub actions: Vec<GrantAction>,
-}
-
 /// One integration step result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IntegrationStep {

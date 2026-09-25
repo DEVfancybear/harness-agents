@@ -11,11 +11,9 @@ pub use harness_types::{
     ToolIntentStatus, ToolSettlementCommit, ToolTaskUpdateCommit,
 };
 use harness_types::{
-    AgentProfileId, AgentRunId, BudgetId, BudgetReservationId, CompositionSnapshotId, ContentHash,
-    ContextPacket, ContextPacketId, ErrorCode, EventEnvelope, EventId, HostId, InputId,
-    MemoryAsset, MemoryAssetId, MemoryAssetStatus, MemoryVersion, PluginManifest, ProjectId,
-    ProviderAttemptId, QuestionId, RequestId, RuntimeCommandId, SessionId, SnapshotId, StepId,
-    TaskId, ToolApprovalId,
+    AgentRunId, BudgetId, BudgetReservationId, CompositionSnapshotId, ContentHash, ContextPacket,
+    ContextPacketId, ErrorCode, HostId, InputId, PluginManifest, ProjectId, ProviderAttemptId,
+    QuestionId, RequestId, RuntimeCommandId, SessionId, SnapshotId, StepId, TaskId, ToolApprovalId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -49,15 +47,6 @@ pub const RUNTIME_SCHEMA_VERSION: i64 = 7;
 /// invocation/call correlation) and the provider call id on intents. 3 adds
 /// optional content hashes to JSON receipts; the SQL layout remains unchanged.
 pub const TOOLS_SCHEMA_VERSION: i64 = 3;
-/// Additive P4 memory tables retain all earlier schema revisions.
-///
-/// 2 adds `memory_sources` (M7): the keyed source dependency of one version, so
-/// freshness and source invalidation are index lookups instead of a scan over a
-/// JSON array of hashes. A database written by version 1 upgrades in place - the
-/// table is created and the revision recorded - and a version that predates the
-/// table still reads, because a version without source rows has no evidence that
-/// its sources moved (see `ADR-N07`, D1/D2).
-pub const MEMORY_SCHEMA_VERSION: i64 = 2;
 /// Additive M5 context surface: the rebuildable history index, the notes table
 /// and the manifest columns a frozen packet and checkpoint record. Version 1 is
 /// the first revision of this module, so a database that predates M5 upgrades
@@ -120,7 +109,6 @@ pub enum StoreFaultPoint {
     BeforeSnapshotCommit,
     BeforeToolIntentCommit,
     BeforeToolSettlementCommit,
-    BeforeMemorySettlementCommit,
     BeforeDelegationDeliveryCommit,
     /// Before a run step and its budget reservation commit together.
     BeforeFreezeStepCommit,
@@ -747,170 +735,6 @@ pub struct ContinuationLinkRecord {
     pub task_id: TaskId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StoreMemoryPrincipal {
-    pub principal_id: String,
-    pub project_id: Option<ProjectId>,
-    pub task_id: Option<TaskId>,
-    pub agent_profile_id: Option<AgentProfileId>,
-    pub session_id: Option<SessionId>,
-}
-
-/// What a memory version was derived from, and the digest observed at that moment.
-///
-/// The digest is the value read when the version was written, never the current
-/// one: the whole point of keeping it is to be able to say later that the source
-/// moved. `event` and `asset` sources reference rows the store already owns;
-/// `file` and `commit` reference the workspace outside it, which is why their
-/// ids are relative paths and revision names rather than ids.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MemorySourceKind {
-    File,
-    Commit,
-    Event,
-    Asset,
-}
-
-impl MemorySourceKind {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::File => "file",
-            Self::Commit => "commit",
-            Self::Event => "event",
-            Self::Asset => "asset",
-        }
-    }
-
-    pub fn parse(value: &str) -> Result<Self, StoreError> {
-        match value {
-            "file" => Ok(Self::File),
-            "commit" => Ok(Self::Commit),
-            "event" => Ok(Self::Event),
-            "asset" => Ok(Self::Asset),
-            _ => Err(StoreError::new(
-                ErrorCode::InvalidPayload,
-                "stored memory source kind is unsupported",
-            )),
-        }
-    }
-}
-
-/// One row of `memory_sources`: the source of exactly one memory version.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct MemorySourceRecord {
-    pub source_kind: MemorySourceKind,
-    /// Relative path for a file, revision name for a commit, id for an event or
-    /// asset. Never an absolute path: the id is what a workspace fingerprint and
-    /// a later invalidation agree on.
-    pub source_id: String,
-    /// Content digest observed when the version was written. Required for
-    /// `file`, optional for the others.
-    pub observed_digest: Option<ContentHash>,
-    /// Version of the referenced asset, or the event sequence, when the kind
-    /// names something that has one.
-    pub source_version: Option<u64>,
-}
-
-/// One source, as the caller currently observes it.
-///
-/// Both halves are needed: `id` says which source, `observed` says what the
-/// caller sees now. The stored digest is compared against this, so a caller that
-/// re-reads a file and finds the same bytes reports no change.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RefreshSource {
-    pub kind: MemorySourceKind,
-    pub id: String,
-    /// `None` means the named source could not be read inside the caller's
-    /// workspace, which is stale for a source that previously had a digest.
-    pub observed: Option<ContentHash>,
-}
-
-/// A maximal run of contiguous committed source-work markers.
-#[derive(Clone, Debug)]
-pub struct SourceWorkRange {
-    pub start_sequence: u64,
-    pub end_sequence: u64,
-    /// The committed events the range covers, in sequence order.
-    pub events: Vec<EventEnvelope>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StoredMemoryVersionRecord {
-    pub record: MemoryVersion,
-    pub content: String,
-    pub normalized_content: String,
-    pub strategy_digest: Option<ContentHash>,
-    /// The sources this version was derived from, written in the same
-    /// transaction as the version itself.
-    pub sources: Vec<MemorySourceRecord>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StoredMemoryAssetRecord {
-    pub asset: MemoryAsset,
-    pub layer: String,
-    pub task_id: Option<TaskId>,
-    pub agent_profile_id: Option<AgentProfileId>,
-    pub session_id: Option<SessionId>,
-    pub current: StoredMemoryVersionRecord,
-}
-
-#[derive(Clone, Debug)]
-pub struct MemoryCreateCommit {
-    pub record: StoredMemoryAssetRecord,
-}
-
-#[derive(Clone, Debug)]
-pub struct MemoryVersionCommit {
-    pub source_assets: Vec<harness_types::MemoryVersionRef>,
-    pub authorization: StoreMemoryPrincipal,
-    pub action: String,
-    pub memory_asset_id: MemoryAssetId,
-    pub expected_version: u64,
-    pub asset: MemoryAsset,
-    pub version: StoredMemoryVersionRecord,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StoredMemoryGrantRecord {
-    pub principal_id: String,
-    pub memory_asset_id: MemoryAssetId,
-    pub project_id: Option<ProjectId>,
-    pub allowed_actions: Vec<String>,
-    pub revision: u64,
-    pub active: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StoredExtractionJobRecord {
-    pub job_id: String,
-    pub source_stream: SessionId,
-    pub start_sequence: u64,
-    pub end_sequence: u64,
-    pub source_digest: ContentHash,
-    pub source_event_ids: Vec<EventId>,
-    pub extractor_version: String,
-    pub strategy_digest: ContentHash,
-    pub status: String,
-    pub attempts: u32,
-    pub lease_owner: Option<String>,
-    pub lease_generation: u64,
-    pub last_error: Option<String>,
-    pub disposition: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct StoredExtractionLeaseRecord {
-    pub job: StoredExtractionJobRecord,
-    pub source_events: Vec<EventEnvelope>,
-    pub owner: String,
-    pub generation: u64,
-}
-
 /// The single durable owner of a task, fenced by ownership generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskOwnerRecord {
@@ -920,21 +744,6 @@ pub struct TaskOwnerRecord {
     pub role: String,
     pub generation: u64,
     pub lease_revision: u64,
-}
-
-/// A host-issued memory binding for one delegated worker. The binding pins the
-/// exact asset version that was injected, so a later revision is detectable.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MemoryBindingRow {
-    pub binding_id: String,
-    pub task_id: TaskId,
-    pub profile_id: AgentProfileId,
-    pub memory_asset_id: MemoryAssetId,
-    pub version: u64,
-    pub injection_mode: String,
-    pub priority: i64,
-    pub actions: Vec<String>,
-    pub revision: u64,
 }
 
 /// A host-owned isolated worker workspace row.
@@ -967,77 +776,13 @@ pub struct TombstoneRow {
     pub created_unix_ms: u64,
 }
 
-/// One atomic operator request to change memory retention and append its journal record.
-#[derive(Clone, Debug)]
-pub struct MemorySourceRetentionUpdate {
-    pub source_kind: String,
-    pub source_id: String,
-    pub status: MemoryAssetStatus,
-    pub reason: Option<String>,
-    pub journal_entry_id: String,
-    pub journal_detail: Value,
-    pub created_unix_ms: u64,
-}
-
-/// One atomic operator request to forget a source, persist its tombstone and journal record.
-#[derive(Clone, Debug)]
-pub struct MemorySourceForget {
-    pub source_kind: String,
-    pub source_id: String,
-    pub tombstone: TombstoneRow,
-    pub journal_entry_id: String,
-    pub journal_action: String,
-    pub journal_detail: Value,
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
         DATA_DIRECTORY_FORMAT_VERSION, DATA_DIRECTORY_KIND, DataDirectoryMarker,
-        MEMORY_SCHEMA_VERSION, STORE_SCHEMA_VERSION,
+        STORE_SCHEMA_VERSION,
     };
     use harness_types::ErrorCode;
-
-    /// M7: a store written by the previous memory schema gains `memory_sources`.
-    ///
-    /// The downgrade is `demote_memory_schema_to_version_one` plus a reopen rather
-    /// than a hand-built old database, because the table is the only difference
-    /// between the two revisions. What the test refuses to allow is the failure
-    /// this guards: an old database that keeps the old marker while this host
-    /// believes it migrated, which would leave the freshness filter querying a
-    /// table that is not there.
-    #[tokio::test]
-    async fn a_version_one_store_gains_the_source_table_on_reopen() {
-        let temp = tempfile::TempDir::new().expect("temporary store");
-        let store = crate::SqliteStore::open_writer(crate::WriterOpenOptions::new(
-            temp.path(),
-            harness_types::HostId::generate(),
-        ))
-        .await
-        .expect("store opens");
-        store
-            .demote_memory_schema_to_version_one()
-            .await
-            .expect("the store is put back to the version 1 shape");
-        store.close().await.expect("store closes");
-
-        let reopened = crate::SqliteStore::open_writer(crate::WriterOpenOptions::new(
-            temp.path(),
-            harness_types::HostId::generate(),
-        ))
-        .await
-        .expect("the old store reopens");
-        let (has_table, recorded) = reopened
-            .memory_schema_shape()
-            .await
-            .expect("the schema is readable");
-        assert!(has_table, "the upgrade created the table");
-        assert_eq!(
-            recorded, MEMORY_SCHEMA_VERSION,
-            "the marker and the table agree, which is the pair this migration must keep true"
-        );
-        reopened.close().await.expect("store closes");
-    }
 
     #[test]
     fn data_directory_marker_accepts_the_current_format_only() {

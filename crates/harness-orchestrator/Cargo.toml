@@ -8,7 +8,6 @@ repository.workspace = true
 
 [dependencies]
 harness-kernel = { path = "../harness-kernel" }
-harness-memory = { path = "../harness-memory" }
 harness-providers = { path = "../harness-providers" }
 harness-runtime = { path = "../harness-runtime" }
 harness-session = { path = "../harness-session" }

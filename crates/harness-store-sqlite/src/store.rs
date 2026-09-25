@@ -36,7 +36,6 @@ pub mod delegation;
 pub mod external_jobs;
 pub mod history;
 mod maintenance;
-mod memory;
 pub mod notifications;
 pub mod port;
 pub mod run;
@@ -216,7 +215,10 @@ impl SqliteStore {
         // re-checking every table each time was about seventy statements before
         // the first useful one; a database this process already brought up to date
         // - and that still exists - is up to date.
-        if existed && options.fault_plan.is_empty() && schema_ensured(&paths.database_path) {
+        if existed
+            && options.fault_plan.is_empty()
+            && schema_ensured(&paths.database_path, schema_stamp(&pool).await.as_deref())
+        {
             let fence = match acquire_fence(&pool, options.host_id).await {
                 Ok(fence) => fence,
                 Err(error) => {
@@ -248,10 +250,6 @@ impl SqliteStore {
             let _ = FileExt::unlock(&lock_file);
             return Err(error);
         }
-        if let Err(error) = memory::ensure_memory_schema(&pool).await {
-            let _ = FileExt::unlock(&lock_file);
-            return Err(error);
-        }
         if let Err(error) = delegation::ensure_delegation_schema(&pool).await {
             let _ = FileExt::unlock(&lock_file);
             return Err(error);
@@ -276,7 +274,9 @@ impl SqliteStore {
                 return Err(error);
             }
         };
-        mark_schema_ensured(&paths.database_path);
+        if let Some(stamp) = schema_stamp(&pool).await {
+            mark_schema_ensured(&paths.database_path, stamp);
+        }
 
         Ok(Self {
             paths,
@@ -2767,23 +2767,52 @@ impl SqliteStore {
     }
 }
 
-/// Databases this process has migrated and checked, by path.
-fn ensured_schemas() -> &'static std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>> {
-    static ENSURED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
-    > = std::sync::OnceLock::new();
-    ENSURED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+type EnsuredSchemas = std::collections::HashMap<std::path::PathBuf, String>;
+
+/// Databases this process has migrated and checked, by path, with the schema
+/// stamp they had then.
+fn ensured_schemas() -> &'static std::sync::Mutex<EnsuredSchemas> {
+    static ENSURED: std::sync::OnceLock<std::sync::Mutex<EnsuredSchemas>> =
+        std::sync::OnceLock::new();
+    ENSURED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn schema_ensured(path: &std::path::Path) -> bool {
+/// One read that changes whenever the schema does: `SQLite`'s schema cookie (bumped
+/// by every CREATE, ALTER or DROP) and every migration table's version. A
+/// database changed by anyone since this process checked it - a newer host, a
+/// restored backup, a test - reads differently and is checked again.
+async fn schema_stamp(pool: &SqlitePool) -> Option<String> {
+    let cookie = sqlx::query_scalar::<_, i64>("PRAGMA schema_version")
+        .fetch_one(pool)
+        .await
+        .ok()?;
+    let versions = sqlx::query_scalar::<_, String>(
+        "SELECT printf('%d/%d/%d/%d/%d/%d',
+            (SELECT MAX(version) FROM schema_migrations),
+            (SELECT MAX(version) FROM runtime_schema_migrations),
+            (SELECT MAX(version) FROM context_schema_migrations),
+            (SELECT MAX(version) FROM tools_schema_migrations),
+            (SELECT MAX(version) FROM delegation_schema_migrations),
+            (SELECT MAX(version) FROM maintenance_schema_migrations))",
+    )
+    .fetch_one(pool)
+    .await
+    .ok()?;
+    Some(format!("{cookie}:{versions}"))
+}
+
+fn schema_ensured(path: &std::path::Path, stamp: Option<&str>) -> bool {
+    let Some(stamp) = stamp else {
+        return false;
+    };
     ensured_schemas()
         .lock()
-        .is_ok_and(|ensured| ensured.contains(path))
+        .is_ok_and(|ensured| ensured.get(path).is_some_and(|known| known == stamp))
 }
 
-fn mark_schema_ensured(path: &std::path::Path) {
+fn mark_schema_ensured(path: &std::path::Path, stamp: String) {
     if let Ok(mut ensured) = ensured_schemas().lock() {
-        ensured.insert(path.to_owned());
+        ensured.insert(path.to_owned(), stamp);
     }
 }
 

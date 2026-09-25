@@ -1150,7 +1150,6 @@ dependencies = [
  "harness-extensions",
  "harness-kernel",
  "harness-maintenance",
- "harness-memory",
  "harness-orchestrator",
  "harness-providers",
  "harness-runtime",
@@ -1215,7 +1214,6 @@ dependencies = [
 name = "harness-maintenance"
 version = "0.1.0"
 dependencies = [
- "harness-memory",
  "harness-session",
  "harness-store-sqlite",
  "harness-types",
@@ -1229,26 +1227,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "harness-memory"
-version = "0.1.0"
-dependencies = [
- "harness-session",
- "harness-store-sqlite",
- "harness-types",
- "proptest",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "unicode-normalization",
-]
-
-[[package]]
 name = "harness-orchestrator"
 version = "0.1.0"
 dependencies = [
  "harness-kernel",
- "harness-memory",
  "harness-providers",
  "harness-runtime",
  "harness-session",
@@ -1283,7 +1265,6 @@ name = "harness-runtime"
 version = "0.1.0"
 dependencies = [
  "futures-util",
- "harness-memory",
  "harness-providers",
  "harness-session",
  "harness-store-sqlite",

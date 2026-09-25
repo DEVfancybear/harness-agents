@@ -392,7 +392,7 @@ Gate P1/P2 bằng durable reconstruction, P3 bằng tool evidence thật, P4 b�
 
 ## 19. Memory: harness state của prime-agent
 
-Memory của ứng dụng theo prime-agent (`core/refinement/refinement.ts`, `prime-agent-runtime/src/rlm/harness.py`). Nó thay cho thiết kế cũ - đường "ghi nhớ …" khớp theo từ khoá, nhật ký lượt, worker trích fact chạy nền và truy xuất theo từ khoá từ memory store SQLite - thiết kế đó đã bị gỡ. Crate `harness-memory` và lệnh `ha memory` vẫn còn như công cụ bảo trì cho dữ liệu ghi trước đây; các lượt không còn đọc hay ghi vào đó.
+Memory của ứng dụng theo prime-agent (`core/refinement/refinement.ts`, `prime-agent-runtime/src/rlm/harness.py`). Nó thay cho thiết kế cũ - đường "ghi nhớ …" khớp theo từ khoá, nhật ký lượt, worker trích fact chạy nền và truy xuất theo từ khoá từ memory store SQLite - thiết kế đó đã bị gỡ. Sau đó crate `harness-memory` và lệnh `ha memory` cũng đã bị gỡ; store ghi trước đây vẫn giữ các bảng memory cũ, nhưng không còn gì đọc chúng.
 
 ### 19.1. Model tự quản memory
 

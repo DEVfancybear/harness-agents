@@ -151,10 +151,6 @@ impl SqliteStore {
                 "SELECT MAX(version) AS version FROM tools_schema_migrations",
             ),
             (
-                "memory",
-                "SELECT MAX(version) AS version FROM memory_schema_migrations",
-            ),
-            (
                 "delegation",
                 "SELECT MAX(version) AS version FROM delegation_schema_migrations",
             ),
@@ -175,7 +171,7 @@ impl SqliteStore {
         Ok(revisions)
     }
 
-    /// Tombstone identities, for a backup manifest and for re-extraction checks.
+    /// Tombstone identities, for a backup manifest.
     pub async fn tombstone_ids(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query(
             "SELECT source_kind, source_id FROM maintenance_tombstones
@@ -229,24 +225,6 @@ impl SqliteStore {
             });
         }
         Ok(records)
-    }
-
-    /// Whether a source is tombstoned, which blocks re-extraction.
-    pub async fn is_tombstoned(
-        &self,
-        source_kind: &str,
-        source_id: &str,
-    ) -> Result<bool, StoreError> {
-        let found = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM maintenance_tombstones
-             WHERE source_kind = ? AND source_id = ?",
-        )
-        .bind(source_kind)
-        .bind(source_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "check tombstone", error))?;
-        Ok(found > 0)
     }
 
     /// Record a tombstone and a journal entry in one transaction.
@@ -454,7 +432,6 @@ impl SqliteStore {
     }
 
     /// Artifact identities referenced by durable receipts and tool scopes.
-    /// Memory version content is stored inline and does not hold artifact IDs.
     pub async fn referenced_artifact_ids(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query(
             "SELECT artifact_id FROM artifacts

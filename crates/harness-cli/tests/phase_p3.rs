@@ -858,15 +858,20 @@ async fn p3_c10_external_workspace_change_invalidates_approved_execution() {
     let store = writer(&temp).await;
     let (session_id, task_id, _) = admit(&store, &root).await;
     let tools = ToolExecutionService::new(Arc::clone(&store));
+    // The change that matters is to the file the approved write targets: the
+    // write is bound to that file's hash, so an edit made while it waited for its
+    // approval turns the approved execution into a durable denial. (Edits
+    // elsewhere in the tree no longer invalidate an approval; see the read case.)
+    let before = fs::read_to_string(root.join("src/parser.txt")).expect("fixture");
     let (prepared, approval) = prepared_and_approved(
         &tools,
         &session_id,
         &task_id,
         &root,
-        CodingToolAction::ReadFile {
+        CodingToolAction::ApplyPatch {
             path: "src/parser.txt".to_owned(),
-            offset: None,
-            limit: None,
+            expected_hash: ContentHash::from_bytes(before.as_bytes()),
+            replacement: "patched\n".to_owned(),
         },
     )
     .await;
