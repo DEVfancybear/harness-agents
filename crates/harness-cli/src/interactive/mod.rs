@@ -204,49 +204,20 @@ pub fn mode_from_args(
     })
 }
 
-/// The data root a launch would use for this environment.
-///
-/// Shared by the interactive launch and by the `ha memory` commands, so the store a
-/// chat turn wrote is the store those commands read without anyone repeating the
-/// path. It applies the same rule the launch does: `HA_HOME/data` when `HA_HOME` is
-/// set, otherwise the platform default (`%LOCALAPPDATA%\HarnessAgents\data` on
-/// Windows).
-///
-/// # Errors
-/// Fails when the platform provides no data directory and the environment names no
-/// `HA_HOME`, which is the same condition that stops a launch.
-pub fn default_data_dir(environment: &paths::LaunchEnvironment) -> Result<PathBuf, HarnessError> {
-    if let Some(home) = environment
-        .value("HA_HOME")
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(PathBuf::from(home).join("data"));
-    }
-    paths::resolve(&paths::PathRequest {
-        platform: paths::HostPlatform::current(),
-        environment,
-        explicit_data_dir: None,
-    })
-    .map(|resolved| resolved.data_dir)
-}
-
-/// The identity and store a workspace root resolves to.
+/// The store a registered workspace root resolves to.
 pub struct ResolvedProject {
-    pub id: harness_types::ProjectId,
     /// The directory that holds this project's store.
     ///
-    /// The `ha memory` commands take this as `--data-dir`, not the data root: they
-    /// open the project store directly. Resolving the identity without also handing
-    /// back the store would leave the caller with an id and the wrong directory.
+    /// Commands that take `--cwd` open this project store directly, not the data
+    /// root.
     pub store_dir: PathBuf,
 }
 
-/// The project identity a workspace root is registered under.
+/// The project store a workspace root is registered under.
 ///
-/// The app neither shows this id nor offers a way to look it up, and a
-/// project-scoped read without it returns nothing at all. This resolves the identity
-/// the chat registered for that root, which is what lets `ha memory --cwd` inspect
-/// what a turn stored.
+/// This resolves the store the chat registered for that root and proves the root
+/// has a registered identity, which is what lets `--cwd` commands inspect what a
+/// turn stored.
 ///
 /// The store directory is derived by running the launch's own resolution rather than
 /// re-deriving the key here: the key hashes a *displayable* path (the Windows
@@ -283,12 +254,12 @@ pub async fn registered_project(root: &std::path::Path) -> Result<ResolvedProjec
                 ),
             )
         })?;
-    let id = project::resolve_project_id(&store, &context.project.root).await?;
+    project::resolve_project_id(&store, &context.project.root).await?;
     store
         .close()
         .await
         .map_err(|error| HarnessError::new(error.code(), format!("store close failed: {error}")))?;
-    Ok(ResolvedProject { id, store_dir })
+    Ok(ResolvedProject { store_dir })
 }
 
 /// Environment variable that selects the renderer explicitly.
@@ -602,7 +573,7 @@ mod tests {
 
     /// K05: the key a launch computes must not depend on how the root was named.
     ///
-    /// `ha memory --cwd <root>` looks the store up by this key, so if a chat that
+    /// `ha maintenance --cwd <root>` looks the store up by this key, so if a chat that
     /// started *in* the directory and a command that *names* the directory disagree,
     /// the lookup opens a store the chat never wrote. That is exactly the bug this
     /// guards: it was written once with a second, look-alike key derivation and the

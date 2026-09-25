@@ -7,7 +7,8 @@
     "`status` uses the plan vocabulary: planned, in_progress, implemented_unverified, verified_local,",
     "accepted, blocked. `implemented_unverified` means the test exists and runs; it is not a verdict.",
     "A01-A36 are cross-layer acceptance cases from docs/implementation-next/ACCEPTANCE.vi.md and stay",
-    "`planned` until their owner milestone implements them."
+    "`planned` until their owner milestone implements them. M7 (scoped memory) was removed with the",
+    "harness-memory crate; its cases A25/A26 are `retired` and name no selector."
   ],
   "milestones": [
     {
@@ -633,96 +634,10 @@
       }
     },
     {
-      "id": "M7",
-      "title": "Memory assets và durable extraction",
-      "runbook": "docs/implementation-next/M7.vi.md",
-      "prerequisites": ["M6"],
-      "status": "in_progress",
-      "integration_target": "milestone_m7",
-      "work_items": [
-        {
-          "id": "M7-01",
-          "title": "Assets, authority và source dependency",
-          "status": "implemented_unverified",
-          "tests": [
-            "m7_01_source_dependency_is_queryable_and_scoped",
-            "m7_01_version_cas_and_content_identity"
-          ]
-        },
-        {
-          "id": "M7-02",
-          "title": "Durable extraction consumer",
-          "status": "implemented_unverified",
-          "tests": [
-            "m7_02_committed_ranges_are_enqueued_and_deduplicated",
-            "m7_02_backlog_survives_reopen_and_schedules_are_stable",
-            "a25_memory_job_cas"
-          ]
-        },
-        {
-          "id": "M7-03",
-          "title": "Retrieval, freshness và invalidation",
-          "status": "implemented_unverified",
-          "tests": ["a26_memory_provenance", "a19_optional_services_failure"]
-        },
-        {
-          "id": "M7-04",
-          "title": "CLI và quality fixtures",
-          "status": "implemented_unverified",
-          "tests": [
-            "m7_04_cli_propose_confirm_reject_export",
-            "m7_04_quality_report_separates_measured_from_unmeasured"
-          ]
-        }
-      ],
-      "required_tests": [
-        "m7_01_source_dependency_is_queryable_and_scoped",
-        "m7_01_version_cas_and_content_identity",
-        "m7_02_committed_ranges_are_enqueued_and_deduplicated",
-        "m7_02_backlog_survives_reopen_and_schedules_are_stable",
-        "m7_04_cli_propose_confirm_reject_export",
-        "m7_04_quality_report_separates_measured_from_unmeasured",
-        "a19_optional_services_failure",
-        "a25_memory_job_cas",
-        "a26_memory_provenance"
-      ],
-      "unit_tests": [
-        {
-          "package": "harness-store-sqlite",
-          "test_name": "models::tests::a_version_one_store_gains_the_source_table_on_reopen"
-        }
-      ],
-      "fixtures": [
-        "crates/harness-cli/tests/milestone_m7.rs",
-        "docs/adr/ADR-N07-MEMORY-SOURCE-FRESHNESS.vi.md"
-      ],
-      "gate": {
-        "script": "scripts/Verify-Milestone.ps1",
-        "dependency_check_bin": "dependency_check",
-        "steps": [
-          "format",
-          "clippy",
-          "build",
-          "workspace-tests",
-          "dependency-allowlist",
-          "unit-tests",
-          "required-test-discovery",
-          "required-tests",
-          "closure-M6",
-          "closure-M5",
-          "closure-M4",
-          "closure-M3",
-          "closure-M1",
-          "closure-M2",
-          "closure-M0"
-        ]
-      }
-    },
-    {
       "id": "M8",
       "title": "Durable DAG và worktree integration",
       "runbook": "docs/implementation-next/M8.vi.md",
-      "prerequisites": ["M7"],
+      "prerequisites": ["M6"],
       "status": "in_progress",
       "integration_target": "milestone_m8",
       "work_items": [
@@ -1277,14 +1192,13 @@
     },
     {
       "id": "A19",
-      "owner_milestones": ["M5", "M7"],
+      "owner_milestones": ["M5"],
       "planned_test": "a19_optional_services_failure",
       "status": "implemented",
       "selectors": [
-        "milestone_m5::a19_summary_failure_falls_back_to_the_mandatory_state",
-        "milestone_m7::a19_optional_services_failure"
+        "milestone_m5::a19_summary_failure_falls_back_to_the_mandatory_state"
       ],
-      "note": "M5 half: a summarizer that fails or returns nothing is not a summary, so the checkpoint holds the deterministic rendering of the mandatory state. M7 half: a committed range whose extractor is disabled is enqueued and left `blocked` with the cursor unmoved, the journal stays readable with no memory service constructed at all, and a bounded catch-up settles the blocked range when the extractor is available again. Both halves exist, so the case is implemented rather than planned"
+      "note": "a summarizer that fails or returns nothing is not a summary, so the checkpoint holds the deterministic rendering of the mandatory state. The former M7 half (memory extraction) was retired with the harness-memory crate"
     },
     {
       "id": "A20",
@@ -1330,17 +1244,17 @@
       "id": "A25",
       "owner_milestones": ["M7"],
       "planned_test": "a25_memory_job_cas",
-      "status": "implemented",
-      "selectors": ["milestone_m7::a25_memory_job_cas"],
-      "note": "two reconciles over one committed range produce one job; a second consumer cannot claim a live lease; the process is dropped with the lease in hand, the store is reopened, the interrupted job is recovered and leased with a newer generation, and the superseded lease is refused with StaleWriter - so one logical settlement, no lost update, and the generation check is what rejects the old consumer rather than a timer. A range whose sources the extractor declined to read is settled `filtered` and the cursor still crosses it, so a filtered range cannot stall the backlog"
+      "status": "retired",
+      "selectors": null,
+      "note": "retired with the harness-memory crate and milestone M7; the scoped-memory extraction and provenance it covered no longer exist"
     },
     {
       "id": "A26",
       "owner_milestones": ["M7"],
       "planned_test": "a26_memory_provenance",
-      "status": "implemented",
-      "selectors": ["milestone_m7::a26_memory_provenance"],
-      "note": "a version read from a named file records the digest observed when it was written; re-reading that file and finding it moved excludes the version from the next packet while leaving the audit intact until an explicit invalidation; the invalidation cascades to a derived summary; a user correction is a new version that outranks what it replaced and the packet stamps the version it selected; and an extractor that quotes memory back settles `self_referential` instead of publishing the quote as independent evidence, while genuinely new material is still extracted"
+      "status": "retired",
+      "selectors": null,
+      "note": "retired with the harness-memory crate and milestone M7; the scoped-memory extraction and provenance it covered no longer exist"
     },
     {
       "id": "A27",

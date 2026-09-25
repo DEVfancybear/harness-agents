@@ -6,7 +6,6 @@ mod extension_cli;
 mod interactive;
 mod maintenance_cli;
 mod mcp_cli;
-mod memory_cli;
 mod sandbox_cli;
 mod web;
 
@@ -28,7 +27,7 @@ use harness_types::{
 
 /// Personal coding-agent harness.
 ///
-/// P4 adds scoped local memory and bounded, explicit extraction catch-up.
+/// Bare `ha` opens the interactive app; `ha exec` runs one prompt headless.
 #[derive(Debug, Parser)]
 #[command(name = "ha", version, about)]
 struct Cli {
@@ -42,8 +41,6 @@ enum Command {
     Chat(ChatArgs),
     /// Run one prompt without a terminal, for scripts and automation.
     Exec(ExecArgs),
-    /// Search, inspect and maintain scoped reusable memory.
-    Memory(memory_cli::MemoryCommand),
     /// Serve the loopback web surface: an authenticated API and the local UI.
     Web {
         #[arg(long)]
@@ -743,7 +740,6 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
         // Boxed: this arm now resolves a project identity before it opens a store,
         // which grows the future past the size the other arms keep. Boxing one arm is
         // cheaper than reshaping the dispatch.
-        Some(Command::Memory(command)) => Box::pin(memory_cli::run(command)).await,
         Some(Command::Mcp(command)) => mcp_cli::run(command),
         Some(Command::Init { data_dir, json }) => init_store(&data_dir, json).await,
         Some(Command::Config(ConfigCommand {

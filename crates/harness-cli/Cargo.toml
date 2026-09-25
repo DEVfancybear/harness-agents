@@ -47,7 +47,6 @@ harness-session = { path = "../harness-session" }
 harness-store-sqlite = { path = "../harness-store-sqlite" }
 harness-runtime = { path = "../harness-runtime" }
 harness-tools = { path = "../harness-tools" }
-harness-memory = { path = "../harness-memory" }
 harness-orchestrator = { path = "../harness-orchestrator" }
 harness-extensions = { path = "../harness-extensions" }
 harness-kernel = { path = "../harness-kernel" }
@@ -91,7 +90,6 @@ harness-kernel = { path = "../harness-kernel" }
 harness-session = { path = "../harness-session" }
 harness-store-sqlite = { path = "../harness-store-sqlite" }
 harness-tools = { path = "../harness-tools" }
-harness-memory = { path = "../harness-memory" }
 harness-orchestrator = { path = "../harness-orchestrator" }
 harness-extensions = { path = "../harness-extensions" }
 harness-maintenance = { path = "../harness-maintenance" }

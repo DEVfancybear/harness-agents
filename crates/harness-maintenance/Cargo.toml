@@ -7,7 +7,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-harness-memory = { path = "../harness-memory" }
 harness-session = { path = "../harness-session" }
 harness-store-sqlite = { path = "../harness-store-sqlite" }
 harness-types = { path = "../harness-types" }

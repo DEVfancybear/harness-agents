@@ -37,7 +37,6 @@ pub mod delegation;
 pub mod external_jobs;
 pub mod history;
 mod maintenance;
-mod memory;
 pub mod notifications;
 pub mod port;
 pub mod run;
@@ -221,10 +220,6 @@ impl SqliteStore {
             return Err(error);
         }
         if let Err(error) = ensure_context_schema(&pool).await {
-            let _ = FileExt::unlock(&lock_file);
-            return Err(error);
-        }
-        if let Err(error) = memory::ensure_memory_schema(&pool).await {
             let _ = FileExt::unlock(&lock_file);
             return Err(error);
         }

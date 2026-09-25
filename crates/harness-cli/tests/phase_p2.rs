@@ -3,9 +3,6 @@ use std::{
     sync::Arc,
 };
 
-use harness_memory::{
-    MemoryIndex, MemoryPrincipal, MemoryService, RetrievalResult, RetrievalState,
-};
 use harness_providers::{
     CancellationToken, DeepSeekAdapter, MessageRole, MockProvider, ModelCapabilities,
     ModelProvider, ProviderMessage, ProviderRequest, ProviderStreamEvent, SseDecoder,
@@ -89,55 +86,6 @@ async fn review_p2_context_budget_includes_rendered_headers() {
     assert_eq!(optional.omitted_optional.len(), 1);
     assert!(build(baseline.packet.token_estimate + 3, vec![]).is_ok());
     drop(session);
-    close_writer(store).await;
-}
-
-#[tokio::test]
-async fn g07_rejected_memory_contribution_emits_a_notice() {
-    let temp = TempDir::new().unwrap();
-    let store = writer(&temp).await;
-    let session_id = SessionId::generate();
-    let task_id = TaskId::generate();
-    let workspace = workspace();
-    let principal = MemoryPrincipal::user("phase-p2-memory")
-        .with_project(workspace.project_id.clone())
-        .with_task(task_id.clone())
-        .with_session(session_id.clone());
-    let mut contribution = MemoryService::new(Arc::clone(&store)).contribute_indexed(
-        &principal,
-        &RetrievalResult {
-            state: RetrievalState::Empty,
-            hits: Vec::new(),
-            detail: None,
-            revision: 1,
-        },
-        64,
-        MemoryIndex::Durable,
-    );
-    contribution.revision += 1;
-    let runtime = RuntimeService::new(
-        Arc::clone(&store),
-        Arc::new(MockProvider::text("answer without stale memory")),
-        RuntimeConfig::default(),
-    );
-
-    let result = runtime
-        .run(
-            RunRequest::new(
-                session_id,
-                task_id,
-                InputId::generate(),
-                "continue safely",
-                workspace,
-            )
-            .with_memory(contribution),
-        )
-        .await
-        .expect("invalid optional memory is omitted without failing the turn");
-
-    assert_eq!(result.notices.len(), 1);
-    assert!(result.notices[0].contains("memory contribution was rejected"));
-    drop(runtime);
     close_writer(store).await;
 }
 

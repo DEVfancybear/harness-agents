@@ -607,7 +607,7 @@ fn m0_02_dependency_allowlist_rejects_forbidden_edge() {
     assert!(clean.status.success(), "{}", output_text(&clean.stderr));
     let report: Value = serde_json::from_slice(&clean.stdout).expect("checker output is JSON");
     assert_eq!(report["status"], "ok");
-    assert!(report["edge_count"].as_u64().unwrap_or_default() >= 40);
+    assert!(report["edge_count"].as_u64().unwrap_or_default() >= 35);
 
     // A declared-forbidden edge fails the checker.
     let forbidden = run_dependency_check(&[
@@ -827,7 +827,7 @@ fn m0_04_milestone_registry_and_gate_self_test() {
     for case in cases {
         let status = case["status"].as_str().expect("status");
         assert!(
-            matches!(status, "planned" | "implemented"),
+            matches!(status, "planned" | "implemented" | "retired"),
             "{} has an unknown status: {status}",
             case["id"]
         );

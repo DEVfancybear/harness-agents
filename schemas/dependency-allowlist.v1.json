@@ -14,7 +14,6 @@
     "harness-store-sqlite": ["harness-types"],
     "harness-session": ["harness-store-sqlite", "harness-types"],
     "harness-runtime": [
-      "harness-memory",
       "harness-providers",
       "harness-session",
       "harness-store-sqlite",
@@ -27,10 +26,8 @@
       "harness-store-sqlite",
       "harness-types"
     ],
-    "harness-memory": ["harness-session", "harness-store-sqlite", "harness-types"],
     "harness-orchestrator": [
       "harness-kernel",
-      "harness-memory",
       "harness-providers",
       "harness-runtime",
       "harness-session",
@@ -45,7 +42,6 @@
       "harness-types"
     ],
     "harness-maintenance": [
-      "harness-memory",
       "harness-session",
       "harness-store-sqlite",
       "harness-types"
@@ -54,7 +50,6 @@
       "harness-extensions",
       "harness-kernel",
       "harness-maintenance",
-      "harness-memory",
       "harness-orchestrator",
       "harness-providers",
       "harness-runtime",
@@ -76,7 +71,6 @@
         "harness-cli",
         "harness-extensions",
         "harness-maintenance",
-        "harness-memory",
         "harness-orchestrator",
         "harness-runtime",
         "harness-session",
@@ -96,7 +90,6 @@
         "harness-extensions",
         "harness-kernel",
         "harness-maintenance",
-        "harness-memory",
         "harness-orchestrator",
         "harness-runtime",
         "harness-session",

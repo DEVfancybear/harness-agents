@@ -27,8 +27,7 @@ use harness_store_sqlite::{
 use harness_types::{
     AgentRunId, BudgetId, BudgetReservationId, ContentHash, ErrorCode, FreezeStepCommit,
     FrozenBudgetReservation, FrozenRunStep, InputId, ProducerIdentity, RunStartRequest,
-    ScopeContext, ScopeTarget, SessionId, SourceAuthority, StepId, StorePort, TaskId,
-    WorkspaceObservation,
+    ScopeContext, SessionId, SourceAuthority, StepId, StorePort, TaskId, WorkspaceObservation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -306,7 +305,6 @@ pub struct RunRequest {
     pub project_rules: Vec<ContextBlock>,
     pub continuation_context: Option<String>,
     pub tool_schemas: Vec<Value>,
-    pub memory: Option<harness_memory::MemoryContribution>,
     /// Images the model is shown with this turn's user message.
     ///
     /// They travel as content blocks, not as text, and the user message names them so
@@ -352,7 +350,6 @@ impl RunRequest {
             project_rules: Vec::new(),
             continuation_context: None,
             tool_schemas: Vec::new(),
-            memory: None,
             images: Vec::new(),
             recovered_messages: Vec::new(),
             conversation: Vec::new(),
@@ -380,12 +377,6 @@ impl RunRequest {
     #[must_use]
     pub fn with_tool_schemas(mut self, tool_schemas: Vec<Value>) -> Self {
         self.tool_schemas = tool_schemas;
-        self
-    }
-
-    #[must_use]
-    pub fn with_memory(mut self, contribution: harness_memory::MemoryContribution) -> Self {
-        self.memory = Some(contribution);
         self
     }
 
@@ -1408,38 +1399,10 @@ impl RuntimeService {
             .await?;
         self.last_attempts.store(command.attempts, Ordering::SeqCst);
         let recovery = session.recover(&request.session_id).await?;
-        let scope = self.run_scope(&request, &config)?;
+        // The run scope is validated up front even though nothing narrows it here.
+        self.run_scope(&request, &config)?;
         let mut request = request;
-        let mut notices = Vec::new();
-        if let Some(contribution) = &request.memory {
-            let principal = &contribution.principal;
-            // A contribution names the scope it belongs to; the run's scope
-            // decides whether that target is inside it. Omitting a field means
-            // the contribution does not claim it, never that it may use it.
-            let named = ScopeTarget {
-                project_id: principal.project_id.clone(),
-                task_id: principal.task_id.clone(),
-                session_id: principal.session_id.clone(),
-                worktree_id: None,
-            };
-            if !scope.authorizes(&named) {
-                return Err(RuntimeError::new(
-                    ErrorCode::PolicyDenied,
-                    "memory contribution is outside run scope",
-                ));
-            }
-            if harness_memory::MemoryService::new(Arc::clone(&self.store))
-                .validate_contribution(contribution)
-                .await
-                .is_err()
-            {
-                request.memory = None;
-                notices.push(
-                    "memory contribution was rejected because its source or digest is no longer valid"
-                        .to_owned(),
-                );
-            }
-        }
+        let notices = Vec::new();
         if request.continuation_context.is_none()
             && let Some(checkpoint) = self
                 .store
@@ -1661,24 +1624,6 @@ impl RuntimeService {
                 last_error = Some(RuntimeError::new(
                     ErrorCode::ProviderCanceled,
                     "run canceled before provider dispatch",
-                ));
-                break;
-            }
-            if let Some(contribution) = &request.memory
-                && let Err(error) = harness_memory::MemoryService::new(Arc::clone(&self.store))
-                    .validate_contribution(contribution)
-                    .await
-            {
-                // Nothing dispatched, so the attempt's bound is released rather
-                // than settled as unknown usage.
-                if let Some(reservation_id) = &attempt_reservation
-                    && let Some((ledger, _)) = &self.budget
-                {
-                    ledger.release(reservation_id).await?;
-                }
-                last_error = Some(RuntimeError::new(
-                    error.code(),
-                    "memory changed after freeze; rebuild context before dispatch",
                 ));
                 break;
             }
@@ -2770,20 +2715,14 @@ impl RuntimeService {
                 through_event_seq: recovery.replayed_through_sequence,
                 recovery,
                 project_rules: request.project_rules.clone(),
-                optional_blocks: request
-                    .memory
-                    .as_ref()
-                    .map_or_else(Vec::new, |memory| memory.blocks.clone()),
+                optional_blocks: Vec::new(),
                 recent_tail: continuation,
                 context_window_tokens: config.context_window_tokens,
                 output_reservation_tokens: config.output_reservation_tokens,
                 protocol_overhead_tokens: config.protocol_overhead_tokens,
                 safety_margin_tokens: config.safety_margin_tokens,
                 optional_token_budget: config.optional_token_budget,
-                memory_versions: request
-                    .memory
-                    .as_ref()
-                    .map_or_else(Vec::new, |memory| memory.versions.clone()),
+                memory_versions: Vec::new(),
                 fixed_request_bytes,
                 manifest: harness_session::ContextManifestInputs {
                     config_revision: config.config_revision,
@@ -2796,8 +2735,7 @@ impl RuntimeService {
     }
 
     /// Build the authority context of one run. The host creates it; tool
-    /// arguments and contributions are checked against it and can never widen
-    /// it.
+    /// arguments are checked against it and can never widen it.
     fn run_scope(
         &self,
         request: &RunRequest,

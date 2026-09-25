@@ -11,7 +11,6 @@
 pub mod contracts;
 pub mod coordinator;
 pub mod integration;
-pub mod memory;
 pub mod scheduler;
 pub mod workspace;
 
@@ -20,8 +19,8 @@ pub use contracts::{
     DEFAULT_MAX_QUEUED_WORKERS, DEFAULT_MAX_WORKERS, DELEGATION_CONTRACT_VERSION, DelegatedOutcome,
     DelegatedResult, DelegationBudget, DelegationGrants, DeliveryNotifier, DeliveryState,
     DirtyReason, GrantAction, IntegrationReport, IntegrationStep, OrchestratorError,
-    ParentDelivery, SchedulerConfig, TaskBrief, TaskGraph, TaskMemoryBinding, TaskNode, TaskPlan,
-    TaskStatus, VerifiedSnapshot, WorkerRef, WorktreeRecord, WorktreeState,
+    ParentDelivery, SchedulerConfig, TaskBrief, TaskGraph, TaskNode, TaskPlan, TaskStatus,
+    VerifiedSnapshot, WorkerRef, WorktreeRecord, WorktreeState,
 };
 pub use coordinator::{
     DelegationCoordinator, EvidenceVerifier, ResultVerifier, StepOutcome, TaskSession,
@@ -30,7 +29,6 @@ pub use coordinator::{
 pub use integration::{
     BranchCandidate, FinalApply, IntegrationOutcome, ResultIntegrator, workspace_candidate,
 };
-pub use memory::{DelegatedMemoryBinding, DelegatedMemoryService, MemoryBoundary};
 pub use scheduler::{
     BudgetLedger, RefusingBackend, WorkerBackend, WorkerHandle, WorkerLease, WorkerOutcome,
     WorkerRequest, WorkerScheduler,

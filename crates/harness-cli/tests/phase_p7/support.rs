@@ -152,11 +152,18 @@ pub fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// Every acceptance case this release claims to exercise: C01-C30 and K01-K14.
+/// Continuity cases that only the removed scoped-memory subsystem exercised.
+pub const RETIRED_MEMORY_CASES: [&str; 12] = [
+    "C05", "C07", "C08", "C12", "C13", "C16", "C17", "C20", "C22", "C26", "C28", "C30",
+];
+
+/// Every acceptance case this release claims to exercise: C01-C30 and K01-K14,
+/// minus the retired memory cases.
 #[must_use]
 pub fn all_case_ids() -> Vec<String> {
     let mut cases = (1..=30)
         .map(|index| format!("C{index:02}"))
+        .filter(|id| !RETIRED_MEMORY_CASES.contains(&id.as_str()))
         .collect::<Vec<_>>();
     cases.extend((1..=14).map(|index| format!("K{index:02}")));
     cases

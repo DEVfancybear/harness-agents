@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 [CmdletBinding()]
 param(
-    [ValidateSet('P0', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7')]
+    [ValidateSet('P0', 'P1', 'P2', 'P3', 'P5', 'P6', 'P7')]
     [string] $Phase = 'P0',
     [string] $RepositoryRoot = (Join-Path $PSScriptRoot '..'),
     [switch] $SelfTest,
@@ -261,7 +261,8 @@ foreach ($case in $phaseCases) {
     }
 }
 
-$activePhases = @('P0', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6', 'P7')
+# P4 (scoped memory) was retired with the harness-memory crate.
+$activePhases = @('P0', 'P1', 'P2', 'P3', 'P5', 'P6', 'P7')
 $activeCases = @($registry.cases | Where-Object { $_.phase -in $activePhases })
 foreach ($activeCase in $activeCases) {
     if ($activeCase.readiness -cne 'implemented' -or $activeCase.required -ne $true) {
@@ -269,8 +270,8 @@ foreach ($activeCase in $activeCases) {
     }
 }
 $futureCases = @($registry.cases | Where-Object { $_.id -match '^[CK]\d{2}$' })
-if ($futureCases.Count -ne 44) {
-    throw (New-GateError -Code 'gate_configuration_error' -Message 'registry must contain all 44 C/K future cases')
+if ($futureCases.Count -ne 32) {
+    throw (New-GateError -Code 'gate_configuration_error' -Message 'registry must contain all 32 active C/K cases')
 }
 foreach ($futureCase in $futureCases) {
     if ($futureCase.phase -notin $activePhases -and
@@ -325,10 +326,9 @@ try {
         'P1' { @('P0') }
         'P2' { @('P0', 'P1') }
         'P3' { @('P0', 'P1', 'P2') }
-        'P4' { @('P0', 'P1', 'P2', 'P3') }
-        'P5' { @('P0', 'P1', 'P2', 'P3', 'P4') }
-        'P6' { @('P0', 'P1', 'P2', 'P3', 'P4', 'P5') }
-        'P7' { @('P0', 'P1', 'P2', 'P3', 'P4', 'P5', 'P6') }
+        'P5' { @('P0', 'P1', 'P2', 'P3') }
+        'P6' { @('P0', 'P1', 'P2', 'P3', 'P5') }
+        'P7' { @('P0', 'P1', 'P2', 'P3', 'P5', 'P6') }
         default { @() }
     }
     foreach ($predecessorPhase in $predecessorPhases) {

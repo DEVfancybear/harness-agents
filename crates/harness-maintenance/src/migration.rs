@@ -8,9 +8,8 @@
 use std::path::{Path, PathBuf};
 
 use harness_store_sqlite::{
-    DELEGATION_SCHEMA_VERSION, MAINTENANCE_SCHEMA_VERSION, MEMORY_SCHEMA_VERSION,
-    RUNTIME_SCHEMA_VERSION, STORE_SCHEMA_VERSION, SqliteStore, StorePaths, TOOLS_SCHEMA_VERSION,
-    WriterOpenOptions,
+    DELEGATION_SCHEMA_VERSION, MAINTENANCE_SCHEMA_VERSION, RUNTIME_SCHEMA_VERSION,
+    STORE_SCHEMA_VERSION, SqliteStore, StorePaths, TOOLS_SCHEMA_VERSION, WriterOpenOptions,
 };
 use harness_types::{ErrorCode, HostId};
 
@@ -117,11 +116,6 @@ pub async fn check_store_compatibility(
             "tools",
             revisions.get("tools").copied().unwrap_or(0),
             TOOLS_SCHEMA_VERSION,
-        ),
-        (
-            "memory",
-            revisions.get("memory").copied().unwrap_or(0),
-            MEMORY_SCHEMA_VERSION,
         ),
         (
             "delegation",

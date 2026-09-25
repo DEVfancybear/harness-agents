@@ -1,8 +1,7 @@
-//! P7 CLI: doctor, backup, restore, retention and garbage collection.
+//! P7 CLI: doctor, backup, restore, tombstones and garbage collection.
 //!
 //! Every command is explicit about what it did and what it refused. A restore
-//! never activates on its own, a forget requires a confirmation equal to its
-//! full `source_kind:source_id` target, and garbage collection reports artifacts kept and
+//! never activates on its own, and garbage collection reports artifacts kept and
 //! why.
 
 use std::path::PathBuf;
@@ -11,9 +10,8 @@ use std::sync::Arc;
 use clap::{Args, Subcommand};
 use harness_maintenance::{
     CapabilityStatus, CapabilitySupport, DEFAULT_GC_GRACE_SECONDS, PlatformStatus, PlatformSupport,
-    ReleaseMatrix, RetentionAction, build_support_bundle, check_store_compatibility,
-    collect_garbage, create_backup, forget_source, list_tombstones, migrate_copy, restore_backup,
-    retention_summary, run_retention, verify_backup,
+    ReleaseMatrix, build_support_bundle, check_store_compatibility, collect_garbage, create_backup,
+    list_tombstones, migrate_copy, restore_backup, retention_summary, verify_backup,
 };
 use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
 use harness_types::{ErrorCode, HarnessError, HostId};
@@ -60,28 +58,6 @@ enum MaintenanceSubcommand {
         backup: PathBuf,
         #[arg(long)]
         into: PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Apply a retention action. Forget requires --confirm equal to kind:id.
-    Retain {
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-        /// invalidate | archive | forget
-        #[arg(long)]
-        action: String,
-        #[arg(long)]
-        source_kind: String,
-        #[arg(long)]
-        source_id: String,
-        #[arg(long)]
-        reason: String,
-        /// Explicit confirmation token; must equal --source-kind:--source-id for forget.
-        #[arg(long)]
-        confirm: Option<String>,
-        /// A copy that may still contain the data, repeatable.
-        #[arg(long = "surviving-copy")]
-        surviving_copy: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -174,28 +150,6 @@ pub async fn run(command: MaintenanceCommand) -> Result<(), HarnessError> {
         MaintenanceSubcommand::VerifyBackup { backup, json } => verify(&backup, json).await,
         MaintenanceSubcommand::Restore { backup, into, json } => {
             restore(&backup, &into, json).await
-        }
-        MaintenanceSubcommand::Retain {
-            data_dir,
-            action,
-            source_kind,
-            source_id,
-            reason,
-            confirm,
-            surviving_copy,
-            json,
-        } => {
-            retain(
-                &resolve(data_dir)?,
-                &action,
-                &source_kind,
-                &source_id,
-                &reason,
-                confirm.as_deref(),
-                &surviving_copy,
-                json,
-            )
-            .await
         }
         MaintenanceSubcommand::Tombstones { data_dir, json } => {
             tombstones(&resolve(data_dir)?, json).await
@@ -494,86 +448,6 @@ async fn restore(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)] // One retention call; every field is operator input.
-async fn retain(
-    data_dir: &PathBuf,
-    action: &str,
-    source_kind: &str,
-    source_id: &str,
-    reason: &str,
-    confirm: Option<&str>,
-    surviving_copies: &[String],
-    json_output: bool,
-) -> Result<(), HarnessError> {
-    let action = match action {
-        "invalidate" => RetentionAction::Invalidate,
-        "archive" => RetentionAction::Archive,
-        "forget" => RetentionAction::Forget,
-        other => {
-            return Err(HarnessError::new(
-                ErrorCode::InvalidPayload,
-                format!("unknown retention action {other}"),
-            ));
-        }
-    };
-    let store = Arc::new(
-        SqliteStore::open_writer(WriterOpenOptions::new(data_dir, HostId::generate()))
-            .await
-            .map_err(|error| store_error(&error))?,
-    );
-    let report = if action == RetentionAction::Forget {
-        forget_source(
-            &store,
-            source_kind,
-            source_id,
-            reason,
-            confirm.unwrap_or_default(),
-            surviving_copies,
-        )
-        .await
-    } else {
-        run_retention(
-            &store,
-            action,
-            source_kind,
-            source_id,
-            reason,
-            confirm,
-            surviving_copies,
-        )
-        .await
-    }
-    .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
-    close_store(store).await?;
-
-    let output = json!({
-        "schema_version": 1,
-        "action": report.action.as_str(),
-        "target": report.target,
-        "affected_assets": report.affected_assets.len(),
-        "derived_invalidated": report.derived_invalidated,
-        "derived_archived": if report.action == RetentionAction::Archive { report.affected_assets.len() } else { 0 },
-        "derived_forgotten": if report.action == RetentionAction::Forget { report.affected_assets.len() } else { 0 },
-        "tombstone_id": report.tombstone_id,
-        "surviving_copies": report.surviving_copies,
-        "note": "invalidate keeps history; only forget removes content and records a tombstone",
-    });
-    if json_output {
-        println!("{output}");
-    } else {
-        let (count, disposition) = match report.action {
-            RetentionAction::Invalidate => (report.derived_invalidated, "invalidated"),
-            RetentionAction::Archive => (report.affected_assets.len(), "archived"),
-            RetentionAction::Forget => (report.affected_assets.len(), "removed"),
-        };
-        println!(
-            "{} applied to {}; {} derived records {disposition}",
-            output["action"], output["target"], count
-        );
-    }
-    Ok(())
-}
-
 async fn tombstones(data_dir: &PathBuf, json_output: bool) -> Result<(), HarnessError> {
     let store = Arc::new(
         SqliteStore::open_read_only(data_dir)
@@ -700,11 +574,9 @@ pub fn release_matrix(retrieval_p95_ms: Option<u64>, restore_ms: Option<u64>) ->
         ],
         capabilities: vec![
             capability("coding_tools", CapabilityStatus::Supported, "policy gate with receipts"),
-            capability("memory", CapabilityStatus::Supported, "scoped assets with FTS retrieval"),
             capability("delegation", CapabilityStatus::Supported, "task DAG with isolated worktrees"),
             capability("extensions", CapabilityStatus::Supported, "trusted stdio plugins and local MCP"),
             capability("backup_restore", CapabilityStatus::Supported, "consistent snapshot into a new directory"),
-            capability("retention", CapabilityStatus::Supported, "invalidate, archive, forget with tombstones"),
             capability(
                 "packaged_linux_artifact",
                 CapabilityStatus::ComponentOnly,
@@ -765,11 +637,17 @@ fn capability(name: &str, status: CapabilityStatus, note: &str) -> CapabilitySup
     }
 }
 
-/// The 44 continuity and plugin cases this release claims to exercise.
+/// Continuity cases that only the removed scoped-memory subsystem exercised.
+const RETIRED_MEMORY_CASES: [&str; 12] = [
+    "C05", "C07", "C08", "C12", "C13", "C16", "C17", "C20", "C22", "C26", "C28", "C30",
+];
+
+/// The 32 continuity and plugin cases this release claims to exercise.
 #[must_use]
 pub fn verified_case_ids() -> Vec<String> {
     let mut cases = (1..=30)
         .map(|index| format!("C{index:02}"))
+        .filter(|id| !RETIRED_MEMORY_CASES.contains(&id.as_str()))
         .collect::<Vec<_>>();
     cases.extend((1..=14).map(|index| format!("K{index:02}")));
     cases

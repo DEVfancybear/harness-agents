@@ -154,51 +154,18 @@ revision newer than the running binary supports, `doctor` reports
 `writable: false`, writes fail with a typed error, and read-only inspection keeps
 working. The remedy is a newer binary, never a hand-edited schema row.
 
-## 6. Retention: invalidate, archive and forget
+## 6. Tombstones
 
 ```console
-ha maintenance retain --data-dir <DATA_DIR> --action invalidate \
-    --source-kind file --source-id src/lib.rs --reason "content changed" --json
-ha maintenance retain --data-dir <DATA_DIR> --action archive \
-    --source-kind file --source-id src/lib.rs --reason "kept for audit" --json
-ha maintenance retain --data-dir <DATA_DIR> --action forget \
-    --source-kind file --source-id src/lib.rs --reason "operator request" \
-    --confirm file:src/lib.rs --surviving-copy backup-2026-01 --json
 ha maintenance tombstones --data-dir <DATA_DIR> --json
 ```
 
-These are three different operations, and the difference matters:
-
-| Action | What it does | Removes content? | Needs confirmation? |
-| --- | --- | --- | --- |
-| `invalidate` | Marks derived knowledge unusable, keeps the history | No | No |
-| `archive` | Moves content out of active use, keeps it restorable | No | No |
-| `forget` | Removes the content and records a tombstone | **Yes** | **Yes** |
-
-**`invalidate` is never `delete`.** An invalidated item is refused for future use
-while its record — and the fact that it existed and changed — is retained. Only
-`forget` removes content.
-
-`forget` requires `--confirm` to equal the full target
-`--source-kind:--source-id` (for example, `file:src/lib.rs`). An ID-only token,
-the wrong kind/ID or an empty value is refused with `retention_refused`, and
-nothing is recorded. Retention applies across all projects in the store that use
-the same kind/ID pair; file source identities are currently workspace-relative
-paths.
-
-A `tombstone` is the durable record that a source was deliberately forgotten. It
-is written in the same transaction as the forget, it survives backup and restore,
-and it blocks re-extraction: any later pass that would re-read that source is
-refused, so forgotten data cannot quietly reappear. `ha maintenance tombstones`
-lists them.
-
-**A tombstone cannot reach outside this data directory.** The delete is local;
-copies you made elsewhere are not touched. That is why `forget` takes
-`--surviving-copy` (repeatable) and reports it back: the tombstone records every
-external or backup copy that may still contain the data, so the operator has an
-explicit list to chase. Passing an empty list is allowed, and it means you assert
-there is no other copy — the tool will not invent one, and it will not pretend
-the deletion was global.
+A `tombstone` is the durable record that a source was deliberately forgotten,
+together with every external or backup copy that may still contain its data. The
+source-level `invalidate`/`archive`/`forget` retention actions were removed with
+the scoped-memory subsystem, so this build no longer writes new tombstones; the
+ones an older store holds survive backup and restore unchanged, and
+`ha maintenance tombstones` lists them.
 
 ## 7. Garbage collection
 
@@ -210,7 +177,7 @@ ha maintenance gc --data-dir <DATA_DIR> --grace-seconds 604800 --json
 Garbage collection removes artifact bytes, and it removes only an artifact that
 is simultaneously:
 
-1. **unreferenced** — no receipt, tool artifact scope or memory version points at it;
+1. **unreferenced** — no receipt or tool artifact scope points at it;
 2. **unpinned** — no backup or unfinished task holds a retention pin on it; and
 3. **older than the grace period** — the default is 604800 seconds (7 days).
 
@@ -243,7 +210,7 @@ The matrix reports four separate things and refuses to blur them:
 - **benchmarks** — a stated `target` with a `measured` value that is `null` until
   a real run produced one. `met` is `null` while `measured` is `null`. A target is
   a target; it is never reported as achieved because it was written down.
-- **verified_cases**, **unverified_checks**, **out_of_scope** — the 44 continuity
+- **verified_cases**, **unverified_checks**, **out_of_scope** — the 32 continuity
   and plugin cases this release exercises, the checks that were not run and why,
   and what this release explicitly does not do.
 
@@ -258,7 +225,7 @@ platform is green.
   collected; if you do not run `backup`, nothing is protected.
 - A restore is not a switch. It produces a candidate directory; activating it is
   an operator decision with its own consequences.
-- A forget is local and durable, not global. Read `surviving_copies` before
+- A tombstone is local and durable, not global. Read `surviving_copies` before
   telling anyone the data is gone.
 - A backup is verified only when `verify-backup` says so on the media you hold.
 - An artifact inside the grace period, pinned, or referenced will not be
@@ -275,7 +242,6 @@ platform is green.
 | `ha maintenance backup` | Snapshot into a new directory | The backup directory exists; the source has no store |
 | `ha maintenance verify-backup` | Validate a backup and its artifacts | The manifest, database or any artifact fails its hash |
 | `ha maintenance restore` | Restore into a new directory, without activating | The destination holds a store or is active; the snapshot is incomplete |
-| `ha maintenance retain` | `invalidate`, `archive` or `forget` a source | `forget` without `--confirm` equal to `--source-kind:--source-id` |
 | `ha maintenance tombstones` | List forgotten sources and surviving copies | Never |
 | `ha maintenance gc` | Collect unreferenced, unpinned, old artifacts | Never; it reports what it retained and why |
 | `ha maintenance migrate-copy` | Migrate a store on a copy | The destination is occupied; the source has no store |
