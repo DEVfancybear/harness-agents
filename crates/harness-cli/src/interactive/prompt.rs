@@ -14,12 +14,6 @@ use std::path::Path;
 use harness_extensions::SkillCatalogEntry;
 use harness_tools::TurnLimits;
 
-/// Largest skills catalogue the prompt carries, in bytes.
-///
-/// prime-agent lists every skill; a project with hundreds of skills would still send
-/// all of them on every call, so ha bounds the list and says when it is cut.
-const SKILLS_MAX_BYTES: usize = 12 * 1024;
-
 #[derive(Clone, Debug)]
 pub struct PromptEnvironment<'a> {
     pub os: &'a str,
@@ -74,6 +68,19 @@ Each `bash()` call is its own process, so shell state does not persist between c
 \n\
 Python state in the kernel persists across cells: named variables, helper functions, classes, imports, notes, parsed outputs, and helper data structures all remain available in every later turn.";
 
+/// prime-agent's recursion block of `buildRlmPrompt`, for the `rlm` calls ha serves.
+///
+/// ha's children are explorer workers that write through the turn's store, so unlike
+/// prime-agent's they cannot outlive the turn; the block says so.
+const REPL_RECURSION: &str = "An `rlm` object is already in your global namespace. `await rlm.spawn('sub-task', name='api-reviewer')` spawns a read-only explorer child and returns immediately after task admission with `rlm_child_id`, `name`, `session_dir`, and `model`; it never waits for or returns the child's answer.
+`name` is required: choose a stable child name that is unique among siblings.
+A child runs on your model; omit `model`, or pass exactly the selector `await rlm.find_models()` returns.
+Use `await rlm.list_subagents()` to recover direct child handles after admission.
+Fan-in results with `await rlm.collect(targets, timeout_ms=0)`: it returns typed snapshots of direct children (status, answer preview, error); an explicit timeout blocks only that call until the children settle or the deadline passes.
+In ha a child cannot outlive the turn: collect the results you need with a positive `timeout_ms` before you end the turn - children still running when the turn ends are canceled.
+Spawn independent children in separate calls. Delete a direct child explicitly with `await rlm.delete_subagent(child)` when it is no longer needed.
+For implementation work, use the `delegate` tool with role `coder`.";
+
 /// prime-agent's `buildSubagentGuidance`, mapped to ha's `delegate` tool.
 const SUBAGENT_GUIDANCE: &str = "# Delegating to sub-agents\n\
 \n\
@@ -123,6 +130,10 @@ impl SystemPromptBuilder {
             environment.limits.max_tool_calls,
             environment.limits.deadline.as_secs(),
         ));
+        if has("ipython") && has("delegate") {
+            parts.push(String::new());
+            parts.push(REPL_RECURSION.to_owned());
+        }
         if has("ipython") {
             parts.push(String::new());
             parts.push(REPL_CONTROL.to_owned());
@@ -177,31 +188,16 @@ pub fn append_skill_metadata(mut prompt: String, entries: &[SkillCatalogEntry]) 
          \n\
          <available_skills>\n",
     );
-    let mut listed = String::new();
-    let mut omitted = 0_usize;
     for entry in &visible {
-        let mut block = String::new();
         let _ = write!(
-            block,
+            prompt,
             "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>\n",
             escape_xml(&entry.name),
             escape_xml(&entry.description),
             escape_xml(&entry.path.display().to_string()),
         );
-        if listed.len() + block.len() > SKILLS_MAX_BYTES {
-            omitted += 1;
-            continue;
-        }
-        listed.push_str(&block);
     }
-    prompt.push_str(&listed);
     prompt.push_str("</available_skills>");
-    if omitted > 0 {
-        let _ = write!(
-            prompt,
-            "\n{omitted} more skill(s) are not listed here; list_skills shows every skill."
-        );
-    }
     prompt
 }
 
@@ -269,6 +265,13 @@ mod tests {
             SystemPromptBuilder::build(&environment(), &["delegate", "ipython", "web_search"]).text;
         assert!(full.contains("# Delegating to sub-agents"));
         assert!(full.contains("persistent Python REPL"));
+        assert!(full.contains("rlm.spawn"));
+        assert!(
+            !SystemPromptBuilder::build(&environment(), &["ipython"])
+                .text
+                .contains("rlm.spawn"),
+            "without workers there is no rlm.spawn to describe"
+        );
         assert!(full.contains("web_search"));
     }
 }

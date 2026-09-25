@@ -28,6 +28,7 @@ pub mod paths;
 pub mod permissions;
 pub mod project;
 pub mod prompt;
+pub mod repl;
 pub mod service;
 pub mod skills;
 pub mod terminal;

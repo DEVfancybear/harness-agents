@@ -1029,6 +1029,8 @@ pub struct AgentSessionService {
     goal: Option<String>,
     /// The stored goal must be erased by the next turn.
     goal_forgotten: bool,
+    /// The Python REPL, kept for the whole session so its state outlives a turn.
+    repl: Option<Arc<super::repl::ReplShared>>,
 }
 
 impl Drop for AgentSessionService {
@@ -1472,6 +1474,11 @@ impl AgentSessionService {
             config_overrides.model.clone(),
         )));
         let writer_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let repl = super::repl::ReplShared::from_environment(
+            &environment,
+            &context.paths.data_dir,
+            &context.project.root,
+        );
         let extraction = super::memory_worker::ExtractionWorker::new(
             context.project_store_dir(),
             Arc::clone(&writer_gate),
@@ -1512,6 +1519,7 @@ impl AgentSessionService {
             extraction,
             goal: None,
             goal_forgotten: false,
+            repl,
         }
     }
 
@@ -1702,6 +1710,7 @@ impl SessionPort for AgentSessionService {
             (None, true) => GoalRecord::Forget,
             (None, false) => GoalRecord::Keep,
         };
+        let repl = self.repl.clone();
         // Every user input opens its own session; the conversation is the chain of
         // sessions linked to the same task.
         let session_id = SessionId::generate();
@@ -1736,6 +1745,7 @@ impl SessionPort for AgentSessionService {
                 writer_gate,
                 extraction,
                 goal,
+                repl,
             ))
             .await;
         });
@@ -2566,6 +2576,7 @@ async fn run_turn(
     writer_gate: Arc<tokio::sync::Mutex<()>>,
     extraction: super::memory_worker::ExtractionWorker,
     goal: GoalRecord,
+    repl: Option<Arc<super::repl::ReplShared>>,
 ) {
     let send = |event| {
         let _ = sender.send(event);
@@ -3087,6 +3098,17 @@ async fn run_turn(
     let web_host = super::web::WebHost::from_environment(&environment);
     let goal_host =
         matches!(goal, GoalRecord::Active(_)).then(|| super::goal::GoalHost::new(sender.clone()));
+    let repl_host = match &repl {
+        Some(shared) => {
+            // `rlm.spawn` and its family run on this turn's delegated workers.
+            let requests: Arc<dyn super::repl::HostRequests> = match &delegate_host {
+                Some(host) => host.rlm_requests(config.model.clone()),
+                None => Arc::new(super::repl::NoHostRequests),
+            };
+            super::repl::ReplHost::for_turn(shared, requests).await
+        }
+        _ => None,
+    };
     let mut tools = ToolExecutionService::new(Arc::clone(&store))
         .with_policy(tool_policy)
         .with_hooks(config.hooks.clone());
@@ -3097,6 +3119,7 @@ async fn run_turn(
         skill_host.as_ref(),
         web_host.as_ref(),
         goal_host.as_ref(),
+        repl_host.as_ref(),
     ) {
         tools = tools.with_external(dispatcher);
     }
@@ -3108,6 +3131,7 @@ async fn run_turn(
         skill_host.as_ref(),
         web_host.as_ref(),
         goal_host.as_ref(),
+        repl_host.as_ref(),
     );
     let driver = match &external_tools {
         Some(tools) => driver.with_external(tools.clone()),

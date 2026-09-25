@@ -14,6 +14,13 @@ use harness_types::{
 };
 use serde::Serialize;
 
+/// The context window assumed for a model no table knows, in tokens.
+///
+/// prime-agent's model registry gives a custom model `contextWindow: 128000`; ha used
+/// 8192, which is smaller than almost any model still served and pushed the first
+/// request of a turn over budget and into compaction.
+pub const UNKNOWN_MODEL_CONTEXT_WINDOW: u64 = 128_000;
+
 /// Provider-neutral preset values for the existing default `DeepSeek` connection.
 /// Adapter code consumes the resolved fields; it does not know these defaults.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -466,25 +473,29 @@ pub fn resolve_layers(
         );
     }
 
-    let (context_window_tokens, context_window_layer, context_window_reason) =
-        if let Some((value, layer)) = model_context_windows.get(&provider.model).copied() {
-            (value, layer, None)
-        } else if let Some(value) = known_context_window(&provider.id, &provider.model) {
-            (
-                value,
-                ConfigLayer::Default,
-                Some("resolved from the built-in model table".to_owned()),
-            )
-        } else {
-            (
-                8192,
-                ConfigLayer::Default,
-                Some(format!(
-                    "notice: no context window is known for {}; using 8192",
-                    provider.model
-                )),
-            )
-        };
+    let (context_window_tokens, context_window_layer, context_window_reason) = if let Some((
+        value,
+        layer,
+    )) =
+        model_context_windows.get(&provider.model).copied()
+    {
+        (value, layer, None)
+    } else if let Some(value) = known_context_window(&provider.id, &provider.model) {
+        (
+            value,
+            ConfigLayer::Default,
+            Some("resolved from the built-in model table".to_owned()),
+        )
+    } else {
+        (
+            UNKNOWN_MODEL_CONTEXT_WINDOW,
+            ConfigLayer::Default,
+            Some(format!(
+                "notice: no context window is known for {}; using {UNKNOWN_MODEL_CONTEXT_WINDOW}",
+                provider.model
+            )),
+        )
+    };
     let context_window_notice = context_window_reason
         .as_deref()
         .filter(|reason| reason.contains("notice:"))
@@ -1243,7 +1254,7 @@ mod tests {
             .iter()
             .find(|entry| entry.key == "runtime.context_window_tokens")
             .expect("fallback window is explained");
-        assert_eq!(source.value, "8192");
+        assert_eq!(source.value, "128000");
         assert!(
             source
                 .reason

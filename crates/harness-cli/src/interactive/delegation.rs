@@ -32,6 +32,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::cost::{CostTracker, ModelPrice, Usage as CostUsage};
 use super::events::SessionEvent;
+use super::repl::{HostReply, HostRequests};
 
 const MAX_BRIEF_BYTES: usize = 8 * 1024;
 const CHILD_MAX_STEPS: u32 = 8;
@@ -62,6 +63,7 @@ const EXPLORER_DENY_TOOLS: &[&str] = &[
 
 /// Creates the per-turn worker scheduler and the external-tool adapter for it.
 pub struct DelegateHost {
+    inner: Arc<DelegateDispatcher>,
     scheduler: Arc<WorkerScheduler>,
     catalog: Arc<DelegateCatalog>,
     dispatcher: Arc<dyn ExternalToolDispatcher>,
@@ -120,7 +122,9 @@ impl DelegateHost {
             *ledger = Some(Arc::clone(scheduler.ledger()));
         }
         let catalog = Arc::new(DelegateCatalog);
-        let dispatcher: Arc<dyn ExternalToolDispatcher> = Arc::new(DelegateDispatcher {
+        let inner = Arc::new(DelegateDispatcher {
+            settled: Mutex::new(BTreeMap::new()),
+            settled_notify: tokio::sync::Notify::new(),
             scheduler: Arc::clone(&scheduler),
             workspace_manager: Arc::clone(&workspace_manager),
             store: Arc::clone(store),
@@ -128,7 +132,9 @@ impl DelegateHost {
             workspace,
             parent_cancellation: parent_cancellation.clone(),
         });
+        let dispatcher: Arc<dyn ExternalToolDispatcher> = Arc::clone(&inner) as _;
         Ok(Self {
+            inner,
             scheduler,
             catalog,
             dispatcher,
@@ -145,6 +151,16 @@ impl DelegateHost {
     #[must_use]
     pub fn dispatcher(&self) -> Arc<dyn ExternalToolDispatcher> {
         Arc::clone(&self.dispatcher)
+    }
+
+    /// The `rlm.*` host requests of the Python REPL, served by these workers.
+    #[must_use]
+    pub fn rlm_requests(&self, model: String) -> Arc<dyn HostRequests> {
+        Arc::new(RlmChildren {
+            dispatcher: Arc::clone(&self.inner),
+            model,
+            children: Mutex::new(Vec::new()),
+        })
     }
 
     pub fn summary(&self) -> Vec<String> {
@@ -210,7 +226,20 @@ impl ExternalToolCatalog for DelegateCatalog {
     }
 }
 
+/// A worker `start` admitted.
+struct StartedWorker {
+    task_id: TaskId,
+    role: AgentRole,
+    /// Stops the parent-cancellation watcher once the worker settles.
+    watcher_done: CancellationToken,
+    /// Cancels this worker alone.
+    cancellation: CancellationToken,
+}
+
 struct DelegateDispatcher {
+    /// Outcomes received by one waiter for another worker.
+    settled: Mutex<BTreeMap<TaskId, WorkerOutcome>>,
+    settled_notify: tokio::sync::Notify,
     scheduler: Arc<WorkerScheduler>,
     workspace_manager: Arc<WorkspaceManager>,
     store: Arc<SqliteStore>,
@@ -220,6 +249,220 @@ struct DelegateDispatcher {
 }
 
 impl DelegateDispatcher {
+    /// Admit and dispatch one worker, returning as soon as it is admitted - the
+    /// part of prime-agent's `rlm.spawn` that happens before the child runs.
+    #[allow(clippy::too_many_lines)]
+    async fn start(
+        &self,
+        role: AgentRole,
+        brief_text: String,
+    ) -> Result<StartedWorker, HarnessError> {
+        if self.parent_cancellation.is_cancelled() {
+            return Err(HarnessError::new(
+                ErrorCode::ProviderCanceled,
+                "parent turn was canceled before the explorer started",
+            ));
+        }
+        self.scheduler
+            .require_admission(1)
+            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+        let task_id = TaskId::generate();
+        let run_id = AgentRunId::generate();
+        let (workspace, base_commit, base_snapshot, worktree) = match role {
+            AgentRole::Explorer => (
+                self.workspace.clone(),
+                self.workspace.base_commit.clone(),
+                self.workspace.observed_fingerprint.as_str().to_owned(),
+                None,
+            ),
+            AgentRole::Coder => {
+                let snapshot = inspect_coder_input(
+                    &self.workspace_manager,
+                    &self.workspace_root,
+                    &self.workspace.project_id,
+                )
+                .await?;
+                let write_scope = vec![".".to_owned()];
+                let record = self
+                    .scheduler
+                    .create_worktree(&snapshot, &task_id, &run_id, &write_scope, 1)
+                    .await
+                    .map_err(coder_unavailable_error)?;
+                persist_worktree(&self.store, &record).await?;
+                let observation =
+                    harness_tools::observe_workspace(record.project_id.clone(), &record.path)
+                        .map_err(|error| {
+                            HarnessError::new(
+                                error.code(),
+                                format!("coder worktree cannot be observed: {error}"),
+                            )
+                        })?;
+                (
+                    observation,
+                    snapshot.base_commit,
+                    snapshot.fingerprint.as_str().to_owned(),
+                    Some(record),
+                )
+            }
+            _ => {
+                return Err(HarnessError::new(
+                    ErrorCode::RoleUnavailable,
+                    format!("role {} is not delegated by this host", role.as_str()),
+                ));
+            }
+        };
+        let brief = TaskBrief {
+            schema_version: harness_orchestrator::DELEGATION_CONTRACT_VERSION,
+            task_id: task_id.clone(),
+            title: brief_text.chars().take(80).collect(),
+            objective: brief_text.clone(),
+            acceptance_criteria: vec!["return a concise report answering the brief".to_owned()],
+            inputs: vec!["current workspace snapshot".to_owned()],
+            base_snapshot,
+            base_commit,
+            workspace,
+            grants: DelegationGrants {
+                project_id: self.workspace.project_id.clone(),
+                task_id: task_id.clone(),
+                actions: if role == AgentRole::Coder {
+                    vec![GrantAction::Read, GrantAction::Propose]
+                } else {
+                    vec![GrantAction::Read]
+                },
+                write_scope: worktree
+                    .as_ref()
+                    .map_or_else(Vec::new, |record| record.write_scope.clone()),
+                edit_workspace: role == AgentRole::Coder,
+                max_depth: 1,
+                budget: DelegationBudget::default(),
+            },
+            expected_artifacts: Vec::new(),
+            deadline_unix_ms: None,
+            role,
+        };
+        brief
+            .validate()
+            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+        let cancellation = CancellationToken::new();
+        let watcher_done = CancellationToken::new();
+        let watcher = watch_parent_cancellation(
+            self.parent_cancellation.clone(),
+            cancellation.clone(),
+            watcher_done.clone(),
+        );
+        self.scheduler
+            .dispatch(WorkerRequest {
+                task_id: task_id.clone(),
+                run_id,
+                generation: 1,
+                depth: 1,
+                brief,
+                worktree,
+                cancellation: cancellation.clone(),
+            })
+            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+        drop(watcher);
+        Ok(StartedWorker {
+            task_id,
+            role,
+            watcher_done,
+            cancellation,
+        })
+    }
+
+    /// Wait for worker `task_id` to settle, or until `deadline`.
+    ///
+    /// The scheduler has one settlement queue. The `delegate` tool and every
+    /// `rlm.collect` may wait at once, so whoever receives an outcome for another
+    /// worker parks it here and wakes the others: no outcome is lost to the wrong
+    /// waiter. `Ok(None)` means the deadline passed first.
+    async fn wait(
+        &self,
+        task_id: &TaskId,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Option<WorkerOutcome>, HarnessError> {
+        loop {
+            let notified = self.settled_notify.notified();
+            if let Some(outcome) = self
+                .settled
+                .lock()
+                .ok()
+                .and_then(|mut settled| settled.remove(task_id))
+            {
+                return Ok(Some(outcome));
+            }
+            let far = tokio::time::Instant::now() + Duration::from_hours(24);
+            tokio::select! {
+                received = self.scheduler.next_settled() => match received {
+                    Some(Ok((settled_task, outcome))) => {
+                        if &settled_task == task_id {
+                            return Ok(Some(outcome));
+                        }
+                        if let Ok(mut settled) = self.settled.lock() {
+                            settled.insert(settled_task, outcome);
+                        }
+                        self.settled_notify.notify_waiters();
+                    }
+                    Some(Err(error)) => {
+                        return Err(HarnessError::new(error.code(), error.to_string()));
+                    }
+                    None => {
+                        // Nothing is outstanding: the outcome is parked or was never
+                        // produced.
+                        return Ok(self
+                            .settled
+                            .lock()
+                            .ok()
+                            .and_then(|mut settled| settled.remove(task_id)));
+                    }
+                },
+                () = notified => {}
+                () = tokio::time::sleep_until(deadline.unwrap_or(far)) => return Ok(None),
+                () = self.parent_cancellation.cancelled() => {
+                    return Err(HarnessError::new(
+                        ErrorCode::ProviderCanceled,
+                        "parent canceled delegated work",
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The report of a settled worker, as the `delegate` tool returns it.
+    fn report(role: AgentRole, outcome: WorkerOutcome) -> Result<Value, HarnessError> {
+        let report = match outcome {
+            WorkerOutcome::Reported(report) => report,
+            WorkerOutcome::Failed { error } => {
+                return Err(HarnessError::new(error.code(), error.message().to_owned()));
+            }
+            WorkerOutcome::NoReport { reason } | WorkerOutcome::OutcomeUnknown { reason } => {
+                return Err(HarnessError::new(ErrorCode::ResultIncomplete, reason));
+            }
+            WorkerOutcome::Observed(_) => {
+                return Err(HarnessError::new(
+                    ErrorCode::ResultIncomplete,
+                    format!(
+                        "{} returned an editing observation without a report",
+                        role.as_str()
+                    ),
+                ));
+            }
+        };
+        let receipt_digest = report.detail["receipts_digest"]
+            .as_str()
+            .unwrap_or("sha256:unavailable");
+        Ok(json!({
+            "role": role.as_str(),
+            "text": report.summary,
+            "receipts_digest": receipt_digest,
+            "steps": report.detail["steps"],
+            "tool_calls": report.detail["tool_calls"],
+            "worktree_id": report.detail["worktree_id"],
+            "worktree_path": report.detail["worktree_path"],
+            "branch": report.detail["branch"],
+        }))
+    }
+
     fn arguments(arguments: &Value) -> Result<(AgentRole, String), HarnessError> {
         let object = arguments.as_object().ok_or_else(|| {
             HarnessError::new(
@@ -411,168 +654,358 @@ impl ExternalToolDispatcher for DelegateDispatcher {
                 ));
             }
             let (role, brief_text) = Self::arguments(arguments)?;
-            if self.parent_cancellation.is_cancelled() {
-                return Err(HarnessError::new(
-                    ErrorCode::ProviderCanceled,
-                    "parent turn was canceled before the explorer started",
-                ));
-            }
-            self.scheduler
-                .require_admission(1)
-                .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
-            let task_id = TaskId::generate();
-            let run_id = AgentRunId::generate();
-            let (workspace, base_commit, base_snapshot, worktree) = match role {
-                AgentRole::Explorer => (
-                    self.workspace.clone(),
-                    self.workspace.base_commit.clone(),
-                    self.workspace.observed_fingerprint.as_str().to_owned(),
-                    None,
-                ),
-                AgentRole::Coder => {
-                    let snapshot = inspect_coder_input(
-                        &self.workspace_manager,
-                        &self.workspace_root,
-                        &self.workspace.project_id,
-                    )
-                    .await?;
-                    let write_scope = vec![".".to_owned()];
-                    let record = self
-                        .scheduler
-                        .create_worktree(&snapshot, &task_id, &run_id, &write_scope, 1)
-                        .await
-                        .map_err(coder_unavailable_error)?;
-                    persist_worktree(&self.store, &record).await?;
-                    let observation =
-                        harness_tools::observe_workspace(record.project_id.clone(), &record.path)
-                            .map_err(|error| {
-                            HarnessError::new(
-                                error.code(),
-                                format!("coder worktree cannot be observed: {error}"),
-                            )
-                        })?;
-                    (
-                        observation,
-                        snapshot.base_commit,
-                        snapshot.fingerprint.as_str().to_owned(),
-                        Some(record),
-                    )
-                }
-                _ => {
-                    return Err(HarnessError::new(
-                        ErrorCode::RoleUnavailable,
-                        format!("role {} is not delegated by this host", role.as_str()),
-                    ));
-                }
-            };
-            let brief = TaskBrief {
-                schema_version: harness_orchestrator::DELEGATION_CONTRACT_VERSION,
-                task_id: task_id.clone(),
-                title: brief_text.chars().take(80).collect(),
-                objective: brief_text.clone(),
-                acceptance_criteria: vec!["return a concise report answering the brief".to_owned()],
-                inputs: vec!["current workspace snapshot".to_owned()],
-                base_snapshot,
-                base_commit,
-                workspace,
-                grants: DelegationGrants {
-                    project_id: self.workspace.project_id.clone(),
-                    task_id: task_id.clone(),
-                    actions: if role == AgentRole::Coder {
-                        vec![GrantAction::Read, GrantAction::Propose]
-                    } else {
-                        vec![GrantAction::Read]
-                    },
-                    write_scope: worktree
-                        .as_ref()
-                        .map_or_else(Vec::new, |record| record.write_scope.clone()),
-                    edit_workspace: role == AgentRole::Coder,
-                    max_depth: 1,
-                    budget: DelegationBudget::default(),
-                },
-                expected_artifacts: Vec::new(),
-                deadline_unix_ms: None,
-                role,
-            };
-            brief
-                .validate()
-                .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
-            let cancellation = CancellationToken::new();
-            let watcher_done = CancellationToken::new();
-            let watcher = watch_parent_cancellation(
-                self.parent_cancellation.clone(),
-                cancellation.clone(),
-                watcher_done.clone(),
-            );
-            self.scheduler
-                .dispatch(WorkerRequest {
-                    task_id: task_id.clone(),
-                    run_id,
-                    generation: 1,
-                    depth: 1,
-                    brief,
-                    worktree,
-                    cancellation,
-                })
-                .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
-            let settled = tokio::select! {
-                result = self.scheduler.next_settled() => result,
-                () = self.parent_cancellation.cancelled() => Some(Err(OrchestratorError::new(
-                    ErrorCode::ProviderCanceled,
-                    "parent canceled delegated work",
-                ))),
-            };
-            watcher_done.cancel();
-            let _ = watcher.await;
-            let (settled_task, outcome) = settled
-                .ok_or_else(|| {
-                    HarnessError::new(
-                        ErrorCode::ServiceUnavailable,
-                        "explorer result channel closed",
-                    )
-                })?
-                .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
-            if settled_task != task_id {
-                return Err(HarnessError::new(
-                    ErrorCode::TaskOwnershipConflict,
-                    "worker scheduler returned an outcome for a different task",
-                ));
-            }
-            let report = match outcome {
-                WorkerOutcome::Reported(report) => report,
-                WorkerOutcome::Failed { error } => {
-                    return Err(HarnessError::new(error.code(), error.message().to_owned()));
-                }
-                WorkerOutcome::NoReport { reason } | WorkerOutcome::OutcomeUnknown { reason } => {
-                    return Err(HarnessError::new(ErrorCode::ResultIncomplete, reason));
-                }
-                WorkerOutcome::Observed(_) => {
-                    return Err(HarnessError::new(
-                        ErrorCode::ResultIncomplete,
-                        format!(
-                            "{} returned an editing observation without a report",
-                            role.as_str()
-                        ),
-                    ));
-                }
-            };
-            let receipt_digest = report.detail["receipts_digest"]
-                .as_str()
-                .unwrap_or("sha256:unavailable");
+            let started = self.start(role, brief_text).await?;
+            let outcome = self.wait(&started.task_id, None).await;
+            started.watcher_done.cancel();
+            let outcome = outcome?.ok_or_else(|| {
+                HarnessError::new(
+                    ErrorCode::ServiceUnavailable,
+                    "explorer result channel closed",
+                )
+            })?;
             Ok(ToolOutput::ExternalTool {
                 plugin_id: "delegate".to_owned(),
                 tool_name: "delegate".to_owned(),
-                payload: json!({
-                    "role": role.as_str(),
-                    "text": report.summary,
-                    "receipts_digest": receipt_digest,
-                    "steps": report.detail["steps"],
-                    "tool_calls": report.detail["tool_calls"],
-                    "worktree_id": report.detail["worktree_id"],
-                    "worktree_path": report.detail["worktree_path"],
-                    "branch": report.detail["branch"],
-                }),
+                payload: Self::report(started.role, outcome)?,
                 inflight: 1,
+            })
+        })
+    }
+}
+
+/// Longest child answer `rlm.collect` and `rlm.list_subagents` return.
+const RLM_ANSWER_MAX_CHARS: usize = 8_000;
+
+/// prime-agent's `rlm.spawn` family, served by this turn's workers.
+///
+/// A child is an explorer worker - the same one the `delegate` tool starts - and
+/// `rlm.spawn` returns the moment it is admitted, as prime-agent's does. What differs
+/// is lifetime: a worker writes through the turn's store, so it cannot outlive the
+/// turn; children still running when the turn ends are canceled with it. Collect
+/// what you need with `rlm.collect(..., timeout_ms=...)` before the turn ends.
+struct RlmChildren {
+    dispatcher: Arc<DelegateDispatcher>,
+    model: String,
+    children: Mutex<Vec<RlmChild>>,
+}
+
+struct RlmChild {
+    task_id: TaskId,
+    name: String,
+    started: std::time::Instant,
+    watcher_done: CancellationToken,
+    cancellation: CancellationToken,
+    state: RlmChildState,
+}
+
+#[derive(Clone)]
+enum RlmChildState {
+    Running,
+    Done {
+        answer: String,
+        tool_calls: Option<i64>,
+        duration_ms: i64,
+    },
+    Error {
+        error: String,
+        duration_ms: i64,
+    },
+    Cancelled,
+}
+
+impl RlmChildren {
+    fn session_dir(&self) -> String {
+        self.dispatcher.workspace_root.display().to_string()
+    }
+
+    /// Find children by id or name; an empty selection means every child.
+    fn select(&self, selectors: &[String]) -> Result<Vec<TaskId>, String> {
+        let children = self
+            .children
+            .lock()
+            .map_err(|_| "the child registry is unavailable".to_owned())?;
+        if selectors.is_empty() {
+            return Ok(children.iter().map(|child| child.task_id.clone()).collect());
+        }
+        selectors
+            .iter()
+            .map(|selector| {
+                children
+                    .iter()
+                    .find(|child| child.task_id.as_str() == selector || &child.name == selector)
+                    .map(|child| child.task_id.clone())
+                    .ok_or_else(|| format!("no child named or numbered {selector:?}"))
+            })
+            .collect()
+    }
+
+    /// Settle `task_id` if its outcome arrives before `deadline`.
+    async fn settle(&self, task_id: &TaskId, deadline: tokio::time::Instant) {
+        let running = self.children.lock().ok().is_some_and(|children| {
+            children.iter().any(|child| {
+                &child.task_id == task_id && matches!(child.state, RlmChildState::Running)
+            })
+        });
+        if !running {
+            return;
+        }
+        let outcome = self.dispatcher.wait(task_id, Some(deadline)).await;
+        let Ok(mut children) = self.children.lock() else {
+            return;
+        };
+        let Some(child) = children.iter_mut().find(|child| &child.task_id == task_id) else {
+            return;
+        };
+        let duration_ms = i64::try_from(child.started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        child.state = match outcome {
+            Ok(None) => return,
+            Ok(Some(outcome)) => match DelegateDispatcher::report(AgentRole::Explorer, outcome) {
+                Ok(report) => RlmChildState::Done {
+                    answer: report["text"].as_str().unwrap_or_default().to_owned(),
+                    tool_calls: report["tool_calls"].as_i64(),
+                    duration_ms,
+                },
+                Err(error) => RlmChildState::Error {
+                    error: error.message().to_owned(),
+                    duration_ms,
+                },
+            },
+            Err(error) => RlmChildState::Error {
+                error: error.message().to_owned(),
+                duration_ms,
+            },
+        };
+        child.watcher_done.cancel();
+    }
+
+    fn row(&self, child: &RlmChild) -> Value {
+        let (status, answer, duration, tool_calls) = match &child.state {
+            RlmChildState::Running => ("running", None, None, None),
+            RlmChildState::Done {
+                answer,
+                tool_calls,
+                duration_ms,
+            } => (
+                "completed",
+                Some(clip(answer)),
+                Some(*duration_ms),
+                *tool_calls,
+            ),
+            RlmChildState::Error { duration_ms, .. } => ("error", None, Some(*duration_ms), None),
+            RlmChildState::Cancelled => ("error", None, None, None),
+        };
+        json!({
+            "rlm_child_id": child.task_id.as_str(),
+            "session_name": child.name,
+            "session_dir": self.session_dir(),
+            "status": status,
+            "answer_preview": answer,
+            "duration_ms": duration,
+            "tool_use_count": tool_calls,
+        })
+    }
+
+    fn result(&self, child: &RlmChild) -> Value {
+        let (status, settled, answer, error, duration, tool_calls) = match &child.state {
+            RlmChildState::Running => ("running", false, None, None, None, None),
+            RlmChildState::Done {
+                answer,
+                tool_calls,
+                duration_ms,
+            } => (
+                "done",
+                true,
+                Some(clip(answer)),
+                None,
+                Some(*duration_ms),
+                *tool_calls,
+            ),
+            RlmChildState::Error { error, duration_ms } => (
+                "error",
+                true,
+                None,
+                Some(error.clone()),
+                Some(*duration_ms),
+                None,
+            ),
+            RlmChildState::Cancelled => ("cancelled", true, None, None, None, None),
+        };
+        json!({
+            "rlm_child_id": child.task_id.as_str(),
+            "session_name": child.name,
+            "session_dir": self.session_dir(),
+            "status": status,
+            "settled": settled,
+            "answer_preview": answer,
+            "error": error,
+            "duration_ms": duration,
+            "tool_use_count": tool_calls,
+        })
+    }
+
+    async fn spawn(&self, request: &Value) -> Result<Value, String> {
+        let prompt = request["prompt"]
+            .as_str()
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty() && prompt.len() <= MAX_BRIEF_BYTES)
+            .ok_or_else(|| format!("rlm.spawn needs a task of 1..={MAX_BRIEF_BYTES} bytes"))?;
+        let kwargs = &request["kwargs"];
+        let name = kwargs["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or("rlm.spawn needs a name")?
+            .to_owned();
+        if let Some(model) = kwargs["model"].as_str()
+            && model != self.model
+        {
+            return Err(format!(
+                "a child runs on the parent's model ({}) in ha",
+                self.model
+            ));
+        }
+        if !kwargs["thinking"].is_null() {
+            return Err("thinking levels are not configurable in ha".to_owned());
+        }
+        if self
+            .children
+            .lock()
+            .map_err(|_| "the child registry is unavailable")?
+            .iter()
+            .any(|child| child.name == name)
+        {
+            return Err(format!("a child named {name:?} already exists"));
+        }
+        let started = self
+            .dispatcher
+            .start(AgentRole::Explorer, prompt.to_owned())
+            .await
+            .map_err(|error| error.message().to_owned())?;
+        let handle = json!({
+            "rlm_child_id": started.task_id.as_str(),
+            "name": name,
+            "session_dir": self.session_dir(),
+            "model": self.model,
+        });
+        self.children
+            .lock()
+            .map_err(|_| "the child registry is unavailable")?
+            .push(RlmChild {
+                task_id: started.task_id,
+                name,
+                started: std::time::Instant::now(),
+                watcher_done: started.watcher_done,
+                cancellation: started.cancellation,
+                state: RlmChildState::Running,
+            });
+        Ok(handle)
+    }
+
+    async fn collect(&self, request: &Value) -> Result<Value, String> {
+        let selectors = request["targets"]
+            .as_array()
+            .map(|targets| {
+                targets
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let timeout = request["timeout_ms"].as_u64().unwrap_or(0);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout);
+        let targets = self.select(&selectors)?;
+        for task_id in &targets {
+            self.settle(task_id, deadline).await;
+        }
+        let children = self
+            .children
+            .lock()
+            .map_err(|_| "the child registry is unavailable")?;
+        let results = targets
+            .iter()
+            .filter_map(|task_id| children.iter().find(|child| &child.task_id == task_id))
+            .map(|child| self.result(child))
+            .collect::<Vec<_>>();
+        Ok(json!({ "results": results }))
+    }
+
+    async fn list(&self) -> Result<Value, String> {
+        let now = tokio::time::Instant::now();
+        for task_id in self.select(&[])? {
+            self.settle(&task_id, now).await;
+        }
+        let children = self
+            .children
+            .lock()
+            .map_err(|_| "the child registry is unavailable")?;
+        Ok(json!({ "subagents": children.iter().map(|child| self.row(child)).collect::<Vec<_>>() }))
+    }
+
+    fn delete(&self, request: &Value) -> Result<Value, String> {
+        let selector = request["target"].as_str().unwrap_or_default().to_owned();
+        let task_id = self
+            .select(std::slice::from_ref(&selector))?
+            .pop()
+            .ok_or("no such child")?;
+        let mut children = self
+            .children
+            .lock()
+            .map_err(|_| "the child registry is unavailable")?;
+        let index = children
+            .iter()
+            .position(|child| child.task_id == task_id)
+            .ok_or("no such child")?;
+        let mut child = children.remove(index);
+        if matches!(child.state, RlmChildState::Running) {
+            child.cancellation.cancel();
+            child.watcher_done.cancel();
+            child.state = RlmChildState::Cancelled;
+        }
+        Ok(json!({ "subagent": self.row(&child) }))
+    }
+
+    fn models(&self, request: &Value) -> Value {
+        let query = request["query"].as_str().unwrap_or_default().to_lowercase();
+        let models = if query.is_empty() || self.model.to_lowercase().contains(&query) {
+            vec![json!({
+                "provider": "ha",
+                "id": self.model,
+                "name": self.model,
+                "selector": self.model,
+            })]
+        } else {
+            Vec::new()
+        };
+        json!({ "models": models })
+    }
+}
+
+fn clip(text: &str) -> String {
+    if text.chars().count() <= RLM_ANSWER_MAX_CHARS {
+        return text.to_owned();
+    }
+    let kept = text.chars().take(RLM_ANSWER_MAX_CHARS).collect::<String>();
+    format!("{kept}\n[answer cut at {RLM_ANSWER_MAX_CHARS} characters]")
+}
+
+impl HostRequests for RlmChildren {
+    fn handle<'a>(&'a self, request: &'a Value) -> HostReply<'a> {
+        Box::pin(async move {
+            let kind = request["type"].as_str().unwrap_or_default();
+            Some(match kind {
+                "rlm.run" => self.spawn(request).await,
+                "rlm.collect" => self.collect(request).await,
+                "rlm.list_subagents" => self.list().await,
+                "rlm.delete_subagent" => self.delete(request),
+                "rlm.find_models" => Ok(self.models(request)),
+                "rlm.progress.note" => Err(
+                    "progress notes are sent by child agents; this is the root agent".to_owned(),
+                ),
+                "rlm.create_session" => {
+                    Err("separate top-level sessions are not available in ha".to_owned())
+                }
+                _ => return None,
             })
         })
     }
@@ -1128,6 +1561,214 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(repo.join("uncommitted.txt")).expect("user change remains"),
             "preserve me\n"
+        );
+    }
+
+    /// Reports each brief back as its answer; "slow" briefs take a moment, "fail"
+    /// briefs fail.
+    struct ScriptedBackend;
+
+    impl harness_orchestrator::WorkerBackend for ScriptedBackend {
+        fn dispatch(
+            &self,
+            request: harness_orchestrator::WorkerRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = harness_orchestrator::WorkerOutcome> + Send + '_>,
+        > {
+            Box::pin(async move {
+                let objective = request.brief.objective.clone();
+                if objective.contains("slow") {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+                if objective.contains("fail") {
+                    return harness_orchestrator::WorkerOutcome::Failed {
+                        error: harness_orchestrator::OrchestratorError::new(
+                            ErrorCode::ServiceUnavailable,
+                            "scripted failure",
+                        ),
+                    };
+                }
+                harness_orchestrator::WorkerOutcome::Reported(Box::new(
+                    harness_orchestrator::DelegatedResult {
+                        schema_version: harness_orchestrator::DELEGATION_CONTRACT_VERSION,
+                        result_id: "result".to_owned(),
+                        task_id: request.task_id.clone(),
+                        worker: harness_orchestrator::WorkerRef {
+                            profile_id: harness_types::AgentProfileId::generate(),
+                            run_id: request.run_id,
+                            role: request.brief.role,
+                            generation: request.generation,
+                        },
+                        outcome: harness_orchestrator::DelegatedOutcome::Completed,
+                        summary: format!("answer: {objective}"),
+                        artifact_refs: Vec::new(),
+                        base_revision: request.brief.base_commit.clone(),
+                        result_revision: request.brief.base_commit.clone(),
+                        checked_revisions: Vec::new(),
+                        check_receipts: Vec::new(),
+                        usage: harness_orchestrator::BudgetUsage {
+                            model_requests: 1,
+                            retries: 0,
+                        },
+                        detail: serde_json::json!({"steps": 1, "tool_calls": 2}),
+                    },
+                ))
+            })
+        }
+    }
+
+    /// prime-agent's `rlm.spawn` family over this turn's workers: spawn returns at
+    /// admission, collect waits within its timeout, and an outcome one waiter
+    /// receives for another child is kept for it rather than lost.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "one scenario, told in order")]
+    async fn rlm_children_spawn_collect_list_and_delete() {
+        use super::{DelegateDispatcher, RlmChildren};
+        use crate::interactive::repl::HostRequests;
+        use serde_json::{Value, json};
+
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let repo = temporary.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo directory");
+        clean_repository(&repo);
+        let store = Arc::new(
+            harness_store_sqlite::SqliteStore::open_writer(
+                harness_store_sqlite::WriterOpenOptions::new(
+                    temporary.path().join("store"),
+                    harness_types::HostId::generate(),
+                ),
+            )
+            .await
+            .expect("store"),
+        );
+        let manager = Arc::new(WorkspaceManager::new(temporary.path().join("delegation")));
+        let scheduler = Arc::new(
+            WorkerScheduler::new(
+                SchedulerConfig {
+                    max_concurrent_workers: 3,
+                    max_depth: 1,
+                    max_queued_workers: 3,
+                    budget: harness_orchestrator::DelegationBudget::default(),
+                },
+                Arc::new(ScriptedBackend),
+                Some(Arc::clone(&manager)),
+            )
+            .expect("scheduler"),
+        );
+        let workspace = harness_tools::observe_workspace(ProjectId::generate(), &repo)
+            .expect("workspace observation");
+        let children = RlmChildren {
+            dispatcher: Arc::new(DelegateDispatcher {
+                settled: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+                settled_notify: tokio::sync::Notify::new(),
+                scheduler,
+                workspace_manager: manager,
+                store,
+                workspace_root: repo.clone(),
+                workspace,
+                parent_cancellation: CancellationToken::new(),
+            }),
+            model: "fixture-model".to_owned(),
+            children: std::sync::Mutex::new(Vec::new()),
+        };
+        let ask = |request: Value| {
+            let children = &children;
+            async move {
+                children
+                    .handle(&request)
+                    .await
+                    .expect("a known request type")
+            }
+        };
+
+        let quick = ask(
+            json!({"type": "rlm.run", "prompt": "map the parser", "kwargs": {"name": "quick"}}),
+        )
+        .await
+        .expect("spawn");
+        assert_eq!(quick["name"], "quick");
+        assert_eq!(quick["model"], "fixture-model");
+        let slow =
+            ask(json!({"type": "rlm.run", "prompt": "slow survey", "kwargs": {"name": "slow"}}))
+                .await
+                .expect("spawn returns at admission, before the slow child finishes");
+        assert!(
+            ask(json!({"type": "rlm.run", "prompt": "again", "kwargs": {"name": "quick"}}))
+                .await
+                .is_err(),
+            "names are unique among siblings"
+        );
+        assert!(
+            ask(json!({"type": "rlm.run", "prompt": "x", "kwargs": {"name": "other", "model": "else"}}))
+                .await
+                .expect_err("another model")
+                .contains("parent's model")
+        );
+
+        // Collect the slow child first: the quick child's outcome arrives while
+        // waiting and must be kept for it.
+        let collected = ask(
+            json!({"type": "rlm.collect", "targets": [slow["rlm_child_id"]], "timeout_ms": 10_000}),
+        )
+        .await
+        .expect("collect");
+        let result = &collected["results"][0];
+        assert_eq!(result["status"], "done", "{collected}");
+        assert_eq!(result["settled"], true);
+        assert_eq!(result["answer_preview"], "answer: slow survey");
+        assert_eq!(result["tool_use_count"], 2);
+        let collected = ask(json!({"type": "rlm.collect", "targets": ["quick"], "timeout_ms": 0}))
+            .await
+            .expect("collect by name");
+        assert_eq!(
+            collected["results"][0]["answer_preview"],
+            "answer: map the parser"
+        );
+
+        let listed = ask(json!({"type": "rlm.list_subagents"}))
+            .await
+            .expect("list");
+        let rows = listed["subagents"].as_array().expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|row| row["status"] == "completed"),
+            "{listed}"
+        );
+
+        let deleted = ask(json!({"type": "rlm.delete_subagent", "target": "quick"}))
+            .await
+            .expect("delete");
+        assert_eq!(deleted["subagent"]["session_name"], "quick");
+        let listed = ask(json!({"type": "rlm.list_subagents"}))
+            .await
+            .expect("list");
+        assert_eq!(listed["subagents"].as_array().expect("rows").len(), 1);
+
+        let failed =
+            ask(json!({"type": "rlm.run", "prompt": "fail please", "kwargs": {"name": "broken"}}))
+                .await
+                .expect("spawn");
+        let collected = ask(json!({"type": "rlm.collect", "targets": [failed["rlm_child_id"]], "timeout_ms": 10_000}))
+            .await
+            .expect("collect");
+        assert_eq!(collected["results"][0]["status"], "error");
+        assert!(
+            collected["results"][0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("scripted failure"))
+        );
+
+        assert!(
+            ask(json!({"type": "rlm.progress.note", "message": "hi"}))
+                .await
+                .is_err(),
+            "the root sends no progress notes"
+        );
+        assert!(
+            children
+                .handle(&json!({"type": "custom.thing"}))
+                .await
+                .is_none()
         );
     }
 

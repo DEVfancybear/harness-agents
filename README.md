@@ -13,6 +13,7 @@
 - **Chat in the terminal.** `ha` opens an interactive app (TUI, or plain line mode). `ha exec "…"` runs one prompt for scripts and CI, with `text`, `json` or `stream-json` output.
 - **Works on your code with guarded tools.** Read, search, glob, patch/edit/write files, run processes and shell commands, inspect Git, ask you a question, delegate to a sub-agent. Every action goes through the host policy: `y` runs once, `a` allows the rest of the turn, `n` refuses; `/mode` sets `ask`, `auto-edit` or `full-auto`.
 - **Reads the web.** `web_search` (Google via Serper with `SERPER_API_KEY`, DuckDuckGo without a key) and `web_fetch` (a page as readable text with its links), so research skills such as `deep-research` have something to search with. Local and private addresses are refused.
+- **Runs a persistent Python REPL.** The `ipython` tool is prime-agent's kernel: variables persist across cells and turns, `bash('cmd')` starts commands in the background and returns a handle, and `await rlm.spawn(...)` / `rlm.collect(...)` run explorer children in parallel. Needs Python 3.11+ (and Git Bash on Windows for `bash()`); each cell asks for approval like `run_shell` unless the mode is `full-auto`.
 - **Works toward a goal.** `/goal <objective>` keeps the app working across turns until the model calls `goal_complete` (at most 10 automatic turns, then it pauses). `/goal status|pause|resume|clear`; Ctrl-C pauses it, and `/resume` brings it back paused. Long turns shorten their oldest tool results to stay within the context budget.
 - **Resumes conversations.** `/resume` lists your conversations (one row each) and replays the chosen one's questions and answers to the model and on screen.
 - **Learns from the conversation.** Memory is on by default: after a turn, the model extracts durable facts (preferences, decisions, conventions, corrections) in the background; facts with confidence ≥ 0.7 are used from then on, the rest wait for review in `ha memory candidates`. Say "remember that …" / "ghi nhớ …" to store something verbatim.
@@ -81,6 +82,9 @@ Settings merge default → user `config.toml` → trusted project `.harness/conf
 | `HA_SKILL_PATHS` | — | Extra skill directories, separated like `PATH` |
 | `SERPER_API_KEY` | — | Google results for `web_search` (without it: DuckDuckGo) |
 | `HA_WEB` | on | `off` removes `web_search` and `web_fetch` |
+| `HA_REPL` | on | `off` removes the `ipython` tool |
+| `HA_PYTHON` | `python3`, `python`, `py -3` | Interpreter for the REPL kernel (3.11 or newer) |
+| `HA_REPL_SHELL` | Git Bash on Windows, `/bin/bash` | Absolute path of the POSIX shell `bash()` runs in |
 | `HA_UI` | auto | `plain` forces line mode |
 
 ### Development
@@ -108,6 +112,7 @@ CI (`.github/workflows/ci.yml`) runs the phase gates (`scripts/Verify-Phase.ps1`
 - **Chat trong terminal.** `ha` mở ứng dụng tương tác (TUI, hoặc chế độ dòng lệnh thuần). `ha exec "…"` chạy một prompt cho script và CI, xuất `text`, `json` hoặc `stream-json`.
 - **Làm việc với code qua công cụ có kiểm soát.** Đọc, tìm kiếm, glob, sửa/ghi file, chạy tiến trình và lệnh shell, xem Git, hỏi lại bạn, giao việc cho agent con. Mọi thao tác đi qua chính sách của host: `y` chạy một lần, `a` cho phép đến hết lượt, `n` từ chối; `/mode` chọn `ask`, `auto-edit` hoặc `full-auto`.
 - **Đọc web.** `web_search` (Google qua Serper khi có `SERPER_API_KEY`, DuckDuckGo khi không có key) và `web_fetch` (một trang dưới dạng văn bản kèm link), để các skill nghiên cứu như `deep-research` có công cụ tìm kiếm. Địa chỉ local và mạng nội bộ bị từ chối.
+- **Python REPL bền.** Tool `ipython` là kernel của prime-agent: biến được giữ qua các cell và các lượt, `bash('cmd')` chạy lệnh nền và trả về handle, `await rlm.spawn(...)` / `rlm.collect(...)` chạy song song các agent con (explorer). Cần Python 3.11+ (và Git Bash trên Windows cho `bash()`); mỗi cell hỏi phê duyệt như `run_shell`, trừ chế độ `full-auto`.
 - **Làm tới khi xong mục tiêu.** `/goal <mục tiêu>` giữ ứng dụng làm việc qua nhiều lượt cho tới khi model gọi `goal_complete` (tối đa 10 lượt tự động, sau đó tạm dừng). `/goal status|pause|resume|clear`; Ctrl-C tạm dừng mục tiêu, `/resume` khôi phục nó ở trạng thái tạm dừng. Lượt dài tự rút gọn các kết quả tool cũ nhất để không vượt ngân sách context.
 - **Tiếp tục hội thoại.** `/resume` liệt kê các hội thoại (mỗi hội thoại một dòng) và phát lại các câu hỏi, câu trả lời của hội thoại được chọn cho model và trên màn hình.
 - **Học từ hội thoại.** Memory mặc định bật: sau mỗi lượt, model trích ra ở chế độ nền các fact bền (sở thích, quyết định, quy ước, chỉnh sửa); fact có confidence ≥ 0.7 được dùng từ đó, phần còn lại chờ duyệt trong `ha memory candidates`. Nói "ghi nhớ …" / "remember that …" để lưu nguyên văn.
@@ -176,6 +181,9 @@ Cấu hình được gộp theo thứ tự mặc định → `config.toml` của
 | `HA_SKILL_PATHS` | — | Thư mục skill bổ sung, phân tách như `PATH` |
 | `SERPER_API_KEY` | — | Kết quả Google cho `web_search` (không có thì dùng DuckDuckGo) |
 | `HA_WEB` | bật | `off` để gỡ `web_search` và `web_fetch` |
+| `HA_REPL` | bật | `off` để gỡ tool `ipython` |
+| `HA_PYTHON` | `python3`, `python`, `py -3` | Trình thông dịch cho kernel REPL (3.11 trở lên) |
+| `HA_REPL_SHELL` | Git Bash trên Windows, `/bin/bash` | Đường dẫn tuyệt đối tới shell POSIX mà `bash()` dùng |
 | `HA_UI` | tự động | `plain` để ép chế độ dòng lệnh |
 
 ### Phát triển

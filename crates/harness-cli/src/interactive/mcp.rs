@@ -484,6 +484,7 @@ struct CatalogMux {
     skills: Option<ExternalTools>,
     web: Option<ExternalTools>,
     goal: Option<ExternalTools>,
+    repl: Option<ExternalTools>,
 }
 
 impl ExternalToolCatalog for CatalogMux {
@@ -495,6 +496,7 @@ impl ExternalToolCatalog for CatalogMux {
             .chain(self.skills.iter())
             .chain(self.web.iter())
             .chain(self.goal.iter())
+            .chain(self.repl.iter())
             .flat_map(ExternalTools::schemas)
             .collect()
     }
@@ -528,6 +530,11 @@ impl ExternalToolCatalog for CatalogMux {
                     .as_ref()
                     .and_then(|tools| tools.resolve(name, arguments))
             })
+            .or_else(|| {
+                self.repl
+                    .as_ref()
+                    .and_then(|tools| tools.resolve(name, arguments))
+            })
     }
 }
 
@@ -538,6 +545,7 @@ pub fn combined_tools_with_delegate(
     skills: Option<&super::skills::SkillHost>,
     web: Option<&super::web::WebHost>,
     goal: Option<&super::goal::GoalHost>,
+    repl: Option<&super::repl::ReplHost>,
 ) -> Option<ExternalTools> {
     if mcp.is_none()
         && extensions.is_none()
@@ -545,6 +553,7 @@ pub fn combined_tools_with_delegate(
         && skills.is_none()
         && web.is_none()
         && goal.is_none()
+        && repl.is_none()
     {
         return None;
     }
@@ -555,6 +564,7 @@ pub fn combined_tools_with_delegate(
         skills: skills.map(super::skills::SkillHost::tools),
         web: web.map(super::web::WebHost::tools),
         goal: goal.map(super::goal::GoalHost::tools),
+        repl: repl.map(super::repl::ReplHost::tools),
     })))
 }
 
@@ -580,9 +590,10 @@ pub fn combined_dispatcher_with_delegate(
     skills: Option<&super::skills::SkillHost>,
     web: Option<&super::web::WebHost>,
     goal: Option<&super::goal::GoalHost>,
+    repl: Option<&super::repl::ReplHost>,
 ) -> Option<Arc<dyn ExternalToolDispatcher>> {
     let inner = combined_dispatcher(mcp, extensions);
-    if delegate.is_none() && skills.is_none() && web.is_none() && goal.is_none() {
+    if delegate.is_none() && skills.is_none() && web.is_none() && goal.is_none() && repl.is_none() {
         return inner;
     }
     Some(Arc::new(DelegateDispatcherMux {
@@ -591,6 +602,7 @@ pub fn combined_dispatcher_with_delegate(
         skills: skills.map(super::skills::SkillHost::dispatcher),
         web: web.map(super::web::WebHost::dispatcher),
         goal: goal.map(super::goal::GoalHost::dispatcher),
+        repl: repl.map(super::repl::ReplHost::dispatcher),
     }))
 }
 
@@ -600,6 +612,7 @@ struct DelegateDispatcherMux {
     skills: Option<Arc<dyn ExternalToolDispatcher>>,
     web: Option<Arc<dyn ExternalToolDispatcher>>,
     goal: Option<Arc<dyn ExternalToolDispatcher>>,
+    repl: Option<Arc<dyn ExternalToolDispatcher>>,
 }
 
 impl ExternalToolDispatcher for DelegateDispatcherMux {
@@ -637,6 +650,14 @@ impl ExternalToolDispatcher for DelegateDispatcherMux {
                 self.goal
                     .as_ref()
                     .ok_or_else(|| HarnessError::new(ErrorCode::PolicyDenied, "no goal is active"))?
+                    .validate_external(plugin_id, tool_name, arguments)
+                    .await
+            } else if plugin_id == "repl" {
+                self.repl
+                    .as_ref()
+                    .ok_or_else(|| {
+                        HarnessError::new(ErrorCode::PolicyDenied, "the Python REPL is off")
+                    })?
                     .validate_external(plugin_id, tool_name, arguments)
                     .await
             } else if let Some(inner) = &self.inner {
@@ -689,6 +710,14 @@ impl ExternalToolDispatcher for DelegateDispatcherMux {
                 self.goal
                     .as_ref()
                     .ok_or_else(|| HarnessError::new(ErrorCode::PolicyDenied, "no goal is active"))?
+                    .dispatch_external(authorization, plugin_id, tool_name, arguments, timeout_ms)
+                    .await
+            } else if plugin_id == "repl" {
+                self.repl
+                    .as_ref()
+                    .ok_or_else(|| {
+                        HarnessError::new(ErrorCode::PolicyDenied, "the Python REPL is off")
+                    })?
                     .dispatch_external(authorization, plugin_id, tool_name, arguments, timeout_ms)
                     .await
             } else if let Some(inner) = &self.inner {

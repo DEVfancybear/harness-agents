@@ -329,6 +329,9 @@ impl ToolPolicy {
         // prompt sent to the model provider. Opening a URL is different: the URL itself
         // can carry data out, so web_fetch asks unless the mode or a rule allows it.
         let web = matches!(action, CodingToolAction::ExternalTool { plugin_id, .. } if plugin_id == "web");
+        // The Python REPL runs code like run_shell does, so it gets run_shell's
+        // treatment: it asks, unless the mode allows every command.
+        let repl = matches!(action, CodingToolAction::ExternalTool { plugin_id, .. } if plugin_id == "repl");
         if web
             && matches!(action, CodingToolAction::ExternalTool { tool_name, .. } if tool_name == "web_search")
         {
@@ -342,7 +345,7 @@ impl ToolPolicy {
                 reason: "mode auto-edit".to_owned(),
             },
             PolicyMode::FullAuto
-                if web || !matches!(action, CodingToolAction::ExternalTool { .. }) =>
+                if web || repl || !matches!(action, CodingToolAction::ExternalTool { .. }) =>
             {
                 Decision::Allow {
                     reason: "mode full-auto".to_owned(),
@@ -773,6 +776,14 @@ mod g05_policy_tests {
             Decision::Allow { .. }
         ));
         assert_eq!(policy.decide(&external("goal", "other")), Decision::Ask);
+        // Running Python is running code: it asks, like run_shell, unless full-auto.
+        assert_eq!(policy.decide(&external("repl", "ipython")), Decision::Ask);
+        assert!(matches!(
+            ToolPolicy::new(1, Vec::new())
+                .with_mode(PolicyMode::FullAuto)
+                .decide(&external("repl", "ipython")),
+            Decision::Allow { .. }
+        ));
         let denied = ToolPolicy::new(1, Vec::new()).with_tool_rules(vec![ToolPatternRule::deny(
             "activate_skill()",
             "no skills here",
