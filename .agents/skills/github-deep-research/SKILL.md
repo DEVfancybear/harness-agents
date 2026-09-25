@@ -38,11 +38,11 @@ Round 4: "{topic} issues", "{topic} roadmap", "site:github.com {topic}"
 ### Research Rounds
 
 **Round 1 - GitHub API**
-Directly execute `scripts/github_api.py` without `read_file()`:
+Directly execute `scripts/github_api.py` (relative to this skill's directory; use its absolute path) without `read_file()`:
 ```bash
-python .agents/skills/github-deep-research/scripts/github_api.py <owner> <repo> summary
-python .agents/skills/github-deep-research/scripts/github_api.py <owner> <repo> readme
-python .agents/skills/github-deep-research/scripts/github_api.py <owner> <repo> tree
+python <skill-directory>/scripts/github_api.py <owner> <repo> summary
+python <skill-directory>/scripts/github_api.py <owner> <repo> readme
+python <skill-directory>/scripts/github_api.py <owner> <repo> tree
 ```
 
 **Available commands (the last argument of `github_api.py`):**

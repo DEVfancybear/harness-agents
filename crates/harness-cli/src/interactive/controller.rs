@@ -61,6 +61,8 @@ pub enum Effect {
     Stream(String),
     /// TUI-only provider reasoning, excluded from plain transcript output.
     Thinking(String),
+    /// Draw the whole scrollback again in this detail mode (ctrl+o).
+    Reprint(super::events::Detail),
     /// Copy the latest assistant answer (TUI mode only).
     Copy(String),
     /// Emit BEL in the interactive terminal.
@@ -207,6 +209,10 @@ pub struct InteractiveController {
     exit_armed_at: Option<Instant>,
     /// The provider whose API key the masked prompt is collecting.
     login_provider: Option<String>,
+    /// Reasoning received since the last committed row.
+    pending_thinking: String,
+    /// The thinking level the next turn uses, for the status line.
+    thinking_label: Option<String>,
     /// The provider whose browser sign-in waits; a pasted redirect URL finishes it.
     signing_in: Option<String>,
 }
@@ -274,6 +280,8 @@ impl InteractiveController {
             exit_armed_at: None,
             login_provider: None,
             signing_in: None,
+            pending_thinking: String::new(),
+            thinking_label: None,
         }
     }
 
@@ -374,6 +382,7 @@ impl InteractiveController {
             fallback_reason: self.fallback_reason.clone(),
             tick: self.tick,
             detail: self.detail,
+            thinking: self.thinking_label.clone(),
         }
     }
 
@@ -466,6 +475,7 @@ impl InteractiveController {
     /// commands on disk now. Skills can appear mid-session (`/refine` writes them),
     /// so this runs at boot, after `/reload` and after every turn.
     fn refresh_menu(&mut self) {
+        self.refresh_status();
         if self.plain {
             return;
         }
@@ -511,7 +521,10 @@ impl InteractiveController {
         }
         if key == Key::CycleDetail {
             self.detail = self.detail.next();
-            return vec![Effect::Redraw];
+            if self.plain {
+                return vec![Effect::Redraw];
+            }
+            return vec![Effect::Reprint(self.detail), Effect::Redraw];
         }
         // A modal owns the keyboard while it is open: Escape closes it, and the
         // picker takes the arrows, Enter and Escape.
@@ -806,14 +819,17 @@ impl InteractiveController {
                 );
             }
             SessionEvent::TextDelta { text } => {
+                self.flush_thinking(effects);
                 self.pending_newlines = self
                     .pending_newlines
                     .saturating_add(text.bytes().filter(|byte| *byte == b'\n').count());
                 self.pending_text.push_str(&text);
             }
             SessionEvent::ThinkingDelta { text } => {
+                // Reasoning is one row, not one row per delta: it is gathered and
+                // committed when the answer starts or the step ends.
                 self.flush_stream(effects);
-                effects.push(Effect::Thinking(text));
+                self.pending_thinking.push_str(&text);
                 effects.push(Effect::Redraw);
             }
             SessionEvent::CostUpdated { label } => {
@@ -1854,17 +1870,17 @@ impl InteractiveController {
                     self.push_history(&mut effects, HistoryItem::Error {
                         message: "usage: /skill:<name> [task]".to_owned(),
                     });
-                } else if self.phase.has_active_run() {
-                    self.push_history(&mut effects, HistoryItem::Error {
-                        message: "cannot activate a skill while a run is active".to_owned(),
-                    });
                 } else {
-                    match self.service.activate_skill(skill_name) {
+                    // As prime-agent does: the skill goes to the model as the
+                    // message itself, so it is in the conversation and a later
+                    // "which skill did I just load?" has its answer there. The row
+                    // shows what was typed; the model reads the whole skill.
+                    match self
+                        .service
+                        .expand_skill(skill_name, raw_argument.unwrap_or_default())
+                    {
                         Ok(message) => {
-                            self.push_history(&mut effects, HistoryItem::Notice { message });
-                            if let Some(task) = raw_argument {
-                                return self.submit_prompt_text(task.to_owned(), effects);
-                            }
+                            return self.submit_prompt_as(message, trimmed.to_owned(), effects);
                         }
                         Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
                     }
@@ -1990,6 +2006,7 @@ impl InteractiveController {
                             Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
                             Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
                         }
+                        self.refresh_status();
                     }
                 } else {
                     let lines = self.service.thinking_status();
@@ -2167,6 +2184,7 @@ impl InteractiveController {
                             Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
                             Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
                         }
+                        self.refresh_status();
                     }
                 } else {
                     let label = self.service.label();
@@ -2248,7 +2266,18 @@ impl InteractiveController {
         effects
     }
 
-    fn submit_prompt_text(&mut self, text: String, mut effects: Vec<Effect>) -> Vec<Effect> {
+    fn submit_prompt_text(&mut self, text: String, effects: Vec<Effect>) -> Vec<Effect> {
+        let shown = text.clone();
+        self.submit_prompt_as(text, shown, effects)
+    }
+
+    /// Send `text` to the model while the transcript shows `shown`.
+    fn submit_prompt_as(
+        &mut self,
+        text: String,
+        shown: String,
+        mut effects: Vec<Effect>,
+    ) -> Vec<Effect> {
         if self.phase.has_active_run() {
             self.push_history(
                 &mut effects,
@@ -2275,7 +2304,7 @@ impl InteractiveController {
             compact_guidance: None,
             refine: None,
         });
-        self.push_history(&mut effects, HistoryItem::User { text });
+        self.push_history(&mut effects, HistoryItem::User { text: shown });
         effects.push(Effect::Redraw);
         effects
     }
@@ -2487,6 +2516,21 @@ impl InteractiveController {
         self.refresh_menu();
     }
 
+    /// The model and thinking level the status line names; they change with
+    /// `/model`, `/effort`, `/login` and `/logout`, so they are read again then.
+    fn refresh_status(&mut self) {
+        let label = format!("Service: {}", self.service.label());
+        match self
+            .header
+            .iter_mut()
+            .find(|line| line.starts_with("Service: "))
+        {
+            Some(line) => *line = label,
+            None => self.header.push(label),
+        }
+        self.thinking_label = self.service.thinking_level();
+    }
+
     /// After a logout: when the model in use has lost its credential, move to a
     /// provider that still has one, or return to setup so the status says so
     /// instead of failing on the next message.
@@ -2601,7 +2645,16 @@ impl InteractiveController {
             .map(|candidate| candidate.session_id.clone())
     }
 
+    /// Commit the reasoning gathered so far as one row.
+    fn flush_thinking(&mut self, effects: &mut Vec<Effect>) {
+        let text = std::mem::take(&mut self.pending_thinking);
+        if !text.trim().is_empty() {
+            effects.push(Effect::Thinking(text));
+        }
+    }
+
     fn flush_stream(&mut self, effects: &mut Vec<Effect>) {
+        self.flush_thinking(effects);
         if self.pending_text.is_empty() {
             return;
         }
@@ -3818,6 +3871,7 @@ mod tests {
                     streaming = true;
                 }
                 Effect::Thinking(_)
+                | Effect::Reprint(_)
                 | Effect::Copy(_)
                 | Effect::Bell
                 | Effect::Redraw

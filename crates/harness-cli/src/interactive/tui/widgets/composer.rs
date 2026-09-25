@@ -279,6 +279,7 @@ mod tests {
             fallback_reason: None,
             tick: 0,
             detail: crate::interactive::events::Detail::default(),
+            thinking: None,
         }
     }
 

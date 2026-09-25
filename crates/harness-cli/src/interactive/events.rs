@@ -420,6 +420,8 @@ pub struct UiState {
     pub tick: u64,
     /// How much of each turn the chat shows (ctrl+o).
     pub detail: Detail,
+    /// The thinking level the next turn uses, when the service knows it.
+    pub thinking: Option<String>,
 }
 
 /// prime-agent's detail modes, cycled with ctrl+o: collapsed hides reasoning and

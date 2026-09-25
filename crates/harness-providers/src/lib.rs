@@ -807,6 +807,39 @@ pub fn http_status_error(status: u16, retry_after: Option<Duration>) -> Provider
         .with_retry_after(retry_after)
 }
 
+/// A refused request, with the provider's own reason when its body gives one:
+/// "HTTP 400" alone leaves the user no way to tell a bad key from a bad model.
+pub(crate) async fn http_response_error(response: reqwest::Response) -> ProviderError {
+    let status = response.status().as_u16();
+    let retry = retry_after_seconds(response.headers());
+    let error = http_status_error(status, retry);
+    let detail = response
+        .text()
+        .await
+        .ok()
+        .and_then(|body| error_message(&body));
+    match detail {
+        Some(detail) => ProviderError::new(error.code(), format!("{}: {detail}", error.message))
+            .with_retry_after(error.retry_after()),
+        None => error,
+    }
+}
+
+/// The message of a JSON error body, cut to one line.
+pub(crate) fn error_message(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let message = value
+        .pointer("/error/message")
+        .or_else(|| value.pointer("/error"))
+        .or_else(|| value.pointer("/detail"))
+        .or_else(|| value.get("message"))?;
+    let text = message
+        .as_str()
+        .map_or_else(|| message.to_string(), str::to_owned);
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty()).then(|| text.chars().take(300).collect())
+}
+
 pub type ProviderFuture =
     Pin<Box<dyn Future<Output = Result<Vec<ProviderStreamEvent>, ProviderError>> + Send>>;
 
@@ -1107,8 +1140,11 @@ pub(crate) fn chat_body(
         "model": request.model,
         "messages": messages,
         "stream": true,
-        "temperature": request.temperature,
     });
+    // Sent only when set, as prime-agent does: some gateways refuse a null.
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = json!(temperature);
+    }
     if let Some(thinking) = thinking {
         thinking.apply_chat(&mut body, provider_id, &request.model);
     }
@@ -1242,8 +1278,7 @@ impl ModelProvider for OpenAiChatAdapter {
                 () = cancellation.cancelled() => return Err(ProviderError::new(ErrorCode::ProviderCanceled, "provider request canceled")),
             };
             if !response.status().is_success() {
-                let retry_after = retry_after_seconds(response.headers());
-                return Err(http_status_error(response.status().as_u16(), retry_after));
+                return Err(http_response_error(response).await);
             }
             let mut stream = response.bytes_stream();
             let mut decoder = SseDecoder::new();
@@ -2261,7 +2296,7 @@ mod g03_openai_wire_snapshot_tests {
         let body = receiver.recv().expect("captured request body");
         assert_eq!(
             String::from_utf8(body).expect("UTF-8 body"),
-            r#"{"messages":[{"content":"hello","role":"user"}],"model":"fixture-model","stream":true,"temperature":null,"thinking":{"type":"disabled"}}"#
+            r#"{"messages":[{"content":"hello","role":"user"}],"model":"fixture-model","stream":true,"thinking":{"type":"disabled"}}"#
         );
     }
 }

@@ -221,8 +221,11 @@ pub trait SessionPort: Send {
     fn menu_commands(&self) -> Vec<super::commands::MenuCommand> {
         Vec::new()
     }
-    fn activate_skill(&mut self, _name: &str) -> Result<String, String> {
-        Err("this backend cannot activate skills".to_owned())
+    /// prime-agent's `_expandSkillCommand`: `/skill:<name> [args]` as the message
+    /// the model is sent - the skill's instructions in a `<skill>` block, then the
+    /// arguments - so the skill is part of the conversation like anything else.
+    fn expand_skill(&self, _name: &str, _arguments: &str) -> Result<String, String> {
+        Err("this backend cannot run skills".to_owned())
     }
     fn reload(&mut self) -> Result<String, String> {
         Err("this backend cannot reload prompt inputs".to_owned())
@@ -267,6 +270,10 @@ pub trait SessionPort: Send {
     /// Choose the thinking level for the next turns.
     fn set_thinking(&mut self, _level: &str) -> Result<String, String> {
         Err("this backend does not support thinking levels".to_owned())
+    }
+    /// The level the next turn uses, for the status line.
+    fn thinking_level(&self) -> Option<String> {
+        None
     }
     /// The thinking level in force and the levels the model offers.
     fn thinking_status(&self) -> Vec<String> {
@@ -708,7 +715,25 @@ pub(super) fn resolve_provider_with_overrides(
             }
         ));
     };
-    let model_price = resolved.model_prices.get(&resolved.provider.model).copied();
+    // A price in the config wins; otherwise the catalog's, as prime-agent prices
+    // every model from its registry.
+    let model_price = resolved
+        .model_prices
+        .get(&resolved.provider.model)
+        .copied()
+        .or_else(|| {
+            super::providers::Catalog::load(data_dir)
+                .find(&format!(
+                    "{}/{}",
+                    resolved.provider.id, resolved.provider.model
+                ))
+                .and_then(|model| model.cost)
+                .filter(|cost| cost.input > 0.0 || cost.output > 0.0)
+                .map(|cost| ModelPrice {
+                    input_per_mtok: cost.input,
+                    output_per_mtok: cost.output,
+                })
+        });
     let max_retry_after_seconds = resolved.retry_after_max_seconds;
     Ok(ProviderConfig {
         provider_id: resolved.provider.id,
@@ -1065,6 +1090,20 @@ pub(super) fn build_provider(
             "provider protocol is unsupported",
         )),
     }
+}
+
+/// A skill document without its `---` front matter.
+fn strip_front_matter(content: &str) -> &str {
+    let Some(rest) = content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))
+    else {
+        return content;
+    };
+    rest.find("\n---").map_or(content, |end| {
+        let after = &rest[end + 4..];
+        after.split_once('\n').map_or("", |(_, body)| body)
+    })
 }
 
 /// Maps turn progress onto the UI vocabulary.
@@ -2206,15 +2245,14 @@ impl SessionPort for AgentSessionService {
         lines
     }
 
-    fn activate_skill(&mut self, name: &str) -> Result<String, String> {
+    fn expand_skill(&self, name: &str, arguments: &str) -> Result<String, String> {
         let trusted = super::config::resolve_layers(
             &self.config_file,
             &self.workspace_root,
             &self.environment,
             &self.config_overrides,
         )
-        .map_err(|error| error.to_string())?
-        .project_trusted;
+        .is_ok_and(|config| config.project_trusted);
         let catalog = super::skills::discover(
             &self.global_config_dir,
             &self.workspace_root,
@@ -2222,18 +2260,27 @@ impl SessionPort for AgentSessionService {
             trusted,
         )
         .map_err(|error| error.to_string())?;
-        let activation =
-            super::skills::activate(&catalog, name, 1).map_err(|error| error.to_string())?;
-        let label = format!(
-            "activated {} ({}) in the Skill context channel",
-            activation.entry.version_ref(),
-            activation.entry.digest.as_str()
+        let entry = catalog
+            .entries()
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| format!("no skill named {name}; /skills lists them"))?;
+        let content = std::fs::read_to_string(&entry.path)
+            .map_err(|error| format!("skill {name} could not be read: {error}"))?;
+        let directory = entry
+            .directory()
+            .map_or_else(String::new, |directory| directory.display().to_string());
+        let block = format!(
+            "<skill name=\"{name}\" location=\"{}\">\nReferences are relative to {directory}.\n\n{}\n</skill>",
+            entry.path.display(),
+            strip_front_matter(&content).trim()
         );
-        self.active_skills
-            .lock()
-            .map_err(|_| "active skills are unavailable".to_owned())?
-            .insert(name.to_owned(), activation);
-        Ok(label)
+        let arguments = arguments.trim();
+        Ok(if arguments.is_empty() {
+            block
+        } else {
+            format!("{block}\n\n{arguments}")
+        })
     }
 
     fn reload(&mut self) -> Result<String, String> {
@@ -2469,6 +2516,21 @@ impl SessionPort for AgentSessionService {
                 config.model
             )
         })
+    }
+
+    fn thinking_level(&self) -> Option<String> {
+        let config = self.configured().ok()?;
+        let model =
+            harness_providers::thinking::reasoning_model(&config.provider_id, &config.model);
+        let chosen = self
+            .thinking
+            .or_else(|| harness_providers::ThinkingLevel::parse(&config.thinking))
+            .unwrap_or_default();
+        Some(
+            harness_providers::thinking::clamp(model, chosen)
+                .as_str()
+                .to_owned(),
+        )
     }
 
     fn thinking_status(&self) -> Vec<String> {
@@ -4020,6 +4082,18 @@ async fn run_turn(
                 ),
             });
         }
+    }
+    // A turn that failed or was canceled after it was admitted is still part of the
+    // conversation: the next message continues from it, and the runtime replays
+    // what it did, as prime-agent keeps an aborted turn's messages.
+    if outcome.is_err()
+        && store
+            .session_task(&session_id)
+            .await
+            .is_ok_and(|task| task.is_some())
+        && let Ok(mut guard) = previous_session.lock()
+    {
+        *guard = Some(session_id.clone());
     }
     drop(runtime);
     if let Ok(store) = Arc::try_unwrap(store) {

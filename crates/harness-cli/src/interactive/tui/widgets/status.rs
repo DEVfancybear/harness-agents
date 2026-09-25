@@ -164,6 +164,12 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
                 let label = format!(" · cost {cost}");
                 push(Span::styled(label, theme.dim));
             }
+            if let Some(model) = short_model(state) {
+                push(Span::styled(format!(" · {model}"), theme.dim));
+            }
+            if let Some(level) = &state.thinking {
+                push(Span::styled(format!(" · thinking {level}"), theme.dim));
+            }
         }
         (None, AppPhase::SetupRequired) => {
             push(Span::styled(" setup required".to_owned(), theme.error));
@@ -175,11 +181,12 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
         (None, _) => {
             // prime-agent's line above the prompt: quiet, dim, and it names the
             // detail mode ctrl+o cycles.
-            if let Some(model) = model_label(state) {
-                let model = model
-                    .split_once(" via ")
-                    .map_or(model.as_str(), |(name, _)| name);
-                push(Span::styled(model.to_owned(), theme.dim));
+            // The model and the thinking level the next turn uses.
+            if let Some(model) = short_model(state) {
+                push(Span::styled(model, theme.muted));
+            }
+            if let Some(level) = &state.thinking {
+                push(Span::styled(format!(" · thinking {level}"), theme.dim));
             }
             if let Some(cost) = cost_label(state) {
                 let label = format!(" · {cost}");
@@ -204,6 +211,19 @@ fn cost_label(state: &UiState) -> Option<String> {
         .header
         .iter()
         .find_map(|line| line.strip_prefix("Cost: ").map(str::to_owned))
+        // No price known is not a cost worth a place on the line.
+        .filter(|label| label != "n/a")
+}
+
+/// The model name without the endpoint it is reached through.
+fn short_model(state: &UiState) -> Option<String> {
+    let model = model_label(state)?;
+    Some(
+        model
+            .split_once(" via ")
+            .map_or(model.as_str(), |(name, _)| name)
+            .to_owned(),
+    )
 }
 
 /// The model label, when the header names one.
@@ -259,6 +279,7 @@ mod tests {
             fallback_reason: None,
             tick: 0,
             detail: crate::interactive::events::Detail::default(),
+            thinking: None,
         }
     }
 

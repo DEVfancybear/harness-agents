@@ -916,22 +916,33 @@ pub struct ConversationHistory {
     pub summary: Option<String>,
     /// How many turns fell outside the replay bound.
     pub omitted: usize,
+    /// Whether the newest turn was interrupted and is replayed step by step, with
+    /// its tool calls and results; its committed results are then already here.
+    pub interrupted_replayed: bool,
 }
 
 impl ConversationHistory {
     /// The replayed turns as (question, answer) pairs, oldest first.
     #[must_use]
     pub fn turns(&self) -> Vec<(String, String)> {
-        self.messages
-            .iter()
-            .filter(|message| message.role != MessageRole::System)
-            .collect::<Vec<_>>()
-            .chunks(2)
-            .filter_map(|pair| match pair {
-                [question, answer] => Some((question.content.clone(), answer.content.clone())),
-                _ => None,
-            })
-            .collect()
+        // A question, then what the assistant said before the next question; an
+        // interrupted turn's tool calls and results sit between them.
+        let mut turns: Vec<(String, String)> = Vec::new();
+        for message in &self.messages {
+            match message.role {
+                MessageRole::User => turns.push((message.content.clone(), String::new())),
+                MessageRole::Assistant if !message.content.trim().is_empty() => {
+                    if let Some((_, answer)) = turns.last_mut() {
+                        if !answer.is_empty() {
+                            answer.push_str("\n\n");
+                        }
+                        answer.push_str(&message.content);
+                    }
+                }
+                _ => {}
+            }
+        }
+        turns
     }
 }
 
@@ -985,8 +996,15 @@ pub async fn conversation_history(
             break;
         }
         if let Some((_, question)) = store.session_admitted_input(&session).await? {
-            let answer = final_answer(store, &session).await?;
-            turns.push((question, answer));
+            // A turn that stopped while its tools were running (canceled, failed,
+            // killed) never gave an answer; what it did is its record. It is
+            // replayed as it happened, the way prime-agent keeps an aborted turn's
+            // messages, so "continue" continues the work instead of starting over.
+            let body = match interrupted_steps(store, &session).await? {
+                Some(steps) => TurnBody::Steps(steps),
+                None => TurnBody::Answer(final_answer(store, &session).await?),
+            };
+            turns.push((question, body));
         }
         current = store
             .continuation_link(&session)
@@ -994,15 +1012,22 @@ pub async fn conversation_history(
             .map(|link| link.source_session_id);
     }
     // `turns` is newest first; keep what fits, then restore speaking order.
+    let interrupted_replayed = matches!(turns.first(), Some((_, TurnBody::Steps(_))));
     let mut kept = Vec::new();
     let mut used = 0_usize;
-    for (question, answer) in &turns {
+    for (question, body) in &turns {
         let question = clip_turn(question);
-        let answer = answer.as_deref().map_or_else(
-            || "(no reply was recorded for this turn)".to_owned(),
-            clip_turn,
-        );
-        let cost = question.len() + answer.len();
+        let answer = match body {
+            TurnBody::Answer(answer) => vec![ProviderMessage::new(
+                MessageRole::Assistant,
+                answer.as_deref().map_or_else(
+                    || "(no reply was recorded for this turn)".to_owned(),
+                    clip_turn,
+                ),
+            )],
+            TurnBody::Steps(steps) => steps.clone(),
+        };
+        let cost = question.len() + message_bytes(&answer);
         if kept.len() == CONVERSATION_MAX_TURNS
             || (!kept.is_empty() && used + cost > CONVERSATION_MAX_BYTES)
         {
@@ -1023,13 +1048,102 @@ pub async fn conversation_history(
     }
     for (question, answer) in kept.into_iter().rev() {
         messages.push(ProviderMessage::new(MessageRole::User, question));
-        messages.push(ProviderMessage::new(MessageRole::Assistant, answer));
+        messages.extend(answer);
     }
     Ok(ConversationHistory {
         messages,
         summary,
         omitted,
+        interrupted_replayed,
     })
+}
+
+/// What one replayed turn contributes after its question.
+enum TurnBody {
+    /// The last text the model sent, if any.
+    Answer(Option<String>),
+    /// The assistant messages and tool results of a turn that never answered.
+    Steps(Vec<ProviderMessage>),
+}
+
+/// How much of one tool result an interrupted turn replays.
+const REPLAYED_RESULT_CHARS: usize = 2000;
+
+/// The steps of a session whose last completed model call asked for tools - the
+/// turn stopped before the model saw their results and answered - or `None` when
+/// the session ended on an answer.
+///
+/// Each completed call becomes its assistant message with the calls it made, and
+/// each call is answered by its recorded result, or by a note that it never
+/// returned, so the transcript stays valid for every provider.
+async fn interrupted_steps(
+    store: &SqliteStore,
+    session_id: &SessionId,
+) -> Result<Option<Vec<ProviderMessage>>, RuntimeError> {
+    let mut attempts = store.list_provider_attempts(session_id).await?;
+    attempts.retain(|attempt| attempt.state == "completed");
+    attempts.sort_by(|left, right| left.attempt_id.as_str().cmp(right.attempt_id.as_str()));
+    let responses = attempts
+        .iter()
+        .filter_map(|attempt| {
+            serde_json::from_value::<Vec<ProviderStreamEvent>>(attempt.events.clone()).ok()
+        })
+        .filter_map(|events| harness_providers::assemble_stream(&events).ok())
+        .collect::<Vec<_>>();
+    if responses
+        .last()
+        .is_none_or(|response| response.tool_calls.is_empty())
+    {
+        return Ok(None);
+    }
+    let results = store.recovered_tool_results(session_id).await?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut steps = Vec::new();
+    for response in &responses {
+        let calls = response
+            .tool_calls
+            .iter()
+            .filter(|call| seen.insert(call.call_id.clone()))
+            .map(|call| harness_providers::ProviderToolCall {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            })
+            .collect::<Vec<_>>();
+        if calls.is_empty() {
+            if !response.text.trim().is_empty() {
+                steps.push(ProviderMessage::new(
+                    MessageRole::Assistant,
+                    clip_turn(&response.text),
+                ));
+            }
+            continue;
+        }
+        steps.push(ProviderMessage::assistant_with_calls(
+            response.text.clone(),
+            calls.clone(),
+        ));
+        for call in calls {
+            let text = results
+                .iter()
+                .rfind(|result| result.call_id.as_deref() == Some(call.call_id.as_str()))
+                .map_or_else(
+                    || "(the turn was interrupted before this call returned)".to_owned(),
+                    |result| clip_result(&result.text),
+                );
+            steps.push(ProviderMessage::tool_result(call.call_id, text));
+        }
+    }
+    Ok(Some(steps))
+}
+
+fn clip_result(text: &str) -> String {
+    if text.chars().count() <= REPLAYED_RESULT_CHARS {
+        return text.to_owned();
+    }
+    let mut clipped = text.chars().take(REPLAYED_RESULT_CHARS).collect::<String>();
+    clipped.push_str("\n[truncated]");
+    clipped
 }
 
 /// The last text the model sent in one session, if it sent any.
@@ -2383,7 +2497,27 @@ impl RuntimeService {
         let request = self
             .prepare_continuation(source_session_id, request)
             .await?;
-        let result = self.run_streaming(request, cancellation, sink).await?;
+        let session_id = request.session_id.clone();
+        let task_id = request.task_id.clone();
+        let result = match self.run_streaming(request, cancellation, sink).await {
+            Ok(result) => result,
+            Err(error) => {
+                // A turn that was admitted and then canceled or failed is still a
+                // turn of this conversation; link it so the next one continues it.
+                if self
+                    .store
+                    .session_task(&session_id)
+                    .await
+                    .is_ok_and(|task| task.is_some())
+                {
+                    let _ = self
+                        .store
+                        .record_continuation_link(source_session_id, &session_id, &task_id)
+                        .await;
+                }
+                return Err(error);
+            }
+        };
         self.store
             .record_continuation_link(source_session_id, &result.session_id, &result.task_id)
             .await?;
@@ -2435,8 +2569,14 @@ impl RuntimeService {
             Some(summary) => request.with_continuation_context(summary),
             None => request,
         };
+        let replayed = history.interrupted_replayed;
         let request = request.with_conversation(history.messages);
-        let recovered = self.recovered_messages(source_session_id).await?;
+        // An interrupted source turn is already replayed with its results.
+        let recovered = if replayed {
+            Vec::new()
+        } else {
+            self.recovered_messages(source_session_id).await?
+        };
         Ok(if recovered.is_empty() {
             request
         } else {

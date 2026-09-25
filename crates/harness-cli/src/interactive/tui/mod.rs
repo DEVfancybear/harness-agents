@@ -101,9 +101,17 @@ pub trait TuiRenderer {
     fn bell(&mut self) -> io::Result<()> {
         Ok(())
     }
+    /// Clear the screen and draw every row again in this detail mode, as
+    /// prime-agent re-renders its chat when ctrl+o changes what rows show.
+    fn reprint(&mut self, _detail: super::events::Detail) -> io::Result<()> {
+        Ok(())
+    }
     /// Erase the viewport footprint and leave the cursor on a fresh line.
     fn finish(&mut self) -> io::Result<()>;
 }
+
+/// How many history entries a renderer keeps for ctrl+o to draw again.
+const REPRINT_ENTRIES: usize = 4000;
 
 /// The terminal-side half of a renderer: a ratatui `Terminal` over some backend.
 pub struct RealRenderer<B: Backend> {
@@ -111,6 +119,8 @@ pub struct RealRenderer<B: Backend> {
     theme: Theme,
     /// The detail mode of the last frame, which history rows are drawn in.
     detail: super::events::Detail,
+    /// What was pushed into the scrollback, newest last, for a reprint.
+    shown: std::collections::VecDeque<HistoryItem>,
 }
 
 impl<B: Backend> RealRenderer<B>
@@ -134,7 +144,19 @@ where
             terminal,
             theme: Theme::detect(),
             detail: super::events::Detail::default(),
+            shown: std::collections::VecDeque::new(),
         })
+    }
+
+    /// Draw every remembered entry again, in `detail`.
+    fn replay(&mut self, detail: super::events::Detail) -> io::Result<()> {
+        self.detail = detail;
+        self.terminal.clear().map_err(to_io)?;
+        let items = self.shown.iter().cloned().collect::<Vec<_>>();
+        for item in &items {
+            self.draw_history(item)?;
+        }
+        Ok(())
     }
 
     fn columns(&self) -> u16 {
@@ -161,6 +183,14 @@ where
     }
 
     fn insert_history(&mut self, item: &HistoryItem) -> io::Result<()> {
+        if self.shown.len() == REPRINT_ENTRIES {
+            self.shown.pop_front();
+        }
+        self.shown.push_back(item.clone());
+        self.draw_history(item)
+    }
+
+    fn draw_history(&mut self, item: &HistoryItem) -> io::Result<()> {
         let theme = self.theme;
         let width = self.columns();
         let rows = history::render(item, width, &theme, self.detail);
@@ -266,6 +296,14 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
 
     fn clear_viewport(&mut self) -> io::Result<()> {
         self.inner.clear_viewport()
+    }
+
+    fn reprint(&mut self, detail: super::events::Detail) -> io::Result<()> {
+        // The rows already in the scrollback were drawn in the old mode; erase the
+        // screen and the scrollback, then draw them all again.
+        self.backend.write("\x1b[2J\x1b[3J\x1b[H")?;
+        self.backend.flush()?;
+        self.inner.replay(detail)
     }
 
     fn copy_text(&mut self, text: &str) -> io::Result<()> {
@@ -390,6 +428,10 @@ impl<T: TerminalBackend> TuiRenderer for ScriptedRenderer<T> {
     fn draw_state(&mut self, state: &UiState) -> io::Result<()> {
         self.inner.draw_state(state)?;
         self.mirror()
+    }
+
+    fn reprint(&mut self, detail: super::events::Detail) -> io::Result<()> {
+        self.inner.replay(detail)
     }
 
     fn insert_history(&mut self, item: &HistoryItem) -> io::Result<()> {
@@ -557,6 +599,9 @@ fn apply(renderer: &mut impl TuiRenderer, effects: Vec<Effect>) -> Result<Step, 
                     .map_err(|error| terminal_error(&error))?;
             }
             Effect::Bell => renderer.bell().map_err(|error| terminal_error(&error))?,
+            Effect::Reprint(detail) => renderer
+                .reprint(detail)
+                .map_err(|error| terminal_error(&error))?,
             Effect::ClearViewport => renderer
                 .clear_viewport()
                 .map_err(|error| terminal_error(&error))?,
@@ -626,6 +671,7 @@ mod tests {
             fallback_reason: None,
             tick: 0,
             detail: crate::interactive::events::Detail::default(),
+            thinking: None,
         }
     }
 

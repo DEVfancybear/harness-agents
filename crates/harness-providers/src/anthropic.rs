@@ -216,8 +216,7 @@ impl ModelProvider for AnthropicMessagesAdapter {
                 () = cancellation.cancelled() => return Err(ProviderError::new(ErrorCode::ProviderCanceled, "provider request canceled")),
             };
             if !response.status().is_success() {
-                let retry = super::retry_after_seconds(response.headers());
-                return Err(super::http_status_error(response.status().as_u16(), retry));
+                return Err(super::http_response_error(response).await);
             }
             let mut stream = response.bytes_stream();
             let mut decoder = AnthropicSseDecoder::default();

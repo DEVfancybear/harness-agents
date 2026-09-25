@@ -96,7 +96,7 @@ For example, if the user wants to install `vercel-react-best-practices`:
 npx skills add vercel-labs/agent-skills --skill vercel-react-best-practices -a codex --copy -y
 ```
 
-On systems with Bash, `bash .agents/skills/find-skills/scripts/install-skill.sh <owner/repo@skill-name>` is a project-local wrapper for the same command. Check for an existing skill of that name before installing or replacing it.
+On systems with Bash, `bash <skill-directory>/scripts/install-skill.sh <owner/repo@skill-name>` (this skill's `scripts/install-skill.sh`) is a wrapper for the same command. Check for an existing skill of that name before installing or replacing it.
 
 ## Common Skill Categories
 

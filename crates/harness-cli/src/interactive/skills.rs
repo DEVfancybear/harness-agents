@@ -138,16 +138,6 @@ fn bundled_io_error(error: &std::io::Error) -> HarnessError {
     )
 }
 
-pub fn activate(
-    catalog: &SkillCatalog,
-    name: &str,
-    sequence: u64,
-) -> Result<SkillActivation, HarnessError> {
-    catalog
-        .activate(name, None, sequence)
-        .map_err(|error| HarnessError::new(error.code(), error.to_string()))
-}
-
 /// The model-facing skill catalogue and digest-pinned activation dispatcher.
 /// Both tools use the shared external-tool policy, approval, intent and receipt
 /// path; activation returns a typed Skill-channel block for the next model step.

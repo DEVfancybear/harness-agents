@@ -774,6 +774,158 @@ async fn m4_01_discovery_results_reach_the_model_and_a_blank_path_is_the_root() 
     close(store).await;
 }
 
+/// Answers the first call with a scripted response, then fails every call after it,
+/// the way a canceled or broken provider ends a turn mid-way.
+struct CutProvider {
+    first: Vec<ProviderStreamEvent>,
+    calls: AtomicUsize,
+}
+
+impl ModelProvider for CutProvider {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::deepseek_fixture()
+    }
+
+    fn stream(&self, request: ProviderRequest, _cancellation: CancellationToken) -> ProviderFuture {
+        let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+        let mut events = self.first.clone();
+        if let Some(ProviderStreamEvent::Started { request_id }) = events.first_mut() {
+            *request_id = request.request_id;
+        }
+        Box::pin(async move {
+            if first {
+                Ok(events)
+            } else {
+                Err(harness_providers::ProviderError::new(
+                    ErrorCode::ProviderCanceled,
+                    "provider request canceled",
+                ))
+            }
+        })
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one cut turn, then the turn that continues it
+async fn m4_01_a_turn_cut_mid_way_is_continued_with_what_it_did() {
+    // Measured: the user canceled a long research turn and said "continue"; the
+    // next turn had no record of it and asked what to do. prime-agent keeps an
+    // aborted turn's messages; the next turn here gets its calls and results.
+    let bench = bench();
+    let workspace = observe_workspace(bench.project_id.clone(), &bench.workspace).unwrap();
+    let task = TaskId::generate();
+    let first_session = SessionId::generate();
+    {
+        let store = bench.open_store().await;
+        let runtime = Arc::new(RuntimeService::new(
+            Arc::clone(&store),
+            Arc::new(CutProvider {
+                first: vec![
+                    ProviderStreamEvent::started(),
+                    ProviderStreamEvent::text("listing the workspace first"),
+                    ProviderStreamEvent::tool_delta(
+                        "call-1",
+                        "list_files",
+                        serde_json::json!({"path": "."}).to_string(),
+                    ),
+                    ProviderStreamEvent::completed("tool_calls"),
+                ],
+                calls: AtomicUsize::new(0),
+            }),
+            RuntimeConfig::default(),
+        ));
+        let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)));
+        let result = driver
+            .run_turn(
+                RunRequest::new(
+                    first_session.clone(),
+                    task.clone(),
+                    InputId::generate(),
+                    "describe this project".to_owned(),
+                    workspace.clone(),
+                )
+                .with_tool_schemas(coding_tool_schemas()),
+                TurnOptions {
+                    workspace_root: bench.workspace.clone(),
+                    actor_id: "m4.test".to_owned(),
+                    approvals: ApprovalMode::Auto,
+                    limits: TurnLimits::default(),
+                },
+                Arc::new(SilentObserver),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_err(), "the second model call was cut");
+        drop(driver);
+        close(store).await;
+    }
+
+    let store = bench.open_store().await;
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        ProviderStreamEvent::started(),
+        ProviderStreamEvent::text("continuing from the listing"),
+        ProviderStreamEvent::completed("stop"),
+    ]]));
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    );
+    runtime
+        .continue_task(
+            &first_session,
+            RunRequest::new(
+                SessionId::generate(),
+                task,
+                InputId::generate(),
+                "continue",
+                workspace,
+            ),
+        )
+        .await
+        .expect("the next turn runs");
+    let seen = provider.seen();
+    let messages = &seen.first().expect("one request").messages;
+    let position = |matches: &dyn Fn(&harness_providers::ProviderMessage) -> bool| {
+        messages
+            .iter()
+            .position(matches)
+            .unwrap_or_else(|| panic!("missing: {messages:#?}"))
+    };
+    let asked = position(&|message| {
+        message.role == MessageRole::User && message.content == "describe this project"
+    });
+    let called = position(&|message| {
+        message.role == MessageRole::Assistant
+            && message
+                .tool_calls
+                .iter()
+                .any(|call| call.call_id == "call-1")
+    });
+    let result = position(&|message| {
+        message.role == MessageRole::Tool
+            && message.tool_call_id.as_deref() == Some("call-1")
+            && message.content.contains("list_files")
+    });
+    let now = position(&|message| {
+        message.role == MessageRole::User
+            && message.content.contains(
+                "[user instruction]
+continue",
+            )
+    });
+    assert!(
+        asked < called && called < result && result < now,
+        "the cut turn is replayed in order before the new message: {messages:#?}"
+    );
+    assert!(
+        harness_providers::validate_transcript(messages).is_ok(),
+        "every replayed call has its result"
+    );
+    drop(runtime);
+    close(store).await;
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // three linked turns and one replay, told in order
 async fn m4_01_a_continued_conversation_replays_what_the_model_answered() {

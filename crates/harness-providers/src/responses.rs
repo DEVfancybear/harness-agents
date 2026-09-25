@@ -291,19 +291,7 @@ impl ModelProvider for OpenAiResponsesAdapter {
                 () = cancellation.cancelled() => return Err(ProviderError::new(ErrorCode::ProviderCanceled, "provider request canceled")),
             };
             if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let retry = super::retry_after_seconds(response.headers());
-                let detail = response
-                    .text()
-                    .await
-                    .ok()
-                    .and_then(|text| error_message(&text));
-                let error = super::http_status_error(status, retry);
-                return Err(match detail {
-                    Some(detail) => ProviderError::new(error.code(), format!("{error}: {detail}"))
-                        .with_retry_after(error.retry_after()),
-                    None => error,
-                });
+                return Err(super::http_response_error(response).await);
             }
             let mut stream = response.bytes_stream();
             let mut decoder = ResponsesSseDecoder::default();
@@ -327,17 +315,6 @@ impl ModelProvider for OpenAiResponsesAdapter {
             Ok(events)
         })
     }
-}
-
-/// The `error.message` of a JSON error body, short enough for one line.
-fn error_message(body: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(body).ok()?;
-    let message = value
-        .pointer("/error/message")
-        .or_else(|| value.pointer("/detail"))
-        .or_else(|| value.get("message"))?
-        .as_str()?;
-    Some(message.chars().take(300).collect())
 }
 
 #[derive(Default)]
