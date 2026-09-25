@@ -360,7 +360,9 @@ Building from source stays available for development:
 
 ### 12.1. Agent tools
 
-The 18 core tools cross the host policy and receipt gate. Skill tools (`list_skills`, `activate_skill`) and `mcp__<server>__<tool>` appear when available.
+The 18 core tools cross the host policy and receipt gate. Skill tools (`list_skills`, `activate_skill`, `read_skill_file`) and `mcp__<server>__<tool>` appear when available.
+
+**Skills** follow the Agent Skills layout (a directory with `SKILL.md` plus its own files). They are found in the bundled set, `<config-dir>/skills`, `~/.agents/skills`, every directory listed in `HA_SKILL_PATHS` (separated like `PATH`, e.g. `~/.claude/skills`), and - for a trusted project - `.harness/skills` and `.agents/skills` in the workspace and each parent up to the Git root. The system prompt lists each skill's name and description; the model activates one by name (the digest from `list_skills` is an optional pin, accepted with or without `sha256:`). Activation adds the instructions plus the skill's directory and file list, and `read_skill_file` reads those files - only inside that skill. The three skill tools only read the trusted catalogue, so they run without an approval panel; a deny rule still blocks them. `disable-model-invocation: true` in the front matter hides a skill from the model; `/skill:<name>` still runs it.
 
 | Group | Tools | Purpose |
 | --- | --- | --- |

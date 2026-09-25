@@ -303,6 +303,27 @@ impl ToolPolicy {
             };
         }
 
+        // Reading the trusted skill catalogue changes nothing: listing skills,
+        // loading one's instructions and reading its own files. Asking before each of
+        // them put an approval panel between the model and every skill, and full-auto
+        // did not cover them either, so skills were used far less than they matched.
+        // Deny rules above still apply.
+        if let CodingToolAction::ExternalTool {
+            plugin_id,
+            tool_name,
+            ..
+        } = action
+            && plugin_id == "skill"
+            && matches!(
+                tool_name.as_str(),
+                "list_skills" | "activate_skill" | "read_skill_file"
+            )
+        {
+            return Decision::Allow {
+                reason: "skill catalogue (read-only)".to_owned(),
+            };
+        }
+
         match self.mode {
             PolicyMode::AutoEdit if auto_edit_action(action) => Decision::Allow {
                 reason: "mode auto-edit".to_owned(),
@@ -688,6 +709,45 @@ mod g05_policy_tests {
             policy.decide(&action),
             Decision::Deny("protected by deny rule".to_owned())
         );
+    }
+
+    /// Loading a trusted skill changes nothing, so it does not open a panel; a tool
+    /// of any other plugin still asks, and a deny rule still wins.
+    #[test]
+    fn reading_the_skill_catalogue_needs_no_approval_but_other_plugins_do() {
+        let external = |plugin: &str, tool: &str| CodingToolAction::ExternalTool {
+            plugin_id: plugin.to_owned(),
+            tool_name: tool.to_owned(),
+            arguments: serde_json::json!({}),
+            parent_invocation_id: None,
+            timeout_ms: 5_000,
+        };
+        let policy = ToolPolicy::new(1, Vec::new());
+        for tool in ["list_skills", "activate_skill", "read_skill_file"] {
+            assert!(
+                matches!(
+                    policy.decide(&external("skill", tool)),
+                    Decision::Allow { .. }
+                ),
+                "{tool}"
+            );
+        }
+        assert_eq!(
+            policy.decide(&external("mcp", "list_skills")),
+            Decision::Ask
+        );
+        assert_eq!(
+            policy.decide(&external("skill", "write_anything")),
+            Decision::Ask
+        );
+        let denied = ToolPolicy::new(1, Vec::new()).with_tool_rules(vec![ToolPatternRule::deny(
+            "activate_skill()",
+            "no skills here",
+        )]);
+        assert!(matches!(
+            denied.decide(&external("skill", "activate_skill")),
+            Decision::Deny(_)
+        ));
     }
 
     #[test]

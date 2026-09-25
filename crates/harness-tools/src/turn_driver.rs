@@ -354,7 +354,12 @@ impl fmt::Debug for ExternalTools {
 }
 
 /// Longest tool result text handed back to the model.
-const TOOL_RESULT_LIMIT: usize = 4000;
+///
+/// It was 4000 characters - about a thousand tokens - so one `read_file` of an
+/// ordinary source file came back cut, and the model spent step after step reading
+/// the same file in slices. Every tool already bounds its own output; this is the
+/// last guard against one result taking over the context.
+const TOOL_RESULT_LIMIT: usize = 24_000;
 
 /// How many recent tool signatures the loop detector remembers.
 const LOOP_WINDOW: usize = 6;
@@ -1776,6 +1781,19 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             operation, output, ..
         } => format!("git {operation}:\n{output}"),
         ToolOutput::TaskUpdate { note } => format!("task_update: {note}"),
+        // A plugin, MCP or skill tool answers with JSON. A payload that carries its
+        // answer as text is handed over as that text; anything else as compact JSON.
+        // It used to be the Rust debug form of the whole output value, which a model
+        // had to parse through `Object {` and `String(` wrappers.
+        ToolOutput::ExternalTool { payload, .. } => {
+            match payload.get("text").and_then(Value::as_str) {
+                Some(text) => format!("{name}:\n{text}"),
+                None => format!(
+                    "{name}: {}",
+                    serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_owned())
+                ),
+            }
+        }
         ToolOutput::SkillActivated { block } => format!(
             "activated skill {} ({}) on the {} context channel",
             block.id,
@@ -1792,5 +1810,6 @@ fn truncate_text(text: &str, limit: usize) -> String {
         return text.to_owned();
     }
     let kept: String = text.chars().take(limit).collect();
-    format!("{kept}\n[truncated]")
+    let rest = text.chars().count() - limit;
+    format!("{kept}\n[truncated: {rest} more characters; request a narrower range]")
 }

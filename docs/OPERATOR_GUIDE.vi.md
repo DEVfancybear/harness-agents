@@ -363,7 +363,9 @@ Build từ source vẫn dùng được cho phát triển:
 
 ### 12.1. Công cụ của agent
 
-18 công cụ cốt lõi đi qua host, policy và receipt. Các tool skill (`list_skills`, `activate_skill`) và `mcp__<server>__<tool>` được thêm khi khả dụng.
+18 công cụ cốt lõi đi qua host, policy và receipt. Các tool skill (`list_skills`, `activate_skill`, `read_skill_file`) và `mcp__<server>__<tool>` được thêm khi khả dụng.
+
+**Skill** theo cấu trúc Agent Skills (một thư mục có `SKILL.md` cùng các file đi kèm). Skill được tìm trong bộ tích hợp sẵn, `<config-dir>/skills`, `~/.agents/skills`, mọi thư mục liệt kê trong `HA_SKILL_PATHS` (phân tách như `PATH`, ví dụ `~/.claude/skills`), và - với project đã trust - `.harness/skills` cùng `.agents/skills` ở workspace và từng thư mục cha tới Git root. System prompt liệt kê tên và mô tả từng skill; model kích hoạt skill theo tên (digest từ `list_skills` là tùy chọn để ghim phiên bản, chấp nhận có hoặc không có `sha256:`). Khi kích hoạt, model nhận hướng dẫn cùng thư mục và danh sách file của skill, và `read_skill_file` đọc các file đó - chỉ trong phạm vi skill. Ba tool skill chỉ đọc catalogue đã trust nên chạy không cần bảng phê duyệt; deny rule vẫn chặn được. `disable-model-invocation: true` trong front matter ẩn skill khỏi model; `/skill:<name>` vẫn chạy được.
 
 | Nhóm | Tool | Mục đích |
 | --- | --- | --- |

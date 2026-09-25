@@ -414,9 +414,148 @@ pub struct SkillCatalogEntry {
     pub requested_tools: Vec<String>,
     /// Secret references the skill asks the host to resolve. Never values.
     pub requested_secrets: Vec<String>,
+    /// Whether the model may find and activate it by itself.
+    ///
+    /// `disable-model-invocation: true` in the front matter (the Agent Skills field
+    /// pi and prime-agent honour) hides the skill from the model's list; the user
+    /// can still run it with `/skill:<name>`.
+    pub model_invocable: bool,
 }
 
+/// The most files a skill's resource listing names.
+pub const MAX_SKILL_RESOURCE_LISTING: usize = 64;
+
+/// The largest resource file `read_resource` returns, in bytes.
+pub const MAX_SKILL_RESOURCE_BYTES: usize = 256 * 1024;
+
 impl SkillCatalogEntry {
+    /// The directory the skill lives in: where its relative paths start.
+    #[must_use]
+    pub fn directory(&self) -> Option<&Path> {
+        self.path.parent()
+    }
+
+    /// The skill's own files other than `SKILL.md`, as paths relative to its
+    /// directory with `/` separators, sorted and bounded.
+    ///
+    /// A skill that says "read `references/api.md`" or "run `scripts/check.py`" is
+    /// only usable if the model knows those files exist and where. Hidden entries
+    /// and dependency trees (`node_modules`, `.venv`, `__pycache__`) are skipped.
+    #[must_use]
+    pub fn resource_files(&self) -> Vec<String> {
+        let Some(root) = self.directory() else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        let mut pending = vec![(root.to_path_buf(), 0_usize)];
+        while let Some((directory, depth)) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.')
+                    || matches!(name.as_str(), "node_modules" | "__pycache__" | "target")
+                {
+                    continue;
+                }
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                let path = entry.path();
+                if kind.is_dir() && depth < 4 {
+                    pending.push((path, depth + 1));
+                } else if kind.is_file()
+                    && let Ok(relative) = path.strip_prefix(root)
+                {
+                    let relative = relative.to_string_lossy().replace('\\', "/");
+                    if !relative.eq_ignore_ascii_case("SKILL.md") {
+                        found.push(relative);
+                    }
+                }
+            }
+        }
+        found.sort();
+        found.truncate(MAX_SKILL_RESOURCE_LISTING);
+        found
+    }
+
+    /// Read one of the skill's own files as text.
+    ///
+    /// The path is relative to the skill directory and must stay inside it after
+    /// symbolic links are resolved; binary files are refused. The second value says
+    /// whether the text was cut at [`MAX_SKILL_RESOURCE_BYTES`].
+    ///
+    /// # Errors
+    /// Refuses an absolute or escaping path, a missing or non-file target, and a
+    /// file that is not UTF-8 text.
+    pub fn read_resource(&self, relative: &str) -> Result<(String, bool), ExtensionError> {
+        let refuse = |message: String| ExtensionError::new(ErrorCode::PolicyDenied, message);
+        let root = self
+            .directory()
+            .ok_or_else(|| refuse(format!("skill {} has no directory", self.name)))?;
+        let candidate = Path::new(relative.trim());
+        if relative.trim().is_empty()
+            || candidate.is_absolute()
+            || candidate.components().any(|part| {
+                !matches!(
+                    part,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(refuse(format!(
+                "{relative:?} is not a path inside skill {}",
+                self.name
+            )));
+        }
+        let root = std::fs::canonicalize(root).map_err(|error| {
+            ExtensionError::new(
+                ErrorCode::SkillUnavailable,
+                format!("skill directory is unavailable: {error}"),
+            )
+        })?;
+        let target = std::fs::canonicalize(root.join(candidate)).map_err(|_| {
+            ExtensionError::new(
+                ErrorCode::SkillUnavailable,
+                format!("skill {} has no file {relative}", self.name),
+            )
+        })?;
+        if !target.starts_with(&root) || !target.is_file() {
+            return Err(refuse(format!(
+                "{relative} is not a file inside skill {}",
+                self.name
+            )));
+        }
+        let bytes = std::fs::read(&target).map_err(|error| {
+            ExtensionError::new(ErrorCode::SkillUnavailable, format!("{relative}: {error}"))
+        })?;
+        let truncated = bytes.len() > MAX_SKILL_RESOURCE_BYTES;
+        // A cut can land inside one UTF-8 character; step back at most three bytes
+        // to the boundary, so a truncated text file is not mistaken for binary.
+        let limit = bytes.len().min(MAX_SKILL_RESOURCE_BYTES);
+        let mut end = limit;
+        while truncated
+            && end > limit.saturating_sub(3)
+            && std::str::from_utf8(&bytes[..end]).is_err()
+        {
+            end -= 1;
+        }
+        let text = std::str::from_utf8(&bytes[..end]).map_err(|_| {
+            ExtensionError::new(
+                ErrorCode::UnsupportedTextEncoding,
+                format!("{relative} in skill {} is not UTF-8 text", self.name),
+            )
+        })?;
+        if text.contains('\0') {
+            return Err(ExtensionError::new(
+                ErrorCode::UnsupportedTextEncoding,
+                format!("{relative} in skill {} is a binary file", self.name),
+            ));
+        }
+        Ok((text.to_owned(), truncated))
+    }
+
     /// A stable identity for this exact version of this skill.
     #[must_use]
     pub fn version_ref(&self) -> String {
@@ -626,6 +765,7 @@ impl SkillCatalog {
             entry: entry.clone(),
             content,
             activated_at_seq,
+            resources: entry.resource_files(),
         })
     }
 }
@@ -642,6 +782,8 @@ pub struct SkillActivation {
     pub content: String,
     /// The event sequence at which this activation became effective.
     pub activated_at_seq: u64,
+    /// The skill's other files, listed when it was activated.
+    pub resources: Vec<String>,
 }
 
 impl SkillActivation {
@@ -683,12 +825,42 @@ impl SkillActivation {
     /// and may be mandatory. It carries no grants: the requested tools and
     /// secrets stay in the catalogue metadata, and every one of them still has
     /// to pass the tool gate on each proposal.
+    ///
+    /// The block opens with where the skill lives and which files it ships. A
+    /// skill's instructions refer to its own files by relative path ("read
+    /// `references/…`", "run `scripts/…`"); without the directory and the listing
+    /// the model had the instructions and no way to reach anything they pointed at.
     #[must_use]
     pub fn block(&self) -> ContextBlock {
+        use std::fmt::Write as _;
+        let directory = self
+            .entry
+            .directory()
+            .map_or_else(String::new, |directory| directory.display().to_string());
+        let mut header = format!(
+            "Skill `{}` is active. Its directory is {directory}; paths in it are relative to that directory.\n",
+            self.entry.name
+        );
+        if self.resources.is_empty() {
+            header.push_str("It ships no other files.\n");
+        } else {
+            let _ = writeln!(
+                header,
+                "Read its files with read_skill_file {{\"name\": \"{}\", \"path\": \"<file>\"}}; run a script by its full path with run_process or run_shell. Files:",
+                self.entry.name
+            );
+            for resource in &self.resources {
+                header.push_str("- ");
+                header.push_str(resource);
+                header.push('\n');
+            }
+        }
+        header.push_str("---\n");
+        header.push_str(&self.content);
         ContextBlock::mandatory(
             format!("skill:{}", self.entry.version_ref()),
             ContextBlockKind::Skill,
-            self.content.clone(),
+            header,
         )
         .on_channel(harness_session::ContextChannel::Skill)
     }
@@ -854,6 +1026,8 @@ fn scan_entry(path: &Path, source: SkillSource) -> Result<SkillCatalogEntry, Ext
             }
         },
         requested_secrets: front_matter_list(&head_text, "secrets"),
+        model_invocable: !front_matter(&head_text, "disable-model-invocation")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("true")),
     })
 }
 

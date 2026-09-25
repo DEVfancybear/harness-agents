@@ -62,9 +62,10 @@ pub use mcp::{
     McpToolDispatcher, validate_arguments, validate_tool_schema,
 };
 pub use skills::{
-    MAX_SKILL_CATALOG_ENTRIES, MAX_SKILL_HEAD_BYTES, SkillActivation, SkillCatalog,
-    SkillCatalogEntry, SkillConflict, SkillContributor, SkillDescriptor, SkillSource, SkillUpdate,
-    SkillVersionPin, TrustedSkillRoot, compose_skills, discover_skills,
+    MAX_SKILL_CATALOG_ENTRIES, MAX_SKILL_HEAD_BYTES, MAX_SKILL_RESOURCE_BYTES,
+    MAX_SKILL_RESOURCE_LISTING, SkillActivation, SkillCatalog, SkillCatalogEntry, SkillConflict,
+    SkillContributor, SkillDescriptor, SkillSource, SkillUpdate, SkillVersionPin, TrustedSkillRoot,
+    compose_skills, discover_skills,
 };
 pub use tasks::{
     DEFAULT_POLL_INTERVAL_MS, DEFAULT_TASK_DEADLINE_MS, EXTERNAL_TASK_SCHEMA_VERSION,

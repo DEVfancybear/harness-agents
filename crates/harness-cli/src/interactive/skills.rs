@@ -45,18 +45,38 @@ pub fn roots(
             roots.push(TrustedSkillRoot::new(path, SkillSource::User));
         }
     }
+    // Extra skill directories, the way prime-agent's `skills` setting adds another
+    // harness's skills (`~/.claude/skills`, `~/.codex/skills`). They are the user's
+    // own choice, so they carry user trust.
+    if let Some(paths) = environment.value(SKILL_PATHS_VARIABLE) {
+        for path in std::env::split_paths(paths) {
+            if path.is_dir() && !roots.iter().any(|root| root.path == path) {
+                roots.push(TrustedSkillRoot::new(path, SkillSource::User));
+            }
+        }
+    }
     if project_trusted {
-        for path in [
-            workspace.join(".agents/skills"),
-            workspace.join(".harness/skills"),
-        ] {
-            if path.is_dir() {
+        let mut paths = vec![workspace.join(".harness/skills")];
+        // `.agents/skills` in the workspace and in each parent up to the repository
+        // root, as prime-agent and pi discover them: a monorepo keeps shared skills
+        // at its root and opens the agent in a package below it.
+        for directory in workspace.ancestors() {
+            paths.push(directory.join(".agents/skills"));
+            if directory.join(".git").exists() {
+                break;
+            }
+        }
+        for path in paths {
+            if path.is_dir() && !roots.iter().any(|root| root.path == path) {
                 roots.push(TrustedSkillRoot::new(path, SkillSource::TrustedProject));
             }
         }
     }
     roots
 }
+
+/// Extra skill directories, separated like `PATH` (`;` on Windows).
+pub const SKILL_PATHS_VARIABLE: &str = "HA_SKILL_PATHS";
 
 pub fn discover(
     config_dir: &Path,
@@ -181,14 +201,30 @@ impl ExternalToolCatalog for SkillToolCatalog {
                 "type": "function",
                 "function": {
                     "name": "activate_skill",
-                    "description": "Load one matching skill using its name and exact digest from list_skills before following its instructions.",
+                    "description": "Load one matching skill by name before following its instructions. Pass the digest from list_skills to pin the exact version you listed; it may be omitted.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "name": {"type": "string", "enum": self.catalog.entries().iter().map(|entry| entry.name.clone()).collect::<Vec<_>>()},
-                            "digest": {"type": "string", "description": "Exact sha256 digest returned by list_skills for this name."}
+                            "name": {"type": "string", "enum": self.catalog.entries().iter().filter(|entry| entry.model_invocable).map(|entry| entry.name.clone()).collect::<Vec<_>>()},
+                            "digest": {"type": "string", "description": "Optional: the sha256 digest list_skills returned for this name, with or without the sha256: prefix."}
                         },
-                        "required": ["name", "digest"],
+                        "required": ["name"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "read_skill_file",
+                    "description": "Read one of a skill's own files (references, prompts, templates, scripts) by its path relative to the skill directory, as listed when the skill was activated.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "The skill's name."},
+                            "path": {"type": "string", "description": "Path relative to the skill directory, e.g. references/api.md."}
+                        },
+                        "required": ["name", "path"],
                         "additionalProperties": false
                     }
                 }
@@ -197,14 +233,29 @@ impl ExternalToolCatalog for SkillToolCatalog {
     }
 
     fn resolve(&self, name: &str, arguments: &Value) -> Option<CodingToolAction> {
-        matches!(name, "list_skills" | "activate_skill").then(|| CodingToolAction::ExternalTool {
-            plugin_id: "skill".to_owned(),
-            tool_name: name.to_owned(),
-            arguments: arguments.clone(),
-            parent_invocation_id: None,
-            timeout_ms: 5_000,
+        matches!(name, "list_skills" | "activate_skill" | "read_skill_file").then(|| {
+            CodingToolAction::ExternalTool {
+                plugin_id: "skill".to_owned(),
+                tool_name: name.to_owned(),
+                arguments: arguments.clone(),
+                parent_invocation_id: None,
+                timeout_ms: 5_000,
+            }
         })
     }
+}
+
+/// Whether two spellings name the same sha256 digest: the `sha256:` prefix and
+/// letter case do not change which content is pinned.
+fn same_digest(catalog: &str, supplied: &str) -> bool {
+    let bare = |digest: &str| {
+        let digest = digest.trim();
+        digest
+            .strip_prefix("sha256:")
+            .unwrap_or(digest)
+            .to_ascii_lowercase()
+    };
+    !supplied.trim().is_empty() && bare(catalog) == bare(supplied)
 }
 
 struct SkillToolDispatcher {
@@ -227,36 +278,87 @@ impl SkillToolDispatcher {
                 "list_skills accepts no arguments",
             )),
             "activate_skill" => {
-                if object.len() != 2 {
+                if object.keys().any(|key| key != "name" && key != "digest") {
                     return Err(HarnessError::new(
                         ErrorCode::InvalidPayload,
-                        "activate_skill requires only name and digest",
+                        "activate_skill accepts only name and an optional digest",
                     ));
                 }
                 let name = object.get("name").and_then(Value::as_str).ok_or_else(|| {
                     HarnessError::new(ErrorCode::InvalidPayload, "skill name must be a string")
                 })?;
-                let digest = object
-                    .get("digest")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        HarnessError::new(
+                let digest = match object.get("digest") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(digest)) => Some(digest.as_str()),
+                    Some(_) => {
+                        return Err(HarnessError::new(
                             ErrorCode::InvalidPayload,
                             "skill digest must be a string",
-                        )
-                    })?;
+                        ));
+                    }
+                };
                 let entry = self.catalog.entry(name).ok_or_else(|| {
+                    let known = self
+                        .catalog
+                        .entries()
+                        .iter()
+                        .map(|entry| entry.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    HarnessError::new(
+                        ErrorCode::SkillUnavailable,
+                        format!(
+                            "no trusted skill named {name} is in this catalogue; available: {known}"
+                        ),
+                    )
+                })?;
+                // The pin protects against a skill that changed between listing and
+                // activation, so a wrong digest is still refused. How it is spelled is
+                // not the point: measured, a model copied the digest without its
+                // `sha256:` prefix, was refused, and gave up on the skill. The refusal
+                // now names the current digest so a genuinely stale pin can be retried
+                // in one step.
+                if !entry.model_invocable {
+                    return Err(HarnessError::new(
+                        ErrorCode::PolicyDenied,
+                        format!("skill {name} is run only by the user, with /skill:{name}"),
+                    ));
+                }
+                if let Some(digest) = digest
+                    && !same_digest(entry.digest.as_str(), digest)
+                {
+                    return Err(HarnessError::new(
+                        ErrorCode::SchemaVersionMismatch,
+                        format!(
+                            "skill {name} changed since that digest was listed; its current digest is {}",
+                            entry.digest.as_str()
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            "read_skill_file" => {
+                if object.keys().any(|key| key != "name" && key != "path") {
+                    return Err(HarnessError::new(
+                        ErrorCode::InvalidPayload,
+                        "read_skill_file accepts only name and path",
+                    ));
+                }
+                let name = object.get("name").and_then(Value::as_str).ok_or_else(|| {
+                    HarnessError::new(ErrorCode::InvalidPayload, "skill name must be a string")
+                })?;
+                object.get("path").and_then(Value::as_str).ok_or_else(|| {
+                    HarnessError::new(
+                        ErrorCode::InvalidPayload,
+                        "skill file path must be a string",
+                    )
+                })?;
+                self.catalog.entry(name).ok_or_else(|| {
                     HarnessError::new(
                         ErrorCode::SkillUnavailable,
                         format!("no trusted skill named {name} is in this catalogue"),
                     )
                 })?;
-                if entry.digest.as_str() != digest {
-                    return Err(HarnessError::new(
-                        ErrorCode::SchemaVersionMismatch,
-                        format!("skill {name} does not match the supplied catalog digest"),
-                    ));
-                }
                 Ok(())
             }
             _ => Err(HarnessError::new(
@@ -264,6 +366,32 @@ impl SkillToolDispatcher {
                 "skill tool target is unavailable",
             )),
         }
+    }
+
+    /// One of a skill's own files, as text the model reads.
+    fn read_file(&self, arguments: &Value) -> Result<ToolOutput, HarnessError> {
+        self.validate("read_skill_file", arguments)?;
+        let name = arguments["name"].as_str().expect("validated skill name");
+        let path = arguments["path"].as_str().expect("validated skill path");
+        let entry = self.catalog.entry(name).expect("validated catalog entry");
+        let (text, truncated) = entry
+            .read_resource(path)
+            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+        Ok(ToolOutput::ExternalTool {
+            plugin_id: "skill".to_owned(),
+            tool_name: "read_skill_file".to_owned(),
+            payload: json!({
+                "name": name,
+                "path": path,
+                "truncated": truncated,
+                "text": if truncated {
+                    format!("{name}/{path} (first {} bytes):\n{text}", harness_extensions::MAX_SKILL_RESOURCE_BYTES)
+                } else {
+                    format!("{name}/{path}:\n{text}")
+                },
+            }),
+            inflight: 1,
+        })
     }
 
     fn activate(&self, arguments: &Value) -> Result<ToolOutput, HarnessError> {
@@ -328,7 +456,7 @@ impl ExternalToolDispatcher for SkillToolDispatcher {
                     tool_name: "list_skills".to_owned(),
                     payload: json!({
                         "catalog_digest": self.catalog.catalog_digest().as_str(),
-                        "skills": self.catalog.entries().iter().map(|entry| json!({
+                        "skills": self.catalog.entries().iter().filter(|entry| entry.model_invocable).map(|entry| json!({
                             "name": entry.name,
                             "description": entry.description,
                             "version": entry.version,
@@ -339,6 +467,7 @@ impl ExternalToolDispatcher for SkillToolDispatcher {
                     inflight: 1,
                 }),
                 "activate_skill" => self.activate(arguments),
+                "read_skill_file" => self.read_file(arguments),
                 _ => Err(HarnessError::new(
                     ErrorCode::PolicyDenied,
                     "skill tool target is unavailable",
@@ -434,6 +563,133 @@ mod tests {
         );
     }
 
+    /// A skill with its own files, as the bundled ones ship: references and scripts.
+    fn skill_with_files(root: &std::path::Path) -> SkillCatalog {
+        let skill = root.join("research");
+        std::fs::create_dir_all(skill.join("references")).expect("references");
+        std::fs::create_dir_all(skill.join("scripts")).expect("scripts");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: research\ndescription: Research a topic\n---\nRead references/method.md, then run scripts/search.py.\n",
+        )
+        .expect("skill body");
+        std::fs::write(skill.join("references/method.md"), "Search three angles.\n")
+            .expect("reference");
+        std::fs::write(skill.join("scripts/search.py"), "print('ok')\n").expect("script");
+        let hidden = root.join("release");
+        std::fs::create_dir_all(&hidden).expect("hidden skill");
+        std::fs::write(
+            hidden.join("SKILL.md"),
+            "---\nname: release\ndescription: Cut a release\ndisable-model-invocation: true\n---\nOnly when asked.\n",
+        )
+        .expect("hidden body");
+        std::fs::write(root.join("secret.txt"), "outside the skill\n").expect("outside file");
+        SkillCatalog::discover(&[TrustedSkillRoot::new(root, SkillSource::User)])
+            .expect("catalog scans metadata")
+    }
+
+    /// Measured: a skill said "read references/..." and "run scripts/...", and the
+    /// model had its instructions but not where they lived, while `read_file` stops at
+    /// the workspace and bundled skills live outside it. The activation now names the
+    /// directory and the files, and `read_skill_file` reads them - inside the skill only.
+    #[test]
+    fn an_activated_skill_names_its_files_and_they_can_be_read_but_nothing_else() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let catalog = skill_with_files(&temporary.path().join("skills"));
+        let dispatcher = SkillToolDispatcher {
+            catalog,
+            active: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        let harness_tools::ToolOutput::SkillActivated { block } = dispatcher
+            .activate(&serde_json::json!({ "name": "research" }))
+            .expect("activation by name")
+        else {
+            panic!("activation returns a skill block");
+        };
+        for expected in [
+            "references/method.md",
+            "scripts/search.py",
+            "read_skill_file",
+            "research",
+        ] {
+            assert!(
+                block.text.contains(expected),
+                "{expected} in:\n{}",
+                block.text
+            );
+        }
+        assert!(
+            block
+                .text
+                .contains("Read references/method.md, then run scripts/search.py.")
+        );
+
+        let read = dispatcher
+            .read_file(&serde_json::json!({ "name": "research", "path": "references/method.md" }))
+            .expect("a skill file is readable");
+        let harness_tools::ToolOutput::ExternalTool { payload, .. } = read else {
+            panic!("the file comes back as tool text");
+        };
+        assert!(
+            payload["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Search three angles.")
+        );
+
+        for escape in [
+            "../secret.txt",
+            "..\\secret.txt",
+            "/etc/passwd",
+            "C:\\Windows\\win.ini",
+            "references/../../secret.txt",
+        ] {
+            let refused = dispatcher
+                .read_file(&serde_json::json!({ "name": "research", "path": escape }))
+                .expect_err("a path outside the skill is refused");
+            assert_eq!(
+                refused.code(),
+                ErrorCode::PolicyDenied,
+                "{escape}: {refused}"
+            );
+        }
+    }
+
+    /// `disable-model-invocation: true` hides a skill from the model - its list, the
+    /// tool schema and the prompt - and it stays available to the user as /skill:name.
+    #[test]
+    fn a_user_only_skill_is_hidden_from_the_model() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let catalog = skill_with_files(&temporary.path().join("skills"));
+        assert!(
+            !catalog
+                .entry("release")
+                .expect("still in the catalogue")
+                .model_invocable
+        );
+        let prompt = metadata_lines(catalog.entries(), 4096);
+        assert!(
+            prompt.contains("research") && !prompt.contains("release"),
+            "{prompt}"
+        );
+        let host = SkillHost::new(catalog.clone(), Arc::new(Mutex::new(BTreeMap::new())));
+        let schemas = serde_json::to_string(&host.tools().schemas()).expect("schemas");
+        assert!(schemas.contains("read_skill_file"), "{schemas}");
+        assert!(!schemas.contains("\"release\""), "{schemas}");
+        let dispatcher = SkillToolDispatcher {
+            catalog: catalog.clone(),
+            active: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        let refused = dispatcher
+            .validate("activate_skill", &serde_json::json!({ "name": "release" }))
+            .expect_err("the model cannot activate it");
+        assert!(refused.to_string().contains("/skill:release"), "{refused}");
+        assert!(
+            catalog.activate("release", None, 1).is_ok(),
+            "the user still can"
+        );
+    }
+
     #[test]
     fn g11_skill_activation_is_digest_pinned_and_uses_the_skill_channel() {
         let temporary = tempfile::tempdir().expect("temporary directory");
@@ -474,6 +730,32 @@ mod tests {
             .validate("activate_skill", &stale)
             .expect_err("stale pin is refused");
         assert_eq!(error.code(), ErrorCode::SchemaVersionMismatch);
+        assert!(
+            error.to_string().contains(&digest),
+            "the refusal names the current digest so the model can retry: {error}"
+        );
+
+        // Measured: the model sent the digest without its `sha256:` prefix and was
+        // refused, then abandoned the skill. The same content is still the same pin.
+        let bare = digest.trim_start_matches("sha256:").to_uppercase();
+        assert!(
+            dispatcher
+                .validate(
+                    "activate_skill",
+                    &serde_json::json!({ "name": "review", "digest": bare })
+                )
+                .is_ok()
+        );
+        // And a name alone activates the version in the catalogue now.
+        assert!(
+            dispatcher
+                .validate("activate_skill", &serde_json::json!({ "name": "review" }))
+                .is_ok()
+        );
+        let unknown = dispatcher
+            .validate("activate_skill", &serde_json::json!({ "name": "nope" }))
+            .expect_err("unknown skill");
+        assert!(unknown.to_string().contains("review"), "{unknown}");
     }
 
     #[test]
@@ -517,7 +799,7 @@ mod tests {
 
 pub fn metadata_lines(entries: &[SkillCatalogEntry], max_bytes: usize) -> String {
     let mut output = String::new();
-    for entry in entries {
+    for entry in entries.iter().filter(|entry| entry.model_invocable) {
         let line = format!("- {}: {}\n", entry.name, entry.description);
         if output.len().saturating_add(line.len()) > max_bytes {
             let remaining = max_bytes.saturating_sub(output.len());
