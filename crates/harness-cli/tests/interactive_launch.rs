@@ -922,10 +922,6 @@ fn i13_resume_continues_the_task_with_recovered_context_and_no_rerun() {
             .env("HA_PROVIDER_ENDPOINT", &endpoint)
             .env("HA_PROVIDER_MODEL", "fixture-model")
             .env("DEEPSEEK_API_KEY", "fixture-secret-value")
-            // The fixture serves exactly the two turns this case sends. Memory is on by
-            // default and a headless turn then asks the model for facts, which would
-            // spend the second answer; this case is about resuming.
-            .env("HA_MEMORY", "off")
             .stdin(Stdio::null())
             .output()
             .expect("ha binary runs")

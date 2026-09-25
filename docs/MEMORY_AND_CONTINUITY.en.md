@@ -390,43 +390,22 @@ Example fixture, without a real model call:
 
 Gate P1/P2 on durable reconstruction, P3 on actual tool evidence, P4 on extraction/retrieval degradation, P5 on cross-agent ownership/delivery, and P7 on backup/migration/retention. C01–C30 and plugin K01–K14 are acceptance specifications only until executable tests and fresh results exist.
 
-## 19. Conversation log: the contract as implemented
+## 19. Memory: prime-agent's continual harness state
 
-This section records a contract decision that was measured, not a proposed design. Long-term chat memory used to accept only "user directives": an input that was not a question was stored as a `user_instruction` asset, and the model's answer was not stored anywhere. The measured consequence: in a new session, "what did I ask you in the previous session?" was answered with "I have no record of that", while the data sat in the store. Memory has been widened into a **conversation log**, and that carries the constraints below.
+The app's memory follows prime-agent (`core/refinement/refinement.ts`, `prime-agent-runtime/src/rlm/harness.py`). It replaced an earlier design - a keyword-matched "remember that" path, a turn log, a background fact extractor and keyword recall from the SQLite memory store - which is removed. The `harness-memory` crate and `ha memory` remain as a maintenance tool over data written before; turns no longer read or write it.
 
-### 19.1. Two kinds of material, two indexes
+### 19.1. The model owns its memory
 
-The store holds two kinds of material that answer two different questions:
+- Entries have four kinds: `memory`, `prompt` (a supplemental prompt note), `skill` (a Python REPL skill with a `reference` and `arguments` contract) and `subagent` (a delegation spec). Each has an id, title, content, path (grouping), version and scope.
+- The model creates, updates and deletes entries itself through `rlm.harness` in the Python REPL - `create_memory(title, content, path=..., global_=...)`, `update_memory`, `delete_memory`, and the same for the other kinds. The host never decides what is worth keeping: there is no keyword list, no classifier and no background extraction.
+- Two scopes: **global** entries live in `<data-dir>/harness/harness_state.json` and are shared by every conversation; **local** entries live in `<data-dir>/sessions/<task-id>/harness/harness_state.json` and belong to one conversation. The kernel is pointed at both through `RLM_GLOBAL_HARNESS_STATE_DIR` and `RLM_HARNESS_STATE_DIR`, and re-pointed when `/new` or `/resume` changes the conversation.
 
-| Kind | Answers | Examples | Lifetime |
-|---|---|---|---|
-| Durable memory | "what do I know" | user instructions, runtime observations, derived L2 | does not expire |
-| Conversation log | "what did we say" | one asset per turn: `asked:`, `session:`, `answered:` | at most 200 records per project |
+### 19.2. The digest each turn carries
 
-A turn record contains the input verbatim, so it and the directive that stored the same input overlap almost completely - and the record also holds part of the answer. Asking both in one search makes the user's instruction compete with its own echo, decided by a bm25 tie-break. Measured: the block injected for the directive's own words was sometimes the turn record, so the user's instruction reached the model framed as something they were quoted saying rather than as an instruction, and it expires at the retention cap.
-
-The keyword search therefore asks **durable memory first**, and asks the log only when durable memory holds nothing for that query. When the log answers, the transcript says so, because a record is an excerpt of what was said. A question *about* the conversation ("what did I ask you in the previous session?") takes its own path: it reads the log newest first, not by term overlap.
-
-### 19.2. Evidence and retention constraints
-
-- A turn happened: the runtime observed the question arrive and the answer go out, so the record carries `RuntimeObserved` + `VerifiedObservation` and is `Active`. Recording it as a `candidate` made the whole feature invisible, because a candidate is not injectable.
-- `answered:` keeps at most **4000** characters of model output and is an **excerpt**, not a verified fact. The memory block's heading says so outright, so a reply is not read as verified knowledge and hardened into durable memory. That number is the point past which more text could not reach the model anyway: one turn's memory budget is 800 tokens, roughly 3200 characters.
-- That budget is **shared**, not raced for. A block that did not fit used to be dropped whole, so one long memory hid everything the same search found - and conversation records made that certain rather than likely, because a record is a question followed by an answer and answers are longer than questions. Each hit now gets a fair share, and a block that still does not fit is clipped and **says so** (`[truncated: ...]`) instead of vanishing: a memory that stops mid-sentence and does not say so is read as a memory that ends there.
-- An input that looks like it carries a credential is not recorded at all, rather than recorded with its substance redacted away.
-- The 200-record cap applies only to assets this path wrote (`provenance_kind = session_turn`). A user directive is not a log entry and is never retired by a log limit.
-- One turn retires at most 8 over-cap records, so work on the answer path does not scale with the length of the log.
-
-### 19.3. The log is not a source of durable knowledge
-
-A turn record is the one asset guaranteed to be retired, and derived memory dies with its source through transitive invalidation. Therefore:
-
-- No path may accept a turn record as a source: both `derive_l2` (summarize) and `write_version` with `source_assets` (semantic merge) refuse it with `InvalidPayload` and a reason. Refusing when the source is chosen is far clearer than a summary that disappears two hundred turns later with no event to explain it.
-- The retention sweep also leaves alone a record that is the source of a live asset: that record is **pinned** and reported. A store written before this rule still holds such edges, so this is a safety net for legacy data, not the main path.
-- Note: if a directive changes, an older turn record still holds what was said at the time. That is correct for a record, and it is why the keyword path does not use the log as its answer.
-
-### 19.4. Consequence for acceptance
-
-C30 and the anti-forgetting acceptance suite in section 12 read under this contract: "does not forget" means a question about the past is answered from the log, while a question about a subject is answered from durable memory. A suite that checks only durable memory misses half of it, and a suite that checks only the log mistakes a record for knowledge - two different defects, needing two different assertions.
+- Before each turn the host reads both files. A missing, unreadable or corrupt file is an empty state, never an error. The states merge with global entries first; a local entry whose id a global one holds is renamed `local:<id>`.
+- Each kind's entries are ranked by relevance to the task: query terms come from the goal objective (weight 3) and the new message (weight 2) - letters, digits and marks of any script, runs shorter than four characters dropped, CJK runs split into bigrams - scored by weighted overlap discounted by inverse document frequency within the kind; ties keep a stable order. At most six entries per kind are shown, each clipped to 180 characters, then the five newest refinement events.
+- The digest is sent as `[harness-digest] ... <harness_state>...</harness_state>`, prime-agent's wording, with the rules for when to refine and, when the REPL is available, the `rlm.harness` call contract. An entry or event whose fields have the wrong type is skipped with a diagnostic line rather than breaking the digest.
+- `ha exec` carries the same digest and reports `memory.kind = "harness"` with the entry count.
 
 ## 20. Conversation continuation: the contract as implemented
 
@@ -448,35 +427,6 @@ What they share: continuing a conversation uses that conversation's own messages
 - The turns are sent as real `user`/`assistant` messages between the system policy and the new user message. The old request packet is no longer nested.
 - `/resume <n>` shows those turns through the same function, so the screen and the model see the same conversation. The picker lists one row per conversation (task): its newest session, with its turn count.
 
-### 20.3. Relation to the conversation log
+### 20.3. Relation to memory
 
-Section 19 answers "what did we say in other sessions" from memory, with excerpts and retention. This section answers "which conversation is being continued" from the original run data of that exact session chain. Neither path replaces the other. Replay writes nothing to memory, and the log is never used to rebuild the conversation being continued.
-
-## 21. Memory that learns from the conversation: the contract as implemented
-
-This section records two measured defects and the contract that replaced them, following TencentDB-Agent-Memory (L0 → L1) and deer-flow (a post-turn updater, facts with confidence).
-
-### 21.1. Measured defects
-
-- Every input that was not a question was stored as a `UserConfirmed` `user_instruction` that never expires. One-off requests ("fix bug X for me") accumulated into standing rules and were injected into later turns.
-- Vietnamese is indexed per syllable, and there were no stopwords. "hãy … cho tôi" shares three terms with any polite request, so grammar alone cleared the two-term overlap floor.
-
-### 21.2. Contract
-
-- **Verbatim storage only on explicit request.** An input that opens with "ghi nhớ", "hãy nhớ", "nhớ rằng", "remember that"…, or that is a standing rule ("từ giờ", "luôn", "đừng bao giờ", "from now on", "always", "never"…), is stored verbatim as before. Any other input is not stored as an instruction, and no notice is printed.
-- **Stopwords on the query side.** Vietnamese function words (in folded form) and English ones are removed from query terms. A syllable that is also half of a common content word (`an` in "dự án", `ban` in "phiên bản", `de` in "vấn đề", `anh` in "hình ảnh") is kept.
-- **Fact extraction after every turn that ended with an answer.** The model that just answered reads the turn and replies with JSON `{facts:[{content, category, confidence, replaces}]}`.
-  - `category` is from a closed set: `preference`, `knowledge`, `context`, `behavior`, `goal`, `correction`.
-  - At most 8 facts per turn, each at most 400 characters. A credential-like fact is refused. An exact duplicate only gains a source.
-- **Applied by confidence.** A fact with `confidence ≥ 0.7` is written `Active` and used on the next turn. A lower one is written `Candidate`, reviewable with `ha memory candidates`. This is the only path on which model inference becomes `Active` without a human: `PublicationPolicy::classify_inferred`. The confidence is kept on the version (`confidence_annotation`) and shown in the memory block the model reads.
-- **Bounded replacement.** The model is shown at most 12 known facts related to the turn. A new fact may replace (invalidate) only a fact from that list, and only when the new fact is `Active`. An id the model makes up is ignored.
-- **Never fails the turn.** A model that errors, takes longer than 20 seconds or does not answer with JSON is a skipped extraction with a stated reason. Only a store failure is an error, and it is reported as a notice.
-
-### 21.3. Background extraction, deer-flow style
-
-- In the interactive app a turn only **queues** itself (question, answer, source event, principal) while its store is open, then ends. No model call sits on the answer's path any more.
-- The worker waits for the conversation to be quiet for 8 seconds (deer-flow: 30), then reads up to 5 turns in **one** model call. Each fact names its `turn`, and its source is that turn's event.
-- Known facts are read through a read-only store. The model call holds nothing. The write takes the **same writer gate** turns and `/rename` take, so the worker never holds the writer when you send the next message; another process holding the writer is retried a few times.
-- On exit the queue is processed at once, without the debounce, and the exit waits at most 12 seconds.
-- `ha exec` / headless runs one turn and exits, so it extracts synchronously before releasing the writer and reports it in the envelope under `memory.facts`.
-- Fixture providers do not extract, as with model compaction.
+Memory (section 19) holds what the model chose to keep. This section answers "which conversation is being continued" from the original run data of that exact session chain. Neither replaces the other: replay writes nothing to memory, and memory is never used to rebuild the conversation being continued.

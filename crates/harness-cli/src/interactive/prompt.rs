@@ -160,7 +160,6 @@ fn additional_guidance(has: &dyn Fn(&str) -> bool) -> Vec<&'static str> {
         "- Never repeat a tool call whose result you already have in this conversation.",
         "- When several tool calls do not depend on each other, request them together in one step.",
         "- Read before changing a file; use edit_file for localized changes; never guess paths.",
-        "- Memory blocks quote what was said or learned earlier; use them, but a quoted reply is not a verified fact.",
     ];
     if has("web_search") {
         lines.push("- For current or external information use web_search, then read the most relevant results with web_fetch; cite the URLs you used. Never claim you cannot access the internet when these tools are listed.");

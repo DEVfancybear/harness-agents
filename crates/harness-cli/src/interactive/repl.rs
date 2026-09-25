@@ -84,6 +84,31 @@ del _ha_os";
 /// The answer to one host request: `None` when the type has no handler.
 pub type HostReply<'a> = Pin<Box<dyn Future<Output = Option<Result<Value, String>>> + Send + 'a>>;
 
+/// Where `rlm.harness` keeps memory: the global state and this conversation's.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessDirs {
+    pub global: PathBuf,
+    pub local: PathBuf,
+}
+
+impl HarnessDirs {
+    /// A cell that points the kernel's `rlm.harness` at these directories. The paths
+    /// are written as JSON strings, which Python reads as the same string literals.
+    fn setup_code(&self) -> String {
+        let quote = |path: &Path| {
+            serde_json::to_string(&path.display().to_string()).unwrap_or_else(|_| "\"\"".to_owned())
+        };
+        format!(
+            "import os as _ha_os
+_ha_os.environ[\"RLM_GLOBAL_HARNESS_STATE_DIR\"] = {}
+_ha_os.environ[\"RLM_HARNESS_STATE_DIR\"] = {}
+del _ha_os",
+            quote(&self.global),
+            quote(&self.local)
+        )
+    }
+}
+
 /// Answers the `host_request`s one turn knows.
 pub trait HostRequests: Send + Sync {
     /// Answer one request, or `None` when this turn has no handler for its type.
@@ -168,6 +193,7 @@ impl ReplShared {
         code: &str,
         timeout: Duration,
         host: &dyn HostRequests,
+        harness: Option<&HarnessDirs>,
     ) -> Result<String, HarnessError> {
         let python = self.python().await.cloned().ok_or_else(|| {
             HarnessError::new(
@@ -195,6 +221,18 @@ impl ReplShared {
             slot.kernel = Some(kernel);
         }
         let kernel = slot.kernel.as_mut().expect("the kernel was just started");
+        // The conversation decides which local memory the kernel writes; a kernel that
+        // outlives `/new` or `/resume` is pointed at the new one before the cell runs.
+        if let Some(dirs) = harness
+            && kernel.harness.as_ref() != Some(dirs)
+        {
+            let applied = kernel
+                .execute(&dirs.setup_code(), READY_TIMEOUT, &NoHostRequests)
+                .await;
+            if applied.is_ok() {
+                kernel.harness = Some(dirs.clone());
+            }
+        }
         let outcome = kernel.execute(code, timeout, host).await;
         let text = match outcome {
             Ok(cell) => cell,
@@ -221,6 +259,8 @@ struct Kernel {
     next: u64,
     /// A cell that was started and whose `done` was never read.
     in_flight: Option<String>,
+    /// The memory directories this kernel was last pointed at.
+    harness: Option<HarnessDirs>,
 }
 
 impl Kernel {
@@ -277,6 +317,7 @@ impl Kernel {
             events,
             next: 0,
             in_flight: None,
+            harness: None,
         };
         let ready = tokio::time::timeout(READY_TIMEOUT, kernel.events.recv())
             .await
@@ -604,15 +645,21 @@ fn default_shell() -> Option<PathBuf> {
 pub struct ReplHost {
     shared: Arc<ReplShared>,
     host: Arc<dyn HostRequests>,
+    harness: HarnessDirs,
 }
 
 impl ReplHost {
     /// The tool for this turn, when an interpreter exists.
-    pub async fn for_turn(shared: &Arc<ReplShared>, host: Arc<dyn HostRequests>) -> Option<Self> {
+    pub async fn for_turn(
+        shared: &Arc<ReplShared>,
+        host: Arc<dyn HostRequests>,
+        harness: HarnessDirs,
+    ) -> Option<Self> {
         shared.python().await?;
         Some(Self {
             shared: Arc::clone(shared),
             host,
+            harness,
         })
     }
 
@@ -723,6 +770,7 @@ impl ExternalToolDispatcher for ReplHost {
                     code,
                     Duration::from_millis(CELL_TIMEOUT_MS),
                     self.host.as_ref(),
+                    Some(&self.harness),
                 )
                 .await?;
             Ok(ToolOutput::ExternalTool {
@@ -783,11 +831,21 @@ mod tests {
             eprintln!("skipped: no Python 3.11+ on this machine");
             return;
         }
+        let dirs = super::HarnessDirs {
+            global: directory.path().join("global-harness"),
+            local: directory.path().join("local-harness"),
+        };
         let run = |code: &'static str, seconds: u64| {
             let shared = Arc::clone(&shared);
+            let dirs = dirs.clone();
             async move {
                 shared
-                    .execute(code, Duration::from_secs(seconds), &NoHostRequests)
+                    .execute(
+                        code,
+                        Duration::from_secs(seconds),
+                        &NoHostRequests,
+                        Some(&dirs),
+                    )
                     .await
                     .expect("cell")
             }
@@ -805,6 +863,21 @@ mod tests {
             run("x", 60).await,
             "41",
             "the kernel survived the interrupt"
+        );
+        // Memory written through `rlm.harness` lands in the conversation's files, where
+        // the host reads its digest from.
+        let created = run(
+            "rlm.harness.create_memory('Indentation', 'The user prefers tabs').id",
+            60,
+        )
+        .await;
+        assert!(!created.contains("Traceback"), "{created}");
+        let state = crate::interactive::harness::load(&dirs.local, "local");
+        let memories = state.entries.get("memory").expect("memories");
+        assert_eq!(memories.len(), 1, "{created}");
+        assert_eq!(
+            memories[0].content.as_deref(),
+            Some("The user prefers tabs")
         );
         if super::default_shell().is_some() {
             let bash = run("(await bash('echo from-bash')).output.strip()", 60).await;

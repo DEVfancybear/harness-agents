@@ -421,5 +421,5 @@ On Windows `run_shell` uses `pwsh`, falling back to `powershell.exe` when pwsh i
 
 ### 12.6. Memory and `/resume`
 
-Memory is on by default; `HA_MEMORY=off` (or `0`, `false`, `no`) turns it off. After a turn that ended with an answer, the model extracts facts worth keeping (preferences, decisions, conventions, corrections): confidence ≥ 0.7 is used from the next turn, lower waits in `ha memory candidates`. Your input is stored verbatim only when you ask ("remember that …", "ghi nhớ …", "from now on …"). `/resume` works with memory off as well: it replays the conversation's own turns to the model and shows them on screen. See `MEMORY_AND_CONTINUITY` sections 20 and 21.
+Memory follows prime-agent's continual harness state: the model keeps memories, prompt notes, skills and subagent specs itself through `rlm.harness` in the Python REPL, global ones shared by every conversation and local ones per conversation, and every turn carries a digest of them ranked for the task. Nothing is stored by keyword or extracted in the background. `/resume` replays the conversation's own turns to the model and shows them on screen. See `MEMORY_AND_CONTINUITY` sections 19 and 20.
 

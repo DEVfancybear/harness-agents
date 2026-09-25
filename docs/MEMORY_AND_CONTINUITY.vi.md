@@ -390,43 +390,22 @@ Fixture minh họa, không gọi model thật:
 
 Gate P1/P2 bằng durable reconstruction, P3 bằng tool evidence thật, P4 bằng extraction/retrieval degradation, P5 bằng cross-agent ownership/delivery, P7 bằng backup/migration/retention. C01–C30 và plugin K01–K14 chỉ là acceptance specifications cho đến khi có executable tests và kết quả mới chạy.
 
-## 19. Nhật ký hội thoại: hợp đồng đã triển khai
+## 19. Memory: harness state của prime-agent
 
-Mục này ghi lại một quyết định hợp đồng đã đo, không phải thiết kế đề xuất. Trước đây memory dài hạn của chat chỉ nhận "chỉ dẫn người dùng": input không phải câu hỏi được lưu thành asset `user_instruction`, còn câu trả lời của model thì không được lưu ở đâu cả. Hệ quả đo được: mở phiên mới hỏi "session trước tôi hỏi bạn những gì?" thì agent trả lời rằng nó không có bản ghi nào, trong khi dữ liệu vẫn nằm trong store. Memory đã được mở rộng thành **nhật ký hội thoại**, và điều đó kéo theo các ràng buộc dưới đây.
+Memory của ứng dụng theo prime-agent (`core/refinement/refinement.ts`, `prime-agent-runtime/src/rlm/harness.py`). Nó thay cho thiết kế cũ - đường "ghi nhớ …" khớp theo từ khoá, nhật ký lượt, worker trích fact chạy nền và truy xuất theo từ khoá từ memory store SQLite - thiết kế đó đã bị gỡ. Crate `harness-memory` và lệnh `ha memory` vẫn còn như công cụ bảo trì cho dữ liệu ghi trước đây; các lượt không còn đọc hay ghi vào đó.
 
-### 19.1. Hai loại vật liệu, hai chỉ mục
+### 19.1. Model tự quản memory
 
-Store giữ hai loại vật liệu trả lời hai câu hỏi khác nhau:
+- Entry có bốn loại: `memory`, `prompt` (ghi chú bổ sung cho prompt), `skill` (skill Python REPL có `reference` và `arguments`) và `subagent` (đặc tả giao việc). Mỗi entry có id, tiêu đề, nội dung, path (nhóm), version và scope.
+- Model tự tạo, sửa, xoá entry qua `rlm.harness` trong Python REPL - `create_memory(title, content, path=..., global_=...)`, `update_memory`, `delete_memory`, và tương tự cho các loại khác. Host không bao giờ tự quyết cái gì đáng giữ: không có danh sách từ khoá, không có bộ phân loại, không có trích xuất chạy nền.
+- Hai scope: entry **global** nằm ở `<data-dir>/harness/harness_state.json`, dùng chung cho mọi hội thoại; entry **local** nằm ở `<data-dir>/sessions/<task-id>/harness/harness_state.json`, thuộc về một hội thoại. Kernel được trỏ tới cả hai qua `RLM_GLOBAL_HARNESS_STATE_DIR` và `RLM_HARNESS_STATE_DIR`, và được trỏ lại khi `/new` hoặc `/resume` đổi hội thoại.
 
-| Loại | Trả lời | Ví dụ | Vòng đời |
-|---|---|---|---|
-| Durable memory | "tôi biết gì" | chỉ dẫn người dùng, quan sát runtime, L2 tổng hợp | không hết hạn |
-| Nhật ký hội thoại | "ta đã nói gì" | một asset cho mỗi lượt: `asked:`, `session:`, `answered:` | tối đa 200 bản ghi mỗi project |
+### 19.2. Digest đi kèm mỗi lượt
 
-Bản ghi lượt chứa nguyên văn input, nên nó và chỉ dẫn ghi cùng input đó trùng nhau gần hết - và bản ghi còn chứa thêm một phần câu trả lời. Nếu hỏi cả hai trong một lần tìm, chỉ dẫn của người dùng phải cạnh tranh với chính tiếng vọng của nó, và kết quả do một tie-break bm25 quyết định. Đo được: khối được inject cho đúng từ ngữ của chỉ dẫn có lúc là bản ghi lượt, tức chỉ dẫn của người dùng đến model trong dạng "thứ mà người dùng đã được trích dẫn là đã nói" thay vì một chỉ dẫn, và nó sẽ hết hạn ở ngưỡng retention.
-
-Vì vậy đường tìm kiếm theo từ khóa hỏi **durable memory trước**, và chỉ hỏi nhật ký khi durable memory không có gì cho truy vấn đó. Khi nhật ký trả lời, transcript nói rõ điều đó, vì bản ghi chỉ là trích đoạn của điều đã được nói. Câu hỏi *về* cuộc hội thoại ("session trước tôi hỏi bạn những gì?") đi đường riêng: đọc nhật ký theo thứ tự mới nhất trước, không theo độ trùng từ khóa.
-
-### 19.2. Ràng buộc về bằng chứng và ngưỡng lưu
-
-- Một lượt là chuyện đã xảy ra: runtime quan sát câu hỏi đến và câu trả lời đi ra, nên bản ghi mang `RuntimeObserved` + `VerifiedObservation` và ở trạng thái `Active`. Ghi nó thành `candidate` làm cả tính năng vô hình, vì `candidate` không được inject.
-- `answered:` giữ tối đa **4000** ký tự output của model và là **trích đoạn**, không phải sự thật đã kiểm chứng. Heading của khối memory nói thẳng điều này, để một câu trả lời không bị đọc như tri thức đã xác minh rồi cứng lại thành durable knowledge. Con số này là điểm mà thêm chữ nữa cũng không thể tới được model: ngân sách memory của một lượt là 800 token, khoảng 3200 ký tự.
-- Ngân sách đó được **chia**, không phải ai nhanh chân thì lấy hết. Một khối không vừa từng bị bỏ nguyên khối, nên một memory dài che mất mọi thứ mà chính lần tìm đó tìm ra - và bản ghi hội thoại làm điều đó thành chắc chắn chứ không chỉ có thể, vì nó là câu hỏi kèm câu trả lời, mà câu trả lời thì dài hơn câu hỏi. Giờ mỗi hit được chia một phần công bằng, và khối vẫn không vừa thì bị cắt và **nói ra** (`[truncated: ...]`) thay vì biến mất: một memory dừng giữa câu mà không nói gì thì bị đọc như một memory kết thúc ở đó.
-- Đầu vào trông như mang credential thì lượt đó không được ghi, thay vì ghi một bản ghi đã bị redact nội dung chính.
-- Ngưỡng 200 bản ghi mỗi project chỉ áp cho asset do chính đường này ghi (`provenance_kind = session_turn`). Chỉ dẫn người dùng không phải mục log và không bao giờ bị ngưỡng log thu hồi.
-- Một lượt chỉ thu hồi tối đa 8 bản ghi quá ngưỡng, để công việc trên đường trả lời không tỉ lệ với độ dài log.
-
-### 19.3. Nhật ký không phải nguồn của tri thức bền
-
-Bản ghi lượt là asset duy nhất chắc chắn sẽ bị thu hồi, và memory dẫn xuất chết theo nguồn của nó qua transitive invalidation. Vì vậy:
-
-- Không đường nào được nhận bản ghi lượt làm source: cả `derive_l2` (summarize) lẫn `write_version` với `source_assets` (semantic merge) từ chối bằng `InvalidPayload` kèm lý do. Từ chối lúc chọn nguồn rõ ràng hơn nhiều so với một bản summary biến mất hai trăm lượt sau mà không có sự kiện nào giải thích.
-- Lượt thu hồi cũng không động vào bản ghi đang là nguồn của một asset còn sống: bản ghi đó bị **pin** và được báo lại. Store ghi trước quy tắc này vẫn còn cạnh phụ thuộc, nên đây là lưới an toàn cho dữ liệu cũ, không phải đường chính.
-- Ghi chú: nếu chỉ dẫn thay đổi thì bản ghi lượt cũ vẫn giữ nguyên văn điều đã nói tại thời điểm đó. Đó là điều đúng cho một bản ghi, và là lý do đường từ khóa không lấy nhật ký làm câu trả lời.
-
-### 19.4. Hệ quả cho acceptance
-
-C30 và bộ nghiệm thu chống quên ở mục 12 phải đọc theo hợp đồng này: "không quên" nghĩa là câu hỏi về quá khứ được trả lời từ nhật ký, còn câu hỏi về chủ đề được trả lời từ durable memory. Một chương trình chỉ kiểm tra durable memory sẽ bỏ sót nửa còn lại, và một chương trình chỉ kiểm tra nhật ký sẽ coi bản ghi là tri thức - hai lỗi khác nhau, cần hai assertion khác nhau.
+- Trước mỗi lượt host đọc cả hai file. File thiếu, không đọc được hoặc hỏng được coi là state rỗng, không bao giờ là lỗi. Hai state được gộp, global đứng trước; entry local trùng id với entry global được đổi tên thành `local:<id>`.
+- Entry của từng loại được xếp theo mức liên quan tới việc đang làm: từ truy vấn lấy từ mục tiêu (trọng số 3) và tin nhắn mới (trọng số 2) - chữ, số và dấu của mọi hệ chữ, cụm ngắn hơn bốn ký tự bị bỏ, cụm CJK tách thành bigram - chấm điểm bằng độ trùng có trọng số, giảm theo tần suất tài liệu trong cùng loại; điểm bằng nhau giữ thứ tự ổn định. Mỗi loại hiện tối đa sáu entry, mỗi entry cắt ở 180 ký tự, sau đó là năm sự kiện refine mới nhất.
+- Digest được gửi dạng `[harness-digest] ... <harness_state>...</harness_state>`, đúng câu chữ của prime-agent, kèm quy tắc khi nào nên refine và, khi có REPL, cách gọi `rlm.harness`. Entry hoặc sự kiện có trường sai kiểu bị bỏ qua kèm một dòng chẩn đoán thay vì làm hỏng digest.
+- `ha exec` mang cùng digest và báo `memory.kind = "harness"` kèm số entry.
 
 ## 20. Tiếp tục hội thoại: hợp đồng đã triển khai
 
@@ -448,35 +427,6 @@ Mục này ghi lại lỗi đã đo với `/resume` và hợp đồng thay thế
 - Các lượt được gửi dưới dạng message `user`/`assistant` thật, đặt giữa system policy và message user mới. Packet request cũ không còn được lồng vào.
 - `/resume <n>` hiển thị lại các lượt đó bằng chính hàm này, nên màn hình và model thấy cùng một hội thoại. Picker liệt kê mỗi hội thoại (task) một dòng, là session mới nhất của nó, kèm số lượt.
 
-### 20.3. Quan hệ với nhật ký hội thoại
+### 20.3. Quan hệ với memory
 
-Mục 19 trả lời "ta đã nói gì ở các phiên khác" bằng memory có trích đoạn và retention. Mục này trả lời "đang tiếp tục cuộc nào" bằng dữ liệu run gốc của đúng chuỗi session đó. Hai đường không thay thế nhau. Replay không ghi gì vào memory, và nhật ký không được dùng để dựng lại hội thoại đang tiếp tục.
-
-## 21. Memory tự học từ hội thoại: hợp đồng đã triển khai
-
-Mục này ghi lại hai lỗi đã đo và hợp đồng thay thế, theo hướng của TencentDB-Agent-Memory (L0 → L1) và deer-flow (updater sau mỗi lượt, fact có confidence).
-
-### 21.1. Lỗi đã đo
-
-- Mọi input không phải câu hỏi đều được lưu thành `user_instruction` `UserConfirmed` và không bao giờ hết hạn. Các yêu cầu làm một lần ("hãy sửa lỗi X cho tôi") tích lũy thành quy tắc thường trực và bị inject vào lượt sau.
-- Tiếng Việt được index theo âm tiết, và không có stopword. "hãy … cho tôi" trùng ba term với mọi yêu cầu lịch sự, nên ngưỡng trùng hai term bị vượt chỉ nhờ ngữ pháp.
-
-### 21.2. Hợp đồng
-
-- **Lưu nguyên văn chỉ khi được yêu cầu rõ.** Input mở đầu bằng "ghi nhớ", "hãy nhớ", "nhớ rằng", "remember that"… hoặc là một quy tắc thường trực ("từ giờ", "luôn", "đừng bao giờ", "from now on", "always", "never"…) được lưu nguyên văn như trước. Input khác không được lưu thành chỉ dẫn, và cũng không có thông báo.
-- **Stopword ở phía truy vấn.** Các từ chức năng tiếng Việt (dạng đã bỏ dấu) và tiếng Anh bị loại khỏi term truy vấn. Âm tiết cũng là nửa của một từ mang nghĩa phổ biến (`an` trong "dự án", `ban` trong "phiên bản", `de` trong "vấn đề", `anh` trong "hình ảnh") được giữ lại.
-- **Trích xuất fact sau mỗi lượt kết thúc bằng câu trả lời.** Chính model đang chạy đọc lượt đó và trả JSON `{facts:[{content, category, confidence, replaces}]}`.
-  - `category` thuộc tập đóng: `preference`, `knowledge`, `context`, `behavior`, `goal`, `correction`.
-  - Tối đa 8 fact mỗi lượt, mỗi fact tối đa 400 ký tự. Fact trông như credential bị từ chối. Fact trùng nguyên văn chỉ ghi thêm nguồn.
-- **Tự áp dụng theo confidence.** Fact có `confidence ≥ 0.7` được ghi `Active` và dùng ngay ở lượt sau. Fact thấp hơn được ghi `Candidate`, xem bằng `ha memory candidates`. Đây là đường duy nhất cho phép suy luận của model thành `Active` mà không qua người: `PublicationPolicy::classify_inferred`. Confidence được lưu trên version (`confidence_annotation`) và hiện trong khối memory gửi cho model.
-- **Thay thế có giới hạn.** Model được xem tối đa 12 fact đã biết liên quan đến lượt. Một fact mới chỉ được thay (invalidate) một fact nằm trong danh sách đó, và chỉ khi fact mới là `Active`. Id do model tự bịa ra bị bỏ qua.
-- **Không bao giờ làm hỏng lượt.** Model lỗi, quá 20 giây, hoặc không trả JSON thì extraction bị bỏ qua và ghi lý do. Chỉ lỗi store mới là lỗi, và được báo bằng notice.
-
-### 21.3. Chạy nền, theo kiểu deer-flow
-
-- Trong app tương tác, lượt chat chỉ **đưa lượt vào hàng đợi** (câu hỏi, câu trả lời, event nguồn, principal) khi store còn mở, rồi kết thúc ngay. Không còn lời gọi model nào trên đường trả lời.
-- Worker chờ hội thoại im lặng 8 giây (deer-flow: 30 giây), rồi đọc tối đa 5 lượt trong **một** lời gọi model. Mỗi fact ghi `turn` để biết nó thuộc lượt nào, và nguồn của fact là event của đúng lượt đó.
-- Đọc fact đã biết dùng store read-only. Lời gọi model không giữ gì. Việc ghi lấy **cùng cổng ghi** mà lượt chat và `/rename` dùng, nên worker không bao giờ giữ writer đúng lúc bạn gửi câu mới; một tiến trình khác đang giữ writer thì worker thử lại vài lần.
-- Khi thoát app, hàng đợi được xử lý ngay, không chờ debounce, và việc thoát chờ tối đa 12 giây.
-- `ha exec` / headless chạy một lượt rồi thoát, nên trích xuất đồng bộ trước khi trả writer, và báo trong envelope ở `memory.facts`.
-- Provider fixture không chạy extraction, giống compaction bằng model.
+Memory (mục 19) giữ những gì model chọn giữ lại. Mục này trả lời "đang tiếp tục cuộc nào" bằng dữ liệu run gốc của đúng chuỗi session đó. Hai đường không thay thế nhau: replay không ghi gì vào memory, và memory không được dùng để dựng lại hội thoại đang tiếp tục.

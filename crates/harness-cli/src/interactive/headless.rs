@@ -36,7 +36,6 @@ use super::bootstrap::{self, LaunchRequest};
 use super::bounds;
 use super::config::ConfigOverrides;
 use super::extensions;
-use super::memory;
 use super::paths::{HostPlatform, LaunchEnvironment};
 use super::project;
 use super::service::{
@@ -178,37 +177,6 @@ async fn run_state_label(store: &SqliteStore, outcome: &harness_tools::TurnOutco
 
 /// Run one headless turn.
 ///
-/// The asset id one memory write produced, when it produced one.
-fn memory_asset_of(
-    remembered: &Result<Option<memory::RememberOutcome>, HarnessError>,
-) -> Option<String> {
-    match remembered {
-        Ok(Some(
-            memory::RememberOutcome::Stored(asset_id)
-            | memory::RememberOutcome::Duplicate(asset_id)
-            | memory::RememberOutcome::StoredButUnpruned { asset_id, .. },
-        )) => Some(asset_id.as_str().to_owned()),
-        _ => None,
-    }
-}
-
-/// What one memory write did, in words a scripting caller can branch on.
-fn memory_disposition_of(
-    remembered: &Result<Option<memory::RememberOutcome>, HarnessError>,
-) -> &'static str {
-    match remembered {
-        Ok(Some(memory::RememberOutcome::Stored(_))) => "stored",
-        // Distinct from `stored` because the caller's next question is about the store, not
-        // about this turn: a log that could not be trimmed keeps growing.
-        Ok(Some(memory::RememberOutcome::StoredButUnpruned { .. })) => "stored_but_unpruned",
-        Ok(Some(memory::RememberOutcome::Duplicate(_))) => "duplicate",
-        Ok(Some(memory::RememberOutcome::NotKnowledge { reason })) => reason,
-        Ok(Some(memory::RememberOutcome::NotRequested)) => "not_requested",
-        Ok(Some(memory::RememberOutcome::NothingAdmitted) | None) => "nothing_admitted",
-        Err(_) => "error",
-    }
-}
-
 /// Run one bounded headless turn and report it as JSON.
 ///
 /// The body is a linear sequence: resolve, run exactly one turn, shut down. It is
@@ -343,17 +311,8 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         .map_or_else(TaskId::generate, |(_, task)| task.clone());
     let session_id = SessionId::generate();
     // One project identity per workspace root, resolved before anything scoped to the
-    // project is written; memory stays a separate opt-in on top of it.
+    // project is written.
     let project_id = project::resolve_project_id(&store, &context.project.root).await?;
-    let memory_principal = if memory::memory_requested_from_environment(&environment) {
-        Some(memory::principal(
-            project_id.clone(),
-            task_id.clone(),
-            session_id.clone(),
-        ))
-    } else {
-        None
-    };
     let observation = observe_workspace(project_id, &context.project.root)?;
     acceptance_trace("workspace_observed");
     let capabilities = match &provider_config {
@@ -493,6 +452,26 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         observation,
     )
     .with_tool_schemas(tool_schemas);
+    // Memory is prime-agent's continual harness state, as in the app: this run reads
+    // the digest of what the model has kept, ranked for this prompt.
+    let harness_state = super::harness::merge(
+        super::harness::load(
+            &super::harness::global_dir(&context.paths.data_dir),
+            "global",
+        ),
+        super::harness::load(
+            &super::harness::local_dir(&context.paths.data_dir, task_id.as_str()),
+            "local",
+        ),
+    );
+    let harness_entries = harness_state.total();
+    let run_request = run_request.with_project_rules(vec![super::harness::digest_block(
+        &super::harness::format_digest(
+            &harness_state,
+            super::harness::DigestOptions::default(),
+            &super::harness::weighted_terms(None, &[request.prompt.as_str()]),
+        ),
+    )]);
     let run_request = if attached.is_empty() {
         run_request
     } else {
@@ -522,30 +501,6 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
             })
         })
         .collect();
-    let mut recall = None;
-    let run_request = match &memory_principal {
-        Some(principal) => {
-            match memory::recall(
-                Arc::clone(&store),
-                principal,
-                &context.project.root,
-                &request.prompt,
-            )
-            .await
-            {
-                Ok(found) => {
-                    let request = run_request.with_memory(found.contribution.clone());
-                    recall = Some(found);
-                    request
-                }
-                Err(error) => {
-                    eprintln!("memory: recall skipped ({error})");
-                    run_request
-                }
-            }
-        }
-        None => run_request,
-    };
     let options = TurnOptions {
         workspace_root: context.project.root.clone(),
         actor_id: "headless.user".to_owned(),
@@ -645,88 +600,10 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         notices.push(notice.clone());
     }
     acceptance_trace("turn_finished");
-    // Stored before the writer is released, exactly like the interactive turn: the
-    // admitted text comes back from the journal and is committed as reusable memory.
-    let remembered = match &memory_principal {
-        Some(principal) => memory::remember_input(Arc::clone(&store), principal, &session_id)
-            .await
-            .map(Some),
-        None => Ok(None),
-    };
-    // And the turn itself, which is what answers "what did I ask you before?". It was
-    // missing here while the interactive path had it, so a headless session recorded no
-    // conversation at all and the history question had nothing to read.
-    let turn = match &memory_principal {
-        Some(principal) => memory::remember_turn(
-            Arc::clone(&store),
-            principal,
-            &session_id,
-            outcome.final_text.as_str(),
-        )
-        .await
-        .map(Some),
-        None => Ok(None),
-    };
-    // A headless run exits right after its one turn, so the background queue the
-    // interactive app uses would lose the work: facts are extracted here, before the
-    // writer is released, and reported in the envelope.
-    let facts = match &memory_principal {
-        Some(principal) if outcome.stop == harness_tools::TurnStop::Final => Some(
-            memory::extract_facts(
-                Arc::clone(&provider),
-                Arc::clone(&store),
-                principal,
-                &session_id,
-                outcome.final_text.as_str(),
-            )
-            .await,
-        ),
-        _ => None,
-    };
-    let facts_report = facts.as_ref().map(|result| match result {
-        Ok(report) => serde_json::json!({
-            "applied": report.applied,
-            "candidates": report.candidates,
-            "duplicates": report.duplicates,
-            "replaced": report.replaced,
-            "refused": report.refused,
-            "skipped": report.skipped,
-        }),
-        Err(error) => serde_json::json!({"error": error.to_string()}),
+    let memory_report = serde_json::json!({
+        "kind": "harness",
+        "entries": harness_entries,
     });
-    let stored = memory_asset_of(&remembered);
-    let stored_turn = memory_asset_of(&turn);
-    // A headless run reports what it did not keep as well: a caller scripting this
-    // reads the disposition instead of inferring it from a null. Two assets can be
-    // written per turn - a directive and a turn record - so each has its own field
-    // rather than one ambiguous id.
-    let stored_disposition = memory_disposition_of(&remembered);
-    let turn_disposition = memory_disposition_of(&turn);
-    let memory_report = match (&memory_principal, &recall, &stored) {
-        (Some(_), recall, stored) => serde_json::json!({
-            "enabled": true,
-            "recall": recall.as_ref().map(|found| serde_json::json!({
-                "state": format!("{:?}", found.state).to_lowercase(),
-                "hits": found.hits,
-                "blocks": found.blocks,
-                "message": found.message,
-            })),
-            "stored_asset_id": stored.clone(),
-            "stored_disposition": stored_disposition,
-            // The turn record is a second asset and gets its own field: one id could
-            // only ever name one of the two, and which one it named was an accident of
-            // write order.
-            "turn_asset_id": stored_turn.clone(),
-            "turn_disposition": turn_disposition,
-            "facts": facts_report,
-            "error": remembered
-                .as_ref()
-                .err()
-                .or_else(|| turn.as_ref().err())
-                .map(ToString::to_string),
-        }),
-        (None, _, _) => serde_json::json!({"enabled": false}),
-    };
     let extensions_report = match &active_extensions {
         Some(active) => serde_json::json!({
             "enabled": true,

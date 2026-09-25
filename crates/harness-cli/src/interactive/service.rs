@@ -47,7 +47,6 @@ use super::cost::{CostTracker, ModelPrice, Usage as CostUsage};
 use super::credentials::{self, CredentialSource};
 use super::events::{PauseReason, RunOutcome, SessionCandidate, SessionEvent, ShellPrefixMode};
 use super::extensions;
-use super::memory;
 use super::paths::LaunchEnvironment;
 use super::project;
 use super::prompt::{PromptEnvironment, SystemPromptBuilder};
@@ -1028,11 +1027,9 @@ pub struct AgentSessionService {
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
     agents_status: Arc<Mutex<Vec<String>>>,
-    /// Held by a turn for as long as it owns the project store, and by the memory
-    /// worker while it writes, so the two never want the writer at the same time.
+    /// Held by a turn for as long as it owns the project store, and by `/rename` while
+    /// it writes, so the two never want the writer at the same time.
     writer_gate: Arc<tokio::sync::Mutex<()>>,
-    /// Extracts facts from finished turns in the background.
-    extraction: super::memory_worker::ExtractionWorker,
     /// The active goal, carried into every turn while it is set.
     goal: Option<String>,
     /// The stored goal must be erased by the next turn.
@@ -1041,16 +1038,6 @@ pub struct AgentSessionService {
     repl: Option<Arc<super::repl::ReplShared>>,
     /// The thinking level `/thinking` chose, for the next turns.
     thinking: Option<harness_providers::ThinkingLevel>,
-}
-
-impl Drop for AgentSessionService {
-    /// Leaving the app must not lose what the last turns taught memory: the queue is
-    /// extracted now, without its quiet period, and the exit waits for it - bounded.
-    fn drop(&mut self) {
-        let _ = self
-            .extraction
-            .flush_blocking(super::memory_worker::EXIT_FLUSH);
-    }
 }
 
 enum McpElicitationAnswer {
@@ -1489,11 +1476,6 @@ impl AgentSessionService {
             &context.paths.data_dir,
             &context.project.root,
         );
-        let extraction = super::memory_worker::ExtractionWorker::new(
-            context.project_store_dir(),
-            Arc::clone(&writer_gate),
-            sender.clone(),
-        );
         Self {
             sender,
             store_dir: context.project_store_dir(),
@@ -1526,7 +1508,6 @@ impl AgentSessionService {
             mcp_status: Arc::new(Mutex::new(Vec::new())),
             agents_status: Arc::new(Mutex::new(Vec::new())),
             writer_gate,
-            extraction,
             goal: None,
             goal_forgotten: false,
             repl,
@@ -1715,7 +1696,6 @@ impl SessionPort for AgentSessionService {
         let gate = Arc::clone(&self.gate);
         let limits = self.limits;
         let writer_gate = Arc::clone(&self.writer_gate);
-        let extraction = self.extraction.clone();
         let goal = match (&self.goal, std::mem::take(&mut self.goal_forgotten)) {
             (Some(objective), _) => GoalRecord::Active(objective.clone()),
             (None, true) => GoalRecord::Forget,
@@ -1755,7 +1735,6 @@ impl SessionPort for AgentSessionService {
                 request,
                 cancellation,
                 writer_gate,
-                extraction,
                 goal,
                 repl,
                 thinking,
@@ -2558,38 +2537,6 @@ fn same_canonical_path(left: &Path, right: &Path) -> bool {
     }
 }
 
-/// Report what one attempt to remember did, in words a reader can act on.
-///
-/// A skipped input and a stored one look the same in a transcript that stays silent,
-/// and the difference is the whole point of classifying inputs at all.
-fn report_memory(
-    send: &impl Fn(SessionEvent),
-    result: Result<memory::RememberOutcome, harness_types::HarnessError>,
-) {
-    match result {
-        Ok(memory::RememberOutcome::Stored(asset_id)) => send(SessionEvent::Notice {
-            message: format!("memory: remembered as {asset_id}"),
-        }),
-        Ok(memory::RememberOutcome::StoredButUnpruned { asset_id, reason }) => {
-            send(SessionEvent::Notice {
-                message: format!(
-                    "memory: remembered as {asset_id}, but the turn log was not trimmed ({reason})"
-                ),
-            });
-        }
-        Ok(memory::RememberOutcome::Duplicate(asset_id)) => send(SessionEvent::Notice {
-            message: format!("memory: already remembered as {asset_id}"),
-        }),
-        Ok(memory::RememberOutcome::NotKnowledge { reason }) => send(SessionEvent::Notice {
-            message: format!("memory: not stored ({reason})"),
-        }),
-        Ok(memory::RememberOutcome::NothingAdmitted | memory::RememberOutcome::NotRequested) => {}
-        Err(error) => send(SessionEvent::Notice {
-            message: format!("memory: nothing was stored ({error})"),
-        }),
-    }
-}
-
 /// What a turn does with the task's stored goal.
 enum GoalRecord {
     /// A goal is active: carry it and store it.
@@ -2633,7 +2580,6 @@ async fn run_turn(
     request: SubmitRequest,
     cancellation: CancellationToken,
     writer_gate: Arc<tokio::sync::Mutex<()>>,
-    extraction: super::memory_worker::ExtractionWorker,
     goal: GoalRecord,
     repl: Option<Arc<super::repl::ReplShared>>,
     thinking: Option<harness_providers::ThinkingLevel>,
@@ -2645,8 +2591,8 @@ async fn run_turn(
         input_id: request.input_id.clone(),
     });
 
-    // The memory worker writes between turns under this gate; a turn waits the moment
-    // it takes to finish rather than failing to open the store.
+    // `/rename` writes between turns under this gate; a turn waits the moment it takes
+    // to finish rather than failing to open the store.
     let _writer_turn = writer_gate.lock().await;
     let store = match SqliteStore::open_writer(WriterOpenOptions::new(
         store_dir.clone(),
@@ -2898,10 +2844,6 @@ async fn run_turn(
             return;
         }
     };
-    let memory_on = memory::memory_requested_from_environment(&environment);
-    let memory_principal = memory_on
-        .then(|| memory::principal(project_id.clone(), task_id.clone(), session_id.clone()));
-
     let capabilities = ModelCapabilities {
         provider_id: config.provider_id.clone(),
         model: config.model.clone(),
@@ -3193,7 +3135,15 @@ async fn run_turn(
                 Some(host) => host.rlm_requests(config.model.clone()),
                 None => Arc::new(super::repl::NoHostRequests),
             };
-            super::repl::ReplHost::for_turn(shared, requests).await
+            super::repl::ReplHost::for_turn(
+                shared,
+                requests,
+                super::repl::HarnessDirs {
+                    global: super::harness::global_dir(&data_dir),
+                    local: super::harness::local_dir(&data_dir, task_id.as_str()),
+                },
+            )
+            .await
         }
         _ => None,
     };
@@ -3310,6 +3260,29 @@ async fn run_turn(
     if let GoalRecord::Active(objective) = &goal {
         project_blocks.push(super::goal::goal_block(objective));
     }
+    // Memory is prime-agent's continual harness state: the model keeps it through
+    // `rlm.harness`, and every turn carries a digest of it ranked for this task.
+    let harness_state = super::harness::merge(
+        super::harness::load(&super::harness::global_dir(&data_dir), "global"),
+        super::harness::load(
+            &super::harness::local_dir(&data_dir, task_id.as_str()),
+            "local",
+        ),
+    );
+    let goal_objective = match &goal {
+        GoalRecord::Active(objective) => Some(objective.as_str()),
+        _ => None,
+    };
+    project_blocks.push(super::harness::digest_block(
+        &super::harness::format_digest(
+            &harness_state,
+            super::harness::DigestOptions {
+                repl: repl_host.is_some(),
+                refine: false,
+            },
+            &super::harness::weighted_terms(goal_objective, &[request.text.as_str()]),
+        ),
+    ));
     let mut run_request = RunRequest::new(
         session_id.clone(),
         task_id,
@@ -3332,32 +3305,6 @@ async fn run_turn(
                 .collect(),
         );
     }
-    // Retrieval happens before dispatch, so the packet the runtime freezes carries
-    // the exact memory versions that were read.
-    let run_request = match &memory_principal {
-        Some(principal) => match memory::recall(
-            Arc::clone(&store),
-            principal,
-            &workspace_root,
-            &request.text,
-        )
-        .await
-        {
-            Ok(recall) => {
-                send(SessionEvent::Notice {
-                    message: recall.message,
-                });
-                run_request.with_memory(recall.contribution)
-            }
-            Err(error) => {
-                send(SessionEvent::Notice {
-                    message: format!("memory: recall skipped ({error})"),
-                });
-                run_request
-            }
-        },
-        None => run_request,
-    };
     let options = TurnOptions {
         workspace_root,
         actor_id: "interactive.user".to_owned(),
@@ -3470,48 +3417,6 @@ async fn run_turn(
 
     // Release the writer before announcing the terminal event: the next turn takes
     // a newer generation of the task lease, and it must not race this one.
-    // Memory is written first: it reads the admitted input back from the journal and
-    // commits its asset under the write generation this turn already holds.
-    if let Some(principal) = &memory_principal {
-        // A directive is knowledge and is kept as one. A question is not knowledge, so
-        // it is not stored as a directive - but the turn itself is still worth
-        // remembering, because otherwise "what did I ask you before?" has no answer in
-        // the store. The turn record carries both halves and the session it happened in.
-        let directive = if outcome.is_ok() {
-            Some(memory::remember_input(Arc::clone(&store), principal, &session_id).await)
-        } else {
-            None
-        };
-        let answered = if outcome.is_ok() {
-            memory::remember_turn(
-                Arc::clone(&store),
-                principal,
-                &session_id,
-                outcome.as_ref().map_or("", |turn| turn.final_text.as_str()),
-            )
-            .await
-        } else {
-            Ok(memory::RememberOutcome::NothingAdmitted)
-        };
-        for result in directive.into_iter().chain(std::iter::once(answered)) {
-            report_memory(&send, result);
-        }
-        // Facts are extracted from a turn that finished with an answer; a turn that
-        // stopped at a bound or was canceled has no settled answer to learn from. The
-        // turn only queues what it said: the model call runs in the background, after
-        // this turn has released the store.
-        if let Ok(turn) = &outcome
-            && turn.stop == TurnStop::Final
-        {
-            match memory::queued_turn(&store, principal, &session_id, &turn.final_text).await {
-                Ok(Some(queued)) => extraction.enqueue(queued, Arc::clone(&provider)),
-                Ok(None) => {}
-                Err(error) => send(SessionEvent::Notice {
-                    message: format!("memory: the turn was not queued for extraction ({error})"),
-                }),
-            }
-        }
-    }
     drop(driver);
     // A finished goal is not brought back by `/resume`.
     if goal_host

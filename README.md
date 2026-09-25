@@ -16,7 +16,7 @@
 - **Runs a persistent Python REPL.** The `ipython` tool is prime-agent's kernel: variables persist across cells and turns, `bash('cmd')` starts commands in the background and returns a handle, and `await rlm.spawn(...)` / `rlm.collect(...)` run explorer children in parallel. Needs Python 3.11+ (and Git Bash on Windows for `bash()`); each cell asks for approval like `run_shell` unless the mode is `full-auto`.
 - **Works toward a goal.** `/goal <objective>` keeps the app working across turns until the model calls `goal_complete` (at most 10 automatic turns, then it pauses). `/goal status|pause|resume|clear`; Ctrl-C pauses it, and `/resume` brings it back paused. Long turns shorten their oldest tool results to stay within the context budget.
 - **Resumes conversations.** `/resume` lists your conversations (one row each) and replays the chosen one's questions and answers to the model and on screen.
-- **Learns from the conversation.** Memory is on by default: after a turn, the model extracts durable facts (preferences, decisions, conventions, corrections) in the background; facts with confidence ≥ 0.7 are used from then on, the rest wait for review in `ha memory candidates`. Say "remember that …" / "ghi nhớ …" to store something verbatim.
+- **Keeps its own memory.** As in prime-agent, the model keeps memories, prompt notes, skills and subagent specs through `rlm.harness` in the Python REPL - global or per conversation - and each turn carries a digest of them ranked for the task. Nothing is stored by keyword or extracted behind your back.
 - **Uses skills.** Agent Skills directories (`SKILL.md` plus references and scripts) from the bundled set, `~/.agents/skills`, a trusted project's `.agents/skills`, or any folder in `HA_SKILL_PATHS` (e.g. `~/.claude/skills`). The model activates a matching skill by name and reads its files with `read_skill_file`; `/skills` lists them, `/skill:<name>` runs one.
 - **Extends.** MCP servers (`ha mcp add`), prompt templates, hooks, and a local web surface (`ha web`).
 
@@ -77,7 +77,6 @@ Settings merge default → user `config.toml` → trusted project `.harness/conf
 | `DEEPSEEK_API_KEY` | — | Provider key (also settable with `/key`, stored in the credentials file) |
 | `HA_PROVIDER_ENDPOINT` | `https://api.deepseek.com/chat/completions` | Any OpenAI-compatible chat endpoint |
 | `HA_PROVIDER_MODEL` | `deepseek-flash` | Model name |
-| `HA_MEMORY` | on | `off` (or `0`, `false`, `no`) disables memory |
 | `HA_TURN_MAX_STEPS` / `HA_TURN_MAX_TOOL_CALLS` | 30 / 80 | Model calls and tool calls per turn before it pauses |
 | `HA_TURN_DEADLINE_SECONDS` / `HA_TURN_CONTINUATIONS` | 900 / 2 | Time per turn; automatic continuations after a bound |
 | `HA_SKILL_PATHS` | — | Extra skill directories, separated like `PATH` |
@@ -116,7 +115,7 @@ CI (`.github/workflows/ci.yml`) runs the phase gates (`scripts/Verify-Phase.ps1`
 - **Python REPL bền.** Tool `ipython` là kernel của prime-agent: biến được giữ qua các cell và các lượt, `bash('cmd')` chạy lệnh nền và trả về handle, `await rlm.spawn(...)` / `rlm.collect(...)` chạy song song các agent con (explorer). Cần Python 3.11+ (và Git Bash trên Windows cho `bash()`); mỗi cell hỏi phê duyệt như `run_shell`, trừ chế độ `full-auto`.
 - **Làm tới khi xong mục tiêu.** `/goal <mục tiêu>` giữ ứng dụng làm việc qua nhiều lượt cho tới khi model gọi `goal_complete` (tối đa 10 lượt tự động, sau đó tạm dừng). `/goal status|pause|resume|clear`; Ctrl-C tạm dừng mục tiêu, `/resume` khôi phục nó ở trạng thái tạm dừng. Lượt dài tự rút gọn các kết quả tool cũ nhất để không vượt ngân sách context.
 - **Tiếp tục hội thoại.** `/resume` liệt kê các hội thoại (mỗi hội thoại một dòng) và phát lại các câu hỏi, câu trả lời của hội thoại được chọn cho model và trên màn hình.
-- **Học từ hội thoại.** Memory mặc định bật: sau mỗi lượt, model trích ra ở chế độ nền các fact bền (sở thích, quyết định, quy ước, chỉnh sửa); fact có confidence ≥ 0.7 được dùng từ đó, phần còn lại chờ duyệt trong `ha memory candidates`. Nói "ghi nhớ …" / "remember that …" để lưu nguyên văn.
+- **Tự giữ memory.** Giống prime-agent, model tự lưu memory, ghi chú prompt, skill và đặc tả subagent qua `rlm.harness` trong Python REPL - global hoặc theo từng hội thoại - và mỗi lượt mang theo digest của chúng xếp theo mức liên quan. Không có gì được lưu theo từ khoá hay trích xuất ngầm.
 - **Dùng skill.** Thư mục Agent Skills (`SKILL.md` cùng references và scripts) từ bộ tích hợp sẵn, `~/.agents/skills`, `.agents/skills` của project đã trust, hoặc bất kỳ thư mục nào trong `HA_SKILL_PATHS` (ví dụ `~/.claude/skills`). Model kích hoạt skill phù hợp theo tên và đọc file của skill bằng `read_skill_file`; `/skills` liệt kê, `/skill:<name>` chạy một skill.
 - **Mở rộng.** MCP server (`ha mcp add`), prompt template, hook, và giao diện web cục bộ (`ha web`).
 
@@ -177,7 +176,6 @@ Cấu hình được gộp theo thứ tự mặc định → `config.toml` của
 | `DEEPSEEK_API_KEY` | — | Khóa provider (cũng đặt được bằng `/key`, lưu trong file credentials) |
 | `HA_PROVIDER_ENDPOINT` | `https://api.deepseek.com/chat/completions` | Bất kỳ endpoint chat tương thích OpenAI |
 | `HA_PROVIDER_MODEL` | `deepseek-flash` | Tên model |
-| `HA_MEMORY` | bật | `off` (hoặc `0`, `false`, `no`) để tắt memory |
 | `HA_TURN_MAX_STEPS` / `HA_TURN_MAX_TOOL_CALLS` | 30 / 80 | Số lời gọi model và tool mỗi lượt trước khi tạm dừng |
 | `HA_TURN_DEADLINE_SECONDS` / `HA_TURN_CONTINUATIONS` | 900 / 2 | Thời gian mỗi lượt; số lần tự tiếp tục sau khi chạm giới hạn |
 | `HA_SKILL_PATHS` | — | Thư mục skill bổ sung, phân tách như `PATH` |

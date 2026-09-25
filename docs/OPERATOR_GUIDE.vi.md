@@ -424,5 +424,5 @@ ha exec "Continue the task" --continue --goal "Task complete" --max-turns 4 --ou
 
 ### 12.6. Memory và `/resume`
 
-Memory mặc định bật; `HA_MEMORY=off` (hoặc `0`, `false`, `no`) để tắt. Sau một lượt kết thúc bằng câu trả lời, model trích ra các fact đáng giữ (sở thích, quyết định, quy ước, chỉnh sửa): confidence ≥ 0.7 được dùng từ lượt sau, thấp hơn thì chờ trong `ha memory candidates`. Input của bạn chỉ được lưu nguyên văn khi bạn yêu cầu ("ghi nhớ …", "từ giờ …", "remember that …"). `/resume` vẫn hoạt động khi tắt memory: nó phát lại chính các lượt của hội thoại cho model và hiện chúng trên màn hình. Xem mục 20 và 21 của `MEMORY_AND_CONTINUITY`.
+Memory theo harness state của prime-agent: model tự giữ memory, ghi chú prompt, skill và đặc tả subagent qua `rlm.harness` trong Python REPL, loại global dùng chung cho mọi hội thoại và loại local theo từng hội thoại, và mỗi lượt mang theo digest của chúng xếp theo mức liên quan. Không có gì được lưu theo từ khoá hay trích xuất chạy nền. `/resume` phát lại chính các lượt của hội thoại cho model và hiện chúng trên màn hình. Xem mục 19 và 20 của `MEMORY_AND_CONTINUITY`.
 

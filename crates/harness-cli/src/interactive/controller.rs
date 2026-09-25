@@ -1563,11 +1563,11 @@ impl InteractiveController {
             "/status" => {
                 let mut lines = self.header.clone();
                 lines.push(format!("Phase:   {}", self.phase.label()));
-                // The project id is what memory is scoped by, and the app shows it
+                // The project id names this workspace's store, and the app shows it
                 // nowhere else: the projects directory is named after a digest, so
-                // without this line there is nothing to hand to `ha memory --project-id`.
+                // without this line there is nothing to hand to `--project-id`.
                 lines.push(match self.service.project_id() {
-                    Some(id) => format!("Project: {id} (memory scope for this workspace)"),
+                    Some(id) => format!("Project: {id} (store scope for this workspace)"),
                     None => {
                         "Project: not registered yet; the first turn in this workspace creates it"
                             .to_owned()
@@ -4873,7 +4873,7 @@ mod tests {
             let text = effects_to_plain(&effects).join("\n");
             assert!(
                 text.contains(expected),
-                "the panel must say what memory is scoped by: {text}"
+                "the panel must say what the store is scoped by: {text}"
             );
             drop(temp);
         }
