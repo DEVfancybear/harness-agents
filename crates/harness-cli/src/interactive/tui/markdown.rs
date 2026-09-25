@@ -1,4 +1,4 @@
-//! Markdown-lite for assistant text.
+//! Markdown for assistant text, as prime-agent renders it.
 //!
 //! Deliberately minimal and dependency-free: fenced code blocks with a language
 //! label, inline code, `#` headings, `-`/`*` bullets, and `**emphasis**`. Anything
@@ -18,66 +18,86 @@ use super::theme::Theme;
 /// How one line of model text is classified.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Block {
-    /// A `#` heading.
-    Heading,
-    /// A `-` or `*` bullet.
+    /// A `#` heading, with its level.
+    Heading(usize),
+    /// A `-`, `*` or `+` bullet.
     Bullet,
+    /// A `>` quote.
+    Quote,
+    /// A `---`, `***` or `___` rule.
+    Rule,
     /// Plain prose.
     Text,
 }
 
-/// Render model text into styled lines of at most `width` cells.
-///
-/// The function is total: every input character appears in the output, in order.
+/// Render model text into styled lines of at most `width` cells, the way
+/// prime-agent's `Markdown` component does (`tui/src/components/markdown.ts`):
+/// headings in `mdHeading` (H1 bold and underlined, H2-H3 bold, H4 bold italic,
+/// deeper italic), code blocks indented two cells in `mdCodeBlock` with no fence
+/// rows, quotes behind a `│ ` bar in italics, rules as `─` up to 80 cells, bullets
+/// as `- `, and prose in `mdBody`.
 #[must_use]
 pub fn render(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut in_fence = false;
     for raw in text.split('\n') {
         let trimmed = raw.trim_end_matches('\r');
-        if let Some(rest) = trimmed.trim_start().strip_prefix("```") {
-            if in_fence {
-                in_fence = false;
-                // The closing fence is a border, not content: it is replaced by a
-                // rule that carries no information away.
-                lines.push(Line::from(vec![Span::styled("└".to_owned(), theme.dim)]));
-            } else {
-                in_fence = true;
-                let label = rest.trim();
-                let title = if label.is_empty() {
-                    "┌ code".to_owned()
-                } else {
-                    format!("┌ {label}")
-                };
-                lines.push(Line::from(vec![Span::styled(title, theme.dim)]));
-            }
+        if trimmed.trim_start().starts_with("```") {
+            // The fence is a border, not content: prime-agent draws no fence rows.
+            in_fence = !in_fence;
             continue;
         }
         if in_fence {
-            let mut spans = vec![Span::styled("│ ".to_owned(), theme.dim)];
-            spans.extend(inline_spans(trimmed, theme));
+            let spans = vec![
+                Span::raw("  ".to_owned()),
+                Span::styled(trimmed.to_owned(), theme.md_code_block),
+            ];
             lines.extend(wrap_spans(spans, width));
             continue;
         }
         match classify(trimmed) {
-            Block::Heading => {
-                let text = trimmed.trim_start_matches('#').trim_start();
+            Block::Heading(level) => {
+                let text = trimmed.trim_start().trim_start_matches('#').trim_start();
+                let style = match level {
+                    1 => theme
+                        .md_heading
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    2 | 3 => theme.md_heading.add_modifier(Modifier::BOLD),
+                    4 => theme
+                        .md_heading
+                        .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                    _ => theme.md_heading.add_modifier(Modifier::ITALIC),
+                };
                 lines.extend(wrap_spans(
-                    vec![Span::styled(
-                        text.to_owned(),
-                        theme.title.add_modifier(Modifier::BOLD),
-                    )],
+                    vec![Span::styled(text.to_owned(), style)],
                     width,
                 ));
             }
             Block::Bullet => {
-                let text = trimmed
-                    .trim_start()
-                    .trim_start_matches(['-', '*'])
-                    .trim_start();
-                let mut spans = vec![Span::styled("• ".to_owned(), theme.accent)];
+                let indent = trimmed.len() - trimmed.trim_start().len();
+                let text = trimmed.trim_start()[1..].trim_start();
+                let mut spans = vec![
+                    Span::raw(" ".repeat(indent)),
+                    Span::styled("- ".to_owned(), theme.md_quote),
+                ];
                 spans.extend(inline_spans(text, theme));
                 lines.extend(wrap_spans(spans, width));
+            }
+            Block::Quote => {
+                let text = trimmed.trim_start()[1..].trim_start();
+                let mut spans = vec![Span::styled("│ ".to_owned(), theme.border)];
+                spans.extend(inline_spans(text, theme).into_iter().map(|span| {
+                    let style = span
+                        .style
+                        .patch(theme.md_quote)
+                        .add_modifier(Modifier::ITALIC);
+                    span.style(style)
+                }));
+                lines.extend(wrap_spans(spans, width));
+            }
+            Block::Rule => {
+                let cells = usize::from(width).clamp(1, 80);
+                lines.push(Line::from(Span::styled("─".repeat(cells), theme.border)));
             }
             Block::Text => lines.extend(wrap_spans(inline_spans(trimmed, theme), width)),
         }
@@ -90,10 +110,27 @@ pub fn render(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
 pub fn classify(line: &str) -> Block {
     let trimmed = line.trim_start();
     if trimmed.starts_with('#') {
-        return Block::Heading;
+        let level = trimmed
+            .chars()
+            .take_while(|character| *character == '#')
+            .count();
+        if trimmed[level..].starts_with(' ') || trimmed.len() == level {
+            return Block::Heading(level);
+        }
     }
-    if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+    let compact = trimmed.replace(' ', "");
+    if compact.len() >= 3
+        && (compact.chars().all(|character| character == '-')
+            || compact.chars().all(|character| character == '*')
+            || compact.chars().all(|character| character == '_'))
+    {
+        return Block::Rule;
+    }
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
         return Block::Bullet;
+    }
+    if trimmed.starts_with('>') {
+        return Block::Quote;
     }
     Block::Text
 }
@@ -150,7 +187,11 @@ fn inline_spans(line: &str, theme: &Theme) -> Vec<Span<'static>> {
 
 /// The style one character of a line carries.
 fn inline_style(at_code: bool, strong: bool, theme: &Theme) -> Style {
-    let base = if at_code { theme.accent } else { Style::new() };
+    let base = if at_code {
+        theme.md_code
+    } else {
+        theme.assistant
+    };
     if strong {
         base.add_modifier(Modifier::BOLD)
     } else {
@@ -287,10 +328,9 @@ mod tests {
             "prose with",
             "`code`",
             "日本語",
-            "rust",
             "fn main() {}",
-            "• bullet",
-            "• other",
+            "- bullet",
+            "- other",
         ] {
             assert!(
                 rendered.contains(needle),
@@ -300,16 +340,23 @@ mod tests {
     }
 
     #[test]
-    fn t04_fences_report_their_language_and_keep_their_body() {
+    /// prime-agent draws a code block indented two cells, with no fence rows.
+    fn t04_code_blocks_are_indented_without_fences() {
         let rendered = render("```sh\ncargo test\n```", 80, &Theme::plain());
-        assert_eq!(rendered.len(), 3);
-        assert!(plain_text(&rendered[0..1]).contains("sh"));
-        assert!(plain_text(&rendered[1..2]).contains("cargo test"));
+        assert_eq!(plain_text(&rendered), "  cargo test");
+    }
+
+    #[test]
+    fn quotes_rules_and_heading_levels_follow_prime_agent() {
+        let rendered = plain_text(&render("> quoted\n---\n## Two", 20, &Theme::plain()));
+        assert_eq!(rendered, format!("│ quoted\n{}\nTwo", "─".repeat(20)));
+        assert_eq!(classify("### three"), Block::Heading(3));
+        assert_eq!(classify("#hashtag"), Block::Text);
     }
 
     #[test]
     fn t04_classification_is_conservative() {
-        assert_eq!(classify("# h"), Block::Heading);
+        assert_eq!(classify("# h"), Block::Heading(1));
         assert_eq!(classify("- item"), Block::Bullet);
         assert_eq!(classify("* item"), Block::Bullet);
         assert_eq!(classify("text - not a bullet"), Block::Text);

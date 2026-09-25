@@ -109,6 +109,8 @@ pub trait TuiRenderer {
 pub struct RealRenderer<B: Backend> {
     terminal: Terminal<B>,
     theme: Theme,
+    /// The detail mode of the last frame, which history rows are drawn in.
+    detail: super::events::Detail,
 }
 
 impl<B: Backend> RealRenderer<B>
@@ -131,6 +133,7 @@ where
         Ok(Self {
             terminal,
             theme: Theme::detect(),
+            detail: super::events::Detail::default(),
         })
     }
 
@@ -144,6 +147,7 @@ where
 
     fn draw_state(&mut self, state: &UiState) -> io::Result<()> {
         let theme = self.theme;
+        self.detail = state.detail;
         self.terminal
             .draw(|frame| {
                 let plan = layout::plan(frame.area(), state, &theme);
@@ -159,7 +163,7 @@ where
     fn insert_history(&mut self, item: &HistoryItem) -> io::Result<()> {
         let theme = self.theme;
         let width = self.columns();
-        let rows = history::render(item, width, &theme);
+        let rows = history::render(item, width, &theme, self.detail);
         if rows.is_empty() {
             return Ok(());
         }
@@ -390,7 +394,7 @@ impl<T: TerminalBackend> TuiRenderer for ScriptedRenderer<T> {
 
     fn insert_history(&mut self, item: &HistoryItem) -> io::Result<()> {
         let width = self.inner.columns();
-        let rows = history::render(item, width, &self.inner.theme);
+        let rows = history::render(item, width, &self.inner.theme, self.inner.detail);
         for line in &rows {
             self.backend.write(&line.to_string())?;
             self.backend.write("\r\n")?;
@@ -621,6 +625,7 @@ mod tests {
             suggestion_selected: 0,
             fallback_reason: None,
             tick: 0,
+            detail: crate::interactive::events::Detail::default(),
         }
     }
 
@@ -709,7 +714,7 @@ mod tests {
         );
         assert!(painted.contains("đang trả lời"), "live text: {painted}");
         assert!(
-            painted.contains("running") && painted.contains("step 2/8"),
+            painted.contains("Writing") && painted.contains("step 2/8"),
             "status row: {painted}"
         );
     }
@@ -860,7 +865,7 @@ mod tests {
         );
         assert!(
             painted.contains("a cả lượt"),
-            "and the composer's border names the same key: {painted}"
+            "and the editor's rule names the same key: {painted}"
         );
 
         // The answer is given: the panel closes, and the status row carries the state
@@ -931,7 +936,7 @@ mod tests {
             output.contains("fixture answer for: hi"),
             "the streamed answer reached the scrollback: {output}"
         );
-        assert!(output.contains("[run] done"), "{output}");
+        assert!(output.contains("done · "), "{output}");
         assert!(
             renderer.painted().join("\n").contains('>'),
             "the last frame keeps the composer marker"

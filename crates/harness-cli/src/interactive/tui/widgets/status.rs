@@ -65,9 +65,6 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
         used += cost;
     };
 
-    push(Span::styled(" HA ", theme.title));
-    push(Span::styled("│", theme.dim));
-
     match (&state.modal, state.phase) {
         (Some(Modal::Approval { expires_at, .. }), _) => {
             let remaining = expires_at.saturating_duration_since(std::time::Instant::now());
@@ -119,20 +116,33 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
             push(Span::styled(" · Esc đóng".to_owned(), theme.dim));
         }
         (None, AppPhase::Running | AppPhase::WaitingMcpInput | AppPhase::Canceling) => {
+            // prime-agent's working line: what the agent is doing, how long it has
+            // been at it, then the counters.
             let activity = if state.phase == AppPhase::Canceling {
-                "canceling"
+                "Canceling"
+            } else if state.open_tool.is_some() {
+                "Executing"
+            } else if state.live_text.is_empty() {
+                "Thinking"
             } else {
-                "running"
+                "Writing"
             };
             push(Span::styled(
-                format!(" {} {activity}", Theme::spinner(state.tick)),
+                format!("{} ", Theme::spinner(state.tick)),
                 if state.phase == AppPhase::Canceling {
                     theme.warning
                 } else {
                     theme.accent
                 },
             ));
-            push(Span::styled(" · Ctrl-C hủy".to_owned(), theme.dim));
+            push(Span::styled(activity.to_owned(), theme.muted));
+            if let Some(started) = state.run_started_at {
+                push(Span::styled(
+                    format!(" · {}", view::clock_label(started.elapsed())),
+                    theme.muted,
+                ));
+            }
+            push(Span::styled(" · esc to interrupt".to_owned(), theme.dim));
             // Put decisions and queued work before progress counters. At 60 cells
             // the right edge may be clipped, but the operator must still see when
             // the approval gate is open for the rest of this turn.
@@ -150,12 +160,6 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
                 format!(" · tools {}/{}", state.tool_calls, state.max_tool_calls),
                 theme.dim,
             ));
-            if let Some(started) = state.run_started_at {
-                push(Span::styled(
-                    format!(" · {}", view::clock_label(started.elapsed())),
-                    theme.dim,
-                ));
-            }
             if let Some(cost) = cost_label(state) {
                 let label = format!(" · cost {cost}");
                 push(Span::styled(label, theme.dim));
@@ -169,19 +173,20 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
             }
         }
         (None, _) => {
-            push(Span::styled(" ● ready".to_owned(), theme.tool_ok));
+            // prime-agent's line above the prompt: quiet, dim, and it names the
+            // detail mode ctrl+o cycles.
             if let Some(model) = model_label(state) {
                 let model = model
                     .split_once(" via ")
                     .map_or(model.as_str(), |(name, _)| name);
-                push(Span::styled(format!(" · {model}"), theme.dim));
+                push(Span::styled(model.to_owned(), theme.dim));
             }
             if let Some(cost) = cost_label(state) {
-                let label = format!(" · cost {cost}");
+                let label = format!(" · {cost}");
                 push(Span::styled(label, theme.dim));
             }
             push(Span::styled(
-                " · / lệnh · @ file · ! shell · /help".to_owned(),
+                format!(" · {}", state.detail.hint()),
                 theme.dim,
             ));
         }
@@ -253,6 +258,7 @@ mod tests {
             suggestion_selected: 0,
             fallback_reason: None,
             tick: 0,
+            detail: crate::interactive::events::Detail::default(),
         }
     }
 
@@ -263,23 +269,22 @@ mod tests {
         state.tool_calls = 3;
         state.run_started_at = Some(Instant::now());
         let text = plain_text(&[row(&state, &Theme::plain(), 120)]);
-        assert!(text.contains("running"), "{text}");
+        assert!(text.contains("Thinking"), "{text}");
         assert!(text.contains("step 2/8"), "{text}");
         assert!(text.contains("tools 3/16"), "{text}");
         assert!(text.contains("00:00"), "{text}");
-        assert!(text.contains("Ctrl-C"), "{text}");
+        assert!(text.contains("esc to interrupt"), "{text}");
     }
 
     #[test]
-    fn t05_an_idle_status_names_the_model_and_the_help_command() {
+    fn t05_an_idle_status_names_the_model_and_the_detail_mode() {
         let state = state(AppPhase::Ready);
         let text = plain_text(&[row(&state, &Theme::plain(), 200)]);
-        assert!(text.contains("ready"), "{text}");
         assert!(
             text.contains("deepseek-chat"),
             "the model label is shown: {text}"
         );
-        assert!(text.contains("/help"), "{text}");
+        assert!(text.contains("Collapsed mode (ctrl+o to expand)"), "{text}");
         assert_eq!(
             model_label(&state).as_deref(),
             Some("deepseek-chat via https://api.deepseek.com")

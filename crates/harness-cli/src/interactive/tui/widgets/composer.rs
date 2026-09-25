@@ -119,9 +119,9 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
         return;
     }
     let prefix = view::prompt_prefix(state.phase);
-    // The top border is the first row of the box, so the content starts one row
-    // down and the scroll offset counts content rows only.
-    let visible_rows = plan.composer.height.saturating_sub(1);
+    // The rules are the first and last rows of the box, so the content starts one
+    // row down and the scroll offset counts content rows only.
+    let visible_rows = plan.composer.height.saturating_sub(2);
     let visible: Vec<&String> = plan
         .composer_lines
         .iter()
@@ -129,7 +129,6 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
         .take(usize::from(visible_rows))
         .collect();
 
-    let title = hint(state);
     let mut lines: Vec<Line<'static>> = Vec::new();
     // One run per row, marker included. A styled marker would make ratatui emit a
     // cursor move between the marker and the draft, and the transcript - which is
@@ -157,14 +156,26 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
     } else {
         theme.composer_border
     };
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(border_style)
-        .title(Span::styled(title, theme.title));
+    // prime-agent's editor sits between two plain rules; a draft taller than the
+    // box says how many rows are scrolled out of view, on the rule.
+    let mut block = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(border_style);
+    if plan.composer_scroll > 0 {
+        block = block.title(Span::styled(
+            format!("─── ↑ {} more ", plan.composer_scroll),
+            theme.border,
+        ));
+    }
+    // A panel or the menu owns the keyboard, so its keys go on the lower rule, the
+    // way prime-agent's selectors name theirs; the idle editor stays bare.
+    if state.modal.is_some() || !state.suggestions.is_empty() {
+        block = block.title_bottom(Span::styled(hint(state), theme.dim));
+    }
     frame.render_widget(Paragraph::new(lines).block(block), plan.composer);
 }
 
-/// The short hint shown in the composer's top border.
+/// The short hint shown on the composer's lower rule while a panel or the menu is up.
 ///
 /// The composer is not focused while a panel owns the keyboard, so the hint names
 /// the panel and the keys that close it instead of describing the composer's own
@@ -223,10 +234,11 @@ pub fn render_live(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme
         lines.clear();
     }
     if let Some((name, summary)) = &state.open_tool {
-        lines.push(super::super::history::tool_card(
+        lines.push(super::super::history::running_card(
             name,
             summary,
-            crate::interactive::events::ToolState::Started,
+            &crate::interactive::events::ToolState::Started,
+            state.tick,
             theme,
         ));
     }
@@ -266,6 +278,7 @@ mod tests {
             suggestion_selected: 0,
             fallback_reason: None,
             tick: 0,
+            detail: crate::interactive::events::Detail::default(),
         }
     }
 

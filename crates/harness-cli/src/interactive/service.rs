@@ -941,6 +941,7 @@ impl TurnObserver for ChannelObserver {
                 Some(SessionEvent::Notice { message })
             }
             TurnProgress::Notice(message) => Some(SessionEvent::Notice { message }),
+            TurnProgress::ToolOutput { text, .. } => Some(SessionEvent::ToolOutput { text }),
             TurnProgress::Usage {
                 prompt_tokens,
                 completion_tokens,

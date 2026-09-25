@@ -198,6 +198,13 @@ pub struct InteractiveController {
     pending_compact: Option<String>,
     /// Heartbeats that came due while the session was busy, sent when it is free.
     pending_heartbeats: std::collections::VecDeque<String>,
+    /// What the tool about to settle returned, shown under its card in the TUI.
+    pending_tool_output: Option<String>,
+    /// prime-agent's detail mode, cycled with ctrl+o.
+    detail: super::events::Detail,
+    /// When ctrl+c last found nothing to interrupt or clear, for the second press
+    /// that exits (prime-agent's "Press ctrl+c again to exit").
+    exit_armed_at: Option<Instant>,
 }
 
 impl InteractiveController {
@@ -258,6 +265,9 @@ impl InteractiveController {
             goal: None,
             pending_compact: None,
             pending_heartbeats: std::collections::VecDeque::new(),
+            pending_tool_output: None,
+            detail: super::events::Detail::default(),
+            exit_armed_at: None,
         }
     }
 
@@ -357,6 +367,7 @@ impl InteractiveController {
             suggestion_selected: self.editor.suggestion_selected(),
             fallback_reason: self.fallback_reason.clone(),
             tick: self.tick,
+            detail: self.detail,
         }
     }
 
@@ -451,6 +462,10 @@ impl InteractiveController {
     )]
     pub fn handle_key(&mut self, key: Key) -> Vec<Effect> {
         if key == Key::Redraw {
+            return vec![Effect::Redraw];
+        }
+        if key == Key::CycleDetail {
+            self.detail = self.detail.next();
             return vec![Effect::Redraw];
         }
         // A modal owns the keyboard while it is open: Escape closes it, and the
@@ -767,6 +782,11 @@ impl InteractiveController {
                     );
                 }
             }
+            SessionEvent::ToolOutput { text } => {
+                if !self.plain {
+                    self.pending_tool_output = Some(text);
+                }
+            }
             SessionEvent::ToolSettled {
                 name,
                 ok,
@@ -796,7 +816,7 @@ impl InteractiveController {
                 self.push_history(
                     effects,
                     HistoryItem::Tool {
-                        name,
+                        name: name.clone(),
                         // In the TUI this is the same card moving from the live
                         // region into scrollback. Plain mode already printed the
                         // summary on the Started row, so its settled row remains
@@ -805,6 +825,13 @@ impl InteractiveController {
                         state,
                     },
                 );
+                if let Some(text) = self
+                    .pending_tool_output
+                    .take()
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    self.push_history(effects, HistoryItem::ToolOutput { name, text });
+                }
             }
             SessionEvent::ApprovalRequired {
                 request_id,
@@ -1532,6 +1559,24 @@ impl InteractiveController {
             return vec![
                 Effect::History(HistoryItem::Notice {
                     message: "^C canceling the active run...".to_owned(),
+                }),
+                Effect::Redraw,
+            ];
+        }
+        // prime-agent: ctrl+c on an empty, idle prompt arms an exit, and a second
+        // press within two seconds leaves the app.
+        if self.editor.is_empty() && !self.plain {
+            if self
+                .exit_armed_at
+                .is_some_and(|armed| armed.elapsed() < Duration::from_secs(2))
+            {
+                self.exit_armed_at = None;
+                return self.command("/exit");
+            }
+            self.exit_armed_at = Some(Instant::now());
+            return vec![
+                Effect::History(HistoryItem::Notice {
+                    message: "Press ctrl+c again to exit".to_owned(),
                 }),
                 Effect::Redraw,
             ];

@@ -48,6 +48,8 @@ pub enum Key {
     Esc,
     /// Ctrl-L: repaint the viewport without touching the scrollback.
     Redraw,
+    /// Ctrl-O: cycle prime-agent's detail modes.
+    CycleDetail,
     PageUp,
     PageDown,
     Enter,
@@ -286,6 +288,9 @@ pub enum HistoryItem {
         summary: String,
         state: ToolState,
     },
+    /// What a settled tool returned; the TUI shows its first lines under the tool's
+    /// panel. The plain transcript has no representation for it.
+    ToolOutput { name: String, text: String },
     /// The end-of-turn summary line.
     Run {
         outcome: RunOutcome,
@@ -413,6 +418,41 @@ pub struct UiState {
     pub fallback_reason: Option<String>,
     /// How many ticks have passed, so the spinner animates without wall clock.
     pub tick: u64,
+    /// How much of each turn the chat shows (ctrl+o).
+    pub detail: Detail,
+}
+
+/// prime-agent's detail modes, cycled with ctrl+o: collapsed hides reasoning and
+/// cuts tool output to three lines, details shows reasoning, expanded shows every
+/// line a tool returned. Rows already in the scrollback keep the mode they were
+/// drawn in.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Detail {
+    #[default]
+    Collapsed,
+    Details,
+    Expanded,
+}
+
+impl Detail {
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Collapsed => Self::Details,
+            Self::Details => Self::Expanded,
+            Self::Expanded => Self::Collapsed,
+        }
+    }
+
+    /// prime-agent's `keybinding-hints.ts` wording.
+    #[must_use]
+    pub const fn hint(self) -> &'static str {
+        match self {
+            Self::Collapsed => "Collapsed mode (ctrl+o to expand)",
+            Self::Details => "Details mode (ctrl+o to expand)",
+            Self::Expanded => "Expanded mode (ctrl+o to collapse)",
+        }
+    }
 }
 
 /// Events the controller consumes from the session port.
@@ -437,6 +477,10 @@ pub enum SessionEvent {
     ToolStarted {
         name: String,
         summary: String,
+    },
+    /// What the tool that is about to settle returned.
+    ToolOutput {
+        text: String,
     },
     ToolSettled {
         name: String,

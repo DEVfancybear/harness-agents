@@ -21,7 +21,7 @@ pub fn plain_lines(item: &HistoryItem) -> Vec<String> {
         // able to tell what they asked for from what the app said on their behalf.
         HistoryItem::Automatic { text } => vec![format!("[auto] {text}")],
         HistoryItem::Assistant { text } | HistoryItem::Message { text } => vec![text.clone()],
-        HistoryItem::Thinking { .. } => Vec::new(),
+        HistoryItem::Thinking { .. } | HistoryItem::ToolOutput { .. } => Vec::new(),
         HistoryItem::Tool {
             name,
             summary,

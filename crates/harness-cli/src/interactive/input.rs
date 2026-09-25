@@ -125,6 +125,12 @@ impl LineEditor {
         Self::default()
     }
 
+    /// Whether nothing has been typed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
     /// The raw buffer, with no masking applied.
     ///
     /// Production code renders through [`Self::display_buffer`]; this accessor
@@ -535,6 +541,7 @@ impl LineEditor {
             | Key::PageUp
             | Key::PageDown
             | Key::Redraw
+            | Key::CycleDetail
             | Key::Resize { .. }
             // Ctrl-V reaches the controller as its own key because the terminal forwards
             // it there, and the controller reads the clipboard. Attaching an image is not

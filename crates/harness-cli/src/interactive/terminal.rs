@@ -240,6 +240,7 @@ fn map_key(key: KeyEvent) -> Key {
         KeyCode::Char('u') if control => Key::EraseToLineStart,
         KeyCode::Char('w') if control => Key::EraseWord,
         KeyCode::Char('l') if control => Key::Redraw,
+        KeyCode::Char('o') if control => Key::CycleDetail,
         // Ctrl-V: a clipboard bitmap is not text, so the app reads it itself. A
         // terminal that binds Ctrl-V (Windows Terminal does) never forwards the key,
         // which is why `/image` runs the same code — this mapping is for the ones that

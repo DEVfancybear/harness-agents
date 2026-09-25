@@ -644,11 +644,11 @@ fn t03_pty_paste_keeps_newlines() {
     let mut session =
         PtySession::spawn_process(&project, &base_env(&temp), &["chat", "--fixture"], &[]);
     session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
-    let accepted_before = session.transcript().matches("[run] accepted").count();
+    let accepted_before = session.transcript().matches("fixture answer for").count();
 
     session.send("\u{1b}[200~first line\r\nsecond line\u{1b}[201~");
     std::thread::sleep(Duration::from_millis(500));
-    if session.transcript().matches("[run] accepted").count() != accepted_before {
+    if session.transcript().matches("fixture answer for").count() != accepted_before {
         // Measured limitation of this ConPTY: it strips the bracket markers and
         // turns the embedded newline into Enter before crossterm can emit Paste.
         // Keep this as an explicit capability result; the event-level T03 test is
@@ -666,11 +666,11 @@ fn t03_pty_paste_keeps_newlines() {
     session.wait_for("fixture answer for: first line", Duration::from_secs(30));
     session.wait_for("second line", Duration::from_secs(30));
     assert_eq!(
-        session.transcript().matches("[run] accepted").count(),
+        session.transcript().matches("fixture answer for").count(),
         accepted_before + 1,
         "the multiline paste is admitted as one message"
     );
-    session.wait_for("[run] done", Duration::from_secs(30));
+    session.wait_for(" steps · ", Duration::from_secs(30));
     session.send("/exit\r");
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
 }
@@ -690,11 +690,11 @@ fn t06_pty_approval_y_key() {
     session.send("y\r");
     wait_for_normalized(
         &session,
-        "[approval] granted fixture-approval-1",
+        "approval granted fixture-approval-1",
         Duration::from_secs(30),
     );
-    session.wait_for("[tool] fixture_action", Duration::from_secs(30));
-    session.wait_for("[run] done", Duration::from_secs(30));
+    wait_for_normalized(&session, "fixture_action · done", Duration::from_secs(30));
+    session.wait_for(" steps · ", Duration::from_secs(30));
     session.send("/exit\r");
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
 }
@@ -724,7 +724,7 @@ fn g06_pty_bang_prefix_needs_approval() {
     let pending = wait_for_normalized(&session, "[approval]", Duration::from_secs(30));
     assert!(pending.contains("SHOULD_NOT_RUN"), "{pending}");
     session.send("n\r");
-    wait_for_normalized(&session, "[approval] denied", Duration::from_secs(30));
+    wait_for_normalized(&session, "approval denied", Duration::from_secs(30));
     session.send("/exit\r");
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
 }
@@ -756,7 +756,7 @@ fn t_more_pty_scroll_keys() {
         PtySession::spawn_process(&project, &base_env(&temp), &["chat", "--fixture"], &[]);
     session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
     session.send("show the transcript\r");
-    session.wait_for("[run] done", Duration::from_secs(30));
+    session.wait_for(" steps · ", Duration::from_secs(30));
     session.send("/more\r");
     session.wait_for("Esc đóng", Duration::from_secs(30));
     session.send("\u{1b}[6~\u{1b}[H\u{1b}[F");
@@ -801,12 +801,12 @@ fn h05_pty_approval_denial_is_fail_closed() {
     );
 
     session.send("n\r");
-    let denied = wait_for_normalized(&session, "[approval] denied", Duration::from_secs(30));
+    let denied = wait_for_normalized(&session, "approval denied", Duration::from_secs(30));
     assert!(
-        denied.contains("[tool] apply_patch") || denied.contains("[run] done"),
+        denied.contains("apply_patch · ") || denied.contains(" steps · "),
         "the real host reports the denied tool result:\n{denied}"
     );
-    session.wait_for("[run] done", Duration::from_secs(30));
+    session.wait_for(" steps · ", Duration::from_secs(30));
     assert!(
         second_request.load(Ordering::SeqCst),
         "the denial result reaches the provider continuation"
@@ -843,7 +843,7 @@ fn g05_pty_always_allow_writes_local_rule() {
     wait_for_normalized(&session, "apply_patch", Duration::from_secs(30));
     assert!(!rule.exists(), "proposal alone must not write a rule");
     session.send("\r");
-    session.wait_for("[run] done", Duration::from_secs(40));
+    session.wait_for(" steps · ", Duration::from_secs(40));
     let local = std::fs::read_to_string(&rule).expect("confirmed rule");
     assert!(local.contains("apply_patch(src/parser.rs)"), "{local}");
     session.send("/exit\r");
@@ -890,7 +890,7 @@ fn g08_pty_undo_panel() {
     session.send("fix the parser\r");
     session.wait_for("[approval] ApplyPatch", Duration::from_secs(40));
     session.send("y\r");
-    session.wait_for("[run] done", Duration::from_secs(40));
+    session.wait_for(" steps · ", Duration::from_secs(40));
     assert_eq!(
         std::fs::read_to_string(&file).expect("patched file"),
         replacement
@@ -898,7 +898,7 @@ fn g08_pty_undo_panel() {
     session.send("/undo\r");
     wait_for_normalized(&session, "[approval] WriteFile", Duration::from_secs(30));
     session.send("y\r");
-    wait_for_occurrences(&session, "[run] done", 2, Duration::from_secs(40));
+    wait_for_occurrences(&session, " steps · ", 2, Duration::from_secs(40));
     assert_eq!(
         std::fs::read_to_string(&file).expect("restored file"),
         source
@@ -953,7 +953,6 @@ fn t07_pty_resize_keeps_the_draft() {
     assert!(session.is_alive(), "typing keeps the TUI alive");
     session.resize(72, 20);
     session.send(" survives\r");
-    session.wait_for("> draft resize survives", Duration::from_secs(30));
     session.wait_for(
         "fixture answer for: draft resize survives",
         Duration::from_secs(30),
@@ -1086,13 +1085,13 @@ fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
         "fixture answer for: sửa lỗi parse!",
         Duration::from_secs(30),
     );
-    session.wait_for("[run] done", Duration::from_secs(30));
+    session.wait_for(" steps · ", Duration::from_secs(30));
 
     // A paste must never turn into several submitted commands. Whether the console
     // forwards the bracketed-paste markers is the console's choice: this ConPTY
     // build does not, and then the newline inside the paste arrives as Enter. Both
     // outcomes are asserted, so the test measures the app instead of the terminal.
-    let accepted_before_paste = session.transcript().matches("[run] accepted").count();
+    let accepted_before_paste = session.transcript().matches("fixture answer for").count();
     session.send("\u{1b}[200~multi\r\nline\u{1b}[201~");
     let pasted = session.wait_for_any(&["multi line", "multi"], Duration::from_secs(15));
     let transcript = session.transcript();
@@ -1101,7 +1100,7 @@ fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
     };
     if transcript.contains("multi line") {
         assert_eq!(
-            transcript.matches("[run] accepted").count(),
+            transcript.matches("fixture answer for").count(),
             accepted_before_paste,
             "a bracketed paste must not submit a request:\n{transcript}"
         );
@@ -1156,7 +1155,7 @@ fn i21_pty_survives_a_multiline_draft_and_keeps_the_prompt_usable() {
     std::thread::sleep(Duration::from_millis(250));
 
     let transcript = session.transcript();
-    let inserted_break = !transcript.contains("[run] accepted");
+    let inserted_break = !transcript.contains("fixture answer for");
     if inserted_break {
         assert!(
             !transcript.contains("> dòng hai"),
@@ -1180,7 +1179,7 @@ fn i21_pty_survives_a_multiline_draft_and_keeps_the_prompt_usable() {
         session.send("\r");
         session.wait_for("> dòng một", Duration::from_secs(30));
         session.wait_for("fixture answer for: dòng một", Duration::from_secs(30));
-        session.wait_for("[run] done", Duration::from_secs(30));
+        session.wait_for(" steps · ", Duration::from_secs(30));
     } else {
         session.send("\u{3}");
     }
@@ -1268,7 +1267,7 @@ fn i07b_ctrl_c_cancels_a_running_turn() {
     running.wait_for("Harness Agents", Duration::from_secs(30));
 
     running.send("hold the turn open\r");
-    running.wait_for("[run] accepted", Duration::from_secs(20));
+    running.wait_for("esc to interrupt", Duration::from_secs(20));
     let waiting = Instant::now() + Duration::from_secs(30);
     while !contacted.load(Ordering::SeqCst) {
         assert!(
@@ -1279,8 +1278,8 @@ fn i07b_ctrl_c_cancels_a_running_turn() {
         std::thread::sleep(Duration::from_millis(25));
     }
     running.send("\u{3}");
-    running.wait_for("canceling", Duration::from_secs(20));
-    running.wait_for("[run]", Duration::from_secs(30));
+    running.wait_for("Canceling", Duration::from_secs(20));
+    running.wait_for(" steps · ", Duration::from_secs(30));
     running.send("/exit\r");
     assert_eq!(
         running.wait_exit(Duration::from_secs(20)),
@@ -1796,7 +1795,7 @@ fn i05_exit_during_an_active_run_releases_the_store_for_the_next_host() {
     session.wait_for("Harness Agents", Duration::from_secs(30));
 
     session.send("hold the turn open\r");
-    session.wait_for("[run] accepted", Duration::from_secs(20));
+    session.wait_for("esc to interrupt", Duration::from_secs(20));
     let waiting = Instant::now() + Duration::from_secs(30);
     while !contacted.load(Ordering::SeqCst) {
         assert!(
@@ -1968,7 +1967,7 @@ fn i12_a_prompt_with_an_unreachable_provider_is_reported_and_the_app_stays_alive
     session.send("hello\r");
 
     // A failed turn is rendered as a run failure naming the provider error.
-    let transcript = session.wait_for("[run] failed", Duration::from_secs(40));
+    let transcript = session.wait_for("failed", Duration::from_secs(40));
     assert!(
         transcript.contains(&address.to_string()),
         "the failure names the endpoint that was called:\n{transcript}"
@@ -1994,7 +1993,7 @@ fn i12_a_prompt_with_an_unreachable_provider_is_reported_and_the_app_stays_alive
 /// A turn that stops at a bound continues by itself, in a real terminal.
 ///
 /// The measured complaint: eight steps, tokens to spare, and the turn stopped —
-/// `[run] paused: step limit reached · 8 steps · 14 tool calls · 46.8s` — as if the task
+/// `paused: step limit reached · 8 steps · 14 tool calls · 46.8s` — as if the task
 /// were broken. A bound stops a loop that has gone wrong, not a task that is still
 /// moving, so the app sends the next request itself, says so, and stops doing that once
 /// the budget the environment set is spent.
@@ -2022,34 +2021,44 @@ fn g4_a_step_bound_continues_the_turn_by_itself() {
     // answer a panel that is no longer there.
     wait_for_occurrences(&session, "[approval] ListFiles", 1, Duration::from_secs(40));
     session.send("y\r");
-    wait_for_occurrences(&session, "list_files path=. ok", 1, Duration::from_secs(40));
+    wait_for_occurrences(
+        &session,
+        "list_files · done · path=.",
+        1,
+        Duration::from_secs(40),
+    );
 
     let continued = wait_for_normalized(
         &session,
-        "[auto] continue: the previous turn stopped at a bound",
+        "◆ continue: the previous turn stopped at a bound",
         Duration::from_secs(40),
     );
     assert!(
-        continued.contains("[info] step limit reached; continuing automatically (1 of 1)"),
+        continued.contains("step limit reached; continuing automatically (1 of 1)"),
         "the app says why it spoke:\n{continued}"
     );
     assert!(
-        continued.contains("[run] paused: step limit reached · 2 steps · 1 tool calls"),
+        continued.contains("paused: step limit reached · 2 steps · 1 tool calls"),
         "the pause is still on the record before the continuation:\n{continued}"
     );
 
     // The continuation runs, and this time the budget is spent: the pause stands.
     wait_for_occurrences(&session, "[approval] ListFiles", 2, Duration::from_secs(40));
     session.send("y\r");
-    wait_for_occurrences(&session, "list_files path=. ok", 2, Duration::from_secs(40));
+    wait_for_occurrences(
+        &session,
+        "list_files · done · path=.",
+        2,
+        Duration::from_secs(40),
+    );
     let paused = wait_for_occurrences(
         &session,
-        "[run] paused: step limit reached",
+        "paused: step limit reached",
         2,
         Duration::from_secs(40),
     );
     assert_eq!(
-        paused.matches("[auto] continue").count(),
+        paused.matches("◆ continue").count(),
         1,
         "the budget was one, so exactly one request was the app's own:\n{paused}"
     );

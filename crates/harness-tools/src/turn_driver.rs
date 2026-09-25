@@ -77,6 +77,12 @@ pub enum TurnProgress {
         /// unable to tell a malformed call from a policy denial.
         detail: Option<String>,
     },
+    /// What a tool returned, as the model is shown it; the TUI shows the first
+    /// lines under the tool's panel, the way prime-agent's tool panel does.
+    ToolOutput {
+        name: String,
+        text: String,
+    },
     /// An action ran without opening the approval panel; this reason is part of
     /// the user-visible transcript.
     Info(String),
@@ -1027,17 +1033,19 @@ impl TurnDriver {
                                 .retain(|existing| existing.id != block.id);
                             request.project_rules.push(block.clone());
                         }
+                        let rendered = render_tool_output(&name, &view.output);
+                        observer.observe(TurnProgress::ToolOutput {
+                            name: name.clone(),
+                            text: rendered.clone(),
+                        });
                         observer.observe(TurnProgress::ToolSettled {
                             name: name.clone(),
                             ok: blocked.is_none(),
                             detail: blocked,
                         });
                         appended.push(
-                            ProviderMessage::tool_result(
-                                transcript_id.clone(),
-                                render_tool_output(&name, &view.output),
-                            )
-                            .with_attachments(tool_output_images(&view.output)),
+                            ProviderMessage::tool_result(transcript_id.clone(), rendered)
+                                .with_attachments(tool_output_images(&view.output)),
                         );
                         executions.push(view);
                     }

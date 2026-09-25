@@ -10,49 +10,93 @@ use ratatui::text::{Line, Span};
 
 use super::markdown;
 use super::theme::Theme;
-use crate::interactive::events::{HistoryItem, RunOutcome, ToolState};
+use crate::interactive::events::{Detail, HistoryItem, RunOutcome, ToolState};
 use crate::interactive::view;
 
-/// Render one history item into styled rows.
+/// How many lines of a tool's output a collapsed panel shows (prime-agent's
+/// `tool-execution.ts`).
+const TOOL_OUTPUT_PREVIEW_LINES: usize = 3;
+
+/// Render one history item into styled rows, the way prime-agent's interactive
+/// mode draws its chat (`modes/interactive/components`): a user message is a box on
+/// `userMessageBg`, assistant prose is markdown with one cell of padding, a tool is
+/// a panel on `toolPanelBg` headed `label · status`, its output collapsed to three
+/// lines, and notices, errors and injected prompts are single styled lines.
 ///
-/// The text of every row matches [`view::plain_lines`] for the same item, so the
-/// scrollback says exactly what the plain transcript says; only the styling is
-/// added. That is what keeps the PTY assertions on `> `, `[tool] `, `[run] `,
-/// `[approval] `, `[error] ` and `[info] ` valid on the TUI.
+/// The plain renderer keeps its own transcript format ([`view::plain_lines`]); this
+/// is only how the TUI shows the same items.
 #[must_use]
-pub fn render(item: &HistoryItem, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> Vec<Line<'static>> {
     match item {
         HistoryItem::Banner { lines } => banner_rows(lines, width, theme),
-        HistoryItem::User { text } => marker_rows("> ", text, width, theme.user, theme),
-        // The app's own continuation keeps the marker a reader can tell apart from their
-        // own words, in the same dim style the plain renderer prints `[auto] `.
-        HistoryItem::Automatic { text } => marker_rows("[auto] ", text, width, theme.dim, theme),
-        HistoryItem::Assistant { text } => markdown::render(text, width, theme),
-        HistoryItem::Thinking { text } => vec![Line::from(Span::styled(text.clone(), theme.dim))],
+        HistoryItem::User { text } => user_box(text, width, theme),
+        HistoryItem::Automatic { text } => injected_prompt(text, width, theme),
+        HistoryItem::Assistant { text } => {
+            let mut rows = vec![Line::default()];
+            rows.extend(padded(markdown::render(
+                text,
+                width.saturating_sub(2),
+                theme,
+            )));
+            rows
+        }
+        // Collapsed mode hides reasoning, as prime-agent's overview does.
+        HistoryItem::Thinking { .. } if detail == Detail::Collapsed => Vec::new(),
+        HistoryItem::Thinking { text } => {
+            // prime-agent shows reasoning as dim markdown, with no label.
+            let dim = Theme {
+                assistant: theme.dim,
+                md_code: theme.dim,
+                md_code_block: theme.dim,
+                md_heading: theme.dim,
+                ..*theme
+            };
+            padded(markdown::render(text, width.saturating_sub(2), &dim))
+        }
         HistoryItem::Tool {
             name,
             summary,
             state,
-        } => vec![tool_card(name, summary, state.clone(), theme)],
+        } => {
+            let mut rows = vec![Line::default()];
+            rows.push(tool_card(name, summary, state, theme));
+            if let ToolState::Failed { detail, .. } = state
+                && !detail.trim().is_empty()
+            {
+                rows.extend(panel_rows(
+                    &format!("  {detail}"),
+                    width,
+                    theme.error,
+                    theme,
+                ));
+            }
+            rows
+        }
+        HistoryItem::ToolOutput { text, .. } => tool_output_rows(
+            text,
+            width,
+            theme,
+            if detail == Detail::Expanded {
+                usize::MAX
+            } else {
+                TOOL_OUTPUT_PREVIEW_LINES
+            },
+        ),
         HistoryItem::Run {
             outcome,
             steps,
             tool_calls,
             elapsed,
-        } => vec![run_row(outcome, *steps, *tool_calls, *elapsed, theme)],
-        HistoryItem::RunAccepted { input_id } => vec![Line::from(vec![Span::styled(
-            view::run_line(&format!("accepted {}", view::short_id(input_id))),
-            theme.dim,
-        )])],
-        HistoryItem::Error { message } => vec![Line::from(vec![Span::styled(
-            format!("[error] {message}"),
-            theme.error,
-        )])],
+            // A failed turn's reason can be long; it wraps rather than being cut off.
+        } => wrap_spans(
+            run_row(outcome, *steps, *tool_calls, *elapsed, theme).spans,
+            width,
+        ),
+        // prime-agent shows no row for an admitted input: the user box is the record.
+        HistoryItem::RunAccepted { .. } => Vec::new(),
+        HistoryItem::Error { message } => error_rows(message, width, theme),
         HistoryItem::Message { text } => vec![Line::from(Span::raw(text.clone()))],
-        HistoryItem::Notice { message } => vec![Line::from(vec![Span::styled(
-            format!("[info] {message}"),
-            theme.dim,
-        )])],
+        HistoryItem::Notice { message } => notice_rows(message, width, theme),
         HistoryItem::Approval {
             action,
             summary,
@@ -63,22 +107,169 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme) -> Vec<Line<'static
             .into_iter()
             .map(|line| Line::from(vec![Span::styled(line, theme.dim)]))
             .collect(),
-        HistoryItem::ApprovalResolution { label, request_id } => vec![Line::from(vec![
-            Span::styled(
-                format!("[approval] {label} "),
-                if label == "granted" {
-                    theme.tool_ok
-                } else {
-                    theme.tool_failed
-                },
-            ),
-            Span::raw(request_id.clone()),
-        ])],
+        HistoryItem::ApprovalResolution { label, request_id } => {
+            let granted = label == "granted";
+            vec![Line::from(vec![
+                Span::styled(
+                    if granted { "✓ " } else { "✗ " },
+                    if granted {
+                        theme.tool_ok
+                    } else {
+                        theme.tool_failed
+                    },
+                ),
+                Span::styled(format!("approval {label} "), theme.muted),
+                Span::styled(request_id.clone(), theme.dim),
+            ])]
+        }
         HistoryItem::Sessions { lines } => lines
             .iter()
             .map(|line| Line::from(Span::raw(line.clone())))
             .collect(),
     }
+}
+
+/// Indent rendered rows by one cell, as prime-agent pads assistant text.
+fn padded(rows: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    rows.into_iter()
+        .map(|line| {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(line.spans);
+            Line::from(spans).style(line.style)
+        })
+        .collect()
+}
+
+/// prime-agent's `UserMessageComponent`: a box on `userMessageBg`, two cells of
+/// padding on each side and one row above and below.
+fn user_box(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let inner = width.saturating_sub(4).max(1);
+    let mut rows = vec![Line::default(), Line::default().style(theme.user_box)];
+    for line in text.split('\n') {
+        for row in wrap_spans(vec![Span::styled(line.to_owned(), theme.user_box)], inner) {
+            let mut spans = vec![Span::styled("  ", theme.user_box)];
+            spans.extend(row.spans);
+            rows.push(Line::from(spans).style(theme.user_box));
+        }
+    }
+    rows.push(Line::default().style(theme.user_box));
+    rows
+}
+
+/// prime-agent's injected prompts (`injected-prompt-message.ts`): a heartbeat is
+/// `♥ Heartbeat prompt · <schedule>`, a goal continuation `◆ Goal · <objective>`,
+/// anything else the app sent by itself `◆ <first line>`.
+fn injected_prompt(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let first = text.lines().next().unwrap_or_default();
+    let (marker, marker_style, label) = if let Some(rest) = first.strip_prefix("[heartbeat: ") {
+        let schedule = rest.split(" run#").next().unwrap_or(rest);
+        ("♥ ", theme.error, format!("Heartbeat prompt · {schedule}"))
+    } else if let Some(objective) = first.strip_prefix("Continue working toward the goal: ") {
+        ("◆ ", theme.accent, format!("Goal · {objective}"))
+    } else {
+        ("◆ ", theme.accent, first.to_owned())
+    };
+    let mut rows = vec![Line::default()];
+    rows.extend(wrap_spans(
+        vec![
+            Span::styled(marker, marker_style),
+            Span::styled(label, theme.muted),
+        ],
+        width,
+    ));
+    rows
+}
+
+/// prime-agent's `⚠ Error: msg`, after a blank row.
+fn error_rows(message: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let mut rows = vec![Line::default()];
+    rows.extend(wrap_spans(
+        vec![Span::styled(format!("⚠ Error: {message}"), theme.error)],
+        width,
+    ));
+    rows
+}
+
+/// A status line in `dim`; a warning (`goal paused`, `refine failed`, ...) in the
+/// warning colour with prime-agent's `⚠`, and a refinement in its own colour.
+fn notice_rows(message: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let lowered = message.to_ascii_lowercase();
+    let spans = if message.starts_with("refine ") {
+        let (head, body) = message.split_once(": ").unwrap_or((message, ""));
+        let mut spans = vec![
+            Span::styled("◆ ", theme.refinement),
+            Span::styled(
+                head.to_owned(),
+                theme.refinement.add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if !body.is_empty() {
+            spans.push(Span::styled(format!(" · {body}"), theme.muted));
+        }
+        spans
+    } else if lowered.contains("failed")
+        || lowered.contains("could not")
+        || lowered.contains("skipped")
+    {
+        vec![Span::styled(format!("⚠ {message}"), theme.warning)]
+    } else {
+        vec![Span::styled(message.to_owned(), theme.dim)]
+    };
+    wrap_spans(spans, width)
+}
+
+/// Rows on the tool panel background, padded to the full width.
+fn panel_rows(text: &str, width: u16, style: Style, theme: &Theme) -> Vec<Line<'static>> {
+    wrap_spans(vec![Span::styled(text.to_owned(), style)], width)
+        .into_iter()
+        .map(|line| line.style(theme.panel))
+        .collect()
+}
+
+/// The collapsed body of a tool panel: the first lines of what the tool returned,
+/// then `… N more lines` - prime-agent's collapsed tool output.
+fn tool_output_rows(text: &str, width: u16, theme: &Theme, shown: usize) -> Vec<Line<'static>> {
+    // The first line repeats the tool's name (`read_file:`), which the header says.
+    let body = text.split_once(":\n").map_or(text, |(_, body)| body);
+    let lines = body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    for line in lines.iter().take(shown) {
+        let clipped = clip(line, usize::from(width.saturating_sub(4)));
+        rows.push(
+            Line::from(vec![Span::raw("  "), Span::styled(clipped, theme.muted)])
+                .style(theme.panel),
+        );
+    }
+    let more = lines.len().saturating_sub(shown);
+    if more > 0 {
+        rows.push(
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("… {more} more lines"), theme.dim),
+            ])
+            .style(theme.panel),
+        );
+    }
+    rows
+}
+
+/// One row of at most `cells` cells, cut with `…`.
+fn clip(text: &str, cells: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let width = super::widgets::composer::char_width(character);
+        if used + width > cells.saturating_sub(1) {
+            out.push('…');
+            return out;
+        }
+        out.push(character);
+        used += width;
+    }
+    out
 }
 
 /// A compact welcome card in scrollback. Keep every original header value visible
@@ -104,7 +295,7 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
         if index == 0 {
             spans.push(Span::styled(line.clone(), theme.title));
         } else if let Some((label, value)) = line.split_once(':') {
-            spans.push(Span::styled(format!("{label}:"), theme.accent));
+            spans.push(Span::styled(format!("{label}:"), theme.muted));
             spans.push(Span::styled(value.to_owned(), theme.dim));
         } else {
             spans.push(Span::styled(line.clone(), theme.dim));
@@ -120,78 +311,71 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
     rows
 }
 
-/// The plain user rows: the marker only precedes the first row.
-fn marker_rows(
-    marker: &str,
-    text: &str,
-    width: u16,
-    style: Style,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
-    let mut rows = Vec::new();
-    for (index, line) in text.split('\n').enumerate() {
-        let head = if index == 0 {
-            marker.to_owned()
-        } else {
-            String::new()
-        };
-        let mut spans = Vec::new();
-        if !head.is_empty() {
-            spans.push(Span::styled(
-                head,
-                theme.accent.add_modifier(Modifier::BOLD),
-            ));
-        }
-        spans.push(Span::styled(line.to_owned(), style));
-        for row in wrap_spans(spans, width) {
-            rows.push(row);
-        }
-    }
-    if rows.is_empty() {
-        rows.push(Line::from(Span::styled(marker.to_owned(), theme.accent)));
-    }
-    rows
+/// A tool panel header: prime-agent's `label · status` on `toolPanelBg` - `running`
+/// with its diamond marker in `bashMode`, `done` in `success`, `error` in `error` -
+/// followed by the arguments and the duration in dim. The Python REPL gets
+/// prime-agent's ipython-cell summary: `✓ python · <code> · <duration>`.
+#[must_use]
+pub fn tool_card(name: &str, summary: &str, state: &ToolState, theme: &Theme) -> Line<'static> {
+    running_card(name, summary, state, 1, theme)
 }
 
-/// The tool card.
-///
-/// A started card shows the summary; a settled card shows `ok`/`failed` with the
-/// duration the service measured. The plain form is still `[tool] name …`, which
-/// is why the name is always present at the start of the row.
+/// [`tool_card`] at animation frame `tick`: a running tool's diamond pulses, as
+/// prime-agent's working icon does.
 #[must_use]
-pub fn tool_card(name: &str, summary: &str, state: ToolState, theme: &Theme) -> Line<'static> {
-    let (status, style, detail) = match state {
-        ToolState::Started => ("…".to_owned(), theme.dim, None),
+pub fn running_card(
+    name: &str,
+    summary: &str,
+    state: &ToolState,
+    tick: u64,
+    theme: &Theme,
+) -> Line<'static> {
+    let (marker, status, style, duration) = match state {
+        ToolState::Started => (Theme::working(tick), "running", theme.bash, None),
         ToolState::Ok { elapsed } => (
-            format!("ok {}", view::seconds_label(elapsed)),
+            "✓",
+            "done",
             theme.tool_ok,
-            None,
+            Some(view::seconds_label(*elapsed)),
         ),
-        ToolState::Failed { elapsed, detail } => (
-            format!("failed {}", view::seconds_label(elapsed)),
+        ToolState::Failed { elapsed, .. } => (
+            "✗",
+            "error",
             theme.tool_failed,
-            (!detail.trim().is_empty()).then(|| detail.clone()),
+            Some(view::seconds_label(*elapsed)),
         ),
     };
-    let mut spans = vec![
-        Span::styled("● ".to_owned(), theme.accent),
-        Span::styled(format!("[tool] {name}"), style.add_modifier(Modifier::BOLD)),
-    ];
-    if !summary.is_empty() {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(summary.to_owned(), theme.dim));
+    let separator = || Span::styled(" · ", theme.dim);
+    let mut spans = vec![Span::raw("  ")];
+    if name == "ipython" {
+        let code = summary.strip_prefix("code=").unwrap_or(summary);
+        spans.push(Span::styled(format!("{marker} "), style));
+        spans.push(Span::styled("python", theme.muted));
+        if !code.is_empty() {
+            spans.push(separator());
+            spans.push(Span::styled(code.to_owned(), theme.dim));
+        }
+    } else {
+        spans.push(Span::styled(name.to_owned(), theme.muted));
+        spans.push(separator());
+        if matches!(state, ToolState::Started) {
+            spans.push(Span::styled(format!("{marker} "), style));
+        }
+        spans.push(Span::styled(status, style));
+        if !summary.is_empty() {
+            spans.push(separator());
+            spans.push(Span::styled(summary.to_owned(), theme.dim));
+        }
     }
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(status, style));
-    // The reason is dim like the summary: the card's colour already says it failed, and
-    // a reader has to be able to tell a malformed call from a policy denial.
-    if let Some(detail) = detail {
-        spans.push(Span::styled(format!(" · {detail}"), theme.dim));
+    if let Some(duration) = duration {
+        spans.push(separator());
+        spans.push(Span::styled(duration, theme.dim));
     }
-    Line::from(spans)
+    Line::from(spans).style(theme.panel)
 }
 
-/// The end-of-turn row, including the summary the plain renderer omits.
+/// The end-of-turn line: a dim status, as prime-agent's `showStatus`, in the
+/// warning colour when the turn stopped short and the error colour when it failed.
 #[must_use]
 pub fn run_row(
     outcome: &RunOutcome,
@@ -201,21 +385,15 @@ pub fn run_row(
     theme: &Theme,
 ) -> Line<'static> {
     let style = match outcome {
-        RunOutcome::Done => theme.tool_ok,
-        // Neither a cancel nor a bound is a red line: nothing broke, and what the turn
-        // did is durable. A waiting run is not a failure either - it is the host
-        // asking for something only a person can give.
+        RunOutcome::Done => theme.dim,
         RunOutcome::Canceled
         | RunOutcome::Paused(_)
         | RunOutcome::WaitingInput { .. }
-        | RunOutcome::ExternalWait => theme.dim,
-        RunOutcome::Blocked(_) | RunOutcome::Failed(_) => theme.tool_failed,
+        | RunOutcome::ExternalWait => theme.warning,
+        RunOutcome::Blocked(_) | RunOutcome::Failed(_) => theme.error,
     };
     Line::from(vec![
-        Span::styled(
-            view::run_line(&outcome.label()),
-            style.add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(outcome.label(), style),
         Span::styled(
             format!(
                 " · {steps} steps · {tool_calls} tool calls · {}",
@@ -263,83 +441,77 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::{render, wrap_spans};
-    use crate::interactive::events::{HistoryItem, RunOutcome, ToolState};
+    use crate::interactive::events::{Detail, HistoryItem, RunOutcome, ToolState};
     use crate::interactive::tui::markdown::plain_text;
     use crate::interactive::tui::theme::Theme;
-    use crate::interactive::view;
     use ratatui::text::{Line, Span};
     use std::time::Duration;
 
-    /// U20 in the TUI: the visible text of a history row is the plain line.
+    /// prime-agent's chat rows: a user box, a tool panel `label · status`, its
+    /// output collapsed to three lines, `⚠ Error:`, and no row for an admitted input.
     #[test]
-    fn t04_history_rows_repeat_the_plain_text() {
+    fn rows_follow_prime_agents_chat() {
         let theme = Theme::plain();
-        let items = vec![
-            HistoryItem::User {
+        let user = plain_text(&render(
+            &HistoryItem::User {
                 text: "sửa lỗi parser".to_owned(),
             },
-            HistoryItem::Tool {
+            40,
+            &theme,
+            Detail::Collapsed,
+        ));
+        assert!(user.contains("  sửa lỗi parser"), "{user}");
+        let card = plain_text(&render(
+            &HistoryItem::Tool {
                 name: "read_file".to_owned(),
                 summary: "path=a.rs".to_owned(),
-                state: ToolState::Started,
-            },
-            HistoryItem::Tool {
-                name: "read_file".to_owned(),
-                summary: String::new(),
                 state: ToolState::Ok {
                     elapsed: Duration::from_millis(12),
                 },
             },
-            HistoryItem::Error {
-                message: "boom".to_owned(),
-            },
-            HistoryItem::Notice {
-                message: "hi".to_owned(),
-            },
-            HistoryItem::RunAccepted {
-                input_id: "input_0192f0aa-bbcc-7ddd-8eee-ffff00001111".to_owned(),
-            },
-        ];
-        for item in items {
-            let rows = plain_text(&render(&item, 80, &theme));
-            let plain = view::plain_lines(&item);
-            // A settled tool card is one styled card, so its plain lines are not
-            // one row; every other item must still carry its exact plain line.
-            for line in &plain {
-                let carried = rows.contains(line.as_str())
-                    || line.split_whitespace().all(|part| rows.contains(part));
-                assert!(
-                    carried,
-                    "the TUI row must carry the plain line {line:?}, got:\n{rows}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn t04_a_settled_tool_card_carries_its_duration() {
-        let theme = Theme::plain();
-        let card = render(
-            &HistoryItem::Tool {
-                name: "apply_patch".to_owned(),
-                summary: String::new(),
-                state: ToolState::Failed {
-                    elapsed: Duration::from_millis(3100),
-                    detail: String::new(),
-                },
+            80,
+            &theme,
+            Detail::Collapsed,
+        ));
+        assert!(
+            card.contains("read_file · done · path=a.rs · 12ms"),
+            "{card}"
+        );
+        let output = plain_text(&render(
+            &HistoryItem::ToolOutput {
+                name: "read_file".to_owned(),
+                text: "read_file:\none\ntwo\nthree\nfour\nfive".to_owned(),
             },
             80,
             &theme,
+            Detail::Collapsed,
+        ));
+        assert_eq!(output, "  one\n  two\n  three\n  … 2 more lines");
+        let error = plain_text(&render(
+            &HistoryItem::Error {
+                message: "boom".to_owned(),
+            },
+            80,
+            &theme,
+            Detail::Collapsed,
+        ));
+        assert!(error.ends_with("⚠ Error: boom"), "{error}");
+        assert!(
+            render(
+                &HistoryItem::RunAccepted {
+                    input_id: "input_1".to_owned()
+                },
+                80,
+                &theme,
+                Detail::Collapsed
+            )
+            .is_empty()
         );
-        let text = plain_text(&card);
-        assert!(text.contains("[tool] apply_patch"), "{text}");
-        assert!(text.contains("failed 3.1s"), "{text}");
     }
 
-    /// The card says why it failed, next to the duration the service measured.
     #[test]
-    fn t04_a_failed_tool_card_carries_the_reason() {
-        let card = render(
+    fn a_failed_tool_card_carries_its_duration_and_reason() {
+        let text = plain_text(&render(
             &HistoryItem::Tool {
                 name: "list_files".to_owned(),
                 summary: "path=".to_owned(),
@@ -350,18 +522,58 @@ mod tests {
             },
             120,
             &Theme::plain(),
+            Detail::Collapsed,
+        ));
+        assert!(
+            text.contains("list_files · error · path= · 962ms"),
+            "{text}"
         );
-        let text = plain_text(&card);
-        assert!(text.contains("failed 962ms"), "{text}");
         assert!(
             text.contains("invalid_payload: optional tool path must not be blank"),
-            "the reader has to be able to tell a malformed call from a denial: {text}"
+            "{text}"
         );
     }
 
+    /// The Python REPL gets prime-agent's ipython-cell summary.
     #[test]
-    fn t04_the_run_row_includes_the_summary() {
-        let row = render(
+    fn an_ipython_cell_is_summarised_like_prime_agent() {
+        let text = plain_text(&render(
+            &HistoryItem::Tool {
+                name: "ipython".to_owned(),
+                summary: "code=print(1)".to_owned(),
+                state: ToolState::Ok {
+                    elapsed: Duration::from_millis(1200),
+                },
+            },
+            80,
+            &Theme::plain(),
+            Detail::Collapsed,
+        ));
+        assert!(text.contains("✓ python · print(1) · 1.2s"), "{text}");
+    }
+
+    #[test]
+    fn injected_prompts_and_the_run_row_are_status_lines() {
+        let theme = Theme::plain();
+        let beat = plain_text(&render(
+            &HistoryItem::Automatic {
+                text: "[heartbeat: every 5m run#2]\n\ncheck ci".to_owned(),
+            },
+            80,
+            &theme,
+            Detail::Collapsed,
+        ));
+        assert!(beat.contains("♥ Heartbeat prompt · every 5m"), "{beat}");
+        let goal = plain_text(&render(
+            &HistoryItem::Automatic {
+                text: "Continue working toward the goal: ship it\nmore".to_owned(),
+            },
+            80,
+            &theme,
+            Detail::Collapsed,
+        ));
+        assert!(goal.contains("◆ Goal · ship it"), "{goal}");
+        let row = plain_text(&render(
             &HistoryItem::Run {
                 outcome: RunOutcome::Done,
                 steps: 3,
@@ -369,11 +581,32 @@ mod tests {
                 elapsed: Duration::from_millis(14_200),
             },
             80,
-            &Theme::plain(),
+            &theme,
+            Detail::Collapsed,
+        ));
+        assert!(
+            row.starts_with("done · 3 steps · 2 tool calls · 14.2s"),
+            "{row}"
         );
-        let text = plain_text(&row);
-        assert!(text.starts_with("[run] done"), "{text}");
-        assert!(text.contains("3 steps · 2 tool calls · 14.2s"), "{text}");
+    }
+
+    /// ctrl+o: collapsed hides reasoning; expanded shows every output line.
+    #[test]
+    fn the_detail_mode_decides_what_a_row_shows() {
+        let theme = Theme::plain();
+        let thinking = HistoryItem::Thinking {
+            text: "plan".to_owned(),
+        };
+        assert!(render(&thinking, 80, &theme, Detail::Collapsed).is_empty());
+        assert!(plain_text(&render(&thinking, 80, &theme, Detail::Details)).contains("plan"));
+        let output = HistoryItem::ToolOutput {
+            name: "t".to_owned(),
+            text: "t:\n1\n2\n3\n4".to_owned(),
+        };
+        assert_eq!(
+            plain_text(&render(&output, 80, &theme, Detail::Expanded)),
+            "  1\n  2\n  3\n  4"
+        );
     }
 
     #[test]

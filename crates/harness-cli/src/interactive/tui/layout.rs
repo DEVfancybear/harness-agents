@@ -6,8 +6,10 @@
 //! +--------------------------------------+
 //! | live block (text still streaming)    |  hidden when there is none
 //! | modal (approval, picker, reference)  |  replaces the live block
+//! | status (exactly one row)             |  prime-agent's working line
+//! | ──────────────────────────────────── |
 //! | composer (1..8 rows, grows upward)   |
-//! | status (exactly one row)             |
+//! | ──────────────────────────────────── |
 //! +--------------------------------------+
 //! ```
 //!
@@ -60,17 +62,10 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
     let width = area.width.max(1);
     let height = area.height.max(1);
     let status_height = STATUS_ROWS.min(height);
-    let status = Rect {
-        x: area.x,
-        y: area.y + height - status_height,
-        width,
-        height: status_height,
-    };
-
-    let body_height = height.saturating_sub(status_height);
+    let body_height = height;
     // The composer grows with its content and takes what it needs first: a draft
-    // the user is typing must never be squeezed by streamed text. One extra row
-    // is the box's top border.
+    // the user is typing must never be squeezed by streamed text. Two extra rows
+    // are prime-agent's rules above and below the editor.
     let prefix_width = u16::try_from(crate::interactive::tui::widgets::composer::display_width(
         crate::interactive::view::prompt_prefix(state.phase),
     ))
@@ -84,19 +79,28 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
         );
     let wanted_rows = composer_rows(composer_lines.len());
     let shown_rows = wanted_rows.min(MAX_COMPOSER_ROWS.max(1));
-    let composer_height = shown_rows.saturating_add(1).min(body_height.max(1));
+    let composer_height = shown_rows
+        .saturating_add(2)
+        .min(body_height.saturating_sub(status_height).max(1));
     let composer = Rect {
         x: area.x,
         y: area.y + body_height.saturating_sub(composer_height),
         width,
         height: composer_height,
     };
+    // The working line sits directly above the editor, as prime-agent's loader does.
+    let status = Rect {
+        x: area.x,
+        y: composer.y.saturating_sub(status_height),
+        width,
+        height: status_height.min(composer.y.saturating_sub(area.y)),
+    };
 
     let upper = Rect {
         x: area.x,
         y: area.y,
         width,
-        height: body_height.saturating_sub(composer_height),
+        height: status.y.saturating_sub(area.y),
     };
 
     // The slash-command menu takes its rows from the live region, directly above
@@ -130,7 +134,7 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
     };
 
     // Rows the draft needs beyond the ones the box can show scroll out of view.
-    let composer_scroll = wanted_rows.saturating_sub(composer.height.saturating_sub(1));
+    let composer_scroll = wanted_rows.saturating_sub(composer.height.saturating_sub(2));
     let cursor = cursor_cell(
         state,
         composer,
@@ -283,18 +287,21 @@ mod tests {
             suggestion_selected: 0,
             fallback_reason: None,
             tick: 0,
+            detail: crate::interactive::events::Detail::default(),
         }
     }
 
     #[test]
-    fn t02_status_is_always_the_last_row_and_composer_sits_above_it() {
+    /// prime-agent's dock: the working line, then the editor between two rules at
+    /// the bottom.
+    fn t02_the_editor_is_last_and_the_working_line_sits_above_it() {
         let area = Rect::new(0, 0, 80, 12);
         let outline = plan(area, &state(AppPhase::Ready), &Theme::plain());
-        assert_eq!(outline.status.y, 11);
+        assert_eq!(outline.status.y, 8);
         assert_eq!(outline.status.height, 1);
         assert_eq!(
-            outline.composer.height, 2,
-            "one content row plus the top border"
+            outline.composer.height, 3,
+            "one content row between the two rules"
         );
         assert_eq!(outline.composer.y, 9);
         assert_eq!(
@@ -311,8 +318,9 @@ mod tests {
         assert_eq!(composer_rows(3), 3);
 
         let outline = plan(Rect::new(0, 0, 80, 12), &state, &Theme::plain());
-        assert_eq!(outline.composer.height, 4);
+        assert_eq!(outline.composer.height, 5);
         assert_eq!(outline.composer.y, 7);
+        assert_eq!(outline.status.y, 6);
         assert_eq!(outline.cursor.map(|(_, y)| y), Some(10));
     }
 
@@ -325,7 +333,7 @@ mod tests {
             .join("\n");
         state.cursor = state.buffer.chars().count();
         let outline = plan(Rect::new(0, 0, 80, 12), &state, &Theme::plain());
-        assert_eq!(outline.composer.height, MAX_COMPOSER_ROWS + 1);
+        assert_eq!(outline.composer.height, MAX_COMPOSER_ROWS + 2);
         assert_eq!(
             outline.composer_scroll, 12,
             "twenty rows minus the eight the box shows"
@@ -361,7 +369,7 @@ mod tests {
         state.live_text = "streaming".to_owned();
         let outline = plan(Rect::new(0, 0, 80, 12), &state, &Theme::plain());
         let live = outline.live.expect("a live block while text streams");
-        assert_eq!(live.y + live.height, outline.composer.y);
+        assert_eq!(live.y + live.height, outline.status.y);
         assert_eq!(live.height, 1);
         assert!(outline.modal.is_none());
 
@@ -402,7 +410,7 @@ mod tests {
         let outline = plan(Rect::new(0, 0, 80, 12), &state, &Theme::plain());
         let menu = outline.suggest.expect("the menu has a row");
         assert_eq!(menu.height, 1, "one match, one row");
-        assert_eq!(menu.y + menu.height, outline.composer.y);
+        assert_eq!(menu.y + menu.height, outline.status.y);
         assert!(
             outline.cursor.is_some(),
             "the composer is still the focused widget"
@@ -422,8 +430,8 @@ mod tests {
         let menu = outline.suggest.expect("the menu is drawn");
         assert_eq!(menu.height, super::MAX_SUGGEST_ROWS);
         assert_eq!(
-            outline.composer.height, 2,
-            "the draft keeps its row and its border"
+            outline.composer.height, 3,
+            "the draft keeps its row and its rules"
         );
         let live = outline.live.expect("the live text still has a row");
         assert!(
