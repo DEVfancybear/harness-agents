@@ -1,9 +1,8 @@
 //! Web access for the agent: `web_search` and `web_fetch`.
 //!
-//! Measured: asked to research a topic, the agent activated `deep-research` and then
-//! said it had no way to reach the internet - the skill describes a method (search
-//! several angles, open the full pages, synthesise) and assumes a search tool and a
-//! page-open tool the harness never had. prime-agent ships the same capability as its
+//! Measured: asked to research a topic, the agent had no way to reach the internet -
+//! research workflows need a search tool and a page-open tool that the harness never
+//! had. prime-agent ships the same capability as its
 //! `websearch` skill (a Serper call made from the Python kernel, pages fetched with
 //! `httpx`); `ha` has no Python kernel, so the two operations are host tools here:
 //!

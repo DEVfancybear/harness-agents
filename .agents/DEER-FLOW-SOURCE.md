@@ -2,7 +2,7 @@
 
 - Upstream: https://github.com/bytedance/deer-flow/tree/fc26204debe2808fa1b4064f8fddfea6db2c71f8/skills/public
 - Source commit: `fc26204debe2808fa1b4064f8fddfea6db2c71f8`
-- Imported: `deep-research`, `find-skills`, and `github-deep-research`, including their scripts and report template.
+- Imported: `find-skills` and `github-deep-research`, including their scripts and report template.
 - License: MIT; see [LICENSE-deer-flow](LICENSE-deer-flow).
 
 Project adaptations:
