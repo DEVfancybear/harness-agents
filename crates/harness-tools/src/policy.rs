@@ -313,11 +313,13 @@ impl ToolPolicy {
             tool_name,
             ..
         } = action
-            && plugin_id == "skill"
-            && matches!(
-                tool_name.as_str(),
-                "list_skills" | "activate_skill" | "read_skill_file"
-            )
+            && ((plugin_id == "skill"
+                && matches!(
+                    tool_name.as_str(),
+                    "list_skills" | "activate_skill" | "read_skill_file"
+                ))
+                // Marking the user's own goal complete changes only host state.
+                || (plugin_id == "goal" && tool_name == "goal_complete"))
         {
             return Decision::Allow {
                 reason: "skill catalogue (read-only)".to_owned(),
@@ -765,6 +767,12 @@ mod g05_policy_tests {
             policy.decide(&external("skill", "write_anything")),
             Decision::Ask
         );
+        // Marking the user's goal complete changes host state only.
+        assert!(matches!(
+            policy.decide(&external("goal", "goal_complete")),
+            Decision::Allow { .. }
+        ));
+        assert_eq!(policy.decide(&external("goal", "other")), Decision::Ask);
         let denied = ToolPolicy::new(1, Vec::new()).with_tool_rules(vec![ToolPatternRule::deny(
             "activate_skill()",
             "no skills here",

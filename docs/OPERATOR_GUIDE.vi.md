@@ -387,8 +387,10 @@ Build từ source vẫn dùng được cho phát triển:
 | --- | --- |
 | Trợ giúp và trạng thái | `/help`, `/status`, `/config`, `/model <name>`, `/cost`, `/context`, `/permissions`, `/hooks`, `/mcp`, `/agents`, `/skills` |
 | Phiên và câu trả lời | `/new`, `/clear`, `/resume <id>`, `/rename <name>`, `/more`, `/compact [guidance]`, `/export [path]`, `/copy`, `/exit` |
-| Workspace và điều khiển | `/diff`, `/undo`, `/trust [yes]`, `/init`, `/mode <ask|auto-edit|full-auto>`, `/steer <text>` |
+| Workspace và điều khiển | `/diff`, `/undo`, `/trust [yes]`, `/init`, `/mode <ask|auto-edit|full-auto>`, `/steer <text>`, `/goal <objective>|status|pause|resume|clear` |
 | Nội dung và mở rộng | `/key`, `/image`, `/attach <path>`, `/skill:<name> [args]`, `/reload`; các template trong `.harness/commands` hoặc `<config-dir>/commands` chạy bằng `/name` |
+
+`/goal <mục tiêu>` đặt một mục tiêu bền. Mỗi lượt mang mục tiêu trong context, và model có tool `goal_complete` (được phép không cần hỏi). Lượt kết thúc mà chưa gọi `goal_complete` sẽ được tự động tiếp tục, tối đa 10 lần, sau đó mục tiêu tạm dừng. Ctrl-C và `/goal pause` tạm dừng; `/goal resume` tiếp tục; `/goal clear` xoá. Mục tiêu được lưu cùng hội thoại: `/resume` khôi phục nó ở trạng thái tạm dừng, `/new` bỏ nó. Trong một lượt, khi transcript của chính lượt đó vượt khoảng 200 KB, các kết quả tool cũ nhất (trừ 6 kết quả mới nhất) được thay bằng một dòng ghi chú; model có thể gọi lại tool nếu cần.
 
 `@` mở bộ chọn file; `@<server>:<uri>` đính kèm MCP text resource. `!cmd` chạy shell qua cổng phê duyệt; `!!cmd` chỉ hiển thị output. Enter gửi, Ctrl-J xuống dòng, ↑↓ chọn menu hoặc lịch sử, PgUp/PgDn và Home/End cuộn panel `/more`, Esc đóng panel, Ctrl-C hủy lượt, Ctrl-D trên dòng rỗng thoát. Trong TUI, bản ghi cũ ở scrollback của terminal; plain mode in theo dòng.
 

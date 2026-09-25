@@ -17,6 +17,7 @@ pub mod delegation;
 pub mod detector;
 pub mod events;
 pub mod extensions;
+pub mod goal;
 pub mod headless;
 pub mod input;
 pub mod instructions;

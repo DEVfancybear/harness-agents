@@ -177,7 +177,14 @@ pub fn help_card_lines() -> Vec<String> {
         ),
         (
             "Run",
-            &["/steer", "/mode", "/permissions", "/cost", "/model"],
+            &[
+                "/goal",
+                "/steer",
+                "/mode",
+                "/permissions",
+                "/cost",
+                "/model",
+            ],
         ),
         (
             "Project",

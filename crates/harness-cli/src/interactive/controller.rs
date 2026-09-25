@@ -23,6 +23,7 @@ use super::events::{
     AppPhase, HistoryItem, Key, Modal, RunOutcome, SessionCandidate, SessionEvent, ToolState,
     UiState,
 };
+use super::goal::{GoalState, GoalStatus};
 use super::input::{InputOutcome, LineEditor};
 use super::service::{ApprovalDecision, SessionChannel, SessionPort, ShellPrefix, SubmitRequest};
 use super::view;
@@ -190,6 +191,8 @@ pub struct InteractiveController {
     /// A quit requested during a run is completed only after the service emits
     /// its terminal event and releases the writer it owns.
     exit_after_run: bool,
+    /// The persistent goal of this conversation, set by `/goal`.
+    goal: Option<GoalState>,
 }
 
 impl InteractiveController {
@@ -247,6 +250,7 @@ impl InteractiveController {
             fallback_reason: None,
             tick: 0,
             exit_after_run: false,
+            goal: None,
         }
     }
 
@@ -875,6 +879,9 @@ impl InteractiveController {
                 summarized,
             } => {
                 self.flush_stream(effects);
+                // A goal belongs to its conversation; the resumed one sends its own.
+                self.goal = None;
+                self.service.set_goal(None);
                 if summarized {
                     self.push_history(
                         effects,
@@ -1014,6 +1021,34 @@ impl InteractiveController {
                 });
                 self.phase = AppPhase::WaitingMcpInput;
             }
+            SessionEvent::GoalCompleted { summary } => {
+                self.flush_stream(effects);
+                if let Some(goal) = &mut self.goal {
+                    goal.status = GoalStatus::Complete;
+                    goal.summary = Some(summary.clone());
+                }
+                self.service.set_goal(None);
+                self.push_history(
+                    effects,
+                    HistoryItem::Notice {
+                        message: format!("goal complete: {summary}"),
+                    },
+                );
+            }
+            SessionEvent::GoalRestored { objective } => {
+                let mut goal = GoalState::new(objective);
+                goal.status = GoalStatus::Paused;
+                self.push_history(
+                    effects,
+                    HistoryItem::Notice {
+                        message: format!(
+                            "this conversation has a goal: {} (paused; /goal resume continues it)",
+                            goal.objective
+                        ),
+                    },
+                );
+                self.goal = Some(goal);
+            }
             SessionEvent::RunTerminal { outcome } => {
                 self.flush_stream(effects);
                 self.settle_run(Some(outcome.clone()));
@@ -1035,6 +1070,9 @@ impl InteractiveController {
                 // After `finish_run`: a continuation is a new request, and the phase has
                 // to be idle again before the service will accept one.
                 effects.extend(self.maybe_continue(&outcome));
+                if !self.phase.has_active_run() {
+                    effects.extend(self.continue_goal(&outcome));
+                }
                 // The phase above is what tells the two cases apart: a continuation is the
                 // *same* user turn carrying on, so the grant the user gave for this turn
                 // stays open across it - revoking here would ask again in the middle of
@@ -1261,6 +1299,116 @@ impl InteractiveController {
         effects
     }
 
+    /// Carry an active goal into another turn once a turn finished without it.
+    ///
+    /// prime-agent's persistent goals: the model stopping is not the goal being done -
+    /// only `goal_complete` is. Each carried turn spends the goal's own budget, and a
+    /// spent budget pauses the goal instead of looping.
+    fn continue_goal(&mut self, outcome: &RunOutcome) -> Vec<Effect> {
+        let Some(goal) = &mut self.goal else {
+            return Vec::new();
+        };
+        if goal.status != GoalStatus::Active || !matches!(outcome, RunOutcome::Done) {
+            return Vec::new();
+        }
+        if goal.continuations >= goal.max_continuations {
+            goal.status = GoalStatus::Paused;
+            let message = format!(
+                "goal paused after {} automatic turn(s) without being completed; /goal resume continues it",
+                goal.continuations
+            );
+            self.service.set_goal(None);
+            return vec![Effect::History(HistoryItem::Notice { message })];
+        }
+        goal.continuations += 1;
+        let text = super::goal::continuation_text(&goal.objective);
+        let mut effects = vec![Effect::History(HistoryItem::Notice {
+            message: format!(
+                "goal not complete yet; continuing ({} of {}) - Ctrl-C or /goal pause stops this",
+                goal.continuations, goal.max_continuations
+            ),
+        })];
+        self.continuations = 0;
+        effects.extend(self.dispatch(text, true));
+        effects
+    }
+
+    /// `/goal` and its subcommands.
+    fn goal_command(&mut self, raw_argument: Option<&str>, effects: &mut Vec<Effect>) {
+        match raw_argument.map(str::trim).unwrap_or_default() {
+            "" | "status" => match &self.goal {
+                Some(goal) => {
+                    let lines = goal.describe();
+                    self.reference("/goal", lines, effects);
+                }
+                None => self.push_history(effects, HistoryItem::Notice {
+                    message: "no goal is set; /goal <objective> sets one and keeps working until it is complete".to_owned(),
+                }),
+            },
+            "pause" => {
+                let message = match &mut self.goal {
+                    Some(goal) if goal.status == GoalStatus::Active => {
+                        goal.status = GoalStatus::Paused;
+                        "goal paused; the current turn finishes, then nothing continues it".to_owned()
+                    }
+                    Some(goal) => format!("the goal is already {}", goal.status.label()),
+                    None => "no goal is set".to_owned(),
+                };
+                self.service.set_goal(None);
+                self.push_history(effects, HistoryItem::Notice { message });
+            }
+            "resume" => {
+                let Some(goal) = &mut self.goal else {
+                    self.push_history(effects, HistoryItem::Notice {
+                        message: "no goal is set".to_owned(),
+                    });
+                    return;
+                };
+                if goal.status == GoalStatus::Complete {
+                    self.push_history(effects, HistoryItem::Notice {
+                        message: "the goal is already complete; /goal <objective> sets a new one".to_owned(),
+                    });
+                    return;
+                }
+                goal.status = GoalStatus::Active;
+                goal.continuations = 0;
+                let objective = goal.objective.clone();
+                self.service.set_goal(Some(objective.clone()));
+                self.push_history(effects, HistoryItem::Notice {
+                    message: format!("goal resumed: {objective}"),
+                });
+                if !self.phase.has_active_run() {
+                    self.continuations = 0;
+                    effects.extend(self.dispatch(super::goal::continuation_text(&objective), true));
+                }
+            }
+            "clear" => {
+                let message = if self.goal.take().is_some() {
+                    "goal cleared"
+                } else {
+                    "no goal is set"
+                };
+                self.service.forget_goal();
+                self.push_history(effects, HistoryItem::Notice {
+                    message: message.to_owned(),
+                });
+            }
+            objective => {
+                let objective = objective.to_owned();
+                self.goal = Some(GoalState::new(objective.clone()));
+                self.service.set_goal(Some(objective.clone()));
+                if self.phase.has_active_run() {
+                    self.push_history(effects, HistoryItem::Notice {
+                        message: "goal set; it applies from the next turn".to_owned(),
+                    });
+                } else {
+                    self.continuations = 0;
+                    effects.extend(self.dispatch(format!("Goal: {objective}"), false));
+                }
+            }
+        }
+    }
+
     /// Start the accounting for a new turn.
     fn fresh_run(&mut self, now: Instant, request: Option<String>) {
         self.pending_text.clear();
@@ -1302,6 +1450,12 @@ impl InteractiveController {
             // Ctrl-C also means "do not start another one": the budget is spent, so the
             // bound that ends the canceled turn is a real stop until the user speaks.
             self.continuations = self.max_continuations;
+            if let Some(goal) = &mut self.goal
+                && goal.status == GoalStatus::Active
+            {
+                goal.status = GoalStatus::Paused;
+                self.service.set_goal(None);
+            }
             self.phase = AppPhase::Canceling;
             return vec![
                 Effect::History(HistoryItem::Notice {
@@ -1600,6 +1754,7 @@ impl InteractiveController {
                     effects.push(Effect::Copy(self.last_answer.clone()));
                 }
             }
+            "/goal" => self.goal_command(raw_argument, &mut effects),
             "/rename" => {
                 if self.phase.has_active_run() {
                     self.push_history(&mut effects, HistoryItem::Notice {
@@ -1732,6 +1887,9 @@ impl InteractiveController {
                         Effect::Redraw,
                     ];
                 } else {
+                    // A new conversation starts without the old one's goal.
+                    self.goal = None;
+                    self.service.set_goal(None);
                     self.session_candidates.clear();
                     self.editor.close_picker();
                     self.push_history(
@@ -1751,6 +1909,9 @@ impl InteractiveController {
                 } else if let Err(error) = self.service.resume(None) {
                     self.push_history(&mut effects, HistoryItem::Error { message: error });
                 } else {
+                    // A new conversation starts without the old one's goal.
+                    self.goal = None;
+                    self.service.set_goal(None);
                     self.session_candidates.clear();
                     self.editor.close_picker();
                     effects.push(Effect::ClearViewport);
@@ -2540,6 +2701,8 @@ mod tests {
         permission_lines: Arc<Mutex<Vec<String>>>,
         allow_root: Arc<Mutex<Option<std::path::PathBuf>>>,
         limits: TurnBounds,
+        /// Every goal handed to the port; `Some("")` records a forgotten goal.
+        goals: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     impl SessionPort for RecordingPort {
@@ -2566,6 +2729,17 @@ mod tests {
 
         fn cancel(&mut self) {
             *self.cancels.lock().expect("cancel log") += 1;
+        }
+
+        fn set_goal(&mut self, objective: Option<String>) {
+            self.goals.lock().expect("goal log").push(objective);
+        }
+
+        fn forget_goal(&mut self) {
+            self.goals
+                .lock()
+                .expect("goal log")
+                .push(Some(String::new()));
         }
 
         fn steer(&mut self, text: &str) -> Result<(), String> {
@@ -5306,6 +5480,144 @@ mod tests {
                 .any(|line| line.contains("continuing automatically")),
             "{plain:#?}"
         );
+        assert_eq!(submissions(&harness).len(), 1);
+    }
+
+    fn end_done(harness: &mut Bench) -> Vec<String> {
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("terminal event");
+        effects_to_plain(&harness.controller.pump_events())
+    }
+
+    #[allow(
+        clippy::option_option,
+        reason = "none logged, a paused goal, and a set goal are three different answers"
+    )]
+    fn last_goal(harness: &Bench) -> Option<Option<String>> {
+        harness.port.goals.lock().expect("goal log").last().cloned()
+    }
+
+    /// prime-agent's persistent goals: a turn that ends is not a goal that is done. The
+    /// app carries the goal into the next turn until the model calls `goal_complete`.
+    #[test]
+    fn a_goal_continues_across_turns_until_the_model_completes_it() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "/goal ship the parser fix");
+        assert_eq!(submissions(&harness), ["Goal: ship the parser fix"]);
+        assert_eq!(
+            last_goal(&harness),
+            Some(Some("ship the parser fix".to_owned()))
+        );
+
+        let plain = end_done(&mut harness);
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("goal not complete yet; continuing (1 of")),
+            "{plain:#?}"
+        );
+        assert_eq!(submissions(&harness).len(), 2);
+        assert!(submissions(&harness)[1].contains("goal_complete"));
+
+        harness
+            .events
+            .send(SessionEvent::GoalCompleted {
+                summary: "fixed and tested".to_owned(),
+            })
+            .expect("goal event");
+        let plain = end_done(&mut harness);
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("goal complete: fixed and tested")),
+            "{plain:#?}"
+        );
+        assert_eq!(submissions(&harness).len(), 2, "a finished goal stops");
+        assert_eq!(last_goal(&harness), Some(None));
+    }
+
+    /// The goal's own budget bounds it: a model that never finishes pauses, it does
+    /// not loop forever.
+    #[test]
+    fn a_goal_pauses_when_its_budget_is_spent() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "/goal never done");
+        for _ in 0..super::super::goal::DEFAULT_GOAL_CONTINUATIONS {
+            let _ = end_done(&mut harness);
+        }
+        let sent = submissions(&harness).len();
+        assert_eq!(
+            sent,
+            1 + super::super::goal::DEFAULT_GOAL_CONTINUATIONS as usize
+        );
+        let plain = end_done(&mut harness);
+        assert!(
+            plain.iter().any(|line| line.contains("goal paused after")),
+            "{plain:#?}"
+        );
+        assert_eq!(submissions(&harness).len(), sent);
+    }
+
+    /// Ctrl-C and `/goal pause` stop the goal; `/goal resume` picks it up; `/goal clear`
+    /// forgets it.
+    #[test]
+    fn a_goal_can_be_paused_resumed_and_cleared() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "/goal refactor the store");
+        let _ = harness.controller.handle_key(Key::Interrupt);
+        assert_eq!(last_goal(&harness), Some(None));
+        let _ = end_done(&mut harness);
+        assert_eq!(submissions(&harness).len(), 1, "Ctrl-C pauses the goal");
+
+        let _ = submit_text(&mut harness.controller, "/goal resume");
+        assert_eq!(submissions(&harness).len(), 2);
+        assert_eq!(
+            last_goal(&harness),
+            Some(Some("refactor the store".to_owned()))
+        );
+        let _ = end_done(&mut harness);
+        assert_eq!(submissions(&harness).len(), 3);
+
+        let _ = submit_text(&mut harness.controller, "/goal pause");
+        let _ = end_done(&mut harness);
+        assert_eq!(submissions(&harness).len(), 3, "a paused goal waits");
+
+        let _ = submit_text(&mut harness.controller, "/goal clear");
+        assert_eq!(last_goal(&harness), Some(Some(String::new())));
+        let plain = effects_to_plain(&submit_text(&mut harness.controller, "/goal"));
+        assert!(
+            plain.iter().any(|line| line.contains("no goal is set")),
+            "{plain:#?}"
+        );
+    }
+
+    /// A resumed conversation brings its goal back paused: nothing runs until asked.
+    #[test]
+    fn a_restored_goal_waits_for_resume() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        harness
+            .events
+            .send(SessionEvent::GoalRestored {
+                objective: "finish the docs".to_owned(),
+            })
+            .expect("goal event");
+        let plain = effects_to_plain(&harness.controller.pump_events());
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("has a goal: finish the docs (paused")),
+            "{plain:#?}"
+        );
+        assert!(submissions(&harness).is_empty());
+        let _ = submit_text(&mut harness.controller, "/goal resume");
         assert_eq!(submissions(&harness).len(), 1);
     }
 

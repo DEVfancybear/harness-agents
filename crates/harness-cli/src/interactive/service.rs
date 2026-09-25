@@ -245,6 +245,10 @@ pub trait SessionPort: Send {
     fn rename(&mut self, _title: &str) -> Result<String, String> {
         Err("this backend does not support session titles".to_owned())
     }
+    /// The goal the next turns work toward; `None` while it is paused or gone.
+    fn set_goal(&mut self, _objective: Option<String>) {}
+    /// Drop the stored goal, so `/resume` no longer brings it back.
+    fn forget_goal(&mut self) {}
     fn set_model(&mut self, _model: &str) -> Result<String, String> {
         Err("this backend does not support model switching".to_owned())
     }
@@ -1022,6 +1026,10 @@ pub struct AgentSessionService {
     writer_gate: Arc<tokio::sync::Mutex<()>>,
     /// Extracts facts from finished turns in the background.
     extraction: super::memory_worker::ExtractionWorker,
+    /// The active goal, carried into every turn while it is set.
+    goal: Option<String>,
+    /// The stored goal must be erased by the next turn.
+    goal_forgotten: bool,
 }
 
 impl Drop for AgentSessionService {
@@ -1503,6 +1511,8 @@ impl AgentSessionService {
             agents_status: Arc::new(Mutex::new(Vec::new())),
             writer_gate,
             extraction,
+            goal: None,
+            goal_forgotten: false,
         }
     }
 
@@ -1579,6 +1589,15 @@ impl AgentSessionService {
                     return;
                 }
             };
+            let goal = match store.session_task(&source).await {
+                Ok(Some(task)) => store
+                    .session_setting(&task, super::goal::GOAL_SETTING)
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|objective| !objective.trim().is_empty()),
+                _ => None,
+            };
             match harness_runtime::conversation_history(&store, &source).await {
                 Ok(history) => {
                     let _ = sender.send(SessionEvent::ConversationRestored {
@@ -1586,6 +1605,9 @@ impl AgentSessionService {
                         omitted: history.omitted,
                         summarized: history.summary.is_some(),
                     });
+                    if let Some(objective) = goal {
+                        let _ = sender.send(SessionEvent::GoalRestored { objective });
+                    }
                 }
                 Err(error) => {
                     let _ = sender.send(SessionEvent::RecoverableError {
@@ -1676,6 +1698,11 @@ impl SessionPort for AgentSessionService {
         let limits = self.limits;
         let writer_gate = Arc::clone(&self.writer_gate);
         let extraction = self.extraction.clone();
+        let goal = match (&self.goal, std::mem::take(&mut self.goal_forgotten)) {
+            (Some(objective), _) => GoalRecord::Active(objective.clone()),
+            (None, true) => GoalRecord::Forget,
+            (None, false) => GoalRecord::Keep,
+        };
         // Every user input opens its own session; the conversation is the chain of
         // sessions linked to the same task.
         let session_id = SessionId::generate();
@@ -1709,9 +1736,19 @@ impl SessionPort for AgentSessionService {
                 cancellation,
                 writer_gate,
                 extraction,
+                goal,
             ))
             .await;
         });
+    }
+
+    fn set_goal(&mut self, objective: Option<String>) {
+        self.goal = objective;
+    }
+
+    fn forget_goal(&mut self) {
+        self.goal = None;
+        self.goal_forgotten = true;
     }
 
     fn answer(&mut self, request_id: &str, decision: ApprovalDecision) -> bool {
@@ -2485,6 +2522,16 @@ fn report_memory(
     }
 }
 
+/// What a turn does with the task's stored goal.
+enum GoalRecord {
+    /// A goal is active: carry it and store it.
+    Active(String),
+    /// The goal was cleared: erase it.
+    Forget,
+    /// Leave whatever is stored alone (a paused goal stays resumable).
+    Keep,
+}
+
 /// One turn, from admission to terminal event.
 ///
 /// Linear setup followed by one bounded turn: the length is the wiring, not
@@ -2519,6 +2566,7 @@ async fn run_turn(
     cancellation: CancellationToken,
     writer_gate: Arc<tokio::sync::Mutex<()>>,
     extraction: super::memory_worker::ExtractionWorker,
+    goal: GoalRecord,
 ) {
     let send = |event| {
         let _ = sender.send(event);
@@ -2714,6 +2762,22 @@ async fn run_turn(
     let selected_model = selected_model
         .or_else(|| config_overrides.model.clone())
         .or(persisted_model);
+    // The goal lives with the task, so `/resume` can bring it back.
+    let stored_goal = match &goal {
+        GoalRecord::Active(objective) => Some(objective.as_str()),
+        GoalRecord::Forget => Some(""),
+        GoalRecord::Keep => None,
+    };
+    if let Some(value) = stored_goal
+        && let Err(error) = store
+            .set_session_setting(&task_id, super::goal::GOAL_SETTING, value)
+            .await
+    {
+        send(SessionEvent::Notice {
+            message: format!("goal could not be saved with the session: {error}"),
+        });
+    }
+    let goal_task = task_id.clone();
     let mut turn_overrides = config_overrides;
     if let Some(model) = &selected_model {
         turn_overrides.model = Some(model.clone());
@@ -3022,6 +3086,8 @@ async fn run_turn(
         .as_ref()
         .map(|catalog| super::skills::SkillHost::new(catalog.clone(), Arc::clone(&active_skills)));
     let web_host = super::web::WebHost::from_environment(&environment);
+    let goal_host =
+        matches!(goal, GoalRecord::Active(_)).then(|| super::goal::GoalHost::new(sender.clone()));
     let mut tools = ToolExecutionService::new(Arc::clone(&store))
         .with_policy(tool_policy)
         .with_hooks(config.hooks.clone());
@@ -3031,6 +3097,7 @@ async fn run_turn(
         delegate_host.as_ref(),
         skill_host.as_ref(),
         web_host.as_ref(),
+        goal_host.as_ref(),
     ) {
         tools = tools.with_external(dispatcher);
     }
@@ -3041,6 +3108,7 @@ async fn run_turn(
         delegate_host.as_ref(),
         skill_host.as_ref(),
         web_host.as_ref(),
+        goal_host.as_ref(),
     );
     let driver = match &external_tools {
         Some(tools) => driver.with_external(tools.clone()),
@@ -3142,6 +3210,9 @@ async fn run_turn(
                 .values()
                 .map(harness_extensions::SkillActivation::block),
         );
+    }
+    if let GoalRecord::Active(objective) = &goal {
+        project_blocks.push(super::goal::goal_block(objective));
     }
     let mut run_request = RunRequest::new(
         session_id.clone(),
@@ -3346,6 +3417,15 @@ async fn run_turn(
         }
     }
     drop(driver);
+    // A finished goal is not brought back by `/resume`.
+    if goal_host
+        .as_ref()
+        .is_some_and(super::goal::GoalHost::completed)
+    {
+        let _ = store
+            .set_session_setting(&goal_task, super::goal::GOAL_SETTING, "")
+            .await;
+    }
     // Stop the extension processes this turn started, whatever the outcome was.
     if let Some(active) = active_extensions {
         active.shutdown().await;

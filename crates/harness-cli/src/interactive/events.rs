@@ -486,6 +486,14 @@ pub enum SessionEvent {
     SessionsListed {
         sessions: Vec<SessionCandidate>,
     },
+    /// The model called `goal_complete`: the active goal is done.
+    GoalCompleted {
+        summary: String,
+    },
+    /// A resumed conversation had a goal; it comes back paused.
+    GoalRestored {
+        objective: String,
+    },
     /// The conversation a resumed session continues, as the model will be sent it.
     ConversationRestored {
         /// (question, answer) pairs, oldest first.

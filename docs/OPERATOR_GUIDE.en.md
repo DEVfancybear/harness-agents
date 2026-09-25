@@ -384,8 +384,10 @@ The 18 core tools cross the host policy and receipt gate. Skill tools (`list_ski
 | --- | --- |
 | Help and state | `/help`, `/status`, `/config`, `/model <name>`, `/cost`, `/context`, `/permissions`, `/hooks`, `/mcp`, `/agents`, `/skills` |
 | Session and answer | `/new`, `/clear`, `/resume <id>`, `/rename <name>`, `/more`, `/compact [guidance]`, `/export [path]`, `/copy`, `/exit` |
-| Workspace and control | `/diff`, `/undo`, `/trust [yes]`, `/init`, `/mode <ask|auto-edit|full-auto>`, `/steer <text>` |
+| Workspace and control | `/diff`, `/undo`, `/trust [yes]`, `/init`, `/mode <ask|auto-edit|full-auto>`, `/steer <text>`, `/goal <objective>|status|pause|resume|clear` |
 | Content and extensions | `/key`, `/image`, `/attach <path>`, `/skill:<name> [args]`, `/reload`; templates in `.harness/commands` or `<config-dir>/commands` run as `/name` |
+
+`/goal <objective>` sets a persistent goal. Every turn carries it in its context, and the model gets a `goal_complete` tool (allowed without asking). A turn that ends without `goal_complete` is continued automatically, at most 10 times, then the goal pauses. Ctrl-C and `/goal pause` pause it; `/goal resume` continues it; `/goal clear` removes it. The goal is stored with the conversation: `/resume` restores it paused, `/new` drops it. Inside one turn, once the turn's own transcript passes about 200 KB, the oldest tool results (all but the newest six) are replaced by a one-line note; the model can call the tool again.
 
 `@` opens the file picker; `@<server>:<uri>` attaches an MCP text resource. `!cmd` runs shell through approval; `!!cmd` only displays output. Enter submits, Ctrl-J inserts a newline, ↑↓ chooses a menu entry or history item, PgUp/PgDn and Home/End scroll the `/more` panel, Esc closes a panel, Ctrl-C cancels the turn, and Ctrl-D on an empty line exits. TUI history remains in terminal scrollback; plain mode prints lines.
 

@@ -353,6 +353,68 @@ impl fmt::Debug for ExternalTools {
     }
 }
 
+/// How large one turn's own transcript may grow before older tool results are
+/// shortened, in bytes (about 50k tokens).
+const TRANSCRIPT_BUDGET_BYTES: usize = 200_000;
+
+/// How many of the newest tool results always stay whole.
+const KEEP_RECENT_RESULTS: usize = 6;
+
+/// What an elided tool result is replaced with.
+const ELIDED_RESULT: &str =
+    "[earlier tool result shortened to save context; call the tool again if you need it]";
+
+/// Keep a long turn's transcript within budget by shortening its oldest tool results.
+///
+/// A turn now carries everything it said and ran, which is what fixed the loop that
+/// forgot its own steps - and it also means a long turn grows until the request
+/// overflows. prime-agent's loop (and pi's) handle that before each model call with a
+/// context transform; this is the same move for the part of the context the turn owns:
+/// the oldest tool results, which are the bulk of it and the part a model can always
+/// ask for again, are replaced by a one-line note, newest last. The call/result pairs
+/// stay whole, so the transcript remains valid, and the newest results and every
+/// assistant message are never touched. Returns how many results were shortened.
+fn trim_transcript(transcript: &mut [ProviderMessage], budget: usize, keep_recent: usize) -> usize {
+    let size = |messages: &[ProviderMessage]| -> usize {
+        messages
+            .iter()
+            .map(|message| {
+                message.content.len()
+                    + message
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.arguments.len())
+                        .sum::<usize>()
+            })
+            .sum()
+    };
+    let mut total = size(transcript);
+    if total <= budget {
+        return 0;
+    }
+    let results = transcript
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == MessageRole::Tool)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let eligible = results.len().saturating_sub(keep_recent);
+    let mut elided = 0;
+    for &index in results.iter().take(eligible) {
+        if total <= budget {
+            break;
+        }
+        let message = &mut transcript[index];
+        if message.content.len() <= ELIDED_RESULT.len() {
+            continue;
+        }
+        total -= message.content.len() - ELIDED_RESULT.len();
+        ELIDED_RESULT.clone_into(&mut message.content);
+        elided += 1;
+    }
+    elided
+}
+
 /// Longest tool result text handed back to the model.
 ///
 /// It was 4000 characters - about a thousand tokens - so one `read_file` of an
@@ -992,6 +1054,16 @@ impl TurnDriver {
             }
             observer.observe(TurnProgress::StepStarted { step: steps });
             transcript.extend(appended);
+            let elided = trim_transcript(
+                &mut transcript,
+                TRANSCRIPT_BUDGET_BYTES,
+                KEEP_RECENT_RESULTS,
+            );
+            if elided > 0 {
+                observer.observe(TurnProgress::Notice(format!(
+                    "context: {elided} older tool result(s) in this turn were shortened to stay within budget"
+                )));
+            }
             result = self
                 .runtime
                 .continue_run(
@@ -1812,4 +1884,55 @@ fn truncate_text(text: &str, limit: usize) -> String {
     let kept: String = text.chars().take(limit).collect();
     let rest = text.chars().count() - limit;
     format!("{kept}\n[truncated: {rest} more characters; request a narrower range]")
+}
+
+#[cfg(test)]
+mod transcript_budget_tests {
+    use super::{ELIDED_RESULT, trim_transcript};
+    use harness_providers::{MessageRole, ProviderMessage, ProviderToolCall};
+
+    fn step(index: usize, result_bytes: usize) -> Vec<ProviderMessage> {
+        let id = format!("call-{index}");
+        vec![
+            ProviderMessage::assistant_with_calls(
+                format!("step {index}"),
+                vec![ProviderToolCall::new(id.clone(), "read_file", "{}")],
+            ),
+            ProviderMessage::tool_result(id, "x".repeat(result_bytes)),
+        ]
+    }
+
+    #[test]
+    fn the_oldest_results_are_shortened_first_and_the_newest_stay_whole() {
+        let mut transcript = (0..10)
+            .flat_map(|index| step(index, 30_000))
+            .collect::<Vec<_>>();
+        let elided = trim_transcript(&mut transcript, 200_000, 6);
+        assert!(elided > 0);
+        let results = transcript
+            .iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .collect::<Vec<_>>();
+        // Oldest first, newest never.
+        assert_eq!(results[0].content, ELIDED_RESULT);
+        for recent in &results[results.len() - 6..] {
+            assert_eq!(recent.content.len(), 30_000);
+        }
+        // Within budget, and every call still has its result.
+        let total: usize = transcript.iter().map(|message| message.content.len()).sum();
+        assert!(total <= 200_000, "{total}");
+        assert!(harness_providers::validate_transcript(&transcript).is_ok());
+        // Assistant text is never touched.
+        assert!(transcript[0].content.starts_with("step 0"));
+    }
+
+    #[test]
+    fn a_transcript_within_budget_is_left_alone() {
+        let mut transcript = (0..3)
+            .flat_map(|index| step(index, 1_000))
+            .collect::<Vec<_>>();
+        let before = transcript.clone();
+        assert_eq!(trim_transcript(&mut transcript, 200_000, 6), 0);
+        assert_eq!(transcript, before);
+    }
 }

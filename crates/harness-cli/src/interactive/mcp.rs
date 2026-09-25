@@ -483,6 +483,7 @@ struct CatalogMux {
     delegate: Option<ExternalTools>,
     skills: Option<ExternalTools>,
     web: Option<ExternalTools>,
+    goal: Option<ExternalTools>,
 }
 
 impl ExternalToolCatalog for CatalogMux {
@@ -493,6 +494,7 @@ impl ExternalToolCatalog for CatalogMux {
             .chain(self.delegate.iter())
             .chain(self.skills.iter())
             .chain(self.web.iter())
+            .chain(self.goal.iter())
             .flat_map(ExternalTools::schemas)
             .collect()
     }
@@ -521,6 +523,11 @@ impl ExternalToolCatalog for CatalogMux {
                     .as_ref()
                     .and_then(|tools| tools.resolve(name, arguments))
             })
+            .or_else(|| {
+                self.goal
+                    .as_ref()
+                    .and_then(|tools| tools.resolve(name, arguments))
+            })
     }
 }
 
@@ -530,12 +537,14 @@ pub fn combined_tools_with_delegate(
     delegate: Option<&super::delegation::DelegateHost>,
     skills: Option<&super::skills::SkillHost>,
     web: Option<&super::web::WebHost>,
+    goal: Option<&super::goal::GoalHost>,
 ) -> Option<ExternalTools> {
     if mcp.is_none()
         && extensions.is_none()
         && delegate.is_none()
         && skills.is_none()
         && web.is_none()
+        && goal.is_none()
     {
         return None;
     }
@@ -545,6 +554,7 @@ pub fn combined_tools_with_delegate(
         delegate: delegate.map(super::delegation::DelegateHost::tools),
         skills: skills.map(super::skills::SkillHost::tools),
         web: web.map(super::web::WebHost::tools),
+        goal: goal.map(super::goal::GoalHost::tools),
     })))
 }
 
@@ -569,9 +579,10 @@ pub fn combined_dispatcher_with_delegate(
     delegate: Option<&super::delegation::DelegateHost>,
     skills: Option<&super::skills::SkillHost>,
     web: Option<&super::web::WebHost>,
+    goal: Option<&super::goal::GoalHost>,
 ) -> Option<Arc<dyn ExternalToolDispatcher>> {
     let inner = combined_dispatcher(mcp, extensions);
-    if delegate.is_none() && skills.is_none() && web.is_none() {
+    if delegate.is_none() && skills.is_none() && web.is_none() && goal.is_none() {
         return inner;
     }
     Some(Arc::new(DelegateDispatcherMux {
@@ -579,6 +590,7 @@ pub fn combined_dispatcher_with_delegate(
         delegate: delegate.map(super::delegation::DelegateHost::dispatcher),
         skills: skills.map(super::skills::SkillHost::dispatcher),
         web: web.map(super::web::WebHost::dispatcher),
+        goal: goal.map(super::goal::GoalHost::dispatcher),
     }))
 }
 
@@ -587,6 +599,7 @@ struct DelegateDispatcherMux {
     delegate: Option<Arc<dyn ExternalToolDispatcher>>,
     skills: Option<Arc<dyn ExternalToolDispatcher>>,
     web: Option<Arc<dyn ExternalToolDispatcher>>,
+    goal: Option<Arc<dyn ExternalToolDispatcher>>,
 }
 
 impl ExternalToolDispatcher for DelegateDispatcherMux {
@@ -618,6 +631,12 @@ impl ExternalToolDispatcher for DelegateDispatcherMux {
                 self.web
                     .as_ref()
                     .ok_or_else(|| HarnessError::new(ErrorCode::PolicyDenied, "web tools are off"))?
+                    .validate_external(plugin_id, tool_name, arguments)
+                    .await
+            } else if plugin_id == "goal" {
+                self.goal
+                    .as_ref()
+                    .ok_or_else(|| HarnessError::new(ErrorCode::PolicyDenied, "no goal is active"))?
                     .validate_external(plugin_id, tool_name, arguments)
                     .await
             } else if let Some(inner) = &self.inner {
@@ -664,6 +683,12 @@ impl ExternalToolDispatcher for DelegateDispatcherMux {
                 self.web
                     .as_ref()
                     .ok_or_else(|| HarnessError::new(ErrorCode::PolicyDenied, "web tools are off"))?
+                    .dispatch_external(authorization, plugin_id, tool_name, arguments, timeout_ms)
+                    .await
+            } else if plugin_id == "goal" {
+                self.goal
+                    .as_ref()
+                    .ok_or_else(|| HarnessError::new(ErrorCode::PolicyDenied, "no goal is active"))?
                     .dispatch_external(authorization, plugin_id, tool_name, arguments, timeout_ms)
                     .await
             } else if let Some(inner) = &self.inner {

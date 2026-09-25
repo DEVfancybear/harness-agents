@@ -13,6 +13,7 @@
 - **Chat in the terminal.** `ha` opens an interactive app (TUI, or plain line mode). `ha exec "…"` runs one prompt for scripts and CI, with `text`, `json` or `stream-json` output.
 - **Works on your code with guarded tools.** Read, search, glob, patch/edit/write files, run processes and shell commands, inspect Git, ask you a question, delegate to a sub-agent. Every action goes through the host policy: `y` runs once, `a` allows the rest of the turn, `n` refuses; `/mode` sets `ask`, `auto-edit` or `full-auto`.
 - **Reads the web.** `web_search` (Google via Serper with `SERPER_API_KEY`, DuckDuckGo without a key) and `web_fetch` (a page as readable text with its links), so research skills such as `deep-research` have something to search with. Local and private addresses are refused.
+- **Works toward a goal.** `/goal <objective>` keeps the app working across turns until the model calls `goal_complete` (at most 10 automatic turns, then it pauses). `/goal status|pause|resume|clear`; Ctrl-C pauses it, and `/resume` brings it back paused. Long turns shorten their oldest tool results to stay within the context budget.
 - **Resumes conversations.** `/resume` lists your conversations (one row each) and replays the chosen one's questions and answers to the model and on screen.
 - **Learns from the conversation.** Memory is on by default: after a turn, the model extracts durable facts (preferences, decisions, conventions, corrections) in the background; facts with confidence ≥ 0.7 are used from then on, the rest wait for review in `ha memory candidates`. Say "remember that …" / "ghi nhớ …" to store something verbatim.
 - **Uses skills.** Agent Skills directories (`SKILL.md` plus references and scripts) from the bundled set, `~/.agents/skills`, a trusted project's `.agents/skills`, or any folder in `HA_SKILL_PATHS` (e.g. `~/.claude/skills`). The model activates a matching skill by name and reads its files with `read_skill_file`; `/skills` lists them, `/skill:<name>` runs one.
@@ -59,6 +60,7 @@ Building a release package (checksums, manifest) is described in [docs/BUILD_AND
 | Attach a file or image | `@` (file picker), `/attach <path>`, `/image` |
 | Run a shell command | `!command` (goes through approval) |
 | Correct a running turn | `/steer <text>` |
+| Keep working until something is done | `/goal <objective>`, then `/goal status`, `/goal pause`, `/goal resume`, `/goal clear` |
 | Shrink a long conversation | `/compact [what to keep]` |
 | See cost, context, permissions | `/cost`, `/context`, `/permissions` |
 
@@ -106,6 +108,7 @@ CI (`.github/workflows/ci.yml`) runs the phase gates (`scripts/Verify-Phase.ps1`
 - **Chat trong terminal.** `ha` mở ứng dụng tương tác (TUI, hoặc chế độ dòng lệnh thuần). `ha exec "…"` chạy một prompt cho script và CI, xuất `text`, `json` hoặc `stream-json`.
 - **Làm việc với code qua công cụ có kiểm soát.** Đọc, tìm kiếm, glob, sửa/ghi file, chạy tiến trình và lệnh shell, xem Git, hỏi lại bạn, giao việc cho agent con. Mọi thao tác đi qua chính sách của host: `y` chạy một lần, `a` cho phép đến hết lượt, `n` từ chối; `/mode` chọn `ask`, `auto-edit` hoặc `full-auto`.
 - **Đọc web.** `web_search` (Google qua Serper khi có `SERPER_API_KEY`, DuckDuckGo khi không có key) và `web_fetch` (một trang dưới dạng văn bản kèm link), để các skill nghiên cứu như `deep-research` có công cụ tìm kiếm. Địa chỉ local và mạng nội bộ bị từ chối.
+- **Làm tới khi xong mục tiêu.** `/goal <mục tiêu>` giữ ứng dụng làm việc qua nhiều lượt cho tới khi model gọi `goal_complete` (tối đa 10 lượt tự động, sau đó tạm dừng). `/goal status|pause|resume|clear`; Ctrl-C tạm dừng mục tiêu, `/resume` khôi phục nó ở trạng thái tạm dừng. Lượt dài tự rút gọn các kết quả tool cũ nhất để không vượt ngân sách context.
 - **Tiếp tục hội thoại.** `/resume` liệt kê các hội thoại (mỗi hội thoại một dòng) và phát lại các câu hỏi, câu trả lời của hội thoại được chọn cho model và trên màn hình.
 - **Học từ hội thoại.** Memory mặc định bật: sau mỗi lượt, model trích ra ở chế độ nền các fact bền (sở thích, quyết định, quy ước, chỉnh sửa); fact có confidence ≥ 0.7 được dùng từ đó, phần còn lại chờ duyệt trong `ha memory candidates`. Nói "ghi nhớ …" / "remember that …" để lưu nguyên văn.
 - **Dùng skill.** Thư mục Agent Skills (`SKILL.md` cùng references và scripts) từ bộ tích hợp sẵn, `~/.agents/skills`, `.agents/skills` của project đã trust, hoặc bất kỳ thư mục nào trong `HA_SKILL_PATHS` (ví dụ `~/.claude/skills`). Model kích hoạt skill phù hợp theo tên và đọc file của skill bằng `read_skill_file`; `/skills` liệt kê, `/skill:<name>` chạy một skill.
@@ -152,6 +155,7 @@ Cách build gói release (checksum, manifest) nằm trong [docs/BUILD_AND_RELEAS
 | Đính kèm file hoặc ảnh | `@` (chọn file), `/attach <path>`, `/image` |
 | Chạy lệnh shell | `!command` (đi qua bước phê duyệt) |
 | Chỉnh hướng một lượt đang chạy | `/steer <text>` |
+| Làm tới khi xong việc | `/goal <mục tiêu>`, rồi `/goal status`, `/goal pause`, `/goal resume`, `/goal clear` |
 | Rút gọn hội thoại dài | `/compact [điều cần giữ]` |
 | Xem chi phí, context, quyền | `/cost`, `/context`, `/permissions` |
 
