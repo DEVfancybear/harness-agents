@@ -61,6 +61,7 @@ Building a release package (checksums, manifest) is described in [docs/BUILD_AND
 | Attach a file or image | `@` (file picker), `/attach <path>`, `/image` |
 | Run a shell command | `!command` (goes through approval) |
 | Correct a running turn | `/steer <text>` |
+| Choose how much the model reasons | `/thinking` (show), `/thinking off\|minimal\|low\|medium\|high\|xhigh\|max` |
 | Keep working until something is done | `/goal <objective>`, then `/goal status`, `/goal pause`, `/goal resume`, `/goal clear` |
 | Shrink a long conversation | `/compact [what to keep]` |
 | See cost, context, permissions | `/cost`, `/context`, `/permissions` |
@@ -160,6 +161,7 @@ Cách build gói release (checksum, manifest) nằm trong [docs/BUILD_AND_RELEAS
 | Đính kèm file hoặc ảnh | `@` (chọn file), `/attach <path>`, `/image` |
 | Chạy lệnh shell | `!command` (đi qua bước phê duyệt) |
 | Chỉnh hướng một lượt đang chạy | `/steer <text>` |
+| Chọn mức suy luận của model | `/thinking` (xem), `/thinking off\|minimal\|low\|medium\|high\|xhigh\|max` |
 | Làm tới khi xong việc | `/goal <mục tiêu>`, rồi `/goal status`, `/goal pause`, `/goal resume`, `/goal clear` |
 | Rút gọn hội thoại dài | `/compact [điều cần giữ]` |
 | Xem chi phí, context, quyền | `/cost`, `/context`, `/permissions` |

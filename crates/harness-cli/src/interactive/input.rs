@@ -752,7 +752,7 @@ impl LineEditor {
 /// This table is the **one** source for both: [`crate::interactive::view::help_lines`]
 /// builds the reference page from it and the menu draws its rows from it, so the
 /// list a user sees while typing cannot drift from the list `/help` promises.
-pub const SLASH_COMMANDS: [SlashCommand; 32] = [
+pub const SLASH_COMMANDS: [SlashCommand; 33] = [
     SlashCommand {
         name: "/help",
         arguments: "",
@@ -842,6 +842,11 @@ pub const SLASH_COMMANDS: [SlashCommand; 32] = [
         name: "/clear",
         arguments: "",
         summary: "start a new session and clear only the TUI viewport",
+    },
+    SlashCommand {
+        name: "/thinking",
+        arguments: "[off|minimal|low|medium|high|xhigh|max]",
+        summary: "show or choose how much the model reasons",
     },
     SlashCommand {
         name: "/goal",

@@ -443,6 +443,10 @@ pub struct RunResult {
     pub request_id: harness_types::RequestId,
     pub packet_id: harness_types::ContextPacketId,
     pub response: String,
+    /// The response's private reasoning, handed back to a thinking model within the
+    /// turn and never stored.
+    #[serde(skip)]
+    pub reasoning: Option<harness_providers::Reasoning>,
     pub attempts: u32,
     pub tool_calls: Vec<NormalizedToolCall>,
     pub incomplete_tool_calls: bool,
@@ -879,7 +883,13 @@ fn provider_usage(events: &[ProviderStreamEvent]) -> Option<u64> {
 fn durable_provider_events(events: &[ProviderStreamEvent]) -> Vec<&ProviderStreamEvent> {
     events
         .iter()
-        .filter(|event| !matches!(event, ProviderStreamEvent::ThinkingDelta { .. }))
+        .filter(|event| {
+            !matches!(
+                event,
+                ProviderStreamEvent::ThinkingDelta { .. }
+                    | ProviderStreamEvent::ThinkingSignature { .. }
+            )
+        })
         .collect()
 }
 
@@ -1755,6 +1765,12 @@ impl RuntimeService {
                 step_id,
                 request_id: provider_request.request_id,
                 packet_id: built.packet.packet_id,
+                reasoning: (!response.reasoning.is_empty()
+                    || response.reasoning_signature.is_some())
+                .then_some(harness_providers::Reasoning {
+                    text: response.reasoning,
+                    signature: response.reasoning_signature,
+                }),
                 response: response.text,
                 attempts,
                 tool_calls: response.tool_calls,

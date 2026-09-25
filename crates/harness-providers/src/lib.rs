@@ -28,7 +28,9 @@ pub(crate) static LOOPBACK_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::M
 
 pub mod anthropic;
 mod streaming;
+pub mod thinking;
 pub use streaming::{ProviderEventStream, collect_events};
+pub use thinking::{Thinking, ThinkingFormat, ThinkingLevel};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
@@ -188,6 +190,20 @@ pub struct ProviderMessage {
     /// The call a tool result answers (canonical model only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// The private reasoning an assistant message came with, kept only for the
+    /// turn so a thinking model gets it back (`DeepSeek`'s `reasoning_content`,
+    /// Anthropic's signed `thinking` block). Never serialized: reasoning is not
+    /// durable.
+    #[serde(skip)]
+    pub reasoning: Option<Reasoning>,
+}
+
+/// One assistant message's private reasoning.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Reasoning {
+    pub text: String,
+    /// Anthropic's signature over the thinking block, when the provider sent one.
+    pub signature: Option<String>,
 }
 
 /// One call an assistant message asked for, as the canonical model keeps it.
@@ -316,6 +332,7 @@ impl ProviderMessage {
             attachments: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning: None,
         }
     }
 
@@ -328,6 +345,7 @@ impl ProviderMessage {
             attachments: images,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning: None,
         }
     }
 
@@ -343,6 +361,7 @@ impl ProviderMessage {
             attachments: Vec::new(),
             tool_calls,
             tool_call_id: None,
+            reasoning: None,
         }
     }
 
@@ -355,7 +374,16 @@ impl ProviderMessage {
             attachments: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
+            reasoning: None,
         }
+    }
+
+    /// Attach the reasoning this assistant message came with.
+    #[must_use]
+    pub fn with_reasoning(mut self, reasoning: Option<Reasoning>) -> Self {
+        self.reasoning = reasoning
+            .filter(|reasoning| !reasoning.text.is_empty() || reasoning.signature.is_some());
+        self
     }
 
     /// The message as OpenAI-compatible chat APIs accept it.
@@ -412,6 +440,28 @@ pub fn wire_messages(messages: &[ProviderMessage]) -> Vec<Value> {
     messages.iter().map(ProviderMessage::to_wire).collect()
 }
 
+/// The `messages` array for a thinking endpoint that wants every assistant message's
+/// `reasoning_content` back - an empty one when none was kept, as `pi-ai` sends for
+/// `DeepSeek` (`requiresReasoningContentOnAssistantMessages`).
+#[must_use]
+pub fn wire_messages_with_reasoning(messages: &[ProviderMessage]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut wire = message.to_wire();
+            if message.role == MessageRole::Assistant {
+                wire["reasoning_content"] = json!(
+                    message
+                        .reasoning
+                        .as_ref()
+                        .map_or("", |reasoning| reasoning.text.as_str())
+                );
+            }
+            wire
+        })
+        .collect()
+}
+
 /// Validate the paired transcript before anything is dispatched.
 ///
 /// The canonical model carries call identity, so the host can refuse a
@@ -462,18 +512,6 @@ pub fn validate_transcript(messages: &[ProviderMessage]) -> Result<(), ProviderE
         }
     }
     Ok(())
-}
-
-/// Thinking mode is off, deliberately.
-///
-/// The provider enables thinking mode by default, and a request that turns it on
-/// must send every assistant `reasoning_content` back on the next request —
-/// measured as `HTTP 400 The 'reasoning_content' in the thinking mode must be
-/// passed back to the API`. This app does not retain reasoning content, so it asks
-/// for the mode it can actually complete instead of failing on the second turn.
-#[must_use]
-pub fn thinking_disabled() -> Value {
-    json!({ "type": "disabled" })
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -534,6 +572,10 @@ pub enum ProviderStreamEvent {
     /// plain transcript or durable conversation text.
     ThinkingDelta {
         text: String,
+    },
+    /// Anthropic's signature over the thinking block, sent back with it.
+    ThinkingSignature {
+        signature: String,
     },
     ToolCallDelta {
         call_id: String,
@@ -611,6 +653,12 @@ pub struct NormalizedToolCall {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderResponse {
     pub text: String,
+    /// Private reasoning of this response; never serialized, so it stays out of the
+    /// response hash and every durable record.
+    #[serde(skip)]
+    pub reasoning: String,
+    #[serde(skip)]
+    pub reasoning_signature: Option<String>,
     pub finish_reason: Option<String>,
     pub incomplete_tool_calls: bool,
     pub tool_calls: Vec<NormalizedToolCall>,
@@ -630,6 +678,8 @@ impl ProviderResponse {
 
 pub fn assemble_stream(events: &[ProviderStreamEvent]) -> Result<ProviderResponse, ProviderError> {
     let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut reasoning_signature: Option<String> = None;
     let mut finish_reason = None;
     let mut calls: BTreeMap<String, NormalizedToolCall> = BTreeMap::new();
     for event in events {
@@ -637,9 +687,13 @@ pub fn assemble_stream(events: &[ProviderStreamEvent]) -> Result<ProviderRespons
             ProviderStreamEvent::TextDelta { text: delta } => text.push_str(delta),
             // Token accounting is durable in the event log; it does not change the
             // assembled answer, and `Started` was never part of one.
-            ProviderStreamEvent::ThinkingDelta { .. }
-            | ProviderStreamEvent::Usage { .. }
-            | ProviderStreamEvent::Started { .. } => {}
+            ProviderStreamEvent::ThinkingDelta { text: delta } => reasoning.push_str(delta),
+            ProviderStreamEvent::ThinkingSignature { signature } => {
+                reasoning_signature
+                    .get_or_insert_with(String::new)
+                    .push_str(signature);
+            }
+            ProviderStreamEvent::Usage { .. } | ProviderStreamEvent::Started { .. } => {}
             ProviderStreamEvent::ToolCallDelta {
                 call_id,
                 name,
@@ -670,6 +724,8 @@ pub fn assemble_stream(events: &[ProviderStreamEvent]) -> Result<ProviderRespons
     });
     Ok(ProviderResponse {
         text,
+        reasoning,
+        reasoning_signature,
         finish_reason,
         incomplete_tool_calls,
         tool_calls: calls.into_values().collect(),
@@ -912,16 +968,17 @@ pub struct OpenAiChatAdapter {
     endpoint: String,
     credentials: Arc<dyn CredentialResolver>,
     capabilities: ModelCapabilities,
-    thinking_parameter: Option<Value>,
+    thinking: Option<Thinking>,
     client: Client,
 }
 
 /// Optional provider extension sent alongside the otherwise generic `OpenAI` Chat
 /// request. Provider-specific defaults live in config presets; the adapter only
 /// serializes the resolved value.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct OpenAiChatOptions {
-    pub thinking_parameter: Option<Value>,
+    /// The session's thinking level and how this endpoint takes it.
+    pub thinking: Option<Thinking>,
 }
 
 impl OpenAiChatAdapter {
@@ -1010,10 +1067,34 @@ impl OpenAiChatAdapter {
             endpoint,
             credentials,
             capabilities,
-            thinking_parameter: options.thinking_parameter,
+            thinking: options.thinking,
             client,
         })
     }
+}
+
+/// The Chat Completions body before transport options: messages - with their
+/// reasoning when the endpoint wants it back - and the thinking level.
+pub(crate) fn chat_body(
+    request: &ProviderRequest,
+    thinking: Option<&Thinking>,
+    provider_id: &str,
+) -> Value {
+    let messages = if thinking.is_some_and(Thinking::replays_reasoning_content) {
+        wire_messages_with_reasoning(&request.messages)
+    } else {
+        wire_messages(&request.messages)
+    };
+    let mut body = json!({
+        "model": request.model,
+        "messages": messages,
+        "stream": true,
+        "temperature": request.temperature,
+    });
+    if let Some(thinking) = thinking {
+        thinking.apply_chat(&mut body, provider_id, &request.model);
+    }
+    body
 }
 
 /// The wait a `Retry-After` header asks for, in seconds; other forms are ignored.
@@ -1110,15 +1191,13 @@ impl ModelProvider for OpenAiChatAdapter {
         let endpoint = self.endpoint.clone();
         let credentials = Arc::clone(&self.credentials);
         let client = self.client.clone();
-        let thinking_parameter = self.thinking_parameter.clone();
+        let thinking = self.thinking;
+        let provider_id = self.capabilities.provider_id.clone();
         Box::pin(async move {
             let token = credentials.resolve()?;
-            let mut body = json!({ "model": request.model, "messages": wire_messages(&request.messages), "stream": true, "temperature": request.temperature });
+            let mut body = chat_body(&request, thinking.as_ref(), &provider_id);
             if let Some(max_tokens) = request.max_output_tokens {
                 body["max_tokens"] = json!(max_tokens);
-            }
-            if let Some(thinking) = &thinking_parameter {
-                body["thinking"] = thinking.clone();
             }
             if !request.tool_schemas.is_empty()
                 && let Some(object) = body.as_object_mut()
@@ -1385,6 +1464,17 @@ impl SseDecoder {
             if let Some(content) = delta.get("content").and_then(Value::as_str) {
                 self.note_output(content.len())?;
                 events.push(ProviderStreamEvent::text(content));
+            }
+            // `pi-ai`: endpoints stream reasoning as `reasoning_content` (DeepSeek,
+            // llama.cpp), `reasoning` or `reasoning_text`; the first non-empty one is
+            // the trace, so an endpoint that sends two copies is not doubled.
+            if let Some(reasoning) = ["reasoning_content", "reasoning", "reasoning_text"]
+                .iter()
+                .find_map(|field| delta.get(*field).and_then(Value::as_str))
+                .filter(|reasoning| !reasoning.is_empty())
+            {
+                self.note_output(reasoning.len())?;
+                events.push(ProviderStreamEvent::thinking(reasoning));
             }
             if let Some(fragments) = delta.get("tool_calls").and_then(Value::as_array) {
                 for fragment in fragments {
@@ -2125,7 +2215,10 @@ mod g03_openai_wire_snapshot_tests {
                 fixture: false,
             },
             super::OpenAiChatOptions {
-                thinking_parameter: Some(super::thinking_disabled()),
+                thinking: Some(super::Thinking {
+                    level: super::ThinkingLevel::Off,
+                    format: super::ThinkingFormat::DeepSeek,
+                }),
             },
         )
         .expect("generic OpenAI Chat adapter");
@@ -2150,7 +2243,9 @@ mod g03_openai_wire_snapshot_tests {
 
 #[cfg(test)]
 mod wire_tests {
-    use super::{MessageRole, ProviderMessage, thinking_disabled, wire_messages};
+    use super::{
+        MessageRole, ProviderMessage, Reasoning, wire_messages, wire_messages_with_reasoning,
+    };
 
     /// The measured 422: a `tool` role message without `tool_call_id`.
     ///
@@ -2187,12 +2282,36 @@ mod wire_tests {
         }
     }
 
-    /// Measured 400: thinking mode demands `reasoning_content` back on turn two.
+    /// Measured 400: thinking mode demands `reasoning_content` back on turn two. As
+    /// `pi-ai` does for `DeepSeek`, every assistant message carries it - the kept
+    /// reasoning, or an empty one - and no other role does.
     #[test]
-    fn thinking_mode_is_disabled_explicitly() {
-        assert_eq!(
-            thinking_disabled(),
-            serde_json::json!({ "type": "disabled" })
+    fn a_thinking_endpoint_gets_every_assistant_reasoning_back() {
+        let messages = vec![
+            ProviderMessage::new(MessageRole::User, "list the files"),
+            ProviderMessage::new(MessageRole::Assistant, "earlier answer"),
+            ProviderMessage::new(MessageRole::Assistant, "calling a tool").with_reasoning(Some(
+                Reasoning {
+                    text: "look at src first".to_owned(),
+                    signature: None,
+                },
+            )),
+        ];
+        let wire = wire_messages_with_reasoning(&messages);
+        assert!(wire[0].get("reasoning_content").is_none());
+        assert_eq!(wire[1]["reasoning_content"], "");
+        assert_eq!(wire[2]["reasoning_content"], "look at src first");
+        assert!(
+            wire_messages(&messages)
+                .iter()
+                .all(|message| message.get("reasoning_content").is_none()),
+            "an endpoint that does not ask for it never gets it"
+        );
+        // Reasoning is private: it is never serialized with the message.
+        let stored = serde_json::to_value(&messages[2]).expect("serializable");
+        assert!(
+            !stored.to_string().contains("look at src first"),
+            "{stored}"
         );
     }
 

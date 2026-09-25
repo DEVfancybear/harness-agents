@@ -21,9 +21,17 @@ pub struct AnthropicMessagesAdapter {
     credentials: Arc<dyn CredentialResolver>,
     capabilities: ModelCapabilities,
     client: Client,
+    thinking: Option<crate::Thinking>,
 }
 
 impl AnthropicMessagesAdapter {
+    /// Send the session's thinking level with every request.
+    #[must_use]
+    pub fn with_thinking(mut self, thinking: Option<crate::Thinking>) -> Self {
+        self.thinking = thinking;
+        self
+    }
+
     pub fn new(
         endpoint: impl Into<String>,
         credentials: Arc<dyn CredentialResolver>,
@@ -47,10 +55,11 @@ impl AnthropicMessagesAdapter {
             credentials,
             capabilities,
             client,
+            thinking: None,
         })
     }
 
-    fn request_body(request: &ProviderRequest) -> Value {
+    fn request_body(request: &ProviderRequest, thinking: Option<&crate::Thinking>) -> Value {
         let mut system = Vec::new();
         let mut messages = Vec::new();
         for message in &request.messages {
@@ -70,6 +79,18 @@ impl AnthropicMessagesAdapter {
                 })),
                 super::MessageRole::Assistant => {
                     let mut blocks = Vec::new();
+                    // A signed thinking block goes back first, as the API requires when
+                    // thinking is on and the turn continues after a tool call.
+                    if thinking.is_some()
+                        && let Some(reasoning) = &message.reasoning
+                        && let Some(signature) = &reasoning.signature
+                    {
+                        blocks.push(json!({
+                            "type": "thinking",
+                            "thinking": reasoning.text,
+                            "signature": signature,
+                        }));
+                    }
                     if !message.content.is_empty() {
                         blocks.push(json!({"type":"text", "text":message.content}));
                     }
@@ -110,6 +131,9 @@ impl AnthropicMessagesAdapter {
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
+        if let Some(thinking) = thinking {
+            thinking.apply_anthropic(&mut body, &request.model);
+        }
         body
     }
 }
@@ -136,6 +160,7 @@ impl ModelProvider for AnthropicMessagesAdapter {
         let endpoint = self.endpoint.clone();
         let client = self.client.clone();
         let credentials = Arc::clone(&self.credentials);
+        let thinking = self.thinking;
         Box::pin(async move {
             let token = credentials.resolve()?;
             let response = tokio::select! {
@@ -143,7 +168,7 @@ impl ModelProvider for AnthropicMessagesAdapter {
                     .header("x-api-key", token)
                     .header("anthropic-version", ANTHROPIC_VERSION)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .json(&Self::request_body(&request))
+                    .json(&Self::request_body(&request, thinking.as_ref()))
                     .send() => result.map_err(|error| {
                         let error = error.without_url();
                         ProviderError::new(
@@ -305,6 +330,13 @@ impl AnthropicSseDecoder {
                     "thinking_delta" => {
                         if let Some(text) = delta["thinking"].as_str() {
                             events.push(ProviderStreamEvent::thinking(text));
+                        }
+                    }
+                    "signature_delta" => {
+                        if let Some(signature) = delta["signature"].as_str() {
+                            events.push(ProviderStreamEvent::ThinkingSignature {
+                                signature: signature.to_owned(),
+                            });
                         }
                     }
                     "input_json_delta" => {

@@ -251,6 +251,14 @@ pub trait SessionPort: Send {
     fn set_model(&mut self, _model: &str) -> Result<String, String> {
         Err("this backend does not support model switching".to_owned())
     }
+    /// Choose the thinking level for the next turns.
+    fn set_thinking(&mut self, _level: &str) -> Result<String, String> {
+        Err("this backend does not support thinking levels".to_owned())
+    }
+    /// The thinking level in force and the levels the model offers.
+    fn thinking_status(&self) -> Vec<String> {
+        vec!["this backend does not support thinking levels".to_owned()]
+    }
     fn set_mode(&mut self, _mode: &str) -> Result<String, String> {
         Err("this backend does not support session permission modes".to_owned())
     }
@@ -1031,6 +1039,8 @@ pub struct AgentSessionService {
     goal_forgotten: bool,
     /// The Python REPL, kept for the whole session so its state outlives a turn.
     repl: Option<Arc<super::repl::ReplShared>>,
+    /// The thinking level `/thinking` chose, for the next turns.
+    thinking: Option<harness_providers::ThinkingLevel>,
 }
 
 impl Drop for AgentSessionService {
@@ -1520,6 +1530,7 @@ impl AgentSessionService {
             goal: None,
             goal_forgotten: false,
             repl,
+            thinking: None,
         }
     }
 
@@ -1711,6 +1722,7 @@ impl SessionPort for AgentSessionService {
             (None, false) => GoalRecord::Keep,
         };
         let repl = self.repl.clone();
+        let thinking = self.thinking;
         // Every user input opens its own session; the conversation is the chain of
         // sessions linked to the same task.
         let session_id = SessionId::generate();
@@ -1746,6 +1758,7 @@ impl SessionPort for AgentSessionService {
                 extraction,
                 goal,
                 repl,
+                thinking,
             ))
             .await;
         });
@@ -2178,6 +2191,52 @@ impl SessionPort for AgentSessionService {
         Ok(format!("model {model} selected for the next turn"))
     }
 
+    fn set_thinking(&mut self, level: &str) -> Result<String, String> {
+        let requested = harness_providers::ThinkingLevel::parse(level).ok_or_else(|| {
+            format!(
+                "unknown thinking level {level:?}; choose one of {}",
+                harness_providers::ThinkingLevel::ALL
+                    .map(harness_providers::ThinkingLevel::as_str)
+                    .join(", ")
+            )
+        })?;
+        self.thinking = Some(requested);
+        let config = self.configured()?;
+        let model =
+            harness_providers::thinking::reasoning_model(&config.provider_id, &config.model);
+        let used = harness_providers::thinking::clamp(model, requested);
+        Ok(if used == requested {
+            format!("thinking {requested} selected for the next turn")
+        } else {
+            format!(
+                "thinking {requested} selected for the next turn; {} uses {used}, the nearest level it offers",
+                config.model
+            )
+        })
+    }
+
+    fn thinking_status(&self) -> Vec<String> {
+        let Ok(config) = self.configured() else {
+            return vec!["no provider is configured".to_owned()];
+        };
+        let model =
+            harness_providers::thinking::reasoning_model(&config.provider_id, &config.model);
+        let chosen = self
+            .thinking
+            .or_else(|| harness_providers::ThinkingLevel::parse(&config.thinking))
+            .unwrap_or_default();
+        let offered = harness_providers::thinking::supported_levels(model)
+            .into_iter()
+            .map(harness_providers::ThinkingLevel::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        vec![
+            format!("Thinking: {chosen} (next turn uses {})", harness_providers::thinking::clamp(model, chosen)),
+            format!("Model:    {} offers {offered}", config.model),
+            "/thinking <off|minimal|low|medium|high|xhigh|max> changes it; provider.thinking or HA_PROVIDER_THINKING sets the default".to_owned(),
+        ]
+    }
+
     fn set_mode(&mut self, mode: &str) -> Result<String, String> {
         let mode = mode
             .parse::<PolicyMode>()
@@ -2577,6 +2636,7 @@ async fn run_turn(
     extraction: super::memory_worker::ExtractionWorker,
     goal: GoalRecord,
     repl: Option<Arc<super::repl::ReplShared>>,
+    thinking: Option<harness_providers::ThinkingLevel>,
 ) {
     let send = |event| {
         let _ = sender.send(event);
@@ -2854,21 +2914,49 @@ async fn run_turn(
         config.credential_variable(),
         data_dir.clone(),
     ));
-    let provider: Result<Arc<dyn ModelProvider>, ProviderError> = match config.protocol.as_str() {
-        "openai_chat" => {
-            let thinking_parameter = (config.provider_id == "deepseek" && config.thinking == "off")
-                .then(harness_providers::thinking_disabled);
-            OpenAiChatAdapter::with_options(
-                config.endpoint.clone(),
-                credentials,
-                capabilities,
-                OpenAiChatOptions { thinking_parameter },
-            )
-            .map(|adapter| Arc::new(adapter) as Arc<dyn ModelProvider>)
+    // The thinking level: what `/thinking` chose (kept with the task), else what the
+    // task last used, else the configuration's.
+    let thinking_level = match thinking {
+        Some(level) => {
+            let _ = store
+                .set_session_setting(&task_id, "thinking", level.as_str())
+                .await;
+            level
         }
+        None => store
+            .session_setting(&task_id, "thinking")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| harness_providers::ThinkingLevel::parse(&value))
+            .or_else(|| harness_providers::ThinkingLevel::parse(&config.thinking))
+            .unwrap_or_default(),
+    };
+    let provider: Result<Arc<dyn ModelProvider>, ProviderError> = match config.protocol.as_str() {
+        "openai_chat" => OpenAiChatAdapter::with_options(
+            config.endpoint.clone(),
+            credentials,
+            capabilities,
+            OpenAiChatOptions {
+                thinking: Some(harness_providers::Thinking {
+                    level: thinking_level,
+                    format: harness_providers::thinking::chat_format(
+                        &config.provider_id,
+                        &config.endpoint,
+                    ),
+                }),
+            },
+        )
+        .map(|adapter| Arc::new(adapter) as Arc<dyn ModelProvider>),
         "anthropic_messages" => {
-            AnthropicMessagesAdapter::new(config.endpoint.clone(), credentials, capabilities)
-                .map(|adapter| Arc::new(adapter) as Arc<dyn ModelProvider>)
+            AnthropicMessagesAdapter::new(config.endpoint.clone(), credentials, capabilities).map(
+                |adapter| {
+                    Arc::new(adapter.with_thinking(Some(harness_providers::Thinking {
+                        level: thinking_level,
+                        format: harness_providers::ThinkingFormat::Anthropic,
+                    }))) as Arc<dyn ModelProvider>
+                },
+            )
         }
         _ => Err(ProviderError::new(
             ErrorCode::ProviderProtocol,

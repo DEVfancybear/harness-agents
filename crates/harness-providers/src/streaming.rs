@@ -134,7 +134,8 @@ pub(crate) fn adapter_stream(
     {
         let endpoint = provider.endpoint.clone();
         let credentials = Arc::clone(&provider.credentials);
-        let thinking_parameter = provider.thinking_parameter.clone();
+        let thinking = provider.thinking;
+        let provider_id = provider.capabilities.provider_id.clone();
         let client = provider.client.clone();
         let (sender, mut receiver) =
             mpsc::channel::<Result<ProviderStreamEvent, ProviderError>>(16);
@@ -155,15 +156,7 @@ pub(crate) fn adapter_stream(
                     return;
                 }
             };
-            let mut body = serde_json::json!({
-                "model": request.model,
-                "messages": crate::wire_messages(&request.messages),
-                "stream": true,
-                "temperature": request.temperature,
-            });
-            if let Some(thinking) = &thinking_parameter {
-                body["thinking"] = thinking.clone();
-            }
+            let mut body = crate::chat_body(&request, thinking.as_ref(), &provider_id);
             if !request.tool_schemas.is_empty()
                 && let Some(object) = body.as_object_mut()
             {

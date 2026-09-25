@@ -766,10 +766,13 @@ impl TurnDriver {
                             // record too, otherwise the continuation reads as if
                             // the model had never replied.
                             if !result.response.trim().is_empty() {
-                                transcript.push(ProviderMessage::new(
-                                    MessageRole::Assistant,
-                                    result.response.clone(),
-                                ));
+                                transcript.push(
+                                    ProviderMessage::new(
+                                        MessageRole::Assistant,
+                                        result.response.clone(),
+                                    )
+                                    .with_reasoning(result.reasoning.clone()),
+                                );
                             }
                             // The continuation instruction is host policy, not
                             // user text: the input was admitted once and this
@@ -916,21 +919,24 @@ impl TurnDriver {
                     id
                 })
                 .collect();
-            appended.push(ProviderMessage::assistant_with_calls(
-                assistant_text,
-                result
-                    .tool_calls
-                    .iter()
-                    .zip(transcript_ids.iter())
-                    .map(|(call, transcript_id)| {
-                        ProviderToolCall::new(
-                            transcript_id.clone(),
-                            call.name.clone(),
-                            call.arguments.clone(),
-                        )
-                    })
-                    .collect(),
-            ));
+            appended.push(
+                ProviderMessage::assistant_with_calls(
+                    assistant_text,
+                    result
+                        .tool_calls
+                        .iter()
+                        .zip(transcript_ids.iter())
+                        .map(|(call, transcript_id)| {
+                            ProviderToolCall::new(
+                                transcript_id.clone(),
+                                call.name.clone(),
+                                call.arguments.clone(),
+                            )
+                        })
+                        .collect(),
+                )
+                .with_reasoning(result.reasoning.clone()),
+            );
             for (call, transcript_id) in result.tool_calls.clone().into_iter().zip(transcript_ids) {
                 tool_calls += 1;
                 let name = call.name.clone();

@@ -1755,6 +1755,23 @@ impl InteractiveController {
                 }
             }
             "/goal" => self.goal_command(raw_argument, &mut effects),
+            "/thinking" => {
+                if let Some(level) = argument {
+                    if self.phase.has_active_run() {
+                        self.push_history(&mut effects, HistoryItem::Notice {
+                            message: "cannot change thinking while a run is active; the running request keeps its level".to_owned(),
+                        });
+                    } else {
+                        match self.service.set_thinking(level) {
+                            Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
+                            Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                        }
+                    }
+                } else {
+                    let lines = self.service.thinking_status();
+                    self.reference("/thinking", lines, &mut effects);
+                }
+            }
             "/rename" => {
                 if self.phase.has_active_run() {
                     self.push_history(&mut effects, HistoryItem::Notice {
