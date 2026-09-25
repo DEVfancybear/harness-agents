@@ -695,7 +695,9 @@ pub fn assemble_stream(events: &[ProviderStreamEvent]) -> Result<ProviderRespons
     let mut reasoning = String::new();
     let mut reasoning_signature: Option<String> = None;
     let mut finish_reason = None;
-    let mut calls: BTreeMap<String, NormalizedToolCall> = BTreeMap::new();
+    // Calls keep the order the model made them in: a batch that runs one call at
+    // a time runs them in that order, and results go back in it.
+    let mut calls: Vec<NormalizedToolCall> = Vec::new();
     for event in events {
         match event {
             ProviderStreamEvent::TextDelta { text: delta } => text.push_str(delta),
@@ -713,13 +715,18 @@ pub fn assemble_stream(events: &[ProviderStreamEvent]) -> Result<ProviderRespons
                 name,
                 arguments,
             } => {
-                let entry = calls
-                    .entry(call_id.clone())
-                    .or_insert_with(|| NormalizedToolCall {
-                        call_id: call_id.clone(),
-                        name: name.clone(),
-                        arguments: String::new(),
-                    });
+                let index =
+                    if let Some(index) = calls.iter().position(|call| &call.call_id == call_id) {
+                        index
+                    } else {
+                        calls.push(NormalizedToolCall {
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                            arguments: String::new(),
+                        });
+                        calls.len() - 1
+                    };
+                let entry = &mut calls[index];
                 if !name.is_empty() {
                     entry.name.clone_from(name);
                 }
@@ -733,7 +740,7 @@ pub fn assemble_stream(events: &[ProviderStreamEvent]) -> Result<ProviderRespons
     // A call with no name or with arguments that never completed JSON cannot be
     // executed; the flag is what lets a caller refuse the whole response instead of
     // reporting one confusing tool failure per fragment.
-    let incomplete_tool_calls = calls.values().any(|call| {
+    let incomplete_tool_calls = calls.iter().any(|call| {
         call.name.trim().is_empty() || serde_json::from_str::<Value>(&call.arguments).is_err()
     });
     Ok(ProviderResponse {
@@ -742,7 +749,7 @@ pub fn assemble_stream(events: &[ProviderStreamEvent]) -> Result<ProviderRespons
         reasoning_signature,
         finish_reason,
         incomplete_tool_calls,
-        tool_calls: calls.into_values().collect(),
+        tool_calls: calls,
     })
 }
 
@@ -1886,6 +1893,33 @@ mod sse_limit_tests {
 mod sse_tool_call_tests {
     use super::{ProviderStreamEvent, SseDecoder, assemble_stream};
     use serde_json::json;
+
+    /// A real `OpenCode` Go (`DeepSeek` V4 Flash) stream: reasoning, a sentence, then
+    /// two calls whose continuation fragments spell `"id": null` and
+    /// `"name": null`, and a usage-only frame after the finish reason.
+    #[test]
+    fn a_recorded_opencode_stream_yields_both_calls() {
+        let stream = include_str!("../tests/fixtures/opencode_go_tool_calls.sse");
+        let mut decoder = SseDecoder::new();
+        let mut events = decoder.feed(stream.as_bytes()).expect("frames decode");
+        events.extend(decoder.finish().expect("stream completes"));
+        let response = assemble_stream(&events).expect("assembled");
+        let calls = response
+            .tool_calls
+            .iter()
+            .map(|call| (call.name.as_str(), call.arguments.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls,
+            [
+                ("list_files", "{\"path\": \".\"}"),
+                ("read_file", "{\"path\": \"README.md\"}")
+            ],
+            "{events:#?}"
+        );
+        assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+        assert!(response.is_dispatchable());
+    }
 
     /// The measured wire shape of one call: this frame opens it, and the argument
     /// fragments that follow carry `index` and `arguments` only.

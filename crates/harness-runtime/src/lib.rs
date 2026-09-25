@@ -20,9 +20,8 @@ use harness_session::{
     SessionService,
 };
 use harness_store_sqlite::{
-    AgentStateRecord, CompositionSnapshotRecord, ContextCheckpointRecord, ContextPacketRecord,
-    FrozenRequestRecord, ProviderAttemptRecord, RunRecord, RunState, RuntimeCommandRecord,
-    RuntimeCommandState, SqliteStore, StoreError,
+    ContextCheckpointRecord, ContextPacketRecord, FrozenRequestRecord, ProviderAttemptRecord,
+    RunRecord, RunState, RuntimeCommandRecord, RuntimeCommandState, SqliteStore, StoreError,
 };
 use harness_types::{
     AgentRunId, BudgetId, BudgetReservationId, ContentHash, ErrorCode, FreezeStepCommit,
@@ -1208,6 +1207,9 @@ pub struct RuntimeService {
     budget: Option<(BudgetLedger, BudgetId)>,
     /// The goal evaluator; production uses the host evaluator.
     evaluator: Arc<dyn GoalEvaluator>,
+    /// The last recovered session's fold, so the next step of the turn reads
+    /// only the events committed since.
+    recovery: Arc<Mutex<Option<harness_session::RecoveryCache>>>,
 }
 
 impl RuntimeService {
@@ -1229,6 +1231,7 @@ impl RuntimeService {
             summarizer,
             last_attempts: Arc::new(AtomicU32::new(0)),
             last_context: Arc::new(Mutex::new(None)),
+            recovery: Arc::new(Mutex::new(None)),
             budget: None,
             evaluator: default_evaluator(),
         }
@@ -1318,6 +1321,20 @@ impl RuntimeService {
             .await
     }
 
+    /// Recover a session for a model step, reusing the fold of the previous step.
+    async fn recover_step(
+        &self,
+        session: &SessionService,
+        session_id: &SessionId,
+    ) -> Result<harness_session::RecoveryView, RuntimeError> {
+        let mut cache = self.recovery.lock().ok().and_then(|mut slot| slot.take());
+        let recovery = session.recover_cached(session_id, &mut cache).await?;
+        if let Ok(mut slot) = self.recovery.lock() {
+            *slot = cache;
+        }
+        Ok(recovery)
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn run_inner(
         &self,
@@ -1363,14 +1380,11 @@ impl RuntimeService {
                 })
                 .await?;
         }
-        let agent_run_id = AgentRunId::generate();
-        self.record_agent(&agent_run_id, &request, AgentState::Idle, 0, &[])
-            .await?;
         // The run state machine is applied, never written directly, so terminal
-        // states cannot be re-entered by a later notification.
-        let started = AgentState::Idle.apply(RunCommand::Start)?;
-        self.record_agent(&agent_run_id, &request, started.next, 1, &started.events)
-            .await?;
+        // states cannot be re-entered by a later notification. The durable run is
+        // the run record claimed below; the reducer's states were also written to
+        // a table nothing read, three commits per model step.
+        AgentState::Idle.apply(RunCommand::Start)?;
         // One admitted input owns one durable run, whether this is the first
         // step or a continuation: the identity was fixed at admission.
         let run = StorePort::claim_run(
@@ -1407,7 +1421,7 @@ impl RuntimeService {
             .claim_runtime_command(&command_id, config.max_attempts)
             .await?;
         self.last_attempts.store(command.attempts, Ordering::SeqCst);
-        let recovery = session.recover(&request.session_id).await?;
+        let recovery = self.recover_step(&session, &request.session_id).await?;
         let scope = self.run_scope(&request, &config)?;
         let mut request = request;
         let mut notices = Vec::new();
@@ -1469,7 +1483,8 @@ impl RuntimeService {
                 }
                 let compacted = self.compact(&request.session_id).await?;
                 request.continuation_context = Some(compacted.packet.content);
-                let mut compacted_recovery = session.recover(&request.session_id).await?;
+                let mut compacted_recovery =
+                    self.recover_step(&session, &request.session_id).await?;
                 compacted_recovery.instruction_texts = vec![request.text.clone()];
                 let rebuilt = self
                     .build_context(&request, compacted_recovery, checkpoint_id, &appended)
@@ -1492,18 +1507,6 @@ impl RuntimeService {
             *last_context = Some((request.session_id.clone(), built.clone()));
         }
         let capabilities = self.provider.capabilities();
-        let composition_content = json!({"config_revision": config.config_revision, "provider_id": capabilities.provider_id, "model": capabilities.model, "packet_checkpoint": built.packet.checkpoint_id, "tool_schemas": request.tool_schemas});
-        let composition_id = harness_types::CompositionSnapshotId::generate();
-        let composition = CompositionSnapshotRecord {
-            snapshot_id: composition_id.clone(),
-            session_id: request.session_id.clone(),
-            task_id: request.task_id.clone(),
-            revision: built.packet.through_event_seq,
-            content_hash: ContentHash::from_canonical_json(&composition_content)
-                .map_err(|error| RuntimeError::new(error.code(), error.to_string()))?,
-            content: composition_content,
-        };
-        self.store.persist_composition_snapshot(composition).await?;
         // An attached image is content blocks on the user message, and the same message
         // names it: the packet is text, so without the marker the model would be looking
         // at something it cannot refer to.
@@ -1560,7 +1563,7 @@ impl RuntimeService {
         self.store
             .persist_context_packet(ContextPacketRecord {
                 packet: built.packet.clone(),
-                composition_snapshot_id: Some(composition_id.clone()),
+                composition_snapshot_id: None,
                 omitted_optional: built.omitted_optional.clone(),
                 degradation: built.degradation.clone(),
             })
@@ -1574,7 +1577,7 @@ impl RuntimeService {
         let frozen = FrozenRequestRecord {
             request_id: provider_request.request_id.clone(),
             packet_id: built.packet.packet_id.clone(),
-            composition_snapshot_id: Some(composition_id),
+            composition_snapshot_id: None,
             session_id: request.session_id.clone(),
             task_id: request.task_id.clone(),
             content_hash: ContentHash::from_canonical_json(&request_json)
@@ -1855,15 +1858,7 @@ impl RuntimeService {
                     None,
                 )
                 .await?;
-            let completed = AgentState::Running.apply(RunCommand::Complete)?;
-            self.record_agent(
-                &agent_run_id,
-                &request,
-                completed.next,
-                u64::from(attempts) + 1,
-                &completed.events,
-            )
-            .await?;
+            AgentState::Running.apply(RunCommand::Complete)?;
             // The step is streamed but the run stays running: the driver owns
             // the loop and either freezes another step or finishes the run with
             // its typed stop reason.
@@ -1911,21 +1906,11 @@ impl RuntimeService {
                     Some(&error.to_string()),
                 )
                 .await;
-            let terminal =
-                AgentState::Running.apply(if error.code() == ErrorCode::ProviderCanceled {
-                    RunCommand::Cancel
-                } else {
-                    RunCommand::Fail
-                })?;
-            let _ = self
-                .record_agent(
-                    &agent_run_id,
-                    &request,
-                    terminal.next,
-                    u64::from(attempts) + 1,
-                    &terminal.events,
-                )
-                .await;
+            AgentState::Running.apply(if error.code() == ErrorCode::ProviderCanceled {
+                RunCommand::Cancel
+            } else {
+                RunCommand::Fail
+            })?;
             // A provider failure ends the run's provider path; the run record
             // says why, so a reopen never mistakes it for a completed turn.
             let canceled = error.code() == ErrorCode::ProviderCanceled;
@@ -2832,33 +2817,6 @@ impl RuntimeService {
             .validate()
             .map_err(|error| RuntimeError::new(error.code(), error.message().to_owned()))?;
         Ok(scope)
-    }
-
-    async fn record_agent(
-        &self,
-        agent_run_id: &AgentRunId,
-        request: &RunRequest,
-        state: AgentState,
-        revision: u64,
-        events: &[RunStateEvent],
-    ) -> Result<(), RuntimeError> {
-        let generation = self.store.fence()?.generation;
-        self.store
-            .record_agent_state(AgentStateRecord {
-                agent_run_id: agent_run_id.clone(),
-                session_id: request.session_id.clone(),
-                task_id: request.task_id.clone(),
-                state: state.as_str().to_owned(),
-                generation,
-                revision,
-                // The reducer's proposed events are durable with the state they
-                // explain, so a later reader does not have to re-derive them.
-                detail: json!({
-                    "events": events.iter().map(|event| event.as_str()).collect::<Vec<_>>()
-                }),
-            })
-            .await
-            .map_err(RuntimeError::from)
     }
 }
 

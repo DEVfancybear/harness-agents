@@ -637,14 +637,19 @@ async fn p3_s02_every_tool_path_uses_one_gate_and_approval_binds_final_action() 
     .await;
     fs::write(root.join("src/parser.txt"), "changed outside the harness\n")
         .expect("external edit fixture");
-    let stale = tools
+    // An edit elsewhere in the tree after approval does not make the approved
+    // action stale: the read runs on the same root and sees the file as it is.
+    // (A whole-tree comparison refused good actions whenever an indexer, an editor
+    // or an export wrote a file mid-turn; writes are bound to their file's hash.)
+    let drifted = tools
         .execute(stale_prepared, Some(stale_approval))
         .await
-        .expect("workspace drift must be durably denied");
-    assert!(matches!(
-        stale.output,
-        ToolOutput::Denied { ref code, .. } if code == "stale_workspace"
-    ));
+        .expect("the approved read runs");
+    assert!(
+        !matches!(drifted.output, ToolOutput::Denied { .. }),
+        "{:?}",
+        drifted.output
+    );
 
     let (policy_prepared, policy_approval) = prepared_and_approved(
         &tools,

@@ -844,21 +844,22 @@ impl ToolExecutionService {
                 .await;
         }
         Self::validate_workspace_action(&prepared.workspace_root, &transformed)?;
-        let reobserved = if is_read_only(&transformed) {
-            inspect_workspace_for_read(&prepared.workspace_root, prepared.project_id.clone())?
-        } else {
-            inspect_workspace(&prepared.workspace_root, prepared.project_id.clone())?
-        };
-        if reobserved.identity_hash != prepared.workspace_identity_hash
-            || reobserved.fingerprint != prepared.workspace_fingerprint
-        {
+        // The dispatch must act on the workspace the approval named: the same root
+        // and repository. Its file contents are not compared: an indexer, an
+        // editor or the app's own export writes files while a turn runs, and a
+        // whole-tree comparison refused good actions as stale. A write is bound to
+        // the file it changes by that file's expected hash; the tree fingerprint is
+        // still recorded before and after, for the receipt.
+        let reobserved =
+            inspect_workspace_for_read(&prepared.workspace_root, prepared.project_id.clone())?;
+        if reobserved.identity_hash != prepared.workspace_identity_hash {
             return self
                 .record_denied_begun(
                     &prepared,
                     execution_id,
                     Some(&approval),
                     ErrorCode::StaleWorkspace,
-                    "workspace root, Git identity, or fingerprint changed after approval",
+                    "workspace root or Git identity changed after approval",
                 )
                 .await;
         }

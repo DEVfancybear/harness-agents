@@ -131,6 +131,10 @@ impl HostRequests for McpRequests {
             let server = request["server"].as_str().unwrap_or_default();
             Some(match kind {
                 "mcp.config" if server.is_empty() => Err("mcp.config requires a server".to_owned()),
+                "mcp.config" if !self.servers.contains_key(server) => Err(format!(
+                    "no MCP server named {server:?} is configured in ha; configured: [{}]. Add it under [mcp_servers.{server}] in ha's config.toml (see /config)",
+                    self.servers.keys().cloned().collect::<Vec<_>>().join(", ")
+                )),
                 "mcp.config" => Ok(self.prime_config(server)),
                 "mcp.list_connections" => Ok(json!({
                     "connections": self.servers.iter().map(|(name, server)| json!({
@@ -495,8 +499,8 @@ mod tests {
             .handle(&json!({"type": "mcp.config", "server": "nope"}))
             .await
             .expect("known")
-            .expect("ok");
-        assert_eq!(unknown, json!({}), "an undeclared server has no config");
+            .expect_err("an undeclared server is named as such");
+        assert!(unknown.contains("files, remote"), "{unknown}");
         let connections = host
             .handle(&json!({"type": "mcp.list_connections"}))
             .await

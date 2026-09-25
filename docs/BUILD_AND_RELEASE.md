@@ -10,6 +10,7 @@
 - [Rust](https://rustup.rs). The pinned toolchain in [`rust-toolchain.toml`](../rust-toolchain.toml) (1.97.1, with `clippy` and `rustfmt`) is installed automatically by the first `cargo` command.
 - PowerShell 7 (`pwsh`) for the scripts, and Git.
 - The MSVC build tools that `rustup` asks for (Visual Studio Build Tools, "Desktop development with C++").
+- [`uv`](https://docs.astral.sh/uv/) for the Python kernel's environment. You do not need to install it yourself: the installer and the release bundle place a pinned, checksum-verified `uv.exe` (0.12.19) next to `ha.exe`, and `ha` looks there first, then `HA_UV`, then `PATH`. On a machine without network access, install uv (`winget install astral-sh.uv`) or copy `uv.exe` next to `ha.exe`.
 
 ### 2. Build
 
@@ -26,7 +27,7 @@ Run a build without installing it: `cargo run -p harness-cli --bin ha -- <args>`
 pwsh -NoProfile -File scripts/Install-Ha.ps1
 ```
 
-The installer builds the release binary, verifies the staged copy (digest and `--version`), keeps a backup until the new file is in place, and installs to `%USERPROFILE%\.cargo\bin`. Useful switches:
+The installer builds the release binary, verifies the staged copy (digest and `--version`), keeps a backup until the new file is in place, and installs to `%USERPROFILE%\.cargo\bin`. It also places the pinned `uv.exe` beside `ha.exe` (downloaded from the uv GitHub release and checked against its SHA-256; from a bundle it is copied); `-SkipUv` leaves it out, and a failed download is a warning, not a failed install. Useful switches:
 
 | Switch | Effect |
 | --- | --- |
@@ -66,11 +67,12 @@ pwsh -NoProfile -File scripts/New-HaRelease.ps1                  # release build
 pwsh -NoProfile -File scripts/New-HaRelease.ps1 -PublishDryRun   # also print what publishing would run
 ```
 
-It writes `target\release-candidate\ha-<version>-windows-x64\` and a `.zip` of it. The bundle contains exactly three files, and the script fails if anything else appears:
+It writes `target\release-candidate\ha-<version>-windows-x64\` and a `.zip` of it. The bundle contains exactly these files, and the script fails if anything else appears:
 
 | File | Content |
 | --- | --- |
 | `ha.exe` | The release executable of the revision you built |
+| `uv.exe` | The pinned `uv` the Python kernel builds its environment with (checksum-verified at packaging) |
 | `ha.release.json` | Target, version, rustc, source revision and the executable's digest |
 | `checksums.txt` | SHA-256 of every other file in the bundle |
 
@@ -95,6 +97,7 @@ Nothing publishes automatically: there is no registry and no release job. `-Publ
 - [Rust](https://rustup.rs). Toolchain được pin trong [`rust-toolchain.toml`](../rust-toolchain.toml) (1.97.1, kèm `clippy` và `rustfmt`) được cài tự động ở lệnh `cargo` đầu tiên.
 - PowerShell 7 (`pwsh`) để chạy script, và Git.
 - MSVC build tools mà `rustup` yêu cầu (Visual Studio Build Tools, mục "Desktop development with C++").
+- [`uv`](https://docs.astral.sh/uv/) để dựng môi trường cho Python kernel. Bạn không cần tự cài: installer và gói release đặt sẵn một `uv.exe` (0.12.19) đã pin phiên bản và kiểm checksum cạnh `ha.exe`; `ha` tìm uv ở đó trước, rồi tới `HA_UV`, rồi `PATH`. Máy không có mạng thì cài uv (`winget install astral-sh.uv`) hoặc chép `uv.exe` vào cạnh `ha.exe`.
 
 ### 2. Build
 
@@ -111,7 +114,7 @@ Chạy bản vừa build mà không cài: `cargo run -p harness-cli --bin ha -- 
 pwsh -NoProfile -File scripts/Install-Ha.ps1
 ```
 
-Installer build bản release, kiểm tra bản sao tạm (digest và `--version`), giữ bản dự phòng cho đến khi file mới vào đúng chỗ, và cài vào `%USERPROFILE%\.cargo\bin`. Các tùy chọn hay dùng:
+Installer build bản release, kiểm tra bản sao tạm (digest và `--version`), giữ bản dự phòng cho đến khi file mới vào đúng chỗ, và cài vào `%USERPROFILE%\.cargo\bin`. Installer cũng đặt `uv.exe` đã pin phiên bản cạnh `ha.exe` (tải từ bản phát hành uv trên GitHub và kiểm SHA-256; nếu cài từ gói thì chép từ gói); `-SkipUv` bỏ bước này, và tải lỗi chỉ là cảnh báo, không làm hỏng việc cài. Các tùy chọn hay dùng:
 
 | Tùy chọn | Tác dụng |
 | --- | --- |
@@ -151,11 +154,12 @@ pwsh -NoProfile -File scripts/New-HaRelease.ps1                  # build release
 pwsh -NoProfile -File scripts/New-HaRelease.ps1 -PublishDryRun   # in thêm các lệnh phát hành sẽ chạy
 ```
 
-Script ghi ra `target\release-candidate\ha-<version>-windows-x64\` và một file `.zip`. Gói chứa đúng ba file, và script báo lỗi nếu có file khác:
+Script ghi ra `target\release-candidate\ha-<version>-windows-x64\` và một file `.zip`. Gói chứa đúng các file sau, và script báo lỗi nếu có file khác:
 
 | File | Nội dung |
 | --- | --- |
 | `ha.exe` | File thực thi release của revision bạn đã build |
+| `uv.exe` | Bản `uv` đã pin mà Python kernel dùng để dựng môi trường (kiểm checksum khi đóng gói) |
 | `ha.release.json` | Target, version, rustc, source revision và digest của file thực thi |
 | `checksums.txt` | SHA-256 của mọi file khác trong gói |
 

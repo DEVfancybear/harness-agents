@@ -142,7 +142,7 @@ function Assert-BundleContents {
 }
 
 function New-Bundle {
-    param([string] $Artifact, [string] $BundleDirectory, [string] $Version, [string] $Target)
+    param([string] $Artifact, [string] $BundleDirectory, [string] $Version, [string] $Target, [string] $Uv = '')
     if (Test-Path -LiteralPath $BundleDirectory) {
         Remove-Item -LiteralPath $BundleDirectory -Recurse -Force
     }
@@ -150,6 +150,13 @@ function New-Bundle {
     $bundleBinary = Join-Path $BundleDirectory $executableName
     Copy-Item -LiteralPath $Artifact -Destination $bundleBinary -Force
     $digest = Get-FileDigest -FilePath $bundleBinary
+    # The pinned `uv` the Python kernel builds its environment with ships beside
+    # `ha`, so a machine without `uv` still gets a working kernel.
+    $expected = @($executableName, 'ha.release.json', 'checksums.txt')
+    if (-not [string]::IsNullOrWhiteSpace($Uv)) {
+        Copy-Item -LiteralPath $Uv -Destination (Join-Path $BundleDirectory 'uv.exe') -Force
+        $expected += 'uv.exe'
+    }
     $manifest = [ordered]@{
         schema_version = 1
         name           = 'ha'
@@ -174,7 +181,7 @@ function New-Bundle {
     }
     Set-Content -LiteralPath (Join-Path $BundleDirectory 'checksums.txt') -Value $checksumLines -Encoding utf8
 
-    $names = Assert-BundleContents -BundleDirectory $BundleDirectory -Executable $executableName -ExpectedNames @($executableName, 'ha.release.json', 'checksums.txt')
+    $names = Assert-BundleContents -BundleDirectory $BundleDirectory -Executable $executableName -ExpectedNames $expected
     return [pscustomobject]@{
         Directory = $BundleDirectory
         Files     = $names
@@ -288,7 +295,12 @@ Write-Host "Version:  $version"
 Write-Host "Target:   $target"
 Write-Host "Bundle:   $bundleDirectory"
 
-$result = New-Bundle -Artifact $artifact -BundleDirectory $bundleDirectory -Version $version -Target $target
+$bundledUv = ''
+if ($isWindowsHost) {
+    . (Join-Path $PSScriptRoot 'Get-HaUv.ps1')
+    $bundledUv = Install-HaUv -Destination (Join-Path $OutputDirectory 'uv-cache')
+}
+$result = New-Bundle -Artifact $artifact -BundleDirectory $bundleDirectory -Version $version -Target $target -Uv $bundledUv
 $archive = Join-Path $OutputDirectory "$bundleName.zip"
 if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
 Compress-Archive -Path (Join-Path $bundleDirectory '*') -DestinationPath $archive

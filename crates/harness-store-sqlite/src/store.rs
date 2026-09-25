@@ -19,15 +19,14 @@ use sqlx::{
 };
 
 use crate::{
-    AdmissionAck, AdmissionCommit, AgentStateRecord, ArtifactPage, CONTEXT_SCHEMA_VERSION,
-    CompositionSnapshotRecord, ContextCheckpointRecord, ContextPacketRecord,
-    ContinuationLinkRecord, DataDirectoryMarker, FrozenRequestRecord, HostFence,
-    PersistedPluginManifest, ProjectRegistrationRecord, ProviderAttemptRecord, PublishedArtifact,
-    RUNTIME_SCHEMA_VERSION, ReceiptAck, ReceiptCommit, RecoveredToolResult, RuntimeCommandRecord,
-    RuntimeCommandState, STORE_SCHEMA_VERSION, SessionSummary, SnapshotRecord, SourceWorkMarker,
-    StoreDiagnostics, StoreError, StoreFaultPlan, StoreFaultPoint, StorePaths,
-    TOOLS_SCHEMA_VERSION, ToolApprovalBinding, ToolApprovalRecord, ToolApprovalState,
-    ToolIntentCommit, ToolIntentRecord, ToolIntentStatus, ToolSettlementCommit,
+    AdmissionAck, AdmissionCommit, ArtifactPage, CONTEXT_SCHEMA_VERSION, ContextCheckpointRecord,
+    ContextPacketRecord, ContinuationLinkRecord, DataDirectoryMarker, FrozenRequestRecord,
+    HostFence, PersistedPluginManifest, ProjectRegistrationRecord, ProviderAttemptRecord,
+    PublishedArtifact, RUNTIME_SCHEMA_VERSION, ReceiptAck, ReceiptCommit, RecoveredToolResult,
+    RuntimeCommandRecord, RuntimeCommandState, STORE_SCHEMA_VERSION, SessionSummary,
+    SnapshotRecord, SourceWorkMarker, StoreDiagnostics, StoreError, StoreFaultPlan,
+    StoreFaultPoint, StorePaths, TOOLS_SCHEMA_VERSION, ToolApprovalBinding, ToolApprovalRecord,
+    ToolApprovalState, ToolIntentCommit, ToolIntentRecord, ToolIntentStatus, ToolSettlementCommit,
     ToolTaskUpdateCommit, WriterOpenOptions,
 };
 
@@ -84,12 +83,6 @@ const MIGRATION_1: &[&str] = &[
         raw_text TEXT NOT NULL,
         event_id TEXT NOT NULL UNIQUE REFERENCES events(event_id),
         admitted_sequence INTEGER NOT NULL CHECK (admitted_sequence >= 1)
-    )",
-    "CREATE TABLE IF NOT EXISTS instruction_ledger (
-        instruction_id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL REFERENCES sessions(session_id),
-        source_event_id TEXT NOT NULL UNIQUE REFERENCES events(event_id),
-        instruction_json TEXT NOT NULL
     )",
     "CREATE TABLE IF NOT EXISTS task_projections (
         task_id TEXT PRIMARY KEY,
@@ -163,6 +156,16 @@ pub struct SqliteStore {
     pool: SqlitePool,
     writer: Option<WriterLease>,
     fault_plan: StoreFaultPlan,
+    /// The messages of the last frozen request this store wrote, so the next one
+    /// of the same session is stored as what it adds (see `persist_frozen_request`).
+    last_frozen: std::sync::Arc<std::sync::Mutex<Option<LastFrozen>>>,
+}
+
+/// The last frozen request written: its session, its id and its full messages.
+struct LastFrozen {
+    session_id: String,
+    request_id: String,
+    messages: Vec<Value>,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -207,7 +210,28 @@ impl SqliteStore {
         // The marker is validated before anything else touches the directory: a
         // data directory from a newer host must not be migrated or rewritten.
         let marker = read_data_directory_marker(&paths)?;
+        let existed = paths.database_path.is_file();
         let pool = open_pool(&paths, false).await?;
+        // The interactive app opens the writer once per turn. Migrating and
+        // re-checking every table each time was about seventy statements before
+        // the first useful one; a database this process already brought up to date
+        // - and that still exists - is up to date.
+        if existed && options.fault_plan.is_empty() && schema_ensured(&paths.database_path) {
+            let fence = match acquire_fence(&pool, options.host_id).await {
+                Ok(fence) => fence,
+                Err(error) => {
+                    let _ = FileExt::unlock(&lock_file);
+                    return Err(error);
+                }
+            };
+            return Ok(Self {
+                paths,
+                pool,
+                writer: Some(WriterLease { lock_file, fence }),
+                fault_plan: options.fault_plan,
+                last_frozen: std::sync::Arc::default(),
+            });
+        }
         if let Err(error) = run_migrations(&pool, &options.fault_plan).await {
             let _ = FileExt::unlock(&lock_file);
             return Err(error);
@@ -252,12 +276,14 @@ impl SqliteStore {
                 return Err(error);
             }
         };
+        mark_schema_ensured(&paths.database_path);
 
         Ok(Self {
             paths,
             pool,
             writer: Some(WriterLease { lock_file, fence }),
             fault_plan: options.fault_plan,
+            last_frozen: std::sync::Arc::default(),
         })
     }
 
@@ -278,6 +304,7 @@ impl SqliteStore {
             pool,
             writer: None,
             fault_plan: StoreFaultPlan::default(),
+            last_frozen: std::sync::Arc::default(),
         })
     }
 
@@ -441,7 +468,6 @@ impl SqliteStore {
         .await?;
 
         let event_json = to_json(&commit.event, "serialize input event")?;
-        let instruction_json = to_json(&commit.instruction, "serialize instruction")?;
         let state_json = to_json(&commit.working_state, "serialize working state")?;
         let marker_json = to_json(&commit.marker, "serialize source-work marker")?;
         let event_id = commit.event.event_id.clone();
@@ -475,17 +501,6 @@ impl SqliteStore {
         .execute(&mut *transaction)
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "insert inbox", error))?;
-        sqlx::query(
-            "INSERT INTO instruction_ledger(instruction_id, session_id, source_event_id, instruction_json)
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(commit.instruction.instruction_id.as_str())
-        .bind(commit.session_id.as_str())
-        .bind(event_id.as_str())
-        .bind(instruction_json)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "insert instruction ledger", error))?;
         upsert_projection(
             &mut transaction,
             &commit.task_id,
@@ -2192,47 +2207,6 @@ impl SqliteStore {
         })
     }
 
-    pub async fn persist_composition_snapshot(
-        &self,
-        record: CompositionSnapshotRecord,
-    ) -> Result<(), StoreError> {
-        validate_hashed_json(&record.content, &record.content_hash)?;
-        let fence = self.fence()?;
-        let mut tx = self.begin_write(&fence).await?;
-        let json = to_json(&record.content, "serialize composition snapshot")?;
-        let result = sqlx::query("INSERT INTO composition_snapshots(snapshot_id, session_id, task_id, revision, content_json, content_hash) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(snapshot_id) DO NOTHING")
-            .bind(record.snapshot_id.as_str()).bind(record.session_id.as_str()).bind(record.task_id.as_str()).bind(to_i64(record.revision, "composition revision")?).bind(json).bind(record.content_hash.as_str())
-            .execute(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "persist composition snapshot", error))?;
-        if result.rows_affected() == 0 {
-            let existing = sqlx::query_scalar::<_, String>(
-                "SELECT content_hash FROM composition_snapshots WHERE snapshot_id = ?",
-            )
-            .bind(record.snapshot_id.as_str())
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|error| {
-                database_error(
-                    ErrorCode::StorageWriteFailed,
-                    "read composition idempotency",
-                    error,
-                )
-            })?;
-            if existing != record.content_hash.as_str() {
-                return Err(StoreError::new(
-                    ErrorCode::IdempotencyConflict,
-                    "composition snapshot ID is immutable",
-                ));
-            }
-        }
-        tx.commit().await.map_err(|error| {
-            database_error(
-                ErrorCode::StorageWriteFailed,
-                "commit composition snapshot",
-                error,
-            )
-        })
-    }
-
     pub async fn persist_context_packet(
         &self,
         record: ContextPacketRecord,
@@ -2299,11 +2273,33 @@ impl SqliteStore {
         record: FrozenRequestRecord,
     ) -> Result<(), StoreError> {
         validate_hashed_json(&record.request_json, &record.content_hash)?;
+        // Every step of a turn sends the whole transcript so far, so storing each
+        // request whole cost the square of the turn's length. A request whose
+        // messages begin with the previous request's is stored as a reference to
+        // it plus the messages it adds; `list_frozen_requests` puts it back
+        // together and checks it against the hash of the whole request.
+        let messages = record
+            .request_json
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned();
+        let mut stored = record.request_json.clone();
+        if let (Some(messages), Ok(last)) = (&messages, self.last_frozen.lock())
+            && let Some(last) = last.as_ref()
+            && last.session_id == record.session_id.as_str()
+            && !last.messages.is_empty()
+            && last.messages.len() <= messages.len()
+            && messages[..last.messages.len()] == last.messages[..]
+        {
+            stored["messages"] = Value::Array(messages[last.messages.len()..].to_vec());
+            stored["delta_of"] = Value::String(last.request_id.clone());
+            stored["delta_prefix"] = Value::from(last.messages.len());
+        }
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;
         let result = sqlx::query("INSERT INTO frozen_requests(request_id, packet_id, composition_snapshot_id, session_id, task_id, request_json, content_hash, provider_id, model, config_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_id) DO NOTHING")
             .bind(record.request_id.as_str()).bind(record.packet_id.as_str()).bind(record.composition_snapshot_id.as_ref().map(harness_types::CompositionSnapshotId::as_str)).bind(record.session_id.as_str()).bind(record.task_id.as_str())
-            .bind(to_json(&record.request_json, "serialize frozen request")?).bind(record.content_hash.as_str()).bind(&record.provider_id).bind(&record.model).bind(to_i64(record.config_revision, "config revision")?)
+            .bind(to_json(&stored, "serialize frozen request")?).bind(record.content_hash.as_str()).bind(&record.provider_id).bind(&record.model).bind(to_i64(record.config_revision, "config revision")?)
             .execute(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "persist frozen request", error))?;
         if result.rows_affected() == 0 {
             let existing = sqlx::query_scalar::<_, String>(
@@ -2332,7 +2328,15 @@ impl SqliteStore {
                 "commit frozen request",
                 error,
             )
-        })
+        })?;
+        if let (Some(messages), Ok(mut last)) = (messages, self.last_frozen.lock()) {
+            *last = Some(LastFrozen {
+                session_id: record.session_id.as_str().to_owned(),
+                request_id: record.request_id.as_str().to_owned(),
+                messages,
+            });
+        }
+        Ok(())
     }
 
     pub async fn list_frozen_requests(
@@ -2340,8 +2344,9 @@ impl SqliteStore {
         session_id: &SessionId,
     ) -> Result<Vec<FrozenRequestRecord>, StoreError> {
         let rows = sqlx::query("SELECT request_id, packet_id, composition_snapshot_id, session_id, task_id, request_json, content_hash, provider_id, model, config_revision FROM frozen_requests WHERE session_id = ? ORDER BY rowid").bind(session_id.as_str()).fetch_all(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list frozen requests", error))?;
+        let mut full = std::collections::HashMap::new();
         rows.into_iter()
-            .map(|row| frozen_request_from_row(&row))
+            .map(|row| frozen_request_from_row(&row, &mut full))
             .collect()
     }
 
@@ -2520,17 +2525,6 @@ impl SqliteStore {
                 "commit runtime command completion",
                 error,
             )
-        })
-    }
-
-    pub async fn record_agent_state(&self, record: AgentStateRecord) -> Result<(), StoreError> {
-        let fence = self.fence()?;
-        let mut tx = self.begin_write(&fence).await?;
-        sqlx::query("INSERT INTO agent_states(agent_run_id, session_id, task_id, state, generation, revision, detail_json) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(agent_run_id) DO UPDATE SET state=excluded.state, generation=excluded.generation, revision=excluded.revision, detail_json=excluded.detail_json")
-            .bind(record.agent_run_id.as_str()).bind(record.session_id.as_str()).bind(record.task_id.as_str()).bind(&record.state).bind(to_i64(record.generation, "agent generation")?).bind(to_i64(record.revision, "agent revision")?).bind(to_json(&record.detail, "serialize agent state")?)
-            .execute(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "record agent state", error))?;
-        tx.commit().await.map_err(|error| {
-            database_error(ErrorCode::StorageWriteFailed, "commit agent state", error)
         })
     }
 
@@ -2773,6 +2767,26 @@ impl SqliteStore {
     }
 }
 
+/// Databases this process has migrated and checked, by path.
+fn ensured_schemas() -> &'static std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>> {
+    static ENSURED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+    > = std::sync::OnceLock::new();
+    ENSURED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn schema_ensured(path: &std::path::Path) -> bool {
+    ensured_schemas()
+        .lock()
+        .is_ok_and(|ensured| ensured.contains(path))
+}
+
+fn mark_schema_ensured(path: &std::path::Path) {
+    if let Ok(mut ensured) = ensured_schemas().lock() {
+        ensured.insert(path.to_owned());
+    }
+}
+
 async fn open_pool(paths: &StorePaths, read_only: bool) -> Result<SqlitePool, StoreError> {
     let mut options = SqliteConnectOptions::new()
         .filename(&paths.database_path)
@@ -3012,8 +3026,6 @@ async fn ensure_runtime_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     let statements = [
         "CREATE TABLE IF NOT EXISTS runtime_schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE IF NOT EXISTS runtime_commands (command_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL, owner_generation INTEGER NOT NULL, payload_json TEXT NOT NULL, last_error TEXT)",
-        "CREATE TABLE IF NOT EXISTS agent_states (agent_run_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, state TEXT NOT NULL, generation INTEGER NOT NULL, revision INTEGER NOT NULL, detail_json TEXT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS composition_snapshots (snapshot_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, revision INTEGER NOT NULL, content_json TEXT NOT NULL, content_hash TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS context_checkpoints (checkpoint_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, through_sequence INTEGER NOT NULL, revision INTEGER NOT NULL, content_json TEXT NOT NULL, content_hash TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS context_packets (packet_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL, packet_json TEXT NOT NULL, composition_snapshot_id TEXT, omitted_json TEXT NOT NULL, degradation TEXT)",
         "CREATE TABLE IF NOT EXISTS frozen_requests (request_id TEXT PRIMARY KEY, packet_id TEXT NOT NULL, composition_snapshot_id TEXT, session_id TEXT NOT NULL, task_id TEXT NOT NULL, request_json TEXT NOT NULL, content_hash TEXT NOT NULL, provider_id TEXT NOT NULL, model TEXT NOT NULL, config_revision INTEGER NOT NULL)",
@@ -4637,16 +4649,58 @@ fn context_packet_from_row(
 }
 
 #[allow(clippy::needless_borrow)]
+/// One frozen request, whole: a request stored as a delta is joined to the
+/// messages of the request it extends, which `full` holds by request id.
 fn frozen_request_from_row(
     row: &sqlx::sqlite::SqliteRow,
+    full: &mut std::collections::HashMap<String, Vec<Value>>,
 ) -> Result<FrozenRequestRecord, StoreError> {
-    let request_json: Value = serde_json::from_str(&row_get::<String>(&row, "request_json")?)
+    let mut request_json: Value = serde_json::from_str(&row_get::<String>(row, "request_json")?)
         .map_err(|_| {
             StoreError::new(
                 ErrorCode::StorageWriteFailed,
                 "frozen request JSON is invalid",
             )
         })?;
+    let delta_of = request_json
+        .get("delta_of")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(base) = delta_of {
+        let prefix = request_json
+            .get("delta_prefix")
+            .and_then(Value::as_u64)
+            .and_then(|prefix| usize::try_from(prefix).ok())
+            .unwrap_or(usize::MAX);
+        let base_messages = full
+            .get(&base)
+            .filter(|messages| messages.len() >= prefix)
+            .ok_or_else(|| {
+                StoreError::new(
+                    ErrorCode::StorageWriteFailed,
+                    "frozen request extends a request that is not stored",
+                )
+            })?;
+        let mut messages = base_messages[..prefix].to_vec();
+        messages.extend(
+            request_json
+                .get("messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        if let Some(object) = request_json.as_object_mut() {
+            object.remove("delta_of");
+            object.remove("delta_prefix");
+            object.insert("messages".to_owned(), Value::Array(messages));
+        }
+    }
+    if let (Some(messages), Ok(id)) = (
+        request_json.get("messages").and_then(Value::as_array),
+        row_get::<String>(row, "request_id"),
+    ) {
+        full.insert(id, messages.clone());
+    }
     let content_hash =
         ContentHash::parse(row_get::<String>(&row, "content_hash")?).map_err(|_| {
             StoreError::new(

@@ -327,6 +327,28 @@ impl SessionService {
     /// Restore a session from a valid snapshot plus every committed tail event.
     #[allow(clippy::too_many_lines)]
     pub async fn recover(&self, session_id: &SessionId) -> Result<RecoveryView, StoreError> {
+        let mut cache = None;
+        self.recover_cached(session_id, &mut cache).await
+    }
+
+    /// [`Self::recover`], reading only the events committed since `cache` was
+    /// filled.
+    ///
+    /// Every model step of a turn recovers its session, and a full recovery
+    /// re-reads and re-hashes every event, so a long turn cost O(steps x events).
+    /// The fold is append-only over a sequence-checked journal, so the state after
+    /// event N plus the events after N is the state a full fold would reach. A
+    /// cache for another session, or one that claims events the journal does not
+    /// have, is discarded and the fold starts over.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fold: pick the start, fold the new events, check coverage, keep the cache"
+    )]
+    pub async fn recover_cached(
+        &self,
+        session_id: &SessionId,
+        cache: &mut Option<RecoveryCache>,
+    ) -> Result<RecoveryView, StoreError> {
         let summary = self
             .store
             .session_summary(session_id)
@@ -338,45 +360,57 @@ impl SessionService {
                 )
             })?;
         let task_id = summary.task_id.clone();
-        let mut snapshot_sequence = None;
-        let mut snapshot_diagnostic = None;
-        let mut state = None;
-        let mut receipts = Vec::new();
-        let mut instruction_texts = Vec::new();
-
-        match self.store.latest_snapshot(session_id).await {
-            Ok(Some(snapshot)) => match restore_snapshot(&snapshot, session_id, &task_id) {
-                Ok(restored) => {
-                    snapshot_sequence = Some(snapshot.through_sequence);
-                    state = Some(restored.working_state);
-                    receipts = restored.receipts;
-                    instruction_texts = restored.instruction_texts;
-                }
-                Err(error) => {
-                    snapshot_diagnostic = Some(error.to_string());
-                }
-            },
-            Ok(None) => {}
-            Err(error) if error.code() == harness_types::ErrorCode::SnapshotCorrupt => {
-                snapshot_diagnostic = Some(error.to_string());
-            }
-            Err(error) => return Err(error),
-        }
-
-        let through = snapshot_sequence.unwrap_or(0);
         let expected_last = summary.next_sequence.checked_sub(1).ok_or_else(|| {
             StoreError::new(
                 harness_types::ErrorCode::StorageWriteFailed,
                 "session next sequence is invalid",
             )
         })?;
-        if through > expected_last {
-            return Err(StoreError::new(
-                harness_types::ErrorCode::SnapshotCorrupt,
-                "snapshot claims coverage beyond the committed journal",
-            ));
-        }
-        let mut seen = FoldSeen::seed(state.as_ref(), &receipts);
+        let usable = cache.take().filter(|cached| {
+            cached.session_id == *session_id
+                && cached.task_id == task_id
+                && cached.through <= expected_last
+        });
+        let (
+            mut state,
+            mut receipts,
+            mut instruction_texts,
+            mut seen,
+            through,
+            snapshot_sequence,
+            snapshot_diagnostic,
+        ) = if let Some(cached) = usable {
+            (
+                cached.state,
+                cached.receipts,
+                cached.instruction_texts,
+                cached.seen,
+                cached.through,
+                cached.snapshot_sequence,
+                cached.snapshot_diagnostic,
+            )
+        } else {
+            {
+                let seeded = self.seed_recovery(session_id, &task_id).await?;
+                let through = seeded.snapshot_sequence.unwrap_or(0);
+                if through > expected_last {
+                    return Err(StoreError::new(
+                        harness_types::ErrorCode::SnapshotCorrupt,
+                        "snapshot claims coverage beyond the committed journal",
+                    ));
+                }
+                let seen = FoldSeen::seed(seeded.state.as_ref(), &seeded.receipts);
+                (
+                    seeded.state,
+                    seeded.receipts,
+                    seeded.instruction_texts,
+                    seen,
+                    through,
+                    seeded.snapshot_sequence,
+                    seeded.snapshot_diagnostic,
+                )
+            }
+        };
         let mut expected_sequence = through;
         let events = self.store.load_events_after(session_id, through).await?;
         for event in events {
@@ -417,6 +451,73 @@ impl SessionService {
                 format!("journal coverage ended at {expected_sequence}, expected {expected_last}"),
             ));
         }
+        *cache = Some(RecoveryCache {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            state: state.clone(),
+            receipts: receipts.clone(),
+            instruction_texts: instruction_texts.clone(),
+            seen,
+            through: expected_sequence,
+            snapshot_sequence,
+            snapshot_diagnostic: snapshot_diagnostic.clone(),
+        });
+        Self::recovery_view(
+            state,
+            receipts,
+            instruction_texts,
+            snapshot_sequence,
+            snapshot_diagnostic,
+        )
+    }
+
+    /// Where a full recovery starts: the latest valid snapshot, or nothing.
+    async fn seed_recovery(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+    ) -> Result<Seeded, StoreError> {
+        let mut snapshot_sequence = None;
+        let mut snapshot_diagnostic = None;
+        let mut state = None;
+        let mut receipts = Vec::new();
+        let mut instruction_texts = Vec::new();
+
+        match self.store.latest_snapshot(session_id).await {
+            Ok(Some(snapshot)) => match restore_snapshot(&snapshot, session_id, task_id) {
+                Ok(restored) => {
+                    snapshot_sequence = Some(snapshot.through_sequence);
+                    state = Some(restored.working_state);
+                    receipts = restored.receipts;
+                    instruction_texts = restored.instruction_texts;
+                }
+                Err(error) => {
+                    snapshot_diagnostic = Some(error.to_string());
+                }
+            },
+            Ok(None) => {}
+            Err(error) if error.code() == harness_types::ErrorCode::SnapshotCorrupt => {
+                snapshot_diagnostic = Some(error.to_string());
+            }
+            Err(error) => return Err(error),
+        }
+
+        Ok(Seeded {
+            state,
+            receipts,
+            instruction_texts,
+            snapshot_sequence,
+            snapshot_diagnostic,
+        })
+    }
+
+    fn recovery_view(
+        state: Option<WorkingState>,
+        receipts: Vec<ToolExecutionReceipt>,
+        instruction_texts: Vec<String>,
+        snapshot_sequence: Option<u64>,
+        snapshot_diagnostic: Option<String>,
+    ) -> Result<RecoveryView, StoreError> {
         let working_state = state.ok_or_else(|| {
             StoreError::new(
                 harness_types::ErrorCode::InvalidPayload,
@@ -765,7 +866,30 @@ fn restore_snapshot(
 ///
 /// Kept outside the folded state so one long journal folds in linear time
 /// instead of rescanning the receipt and pending vectors for every event.
-#[derive(Default)]
+/// The fold of one session's journal through `through`, kept by a caller that
+/// recovers the same session again (see [`SessionService::recover_cached`]).
+#[derive(Clone, Debug)]
+pub struct RecoveryCache {
+    session_id: SessionId,
+    task_id: TaskId,
+    state: Option<WorkingState>,
+    receipts: Vec<ToolExecutionReceipt>,
+    instruction_texts: Vec<String>,
+    seen: FoldSeen,
+    through: u64,
+    snapshot_sequence: Option<u64>,
+    snapshot_diagnostic: Option<String>,
+}
+
+struct Seeded {
+    state: Option<WorkingState>,
+    receipts: Vec<ToolExecutionReceipt>,
+    instruction_texts: Vec<String>,
+    snapshot_sequence: Option<u64>,
+    snapshot_diagnostic: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
 struct FoldSeen {
     receipts: BTreeSet<String>,
     pending: BTreeSet<String>,

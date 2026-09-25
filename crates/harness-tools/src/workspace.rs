@@ -286,6 +286,42 @@ pub(crate) fn workspace_fingerprint(
     }))
 }
 
+/// The part of an absolute `path` below `root`, with `/` separators; `None` when
+/// `path` is not absolute or not inside `root`. Compared case-insensitively on
+/// Windows, and without the verbatim prefix a canonical path carries there.
+fn absolute_within(root: &Path, path: &str) -> Option<String> {
+    let candidate = Path::new(path);
+    if !candidate.is_absolute() {
+        return None;
+    }
+    let normalize = |text: &str| {
+        let text = text
+            .strip_prefix(r"\\?\")
+            .unwrap_or(text)
+            .replace('\\', "/");
+        let text = text.trim_end_matches('/').to_owned();
+        if cfg!(windows) {
+            text.to_lowercase()
+        } else {
+            text
+        }
+    };
+    let root_text = root.to_str()?;
+    let root_norm = normalize(root_text);
+    let original = path
+        .strip_prefix(r"\\?\")
+        .unwrap_or(path)
+        .replace('\\', "/");
+    let path_norm = normalize(path);
+    if path_norm == root_norm {
+        return Some(String::new());
+    }
+    let prefix = format!("{root_norm}/");
+    path_norm
+        .starts_with(&prefix)
+        .then(|| original[prefix.len()..].trim_end_matches('/').to_owned())
+}
+
 pub(crate) fn resolve_relative(
     root: &Path,
     relative: &str,
@@ -300,6 +336,23 @@ pub(crate) fn resolve_relative(
             "workspace path must not be empty",
         ));
     }
+    // An absolute path inside the workspace is that relative path, as prime-agent's
+    // tools resolve it; models name files by the path they were shown. One that
+    // leaves the workspace is still refused below.
+    let within = absolute_within(root, relative);
+    let relative = match &within {
+        Some(inside) if inside.is_empty() => {
+            if allow_root {
+                return Ok(root.to_owned());
+            }
+            return Err(HarnessError::new(
+                ErrorCode::WorkspaceEscape,
+                "workspace path must name a file inside the workspace",
+            ));
+        }
+        Some(inside) => inside.as_str(),
+        None => relative,
+    };
     let input = Path::new(relative);
     if input.is_absolute()
         || input.components().any(|component| {
@@ -1342,6 +1395,33 @@ fn truncate_text(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Models name files by the absolute path they were shown; inside the
+    /// workspace that is the relative path, outside it stays refused.
+    #[test]
+    fn an_absolute_path_inside_the_workspace_resolves_and_outside_is_refused() {
+        let root = std::env::temp_dir().join(format!("ws-{}", harness_types::InputId::generate()));
+        std::fs::create_dir_all(root.join("docs")).expect("root");
+        std::fs::write(root.join("docs").join("a.md"), "x").expect("file");
+        let root = std::fs::canonicalize(&root).expect("canonical");
+        let plain = root
+            .to_str()
+            .expect("utf-8")
+            .trim_start_matches(r"\\?\")
+            .to_owned();
+        let inside = format!("{plain}\\docs\\a.md");
+        assert_eq!(
+            resolve_relative(&root, &inside, false).expect("inside resolves"),
+            root.join("docs").join("a.md")
+        );
+        assert_eq!(
+            resolve_relative(&root, &plain, true).expect("the root itself"),
+            root
+        );
+        let outside = std::env::temp_dir().join("elsewhere.md");
+        assert!(resolve_relative(&root, outside.to_str().expect("utf-8"), false).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn review_bounded_reader_rejects_invalid_utf8_inside_prefix() {

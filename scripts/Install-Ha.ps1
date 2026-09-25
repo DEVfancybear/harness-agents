@@ -93,6 +93,9 @@ param(
     # Install from a release candidate bundle instead of building: the bundle
     # manifest and its checksums are verified before anything is staged.
     [string] $FromBundle = '',
+    # Do not place the pinned `uv` next to `ha` (the Python kernel then needs `uv`
+    # on PATH to build its environment).
+    [switch] $SkipUv,
     # Remove exactly what this installer recorded, keeping user data.
     [switch] $Uninstall,
     # Required for -Uninstall to delete the recorded PATH entry: install takes an
@@ -735,12 +738,35 @@ function Invoke-Install {
         }
     }
 
+    # The Python kernel builds its environment with `uv`; `ha` looks for it beside
+    # itself first. A bundle carries it; otherwise the pinned release is fetched
+    # and checksum-verified. A failure is reported, not fatal: `uv` on PATH works too.
+    $ownedFiles = @($installedBinary, $manifestPath)
+    $installedUv = $null
+    if (-not $SkipUv -and -not $SelfTest -and $isWindowsHost) {
+        $bundledUv = if (-not [string]::IsNullOrWhiteSpace($FromBundle)) { Join-Path $FromBundle 'uv.exe' } else { '' }
+        try {
+            if ($bundledUv -and (Test-Path -LiteralPath $bundledUv -PathType Leaf)) {
+                $installedUv = Join-Path $installDirectory 'uv.exe'
+                Copy-Item -LiteralPath $bundledUv -Destination $installedUv -Force
+            }
+            else {
+                . (Join-Path $PSScriptRoot 'Get-HaUv.ps1')
+                $installedUv = Install-HaUv -Destination $installDirectory
+            }
+            $ownedFiles += $installedUv
+        }
+        catch {
+            Write-Host "WARNING:   uv was not placed next to ha ($($_.Exception.Message)); install uv (https://docs.astral.sh/uv/) so the Python kernel can build its environment."
+        }
+    }
+
     $manifestArguments = @{
         ManifestPath   = $manifestPath
         Version        = $version
         Digest         = $digest
         Commit         = (Get-BuildCommit)
-        OwnedFiles     = @($installedBinary, $manifestPath)
+        OwnedFiles     = $ownedFiles
         AddedPathEntry = $addedPathEntry
         Source         = $manifestSource
     }
@@ -756,6 +782,9 @@ function Invoke-Install {
     Write-Host "Version:   $version"
     Write-Host "SHA-256:   $digest"
     Write-Host "Manifest:  $manifestPath"
+    if ($null -ne $installedUv) {
+        Write-Host "uv:        $installedUv"
+    }
     if ($foreign.Count -gt 0) {
         Write-Host "WARNING:   'ha' currently resolves to $($foreign[0].Path) first. This installer does not own or remove it; put $installDirectory earlier on PATH to win."
     }

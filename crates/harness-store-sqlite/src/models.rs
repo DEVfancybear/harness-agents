@@ -152,6 +152,12 @@ impl StoreFaultPlan {
         points.insert(point);
     }
 
+    /// Whether no fault is armed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.points.lock().is_ok_and(|points| points.is_empty())
+    }
+
     #[must_use]
     pub fn consume(&self, point: StoreFaultPoint) -> bool {
         let mut points = self
@@ -408,27 +414,6 @@ pub struct RuntimeCommandRecord {
     pub owner_generation: u64,
     pub payload: Value,
     pub last_error: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct AgentStateRecord {
-    pub agent_run_id: AgentRunId,
-    pub session_id: SessionId,
-    pub task_id: TaskId,
-    pub state: String,
-    pub generation: u64,
-    pub revision: u64,
-    pub detail: Value,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct CompositionSnapshotRecord {
-    pub snapshot_id: CompositionSnapshotId,
-    pub session_id: SessionId,
-    pub task_id: TaskId,
-    pub revision: u64,
-    pub content: Value,
-    pub content_hash: ContentHash,
 }
 
 #[derive(Clone, Debug, PartialEq)]

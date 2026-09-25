@@ -3713,12 +3713,13 @@ async fn run_turn(
             if let Some(host) = &delegate_host {
                 chain.push(host.rlm_requests(config.model.clone()));
             }
-            if !config.mcp_servers.is_empty() {
-                chain.push(Arc::new(super::skill_requests::McpRequests::new(
-                    config.mcp_servers.clone(),
-                    workspace_root.clone(),
-                )));
-            }
+            // Always answered, even with no server configured: an unanswered
+            // `mcp.list_connections` reached the model as "request failed", and it
+            // kept retrying a bridge that had nothing behind it.
+            chain.push(Arc::new(super::skill_requests::McpRequests::new(
+                config.mcp_servers.clone(),
+                workspace_root.clone(),
+            )));
             let requests: Arc<dyn super::repl::HostRequests> =
                 Arc::new(super::skill_requests::ChainedRequests(chain));
             super::repl::ReplHost::for_turn(
