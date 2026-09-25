@@ -428,5 +428,5 @@ ha exec "Continue the task" --continue --goal "Task complete" --max-turns 4 --ou
 
 ### 12.6. Memory và `/resume`
 
-Memory theo harness state của prime-agent: model tự giữ memory, ghi chú prompt, skill và đặc tả subagent qua `rlm.harness` trong Python REPL, loại global dùng chung cho mọi hội thoại và loại local theo từng hội thoại, và mỗi lượt mang theo digest của chúng xếp theo mức liên quan. Không có gì được lưu theo từ khoá hay trích xuất chạy nền. `/resume` phát lại chính các lượt của hội thoại cho model và hiện chúng trên màn hình. Xem mục 19 và 20 của `MEMORY_AND_CONTINUITY`.
+Memory theo harness state của prime-agent: model tự giữ memory, ghi chú prompt, skill và đặc tả subagent qua `rlm.harness` trong Python REPL, loại global dùng chung cho mọi hội thoại và loại local theo từng hội thoại, và mỗi lượt mang theo digest của chúng xếp theo mức liên quan. Không có gì được lưu theo từ khoá. `/refine` (hoặc `refine.run()` trong kernel) biến hội thoại thành các chỉnh sửa đã kiểm tra, `/refine --rollback <id>` hoàn tác một lần, và cứ 25 lượt một bước review tự động refine local khi có điều đáng giữ (`HA_AUTO_REFINE=off` để tắt). `/resume` phát lại chính các lượt của hội thoại cho model và hiện chúng trên màn hình. Xem mục 19 và 20 của `MEMORY_AND_CONTINUITY`.
 

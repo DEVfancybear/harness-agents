@@ -42,6 +42,8 @@ pub struct ModelInfo {
 
 /// `goal.*`, `compact.*` and `model.info` for one turn.
 pub struct SkillRequests {
+    /// A refinement the `refine` skill scheduled for the end of the turn.
+    refine: Arc<std::sync::Mutex<Option<super::refine::RefineOptions>>>,
     sender: UnboundedSender<SessionEvent>,
     model: ModelInfo,
     context_window: u64,
@@ -57,6 +59,7 @@ pub struct SkillRequests {
 impl SkillRequests {
     #[must_use]
     pub fn new(
+        refine: Arc<std::sync::Mutex<Option<super::refine::RefineOptions>>>,
         sender: UnboundedSender<SessionEvent>,
         model: ModelInfo,
         context_window: u64,
@@ -64,6 +67,7 @@ impl SkillRequests {
         goal_host: Option<super::goal::GoalHost>,
     ) -> Self {
         Self {
+            refine,
             sender,
             model,
             context_window,
@@ -153,6 +157,46 @@ impl SkillRequests {
         }
     }
 
+    /// `handleRefineHostRequest`: refinement waits for the turn to end, so
+    /// `refine.run` only schedules it.
+    fn refine(&self, kind: &str, request: &Value) -> Result<Value, String> {
+        match kind {
+            "refine.status" => Ok(json!({
+                "pending": self.refine.lock().is_ok_and(|pending| pending.is_some()),
+                "in_flight": false,
+            })),
+            "refine.run" => {
+                let instructions = match &request["instructions"] {
+                    Value::Null => None,
+                    Value::String(text) => Some(text.clone()),
+                    _ => {
+                        return Err(
+                            "refine.run instructions must be a string when provided".to_owned()
+                        );
+                    }
+                };
+                let global = match &request["global"] {
+                    Value::Null => false,
+                    Value::Bool(flag) => *flag,
+                    _ => return Err("refine.run global must be a boolean when provided".to_owned()),
+                };
+                if let Ok(mut pending) = self.refine.lock() {
+                    let previous = pending.take().unwrap_or_default();
+                    *pending = Some(super::refine::RefineOptions {
+                        instructions: instructions.or(previous.instructions),
+                        global: global || previous.global,
+                        rollback: None,
+                    });
+                }
+                Ok(json!({
+                    "scheduled": true,
+                    "note": "Refinement runs when the current turn ends; applied edits are reported and reach your context through the harness digest. Continue working normally.",
+                }))
+            }
+            _ => Err(format!("unknown refine request type \"{kind}\"")),
+        }
+    }
+
     /// `handleCompactHostRequest`: a compaction would end the turn running the
     /// requesting cell, so `compact.run` only schedules it for the turn's end.
     fn compact(&self, kind: &str, request: &Value) -> Result<Value, String> {
@@ -199,6 +243,7 @@ impl HostRequests for SkillRequests {
                 })),
                 kind if kind.starts_with("goal.") => self.goal(kind, request),
                 kind if kind.starts_with("compact.") => self.compact(kind, request),
+                kind if kind.starts_with("refine.") => self.refine(kind, request),
                 _ => return None,
             })
         })
@@ -221,6 +266,7 @@ mod tests {
         let (sender, events) = tokio::sync::mpsc::unbounded_channel();
         (
             SkillRequests::new(
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
                 sender,
                 ModelInfo {
                     id: "deepseek-v4-flash".to_owned(),
@@ -310,5 +356,17 @@ mod tests {
                 .await
                 .is_none()
         );
+        let scheduled = host
+            .handle(&json!({"type": "refine.run", "instructions": "remember tabs", "global": true}))
+            .await
+            .expect("known")
+            .expect("ok");
+        assert_eq!(scheduled["scheduled"], true);
+        let status = host
+            .handle(&json!({"type": "refine.status"}))
+            .await
+            .expect("known")
+            .expect("ok");
+        assert_eq!(status["pending"], true);
     }
 }

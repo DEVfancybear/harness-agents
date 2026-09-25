@@ -289,6 +289,7 @@ async fn resume_flow() {
         answer_question_id: None,
         shell_prefix: None,
         compact_guidance: None,
+        refine: None,
     });
     let (request, outcome) = tokio::time::timeout(Duration::from_mins(1), async {
         tokio::join!(
@@ -340,6 +341,7 @@ async fn resume_flow() {
         answer_question_id: None,
         shell_prefix: None,
         compact_guidance: None,
+        refine: None,
     });
     let outcome = terminal(&mut channel).await;
     assert!(
@@ -364,6 +366,7 @@ async fn resume_flow() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one scenario, told in order")]
 async fn g06_bang_prefix_uses_interactive_approval_and_attaches_output() {
     let temp = tempfile::tempdir().expect("temp root");
     let project = temp.path().join("project");
@@ -389,6 +392,7 @@ async fn g06_bang_prefix_uses_interactive_approval_and_attaches_output() {
             mode: ShellPrefixMode::AttachToNextMessage,
         }),
         compact_guidance: None,
+        refine: None,
     });
 
     let approval = tokio::time::timeout(Duration::from_secs(30), async {

@@ -63,6 +63,7 @@ Building a release package (checksums, manifest) is described in [docs/BUILD_AND
 | Correct a running turn | `/steer <text>` |
 | Choose how much the model reasons | `/thinking` (show), `/thinking off\|minimal\|low\|medium\|high\|xhigh\|max` |
 | Keep working until something is done | `/goal <objective>`, then `/goal status`, `/goal pause`, `/goal resume`, `/goal clear` |
+| Keep what this conversation taught | `/refine [--global] [instructions]`, `/refine --rollback <id>` |
 | Shrink a long conversation | `/compact [what to keep]` |
 | See cost, context, permissions | `/cost`, `/context`, `/permissions` |
 
@@ -83,6 +84,7 @@ Settings merge default → user `config.toml` → trusted project `.harness/conf
 | `SERPER_API_KEY` | — | Google results for `web_search` (without it: DuckDuckGo) |
 | `HA_WEB` | on | `off` removes `web_search` and `web_fetch` |
 | `HA_REPL` | on | `off` removes the `ipython` tool |
+| `HA_AUTO_REFINE` | on | `off` stops the review every 25 turns that refines memory |
 | `HA_PYTHON` | `python3`, `python`, `py -3` | Interpreter for the REPL kernel (3.11 or newer) |
 | `HA_REPL_SHELL` | Git Bash on Windows, `/bin/bash` | Absolute path of the POSIX shell `bash()` runs in |
 | `HA_UI` | auto | `plain` forces line mode |
@@ -162,6 +164,7 @@ Cách build gói release (checksum, manifest) nằm trong [docs/BUILD_AND_RELEAS
 | Chỉnh hướng một lượt đang chạy | `/steer <text>` |
 | Chọn mức suy luận của model | `/thinking` (xem), `/thinking off\|minimal\|low\|medium\|high\|xhigh\|max` |
 | Làm tới khi xong việc | `/goal <mục tiêu>`, rồi `/goal status`, `/goal pause`, `/goal resume`, `/goal clear` |
+| Giữ lại điều hội thoại đã học | `/refine [--global] [chỉ dẫn]`, `/refine --rollback <id>` |
 | Rút gọn hội thoại dài | `/compact [điều cần giữ]` |
 | Xem chi phí, context, quyền | `/cost`, `/context`, `/permissions` |
 
@@ -182,6 +185,7 @@ Cấu hình được gộp theo thứ tự mặc định → `config.toml` của
 | `SERPER_API_KEY` | — | Kết quả Google cho `web_search` (không có thì dùng DuckDuckGo) |
 | `HA_WEB` | bật | `off` để gỡ `web_search` và `web_fetch` |
 | `HA_REPL` | bật | `off` để gỡ tool `ipython` |
+| `HA_AUTO_REFINE` | bật | `off` để tắt bước review mỗi 25 lượt dùng để refine memory |
 | `HA_PYTHON` | `python3`, `python`, `py -3` | Trình thông dịch cho kernel REPL (3.11 trở lên) |
 | `HA_REPL_SHELL` | Git Bash trên Windows, `/bin/bash` | Đường dẫn tuyệt đối tới shell POSIX mà `bash()` dùng |
 | `HA_UI` | tự động | `plain` để ép chế độ dòng lệnh |

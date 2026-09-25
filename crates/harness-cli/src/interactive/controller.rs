@@ -1213,6 +1213,7 @@ impl InteractiveController {
             answer_question_id: None,
             shell_prefix: None,
             compact_guidance: None,
+            refine: None,
         });
         let mut effects = Vec::new();
         let item = if automatic {
@@ -1246,6 +1247,7 @@ impl InteractiveController {
             answer_question_id: Some(question.question_id),
             shell_prefix: None,
             compact_guidance: None,
+            refine: None,
         });
         vec![Effect::History(HistoryItem::User { text }), Effect::Redraw]
     }
@@ -1259,6 +1261,7 @@ impl InteractiveController {
             answer_question_id: None,
             shell_prefix: Some(shell_prefix),
             compact_guidance: None,
+            refine: None,
         });
         let mut effects = Vec::new();
         self.push_history(&mut effects, HistoryItem::User { text });
@@ -1842,6 +1845,34 @@ impl InteractiveController {
                         answer_question_id: None,
                         shell_prefix: None,
                         compact_guidance: Some(guidance),
+                        refine: None,
+                    });
+                    self.push_history(&mut effects, HistoryItem::User { text });
+                }
+            }
+            "/refine" => {
+                if self.phase.has_active_run() {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "cannot refine while a run is active; wait for it to finish".to_owned(),
+                    });
+                } else if let Some(problem) = self.service.provider_problem() {
+                    self.push_history(&mut effects, HistoryItem::Error { message: problem });
+                } else {
+                    let arguments = raw_argument.unwrap_or_default().to_owned();
+                    let text = if arguments.is_empty() {
+                        "/refine".to_owned()
+                    } else {
+                        format!("/refine {arguments}")
+                    };
+                    self.continuations = 0;
+                    self.fresh_run(Instant::now(), Some(text.clone()));
+                    self.service.submit(SubmitRequest {
+                        input_id: InputId::generate(),
+                        text: text.clone(),
+                        answer_question_id: None,
+                        shell_prefix: None,
+                        compact_guidance: None,
+                        refine: Some(super::refine::RefineOptions::parse(&arguments)),
                     });
                     self.push_history(&mut effects, HistoryItem::User { text });
                 }
@@ -2087,6 +2118,7 @@ impl InteractiveController {
             answer_question_id: None,
             shell_prefix: None,
             compact_guidance: None,
+            refine: None,
         });
         self.push_history(&mut effects, HistoryItem::User { text });
         effects.push(Effect::Redraw);
@@ -2217,6 +2249,7 @@ impl InteractiveController {
             answer_question_id: None,
             shell_prefix: None,
             compact_guidance: None,
+            refine: None,
         });
         self.push_history(effects, HistoryItem::User { text });
     }

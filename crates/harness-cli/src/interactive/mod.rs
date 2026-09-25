@@ -27,6 +27,7 @@ pub mod paths;
 pub mod permissions;
 pub mod project;
 pub mod prompt;
+pub mod refine;
 pub mod repl;
 pub mod service;
 pub mod skill_requests;

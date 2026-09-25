@@ -425,5 +425,5 @@ On Windows `run_shell` uses `pwsh`, falling back to `powershell.exe` when pwsh i
 
 ### 12.6. Memory and `/resume`
 
-Memory follows prime-agent's continual harness state: the model keeps memories, prompt notes, skills and subagent specs itself through `rlm.harness` in the Python REPL, global ones shared by every conversation and local ones per conversation, and every turn carries a digest of them ranked for the task. Nothing is stored by keyword or extracted in the background. `/resume` replays the conversation's own turns to the model and shows them on screen. See `MEMORY_AND_CONTINUITY` sections 19 and 20.
+Memory follows prime-agent's continual harness state: the model keeps memories, prompt notes, skills and subagent specs itself through `rlm.harness` in the Python REPL, global ones shared by every conversation and local ones per conversation, and every turn carries a digest of them ranked for the task. Nothing is stored by keyword. `/refine` (or `refine.run()` in the kernel) turns the conversation into validated edits, `/refine --rollback <id>` undoes one, and every 25 turns an automatic review refines locally when there is something worth keeping (`HA_AUTO_REFINE=off` turns it off). `/resume` replays the conversation's own turns to the model and shows them on screen. See `MEMORY_AND_CONTINUITY` sections 19 and 20.
 

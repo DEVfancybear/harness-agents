@@ -113,6 +113,8 @@ pub struct SubmitRequest {
     /// A host-issued compaction action. It shares the normal admitted-input and
     /// cancellation path but never dispatches the command text to the model.
     pub compact_guidance: Option<String>,
+    /// A host-issued `/refine`: like compaction, it never reaches the model as a turn.
+    pub refine: Option<super::refine::RefineOptions>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1038,6 +1040,11 @@ pub struct AgentSessionService {
     repl: Option<Arc<super::repl::ReplShared>>,
     /// The thinking level `/thinking` chose, for the next turns.
     thinking: Option<harness_providers::ThinkingLevel>,
+    /// Turns since the last automatic refine review.
+    turns_since_review: Arc<std::sync::atomic::AtomicU32>,
+    /// `HA_AUTO_REFINE=off` turns the automatic review off (prime-agent's
+    /// `autoRefine.enabled`, on by default).
+    auto_refine: bool,
 }
 
 enum McpElicitationAnswer {
@@ -1471,6 +1478,15 @@ impl AgentSessionService {
             config_overrides.model.clone(),
         )));
         let writer_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let auto_refine = !environment
+            .value("HA_AUTO_REFINE")
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "off" | "0" | "false" | "no"
+                )
+            });
         let repl = super::repl::ReplShared::from_environment(
             &environment,
             &context.paths.data_dir,
@@ -1512,6 +1528,8 @@ impl AgentSessionService {
             goal_forgotten: false,
             repl,
             thinking: None,
+            turns_since_review: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            auto_refine,
         }
     }
 
@@ -1703,6 +1721,8 @@ impl SessionPort for AgentSessionService {
         };
         let repl = self.repl.clone();
         let thinking = self.thinking;
+        let turns_since_review = Arc::clone(&self.turns_since_review);
+        let auto_refine = self.auto_refine;
         // Every user input opens its own session; the conversation is the chain of
         // sessions linked to the same task.
         let session_id = SessionId::generate();
@@ -1738,6 +1758,8 @@ impl SessionPort for AgentSessionService {
                 goal,
                 repl,
                 thinking,
+                turns_since_review,
+                auto_refine,
             ))
             .await;
         });
@@ -2583,6 +2605,8 @@ async fn run_turn(
     goal: GoalRecord,
     repl: Option<Arc<super::repl::ReplShared>>,
     thinking: Option<harness_providers::ThinkingLevel>,
+    turns_since_review: Arc<std::sync::atomic::AtomicU32>,
+    auto_refine: bool,
 ) {
     let send = |event| {
         let _ = sender.send(event);
@@ -2742,6 +2766,7 @@ async fn run_turn(
     }
 
     if request.compact_guidance.is_none()
+        && request.refine.is_none()
         && store
             .session_setting(&task_id, "title")
             .await
@@ -3003,6 +3028,46 @@ async fn run_turn(
         }
         return;
     }
+    // `/refine` reads the conversation so far and edits the harness state; it is not
+    // a model turn, like compaction above.
+    if let Some(options) = request.refine.clone() {
+        let scopes = super::refine::HarnessScopes {
+            global: super::harness::global_dir(&data_dir),
+            local: super::harness::local_dir(&data_dir, task_id.as_str()),
+        };
+        let conversation = match source.as_ref() {
+            Some(source_session) => harness_runtime::conversation_history(&store, source_session)
+                .await
+                .map(|history| super::refine::serialize_turns(&history.turns()))
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        let result =
+            super::refine::refine(&provider, &config.model, &conversation, &scopes, &options).await;
+        drop(runtime);
+        if let Ok(store) = Arc::try_unwrap(store) {
+            let _ = store.close().await;
+        }
+        match result {
+            Ok(refinement) => {
+                send(SessionEvent::Notice {
+                    message: format!("refine {}: {}", refinement.id(), refinement.notice()),
+                });
+                send(SessionEvent::RunTerminal {
+                    outcome: RunOutcome::Done,
+                });
+            }
+            Err(message) => {
+                send(SessionEvent::RecoverableError {
+                    message: format!("refine failed: {message}"),
+                });
+                send(SessionEvent::RunTerminal {
+                    outcome: RunOutcome::Failed("refine failed".to_owned()),
+                });
+            }
+        }
+        return;
+    }
     // Local extensions are explicit opt-in, loaded for this turn and stopped when it
     // ends: a chat turn never leaves an extension process behind.
     let extension_root = extensions::extensions_root(&environment, &data_dir);
@@ -3155,12 +3220,16 @@ async fn run_turn(
         .iter()
         .map(|skill| skill.import_name.clone())
         .collect::<Vec<_>>();
+    // What the `refine` skill asks for, run when the turn ends.
+    let refine_request: Arc<Mutex<Option<super::refine::RefineOptions>>> =
+        Arc::new(Mutex::new(None));
     let repl_host = match &repl {
         Some(shared) => {
             // `rlm.spawn` and its family run on this turn's delegated workers; the
             // other skills' requests are answered from the session's state.
             let skills: Arc<dyn super::repl::HostRequests> =
                 Arc::new(super::skill_requests::SkillRequests::new(
+                    Arc::clone(&refine_request),
                     sender.clone(),
                     super::skill_requests::ModelInfo {
                         id: config.model.clone(),
@@ -3330,7 +3399,8 @@ async fn run_turn(
             &harness_state,
             super::harness::DigestOptions {
                 repl: repl_host.is_some(),
-                refine: false,
+                refine: repl_host.is_some()
+                    && kernel_skill_imports.iter().any(|name| name == "refine"),
             },
             &super::harness::weighted_terms(goal_objective, &[request.text.as_str()]),
         ),
@@ -3470,6 +3540,74 @@ async fn run_turn(
     // Release the writer before announcing the terminal event: the next turn takes
     // a newer generation of the task lease, and it must not race this one.
     drop(driver);
+    // prime-agent refines at the turn boundary: what the `refine` skill asked for, and
+    // every twenty-five turns an automatic review that refines when the trajectory
+    // holds something worth keeping.
+    if outcome.is_ok() {
+        let requested = refine_request
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take());
+        let turns = turns_since_review.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let review_due = auto_refine && turns >= super::refine::AUTO_REFINE_TURN_INTERVAL;
+        if requested.is_some() || review_due {
+            let scopes = super::refine::HarnessScopes {
+                global: super::harness::global_dir(&data_dir),
+                local: super::harness::local_dir(&data_dir, goal_task.as_str()),
+            };
+            let conversation = harness_runtime::conversation_history(&store, &session_id)
+                .await
+                .map(|history| super::refine::serialize_turns(&history.turns()))
+                .unwrap_or_default();
+            let options = if let Some(options) = requested {
+                Some(options)
+            } else {
+                turns_since_review.store(0, std::sync::atomic::Ordering::SeqCst);
+                match super::refine::review(&provider, &config.model, &conversation, &scopes, turns)
+                    .await
+                {
+                    Ok(review) if review.should_refine => Some(super::refine::RefineOptions {
+                        instructions: review.instructions,
+                        global: false,
+                        rollback: None,
+                    }),
+                    Ok(review) => {
+                        send(SessionEvent::Notice {
+                            message: format!(
+                                "auto-refine: nothing to refine ({})",
+                                review.rationale
+                            ),
+                        });
+                        None
+                    }
+                    Err(error) => {
+                        send(SessionEvent::Notice {
+                            message: format!("auto-refine review skipped: {error}"),
+                        });
+                        None
+                    }
+                }
+            };
+            if let Some(options) = options {
+                match super::refine::refine(
+                    &provider,
+                    &config.model,
+                    &conversation,
+                    &scopes,
+                    &options,
+                )
+                .await
+                {
+                    Ok(refinement) => send(SessionEvent::Notice {
+                        message: format!("refine {}: {}", refinement.id(), refinement.notice()),
+                    }),
+                    Err(error) => send(SessionEvent::Notice {
+                        message: format!("refine failed: {error}"),
+                    }),
+                }
+            }
+        }
+    }
     // A finished goal is not brought back by `/resume`.
     if goal_host
         .as_ref()
@@ -4476,6 +4614,7 @@ mod tests {
             answer_question_id: None,
             shell_prefix: None,
             compact_guidance: None,
+            refine: None,
         }
     }
 

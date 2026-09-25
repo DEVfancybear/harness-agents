@@ -407,6 +407,13 @@ The app's memory follows prime-agent (`core/refinement/refinement.ts`, `prime-ag
 - The digest is sent as `[harness-digest] ... <harness_state>...</harness_state>`, prime-agent's wording, with the rules for when to refine and, when the REPL is available, the `rlm.harness` call contract. An entry or event whose fields have the wrong type is skipped with a diagnostic line rather than breaking the digest.
 - `ha exec` carries the same digest and reports `memory.kind = "harness"` with the entry count.
 
+### 19.3. Refinement: how memory is learned
+
+- `/refine [--global] [--rollback <id>] [instructions]` - or `await refine.run()` from the kernel, applied when the turn ends - asks the model, with prime-agent's refinement prompt, to turn the conversation into create/update/delete edits to the harness state. It sees the conversation (the newest 80 000 characters), every entry of both scopes and the last twenty refinements, and answers with JSON.
+- Every edit is validated before it is applied, as prime-agent validates it: a known action and kind, an id for update and delete, title and content for create and update, a Python `reference` and `arguments` for a skill, and never the base system prompt. A refused edit is reported with its reason; the rest are applied to the requested scope (local unless `--global`) with a version number, and an entry that changed while the model was planning is not overwritten.
+- Each refinement is recorded in the scope's `refinements.jsonl`; `--rollback <id>` restores the snapshots it replaced.
+- Every twenty-five turns an automatic review asks the model whether the trajectory holds something worth refining, and refines locally when it does - prime-agent's auto-refine, on by default; `HA_AUTO_REFINE=off` turns it off. This is the only way memory is learned without being asked.
+
 ## 20. Conversation continuation: the contract as implemented
 
 This section records a failure measured with `/resume` and the contract that replaced it. Each chat turn is its own session, linked to the previous turn through `session_lineage`. A continued session used to carry only the previous turn's **request packet** as `continuation_context`: the question and the state around it, never the model's answer. Measured consequence: after `/resume` the model knew what it had been asked but not what it had answered. Each packet also contained the one before it, so every turn re-sent all earlier packets nested inside each other. The picker listed every turn as a separate session, and picking any row other than the newest continued from the middle of the conversation.

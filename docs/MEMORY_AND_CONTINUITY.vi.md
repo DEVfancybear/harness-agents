@@ -407,6 +407,13 @@ Memory của ứng dụng theo prime-agent (`core/refinement/refinement.ts`, `pr
 - Digest được gửi dạng `[harness-digest] ... <harness_state>...</harness_state>`, đúng câu chữ của prime-agent, kèm quy tắc khi nào nên refine và, khi có REPL, cách gọi `rlm.harness`. Entry hoặc sự kiện có trường sai kiểu bị bỏ qua kèm một dòng chẩn đoán thay vì làm hỏng digest.
 - `ha exec` mang cùng digest và báo `memory.kind = "harness"` kèm số entry.
 
+### 19.3. Refine: memory được học như thế nào
+
+- `/refine [--global] [--rollback <id>] [chỉ dẫn]` - hoặc `await refine.run()` từ kernel, chạy khi lượt kết thúc - yêu cầu model, bằng prompt refine của prime-agent, biến hội thoại thành các chỉnh sửa create/update/delete cho harness state. Model thấy hội thoại (80 000 ký tự mới nhất), mọi entry của cả hai scope và hai mươi lần refine gần nhất, và trả lời bằng JSON.
+- Mỗi chỉnh sửa được kiểm tra trước khi áp dụng, như prime-agent kiểm tra: action và kind hợp lệ, có id khi update và delete, có tiêu đề và nội dung khi create và update, skill phải có `reference` Python và `arguments`, và không bao giờ sửa system prompt gốc. Chỉnh sửa bị từ chối được báo kèm lý do; phần còn lại được áp vào scope được yêu cầu (local, trừ khi `--global`) kèm số version, và entry đã đổi trong lúc model đang lập kế hoạch sẽ không bị ghi đè.
+- Mỗi lần refine được ghi vào `refinements.jsonl` của scope; `--rollback <id>` khôi phục các bản đã bị thay.
+- Cứ hai mươi lăm lượt, một bước review tự động hỏi model xem hội thoại có gì đáng refine không, và refine local khi có - auto-refine của prime-agent, mặc định bật; `HA_AUTO_REFINE=off` để tắt. Đây là cách duy nhất memory được học mà không cần yêu cầu.
+
 ## 20. Tiếp tục hội thoại: hợp đồng đã triển khai
 
 Mục này ghi lại lỗi đã đo với `/resume` và hợp đồng thay thế. Mỗi lượt chat là một session riêng, nối với lượt trước bằng `session_lineage`. Trước đây session tiếp nối chỉ mang theo **packet request** của lượt trước làm `continuation_context`: câu hỏi và trạng thái quanh nó, không bao giờ có câu trả lời của model. Hệ quả đo được: sau `/resume`, model biết mình đã được hỏi gì nhưng không biết mình đã trả lời gì. Ngoài ra mỗi packet chứa packet trước nó, nên mỗi lượt gửi lại toàn bộ packet cũ lồng nhau. Picker cũng liệt kê từng lượt như một session riêng: chọn dòng nào khác dòng mới nhất thì tiếp tục từ giữa hội thoại.

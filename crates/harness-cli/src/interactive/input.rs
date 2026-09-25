@@ -752,7 +752,7 @@ impl LineEditor {
 /// This table is the **one** source for both: [`crate::interactive::view::help_lines`]
 /// builds the reference page from it and the menu draws its rows from it, so the
 /// list a user sees while typing cannot drift from the list `/help` promises.
-pub const SLASH_COMMANDS: [SlashCommand; 33] = [
+pub const SLASH_COMMANDS: [SlashCommand; 34] = [
     SlashCommand {
         name: "/help",
         arguments: "",
@@ -842,6 +842,11 @@ pub const SLASH_COMMANDS: [SlashCommand; 33] = [
         name: "/clear",
         arguments: "",
         summary: "start a new session and clear only the TUI viewport",
+    },
+    SlashCommand {
+        name: "/refine",
+        arguments: "[--global] [--rollback <id>] [instructions]",
+        summary: "turn what this conversation taught into memories, notes, skills or subagent specs",
     },
     SlashCommand {
         name: "/thinking",
@@ -1321,7 +1326,7 @@ mod tests {
         );
 
         type_text(&mut editor, "re");
-        assert_eq!(names(&editor), ["/reload", "/rename", "/resume"]);
+        assert_eq!(names(&editor), ["/reload", "/refine", "/rename", "/resume"]);
 
         // A complete command has nothing left to suggest, and an argument means
         // the word is over: neither keeps a menu on screen.
@@ -1469,7 +1474,7 @@ mod tests {
                 .iter()
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["/reload", "/rename", "/resume"]
+            ["/reload", "/refine", "/rename", "/resume"]
         );
         assert_eq!(
             super::matching("/c")

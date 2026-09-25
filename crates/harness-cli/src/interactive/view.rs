@@ -171,8 +171,8 @@ pub fn help_card_lines() -> Vec<String> {
         (
             "Chat",
             &[
-                "/new", "/resume", "/rename", "/clear", "/compact", "/context", "/undo", "/copy",
-                "/export",
+                "/new", "/resume", "/rename", "/clear", "/compact", "/refine", "/context", "/undo",
+                "/copy", "/export",
             ],
         ),
         (
