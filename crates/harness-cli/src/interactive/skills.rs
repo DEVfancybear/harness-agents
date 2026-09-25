@@ -529,6 +529,10 @@ mod tests {
             "the release must not ship prime-intellect"
         );
         assert!(
+            catalog.entry("writing-skills").is_none(),
+            "the release must not ship writing-skills"
+        );
+        assert!(
             catalog
                 .entry("github-deep-research")
                 .expect("research skill")
