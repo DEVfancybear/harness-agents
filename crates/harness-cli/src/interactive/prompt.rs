@@ -152,6 +152,28 @@ impl SystemPromptBuilder {
     }
 }
 
+/// prime-agent's skill lines of `buildRlmPrompt` for a session with the REPL: the
+/// Python skills the kernel pre-imports, and how to learn their API.
+#[must_use]
+pub fn python_skills_block(imports: &[String]) -> Option<String> {
+    if imports.is_empty() {
+        return None;
+    }
+    let installed = imports
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut lines = vec![
+        format!("Installed Python skill modules (pre-imported): {installed}."),
+        "Read each skill's SKILL.md for its API. Inspect a module with `help(<skill>)` or `dir(<skill>)`, then inspect a documented callable with `inspect.signature(<skill>.<function>)`.".to_owned(),
+    ];
+    if imports.iter().any(|name| name == "edit") {
+        lines.push("For targeted existing-file edits, prefer the pre-imported async `edit` skill from the REPL: `old = '''...'''; new = '''...'''; await edit(path=\"pkg/file.py\", old_str=old, new_str=new)`. Use exact old/new strings; if the text contains triple double quotes, use triple single-quoted variables or build `old`/`new` from inspected file slices.".to_owned());
+    }
+    Some(lines.join("\n"))
+}
+
 /// ha's own guidelines, prime-agent's `promptGuidelines` slot: each one a rule that
 /// measurably cost turns here, shown only when its tool is present.
 fn additional_guidance(has: &dyn Fn(&str) -> bool) -> Vec<&'static str> {
@@ -183,15 +205,32 @@ pub fn append_skill_metadata(mut prompt: String, entries: &[SkillCatalogEntry]) 
     prompt.push_str(
         "\n\nThe following skills provide specialized instructions for specific tasks.\n\
          Use activate_skill to load a skill's instructions when the task matches its description; read_skill_file reads the other files a skill ships.\n\
+         Skills with a python_import are prepared in the persistent Python kernel when available and can be called directly by that import name.\n\
          When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md) and use that absolute path in tool commands.\n\
          \n\
          <available_skills>\n",
     );
     for entry in &visible {
+        // A skill that ships a Python package says so, and under which import name
+        // the kernel has it, as `formatSkillsForPrompt` does.
+        let imports = super::repl::python_skill_packages(&entry.path);
+        let mut python = String::new();
+        for skill in &imports {
+            let _ = write!(
+                python,
+                "\n    <python_import>{}</python_import>",
+                escape_xml(&skill.import_name)
+            );
+        }
         let _ = write!(
             prompt,
-            "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>\n",
+            "  <skill>\n    <name>{}</name>\n    <type>{}</type>{python}\n    <description>{}</description>\n    <location>{}</location>\n  </skill>\n",
             escape_xml(&entry.name),
+            if imports.is_empty() {
+                "markdown"
+            } else {
+                "python"
+            },
             escape_xml(&entry.description),
             escape_xml(&entry.path.display().to_string()),
         );

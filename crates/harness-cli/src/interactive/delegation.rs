@@ -1005,6 +1005,47 @@ impl HostRequests for RlmChildren {
                 "rlm.create_session" => {
                     Err("separate top-level sessions are not available in ha".to_owned())
                 }
+                // prime-agent's `agent_observe` skill over this turn's children: the
+                // only family a turn has here.
+                "agent_observe.list" => self.list().await.map(|listed| {
+                    json!({ "parent": null, "siblings": [], "children": listed["subagents"] })
+                }),
+                "agent_observe.get" | "agent_observe.recent" => {
+                    let target = request["target"].as_str().unwrap_or_default().to_owned();
+                    match self.select(std::slice::from_ref(&target)) {
+                        Ok(ids) => {
+                            let now = tokio::time::Instant::now();
+                            for task_id in &ids {
+                                self.settle(task_id, now).await;
+                            }
+                            self.children
+                                .lock()
+                                .map_err(|_| "the child registry is unavailable".to_owned())
+                                .and_then(|children| {
+                                    let child = children
+                                        .iter()
+                                        .find(|child| ids.contains(&child.task_id))
+                                        .ok_or("no such child")?;
+                                    let row = self.row(child);
+                                    Ok(if kind == "agent_observe.get" {
+                                        row
+                                    } else {
+                                        json!({
+                                            "target": target,
+                                            "messages": row["answer_preview"]
+                                                .as_str()
+                                                .map(|answer| vec![json!({"role": "assistant", "text": answer})])
+                                                .unwrap_or_default(),
+                                        })
+                                    })
+                                })
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                "agent_message.send" => Err(
+                    "agent messages are not available in ha: this agent has no parent, and its children are delegated workers that take no messages; collect their results with rlm.collect".to_owned(),
+                ),
                 _ => return None,
             })
         })

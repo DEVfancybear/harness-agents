@@ -29,6 +29,7 @@ pub mod project;
 pub mod prompt;
 pub mod repl;
 pub mod service;
+pub mod skill_requests;
 pub mod skills;
 pub mod terminal;
 pub mod tui;

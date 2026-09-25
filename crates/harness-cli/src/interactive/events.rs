@@ -494,6 +494,14 @@ pub enum SessionEvent {
     GoalRestored {
         objective: String,
     },
+    /// The model started a goal through the `goal` skill.
+    GoalCreated {
+        objective: String,
+    },
+    /// The model asked, through the `compact` skill, for a compaction when the turn ends.
+    CompactRequested {
+        instructions: Option<String>,
+    },
     /// The conversation a resumed session continues, as the model will be sent it.
     ConversationRestored {
         /// (question, answer) pairs, oldest first.

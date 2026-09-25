@@ -193,6 +193,9 @@ pub struct InteractiveController {
     exit_after_run: bool,
     /// The persistent goal of this conversation, set by `/goal`.
     goal: Option<GoalState>,
+    /// A compaction the `compact` skill asked for (with its guidance, possibly empty),
+    /// run when the turn ends.
+    pending_compact: Option<String>,
 }
 
 impl InteractiveController {
@@ -251,6 +254,7 @@ impl InteractiveController {
             tick: 0,
             exit_after_run: false,
             goal: None,
+            pending_compact: None,
         }
     }
 
@@ -1035,6 +1039,22 @@ impl InteractiveController {
                     },
                 );
             }
+            SessionEvent::GoalCreated { objective } => {
+                self.flush_stream(effects);
+                self.service.set_goal(Some(objective.clone()));
+                self.push_history(
+                    effects,
+                    HistoryItem::Notice {
+                        message: format!(
+                            "goal set by the model: {objective} (/goal pause stops it)"
+                        ),
+                    },
+                );
+                self.goal = Some(GoalState::new(objective));
+            }
+            SessionEvent::CompactRequested { instructions } => {
+                self.pending_compact = Some(instructions.unwrap_or_default());
+            }
             SessionEvent::GoalRestored { objective } => {
                 let mut goal = GoalState::new(objective);
                 goal.status = GoalStatus::Paused;
@@ -1065,6 +1085,18 @@ impl InteractiveController {
                 if let Some(text) = self.queued_input.take() {
                     self.close_run_grant();
                     effects.extend(self.dispatch(text, false));
+                    return;
+                }
+                // The `compact` skill's request runs now that the turn is over; the goal,
+                // if any, continues after the compaction run ends.
+                if let Some(instructions) = self.pending_compact.take() {
+                    let command = if instructions.trim().is_empty() {
+                        "/compact".to_owned()
+                    } else {
+                        format!("/compact {instructions}")
+                    };
+                    effects.extend(self.command(&command));
+                    self.finish_pending_exit(effects);
                     return;
                 }
                 // After `finish_run`: a continuation is a new request, and the phase has
@@ -5612,6 +5644,52 @@ mod tests {
         assert!(
             plain.iter().any(|line| line.contains("no goal is set")),
             "{plain:#?}"
+        );
+    }
+
+    /// prime-agent's `goal` and `compact` skills: a goal the model starts is carried
+    /// like one the user set, and a compaction it asks for runs when the turn ends,
+    /// before the goal continues.
+    #[test]
+    fn the_skills_start_a_goal_and_compact_after_the_turn() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "work on the release");
+        harness
+            .events
+            .send(SessionEvent::GoalCreated {
+                objective: "ship the release".to_owned(),
+            })
+            .expect("goal event");
+        harness
+            .events
+            .send(SessionEvent::CompactRequested {
+                instructions: Some("keep the plan".to_owned()),
+            })
+            .expect("compact event");
+        let plain = end_done(&mut harness);
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("goal set by the model: ship the release")),
+            "{plain:#?}"
+        );
+        assert_eq!(
+            last_goal(&harness),
+            Some(Some("ship the release".to_owned()))
+        );
+        assert_eq!(
+            submissions(&harness).last().map(String::as_str),
+            Some("/compact keep the plan"),
+            "the compaction runs first"
+        );
+        let _ = end_done(&mut harness);
+        assert!(
+            submissions(&harness)
+                .last()
+                .is_some_and(|text| text.contains("goal_complete")),
+            "then the goal continues: {:?}",
+            submissions(&harness)
         );
     }
 

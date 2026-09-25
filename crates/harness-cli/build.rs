@@ -50,6 +50,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         "SUPERPOWERS-SOURCE.md",
         "LICENSE-deer-flow",
         "DEER-FLOW-SOURCE.md",
+        "LICENSE-prime-agent",
+        "PRIME-AGENT-SOURCE.md",
     ] {
         let path = notices.join(name);
         println!("cargo:rerun-if-changed={}", path.display());

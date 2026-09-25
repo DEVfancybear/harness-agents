@@ -68,6 +68,15 @@ impl GoalHost {
         }
     }
 
+    /// Mark the goal complete: the turn erases it from the task, and the controller
+    /// is told. Used by `goal_complete` and by the `goal` skill's `goal.complete()`.
+    pub fn complete(&self, summary: &str) {
+        self.completed.store(true, Ordering::SeqCst);
+        let _ = self.sender.send(SessionEvent::GoalCompleted {
+            summary: summary.to_owned(),
+        });
+    }
+
     /// Whether the model marked the goal complete during this turn.
     #[must_use]
     pub fn completed(&self) -> bool {
@@ -182,10 +191,7 @@ impl ExternalToolDispatcher for GoalHost {
                 ));
             }
             let summary = Self::summary(arguments)?;
-            self.completed.store(true, Ordering::SeqCst);
-            let _ = self.sender.send(SessionEvent::GoalCompleted {
-                summary: summary.clone(),
-            });
+            self.complete(&summary);
             Ok(ToolOutput::ExternalTool {
                 plugin_id: "goal".to_owned(),
                 tool_name: "goal_complete".to_owned(),

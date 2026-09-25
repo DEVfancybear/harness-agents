@@ -2844,6 +2844,18 @@ async fn run_turn(
             return;
         }
     };
+    // What the model reads, for `model.info`: the provider's documented claim, as
+    // `pi-ai`'s model table carries `input`; a model with no claim reads text, as a
+    // `pi-ai` custom model does.
+    let capabilities_images = match config.protocol.as_str() {
+        "anthropic_messages" => true,
+        _ => {
+            config.provider_id == "deepseek"
+                && harness_providers::CapabilityMatrix::deepseek_documented(config.model.clone())
+                    .images
+                    == harness_providers::CapabilityClaim::Supported
+        }
+    };
     let capabilities = ModelCapabilities {
         provider_id: config.provider_id.clone(),
         model: config.model.clone(),
@@ -3128,19 +3140,53 @@ async fn run_turn(
     let web_host = super::web::WebHost::from_environment(&environment);
     let goal_host =
         matches!(goal, GoalRecord::Active(_)).then(|| super::goal::GoalHost::new(sender.clone()));
+    let kernel_skills = skill_catalog
+        .as_ref()
+        .map(|catalog| {
+            catalog
+                .entries()
+                .iter()
+                .filter(|entry| entry.model_invocable)
+                .flat_map(|entry| super::repl::python_skill_packages(&entry.path))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let kernel_skill_imports = kernel_skills
+        .iter()
+        .map(|skill| skill.import_name.clone())
+        .collect::<Vec<_>>();
     let repl_host = match &repl {
         Some(shared) => {
-            // `rlm.spawn` and its family run on this turn's delegated workers.
-            let requests: Arc<dyn super::repl::HostRequests> = match &delegate_host {
-                Some(host) => host.rlm_requests(config.model.clone()),
-                None => Arc::new(super::repl::NoHostRequests),
-            };
+            // `rlm.spawn` and its family run on this turn's delegated workers; the
+            // other skills' requests are answered from the session's state.
+            let skills: Arc<dyn super::repl::HostRequests> =
+                Arc::new(super::skill_requests::SkillRequests::new(
+                    sender.clone(),
+                    super::skill_requests::ModelInfo {
+                        id: config.model.clone(),
+                        provider: config.provider_id.clone(),
+                        images: capabilities_images,
+                    },
+                    config.context_window_tokens,
+                    match &goal {
+                        GoalRecord::Active(objective) => Some(objective.clone()),
+                        _ => None,
+                    },
+                    goal_host.clone(),
+                ));
+            let mut chain = vec![skills];
+            if let Some(host) = &delegate_host {
+                chain.push(host.rlm_requests(config.model.clone()));
+            }
+            let requests: Arc<dyn super::repl::HostRequests> =
+                Arc::new(super::skill_requests::ChainedRequests(chain));
             super::repl::ReplHost::for_turn(
                 shared,
                 requests,
-                super::repl::HarnessDirs {
+                super::repl::KernelContext {
                     global: super::harness::global_dir(&data_dir),
                     local: super::harness::local_dir(&data_dir, task_id.as_str()),
+                    skills: kernel_skills.clone(),
                 },
             )
             .await
@@ -3245,6 +3291,12 @@ async fn run_turn(
         })
         .collect::<Vec<_>>();
     let mut built_prompt = SystemPromptBuilder::build(&prompt_environment, &prompt_tools);
+    if repl_host.is_some()
+        && let Some(block) = super::prompt::python_skills_block(&kernel_skill_imports)
+    {
+        built_prompt.text.push_str("\n\n");
+        built_prompt.text.push_str(&block);
+    }
     if let Some(catalog) = &skill_catalog {
         built_prompt.text =
             super::prompt::append_skill_metadata(built_prompt.text, catalog.entries());

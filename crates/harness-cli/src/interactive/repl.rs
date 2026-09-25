@@ -84,29 +84,175 @@ del _ha_os";
 /// The answer to one host request: `None` when the type has no handler.
 pub type HostReply<'a> = Pin<Box<dyn Future<Output = Option<Result<Value, String>>> + Send + 'a>>;
 
-/// Where `rlm.harness` keeps memory: the global state and this conversation's.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HarnessDirs {
+/// What one turn's kernel must see: where `rlm.harness` keeps memory (the global
+/// state and this conversation's), and the Python skills to pre-import.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct KernelContext {
     pub global: PathBuf,
     pub local: PathBuf,
+    pub skills: Vec<PythonSkill>,
 }
 
-impl HarnessDirs {
-    /// A cell that points the kernel's `rlm.harness` at these directories. The paths
-    /// are written as JSON strings, which Python reads as the same string literals.
+/// A skill that ships a Python package, imported into the kernel by its name.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PythonSkill {
+    pub import_name: String,
+    /// The directory the package sits in, put on `sys.path`.
+    pub src: PathBuf,
+}
+
+/// The Python packages a skill directory ships: every `src/<package>/__init__.py`.
+#[must_use]
+pub fn python_skill_packages(skill_file: &Path) -> Vec<PythonSkill> {
+    let Some(src) = skill_file.parent().map(|dir| dir.join("src")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&src) else {
+        return Vec::new();
+    };
+    let mut skills = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join("__init__.py").is_file())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let identifier = name
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_');
+            identifier.then(|| PythonSkill {
+                import_name: name,
+                src: src.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    skills.sort();
+    skills
+}
+
+/// Printed by the setup cell when a skill failed to import (prime-agent's
+/// `PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER`).
+const SKILL_IMPORT_ERRORS_MARKER: &str = "__HA_PYTHON_SKILL_IMPORT_ERRORS__";
+
+impl KernelContext {
+    /// The cell that prepares a kernel for this context: `rlm.harness` pointed at the
+    /// conversation's memory, and the Python skills imported by name, as prime-agent's
+    /// `buildRlmBootstrapCode` does - a module with a callable `run` becomes callable
+    /// itself, and a skill that fails to import is replaced by a stub that says why,
+    /// so an unavailable skill reaches the model instead of failing the kernel. Paths
+    /// are written as JSON strings, which Python reads as the same literals.
     fn setup_code(&self) -> String {
-        let quote = |path: &Path| {
-            serde_json::to_string(&path.display().to_string()).unwrap_or_else(|_| "\"\"".to_owned())
-        };
-        format!(
-            "import os as _ha_os
-_ha_os.environ[\"RLM_GLOBAL_HARNESS_STATE_DIR\"] = {}
-_ha_os.environ[\"RLM_HARNESS_STATE_DIR\"] = {}
-del _ha_os",
-            quote(&self.global),
-            quote(&self.local)
+        let quote = |text: &str| serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned());
+        let mut code = format!(
+            "import os as _ha_os\n_ha_os.environ[\"RLM_GLOBAL_HARNESS_STATE_DIR\"] = {}\n_ha_os.environ[\"RLM_HARNESS_STATE_DIR\"] = {}\ndel _ha_os\n",
+            quote(&self.global.display().to_string()),
+            quote(&self.local.display().to_string())
+        );
+        if self.skills.is_empty() {
+            return code;
+        }
+        let mut paths = self
+            .skills
+            .iter()
+            .map(|skill| skill.src.display().to_string())
+            .collect::<Vec<_>>();
+        paths.dedup();
+        let names = self
+            .skills
+            .iter()
+            .map(|skill| skill.import_name.clone())
+            .collect::<Vec<_>>();
+        let _ = write!(
+            code,
+            r#"import importlib as _ha_importlib
+import inspect as _ha_inspect
+import sys as _ha_sys
+import types as _ha_types
+for _ha_path in {paths}:
+    if _ha_path not in _ha_sys.path:
+        _ha_sys.path.insert(0, _ha_path)
+
+class _HaCallableSkillModule(_ha_types.ModuleType):
+    async def __call__(self, *args, **kwargs):
+        result = self.run(*args, **kwargs)
+        if _ha_inspect.isawaitable(result):
+            return await result
+        return result
+
+class _HaUnavailableSkill:
+    def __init__(self, name, error):
+        self.__name__ = name
+        self._ha_import_error = error
+        self.__doc__ = f"Python skill {{name}} is unavailable: {{error}}"
+
+    async def run(self, *args, **kwargs):
+        raise RuntimeError(
+            f"Python skill {{self.__name__}} is unavailable in this kernel. "
+            f"Import error: {{self._ha_import_error}}"
         )
+
+    async def __call__(self, *args, **kwargs):
+        return await self.run(*args, **kwargs)
+
+    def __repr__(self):
+        return f"<unavailable Python skill {{self.__name__!r}}: {{self._ha_import_error}}>"
+
+def _ha_wrap_skill_module(module):
+    run = getattr(module, "run", None)
+    if not callable(run) or isinstance(module, _HaCallableSkillModule):
+        return module
+    wrapped = _HaCallableSkillModule(module.__name__)
+    wrapped.__dict__.update(module.__dict__)
+    try:
+        wrapped.__signature__ = _ha_inspect.signature(run)
+    except Exception:
+        pass
+    doc = getattr(run, "__doc__", None)
+    if doc:
+        wrapped.__doc__ = doc
+    _ha_sys.modules[module.__name__] = wrapped
+    return wrapped
+
+_HA_SKILL_IMPORT_ERRORS = {{}}
+for _ha_skill_name in {names}:
+    try:
+        globals()[_ha_skill_name] = _ha_wrap_skill_module(_ha_importlib.import_module(_ha_skill_name))
+    except Exception as _ha_skill_error:
+        _ha_skill_error_text = str(_ha_skill_error) or type(_ha_skill_error).__name__
+        _HA_SKILL_IMPORT_ERRORS[_ha_skill_name] = _ha_skill_error_text
+        globals()[_ha_skill_name] = _HaUnavailableSkill(_ha_skill_name, _ha_skill_error_text)
+
+if _HA_SKILL_IMPORT_ERRORS:
+    import json as _ha_json
+    print({marker} + _ha_json.dumps(_HA_SKILL_IMPORT_ERRORS))
+"#,
+            paths = serde_json::to_string(&paths).unwrap_or_default(),
+            names = serde_json::to_string(&names).unwrap_or_default(),
+            marker = serde_json::to_string(SKILL_IMPORT_ERRORS_MARKER).unwrap_or_default(),
+        );
+        code
     }
+}
+
+/// The skills a setup cell reported unavailable, by name.
+fn unavailable_skills(output: &str) -> Vec<(String, String)> {
+    let Some(at) = output.find(SKILL_IMPORT_ERRORS_MARKER) else {
+        return Vec::new();
+    };
+    let raw = output[at + SKILL_IMPORT_ERRORS_MARKER.len()..]
+        .lines()
+        .next()
+        .unwrap_or_default();
+    serde_json::from_str::<serde_json::Map<String, Value>>(raw)
+        .map(|errors| {
+            errors
+                .into_iter()
+                .filter_map(|(name, error)| error.as_str().map(|error| (name, error.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Answers the `host_request`s one turn knows.
@@ -131,6 +277,11 @@ pub struct ReplShared {
     python_override: Option<String>,
     shell: Option<PathBuf>,
     python: OnceCell<Option<PathBuf>>,
+    /// Whether any interpreter can be had: found, or buildable with `uv`.
+    available: OnceCell<bool>,
+    /// The kernel's interpreter, resolved on first use, with what to tell the model
+    /// about how it was set up.
+    kernel_python: OnceCell<(Option<PathBuf>, Option<String>)>,
     kernel: Mutex<KernelSlot>,
 }
 
@@ -139,6 +290,8 @@ struct KernelSlot {
     kernel: Option<Kernel>,
     /// A kernel ran before and is gone, so the next result says so.
     lost: bool,
+    /// How the interpreter was set up was said once.
+    announced: bool,
 }
 
 impl ReplShared {
@@ -175,16 +328,75 @@ impl ReplShared {
             python_override: value(PYTHON_VARIABLE),
             shell,
             python: OnceCell::new(),
+            available: OnceCell::new(),
+            kernel_python: OnceCell::new(),
             kernel: Mutex::new(KernelSlot::default()),
         }))
     }
 
-    /// The interpreter the kernel runs on, found once.
+    /// A Python 3.11+ found on this machine (or `HA_PYTHON`), found once.
     pub async fn python(&self) -> Option<&PathBuf> {
         self.python
             .get_or_init(|| find_python(self.python_override.clone()))
             .await
             .as_ref()
+    }
+
+    /// Whether the REPL can run at all, decided without building anything: an
+    /// interpreter is set, the kernel venv exists, `uv` can build it, or a system
+    /// Python is found.
+    pub async fn available(&self) -> bool {
+        *self
+            .available
+            .get_or_init(|| async {
+                self.python_override.is_some()
+                    || venv::python(&venv::dir(&self.data_dir)).is_file()
+                    || venv::find_uv().await.is_some()
+                    || self.python().await.is_some()
+            })
+            .await
+    }
+
+    /// The interpreter the kernel runs on, as prime-agent's `ensureKernelPython`
+    /// picks it: `HA_PYTHON` as given; else the kernel venv under the data directory,
+    /// built with `uv` - Python 3.11, prime-agent's default packages and what the
+    /// bundled skills import - when it is missing or stale; else the system Python,
+    /// on which skills whose packages are absent are reported unavailable.
+    async fn kernel_python(&self) -> (Option<PathBuf>, Option<String>) {
+        self.kernel_python
+            .get_or_init(|| async {
+                if self.python_override.is_some() {
+                    return (self.python().await.cloned(), None);
+                }
+                let venv_dir = venv::dir(&self.data_dir);
+                if venv::ready(&venv_dir) {
+                    return (Some(venv::python(&venv_dir)), None);
+                }
+                let fallback = self.python().await.cloned();
+                let Some(uv) = venv::find_uv().await else {
+                    return (
+                        fallback,
+                        Some(format!(
+                            "[The kernel runs on the system Python: uv is not installed, so the kernel venv with prime-agent's default packages was not built. Install uv ({}) and restart to get it.]",
+                            venv::UV_INSTALL_HINT
+                        )),
+                    );
+                };
+                match venv::build(&uv, &venv_dir).await {
+                    Ok(()) => (
+                        Some(venv::python(&venv_dir)),
+                        Some("[The kernel venv was set up with uv (one-time).]".to_owned()),
+                    ),
+                    Err(error) => (
+                        fallback,
+                        Some(format!(
+                            "[The kernel venv could not be built ({error}); the kernel runs on the system Python.]"
+                        )),
+                    ),
+                }
+            })
+            .await
+            .clone()
     }
 
     /// Run one cell, starting the kernel when there is none.
@@ -193,9 +405,10 @@ impl ReplShared {
         code: &str,
         timeout: Duration,
         host: &dyn HostRequests,
-        harness: Option<&HarnessDirs>,
+        harness: Option<&KernelContext>,
     ) -> Result<String, HarnessError> {
-        let python = self.python().await.cloned().ok_or_else(|| {
+        let (python, setup) = self.kernel_python().await;
+        let python = python.ok_or_else(|| {
             HarnessError::new(
                 ErrorCode::PolicyDenied,
                 "no Python 3.11+ interpreter was found for the REPL",
@@ -205,7 +418,9 @@ impl ReplShared {
         let mut notice = None;
         if slot.kernel.is_none() {
             if std::mem::take(&mut slot.lost) {
-                notice = Some(KERNEL_RESTART_NOTICE);
+                notice = Some(KERNEL_RESTART_NOTICE.to_owned());
+            } else if !std::mem::replace(&mut slot.announced, true) {
+                notice = setup;
             }
             let runtime = write_runtime(&self.data_dir)
                 .map_err(|error| HarnessError::new(ErrorCode::StorageWriteFailed, error))?;
@@ -223,14 +438,26 @@ impl ReplShared {
         let kernel = slot.kernel.as_mut().expect("the kernel was just started");
         // The conversation decides which local memory the kernel writes; a kernel that
         // outlives `/new` or `/resume` is pointed at the new one before the cell runs.
-        if let Some(dirs) = harness
-            && kernel.harness.as_ref() != Some(dirs)
+        let mut setup_note = None;
+        if let Some(context) = harness
+            && kernel.harness.as_ref() != Some(context)
         {
             let applied = kernel
-                .execute(&dirs.setup_code(), READY_TIMEOUT, &NoHostRequests)
+                .execute(&context.setup_code(), READY_TIMEOUT, &NoHostRequests)
                 .await;
-            if applied.is_ok() {
-                kernel.harness = Some(dirs.clone());
+            if let Ok(output) = &applied {
+                kernel.harness = Some(context.clone());
+                let missing = unavailable_skills(output);
+                if !missing.is_empty() {
+                    setup_note = Some(format!(
+                        "[Python skills unavailable in this kernel: {}]",
+                        missing
+                            .iter()
+                            .map(|(name, error)| format!("{name} ({error})"))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ));
+                }
             }
         }
         let outcome = kernel.execute(code, timeout, host).await;
@@ -243,10 +470,16 @@ impl ReplShared {
                 dead
             }
         };
-        Ok(match notice {
-            Some(notice) if text.is_empty() => notice.to_owned(),
-            Some(notice) => format!("{notice}\n\n{text}"),
-            None => text,
+        let notes = [notice, setup_note]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        Ok(if notes.is_empty() {
+            text
+        } else if text.is_empty() {
+            notes.join("\n")
+        } else {
+            format!("{}\n\n{text}", notes.join("\n"))
         })
     }
 }
@@ -260,7 +493,7 @@ struct Kernel {
     /// A cell that was started and whose `done` was never read.
     in_flight: Option<String>,
     /// The memory directories this kernel was last pointed at.
-    harness: Option<HarnessDirs>,
+    harness: Option<KernelContext>,
 }
 
 impl Kernel {
@@ -564,6 +797,146 @@ fn write_runtime(data_dir: &Path) -> Result<PathBuf, String> {
     Ok(root)
 }
 
+/// The kernel venv, as prime-agent's `kernel/bootstrap.ts` builds it.
+mod venv {
+    use std::path::{Path, PathBuf};
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    use tokio::process::Command;
+
+    /// The Python the venv is built on (prime-agent's `PYTHON_VERSION`).
+    const PYTHON_VERSION: &str = "3.11";
+    /// `dill` for state snapshots, prime-agent's `DEFAULT_RLM_EXTRA_PACKAGES`, and
+    /// the packages the bundled skills import (`pillow` for `attach_image`).
+    pub const PACKAGES: [&str; 14] = [
+        "dill",
+        "requests",
+        "httpx",
+        "pyyaml",
+        "tomli",
+        "python-dotenv",
+        "pandas",
+        "numpy",
+        "scipy",
+        "beautifulsoup4",
+        "lxml",
+        "pydantic",
+        "tyro",
+        "pillow",
+    ];
+    const MARKER: &str = "ha-kernel.json";
+    const STEP_TIMEOUT: Duration = Duration::from_mins(15);
+    pub const UV_INSTALL_HINT: &str = "https://docs.astral.sh/uv/getting-started/installation/";
+
+    #[must_use]
+    pub fn dir(data_dir: &Path) -> PathBuf {
+        data_dir.join("kernel-venv")
+    }
+
+    #[must_use]
+    pub fn python(venv: &Path) -> PathBuf {
+        if cfg!(windows) {
+            venv.join("Scripts").join("python.exe")
+        } else {
+            venv.join("bin").join("python")
+        }
+    }
+
+    /// What the marker records: a venv built for another list is rebuilt.
+    #[must_use]
+    pub fn identity() -> String {
+        format!("python {PYTHON_VERSION}; {}", PACKAGES.join(" "))
+    }
+
+    /// Whether the venv exists and was built for the current package list.
+    #[must_use]
+    pub fn ready(venv: &Path) -> bool {
+        python(venv).is_file()
+            && std::fs::read_to_string(venv.join(MARKER))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .is_some_and(|marker| marker["identity"].as_str() == Some(identity().as_str()))
+    }
+
+    fn command(program: &Path) -> Command {
+        let mut command = Command::new(program);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            command.creation_flags(0x0800_0000);
+        }
+        command
+    }
+
+    /// `uv` on `PATH`, or where its installer puts it (prime-agent's `ensureUv`).
+    /// Nothing is installed: an absent `uv` is reported, not fetched.
+    pub async fn find_uv() -> Option<PathBuf> {
+        let mut candidates = vec![PathBuf::from("uv")];
+        if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+            let name = if cfg!(windows) { "uv.exe" } else { "uv" };
+            candidates.push(PathBuf::from(home).join(".local").join("bin").join(name));
+        }
+        for candidate in candidates {
+            let ran = tokio::time::timeout(
+                Duration::from_secs(10),
+                command(&candidate).arg("--version").status(),
+            )
+            .await;
+            if matches!(ran, Ok(Ok(status)) if status.success()) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    async fn run(uv: &Path, args: &[&str]) -> Result<(), String> {
+        let output = tokio::time::timeout(STEP_TIMEOUT, command(uv).args(args).output())
+            .await
+            .map_err(|_| format!("uv {} timed out", args.first().unwrap_or(&"")))?
+            .map_err(|error| format!("uv could not run: {error}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail = stderr.lines().rev().take(3).collect::<Vec<_>>();
+        Err(format!(
+            "uv {} failed: {}",
+            args.first().unwrap_or(&""),
+            tail.into_iter().rev().collect::<Vec<_>>().join(" / ")
+        ))
+    }
+
+    /// Build (or rebuild) the venv: the Python, the venv unseeded, then every
+    /// package through `uv pip install --python`, and the marker last, so a build
+    /// cut short is rebuilt next time.
+    pub async fn build(uv: &Path, venv: &Path) -> Result<(), String> {
+        if venv.exists() {
+            std::fs::remove_dir_all(venv)
+                .map_err(|error| format!("the old venv could not be removed: {error}"))?;
+        }
+        if let Some(parent) = venv.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let venv_text = venv.display().to_string();
+        run(uv, &["python", "install", PYTHON_VERSION]).await?;
+        run(uv, &["venv", &venv_text, "--python", PYTHON_VERSION]).await?;
+        let python_text = python(venv).display().to_string();
+        let mut install = vec!["pip", "install", "--python", python_text.as_str()];
+        install.extend(PACKAGES);
+        run(uv, &install).await?;
+        std::fs::write(
+            venv.join(MARKER),
+            serde_json::json!({ "identity": identity() }).to_string(),
+        )
+        .map_err(|error| format!("the venv marker could not be written: {error}"))
+    }
+}
+
 /// The first interpreter that is Python 3.11 or newer.
 async fn find_python(explicit: Option<String>) -> Option<PathBuf> {
     let candidates: Vec<Vec<String>> = if let Some(path) = explicit {
@@ -645,7 +1018,7 @@ fn default_shell() -> Option<PathBuf> {
 pub struct ReplHost {
     shared: Arc<ReplShared>,
     host: Arc<dyn HostRequests>,
-    harness: HarnessDirs,
+    harness: KernelContext,
 }
 
 impl ReplHost {
@@ -653,9 +1026,11 @@ impl ReplHost {
     pub async fn for_turn(
         shared: &Arc<ReplShared>,
         host: Arc<dyn HostRequests>,
-        harness: HarnessDirs,
+        harness: KernelContext,
     ) -> Option<Self> {
-        shared.python().await?;
+        if !shared.available().await {
+            return None;
+        }
         Some(Self {
             shared: Arc::clone(shared),
             host,
@@ -806,6 +1181,24 @@ mod tests {
     }
 
     #[test]
+    fn a_venv_is_ready_only_when_built_for_the_current_packages() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let venv = super::venv::dir(directory.path());
+        assert!(!super::venv::ready(&venv));
+        let python = super::venv::python(&venv);
+        std::fs::create_dir_all(python.parent().expect("parent")).expect("dirs");
+        std::fs::write(&python, "").expect("python");
+        std::fs::write(venv.join("ha-kernel.json"), r#"{"identity": "old list"}"#).expect("marker");
+        assert!(!super::venv::ready(&venv), "a stale marker is rebuilt");
+        std::fs::write(
+            venv.join("ha-kernel.json"),
+            serde_json::json!({ "identity": super::venv::identity() }).to_string(),
+        )
+        .expect("marker");
+        assert!(super::venv::ready(&venv));
+    }
+
+    #[test]
     fn the_runtime_is_written_once_per_version() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let first = write_runtime(directory.path()).expect("runtime");
@@ -825,16 +1218,34 @@ mod tests {
             python_override: None,
             shell: super::default_shell(),
             python: tokio::sync::OnceCell::new(),
+            available: tokio::sync::OnceCell::new(),
+            kernel_python: tokio::sync::OnceCell::new(),
             kernel: tokio::sync::Mutex::new(super::KernelSlot::default()),
         });
         if shared.python().await.is_none() {
             eprintln!("skipped: no Python 3.11+ on this machine");
             return;
         }
-        let dirs = super::HarnessDirs {
+        // One skill that imports and one that does not, as the vendored skills can be.
+        let skills_root = directory.path().join("skills");
+        for (name, body) in [
+            (
+                "hello_skill",
+                "async def run(name):\n    return f'hello {name}'\n",
+            ),
+            ("broken_skill", "import not_a_module_anywhere\n"),
+        ] {
+            let package = skills_root.join("src").join(name);
+            std::fs::create_dir_all(&package).expect("package");
+            std::fs::write(package.join("__init__.py"), body).expect("init");
+        }
+        std::fs::write(skills_root.join("SKILL.md"), "---\nname: hello\n---\n").expect("skill");
+        let dirs = super::KernelContext {
             global: directory.path().join("global-harness"),
             local: directory.path().join("local-harness"),
+            skills: super::python_skill_packages(&skills_root.join("SKILL.md")),
         };
+        assert_eq!(dirs.skills.len(), 2);
         let run = |code: &'static str, seconds: u64| {
             let shared = Arc::clone(&shared);
             let dirs = dirs.clone();
@@ -850,7 +1261,17 @@ mod tests {
                     .expect("cell")
             }
         };
-        assert_eq!(run("x = 41\nprint('hi')\nx + 1", 60).await, "hi\n42");
+        let first = run("x = 41\nprint('hi')\nx + 1", 60).await;
+        assert!(
+            first.contains("[Python skills unavailable in this kernel: broken_skill (")
+                && first.ends_with("hi\n42"),
+            "an unavailable skill is reported once, before the first output: {first}"
+        );
+        assert_eq!(
+            run("await hello_skill('ha')", 60).await,
+            "'hello ha'",
+            "a skill module with run() is callable"
+        );
         assert_eq!(run("x", 60).await, "41", "state persists");
         let spawn = run("await rlm.spawn('task', name='w')", 60).await;
         assert!(

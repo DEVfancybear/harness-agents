@@ -789,6 +789,51 @@ mod tests {
         assert_eq!(trusted[0].description, "Trusted project override");
     }
 
+    /// prime-agent's Python skills ship with the app: each is in the catalogue, its
+    /// package is found for the kernel, and the prompt names its import.
+    #[test]
+    fn the_bundled_prime_agent_skills_carry_their_python_packages() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let catalog = discover(
+            &temporary.path().join("config"),
+            temporary.path(),
+            &crate::interactive::paths::LaunchEnvironment::from_pairs([(
+                "HA_HOME",
+                temporary.path().join("home").into_os_string(),
+            )]),
+            false,
+        )
+        .expect("catalog");
+        let imports = catalog
+            .entries()
+            .iter()
+            .flat_map(|entry| crate::interactive::repl::python_skill_packages(&entry.path))
+            .map(|skill| skill.import_name)
+            .collect::<Vec<_>>();
+        for name in [
+            "edit",
+            "goal",
+            "compact",
+            "refine",
+            "websearch",
+            "attach_image",
+            "agent_message",
+            "agent_observe",
+            "rlm_heartbeat",
+        ] {
+            assert!(
+                imports.iter().any(|import| import == name),
+                "{name}: {imports:?}"
+            );
+        }
+        let prompt =
+            crate::interactive::prompt::append_skill_metadata(String::new(), catalog.entries());
+        assert!(
+            prompt.contains("<python_import>edit</python_import>"),
+            "{prompt}"
+        );
+    }
+
     #[test]
     fn g11_prompt_skill_metadata_is_bounded_to_the_supplied_budget() {
         let temporary = tempfile::tempdir().expect("temporary directory");
