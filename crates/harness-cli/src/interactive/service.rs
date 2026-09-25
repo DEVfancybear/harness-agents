@@ -1894,6 +1894,25 @@ impl AgentSessionService {
     }
 }
 
+/// The app is closing: its Python kernel is disposed the way prime-agent disposes a
+/// session's - a final snapshot of the namespace, then the protocol's shutdown - so
+/// the next start of the conversation revives it. Only a multi-threaded runtime can
+/// wait for that here; anywhere else the kernel is killed with the process.
+impl Drop for AgentSessionService {
+    fn drop(&mut self) {
+        let Some(repl) = self.repl.take() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return;
+        }
+        tokio::task::block_in_place(|| handle.block_on(repl.dispose()));
+    }
+}
+
 impl SessionPort for AgentSessionService {
     fn label(&self) -> String {
         match self.configured() {
@@ -3453,6 +3472,20 @@ async fn run_turn(
         if let Ok(store) = Arc::try_unwrap(store) {
             let _ = store.close().await;
         }
+        // prime-agent's `_syncKernelStateAfterCompaction`: the kernel's namespace is
+        // snapshotted and the variables too large to snapshot are removed with it.
+        if result.is_ok()
+            && let Some(repl) = &repl
+            && let Some(pruned) = repl.prune_oversized_variables().await
+            && !pruned.is_empty()
+        {
+            send(SessionEvent::Notice {
+                message: format!(
+                    "python: variables over the snapshot size limit were removed: {}",
+                    pruned.join(", ")
+                ),
+            });
+        }
         match result {
             Ok(()) => send(SessionEvent::RunTerminal {
                 outcome: RunOutcome::Done,
@@ -3728,6 +3761,7 @@ async fn run_turn(
                     global: super::harness::global_dir(&data_dir),
                     local: super::harness::local_dir(&data_dir, task_id.as_str()),
                     skills: kernel_skills.clone(),
+                    kernel_dir: super::repl::kernel_dir(&data_dir, task_id.as_str()),
                 },
             )
             .await
