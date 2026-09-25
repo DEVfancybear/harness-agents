@@ -22,6 +22,7 @@ pub struct AnthropicMessagesAdapter {
     capabilities: ModelCapabilities,
     client: Client,
     thinking: Option<crate::Thinking>,
+    headers: Vec<(String, String)>,
 }
 
 impl AnthropicMessagesAdapter {
@@ -29,6 +30,13 @@ impl AnthropicMessagesAdapter {
     #[must_use]
     pub fn with_thinking(mut self, thinking: Option<crate::Thinking>) -> Self {
         self.thinking = thinking;
+        self
+    }
+
+    /// Send these headers with every request, such as `OpenCode`'s session header.
+    #[must_use]
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.headers = headers;
         self
     }
 
@@ -56,6 +64,7 @@ impl AnthropicMessagesAdapter {
             capabilities,
             client,
             thinking: None,
+            headers: Vec::new(),
         })
     }
 
@@ -186,10 +195,13 @@ impl ModelProvider for AnthropicMessagesAdapter {
         let client = self.client.clone();
         let credentials = Arc::clone(&self.credentials);
         let thinking = self.thinking;
+        let headers = self.headers.clone();
         Box::pin(async move {
             let token = credentials.resolve()?;
             let response = tokio::select! {
-                result = client.post(endpoint)
+                result = headers
+                    .iter()
+                    .fold(client.post(endpoint), |post, (name, value)| post.header(name, value))
                     .header("x-api-key", token)
                     .header("anthropic-version", ANTHROPIC_VERSION)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")

@@ -27,8 +27,10 @@ pub use tokio_util::sync::CancellationToken;
 pub(crate) static LOOPBACK_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub mod anthropic;
+pub mod responses;
 mod streaming;
 pub mod thinking;
+pub use responses::{OpenAiResponsesAdapter, ResponsesFlavor, ResponsesOptions};
 pub use streaming::{ProviderEventStream, collect_events};
 pub use thinking::{Thinking, ThinkingFormat, ThinkingLevel};
 
@@ -981,16 +983,19 @@ pub struct OpenAiChatAdapter {
     credentials: Arc<dyn CredentialResolver>,
     capabilities: ModelCapabilities,
     thinking: Option<Thinking>,
+    headers: Vec<(String, String)>,
     client: Client,
 }
 
 /// Optional provider extension sent alongside the otherwise generic `OpenAI` Chat
 /// request. Provider-specific defaults live in config presets; the adapter only
 /// serializes the resolved value.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct OpenAiChatOptions {
     /// The session's thinking level and how this endpoint takes it.
     pub thinking: Option<Thinking>,
+    /// Extra headers, such as `OpenCode`'s session header.
+    pub headers: Vec<(String, String)>,
 }
 
 impl OpenAiChatAdapter {
@@ -1080,6 +1085,7 @@ impl OpenAiChatAdapter {
             credentials,
             capabilities,
             thinking: options.thinking,
+            headers: options.headers,
             client,
         })
     }
@@ -1205,6 +1211,7 @@ impl ModelProvider for OpenAiChatAdapter {
         let client = self.client.clone();
         let thinking = self.thinking;
         let provider_id = self.capabilities.provider_id.clone();
+        let headers = self.headers.clone();
         Box::pin(async move {
             let token = credentials.resolve()?;
             let mut body = chat_body(&request, thinking.as_ref(), &provider_id);
@@ -1217,7 +1224,12 @@ impl ModelProvider for OpenAiChatAdapter {
                 object.insert("tools".to_owned(), Value::Array(request.tool_schemas));
             }
             let response = tokio::select! {
-                result = client.post(endpoint).bearer_auth(token).json(&body).send() => result.map_err(|error| {
+                result = headers
+                    .iter()
+                    .fold(client.post(endpoint), |post, (name, value)| post.header(name, value))
+                    .bearer_auth(token)
+                    .json(&body)
+                    .send() => result.map_err(|error| {
                     // `without_url` keeps a query-string token or userinfo out of
                     // the message the runtime persists and renders.
                     let error = error.without_url();
@@ -2231,6 +2243,7 @@ mod g03_openai_wire_snapshot_tests {
                     level: super::ThinkingLevel::Off,
                     format: super::ThinkingFormat::DeepSeek,
                 }),
+                headers: Vec::new(),
             },
         )
         .expect("generic OpenAI Chat adapter");

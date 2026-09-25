@@ -128,7 +128,7 @@ pub struct InteractiveController {
     setup_required: bool,
     header: Vec<String>,
     setup_hint: Option<String>,
-    /// The launch context this session started from. Kept so `/key` can refresh
+    /// The launch context this session started from. Kept so `/login` can refresh
     /// the provider state from the same rules the launch used, instead of writing
     /// a second copy of them here.
     context: LaunchContext,
@@ -205,6 +205,10 @@ pub struct InteractiveController {
     /// When ctrl+c last found nothing to interrupt or clear, for the second press
     /// that exits (prime-agent's "Press ctrl+c again to exit").
     exit_armed_at: Option<Instant>,
+    /// The provider whose API key the masked prompt is collecting.
+    login_provider: Option<String>,
+    /// The provider whose browser sign-in waits; a pasted redirect URL finishes it.
+    signing_in: Option<String>,
 }
 
 impl InteractiveController {
@@ -268,6 +272,8 @@ impl InteractiveController {
             pending_tool_output: None,
             detail: super::events::Detail::default(),
             exit_armed_at: None,
+            login_provider: None,
+            signing_in: None,
         }
     }
 
@@ -446,13 +452,52 @@ impl InteractiveController {
         } else {
             AppPhase::Ready
         };
+        self.refresh_menu();
         let mut lines = vec![String::new()];
         lines.extend(self.header.iter().cloned());
         if let Some(hint) = &self.setup_hint {
             lines.push(hint.clone());
         }
-        lines.push("Nhập yêu cầu. /help trợ giúp · /status chẩn đoán · /exit thoát".to_owned());
+        lines.push("Nhập yêu cầu. / lệnh · /login đăng nhập · /quit thoát".to_owned());
         lines
+    }
+
+    /// What the slash menu offers beyond the built-ins: the skills and prompt
+    /// commands on disk now. Skills can appear mid-session (`/refine` writes them),
+    /// so this runs at boot, after `/reload` and after every turn.
+    fn refresh_menu(&mut self) {
+        if self.plain {
+            return;
+        }
+        self.editor.set_menu_commands(self.service.menu_commands());
+        let stored = self.service.stored_credentials();
+        self.editor.set_argument_options(
+            "/login",
+            super::providers::PROVIDERS
+                .iter()
+                .map(|entry| {
+                    let state = if stored.iter().any(|(id, _)| id == entry.id) {
+                        " · logged in"
+                    } else {
+                        ""
+                    };
+                    (entry.id.to_owned(), format!("{}{state}", entry.name))
+                })
+                .collect(),
+        );
+        self.editor.set_argument_options(
+            "/logout",
+            stored
+                .iter()
+                .map(|(id, kind)| {
+                    let name =
+                        super::providers::provider(id).map_or(id.as_str(), |entry| entry.name);
+                    (id.clone(), format!("{name} · {kind}"))
+                })
+                .collect(),
+        );
+        self.editor
+            .set_argument_options("/model", self.service.model_options());
     }
 
     /// Apply one key.
@@ -614,8 +659,10 @@ impl InteractiveController {
         }
         // The suggestion menu does not own the keyboard - the composer keeps the
         // focus and the draft stays visible - but while it is drawn these keys act
-        // on it, and only then. Enter completes a half-typed command instead of
-        // submitting it; the next Enter runs it.
+        // on it, and only then. Tab completes the highlighted row. Enter completes it
+        // too, and when the row is whole - `/copy`, or `/effort high` picked from
+        // the argument menu - runs it at once; a command that takes an argument
+        // gains a space instead and opens its argument menu, as in prime-agent.
         if self.suggestion_menu_open() {
             match key {
                 Key::Up => {
@@ -626,15 +673,33 @@ impl InteractiveController {
                     self.editor.move_suggestion(1);
                     return vec![Effect::Redraw];
                 }
-                Key::Tab | Key::Enter => {
+                Key::Tab => {
                     self.editor.accept_suggestion();
                     return vec![Effect::Redraw];
+                }
+                Key::Enter => {
+                    self.editor.accept_suggestion();
+                    if self.editor.display_buffer().ends_with(' ')
+                        || !self.editor.suggestions().is_empty()
+                    {
+                        return vec![Effect::Redraw];
+                    }
                 }
                 _ => {}
             }
         }
         if key == Key::Esc && self.phase == AppPhase::Running {
             return self.interrupt();
+        }
+        if key == Key::Esc && self.signing_in.is_some() && self.editor.is_empty() {
+            self.signing_in = None;
+            self.service.cancel_sign_in();
+            return vec![
+                Effect::History(HistoryItem::Notice {
+                    message: "sign-in canceled".to_owned(),
+                }),
+                Effect::Redraw,
+            ];
         }
         // A pasted screenshot: the key is handled here rather than by the editor
         // because there is no text to insert until the clipboard has been read.
@@ -980,6 +1045,38 @@ impl InteractiveController {
                 self.flush_stream(effects);
                 self.reference(&title, lines, effects);
             }
+            SessionEvent::LoginFinished { provider, result } => {
+                self.flush_stream(effects);
+                self.signing_in = None;
+                let name = super::providers::provider(&provider)
+                    .map_or(provider.as_str(), |entry| entry.name)
+                    .to_owned();
+                match result {
+                    Ok(()) => {
+                        let path = super::credentials::resolve_file(
+                            &super::paths::LaunchEnvironment::capture(),
+                            &self.context.paths.data_dir,
+                        );
+                        let _ = self.activate_credential(CredentialSource::File {
+                            path,
+                            protection: super::credentials::Protection::NotReverified,
+                        });
+                        self.push_history(
+                            effects,
+                            HistoryItem::Notice {
+                                message: format!("Logged in to {name}."),
+                            },
+                        );
+                        self.after_login(&provider, effects);
+                    }
+                    Err(message) => self.push_history(
+                        effects,
+                        HistoryItem::Error {
+                            message: format!("{name} sign-in failed: {message}"),
+                        },
+                    ),
+                }
+            }
             SessionEvent::Notice { message } => {
                 self.flush_stream(effects);
                 // An action that ran without a panel is announced before it runs. In
@@ -1128,6 +1225,7 @@ impl InteractiveController {
                 self.goal = Some(goal);
             }
             SessionEvent::RunTerminal { outcome } => {
+                self.refresh_menu();
                 self.flush_stream(effects);
                 self.settle_run(Some(outcome.clone()));
                 self.push_history(
@@ -1207,6 +1305,22 @@ impl InteractiveController {
         if matches!(text.split_whitespace().next(), Some("/exit" | "/quit")) {
             return self.command(&text);
         }
+        // While a browser sign-in waits, a pasted redirect URL (or code) finishes it:
+        // the browser may run on another machine, as prime-agent allows.
+        if self.signing_in.is_some() && !automatic && !text.trim_start().starts_with('/') {
+            let mut effects = Vec::new();
+            match self.service.finish_sign_in(&text) {
+                Ok(()) => self.push_history(
+                    &mut effects,
+                    HistoryItem::Notice {
+                        message: "exchanging the authorization code for tokens...".to_owned(),
+                    },
+                ),
+                Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+            }
+            effects.push(Effect::Redraw);
+            return effects;
+        }
         if text.trim_start().starts_with("/steer") {
             return self.command(&text);
         }
@@ -1222,7 +1336,7 @@ impl InteractiveController {
             return self.answer_mcp_elicitation(&text);
         }
         if text.trim_start().starts_with('/') {
-            // A leading space must not turn a command into chat text: `/key`
+            // A leading space must not turn a command into chat text: `/login`
             // would otherwise be sent to the provider and stored in history.
             return self.command(&text);
         }
@@ -1260,7 +1374,7 @@ impl InteractiveController {
             return self.dispatch_shell_prefix(text, shell_prefix);
         }
         // Ask the port at submission time, not at boot: the answer changes the
-        // moment `/key` saves a credential, and a stale "setup required" would
+        // moment `/login` saves a credential, and a stale "setup required" would
         // refuse a request the app can now serve.
         if let Some(problem) = self.service.provider_problem() {
             return vec![
@@ -1614,29 +1728,21 @@ impl InteractiveController {
 
     #[allow(clippy::too_many_lines)]
     fn command(&mut self, line: &str) -> Vec<Effect> {
-        // The raw remainder matters for `/key`, whose argument may contain any
-        // character. Commands that take one whitespace-delimited word keep reading
-        // `argument`, so their behavior is unchanged.
+        // Commands that take free text read `raw_argument`; those that take one
+        // word read `argument`.
         let trimmed = line.trim();
         let name = trimmed.split_whitespace().next().unwrap_or_default();
         let raw_argument = trimmed
             .get(name.len()..)
             .map(str::trim)
             .filter(|rest| !rest.is_empty());
-        let key_argument = line
-            .trim_start()
-            .get(name.len()..)
-            .and_then(|rest| {
-                let separator = rest.chars().next()?;
-                separator
-                    .is_whitespace()
-                    .then_some(&rest[separator.len_utf8()..])
-            })
-            .filter(|rest| !rest.trim().is_empty());
         let argument = raw_argument.and_then(|rest| rest.split_whitespace().next());
         let mut effects = Vec::new();
+        // An alias runs its command: `/thinking` is `/effort`, `/exit` is `/quit`.
+        let typed = name;
+        let name = super::commands::canonical(typed);
         match name {
-            "/exit" | "/quit" => {
+            "/quit" => {
                 if self.phase.has_active_run() {
                     self.service.cancel();
                     self.exit_after_run = true;
@@ -1677,7 +1783,7 @@ impl InteractiveController {
                     ),
                 }
             }
-            "/status" => {
+            "/session" => {
                 let mut lines = self.header.clone();
                 lines.push(format!("Phase:   {}", self.phase.label()));
                 // The project id names this workspace's store, and the app shows it
@@ -1739,6 +1845,7 @@ impl InteractiveController {
                         Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
                         Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
                     }
+                    self.refresh_menu();
                 }
             }
             skill_command if skill_command.starts_with("/skill:") => {
@@ -1872,7 +1979,7 @@ impl InteractiveController {
                 }
             }
             "/goal" => self.goal_command(raw_argument, &mut effects),
-            "/thinking" => {
+            "/effort" => {
                 if let Some(level) = argument {
                     if self.phase.has_active_run() {
                         self.push_history(&mut effects, HistoryItem::Notice {
@@ -1886,10 +1993,10 @@ impl InteractiveController {
                     }
                 } else {
                     let lines = self.service.thinking_status();
-                    self.reference("/thinking", lines, &mut effects);
+                    self.reference("/effort", lines, &mut effects);
                 }
             }
-            "/rename" => {
+            "/name" => {
                 if self.phase.has_active_run() {
                     self.push_history(&mut effects, HistoryItem::Notice {
                         message: "cannot rename the session while a run is active".to_owned(),
@@ -1901,7 +2008,7 @@ impl InteractiveController {
                     }
                 } else {
                     self.push_history(&mut effects, HistoryItem::Error {
-                        message: "usage: /rename <name up to 60 characters>".to_owned(),
+                        message: "usage: /name <name up to 60 characters>".to_owned(),
                     });
                 }
             }
@@ -1993,45 +2100,20 @@ impl InteractiveController {
                     &mut effects,
                 );
             }
+            "/hotkeys" => {
+                self.reference("/hotkeys", view::hotkey_lines(), &mut effects);
+            }
+            "/system-prompt" => {
+                self.reference("/system-prompt", self.service.system_prompt(), &mut effects);
+            }
             "/more" => {
                 // The whole point is to read what the viewport clipped, so the panel
                 // opens at the TOP: a reader who has to scroll before seeing the
                 // beginning is exactly the problem this command exists to fix.
                 self.reference("/more", self.recall_lines(), &mut effects);
             }
-            "/key" => match key_argument {
-                Some(value) => {
-                    // `line` is the raw submitted buffer, which is what the
-                    // editor stored: forgetting the trimmed form would leave the
-                    // key reachable through Up-arrow history.
-                    self.editor.forget_submission(line);
-                    return self.save_key(value);
-                }
-                None if self.phase.has_active_run() => {
-                    self.push_history(
-                        &mut effects,
-                        HistoryItem::Notice {
-                            message:
-                                "cannot enter an API key while a run is active; cancel it first"
-                                    .to_owned(),
-                        },
-                    );
-                }
-                None => {
-                    self.editor.begin_secret_entry();
-                    self.push_history(
-                        &mut effects,
-                        HistoryItem::Notice {
-                            message:
-                                "paste the API key and press Enter; it is masked, never stored in \
-                                      history, and saved to the credential file so the next launch \
-                                      starts configured. Esc cancels. /key <value> also works but \
-                                      shows the value while it is typed"
-                                    .to_owned(),
-                        },
-                    );
-                }
-            },
+            "/login" => self.login_command(argument, &mut effects),
+            "/logout" => self.logout_command(argument, &mut effects),
             "/new" => {
                 // A new conversation never abandons a running one: the run is
                 // settled first, exactly like Ctrl-C.
@@ -2054,32 +2136,20 @@ impl InteractiveController {
                     self.service.set_goal(None);
                     self.session_candidates.clear();
                     self.editor.close_picker();
+                    // `/clear` is prime-agent's alias for `/new`; it also clears the
+                    // viewport, and the earlier output stays in the scrollback.
+                    let message = if typed == "/clear" {
+                        effects.push(Effect::ClearViewport);
+                        "started a new session; earlier output remains in scrollback"
+                    } else {
+                        "starting a fresh conversation; the earlier chain is no longer continued"
+                    };
                     self.push_history(
                         &mut effects,
                         HistoryItem::Notice {
-                            message: "starting a fresh conversation; the earlier chain is no longer continued"
-                                .to_owned(),
+                            message: message.to_owned(),
                         },
                     );
-                }
-            }
-            "/clear" => {
-                if self.phase.has_active_run() {
-                    self.push_history(&mut effects, HistoryItem::Notice {
-                        message: "cannot clear the session while a run is active; press Ctrl-C first".to_owned(),
-                    });
-                } else if let Err(error) = self.service.resume(None) {
-                    self.push_history(&mut effects, HistoryItem::Error { message: error });
-                } else {
-                    // A new conversation starts without the old one's goal.
-                    self.goal = None;
-                    self.service.set_goal(None);
-                    self.session_candidates.clear();
-                    self.editor.close_picker();
-                    effects.push(Effect::ClearViewport);
-                    self.push_history(&mut effects, HistoryItem::Notice {
-                        message: "started a new session; earlier output remains in scrollback".to_owned(),
-                    });
                 }
             }
             "/model" => {
@@ -2162,9 +2232,12 @@ impl InteractiveController {
                     Ok(None) => self.push_history(
                         &mut effects,
                         HistoryItem::Notice {
-                            message: format!(
-                                "unknown command {other}; /help lists built-in commands and configured prompt commands"
-                            ),
+                            message: match super::commands::closest(other) {
+                                Some(near) => format!("unknown command {other}; did you mean {near}?"),
+                                None => format!(
+                                    "unknown command {other}; /help lists built-in commands and configured prompt commands"
+                                ),
+                            },
                         },
                     ),
                     Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
@@ -2226,6 +2299,9 @@ impl InteractiveController {
     /// the same step, so the next message is dispatched for real instead of being
     /// refused — a saved key that still needed a restart would be a trap.
     fn save_key(&mut self, value: &str) -> Vec<Effect> {
+        let Some(provider) = self.login_provider.take() else {
+            return vec![Effect::Redraw];
+        };
         if value.trim().is_empty() {
             return vec![
                 Effect::History(HistoryItem::Notice {
@@ -2234,7 +2310,8 @@ impl InteractiveController {
                 Effect::Redraw,
             ];
         }
-        let source = match self.service.save_credential(value) {
+        let credential = super::credentials::Credential::api_key(value.trim());
+        let source = match self.service.save_credential(&provider, &credential) {
             Ok(source) => source,
             Err(message) => {
                 self.editor.cancel_secret();
@@ -2247,15 +2324,18 @@ impl InteractiveController {
         match self.activate_credential(source.clone()) {
             Ok(()) => {
                 let mut effects = Vec::new();
+                let name = super::providers::provider(&provider)
+                    .map_or(provider.as_str(), |entry| entry.name);
                 self.push_history(
                     &mut effects,
                     HistoryItem::Notice {
                         message: format!(
-                            "API key saved to {}; the next message uses it, and the next launch starts configured. The value is never shown, logged or kept in history.",
+                            "Saved API key for {name}. Credentials saved to {}; the value is never shown, logged or kept in history.",
                             source.describe()
                         ),
                     },
                 );
+                self.after_login(&provider, &mut effects);
                 effects.push(Effect::Redraw);
                 effects
             }
@@ -2292,6 +2372,138 @@ impl InteractiveController {
             self.phase = AppPhase::Ready;
         }
         Ok(())
+    }
+
+    /// prime-agent's `/login`: pick a provider, then type its API key into the
+    /// masked prompt, or sign in in the browser.
+    fn login_command(&mut self, argument: Option<&str>, effects: &mut Vec<Effect>) {
+        if self.phase.has_active_run() {
+            self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: "cannot log in while a run is active; cancel it first".to_owned(),
+                },
+            );
+            return;
+        }
+        let Some(provider) = argument.and_then(super::providers::provider) else {
+            let stored = self.service.stored_credentials();
+            let mut lines = vec!["/login <provider>:".to_owned()];
+            for entry in &super::providers::PROVIDERS {
+                let state = stored
+                    .iter()
+                    .find(|(id, _)| id == entry.id)
+                    .map_or(String::new(), |(_, kind)| format!(" · logged in ({kind})"));
+                let how = match entry.login {
+                    super::providers::Login::ApiKey => "API key",
+                    super::providers::Login::OAuth => "browser sign-in",
+                };
+                lines.push(format!("  {:<14}{} · {how}{state}", entry.id, entry.name));
+            }
+            self.reference("/login", lines, effects);
+            return;
+        };
+        match provider.login {
+            super::providers::Login::ApiKey => {
+                self.login_provider = Some(provider.id.to_owned());
+                self.editor.begin_secret_entry();
+                self.push_history(
+                    effects,
+                    HistoryItem::Notice {
+                        message: format!(
+                            "Enter API key for {}: it is masked, never kept in history, and saved to the credential file. Esc cancels.",
+                            provider.name
+                        ),
+                    },
+                );
+            }
+            super::providers::Login::OAuth => match self.service.begin_sign_in(provider.id) {
+                Ok(url) => {
+                    self.signing_in = Some(provider.id.to_owned());
+                    self.push_history(
+                        effects,
+                        HistoryItem::Notice {
+                            message: format!(
+                                "Complete the {} sign-in in your browser. If it did not open, visit:\n{url}\nIf the browser is on another machine, paste the final redirect URL here. Esc cancels.",
+                                provider.name
+                            ),
+                        },
+                    );
+                }
+                Err(message) => self.push_history(effects, HistoryItem::Error { message }),
+            },
+        }
+    }
+
+    /// prime-agent's `/logout`: remove a saved credential; environment variables
+    /// are left alone.
+    fn logout_command(&mut self, argument: Option<&str>, effects: &mut Vec<Effect>) {
+        let stored = self.service.stored_credentials();
+        let Some(provider) = argument else {
+            let message = if stored.is_empty() {
+                "No stored credentials to remove; environment variables are unchanged.".to_owned()
+            } else {
+                format!(
+                    "/logout <provider>: stored credentials for {}",
+                    stored
+                        .iter()
+                        .map(|(id, kind)| format!("{id} ({kind})"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            self.push_history(effects, HistoryItem::Notice { message });
+            return;
+        };
+        let name = super::providers::provider(provider).map_or(provider, |entry| entry.name);
+        match self.service.remove_credential(provider) {
+            Ok(true) => self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: format!(
+                        "Removed stored credential for {name}. Environment variables and config files are unchanged."
+                    ),
+                },
+            ),
+            Ok(false) => self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: format!("No stored credential for {name}."),
+                },
+            ),
+            Err(message) => self.push_history(effects, HistoryItem::Error { message }),
+        }
+        self.refresh_menu();
+    }
+
+    /// After a login, as prime-agent's `prepareForModelSelectionAfterLogin`: the
+    /// app is ready, the menus know the new models, and when the model in use
+    /// belongs to another provider that has no credential, the new provider's
+    /// default model is selected. The model menu opens on the provider's models.
+    fn after_login(&mut self, provider: &str, effects: &mut Vec<Effect>) {
+        let current_needs_login = self.service.provider_id().is_some_and(|id| {
+            id != provider
+                && !self
+                    .service
+                    .stored_credentials()
+                    .iter()
+                    .any(|(stored, _)| *stored == id)
+        });
+        if current_needs_login && let Some(entry) = super::providers::provider(provider) {
+            match self
+                .service
+                .set_model(&format!("{provider}/{}", entry.default_model))
+            {
+                Ok(message) => self.push_history(effects, HistoryItem::Notice { message }),
+                Err(message) => self.push_history(effects, HistoryItem::Error { message }),
+            }
+        }
+        self.refresh_menu();
+        if !self.plain {
+            let _ = self
+                .editor
+                .handle(Key::Paste(format!("/model {provider}/")));
+        }
     }
 
     /// Continue from one session id, reporting the outcome like the pre-T02 code.
@@ -3035,15 +3247,31 @@ mod tests {
         }
         fn save_credential(
             &mut self,
-            key: &str,
+            provider: &str,
+            credential: &crate::interactive::credentials::Credential,
         ) -> Result<crate::interactive::credentials::CredentialSource, String> {
             let path = crate::interactive::credentials::resolve_file(
                 &crate::interactive::paths::LaunchEnvironment::default(),
                 &self.data_dir,
             );
-            let protection = crate::interactive::credentials::save(&path, key)
+            let protection = crate::interactive::credentials::save(&path, provider, credential)
                 .expect("the fixture credential directory is writable");
             Ok(crate::interactive::credentials::CredentialSource::File { path, protection })
+        }
+        fn stored_credentials(&self) -> Vec<(String, &'static str)> {
+            let path = crate::interactive::credentials::resolve_file(
+                &crate::interactive::paths::LaunchEnvironment::default(),
+                &self.data_dir,
+            );
+            crate::interactive::credentials::stored(&path).unwrap_or_default()
+        }
+        fn remove_credential(&mut self, provider: &str) -> Result<bool, String> {
+            let path = crate::interactive::credentials::resolve_file(
+                &crate::interactive::paths::LaunchEnvironment::default(),
+                &self.data_dir,
+            );
+            crate::interactive::credentials::remove(&path, provider)
+                .map_err(|error| error.to_string())
         }
     }
 
@@ -3326,7 +3554,7 @@ mod tests {
         )
     }
 
-    /// K01: the whole `/key` chain, driven by keys rather than by calling the
+    /// K01: the whole `/login` API-key chain, driven by keys rather than by calling the
     /// handler directly — editor, controller, the port that saves the file, and the
     /// bootstrap refresh that clears the setup gate.
     ///
@@ -3352,12 +3580,12 @@ mod tests {
         drop(temp);
     }
 
-    /// A bare `/key` opens masked entry, and the prompt shows the mask, not the key.
+    /// `/login deepseek` opens masked entry, and the prompt shows the mask, not the key.
     fn assert_masked_entry_hides_the_key(controller: &mut InteractiveController) {
-        submit_text(controller, "/key");
+        submit_text(controller, "/login deepseek");
         assert!(
             controller.editor.secret_entry(),
-            "a bare /key starts secret entry"
+            "an API-key provider starts secret entry"
         );
         assert!(
             controller.ui_state().setup_required,
@@ -3394,7 +3622,7 @@ mod tests {
             controller
                 .transcript()
                 .join("\n")
-                .contains("API key saved to"),
+                .contains("Saved API key for DeepSeek"),
             "the user is told what happened: {:?}",
             controller.transcript()
         );
@@ -3423,22 +3651,22 @@ mod tests {
         );
     }
 
-    /// `/key` refuses while a run is active, and Esc then abandons entry safely.
+    /// `/login` refuses while a run is active, and Esc then abandons entry safely.
     fn assert_escape_abandons_entry_without_overwriting(
         controller: &mut InteractiveController,
         events: &tokio::sync::mpsc::UnboundedSender<SessionEvent>,
         context: &LaunchContext,
     ) {
-        submit_text(controller, "/key");
+        submit_text(controller, "/login deepseek");
         assert!(
             !controller.editor.secret_entry(),
-            "/key must not open secret entry while a run is active"
+            "/login must not open secret entry while a run is active"
         );
         assert!(
             controller
                 .transcript()
                 .join("\n")
-                .contains("cannot enter an API key while a run is active"),
+                .contains("cannot log in while a run is active"),
             "{:?}",
             controller.transcript()
         );
@@ -3447,7 +3675,7 @@ mod tests {
         });
         let _ = controller.pump_events();
 
-        submit_text(controller, "/key");
+        submit_text(controller, "/login deepseek");
         assert!(controller.editor.secret_entry());
         type_text(controller, "sk-abandoned");
         let _ = controller.handle_key(Key::Esc);
@@ -3459,14 +3687,18 @@ mod tests {
         );
         let path = saved_credential_path(context);
         assert_eq!(
-            std::fs::read_to_string(&path).expect("credential file"),
-            "DEEPSEEK_API_KEY=\"sk-controller-fixture\"\n",
+            crate::interactive::credentials::load(&path, "deepseek")
+                .expect("credential file")
+                .map(|credential| credential.secret().to_owned())
+                .as_deref(),
+            Some("sk-controller-fixture"),
             "Esc must not overwrite the stored key"
         );
     }
 
+    /// A bare `/login` lists the providers; each provider keeps its own key.
     #[test]
-    fn k01_inline_key_uses_the_full_remainder_and_is_not_recallable() {
+    fn k01_login_lists_providers_and_saves_each_key_under_its_provider() {
         let (_temp, context) = context(false);
         let channel = SessionChannel::new();
         let port = SavingPort {
@@ -3476,33 +3708,44 @@ mod tests {
         let mut controller = InteractiveController::new(&context, Box::new(port), channel, true);
         controller.boot_lines();
 
-        let command = "/key  sk-with an intentional space ";
-        let effects = submit_text(&mut controller, command);
-        assert!(
-            effects_to_plain(&effects)
-                .join("\n")
-                .contains("API key saved"),
-            "{effects:#?}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(saved_credential_path(&context)).expect("credential file"),
-            "DEEPSEEK_API_KEY=\" sk-with an intentional space \"\n"
-        );
+        let listing = effects_to_plain(&submit_text(&mut controller, "/login")).join("\n");
+        for name in [
+            "OpenCode Zen",
+            "OpenCode Go",
+            "DeepSeek",
+            "OpenAI",
+            "Anthropic",
+        ] {
+            assert!(listing.contains(name), "{listing}");
+        }
+
+        submit_text(&mut controller, "/login opencode");
+        assert!(controller.editor.secret_entry());
+        type_text(&mut controller, "sk-open");
+        let _ = controller.handle_key(Key::Enter);
+        let path = saved_credential_path(&context);
+        let key = |provider: &str| {
+            crate::interactive::credentials::load(&path, provider)
+                .expect("credential file")
+                .map(|credential| credential.secret().to_owned())
+        };
+        assert_eq!(key("opencode").as_deref(), Some("sk-open"));
+        assert_eq!(key("deepseek"), None, "another provider is untouched");
 
         let _ = controller.handle_key(Key::Up);
-        assert_eq!(
-            controller.prompt(),
-            "> ",
-            "Up must not recall an inline credential"
-        );
         assert!(
-            !controller
-                .editor
-                .history()
-                .iter()
-                .any(|entry| entry == command),
-            "the inline credential must not remain in editor history"
+            !controller.prompt().contains("sk-open"),
+            "Up must never recall a key"
         );
+        let _ = controller.handle_key(Key::EraseToLineStart);
+
+        let removed =
+            effects_to_plain(&submit_text(&mut controller, "/logout opencode")).join("\n");
+        assert!(
+            removed.contains("Removed stored credential for OpenCode Zen"),
+            "{removed}"
+        );
+        assert_eq!(key("opencode"), None);
     }
 
     /// The plain lines of one effect batch: exactly what the plain renderer
@@ -4051,7 +4294,9 @@ mod tests {
 
         let help = effects_to_plain(&submit_text(&mut harness.controller, "/help")).join("\n");
         assert!(help.contains("/resume"), "{help}");
-        assert!(help.contains("Ctrl-D"), "{help}");
+        assert!(help.contains("/hotkeys"), "{help}");
+        let keys = effects_to_plain(&submit_text(&mut harness.controller, "/hotkeys")).join("\n");
+        assert!(keys.contains("Ctrl-D"), "{keys}");
 
         let status = effects_to_plain(&submit_text(&mut harness.controller, "/status")).join("\n");
         assert!(status.contains("Phase:"), "{status}");
@@ -4103,7 +4348,7 @@ mod tests {
             state
                 .suggestions
                 .iter()
-                .map(|command| command.name)
+                .map(|item| item.name().to_owned())
                 .collect::<Vec<_>>(),
             SLASH_COMMANDS
                 .iter()
@@ -4120,7 +4365,7 @@ mod tests {
             state
                 .suggestions
                 .iter()
-                .map(|command| command.name)
+                .map(|item| item.name().to_owned())
                 .collect::<Vec<_>>(),
             ["/resume"],
             "the menu narrows with every letter"
@@ -4152,8 +4397,8 @@ mod tests {
         assert_eq!(effects, vec![Effect::Redraw]);
         assert_eq!(
             harness.controller.ui_state().buffer,
-            "/help",
-            "Tab takes the first row"
+            "/model ",
+            "Tab takes the first row, and its argument follows a space"
         );
 
         // Move the highlight, and Tab takes that row instead.
@@ -4162,37 +4407,42 @@ mod tests {
         let _ = harness.controller.handle_key(Key::Down);
         let _ = harness.controller.handle_key(Key::Down);
         let _ = harness.controller.handle_key(Key::Tab);
-        assert_eq!(harness.controller.ui_state().buffer, "/key");
+        assert_eq!(harness.controller.ui_state().buffer, "/export ");
     }
 
-    /// Enter completes a half-typed command instead of submitting it; the next
-    /// Enter runs the command. `/he` used to be answered with "unknown command".
+    /// Enter on the menu picks the row: a whole command runs at once, a command
+    /// that takes an argument opens its argument menu, and a picked argument runs
+    /// - `/thinking`, pick a level, applied (prime-agent's selectors).
     #[test]
-    fn slash_enter_completes_a_half_typed_command_then_runs_it() {
+    fn slash_enter_picks_a_row_and_runs_it_when_it_is_whole() {
         let mut harness = tui_bench(true);
         let _ = harness.controller.boot_lines();
         type_text(&mut harness.controller, "/he");
-
-        let effects = harness.controller.handle_key(Key::Enter);
-        assert_eq!(effects, vec![Effect::Redraw], "nothing ran yet");
-        assert_eq!(harness.controller.ui_state().buffer, "/help");
-        assert!(
-            submissions(&harness).is_empty(),
-            "completing a command is not submitting a request"
-        );
-        assert!(
-            harness.controller.transcript().is_empty(),
-            "and not a command either"
-        );
-
         let _ = harness.controller.handle_key(Key::Enter);
         assert!(
             matches!(
                 harness.controller.ui_state().modal,
                 Some(Modal::Overlay { ref title, .. }) if title == "/help"
             ),
-            "the second Enter ran the completed command: {:?}",
+            "Enter ran the picked command: {:?}",
             harness.controller.ui_state().modal
+        );
+        assert!(
+            submissions(&harness).is_empty(),
+            "a command is not a request"
+        );
+        let _ = harness.controller.handle_key(Key::Esc);
+
+        type_text(&mut harness.controller, "/thinking");
+        let _ = harness.controller.handle_key(Key::Enter);
+        assert_eq!(harness.controller.ui_state().buffer, "/effort ");
+        let levels = harness.controller.ui_state().suggestions;
+        assert_eq!(levels.first().map(|item| item.label.as_str()), Some("off"));
+        let _ = harness.controller.handle_key(Key::Down);
+        let effects = harness.controller.handle_key(Key::Enter);
+        assert!(
+            harness.controller.ui_state().buffer.is_empty(),
+            "the picked level was submitted: {effects:#?}"
         );
     }
 
@@ -4222,7 +4472,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.starts_with("/help") && line.contains("list these commands")),
+                .any(|line| line.starts_with("/help") && line.contains("List every command")),
             "the full table: {lines:#?}"
         );
     }
@@ -4303,10 +4553,9 @@ mod tests {
             "the reference panel is open"
         );
         type_text(&mut tui.controller, "/he");
-        assert_eq!(
-            tui.controller.ui_state().suggestions.len(),
-            1,
-            "the editor still holds the candidate; the frame is what hides it"
+        assert!(
+            !tui.controller.ui_state().suggestions.is_empty(),
+            "the editor still holds the candidates; the frame is what hides them"
         );
         let _ = tui.controller.handle_key(Key::Enter);
         assert!(

@@ -1,42 +1,60 @@
-//! The provider API key saved by the app itself.
+//! Provider credentials saved by the app itself, one entry per provider, after
+//! prime-agent's `auth.json` (`packages/coding-agent/src/core/auth-storage.ts`).
 //!
 //! `HA_LAUNCH` kept credentials out of the strict configuration file, and that
-//! stays true: this is a separate file, written only when the user pastes a key
-//! into the app, and readable only by that user.
+//! stays true: this is a separate file, written only by `/login`, and readable
+//! only by that user. It maps a provider id to either an API key or the tokens a
+//! browser sign-in returned:
+//!
+//! ```json
+//! {"opencode": {"type": "api_key", "key": "..."},
+//!  "openai-codex": {"type": "oauth", "access": "...", "refresh": "...", "expires": 0}}
+//! ```
 //!
 //! Two rules decide everything here:
 //!
-//! 1. **A sourced environment variable always wins over the file.** The file is
-//!    what `/key` writes; the environment is what scripts, CI and shells set, and
-//!    it must be able to override a stored key without editing a file by hand.
-//! 2. **The key is only ever written into a file nobody else can open.** On Unix
-//!    the stage file is created with mode 0600 and the directory with 0700, so the
-//!    guarantee is the same one `ssh` and `git` make for their own secrets. On
-//!    Windows the private directory receives an explicit ACL for the process
-//!    identity and SYSTEM before the key is staged.
+//! 1. **A saved credential wins over the environment**, as in prime-agent: what the
+//!    user chose with `/login` is what runs. The provider's environment variables
+//!    are the fallback, and `/logout` removes the saved entry so they apply again.
+//! 2. **The file is only ever written where nobody else can open it.** On Unix the
+//!    stage file is created with mode 0600 and the directory with 0700; on Windows
+//!    the private directory receives an explicit ACL for the process identity and
+//!    SYSTEM before the file is staged.
 //!
 //! An unreadable or malformed file is never quietly treated as "no credential":
 //! the message names the path and a next step, and it deliberately does not echo
-//! the parser detail, because a TOML type error can quote the value it rejected.
+//! the parser detail, because a parse error can quote the value it rejected.
+//!
+//! The single-key `credentials.env` of earlier versions is read as the `deepseek`
+//! entry until the first save writes `auth.json`.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use harness_types::{ErrorCode, HarnessError};
+use serde::{Deserialize, Serialize};
 
 use super::paths::LaunchEnvironment;
 
-/// File name under the resolved data root; `.env`-style, not the strict config.
-pub const CREDENTIAL_FILE_NAME: &str = "credentials.env";
+/// File name under the private directory.
+pub const CREDENTIAL_FILE_NAME: &str = "auth.json";
 
-/// Variable used inside the credential file.
-pub const CREDENTIAL_FILE_VARIABLE: &str = "DEEPSEEK_API_KEY";
+/// The single-key file earlier versions wrote; read as the `deepseek` entry.
+pub const LEGACY_FILE_NAME: &str = "credentials.env";
 
-/// Environment variables probed for a key, in precedence order.
-///
-/// Only presence and the name are ever reported: the value is never logged,
-/// stored in a journal, or placed in a command history.
-pub const CREDENTIAL_VARIABLES: [&str; 2] = ["DEEPSEEK_API_KEY", "HA_API_KEY"];
+/// Variable used inside the legacy file.
+const LEGACY_FILE_VARIABLE: &str = "DEEPSEEK_API_KEY";
+
+/// Every environment variable that can carry a provider key, for the boot check
+/// and for redaction. Only presence and the name are ever reported.
+pub const CREDENTIAL_VARIABLES: [&str; 5] = [
+    "DEEPSEEK_API_KEY",
+    "HA_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENCODE_API_KEY",
+];
 
 /// Environment variable that relocates the credential file, for tests and for a
 /// caller that keeps its secrets somewhere else. It holds a directory, like
@@ -50,6 +68,54 @@ pub const CREDENTIAL_DIRECTORY_VARIABLE: &str = "HA_CREDENTIALS_DIR";
 /// the ACL of directories this module does not own. A dedicated subdirectory can
 /// be locked down without touching anything else.
 pub const CREDENTIAL_DIRECTORY_NAME: &str = "private";
+
+/// One saved credential.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Credential {
+    ApiKey {
+        key: String,
+    },
+    /// Tokens from a browser sign-in; `expires` is milliseconds since the epoch.
+    Oauth {
+        access: String,
+        refresh: String,
+        expires: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
+    },
+}
+
+impl Credential {
+    #[must_use]
+    pub fn api_key(key: impl Into<String>) -> Self {
+        Self::ApiKey { key: key.into() }
+    }
+
+    /// What goes in the request: the key, or the access token.
+    #[must_use]
+    pub fn secret(&self) -> &str {
+        match self {
+            Self::ApiKey { key } => key,
+            Self::Oauth { access, .. } => access,
+        }
+    }
+
+    /// `API key` or `sign-in`, for listings; never the value.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::ApiKey { .. } => "API key",
+            Self::Oauth { .. } => "sign-in",
+        }
+    }
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Credential({})", self.kind())
+    }
+}
 
 /// The Windows account of the process token, rather than the interactive account
 /// inherited through `USERNAME`/`USERDOMAIN`.
@@ -100,7 +166,7 @@ pub enum Protection {
 }
 
 impl Protection {
-    /// How the protection reads in `/status` and in the saved notice.
+    /// How the protection reads in `/session` and in the saved notice.
     #[must_use]
     pub const fn describe(self) -> &'static str {
         match self {
@@ -119,13 +185,13 @@ impl Protection {
 
 /// Where the credential for this launch came from, and its name.
 ///
-/// The value is deliberately absent: this type is rendered in `/status`, in
+/// The value is deliberately absent: this type is rendered in `/session`, in
 /// notices and in errors, so it can only ever carry the *name* of the source.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CredentialSource {
     /// An environment variable carried the key at process start.
     Environment { variable: String },
-    /// The app saved the key in this file.
+    /// The app saved the credential in this file.
     File {
         path: PathBuf,
         protection: Protection,
@@ -154,13 +220,10 @@ impl CredentialSource {
 
     /// Whether the key can still change while the process runs.
     ///
-    /// An environment variable is read from the same process table the credential
-    /// resolver reads, so replacing it in the app would be a lie unless the whole
-    /// process environment changed. The file is re-read at call time, so it
-    /// changes the moment the app writes it — which is the whole reason `/key`
-    /// works without a restart. Asserted by the unit test, not called in
-    /// production.
-    #[allow(dead_code, reason = "documents the /key contract; asserted by tests")]
+    /// The file is re-read at call time, so it changes the moment `/login` writes
+    /// it; an environment variable is fixed for the process. Asserted by the unit
+    /// test, not called in production.
+    #[allow(dead_code, reason = "documents the /login contract; asserted by tests")]
     #[must_use]
     pub const fn is_live(&self) -> bool {
         match self {
@@ -191,69 +254,108 @@ pub fn resolve_path(environment: &LaunchEnvironment, data_dir: &Path) -> PathBuf
         .map_or_else(|| data_dir.join(CREDENTIAL_DIRECTORY_NAME), PathBuf::from)
 }
 
-/// Where the credential for this launch comes from, if anywhere.
-///
-/// An environment variable always wins over the saved file: scripts, CI and
-/// shells export the key, and an override has to be able to beat a file the app
-/// wrote earlier without editing that file by hand.
-///
-/// A **malformed** file is not an error here. This runs during boot and on every
-/// render, so it stays infallible and cheap: it answers from the process
-/// environment and one `stat`. A broken file is reported with its path by
-/// [`load`], at call time, where the message can be acted on.
+/// Whether any credential exists for this launch: a saved one, or a provider
+/// variable in the environment. The boot check asks this; which provider the
+/// credential is for is settled when the provider is resolved.
 #[must_use]
 pub fn source(environment: &LaunchEnvironment, data_dir: &Path) -> Option<CredentialSource> {
-    if let Some(variable) = CREDENTIAL_VARIABLES.iter().find(|name| {
-        environment
-            .value(name)
-            .is_some_and(|value| !value.is_empty())
-    }) {
-        return Some(CredentialSource::Environment {
-            variable: (*variable).to_owned(),
+    let path = resolve_file(environment, data_dir);
+    if read_all(&path).is_ok_and(|entries| !entries.is_empty()) {
+        return Some(CredentialSource::File {
+            path,
+            protection: Protection::NotReverified,
         });
     }
-    source_for(environment, data_dir, CREDENTIAL_VARIABLES[0])
+    CREDENTIAL_VARIABLES
+        .iter()
+        .find(|name| {
+            environment
+                .value(name)
+                .is_some_and(|value| !value.is_empty())
+        })
+        .map(|variable| CredentialSource::Environment {
+            variable: (*variable).to_owned(),
+        })
 }
 
-/// Resolve a configured credential variable before the app-owned file fallback.
+/// Where one provider's credential comes from: the saved entry first, then the
+/// configured variable, then the provider's own variables.
+///
+/// This stays infallible and cheap because it runs on render paths: a broken file
+/// is reported with its path by [`load`], at call time, where it can be acted on.
 #[must_use]
 pub fn source_for(
     environment: &LaunchEnvironment,
     data_dir: &Path,
+    provider: &str,
     variable: &str,
 ) -> Option<CredentialSource> {
-    if environment
-        .value(variable)
-        .is_some_and(|value| !value.is_empty())
-    {
-        return Some(CredentialSource::Environment {
-            variable: variable.to_owned(),
-        });
-    }
     let path = resolve_file(environment, data_dir);
-    match std::fs::metadata(&path) {
-        Ok(metadata) if metadata.is_file() => Some(CredentialSource::File {
+    if read_all(&path).is_ok_and(|entries| entries.contains_key(provider)) {
+        return Some(CredentialSource::File {
             path,
             // Measured when the key was saved, not on every launch: re-reading an
-            // ACL means shelling out on Windows, and `source` runs on render paths.
-            // `NotReverified` is the honest label for that; it never claims more
-            // protection than was actually applied.
+            // ACL means shelling out on Windows, and this runs on render paths.
             protection: Protection::NotReverified,
-        }),
-        _ => None,
+        });
     }
+    std::iter::once(variable)
+        .chain(super::providers::env_variables(provider).iter().copied())
+        .filter(|name| !name.is_empty())
+        .find(|name| {
+            environment
+                .value(name)
+                .is_some_and(|value| !value.is_empty())
+        })
+        .map(|variable| CredentialSource::Environment {
+            variable: variable.to_owned(),
+        })
 }
 
-/// The stored key, if the file exists and holds one.
+/// The saved credential for one provider, if there is one.
 ///
-/// Returns `Ok(None)` when the file is absent, and an actionable error when it
-/// exists but cannot be used. An empty or blank value is treated as absent: it
-/// grants nothing, and reporting it as a credential would only produce a
-/// confusing failure at call time.
-pub fn load(path: &Path) -> Result<Option<String>, HarnessError> {
+/// Returns `Ok(None)` when the file or the entry is absent, and an actionable
+/// error when the file exists but cannot be used. A blank key is treated as
+/// absent: it grants nothing.
+pub fn load(path: &Path, provider: &str) -> Result<Option<Credential>, HarnessError> {
+    Ok(read_all(path)?
+        .remove(provider)
+        .filter(|credential| !credential.secret().trim().is_empty()))
+}
+
+/// The providers with a saved credential, and what kind each is.
+pub fn stored(path: &Path) -> Result<Vec<(String, &'static str)>, HarnessError> {
+    Ok(read_all(path)?
+        .into_iter()
+        .map(|(provider, credential)| (provider, credential.kind()))
+        .collect())
+}
+
+/// Every saved secret - keys, access and refresh tokens - so an export can
+/// redact them. Unreadable files contribute nothing.
+#[must_use]
+pub fn secrets(path: &Path) -> Vec<String> {
+    read_all(path)
+        .unwrap_or_default()
+        .into_values()
+        .flat_map(|credential| match credential {
+            Credential::ApiKey { key } => vec![key],
+            Credential::Oauth {
+                access, refresh, ..
+            } => vec![access, refresh],
+        })
+        .filter(|secret| !secret.trim().is_empty())
+        .collect()
+}
+
+/// Every saved entry. A missing file is empty; before `auth.json` exists, the
+/// legacy `credentials.env` beside it is read as the `deepseek` entry.
+fn read_all(path: &Path) -> Result<BTreeMap<String, Credential>, HarnessError> {
     let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return read_legacy(&path.with_file_name(LEGACY_FILE_NAME));
+        }
         Err(error) => {
             return Err(HarnessError::new(
                 ErrorCode::ConfigReadError,
@@ -264,27 +366,53 @@ pub fn load(path: &Path) -> Result<Option<String>, HarnessError> {
             ));
         }
     };
-    let value = parse(&contents).map_err(|detail| {
+    if contents.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    serde_json::from_str(&contents).map_err(|_| {
         HarnessError::new(
             ErrorCode::ConfigParseError,
             format!(
-                "credential file {} is invalid: {detail}; run ha again and use /key to save the key, or delete the file",
+                "credential file {} is invalid; run /login again, or delete the file",
+                path.display()
+            ),
+        )
+    })
+}
+
+fn read_legacy(path: &Path) -> Result<BTreeMap<String, Credential>, HarnessError> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeMap::new());
+        }
+        Err(error) => {
+            return Err(HarnessError::new(
+                ErrorCode::ConfigReadError,
+                format!(
+                    "credential file {} could not be read: {error}",
+                    path.display()
+                ),
+            ));
+        }
+    };
+    let value = parse_legacy(&contents).map_err(|detail| {
+        HarnessError::new(
+            ErrorCode::ConfigParseError,
+            format!(
+                "credential file {} is invalid: {detail}; use /login to save the key again, or delete the file",
                 path.display()
             ),
         )
     })?;
-    match value {
-        Some(value) if !value.trim().is_empty() => Ok(Some(value)),
-        _ => Ok(None),
-    }
+    Ok(value
+        .filter(|key| !key.trim().is_empty())
+        .map(|key| BTreeMap::from([("deepseek".to_owned(), Credential::api_key(key))]))
+        .unwrap_or_default())
 }
 
-/// Parse one `NAME=value` line.
-///
-/// Only the single known variable is accepted: a file that happens to hold
-/// something else is reported rather than half-understood. The returned detail
-/// never contains the value.
-fn parse(contents: &str) -> Result<Option<String>, &'static str> {
+/// Parse the legacy `DEEPSEEK_API_KEY="..."` line. The detail never has the value.
+fn parse_legacy(contents: &str) -> Result<Option<String>, &'static str> {
     let mut stored: Option<String> = None;
     for (index, raw) in contents.lines().enumerate() {
         let line = raw.trim();
@@ -298,8 +426,7 @@ fn parse(contents: &str) -> Result<Option<String>, &'static str> {
                 "a line is not NAME=value"
             });
         };
-        let name = name.trim();
-        if name != CREDENTIAL_FILE_VARIABLE {
+        if name.trim() != LEGACY_FILE_VARIABLE {
             return Err("it names a variable this app does not use");
         }
         if stored.is_some() {
@@ -322,16 +449,40 @@ fn parse(contents: &str) -> Result<Option<String>, &'static str> {
     Ok(stored)
 }
 
-/// Save a key so the next launch is already configured.
+/// Save one provider's credential, keeping the others.
 ///
 /// The write is staged and then renamed, so a reader never observes a half-written
-/// file. The order that matters is the one inside [`write_staged`]: on Unix the
-/// file is **created** with mode 0600, so the key is never in a file that anyone
-/// else can open, not even for the instant between creating and tightening it. The
-/// containing directory is restricted first as well, which is what bounds exposure
-/// on Windows, where creating a file with an explicit owner-only ACL is not
-/// something this crate does.
-pub fn save(path: &Path, key: &str) -> Result<Protection, HarnessError> {
+/// file. On Unix the stage file is **created** with mode 0600, so the key is never
+/// in a file anyone else can open; the directory is restricted first as well,
+/// which is what bounds exposure on Windows.
+pub fn save(
+    path: &Path,
+    provider: &str,
+    credential: &Credential,
+) -> Result<Protection, HarnessError> {
+    let mut entries = read_all(path)?;
+    entries.insert(provider.to_owned(), credential.clone());
+    write_all(path, &entries)
+}
+
+/// Remove one provider's saved credential. Returns whether there was one.
+pub fn remove(path: &Path, provider: &str) -> Result<bool, HarnessError> {
+    let mut entries = read_all(path)?;
+    if entries.remove(provider).is_none() {
+        return Ok(false);
+    }
+    write_all(path, &entries)?;
+    // The legacy file would otherwise bring the key back as `deepseek`.
+    if provider == "deepseek" {
+        let _ = std::fs::remove_file(path.with_file_name(LEGACY_FILE_NAME));
+    }
+    Ok(true)
+}
+
+fn write_all(
+    path: &Path,
+    entries: &BTreeMap<String, Credential>,
+) -> Result<Protection, HarnessError> {
     let Some(directory) = path.parent() else {
         return Err(HarnessError::new(
             ErrorCode::StorageOpenFailed,
@@ -353,7 +504,13 @@ pub fn save(path: &Path, key: &str) -> Result<Protection, HarnessError> {
     let account = current_windows_account();
     let protection = restrict_acl(directory, account.as_deref());
     let staging = staging_path(path);
-    let contents = format!("{CREDENTIAL_FILE_VARIABLE}=\"{}\"\n", escape(key));
+    let mut contents = serde_json::to_string_pretty(entries).map_err(|error| {
+        HarnessError::new(
+            ErrorCode::StorageOpenFailed,
+            format!("credentials could not be encoded: {error}"),
+        )
+    })?;
+    contents.push('\n');
     write_staged(&staging, contents.as_bytes()).map_err(|error| {
         HarnessError::new(
             ErrorCode::StorageOpenFailed,
@@ -462,15 +619,7 @@ fn write_staged(staging: &Path, contents: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
-/// Escape the characters that would break the quoted value.
-///
-/// The backslash is escaped first, then the quote, so the two never collide: a
-/// key that contains a literal `\"` survives the round trip through [`unescape`].
-fn escape(key: &str) -> String {
-    key.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// Reverse [`escape`].
+/// Undo the legacy file's quoting.
 ///
 /// A trailing lone backslash is kept as written rather than dropped: the file is
 /// user-editable, and silently losing a character from a key would produce a
@@ -503,7 +652,7 @@ fn staging_path(path: &Path) -> PathBuf {
     let mut name = OsString::from(".");
     name.push(
         path.file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("credentials.env")),
+            .unwrap_or_else(|| std::ffi::OsStr::new(CREDENTIAL_FILE_NAME)),
     );
     name.push(".staged");
     path.with_file_name(name)
@@ -538,8 +687,8 @@ fn restrict_directory(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CREDENTIAL_DIRECTORY_VARIABLE, CREDENTIAL_FILE_NAME, CREDENTIAL_FILE_VARIABLE,
-        CredentialSource, Protection, load, resolve_file, save,
+        CREDENTIAL_DIRECTORY_VARIABLE, CREDENTIAL_FILE_NAME, Credential, CredentialSource,
+        LEGACY_FILE_NAME, Protection, load, remove, resolve_file, save, source_for, stored,
     };
     use crate::interactive::paths::LaunchEnvironment;
     use std::path::{Path, PathBuf};
@@ -552,62 +701,21 @@ mod tests {
         )
     }
 
-    #[test]
-    fn k01_only_the_known_variable_is_accepted() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let path = temp.path().join(CREDENTIAL_FILE_NAME);
-        std::fs::write(&path, "SOMETHING_ELSE=\"sk-x\"\n").expect("fixture");
-        let error = load(&path).expect_err("an unknown variable is refused");
-        let message = error.to_string();
-        assert!(message.contains("does not use"), "{message}");
-        assert!(
-            !message.contains("sk-x"),
-            "the message must not echo the file: {message}"
-        );
+    fn key(path: &Path, provider: &str) -> Option<String> {
+        load(path, provider)
+            .expect("the file loads")
+            .map(|credential| credential.secret().to_owned())
     }
 
     #[test]
-    fn k01_the_parser_detail_never_quotes_the_value() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let path = temp.path().join(CREDENTIAL_FILE_NAME);
-        std::fs::write(&path, "DEEPSEEK_API_KEY=sk-secret-without-quotes\n").expect("fixture");
-        let error = load(&path).expect_err("an unquoted value is refused");
-        let message = error.to_string();
-        assert!(message.contains(&path.display().to_string()), "{message}");
-        assert!(message.contains("/key"), "{message}");
-        assert!(
-            !message.contains("sk-secret-without-quotes"),
-            "a parse error must not echo the key: {message}"
-        );
-    }
-
-    #[test]
-    fn k01_missing_and_blank_files_are_absent_not_errors() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        assert!(
-            load(&temp.path().join("nothing-here.env"))
-                .expect("a missing file is not an error")
-                .is_none()
-        );
-        let blank = temp.path().join(CREDENTIAL_FILE_NAME);
-        std::fs::write(&blank, format!("{CREDENTIAL_FILE_VARIABLE}=\"   \"\n")).expect("fixture");
-        assert!(
-            load(&blank)
-                .expect("a blank value is not an error")
-                .is_none(),
-            "a blank value grants nothing"
-        );
-    }
-
-    #[test]
-    fn k01_round_trip_keeps_the_key_and_leaves_no_staging_file() {
+    fn k01_each_provider_keeps_its_own_entry() {
         let temp = tempfile::tempdir().expect("temp dir");
         let path = temp.path().join("nested").join(CREDENTIAL_FILE_NAME);
-        save(&path, "sk-round-trip").expect("the key is saved");
-        assert_eq!(
-            load(&path).expect("the key loads").as_deref(),
-            Some("sk-round-trip")
-        );
+        save(&path, "opencode", &Credential::api_key("sk-open")).expect("saved");
+        save(&path, "deepseek", &Credential::api_key("sk-deep")).expect("saved");
+        assert_eq!(key(&path, "opencode").as_deref(), Some("sk-open"));
+        assert_eq!(key(&path, "deepseek").as_deref(), Some("sk-deep"));
+        assert_eq!(key(&path, "openai"), None);
         let leftovers: Vec<PathBuf> = std::fs::read_dir(path.parent().expect("parent"))
             .expect("readable")
             .filter_map(Result::ok)
@@ -615,17 +723,77 @@ mod tests {
             .filter(|entry| entry.to_string_lossy().contains("staged"))
             .collect();
         assert!(leftovers.is_empty(), "staging files remain: {leftovers:?}");
+
+        assert!(remove(&path, "opencode").expect("removed"));
+        assert!(!remove(&path, "opencode").expect("already gone"));
+        assert_eq!(key(&path, "opencode"), None);
+        assert_eq!(
+            stored(&path).expect("listed"),
+            vec![("deepseek".to_owned(), "API key")]
+        );
     }
 
     #[test]
-    fn k01_a_quote_in_the_key_survives_a_round_trip() {
+    fn k01_a_broken_file_is_reported_without_its_contents() {
         let temp = tempfile::tempdir().expect("temp dir");
         let path = temp.path().join(CREDENTIAL_FILE_NAME);
-        save(&path, "sk-with\"quote").expect("the key is saved");
+        std::fs::write(&path, "{\"deepseek\": sk-not-json").expect("fixture");
+        let message = load(&path, "deepseek")
+            .expect_err("a broken file is refused")
+            .to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("/login"), "{message}");
+        assert!(!message.contains("sk-not-json"), "{message}");
+    }
+
+    #[test]
+    fn k01_the_legacy_single_key_file_reads_as_deepseek() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join(CREDENTIAL_FILE_NAME);
+        std::fs::write(
+            temp.path().join(LEGACY_FILE_NAME),
+            "DEEPSEEK_API_KEY=\"sk-with\\\"quote\"\n",
+        )
+        .expect("fixture");
+        assert_eq!(key(&path, "deepseek").as_deref(), Some("sk-with\"quote"));
+        // The first save carries it over; removing it removes the legacy file too.
+        save(&path, "opencode", &Credential::api_key("sk-open")).expect("saved");
+        assert_eq!(key(&path, "deepseek").as_deref(), Some("sk-with\"quote"));
+        assert!(remove(&path, "deepseek").expect("removed"));
+        assert!(!temp.path().join(LEGACY_FILE_NAME).exists());
+        assert_eq!(key(&path, "deepseek"), None);
+    }
+
+    #[test]
+    fn k01_a_blank_key_grants_nothing_and_debug_never_shows_a_value() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join(CREDENTIAL_FILE_NAME);
+        save(&path, "deepseek", &Credential::api_key("   ")).expect("saved");
+        assert_eq!(key(&path, "deepseek"), None);
+        let shown = format!("{:?}", Credential::api_key("sk-secret"));
+        assert!(!shown.contains("sk-secret"), "{shown}");
+    }
+
+    /// prime-agent's order: what `/login` saved wins over the environment.
+    #[test]
+    fn k02_a_saved_credential_wins_over_the_environment() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_dir = temp.path();
+        let env = environment(&[("OPENCODE_API_KEY", "sk-env")]);
         assert_eq!(
-            load(&path).expect("the key loads").as_deref(),
-            Some("sk-with\"quote")
+            source_for(&env, data_dir, "opencode", ""),
+            Some(CredentialSource::Environment {
+                variable: "OPENCODE_API_KEY".to_owned()
+            })
         );
+        let path = resolve_file(&env, data_dir);
+        save(&path, "opencode", &Credential::api_key("sk-saved")).expect("saved");
+        assert!(matches!(
+            source_for(&env, data_dir, "opencode", ""),
+            Some(CredentialSource::File { .. })
+        ));
+        // Another provider's saved key is not this provider's credential.
+        assert_eq!(source_for(&environment(&[]), data_dir, "openai", ""), None);
     }
 
     #[cfg(unix)]
@@ -634,7 +802,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().expect("temp dir");
         let path = temp.path().join(CREDENTIAL_FILE_NAME);
-        save(&path, "sk-permissions").expect("the key is saved");
+        save(&path, "deepseek", &Credential::api_key("sk-permissions")).expect("saved");
         let mode = std::fs::metadata(&path)
             .expect("metadata")
             .permissions()
@@ -661,8 +829,8 @@ mod tests {
     #[test]
     fn k01_the_stage_file_is_created_with_restrictive_flags() {
         let temp = tempfile::tempdir().expect("temp dir");
-        let staging = temp.path().join(".credentials.env.staged");
-        super::write_staged(&staging, b"DEEPSEEK_API_KEY=\"sk-x\"\n").expect("staged write");
+        let staging = temp.path().join(".auth.json.staged");
+        super::write_staged(&staging, b"{}\n").expect("staged write");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -673,10 +841,7 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600, "stage file mode was {mode:o}");
         }
-        assert_eq!(
-            std::fs::read_to_string(&staging).expect("readable"),
-            "DEEPSEEK_API_KEY=\"sk-x\"\n"
-        );
+        assert_eq!(std::fs::read_to_string(&staging).expect("readable"), "{}\n");
     }
 
     #[test]
@@ -716,10 +881,10 @@ mod tests {
         assert!(!from_environment.is_live());
 
         let from_file = CredentialSource::File {
-            path: PathBuf::from("C:/fixture/credentials.env"),
+            path: PathBuf::from("C:/fixture/auth.json"),
             protection: Protection::OwnerOnlyAcl,
         };
-        assert!(from_file.describe().contains("credentials.env"));
+        assert!(from_file.describe().contains("auth.json"));
         assert!(from_file.is_live(), "a saved file is re-read at call time");
         assert_eq!(from_file.protection(), Some(Protection::OwnerOnlyAcl));
         assert!(
@@ -761,9 +926,6 @@ mod tests {
     /// This measures the actual ACL instead of trusting the code path: it saves a
     /// key, reads the ACL back with `icacls`, and asserts that the account running
     /// the test and SYSTEM are present while an unrelated sandbox group is gone.
-    /// The profile directory on this machine inherits a read grant to a group that
-    /// is not the user, so this is the difference between claiming protection and
-    /// applying it.
     ///
     /// The assertion is on the English spelling of SYSTEM, because `icacls` prints
     /// resolved account names rather than SIDs. That is the measured behavior here;
@@ -774,7 +936,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let directory = temp.path().join("private");
         let path = directory.join(CREDENTIAL_FILE_NAME);
-        let protection = save(&path, "sk-acl-measured").expect("the key is saved");
+        let protection =
+            save(&path, "deepseek", &Credential::api_key("sk-acl-measured")).expect("saved");
         assert_eq!(
             protection,
             Protection::OwnerOnlyAcl,
@@ -797,10 +960,7 @@ mod tests {
             "the inherited group grants must be gone: {text}"
         );
         // The app must still be able to use what it just protected.
-        assert_eq!(
-            load(&path).expect("the key loads").as_deref(),
-            Some("sk-acl-measured")
-        );
+        assert_eq!(key(&path, "deepseek").as_deref(), Some("sk-acl-measured"));
     }
 
     /// The mode bits and the ACL are one contract: owner-only either way.

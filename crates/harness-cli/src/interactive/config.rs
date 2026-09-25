@@ -12,7 +12,7 @@ use harness_tools::ConfiguredToolHook;
 use harness_types::{
     ErrorCode, HarnessConfig, HarnessConfigV2, HarnessError, McpServerConfigV2, ProviderConfigV2,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The context window assumed for a model no table knows, in tokens.
 ///
@@ -51,6 +51,8 @@ pub const DEEPSEEK_MODEL: &str = DEEPSEEK_PRESET.model;
 pub enum ConfigLayer {
     Default,
     User,
+    /// The model `/model` chose.
+    Selection,
     Project,
     Local,
     Environment,
@@ -63,6 +65,7 @@ impl ConfigLayer {
         match self {
             Self::Default => "default",
             Self::User => "user",
+            Self::Selection => "selection",
             Self::Project => "project(trust)",
             Self::Local => "project(local)",
             Self::Environment => "env",
@@ -88,6 +91,61 @@ pub struct ResolvedProviderConfig {
     pub model: String,
     pub api_key_env: String,
     pub thinking: String,
+    /// How the model takes a thinking level, from the catalog (`deepseek`,
+    /// `qwen`); `None` lets the adapter decide from the provider.
+    pub thinking_format: Option<String>,
+}
+
+/// The model `/model` chose, as prime-agent keeps its default model in its
+/// settings: saved beside the user config, applied right after it, and still
+/// overridden by a trusted project, a profile, the environment and `--model`.
+///
+/// It carries the transport resolved from the catalog when it was chosen, so
+/// resolving the configuration never needs the catalog.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Selection {
+    pub provider: String,
+    pub model: String,
+    pub protocol: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_format: Option<String>,
+}
+
+/// The file the selection lives in, beside the user config.
+#[must_use]
+pub fn selection_path(user_path: &Path) -> PathBuf {
+    user_path.with_file_name("selection.json")
+}
+
+/// The saved selection; a missing or unreadable file is no selection.
+#[must_use]
+pub fn load_selection(user_path: &Path) -> Option<Selection> {
+    let text = std::fs::read_to_string(selection_path(user_path)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Save the selection for this and later launches.
+pub fn save_selection(user_path: &Path, selection: &Selection) -> Result<(), HarnessError> {
+    let path = selection_path(user_path);
+    let failed = |error: &dyn std::fmt::Display| {
+        HarnessError::new(
+            ErrorCode::StorageOpenFailed,
+            format!(
+                "model selection {} could not be saved: {error}",
+                path.display()
+            ),
+        )
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| failed(&error))?;
+    }
+    let text = serde_json::to_string_pretty(selection).map_err(|error| failed(&error))?;
+    let staged = path.with_extension("json.staged");
+    std::fs::write(&staged, text).map_err(|error| failed(&error))?;
+    std::fs::rename(&staged, &path).map_err(|error| failed(&error))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -133,6 +191,7 @@ pub fn resolve_layers(
         model: DEEPSEEK_PRESET.model.to_owned(),
         api_key_env: DEEPSEEK_PRESET.api_key_env.to_owned(),
         thinking: DEEPSEEK_PRESET.thinking.to_owned(),
+        thinking_format: None,
     };
     let mut entries = BTreeMap::new();
     let mut model_prices = BTreeMap::new();
@@ -220,6 +279,14 @@ pub fn resolve_layers(
             ConfigLayer::User,
         )?;
         mcp_servers.extend(config.mcp_servers.clone());
+    }
+    if let Some(selection) = load_selection(user_path) {
+        apply_selection(
+            &mut provider,
+            &mut model_context_windows,
+            &selection,
+            &mut entries,
+        );
     }
 
     let canonical_root = project_root
@@ -861,6 +928,33 @@ fn apply_environment_provider(
             set_explain(entries, key, &value, ConfigLayer::Environment, None);
         }
     }
+}
+
+fn apply_selection(
+    provider: &mut ResolvedProviderConfig,
+    model_context_windows: &mut BTreeMap<String, (u64, ConfigLayer)>,
+    selection: &Selection,
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+) {
+    provider.id.clone_from(&selection.provider);
+    provider.protocol.clone_from(&selection.protocol);
+    provider.endpoint.clone_from(&selection.endpoint);
+    provider.model.clone_from(&selection.model);
+    provider.api_key_env = super::providers::env_variables(&selection.provider)
+        .first()
+        .map_or_else(String::new, |variable| (*variable).to_owned());
+    provider
+        .thinking_format
+        .clone_from(&selection.thinking_format);
+    if let Some(window) = selection.context_window {
+        model_context_windows.insert(selection.model.clone(), (window, ConfigLayer::Selection));
+    }
+    explain_provider(
+        entries,
+        provider,
+        ConfigLayer::Selection,
+        Some("chosen with /model".to_owned()),
+    );
 }
 
 fn explain_provider(

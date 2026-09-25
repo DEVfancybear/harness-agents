@@ -214,6 +214,7 @@ mod tests {
                 model: "test".to_owned(),
                 api_key_env: "TEST_KEY".to_owned(),
                 thinking: "off".to_owned(),
+                thinking_format: None,
             },
             profile: None,
             approval: approval.to_owned(),

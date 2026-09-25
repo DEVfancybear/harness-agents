@@ -1111,7 +1111,7 @@ mod tests {
         let painted = renderer.painted();
         let text = painted.join("\n");
         assert!(
-            text.contains("❯ /help"),
+            text.contains("❯ /model"),
             "the first row is highlighted: {text}"
         );
         assert!(
@@ -1119,12 +1119,12 @@ mod tests {
             "the composer keeps the draft while the menu is up: {text}"
         );
         assert!(
-            text.contains("Tab/Enter nhận"),
+            text.contains("Tab/Enter"),
             "the border names the menu's keys, not the composer's: {text}"
         );
         let menu_row = painted
             .iter()
-            .position(|row| row.contains("❯ /help"))
+            .position(|row| row.contains("❯ /model"))
             .expect("a menu row");
         let composer_row = painted
             .iter()

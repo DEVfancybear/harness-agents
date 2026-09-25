@@ -133,46 +133,52 @@ pub fn cursor_cell(phase: AppPhase, buffer: &str, cursor: usize) -> (usize, usiz
 
 /// The `/help` page, built from the same table the suggestion menu draws.
 ///
-/// One row is added by hand: `/key <value>` is the *less private* form of `/key`,
-/// and it is the only command whose second form earns a line of its own. A command
-/// added to `SLASH_COMMANDS` therefore appears here without anyone remembering to
+/// One row is added by hand: `/skill:<name>`, which the menu lists skill by skill.
+/// A command added to `SLASH_COMMANDS` appears here without anyone remembering to
 /// write a second row, which is the point: the list a user sees while typing and
 /// the list `/help` prints cannot drift apart.
 #[must_use]
 pub fn help_lines() -> Vec<String> {
     let mut lines = Vec::with_capacity(SLASH_COMMANDS.len() + 2);
     for command in SLASH_COMMANDS {
-        lines.push(usage_line(&command.usage(), command.summary));
-        if command.name == "/key" {
-            lines.push(usage_line(
-                "/key <value>",
-                "save it in one line: less private because the value is visible while typed; it is \
-                 removed from recall history afterwards",
-            ));
+        let mut summary = command.summary.to_owned();
+        if !command.aliases.is_empty() {
+            summary = format!("{summary} (also {})", command.aliases.join(", "));
         }
+        lines.push(usage_line(&command.usage(), &summary));
     }
-    lines.push(
-        "↑↓ recall prompts or choose a menu item; Ctrl-C cancels a run or clears an idle prompt; Ctrl-D exits on an empty line."
-            .to_owned(),
-    );
+    lines.push(usage_line(
+        "/skill:<name> [task]",
+        "Run a skill; typing /skill lists them",
+    ));
+    lines.push("Keys: /hotkeys".to_owned());
     lines
 }
 
 /// The `/help` card the TUI shows: every command, grouped, on one screen.
 ///
-/// The full table is 33 rows and the inline viewport gives a panel about eight, so
-/// `/help` used to open on seven commands and "còn 26 dòng" - measured as the reason
-/// the app felt hard to find one's way in. The card lists every command by name in
-/// its group, which fits without scrolling; the suggestion menu shows what each one
-/// does while typing `/`, and `/help all` still opens the full table.
+/// The full table does not fit the inline viewport, so the card lists every
+/// command by name in its group; the suggestion menu shows what each one does
+/// while typing `/`, and `/help all` opens the full table.
 #[must_use]
 pub fn help_card_lines() -> Vec<String> {
-    let groups: [(&str, &[&str]); 6] = [
+    let groups: [(&str, &[&str]); 5] = [
         (
-            "Chat",
+            "Session",
             &[
-                "/new", "/resume", "/rename", "/clear", "/compact", "/refine", "/context", "/undo",
-                "/copy", "/export",
+                "/new", "/resume", "/name", "/session", "/compact", "/refine", "/context", "/copy",
+                "/export", "/undo", "/diff",
+            ],
+        ),
+        (
+            "Model",
+            &[
+                "/model",
+                "/effort",
+                "/login",
+                "/logout",
+                "/cost",
+                "/system-prompt",
             ],
         ),
         (
@@ -182,14 +188,9 @@ pub fn help_card_lines() -> Vec<String> {
                 "/steer",
                 "/mode",
                 "/permissions",
-                "/cost",
-                "/model",
-                "/thinking",
+                "/agents",
+                "/more",
             ],
-        ),
-        (
-            "Project",
-            &["/status", "/config", "/diff", "/init", "/trust", "/more"],
         ),
         (
             "Tools",
@@ -197,30 +198,23 @@ pub fn help_card_lines() -> Vec<String> {
                 "/skills",
                 "/skill:<name>",
                 "/mcp",
-                "/agents",
                 "/hooks",
                 "/reload",
+                "/config",
+                "/trust",
+                "/init",
             ],
         ),
         (
             "Input",
             &[
+                "/help",
                 "/image",
                 "/attach <path>",
                 "@file",
                 "!command",
-                "/key",
-                "/exit",
-            ],
-        ),
-        (
-            "Keys",
-            &[
-                "Enter gửi",
-                "Ctrl-J xuống dòng",
-                "↑↓ lịch sử",
-                "Esc/Ctrl-C hủy",
-                "Ctrl-D thoát",
+                "/hotkeys",
+                "/quit",
             ],
         ),
     ];
@@ -230,6 +224,30 @@ pub fn help_card_lines() -> Vec<String> {
         .collect::<Vec<_>>();
     lines.push("Gõ / để xem mô tả từng lệnh · /help all để xem bảng đầy đủ".to_owned());
     lines
+}
+
+/// prime-agent's `/hotkeys`: every key the prompt understands.
+#[must_use]
+pub fn hotkey_lines() -> Vec<String> {
+    [
+        ("Enter", "send; in the / menu, pick the highlighted row"),
+        ("Tab", "complete the highlighted command or argument"),
+        ("Ctrl-J / Alt+Enter", "new line"),
+        ("↑ ↓", "move in a menu, or recall earlier prompts"),
+        ("Esc", "close a panel or menu; interrupt a run"),
+        ("Ctrl-C", "cancel the run; twice on an empty prompt quits"),
+        ("Ctrl-D", "quit on an empty prompt"),
+        ("Ctrl-O", "cycle collapsed / details / expanded"),
+        ("Ctrl-L", "redraw"),
+        ("Ctrl-U / Ctrl-W", "erase to line start / erase a word"),
+        ("Ctrl-V", "paste an image or path from the clipboard"),
+        ("PgUp / PgDn", "scroll a panel"),
+        ("@", "pick a file to mention"),
+        ("!cmd / !!cmd", "run a shell command / only show its output"),
+    ]
+    .iter()
+    .map(|(key, what)| usage_line(key, what))
+    .collect()
 }
 
 /// One help row: the command in a fixed column, then what it does.
@@ -434,14 +452,17 @@ mod tests {
     fn h03_help_lists_the_commands_the_plan_requires() {
         let help = help_lines().join("\n");
         for command in [
-            "/help", "/status", "/new", "/model", "/config", "/resume", "/exit",
+            "/help", "/session", "/status", "/new", "/model", "/login", "/logout", "/config",
+            "/resume", "/quit", "/exit",
         ] {
             assert!(help.contains(command), "missing {command} in {help}");
         }
-        assert!(help.contains("Ctrl-C"));
-        assert!(help.contains("Ctrl-D"));
+        let keys = super::hotkey_lines().join("\n");
+        assert!(keys.contains("Ctrl-C"), "{keys}");
+        assert!(keys.contains("Ctrl-D"), "{keys}");
+        assert!(keys.contains("Ctrl-O"), "{keys}");
         assert!(
-            help.contains("/help            list these commands"),
+            help.contains("/help            List every command"),
             "the reference page keeps its column layout: {help}"
         );
     }
@@ -457,22 +478,23 @@ mod tests {
             assert!(
                 help.iter()
                     .any(|line| line.starts_with(&format!("{:<17}", command.usage()))
-                        && line.contains(command.summary)),
+                        && line.contains(command.summary)
+                        && command.aliases.iter().all(|alias| line.contains(alias))),
                 "{} is offered by the menu but missing from /help: {text}",
                 command.name
             );
         }
 
-        // The one row written by hand: the less private form of `/key`.
+        // The one row written by hand: skills, which the menu lists by name.
         assert!(
-            help.iter().any(|line| line.starts_with("/key <value>")),
+            help.iter().any(|line| line.starts_with("/skill:<name>")),
             "{text}"
         );
 
         // Nothing else names a command: the footer is the only row that is not one.
         for line in &help {
             let first = line.split_whitespace().next().unwrap_or_default();
-            if first.starts_with("Ctrl-") || first == "↑↓" {
+            if first.starts_with("/skill:") || first == "Keys:" {
                 continue;
             }
             assert!(
@@ -483,7 +505,7 @@ mod tests {
         assert_eq!(
             help.len(),
             SLASH_COMMANDS.len() + 2,
-            "one row per command, the /key <value> row, and the footer"
+            "one row per command, the skill row, and the footer"
         );
     }
 

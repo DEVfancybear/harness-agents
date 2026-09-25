@@ -12,9 +12,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use harness_providers::{
-    CancellationToken, DeepSeekAdapter, MockProvider, ModelCapabilities, ModelProvider,
-};
+use harness_providers::{CancellationToken, MockProvider, ModelCapabilities, ModelProvider};
 use harness_runtime::{
     BudgetLedger, EvidenceKind, GoalCriterion, GoalSpec, HumanInputService, RunInbox, RunRequest,
     RuntimeConfig, RuntimeService,
@@ -317,7 +315,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     acceptance_trace("workspace_observed");
     let capabilities = match &provider_config {
         Some(config) => ModelCapabilities {
-            provider_id: "deepseek".to_owned(),
+            provider_id: config.provider_id.clone(),
             model: config.model.clone(),
             supports_streaming: true,
             supports_tools: true,
@@ -332,17 +330,19 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         },
     };
     let provider: Arc<dyn ModelProvider> = match &provider_config {
-        Some(config) => Arc::new(
-            DeepSeekAdapter::new(
-                config.endpoint.clone(),
-                Arc::new(EnvironmentCredential::new(
-                    config.credential_variable(),
-                    context.paths.data_dir.clone(),
-                )),
-                capabilities,
-            )
-            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?,
-        ),
+        Some(config) => super::service::build_provider(
+            config,
+            Arc::new(EnvironmentCredential::new(
+                config.provider_id.clone(),
+                config.credential_variable(),
+                context.paths.data_dir.clone(),
+            )),
+            capabilities,
+            harness_providers::ThinkingLevel::parse(&config.thinking).unwrap_or_default(),
+            task_id.as_ref(),
+            &context.paths.data_dir,
+        )
+        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?,
         None => Arc::new(MockProvider::text("mock profile: no model was called")),
     };
     let mut runtime = RuntimeService::new(

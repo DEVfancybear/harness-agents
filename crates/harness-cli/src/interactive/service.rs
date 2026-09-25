@@ -37,7 +37,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use super::attachments;
-use super::bootstrap::{CREDENTIAL_VARIABLES, LaunchContext};
+use super::bootstrap::LaunchContext;
 use super::bounds;
 use super::config::ConfigOverrides;
 #[cfg(test)]
@@ -217,6 +217,10 @@ pub trait SessionPort: Send {
     fn skills_summary(&self) -> Vec<String> {
         vec!["skill catalog is unavailable".to_owned()]
     }
+    /// Skills and prompt commands, for the slash-command menu.
+    fn menu_commands(&self) -> Vec<super::commands::MenuCommand> {
+        Vec::new()
+    }
     fn activate_skill(&mut self, _name: &str) -> Result<String, String> {
         Err("this backend cannot activate skills".to_owned())
     }
@@ -238,6 +242,10 @@ pub trait SessionPort: Send {
     }
     fn context_summary(&self) -> Vec<String> {
         vec!["no context packet has been built in this session yet".to_owned()]
+    }
+    /// The system prompt the last turn sent, as prime-agent's `/system-prompt` shows it.
+    fn system_prompt(&self) -> Vec<String> {
+        vec!["no turn has run in this session yet".to_owned()]
     }
     fn git_diff(&mut self) -> Result<(), String> {
         Err("this backend does not support session diffs".to_owned())
@@ -283,7 +291,7 @@ pub trait SessionPort: Send {
     /// Why a real dispatch is impossible right now, or `None` when it is possible.
     ///
     /// The controller asks this before submitting a turn, so the answer is always
-    /// evaluated against the *current* credential: after `/key` saves one, this
+    /// evaluated against the *current* credential: after `/login` saves one, this
     /// turns `None` and the very next message reaches the provider.
     fn provider_problem(&self) -> Option<String> {
         None
@@ -297,14 +305,46 @@ pub trait SessionPort: Send {
     fn project_id(&mut self) -> Option<String> {
         None
     }
-    /// Save a key so this session and the next launch can use it.
+    /// Save a provider's credential so this session and the next launch can use it.
     ///
     /// The file is the source of truth because the credential resolver re-reads it
     /// at call time; nothing has to restart for the next turn to use it. The
     /// returned source carries the source *name*, never the value.
-    fn save_credential(&mut self, _key: &str) -> Result<CredentialSource, String> {
+    fn save_credential(
+        &mut self,
+        _provider: &str,
+        _credential: &credentials::Credential,
+    ) -> Result<CredentialSource, String> {
         Err("this backend cannot save a provider credential".to_owned())
     }
+    /// Remove a provider's saved credential; whether there was one.
+    fn remove_credential(&mut self, _provider: &str) -> Result<bool, String> {
+        Err("this backend cannot remove a provider credential".to_owned())
+    }
+    /// The providers with a saved credential, and what kind each is.
+    fn stored_credentials(&self) -> Vec<(String, &'static str)> {
+        Vec::new()
+    }
+    /// The provider the next turn uses.
+    fn provider_id(&self) -> Option<String> {
+        None
+    }
+    /// `provider/model` and its name, for every catalog model whose provider has a
+    /// credential: what the `/model` menu offers.
+    fn model_options(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    /// Start a browser sign-in; returns the URL to open. The outcome arrives as
+    /// [`SessionEvent::LoginFinished`].
+    fn begin_sign_in(&mut self, _provider: &str) -> Result<String, String> {
+        Err("this backend cannot sign in".to_owned())
+    }
+    /// Finish the sign-in in progress with a pasted redirect URL or code.
+    fn finish_sign_in(&mut self, _pasted: &str) -> Result<(), String> {
+        Err("no sign-in is in progress".to_owned())
+    }
+    /// Stop waiting for the browser.
+    fn cancel_sign_in(&mut self) {}
 }
 
 /// Asks the user for each gated action and waits for the answer.
@@ -562,6 +602,8 @@ pub struct ProviderConfig {
     pub model: String,
     pub api_key_env: String,
     pub thinking: String,
+    /// How the model takes a thinking level, from the catalog.
+    pub thinking_format: Option<String>,
     pub approval: String,
     pub allow_rules: Vec<String>,
     pub deny_rules: Vec<String>,
@@ -642,19 +684,28 @@ pub(super) fn resolve_provider_with_overrides(
         .map_err(|error| error.to_string())?;
     if !matches!(
         resolved.provider.protocol.as_str(),
-        "openai_chat" | "anthropic_messages"
+        "openai_chat" | "anthropic_messages" | "openai_responses" | "openai_codex"
     ) {
         return Err(format!(
             "unsupported provider protocol {:?}",
             resolved.provider.protocol
         ));
     }
-    let credential = credentials::source_for(environment, data_dir, &resolved.provider.api_key_env)
-        .or_else(|| credentials::source(environment, data_dir));
+    let credential = credentials::source_for(
+        environment,
+        data_dir,
+        &resolved.provider.id,
+        &resolved.provider.api_key_env,
+    );
     let Some(credential) = credential else {
         return Err(format!(
-            "provider setup is incomplete: set {} or save the key in the app with /key (API key). Nothing was sent and no fixture answer was substituted.",
-            resolved.provider.api_key_env
+            "provider setup is incomplete: log in to {} with /login{}. Nothing was sent and no fixture answer was substituted.",
+            resolved.provider.id,
+            if resolved.provider.api_key_env.is_empty() {
+                String::new()
+            } else {
+                format!(" or set {}", resolved.provider.api_key_env)
+            }
         ));
     };
     let model_price = resolved.model_prices.get(&resolved.provider.model).copied();
@@ -666,6 +717,7 @@ pub(super) fn resolve_provider_with_overrides(
         model: resolved.provider.model,
         api_key_env: resolved.provider.api_key_env,
         thinking: resolved.provider.thinking,
+        thinking_format: resolved.provider.thinking_format,
         approval: resolved.approval,
         allow_rules: resolved.allow_rules,
         deny_rules: resolved.deny_rules,
@@ -694,26 +746,10 @@ pub fn validate_credential_file(
     environment: &LaunchEnvironment,
     data_dir: &Path,
 ) -> Result<(), String> {
-    let Some(CredentialSource::File { path, .. }) = credentials::source(environment, data_dir)
-    else {
-        return Ok(());
-    };
-    let resolver_path = credentials::resolve_file(environment, data_dir);
-    if resolver_path != path {
-        return Err(format!(
-            "the credential source {} and the file the resolver reads {} disagree; nothing was sent",
-            path.display(),
-            resolver_path.display()
-        ));
-    }
-    match credentials::load(&path) {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(format!(
-            "the credential file {} holds no key; save it in the app with /key",
-            path.display()
-        )),
-        Err(error) => Err(error.to_string()),
-    }
+    let path = credentials::resolve_file(environment, data_dir);
+    credentials::stored(&path)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// One line per provider fact, for `/status`.
@@ -751,9 +787,12 @@ fn provider_diagnostics_with_config(
         "Provider: {} ({})",
         resolved.provider.id, resolved.provider.protocol
     )];
-    match credentials::source_for(environment, data_dir, &resolved.provider.api_key_env)
-        .or_else(|| credentials::source(environment, data_dir))
-    {
+    match credentials::source_for(
+        environment,
+        data_dir,
+        &resolved.provider.id,
+        &resolved.provider.api_key_env,
+    ) {
         Some(source) => {
             lines.push(format!(
                 "Provider: credential from {} (value hidden)",
@@ -767,8 +806,8 @@ fn provider_diagnostics_with_config(
             }
         }
         None => lines.push(format!(
-            "Provider: no credential; set one of {} or save it with /key",
-            CREDENTIAL_VARIABLES.join(", ")
+            "Provider: no credential for {}; log in with /login",
+            resolved.provider.id
         )),
     }
     for key in ["provider.endpoint", "provider.model"] {
@@ -799,9 +838,12 @@ fn provider_diagnostics_with_config(
             }
         }
     }
-    match credentials::source_for(environment, data_dir, &resolved.provider.api_key_env)
-        .or_else(|| credentials::source(environment, data_dir))
-    {
+    match credentials::source_for(
+        environment,
+        data_dir,
+        &resolved.provider.id,
+        &resolved.provider.api_key_env,
+    ) {
         Some(_) => {
             lines.push(format!(
                 "Provider: ready, would call {}",
@@ -813,8 +855,8 @@ fn provider_diagnostics_with_config(
             });
         }
         None => lines.push(format!(
-            "Provider: not ready (set {} or save a key with /key)",
-            resolved.provider.api_key_env
+            "Provider: not ready (log in to {} with /login)",
+            resolved.provider.id
         )),
     }
     lines
@@ -859,28 +901,35 @@ fn endpoint_reachability(endpoint: &str) -> Result<(), String> {
 /// Reads the credential when a call is made; the value is never stored, logged
 /// or rendered anywhere in the app.
 ///
-/// Two ordered sources, and the order is the whole contract: the environment
-/// variable wins, the file saved by `/key` is the fallback. The file is re-read
-/// on every call, which is why saving a key takes effect in a running app
-/// without a restart.
+/// Two ordered sources, and the order is the whole contract, as in prime-agent:
+/// what `/login` saved for the provider wins, the provider's environment variables
+/// are the fallback. The file is re-read on every call, which is why logging in
+/// takes effect in a running app without a restart, and why a sign-in token is
+/// refreshed here when it is about to expire.
 pub struct EnvironmentCredential {
+    provider: String,
     variable: String,
     data_dir: PathBuf,
     environment: LaunchEnvironment,
 }
 
 impl EnvironmentCredential {
-    /// Bind the resolver to one environment variable name and one data root.
+    /// Bind the resolver to one provider, its configured variable and one data root.
     #[must_use]
-    pub fn new(variable: impl Into<String>, data_dir: PathBuf) -> Self {
+    pub fn new(
+        provider: impl Into<String>,
+        variable: impl Into<String>,
+        data_dir: PathBuf,
+    ) -> Self {
         Self {
+            provider: provider.into(),
             variable: variable.into(),
             data_dir,
             environment: LaunchEnvironment::capture(),
         }
     }
 
-    /// The file this launch falls back to when the variable is absent.
+    /// The file `/login` saves to and this resolver reads first.
     #[must_use]
     pub fn file(&self) -> PathBuf {
         credentials::resolve_file(&self.environment, &self.data_dir)
@@ -889,32 +938,132 @@ impl EnvironmentCredential {
 
 impl CredentialResolver for EnvironmentCredential {
     fn resolve(&self) -> Result<String, ProviderError> {
-        if let Some(value) = self
-            .environment
-            .value(&self.variable)
-            .filter(|value| !value.is_empty())
-        {
-            return Ok(value.to_string_lossy().into_owned());
-        }
         let path = self.file();
-        match credentials::load(&path) {
-            Ok(Some(value)) => Ok(value),
-            Err(error) => Err(ProviderError::new(
-                ErrorCode::SecretNotGranted,
-                format!(
-                    "credential {} is not present in the environment and the saved file cannot be used: {error}",
-                    self.variable
-                ),
-            )),
-            Ok(None) => Err(ProviderError::new(
-                ErrorCode::SecretNotGranted,
-                format!(
-                    "credential {} is not present in the environment and {} holds no key; save it in the app with /key",
-                    self.variable,
-                    path.display()
-                ),
-            )),
+        match credentials::load(&path, &self.provider) {
+            Ok(Some(credential)) => {
+                return super::oauth::current_secret(&path, &self.provider, credential)
+                    .map_err(|message| ProviderError::new(ErrorCode::SecretNotGranted, message));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(ProviderError::new(
+                    ErrorCode::SecretNotGranted,
+                    format!("the saved credential file cannot be used: {error}"),
+                ));
+            }
         }
+        std::iter::once(self.variable.as_str())
+            .chain(
+                super::providers::env_variables(&self.provider)
+                    .iter()
+                    .copied(),
+            )
+            .filter(|name| !name.is_empty())
+            .find_map(|name| {
+                self.environment
+                    .value(name)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string_lossy().into_owned())
+            })
+            .ok_or_else(|| {
+                ProviderError::new(
+                    ErrorCode::SecretNotGranted,
+                    format!(
+                        "no credential for {}: log in with /login{}",
+                        self.provider,
+                        if self.variable.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" or set {}", self.variable)
+                        }
+                    ),
+                )
+            })
+    }
+}
+
+/// The adapter for one resolved provider: the wire format its protocol names,
+/// with the thinking level and the headers the provider wants.
+pub(super) fn build_provider(
+    config: &ProviderConfig,
+    credentials: Arc<dyn harness_providers::CredentialResolver>,
+    capabilities: ModelCapabilities,
+    thinking_level: harness_providers::ThinkingLevel,
+    session: &str,
+    data_dir: &Path,
+) -> Result<Arc<dyn ModelProvider>, ProviderError> {
+    // prime-agent's `opencode-headers.ts`: OpenCode wants to know the client and
+    // the conversation.
+    let extra_headers = if config.provider_id.starts_with("opencode") {
+        vec![
+            (
+                "User-Agent".to_owned(),
+                format!("ha/{}", env!("CARGO_PKG_VERSION")),
+            ),
+            ("x-opencode-session".to_owned(), session.to_owned()),
+        ]
+    } else {
+        Vec::new()
+    };
+    let chat_thinking_format = match config.thinking_format.as_deref() {
+        Some("deepseek") => harness_providers::ThinkingFormat::DeepSeek,
+        Some(_) => harness_providers::ThinkingFormat::ReasoningEffort,
+        None => harness_providers::thinking::chat_format(&config.provider_id, &config.endpoint),
+    };
+    match config.protocol.as_str() {
+        "openai_chat" => OpenAiChatAdapter::with_options(
+            config.endpoint.clone(),
+            credentials,
+            capabilities,
+            OpenAiChatOptions {
+                thinking: Some(harness_providers::Thinking {
+                    level: thinking_level,
+                    format: chat_thinking_format,
+                }),
+                headers: extra_headers,
+            },
+        )
+        .map(|adapter| Arc::new(adapter) as Arc<dyn ModelProvider>),
+        "anthropic_messages" => {
+            AnthropicMessagesAdapter::new(config.endpoint.clone(), credentials, capabilities).map(
+                |adapter| {
+                    Arc::new(
+                        adapter
+                            .with_thinking(Some(harness_providers::Thinking {
+                                level: thinking_level,
+                                format: harness_providers::ThinkingFormat::Anthropic,
+                            }))
+                            .with_headers(extra_headers),
+                    ) as Arc<dyn ModelProvider>
+                },
+            )
+        }
+        "openai_responses" | "openai_codex" => harness_providers::OpenAiResponsesAdapter::new(
+            config.endpoint.clone(),
+            credentials,
+            capabilities,
+            if config.protocol == "openai_codex" {
+                harness_providers::ResponsesFlavor::Codex {
+                    originator: super::oauth::ORIGINATOR.to_owned(),
+                }
+            } else {
+                harness_providers::ResponsesFlavor::Api
+            },
+            harness_providers::ResponsesOptions {
+                // Only a model the catalog marks as reasoning is sent an effort.
+                reasoning: super::providers::Catalog::load(data_dir)
+                    .find(&format!("{}/{}", config.provider_id, config.model))
+                    .is_some_and(|model| model.reasoning)
+                    .then_some(thinking_level),
+                headers: extra_headers,
+                session_id: Some(session.to_owned()),
+            },
+        )
+        .map(|adapter| Arc::new(adapter) as Arc<dyn ModelProvider>),
+        _ => Err(ProviderError::new(
+            ErrorCode::ProviderProtocol,
+            "provider protocol is unsupported",
+        )),
     }
 }
 
@@ -1001,8 +1150,10 @@ impl TurnObserver for ChannelObserver {
 /// when the turn ends.
 pub struct AgentSessionService {
     sender: UnboundedSender<SessionEvent>,
+    /// The browser sign-in waiting for its code, if any.
+    sign_in: Option<Arc<super::oauth::PendingLogin>>,
     store_dir: PathBuf,
-    /// Root that owns the credential file `/key` writes.
+    /// Root that owns the credential file `/login` writes.
     data_dir: PathBuf,
     config_file: PathBuf,
     workspace_root: PathBuf,
@@ -1030,6 +1181,7 @@ pub struct AgentSessionService {
     /// first turn arrives.
     project_id: Arc<Mutex<Option<String>>>,
     context_summary: Arc<Mutex<Vec<String>>>,
+    system_prompt: Arc<Mutex<String>>,
     active_skills: Arc<Mutex<BTreeMap<String, harness_extensions::SkillActivation>>>,
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
@@ -1526,6 +1678,8 @@ impl AgentSessionService {
             limits,
             project_id: Arc::new(Mutex::new(None)),
             context_summary: Arc::new(Mutex::new(Vec::new())),
+            sign_in: None,
+            system_prompt: Arc::new(Mutex::new(String::new())),
             active_skills: Arc::new(Mutex::new(BTreeMap::new())),
             pending_mcp_elicitations: Arc::new(Mutex::new(HashMap::new())),
             mcp_status: Arc::new(Mutex::new(Vec::new())),
@@ -1712,6 +1866,7 @@ impl SessionPort for AgentSessionService {
         let session_mode = self.session_mode.lock().ok().and_then(|mode| *mode);
         let auto_allowed_count = Arc::clone(&self.auto_allowed_count);
         let context_summary = Arc::clone(&self.context_summary);
+        let system_prompt = Arc::clone(&self.system_prompt);
         let active_skills = Arc::clone(&self.active_skills);
         let pending_mcp_elicitations = Arc::clone(&self.pending_mcp_elicitations);
         let mcp_status = Arc::clone(&self.mcp_status);
@@ -1751,6 +1906,7 @@ impl SessionPort for AgentSessionService {
                 session_mode,
                 auto_allowed_count,
                 context_summary,
+                system_prompt,
                 active_skills,
                 pending_mcp_elicitations,
                 mcp_status,
@@ -1963,6 +2119,50 @@ impl SessionPort for AgentSessionService {
         )
     }
 
+    fn menu_commands(&self) -> Vec<super::commands::MenuCommand> {
+        let trusted = super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .is_ok_and(|config| config.project_trusted);
+        let mut commands = Vec::new();
+        if let Ok(catalog) = super::skills::discover(
+            &self.global_config_dir,
+            &self.workspace_root,
+            &self.environment,
+            trusted,
+        ) {
+            commands.extend(
+                catalog
+                    .entries()
+                    .iter()
+                    .map(|entry| super::commands::MenuCommand {
+                        name: format!("/skill:{}", entry.name),
+                        description: entry.description.clone(),
+                        argument_hint: String::new(),
+                        tag: "skill",
+                    }),
+            );
+        }
+        if let Ok(prompts) =
+            super::skills::commands(&self.global_config_dir, &self.workspace_root, trusted)
+        {
+            commands.extend(
+                prompts
+                    .into_iter()
+                    .map(|command| super::commands::MenuCommand {
+                        name: format!("/{}", command.name),
+                        description: command.description,
+                        argument_hint: command.argument_hint,
+                        tag: "prompt",
+                    }),
+            );
+        }
+        commands
+    }
+
     fn skills_summary(&self) -> Vec<String> {
         let mut lines = match super::skills::discover(
             &self.global_config_dir,
@@ -2091,6 +2291,13 @@ impl SessionPort for AgentSessionService {
             .map_or_else(|_| "n/a".to_owned(), |tracker| tracker.display())
     }
 
+    fn system_prompt(&self) -> Vec<String> {
+        match self.system_prompt.lock() {
+            Ok(text) if !text.is_empty() => text.lines().map(str::to_owned).collect(),
+            _ => vec!["no turn has run in this session yet".to_owned()],
+        }
+    }
+
     fn context_summary(&self) -> Vec<String> {
         self.context_summary.lock().map_or_else(
             |_| vec!["context details are unavailable".to_owned()],
@@ -2194,6 +2401,40 @@ impl SessionPort for AgentSessionService {
         let model = model.trim();
         if model.is_empty() {
             return Err("model name must not be empty".to_owned());
+        }
+        // A catalog model, `provider/id` or an unambiguous id, becomes the saved
+        // selection: provider, wire format and endpoint together, as prime-agent's
+        // model selector sets its default model.
+        if let Some(entry) = super::providers::Catalog::load(&self.data_dir).find(model) {
+            let selection = super::config::Selection {
+                provider: entry.provider.clone(),
+                model: entry.id.clone(),
+                protocol: entry.protocol().unwrap_or("openai_chat").to_owned(),
+                endpoint: entry.endpoint(),
+                context_window: entry.context_window,
+                thinking_format: entry
+                    .compat
+                    .as_ref()
+                    .and_then(|compat| compat.thinking_format.clone()),
+            };
+            super::config::save_selection(&self.config_file, &selection)
+                .map_err(|error| error.to_string())?;
+            if let Ok(mut selection) = self.model_selection.lock() {
+                *selection = TurnModelSelection::default();
+            }
+            let ready =
+                credentials::source_for(&self.environment, &self.data_dir, &entry.provider, "")
+                    .is_some();
+            let provider_name = super::providers::provider(&entry.provider)
+                .map_or(entry.provider.as_str(), |provider| provider.name);
+            return Ok(if ready {
+                format!("model {} ({provider_name}) selected", entry.name)
+            } else {
+                format!(
+                    "model {} ({provider_name}) selected; log in with /login {} before the next turn",
+                    entry.name, entry.provider
+                )
+            });
         }
         self.model_selection
             .lock()
@@ -2350,11 +2591,118 @@ impl SessionPort for AgentSessionService {
         self.resolve_project_id()
     }
 
-    fn save_credential(&mut self, key: &str) -> Result<CredentialSource, String> {
+    fn save_credential(
+        &mut self,
+        provider: &str,
+        credential: &credentials::Credential,
+    ) -> Result<CredentialSource, String> {
         let path = credentials::resolve_file(&self.environment, &self.data_dir);
-        credentials::save(&path, key)
+        credentials::save(&path, provider, credential)
             .map(|protection| CredentialSource::File { path, protection })
-            .map_err(|error| format!("the key could not be saved: {error}"))
+            .map_err(|error| format!("the credential could not be saved: {error}"))
+    }
+
+    fn remove_credential(&mut self, provider: &str) -> Result<bool, String> {
+        let path = credentials::resolve_file(&self.environment, &self.data_dir);
+        credentials::remove(&path, provider).map_err(|error| error.to_string())
+    }
+
+    fn begin_sign_in(&mut self, provider: &str) -> Result<String, String> {
+        self.cancel_sign_in();
+        let pending = Arc::new(super::oauth::start(provider)?);
+        let url = pending.url.clone();
+        if pending.listening() {
+            let waiting = Arc::clone(&pending);
+            let sender = self.sender.clone();
+            let path = credentials::resolve_file(&self.environment, &self.data_dir);
+            std::thread::spawn(move || {
+                let Some(code) = super::oauth::wait_for_code(&waiting) else {
+                    return;
+                };
+                if waiting
+                    .canceller()
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return;
+                }
+                let result = super::oauth::finish(&waiting, &code, &path);
+                let _ = sender.send(SessionEvent::LoginFinished {
+                    provider: waiting.provider.clone(),
+                    result,
+                });
+            });
+        }
+        super::oauth::open_browser(&url);
+        self.sign_in = Some(pending);
+        Ok(url)
+    }
+
+    fn finish_sign_in(&mut self, pasted: &str) -> Result<(), String> {
+        let pending = self
+            .sign_in
+            .take()
+            .ok_or_else(|| "no sign-in is in progress".to_owned())?;
+        let code = match pending.code_from_paste(pasted) {
+            Ok(code) => code,
+            Err(error) => {
+                self.sign_in = Some(pending);
+                return Err(error);
+            }
+        };
+        pending
+            .canceller()
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let sender = self.sender.clone();
+        let path = credentials::resolve_file(&self.environment, &self.data_dir);
+        std::thread::spawn(move || {
+            let result = super::oauth::finish(&pending, &code, &path);
+            let _ = sender.send(SessionEvent::LoginFinished {
+                provider: pending.provider.clone(),
+                result,
+            });
+        });
+        Ok(())
+    }
+
+    fn cancel_sign_in(&mut self) {
+        if let Some(pending) = self.sign_in.take() {
+            pending
+                .canceller()
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn stored_credentials(&self) -> Vec<(String, &'static str)> {
+        let path = credentials::resolve_file(&self.environment, &self.data_dir);
+        credentials::stored(&path).unwrap_or_default()
+    }
+
+    fn provider_id(&self) -> Option<String> {
+        super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .ok()
+        .map(|config| config.provider.id)
+    }
+
+    fn model_options(&self) -> Vec<(String, String)> {
+        let catalog = super::providers::Catalog::load(&self.data_dir);
+        super::providers::PROVIDERS
+            .iter()
+            .filter(|provider| {
+                credentials::source_for(&self.environment, &self.data_dir, provider.id, "")
+                    .is_some()
+            })
+            .flat_map(|provider| {
+                catalog
+                    .for_provider(provider.id)
+                    .map(|model| (model.reference(), model.name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     fn list_sessions(&mut self) {
@@ -2603,6 +2951,7 @@ async fn run_turn(
     session_mode: Option<PolicyMode>,
     auto_allowed_count: Arc<AtomicUsize>,
     context_summary: Arc<Mutex<Vec<String>>>,
+    system_prompt: Arc<Mutex<String>>,
     active_skills: Arc<Mutex<BTreeMap<String, harness_extensions::SkillActivation>>>,
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
@@ -2905,6 +3254,7 @@ async fn run_turn(
         fixture: false,
     };
     let credentials = Arc::new(EnvironmentCredential::new(
+        config.provider_id.clone(),
         config.credential_variable(),
         data_dir.clone(),
     ));
@@ -2926,37 +3276,14 @@ async fn run_turn(
             .or_else(|| harness_providers::ThinkingLevel::parse(&config.thinking))
             .unwrap_or_default(),
     };
-    let provider: Result<Arc<dyn ModelProvider>, ProviderError> = match config.protocol.as_str() {
-        "openai_chat" => OpenAiChatAdapter::with_options(
-            config.endpoint.clone(),
-            credentials,
-            capabilities,
-            OpenAiChatOptions {
-                thinking: Some(harness_providers::Thinking {
-                    level: thinking_level,
-                    format: harness_providers::thinking::chat_format(
-                        &config.provider_id,
-                        &config.endpoint,
-                    ),
-                }),
-            },
-        )
-        .map(|adapter| Arc::new(adapter) as Arc<dyn ModelProvider>),
-        "anthropic_messages" => {
-            AnthropicMessagesAdapter::new(config.endpoint.clone(), credentials, capabilities).map(
-                |adapter| {
-                    Arc::new(adapter.with_thinking(Some(harness_providers::Thinking {
-                        level: thinking_level,
-                        format: harness_providers::ThinkingFormat::Anthropic,
-                    }))) as Arc<dyn ModelProvider>
-                },
-            )
-        }
-        _ => Err(ProviderError::new(
-            ErrorCode::ProviderProtocol,
-            "provider protocol is unsupported",
-        )),
-    };
+    let provider = build_provider(
+        &config,
+        credentials,
+        capabilities,
+        thinking_level,
+        task_id.as_ref(),
+        &data_dir,
+    );
     let provider = match provider {
         Ok(provider) => provider,
         Err(error) => {
@@ -3469,7 +3796,12 @@ async fn run_turn(
         prompt,
         observation,
     )
-    .with_system_policy(built_prompt.text)
+    .with_system_policy({
+        if let Ok(mut shown) = system_prompt.lock() {
+            shown.clone_from(&built_prompt.text);
+        }
+        built_prompt.text
+    })
     .with_project_rules(project_blocks)
     .with_tool_schemas(tool_schemas);
     if !attached.is_empty() {
@@ -4096,12 +4428,10 @@ async fn render_session_export(
             secrets.push(value);
         }
     }
-    if let Some(value) = credentials::load(&credentials::resolve_file(environment, data_dir))
-        .map_err(|error| error.to_string())?
-        && !value.is_empty()
-    {
-        secrets.push(value);
-    }
+    secrets.extend(credentials::secrets(&credentials::resolve_file(
+        environment,
+        data_dir,
+    )));
     let mut sessions = store
         .list_sessions()
         .await
@@ -6234,7 +6564,7 @@ mod tests {
             .expect_err("an empty environment is not configured");
         assert!(error.contains("DEEPSEEK_API_KEY"), "{error}");
         assert!(
-            error.contains("/key"),
+            error.contains("/login"),
             "the message must name the in-app way to set it: {error}"
         );
         assert!(
@@ -6325,13 +6655,18 @@ mod tests {
         );
     }
 
-    /// K02: the file `/key` writes is a real credential source, and the
+    /// K02: the file `/login` writes is a real credential source, and the
     /// environment still beats it.
     #[test]
     fn k02_a_saved_file_configures_the_provider_and_the_environment_still_wins() {
         let (environment, data_dir) = credential_environment(&[]);
         let path = credentials::resolve_file(&environment, &data_dir);
-        credentials::save(&path, "sk-from-file").expect("the key is saved");
+        credentials::save(
+            &path,
+            "deepseek",
+            &credentials::Credential::api_key("sk-from-file"),
+        )
+        .expect("the key is saved");
 
         let from_file =
             resolve_provider(&environment, &data_dir).expect("a saved key configures the provider");
@@ -6369,11 +6704,11 @@ mod tests {
         // itself reads the process environment and cannot be pointed at this
         // directory without mutating global state under parallel tests, so its
         // file branch is covered where that environment is controlled.
-        let _ = EnvironmentCredential::new("DEEPSEEK_API_KEY", data_dir.clone());
+        let _ = EnvironmentCredential::new("deepseek", "DEEPSEEK_API_KEY", data_dir.clone());
         let _ = std::fs::remove_file(&path);
     }
 
-    /// K02: the file `/key` writes is what the resolver reads, and a corrupt file
+    /// K02: the file `/login` writes is what the resolver reads, and a corrupt file
     /// is refused instead of being treated as no credential.
     ///
     /// A **missing** file is not this function's business: "no credential at all"
@@ -6385,13 +6720,18 @@ mod tests {
         validate_credential_file(&environment, &data_dir)
             .expect("no file is nothing to validate, not a failure");
 
-        credentials::save(&path, "sk-validated").expect("the key is saved");
+        credentials::save(
+            &path,
+            "deepseek",
+            &credentials::Credential::api_key("sk-validated"),
+        )
+        .expect("the key is saved");
         validate_credential_file(&environment, &data_dir).expect("the saved file is readable");
 
-        std::fs::write(&path, "DEEPSEEK_API_KEY=unquoted\n").expect("fixture");
+        std::fs::write(&path, "{\"deepseek\": unquoted").expect("fixture");
         let error = validate_credential_file(&environment, &data_dir)
             .expect_err("a corrupt file must stop the launch");
-        assert!(error.contains("credentials.env"), "{error}");
+        assert!(error.contains("auth.json"), "{error}");
         assert!(
             !error.contains("unquoted"),
             "the refusal must not echo the file: {error}"
@@ -6404,11 +6744,16 @@ mod tests {
     fn k02_diagnostics_name_the_source_and_never_the_value() {
         let (environment, data_dir) = credential_environment(&[]);
         let path = credentials::resolve_file(&environment, &data_dir);
-        credentials::save(&path, "sk-must-not-be-rendered").expect("the key is saved");
+        credentials::save(
+            &path,
+            "deepseek",
+            &credentials::Credential::api_key("sk-must-not-be-rendered"),
+        )
+        .expect("the key is saved");
 
         let lines = provider_diagnostics(&environment, &data_dir);
         let joined = lines.join("\n");
-        assert!(joined.contains("credentials.env"), "{joined}");
+        assert!(joined.contains("auth.json"), "{joined}");
         assert!(joined.contains("value hidden"), "{joined}");
         assert!(
             !joined.contains("sk-must-not-be-rendered"),
@@ -6480,9 +6825,9 @@ mod tests {
 
         let (environment, data_dir) = credential_environment(&[]);
         let empty = provider_diagnostics(&environment, &data_dir).join("\n");
-        assert!(empty.contains("no credential; set one of"), "{empty}");
+        assert!(empty.contains("no credential for deepseek"), "{empty}");
         assert!(
-            empty.contains("/key"),
+            empty.contains("/login"),
             "the empty state must name the in-app way to fix it: {empty}"
         );
         assert!(empty.contains("not ready"), "{empty}");

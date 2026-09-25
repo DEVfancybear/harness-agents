@@ -14,7 +14,7 @@ provider behavior, settled-receipt recovery, staged install, and a multiline dra
 Six HA_TUI cases cover the inline viewport, multiline paste, approval by `y`, resize,
 plain fallback, and `NO_COLOR`.
 Seven G14 cases cover local rules, ask_user, the @ picker, shell approval,
-undo, /key with spaces, and /more scrolling.
+undo, /login with a spaced key, and /more scrolling.
 
 The gate requires one bounded run with PTY_EXIT 0 and "25 passed; 0 failed". The cases stay
 `#[ignore]`d because `cargo test` in a sandbox has no console; this helper is how they

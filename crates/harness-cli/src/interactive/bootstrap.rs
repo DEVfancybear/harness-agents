@@ -18,7 +18,7 @@ use super::paths::{self, HostPlatform, LaunchEnvironment, PathRequest, ResolvedP
 /// Only presence is checked: the value is never read, logged, stored, or placed
 /// in a command history. The canonical list lives in [`credentials`], which also
 /// owns the order the variables are probed in.
-pub const CREDENTIAL_VARIABLES: [&str; 2] = credentials::CREDENTIAL_VARIABLES;
+pub const CREDENTIAL_VARIABLES: [&str; 5] = credentials::CREDENTIAL_VARIABLES;
 
 /// Compatibility re-exports; the actual provider preset is owned by config.
 #[cfg(test)]
@@ -53,7 +53,7 @@ pub enum ProviderState {
     /// A credential source is present; the model is resolved on the first request.
     ///
     /// The source carries the *name* of where the key lives — an environment
-    /// variable or the file `/key` saved — and never the key itself.
+    /// variable or the file `/login` saved — and never the key itself.
     CredentialPresent { source: CredentialSource },
 }
 
@@ -152,12 +152,12 @@ impl LaunchContext {
         }
         if let ProviderState::SetupRequired { reason } = &self.provider {
             reasons.push(format!(
-                "provider {reason}; set {} to a key kept outside this repository, or paste it here with /key",
-                CREDENTIAL_VARIABLES.join(" or ")
+                "provider {reason}; log in with /login (API key or sign-in), or set one of {}",
+                CREDENTIAL_VARIABLES.join(", ")
             ));
         }
         Some(format!(
-            "setup required: {}. Nothing is sent to a provider until this is resolved; /key saves an API key, /exit quits.",
+            "setup required: {}. Nothing is sent to a provider until this is resolved; /login signs in, /quit quits.",
             reasons.join("; ")
         ))
     }
@@ -170,7 +170,7 @@ impl LaunchContext {
 
     /// The context after the app saved a usable credential.
     ///
-    /// `/key` is a complete setup, not half of one. The credential file is not
+    /// `/login` is a complete setup, not half of one. The credential file is not
     /// part of the strict configuration and never will be, so the app also writes
     /// the minimal valid configuration file when none exists — otherwise the user
     /// pastes a working key and still faces a first-run gate.
@@ -506,7 +506,12 @@ mod tests {
         );
 
         let path = credentials::resolve_file(&environment, &context.paths.data_dir);
-        credentials::save(&path, "sk-bootstrap-fixture").expect("the key is saved");
+        credentials::save(
+            &path,
+            "deepseek",
+            &credentials::Credential::api_key("sk-bootstrap-fixture"),
+        )
+        .expect("the key is saved");
         let source = credentials::source(&environment, &context.paths.data_dir)
             .expect("the saved file is a credential source");
         let updated = context
@@ -519,10 +524,7 @@ mod tests {
         );
         assert!(updated.setup_hint().is_none());
         assert!(
-            updated
-                .header_lines()
-                .join("\n")
-                .contains("credentials.env"),
+            updated.header_lines().join("\n").contains("auth.json"),
             "the header names the source and never the value: {:?}",
             updated.header_lines()
         );

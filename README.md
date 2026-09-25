@@ -37,8 +37,7 @@ git clone https://github.com/DEVfancybear/harness-agents.git
 cd harness-agents
 pwsh -NoProfile -File scripts/Install-Ha.ps1        # release build, installed to %USERPROFILE%\.cargo\bin
 ha --version
-$env:DEEPSEEK_API_KEY = "sk-..."                     # or type /key inside the app
-ha                                                   # open the app in the current project
+ha                                                   # open the app, then /login to pick a provider
 ```
 
 **Updating:** pull, then run `scripts/Install-Ha.ps1` again. Building with `cargo build --release` alone does **not** update the `ha` you type: that command runs the copy in `.cargo\bin`. If the app behaves like an older version, check which binary runs:
@@ -55,13 +54,15 @@ Building a release package (checksums, manifest) is described in [docs/BUILD_AND
 
 | You want to | Type |
 | --- | --- |
-| See every command | `/help` (grouped card), `/help all` (full table), or `/` to open the menu |
+| Log in to a provider | `/login` (DeepSeek, OpenAI, Anthropic, OpenCode Zen/Go with an API key; ChatGPT Plus/Pro with a browser sign-in), `/logout` |
+| Pick a model | `/model` opens the menu of models your logins can use; `/model opencode/kimi-k2.6` picks one |
+| See every command | `/` opens the menu (fuzzy: `/skil` lists the skills), `/help`, `/hotkeys` |
 | Continue an earlier conversation | `/resume`, then pick one |
 | Start over | `/new` |
 | Attach a file or image | `@` (file picker), `/attach <path>`, `/image` |
 | Run a shell command | `!command` (goes through approval) |
 | Correct a running turn | `/steer <text>` |
-| Choose how much the model reasons | `/thinking` (show), `/thinking off\|minimal\|low\|medium\|high\|xhigh\|max` |
+| Choose how much the model reasons | `/effort` (or `/thinking`), then pick a level from the menu |
 | Keep working until something is done | `/goal <objective>`, then `/goal status`, `/goal pause`, `/goal resume`, `/goal clear` |
 | Keep what this conversation taught | `/refine [--global] [instructions]`, `/refine --rollback <id>` |
 | Shrink a long conversation | `/compact [what to keep]` |
@@ -75,7 +76,7 @@ Settings merge default → user `config.toml` → trusted project `.harness/conf
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `DEEPSEEK_API_KEY` | — | Provider key (also settable with `/key`, stored in the credentials file) |
+| `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENCODE_API_KEY` | — | Provider keys; a key saved with `/login` (in `auth.json`) wins over them |
 | `HA_PROVIDER_ENDPOINT` | `https://api.deepseek.com/chat/completions` | Any OpenAI-compatible chat endpoint |
 | `HA_PROVIDER_MODEL` | `deepseek-flash` | Model name |
 | `HA_TURN_MAX_STEPS` / `HA_TURN_MAX_TOOL_CALLS` | 30 / 80 | Model calls and tool calls per turn before it pauses |
@@ -138,8 +139,7 @@ git clone https://github.com/DEVfancybear/harness-agents.git
 cd harness-agents
 pwsh -NoProfile -File scripts/Install-Ha.ps1        # build release, cài vào %USERPROFILE%\.cargo\bin
 ha --version
-$env:DEEPSEEK_API_KEY = "sk-..."                     # hoặc gõ /key trong app
-ha                                                   # mở app trong project hiện tại
+ha                                                   # mở app, rồi /login để chọn provider
 ```
 
 **Cập nhật:** `git pull` rồi chạy lại `scripts/Install-Ha.ps1`. Chỉ chạy `cargo build --release` thì **không** cập nhật lệnh `ha` bạn gõ, vì lệnh đó chạy bản trong `.cargo\bin`. Nếu app vẫn chạy như bản cũ, kiểm tra xem đang chạy file nào:
@@ -156,13 +156,15 @@ Cách build gói release (checksum, manifest) nằm trong [docs/BUILD_AND_RELEAS
 
 | Bạn muốn | Gõ |
 | --- | --- |
-| Xem mọi lệnh | `/help` (bảng gọn theo nhóm), `/help all` (bảng đầy đủ), hoặc `/` để mở menu |
+| Đăng nhập provider | `/login` (DeepSeek, OpenAI, Anthropic, OpenCode Zen/Go bằng API key; ChatGPT Plus/Pro bằng đăng nhập trình duyệt), `/logout` |
+| Chọn model | `/model` mở menu các model mà tài khoản đã đăng nhập dùng được; `/model opencode/kimi-k2.6` chọn thẳng |
+| Xem mọi lệnh | `/` mở menu (tìm mờ: `/skil` liệt kê các skill), `/help`, `/hotkeys` |
 | Tiếp tục hội thoại cũ | `/resume` rồi chọn |
 | Bắt đầu lại | `/new` |
 | Đính kèm file hoặc ảnh | `@` (chọn file), `/attach <path>`, `/image` |
 | Chạy lệnh shell | `!command` (đi qua bước phê duyệt) |
 | Chỉnh hướng một lượt đang chạy | `/steer <text>` |
-| Chọn mức suy luận của model | `/thinking` (xem), `/thinking off\|minimal\|low\|medium\|high\|xhigh\|max` |
+| Chọn mức suy luận của model | `/effort` (hoặc `/thinking`) rồi chọn mức trong menu |
 | Làm tới khi xong việc | `/goal <mục tiêu>`, rồi `/goal status`, `/goal pause`, `/goal resume`, `/goal clear` |
 | Giữ lại điều hội thoại đã học | `/refine [--global] [chỉ dẫn]`, `/refine --rollback <id>` |
 | Rút gọn hội thoại dài | `/compact [điều cần giữ]` |
@@ -176,7 +178,7 @@ Cấu hình được gộp theo thứ tự mặc định → `config.toml` của
 
 | Biến | Mặc định | Ý nghĩa |
 | --- | --- | --- |
-| `DEEPSEEK_API_KEY` | — | Khóa provider (cũng đặt được bằng `/key`, lưu trong file credentials) |
+| `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENCODE_API_KEY` | — | Khóa provider; khóa lưu bằng `/login` (trong `auth.json`) được ưu tiên hơn |
 | `HA_PROVIDER_ENDPOINT` | `https://api.deepseek.com/chat/completions` | Bất kỳ endpoint chat tương thích OpenAI |
 | `HA_PROVIDER_MODEL` | `deepseek-flash` | Tên model |
 | `HA_TURN_MAX_STEPS` / `HA_TURN_MAX_TOOL_CALLS` | 30 / 80 | Số lời gọi model và tool mỗi lượt trước khi tạm dừng |

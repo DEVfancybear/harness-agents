@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use harness_types::InputId;
 use serde_json::Value;
 
-use super::input::SlashCommand;
+use super::commands::MenuItem;
 
 /// One normalized terminal input event.
 ///
@@ -411,7 +411,7 @@ pub struct UiState {
     /// The menu that draws these is not a modal: the composer keeps the focus and
     /// the draft stays visible. It is drawn only while the composer owns the
     /// keyboard, so a panel or picker that replaces it also takes the menu away.
-    pub suggestions: Vec<&'static SlashCommand>,
+    pub suggestions: Vec<MenuItem>,
     /// Which suggestion row carries the highlight.
     pub suggestion_selected: usize,
     /// Why the TUI is not in use, when the host fell back to the plain renderer.
@@ -460,6 +460,11 @@ impl Detail {
 pub enum SessionEvent {
     Accepted {
         input_id: InputId,
+    },
+    /// A browser sign-in ended: the credential is saved, or why it is not.
+    LoginFinished {
+        provider: String,
+        result: Result<(), String>,
     },
     TextDelta {
         text: String,

@@ -21,21 +21,36 @@ use crate::interactive::events::UiState;
 /// Cells the command column occupies, so every summary starts in the same place.
 pub const NAME_COLUMN: usize = 17;
 
+/// The widest the name column grows for long labels.
+const MAX_NAME_COLUMN: usize = 32;
+
 /// The rows the menu shows, with the highlighted one marked.
 #[must_use]
 pub fn rows(state: &UiState, theme: &Theme) -> Vec<Line<'static>> {
     let (start, end) = window(state.suggestions.len(), state.suggestion_selected);
+    // The name column fits the longest label on screen (a skill name can be long),
+    // within bounds, so the descriptions line up.
+    let column = state.suggestions[start..end]
+        .iter()
+        .map(|item| item.label.chars().count() + 2)
+        .max()
+        .unwrap_or(NAME_COLUMN)
+        .clamp(NAME_COLUMN, MAX_NAME_COLUMN);
     let mut lines = Vec::new();
     for index in start..end {
-        let command = state.suggestions[index];
+        let item = &state.suggestions[index];
         let selected = index == state.suggestion_selected;
         let style = if selected { theme.selection } else { theme.dim };
         let marker = if selected { "❯ " } else { "  " };
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(marker.to_owned(), style),
-            Span::styled(format!("{:<NAME_COLUMN$}", command.usage()), style),
-            Span::styled(command.summary.to_owned(), style),
-        ]));
+            Span::styled(format!("{:<column$}", item.label), style),
+            Span::styled(item.description.clone(), style),
+        ];
+        if let Some(tag) = &item.tag {
+            spans.push(Span::styled(format!(" ({tag})"), theme.dim));
+        }
+        lines.push(Line::from(spans));
     }
     lines
 }
@@ -120,7 +135,7 @@ mod tests {
             );
         }
         assert!(
-            plain_text(&rows(&state("/", 0), &Theme::plain())).starts_with("❯ /help"),
+            plain_text(&rows(&state("/", 0), &Theme::plain())).starts_with("❯ /model"),
             "the arrow starts on the first match"
         );
     }
@@ -135,7 +150,7 @@ mod tests {
             plain_text(&rows(&state("/res", 0), &Theme::plain())).trim_start_matches("❯ "),
             format!(
                 "{:<NAME_COLUMN$}{}",
-                "/resume <id>", "resume a persisted session"
+                "/resume [id]", "Open the session picker, or resume a session by id"
             ),
             "the name column is padded so the summaries line up"
         );
@@ -147,9 +162,9 @@ mod tests {
     fn slash_the_highlight_moves_with_the_selection() {
         let first = plain_text(&rows(&state("/", 0), &Theme::plain()));
         let second = plain_text(&rows(&state("/", 1), &Theme::plain()));
-        assert!(first.starts_with("❯ /help"), "{first}");
-        assert!(second.starts_with("  /help"), "{second}");
-        assert!(second.contains("\n❯ /status"), "{second}");
+        assert!(first.starts_with("❯ /model"), "{first}");
+        assert!(second.starts_with("  /model"), "{second}");
+        assert!(second.contains("\n❯ /effort"), "{second}");
         assert_eq!(
             first.matches('❯').count(),
             1,

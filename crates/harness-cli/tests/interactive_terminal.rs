@@ -738,13 +738,31 @@ fn t_key_pty_key_with_spaces() {
     env.push(("HA_CREDENTIALS_DIR", credential_dir.display().to_string()));
     let mut session = PtySession::spawn(&project, &env);
     session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
-    session.send("/key sk-with embedded spaces\r");
-    wait_for_normalized(&session, "API key saved", Duration::from_secs(30));
-    assert_eq!(
-        std::fs::read_to_string(credential_dir.join("credentials.env")).expect("saved key"),
-        "DEEPSEEK_API_KEY=\"sk-with embedded spaces\"\n"
+    session.send("/login opencode\r");
+    wait_for_normalized(
+        &session,
+        "Enter API key for OpenCode Zen",
+        Duration::from_secs(30),
     );
-    session.send("/exit\r");
+    session.send("sk-with embedded spaces\r");
+    wait_for_normalized(
+        &session,
+        "Saved API key for OpenCode Zen",
+        Duration::from_secs(30),
+    );
+    let saved: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(credential_dir.join("auth.json")).expect("saved key"),
+    )
+    .expect("auth.json is JSON");
+    assert_eq!(saved["opencode"]["key"], "sk-with embedded spaces");
+    assert!(
+        !session.transcript().contains("sk-with embedded spaces"),
+        "the key never reaches the screen"
+    );
+    // After a login the model menu opens on the provider's models, as prime-agent
+    // opens its model selector; Ctrl-U clears it.
+    wait_for_normalized(&session, "/model opencode/", Duration::from_secs(30));
+    session.send("\u{15}/exit\r");
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
 }
 

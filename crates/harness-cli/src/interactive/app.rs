@@ -178,6 +178,9 @@ fn controller_for_with_overrides(
     let service: Box<dyn SessionPort> = if fixture {
         Box::new(FixtureService::new(channel.sender()))
     } else {
+        // prime-agent refreshes its model catalog in the background; the snapshot
+        // compiled in keeps working when the download fails.
+        super::providers::refresh_in_background(&context.paths.data_dir);
         Box::new(AgentSessionService::new_with_overrides(
             context,
             environment.clone(),
