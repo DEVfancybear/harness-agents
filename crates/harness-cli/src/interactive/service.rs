@@ -27,9 +27,8 @@ use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
 use harness_tools::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CodingToolAction, IsolationMode,
     PolicyMode, ToolExecutionService, ToolOutput, ToolPatternRule, ToolPolicyRules, TurnDriver,
-    TurnLimits, TurnObserver, TurnOptions, TurnProgress, TurnStop, coding_tool_names,
-    coding_tool_schemas, execute_action_with_approval, observe_workspace, observed_file_hash,
-    validate_tool_pattern,
+    TurnLimits, TurnObserver, TurnOptions, TurnProgress, TurnStop, coding_tool_schemas,
+    execute_action_with_approval, observe_workspace, observed_file_hash, validate_tool_pattern,
 };
 use harness_types::{
     ErrorCode, HostId, InputId, QuestionId, RequestId, SessionId, SourceAuthority, TaskId,
@@ -51,7 +50,7 @@ use super::extensions;
 use super::memory;
 use super::paths::LaunchEnvironment;
 use super::project;
-use super::prompt::{PromptEnvironment, PromptTool, SystemPromptBuilder};
+use super::prompt::{PromptEnvironment, SystemPromptBuilder};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct TurnModelSelection {
@@ -3173,29 +3172,14 @@ async fn run_turn(
         date_iso: &today,
         limits,
     };
-    let prompt_tools = coding_tool_names()
+    // Every advertised tool, core and external: the prompt shows a block only when
+    // its tool is active, the way prime-agent's does.
+    let prompt_tools = tool_schemas
         .iter()
-        .map(|name| {
-            let name = *name;
-            PromptTool {
-                name,
-                effect: if matches!(
-                    name,
-                    "read_file"
-                        | "list_files"
-                        | "search_text"
-                        | "glob"
-                        | "git_status"
-                        | "git_diff"
-                        | "git_log"
-                ) {
-                    "read only"
-                } else if name == "ask_user" {
-                    "interactive input; no approval"
-                } else {
-                    "subject to host policy and approval"
-                },
-            }
+        .filter_map(|schema| {
+            schema
+                .pointer("/function/name")
+                .and_then(|name| name.as_str())
         })
         .collect::<Vec<_>>();
     let mut built_prompt = SystemPromptBuilder::build(&prompt_environment, &prompt_tools);

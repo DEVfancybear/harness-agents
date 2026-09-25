@@ -7,8 +7,7 @@ use std::{
 };
 
 use harness_extensions::{
-    MAX_SKILL_CATALOG_ENTRIES, SkillActivation, SkillCatalog, SkillCatalogEntry, SkillSource,
-    TrustedSkillRoot,
+    MAX_SKILL_CATALOG_ENTRIES, SkillActivation, SkillCatalog, SkillSource, TrustedSkillRoot,
 };
 use harness_tools::{
     CodingToolAction, ExternalToolCatalog, ExternalToolDispatcher, ExternalTools,
@@ -488,7 +487,7 @@ mod tests {
     use harness_session::ContextChannel;
     use harness_types::ErrorCode;
 
-    use super::{SkillHost, SkillToolDispatcher, commands, discover, expand, metadata_lines};
+    use super::{SkillHost, SkillToolDispatcher, commands, discover, expand};
 
     fn skill_catalog(root: &std::path::Path) -> SkillCatalog {
         let skill = root.join("review");
@@ -667,7 +666,8 @@ mod tests {
                 .expect("still in the catalogue")
                 .model_invocable
         );
-        let prompt = metadata_lines(catalog.entries(), 4096);
+        let prompt =
+            crate::interactive::prompt::append_skill_metadata(String::new(), catalog.entries());
         assert!(
             prompt.contains("research") && !prompt.contains("release"),
             "{prompt}"
@@ -793,22 +793,11 @@ mod tests {
     fn g11_prompt_skill_metadata_is_bounded_to_the_supplied_budget() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let catalog = skill_catalog(&temporary.path().join("skills"));
-        assert!(metadata_lines(catalog.entries(), 24).len() <= 24);
+        let prompt =
+            crate::interactive::prompt::append_skill_metadata(String::new(), catalog.entries());
+        assert!(prompt.contains("<available_skills>"), "{prompt}");
+        assert!(prompt.len() <= 16 * 1024, "{}", prompt.len());
     }
-}
-
-pub fn metadata_lines(entries: &[SkillCatalogEntry], max_bytes: usize) -> String {
-    let mut output = String::new();
-    for entry in entries.iter().filter(|entry| entry.model_invocable) {
-        let line = format!("- {}: {}\n", entry.name, entry.description);
-        if output.len().saturating_add(line.len()) > max_bytes {
-            let remaining = max_bytes.saturating_sub(output.len());
-            output.push_str(prefix_bytes(&line, remaining));
-            break;
-        }
-        output.push_str(&line);
-    }
-    output
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -927,14 +916,6 @@ fn split_front_matter(document: &str) -> (&str, &str) {
         offset += line.len();
     }
     ("", document)
-}
-
-fn prefix_bytes(value: &str, limit: usize) -> &str {
-    let mut end = value.len().min(limit);
-    while !value.is_char_boundary(end) {
-        end = end.saturating_sub(1);
-    }
-    &value[..end]
 }
 
 fn front_value(front: &str, key: &str) -> Option<String> {
