@@ -27,9 +27,9 @@ use crate::{
     process::{self, ProcessResult, TreeCleanup},
     secrets::{HostEnvironmentSecrets, ProcessEnvironment, SecretResolver},
     workspace::{
-        apply_text_patch, edit_text, glob_files, inspect_workspace, list_files, plan_edit_text,
-        read_file_range, read_text, redact_text, resolve_relative, search_text, validate_glob,
-        validate_search, write_text_checked,
+        apply_text_patch, edit_text, glob_files, inspect_workspace, inspect_workspace_for_read,
+        list_files, plan_edit_text, read_file_range, read_text, redact_text, resolve_relative,
+        search_text, validate_glob, validate_search, write_text_checked,
     },
 };
 use harness_store_sqlite::HistoryScope;
@@ -608,8 +608,11 @@ impl ToolExecutionService {
                 ));
             }
         }
-        let workspace =
-            inspect_workspace(&request.workspace_root, state.workspace.project_id.clone())?;
+        let workspace = if is_read_only(&final_action) {
+            inspect_workspace_for_read(&request.workspace_root, state.workspace.project_id.clone())?
+        } else {
+            inspect_workspace(&request.workspace_root, state.workspace.project_id.clone())?
+        };
         self.store
             .register_project(workspace.registration())
             .await
@@ -748,6 +751,31 @@ impl ToolExecutionService {
         approval: Option<ApprovalGrant>,
         cancellation: CancellationToken,
     ) -> Result<ToolExecutionView, HarnessError> {
+        match self.begin(prepared, approval, &cancellation).await? {
+            Begun::Finished(view) => Ok(view),
+            Begun::Ready(call) => {
+                let outcome = self.run_begun(&call, cancellation).await;
+                self.finish_begun(*call, outcome).await
+            }
+        }
+    }
+
+    /// First of three phases: every gate check, then the durable intent.
+    ///
+    /// Intents are committed one at a time, in call order, because each takes the
+    /// next journal sequence. What follows - [`Self::run_begun`], the side effect
+    /// itself - holds no sequence, so several begun calls can run at once; their
+    /// receipts are then committed in call order by [`Self::finish_begun`].
+    #[allow(
+        clippy::too_many_lines,
+        reason = "every gate check before the intent, in the order the contract states them"
+    )]
+    pub(crate) async fn begin(
+        &self,
+        prepared: PreparedToolRequest,
+        approval: Option<ApprovalGrant>,
+        cancellation: &CancellationToken,
+    ) -> Result<Begun, HarnessError> {
         let execution_id = ToolExecutionId::generate();
         let transformed = self
             .policy
@@ -756,7 +784,7 @@ impl ToolExecutionService {
             || transformed != prepared.final_action
         {
             return self
-                .record_denied(
+                .record_denied_begun(
                     &prepared,
                     execution_id,
                     approval.as_ref(),
@@ -767,7 +795,7 @@ impl ToolExecutionService {
         }
         if let Some(reason) = self.policy.denial_for(&transformed) {
             return self
-                .record_denied(
+                .record_denied_begun(
                     &prepared,
                     execution_id,
                     approval.as_ref(),
@@ -779,7 +807,7 @@ impl ToolExecutionService {
         if action_requests_strict_isolation(&transformed) {
             let reason = self.strict_refusal_reason();
             return self
-                .record_denied(
+                .record_denied_begun(
                     &prepared,
                     execution_id,
                     approval.as_ref(),
@@ -790,7 +818,7 @@ impl ToolExecutionService {
         }
         if cancellation.is_cancelled() {
             return self
-                .record_denied(
+                .record_denied_begun(
                     &prepared,
                     execution_id,
                     approval.as_ref(),
@@ -801,7 +829,7 @@ impl ToolExecutionService {
         }
         let Some(approval) = approval else {
             return self
-                .record_denied(
+                .record_denied_begun(
                     &prepared,
                     execution_id,
                     None,
@@ -812,16 +840,20 @@ impl ToolExecutionService {
         };
         if let Some((code, reason)) = approval_mismatch(&prepared, &approval) {
             return self
-                .record_denied(&prepared, execution_id, Some(&approval), code, &reason)
+                .record_denied_begun(&prepared, execution_id, Some(&approval), code, &reason)
                 .await;
         }
         Self::validate_workspace_action(&prepared.workspace_root, &transformed)?;
-        let reobserved = inspect_workspace(&prepared.workspace_root, prepared.project_id.clone())?;
+        let reobserved = if is_read_only(&transformed) {
+            inspect_workspace_for_read(&prepared.workspace_root, prepared.project_id.clone())?
+        } else {
+            inspect_workspace(&prepared.workspace_root, prepared.project_id.clone())?
+        };
         if reobserved.identity_hash != prepared.workspace_identity_hash
             || reobserved.fingerprint != prepared.workspace_fingerprint
         {
             return self
-                .record_denied(
+                .record_denied_begun(
                     &prepared,
                     execution_id,
                     Some(&approval),
@@ -840,7 +872,7 @@ impl ToolExecutionService {
         {
             let code = error.code();
             return self
-                .record_denied(
+                .record_denied_begun(
                     &prepared,
                     execution_id,
                     Some(&approval),
@@ -852,7 +884,8 @@ impl ToolExecutionService {
         if matches!(transformed, CodingToolAction::TaskUpdate { .. }) {
             return self
                 .execute_task_update(prepared, approval, execution_id)
-                .await;
+                .await
+                .map(Begun::Finished);
         }
         let mut state = self
             .current_state(&prepared.request.session_id, &prepared.request.task_id)
@@ -908,7 +941,28 @@ impl ToolExecutionService {
         )
         .await?;
 
-        let dispatched = match &transformed {
+        Ok(Begun::Ready(Box::new(BegunCall {
+            prepared,
+            approval,
+            execution_id,
+            transformed,
+        })))
+    }
+
+    /// Second phase: the side effect, with no journal write, so begun calls can
+    /// run side by side.
+    pub(crate) async fn run_begun(
+        &self,
+        call: &BegunCall,
+        cancellation: CancellationToken,
+    ) -> Result<Dispatched, HarnessError> {
+        let BegunCall {
+            prepared,
+            execution_id,
+            transformed,
+            ..
+        } = call;
+        match transformed {
             CodingToolAction::ExternalTool {
                 plugin_id,
                 tool_name,
@@ -942,13 +996,27 @@ impl ToolExecutionService {
                 );
                 match environment {
                     Ok(environment) => {
-                        self.dispatch(&prepared, other, cancellation, &environment, &execution_id)
+                        self.dispatch(prepared, other, cancellation, &environment, execution_id)
                             .await
                     }
                     Err(error) => Err(error),
                 }
             }
-        };
+        }
+    }
+
+    /// Third phase: the receipt, committed in call order.
+    pub(crate) async fn finish_begun(
+        &self,
+        call: BegunCall,
+        dispatched: Result<Dispatched, HarnessError>,
+    ) -> Result<ToolExecutionView, HarnessError> {
+        let BegunCall {
+            prepared,
+            approval,
+            execution_id,
+            ..
+        } = call;
         match dispatched {
             Ok(dispatched) => {
                 self.settle(
@@ -1962,11 +2030,15 @@ impl ToolExecutionService {
             .retain(|pending| pending.execution_id != execution_id);
         state.revision = sequence;
         state.through_event_seq = sequence;
-        let after_fingerprint =
+        // A read changed nothing: its workspace after is the one it started from.
+        let after_fingerprint = if is_read_only(&prepared.final_action) {
+            prepared.workspace_fingerprint.clone()
+        } else {
             inspect_workspace(&prepared.workspace_root, prepared.project_id.clone()).map_or_else(
                 |_| prepared.workspace_fingerprint.clone(),
                 |workspace| workspace.fingerprint,
-            );
+            )
+        };
         // A process capture is its own durable evidence: the receipt points at
         // the captured bytes rather than at a re-serialization of them. Every
         // other output keeps the long-standing behavior of publishing its own
@@ -2065,6 +2137,19 @@ impl ToolExecutionService {
         };
         self.notify(&mut view);
         Ok(view)
+    }
+
+    async fn record_denied_begun(
+        &self,
+        prepared: &PreparedToolRequest,
+        execution_id: ToolExecutionId,
+        approval: Option<&ApprovalGrant>,
+        code: ErrorCode,
+        reason: &str,
+    ) -> Result<Begun, HarnessError> {
+        self.record_denied(prepared, execution_id, approval, code, reason)
+            .await
+            .map(Begun::Finished)
     }
 
     async fn record_denied(
@@ -2325,9 +2410,28 @@ fn process_output(
 
 /// A dispatched action: what the model sees, and the durable artifact that
 /// belongs to the receipt when the action produced one of its own.
-struct Dispatched {
+pub(crate) struct Dispatched {
     output: ToolOutput,
     artifact: Option<PublishedArtifact>,
+}
+
+/// A call past its gate: either already answered, or intent-committed and ready
+/// to run.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one value per tool call, moved once; boxing the view only adds an allocation"
+)]
+pub(crate) enum Begun {
+    Finished(ToolExecutionView),
+    Ready(Box<BegunCall>),
+}
+
+/// A call whose durable intent is committed and whose side effect has not run.
+pub(crate) struct BegunCall {
+    prepared: PreparedToolRequest,
+    approval: ApprovalGrant,
+    execution_id: ToolExecutionId,
+    transformed: CodingToolAction,
 }
 
 impl Dispatched {
@@ -2503,6 +2607,12 @@ fn current_unix_ms() -> Result<u64, HarnessError> {
 
 fn store_error(error: StoreError) -> HarnessError {
     error.into_harness_error()
+}
+
+/// Whether an action only reads, so the workspace need not be fingerprinted for it.
+fn is_read_only(action: &CodingToolAction) -> bool {
+    crate::contracts::effect_class_for(action.kind().as_str())
+        == crate::contracts::EffectClass::ReadOnly
 }
 
 #[cfg(test)]

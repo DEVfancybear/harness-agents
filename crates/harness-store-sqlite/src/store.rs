@@ -6,10 +6,10 @@ use std::{
 
 use fs2::FileExt;
 use harness_types::{
-    AgentRunId, ArtifactId, CompositionSnapshotId, ContentHash, ContextPacket, ContextPacketId,
-    ErrorCode, EventEnvelope, EventId, HostId, PluginInstanceId, PluginManifest, ProjectId,
-    ProviderAttemptId, RequestId, RuntimeCommandId, SessionId, SnapshotId, TaskId, ToolApprovalId,
-    ToolExecutionId, WorkingState,
+    ArtifactId, CompositionSnapshotId, ContentHash, ContextPacket, ContextPacketId, ErrorCode,
+    EventEnvelope, EventId, HostId, PluginInstanceId, PluginManifest, ProjectId, ProviderAttemptId,
+    RequestId, RuntimeCommandId, SessionId, SnapshotId, TaskId, ToolApprovalId, ToolExecutionId,
+    WorkingState,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -2119,12 +2119,6 @@ impl SqliteStore {
         })
     }
 
-    /// Low-level event append used by runtime continuity fixtures. It retains
-    /// the same fence and sequence checks as the P1 test helper.
-    pub async fn append_event(&self, event: EventEnvelope) -> Result<(), StoreError> {
-        self.append_event_for_test(event).await
-    }
-
     /// Return the next unallocated journal sequence for a session.
     pub async fn next_sequence(&self, session_id: &SessionId) -> Result<u64, StoreError> {
         let value =
@@ -2237,14 +2231,6 @@ impl SqliteStore {
                 error,
             )
         })
-    }
-
-    pub async fn latest_composition_snapshot(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Option<CompositionSnapshotRecord>, StoreError> {
-        let row = sqlx::query("SELECT snapshot_id, session_id, task_id, revision, content_json, content_hash FROM composition_snapshots WHERE session_id = ? ORDER BY revision DESC LIMIT 1").bind(session_id.as_str()).fetch_optional(&self.pool).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read composition snapshot", error))?;
-        row.map(|row| composition_from_row(&row)).transpose()
     }
 
     pub async fn persist_context_packet(
@@ -2548,33 +2534,6 @@ impl SqliteStore {
         })
     }
 
-    pub async fn agent_state(
-        &self,
-        agent_run_id: &AgentRunId,
-    ) -> Result<Option<AgentStateRecord>, StoreError> {
-        let row = sqlx::query("SELECT agent_run_id, session_id, task_id, state, generation, revision, detail_json FROM agent_states WHERE agent_run_id = ?")
-            .bind(agent_run_id.as_str())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read agent state", error))?;
-        row.map(|row| {
-            Ok(AgentStateRecord {
-                agent_run_id: AgentRunId::parse(row_get::<String>(&row, "agent_run_id")?).map_err(
-                    |_| StoreError::new(ErrorCode::StorageWriteFailed, "agent run ID is invalid"),
-                )?,
-                session_id: parse_session(row_get::<String>(&row, "session_id")?)?,
-                task_id: parse_task(row_get::<String>(&row, "task_id")?)?,
-                state: row_get::<String>(&row, "state")?,
-                generation: to_u64(row_get::<i64>(&row, "generation")?, "agent generation")?,
-                revision: to_u64(row_get::<i64>(&row, "revision")?, "agent revision")?,
-                detail: serde_json::from_str(&row_get::<String>(&row, "detail_json")?).map_err(
-                    |_| StoreError::new(ErrorCode::StorageWriteFailed, "agent detail is invalid"),
-                )?,
-            })
-        })
-        .transpose()
-    }
-
     pub async fn record_continuation_link(
         &self,
         source_session_id: &SessionId,
@@ -2822,9 +2781,14 @@ async fn open_pool(paths: &StorePaths, read_only: bool) -> Result<SqlitePool, St
         .foreign_keys(true)
         .busy_timeout(BUSY_TIMEOUT);
     if !read_only {
+        // WAL with `NORMAL`: a commit is durable once it is in the WAL, which
+        // survives a crash or kill of this process; only an operating-system crash
+        // or power loss can drop the last commits, and the database stays
+        // consistent either way. `FULL` fsynced the WAL on every commit - three
+        // times per tool call - which is what made every tool call slow.
         options = options
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Full);
+            .synchronous(SqliteSynchronous::Normal);
     }
     SqlitePoolOptions::new()
         .max_connections(1)
@@ -4616,40 +4580,6 @@ fn runtime_command_from_row(
                 "stored command error is invalid",
             )
         })?,
-    })
-}
-
-fn composition_from_row(
-    row: &sqlx::sqlite::SqliteRow,
-) -> Result<CompositionSnapshotRecord, StoreError> {
-    let content: Value =
-        serde_json::from_str(&row_get::<String>(row, "content_json")?).map_err(|_| {
-            StoreError::new(
-                ErrorCode::StorageWriteFailed,
-                "composition snapshot JSON is invalid",
-            )
-        })?;
-    let hash = ContentHash::parse(row_get::<String>(row, "content_hash")?).map_err(|_| {
-        StoreError::new(
-            ErrorCode::StorageWriteFailed,
-            "composition snapshot hash is invalid",
-        )
-    })?;
-    validate_hashed_json(&content, &hash)?;
-    Ok(CompositionSnapshotRecord {
-        snapshot_id: CompositionSnapshotId::parse(row_get::<String>(row, "snapshot_id")?).map_err(
-            |_| {
-                StoreError::new(
-                    ErrorCode::StorageWriteFailed,
-                    "composition snapshot ID is invalid",
-                )
-            },
-        )?,
-        session_id: parse_session(row_get::<String>(row, "session_id")?)?,
-        task_id: parse_task(row_get::<String>(row, "task_id")?)?,
-        revision: to_u64(row_get::<i64>(row, "revision")?, "composition revision")?,
-        content,
-        content_hash: hash,
     })
 }
 

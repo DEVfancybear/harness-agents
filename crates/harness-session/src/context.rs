@@ -1,6 +1,6 @@
 use harness_types::{
-    ContentHash, ContextPacket, ContextPacketId, MemoryAssetId, MemoryVersionRef,
-    P0_SCHEMA_VERSION, SessionId, SourceAuthority, SourceRef, TaskId,
+    ContentHash, ContextPacket, ContextPacketId, MemoryVersionRef, P0_SCHEMA_VERSION, SessionId,
+    SourceAuthority, SourceRef, TaskId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -192,12 +192,6 @@ impl ContextBlock {
     #[must_use]
     pub fn with_authority(mut self, authority: SourceAuthority) -> Self {
         self.authority = authority;
-        self
-    }
-
-    #[must_use]
-    pub fn with_provenance(mut self, provenance: Vec<SourceRef>) -> Self {
-        self.provenance = provenance;
         self
     }
 
@@ -806,14 +800,6 @@ fn estimate_bytes(bytes: usize) -> u64 {
     u64::try_from(bytes.saturating_add(3) / 4)
         .unwrap_or(u64::MAX)
         .max(1)
-}
-
-#[allow(dead_code)]
-fn _memory_marker(id: MemoryAssetId, version: u64) -> MemoryVersionRef {
-    MemoryVersionRef {
-        memory_asset_id: id,
-        version,
-    }
 }
 
 #[cfg(test)]

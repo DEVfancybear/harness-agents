@@ -1,9 +1,11 @@
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Read, Write},
     path::{Component, Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Mutex, OnceLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use globset::Glob;
@@ -157,8 +159,7 @@ pub(crate) fn inspect_identity(root: &Path) -> Result<WorkspaceIdentity, Harness
         ));
     }
     let root_text = canonical_path_text(&canonical)?;
-    let git_common_dir = git_output(&canonical, ["rev-parse", "--git-common-dir"])
-        .and_then(|value| canonicalize_git_path(&canonical, &value));
+    let git_common_dir = cached_git_common_dir(&canonical);
     // Project identity is deliberately independent of the current revision.
     // `git_head` and all tracked/untracked file content remain in the mutable
     // workspace fingerprint, so an external commit invalidates an approval
@@ -175,6 +176,27 @@ pub(crate) fn inspect_identity(root: &Path) -> Result<WorkspaceIdentity, Harness
         git_common_dir,
         identity_hash,
     })
+}
+
+/// The Git directory of a root, asked of `git` once per process and root.
+///
+/// Every tool call inspects the workspace, and on Windows each `git` spawn costs
+/// tens of milliseconds. The answer only changes when a repository is created or
+/// removed, so the cache is keyed by whether the root has a `.git` entry.
+fn cached_git_common_dir(root: &Path) -> Option<String> {
+    type GitDirs = HashMap<(PathBuf, bool), Option<String>>;
+    static CACHE: OnceLock<Mutex<GitDirs>> = OnceLock::new();
+    let key = (root.to_owned(), root.join(".git").exists());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(value) = cache.lock().ok().and_then(|map| map.get(&key).cloned()) {
+        return value;
+    }
+    let value = git_output(root, ["rev-parse", "--git-common-dir"])
+        .and_then(|value| canonicalize_git_path(root, &value));
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, value.clone());
+    }
+    value
 }
 
 pub(crate) fn inspect_workspace(
@@ -196,13 +218,54 @@ pub(crate) fn inspect_workspace(
     })
 }
 
+/// The workspace as a read-only action needs it: where it is, without hashing
+/// its files.
+///
+/// The fingerprint binds an approval to the workspace it was given for, so that a
+/// change made while a write waited for its approval invalidates it. A read
+/// changes nothing and its result is taken when it runs, so it binds only to the
+/// root's identity; the files are not walked three times for one `read_file`.
+pub(crate) fn inspect_workspace_for_read(
+    root: &Path,
+    project_id: ProjectId,
+) -> Result<WorkspaceDescriptor, HarnessError> {
+    let identity = inspect_identity(root)?;
+    let fingerprint = ContentHash::from_canonical_json(&json!({
+        "identity": identity.identity_hash,
+        "files": "not observed for a read-only action",
+    }))?;
+    Ok(WorkspaceDescriptor {
+        project_id,
+        root: identity.root,
+        root_text: identity.root_text,
+        git_common_dir: identity.git_common_dir,
+        git_head: "not_observed".to_owned(),
+        identity_hash: identity.identity_hash,
+        fingerprint,
+    })
+}
+
 pub(crate) fn workspace_fingerprint(
     root: &Path,
     git_head: &str,
 ) -> Result<ContentHash, HarnessError> {
-    let mut entries = Vec::new();
-    for item in walk_files(root)? {
-        match hash_file(&item.absolute)? {
+    // `git status` runs on its own thread while the files are walked and hashed.
+    let (files, status) = std::thread::scope(|scope| {
+        let status = scope.spawn(|| {
+            git_output(root, ["status", "--porcelain=v1", "--untracked-files=all"])
+                .unwrap_or_else(|| "not_git".to_owned())
+        });
+        let files = walk_files_bounded(root, MAX_FINGERPRINT_ENTRIES)
+            .and_then(|files| hash_files(&files).map(|hashes| (files, hashes)));
+        (
+            files,
+            status.join().unwrap_or_else(|_| "not_git".to_owned()),
+        )
+    });
+    let (files, hashes) = files?;
+    let mut entries = Vec::with_capacity(files.len());
+    for (item, hash) in files.iter().zip(hashes) {
+        match hash {
             Some(hash) => entries.push(json!({"path": item.relative, "content_hash": hash})),
             // Present but locked by another process. The path stays in the
             // fingerprint; its content does not. Once it becomes readable the
@@ -216,8 +279,6 @@ pub(crate) fn workspace_fingerprint(
             })),
         }
     }
-    let status = git_output(root, ["status", "--porcelain=v1", "--untracked-files=all"])
-        .unwrap_or_else(|| "not_git".to_owned());
     ContentHash::from_canonical_json(&json!({
         "git_head": git_head,
         "git_status": status,
@@ -788,6 +849,15 @@ fn entry_failure(path: &Path, error: &std::io::Error) -> HarnessError {
 }
 
 fn walk_files(root: &Path) -> Result<Vec<WalkFile>, HarnessError> {
+    walk_files_bounded(root, MAX_WALK_ENTRIES)
+}
+
+/// The walk behind the workspace fingerprint: every file, up to a far higher
+/// bound than a listing shown to the model, so a large repository is still
+/// fingerprinted instead of failing every write.
+const MAX_FINGERPRINT_ENTRIES: usize = 200_000;
+
+fn walk_files_bounded(root: &Path, bound: usize) -> Result<Vec<WalkFile>, HarnessError> {
     let mut files = Vec::new();
     let walker = WalkBuilder::new(root)
         .hidden(false)
@@ -828,7 +898,7 @@ fn walk_files(root: &Path) -> Result<Vec<WalkFile>, HarnessError> {
         if is_sensitive_relative(relative) {
             continue;
         }
-        if files.len() == MAX_WALK_ENTRIES {
+        if files.len() == bound {
             return Err(HarnessError::new(
                 ErrorCode::OutputLimitExceeded,
                 "workspace walk exceeded the P3 entry bound",
@@ -837,6 +907,8 @@ fn walk_files(root: &Path) -> Result<Vec<WalkFile>, HarnessError> {
         files.push(WalkFile {
             absolute: path.to_owned(),
             relative: relative_text(relative),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
         });
     }
     files.sort_by(|left, right| left.relative.cmp(&right.relative));
@@ -847,6 +919,87 @@ fn walk_files(root: &Path) -> Result<Vec<WalkFile>, HarnessError> {
 struct WalkFile {
     absolute: PathBuf,
     relative: String,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+/// Content hashes of workspace files, by path, size and modification time.
+///
+/// Every tool call fingerprints the workspace, and reading every file every time
+/// made a `read_file` cost most of a second on a real repository. A file whose
+/// size and modification time are unchanged is not read again - the same test
+/// `git` uses for its index. A file modified in the last two seconds is always
+/// read, because a second write inside one timestamp tick keeps the same time
+/// ("racily clean" in git's terms).
+type HashCache = HashMap<PathBuf, (u64, SystemTime, ContentHash)>;
+
+fn hash_cache() -> &'static Mutex<HashCache> {
+    static CACHE: OnceLock<Mutex<HashCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const RACY_WINDOW: Duration = Duration::from_secs(2);
+
+/// Hash every file, reusing cached hashes and reading the rest on all cores.
+fn hash_files(files: &[WalkFile]) -> Result<Vec<Option<ContentHash>>, HarnessError> {
+    let now = SystemTime::now();
+    let mut hashes: Vec<Option<Option<ContentHash>>> = vec![None; files.len()];
+    let mut misses = Vec::new();
+    if let Ok(cache) = hash_cache().lock() {
+        for (index, file) in files.iter().enumerate() {
+            let settled = file.modified.filter(|modified| {
+                now.duration_since(*modified)
+                    .is_ok_and(|age| age >= RACY_WINDOW)
+            });
+            match (settled, cache.get(&file.absolute)) {
+                (Some(modified), Some((len, cached_modified, hash)))
+                    if *len == file.len && *cached_modified == modified =>
+                {
+                    hashes[index] = Some(Some(hash.clone()));
+                }
+                _ => misses.push(index),
+            }
+        }
+    } else {
+        misses.extend(0..files.len());
+    }
+    let workers = std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .clamp(1, 16)
+        .min(misses.len().max(1));
+    let chunk = misses.len().div_ceil(workers).max(1);
+    let computed = std::thread::scope(|scope| {
+        let handles = misses
+            .chunks(chunk)
+            .map(|indexes| {
+                scope.spawn(move || {
+                    indexes
+                        .iter()
+                        .map(|index| (*index, hash_file(&files[*index].absolute)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect::<Vec<_>>()
+    });
+    let mut cache = hash_cache().lock().ok();
+    for (index, hash) in computed {
+        let hash = hash?;
+        let file = &files[index];
+        if let (Some(cache), Some(hash), Some(modified)) = (cache.as_mut(), &hash, file.modified) {
+            let settled = now
+                .duration_since(modified)
+                .is_ok_and(|age| age >= RACY_WINDOW);
+            if settled {
+                cache.insert(file.absolute.clone(), (file.len, modified, hash.clone()));
+            }
+        }
+        hashes[index] = Some(hash);
+    }
+    Ok(hashes.into_iter().map(Option::flatten).collect())
 }
 
 fn create_text_atomically(path: &Path, content: &str) -> Result<(), HarnessError> {

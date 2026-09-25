@@ -181,6 +181,7 @@ fn controller_for_with_overrides(
         // prime-agent refreshes its model catalog in the background; the snapshot
         // compiled in keeps working when the download fails.
         super::providers::refresh_in_background(&context.paths.data_dir);
+        super::providers::refresh_listed_models_for_logins(environment, &context.paths.data_dir);
         Box::new(AgentSessionService::new_with_overrides(
             context,
             environment.clone(),

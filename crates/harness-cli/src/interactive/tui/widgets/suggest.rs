@@ -97,7 +97,7 @@ mod tests {
             buffer: prefix.to_owned(),
             cursor: prefix.chars().count(),
             live_text: String::new(),
-            open_tool: None,
+            open_tools: Vec::new(),
             modal: None,
             granted_for_run: false,
             queued_input: false,

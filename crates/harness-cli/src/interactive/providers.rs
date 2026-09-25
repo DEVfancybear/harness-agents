@@ -127,6 +127,10 @@ pub struct Model {
     pub max_tokens: Option<u64>,
     #[serde(default)]
     pub compat: Option<Compat>,
+    /// prime-agent's per-model level map: `null` for a level the model does not
+    /// offer, a string for how the provider spells it.
+    #[serde(default)]
+    pub thinking_level_map: Option<std::collections::BTreeMap<String, Option<String>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -150,6 +154,16 @@ pub struct Compat {
 }
 
 impl Model {
+    /// What the model offers for reasoning, from its catalog entry, as prime-agent
+    /// reads it from its registry.
+    #[must_use]
+    pub fn reasoning_model(&self) -> harness_providers::thinking::ReasoningModel {
+        harness_providers::thinking::reasoning_from_catalog(
+            self.reasoning,
+            &self.thinking_level_map.clone().unwrap_or_default(),
+        )
+    }
+
     /// `provider/id`, the form `/model` takes and shows.
     #[must_use]
     pub fn reference(&self) -> String {
@@ -202,8 +216,9 @@ impl Catalog {
         }
     }
 
-    /// The cached download when it is usable, else the snapshot. Never touches
-    /// the network; [`refresh_in_background`] does that.
+    /// The cached download when it is usable, else the snapshot, plus the models
+    /// the providers you are logged in to list themselves. Never touches the
+    /// network; [`refresh_in_background`] does that.
     #[must_use]
     pub fn load(data_dir: &Path) -> Self {
         let bundled = Self::bundled();
@@ -212,7 +227,47 @@ impl Catalog {
             .and_then(|text| parse(&text))
             .map(|models| bundled.admit(models))
             .filter(|models| !models.is_empty());
-        cached.map_or(bundled, |models| Self { models })
+        let mut catalog = cached.map_or(bundled, |models| Self { models });
+        for provider in LIVE_LISTS {
+            let Some(ids) = std::fs::read_to_string(live_path(data_dir, provider.0))
+                .ok()
+                .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
+            else {
+                continue;
+            };
+            catalog.add_listed(provider.0, &ids);
+        }
+        catalog
+    }
+
+    /// Models a provider lists that the catalog does not have yet (a release
+    /// newer than the catalog, such as `deepseek-v4.1-flash`). Each takes the wire
+    /// format, reasoning and level map of the catalog model of the same provider
+    /// whose id it shares the longest start with - its predecessor in the family.
+    fn add_listed(&mut self, provider: &str, ids: &[String]) {
+        let known = self
+            .models
+            .iter()
+            .filter(|model| model.provider == provider)
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in ids {
+            if known.iter().any(|model| &model.id == id) {
+                continue;
+            }
+            let Some(sibling) = known
+                .iter()
+                .max_by_key(|model| common_prefix(&model.id, id))
+                .filter(|model| common_prefix(&model.id, id) >= 3)
+            else {
+                continue;
+            };
+            let mut model = sibling.clone();
+            model.id.clone_from(id);
+            model.name.clone_from(id);
+            model.cost = None;
+            self.models.push(model);
+        }
     }
 
     /// Keep the downloaded models whose transport the snapshot already knows.
@@ -268,6 +323,113 @@ fn parse(text: &str) -> Option<Vec<Model>> {
 
 fn cache_path(data_dir: &Path) -> PathBuf {
     data_dir.join(CACHE_FILE)
+}
+
+/// Providers whose own model list is read, and where (OpenAI-compatible
+/// `GET /models`): the catalog lags behind their releases.
+const LIVE_LISTS: [(&str, &str); 3] = [
+    ("deepseek", "https://api.deepseek.com/models"),
+    ("opencode", "https://opencode.ai/zen/v1/models"),
+    ("opencode-go", "https://opencode.ai/zen/go/v1/models"),
+];
+
+fn live_path(data_dir: &Path, provider: &str) -> PathBuf {
+    data_dir.join(format!("cache/models-{provider}.json"))
+}
+
+fn common_prefix(left: &str, right: &str) -> usize {
+    left.chars()
+        .zip(right.chars())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+/// Refresh the model list of every listing provider this launch has a key for.
+pub fn refresh_listed_models_for_logins(
+    environment: &super::paths::LaunchEnvironment,
+    data_dir: &Path,
+) {
+    let auth = super::credentials::resolve_file(environment, data_dir);
+    for (provider, _) in LIVE_LISTS {
+        let saved = super::credentials::load(&auth, provider)
+            .ok()
+            .flatten()
+            .map(|credential| credential.secret().to_owned());
+        let from_environment = || {
+            env_variables(provider).iter().find_map(|name| {
+                environment
+                    .value(name)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string_lossy().into_owned())
+            })
+        };
+        if let Some(key) = saved.or_else(from_environment) {
+            refresh_listed_models(data_dir, provider, key);
+        }
+    }
+}
+
+/// Read one provider's model list with its key and cache the ids, on a thread of
+/// its own. A failure leaves the previous list in place.
+fn refresh_listed_models(data_dir: &Path, provider: &str, key: String) {
+    let Some((_, url)) = LIVE_LISTS.iter().find(|(id, _)| *id == provider) else {
+        return;
+    };
+    let url = (*url).to_owned();
+    let path = live_path(data_dir, provider);
+    let _ = std::thread::Builder::new()
+        .name("ha-model-list".to_owned())
+        .spawn(move || {
+            let Some(text) = download_with_key(&url, &key) else {
+                return;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                return;
+            };
+            let ids = value["data"]
+                .as_array()
+                .map(|models| {
+                    models
+                        .iter()
+                        .filter_map(|model| model["id"].as_str().map(str::to_owned))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if ids.is_empty() {
+                return;
+            }
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(text) = serde_json::to_string(&ids) {
+                let _ = std::fs::write(path, text);
+            }
+        });
+}
+
+fn download_with_key(url: &str, key: &str) -> Option<String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    runtime.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .ok()?;
+        let response = client
+            .get(url)
+            .bearer_auth(key)
+            .header("User-Agent", format!("ha/{}", env!("CARGO_PKG_VERSION")))
+            .header("x-opencode-session", "ha-model-list")
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.text().await.ok()
+    })
 }
 
 /// Download the catalog when the cached copy is missing or older than a day.
@@ -370,6 +532,24 @@ mod tests {
         let mut evil = catalog.find("deepseek/deepseek-v4-flash").cloned().unwrap();
         evil.base_url = "https://attacker.example".to_owned();
         assert!(catalog.admit(vec![evil]).is_empty());
+    }
+
+    #[test]
+    fn a_listed_model_the_catalog_lacks_follows_its_family() {
+        let mut catalog = Catalog::bundled();
+        catalog.add_listed("opencode-go", &["deepseek-v4.1-flash".to_owned()]);
+        let model = catalog
+            .find("opencode-go/deepseek-v4.1-flash")
+            .expect("the listed model is offered");
+        assert_eq!(model.protocol(), Some("openai_chat"));
+        assert_eq!(
+            model
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.thinking_format.as_deref()),
+            Some("deepseek")
+        );
+        assert!(model.thinking_level_map.is_some());
     }
 
     #[test]

@@ -9,9 +9,9 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use super::{SqliteStore, assert_fence_in_tx, database_error, row_get, to_i64, to_u64};
 use crate::{
-    BudgetUsageRecord, DELEGATION_SCHEMA_VERSION, DeliveryCommit, MemoryBindingRow,
-    ParentDeliveryRecord, StoreError, StoreFaultPoint, StoredDelegatedResultRecord,
-    StoredTaskNodeRecord, TaskOwnerRecord, WorktreeRecordRow,
+    DELEGATION_SCHEMA_VERSION, DeliveryCommit, MemoryBindingRow, ParentDeliveryRecord, StoreError,
+    StoreFaultPoint, StoredDelegatedResultRecord, StoredTaskNodeRecord, TaskOwnerRecord,
+    WorktreeRecordRow,
 };
 
 const DELEGATION_SCHEMA: &[&str] = &[
@@ -561,50 +561,6 @@ impl SqliteStore {
         })
     }
 
-    /// Record the final integration report. Only this revision is current.
-    pub async fn record_integration(
-        &self,
-        integration_id: &str,
-        project_id: &ProjectId,
-        base_commit: &str,
-        final_commit: &str,
-        final_fingerprint: &ContentHash,
-        report: &Value,
-    ) -> Result<(), StoreError> {
-        let fence = self.fence()?;
-        let mut tx = self.begin_write(&fence).await?;
-        assert_fence_in_tx(&mut tx, &fence).await?;
-        let report_json = serde_json::to_string(report).map_err(|_| {
-            StoreError::new(
-                ErrorCode::InvalidPayload,
-                "integration report is not serializable",
-            )
-        })?;
-        sqlx::query(
-            "INSERT INTO delegation_integrations(
-                 integration_id, project_id, base_commit, final_commit, final_fingerprint, report_json)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(integration_id) DO UPDATE SET
-                 final_commit = excluded.final_commit,
-                 final_fingerprint = excluded.final_fingerprint,
-                 report_json = excluded.report_json",
-        )
-        .bind(integration_id)
-        .bind(project_id.as_str())
-        .bind(base_commit)
-        .bind(final_commit)
-        .bind(final_fingerprint.as_str())
-        .bind(report_json)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| {
-            database_error(ErrorCode::StorageWriteFailed, "record integration", error)
-        })?;
-        tx.commit().await.map_err(|error| {
-            database_error(ErrorCode::StorageWriteFailed, "commit integration", error)
-        })
-    }
-
     pub async fn task_node(
         &self,
         task_id: &TaskId,
@@ -790,32 +746,6 @@ impl SqliteStore {
         .await
         .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list worktrees", error))?;
         rows.iter().map(read_worktree_row).collect()
-    }
-
-    pub async fn budget_usage(
-        &self,
-        task_id: &TaskId,
-    ) -> Result<Option<BudgetUsageRecord>, StoreError> {
-        let row = sqlx::query(
-            "SELECT task_id, model_requests, retries, cost_units
-             FROM delegation_budget_usage WHERE task_id = ?",
-        )
-        .bind(task_id.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read usage", error))?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        Ok(Some(BudgetUsageRecord {
-            model_requests: u32::try_from(row_get::<i64>(&row, "model_requests")?).map_err(
-                |_| StoreError::new(ErrorCode::StorageWriteFailed, "usage is out of range"),
-            )?,
-            retries: u32::try_from(row_get::<i64>(&row, "retries")?).map_err(|_| {
-                StoreError::new(ErrorCode::StorageWriteFailed, "retries are out of range")
-            })?,
-            cost_units: to_u64(row_get::<i64>(&row, "cost_units")?, "cost units")?,
-        }))
     }
 
     pub async fn delegation_task_count(&self) -> Result<u64, StoreError> {

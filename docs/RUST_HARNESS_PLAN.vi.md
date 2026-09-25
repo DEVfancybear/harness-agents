@@ -128,7 +128,7 @@ Mở phiên mới cùng project có thể tìm task chưa xong. Nếu có một 
 
 ## 7. Lưu trữ và tính bền vững
 
-Chọn SQLite trên ổ đĩa cục bộ, WAL, foreign keys, busy timeout và mức đồng bộ phù hợp với hợp đồng durable commit. Với v1, dùng `synchronous=FULL` cho các transaction xác nhận công việc. WAL không dành cho database đặt trên network filesystem. [SQLite WAL](https://sqlite.org/wal.html).
+Chọn SQLite trên ổ đĩa cục bộ, WAL, foreign keys, busy timeout và mức đồng bộ phù hợp với hợp đồng durable commit. Bản v1 dùng `synchronous=FULL` cho các transaction xác nhận công việc; từ 2026-09-26 chuyển sang `NORMAL` với WAL (xem ADR-N02). WAL không dành cho database đặt trên network filesystem. [SQLite WAL](https://sqlite.org/wal.html).
 
 Các bảng dự kiến:
 

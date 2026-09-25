@@ -192,9 +192,7 @@ pub fn live_rows(state: &UiState, width: u16) -> u16 {
             rows = rows.saturating_add(cells.max(1).div_ceil(width.max(1)));
         }
     }
-    if state.open_tool.is_some() {
-        rows = rows.saturating_add(1);
-    }
+    rows = rows.saturating_add(u16::try_from(state.open_tools.len()).unwrap_or(u16::MAX));
     rows.min(MAX_LIVE_ROWS)
 }
 
@@ -272,7 +270,7 @@ mod tests {
             buffer: String::new(),
             cursor: 0,
             live_text: String::new(),
-            open_tool: None,
+            open_tools: Vec::new(),
             modal: None,
             granted_for_run: false,
             queued_input: false,

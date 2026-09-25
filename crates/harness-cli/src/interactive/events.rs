@@ -388,7 +388,8 @@ pub struct UiState {
     /// Model text that has not been committed to the scrollback yet.
     pub live_text: String,
     /// The open tool card, if any: it updates in place until it settles.
-    pub open_tool: Option<(String, String)>,
+    /// Calls started and not yet settled, oldest first (a batch runs side by side).
+    pub open_tools: Vec<(String, String)>,
     pub modal: Option<Modal>,
     /// Whether the user allowed every gated action for the run in flight, so the
     /// status row can say the gate is open instead of leaving a silent widening of

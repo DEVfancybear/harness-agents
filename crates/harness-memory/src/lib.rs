@@ -2,11 +2,7 @@
 
 //! Scoped reusable-memory contracts and services.
 
-use std::{
-    collections::BTreeSet,
-    path::{Component, Path},
-    sync::Arc,
-};
+use std::{collections::BTreeSet, sync::Arc};
 
 use harness_store_sqlite::SqliteStore;
 use harness_store_sqlite::{
@@ -20,7 +16,6 @@ use harness_types::{
     Validity,
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 mod extraction;
@@ -42,50 +37,6 @@ pub const MEMORY_CONTRACT_VERSION: u16 = 1;
 /// Declared here, next to the contract, because it is a value two crates have to agree
 /// on: the host writes it, and the retention rule in this crate selects on it.
 pub const TURN_PROVENANCE_KIND: &str = "session_turn";
-
-/// The asset kind of a fact a model extracted from a conversation.
-pub const FACT_KIND: &str = "fact";
-
-/// The provenance kind of a fact a model extracted from a conversation.
-pub const FACT_PROVENANCE_KIND: &str = "model_extraction";
-
-/// The confidence at which an extracted fact is applied without review.
-///
-/// Below it the fact is kept as a candidate a human can confirm or reject, which is
-/// the only path any model inference had before. The value is deer-flow's default
-/// fact threshold: high enough that a guess stays a candidate, low enough that a
-/// plainly stated preference is used on the next turn.
-pub const FACT_AUTO_APPLY_CONFIDENCE: f64 = 0.7;
-
-/// What a fact is about. The set is deliberately small and closed so that ranking,
-/// display and review can rely on it.
-pub const FACT_CATEGORIES: &[&str] = &[
-    "preference",
-    "knowledge",
-    "context",
-    "behavior",
-    "goal",
-    "correction",
-];
-
-/// One fact a model extracted, before it is written.
-#[derive(Clone, Debug, PartialEq)]
-pub struct InferredFact {
-    /// The fact, as one self-contained sentence.
-    pub content: String,
-    /// One of [`FACT_CATEGORIES`].
-    pub category: String,
-    /// How sure the extractor is, in `0.0..=1.0`.
-    pub confidence: f64,
-    /// Scope and owner of the fact.
-    pub scope: MemoryScope,
-    /// The project the fact belongs to, for project scope.
-    pub project_id: Option<ProjectId>,
-    /// The admitted input the fact was extracted from.
-    pub source_event_refs: Vec<EventId>,
-    /// Which extractor produced it, recorded on the version.
-    pub extractor_version: String,
-}
 
 /// The heading that opens a memory block in the context packet.
 ///
@@ -540,84 +491,16 @@ impl MemoryService {
     pub async fn create_asset(
         &self,
         principal: &MemoryPrincipal,
-        request: CreateMemoryAsset,
-    ) -> Result<StoredMemoryAsset, HarnessError> {
-        self.create_asset_with(principal, request, None, None).await
-    }
-
-    /// Write one fact a model extracted, applying it when it is confident enough.
-    ///
-    /// A fact at or above [`FACT_AUTO_APPLY_CONFIDENCE`] is active at once and reaches
-    /// the next turn; a less certain one is a candidate, the state every model
-    /// inference used to land in. The confidence is kept on the version, so review and
-    /// ranking can see how sure the extractor was.
-    ///
-    /// # Errors
-    /// Refuses a category outside [`FACT_CATEGORIES`], a confidence outside
-    /// `0.0..=1.0`, and anything [`Self::create_asset`] refuses.
-    pub async fn apply_inferred_fact(
-        &self,
-        principal: &MemoryPrincipal,
-        fact: InferredFact,
-    ) -> Result<StoredMemoryAsset, HarnessError> {
-        if !fact.confidence.is_finite() || !(0.0..=1.0).contains(&fact.confidence) {
-            return Err(HarnessError::new(
-                ErrorCode::InvalidPayload,
-                "fact confidence must be between 0 and 1",
-            ));
-        }
-        if !FACT_CATEGORIES.contains(&fact.category.as_str()) {
-            return Err(HarnessError::new(
-                ErrorCode::InvalidPayload,
-                "fact category is not one of the known categories",
-            ));
-        }
-        let request = CreateMemoryAsset {
-            kind: FACT_KIND.to_owned(),
-            scope: fact.scope,
-            layer: MemoryLayer::L1,
-            project_id: fact.project_id,
-            task_id: None,
-            agent_profile_id: None,
-            session_id: None,
-            visibility: "scoped".to_owned(),
-            content: format!("[{}] {}", fact.category, fact.content.trim()),
-            authority: SourceAuthority::ModelProposed,
-            evidence: EvidenceState::ModelInference,
-            user_confirmed: false,
-            source_event_refs: fact.source_event_refs,
-            source_file_hashes: Vec::new(),
-            source_commit: None,
-            provenance_kind: FACT_PROVENANCE_KIND.to_owned(),
-            sources: Vec::new(),
-        };
-        self.create_asset_with(
-            principal,
-            request,
-            Some(fact.confidence),
-            Some(fact.extractor_version),
-        )
-        .await
-    }
-
-    async fn create_asset_with(
-        &self,
-        principal: &MemoryPrincipal,
         mut request: CreateMemoryAsset,
-        confidence: Option<f64>,
-        extractor_version: Option<String>,
     ) -> Result<StoredMemoryAsset, HarnessError> {
         validate_create(principal, &request)?;
         request.content = extraction::sanitize_memory_text(&request.content);
-        let decision = match confidence {
-            Some(confidence) => self.publication.classify_inferred(confidence),
-            None => self.publication.classify(
-                request.authority,
-                request.evidence,
-                request.layer,
-                request.user_confirmed,
-            ),
-        };
+        let decision = self.publication.classify(
+            request.authority,
+            request.evidence,
+            request.layer,
+            request.user_confirmed,
+        );
         let memory_asset_id = MemoryAssetId::generate();
         let content_hash = ContentHash::from_bytes(request.content.as_bytes());
         let sources = collect_sources(
@@ -655,10 +538,10 @@ impl MemoryService {
             source_commit: request.source_commit,
             provenance_kind: request.provenance_kind,
             evidence_state: request.evidence.as_str().to_owned(),
-            confidence_annotation: confidence.map(|confidence| format!("{confidence:.2}")),
+            confidence_annotation: None,
             validity: Validity::Valid,
             supersedes: None,
-            extractor_version,
+            extractor_version: None,
         };
         let record = StoredMemoryAssetRecord {
             asset,
@@ -1038,83 +921,6 @@ impl MemoryService {
         Ok(retired)
     }
 
-    /// Re-read the current file sources this principal may search.
-    ///
-    /// Missing, unreadable, oversized, or out-of-workspace paths are represented
-    /// with `observed: None`, which makes file-backed versions stale in the SQL
-    /// filter. This keeps the normal recall path from treating an unread file as
-    /// fresh memory.
-    pub async fn refresh_workspace_file_sources(
-        &self,
-        principal: &MemoryPrincipal,
-        workspace_root: &Path,
-    ) -> Result<Vec<RefreshSource>, HarnessError> {
-        const MAX_REFRESH_FILE_BYTES: u64 = 16 * 1024 * 1024;
-
-        validate_principal(principal)?;
-        let sources = self
-            .store
-            .searchable_current_file_sources(&store_principal(principal))
-            .await
-            .map_err(to_harness_error)?;
-        let root = tokio::fs::canonicalize(workspace_root).await.ok();
-        let mut refresh = Vec::with_capacity(sources.len());
-        let mut seen = BTreeSet::new();
-        for source in sources {
-            if !seen.insert(source.source_id.clone()) {
-                continue;
-            }
-            let relative = Path::new(&source.source_id);
-            let safe_relative = !relative.as_os_str().is_empty()
-                && relative
-                    .components()
-                    .all(|component| matches!(component, Component::Normal(_) | Component::CurDir));
-            let observed = if safe_relative {
-                if let Some(root) = &root {
-                    let path = root.join(relative);
-                    match tokio::fs::canonicalize(&path).await {
-                        Ok(path) if path.starts_with(root) => {
-                            match tokio::fs::File::open(&path).await {
-                                Ok(file) => match file.metadata().await {
-                                    Ok(metadata)
-                                        if metadata.is_file()
-                                            && metadata.len() <= MAX_REFRESH_FILE_BYTES =>
-                                    {
-                                        let mut bytes = Vec::with_capacity(
-                                            usize::try_from(metadata.len()).unwrap_or(0),
-                                        );
-                                        let mut bounded = file.take(MAX_REFRESH_FILE_BYTES + 1);
-                                        match bounded.read_to_end(&mut bytes).await {
-                                            Ok(_)
-                                                if bytes.len() as u64 <= MAX_REFRESH_FILE_BYTES =>
-                                            {
-                                                Some(ContentHash::from_bytes(&bytes))
-                                            }
-                                            _ => None,
-                                        }
-                                    }
-                                    _ => None,
-                                },
-                                Err(_) => None,
-                            }
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            refresh.push(RefreshSource {
-                kind: MemorySourceKind::File,
-                id: source.source_id,
-                observed,
-            });
-        }
-        Ok(refresh)
-    }
-
     /// Confirm a bounded batch of candidate assets at their current version.
     ///
     /// One asset that cannot be confirmed fails the batch rather than being skipped: a
@@ -1246,109 +1052,6 @@ impl MemoryService {
             )
             .await
             .map_err(to_harness_error)
-    }
-
-    /// Record one more source event on a version that already exists.    ///
-    /// Used by deduplication: the same text said twice is one memory with two
-    /// sources, not two memories. The asset keeps its id, its version number and its
-    /// content hash, so nothing that depends on it needs rebuilding.
-    ///
-    /// Returns whether the source list changed - `false` when the event was already
-    /// recorded.
-    ///
-    /// # Errors
-    /// Fails when the principal may not bind the asset, or the store cannot write.
-    pub async fn append_version_source(
-        &self,
-        principal: &MemoryPrincipal,
-        memory_asset_id: &MemoryAssetId,
-        event_id: &EventId,
-    ) -> Result<bool, HarnessError> {
-        validate_principal(principal)?;
-        self.store
-            .append_memory_version_source(&store_principal(principal), memory_asset_id, event_id)
-            .await
-            .map_err(to_harness_error)
-    }
-
-    /// Turn records past the cap, oldest first, and how many of them are pinned.
-    ///
-    /// A retention rule for the conversation log: the caller retires what this returns
-    /// through [`MemoryService::invalidate`], so the removal goes through the same
-    /// authorization and lineage machinery as any other invalidation.
-    ///
-    /// A pinned record is one another live asset was derived from. It is over the cap and
-    /// it stays: invalidating it would take the derived asset with it, and a log limit
-    /// must never be able to delete knowledge. The count is returned rather than dropped
-    /// so the caller can report a log that is over its cap for a reason.
-    ///
-    /// # Errors
-    /// Fails when the principal is unusable or the store cannot answer.
-    pub async fn turn_records_over_limit(
-        &self,
-        principal: &MemoryPrincipal,
-        project_id: Option<&ProjectId>,
-        keep: usize,
-    ) -> Result<(Vec<MemoryAssetId>, usize), HarnessError> {
-        validate_principal(principal)?;
-        let store_principal = StoreMemoryPrincipal {
-            project_id: project_id.cloned(),
-            ..store_principal(principal)
-        };
-        self.store
-            .turn_records_over_limit(&store_principal, TURN_PROVENANCE_KIND, keep)
-            .await
-            .map_err(to_harness_error)
-    }
-
-    /// The newest turn records, newest first, up to `limit`.
-    ///
-    /// A question about the conversation - "what did I ask you before?" - is a question
-    /// about *when*, not about *what*. Answering it by keyword overlap is the wrong
-    /// tool: the words in that question appear in no particular turn, and the overlap
-    /// floor that keeps unrelated notes out of the knowledge path also keeps the
-    /// history out. Recentness is the right index for it, so this is a separate read.
-    ///
-    /// # Errors
-    /// Fails when the principal is unusable or the store cannot answer.
-    pub async fn recent_turns(
-        &self,
-        principal: &MemoryPrincipal,
-        project_id: Option<&ProjectId>,
-        limit: usize,
-    ) -> Result<RetrievalResult, HarnessError> {
-        validate_principal(principal)?;
-        if limit == 0 || limit > 64 {
-            return Err(HarnessError::new(
-                ErrorCode::InvalidPayload,
-                "turn history is bounded to 1..=64 records",
-            ));
-        }
-        let store_principal = StoreMemoryPrincipal {
-            project_id: project_id.cloned(),
-            ..store_principal(principal)
-        };
-        let (records, revision) = self
-            .store
-            .recent_turn_records(&store_principal, TURN_PROVENANCE_KIND, limit)
-            .await
-            .map_err(to_harness_error)?;
-        let hits = records
-            .into_iter()
-            .map(convert_asset)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(RetrievalResult {
-            state: if hits.is_empty() {
-                RetrievalState::Empty
-            } else {
-                RetrievalState::Found
-            },
-            hits,
-            detail: None,
-            // The store's revision, never a placeholder: this value is checked before
-            // dispatch and a wrong one makes the contribution be dropped in silence.
-            revision,
-        })
     }
 
     pub async fn export_versions(
@@ -2135,24 +1838,6 @@ impl PublicationPolicy {
                 MemoryAssetStatus::Candidate
             },
             publish_allowed,
-        }
-    }
-
-    /// The decision for a fact a model inferred with a stated confidence.
-    ///
-    /// This is the one path on which model inference may be active without a human:
-    /// the operator chose applying confident facts over reviewing every one, and the
-    /// confidence is what keeps a guess from being applied with them.
-    #[must_use]
-    pub fn classify_inferred(&self, confidence: f64) -> PublicationDecision {
-        let applied = confidence.is_finite() && confidence >= FACT_AUTO_APPLY_CONFIDENCE;
-        PublicationDecision {
-            status: if applied {
-                MemoryAssetStatus::Active
-            } else {
-                MemoryAssetStatus::Candidate
-            },
-            publish_allowed: applied,
         }
     }
 

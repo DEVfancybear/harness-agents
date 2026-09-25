@@ -386,7 +386,8 @@ async fn p1_s02_sqlite_diagnostics_and_read_only_boundaries_are_real() {
     let diagnostics = store.diagnostics().await.expect("diagnostics are readable");
     assert!(diagnostics.foreign_keys_enabled);
     assert_eq!(diagnostics.journal_mode.to_lowercase(), "wal");
-    assert_eq!(diagnostics.synchronous, 2);
+    // NORMAL under WAL (ADR-N02, amended 2026-09-26).
+    assert_eq!(diagnostics.synchronous, 1);
     assert!(diagnostics.busy_timeout_ms >= 5_000);
 }
 

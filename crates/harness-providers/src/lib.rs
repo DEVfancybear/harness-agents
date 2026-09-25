@@ -813,11 +813,13 @@ pub(crate) async fn http_response_error(response: reqwest::Response) -> Provider
     let status = response.status().as_u16();
     let retry = retry_after_seconds(response.headers());
     let error = http_status_error(status, retry);
-    let detail = response
-        .text()
-        .await
-        .ok()
-        .and_then(|body| error_message(&body));
+    let detail = response.text().await.ok().and_then(|body| {
+        // A JSON error names its message; anything else is shown as sent.
+        error_message(&body).or_else(|| {
+            let text = body.split_whitespace().collect::<Vec<_>>().join(" ");
+            (!text.is_empty()).then(|| text.chars().take(300).collect())
+        })
+    });
     match detail {
         Some(detail) => ProviderError::new(error.code(), format!("{}: {detail}", error.message))
             .with_retry_after(error.retry_after()),
@@ -2277,6 +2279,7 @@ mod g03_openai_wire_snapshot_tests {
                 thinking: Some(super::Thinking {
                     level: super::ThinkingLevel::Off,
                     format: super::ThinkingFormat::DeepSeek,
+                    model: None,
                 }),
                 headers: Vec::new(),
             },

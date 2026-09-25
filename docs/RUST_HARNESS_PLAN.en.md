@@ -128,7 +128,7 @@ A new session in the same project can discover unfinished tasks. A suitable sing
 
 ## 7. Storage and durability
 
-Use SQLite on local disk, WAL, foreign keys, a busy timeout, and synchronization matching the durable-commit contract. v1 uses `synchronous=FULL` for transactions acknowledging work. WAL databases must not live on network filesystems. [SQLite WAL](https://sqlite.org/wal.html).
+Use SQLite on local disk, WAL, foreign keys, a busy timeout, and synchronization matching the durable-commit contract. v1 used `synchronous=FULL` for transactions acknowledging work; since 2026-09-26 it uses `NORMAL` under WAL (see ADR-N02). WAL databases must not live on network filesystems. [SQLite WAL](https://sqlite.org/wal.html).
 
 Proposed tables:
 

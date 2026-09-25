@@ -232,6 +232,7 @@ fn map_event(event: Event) -> Key {
 
 fn map_key(key: KeyEvent) -> Key {
     let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
         KeyCode::Char('c') if control => Key::Interrupt,
         KeyCode::Char('d') if control => Key::EndOfInput,
@@ -246,6 +247,9 @@ fn map_key(key: KeyEvent) -> Key {
         // which is why `/image` runs the same code — this mapping is for the ones that
         // do forward it, and for a console without bracketed paste.
         KeyCode::Char('v') if control => Key::PasteImage,
+        // Windows Terminal keeps Ctrl-V for its own paste and sends nothing when the
+        // clipboard holds only an image; Alt-V reaches the app, as in Claude Code.
+        KeyCode::Char('v') if alt => Key::PasteImage,
         // Ctrl-J is a line feed. Measured on this ConPTY (HA_TUI T01): the
         // console reports it as Enter with the CONTROL modifier, not as
         // Ctrl+Char('j'), so both spellings are accepted as the multiline key.

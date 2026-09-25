@@ -45,11 +45,6 @@ impl StoredApproval {
     pub fn is_open(&self) -> bool {
         self.state == "open"
     }
-
-    #[must_use]
-    pub fn is_decided(&self) -> bool {
-        matches!(self.state.as_str(), "approved" | "denied")
-    }
 }
 
 impl SqliteStore {
@@ -102,19 +97,6 @@ impl SqliteStore {
                 database_error(ErrorCode::StorageOpenFailed, "read approval", error)
             })?;
         row.map(|row| decode_approval(&row)).transpose()
-    }
-
-    /// Approvals still waiting for a decision.
-    pub async fn open_approvals(&self) -> Result<Vec<StoredApproval>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT * FROM schedule_approvals WHERE state = 'open' ORDER BY requested_at_unix_ms, occurrence_key",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|error| {
-            database_error(ErrorCode::StorageOpenFailed, "list open approvals", error)
-        })?;
-        rows.iter().map(decode_approval).collect()
     }
 
     /// Record a decision.

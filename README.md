@@ -68,7 +68,7 @@ Building a release package (checksums, manifest) is described in [docs/BUILD_AND
 | Shrink a long conversation | `/compact [what to keep]` |
 | See cost, context, permissions | `/cost`, `/context`, `/permissions` |
 
-Keys: Enter sends, Ctrl-J or Alt+Enter adds a line, ↑↓ recall history or move in a menu, Esc closes a panel or interrupts a run, Ctrl-C cancels a run (pressed twice on an empty prompt it exits), Ctrl-O cycles the detail mode (collapsed, details, expanded), Ctrl-D on an empty line exits. The TUI follows prime-agent's look: user messages in a shaded box, tool calls as `name · status` rows with three lines of output, the working line above an editor drawn between two rules.
+Keys: Enter sends, Ctrl-J or Alt+Enter adds a line, Ctrl-V (or Alt-V where the terminal keeps Ctrl-V) pastes a screenshot or files copied in Explorer as attachments, ↑↓ recall history or move in a menu, Esc closes a panel or interrupts a run, Ctrl-C cancels a run (pressed twice on an empty prompt it exits), Ctrl-O cycles the detail mode (collapsed, details, expanded), Ctrl-D on an empty line exits. The TUI follows prime-agent's look: user messages in a shaded box, tool calls as `name · status` rows with three lines of output, the working line above an editor drawn between two rules.
 
 ### Configuration
 
@@ -170,7 +170,7 @@ Cách build gói release (checksum, manifest) nằm trong [docs/BUILD_AND_RELEAS
 | Rút gọn hội thoại dài | `/compact [điều cần giữ]` |
 | Xem chi phí, context, quyền | `/cost`, `/context`, `/permissions` |
 
-Phím: Enter gửi, Ctrl-J hoặc Alt+Enter xuống dòng, ↑↓ gọi lại lịch sử hoặc di chuyển trong menu, Esc đóng panel hoặc ngắt lượt đang chạy, Ctrl-C hủy lượt đang chạy (bấm hai lần trên dòng trống để thoát), Ctrl-O đổi chế độ chi tiết (thu gọn, chi tiết, mở rộng), Ctrl-D trên dòng trống để thoát. TUI theo giao diện prime-agent: tin nhắn người dùng trong khung nền, tool call là dòng `tên · trạng thái` kèm ba dòng output, dòng trạng thái nằm trên ô soạn thảo kẹp giữa hai đường kẻ.
+Phím: Enter gửi, Ctrl-J hoặc Alt+Enter xuống dòng, Ctrl-V (hoặc Alt-V khi terminal giữ Ctrl-V) dán ảnh chụp màn hình hoặc file đã copy trong Explorer làm tệp đính kèm, ↑↓ gọi lại lịch sử hoặc di chuyển trong menu, Esc đóng panel hoặc ngắt lượt đang chạy, Ctrl-C hủy lượt đang chạy (bấm hai lần trên dòng trống để thoát), Ctrl-O đổi chế độ chi tiết (thu gọn, chi tiết, mở rộng), Ctrl-D trên dòng trống để thoát. TUI theo giao diện prime-agent: tin nhắn người dùng trong khung nền, tool call là dòng `tên · trạng thái` kèm ba dòng output, dòng trạng thái nằm trên ô soạn thảo kẹp giữa hai đường kẻ.
 
 ### Cấu hình
 

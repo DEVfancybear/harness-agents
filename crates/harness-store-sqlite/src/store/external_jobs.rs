@@ -520,16 +520,6 @@ impl SqliteStore {
         row.map(|row| decode_external_job(&row)).transpose()
     }
 
-    pub async fn list_external_jobs(&self) -> Result<Vec<StoredExternalJob>, StoreError> {
-        let rows = sqlx::query("SELECT * FROM external_jobs ORDER BY submitted_at_unix_ms, job_id")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| {
-                database_error(ErrorCode::StorageOpenFailed, "list external jobs", error)
-            })?;
-        rows.iter().map(decode_external_job).collect()
-    }
-
     /// Unsettled jobs whose next poll is due, earliest first.
     pub async fn due_external_jobs(
         &self,
@@ -548,24 +538,6 @@ impl SqliteStore {
             database_error(
                 ErrorCode::StorageOpenFailed,
                 "list due external jobs",
-                error,
-            )
-        })?;
-        rows.iter().map(decode_external_job).collect()
-    }
-
-    /// Every job that still owes an answer, including the ambiguous ones.
-    pub async fn unresolved_external_jobs(&self) -> Result<Vec<StoredExternalJob>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT * FROM external_jobs WHERE settled_at_unix_ms IS NULL
-             ORDER BY submitted_at_unix_ms, job_id",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|error| {
-            database_error(
-                ErrorCode::StorageOpenFailed,
-                "list unresolved external jobs",
                 error,
             )
         })?;

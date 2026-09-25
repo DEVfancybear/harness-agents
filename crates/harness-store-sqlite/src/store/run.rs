@@ -982,20 +982,6 @@ impl SqliteStore {
         row.map(|row| question_from_row(&row)).transpose()
     }
 
-    pub async fn question_by_scope(
-        &self,
-        scope_key: &str,
-    ) -> Result<Option<QuestionRecord>, StoreError> {
-        let row = sqlx::query(
-            "SELECT question_id, scope_key, session_id, task_id, run_id, kind, prompt, payload_json, state, answer_json, answer_hash, answered_by, expires_at_unix_ms, created_at_unix_ms, answered_at_unix_ms FROM questions WHERE scope_key = ?"
-        )
-        .bind(scope_key)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read question by scope", error))?;
-        row.map(|row| question_from_row(&row)).transpose()
-    }
-
     pub async fn list_questions(
         &self,
         session_id: &SessionId,

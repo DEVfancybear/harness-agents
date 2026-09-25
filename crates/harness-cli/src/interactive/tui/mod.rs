@@ -655,7 +655,7 @@ mod tests {
             buffer: "sửa lỗi".to_owned(),
             cursor: 6,
             live_text: "đang trả lời".to_owned(),
-            open_tool: None,
+            open_tools: Vec::new(),
             modal: None,
             granted_for_run: false,
             queued_input: false,

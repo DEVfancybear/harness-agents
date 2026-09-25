@@ -120,7 +120,7 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
             // been at it, then the counters.
             let activity = if state.phase == AppPhase::Canceling {
                 "Canceling"
-            } else if state.open_tool.is_some() {
+            } else if !state.open_tools.is_empty() {
                 "Executing"
             } else if state.live_text.is_empty() {
                 "Thinking"
@@ -263,7 +263,7 @@ mod tests {
             buffer: String::new(),
             cursor: 0,
             live_text: String::new(),
-            open_tool: None,
+            open_tools: Vec::new(),
             modal: None,
             granted_for_run: false,
             queued_input: false,

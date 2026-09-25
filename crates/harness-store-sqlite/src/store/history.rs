@@ -16,7 +16,7 @@
 
 use std::collections::BTreeSet;
 
-use harness_types::{ContentHash, ErrorCode, EventId, ProjectId, SessionId, SourceRef, TaskId};
+use harness_types::{ContentHash, ErrorCode, ProjectId, SessionId, SourceRef, TaskId};
 use sqlx::Row;
 
 use crate::{SqliteStore, StoreError};
@@ -698,19 +698,6 @@ impl SqliteStore {
         row.map(|row| note_from_row(&row)).transpose()
     }
 
-    /// Every note of one task, oldest key first.
-    pub async fn list_notes(&self, task_id: &TaskId) -> Result<Vec<NoteRecord>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT note_id, task_id, session_id, note_key, revision, content, sources_json, authority
-             FROM session_notes WHERE task_id = ? ORDER BY note_key",
-        )
-        .bind(task_id.as_str())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "list notes", error))?;
-        rows.iter().map(note_from_row).collect()
-    }
-
     async fn history_watermark(&self, session_id: &SessionId) -> Result<u64, StoreError> {
         let value = sqlx::query_scalar::<_, Option<i64>>(
             "SELECT MAX(sequence) FROM history_sources WHERE session_id = ?",
@@ -826,34 +813,6 @@ impl SqliteStore {
                 error,
             )
         })
-    }
-
-    /// A source reference for one indexed entry, for provenance lists.
-    pub async fn history_source_ref(
-        &self,
-        source_id: &str,
-    ) -> Result<Option<SourceRef>, StoreError> {
-        let row = sqlx::query(
-            "SELECT source_id, sequence, content_hash FROM history_sources WHERE source_id = ?",
-        )
-        .bind(source_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|error| {
-            database_error(
-                ErrorCode::StorageWriteFailed,
-                "read history source ref",
-                error,
-            )
-        })?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        Ok(Some(SourceRef {
-            event_id: EventId::parse(row_get::<String>(&row, "source_id")?)?,
-            sequence: u64::try_from(row_get::<i64>(&row, "sequence")?).unwrap_or_default(),
-            content_hash: ContentHash::parse(row_get::<String>(&row, "content_hash")?)?,
-        }))
     }
 }
 

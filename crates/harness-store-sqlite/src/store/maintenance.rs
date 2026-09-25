@@ -308,44 +308,6 @@ impl SqliteStore {
         })
     }
 
-    /// Append one maintenance journal entry.
-    pub async fn record_maintenance_entry(
-        &self,
-        entry_id: &str,
-        action: &str,
-        target: &str,
-        detail: &serde_json::Value,
-        created_unix_ms: u64,
-    ) -> Result<(), StoreError> {
-        let fence = self.fence()?;
-        let mut tx = self.begin_write(&fence).await?;
-        assert_fence_in_tx(&mut tx, &fence).await?;
-        let serialized = serde_json::to_string(detail).map_err(|_| {
-            StoreError::new(
-                ErrorCode::InvalidPayload,
-                "journal detail is not serializable",
-            )
-        })?;
-        sqlx::query(
-            "INSERT INTO maintenance_journal(
-                 entry_id, action, target, detail_json, created_unix_ms)
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(entry_id)
-        .bind(action)
-        .bind(target)
-        .bind(serialized)
-        .bind(to_i64(created_unix_ms, "journal time")?)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| {
-            database_error(ErrorCode::StorageWriteFailed, "record journal entry", error)
-        })?;
-        tx.commit().await.map_err(|error| {
-            database_error(ErrorCode::StorageWriteFailed, "commit journal entry", error)
-        })
-    }
-
     /// Pin artifacts referenced by unfinished work, so garbage collection
     /// cannot drop them.
     pub async fn pin_artifacts(

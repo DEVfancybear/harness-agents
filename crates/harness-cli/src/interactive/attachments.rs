@@ -466,6 +466,19 @@ pub fn clipboard_png() -> Result<Option<Vec<u8>>, String> {
 ///
 /// A `None` means the clipboard holds something else — a bitmap, a file list, or nothing —
 /// which is how a paste that is not text can say what happened instead of doing nothing.
+/// The files the clipboard holds: what Ctrl-C on files in Explorer or Finder puts
+/// there, which is not text a terminal pastes.
+pub fn clipboard_files() -> Result<Vec<PathBuf>, String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|error| format!("clipboard: {error}"))?;
+    match clipboard.get().file_list() {
+        Ok(files) => Ok(files),
+        Err(arboard::Error::ContentNotAvailable | arboard::Error::ClipboardNotSupported) => {
+            Ok(Vec::new())
+        }
+        Err(error) => Err(format!("clipboard: {error}")),
+    }
+}
+
 pub fn clipboard_text() -> Result<Option<String>, String> {
     let mut clipboard = arboard::Clipboard::new().map_err(|error| format!("clipboard: {error}"))?;
     match clipboard.get_text() {

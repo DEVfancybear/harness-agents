@@ -275,6 +275,10 @@ pub trait SessionPort: Send {
     fn thinking_level(&self) -> Option<String> {
         None
     }
+    /// The levels the model in use offers, for the `/effort` menu.
+    fn thinking_levels(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// The thinking level in force and the levels the model offers.
     fn thinking_status(&self) -> Vec<String> {
         vec!["this backend does not support thinking levels".to_owned()]
@@ -1030,6 +1034,10 @@ pub(super) fn build_provider(
     } else {
         Vec::new()
     };
+    // The model's levels, from the catalog as prime-agent reads them.
+    let catalog_reasoning = super::providers::Catalog::load(data_dir)
+        .find(&format!("{}/{}", config.provider_id, config.model))
+        .map(super::providers::Model::reasoning_model);
     let chat_thinking_format = match config.thinking_format.as_deref() {
         Some("deepseek") => harness_providers::ThinkingFormat::DeepSeek,
         Some(_) => harness_providers::ThinkingFormat::ReasoningEffort,
@@ -1044,6 +1052,7 @@ pub(super) fn build_provider(
                 thinking: Some(harness_providers::Thinking {
                     level: thinking_level,
                     format: chat_thinking_format,
+                    model: catalog_reasoning,
                 }),
                 headers: extra_headers,
             },
@@ -1057,6 +1066,7 @@ pub(super) fn build_provider(
                             .with_thinking(Some(harness_providers::Thinking {
                                 level: thinking_level,
                                 format: harness_providers::ThinkingFormat::Anthropic,
+                                model: catalog_reasoning,
                             }))
                             .with_headers(extra_headers),
                     ) as Arc<dyn ModelProvider>
@@ -1076,10 +1086,9 @@ pub(super) fn build_provider(
             },
             harness_providers::ResponsesOptions {
                 // Only a model the catalog marks as reasoning is sent an effort.
-                reasoning: super::providers::Catalog::load(data_dir)
-                    .find(&format!("{}/{}", config.provider_id, config.model))
-                    .is_some_and(|model| model.reasoning)
-                    .then_some(thinking_level),
+                reasoning: catalog_reasoning
+                    .filter(|model| model.reasoning)
+                    .map(|model| harness_providers::thinking::clamp(Some(model), thinking_level)),
                 headers: extra_headers,
                 session_id: Some(session.to_owned()),
             },
@@ -1116,7 +1125,7 @@ struct ChannelObserver {
     /// Calls are executed serially by the turn driver. Keeping the current
     /// boundary here makes duration delivery O(1) and avoids a process-lifetime
     /// map keyed by a non-unique tool name.
-    tool_started: Mutex<Option<(String, Instant)>>,
+    tool_started: Mutex<Vec<(String, Instant)>>,
 }
 
 impl TurnObserver for ChannelObserver {
@@ -1155,17 +1164,21 @@ impl TurnObserver for ChannelObserver {
                     let _ = self.sender.send(SessionEvent::Bell);
                 }
                 if let Ok(mut started) = self.tool_started.lock() {
-                    *started = Some((name.clone(), Instant::now()));
+                    started.push((name.clone(), Instant::now()));
                 }
                 Some(SessionEvent::ToolStarted { name, summary })
             }
             TurnProgress::ToolSettled { name, ok, detail } => {
+                // Calls of a batch settle in the order they started; the oldest
+                // open call of this name is the one settling.
                 let elapsed = self
                     .tool_started
                     .lock()
                     .ok()
-                    .and_then(|mut started| started.take())
-                    .filter(|(started_name, _)| started_name == &name)
+                    .and_then(|mut started| {
+                        let index = started.iter().position(|(open, _)| open == &name)?;
+                        Some(started.remove(index))
+                    })
                     .map_or(Duration::ZERO, |(_, started)| started.elapsed());
                 Some(SessionEvent::ToolSettled {
                     name,
@@ -1767,6 +1780,20 @@ impl AgentSessionService {
             *cache = Some(resolved.clone());
         }
         Some(resolved)
+    }
+
+    /// What the configured model offers for reasoning: its catalog entry, as
+    /// prime-agent reads it, else the built-in table.
+    fn reasoning_of(
+        &self,
+        config: &ProviderConfig,
+    ) -> Option<harness_providers::thinking::ReasoningModel> {
+        super::providers::Catalog::load(&self.data_dir)
+            .find(&format!("{}/{}", config.provider_id, config.model))
+            .map(super::providers::Model::reasoning_model)
+            .or_else(|| {
+                harness_providers::thinking::reasoning_model(&config.provider_id, &config.model)
+            })
     }
 
     fn configured(&self) -> Result<ProviderConfig, String> {
@@ -2505,8 +2532,7 @@ impl SessionPort for AgentSessionService {
         })?;
         self.thinking = Some(requested);
         let config = self.configured()?;
-        let model =
-            harness_providers::thinking::reasoning_model(&config.provider_id, &config.model);
+        let model = self.reasoning_of(&config);
         let used = harness_providers::thinking::clamp(model, requested);
         Ok(if used == requested {
             format!("thinking {requested} selected for the next turn")
@@ -2518,10 +2544,19 @@ impl SessionPort for AgentSessionService {
         })
     }
 
+    fn thinking_levels(&self) -> Vec<String> {
+        let Ok(config) = self.configured() else {
+            return Vec::new();
+        };
+        harness_providers::thinking::supported_levels(self.reasoning_of(&config))
+            .into_iter()
+            .map(|level| level.as_str().to_owned())
+            .collect()
+    }
+
     fn thinking_level(&self) -> Option<String> {
         let config = self.configured().ok()?;
-        let model =
-            harness_providers::thinking::reasoning_model(&config.provider_id, &config.model);
+        let model = self.reasoning_of(&config);
         let chosen = self
             .thinking
             .or_else(|| harness_providers::ThinkingLevel::parse(&config.thinking))
@@ -2537,8 +2572,7 @@ impl SessionPort for AgentSessionService {
         let Ok(config) = self.configured() else {
             return vec!["no provider is configured".to_owned()];
         };
-        let model =
-            harness_providers::thinking::reasoning_model(&config.provider_id, &config.model);
+        let model = self.reasoning_of(&config);
         let chosen = self
             .thinking
             .or_else(|| harness_providers::ThinkingLevel::parse(&config.thinking))
@@ -3892,7 +3926,7 @@ async fn run_turn(
         model_price: config.model_price,
         auto_allowed_count,
         bell: config.bell,
-        tool_started: Mutex::new(None),
+        tool_started: Mutex::new(Vec::new()),
     });
 
     let run_inbox = RunInbox::new(Arc::clone(&store));
@@ -4332,7 +4366,7 @@ async fn run_session_file_action_inner(
         model_price: config.model_prices.get(&config.provider.model).copied(),
         auto_allowed_count,
         bell: config.bell,
-        tool_started: Mutex::new(None),
+        tool_started: Mutex::new(Vec::new()),
     });
     let name = if is_undo { "undo" } else { "write_file" };
     observer.observe(TurnProgress::StepStarted { step: 1 });
@@ -4749,7 +4783,7 @@ async fn run_shell_prefix_turn(
         model_price: config.model_prices.get(&config.provider.model).copied(),
         auto_allowed_count,
         bell: config.bell,
-        tool_started: Mutex::new(None),
+        tool_started: Mutex::new(Vec::new()),
     });
     observer.observe(TurnProgress::StepStarted { step: 1 });
     observer.observe(TurnProgress::ToolStarted {

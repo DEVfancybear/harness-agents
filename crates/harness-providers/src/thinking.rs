@@ -225,9 +225,59 @@ pub fn supports_adaptive_thinking(model: &str) -> bool {
 pub struct Thinking {
     pub level: ThinkingLevel,
     pub format: ThinkingFormat,
+    /// What the model catalog says about this model's reasoning, as prime-agent
+    /// reads `reasoning` and `thinkingLevelMap` from its registry; `None` falls
+    /// back to the built-in table.
+    pub model: Option<ReasoningModel>,
+}
+
+/// A model's reasoning description from catalog data: whether it reasons, and
+/// its level map (`null` for a level it does not offer, a string for how the
+/// provider spells it).
+///
+/// Maps are few and shared by many models, so each distinct one is kept once for
+/// the life of the process, which is what lets [`ReasoningModel`] stay `Copy`.
+#[must_use]
+pub fn reasoning_from_catalog(
+    reasoning: bool,
+    map: &std::collections::BTreeMap<String, Option<String>>,
+) -> ReasoningModel {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Map = &'static [(ThinkingLevel, Option<&'static str>)];
+    type Key = Vec<(ThinkingLevel, Option<String>)>;
+    static INTERNED: OnceLock<Mutex<HashMap<Key, Map>>> = OnceLock::new();
+    let key = map
+        .iter()
+        .filter_map(|(level, value)| Some((ThinkingLevel::parse(level)?, value.clone())))
+        .collect::<Vec<_>>();
+    let interned = INTERNED.get_or_init(|| Mutex::new(HashMap::new()));
+    let map = match interned.lock() {
+        Ok(mut interned) => *interned.entry(key.clone()).or_insert_with(|| {
+            let entries = key
+                .iter()
+                .map(|(level, value)| {
+                    (
+                        *level,
+                        value
+                            .as_ref()
+                            .map(|value| &*Box::leak(value.clone().into_boxed_str())),
+                    )
+                })
+                .collect::<Vec<_>>();
+            Box::leak(entries.into_boxed_slice())
+        }),
+        Err(_) => &[],
+    };
+    ReasoningModel { reasoning, map }
 }
 
 impl Thinking {
+    /// The model's reasoning description: the catalog's, else the built-in table's.
+    fn describe(&self, provider_id: &str, model: &str) -> Option<ReasoningModel> {
+        self.model.or_else(|| reasoning_model(provider_id, model))
+    }
+
     /// Whether assistant messages must carry their reasoning back.
     #[must_use]
     pub fn replays_reasoning_content(&self) -> bool {
@@ -237,7 +287,7 @@ impl Thinking {
     /// Fill the request body's reasoning fields for `model` (`pi-ai`'s
     /// `buildParams` for Chat Completions).
     pub fn apply_chat(&self, body: &mut Value, provider_id: &str, model: &str) {
-        let description = reasoning_model(provider_id, model);
+        let description = self.describe(provider_id, model);
         let level = clamp(description, self.level);
         let reasons = description.is_some_and(|model| model.reasoning);
         match self.format {
@@ -264,7 +314,7 @@ impl Thinking {
     /// thinking with an effort on the models that have it, a token budget - raising
     /// `max_tokens` to make room - on the others, and nothing when thinking is off.
     pub fn apply_anthropic(&self, body: &mut Value, model: &str) {
-        let description = reasoning_model("anthropic", model);
+        let description = self.describe("anthropic", model);
         let level = clamp(description, self.level);
         if !description.is_some_and(|model| model.reasoning) {
             return;
@@ -340,6 +390,7 @@ mod tests {
         Thinking {
             level: ThinkingLevel::Xhigh,
             format: ThinkingFormat::DeepSeek,
+            model: None,
         }
         .apply_chat(&mut body, "deepseek", "deepseek-v4-flash");
         assert_eq!(
@@ -350,6 +401,7 @@ mod tests {
         Thinking {
             level: ThinkingLevel::Off,
             format: ThinkingFormat::DeepSeek,
+            model: None,
         }
         .apply_chat(&mut body, "deepseek", "deepseek-v4-flash");
         assert_eq!(body, json!({"thinking": {"type": "disabled"}}));
@@ -363,6 +415,7 @@ mod tests {
         Thinking {
             level: ThinkingLevel::High,
             format: ThinkingFormat::ReasoningEffort,
+            model: None,
         }
         .apply_chat(&mut body, "openai", "local-model");
         assert_eq!(body, json!({}));
@@ -374,6 +427,7 @@ mod tests {
         Thinking {
             level: ThinkingLevel::Medium,
             format: ThinkingFormat::Anthropic,
+            model: None,
         }
         .apply_anthropic(&mut body, "claude-sonnet-4-5");
         assert_eq!(body["thinking"]["budget_tokens"], 8192);
@@ -383,10 +437,44 @@ mod tests {
         Thinking {
             level: ThinkingLevel::Max,
             format: ThinkingFormat::Anthropic,
+            model: None,
         }
         .apply_anthropic(&mut body, "claude-opus-5-5");
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "max");
+    }
+
+    /// prime-agent reads a model's levels from its catalog entry.
+    #[test]
+    fn a_catalog_map_decides_the_levels() {
+        let map = [
+            ("minimal", None),
+            ("low", None),
+            ("medium", None),
+            ("high", Some("high")),
+            ("xhigh", Some("max")),
+            ("max", None),
+        ]
+        .into_iter()
+        .map(|(level, value)| (level.to_owned(), value.map(str::to_owned)))
+        .collect();
+        let model = super::reasoning_from_catalog(true, &map);
+        assert_eq!(
+            supported_levels(Some(model)),
+            [
+                ThinkingLevel::Off,
+                ThinkingLevel::High,
+                ThinkingLevel::Xhigh
+            ]
+        );
+        let mut body = json!({});
+        Thinking {
+            level: ThinkingLevel::Xhigh,
+            format: ThinkingFormat::DeepSeek,
+            model: Some(model),
+        }
+        .apply_chat(&mut body, "opencode-go", "deepseek-v4.1-flash");
+        assert_eq!(body["reasoning_effort"], "max");
     }
 
     #[test]

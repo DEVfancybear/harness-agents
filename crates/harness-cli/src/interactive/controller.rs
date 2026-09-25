@@ -173,7 +173,7 @@ pub struct InteractiveController {
     /// The plain renderer prints slash-command output; the TUI opens an overlay.
     plain: bool,
     /// The tool card that is still open, so it settles in place.
-    open_tool: Option<(String, String)>,
+    open_tools: Vec<(String, String)>,
     /// Why the next tool runs without a panel, shown on its card in the TUI.
     pending_allowance: Option<String>,
     // Progress accounting for the status bar.
@@ -259,7 +259,7 @@ impl InteractiveController {
             file_picker_query: String::new(),
             file_picker_candidates: Vec::new(),
             plain,
-            open_tool: None,
+            open_tools: Vec::new(),
             pending_allowance: None,
             steps: 0,
             tool_calls: 0,
@@ -366,7 +366,7 @@ impl InteractiveController {
             buffer: self.display_buffer(),
             cursor: self.editor.cursor(),
             live_text: self.pending_text.clone(),
-            open_tool: self.open_tool.clone(),
+            open_tools: self.open_tools.clone(),
             modal: self.modal(),
             granted_for_run: self.granted_for_run,
             queued_input: self.queued_input.is_some(),
@@ -716,7 +716,10 @@ impl InteractiveController {
         }
         // A pasted screenshot: the key is handled here rather than by the editor
         // because there is no text to insert until the clipboard has been read.
-        if key == Key::PasteImage {
+        // A paste with no text is what a terminal sends when the clipboard holds an
+        // image or copied files: read the clipboard for them instead.
+        let empty_paste = matches!(&key, Key::Paste(text) if text.trim().is_empty());
+        if key == Key::PasteImage || (empty_paste && !self.editor.secret_entry()) {
             let mut effects = Vec::new();
             self.paste_image(&mut effects);
             return effects;
@@ -828,7 +831,9 @@ impl InteractiveController {
             SessionEvent::ThinkingDelta { text } => {
                 // Reasoning is one row, not one row per delta: it is gathered and
                 // committed when the answer starts or the step ends.
-                self.flush_stream(effects);
+                // Answer text before it is committed first; the reasoning keeps
+                // gathering until the answer starts or the step ends.
+                self.flush_text(effects);
                 self.pending_thinking.push_str(&text);
                 effects.push(Effect::Redraw);
             }
@@ -851,7 +856,7 @@ impl InteractiveController {
             SessionEvent::ToolStarted { name, summary } => {
                 self.flush_stream(effects);
                 self.tool_calls = self.tool_calls.saturating_add(1);
-                self.open_tool = Some((name.clone(), summary.clone()));
+                self.open_tools.push((name.clone(), summary.clone()));
                 if self.plain {
                     self.push_history(
                         effects,
@@ -876,10 +881,10 @@ impl InteractiveController {
             } => {
                 self.flush_stream(effects);
                 let summary = self
-                    .open_tool
-                    .take()
-                    .filter(|(open_name, _)| open_name == &name)
-                    .map_or_else(String::new, |(_, summary)| summary);
+                    .open_tools
+                    .iter()
+                    .position(|(open_name, _)| open_name == &name)
+                    .map_or_else(String::new, |index| self.open_tools.remove(index).1);
                 let state = if ok {
                     ToolState::Ok { elapsed }
                 } else {
@@ -1643,7 +1648,7 @@ impl InteractiveController {
         self.pending_text.clear();
         self.pending_newlines = 0;
         self.last_answer.clear();
-        self.open_tool = None;
+        self.open_tools.clear();
         self.steps = 0;
         self.tool_calls = 0;
         self.last_run_elapsed = Duration::ZERO;
@@ -1660,7 +1665,7 @@ impl InteractiveController {
             .run_started_at
             .take()
             .map_or(Duration::ZERO, |started| started.elapsed());
-        self.open_tool = None;
+        self.open_tools.clear();
     }
 
     fn interrupt(&mut self) -> Vec<Effect> {
@@ -2529,6 +2534,17 @@ impl InteractiveController {
             None => self.header.push(label),
         }
         self.thinking_label = self.service.thinking_level();
+        // prime-agent rewrites `/effort`'s hint to the levels the model offers.
+        let levels = self.service.thinking_levels();
+        if !levels.is_empty() {
+            self.editor.set_argument_options(
+                "/effort",
+                levels
+                    .into_iter()
+                    .map(|level| (level, String::new()))
+                    .collect(),
+            );
+        }
     }
 
     /// After a logout: when the model in use has lost its credential, move to a
@@ -2586,6 +2602,12 @@ impl InteractiveController {
                 Err(message) => self.push_history(effects, HistoryItem::Error { message }),
             }
         }
+        // The provider's own model list, for releases newer than the catalog; it
+        // is read in the background and joins the menu on the next refresh.
+        super::providers::refresh_listed_models_for_logins(
+            &super::paths::LaunchEnvironment::capture(),
+            &self.context.paths.data_dir,
+        );
         self.refresh_menu();
         if !self.plain {
             let _ = self
@@ -2655,6 +2677,11 @@ impl InteractiveController {
 
     fn flush_stream(&mut self, effects: &mut Vec<Effect>) {
         self.flush_thinking(effects);
+        self.flush_text(effects);
+    }
+
+    /// Commit the answer text gathered so far.
+    fn flush_text(&mut self, effects: &mut Vec<Effect>) {
         if self.pending_text.is_empty() {
             return;
         }
@@ -2736,6 +2763,34 @@ impl InteractiveController {
     /// what the terminal's own paste is for, and a stray Ctrl-V must not turn a draft into a
     /// document.
     fn paste_image(&mut self, effects: &mut Vec<Effect>) {
+        // Files copied in the file manager first: each path goes into the message,
+        // and the message scan attaches it (an image is shown, text is read).
+        match attachments::clipboard_files() {
+            Ok(files) if !files.is_empty() => {
+                let text = files
+                    .iter()
+                    .map(|path| quote_for_composer(&path.display().to_string()))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let _ = self.editor.handle(Key::Paste(format!("{text} ")));
+                self.push_history(
+                    effects,
+                    HistoryItem::Notice {
+                        message: format!(
+                            "pasted {} file(s): they are read and attached when you send the message",
+                            files.len()
+                        ),
+                    },
+                );
+                effects.push(Effect::Redraw);
+                return;
+            }
+            Ok(_) => {}
+            Err(reason) => {
+                self.push_history(effects, HistoryItem::Error { message: reason });
+                return;
+            }
+        }
         let png = match attachments::clipboard_png() {
             Ok(Some(png)) => png,
             Ok(None) => {
@@ -3029,7 +3084,7 @@ impl InteractiveController {
     fn finish_run(&mut self) {
         self.pending_approval = None;
         self.pending_mcp_elicitation = None;
-        self.open_tool = None;
+        self.open_tools.clear();
         self.phase = if self.pending_question.is_some() {
             AppPhase::WaitingInput
         } else if self.setup_required {
@@ -4110,7 +4165,7 @@ mod tests {
             "the card carries the duration the service measured"
         );
         assert!(
-            harness.controller.ui_state().open_tool.is_none(),
+            harness.controller.ui_state().open_tools.is_empty(),
             "the open card closes when it settles"
         );
     }
@@ -5457,8 +5512,8 @@ mod tests {
             "a running card belongs to the live viewport"
         );
         assert_eq!(
-            harness.controller.ui_state().open_tool,
-            Some(("read_file".to_owned(), "path=a.rs".to_owned()))
+            harness.controller.ui_state().open_tools,
+            vec![("read_file".to_owned(), "path=a.rs".to_owned())]
         );
 
         harness
@@ -5481,7 +5536,7 @@ mod tests {
             HistoryItem::Tool { name, summary, state: ToolState::Ok { elapsed } }
                 if name == "read_file" && summary == "path=a.rs" && *elapsed == Duration::from_millis(12)
         ));
-        assert!(harness.controller.ui_state().open_tool.is_none());
+        assert!(harness.controller.ui_state().open_tools.is_empty());
     }
 
     #[test]
@@ -6379,6 +6434,35 @@ mod tests {
                 "{command} is missing from the help and suggestion table"
             );
         }
+    }
+
+    /// Reasoning arrives token by token; it is one row, not one row per token.
+    #[test]
+    fn reasoning_deltas_become_one_row() {
+        let mut harness = tui_bench(true);
+        for token in ["Let", " me", " keep", " it", " short"] {
+            harness
+                .events
+                .send(SessionEvent::ThinkingDelta {
+                    text: token.to_owned(),
+                })
+                .expect("thinking");
+        }
+        harness
+            .events
+            .send(SessionEvent::TextDelta {
+                text: "answer".to_owned(),
+            })
+            .expect("text");
+        let effects = harness.controller.pump_events();
+        let thinking = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Thinking(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(thinking, ["Let me keep it short"]);
     }
 
     #[test]

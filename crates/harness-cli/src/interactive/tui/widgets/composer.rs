@@ -226,14 +226,14 @@ pub fn hint(state: &UiState) -> String {
 
 /// Draw the live block: model text that has not been committed yet.
 pub fn render_live(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
-    if area.height == 0 || (state.live_text.is_empty() && state.open_tool.is_none()) {
+    if area.height == 0 || (state.live_text.is_empty() && state.open_tools.is_empty()) {
         return;
     }
     let mut lines = markdown::render(&state.live_text, area.width, theme);
     if state.live_text.is_empty() {
         lines.clear();
     }
-    if let Some((name, summary)) = &state.open_tool {
+    for (name, summary) in &state.open_tools {
         lines.push(super::super::history::running_card(
             name,
             summary,
@@ -263,7 +263,7 @@ mod tests {
             buffer: String::new(),
             cursor: 0,
             live_text: String::new(),
-            open_tool: None,
+            open_tools: Vec::new(),
             modal: None,
             granted_for_run: false,
             queued_input: false,

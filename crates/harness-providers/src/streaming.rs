@@ -137,6 +137,7 @@ pub(crate) fn adapter_stream(
         let thinking = provider.thinking;
         let provider_id = provider.capabilities.provider_id.clone();
         let client = provider.client.clone();
+        let headers = provider.headers.clone();
         let (sender, mut receiver) =
             mpsc::channel::<Result<ProviderStreamEvent, ProviderError>>(16);
         tokio::spawn(async move {
@@ -166,7 +167,12 @@ pub(crate) fn adapter_stream(
                 );
             }
             let response = tokio::select! {
-                result = client.post(&endpoint).bearer_auth(token).json(&body).send() => match result {
+                result = headers
+                    .iter()
+                    .fold(client.post(&endpoint), |post, (name, value)| post.header(name, value))
+                    .bearer_auth(token)
+                    .json(&body)
+                    .send() => match result {
                     Ok(response) => response,
                     Err(error) => {
                         let error = error.without_url();
@@ -192,12 +198,8 @@ pub(crate) fn adapter_stream(
             if !response.status().is_success() {
                 // The taxonomy (401 no retry, 429/5xx transient, Retry-After) is
                 // decided here, and the retry owner is the runtime.
-                let retry_after = crate::retry_after_seconds(response.headers());
                 let _ = sender
-                    .send(Err(crate::http_status_error(
-                        response.status().as_u16(),
-                        retry_after,
-                    )))
+                    .send(Err(crate::http_response_error(response).await))
                     .await;
                 return;
             }

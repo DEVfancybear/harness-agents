@@ -943,6 +943,14 @@ impl TurnDriver {
                 )
                 .with_reasoning(result.reasoning.clone()),
             );
+            // prime-agent's `executeToolCalls`: a batch runs its calls side by side
+            // unless one of them must run alone. Gates, approvals and intents go
+            // one at a time in call order; the side effects run concurrently on the
+            // runtime's worker threads; receipts and results are committed in call
+            // order, so the journal and the transcript read as if run in sequence.
+            let parallel = result.tool_calls.len() > 1
+                && !result.tool_calls.iter().any(|call| runs_alone(&call.name));
+            let mut slots: Vec<(String, String, Slot)> = Vec::new();
             for (call, transcript_id) in result.tool_calls.clone().into_iter().zip(transcript_ids) {
                 tool_calls += 1;
                 let name = call.name.clone();
@@ -955,16 +963,12 @@ impl TurnDriver {
                 // execution gate would otherwise answer with a policy denial that
                 // reads as if the tool itself had been refused.
                 if let Some(reason) = malformed_call(&call) {
-                    observer.observe(TurnProgress::ToolSettled {
-                        name: name.clone(),
-                        ok: false,
-                        detail: Some(reason.to_owned()),
-                    });
-                    appended.push(ProviderMessage::tool_result(
-                        transcript_id.clone(),
-                        format!(
+                    slots.push((
+                        name.clone(),
+                        transcript_id,
+                        Slot::Failed(format!(
                             "tool call {name:?} was not executed: {reason}; re-issue it with a function name and complete JSON arguments"
-                        ),
+                        ), reason.to_owned()),
                     ));
                     continue;
                 }
@@ -996,31 +1000,109 @@ impl TurnDriver {
                             break 'turn TurnStop::NeedsInput;
                         }
                         Err(error) => {
-                            observer.observe(TurnProgress::ToolSettled {
-                                name: name.clone(),
-                                ok: false,
-                                detail: Some(error.to_string()),
-                            });
-                            appended.push(ProviderMessage::tool_result(
-                                transcript_id.clone(),
-                                format!("ask_user failed: {error}"),
+                            let message = format!("ask_user failed: {error}");
+                            slots.push((
+                                name,
+                                transcript_id,
+                                Slot::Failed(message, error.to_string()),
                             ));
                             continue;
                         }
                     }
                 }
-                match self
-                    .execute_call(
-                        &result,
-                        &call,
-                        &options,
-                        tool_calls,
-                        &observer,
-                        &cancellation,
-                    )
-                    .await
-                {
-                    Ok(view) => {
+                let gated = match self.resolve_action(&call) {
+                    Ok(action) => {
+                        let request = ToolRequest::new(
+                            result.session_id.clone(),
+                            result.task_id.clone(),
+                            options.actor_id.clone(),
+                            options.workspace_root.clone(),
+                            action,
+                        );
+                        // Correlation only: the provider call id is recorded with the
+                        // intent and receipt so the transcript and the durable records
+                        // can be paired.
+                        let request = if call.call_id.trim().is_empty() {
+                            request
+                        } else {
+                            request.with_call_id(call.call_id.clone())
+                        };
+                        gate_action(
+                            &self.tools,
+                            request,
+                            &options,
+                            tool_calls,
+                            &observer,
+                            &cancellation,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                let slot = match gated {
+                    Ok(Gated::Done(done)) => Slot::Done(done),
+                    Ok(Gated::Ready(ready)) if parallel => Slot::Ready(ready),
+                    Ok(Gated::Ready(ready)) => {
+                        let outcome = self
+                            .tools
+                            .run_begun(&ready.begun, cancellation.clone())
+                            .await;
+                        Slot::Done(
+                            complete_action(&self.tools, ready, outcome, &observer, &cancellation)
+                                .await,
+                        )
+                    }
+                    Err(error) => Slot::Done(Err(error)),
+                };
+                slots.push((name, transcript_id, slot));
+            }
+
+            // The side effects of a parallel batch, each on its own task.
+            let mut running = Vec::new();
+            for (index, (_, _, slot)) in slots.iter_mut().enumerate() {
+                if let Slot::Ready(_) = slot {
+                    let Slot::Ready(ready) = std::mem::replace(slot, Slot::Taken) else {
+                        continue;
+                    };
+                    let tools = self.tools.clone();
+                    let cancellation = cancellation.clone();
+                    running.push(tokio::spawn(async move {
+                        let outcome = tools.run_begun(&ready.begun, cancellation).await;
+                        (index, ready, outcome)
+                    }));
+                }
+            }
+            let mut finished = Vec::new();
+            for task in running {
+                match task.await {
+                    Ok(done) => finished.push(done),
+                    Err(error) => {
+                        return Err(HarnessError::new(
+                            ErrorCode::ProviderProtocol,
+                            format!("a tool task stopped unexpectedly: {error}"),
+                        ));
+                    }
+                }
+            }
+            finished.sort_by_key(|(index, _, _)| *index);
+            for (index, ready, outcome) in finished {
+                let done =
+                    complete_action(&self.tools, ready, outcome, &observer, &cancellation).await;
+                slots[index].2 = Slot::Done(done);
+            }
+
+            // Results in call order.
+            for (name, transcript_id, slot) in slots {
+                match slot {
+                    Slot::Failed(message, detail) => {
+                        observer.observe(TurnProgress::ToolSettled {
+                            name,
+                            ok: false,
+                            detail: Some(detail),
+                        });
+                        appended.push(ProviderMessage::tool_result(transcript_id, message));
+                    }
+                    Slot::Done(Ok(view)) => {
                         let blocked = match &view.output {
                             ToolOutput::Denied { code, reason } => {
                                 Some(format!("{code}: {reason}"))
@@ -1044,12 +1126,12 @@ impl TurnDriver {
                             detail: blocked,
                         });
                         appended.push(
-                            ProviderMessage::tool_result(transcript_id.clone(), rendered)
+                            ProviderMessage::tool_result(transcript_id, rendered)
                                 .with_attachments(tool_output_images(&view.output)),
                         );
                         executions.push(view);
                     }
-                    Err(error) => {
+                    Slot::Done(Err(error)) => {
                         // A failed tool is reported back to the model instead of
                         // ending the turn: that is what lets it fix its own call.
                         observer.observe(TurnProgress::ToolSettled {
@@ -1058,10 +1140,11 @@ impl TurnDriver {
                             detail: Some(error.to_string()),
                         });
                         appended.push(ProviderMessage::tool_result(
-                            transcript_id.clone(),
+                            transcript_id,
                             format!("tool {name} failed: {error}"),
                         ));
                     }
+                    Slot::Ready(_) | Slot::Taken => {}
                 }
             }
 
@@ -1254,41 +1337,6 @@ impl TurnDriver {
         Ok(record.question_id)
     }
 
-    async fn execute_call(
-        &self,
-        result: &RunResult,
-        call: &NormalizedToolCall,
-        options: &TurnOptions,
-        sequence: u32,
-        observer: &Arc<dyn TurnObserver>,
-        cancellation: &CancellationToken,
-    ) -> Result<ToolExecutionView, HarnessError> {
-        let action = self.resolve_action(call)?;
-        let request = ToolRequest::new(
-            result.session_id.clone(),
-            result.task_id.clone(),
-            options.actor_id.clone(),
-            options.workspace_root.clone(),
-            action,
-        );
-        // Correlation only: the provider call id is recorded with the intent and
-        // receipt so the transcript and the durable records can be paired.
-        let request = if call.call_id.trim().is_empty() {
-            request
-        } else {
-            request.with_call_id(call.call_id.clone())
-        };
-        execute_action_with_approval(
-            &self.tools,
-            request,
-            options,
-            sequence,
-            observer,
-            cancellation,
-        )
-        .await
-    }
-
     /// Resolve one streamed call into an action.
     ///
     /// A built-in name is resolved by the P3 parser first, so an extension can never
@@ -1330,6 +1378,44 @@ pub async fn execute_action_with_approval(
     observer: &Arc<dyn TurnObserver>,
     cancellation: &CancellationToken,
 ) -> Result<ToolExecutionView, HarnessError> {
+    match gate_action(tools, request, options, sequence, observer, cancellation).await? {
+        Gated::Done(result) => result,
+        Gated::Ready(ready) => {
+            let outcome = tools.run_begun(&ready.begun, cancellation.clone()).await;
+            complete_action(tools, ready, outcome, observer, cancellation).await
+        }
+    }
+}
+
+/// A call that has passed its gate: answered already, or with its durable intent
+/// committed and its side effect still to run.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one value per tool call, moved once; boxing the view only adds an allocation"
+)]
+enum Gated {
+    Done(Result<ToolExecutionView, HarnessError>),
+    Ready(Box<ReadyAction>),
+}
+
+struct ReadyAction {
+    begun: Box<crate::service::BegunCall>,
+    prepared: PreparedToolRequest,
+    granted_gate: Option<(Arc<dyn ApprovalGate>, String)>,
+}
+
+/// Everything before the side effect: policy, hooks, the approval (asked of the
+/// user when the policy says so) and the durable intent. It runs one call at a
+/// time, in the order the model asked, so approvals are asked in that order and
+/// intents take their journal sequences in that order.
+async fn gate_action(
+    tools: &ToolExecutionService,
+    request: ToolRequest,
+    options: &TurnOptions,
+    sequence: u32,
+    observer: &Arc<dyn TurnObserver>,
+    cancellation: &CancellationToken,
+) -> Result<Gated, HarnessError> {
     let prepared = tools.prepare(request).await?;
     let decision = match (tools.decision(&prepared), &options.approvals) {
         (Decision::Ask, ApprovalMode::Auto) => Decision::Allow {
@@ -1338,20 +1424,57 @@ pub async fn execute_action_with_approval(
         (decision, _) => decision,
     };
     if matches!(&decision, Decision::Blocked(_) | Decision::Deny(_)) {
-        return tools
-            .execute_with_cancellation(prepared, None, cancellation.clone())
-            .await;
+        return Ok(Gated::Done(
+            tools
+                .execute_with_cancellation(prepared, None, cancellation.clone())
+                .await,
+        ));
     }
     if let Some(reason) = tools.run_pre_tool_hooks(&prepared, cancellation).await {
         observer.observe(TurnProgress::Notice(format!("blocked by hook: {reason}")));
-        return tools.record_hook_block(&prepared, &reason).await;
+        return Ok(Gated::Done(
+            tools.record_hook_block(&prepared, &reason).await,
+        ));
     }
     notify_action_approval_required(tools, &prepared, &decision, observer, cancellation).await;
     let (approval, granted_gate) =
         resolve_action_approval(tools, &prepared, decision, options, sequence, observer).await?;
-    let execution = tools
-        .execute_with_cancellation(prepared.clone(), approval, cancellation.clone())
-        .await;
+    match tools.begin(prepared.clone(), approval, cancellation).await {
+        Ok(crate::service::Begun::Ready(begun)) => Ok(Gated::Ready(Box::new(ReadyAction {
+            begun,
+            prepared,
+            granted_gate,
+        }))),
+        Ok(crate::service::Begun::Finished(view)) => {
+            if let Some((gate, request_id)) = granted_gate {
+                gate.action_completed(&request_id);
+            }
+            Ok(Gated::Done(Ok(view)))
+        }
+        Err(error) => {
+            if let Some((gate, request_id)) = granted_gate {
+                gate.action_completed(&request_id);
+            }
+            Ok(Gated::Done(Err(error)))
+        }
+    }
+}
+
+/// Everything after the side effect: the receipt, the approval gate's release and
+/// the post-tool hooks. Run in call order, so receipts keep the order of intents.
+async fn complete_action(
+    tools: &ToolExecutionService,
+    ready: Box<ReadyAction>,
+    outcome: Result<crate::service::Dispatched, HarnessError>,
+    observer: &Arc<dyn TurnObserver>,
+    cancellation: &CancellationToken,
+) -> Result<ToolExecutionView, HarnessError> {
+    let ReadyAction {
+        begun,
+        prepared,
+        granted_gate,
+    } = *ready;
+    let execution = tools.finish_begun(*begun, outcome).await;
     if let Some((gate, request_id)) = granted_gate {
         gate.action_completed(&request_id);
     }
@@ -1359,6 +1482,30 @@ pub async fn execute_action_with_approval(
         run_post_tool_hooks(tools, &prepared, observer, cancellation).await;
     }
     execution
+}
+
+/// One call of a batch on its way to a result.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one value per tool call, moved once; boxing the view only adds an allocation"
+)]
+enum Slot {
+    /// Refused before any gate: the text the model gets, and the reason shown.
+    Failed(String, String),
+    Done(Result<ToolExecutionView, HarnessError>),
+    Ready(Box<ReadyAction>),
+    Taken,
+}
+
+/// Whether a batch holding this call runs one call at a time, as prime-agent runs
+/// a batch sequentially when any tool in it is marked `sequential`: the Python
+/// kernel keeps state between cells, and writes and processes may depend on the
+/// calls before them. Reads, searches, web and MCP lookups run side by side.
+fn runs_alone(name: &str) -> bool {
+    matches!(
+        crate::contracts::effect_class_for(name),
+        crate::contracts::EffectClass::Mutating | crate::contracts::EffectClass::Interactive
+    ) || matches!(name, "ipython" | "run_process" | "run_shell" | "shell")
 }
 
 async fn notify_action_approval_required(

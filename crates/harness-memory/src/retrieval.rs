@@ -1,7 +1,7 @@
 use super::{
     ErrorCode, EvidenceState, HarnessError, InjectionMode, MEMORY_BLOCK_HEADING, MemoryBinding,
-    MemoryPrincipal, MemoryService, Serialize, StoredMemoryAsset, TURN_PROVENANCE_KIND,
-    convert_asset, normalize_search_text, store_principal, to_harness_error,
+    MemoryPrincipal, MemoryService, Serialize, StoredMemoryAsset, convert_asset,
+    normalize_search_text, store_principal, to_harness_error,
 };
 use harness_session::{ContextBlock, ContextBlockKind};
 use harness_store_sqlite::RefreshSource;
@@ -233,10 +233,9 @@ impl MemoryService {
             .await
     }
 
-    /// Search, leaving one provenance kind out of the index.
+    /// Search, optionally leaving one provenance kind out of the index.
     ///
-    /// See [`MemoryService::search_durable_before_log`] for why a caller would want that;
-    /// this is the mechanism, and `exclude_provenance` is a kind, not a filter language.
+    /// `exclude_provenance` is a kind, not a filter language.
     async fn search_terms_in(
         &self,
         principal: &MemoryPrincipal,
@@ -348,73 +347,6 @@ impl MemoryService {
             None
         };
         Ok(self.finish(hits, revision, vector, detail).await)
-    }
-
-    /// Answer from durable memory, and from the conversation log only if it is silent.
-    ///
-    /// The store holds two kinds of material. Durable memory is what someone chose to keep:
-    /// the user's own instructions, what the runtime observed, what an extraction published.
-    /// The conversation log is what was said, turn by turn, and it quotes the input it
-    /// recorded - so a directive and the log entry of the turn that carried it overlap
-    /// almost completely, and the log entry is not the weaker match: it holds the directive
-    /// plus part of the answer.
-    ///
-    /// Searching both at once therefore makes the user's instruction compete with its own
-    /// echo, decided by a bm25 tie-break. Measured: with a directive and its turn record
-    /// both present, the block injected for the directive's own words was sometimes the log
-    /// entry, which reaches the model framed as something the user was quoted saying rather
-    /// than as an instruction, and which expires at the retention cap.
-    ///
-    /// So the two are asked in order, not together. Durable memory first: if it holds
-    /// anything for this query, that is the answer, and no log entry can displace it. The
-    /// log is the fallback for what durable memory never captured - an answer that was given
-    /// and never promoted to knowledge - and when it answers, the caller is told, because a
-    /// log entry is an excerpt of what was said and not a verified fact.
-    ///
-    /// An outage is not a silence: a search that failed to run is returned as it is rather
-    /// than retried against the other index, which lives in the same table and would fail
-    /// the same way.
-    ///
-    /// # Errors
-    /// Fails when the query is unusable or the store refuses it.
-    pub async fn search_durable_before_log(
-        &self,
-        principal: &MemoryPrincipal,
-        terms: &[String],
-        limit: usize,
-        vector: Option<&dyn VectorAdapter>,
-    ) -> Result<(MemoryIndex, RetrievalResult), HarnessError> {
-        self.search_durable_before_log_fresh(principal, terms, limit, vector, &[])
-            .await
-    }
-
-    /// Search durable memory before the conversation log using the caller's
-    /// current view of source files. Stale assets are removed before ranking.
-    pub async fn search_durable_before_log_fresh(
-        &self,
-        principal: &MemoryPrincipal,
-        terms: &[String],
-        limit: usize,
-        vector: Option<&dyn VectorAdapter>,
-        refresh: &[RefreshSource],
-    ) -> Result<(MemoryIndex, RetrievalResult), HarnessError> {
-        let durable = self
-            .search_terms_in(
-                principal,
-                terms,
-                limit,
-                vector,
-                Some(TURN_PROVENANCE_KIND),
-                refresh,
-            )
-            .await?;
-        if durable.state != RetrievalState::Empty {
-            return Ok((MemoryIndex::Durable, durable));
-        }
-        let log = self
-            .search_terms_in(principal, terms, limit, vector, None, refresh)
-            .await?;
-        Ok((MemoryIndex::Log, log))
     }
 
     /// Run one MATCH expression under the store timeout.
