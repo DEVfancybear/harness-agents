@@ -22,10 +22,13 @@ pub fn plain_lines(item: &HistoryItem) -> Vec<String> {
         HistoryItem::Automatic { text } => vec![format!("[auto] {text}")],
         HistoryItem::Assistant { text } | HistoryItem::Message { text } => vec![text.clone()],
         HistoryItem::Thinking { .. } | HistoryItem::ToolOutput { .. } => Vec::new(),
+        // The plain transcript is the byte-stable contract (U20): it keeps the
+        // one-line summary and never prints the full input.
         HistoryItem::Tool {
             name,
             summary,
             state,
+            ..
         } => match state {
             ToolState::Started => vec![tool_line(name, summary)],
             ToolState::Ok { .. } => vec![tool_line(name, "ok")],
@@ -366,6 +369,7 @@ mod tests {
         let failed = HistoryItem::Tool {
             name: "list_files".to_owned(),
             summary: "path=".to_owned(),
+            input: r#"{"path":""}"#.to_owned(),
             state: ToolState::Failed {
                 elapsed: Duration::from_millis(962),
                 detail: "invalid_payload: optional tool path must not be blank".to_owned(),
@@ -383,6 +387,7 @@ mod tests {
         let bare = HistoryItem::Tool {
             name: "list_files".to_owned(),
             summary: String::new(),
+            input: String::new(),
             state: ToolState::Failed {
                 elapsed: Duration::from_millis(962),
                 detail: String::new(),

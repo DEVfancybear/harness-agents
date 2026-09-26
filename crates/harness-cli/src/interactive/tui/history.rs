@@ -21,7 +21,9 @@ const TOOL_OUTPUT_PREVIEW_LINES: usize = 3;
 /// mode draws its chat (`modes/interactive/components`): a user message is a box on
 /// `userMessageBg`, assistant prose is markdown with one cell of padding, a tool is
 /// a panel on `toolPanelBg` headed `label · status`, its output collapsed to three
-/// lines, and notices, errors and injected prompts are single styled lines.
+/// lines, and notices, errors and injected prompts are single styled lines. In
+/// [`Detail::Expanded`] a tool is drawn as Claude Code's transcript view draws it:
+/// its whole input and its whole output, each in a box.
 ///
 /// The plain renderer keeps its own transcript format ([`view::plain_lines`]); this
 /// is only how the TUI shows the same items.
@@ -56,10 +58,15 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
         HistoryItem::Tool {
             name,
             summary,
+            input,
             state,
         } => {
             let mut rows = vec![Line::default()];
-            rows.push(tool_card(name, summary, state, theme));
+            if detail == Detail::Expanded {
+                rows.extend(expanded_tool(name, summary, input, state, width, theme));
+            } else {
+                rows.push(tool_card(name, summary, state, theme));
+            }
             if let ToolState::Failed { detail, .. } = state
                 && !detail.trim().is_empty()
             {
@@ -72,16 +79,12 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
             }
             rows
         }
-        HistoryItem::ToolOutput { text, .. } => tool_output_rows(
-            text,
-            width,
-            theme,
-            if detail == Detail::Expanded {
-                usize::MAX
-            } else {
-                TOOL_OUTPUT_PREVIEW_LINES
-            },
-        ),
+        HistoryItem::ToolOutput { text, .. } if detail == Detail::Expanded => {
+            output_box(text, width, theme)
+        }
+        HistoryItem::ToolOutput { text, .. } => {
+            tool_output_rows(text, width, theme, TOOL_OUTPUT_PREVIEW_LINES)
+        }
         HistoryItem::Run {
             outcome,
             steps,
@@ -276,6 +279,284 @@ fn tool_output_rows(text: &str, width: u16, theme: &Theme, shown: usize) -> Vec<
     rows
 }
 
+/// One logical row of an expanded box: its spans, and how many cells a row it
+/// wraps onto is indented, so a long command continues under its own text
+/// instead of under the `$ `.
+type BoxRow = (Vec<Span<'static>>, usize);
+
+/// Cells between the left edge and an expanded box, matching the tool card.
+const BOX_INDENT: usize = 2;
+
+/// The expanded form of a tool call, after Claude Code's transcript view (ctrl+o):
+/// the card with a collapse chevron and the call's one-line title, then the whole
+/// input in a box - a shell-like call as `$ command`, a replacement pair as a diff,
+/// anything else as its arguments. Nothing in it is cut: expanded is where a reader
+/// goes to see exactly what ran.
+fn expanded_tool(
+    name: &str,
+    summary: &str,
+    input: &str,
+    state: &ToolState,
+    width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let arguments = serde_json::from_str::<serde_json::Value>(input).ok();
+    let fields = arguments.as_ref().and_then(serde_json::Value::as_object);
+    // A call that says what it is for (MCP tools and shell tools often carry a
+    // `description`) is titled by that sentence, as Claude Code titles a Bash call;
+    // otherwise the card's summary is the best one-line account there is.
+    let title = fields
+        .and_then(|fields| fields.get("description"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
+        .map_or_else(|| summary.to_owned(), str::to_owned);
+    let mut header = running_card(name, &title, state, 1, theme);
+    header.spans.insert(1, Span::styled("▾ ", theme.accent));
+    let mut rows = vec![header];
+    let body = input_rows(input, fields, theme);
+    if !body.is_empty() {
+        rows.extend(framed(None, body, width, theme));
+    }
+    rows
+}
+
+/// The rows of a call's input.
+///
+/// The only rules are about the shape of the arguments, never the tool's name: a
+/// `command` (or an `executable` with its `args`) is what a shell-like tool runs and
+/// is drawn as a prompt line; an `old_*`/`new_*` pair of strings is a replacement
+/// and is drawn as the diff it makes; every other field is `key: value`, a
+/// multi-line value on rows of its own. A `description` is already the title.
+fn input_rows(
+    input: &str,
+    fields: Option<&serde_json::Map<String, serde_json::Value>>,
+    theme: &Theme,
+) -> Vec<BoxRow> {
+    use serde_json::Value;
+    let Some(fields) = fields else {
+        // Not a JSON object: arguments that never became JSON, or a provider that
+        // sends plain text. They are shown as they came.
+        let raw = input.trim();
+        return if raw.is_empty() {
+            Vec::new()
+        } else {
+            text_rows(raw, theme.muted, 0, theme)
+        };
+    };
+    let mut rows = Vec::new();
+    let mut drawn = vec!["description".to_owned()];
+    if let Some((command, used)) = shell_command(fields) {
+        drawn.extend(used.iter().map(|key| (*key).to_owned()));
+        for (index, line) in command.lines().enumerate() {
+            let marker = if index == 0 { "$ " } else { "  " };
+            rows.push((
+                vec![
+                    Span::styled(marker, theme.dim),
+                    Span::styled(untab(line), theme.bash),
+                ],
+                2,
+            ));
+        }
+    }
+    for (key, value) in fields {
+        let Some(rest) = key.strip_prefix("old_") else {
+            continue;
+        };
+        let new_key = format!("new_{rest}");
+        let (Some(old), Some(new)) = (value.as_str(), fields.get(&new_key).and_then(Value::as_str))
+        else {
+            continue;
+        };
+        for line in old.lines() {
+            rows.push((
+                vec![Span::styled(
+                    format!("- {}", untab(line)),
+                    theme.diff_removed,
+                )],
+                2,
+            ));
+        }
+        for line in new.lines() {
+            rows.push((
+                vec![Span::styled(format!("+ {}", untab(line)), theme.diff_added)],
+                2,
+            ));
+        }
+        drawn.push(key.clone());
+        drawn.push(new_key);
+    }
+    for (key, value) in fields {
+        if value.is_null() || drawn.contains(key) {
+            continue;
+        }
+        match value {
+            Value::String(text) if text.contains('\n') => {
+                rows.push((vec![Span::styled(format!("{key}:"), theme.dim)], 0));
+                rows.extend(text_rows(text, theme.muted, 2, theme));
+            }
+            other => {
+                let text = match other {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                rows.push((
+                    vec![
+                        Span::styled(format!("{key}: "), theme.dim),
+                        Span::styled(untab(&text), theme.muted),
+                    ],
+                    2,
+                ));
+            }
+        }
+    }
+    rows
+}
+
+/// What a shell-like call runs, and the fields that said so: a `command` string (or
+/// a list of words), or an `executable` followed by its `args`.
+fn shell_command(
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> Option<(String, &'static [&'static str])> {
+    use serde_json::Value;
+    let words = |value: &Value| -> Option<String> {
+        match value {
+            Value::String(text) => Some(text.clone()),
+            Value::Array(items) => items
+                .iter()
+                .map(|item| item.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+                .map(|words| words.join(" ")),
+            _ => None,
+        }
+    };
+    if let Some(command) = fields.get("command").and_then(words) {
+        return Some((command, &["command"]));
+    }
+    let executable = fields.get("executable").and_then(Value::as_str)?;
+    let args = fields.get("args").and_then(words).unwrap_or_default();
+    let command = if args.is_empty() {
+        executable.to_owned()
+    } else {
+        format!("{executable} {args}")
+    };
+    Some((command, &["executable", "args"]))
+}
+
+/// Rows for a block of text, `indent` cells in, every line kept - blank ones too,
+/// since they are part of what a file or a command printed. Text that reads as a
+/// diff is coloured by its line markers.
+fn text_rows(text: &str, style: Style, indent: usize, theme: &Theme) -> Vec<BoxRow> {
+    let diff = looks_like_diff(text);
+    text.lines()
+        .map(|line| {
+            let line = untab(line.trim_end_matches('\r'));
+            let style = if !diff {
+                style
+            } else if line.starts_with("+++") || line.starts_with("---") {
+                theme.dim
+            } else if line.starts_with('+') {
+                theme.diff_added
+            } else if line.starts_with('-') {
+                theme.diff_removed
+            } else if line.starts_with("@@") {
+                theme.accent
+            } else {
+                style
+            };
+            let mut spans = Vec::new();
+            if indent > 0 {
+                spans.push(Span::raw(" ".repeat(indent)));
+            }
+            spans.push(Span::styled(line, style));
+            (spans, indent)
+        })
+        .collect()
+}
+
+/// Whether text is a patch: a unified diff hunk, or the `*** Begin Patch` envelope.
+fn looks_like_diff(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.starts_with("@@") || line.starts_with("*** Begin Patch"))
+}
+
+/// A tab has no cell width of its own; four spaces keep indented code readable.
+fn untab(line: &str) -> String {
+    line.replace('\t', "    ")
+}
+
+/// The whole of what a tool returned, in a box of its own under the call (the
+/// expanded view): every line, wrapped rather than cut.
+fn output_box(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let body = text.trim_end();
+    let body = body.trim_start_matches(['\n', '\r']);
+    if body.trim().is_empty() {
+        return Vec::new();
+    }
+    framed(
+        Some("output"),
+        text_rows(body, theme.muted, 0, theme),
+        width,
+        theme,
+    )
+}
+
+/// Frame rows in the single-line box the overlays draw (`┌─┐ │ └─┘`), two cells in
+/// and as wide as the console, wrapping each row inside it.
+///
+/// Too narrow a console has no room for a frame; the rows then go out bare,
+/// indented like collapsed output, so nothing is lost to the border.
+fn framed(title: Option<&str>, rows: Vec<BoxRow>, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    const MIN_INNER: usize = 8;
+    let width = usize::from(width);
+    let indent = " ".repeat(BOX_INDENT);
+    let inner = width.saturating_sub(BOX_INDENT + 4);
+    if inner < MIN_INNER {
+        let limit = width.saturating_sub(BOX_INDENT).max(1);
+        return rows
+            .into_iter()
+            .flat_map(|(spans, hang)| wrap_words(spans, limit, hang))
+            .map(|line| {
+                let mut spans = vec![Span::raw(indent.clone())];
+                spans.extend(line.spans);
+                Line::from(spans)
+            })
+            .collect();
+    }
+    let rule = |cells: usize| "─".repeat(cells);
+    let mut top = vec![Span::styled(format!("{indent}┌"), theme.border)];
+    let mut used = 0;
+    if let Some(title) = title {
+        let label = format!(" {title} ");
+        used = super::widgets::composer::display_width(&label);
+        top.push(Span::styled(label, theme.dim));
+    }
+    top.push(Span::styled(
+        format!("{}┐", rule((inner + 2).saturating_sub(used))),
+        theme.border,
+    ));
+    let mut lines = vec![Line::from(top)];
+    for (spans, hang) in rows {
+        for row in wrap_words(spans, inner, hang) {
+            let cells = row
+                .spans
+                .iter()
+                .flat_map(|span| span.content.chars())
+                .map(super::widgets::composer::char_width)
+                .sum::<usize>();
+            let mut spans = vec![Span::styled(format!("{indent}│ "), theme.border)];
+            spans.extend(row.spans);
+            spans.push(Span::raw(" ".repeat(inner.saturating_sub(cells))));
+            spans.push(Span::styled(" │", theme.border));
+            lines.push(Line::from(spans));
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        format!("{indent}└{}┘", rule(inner + 2)),
+        theme.border,
+    )));
+    lines
+}
+
 /// One row of at most `cells` cells, cut with `…`.
 fn clip(text: &str, cells: usize) -> String {
     let mut out = String::new();
@@ -458,6 +739,70 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
     rows
 }
 
+/// [`wrap_spans`] for the rows of an expanded box: it breaks between words where
+/// it can, so a wrapped command or path reads as whole tokens (`--no-fail-fast`
+/// stays in one piece), and every row after the first starts `hang` cells in, so
+/// a continuation stays under its own text rather than under the `$ `. A word
+/// wider than a row is still broken by cells.
+fn wrap_words(spans: Vec<Span<'static>>, width: usize, hang: usize) -> Vec<Line<'static>> {
+    let limit = width.max(1);
+    // Two cells is the widest character; a hang must still leave room for it.
+    let hang = if hang + 2 <= limit { hang } else { 0 };
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut used = 0_usize;
+    let mut row_start = 0_usize;
+    let next_row = |rows: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>| {
+        rows.push(Line::from(std::mem::take(current)));
+        if hang > 0 {
+            current.push(Span::raw(" ".repeat(hang)));
+        }
+    };
+    for span in spans {
+        let style = span.style;
+        // Words keep the spaces that follow them.
+        for word in span.content.split_inclusive(' ') {
+            let visible = word
+                .trim_end_matches(' ')
+                .chars()
+                .map(super::widgets::composer::char_width)
+                .sum::<usize>();
+            // A word that does not fit moves to the next row, unless the row holds
+            // nothing yet or the word would not fit on a fresh row either.
+            if used > row_start && used + visible > limit && hang + visible <= limit {
+                next_row(&mut rows, &mut current);
+                used = hang;
+                row_start = hang;
+            }
+            let mut chunk = String::new();
+            for character in word.chars() {
+                let cells = super::widgets::composer::char_width(character);
+                if used + cells > limit {
+                    // A space at the end of a row is dropped, not wrapped.
+                    if character == ' ' {
+                        continue;
+                    }
+                    if !chunk.is_empty() {
+                        current.push(Span::styled(std::mem::take(&mut chunk), style));
+                    }
+                    next_row(&mut rows, &mut current);
+                    used = hang;
+                    row_start = hang;
+                }
+                chunk.push(character);
+                used += cells;
+            }
+            if !chunk.is_empty() {
+                current.push(Span::styled(chunk, style));
+            }
+        }
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(Line::from(current));
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::{render, wrap_spans};
@@ -486,6 +831,7 @@ mod tests {
             &HistoryItem::Tool {
                 name: "read_file".to_owned(),
                 summary: "path=a.rs".to_owned(),
+                input: String::new(),
                 state: ToolState::Ok {
                     elapsed: Duration::from_millis(12),
                 },
@@ -536,6 +882,7 @@ mod tests {
             &HistoryItem::Tool {
                 name: "list_files".to_owned(),
                 summary: "path=".to_owned(),
+                input: String::new(),
                 state: ToolState::Failed {
                     elapsed: Duration::from_millis(962),
                     detail: "invalid_payload: optional tool path must not be blank".to_owned(),
@@ -562,6 +909,7 @@ mod tests {
             &HistoryItem::Tool {
                 name: "ipython".to_owned(),
                 summary: "code=print(1)".to_owned(),
+                input: String::new(),
                 state: ToolState::Ok {
                     elapsed: Duration::from_millis(1200),
                 },
@@ -648,9 +996,254 @@ mod tests {
             text: "t:\n1\n2\n3\n4".to_owned(),
         };
         assert_eq!(
-            plain_text(&render(&output, 80, &theme, Detail::Expanded)),
-            "  1\n  2\n  3\n  4"
+            plain_text(&render(&output, 80, &theme, Detail::Details)),
+            "  1\n  2\n  3\n  … 1 more lines"
         );
+        assert_eq!(
+            plain_text(&render(&output, 20, &theme, Detail::Expanded)),
+            [
+                "  ┌ output ────────┐",
+                "  │ t:             │",
+                "  │ 1              │",
+                "  │ 2              │",
+                "  │ 3              │",
+                "  │ 4              │",
+                "  └────────────────┘",
+            ]
+            .join("\n")
+        );
+    }
+
+    fn shell_call() -> HistoryItem {
+        HistoryItem::Tool {
+            name: "run_shell".to_owned(),
+            summary: "command=cargo test --workspace --locked timeout_ms=60000".to_owned(),
+            input: r#"{"command":"cargo test --workspace --locked --no-fail-fast -- --test-threads=1","timeout_ms":60000}"#
+                .to_owned(),
+            state: ToolState::Ok {
+                elapsed: Duration::from_millis(1200),
+            },
+        }
+    }
+
+    fn cells(text: &str) -> usize {
+        crate::interactive::tui::widgets::composer::display_width(text)
+    }
+
+    /// Expanded (ctrl+o), as Claude Code's transcript view: a chevron card, then
+    /// the whole command in a box - `$ `, wrapped under its own text, never cut -
+    /// and the other arguments after it. Every row fits the console exactly.
+    #[test]
+    fn an_expanded_shell_call_shows_its_whole_command_in_a_box() {
+        let text = plain_text(&render(
+            &shell_call(),
+            48,
+            &Theme::plain(),
+            Detail::Expanded,
+        ));
+        let rows = text.lines().collect::<Vec<_>>();
+        assert_eq!(rows[0], "", "a blank row separates calls");
+        assert!(
+            rows[1].starts_with("  ▾ run_shell · done · command=cargo test"),
+            "{text}"
+        );
+        assert!(rows[1].ends_with(" · 1.2s"), "{text}");
+        assert_eq!(rows[2], format!("  ┌{}┐", "─".repeat(44)), "{text}");
+        assert_eq!(
+            inside(&rows[3..rows.len() - 1]),
+            [
+                "$ cargo test --workspace --locked",
+                "  --no-fail-fast -- --test-threads=1",
+                "timeout_ms: 60000",
+            ],
+            "{text}"
+        );
+        assert_eq!(rows[rows.len() - 1], format!("  └{}┘", "─".repeat(44)));
+        for row in &rows[2..] {
+            assert_eq!(cells(row), 48, "{row:?}");
+        }
+    }
+
+    /// The text of framed rows, without the frame and the padding.
+    fn inside(rows: &[&str]) -> Vec<String> {
+        rows.iter()
+            .map(|row| {
+                row.strip_prefix("  │ ")
+                    .and_then(|row| row.strip_suffix(" │"))
+                    .unwrap_or_else(|| panic!("not a framed row: {row:?}"))
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// Collapsed and details keep today's one-line card: the full input is only
+    /// drawn in expanded mode.
+    #[test]
+    fn the_full_input_only_shows_in_expanded_mode() {
+        for detail in [Detail::Collapsed, Detail::Details] {
+            let text = plain_text(&render(&shell_call(), 100, &Theme::plain(), detail));
+            assert_eq!(
+                text,
+                "\n  run_shell · done · command=cargo test --workspace --locked timeout_ms=60000 · 1.2s"
+            );
+        }
+    }
+
+    /// A call's `description` is its title, and it is not repeated in the box.
+    #[test]
+    fn a_described_call_is_titled_by_its_description() {
+        let text = plain_text(&render(
+            &HistoryItem::Tool {
+                name: "Bash".to_owned(),
+                summary: "command=ls description=List files".to_owned(),
+                input: r#"{"command":"ls -la","description":"List files"}"#.to_owned(),
+                state: ToolState::Ok {
+                    elapsed: Duration::from_millis(5),
+                },
+            },
+            40,
+            &Theme::plain(),
+            Detail::Expanded,
+        ));
+        assert!(text.contains("▾ Bash · done · List files · 5ms"), "{text}");
+        assert!(text.contains("│ $ ls -la"), "{text}");
+        assert_eq!(text.matches("List files").count(), 1, "{text}");
+    }
+
+    /// A file tool shows its arguments as `key: value`; its output box holds every
+    /// line, blank ones included, where collapsed mode would stop after three.
+    #[test]
+    fn an_expanded_file_call_shows_its_arguments_and_all_of_its_output() {
+        let theme = Theme::plain();
+        let call = plain_text(&render(
+            &HistoryItem::Tool {
+                name: "read_file".to_owned(),
+                summary: "path=src/lib.rs offset=10".to_owned(),
+                input: r#"{"path":"src/lib.rs","offset":10,"limit":null}"#.to_owned(),
+                state: ToolState::Ok {
+                    elapsed: Duration::from_millis(12),
+                },
+            },
+            40,
+            &theme,
+            Detail::Expanded,
+        ));
+        assert!(call.contains("│ offset: 10"), "{call}");
+        assert!(call.contains("│ path: src/lib.rs"), "{call}");
+        assert!(
+            !call.contains("limit"),
+            "a null argument was never sent: {call}"
+        );
+        let output = plain_text(&render(
+            &HistoryItem::ToolOutput {
+                name: "read_file".to_owned(),
+                text: "read_file src/lib.rs:\nfn a() {}\n\nfn b() {}\nfn c() {}\nfn d() {}\n"
+                    .to_owned(),
+            },
+            40,
+            &theme,
+            Detail::Expanded,
+        ));
+        let rows = output.lines().collect::<Vec<_>>();
+        assert_eq!(
+            inside(&rows[1..rows.len() - 1]),
+            [
+                "read_file src/lib.rs:",
+                "fn a() {}",
+                "",
+                "fn b() {}",
+                "fn c() {}",
+                "fn d() {}"
+            ],
+            "{output}"
+        );
+    }
+
+    /// A replacement pair is drawn as the diff it makes, in the diff colours.
+    #[test]
+    fn an_edit_shows_the_diff_it_makes() {
+        let theme = Theme::colored();
+        let rows = render(
+            &HistoryItem::Tool {
+                name: "edit_file".to_owned(),
+                summary: "path=a.rs".to_owned(),
+                input: r#"{"path":"a.rs","old_string":"let x = 1;","new_string":"let x = 2;\nlet y = 3;"}"#
+                    .to_owned(),
+                state: ToolState::Ok {
+                    elapsed: Duration::from_millis(3),
+                },
+            },
+            60,
+            &theme,
+            Detail::Expanded,
+        );
+        let text = plain_text(&rows);
+        assert!(text.contains("│ - let x = 1;"), "{text}");
+        assert!(text.contains("│ + let x = 2;"), "{text}");
+        assert!(text.contains("│ + let y = 3;"), "{text}");
+        assert!(!text.contains("old_string"), "{text}");
+        let added = rows
+            .iter()
+            .flat_map(|row| row.spans.iter())
+            .find(|span| span.content.starts_with('+'))
+            .expect("added line");
+        assert_eq!(added.style, theme.diff_added);
+    }
+
+    /// Vietnamese and CJK text wraps by cells, so the right border stays in line.
+    #[test]
+    fn a_box_measures_wide_text_in_cells() {
+        let text = plain_text(&render(
+            &HistoryItem::ToolOutput {
+                name: "t".to_owned(),
+                text: "sửa lỗi phân tích cú pháp 解析器错误 解析器错误".to_owned(),
+            },
+            24,
+            &Theme::plain(),
+            Detail::Expanded,
+        ));
+        for row in text.lines() {
+            assert_eq!(cells(row), 24, "{row:?} in\n{text}");
+        }
+    }
+
+    /// Too narrow for a frame, the input still shows, indented and unframed.
+    #[test]
+    fn a_narrow_console_drops_the_frame_not_the_input() {
+        let text = plain_text(&render(
+            &shell_call(),
+            12,
+            &Theme::plain(),
+            Detail::Expanded,
+        ));
+        assert!(!text.contains('┌'), "{text}");
+        assert!(text.contains("\n  $ cargo"), "{text}");
+        assert!(text.contains("timeout_ms"), "{text}");
+        for row in text.lines().skip(2) {
+            assert!(cells(row) <= 12, "{row:?}");
+        }
+    }
+
+    /// Arguments that never became JSON are shown as they came.
+    #[test]
+    fn input_that_is_not_json_is_shown_verbatim() {
+        let text = plain_text(&render(
+            &HistoryItem::Tool {
+                name: "t".to_owned(),
+                summary: String::new(),
+                input: "{\"path\": \"a".to_owned(),
+                state: ToolState::Failed {
+                    elapsed: Duration::from_millis(1),
+                    detail: "invalid_payload".to_owned(),
+                },
+            },
+            40,
+            &Theme::plain(),
+            Detail::Expanded,
+        ));
+        assert!(text.contains("│ {\"path\": \"a"), "{text}");
+        assert!(text.contains("invalid_payload"), "{text}");
     }
 
     #[test]

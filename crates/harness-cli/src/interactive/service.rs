@@ -1202,14 +1202,22 @@ impl TurnObserver for ChannelObserver {
             }
             // Step boundaries are what the status bar counts (`step 2/8`).
             TurnProgress::StepStarted { step } => Some(SessionEvent::StepStarted { step }),
-            TurnProgress::ToolStarted { name, summary } => {
+            TurnProgress::ToolStarted {
+                name,
+                summary,
+                input,
+            } => {
                 if self.bell && name == "ask_user" {
                     let _ = self.sender.send(SessionEvent::Bell);
                 }
                 if let Ok(mut started) = self.tool_started.lock() {
                     started.push((name.clone(), Instant::now()));
                 }
-                Some(SessionEvent::ToolStarted { name, summary })
+                Some(SessionEvent::ToolStarted {
+                    name,
+                    summary,
+                    input,
+                })
             }
             TurnProgress::ToolSettled { name, ok, detail } => {
                 // Calls of a batch settle in the order they started; the oldest
@@ -4575,6 +4583,9 @@ async fn run_session_file_action_inner(
         } else {
             "export session transcript".to_owned()
         },
+        // The app chose this action itself; the summary already says all of it,
+        // and an export's input would be the whole transcript again.
+        input: String::new(),
     });
     let tool_request = harness_tools::ToolRequest::new(
         session_id,
@@ -4989,6 +5000,9 @@ async fn run_shell_prefix_turn(
     observer.observe(TurnProgress::ToolStarted {
         name: "run_shell".to_owned(),
         summary: format!("shell: {}", shell_prefix.command),
+        // The same shape a model's shell call has, so the expanded view shows the
+        // command the user typed like any other shell call.
+        input: serde_json::json!({ "command": shell_prefix.command }).to_string(),
     });
     let tool_request = harness_tools::ToolRequest::new(
         session_id,
@@ -5170,6 +5184,7 @@ impl FixtureService {
         let _ = self.sender.send(SessionEvent::ToolStarted {
             name: name.to_owned(),
             summary: summary.to_owned(),
+            input: String::new(),
         });
         let elapsed = started.elapsed();
         let _ = self.sender.send(SessionEvent::ToolSettled {

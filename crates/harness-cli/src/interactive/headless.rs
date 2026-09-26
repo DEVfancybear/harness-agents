@@ -92,7 +92,7 @@ impl TurnObserver for HeadlessObserver {
             TurnProgress::TextDelta(text) => self.stream_event("text.delta", &serde_json::json!({"text": text})),
             TurnProgress::ThinkingDelta(text) => self.stream_event("thinking.delta", &serde_json::json!({"text": text})),
             TurnProgress::Usage { prompt_tokens, completion_tokens } => self.stream_event("usage", &serde_json::json!({"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens})),
-            TurnProgress::ToolStarted { name, summary } => self.stream_event("tool.started", &serde_json::json!({"name": name, "summary": summary})),
+            TurnProgress::ToolStarted { name, summary, .. } => self.stream_event("tool.started", &serde_json::json!({"name": name, "summary": summary})),
             TurnProgress::ToolSettled { name, ok, detail } => {
                 self.stream_event("tool.settled", &serde_json::json!({"name": name, "ok": ok, "detail": detail}));
                 if !ok && detail.as_deref().is_some_and(|text| text.contains("approval") || text.contains("denied by the user")) {

@@ -1342,7 +1342,7 @@ impl TurnObserver for ExplorerObserver {
                     );
                 }
             }
-            TurnProgress::ToolStarted { name, summary } => {
+            TurnProgress::ToolStarted { name, summary, .. } => {
                 let _ = self.sender.send(SessionEvent::Notice {
                     message: format!("[child {}] {name}: {summary}", self.role_name),
                 });
