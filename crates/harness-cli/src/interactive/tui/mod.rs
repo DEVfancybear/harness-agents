@@ -12,6 +12,7 @@
 //! viewport needs a blank frame, otherwise rows an earlier frame painted stay on
 //! screen above the shell prompt.
 
+pub mod highlight;
 pub mod history;
 pub mod layout;
 pub mod markdown;
@@ -519,6 +520,9 @@ pub fn run(
     notice: Option<&str>,
 ) -> Result<u8, HarnessError> {
     let renderer = RuntimeRenderer::open(backend).map_err(|error| terminal_error(&error))?;
+    if Theme::detect().color {
+        highlight::warm_up();
+    }
     run_loop(renderer, controller, notice).map(|outcome| outcome.code)
 }
 

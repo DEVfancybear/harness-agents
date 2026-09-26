@@ -30,6 +30,45 @@ mod palette {
     pub const DIFF_ADDED: u32 = 0x3f_b9_50;
     pub const DIFF_REMOVED: u32 = 0xf8_51_49;
     pub const REFINEMENT: u32 = 0x95_75_cd;
+    pub const NEUTRAL: u32 = 0xd4_d4_d8;
+    pub const DIFF_ADDED_BG: u32 = 0x01_5f_00;
+    pub const DIFF_REMOVED_BG: u32 = 0x5e_00_00;
+}
+
+/// prime-agent's `syntax*` tokens: how highlighted code is coloured.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SyntaxStyles {
+    /// Code no scope names.
+    pub plain: Style,
+    pub comment: Style,
+    pub keyword: Style,
+    pub function: Style,
+    pub variable: Style,
+    pub string: Style,
+    pub number: Style,
+    /// `syntaxType`.
+    pub kind: Style,
+    pub operator: Style,
+    pub punctuation: Style,
+}
+
+impl SyntaxStyles {
+    /// Every kind drawn alike: the plain theme, and reasoning, which is all dim.
+    #[must_use]
+    pub const fn uniform(style: Style) -> Self {
+        Self {
+            plain: style,
+            comment: style,
+            keyword: style,
+            function: style,
+            variable: style,
+            string: style,
+            number: style,
+            kind: style,
+            operator: style,
+            punctuation: style,
+        }
+    }
 }
 
 /// How many colours the terminal renders.
@@ -127,6 +166,13 @@ pub struct Theme {
     pub md_quote: Style,
     pub diff_added: Style,
     pub diff_removed: Style,
+    /// `toolDiffAddedBg`/`toolDiffRemovedBg`: the block behind a changed line. Only
+    /// in true colour, as in prime-agent - a dark tint quantised to 256 colours
+    /// lands on black - so elsewhere they carry no colour.
+    pub diff_added_bg: Style,
+    pub diff_removed_bg: Style,
+    /// Highlighted code.
+    pub syntax: SyntaxStyles,
     /// `refinementHeader`.
     pub refinement: Style,
     /// `info`.
@@ -167,6 +213,28 @@ impl Theme {
             md_quote: fg(palette::MUTED),
             diff_added: fg(palette::DIFF_ADDED),
             diff_removed: fg(palette::DIFF_REMOVED),
+            diff_added_bg: match depth {
+                Depth::TrueColor => bg(palette::DIFF_ADDED_BG),
+                Depth::Ansi256 => Style::new(),
+            },
+            diff_removed_bg: match depth {
+                Depth::TrueColor => bg(palette::DIFF_REMOVED_BG),
+                Depth::Ansi256 => Style::new(),
+            },
+            // prime.json: comment muted, keyword and function info, string mint,
+            // number and type warning, the rest neutral.
+            syntax: SyntaxStyles {
+                plain: fg(palette::NEUTRAL),
+                comment: fg(palette::MUTED),
+                keyword: fg(palette::INFO),
+                function: fg(palette::INFO),
+                variable: fg(palette::NEUTRAL),
+                string: fg(palette::STRING_MINT),
+                number: fg(palette::WARNING),
+                kind: fg(palette::WARNING),
+                operator: fg(palette::NEUTRAL),
+                punctuation: fg(palette::NEUTRAL),
+            },
             refinement: fg(palette::REFINEMENT),
             info: fg(palette::INFO),
         }
@@ -235,6 +303,9 @@ impl Theme {
             md_quote: none,
             diff_added: none,
             diff_removed: none,
+            diff_added_bg: none,
+            diff_removed_bg: none,
+            syntax: SyntaxStyles::uniform(none),
             refinement: none,
             info: none,
         }

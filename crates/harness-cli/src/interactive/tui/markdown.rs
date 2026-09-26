@@ -1,7 +1,7 @@
 //! Markdown for assistant text, as prime-agent renders it.
 //!
-//! Deliberately minimal and dependency-free: fenced code blocks with a language
-//! label, inline code, `#` headings, `-`/`*` bullets, and `**emphasis**`. Anything
+//! Deliberately minimal: fenced code blocks, highlighted in the language their
+//! label names ([`super::highlight`]), inline code, `#` headings, `-`/`*` bullets, and `**emphasis**`. Anything
 //! the parser does not recognise is emitted **verbatim** - the one thing this module
 //! must never do is swallow a character, because the transcript is the user's record
 //! of what the model said.
@@ -13,6 +13,7 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use super::highlight::{self, Kind, Language};
 use super::theme::Theme;
 
 /// How one line of model text is classified.
@@ -33,26 +34,34 @@ pub enum Block {
 /// Render model text into styled lines of at most `width` cells, the way
 /// prime-agent's `Markdown` component does (`tui/src/components/markdown.ts`):
 /// headings in `mdHeading` (H1 bold and underlined, H2-H3 bold, H4 bold italic,
-/// deeper italic), code blocks indented two cells in `mdCodeBlock` with no fence
-/// rows, quotes behind a `│ ` bar in italics, rules as `─` up to 80 cells, bullets
+/// deeper italic), code blocks indented two cells with no fence rows - highlighted
+/// when the fence names a language, in `mdCodeBlock` when it does not - quotes behind a `│ ` bar in italics, rules as `─` up to 80 cells, bullets
 /// as `- `, and prose in `mdBody`.
 #[must_use]
 pub fn render(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let mut in_fence = false;
+    let mut fence: Option<Fence> = None;
     for raw in text.split('\n') {
         let trimmed = raw.trim_end_matches('\r');
-        if trimmed.trim_start().starts_with("```") {
+        if let Some(label) = trimmed.trim_start().strip_prefix("```") {
             // The fence is a border, not content: prime-agent draws no fence rows.
-            in_fence = !in_fence;
+            match fence.take() {
+                Some(block) => lines.extend(code_block(&block, width, theme)),
+                None => {
+                    fence = Some(Fence {
+                        // A plain theme draws every kind alike, so it skips the work.
+                        language: theme
+                            .color
+                            .then(|| highlight::language_for_label(label.trim_start_matches('`')))
+                            .flatten(),
+                        lines: Vec::new(),
+                    });
+                }
+            }
             continue;
         }
-        if in_fence {
-            let spans = vec![
-                Span::raw("  ".to_owned()),
-                Span::styled(trimmed.to_owned(), theme.md_code_block),
-            ];
-            lines.extend(wrap_spans(spans, width));
+        if let Some(block) = fence.as_mut() {
+            block.lines.push(trimmed.to_owned());
             continue;
         }
         match classify(trimmed) {
@@ -101,6 +110,42 @@ pub fn render(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
             }
             Block::Text => lines.extend(wrap_spans(inline_spans(trimmed, theme), width)),
         }
+    }
+    // A block still open is drawn as it stands: a streaming answer is mid-block.
+    if let Some(block) = fence {
+        lines.extend(code_block(&block, width, theme));
+    }
+    lines
+}
+
+/// A fenced block: the language its label names, and its lines.
+struct Fence {
+    language: Option<Language>,
+    lines: Vec<String>,
+}
+
+/// A code block's rows, two cells in, each line highlighted in the block's
+/// language and wrapped like prose.
+fn code_block(block: &Fence, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let texts: Vec<&str> = block.lines.iter().map(String::as_str).collect();
+    let (runs, plain) = match block.language {
+        Some(language) => (highlight::highlight(language, &texts), theme.syntax.plain),
+        None => (
+            texts
+                .iter()
+                .map(|line| vec![(Kind::Plain, (*line).to_owned())])
+                .collect(),
+            theme.md_code_block,
+        ),
+    };
+    let mut lines = Vec::new();
+    for line in runs {
+        let mut spans = vec![Span::raw("  ".to_owned())];
+        spans.extend(
+            line.into_iter()
+                .map(|(kind, text)| Span::styled(text, highlight::style(kind, plain, theme))),
+        );
+        lines.extend(wrap_spans(spans, width));
     }
     lines
 }
@@ -344,6 +389,74 @@ mod tests {
     fn t04_code_blocks_are_indented_without_fences() {
         let rendered = render("```sh\ncargo test\n```", 80, &Theme::plain());
         assert_eq!(plain_text(&rendered), "  cargo test");
+    }
+
+    /// A fence that names a language is highlighted in the theme's syntax colours;
+    /// one that names none, or a language nobody knows, keeps `mdCodeBlock`.
+    #[test]
+    fn a_labelled_code_block_is_highlighted_in_the_theme_colours() {
+        let theme = Theme::prime(crate::interactive::tui::theme::Depth::TrueColor);
+        let rendered = render(
+            "```rust
+fn main() {} // hi
+```",
+            80,
+            &theme,
+        );
+        assert_eq!(plain_text(&rendered), "  fn main() {} // hi");
+        let style_of = |text: &str| {
+            rendered[0]
+                .spans
+                .iter()
+                .find(|span| span.content.contains(text))
+                .map(|span| span.style)
+        };
+        assert_eq!(style_of("fn"), Some(theme.syntax.keyword));
+        assert_eq!(style_of("main"), Some(theme.syntax.function));
+        assert_eq!(style_of("// hi"), Some(theme.syntax.comment));
+
+        for fence in [
+            "```
+fn main() {}
+```",
+            "```nolang
+fn main() {}
+```",
+        ] {
+            let rendered = render(fence, 80, &theme);
+            assert!(
+                rendered[0]
+                    .spans
+                    .iter()
+                    .skip(1)
+                    .all(|span| span.style == theme.md_code_block),
+                "no language, no guessing: {fence}"
+            );
+        }
+    }
+
+    /// A streaming answer is often mid-block: the open block is drawn, highlighted.
+    #[test]
+    fn an_unclosed_block_is_still_drawn_highlighted() {
+        let theme = Theme::prime(crate::interactive::tui::theme::Depth::TrueColor);
+        let rendered = render(
+            "text
+```python
+def f():",
+            80,
+            &theme,
+        );
+        assert_eq!(
+            plain_text(&rendered),
+            "text
+  def f():"
+        );
+        assert!(
+            rendered[1]
+                .spans
+                .iter()
+                .any(|span| span.content == "def" && span.style == theme.syntax.keyword)
+        );
     }
 
     #[test]

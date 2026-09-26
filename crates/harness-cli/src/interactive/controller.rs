@@ -981,6 +981,7 @@ impl InteractiveController {
                         None => summary,
                     }
                 };
+                let path = super::events::path_argument(&input);
                 self.push_history(
                     effects,
                     HistoryItem::Tool {
@@ -999,7 +1000,7 @@ impl InteractiveController {
                     .take()
                     .filter(|text| !text.trim().is_empty())
                 {
-                    self.push_history(effects, HistoryItem::ToolOutput { name, text });
+                    self.push_history(effects, HistoryItem::ToolOutput { name, text, path });
                 }
             }
             SessionEvent::ApprovalRequired {

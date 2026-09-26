@@ -8,6 +8,7 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use super::highlight::{self, Language};
 use super::markdown;
 use super::theme::Theme;
 use crate::interactive::events::{Detail, HistoryItem, RunOutcome, ToolState};
@@ -47,6 +48,9 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
                 md_code: theme.dim,
                 md_code_block: theme.dim,
                 md_heading: theme.dim,
+                diff_added: theme.dim,
+                diff_removed: theme.dim,
+                syntax: super::theme::SyntaxStyles::uniform(theme.dim),
                 ..*theme
             };
             padded(markdown::render(text, width.saturating_sub(2), &dim))
@@ -75,12 +79,16 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
             }
             rows
         }
-        HistoryItem::ToolOutput { text, .. } if detail == Detail::Expanded => {
-            output_box(text, width, theme)
+        HistoryItem::ToolOutput { text, path, .. } if detail == Detail::Expanded => {
+            output_box(text, path.as_deref(), width, theme)
         }
-        HistoryItem::ToolOutput { text, .. } => {
-            tool_output_rows(text, width, theme, TOOL_OUTPUT_PREVIEW_LINES)
-        }
+        HistoryItem::ToolOutput { text, path, .. } => tool_output_rows(
+            text,
+            path.as_deref(),
+            width,
+            theme,
+            TOOL_OUTPUT_PREVIEW_LINES,
+        ),
         HistoryItem::Run {
             outcome,
             steps,
@@ -260,22 +268,45 @@ fn panel_rows(text: &str, width: u16, style: Style, theme: &Theme) -> Vec<Line<'
 
 /// The collapsed body of a tool panel: the first lines of what the tool returned,
 /// then `… N more lines` - prime-agent's collapsed tool output.
-fn tool_output_rows(text: &str, width: u16, theme: &Theme, shown: usize) -> Vec<Line<'static>> {
-    // The first line repeats the tool's name (`read_file:`), which the header says.
-    let body = text.split_once(":\n").map_or(text, |(_, body)| body);
-    let lines = body
+fn tool_output_rows(
+    text: &str,
+    path: Option<&str>,
+    width: u16,
+    theme: &Theme,
+    shown: usize,
+) -> Vec<Line<'static>> {
+    // The first line repeats the tool's name (`read_file src/a.rs:`), which the
+    // header says.
+    let body = text
+        .split_once('\n')
+        .filter(|(first, _)| first.trim_end().ends_with(':'))
+        .map_or(text, |(_, body)| body);
+    let total = body.lines().filter(|line| !line.trim().is_empty()).count();
+    // Only the lines up to the last one shown are highlighted: a long file's
+    // preview does not parse the whole file.
+    let mut kept = 0;
+    let head = body
         .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>();
+        .take_while(|line| {
+            let take = kept < shown;
+            if !line.trim().is_empty() {
+                kept += 1;
+            }
+            take
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut rows = Vec::new();
-    for line in lines.iter().take(shown) {
-        let clipped = clip(line, usize::from(width.saturating_sub(4)));
-        rows.push(
-            Line::from(vec![Span::raw("  "), Span::styled(clipped, theme.muted)])
-                .style(theme.panel),
-        );
+    for line in styled_lines(&head, path, Body::Output, theme.muted, theme)
+        .into_iter()
+        .filter(|spans| spans.iter().any(|span| !span.content.trim().is_empty()))
+        .take(shown)
+    {
+        let mut spans = vec![Span::raw("  ")];
+        spans.extend(clip_spans(line, usize::from(width.saturating_sub(4))));
+        rows.push(Line::from(spans).style(theme.panel));
     }
-    let more = lines.len().saturating_sub(shown);
+    let more = total.saturating_sub(shown);
     if more > 0 {
         rows.push(
             Line::from(vec![
@@ -349,9 +380,12 @@ fn input_rows(
         return if raw.is_empty() {
             Vec::new()
         } else {
-            text_rows(raw, theme.muted, 0, theme)
+            text_rows(raw, None, Body::Output, theme.muted, 0, theme)
         };
     };
+    // The file the call works on names the language its code is in.
+    let path = crate::interactive::events::path_argument(input);
+    let language = code_language(path.as_deref(), theme);
     let mut rows = Vec::new();
     let mut drawn = vec!["description".to_owned()];
     if let Some((command, used)) = shell_command(fields) {
@@ -378,16 +412,13 @@ fn input_rows(
         };
         for line in old.lines() {
             rows.push((
-                vec![Span::styled(
-                    format!("- {}", untab(line)),
-                    theme.diff_removed,
-                )],
+                diff_row('-', " ", &untab(line), language, theme.muted, theme),
                 2,
             ));
         }
         for line in new.lines() {
             rows.push((
-                vec![Span::styled(format!("+ {}", untab(line)), theme.diff_added)],
+                diff_row('+', " ", &untab(line), language, theme.muted, theme),
                 2,
             ));
         }
@@ -401,7 +432,15 @@ fn input_rows(
         match value {
             Value::String(text) if text.contains('\n') => {
                 rows.push((vec![Span::styled(format!("{key}:"), theme.dim)], 0));
-                rows.extend(text_rows(text, theme.muted, 2, theme));
+                // A call on a file writes its multi-line values into that file.
+                rows.extend(text_rows(
+                    text,
+                    path.as_deref(),
+                    Body::Source,
+                    theme.muted,
+                    2,
+                    theme,
+                ));
             }
             other => {
                 let text = match other {
@@ -452,34 +491,306 @@ fn shell_command(
 }
 
 /// Rows for a block of text, `indent` cells in, every line kept - blank ones too,
-/// since they are part of what a file or a command printed. Text that reads as a
-/// diff is coloured by its line markers.
-fn text_rows(text: &str, style: Style, indent: usize, theme: &Theme) -> Vec<BoxRow> {
-    let diff = looks_like_diff(text);
-    text.lines()
+/// since they are part of what a file or a command printed - styled by
+/// [`styled_lines`].
+fn text_rows(
+    text: &str,
+    path: Option<&str>,
+    body: Body,
+    style: Style,
+    indent: usize,
+    theme: &Theme,
+) -> Vec<BoxRow> {
+    styled_lines(text, path, body, style, theme)
+        .into_iter()
         .map(|line| {
-            let line = untab(line.trim_end_matches('\r'));
-            let style = if !diff {
-                style
-            } else if line.starts_with("+++") || line.starts_with("---") {
-                theme.dim
-            } else if line.starts_with('+') {
-                theme.diff_added
-            } else if line.starts_with('-') {
-                theme.diff_removed
-            } else if line.starts_with("@@") {
-                theme.accent
-            } else {
-                style
-            };
             let mut spans = Vec::new();
             if indent > 0 {
                 spans.push(Span::raw(" ".repeat(indent)));
             }
-            spans.push(Span::styled(line, style));
+            spans.extend(line);
             (spans, indent)
         })
         .collect()
+}
+
+/// What a block of text is, for highlighting it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Body {
+    /// What a tool printed: file contents come as numbered rows (`12: code`).
+    Output,
+    /// A file's own text, as a call writes it.
+    Source,
+}
+
+/// The language code in `path` is written in, when the theme has colours to
+/// show it with.
+fn code_language(path: Option<&str>, theme: &Theme) -> Option<Language> {
+    if theme.color {
+        path.and_then(highlight::language_for_path)
+    } else {
+        None
+    }
+}
+
+/// A block of text as styled lines, one per line and not yet wrapped.
+///
+/// A diff is coloured by its markers, with the code in each line highlighted in
+/// its file's language - the file a `diff --git`, `+++` or `*** Update File:`
+/// header names, or else the call's own `path` - as prime-agent draws a diff.
+/// File contents (`Body::Source`, or an output's numbered rows) are highlighted in
+/// the language of `path`. Everything else keeps `style`: without a language
+/// nothing is guessed, so prose is never coloured as code.
+fn styled_lines(
+    text: &str,
+    path: Option<&str>,
+    body: Body,
+    style: Style,
+    theme: &Theme,
+) -> Vec<Vec<Span<'static>>> {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| untab(line.trim_end_matches('\r')))
+        .collect();
+    let language = code_language(path, theme);
+    let numbered = numbered_diff(&lines);
+    if numbered || looks_like_diff(text) {
+        return diff_lines(&lines, numbered, language, style, theme);
+    }
+    let plain = |lines: &[String]| {
+        lines
+            .iter()
+            .map(|line| vec![Span::styled(line.clone(), style)])
+            .collect()
+    };
+    let Some(language) = language else {
+        return plain(&lines);
+    };
+    match body {
+        Body::Source => {
+            let texts: Vec<&str> = lines.iter().map(String::as_str).collect();
+            highlight::highlight(language, &texts)
+                .into_iter()
+                .map(|runs| code_spans(runs, theme.syntax.plain, None, theme))
+                .collect()
+        }
+        Body::Output => {
+            let rows: Vec<Option<usize>> = lines.iter().map(|line| numbered_row(line)).collect();
+            if rows.iter().all(Option::is_none) {
+                return plain(&lines);
+            }
+            let code: Vec<&str> = lines
+                .iter()
+                .zip(&rows)
+                .filter_map(|(line, row)| row.map(|at| &line[at..]))
+                .collect();
+            let mut highlighted = highlight::highlight(language, &code).into_iter();
+            lines
+                .iter()
+                .zip(rows)
+                .map(|(line, row)| match row {
+                    Some(at) => {
+                        let mut spans = vec![Span::styled(line[..at].to_owned(), theme.dim)];
+                        let runs = highlighted.next().unwrap_or_default();
+                        spans.extend(code_spans(runs, theme.syntax.plain, None, theme));
+                        spans
+                    }
+                    None => vec![Span::styled(line.clone(), style)],
+                })
+                .collect()
+        }
+    }
+}
+
+/// Highlighted runs as spans, each on `background` when there is one.
+fn code_spans(
+    runs: Vec<highlight::Run>,
+    plain: Style,
+    background: Option<Style>,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    runs.into_iter()
+        .map(|(kind, text)| {
+            let style = highlight::style(kind, plain, theme);
+            Span::styled(text, background.map_or(style, |bg| style.patch(bg)))
+        })
+        .collect()
+}
+
+/// A diff's lines: headers dim, hunk ranges in the accent, changed lines behind
+/// their `+`/`-` in the diff colours, and the code in them highlighted.
+fn diff_lines(
+    lines: &[String],
+    numbered: bool,
+    mut language: Option<Language>,
+    style: Style,
+    theme: &Theme,
+) -> Vec<Vec<Span<'static>>> {
+    lines
+        .iter()
+        .map(|line| {
+            if let Some(header) = diff_header(line) {
+                if let Header::File(file) = header
+                    && let Some(found) = code_language(Some(file), theme)
+                {
+                    language = Some(found);
+                }
+                return vec![Span::styled(line.clone(), theme.dim)];
+            }
+            if line.starts_with("@@") {
+                return vec![Span::styled(line.clone(), theme.accent)];
+            }
+            let mut characters = line.chars();
+            let marker = characters.next();
+            let rest = characters.as_str();
+            let (gutter, content) = if numbered {
+                numbered_diff_row(line).map_or(("", rest), |at| (&line[1..at], &line[at..]))
+            } else {
+                ("", rest)
+            };
+            match marker {
+                Some(marker @ ('+' | '-' | ' ')) => {
+                    diff_row(marker, gutter, content, language, style, theme)
+                }
+                _ => vec![Span::styled(line.clone(), style)],
+            }
+        })
+        .collect()
+}
+
+/// One line of a diff: its marker and gutter in the diff colour, then its code.
+/// A changed line sits on the diff background, as prime-agent's block rows do.
+fn diff_row(
+    marker: char,
+    gutter: &str,
+    content: &str,
+    language: Option<Language>,
+    style: Style,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let (color, background) = match marker {
+        '+' => (theme.diff_added, Some(theme.diff_added_bg)),
+        '-' => (theme.diff_removed, Some(theme.diff_removed_bg)),
+        _ => (style, None),
+    };
+    let on = |style: Style| background.map_or(style, |bg| style.patch(bg));
+    let head = if marker == ' ' {
+        Span::styled(format!(" {gutter}"), theme.dim)
+    } else {
+        Span::styled(format!("{marker}{gutter}"), on(color))
+    };
+    let mut spans = vec![head];
+    match language {
+        Some(language) => {
+            let runs = highlight::highlight_each(language, &[content])
+                .pop()
+                .unwrap_or_default();
+            spans.extend(code_spans(runs, theme.syntax.plain, background, theme));
+        }
+        None => spans.push(Span::styled(content.to_owned(), on(color))),
+    }
+    spans
+}
+
+/// A diff's header line.
+enum Header<'a> {
+    /// A header that names the file the hunks below it change.
+    File(&'a str),
+    /// Any other header (`index ...`, `*** Begin Patch`, `/dev/null`).
+    Other,
+}
+
+/// Whether a line heads a diff's file, and the file it names if it names one.
+fn diff_header(line: &str) -> Option<Header<'_>> {
+    for prefix in ["+++ ", "--- "] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            let file = rest.split('\t').next().unwrap_or(rest).trim();
+            return Some(if file == "/dev/null" {
+                Header::Other
+            } else {
+                Header::File(file)
+            });
+        }
+    }
+    if let Some(rest) = line.strip_prefix("diff --git ") {
+        return Some(
+            rest.split_whitespace()
+                .last()
+                .map_or(Header::Other, Header::File),
+        );
+    }
+    for prefix in [
+        "*** Update File: ",
+        "*** Add File: ",
+        "*** Delete File: ",
+        "*** Move to: ",
+    ] {
+        if let Some(file) = line.strip_prefix(prefix) {
+            return Some(Header::File(file.trim()));
+        }
+    }
+    if line.starts_with("*** ") || line.starts_with("index ") {
+        return Some(Header::Other);
+    }
+    None
+}
+
+/// Where the code starts in a numbered file row (`12: code`), if it is one.
+fn numbered_row(line: &str) -> Option<usize> {
+    let digits = line.trim_start_matches(' ');
+    let lead = line.len() - digits.len();
+    let count = digits.bytes().take_while(u8::is_ascii_digit).count();
+    if count == 0 {
+        return None;
+    }
+    let rest = &digits[count..];
+    if rest.starts_with(": ") {
+        Some(lead + count + 2)
+    } else if rest == ":" {
+        Some(lead + count + 1)
+    } else {
+        None
+    }
+}
+
+/// Where the code starts in a numbered diff row (`+ 12 code`, `-  3 code`,
+/// `  12 code`), as an edit reports the change it made.
+fn numbered_diff_row(line: &str) -> Option<usize> {
+    let rest = line.strip_prefix(['+', '-', ' '])?;
+    let digits = rest.trim_start_matches(' ');
+    let count = digits.bytes().take_while(u8::is_ascii_digit).count();
+    if count == 0 {
+        return None;
+    }
+    let after = &digits[count..];
+    let at = line.len() - after.len();
+    if after.is_empty() {
+        Some(at)
+    } else if after.starts_with(' ') {
+        Some(at + 1)
+    } else {
+        None
+    }
+}
+
+/// Whether lines are an edit's numbered diff: after its header, every row is a
+/// numbered diff row, a `...` gap or the truncation notice, and some row changed.
+fn numbered_diff(lines: &[String]) -> bool {
+    let Some(first) = lines
+        .iter()
+        .position(|line| numbered_diff_row(line).is_some())
+    else {
+        return false;
+    };
+    let rows = &lines[first..];
+    rows.iter()
+        .any(|line| line.starts_with(['+', '-']) && numbered_diff_row(line).is_some())
+        && rows.iter().all(|line| {
+            numbered_diff_row(line).is_some()
+                || line.trim() == "..."
+                || line.trim().is_empty()
+                || line.starts_with("[diff truncated")
+        })
 }
 
 /// Whether text is a patch: a unified diff hunk, or the `*** Begin Patch` envelope.
@@ -495,7 +806,7 @@ fn untab(line: &str) -> String {
 
 /// The whole of what a tool returned, in a box of its own under the call (the
 /// expanded view): every line, wrapped rather than cut.
-fn output_box(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+fn output_box(text: &str, path: Option<&str>, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let body = text.trim_end();
     let body = body.trim_start_matches(['\n', '\r']);
     if body.trim().is_empty() {
@@ -503,7 +814,7 @@ fn output_box(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     }
     framed(
         Some("output"),
-        text_rows(body, theme.muted, 0, theme),
+        text_rows(body, path, Body::Output, theme.muted, 0, theme),
         width,
         theme,
     )
@@ -553,8 +864,14 @@ fn framed(title: Option<&str>, rows: Vec<BoxRow>, width: u16, theme: &Theme) -> 
                 .map(super::widgets::composer::char_width)
                 .sum::<usize>();
             let mut spans = vec![Span::styled(format!("{indent}│ "), theme.border)];
+            // A diff row's block reaches the border, as prime-agent's rows do.
+            let fill = row
+                .spans
+                .last()
+                .and_then(|span| span.style.bg)
+                .map_or_else(Style::new, |bg| Style::new().bg(bg));
             spans.extend(row.spans);
-            spans.push(Span::raw(" ".repeat(inner.saturating_sub(cells))));
+            spans.push(Span::styled(" ".repeat(inner.saturating_sub(cells)), fill));
             spans.push(Span::styled(" │", theme.border));
             lines.push(Line::from(spans));
         }
@@ -566,18 +883,33 @@ fn framed(title: Option<&str>, rows: Vec<BoxRow>, width: u16, theme: &Theme) -> 
     lines
 }
 
-/// One row of at most `cells` cells, cut with `…`.
-fn clip(text: &str, cells: usize) -> String {
-    let mut out = String::new();
+/// Styled spans cut to at most `cells` cells, ending in `…` when cut.
+fn clip_spans(spans: Vec<Span<'static>>, cells: usize) -> Vec<Span<'static>> {
+    let total = spans
+        .iter()
+        .flat_map(|span| span.content.chars())
+        .map(super::widgets::composer::char_width)
+        .sum::<usize>();
+    if total <= cells {
+        return spans;
+    }
+    let mut out = Vec::new();
     let mut used = 0;
-    for character in text.chars() {
-        let width = super::widgets::composer::char_width(character);
-        if used + width > cells.saturating_sub(1) {
-            out.push('…');
-            return out;
+    for span in spans {
+        let mut text = String::new();
+        for character in span.content.chars() {
+            let width = super::widgets::composer::char_width(character);
+            if used + width > cells.saturating_sub(1) {
+                if !text.is_empty() {
+                    out.push(Span::styled(text, span.style));
+                }
+                out.push(Span::styled("…", span.style));
+                return out;
+            }
+            text.push(character);
+            used += width;
         }
-        out.push(character);
-        used += width;
+        out.push(Span::styled(text, span.style));
     }
     out
 }
@@ -858,6 +1190,7 @@ mod tests {
         let output = plain_text(&render(
             &HistoryItem::ToolOutput {
                 name: "read_file".to_owned(),
+                path: None,
                 text: "read_file:\none\ntwo\nthree\nfour\nfive".to_owned(),
             },
             80,
@@ -1004,6 +1337,7 @@ mod tests {
         assert!(plain_text(&render(&thinking, 80, &theme, Detail::Details)).contains("plan"));
         let output = HistoryItem::ToolOutput {
             name: "t".to_owned(),
+            path: None,
             text: "t:\n1\n2\n3\n4".to_owned(),
         };
         assert_eq!(
@@ -1149,6 +1483,7 @@ mod tests {
         let output = plain_text(&render(
             &HistoryItem::ToolOutput {
                 name: "read_file".to_owned(),
+                path: None,
                 text: "read_file src/lib.rs:\nfn a() {}\n\nfn b() {}\nfn c() {}\nfn d() {}\n"
                     .to_owned(),
             },
@@ -1199,7 +1534,169 @@ mod tests {
             .flat_map(|row| row.spans.iter())
             .find(|span| span.content.starts_with('+'))
             .expect("added line");
-        assert_eq!(added.style, theme.diff_added);
+        // The marker keeps the diff colour; in true colour it also sits on the
+        // diff background, which the terminal running the test decides.
+        assert_eq!(added.style.fg, theme.diff_added.fg);
+    }
+
+    fn truecolor() -> Theme {
+        Theme::prime(crate::interactive::tui::theme::Depth::TrueColor)
+    }
+
+    /// The last span that reads `text` (wrapping splits a run at its spaces).
+    fn span_with<'a>(rows: &'a [Line<'static>], text: &str) -> &'a Span<'static> {
+        rows.iter()
+            .flat_map(|row| row.spans.iter())
+            .rfind(|span| span.content.trim_end() == text)
+            .unwrap_or_else(|| panic!("no span {text:?} in {rows:?}"))
+    }
+
+    fn output(text: &str, path: Option<&str>, theme: &Theme) -> Vec<Line<'static>> {
+        render(
+            &HistoryItem::ToolOutput {
+                name: "t".to_owned(),
+                text: text.to_owned(),
+                path: path.map(str::to_owned),
+            },
+            80,
+            theme,
+            Detail::Expanded,
+        )
+    }
+
+    /// A git diff names its file; the code in each changed line is highlighted in
+    /// that file's language, on the diff background, behind its marker.
+    #[test]
+    fn a_git_diff_is_highlighted_in_the_language_of_its_file() {
+        let theme = truecolor();
+        let rows = output(
+            "git diff:
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1 @@
+-let x = 1;
++let x = \"two\";
+ context();",
+            None,
+            &theme,
+        );
+        let text = plain_text(&rows);
+        assert!(
+            text.contains("│ +let x = \"two\";"),
+            "text is unchanged: {text}"
+        );
+        let keyword = rows
+            .iter()
+            .flat_map(|row| row.spans.iter())
+            .filter(|span| span.content.as_ref() == "let")
+            .map(|span| span.style)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keyword,
+            vec![
+                theme.syntax.keyword.patch(theme.diff_removed_bg),
+                theme.syntax.keyword.patch(theme.diff_added_bg),
+            ]
+        );
+        assert_eq!(
+            span_with(&rows, "\"two\"").style,
+            theme.syntax.string.patch(theme.diff_added_bg)
+        );
+        assert_eq!(
+            span_with(&rows, "+").style,
+            theme.diff_added.patch(theme.diff_added_bg)
+        );
+        assert_eq!(span_with(&rows, "@@").style, theme.accent);
+    }
+
+    /// A file read shows numbered rows: the numbers stay dim, the code is
+    /// highlighted in the language of the file the call read.
+    #[test]
+    fn a_read_file_is_highlighted_in_the_language_of_its_path() {
+        let theme = truecolor();
+        let rows = output(
+            "read_file src/app.py:
+1: def run():
+2:     return 42",
+            Some("src/app.py"),
+            &theme,
+        );
+        assert_eq!(span_with(&rows, "def").style, theme.syntax.keyword);
+        assert_eq!(span_with(&rows, "42").style, theme.syntax.number);
+        assert_eq!(span_with(&rows, "1:").style, theme.dim);
+        assert_eq!(span_with(&rows, "read_file").style, theme.muted);
+        // The collapsed preview is highlighted the same way.
+        let collapsed = render(
+            &HistoryItem::ToolOutput {
+                name: "read_file".to_owned(),
+                text: "read_file src/app.py:
+1: def run():
+2:     return 42"
+                    .to_owned(),
+                path: Some("src/app.py".to_owned()),
+            },
+            80,
+            &theme,
+            Detail::Collapsed,
+        );
+        assert_eq!(
+            plain_text(&collapsed),
+            "  1: def run():
+  2:     return 42"
+        );
+        assert_eq!(span_with(&collapsed, "def").style, theme.syntax.keyword);
+    }
+
+    /// An edit reports the change as a numbered diff (`+ 3 code`).
+    #[test]
+    fn an_edit_diff_is_highlighted_behind_its_numbers() {
+        let theme = truecolor();
+        let rows = output(
+            "edit_file a.py: h1 -> h2 (1 replacement(s))
+  2 import os
+- 3 x = 1
++ 3 x = 2",
+            Some("a.py"),
+            &theme,
+        );
+        assert_eq!(
+            span_with(&rows, "2").style,
+            theme.syntax.number.patch(theme.diff_added_bg)
+        );
+        assert_eq!(
+            span_with(&rows, "+").style,
+            theme.diff_added.patch(theme.diff_added_bg)
+        );
+        assert_eq!(span_with(&rows, "import").style, theme.syntax.keyword);
+    }
+
+    /// Without a language nothing is guessed, and without colour nothing changes.
+    #[test]
+    fn output_without_a_language_or_colour_stays_as_it_was() {
+        let theme = truecolor();
+        let rows = output(
+            "process ok
+stdout:
+fn main() {}",
+            None,
+            &theme,
+        );
+        assert_eq!(span_with(&rows, "fn").style, theme.muted);
+        let plain = Theme::plain();
+        let text = "read_file a.rs:
+1: fn a() {}";
+        assert_eq!(
+            plain_text(&output(text, Some("a.rs"), &plain)),
+            plain_text(&output(text, Some("a.rs"), &truecolor())),
+            "highlighting never changes the text"
+        );
+        assert!(
+            output(text, Some("a.rs"), &plain)
+                .iter()
+                .flat_map(|row| row.spans.iter())
+                .all(|span| span.style.fg.is_none() && span.style.bg.is_none())
+        );
     }
 
     /// Vietnamese and CJK text wraps by cells, so the right border stays in line.
@@ -1208,6 +1705,7 @@ mod tests {
         let text = plain_text(&render(
             &HistoryItem::ToolOutput {
                 name: "t".to_owned(),
+                path: None,
                 text: "sửa lỗi phân tích cú pháp 解析器错误 解析器错误".to_owned(),
             },
             24,

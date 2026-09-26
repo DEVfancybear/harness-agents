@@ -296,7 +296,13 @@ pub enum HistoryItem {
     },
     /// What a settled tool returned; the TUI shows its first lines under the tool's
     /// panel. The plain transcript has no representation for it.
-    ToolOutput { name: String, text: String },
+    ToolOutput {
+        name: String,
+        text: String,
+        /// The file the call worked on ([`path_argument`]), so file contents and
+        /// diffs are highlighted in that file's language.
+        path: Option<String>,
+    },
     /// The end-of-turn summary line.
     Run {
         outcome: RunOutcome,
@@ -601,6 +607,17 @@ pub enum SessionEvent {
     RecoverableError {
         message: String,
     },
+}
+
+/// The file a tool call works on, read from the shape of its arguments rather
+/// than from the tool's name: a `path` or `file_path` string.
+#[must_use]
+pub fn path_argument(input: &str) -> Option<String> {
+    let arguments = serde_json::from_str::<Value>(input).ok()?;
+    ["path", "file_path"]
+        .iter()
+        .find_map(|key| arguments.get(key).and_then(Value::as_str))
+        .map(str::to_owned)
 }
 
 #[cfg(test)]

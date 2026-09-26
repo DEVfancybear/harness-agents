@@ -41,6 +41,13 @@ ratatui.workspace = true
 # HA_TUI T01/D1: cell width after NFC, so Vietnamese text cannot shift the cursor.
 unicode-width.workspace = true
 unicode-normalization.workspace = true
+# Syntax highlighting for code blocks, diffs and file contents in the TUI, as
+# prime-agent highlights them (it uses highlight.js through cli-highlight).
+# Sublime/TextMate grammars with the pure-Rust regex engine, so no C library
+# (oniguruma) has to build on Windows; `two-face` adds bat's grammar set
+# (TypeScript, TOML, Dockerfile, ...), which syntect's own defaults lack.
+syntect = { version = "=5.3.0", default-features = false, features = ["parsing", "regex-fancy", "dump-load"] }
+two-face = { version = "=0.5.2", default-features = false, features = ["syntect-fancy"] }
 harness-types = { path = "../harness-types" }
 harness-providers = { path = "../harness-providers" }
 harness-session = { path = "../harness-session" }
