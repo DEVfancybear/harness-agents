@@ -92,11 +92,14 @@ pub const SLASH_COMMANDS: [SlashCommand; 34] = [
     command("/hotkeys", "", "Show all keyboard shortcuts"),
     command("/login", "[provider]", "Configure provider authentication"),
     command("/logout", "[provider]", "Remove provider authentication"),
-    command(
-        "/mcp",
-        "",
-        "Show MCP integrations, transport and tool filters",
-    ),
+    SlashCommand {
+        options: &["add", "list", "get", "remove"],
+        ..command(
+            "/mcp",
+            "[add|list|get|remove]",
+            "Show MCP servers, or add, inspect and remove them",
+        )
+    },
     SlashCommand {
         aliases: &["/clear"],
         ..command("/new", "", "Start a new session")

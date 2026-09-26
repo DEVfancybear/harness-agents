@@ -211,6 +211,10 @@ pub trait SessionPort: Send {
     fn mcp_summary(&self) -> Vec<String> {
         vec!["MCP status is unavailable".to_owned()]
     }
+    /// `/mcp add | list | get | remove`: change the servers the app manages.
+    fn manage_mcp(&mut self, _args: &[String]) -> Result<Vec<String>, String> {
+        Err("this backend does not manage MCP servers".to_owned())
+    }
     fn agents_summary(&self) -> Vec<String> {
         vec!["no delegated workers have run in this session".to_owned()]
     }
@@ -2292,6 +2296,18 @@ impl SessionPort for AgentSessionService {
                 .collect(),
             Err(error) => vec![format!("hooks unavailable: {error}")],
         }
+    }
+
+    fn manage_mcp(&mut self, args: &[String]) -> Result<Vec<String>, String> {
+        let configured = super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .map(|resolved| resolved.mcp_servers)
+        .map_err(|error| error.to_string())?;
+        super::mcp_config::run(&self.config_file, args, &configured).map(|outcome| outcome.lines)
     }
 
     fn mcp_summary(&self) -> Vec<String> {

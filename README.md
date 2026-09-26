@@ -11,14 +11,14 @@
 ### What it does
 
 - **Chat in the terminal.** `ha` opens an interactive app (TUI, or plain line mode). `ha exec "…"` runs one prompt for scripts and CI, with `text`, `json` or `stream-json` output.
-- **Works on your code with guarded tools.** Read, search, glob, patch/edit/write files, run processes and shell commands, inspect Git, ask you a question, delegate to a sub-agent. Every action goes through the host policy: `y` runs once, `a` allows the rest of the turn, `n` refuses; `/mode` sets `ask`, `auto-edit` or `full-auto`.
+- **Works on your code with guarded tools.** Read, search, glob, patch/edit/write files, run processes and shell commands, inspect Git, ask you a question, delegate to a sub-agent. Every action goes through the host policy: `y` runs once, `a` allows the rest of the turn, `n` refuses; `/permissions` picks `ask`, `auto-edit` or `full-auto` from a menu (`full-auto` asks for nothing; deny rules still apply).
 - **Reads the web.** `web_search` (Google via Serper with `SERPER_API_KEY`, DuckDuckGo without a key) and `web_fetch` (a page as readable text with its links) support research workflows. Local and private addresses are refused.
 - **Runs a persistent Python REPL.** The `ipython` tool is prime-agent's kernel: variables persist across cells and turns, `bash('cmd')` starts commands in the background and returns a handle, and `await rlm.spawn(...)` / `rlm.collect(...)` run explorer children in parallel. prime-agent's Python skills come pre-imported (`edit`, `websearch`, `attach_image`, `goal`, `compact`, `refine`, …). With `uv` installed the kernel gets its own venv with prime-agent's default packages; otherwise it runs on Python 3.11+ from the system. Git Bash is needed on Windows for `bash()`. Each cell asks for approval like `run_shell` unless the mode is `full-auto`.
 - **Works toward a goal.** `/goal <objective>` keeps the app working across turns until the model calls `goal_complete` (at most 10 automatic turns, then it pauses). `/goal status|pause|resume|clear`; Ctrl-C pauses it, and `/resume` brings it back paused. Long turns shorten their oldest tool results to stay within the context budget.
 - **Resumes conversations.** `/resume` lists your conversations (one row each) and replays the chosen one's questions and answers to the model and on screen.
 - **Keeps its own memory.** As in prime-agent, the model keeps memories, prompt notes, skills and subagent specs through `rlm.harness` in the Python REPL - global or per conversation - and each turn carries a digest of them ranked for the task. Nothing is stored by keyword or extracted behind your back.
 - **Uses skills.** Agent Skills directories (`SKILL.md` plus references and scripts) from the bundled set, `~/.agents/skills`, a trusted project's `.agents/skills`, or any folder in `HA_SKILL_PATHS` (e.g. `~/.claude/skills`). The model activates a matching skill by name and reads its files with `read_skill_file`; `/skills` lists them, `/skill:<name>` runs one.
-- **Extends.** MCP servers (`ha mcp add`), prompt templates, hooks, and a local web surface (`ha web`).
+- **Extends.** MCP servers (`/mcp add` in chat, or `ha mcp add`), prompt templates, hooks, and a local web surface (`ha web`).
 
 ### Platform status
 
@@ -113,14 +113,14 @@ CI (`.github/workflows/ci.yml`) runs the phase gates (`scripts/Verify-Phase.ps1`
 ### `ha` làm được gì
 
 - **Chat trong terminal.** `ha` mở ứng dụng tương tác (TUI, hoặc chế độ dòng lệnh thuần). `ha exec "…"` chạy một prompt cho script và CI, xuất `text`, `json` hoặc `stream-json`.
-- **Làm việc với code qua công cụ có kiểm soát.** Đọc, tìm kiếm, glob, sửa/ghi file, chạy tiến trình và lệnh shell, xem Git, hỏi lại bạn, giao việc cho agent con. Mọi thao tác đi qua chính sách của host: `y` chạy một lần, `a` cho phép đến hết lượt, `n` từ chối; `/mode` chọn `ask`, `auto-edit` hoặc `full-auto`.
+- **Làm việc với code qua công cụ có kiểm soát.** Đọc, tìm kiếm, glob, sửa/ghi file, chạy tiến trình và lệnh shell, xem Git, hỏi lại bạn, giao việc cho agent con. Mọi thao tác đi qua chính sách của host: `y` chạy một lần, `a` cho phép đến hết lượt, `n` từ chối; `/permissions` chọn `ask`, `auto-edit` hoặc `full-auto` từ menu (`full-auto` không hỏi gì; rule deny vẫn áp dụng).
 - **Đọc web.** `web_search` (Google qua Serper khi có `SERPER_API_KEY`, DuckDuckGo khi không có key) và `web_fetch` (một trang dưới dạng văn bản kèm link) hỗ trợ các quy trình nghiên cứu. Địa chỉ local và mạng nội bộ bị từ chối.
 - **Python REPL bền.** Tool `ipython` là kernel của prime-agent: biến được giữ qua các cell và các lượt, `bash('cmd')` chạy lệnh nền và trả về handle, `await rlm.spawn(...)` / `rlm.collect(...)` chạy song song các agent con (explorer). Các Python skill của prime-agent được import sẵn (`edit`, `websearch`, `attach_image`, `goal`, `compact`, `refine`, …). Khi có `uv`, kernel có venv riêng với bộ package mặc định của prime-agent; nếu không thì chạy trên Python 3.11+ của hệ thống. Trên Windows cần Git Bash cho `bash()`. Mỗi cell hỏi phê duyệt như `run_shell`, trừ chế độ `full-auto`.
 - **Làm tới khi xong mục tiêu.** `/goal <mục tiêu>` giữ ứng dụng làm việc qua nhiều lượt cho tới khi model gọi `goal_complete` (tối đa 10 lượt tự động, sau đó tạm dừng). `/goal status|pause|resume|clear`; Ctrl-C tạm dừng mục tiêu, `/resume` khôi phục nó ở trạng thái tạm dừng. Lượt dài tự rút gọn các kết quả tool cũ nhất để không vượt ngân sách context.
 - **Tiếp tục hội thoại.** `/resume` liệt kê các hội thoại (mỗi hội thoại một dòng) và phát lại các câu hỏi, câu trả lời của hội thoại được chọn cho model và trên màn hình.
 - **Tự giữ memory.** Giống prime-agent, model tự lưu memory, ghi chú prompt, skill và đặc tả subagent qua `rlm.harness` trong Python REPL - global hoặc theo từng hội thoại - và mỗi lượt mang theo digest của chúng xếp theo mức liên quan. Không có gì được lưu theo từ khoá hay trích xuất ngầm.
 - **Dùng skill.** Thư mục Agent Skills (`SKILL.md` cùng references và scripts) từ bộ tích hợp sẵn, `~/.agents/skills`, `.agents/skills` của project đã trust, hoặc bất kỳ thư mục nào trong `HA_SKILL_PATHS` (ví dụ `~/.claude/skills`). Model kích hoạt skill phù hợp theo tên và đọc file của skill bằng `read_skill_file`; `/skills` liệt kê, `/skill:<name>` chạy một skill.
-- **Mở rộng.** MCP server (`ha mcp add`), prompt template, hook, và giao diện web cục bộ (`ha web`).
+- **Mở rộng.** MCP server (`/mcp add` trong chat, hoặc `ha mcp add`), prompt template, hook, và giao diện web cục bộ (`ha web`).
 
 ### Nền tảng
 

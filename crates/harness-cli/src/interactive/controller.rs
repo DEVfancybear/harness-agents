@@ -649,12 +649,14 @@ impl InteractiveController {
                 _ => {}
             }
         } else if self.editor.overlay().is_some() {
-            // An open panel owns the scroll keys: a long answer or a long help page
-            // has to be readable to its first line, and the composer is not being
-            // typed into while the panel is up. Escape still closes it, which is
-            // what acceptance U09 asserts. Arrows are left to the editor, which is
-            // what a panel opened from a draft must not steal.
+            // An open panel owns the scroll keys, arrows included: every panel
+            // (`/config`, `/hotkeys`, `/help`, `/mcp`, ...) is read by moving
+            // through it, as prime-agent's and Claude Code's panels are, and the
+            // composer is not being typed into while one is up. Escape still
+            // closes it, which is what acceptance U09 asserts.
             let scrolled = match key {
+                Key::Up => self.editor.scroll_overlay(-1),
+                Key::Down => self.editor.scroll_overlay(1),
                 Key::PageUp => self.editor.scroll_overlay(-8),
                 Key::PageDown => self.editor.scroll_overlay(8),
                 Key::Home => self.editor.scroll_overlay_to(false),
@@ -1949,7 +1951,28 @@ impl InteractiveController {
                 self.reference("/hooks", self.service.hooks_summary(), &mut effects);
             }
             "/mcp" => {
-                self.reference("/mcp", self.service.mcp_summary(), &mut effects);
+                // prime-agent's `/mcp add | list | get | remove`; bare `/mcp`
+                // shows the servers and how to add one.
+                match raw_argument.map(super::mcp_config::split_words) {
+                    Some(args) if !args.is_empty() => match self.service.manage_mcp(&args) {
+                        Ok(lines) if lines.len() == 1 => self.push_history(
+                            &mut effects,
+                            HistoryItem::Notice {
+                                message: lines.into_iter().next().unwrap_or_default(),
+                            },
+                        ),
+                        Ok(lines) => self.reference("/mcp", lines, &mut effects),
+                        Err(message) => {
+                            self.push_history(&mut effects, HistoryItem::Error { message });
+                        }
+                    },
+                    _ => {
+                        let mut lines = self.service.mcp_summary();
+                        lines.push(String::new());
+                        lines.extend(super::mcp_config::USAGE.iter().map(|line| (*line).to_owned()));
+                        self.reference("/mcp", lines, &mut effects);
+                    }
+                }
             }
             "/agents" => {
                 self.reference("/agents", self.service.agents_summary(), &mut effects);
@@ -3327,7 +3350,7 @@ const PERMISSION_MODES: [(&str, &str); 3] = [
     ),
     (
         "full-auto",
-        "built-in workspace tools run unasked; extension tools still ask",
+        "nothing asks: every tool runs unasked; deny rules still apply",
     ),
 ];
 
@@ -5565,6 +5588,14 @@ mod tests {
             panic!("the panel stays open at the top");
         };
         assert_eq!(scroll, 0, "Home returns to the top");
+        // The arrows move a panel one line, as they do in prime-agent's panels.
+        let _ = harness.controller.handle_key(Key::Down);
+        let _ = harness.controller.handle_key(Key::Down);
+        let _ = harness.controller.handle_key(Key::Up);
+        let Some(Modal::Overlay { scroll, .. }) = harness.controller.ui_state().modal else {
+            panic!("the panel stays open while the arrows move it");
+        };
+        assert_eq!(scroll, 1, "Down twice and Up once leave it one line down");
         assert_eq!(
             harness.controller.transcript().len(),
             before,

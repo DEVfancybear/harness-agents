@@ -329,9 +329,6 @@ impl ToolPolicy {
         // prompt sent to the model provider. Opening a URL is different: the URL itself
         // can carry data out, so web_fetch asks unless the mode or a rule allows it.
         let web = matches!(action, CodingToolAction::ExternalTool { plugin_id, .. } if plugin_id == "web");
-        // The Python REPL runs code like run_shell does, so it gets run_shell's
-        // treatment: it asks, unless the mode allows every command.
-        let repl = matches!(action, CodingToolAction::ExternalTool { plugin_id, .. } if plugin_id == "repl");
         if web
             && matches!(action, CodingToolAction::ExternalTool { tool_name, .. } if tool_name == "web_search")
         {
@@ -344,14 +341,15 @@ impl ToolPolicy {
             PolicyMode::AutoEdit if auto_edit_action(action) => Decision::Allow {
                 reason: "mode auto-edit".to_owned(),
             },
-            PolicyMode::FullAuto
-                if web || repl || !matches!(action, CodingToolAction::ExternalTool { .. }) =>
-            {
-                Decision::Allow {
-                    reason: "mode full-auto".to_owned(),
-                }
-            }
-            PolicyMode::Ask | PolicyMode::AutoEdit | PolicyMode::FullAuto => Decision::Ask,
+            // full-auto is the user saying "do not ask me": every tool runs,
+            // extension and MCP tools and subagents included, as Claude Code's
+            // bypass mode does. Deny rules and protected paths above still apply.
+            // It used to keep asking for extension tools, so a full-auto session
+            // still stopped at a panel for every MCP call or delegated worker.
+            PolicyMode::FullAuto => Decision::Allow {
+                reason: "mode full-auto".to_owned(),
+            },
+            PolicyMode::Ask | PolicyMode::AutoEdit => Decision::Ask,
         }
     }
 
@@ -776,6 +774,29 @@ mod g05_policy_tests {
             Decision::Allow { .. }
         ));
         assert_eq!(policy.decide(&external("goal", "other")), Decision::Ask);
+        // full-auto asks for nothing, extension and MCP tools included; a deny
+        // rule still wins.
+        let full_auto = ToolPolicy::new(1, Vec::new()).with_mode(PolicyMode::FullAuto);
+        for (plugin, tool) in [
+            ("mcp", "list_skills"),
+            ("delegate", "delegate"),
+            ("skill", "write_anything"),
+        ] {
+            assert!(
+                matches!(
+                    full_auto.decide(&external(plugin, tool)),
+                    Decision::Allow { .. }
+                ),
+                "{plugin}/{tool}"
+            );
+        }
+        assert!(matches!(
+            full_auto
+                .clone()
+                .with_tool_rules(vec![ToolPatternRule::deny("delegate()", "no delegation")])
+                .decide(&external("delegate", "delegate")),
+            Decision::Deny(_)
+        ));
         // Running Python is running code: it asks, like run_shell, unless full-auto.
         assert_eq!(policy.decide(&external("repl", "ipython")), Decision::Ask);
         assert!(matches!(

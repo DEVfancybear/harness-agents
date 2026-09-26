@@ -25,6 +25,7 @@ pub mod heartbeat;
 pub mod input;
 pub mod instructions;
 pub mod mcp;
+pub mod mcp_config;
 pub mod oauth;
 pub mod paths;
 pub mod permissions;

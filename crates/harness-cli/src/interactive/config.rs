@@ -280,6 +280,9 @@ pub fn resolve_layers(
         )?;
         mcp_servers.extend(config.mcp_servers.clone());
     }
+    // The servers `/mcp add` saved beside the user config, at the user layer: a
+    // trusted project's servers still override them.
+    mcp_servers.extend(super::mcp_config::load(user_path));
     if let Some(selection) = load_selection(user_path) {
         apply_selection(
             &mut provider,
