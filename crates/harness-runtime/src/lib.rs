@@ -325,6 +325,9 @@ pub struct RunRequest {
     /// me" had nothing to work from. These messages sit between the system policy
     /// and the new user message, the same place a live conversation keeps them.
     pub conversation: Vec<ProviderMessage>,
+    /// Who the admitted input comes from: the user, or a model that proposed it
+    /// (a delegated child's brief). The input is admitted once, by the run.
+    pub authority: SourceAuthority,
     /// Shared across cloned continuation requests so one admitted input cannot
     /// start more than one automatic compaction.
     auto_compaction_attempted: Arc<AtomicBool>,
@@ -352,8 +355,16 @@ impl RunRequest {
             images: Vec::new(),
             recovered_messages: Vec::new(),
             conversation: Vec::new(),
+            authority: SourceAuthority::User,
             auto_compaction_attempted: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Admit the input as coming from `authority` rather than the user.
+    #[must_use]
+    pub const fn with_authority(mut self, authority: SourceAuthority) -> Self {
+        self.authority = authority;
+        self
     }
     #[must_use]
     pub fn with_system_policy(mut self, policy: impl Into<String>) -> Self {
@@ -1364,7 +1375,7 @@ impl RuntimeService {
                     task_id: request.task_id.clone(),
                     input_id: request.input_id.clone(),
                     expected_sequence,
-                    authority: SourceAuthority::User,
+                    authority: request.authority,
                     raw_text: request.text.clone(),
                     workspace: request.workspace.clone(),
                     initial_plan_items: Vec::new(),

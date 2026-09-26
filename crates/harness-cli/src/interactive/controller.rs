@@ -723,6 +723,13 @@ impl InteractiveController {
                 _ => {}
             }
         }
+        // Escape closes what is open first - a reference panel (`/agents`, `/help`)
+        // or the slash menu - and only then interrupts the run, as in prime-agent:
+        // closing a panel must never cancel the work it was showing.
+        if key == Key::Esc && (self.editor.overlay().is_some() || self.suggestion_menu_open()) {
+            let _ = self.editor.handle(Key::Esc);
+            return vec![Effect::Redraw];
+        }
         if key == Key::Esc && self.phase == AppPhase::Running {
             return self.interrupt();
         }
@@ -3596,6 +3603,29 @@ mod tests {
         assert_eq!(approval.controller.phase(), AppPhase::WaitingApproval);
         assert_eq!(*approval.port.cancels.lock().expect("cancels"), 0);
         assert!(approval.controller.ui_state().modal.is_some());
+    }
+
+    /// Escape on a panel opened during a run closes the panel; the run goes on.
+    #[test]
+    fn esc_closes_a_panel_opened_during_a_run_without_canceling_it() {
+        let mut harness = tui_bench(true);
+        let _ = submit_text(&mut harness.controller, "start");
+        assert_eq!(harness.controller.phase(), AppPhase::Running);
+        let _ = submit_text(&mut harness.controller, "/agents");
+        assert!(
+            harness.controller.ui_state().modal.is_some(),
+            "the panel is open"
+        );
+        let _ = harness.controller.handle_key(Key::Esc);
+        assert!(
+            harness.controller.ui_state().modal.is_none(),
+            "the panel closed"
+        );
+        assert_eq!(*harness.port.cancels.lock().expect("cancels"), 0);
+        assert_eq!(harness.controller.phase(), AppPhase::Running);
+        // With nothing open, Escape interrupts as before.
+        let _ = harness.controller.handle_key(Key::Esc);
+        assert_eq!(*harness.port.cancels.lock().expect("cancels"), 1);
     }
 
     #[test]

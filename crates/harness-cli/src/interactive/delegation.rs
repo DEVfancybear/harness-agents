@@ -15,7 +15,6 @@ use harness_orchestrator::{
 };
 use harness_providers::{CancellationToken, ModelProvider};
 use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
-use harness_session::{AdmitInputRequest, SessionService};
 use harness_store_sqlite::{SqliteStore, WorktreeRecordRow};
 use harness_tools::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CodingToolAction,
@@ -1137,24 +1136,12 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 }
             }
             let session_id = SessionId::generate();
+            // The run admits the brief once, as the child's input and as proposed
+            // by the parent's model. Admitting it here as well - with the brief's
+            // text, while the run admits the prompt around it - put two contents
+            // under one input id, and every child failed with
+            // `idempotency_conflict` before its first step.
             let input_id = InputId::generate();
-            if let Err(error) = SessionService::new(Arc::clone(&self.store))
-                .admit_input(AdmitInputRequest {
-                    session_id: session_id.clone(),
-                    task_id: task_id.clone(),
-                    input_id: input_id.clone(),
-                    expected_sequence: 1,
-                    authority: SourceAuthority::ModelProposed,
-                    raw_text: request.brief.objective.clone(),
-                    workspace: request.brief.workspace.clone(),
-                    initial_plan_items: Vec::new(),
-                })
-                .await
-            {
-                return WorkerOutcome::Failed {
-                    error: OrchestratorError::new(error.code(), error.to_string()),
-                };
-            }
             let tools = ToolExecutionService::new(Arc::clone(&self.store))
                 .with_policy(policy)
                 .with_hooks(self.hooks.clone());
@@ -1174,7 +1161,8 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 request.brief.workspace.clone(),
             )
             .with_system_policy(system_policy)
-            .with_tool_schemas(schemas);
+            .with_tool_schemas(schemas)
+            .with_authority(SourceAuthority::ModelProposed);
             let driver = TurnDriver::new(Arc::clone(&runtime), tools);
             let observer = Arc::new(ExplorerObserver {
                 task_key: task_key.clone(),
@@ -1828,5 +1816,102 @@ mod tests {
             schema["parameters"]["properties"]["role"]["enum"],
             serde_json::json!(["explorer", "coder"])
         );
+    }
+}
+
+#[cfg(test)]
+mod real_worker_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use harness_providers::{
+        CancellationToken, ModelCapabilities, ModelProvider, ProviderFuture, ProviderRequest,
+        ProviderStreamEvent,
+    };
+    use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
+    use harness_types::{HostId, ProjectId};
+    use serde_json::{Value, json};
+
+    use super::DelegateHost;
+    use crate::interactive::service::{ChannelApprovalGate, SessionChannel};
+
+    /// Answers every request with one line of text naming the call.
+    struct Answering(AtomicUsize);
+
+    impl ModelProvider for Answering {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::deepseek_fixture()
+        }
+
+        fn stream(&self, request: ProviderRequest, _: CancellationToken) -> ProviderFuture {
+            let call = self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(vec![
+                    ProviderStreamEvent::Started {
+                        request_id: request.request_id,
+                    },
+                    ProviderStreamEvent::TextDelta {
+                        text: format!("answer {call}"),
+                    },
+                    ProviderStreamEvent::completed("stop"),
+                ])
+            })
+        }
+    }
+
+    /// Several children spawned at once from the kernel each run to an answer.
+    #[tokio::test]
+    async fn children_spawned_together_each_answer() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let repo = temporary.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::write(repo.join("a.txt"), "a\n").expect("file");
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                temporary.path().join("store"),
+                HostId::generate(),
+            ))
+            .await
+            .expect("store"),
+        );
+        let channel = SessionChannel::new();
+        let gate = Arc::new(ChannelApprovalGate::new(
+            channel.sender(),
+            std::time::Duration::from_secs(5),
+        ));
+        let host = DelegateHost::new(
+            &store,
+            Arc::new(Answering(AtomicUsize::new(0))),
+            harness_runtime::RuntimeConfig::default(),
+            repo.clone(),
+            harness_tools::observe_workspace(ProjectId::generate(), &repo).expect("observe"),
+            temporary.path().join("delegation"),
+            Vec::new(),
+            Vec::new(),
+            None,
+            gate,
+            channel.sender(),
+            CancellationToken::new(),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        )
+        .expect("delegate host");
+        let children = host.rlm_requests("fixture-model".to_owned());
+        let mut ids = Vec::new();
+        for name in ["one", "two", "three"] {
+            let spawned: Value = children
+                .handle(&json!({"type": "rlm.run", "prompt": format!("task {name}"), "kwargs": {"name": name}}))
+                .await
+                .expect("known")
+                .expect("spawn");
+            ids.push(spawned["rlm_child_id"].clone());
+        }
+        let collected = children
+            .handle(&json!({"type": "rlm.collect", "targets": ids, "timeout_ms": 20_000}))
+            .await
+            .expect("known")
+            .expect("collect");
+        for result in collected["results"].as_array().expect("results") {
+            assert_eq!(result["status"], "done", "{collected}");
+        }
     }
 }
