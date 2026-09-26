@@ -592,6 +592,10 @@ impl TurnDriver {
         // dispatch again after each round of tools made `max_steps` mean about half of
         // what it says and reported a turn that used four calls as eight steps.
         let mut steps = 1_u32;
+        // The first model call is step one; later ones announce themselves as
+        // they start. Without this a turn answered in one call reported
+        // `0 steps`, and the status line counted from zero while it ran.
+        observer.observe(TurnProgress::StepStarted { step: steps });
         // Goal state. `continuations` counts host continuations of one admitted
         // input; `no_progress` counts continuations whose evidence fingerprint
         // did not change.

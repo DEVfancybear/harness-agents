@@ -4009,9 +4009,13 @@ async fn run_turn(
             message: notice.clone(),
         });
     }
-    send(SessionEvent::Notice {
-        message: format!("AGENTS.md: {} files", loaded_instructions.files.len()),
-    });
+    // Only instructions that were actually loaded are worth a line in the
+    // conversation; "0 files" before every answer was noise.
+    if !loaded_instructions.files.is_empty() {
+        send(SessionEvent::Notice {
+            message: format!("AGENTS.md: {} files", loaded_instructions.files.len()),
+        });
+    }
     let (git_branch, changed_files) = prompt_git_facts(&workspace_root);
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let shell = if cfg!(windows) {

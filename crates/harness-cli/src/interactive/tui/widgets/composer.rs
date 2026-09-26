@@ -19,7 +19,6 @@ use unicode_normalization::UnicodeNormalization;
 use unicode_width::UnicodeWidthChar;
 
 use super::super::layout::Plan;
-use super::super::markdown;
 use super::super::theme::Theme;
 use crate::interactive::events::{Modal, UiState};
 use crate::interactive::view;
@@ -229,7 +228,7 @@ pub fn render_live(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme
     if area.height == 0 || (state.live_text.is_empty() && state.open_tools.is_empty()) {
         return;
     }
-    let mut lines = markdown::render(&state.live_text, area.width, theme);
+    let mut lines = super::super::history::assistant_rows(&state.live_text, area.width, theme);
     if state.live_text.is_empty() {
         lines.clear();
     }

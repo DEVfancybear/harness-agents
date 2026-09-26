@@ -133,6 +133,9 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
         (None, if rect.height > 0 { Some(rect) } else { None })
     };
 
+    let (live, modal, suggest, status, composer) =
+        lift_to_top(area.y, live, modal, suggest, status, composer);
+
     // Rows the draft needs beyond the ones the box can show scroll out of view.
     let composer_scroll = wanted_rows.saturating_sub(composer.height.saturating_sub(2));
     let cursor = cursor_cell(
@@ -153,6 +156,42 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
         composer_scroll,
         composer_lines,
     }
+}
+
+/// Move the frame's parts up so the first one starts at `top`.
+///
+/// Everything sits directly under the conversation, as prime-agent's editor
+/// does: the viewport is a fixed height, and laying the frame out from its
+/// bottom left the unused rows as a band of blank lines between the last message
+/// and the working line - above the editor on every screen. The rows nobody uses
+/// now stay below the editor instead.
+fn lift_to_top(
+    top: u16,
+    live: Option<Rect>,
+    modal: Option<Rect>,
+    suggest: Rect,
+    status: Rect,
+    composer: Rect,
+) -> (Option<Rect>, Option<Rect>, Rect, Rect, Rect) {
+    let first = [live, modal, Some(suggest), Some(status), Some(composer)]
+        .into_iter()
+        .flatten()
+        .filter(|rect| rect.height > 0)
+        .map(|rect| rect.y)
+        .min()
+        .unwrap_or(top);
+    let lift = first.saturating_sub(top);
+    let raise = |rect: Rect| Rect {
+        y: rect.y.saturating_sub(lift),
+        ..rect
+    };
+    (
+        live.map(raise),
+        modal.map(raise),
+        raise(suggest),
+        raise(status),
+        raise(composer),
+    )
 }
 
 /// The bottom `rows` of `area`.
@@ -176,9 +215,11 @@ pub fn composer_rows(wrapped_lines: usize) -> u16 {
     u16::try_from(wrapped_lines).unwrap_or(u16::MAX).max(1)
 }
 
-/// Rows the live block needs for the text still streaming.
+/// Rows the live block needs for the text still streaming, wrapped the way the
+/// answer is drawn: one cell in from each edge.
 #[must_use]
 pub fn live_rows(state: &UiState, width: u16) -> u16 {
+    let width = width.saturating_sub(2);
     if state.modal.is_some() {
         return 0;
     }
@@ -291,21 +332,22 @@ mod tests {
     }
 
     #[test]
-    /// prime-agent's dock: the working line, then the editor between two rules at
-    /// the bottom.
+    /// prime-agent's dock: the working line, then the editor between two rules,
+    /// directly under the conversation - the rows nobody uses stay below it, not
+    /// as a blank band between the last message and the working line.
     fn t02_the_editor_is_last_and_the_working_line_sits_above_it() {
         let area = Rect::new(0, 0, 80, 12);
         let outline = plan(area, &state(AppPhase::Ready), &Theme::plain());
-        assert_eq!(outline.status.y, 8);
+        assert_eq!(outline.status.y, 0, "nothing blank above the working line");
         assert_eq!(outline.status.height, 1);
         assert_eq!(
             outline.composer.height, 3,
             "one content row between the two rules"
         );
-        assert_eq!(outline.composer.y, 9);
+        assert_eq!(outline.composer.y, 1);
         assert_eq!(
             outline.cursor,
-            Some((2, 10)),
+            Some((2, 2)),
             "the marker sits on the content row"
         );
     }
@@ -318,9 +360,9 @@ mod tests {
 
         let outline = plan(Rect::new(0, 0, 80, 12), &state, &Theme::plain());
         assert_eq!(outline.composer.height, 5);
-        assert_eq!(outline.composer.y, 7);
-        assert_eq!(outline.status.y, 6);
-        assert_eq!(outline.cursor.map(|(_, y)| y), Some(10));
+        assert_eq!(outline.status.y, 0);
+        assert_eq!(outline.composer.y, 1, "the editor follows the working line");
+        assert_eq!(outline.cursor.map(|(_, y)| y), Some(4));
     }
 
     #[test]

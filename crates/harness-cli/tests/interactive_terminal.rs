@@ -323,6 +323,26 @@ impl Drop for PtySession {
 /// what the user could read therefore compare against this view - it keeps every
 /// printable character in order - while assertions about the app's own output
 /// (the echo lines, the run landmarks) use the raw transcript.
+/// Whether the output leaves the shell on a fresh line: the last character
+/// written is a newline. Mode switches after it (`ESC[?25h` showing the cursor,
+/// `ESC[?2004l` ending bracketed paste) print nothing; `ConPTY` re-renders and may
+/// report the cursor's visibility after the app's final newline, in an order
+/// that depends on where the cursor was.
+fn ends_on_a_fresh_line(transcript: &str) -> bool {
+    let mut rest = transcript;
+    while let Some(start) = rest.rfind("\u{1b}[?") {
+        let tail = &rest[start + 3..];
+        let is_mode_switch = tail.len() >= 2
+            && tail[..tail.len() - 1].chars().all(|ch| ch.is_ascii_digit())
+            && matches!(tail.chars().last(), Some('h' | 'l'));
+        if !is_mode_switch {
+            break;
+        }
+        rest = &rest[..start];
+    }
+    rest.ends_with('\n')
+}
+
 fn normalized(transcript: &str) -> String {
     let mut out = String::with_capacity(transcript.len());
     let mut characters = transcript.chars().peekable();
@@ -613,9 +633,7 @@ fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     // line instead of parking it inside its own prompt.
     let transcript = session.transcript();
     assert!(
-        transcript.ends_with("\r\n")
-            || transcript.ends_with('\n')
-            || transcript.ends_with("\n\u{1b}[?2004l"),
+        ends_on_a_fresh_line(&transcript),
         "the app restores the terminal before exiting: {transcript:?}"
     );
 }
@@ -670,7 +688,7 @@ fn t03_pty_paste_keeps_newlines() {
         accepted_before + 1,
         "the multiline paste is admitted as one message"
     );
-    session.wait_for(" steps · ", Duration::from_secs(30));
+    session.wait_for(" tool call", Duration::from_secs(30));
     session.send("/exit\r");
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
 }
@@ -694,7 +712,7 @@ fn t06_pty_approval_y_key() {
         Duration::from_secs(30),
     );
     wait_for_normalized(&session, "fixture_action · done", Duration::from_secs(30));
-    session.wait_for(" steps · ", Duration::from_secs(30));
+    session.wait_for(" tool call", Duration::from_secs(30));
     session.send("/exit\r");
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
 }
@@ -774,7 +792,7 @@ fn t_more_pty_scroll_keys() {
         PtySession::spawn_process(&project, &base_env(&temp), &["chat", "--fixture"], &[]);
     session.wait_for("Nhập yêu cầu", Duration::from_secs(30));
     session.send("show the transcript\r");
-    session.wait_for(" steps · ", Duration::from_secs(30));
+    session.wait_for(" tool call", Duration::from_secs(30));
     session.send("/more\r");
     session.wait_for("Esc đóng", Duration::from_secs(30));
     session.send("\u{1b}[6~\u{1b}[H\u{1b}[F");
@@ -821,10 +839,10 @@ fn h05_pty_approval_denial_is_fail_closed() {
     session.send("n\r");
     let denied = wait_for_normalized(&session, "approval denied", Duration::from_secs(30));
     assert!(
-        denied.contains("apply_patch · ") || denied.contains(" steps · "),
+        denied.contains("apply_patch · ") || denied.contains(" tool call"),
         "the real host reports the denied tool result:\n{denied}"
     );
-    session.wait_for(" steps · ", Duration::from_secs(30));
+    session.wait_for(" tool call", Duration::from_secs(30));
     assert!(
         second_request.load(Ordering::SeqCst),
         "the denial result reaches the provider continuation"
@@ -861,7 +879,7 @@ fn g05_pty_always_allow_writes_local_rule() {
     wait_for_normalized(&session, "apply_patch", Duration::from_secs(30));
     assert!(!rule.exists(), "proposal alone must not write a rule");
     session.send("\r");
-    session.wait_for(" steps · ", Duration::from_secs(40));
+    session.wait_for(" tool call", Duration::from_secs(40));
     let local = std::fs::read_to_string(&rule).expect("confirmed rule");
     assert!(local.contains("apply_patch(src/parser.rs)"), "{local}");
     session.send("/exit\r");
@@ -908,7 +926,7 @@ fn g08_pty_undo_panel() {
     session.send("fix the parser\r");
     session.wait_for("[approval] ApplyPatch", Duration::from_secs(40));
     session.send("y\r");
-    session.wait_for(" steps · ", Duration::from_secs(40));
+    session.wait_for(" tool call", Duration::from_secs(40));
     assert_eq!(
         std::fs::read_to_string(&file).expect("patched file"),
         replacement
@@ -916,7 +934,7 @@ fn g08_pty_undo_panel() {
     session.send("/undo\r");
     wait_for_normalized(&session, "[approval] WriteFile", Duration::from_secs(30));
     session.send("y\r");
-    wait_for_occurrences(&session, " steps · ", 2, Duration::from_secs(40));
+    wait_for_occurrences(&session, " tool call", 2, Duration::from_secs(40));
     assert_eq!(
         std::fs::read_to_string(&file).expect("restored file"),
         source
@@ -1062,7 +1080,7 @@ fn i14_the_installed_artifact_opens_the_app_in_a_real_terminal() {
     );
     let transcript = session.transcript();
     assert!(
-        transcript.ends_with("\r\n") || transcript.ends_with('\n'),
+        ends_on_a_fresh_line(&transcript),
         "the installed app restores the terminal before exiting: {transcript:?}"
     );
     // Read the install directory the way an operator would: it must still hold the
@@ -1103,7 +1121,7 @@ fn i06_pty_keeps_vietnamese_input_and_paste_intact() {
         "fixture answer for: sửa lỗi parse!",
         Duration::from_secs(30),
     );
-    session.wait_for(" steps · ", Duration::from_secs(30));
+    session.wait_for(" tool call", Duration::from_secs(30));
 
     // A paste must never turn into several submitted commands. Whether the console
     // forwards the bracketed-paste markers is the console's choice: this ConPTY
@@ -1195,9 +1213,12 @@ fn i21_pty_survives_a_multiline_draft_and_keeps_the_prompt_usable() {
         // Submitting the draft makes the in-memory editor state observable through
         // both the committed history row and the fixture service response.
         session.send("\r");
-        session.wait_for("> dòng một", Duration::from_secs(30));
+        // The answer echoes the whole draft, both rows. (The editor's "> " marker
+        // is not searched for: the frame is drawn by difference, and the marker
+        // already on screen is not written again next to the typed text.)
         session.wait_for("fixture answer for: dòng một", Duration::from_secs(30));
-        session.wait_for(" steps · ", Duration::from_secs(30));
+        session.wait_for("dòng hai (no model was called)", Duration::from_secs(30));
+        session.wait_for(" tool call", Duration::from_secs(30));
     } else {
         session.send("\u{3}");
     }
@@ -1297,7 +1318,7 @@ fn i07b_ctrl_c_cancels_a_running_turn() {
     }
     running.send("\u{3}");
     running.wait_for("Canceling", Duration::from_secs(20));
-    running.wait_for(" steps · ", Duration::from_secs(30));
+    running.wait_for(" tool call", Duration::from_secs(30));
     running.send("/exit\r");
     assert_eq!(
         running.wait_exit(Duration::from_secs(20)),
@@ -2056,7 +2077,7 @@ fn g4_a_step_bound_continues_the_turn_by_itself() {
         "the app says why it spoke:\n{continued}"
     );
     assert!(
-        continued.contains("paused: step limit reached · 2 steps · 1 tool calls"),
+        continued.contains("paused: step limit reached · 2 steps · 1 tool call ·"),
         "the pause is still on the record before the continuation:\n{continued}"
     );
 

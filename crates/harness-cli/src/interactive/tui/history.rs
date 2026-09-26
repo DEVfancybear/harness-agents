@@ -35,11 +35,7 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
         HistoryItem::Automatic { text } => injected_prompt(text, width, theme),
         HistoryItem::Assistant { text } => {
             let mut rows = vec![Line::default()];
-            rows.extend(padded(markdown::render(
-                text,
-                width.saturating_sub(2),
-                theme,
-            )));
+            rows.extend(assistant_rows(text, width, theme));
             rows
         }
         // Collapsed mode hides reasoning, as prime-agent's overview does.
@@ -133,6 +129,19 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
 }
 
 /// Indent rendered rows by one cell, as prime-agent pads assistant text.
+/// An answer's rows: markdown one cell in from each edge. The live block draws
+/// the text still streaming with this too, so a line keeps its place and its
+/// wrapping when the answer is committed to the scrollback.
+#[must_use]
+pub fn assistant_rows(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    padded(markdown::render(text, width.saturating_sub(2), theme))
+}
+
+/// `1 step`, `3 steps`.
+fn counted(count: u64, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
 fn padded(rows: Vec<Line<'static>>) -> Vec<Line<'static>> {
     rows.into_iter()
         .map(|line| {
@@ -697,7 +706,9 @@ pub fn run_row(
         Span::styled(outcome.label(), style),
         Span::styled(
             format!(
-                " · {steps} steps · {tool_calls} tool calls · {}",
+                " · {} · {} · {}",
+                counted(u64::from(steps), "step", "steps"),
+                counted(u64::from(tool_calls), "tool call", "tool calls"),
                 view::seconds_label(elapsed)
             ),
             theme.dim,
