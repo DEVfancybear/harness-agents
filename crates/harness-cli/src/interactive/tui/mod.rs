@@ -513,6 +513,7 @@ fn run_loop_inner(
             .resume_source(source)
             .map_err(|message| HarnessError::new(ErrorCode::InvalidPayload, message))?;
     }
+    controller.set_columns(renderer.columns());
     let boot = controller.boot_lines();
     renderer
         .insert_history(&HistoryItem::Banner { lines: boot })
@@ -537,9 +538,10 @@ fn run_loop_inner(
             .poll_key(POLL_INTERVAL)
             .map_err(|error| terminal_error(&error))?
         {
-            if matches!(key, Key::Resize { .. }) {
+            if let Key::Resize { columns, .. } = key {
                 // The viewport height cannot change (T01), so a resize only
                 // repaints the layout at the new size; the draft is untouched.
+                controller.set_columns(columns);
                 redraw = true;
             } else {
                 let effects = controller.handle_key(key);

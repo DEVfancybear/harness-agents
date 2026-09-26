@@ -65,7 +65,12 @@ pub enum TurnProgress {
     },
     ToolStarted {
         name: String,
+        /// One short line of the arguments, for the collapsed card.
         summary: String,
+        /// The call's arguments exactly as the model sent them (normally a JSON
+        /// object), so an expanded transcript can show the whole input - the full
+        /// command, every path, the patch - rather than the cut summary.
+        input: String,
     },
     ToolSettled {
         name: String,
@@ -948,6 +953,7 @@ impl TurnDriver {
                 observer.observe(TurnProgress::ToolStarted {
                     name: name.clone(),
                     summary: summarize_arguments(&call.arguments),
+                    input: call.arguments.clone(),
                 });
                 // A call the model never named, or whose arguments never became JSON,
                 // is not an action. Rejecting it here says so in one sentence; the

@@ -285,7 +285,13 @@ pub enum HistoryItem {
     /// A tool card: started, then settled with a duration.
     Tool {
         name: String,
+        /// The one-line card text the collapsed view shows.
         summary: String,
+        /// The call's full input (normally its arguments JSON). Only the expanded
+        /// view draws it; it travels with the row so that a reprint or `/more` in
+        /// expanded mode can show what a row already in the scrollback was called
+        /// with. Empty when the call has no input worth showing.
+        input: String,
         state: ToolState,
     },
     /// What a settled tool returned; the TUI shows its first lines under the tool's
@@ -426,9 +432,10 @@ pub struct UiState {
 }
 
 /// prime-agent's detail modes, cycled with ctrl+o: collapsed hides reasoning and
-/// cuts tool output to three lines, details shows reasoning, expanded shows every
-/// line a tool returned. Rows already in the scrollback keep the mode they were
-/// drawn in.
+/// cuts tool output to three lines, details shows reasoning, expanded draws each
+/// call as Claude Code's transcript view does - its whole input in a box (a shell
+/// command as `$ command`) and every line it returned in another. Rows already in
+/// the scrollback keep the mode they were drawn in until ctrl+o reprints them.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Detail {
     #[default]
@@ -490,6 +497,8 @@ pub enum SessionEvent {
     ToolStarted {
         name: String,
         summary: String,
+        /// The whole call input (the arguments JSON), for the expanded view.
+        input: String,
     },
     /// What the tool that is about to settle returned.
     ToolOutput {
@@ -628,6 +637,7 @@ mod tests {
             SessionEvent::ToolStarted {
                 name: "read_file".to_owned(),
                 summary: "path=a.rs".to_owned(),
+                input: r#"{"path":"a.rs"}"#.to_owned(),
             },
             SessionEvent::ToolSettled {
                 name: "read_file".to_owned(),

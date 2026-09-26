@@ -297,8 +297,8 @@ fn spans_of(row: Vec<Glyph>) -> Vec<Span<'static>> {
     spans
 }
 
-/// The visible text of a set of rendered lines, for tests and for measuring.
-#[cfg(test)]
+/// The visible text of a set of rendered lines, for tests, for measuring and for
+/// `/more`, which shows rendered rows as plain panel lines.
 #[must_use]
 pub fn plain_text(lines: &[Line<'_>]) -> String {
     lines

@@ -124,6 +124,21 @@ struct PendingMcpElicitation {
     url: Option<String>,
 }
 
+/// The width `/more` draws for until the TUI reports the console's.
+const DEFAULT_COLUMNS: u16 = 100;
+
+/// One entry of what `/more` can show again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Recalled {
+    /// A line exactly as the transcript printed it.
+    Line(String),
+    /// A tool call or its output, drawn when `/more` opens and in the detail mode
+    /// of that moment: the transcript has one line for a call and nothing for what
+    /// it returned, and looking back in expanded mode is how a user reads exactly
+    /// what ran.
+    Tool(HistoryItem),
+}
+
 /// Interactive app state and its transitions.
 pub struct InteractiveController {
     phase: AppPhase,
@@ -137,9 +152,12 @@ pub struct InteractiveController {
     /// The committed plain transcript, byte for byte what the old controller
     /// pushed. Kept as text so U20 can be asserted without a renderer.
     transcript: Vec<String>,
-    /// The newest lines of the same transcript, so `/more` can show them again in a
-    /// scrollable panel without the terminal's scrollback.
-    recall: Vec<String>,
+    /// The newest entries of the same transcript, so `/more` can show them again in
+    /// a scrollable panel without the terminal's scrollback.
+    recall: Vec<Recalled>,
+    /// The console width the TUI last reported, so `/more` can draw an expanded
+    /// tool block to fit its panel.
+    columns: u16,
     editor: LineEditor,
     service: Box<dyn SessionPort>,
     channel: SessionChannel,
@@ -172,8 +190,9 @@ pub struct InteractiveController {
     file_picker_candidates: Vec<String>,
     /// The plain renderer prints slash-command output; the TUI opens an overlay.
     plain: bool,
-    /// The tool card that is still open, so it settles in place.
-    open_tools: Vec<(String, String)>,
+    /// The tool cards still open, so each settles in place: name, one-line summary
+    /// and the full input the settled row carries for the expanded view.
+    open_tools: Vec<(String, String, String)>,
     /// Why the next tool runs without a panel, shown on its card in the TUI.
     pending_allowance: Option<String>,
     // Progress accounting for the status bar.
@@ -242,6 +261,7 @@ impl InteractiveController {
             context: context.clone(),
             transcript: Vec::new(),
             recall: Vec::new(),
+            columns: DEFAULT_COLUMNS,
             editor: LineEditor::new(),
             service,
             channel,
@@ -366,7 +386,12 @@ impl InteractiveController {
             buffer: self.display_buffer(),
             cursor: self.editor.cursor(),
             live_text: self.pending_text.clone(),
-            open_tools: self.open_tools.clone(),
+            // The live block only ever draws the compact card.
+            open_tools: self
+                .open_tools
+                .iter()
+                .map(|(name, summary, _)| (name.clone(), summary.clone()))
+                .collect(),
             modal: self.modal(),
             granted_for_run: self.granted_for_run,
             queued_input: self.queued_input.is_some(),
@@ -888,16 +913,22 @@ impl InteractiveController {
             SessionEvent::StepStarted { step } => {
                 self.steps = step;
             }
-            SessionEvent::ToolStarted { name, summary } => {
+            SessionEvent::ToolStarted {
+                name,
+                summary,
+                input,
+            } => {
                 self.flush_stream(effects);
                 self.tool_calls = self.tool_calls.saturating_add(1);
-                self.open_tools.push((name.clone(), summary.clone()));
+                self.open_tools
+                    .push((name.clone(), summary.clone(), input.clone()));
                 if self.plain {
                     self.push_history(
                         effects,
                         HistoryItem::Tool {
                             name,
                             summary,
+                            input,
                             state: ToolState::Started,
                         },
                     );
@@ -915,11 +946,17 @@ impl InteractiveController {
                 detail,
             } => {
                 self.flush_stream(effects);
-                let summary = self
+                let (summary, input) = self
                     .open_tools
                     .iter()
-                    .position(|(open_name, _)| open_name == &name)
-                    .map_or_else(String::new, |index| self.open_tools.remove(index).1);
+                    .position(|(open_name, _, _)| open_name == &name)
+                    .map_or_else(
+                        || (String::new(), String::new()),
+                        |index| {
+                            let (_, summary, input) = self.open_tools.remove(index);
+                            (summary, input)
+                        },
+                    );
                 let state = if ok {
                     ToolState::Ok { elapsed }
                 } else {
@@ -943,6 +980,7 @@ impl InteractiveController {
                         // summary on the Started row, so its settled row remains
                         // byte-identical to H03.
                         summary,
+                        input,
                         state,
                     },
                 );
@@ -2778,8 +2816,22 @@ impl InteractiveController {
     fn push_history(&mut self, effects: &mut Vec<Effect>, item: HistoryItem) {
         let lines = view::plain_lines(&item);
         self.transcript.extend(lines.clone());
-        self.remember(lines);
+        if !self.plain
+            && matches!(
+                item,
+                HistoryItem::Tool { .. } | HistoryItem::ToolOutput { .. }
+            )
+        {
+            self.keep_recalled(Recalled::Tool(item.clone()));
+        } else {
+            self.remember(lines);
+        }
         effects.push(Effect::History(item));
+    }
+
+    /// The console width the TUI draws at; `/more` fits its expanded blocks to it.
+    pub fn set_columns(&mut self, columns: u16) {
+        self.columns = columns;
     }
 
     /// Take what the clipboard holds and make it part of the message.
@@ -2940,17 +2992,50 @@ impl InteractiveController {
     /// not try to replace it. What it adds is a way to read the last answer without
     /// leaving the app, bounded so a long session cannot grow without limit.
     fn remember(&mut self, lines: Vec<String>) {
-        const RECALL_LINES: usize = 500;
-        self.recall.extend(lines);
-        if self.recall.len() > RECALL_LINES {
-            let excess = self.recall.len() - RECALL_LINES;
+        for line in lines {
+            self.keep_recalled(Recalled::Line(line));
+        }
+    }
+
+    /// Keep one entry for `/more`, dropping the oldest past the bound. A tool entry
+    /// counts as one, whatever its size: its text is already held by the row.
+    fn keep_recalled(&mut self, entry: Recalled) {
+        const RECALL_ENTRIES: usize = 500;
+        self.recall.push(entry);
+        if self.recall.len() > RECALL_ENTRIES {
+            let excess = self.recall.len() - RECALL_ENTRIES;
             self.recall.drain(..excess);
         }
     }
 
     /// The text `/more` shows: the recent transcript, newest last.
+    ///
+    /// Tool entries follow the detail mode: collapsed and details show the
+    /// transcript's `[tool]` line, and expanded draws the whole block - the full
+    /// input and every output line - fitted to the panel, as ctrl+o's reprint does
+    /// in the scrollback.
     fn recall_lines(&self) -> Vec<String> {
-        let mut lines = self.recall.clone();
+        let panel = self.columns.saturating_sub(2);
+        let mut lines = Vec::new();
+        for entry in &self.recall {
+            match entry {
+                Recalled::Line(line) => lines.push(line.clone()),
+                Recalled::Tool(item) if self.detail == super::events::Detail::Expanded => {
+                    let rows = super::tui::history::render(
+                        item,
+                        panel,
+                        &super::tui::theme::Theme::plain(),
+                        self.detail,
+                    );
+                    lines.extend(
+                        super::tui::markdown::plain_text(&rows)
+                            .split('\n')
+                            .map(str::to_owned),
+                    );
+                }
+                Recalled::Tool(item) => lines.extend(view::plain_lines(item)),
+            }
+        }
         // Text still streaming is part of the answer the user is reading.
         if !self.pending_text.is_empty() {
             lines.extend(self.pending_text.split('\n').map(str::to_owned));
@@ -4185,6 +4270,7 @@ mod tests {
             .send(SessionEvent::ToolStarted {
                 name: "apply_patch".to_owned(),
                 summary: "path=a.rs".to_owned(),
+                input: String::new(),
             })
             .expect("started");
         harness
@@ -4230,6 +4316,7 @@ mod tests {
             .send(SessionEvent::ToolStarted {
                 name: "read_file".to_owned(),
                 summary: "path=a.rs".to_owned(),
+                input: String::new(),
             })
             .expect("tool");
         harness
@@ -4694,6 +4781,7 @@ mod tests {
             .send(SessionEvent::ToolStarted {
                 name: "list_files".to_owned(),
                 summary: "path=.".to_owned(),
+                input: String::new(),
             })
             .expect("started");
         harness
@@ -5319,6 +5407,74 @@ mod tests {
         );
     }
 
+    /// Looking back in expanded mode: `/more` draws a tool call the way ctrl+o's
+    /// reprint does - the whole command and every output line - while collapsed
+    /// mode keeps the transcript's one `[tool]` line.
+    #[test]
+    fn more_in_expanded_mode_shows_the_whole_tool_call() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        harness.controller.set_columns(60);
+        let _ = submit_text(&mut harness.controller, "run the tests");
+        for event in [
+            SessionEvent::ToolStarted {
+                name: "run_shell".to_owned(),
+                summary: "command=cargo test".to_owned(),
+                input: r#"{"command":"cargo test --workspace --locked"}"#.to_owned(),
+            },
+            SessionEvent::ToolOutput {
+                text: "run_shell:\nline 1\nline 2\nline 3\nline 4\nline 5".to_owned(),
+            },
+            SessionEvent::ToolSettled {
+                name: "run_shell".to_owned(),
+                ok: true,
+                elapsed: Duration::from_millis(40),
+                detail: String::new(),
+            },
+            SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            },
+        ] {
+            harness.events.send(event).expect("event");
+        }
+        let _ = harness.controller.pump_events();
+        let more = |controller: &mut InteractiveController| {
+            let _ = submit_text(controller, "/more");
+            let Some(Modal::Overlay { lines, .. }) = controller.ui_state().modal else {
+                panic!("/more opens a panel");
+            };
+            let _ = controller.handle_key(Key::Esc);
+            lines.join("\n")
+        };
+
+        let collapsed = more(&mut harness.controller);
+        assert!(collapsed.contains("run_shell"), "{collapsed}");
+        assert!(!collapsed.contains("line 5"), "{collapsed}");
+        assert!(!collapsed.contains("--locked"), "{collapsed}");
+
+        let _ = harness.controller.handle_key(Key::CycleDetail);
+        let effects = harness.controller.handle_key(Key::CycleDetail);
+        assert!(
+            effects.contains(&Effect::Reprint(
+                crate::interactive::events::Detail::Expanded
+            )),
+            "ctrl+o redraws the scrollback in expanded mode: {effects:?}"
+        );
+        let expanded = more(&mut harness.controller);
+        assert!(
+            expanded.contains("│ $ cargo test --workspace --locked"),
+            "{expanded}"
+        );
+        assert!(expanded.contains("│ line 5"), "{expanded}");
+        for row in expanded.lines().filter(|row| row.contains('│')) {
+            assert_eq!(
+                crate::interactive::tui::widgets::composer::display_width(row),
+                58,
+                "a row fits the panel inside its border: {row:?}"
+            );
+        }
+    }
+
     /// K04: `/more` reopens what the live viewport clipped, from its first line.
     ///
     /// The live block keeps only a bounded tail, so a long answer scrolls its own
@@ -5548,6 +5704,7 @@ mod tests {
             .send(SessionEvent::ToolStarted {
                 name: "read_file".to_owned(),
                 summary: "path=a.rs".to_owned(),
+                input: r#"{"path":"a.rs"}"#.to_owned(),
             })
             .expect("started");
         let started = harness.controller.pump_events();
@@ -5579,8 +5736,9 @@ mod tests {
         assert_eq!(cards.len(), 1, "settling creates one final card");
         assert!(matches!(
             &cards[0],
-            HistoryItem::Tool { name, summary, state: ToolState::Ok { elapsed } }
-                if name == "read_file" && summary == "path=a.rs" && *elapsed == Duration::from_millis(12)
+            HistoryItem::Tool { name, summary, input, state: ToolState::Ok { elapsed } }
+                if name == "read_file" && summary == "path=a.rs" && input == r#"{"path":"a.rs"}"#
+                    && *elapsed == Duration::from_millis(12)
         ));
         assert!(harness.controller.ui_state().open_tools.is_empty());
     }
@@ -5628,6 +5786,7 @@ mod tests {
             .send(SessionEvent::ToolStarted {
                 name: "read_file".to_owned(),
                 summary: "path=a.rs".to_owned(),
+                input: String::new(),
             })
             .expect("start");
         harness
@@ -5851,11 +6010,13 @@ mod tests {
             HistoryItem::Tool {
                 name: "search_text".to_owned(),
                 summary: "pattern=parser".to_owned(),
+                input: String::new(),
                 state: ToolState::Started,
             },
             HistoryItem::Tool {
                 name: "search_text".to_owned(),
                 summary: String::new(),
+                input: String::new(),
                 state: ToolState::Failed {
                     elapsed: Duration::from_millis(3100),
                     detail: String::new(),
@@ -5864,6 +6025,7 @@ mod tests {
             HistoryItem::Tool {
                 name: "apply_patch".to_owned(),
                 summary: String::new(),
+                input: String::new(),
                 state: ToolState::Ok {
                     elapsed: Duration::from_millis(12),
                 },
