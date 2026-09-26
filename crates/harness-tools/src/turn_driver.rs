@@ -7,7 +7,7 @@
 //! existing policy/approval/receipt gate, and a bounded number of continuation
 //! steps.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -30,7 +30,14 @@ use serde_json::{Value, json};
 use crate::{
     ApprovalGrant, AskUserInput, CodingToolAction, Decision, GIT_LOG_DEFAULT_LIMIT,
     HISTORY_SEARCH_DEFAULT_LIMIT, PreparedToolRequest, ToolExecutionService, ToolExecutionView,
-    ToolOutput, ToolRequest, coding_tool_names, tool_pattern_for_action,
+    ToolOutput, ToolRequest,
+    capture::StreamTail,
+    coding_tool_names, tool_pattern_for_action,
+    truncate::{
+        DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, TruncatedBy, TruncationLimits, format_size,
+        truncate_head, truncate_tail,
+    },
+    workspace::MAX_SEARCH_MATCHES,
 };
 
 /// Limits that bound one user turn.
@@ -425,9 +432,12 @@ fn trim_transcript(transcript: &mut [ProviderMessage], budget: usize, keep_recen
 ///
 /// It was 4000 characters - about a thousand tokens - so one `read_file` of an
 /// ordinary source file came back cut, and the model spent step after step reading
-/// the same file in slices. Every tool already bounds its own output; this is the
-/// last guard against one result taking over the context.
-const TOOL_RESULT_LIMIT: usize = 24_000;
+/// the same file in slices. Every tool already bounds its own output to the
+/// shared limits of [`crate::truncate`] and says what it left out; this is the
+/// last guard against one result taking over the context. It leaves room above
+/// that limit for a result's header and notices, so a notice telling the model
+/// how to read the rest is never the part that gets cut.
+const TOOL_RESULT_LIMIT: usize = DEFAULT_MAX_BYTES + 4 * 1024;
 
 /// How many recent tool signatures the loop detector remembers.
 const LOOP_WINDOW: usize = 6;
@@ -1927,6 +1937,23 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
         // hits are already capped and redacted where they are produced, so the
         // rendering here is the same bound the tool applied.
         ToolOutput::SearchText { matches, truncated } => {
+            let mut notices = String::new();
+            if *truncated {
+                let _ = write!(
+                    notices,
+                    "\n\n[Results stop at {MAX_SEARCH_MATCHES} matches or {}. Narrow the path, glob or query to see the rest.]",
+                    format_size(DEFAULT_MAX_BYTES as u64)
+                );
+            }
+            if matches
+                .iter()
+                .any(|hit| hit.preview.ends_with("... [truncated]"))
+            {
+                let _ = write!(
+                    notices,
+                    "\n\n[Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read_file to see full lines.]"
+                );
+            }
             let hits = matches
                 .iter()
                 .map(|hit| {
@@ -1944,7 +1971,7 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
 ",
                 );
             format!(
-                "search_text{}: {} match(es){}{hits}",
+                "search_text{}: {} match(es){}{hits}{notices}",
                 if *truncated { " (truncated)" } else { "" },
                 matches.len(),
                 if matches.is_empty() {
@@ -1993,11 +2020,13 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             before_hash,
             after_hash,
             replacements,
+            diff,
         } => format!(
-            "edit_file {path}: {} -> {} ({} replacement(s))",
+            "edit_file {path}: {} -> {} ({} replacement(s)){}",
             before_hash.as_str(),
             after_hash.as_str(),
-            replacements
+            replacements,
+            render_edit_diff(diff)
         ),
         ToolOutput::Process {
             executable,
@@ -2006,12 +2035,31 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             canceled,
             queued,
             tree_cleanup,
-            stdout,
-            stderr,
+            stdout_tail,
+            stderr_tail,
+            artifact_id,
+            capture_truncated,
             ..
-        } => format!(
-            "process {executable} exit={exit_code:?} timed_out={timed_out} canceled={canceled} queued={queued} tree_cleanup={tree_cleanup}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        ),
+        } => {
+            let (stdout_limits, stderr_limits) = split_process_limits(stdout_tail, stderr_tail);
+            let full_output = |stream: &str| {
+                artifact_id.as_ref().map(|id| {
+                    let quota = if *capture_truncated {
+                        " (captured up to the capture quota)"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        ". Full output: read_process_output artifact_id={id} stream={stream}{quota}"
+                    )
+                })
+            };
+            format!(
+                "process {executable} exit={exit_code:?} timed_out={timed_out} canceled={canceled} queued={queued} tree_cleanup={tree_cleanup}\nstdout:\n{}\nstderr:\n{}",
+                render_stream_tail(stdout_tail, stdout_limits, full_output("stdout")),
+                render_stream_tail(stderr_tail, stderr_limits, full_output("stderr")),
+            )
+        }
         ToolOutput::ProcessOutput {
             artifact_id,
             stream,
@@ -2078,6 +2126,102 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
     truncate_text(&body, TOOL_RESULT_LIMIT)
 }
 
+/// An edit's diff below its summary line, cut to the shared output limits.
+fn render_edit_diff(diff: &str) -> String {
+    if diff.is_empty() {
+        return String::new();
+    }
+    let cut = truncate_head(diff, TruncationLimits::default());
+    if cut.truncated {
+        format!(
+            "\n{}\n[diff truncated: showing {} of {} lines]",
+            cut.content, cut.output_lines, cut.total_lines
+        )
+    } else {
+        format!("\n{}", cut.content)
+    }
+}
+
+/// Share one tool-output budget between a process's two streams.
+///
+/// prime-agent writes stdout and stderr into one accumulator and shows its
+/// tail. ha keeps the streams apart, so the budget is split instead: a stream
+/// that fits in half leaves the rest to the other, and two long streams get
+/// half each.
+fn split_process_limits(
+    stdout: &StreamTail,
+    stderr: &StreamTail,
+) -> (TruncationLimits, TruncationLimits) {
+    let full = TruncationLimits::default();
+    let half = TruncationLimits {
+        max_lines: full.max_lines / 2,
+        max_bytes: full.max_bytes / 2,
+    };
+    let fits = |stream: &StreamTail| {
+        stream.total_lines <= half.max_lines as u64 && stream.total_bytes <= half.max_bytes as u64
+    };
+    let rest = |stream: &StreamTail| TruncationLimits {
+        max_lines: full.max_lines - usize::try_from(stream.total_lines).unwrap_or(0),
+        max_bytes: full.max_bytes - usize::try_from(stream.total_bytes).unwrap_or(0),
+    };
+    if fits(stderr) {
+        (rest(stderr), half)
+    } else if fits(stdout) {
+        (half, rest(stdout))
+    } else {
+        (half, half)
+    }
+}
+
+/// The end of one process stream as the model reads it, with prime-agent's
+/// notice when lines were left out (the snapshot and `formatOutput` of its
+/// bash tool). `full_output` says where the whole stream can be read.
+fn render_stream_tail(
+    stream: &StreamTail,
+    limits: TruncationLimits,
+    full_output: Option<String>,
+) -> String {
+    let cut = truncate_tail(&stream.text, limits);
+    // The tail text is only the end of the stream; the totals decide whether
+    // the stream as a whole was cut.
+    let truncated = stream.total_lines > limits.max_lines as u64
+        || stream.total_bytes > limits.max_bytes as u64;
+    if !truncated {
+        return cut.content;
+    }
+    let truncated_by =
+        cut.truncated_by
+            .unwrap_or(if stream.total_bytes > limits.max_bytes as u64 {
+                TruncatedBy::Bytes
+            } else {
+                TruncatedBy::Lines
+            });
+    let total = stream.total_lines;
+    let start = total.saturating_sub(cut.output_lines as u64) + 1;
+    // A capture that could not be published has no location; never advertise
+    // one that does not exist.
+    let location = full_output.unwrap_or_default();
+    let notice = if cut.last_line_partial {
+        let line_size = if stream.last_line_bytes > 0 {
+            format!(" (line is {})", format_size(stream.last_line_bytes))
+        } else {
+            String::new()
+        };
+        format!(
+            "[Showing last {} of line {start}{line_size}{location}]",
+            format_size(cut.output_bytes as u64)
+        )
+    } else if truncated_by == TruncatedBy::Lines {
+        format!("[Showing lines {start}-{total} of {total}{location}]")
+    } else {
+        format!(
+            "[Showing lines {start}-{total} of {total} ({} limit){location}]",
+            format_size(limits.max_bytes as u64)
+        )
+    };
+    format!("{}\n\n{notice}", cut.content)
+}
+
 fn truncate_text(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_owned();
@@ -2085,6 +2229,181 @@ fn truncate_text(text: &str, limit: usize) -> String {
     let kept: String = text.chars().take(limit).collect();
     let rest = text.chars().count() - limit;
     format!("{kept}\n[truncated: {rest} more characters; request a narrower range]")
+}
+
+#[cfg(test)]
+mod tool_output_render_tests {
+    use super::{
+        StreamTail, TruncationLimits, render_stream_tail, render_tool_output, split_process_limits,
+    };
+    use crate::{ToolOutput, contracts::SearchMatch};
+    use harness_types::ContentHash;
+
+    fn stream(text: &str) -> StreamTail {
+        StreamTail {
+            text: text.to_owned(),
+            total_bytes: text.len() as u64,
+            total_lines: text.split('\n').count() as u64,
+            last_line_bytes: text.rsplit('\n').next().map_or(0, str::len) as u64,
+        }
+    }
+
+    fn limits(max_lines: usize, max_bytes: usize) -> TruncationLimits {
+        TruncationLimits {
+            max_lines,
+            max_bytes,
+        }
+    }
+
+    #[test]
+    fn a_stream_within_its_limits_is_shown_whole_without_a_notice() {
+        assert_eq!(
+            render_stream_tail(&stream("a\nb"), limits(10, 100), Some(". x".to_owned())),
+            "a\nb"
+        );
+    }
+
+    #[test]
+    fn a_long_stream_shows_its_last_lines_and_where_the_rest_is() {
+        let rendered = render_stream_tail(
+            &stream("1\n2\n3\n4\n5"),
+            limits(2, 100),
+            Some(". Full output: read_process_output artifact_id=a1 stream=stdout".to_owned()),
+        );
+        assert_eq!(
+            rendered,
+            "4\n5\n\n[Showing lines 4-5 of 5. Full output: read_process_output artifact_id=a1 stream=stdout]"
+        );
+    }
+
+    #[test]
+    fn a_byte_cut_names_the_limit_and_a_missing_capture_names_no_location() {
+        let rendered = render_stream_tail(&stream("aaa\nbbb\nccc"), limits(10, 9), None);
+        assert_eq!(rendered, "bbb\nccc\n\n[Showing lines 2-3 of 3 (9B limit)]");
+    }
+
+    #[test]
+    fn an_oversized_last_line_shows_its_end_and_its_size() {
+        let rendered = render_stream_tail(&stream(&"z".repeat(30)), limits(10, 8), None);
+        assert_eq!(
+            rendered,
+            "zzzzzzzz\n\n[Showing last 8B of line 1 (line is 30B)]"
+        );
+    }
+
+    /// The totals, not the kept text, decide the line numbers: the tail may
+    /// be only the end of a stream far longer than the window.
+    #[test]
+    fn line_numbers_count_from_the_whole_stream() {
+        let tail = StreamTail {
+            text: "x\ny".to_owned(),
+            total_bytes: 1_000_000,
+            total_lines: 5000,
+            last_line_bytes: 1,
+        };
+        let rendered = render_stream_tail(&tail, limits(10, 100), None);
+        assert_eq!(
+            rendered,
+            "x\ny\n\n[Showing lines 4999-5000 of 5000 (100B limit)]"
+        );
+    }
+
+    #[test]
+    fn the_two_streams_share_one_budget() {
+        let full = TruncationLimits::default();
+        let short = stream("warning");
+        let long = StreamTail {
+            text: String::new(),
+            total_bytes: 10_000_000,
+            total_lines: 100_000,
+            last_line_bytes: 0,
+        };
+        let (stdout, stderr) = split_process_limits(&long, &short);
+        assert_eq!(stdout.max_bytes, full.max_bytes - 7);
+        assert_eq!(stdout.max_lines, full.max_lines - 1);
+        assert_eq!(stderr.max_bytes, full.max_bytes / 2);
+
+        let (stdout, stderr) = split_process_limits(&short, &long);
+        assert_eq!(stdout.max_bytes, full.max_bytes / 2);
+        assert_eq!(stderr.max_bytes, full.max_bytes - 7);
+
+        let (stdout, stderr) = split_process_limits(&long, &long);
+        assert_eq!(
+            (stdout.max_bytes, stderr.max_bytes),
+            (full.max_bytes / 2, full.max_bytes / 2)
+        );
+    }
+
+    #[test]
+    fn process_output_is_rendered_from_the_stream_tails() {
+        let output = ToolOutput::Process {
+            executable: "sh".to_owned(),
+            shell: None,
+            exit_code: Some(1),
+            timed_out: false,
+            canceled: false,
+            queued: false,
+            tree_cleanup_confirmed: false,
+            tree_cleanup: "reaped_on_exit".to_owned(),
+            stdout: "HEAD ONLY".to_owned(),
+            stderr: String::new(),
+            stdout_truncated: true,
+            stderr_truncated: false,
+            artifact_id: Some("art-1".to_owned()),
+            captured_bytes: 0,
+            capture_hash: None,
+            capture_truncated: false,
+            capture_tail: String::new(),
+            stdout_tail: stream("the end"),
+            stderr_tail: stream("error: boom"),
+        };
+        let rendered = render_tool_output("run_shell", &output);
+        assert!(
+            rendered.contains("stdout:\nthe end\nstderr:\nerror: boom"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("HEAD ONLY"), "{rendered}");
+    }
+
+    #[test]
+    fn an_edit_result_carries_its_diff() {
+        let output = ToolOutput::EditFile {
+            path: "f.txt".to_owned(),
+            before_hash: ContentHash::from_bytes(b"a"),
+            after_hash: ContentHash::from_bytes(b"b"),
+            replacements: 1,
+            diff: "-1 a\n+1 b".to_owned(),
+        };
+        let rendered = render_tool_output("edit_file", &output);
+        assert!(
+            rendered.ends_with("(1 replacement(s))\n-1 a\n+1 b"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_cut_search_says_so_and_how_to_see_full_lines() {
+        let output = ToolOutput::SearchText {
+            matches: vec![SearchMatch {
+                path: "a.rs".to_owned(),
+                line: 1,
+                column: 1,
+                preview: "long... [truncated]".to_owned(),
+                context: Vec::new(),
+            }],
+            truncated: true,
+        };
+        let rendered = render_tool_output("search_text", &output);
+        assert!(
+            rendered.contains("[Results stop at 512 matches or 50.0KB."),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .ends_with("[Some lines truncated to 500 chars. Use read_file to see full lines.]"),
+            "{rendered}"
+        );
+    }
 }
 
 #[cfg(test)]

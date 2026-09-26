@@ -1,10 +1,10 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Read, Write},
     path::{Component, Path, PathBuf},
     process::Command,
-    sync::{Mutex, OnceLock},
+    sync::{Condvar, Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -16,12 +16,21 @@ use regex::RegexBuilder;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::contracts::{SearchMatch, observation};
+use crate::{
+    contracts::{SearchMatch, observation},
+    edit_diff::{PlannedEdit, plan_edit},
+    truncate::{
+        DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, TruncatedBy, TruncationLimits, format_size,
+        truncate_head, truncate_line,
+    },
+};
 
 pub(crate) const MAX_TEXT_FILE_BYTES: usize = 1024 * 1024;
+#[cfg(test)]
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_WALK_ENTRIES: usize = 4096;
-const MAX_SEARCH_MATCHES: usize = 512;
+/// Most entries one `list_files` or `search_text` result carries.
+pub(crate) const MAX_SEARCH_MATCHES: usize = 512;
 
 #[derive(Clone, Debug)]
 pub(crate) struct WorkspaceDescriptor {
@@ -566,6 +575,12 @@ pub(crate) fn validate_search(
         .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error.to_string()))
 }
 
+/// One search result line, redacted and cut by characters with prime-agent's
+/// visible marker, so the model knows to read the file for the rest of it.
+fn search_line(line: &str) -> String {
+    truncate_line(&redact_text(line), GREP_MAX_LINE_LENGTH).0
+}
+
 pub(crate) fn search_text(
     root: &Path,
     query: &str,
@@ -631,9 +646,9 @@ pub(crate) fn search_text(
                     .iter()
                     .enumerate()
                     .filter(|(offset, _)| start + *offset != line_index)
-                    .map(|(_, context_line)| truncate_text(&redact_text(context_line), 160))
+                    .map(|(_, context_line)| search_line(context_line))
                     .collect::<Vec<_>>();
-                let preview = truncate_text(&redact_text(line), 240);
+                let preview = search_line(line);
                 let relative = file.absolute.strip_prefix(root).map_err(|_| {
                     HarnessError::new(
                         ErrorCode::WorkspaceEscape,
@@ -646,7 +661,7 @@ pub(crate) fn search_text(
                     .saturating_add(preview.len())
                     .saturating_add(context_bytes)
                     .saturating_add(path.len())
-                    > MAX_OUTPUT_BYTES
+                    > DEFAULT_MAX_BYTES
                 {
                     truncated = true;
                     break;
@@ -677,37 +692,67 @@ pub(crate) fn search_text(
     })
 }
 
+/// Read a numbered line range, cut to the shared output limits.
+///
+/// A range that stops before the end of the file says so in the text, with the
+/// `offset` that continues it (prime-agent's read notice, with ha's zero-based
+/// offset), so the model pages on instead of re-reading the same slice.
 pub(crate) fn read_file_range(
     path: &Path,
     offset: u64,
     limit: u32,
 ) -> Result<TextOutput, HarnessError> {
-    use std::fmt::Write as _;
-
     let text = read_text(path)?;
     let lines = text.lines().collect::<Vec<_>>();
-    let start = usize::try_from(offset)
-        .unwrap_or(usize::MAX)
-        .min(lines.len());
+    let total = lines.len();
+    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(total);
     let count = usize::try_from(limit).unwrap_or(usize::MAX);
-    let end = start.saturating_add(count).min(lines.len());
-    let mut numbered = String::new();
-    for (index, line) in lines[start..end].iter().enumerate() {
-        if numbered.len() >= MAX_OUTPUT_BYTES {
-            return Ok(TextOutput {
-                text: numbered,
-                truncated: true,
-            });
+    let end = start.saturating_add(count).min(total);
+    let numbered = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(index, line)| format!("{}: {}", start + index + 1, redact_text(line)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let limits = TruncationLimits::default();
+    let cut = truncate_head(&numbered, limits);
+    let first = start + 1;
+    if cut.first_line_exceeds_limit {
+        // One line alone is over the limit: show its beginning rather than
+        // nothing, and say where the next line starts.
+        let line = &numbered[..numbered.find('\n').unwrap_or(numbered.len())];
+        let mut kept = limits.max_bytes;
+        while !line.is_char_boundary(kept) {
+            kept -= 1;
         }
-        let number = start.saturating_add(index).saturating_add(1);
-        let _ = write!(numbered, "{number}: {}", redact_text(line));
-        if index + start + 1 < end {
-            numbered.push('\n');
-        }
+        let limit_size = format_size(limits.max_bytes as u64);
+        return Ok(TextOutput {
+            text: format!(
+                "{}\n\n[Line {first} is {}, exceeds {limit_size} limit; showing its first {limit_size}. Use offset={first} to continue after it.]",
+                &line[..kept],
+                format_size(line.len() as u64),
+            ),
+            truncated: true,
+        });
     }
+    let shown_end = start + cut.output_lines;
+    if !cut.truncated && end == total {
+        return Ok(TextOutput {
+            text: cut.content,
+            truncated: false,
+        });
+    }
+    let limit_note = if cut.truncated_by == Some(TruncatedBy::Bytes) {
+        format!(" ({} limit)", format_size(limits.max_bytes as u64))
+    } else {
+        String::new()
+    };
     Ok(TextOutput {
-        text: truncate_text(&numbered, MAX_OUTPUT_BYTES),
-        truncated: end < lines.len() || numbered.len() > MAX_OUTPUT_BYTES,
+        text: format!(
+            "{}\n\n[Showing lines {first}-{shown_end} of {total}{limit_note}. Use offset={shown_end} to continue.]",
+            cut.content
+        ),
+        truncated: true,
     })
 }
 
@@ -719,7 +764,76 @@ pub(crate) fn apply_text_patch(
     write_text_checked(path, Some(expected_hash), replacement)
 }
 
+/// Serializes mutations of one file within this process (prime-agent's
+/// `file-mutation-queue.ts`).
+///
+/// Every write re-checks the file's hash just before it replaces it, but two
+/// writers inside this process — parallel delegated workers, say — can still
+/// both pass that check before either renames. Holding this lock across the
+/// read, the check and the replacement closes that window for writers here;
+/// the hash check still catches every writer outside the process. Different
+/// files never wait for each other.
+pub(crate) struct FileMutationGuard {
+    key: PathBuf,
+}
+
+fn busy_files() -> &'static (Mutex<HashSet<PathBuf>>, Condvar) {
+    static BUSY: OnceLock<(Mutex<HashSet<PathBuf>>, Condvar)> = OnceLock::new();
+    BUSY.get_or_init(|| (Mutex::new(HashSet::new()), Condvar::new()))
+}
+
+/// The key two spellings of one file share: its real path, or its parent's
+/// real path and its name when it does not exist yet.
+fn mutation_key(path: &Path) -> PathBuf {
+    if let Ok(real) = fs::canonicalize(path) {
+        return real;
+    }
+    match (path.parent().map(fs::canonicalize), path.file_name()) {
+        (Some(Ok(parent)), Some(name)) => parent.join(name),
+        _ => path.to_owned(),
+    }
+}
+
+/// Wait until no other mutation of `path` runs in this process, then hold it.
+pub(crate) fn lock_file_mutation(path: &Path) -> FileMutationGuard {
+    let key = mutation_key(path);
+    let (busy, released) = busy_files();
+    // A poisoned set only means another writer panicked; the set itself is
+    // still a set of paths, so keep using it.
+    let mut held = busy
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while held.contains(&key) {
+        held = released
+            .wait(held)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    held.insert(key.clone());
+    FileMutationGuard { key }
+}
+
+impl Drop for FileMutationGuard {
+    fn drop(&mut self) {
+        let (busy, released) = busy_files();
+        busy.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+        released.notify_all();
+    }
+}
+
 pub(crate) fn write_text_checked(
+    path: &Path,
+    expected_hash: Option<&ContentHash>,
+    replacement: &str,
+) -> Result<WorkspaceMutation, HarnessError> {
+    let _guard = lock_file_mutation(path);
+    write_text_checked_locked(path, expected_hash, replacement)
+}
+
+/// [`write_text_checked`] for a caller that already holds the file's
+/// mutation lock.
+fn write_text_checked_locked(
     path: &Path,
     expected_hash: Option<&ContentHash>,
     replacement: &str,
@@ -785,52 +899,39 @@ pub(crate) fn write_text_checked(
     })
 }
 
+/// Apply one `edit_file` replacement and return the mutation with the diff of
+/// the edit.
+///
+/// The file is read, matched and replaced under its mutation lock, so a
+/// second edit of the same file in this process applies to the result of the
+/// first instead of failing its hash check.
 pub(crate) fn edit_text(
     path: &Path,
+    display_path: &str,
     old_string: &str,
     new_string: &str,
     replace_all: bool,
-) -> Result<WorkspaceMutation, HarnessError> {
+) -> Result<(WorkspaceMutation, String), HarnessError> {
+    let _guard = lock_file_mutation(path);
     let current = read_text(path)?;
-    let (replacement, replacements) =
-        plan_edit_text(&current, old_string, new_string, replace_all)?;
+    let planned = plan_edit_text(&current, old_string, new_string, replace_all, display_path)?;
     let expected = ContentHash::from_bytes(current.as_bytes());
-    let mut mutation = write_text_checked(path, Some(&expected), &replacement)?;
-    mutation.replacements = replacements;
-    Ok(mutation)
+    let mut mutation = write_text_checked_locked(path, Some(&expected), &planned.content)?;
+    mutation.replacements = planned.replacements;
+    Ok((mutation, planned.diff))
 }
 
+/// Plan an `edit_file` replacement of `current` without writing it: exact
+/// match first, then prime-agent's normalized match (see [`crate::edit_diff`]).
+/// `display_path` only names the file in an error.
 pub(crate) fn plan_edit_text(
     current: &str,
     old_string: &str,
     new_string: &str,
     replace_all: bool,
-) -> Result<(String, u64), HarnessError> {
-    if old_string.is_empty() {
-        return Err(HarnessError::new(
-            ErrorCode::InvalidPayload,
-            "edit_file old_string must not be empty",
-        ));
-    }
-    let count = current.matches(old_string).count();
-    if count == 0 {
-        return Err(HarnessError::new(
-            ErrorCode::EditNotFound,
-            "edit_file old_string was not found",
-        ));
-    }
-    if !replace_all && count != 1 {
-        return Err(HarnessError::new(
-            ErrorCode::EditAmbiguous,
-            format!("edit_file old_string matched {count} times"),
-        ));
-    }
-    let replacement = if replace_all {
-        current.replace(old_string, new_string)
-    } else {
-        current.replacen(old_string, new_string, 1)
-    };
-    Ok((replacement, u64::try_from(count).unwrap_or(u64::MAX)))
+    display_path: &str,
+) -> Result<PlannedEdit, HarnessError> {
+    plan_edit(current, old_string, new_string, replace_all, display_path)
 }
 
 pub(crate) fn redact_text(text: &str) -> String {
@@ -1381,17 +1482,6 @@ fn relative_text(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn truncate_text(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_owned();
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end = end.saturating_sub(1);
-    }
-    format!("{}…", &value[..end])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1421,6 +1511,115 @@ mod tests {
         let outside = std::env::temp_dir().join("elsewhere.md");
         assert!(resolve_relative(&root, outside.to_str().expect("utf-8"), false).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn scratch_file(content: &str) -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        let path = directory.path().join("f.txt");
+        fs::write(&path, content).expect("scratch file");
+        (directory, path)
+    }
+
+    #[test]
+    fn a_read_that_stops_before_the_end_says_how_to_continue() {
+        let (_directory, path) = scratch_file("a\nb\nc\nd\n");
+        let partial = read_file_range(&path, 1, 2).expect("range");
+        assert!(partial.truncated);
+        assert_eq!(
+            partial.text,
+            "2: b\n3: c\n\n[Showing lines 2-3 of 4. Use offset=3 to continue.]"
+        );
+
+        let whole = read_file_range(&path, 0, 10).expect("whole");
+        assert!(!whole.truncated);
+        assert_eq!(whole.text, "1: a\n2: b\n3: c\n4: d");
+    }
+
+    #[test]
+    fn a_read_over_the_byte_limit_names_the_limit_and_the_next_offset() {
+        let line = "x".repeat(1000);
+        let (_directory, path) = scratch_file(&format!("{line}\n").repeat(100));
+        let output = read_file_range(&path, 0, 100).expect("range");
+        assert!(output.truncated);
+        // 50 numbered lines of 1003-1005 bytes fit in 50 KiB; the 51st does not.
+        assert!(
+            output.text.ends_with(
+                "[Showing lines 1-50 of 100 (50.0KB limit). Use offset=50 to continue.]"
+            ),
+            "{}",
+            &output.text[output.text.len() - 120..]
+        );
+    }
+
+    #[test]
+    fn a_single_line_over_the_byte_limit_shows_its_beginning() {
+        let (_directory, path) = scratch_file(&format!("{}\nnext\n", "y".repeat(60 * 1024)));
+        let output = read_file_range(&path, 0, 2).expect("range");
+        assert!(output.truncated);
+        assert!(output.text.starts_with("1: yyy"));
+        assert!(
+            output.text.ends_with(
+                "[Line 1 is 60.0KB, exceeds 50.0KB limit; showing its first 50.0KB. Use offset=1 to continue after it.]"
+            ),
+            "{}",
+            &output.text[output.text.len() - 150..]
+        );
+    }
+
+    #[test]
+    fn a_long_search_match_is_cut_with_a_visible_marker() {
+        let directory = tempfile::tempdir().expect("scratch directory");
+        fs::write(
+            directory.path().join("long.txt"),
+            format!("needle {}\n", "z".repeat(900)),
+        )
+        .expect("file");
+        let root = fs::canonicalize(directory.path()).expect("root");
+        let output = search_text(&root, "needle", None, false, false, None, 0).expect("search");
+        assert_eq!(output.matches.len(), 1);
+        let preview = &output.matches[0].preview;
+        assert!(preview.ends_with("... [truncated]"), "{preview}");
+        assert_eq!(preview.chars().count(), GREP_MAX_LINE_LENGTH + 15);
+    }
+
+    #[test]
+    fn edits_of_a_crlf_file_keep_its_line_endings_and_return_the_diff() {
+        let (_directory, path) = scratch_file("one\r\ntwo\r\n");
+        let (mutation, diff) = edit_text(&path, "f.txt", "two\n", "2\n", false).expect("edit");
+        assert_eq!(mutation.replacements, 1);
+        assert_eq!(fs::read_to_string(&path).expect("read"), "one\r\n2\r\n");
+        assert_eq!(diff, [" 1 one", "-2 two", "+2 2"].join("\n"));
+    }
+
+    /// Two writers in this process editing one file both land: the second
+    /// waits for the first and applies to its result instead of failing the
+    /// hash check it would otherwise race.
+    #[test]
+    fn concurrent_edits_of_one_file_are_serialized() {
+        let numbered = |prefix: &str| {
+            (0..16).fold(String::new(), |mut text, n| {
+                use std::fmt::Write as _;
+                let _ = writeln!(text, "{prefix} {n}");
+                text
+            })
+        };
+        let (_directory, path) = scratch_file(&numbered("line"));
+        std::thread::scope(|scope| {
+            for n in 0..16 {
+                let path = &path;
+                scope.spawn(move || {
+                    edit_text(
+                        path,
+                        "f.txt",
+                        &format!("line {n}\n"),
+                        &format!("edited {n}\n"),
+                        false,
+                    )
+                    .expect("every edit lands");
+                });
+            }
+        });
+        assert_eq!(fs::read_to_string(&path).expect("read"), numbered("edited"));
     }
 
     #[test]

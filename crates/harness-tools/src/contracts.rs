@@ -7,6 +7,8 @@ use harness_types::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::capture::StreamTail;
+
 /// The independently versioned P3 tool contract.
 pub const TOOL_CONTRACT_VERSION: u16 = 1;
 
@@ -1496,6 +1498,9 @@ pub enum ToolOutput {
         before_hash: ContentHash,
         after_hash: ContentHash,
         replacements: u64,
+        /// Numbered diff of the edit (prime-agent's edit diff), redacted. When
+        /// the match was normalized it is the diff in normalized space.
+        diff: String,
     },
     Process {
         executable: String,
@@ -1530,6 +1535,10 @@ pub enum ToolOutput {
         capture_truncated: bool,
         /// Tail preview of the capture, so a long log still shows how it ended.
         capture_tail: String,
+        /// The redacted end of each stream with its totals: what the model
+        /// is shown, cut to the tool-output limits when it is rendered.
+        stdout_tail: StreamTail,
+        stderr_tail: StreamTail,
     },
     /// One page of a captured process output.
     ProcessOutput {

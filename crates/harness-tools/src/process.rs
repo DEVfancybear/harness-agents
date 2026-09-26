@@ -22,7 +22,7 @@ use tokio::{
 use crate::{
     capture::{
         FinalizedCapture, ProcessSpoolConfig, Redactor, SpoolLimits, SpoolWriter, SpooledStream,
-        finalize_capture,
+        StreamTail, finalize_capture,
     },
     secrets::ProcessEnvironment,
 };
@@ -197,6 +197,9 @@ pub(crate) struct ProcessResult {
     pub stderr: String,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// The end of each stream, which is what the model reads of a command.
+    pub stdout_tail: StreamTail,
+    pub stderr_tail: StreamTail,
     /// The spooled capture, when the call actually ran a process. It is the
     /// durable copy of everything the process wrote, bounded by the quota.
     pub capture: Option<FinalizedCapture>,
@@ -659,6 +662,8 @@ async fn run(
         stderr: capture.stderr_head.clone(),
         stdout_truncated: capture.stdout_preview_truncated,
         stderr_truncated: capture.stderr_preview_truncated,
+        stdout_tail: capture.stdout_tail.clone(),
+        stderr_tail: capture.stderr_tail.clone(),
         capture: Some(capture),
     })
 }
@@ -681,6 +686,8 @@ fn canceled_before_spawn(executable: &str, queued: bool) -> ProcessResult {
         stderr: String::new(),
         stdout_truncated: false,
         stderr_truncated: false,
+        stdout_tail: StreamTail::default(),
+        stderr_tail: StreamTail::default(),
         capture: None,
     }
 }

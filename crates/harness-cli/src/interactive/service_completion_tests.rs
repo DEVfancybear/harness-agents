@@ -28,6 +28,8 @@ fn g06_shell_prefix_marks_process_capture_truncation() {
         capture_hash: None,
         capture_truncated: true,
         capture_tail: "tail output".to_owned(),
+        stdout_tail: harness_tools::StreamTail::default(),
+        stderr_tail: harness_tools::StreamTail::default(),
     };
 
     let (rendered, successful) = super::shell_output(&output);

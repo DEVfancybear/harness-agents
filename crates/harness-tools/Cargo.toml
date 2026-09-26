@@ -23,6 +23,7 @@ similar.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 # Already in Cargo.lock; the M12 probe unit tests need a disposable root.
