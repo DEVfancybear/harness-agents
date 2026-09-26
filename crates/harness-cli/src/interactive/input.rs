@@ -1170,6 +1170,28 @@ mod tests {
 
     /// Accepting puts the highlighted command in the buffer, as prime-agent does: a
     /// command that takes an argument gains a space and opens its argument menu.
+    /// Choosing an argument that needs more input types it and waits: `/mcp add`
+    /// alone names no server, so accepting `add` must not submit it. An argument
+    /// that is complete on its own still completes without a trailing space.
+    #[test]
+    fn an_argument_that_needs_more_input_is_typed_not_submitted() {
+        let mut editor = LineEditor::new();
+        type_text(&mut editor, "/mcp");
+        assert!(editor.accept_suggestion());
+        assert_eq!(editor.buffer(), "/mcp ");
+        assert!(
+            editor.suggestions()[0].label.starts_with("add <name>"),
+            "the menu shows what add takes"
+        );
+        assert!(editor.accept_suggestion());
+        assert_eq!(editor.buffer(), "/mcp add ", "the name comes next");
+
+        let mut list = LineEditor::new();
+        type_text(&mut list, "/mcp li");
+        assert!(list.accept_suggestion());
+        assert_eq!(list.buffer(), "/mcp list");
+    }
+
     #[test]
     fn slash_accepting_the_highlight_opens_the_argument_menu() {
         let mut editor = LineEditor::new();

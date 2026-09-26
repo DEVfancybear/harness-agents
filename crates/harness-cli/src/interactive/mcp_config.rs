@@ -141,6 +141,7 @@ pub fn run(
                 changed: true,
             })
         }
+        Some("add") if args.len() == 1 => Err(USAGE.join("\n")),
         Some("add") => {
             let (name, config, force) = parse_add(&args[1..])?;
             let mut managed = managed;
@@ -477,7 +478,8 @@ mod tests {
         let user = temporary.path().join("config.toml");
         let none = BTreeMap::new();
         for (line, reason) in [
-            ("add", "names must"),
+            ("add", "/mcp add <name>"),
+            ("add -bad -- cmd", "names must"),
             ("add x", "--url"),
             ("add x --url https://a.example -- cmd", "cannot use HTTP"),
             ("add x --env NOEQUALS -- cmd", "KEY=VALUE"),

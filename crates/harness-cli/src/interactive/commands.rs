@@ -19,7 +19,10 @@ pub struct SlashCommand {
     pub arguments: &'static str,
     /// One line, short enough for one menu row.
     pub summary: &'static str,
-    /// Values the argument menu offers, when they are fixed.
+    /// Values the argument menu offers, when they are fixed. A value may carry
+    /// its own placeholder after its first word (`add <name> -- <command>`): the
+    /// menu shows it whole, and choosing it types the first word and a space so
+    /// the rest can be entered, instead of running the command without it.
     pub options: &'static [&'static str],
 }
 
@@ -93,7 +96,12 @@ pub const SLASH_COMMANDS: [SlashCommand; 34] = [
     command("/login", "[provider]", "Configure provider authentication"),
     command("/logout", "[provider]", "Remove provider authentication"),
     SlashCommand {
-        options: &["add", "list", "get", "remove"],
+        options: &[
+            "add <name> -- <command> [args...] | --url <url>",
+            "list",
+            "get <name>",
+            "remove <name>",
+        ],
         ..command(
             "/mcp",
             "[add|list|get|remove]",
@@ -353,19 +361,35 @@ fn suggest_arguments(name: &str, argument: &str, dynamic: &ArgumentOptions) -> V
             .map(|option| ((*option).to_owned(), String::new()))
             .collect(),
     };
-    if options.iter().any(|(value, _)| value == argument) {
+    // An option that names more input after its first word completes to that
+    // word and a space: the argument is not finished, so accepting it must not
+    // submit (`/mcp add` alone has no server to add).
+    let word = |value: &str| {
+        value
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    if options.iter().any(|(value, _)| word(value) == argument) {
         return Vec::new();
     }
     let scored = options
         .into_iter()
         .enumerate()
         .filter_map(|(order, (value, description))| {
-            let score = fuzzy_score(argument, &value)?;
+            let head = word(&value);
+            let score = fuzzy_score(argument, &head)?;
+            let takes_more = value.trim() != head;
             Some((
                 score,
                 order,
                 MenuItem {
-                    completion: format!("{name} {value}"),
+                    completion: if takes_more {
+                        format!("{name} {head} ")
+                    } else {
+                        format!("{name} {head}")
+                    },
                     label: value,
                     description,
                     tag: None,
