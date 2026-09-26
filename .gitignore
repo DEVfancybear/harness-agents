@@ -5,3 +5,7 @@
 /.harness/*.db
 /.harness/*.db-shm
 /.harness/*.db-wal
+
+# Python bytecode (e.g. from running a bundled skill script)
+__pycache__/
+*.pyc

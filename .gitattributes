@@ -1,3 +1,8 @@
 # Generated JSON Schemas are byte-stable UTF-8/LF artifacts. Keep their line
 # endings independent of a Windows checkout's core.autocrlf setting.
 schemas/*.json text eol=lf
+
+# Archives bundled with skills are bytes, never text to normalize.
+*.tar.gz binary
+*.tgz binary
+*.zip binary
