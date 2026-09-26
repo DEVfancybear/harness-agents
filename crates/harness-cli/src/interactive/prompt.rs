@@ -126,9 +126,9 @@ impl SystemPromptBuilder {
         ));
         parts.push(format!(
             "Turn limits: max_steps={}; max_tool_calls={}; deadline_seconds={}",
-            environment.limits.max_steps,
-            environment.limits.max_tool_calls,
-            environment.limits.deadline.as_secs(),
+            super::bounds::bound_label(u64::from(environment.limits.max_steps)),
+            super::bounds::bound_label(u64::from(environment.limits.max_tool_calls)),
+            super::bounds::bound_label(environment.limits.deadline.as_secs()),
         ));
         if has("ipython") && has("delegate") {
             parts.push(String::new());

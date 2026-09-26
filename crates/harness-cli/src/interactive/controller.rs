@@ -408,6 +408,7 @@ impl InteractiveController {
             tick: self.tick,
             detail: self.detail,
             thinking: self.thinking_label.clone(),
+            goal: self.goal.as_ref().and_then(GoalState::tray_label),
         }
     }
 
@@ -6613,8 +6614,8 @@ mod tests {
             .iter()
             .find(|line| line.starts_with("Bounds:"))
             .unwrap_or_else(|| panic!("no bounds line in {plain:#?}"));
-        assert!(line.contains("8 steps"), "{line}");
-        assert!(line.contains("16 tool calls"), "{line}");
+        assert!(line.contains("steps 8"), "{line}");
+        assert!(line.contains("tool calls 16"), "{line}");
         assert!(
             line.contains(&format!("{DEFAULT_CONTINUATIONS} automatic continuation")),
             "{line}"

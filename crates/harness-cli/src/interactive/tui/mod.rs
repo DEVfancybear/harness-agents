@@ -711,6 +711,7 @@ mod tests {
             tick: 0,
             detail: crate::interactive::events::Detail::default(),
             thinking: None,
+            goal: None,
         }
     }
 

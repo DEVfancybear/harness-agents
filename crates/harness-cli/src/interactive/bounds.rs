@@ -1,17 +1,20 @@
 //! How long one turn may run, and what happens when a bound stops it.
 //!
-//! The bounds are a safety net, not the task's budget. They exist so a loop that has
-//! gone wrong cannot spend a context window unattended — which is why a run that hits
-//! one *pauses* instead of failing, and why the app continues it by itself while the
-//! stop was only a count of work.
+//! By default a turn has no bound, as prime-agent's agent loop has none: it runs
+//! until the model stops asking for tools, the user interrupts it, or the context
+//! and the provider's tokens run out - and a context about to overflow is compacted
+//! and the turn goes on. A count of steps stopped real work mid-task ("step limit
+//! reached · 30 steps") for no reason the user had.
 //!
-//! Four variables move them, all optional:
+//! An operator who wants a safety net sets one; a run that hits it *pauses* instead
+//! of failing, and the app continues it by itself while the stop was only a count of
+//! work. Four variables, all optional:
 //!
 //! | Variable | Default | What it bounds |
 //! | --- | --- | --- |
-//! | `HA_TURN_MAX_STEPS` | 30 | Model calls in one turn. |
-//! | `HA_TURN_MAX_TOOL_CALLS` | 80 | Tool calls in one turn. |
-//! | `HA_TURN_DEADLINE_SECONDS` | 900 | Wall-clock seconds in one turn. |
+//! | `HA_TURN_MAX_STEPS` | none | Model calls in one turn. |
+//! | `HA_TURN_MAX_TOOL_CALLS` | none | Tool calls in one turn. |
+//! | `HA_TURN_DEADLINE_SECONDS` | none | Wall-clock seconds in one turn. |
 //! | `HA_TURN_CONTINUATIONS` | 2 | Turns the app may continue on its own after a step or tool-call bound. |
 //!
 //! The app's defaults are its own, not the driver's. The driver keeps 8 steps and 16
@@ -43,14 +46,27 @@ pub const DEADLINE_VARIABLE: &str = "HA_TURN_DEADLINE_SECONDS";
 /// Turns the app may continue by itself after a step or tool-call bound.
 pub const CONTINUATIONS_VARIABLE: &str = "HA_TURN_CONTINUATIONS";
 
-/// Model calls one turn of the app may make before it pauses.
-pub const DEFAULT_MAX_STEPS: u32 = 30;
+/// A bound that is not set: the count can never reach it.
+pub const UNLIMITED: u32 = u32::MAX;
 
-/// Tool calls one turn of the app may make before it pauses.
-pub const DEFAULT_MAX_TOOL_CALLS: u32 = 80;
+/// Model calls one turn of the app may make before it pauses: no bound.
+pub const DEFAULT_MAX_STEPS: u32 = UNLIMITED;
 
-/// Wall-clock seconds one turn of the app may take before it pauses.
-pub const DEFAULT_DEADLINE_SECONDS: u32 = 900;
+/// Tool calls one turn of the app may make before it pauses: no bound.
+pub const DEFAULT_MAX_TOOL_CALLS: u32 = UNLIMITED;
+
+/// Wall-clock seconds one turn of the app may take before it pauses: no bound.
+pub const DEFAULT_DEADLINE_SECONDS: u32 = UNLIMITED;
+
+/// A bound as a reader wants it: the number, or "no limit".
+#[must_use]
+pub fn bound_label(value: u64) -> String {
+    if value >= u64::from(UNLIMITED) {
+        "no limit".to_owned()
+    } else {
+        value.to_string()
+    }
+}
 
 /// How many times one request is continued automatically.
 ///
@@ -126,10 +142,10 @@ pub fn describe(limits: &TurnLimits, continuations: u32) -> String {
         format!("up to {continuations} automatic continuation(s)")
     };
     format!(
-        "Bounds:  {} steps, {} tool calls, {} s per turn; {continuation}",
-        limits.max_steps,
-        limits.max_tool_calls,
-        limits.deadline.as_secs(),
+        "Bounds:  steps {}, tool calls {}, seconds per turn {}; {continuation}",
+        bound_label(u64::from(limits.max_steps)),
+        bound_label(u64::from(limits.max_tool_calls)),
+        bound_label(limits.deadline.as_secs()),
     )
 }
 
@@ -137,7 +153,8 @@ pub fn describe(limits: &TurnLimits, continuations: u32) -> String {
 mod tests {
     use super::{
         CONTINUATIONS_VARIABLE, DEADLINE_VARIABLE, DEFAULT_CONTINUATIONS, MAX_STEPS_VARIABLE,
-        MAX_TOOL_CALLS_VARIABLE, continuations_from_environment, describe, limits_from_environment,
+        MAX_TOOL_CALLS_VARIABLE, UNLIMITED, continuations_from_environment, describe,
+        limits_from_environment,
     };
     use crate::interactive::paths::LaunchEnvironment;
 
@@ -145,12 +162,14 @@ mod tests {
         LaunchEnvironment::from_pairs(pairs.iter().map(|(name, value)| (*name, *value)))
     }
 
+    /// As in prime-agent, a turn has no bound unless one is set: it ends when the
+    /// model is done, the user stops it, or the tokens run out.
     #[test]
     fn the_defaults_are_the_documented_ones() {
         let limits = limits_from_environment(&environment(&[]));
-        assert_eq!(limits.max_steps, 30);
-        assert_eq!(limits.max_tool_calls, 80);
-        assert_eq!(limits.deadline.as_secs(), 900);
+        assert_eq!(limits.max_steps, UNLIMITED);
+        assert_eq!(limits.max_tool_calls, UNLIMITED);
+        assert_eq!(limits.deadline.as_secs(), u64::from(UNLIMITED));
         assert_eq!(
             continuations_from_environment(&environment(&[])),
             DEFAULT_CONTINUATIONS
@@ -182,11 +201,14 @@ mod tests {
                 (MAX_TOOL_CALLS_VARIABLE, value),
                 (DEADLINE_VARIABLE, value),
             ]));
-            assert_eq!(limits.max_steps, 30, "HA_TURN_MAX_STEPS={value}");
-            assert_eq!(limits.max_tool_calls, 80, "HA_TURN_MAX_TOOL_CALLS={value}");
+            assert_eq!(limits.max_steps, UNLIMITED, "HA_TURN_MAX_STEPS={value}");
+            assert_eq!(
+                limits.max_tool_calls, UNLIMITED,
+                "HA_TURN_MAX_TOOL_CALLS={value}"
+            );
             assert_eq!(
                 limits.deadline.as_secs(),
-                900,
+                u64::from(UNLIMITED),
                 "{DEADLINE_VARIABLE}={value}"
             );
         }
@@ -215,11 +237,19 @@ mod tests {
 
     #[test]
     fn the_status_line_names_every_bound() {
-        let limits = limits_from_environment(&environment(&[]));
-        let line = describe(&limits, 2);
-        assert!(line.contains("30 steps"), "{line}");
-        assert!(line.contains("80 tool calls"), "{line}");
-        assert!(line.contains("900 s"), "{line}");
+        let line = describe(&limits_from_environment(&environment(&[])), 2);
+        assert!(line.contains("steps no limit"), "{line}");
+        assert!(line.contains("tool calls no limit"), "{line}");
+        assert!(line.contains("seconds per turn no limit"), "{line}");
         assert!(line.contains("2 automatic continuation"), "{line}");
+        let set = limits_from_environment(&environment(&[
+            (MAX_STEPS_VARIABLE, "30"),
+            (MAX_TOOL_CALLS_VARIABLE, "80"),
+            (DEADLINE_VARIABLE, "900"),
+        ]));
+        let line = describe(&set, 2);
+        assert!(line.contains("steps 30"), "{line}");
+        assert!(line.contains("tool calls 80"), "{line}");
+        assert!(line.contains("seconds per turn 900"), "{line}");
     }
 }

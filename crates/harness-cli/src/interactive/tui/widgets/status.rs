@@ -153,11 +153,19 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
                 push(Span::styled(" · queued (1)", theme.accent));
             }
             push(Span::styled(
-                format!(" · step {}/{}", state.steps, state.max_steps),
+                if state.max_steps == crate::interactive::bounds::UNLIMITED {
+                    format!(" · step {}", state.steps)
+                } else {
+                    format!(" · step {}/{}", state.steps, state.max_steps)
+                },
                 theme.dim,
             ));
             push(Span::styled(
-                format!(" · tools {}/{}", state.tool_calls, state.max_tool_calls),
+                if state.max_tool_calls == crate::interactive::bounds::UNLIMITED {
+                    format!(" · tools {}", state.tool_calls)
+                } else {
+                    format!(" · tools {}/{}", state.tool_calls, state.max_tool_calls)
+                },
                 theme.dim,
             ));
             if let Some(cost) = cost_label(state) {
@@ -172,6 +180,9 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
             }
             if let Some(level) = &state.thinking {
                 push(Span::styled(format!(" · thinking {level}"), theme.dim));
+            }
+            if let Some(goal) = &state.goal {
+                push(Span::styled(format!(" · {goal}"), theme.accent));
             }
         }
         (None, AppPhase::SetupRequired) => {
@@ -190,6 +201,9 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
             }
             if let Some(level) = &state.thinking {
                 push(Span::styled(format!(" · thinking {level}"), theme.dim));
+            }
+            if let Some(goal) = &state.goal {
+                push(Span::styled(format!(" · {goal}"), theme.accent));
             }
             if let Some(cost) = cost_label(state) {
                 let label = format!(" · {cost}");
@@ -294,6 +308,7 @@ mod tests {
             tick: 0,
             detail: crate::interactive::events::Detail::default(),
             thinking: None,
+            goal: None,
         }
     }
 

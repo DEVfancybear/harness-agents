@@ -429,6 +429,8 @@ pub struct UiState {
     pub detail: Detail,
     /// The thinking level the next turn uses, when the service knows it.
     pub thinking: Option<String>,
+    /// The goal being pursued, as the status line names it.
+    pub goal: Option<String>,
 }
 
 /// prime-agent's detail modes, cycled with ctrl+o: collapsed hides reasoning and

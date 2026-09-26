@@ -231,9 +231,24 @@ pub struct GoalState {
     pub max_continuations: u32,
     /// What `goal_complete` said, once it was called.
     pub summary: Option<String>,
+    /// When it was set, for the time the status line shows it has been pursued.
+    pub started: std::time::Instant,
 }
 
 impl GoalState {
+    /// prime-agent's tray label for a goal that is still being worked on:
+    /// "Pursuing goal (1m 05s)" while active, "Goal paused" when paused. A
+    /// finished goal has no label.
+    #[must_use]
+    pub fn tray_label(&self) -> Option<String> {
+        let elapsed = super::view::clock_label(self.started.elapsed());
+        match self.status {
+            GoalStatus::Active => Some(format!("Pursuing goal ({elapsed})")),
+            GoalStatus::Paused => Some("Goal paused (/goal resume)".to_owned()),
+            GoalStatus::Complete => None,
+        }
+    }
+
     #[must_use]
     pub fn new(objective: impl Into<String>) -> Self {
         Self {
@@ -242,6 +257,7 @@ impl GoalState {
             continuations: 0,
             max_continuations: DEFAULT_GOAL_CONTINUATIONS,
             summary: None,
+            started: std::time::Instant::now(),
         }
     }
 
