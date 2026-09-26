@@ -1,2 +1,8 @@
 # Keep imported skill files, including executable scripts, on LF across checkouts.
 skills/** text eol=lf
+# Archives and bytecode inside a skill are bytes; normalizing their line endings
+# would corrupt them.
+skills/**/*.tar.gz binary
+skills/**/*.tgz binary
+skills/**/*.zip binary
+skills/**/*.pyc binary
