@@ -4165,6 +4165,9 @@ async fn run_turn(
         *guard = Some(session_id.clone());
     }
     drop(runtime);
+    if let Some(repl) = &repl {
+        repl.release_host();
+    }
     if let Ok(store) = Arc::try_unwrap(store) {
         let _ = store.close().await;
     }

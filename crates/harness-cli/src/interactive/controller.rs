@@ -467,7 +467,9 @@ impl InteractiveController {
         if let Some(hint) = &self.setup_hint {
             lines.push(hint.clone());
         }
-        lines.push("Nhập yêu cầu. / lệnh · /login đăng nhập · /quit thoát".to_owned());
+        lines.push(
+            "Nhập yêu cầu. / lệnh · Alt+V dán ảnh/file · /login đăng nhập · /quit thoát".to_owned(),
+        );
         lines
     }
 

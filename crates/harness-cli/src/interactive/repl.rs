@@ -834,6 +834,21 @@ impl ReplShared {
         });
     }
 
+    /// A turn's handlers hold that turn's store. The kernel outlives the turn, so
+    /// the turn takes them back when it ends: otherwise the store never closes and
+    /// the next turn finds the project locked (`writer_locked`). A request a task
+    /// makes between turns is answered as having no host, until the next cell.
+    pub fn release_host(&self) {
+        let link = self
+            .link
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(link) = link {
+            link.state().host = None;
+        }
+    }
+
     /// Dispose the kernel as prime-agent's session teardown does: a cell still
     /// running is interrupted, the namespace gets its final snapshot, host requests in
     /// flight get a moment, and the kernel is asked to shut down before it is
@@ -2990,6 +3005,27 @@ mod tests {
             runtime.done(&shutdown).await;
         };
         tokio::join!(kernel.shutdown(true), script);
+    }
+
+    /// The kernel outlives a turn; the turn's handlers - which hold its store -
+    /// must not, or the next turn cannot open the project (`writer_locked`).
+    #[tokio::test]
+    async fn a_finished_turn_takes_its_handlers_back_from_the_kernel() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let shared = ReplShared::new(directory.path(), directory.path(), None, None);
+        let (kernel, _runtime) = fake_kernel(None);
+        let host = Arc::new(GatedHost::default());
+        kernel
+            .link
+            .set_host(Arc::clone(&host) as Arc<dyn HostRequests>);
+        shared.set_link(Some(Arc::clone(&kernel.link)));
+        assert_eq!(
+            Arc::strong_count(&host),
+            2,
+            "the kernel holds the turn's handlers"
+        );
+        shared.release_host();
+        assert_eq!(Arc::strong_count(&host), 1, "the turn got them back");
     }
 
     #[tokio::test]
