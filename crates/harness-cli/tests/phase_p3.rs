@@ -1682,3 +1682,38 @@ async fn p3_s07_cli_fixture_runs_p2_response_through_p3_tools_and_recovers_after
     let replay_json: Value = serde_json::from_slice(&replay.stdout).expect("replay JSON");
     assert_eq!(replay_json["dispatch_count"], 0);
 }
+
+/// A folder that becomes a repository after the first turn (`git init`, as an
+/// agent may run) is still the same project: its registration follows the new
+/// Git state instead of every later tool call failing with an identity conflict.
+#[tokio::test]
+async fn a_root_that_becomes_a_repository_keeps_its_project() {
+    let temp = TempDir::new().expect("temporary store");
+    let root = temp.path().join("plain-folder");
+    fs::create_dir_all(root.join("src")).expect("fixture source directory");
+    fs::write(root.join("src").join("parser.txt"), "BUG parser\r\n").expect("fixture file");
+    let store = writer(&temp).await;
+    let (session_id, task_id, _) = admit(&store, &root).await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let read = || CodingToolAction::ReadFile {
+        path: "src/parser.txt".to_owned(),
+        offset: None,
+        limit: None,
+    };
+    let (prepared, approval) =
+        prepared_and_approved(&tools, &session_id, &task_id, &root, read()).await;
+    tools
+        .execute(prepared, Some(approval))
+        .await
+        .expect("the plain folder registers");
+
+    git(&root, &["init"]);
+    let (prepared, approval) =
+        prepared_and_approved(&tools, &session_id, &task_id, &root, read()).await;
+    tools
+        .execute(prepared, Some(approval))
+        .await
+        .expect("the same root, now a repository, is the same project");
+    drop(tools);
+    close_writer(store).await;
+}

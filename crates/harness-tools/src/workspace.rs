@@ -202,7 +202,13 @@ fn cached_git_common_dir(root: &Path) -> Option<String> {
     }
     let value = git_output(root, ["rev-parse", "--git-common-dir"])
         .and_then(|value| canonicalize_git_path(root, &value));
-    if let Ok(mut map) = cache.lock() {
+    // No answer for a root that has a `.git` entry is a `git` that failed this
+    // once (a timeout, a lock), not a root outside a repository: it is asked
+    // again next time instead of being remembered for the whole session, where it
+    // would change the project's identity until the app restarts.
+    if (value.is_some() || !key.1)
+        && let Ok(mut map) = cache.lock()
+    {
         map.insert(key, value.clone());
     }
     value

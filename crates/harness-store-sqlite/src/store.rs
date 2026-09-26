@@ -3962,15 +3962,43 @@ async fn insert_project_registration(
             )
         })?;
         let identity_hash: String = row_get(&row, "identity_hash")?;
-        if project == record.project_id.as_str()
-            && git_common_dir == record.git_common_dir
-            && identity_hash == record.identity_hash.as_str()
-        {
+        if project == record.project_id.as_str() {
+            if git_common_dir == record.git_common_dir
+                && identity_hash == record.identity_hash.as_str()
+            {
+                return Ok(());
+            }
+            // The same root, claimed by the project already bound to it, whose Git
+            // state changed: a repository was created in it (`git init` after the
+            // first turn), removed, or its Git directory moved. The root is what
+            // the project is, so its registration follows; refusing left every
+            // later tool call of that project failing with this conflict.
+            sqlx::query(
+                "UPDATE project_registrations SET git_common_dir = ?, identity_hash = ?
+                 WHERE project_id = ? AND canonical_root = ?",
+            )
+            .bind(record.git_common_dir.as_deref())
+            .bind(record.identity_hash.as_str())
+            .bind(record.project_id.as_str())
+            .bind(&record.canonical_root)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::StorageWriteFailed,
+                    "update project registration",
+                    error,
+                )
+            })?;
             return Ok(());
         }
         return Err(StoreError::new(
             ErrorCode::ProjectIdentityConflict,
-            "canonical workspace root is already bound to a different project identity",
+            format!(
+                "canonical workspace root {} is already bound to project {project}, not {}",
+                record.canonical_root,
+                record.project_id.as_str()
+            ),
         ));
     }
     let prior =
