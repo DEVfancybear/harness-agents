@@ -23,7 +23,9 @@ use crate::{
     ApprovalGrant, CaptureStream, CodingToolAction, Decision, GIT_LOG_DEFAULT_LIMIT,
     HISTORY_READ_MAX_BYTES, HISTORY_SEARCH_DEFAULT_LIMIT, IsolationMode,
     PROCESS_OUTPUT_PAGE_MAX_BYTES, PreparedToolRequest, TOOL_CONTRACT_VERSION, ToolCapabilities,
-    ToolExecutionView, ToolOutput, ToolPolicy, ToolRequest, capture, coding_tool_names,
+    ToolExecutionView, ToolOutput, ToolPolicy, ToolRequest,
+    capture::{self, StreamTail},
+    coding_tool_names,
     process::{self, ProcessResult, TreeCleanup},
     secrets::{HostEnvironmentSecrets, ProcessEnvironment, SecretResolver},
     workspace::{
@@ -517,7 +519,8 @@ impl ToolExecutionService {
             } => {
                 let target = resolve_relative(root, path, false)?;
                 let before = read_text(&target)?;
-                let (after, _) = plan_edit_text(&before, old_string, new_string, *replace_all)?;
+                let after =
+                    plan_edit_text(&before, old_string, new_string, *replace_all, path)?.content;
                 (path.as_str(), before, after)
             }
             _ => return Ok(None),
@@ -1271,7 +1274,7 @@ impl ToolExecutionService {
             } => {
                 let target = resolve_relative(root, path, false)?;
                 let current = read_text(&target)?;
-                let _ = plan_edit_text(&current, old_string, new_string, *replace_all)?;
+                let _ = plan_edit_text(&current, old_string, new_string, *replace_all, path)?;
             }
             _ => {}
         }
@@ -1374,7 +1377,7 @@ impl ToolExecutionService {
             } => {
                 let target = resolve_relative(root, path, false)?;
                 let current = read_text(&target)?;
-                let _ = plan_edit_text(&current, old_string, new_string, *replace_all)?;
+                let _ = plan_edit_text(&current, old_string, new_string, *replace_all, path)?;
             }
             CodingToolAction::ReadProcessOutput {
                 artifact_id,
@@ -1600,12 +1603,14 @@ impl ToolExecutionService {
                 let target = resolve_relative(root, path, false)?;
                 let before = read_text(&target)?;
                 let artifact = self.publish_before_content(Some(&before))?;
-                let mutation = edit_text(&target, old_string, new_string, *replace_all)?;
+                let (mutation, diff) =
+                    edit_text(&target, path, old_string, new_string, *replace_all)?;
                 let output = ToolOutput::EditFile {
                     path: path.replace('\\', "/"),
                     before_hash: mutation.before_hash.clone(),
                     after_hash: mutation.after_hash.clone(),
                     replacements: mutation.replacements,
+                    diff: redact_text(&diff),
                 };
                 Ok(Dispatched { output, artifact })
             }
@@ -2406,6 +2411,16 @@ fn process_output(
         capture_hash,
         capture_truncated,
         capture_tail: redact_text(capture_tail),
+        stdout_tail: redact_tail(&output.stdout_tail),
+        stderr_tail: redact_tail(&output.stderr_tail),
+    }
+}
+
+/// A stream tail with the same line redaction every other preview gets.
+fn redact_tail(tail: &StreamTail) -> StreamTail {
+    StreamTail {
+        text: redact_text(&tail.text),
+        ..tail.clone()
     }
 }
 

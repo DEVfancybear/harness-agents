@@ -8,18 +8,21 @@
 
 mod capture;
 mod contracts;
+mod edit_diff;
 mod execution;
 mod loop_service;
 mod policy;
 mod process;
 mod secrets;
 mod service;
+mod truncate;
 mod turn_driver;
 mod workspace;
 
 pub use capture::{
     CAPTURE_HEADER_VERSION, CaptureHeader, DEFAULT_CAPTURE_QUOTA_BYTES, DEFAULT_HEAD_PREVIEW_BYTES,
-    DEFAULT_TAIL_PREVIEW_BYTES, ProcessSpoolConfig, SpoolLimits, parse_capture_header,
+    DEFAULT_TAIL_PREVIEW_BYTES, ProcessSpoolConfig, STREAM_TAIL_BYTES, SpoolLimits, StreamTail,
+    parse_capture_header,
 };
 pub use contracts::{
     ApprovalGrant, AskUserInput, CaptureStream, CodingToolAction, ENV_REFERENCE_PREFIX,

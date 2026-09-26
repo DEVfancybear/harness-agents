@@ -3333,7 +3333,11 @@ async fn g04_read_file_range_has_line_numbers() {
     .await
     .expect("bounded range reads");
     let output = serde_json::to_value(view.output).expect("read output serializes");
-    assert_eq!(output["content"], "2: second");
+    // A range that stops before the end says which offset continues it.
+    assert_eq!(
+        output["content"],
+        "2: second\n\n[Showing lines 2-2 of 3. Use offset=2 to continue.]"
+    );
     assert_eq!(output["truncated"], true);
     drop(tools);
     close(store).await;
