@@ -1399,6 +1399,42 @@ impl InteractiveController {
         self.dispatch(text, false)
     }
 
+    /// A message sent while a turn runs: it steers the turn, or waits for it.
+    fn dispatch_while_running(&mut self, text: String) -> Vec<Effect> {
+        // prime-agent's Enter while the agent works: the message steers the
+        // running turn - the model reads it at its next step, or right after
+        // the answer it is writing - instead of waiting for the whole task to
+        // finish. It shows in the conversation now, as it was sent.
+        if self.phase == AppPhase::Running && self.service.steer(&text).is_ok() {
+            return vec![
+                Effect::History(HistoryItem::User { text }),
+                Effect::History(HistoryItem::Notice {
+                    message: "sent to the running agent; it reads this at its next step".to_owned(),
+                }),
+                Effect::Redraw,
+            ];
+        }
+        if self.phase == AppPhase::Running && self.queued_input.is_none() {
+            self.queued_input = Some(text);
+            return vec![
+                Effect::History(HistoryItem::Notice {
+                    message: "queued (1): sent after the active run finishes".to_owned(),
+                }),
+                Effect::Redraw,
+            ];
+        }
+        vec![
+            Effect::History(HistoryItem::Notice {
+                message: if self.queued_input.is_some() {
+                    "one input is already queued; wait for the active run to finish".to_owned()
+                } else {
+                    "a run is already active; wait for it or press Ctrl-C to cancel".to_owned()
+                },
+            }),
+            Effect::Redraw,
+        ]
+    }
+
     /// Send one request to the service.
     ///
     /// `automatic` marks a continuation the app started because a bound stopped the
@@ -1444,25 +1480,7 @@ impl InteractiveController {
             return self.command(&text);
         }
         if self.phase.has_active_run() {
-            if self.phase == AppPhase::Running && self.queued_input.is_none() {
-                self.queued_input = Some(text);
-                return vec![
-                    Effect::History(HistoryItem::Notice {
-                        message: "queued (1): sent after the active run finishes".to_owned(),
-                    }),
-                    Effect::Redraw,
-                ];
-            }
-            return vec![
-                Effect::History(HistoryItem::Notice {
-                    message: if self.queued_input.is_some() {
-                        "one input is already queued; wait for the active run to finish".to_owned()
-                    } else {
-                        "a run is already active; wait for it or press Ctrl-C to cancel".to_owned()
-                    },
-                }),
-                Effect::Redraw,
-            ];
+            return self.dispatch_while_running(text);
         }
         let shell_prefix = match parse_shell_prefix(&text) {
             Ok(prefix) => prefix,
@@ -1924,20 +1942,20 @@ impl InteractiveController {
             }
             "/permissions" => {
                 if let Some(mode) = argument {
-                    if self.phase.has_active_run() {
-                        self.push_history(
-                            &mut effects,
-                            HistoryItem::Notice {
-                                message: "permission mode changes apply between turns; wait for this run to finish".to_owned(),
+                    // Allowed while the agent works, as Claude Code's Shift+Tab
+                    // is: the running turn's next action is decided under it.
+                    let running = self.phase.has_active_run();
+                    match self.service.set_mode(mode) {
+                        Ok(message) => self.push_history(&mut effects, HistoryItem::Notice {
+                            message: if running {
+                                format!("{message}; the running turn follows it from its next action")
+                            } else {
+                                message
                             },
-                        );
-                    } else {
-                        match self.service.set_mode(mode) {
-                            Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
-                            Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
-                        }
-                        self.refresh_menu();
+                        }),
+                        Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
                     }
+                    self.refresh_menu();
                 } else {
                     let mut lines = self.service.permissions_summary();
                     lines.push(
@@ -2092,17 +2110,22 @@ impl InteractiveController {
             "/goal" => self.goal_command(raw_argument, &mut effects),
             "/effort" => {
                 if let Some(level) = argument {
-                    if self.phase.has_active_run() {
-                        self.push_history(&mut effects, HistoryItem::Notice {
-                            message: "cannot change thinking while a run is active; the running request keeps its level".to_owned(),
-                        });
-                    } else {
-                        match self.service.set_thinking(level) {
-                            Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
-                            Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
-                        }
-                        self.refresh_status();
+                    // Allowed while the agent works, as in prime-agent and Claude
+                    // Code: the running turn uses it from its next model call.
+                    match self.service.set_thinking(level) {
+                        Ok(message) => self.push_history(&mut effects, HistoryItem::Notice {
+                            message: if self.phase.has_active_run() {
+                                format!(
+                                    "{}; the running turn uses it from its next step",
+                                    message.replace(" for the next turn", "")
+                                )
+                            } else {
+                                message
+                            },
+                        }),
+                        Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
                     }
+                    self.refresh_status();
                 } else {
                     let lines = self.service.thinking_status();
                     self.reference("/effort", lines, &mut effects);
@@ -2272,17 +2295,19 @@ impl InteractiveController {
                 // provider facts follow it, so a surprising answer can be diagnosed
                 // without leaving the app.
                 if let Some(model) = argument {
-                    if self.phase.has_active_run() {
-                        self.push_history(&mut effects, HistoryItem::Notice {
-                            message: "cannot change the model while a run is active; the running request keeps its selected model".to_owned(),
-                        });
-                    } else {
-                        match self.service.set_model(model) {
-                            Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
-                            Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
-                        }
-                        self.refresh_status();
+                    // Allowed while the agent works, as prime-agent's model
+                    // selector is: the running turn switches at its next call.
+                    match self.service.set_model(model) {
+                        Ok(message) => self.push_history(&mut effects, HistoryItem::Notice {
+                            message: if self.phase.has_active_run() {
+                                format!("{message}; the running turn switches at its next step")
+                            } else {
+                                message
+                            },
+                        }),
+                        Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
                     }
+                    self.refresh_status();
                 } else {
                     let label = self.service.label();
                     let mut lines = vec![format!("backend: {label}")];
@@ -3381,6 +3406,8 @@ mod tests {
         cancels: Arc<Mutex<u32>>,
         answers: Arc<Mutex<Vec<(String, ApprovalDecision)>>>,
         steers: Arc<Mutex<Vec<String>>>,
+        /// Refuse steering, as a service without a running inbox does.
+        refuse_steer: bool,
         resumes: Arc<Mutex<Vec<Option<String>>>>,
         /// Every turn-wide grant the controller handed to the port, and every
         /// revocation, so a test can assert the grant is scoped to one turn.
@@ -3438,6 +3465,9 @@ mod tests {
         }
 
         fn steer(&mut self, text: &str) -> Result<(), String> {
+            if self.refuse_steer {
+                return Err("no active run inbox is available".to_owned());
+            }
             self.steers.lock().expect("steer log").push(text.to_owned());
             Ok(())
         }
@@ -3655,17 +3685,47 @@ mod tests {
     }
 
     #[test]
-    fn g06_enter_while_running_queues_and_sends_after_terminal() {
+    fn g06_enter_while_running_steers_the_running_turn() {
         let mut harness = bench(true);
         submit_text(&mut harness.controller, "first input");
-        submit_text(&mut harness.controller, "queued input");
+        submit_text(&mut harness.controller, "and also check the tests");
         assert_eq!(
             *harness.port.submissions.lock().expect("submissions"),
             ["first input"],
-            "a queued input is not admitted while the current session is active"
+            "the second message is not a second turn"
         );
-        assert!(harness.controller.ui_state().queued_input);
+        assert_eq!(
+            *harness.port.steers.lock().expect("steers"),
+            ["and also check the tests"],
+            "it reaches the running turn, as prime-agent's Enter does"
+        );
+        assert!(!harness.controller.ui_state().queued_input);
 
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("terminal event");
+        let _ = harness.controller.pump_events();
+        assert_eq!(
+            *harness.port.submissions.lock().expect("submissions"),
+            ["first input"],
+            "nothing is sent again after the turn"
+        );
+    }
+
+    /// A turn that cannot take the message yet (no inbox) keeps it for after.
+    #[test]
+    fn g06_enter_while_running_queues_when_the_turn_cannot_take_it() {
+        let port = RecordingPort {
+            refuse_steer: true,
+            ..RecordingPort::default()
+        };
+        let mut harness = bench_with(true, port, false);
+        submit_text(&mut harness.controller, "first input");
+        submit_text(&mut harness.controller, "queued input");
+        assert!(harness.controller.ui_state().queued_input);
         harness
             .events
             .send(SessionEvent::RunTerminal {
@@ -3677,7 +3737,6 @@ mod tests {
             *harness.port.submissions.lock().expect("submissions"),
             ["first input", "queued input"]
         );
-        assert_eq!(harness.controller.phase(), AppPhase::Running);
     }
 
     #[test]
@@ -4164,7 +4223,7 @@ mod tests {
     }
 
     #[test]
-    fn h03_one_admission_per_message_and_a_running_run_queues_a_second() {
+    fn h03_one_admission_per_message_and_a_second_steers_the_running_run() {
         let mut harness = bench(true);
         let _ = harness.controller.boot_lines();
         let effects = submit_text(&mut harness.controller, "first request");
@@ -4186,25 +4245,16 @@ mod tests {
 
         let effects = submit_text(&mut harness.controller, "second request");
         let plain = effects_to_plain(&effects).join("\n");
-        assert!(plain.contains("queued (1)"), "{plain}");
+        assert!(plain.contains("> second request"), "{plain}");
+        assert!(plain.contains("sent to the running agent"), "{plain}");
         assert_eq!(
             harness.port.submissions.lock().expect("submissions").len(),
             1,
-            "the second input waits until the active run releases the session"
+            "the second message joins the running turn instead of opening another"
         );
-        assert!(harness.controller.ui_state().queued_input);
-
-        harness
-            .events
-            .send(SessionEvent::RunTerminal {
-                outcome: RunOutcome::Done,
-            })
-            .expect("terminal event");
-        let _ = harness.controller.pump_events();
         assert_eq!(
-            *harness.port.submissions.lock().expect("submissions"),
-            ["first request", "second request"],
-            "the queued message is admitted once, after the first run terminates"
+            *harness.port.steers.lock().expect("steers"),
+            ["second request"]
         );
         assert!(!harness.controller.ui_state().queued_input);
         assert_eq!(harness.controller.phase(), AppPhase::Running);
@@ -5072,10 +5122,15 @@ mod tests {
         assert!(permissions.contains("allow (project(local)): run_shell(cargo test *)"));
         assert!(permissions.contains("actions auto-allowed this session: 0"));
 
+        // As Claude Code's Shift+Tab: the running turn follows the change from
+        // its next action.
         let _ = submit_text(&mut harness.controller, "running request");
-        let blocked =
+        let changed =
             effects_to_plain(&submit_text(&mut harness.controller, "/mode ask")).join("\n");
-        assert!(blocked.contains("permission mode changes apply between turns"));
+        assert!(
+            changed.contains("the running turn follows it from its next action"),
+            "{changed}"
+        );
         assert_eq!(
             harness
                 .port
@@ -5083,8 +5138,7 @@ mod tests {
                 .lock()
                 .expect("mode updates")
                 .as_slice(),
-            ["auto-edit"],
-            "a running turn's policy cannot change midway through an action"
+            ["auto-edit", "ask"]
         );
     }
 
@@ -5965,8 +6019,8 @@ mod tests {
             .expect("approval");
         let _ = harness.controller.pump_events();
         // Expire it behind the controller's back. The panel closes and the run is
-        // active again, so a late "y" queues as ordinary text; it never reaches the
-        // gate as an answer.
+        // active again, so a late "y" is ordinary text for the running turn; it
+        // never reaches the gate as an answer.
         harness
             .events
             .send(SessionEvent::ApprovalExpired {
@@ -5977,28 +6031,14 @@ mod tests {
         let effects = submit_text(&mut harness.controller, "y");
         let plain = effects_to_plain(&effects).join("\n");
         assert!(
-            plain.contains("queued (1)"),
-            "a late answer becomes queued text, not an answer to the expired gate: {effects:#?}"
+            plain.contains("sent to the running agent"),
+            "a late answer is ordinary text for the running turn: {effects:#?}"
         );
-        assert!(harness.controller.ui_state().queued_input);
+        assert_eq!(*harness.port.steers.lock().expect("steers"), ["y"]);
         assert!(
             harness.port.answers.lock().expect("answers").is_empty(),
             "the gate is never told about a request that already expired"
         );
-
-        harness
-            .events
-            .send(SessionEvent::RunTerminal {
-                outcome: RunOutcome::Done,
-            })
-            .expect("terminal event");
-        let _ = harness.controller.pump_events();
-        assert_eq!(
-            *harness.port.submissions.lock().expect("submissions"),
-            ["active request", "y"],
-            "the expired answer is delivered only later as ordinary user input"
-        );
-        assert!(harness.port.answers.lock().expect("answers").is_empty());
     }
 
     #[test]

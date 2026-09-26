@@ -465,6 +465,65 @@ pub struct TurnDriver {
 }
 
 impl TurnDriver {
+    /// Claim what the user sent to the running turn: steering notes, as user
+    /// messages for the next model call, and a cancel with its reason.
+    async fn claim_inbox(
+        &self,
+        run_id: &harness_types::AgentRunId,
+    ) -> Result<(Vec<ProviderMessage>, Option<String>), HarnessError> {
+        let mut appended = Vec::new();
+        let Some(inbox) = &self.inbox else {
+            return Ok((appended, None));
+        };
+        let error = |error: &dyn std::fmt::Display| {
+            HarnessError::new(ErrorCode::StorageWriteFailed, error.to_string())
+        };
+        let run = self
+            .runtime
+            .run_record(run_id)
+            .await
+            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+        let Some(run) = run else {
+            return Ok((appended, None));
+        };
+        let commands = inbox
+            .claim(&run, 8, now_unix_ms())
+            .await
+            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+        let mut canceled = None;
+        for command in &commands {
+            match command.kind {
+                RunCommandKind::Cancel => {
+                    canceled = Some(
+                        RunInbox::cancel_reason(command)
+                            .unwrap_or_else(|| "canceled by the user".to_owned()),
+                    );
+                    inbox
+                        .apply(command, "canceled at a step boundary", now_unix_ms())
+                        .await
+                        .map_err(|failure| error(&failure))?;
+                }
+                RunCommandKind::Steer => {
+                    if let Some(text) = RunInbox::steering_text(command) {
+                        appended.push(ProviderMessage::new(
+                            MessageRole::User,
+                            format!("[steering correction from the user]\n{text}"),
+                        ));
+                    }
+                    inbox
+                        .apply(
+                            command,
+                            "steering delivered to the next step",
+                            now_unix_ms(),
+                        )
+                        .await
+                        .map_err(|failure| error(&failure))?;
+                }
+            }
+        }
+        Ok((appended, canceled))
+    }
+
     #[must_use]
     pub fn new(runtime: Arc<RuntimeService>, tools: ToolExecutionService) -> Self {
         Self {
@@ -824,6 +883,39 @@ impl TurnDriver {
                         }
                     }
                 }
+                // A message the user sent while this answer was being written
+                // belongs to this turn, as prime-agent's loop polls its steering
+                // queue after every assistant turn: the model reads it and the
+                // turn goes on, instead of the message waiting for a new turn.
+                let (steering, canceled) = self.claim_inbox(&result.run_id).await?;
+                if let Some(reason) = canceled {
+                    observer.observe(TurnProgress::TextDelta(format!(
+                        "canceled at a step boundary: {reason}"
+                    )));
+                    break TurnStop::Canceled;
+                }
+                if !steering.is_empty() && steps < options.limits.max_steps {
+                    steps += 1;
+                    observer.observe(TurnProgress::StepStarted { step: steps });
+                    if !result.response.trim().is_empty() {
+                        transcript.push(
+                            ProviderMessage::new(MessageRole::Assistant, result.response.clone())
+                                .with_reasoning(result.reasoning.clone()),
+                        );
+                    }
+                    transcript.extend(steering);
+                    result = self
+                        .runtime
+                        .continue_run(
+                            request.clone(),
+                            transcript.clone(),
+                            cancellation.clone(),
+                            Some(sink_for(&observer)),
+                        )
+                        .await
+                        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+                    continue 'turn;
+                }
                 break TurnStop::Final;
             }
             if cancellation.is_cancelled() {
@@ -841,62 +933,14 @@ impl TurnDriver {
                 break TurnStop::ToolLimit;
             }
 
-            let mut appended = Vec::new();
             // A safe boundary: steering is delivered and a cancel stops the turn
             // before any queued work executes.
-            if let Some(inbox) = &self.inbox {
-                let run = self
-                    .runtime
-                    .run_record(&result.run_id)
-                    .await
-                    .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
-                if let Some(run) = run {
-                    let commands = inbox
-                        .claim(&run, 8, now_unix_ms())
-                        .await
-                        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
-                    let mut canceled = None;
-                    for command in &commands {
-                        match command.kind {
-                            RunCommandKind::Cancel => {
-                                canceled = Some(
-                                    RunInbox::cancel_reason(command)
-                                        .unwrap_or_else(|| "canceled by the user".to_owned()),
-                                );
-                                inbox
-                                    .apply(command, "canceled at a step boundary", now_unix_ms())
-                                    .await
-                                    .map_err(|error| {
-                                        HarnessError::new(error.code(), error.to_string())
-                                    })?;
-                            }
-                            RunCommandKind::Steer => {
-                                if let Some(text) = RunInbox::steering_text(command) {
-                                    appended.push(ProviderMessage::new(
-                                        MessageRole::User,
-                                        format!("[steering correction from the user]\n{text}"),
-                                    ));
-                                }
-                                inbox
-                                    .apply(
-                                        command,
-                                        "steering delivered to the next step",
-                                        now_unix_ms(),
-                                    )
-                                    .await
-                                    .map_err(|error| {
-                                        HarnessError::new(error.code(), error.to_string())
-                                    })?;
-                            }
-                        }
-                    }
-                    if let Some(reason) = canceled {
-                        observer.observe(TurnProgress::TextDelta(format!(
-                            "canceled at a step boundary: {reason}"
-                        )));
-                        break TurnStop::Canceled;
-                    }
-                }
+            let (mut appended, canceled) = self.claim_inbox(&result.run_id).await?;
+            if let Some(reason) = canceled {
+                observer.observe(TurnProgress::TextDelta(format!(
+                    "canceled at a step boundary: {reason}"
+                )));
+                break TurnStop::Canceled;
             }
             // Loop detection: the same tool call repeated inside the window is a
             // loop, not progress. Different arguments or a changed batch are not.

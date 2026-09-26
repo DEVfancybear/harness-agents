@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use harness_types::{ErrorCode, HarnessError};
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
@@ -113,6 +114,12 @@ pub trait TuiRenderer {
 /// How many history entries a renderer keeps for ctrl+o to draw again.
 const REPRINT_ENTRIES: usize = 4000;
 
+/// How many rows ctrl+o draws again: the recent end of the conversation, which
+/// is what the scrollback shows. Drawing every entry of a long session one
+/// insert at a time - each insert repaints the viewport - kept the console busy
+/// for long enough that the app looked frozen; `/more` still reaches the rest.
+const REPRINT_ROWS: usize = 3000;
+
 /// The terminal-side half of a renderer: a ratatui `Terminal` over some backend.
 pub struct RealRenderer<B: Backend> {
     terminal: Terminal<B>,
@@ -152,9 +159,59 @@ where
     fn replay(&mut self, detail: super::events::Detail) -> io::Result<()> {
         self.detail = detail;
         self.terminal.clear().map_err(to_io)?;
-        let items = self.shown.iter().cloned().collect::<Vec<_>>();
-        for item in &items {
-            self.draw_history(item)?;
+        let theme = self.theme;
+        let width = self.columns();
+        // Newest first until the budget is spent, then back into reading order,
+        // so the rows drawn are the end of the conversation.
+        let mut blocks = Vec::new();
+        let mut total = 0_usize;
+        let mut cut = false;
+        for item in self.shown.iter().rev() {
+            let rows = history::render(item, width, &theme, detail);
+            if total + rows.len() > REPRINT_ROWS && total > 0 {
+                cut = true;
+                break;
+            }
+            total += rows.len();
+            blocks.push(rows);
+        }
+        let mut rows = Vec::with_capacity(total + 1);
+        if cut {
+            rows.push(Line::from(Span::styled(
+                "… earlier conversation: /more",
+                theme.dim,
+            )));
+        }
+        rows.extend(blocks.into_iter().rev().flatten());
+        self.insert_rows(&rows)
+    }
+
+    /// Push rows above the viewport in screen-sized batches: one insert per batch
+    /// rather than one per history entry, since every insert repaints the viewport.
+    fn insert_rows(&mut self, rows: &[Line<'static>]) -> io::Result<()> {
+        let batch = usize::from(self.rows().max(1));
+        for chunk in rows.chunks(batch) {
+            let height = u16::try_from(chunk.len()).unwrap_or(u16::MAX);
+            self.terminal
+                .insert_before(height, |buffer| {
+                    let area = buffer.area;
+                    for (index, line) in chunk.iter().enumerate() {
+                        let offset = u16::try_from(index).unwrap_or(0);
+                        if offset >= area.height {
+                            break;
+                        }
+                        line.clone().render(
+                            Rect {
+                                x: area.x,
+                                y: area.y + offset,
+                                width: area.width,
+                                height: 1,
+                            },
+                            buffer,
+                        );
+                    }
+                })
+                .map_err(to_io)?;
         }
         Ok(())
     }
@@ -197,27 +254,7 @@ where
         if rows.is_empty() {
             return Ok(());
         }
-        let height = u16::try_from(rows.len()).unwrap_or(u16::MAX);
-        self.terminal
-            .insert_before(height, |buffer| {
-                let area = buffer.area;
-                for (index, line) in rows.iter().enumerate() {
-                    let offset = u16::try_from(index).unwrap_or(0);
-                    if offset >= area.height {
-                        break;
-                    }
-                    line.clone().render(
-                        Rect {
-                            x: area.x,
-                            y: area.y + offset,
-                            width: area.width,
-                            height: 1,
-                        },
-                        buffer,
-                    );
-                }
-            })
-            .map_err(to_io)
+        self.insert_rows(&rows)
     }
 
     fn clear_viewport(&mut self) -> io::Result<()> {

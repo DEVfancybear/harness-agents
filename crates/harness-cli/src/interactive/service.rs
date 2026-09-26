@@ -1035,6 +1035,147 @@ impl CredentialResolver for EnvironmentCredential {
 
 /// The adapter for one resolved provider: the wire format its protocol names,
 /// with the thinking level and the headers the provider wants.
+/// What the user changed while a turn runs - the thinking level and the model -
+/// which the turn's next model call uses, as prime-agent's agent reads its
+/// model and level for every request.
+#[derive(Debug, Default)]
+pub struct LiveTurn {
+    level: Mutex<Option<harness_providers::ThinkingLevel>>,
+    config: Mutex<Option<ProviderConfig>>,
+}
+
+impl LiveTurn {
+    /// A new turn starts from what it resolved.
+    fn start(&self, level: harness_providers::ThinkingLevel) {
+        if let Ok(mut current) = self.level.lock() {
+            *current = Some(level);
+        }
+        if let Ok(mut current) = self.config.lock() {
+            *current = None;
+        }
+    }
+
+    fn set_level(&self, level: harness_providers::ThinkingLevel) {
+        if let Ok(mut current) = self.level.lock() {
+            *current = Some(level);
+        }
+    }
+
+    fn set_config(&self, config: ProviderConfig) {
+        if let Ok(mut current) = self.config.lock() {
+            *current = Some(config);
+        }
+    }
+}
+
+/// The turn's provider, rebuilt for the next call when `/model` or `/effort`
+/// changed what it should be while the turn was running.
+struct LiveProvider {
+    live: Arc<LiveTurn>,
+    base: ProviderConfig,
+    session: String,
+    data_dir: PathBuf,
+    current: Mutex<(String, Arc<dyn ModelProvider>)>,
+}
+
+impl LiveProvider {
+    fn new(
+        live: Arc<LiveTurn>,
+        base: ProviderConfig,
+        level: harness_providers::ThinkingLevel,
+        session: String,
+        data_dir: PathBuf,
+    ) -> Result<Self, ProviderError> {
+        let provider = Self::build(&base, level, &session, &data_dir)?;
+        Ok(Self {
+            current: Mutex::new((Self::key(&base, level), provider)),
+            live,
+            base,
+            session,
+            data_dir,
+        })
+    }
+
+    fn key(config: &ProviderConfig, level: harness_providers::ThinkingLevel) -> String {
+        format!("{}/{}/{}", config.provider_id, config.model, level.as_str())
+    }
+
+    fn build(
+        config: &ProviderConfig,
+        level: harness_providers::ThinkingLevel,
+        session: &str,
+        data_dir: &Path,
+    ) -> Result<Arc<dyn ModelProvider>, ProviderError> {
+        let capabilities = ModelCapabilities {
+            provider_id: config.provider_id.clone(),
+            model: config.model.clone(),
+            supports_streaming: true,
+            supports_tools: true,
+            fixture: false,
+        };
+        let credentials = Arc::new(EnvironmentCredential::new(
+            config.provider_id.clone(),
+            config.credential_variable(),
+            data_dir.to_path_buf(),
+        ));
+        build_provider(config, credentials, capabilities, level, session, data_dir)
+    }
+
+    /// The provider for the next call: the current one, or a new one when the
+    /// model or level changed. A change that cannot be built keeps the current
+    /// provider, so a bad choice never breaks the running turn.
+    fn provider(&self) -> Arc<dyn ModelProvider> {
+        let config = self
+            .live
+            .config
+            .lock()
+            .ok()
+            .and_then(|config| config.clone())
+            .unwrap_or_else(|| self.base.clone());
+        let level = self.live.level.lock().ok().and_then(|level| *level);
+        let Ok(mut current) = self.current.lock() else {
+            return Self::build(
+                &self.base,
+                level.unwrap_or_default(),
+                &self.session,
+                &self.data_dir,
+            )
+            .unwrap_or_else(|_| Arc::new(harness_providers::MockProvider::scripted(Vec::new())));
+        };
+        if let Some(level) = level {
+            let key = Self::key(&config, level);
+            if key != current.0
+                && let Ok(provider) = Self::build(&config, level, &self.session, &self.data_dir)
+            {
+                *current = (key, provider);
+            }
+        }
+        Arc::clone(&current.1)
+    }
+}
+
+impl ModelProvider for LiveProvider {
+    fn capabilities(&self) -> ModelCapabilities {
+        self.provider().capabilities()
+    }
+
+    fn stream(
+        &self,
+        request: ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> harness_providers::ProviderFuture {
+        self.provider().stream(request, cancellation)
+    }
+
+    fn stream_events(
+        &self,
+        request: ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> harness_providers::ProviderEventStream {
+        self.provider().stream_events(request, cancellation)
+    }
+}
+
 pub(super) fn build_provider(
     config: &ProviderConfig,
     credentials: Arc<dyn harness_providers::CredentialResolver>,
@@ -1311,6 +1452,8 @@ pub struct AgentSessionService {
     /// `HA_AUTO_REFINE=off` turns the automatic review off (prime-agent's
     /// `autoRefine.enabled`, on by default).
     auto_refine: bool,
+    /// The model and thinking level a running turn's next call uses.
+    live: Arc<LiveTurn>,
 }
 
 enum McpElicitationAnswer {
@@ -1798,6 +1941,7 @@ impl AgentSessionService {
             thinking: None,
             turns_since_review: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             heartbeats: Arc::new(super::heartbeat::Heartbeats::default()),
+            live: Arc::new(LiveTurn::default()),
             auto_refine,
         }
     }
@@ -2108,6 +2252,7 @@ impl SessionPort for AgentSessionService {
         let thinking = self.thinking;
         let turns_since_review = Arc::clone(&self.turns_since_review);
         let heartbeats = Arc::clone(&self.heartbeats);
+        let live = Arc::clone(&self.live);
         let auto_refine = self.auto_refine;
         // Every user input opens its own session; the conversation is the chain of
         // sessions linked to the same task.
@@ -2148,6 +2293,7 @@ impl SessionPort for AgentSessionService {
                 turns_since_review,
                 auto_refine,
                 heartbeats,
+                live,
             ))
             .await;
         });
@@ -2673,6 +2819,11 @@ impl SessionPort for AgentSessionService {
                     .is_some();
             let provider_name = super::providers::provider(&entry.provider)
                 .map_or(entry.provider.as_str(), |provider| provider.name);
+            // A running turn switches at its next model call, as prime-agent's
+            // model selector does.
+            if ready && let Ok(config) = self.configured() {
+                self.live.set_config(config);
+            }
             return Ok(if ready {
                 format!("model {} ({provider_name}) selected", entry.name)
             } else {
@@ -2709,6 +2860,8 @@ impl SessionPort for AgentSessionService {
             )
         })?;
         self.thinking = Some(requested);
+        // A running turn uses the new level from its next model call.
+        self.live.set_level(requested);
         let used = harness_providers::thinking::clamp(model, requested);
         let name = |level| harness_providers::thinking::provider_name(model, level);
         Ok(if used == requested {
@@ -2791,6 +2944,9 @@ impl SessionPort for AgentSessionService {
             .session_mode
             .lock()
             .map_err(|_| "session permission mode is unavailable".to_owned())? = Some(mode);
+        // A turn that is running follows the change from its next action, as
+        // Claude Code's mode switch does; the next turns start in it.
+        self.gate.turn_rules().set_mode(mode);
         Ok(format!(
             "permission mode set to {} for this session",
             mode.as_str()
@@ -3265,6 +3421,7 @@ async fn run_turn(
     turns_since_review: Arc<std::sync::atomic::AtomicU32>,
     auto_refine: bool,
     heartbeats: Arc<super::heartbeat::Heartbeats>,
+    live: Arc<LiveTurn>,
 ) {
     let send = |event| {
         let _ = sender.send(event);
@@ -3570,14 +3727,18 @@ async fn run_turn(
             .or_else(|| harness_providers::ThinkingLevel::parse(&config.thinking))
             .unwrap_or_default(),
     };
-    let provider = build_provider(
-        &config,
-        credentials,
-        capabilities,
+    // What `/model` and `/effort` change while this turn runs reaches its next
+    // model call.
+    live.start(thinking_level);
+    let _ = (credentials, capabilities);
+    let provider = LiveProvider::new(
+        Arc::clone(&live),
+        config.clone(),
         thinking_level,
-        task_id.as_ref(),
-        &data_dir,
-    );
+        task_id.as_ref().to_owned(),
+        data_dir.clone(),
+    )
+    .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>);
     let provider = match provider {
         Ok(provider) => provider,
         Err(error) => {

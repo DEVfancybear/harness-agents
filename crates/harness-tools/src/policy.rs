@@ -85,15 +85,21 @@ pub struct ToolPolicyRules {
 struct ToolPolicyRulesState {
     revision: u64,
     rules: Vec<ToolPatternRule>,
+    /// The permission mode the user chose while the turn runs, which the turn's
+    /// policy follows from its next action on (Claude Code's Shift+Tab).
+    mode: Option<PolicyMode>,
 }
 
 impl ToolPolicyRules {
     /// Clear turn-scoped rules before a new user input is admitted.
     pub fn clear(&self) {
         if let Ok(mut state) = self.state.write()
-            && !state.rules.is_empty()
+            && (!state.rules.is_empty() || state.mode.is_some())
         {
             state.rules.clear();
+            // A new turn builds its policy from the session's mode, which a
+            // mid-turn change also set.
+            state.mode = None;
             state.revision = state.revision.saturating_add(1);
         }
     }
@@ -109,6 +115,22 @@ impl ToolPolicyRules {
             state.revision = state.revision.saturating_add(1);
         }
         Ok(())
+    }
+
+    /// Switch the running turn's permission mode. Its next action is decided under
+    /// it; the policy revision moves, so an approval bound to the old mode is not
+    /// reused.
+    pub fn set_mode(&self, mode: PolicyMode) {
+        if let Ok(mut state) = self.state.write()
+            && state.mode != Some(mode)
+        {
+            state.mode = Some(mode);
+            state.revision = state.revision.saturating_add(1);
+        }
+    }
+
+    fn mode(&self) -> Option<PolicyMode> {
+        self.state.read().ok().and_then(|state| state.mode)
     }
 
     fn snapshot(&self) -> Option<(u64, Vec<ToolPatternRule>)> {
@@ -257,8 +279,8 @@ impl ToolPolicy {
     }
 
     #[must_use]
-    pub const fn mode(&self) -> PolicyMode {
-        self.mode
+    pub fn mode(&self) -> PolicyMode {
+        self.turn_rules.mode().unwrap_or(self.mode)
     }
 
     #[must_use]
@@ -337,7 +359,7 @@ impl ToolPolicy {
             };
         }
 
-        match self.mode {
+        match self.mode() {
             PolicyMode::AutoEdit if auto_edit_action(action) => Decision::Allow {
                 reason: "mode auto-edit".to_owned(),
             },
@@ -813,6 +835,35 @@ mod g05_policy_tests {
             denied.decide(&external("skill", "activate_skill")),
             Decision::Deny(_)
         ));
+    }
+
+    /// A mode chosen while the turn runs decides its next action, and a new turn
+    /// starts from its own policy again.
+    #[test]
+    fn a_mode_switched_mid_turn_decides_the_next_action() {
+        let shared = ToolPolicyRules::default();
+        let policy = ToolPolicy::new(1, Vec::new())
+            .with_mode(PolicyMode::Ask)
+            .with_turn_rules(shared.clone());
+        let external = CodingToolAction::ExternalTool {
+            plugin_id: "mcp".to_owned(),
+            tool_name: "search".to_owned(),
+            arguments: serde_json::json!({}),
+            parent_invocation_id: None,
+            timeout_ms: 30_000,
+        };
+        assert_eq!(policy.decide(&external), Decision::Ask);
+        let before = policy.revision();
+        shared.set_mode(PolicyMode::FullAuto);
+        assert!(matches!(policy.decide(&external), Decision::Allow { .. }));
+        assert_eq!(policy.mode(), PolicyMode::FullAuto);
+        assert_ne!(
+            policy.revision(),
+            before,
+            "an approval bound to the old mode is not reused"
+        );
+        shared.clear();
+        assert_eq!(policy.decide(&external), Decision::Ask);
     }
 
     #[test]
