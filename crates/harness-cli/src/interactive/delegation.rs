@@ -18,9 +18,9 @@ use harness_runtime::{RunRequest, RuntimeConfig, RuntimeService};
 use harness_store_sqlite::{SqliteStore, WorktreeRecordRow};
 use harness_tools::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CodingToolAction,
-    ExternalToolCatalog, ExternalToolDispatcher, ExternalTools, PolicyMode, ToolExecutionService,
-    ToolOutput, ToolPatternRule, ToolPolicy, ToolPolicyRules, TurnDriver, TurnLimits, TurnObserver,
-    TurnOptions, TurnProgress, TurnStop, coding_tool_schemas,
+    ExternalToolCatalog, ExternalToolDispatcher, ExternalTools, ToolExecutionService, ToolOutput,
+    ToolPatternRule, ToolPolicy, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnProgress,
+    TurnStop, coding_tool_schemas,
 };
 use harness_types::{
     AgentProfileId, AgentRunId, ContentHash, ErrorCode, HarnessError, InputId, SessionId,
@@ -34,9 +34,6 @@ use super::events::SessionEvent;
 use super::repl::{HostReply, HostRequests};
 
 const MAX_BRIEF_BYTES: usize = 8 * 1024;
-const CHILD_MAX_STEPS: u32 = 8;
-const CHILD_MAX_TOOL_CALLS: u32 = 16;
-const CHILD_DEADLINE: Duration = Duration::from_mins(2);
 const CHILD_READ_TOOLS: &[&str] = &[
     "read_file",
     "list_files",
@@ -80,7 +77,8 @@ impl DelegateHost {
         workspace: WorkspaceObservation,
         delegation_state_root: PathBuf,
         hooks: Vec<harness_tools::ConfiguredToolHook>,
-        deny_rules: Vec<String>,
+        parent_policy: ToolPolicy,
+        child_limits: TurnLimits,
         model_price: Option<ModelPrice>,
         approval_gate: Arc<dyn ApprovalGate>,
         sender: UnboundedSender<SessionEvent>,
@@ -96,7 +94,8 @@ impl DelegateHost {
             runtime_config,
             workspace_root: workspace_root.clone(),
             hooks,
-            deny_rules,
+            parent_policy,
+            child_limits,
             model_price,
             approval_gate,
             sender,
@@ -110,7 +109,15 @@ impl DelegateHost {
                     max_concurrent_workers: 3,
                     max_depth: 1,
                     max_queued_workers: 3,
-                    budget: DelegationBudget::default(),
+                    // prime-agent bounds a child by its own turn - its steps, tool
+                    // calls and deadline - and the depth, not by a request pool
+                    // shared across siblings. A pool of 24 ran out after four or
+                    // five children had each read a large file, and every later
+                    // step and spawn of the turn was refused.
+                    budget: DelegationBudget {
+                        max_model_requests: u32::MAX,
+                        ..DelegationBudget::default()
+                    },
                 },
                 backend,
                 Some(Arc::clone(&workspace_manager)),
@@ -169,9 +176,8 @@ impl DelegateHost {
             .map_or_else(|_| Vec::new(), |items| items.clone());
         if lines.is_empty() {
             lines.push(format!(
-                "no delegated workers; budget {}/{} model requests",
-                self.scheduler.ledger().requests_used(),
-                24
+                "no delegated workers; {} model requests so far",
+                self.scheduler.ledger().requests_used()
             ));
         }
         lines
@@ -553,20 +559,17 @@ async fn persist_worktree(
         .map_err(|error| HarnessError::new(error.code(), error.to_string()))
 }
 
-fn explorer_policy(parent_deny_rules: &[String]) -> ToolPolicy {
-    let mut denies = EXPLORER_DENY_TOOLS
+/// An explorer works under its parent's policy - the permission mode, the allow
+/// and deny rules and what the user allowed for this turn - with every tool that
+/// changes anything denied on top, as prime-agent's children inherit their
+/// parent's permissions. A child that asked for each read in a `full-auto`
+/// session stopped at a panel nobody expected.
+fn explorer_policy(parent: &ToolPolicy) -> ToolPolicy {
+    let denies = EXPLORER_DENY_TOOLS
         .iter()
         .map(|name| ToolPatternRule::deny(format!("{name}*"), "explorer is read-only"))
         .collect::<Vec<_>>();
-    denies.extend(
-        parent_deny_rules
-            .iter()
-            .map(|pattern| ToolPatternRule::deny(pattern, "parent deny rule")),
-    );
-    ToolPolicy::new(1, Vec::new())
-        .with_mode(PolicyMode::Ask)
-        .with_tool_rules(denies)
-        .with_turn_rules(ToolPolicyRules::default())
+    parent.clone().with_tool_rules(denies)
 }
 
 fn explorer_tool_schemas() -> Vec<Value> {
@@ -580,15 +583,9 @@ fn explorer_tool_schemas() -> Vec<Value> {
         .collect()
 }
 
-fn coder_policy(parent_deny_rules: &[String]) -> ToolPolicy {
-    let denies = parent_deny_rules
-        .iter()
-        .map(|pattern| ToolPatternRule::deny(pattern, "parent deny rule"))
-        .collect();
-    ToolPolicy::new(1, Vec::new())
-        .with_mode(PolicyMode::Ask)
-        .with_tool_rules(denies)
-        .with_turn_rules(ToolPolicyRules::default())
+/// A coder works in its own worktree under its parent's policy.
+fn coder_policy(parent: &ToolPolicy) -> ToolPolicy {
+    parent.clone()
 }
 
 fn watch_parent_cancellation(
@@ -1057,7 +1054,10 @@ struct InteractiveWorkerBackend {
     runtime_config: RuntimeConfig,
     workspace_root: PathBuf,
     hooks: Vec<harness_tools::ConfiguredToolHook>,
-    deny_rules: Vec<String>,
+    parent_policy: ToolPolicy,
+    /// A child is a full agent: it gets the parent turn's steps, tool calls and
+    /// deadline, as prime-agent's children run under the normal turn limits.
+    child_limits: TurnLimits,
     model_price: Option<ModelPrice>,
     approval_gate: Arc<dyn ApprovalGate>,
     sender: UnboundedSender<SessionEvent>,
@@ -1079,7 +1079,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
             let (workspace_root, policy, schemas, system_policy) = match request.brief.role {
                 AgentRole::Explorer => (
                     self.workspace_root.clone(),
-                    explorer_policy(&self.deny_rules),
+                    explorer_policy(&self.parent_policy),
                     explorer_tool_schemas(),
                     "You are a read-only explorer. Inspect the current workspace and answer the brief. You cannot edit files, run commands, call external tools, or delegate again.",
                 ),
@@ -1107,7 +1107,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     }
                     (
                         PathBuf::from(&worktree.path),
-                        coder_policy(&self.deny_rules),
+                        coder_policy(&self.parent_policy),
                         coding_tool_schemas(),
                         "You are a delegated coder. Work only in the assigned isolated M8-03 worktree and follow the brief. Tool calls use the host approval and policy service. Leave your changes in that worktree and report what changed; do not claim the changes were merged into the user's checkout.",
                     )
@@ -1180,6 +1180,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 token_usage: Mutex::new((0_u64, 0_u64)),
                 cost_tracker: Mutex::new(CostTracker::default()),
                 summary_status: Arc::clone(&self.status),
+                max_steps: self.child_limits.max_steps,
             });
             let approval: Arc<dyn ApprovalGate> = Arc::new(ChildApprovalGate {
                 role: role_name.clone(),
@@ -1192,11 +1193,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                         workspace_root: workspace_root.clone(),
                         actor_id: format!("interactive.child.{role_name}"),
                         approvals: ApprovalMode::Ask(approval),
-                        limits: TurnLimits {
-                            max_steps: CHILD_MAX_STEPS,
-                            max_tool_calls: CHILD_MAX_TOOL_CALLS,
-                            deadline: CHILD_DEADLINE,
-                        },
+                        limits: self.child_limits,
                     },
                     observer.clone(),
                     request.cancellation.clone(),
@@ -1299,6 +1296,8 @@ struct ExplorerObserver {
     token_usage: Mutex<(u64, u64)>,
     cost_tracker: Mutex<CostTracker>,
     summary_status: Arc<Mutex<Vec<String>>>,
+    /// The child's step bound, for its status line.
+    max_steps: u32,
 }
 
 impl TurnObserver for ExplorerObserver {
@@ -1317,7 +1316,7 @@ impl TurnObserver for ExplorerObserver {
                 if let Ok(mut status) = self.worker_status.lock() {
                     status.insert(
                         self.task_key.clone(),
-                        self.status_text(&format!("step {step}/{CHILD_MAX_STEPS}")),
+                        self.status_text(&format!("step {step}/{}", self.max_steps)),
                     );
                     if let Ok(mut summary) = self.summary_status.lock() {
                         *summary = status.values().cloned().collect();
@@ -1441,7 +1440,7 @@ mod tests {
 
     #[test]
     fn g12_explorer_child_cannot_call_mutating_tools() {
-        let policy = explorer_policy(&[]);
+        let policy = explorer_policy(&harness_tools::ToolPolicy::new(1, Vec::new()));
         let writes = [
             CodingToolAction::WriteFile {
                 path: "note.txt".to_owned(),
@@ -1467,6 +1466,31 @@ mod tests {
             limit: None,
         };
         assert!(policy.denial_for(&read).is_none());
+    }
+
+    /// A child works under its parent's permission mode: in a `full-auto` session
+    /// an explorer reads without a panel, and it still cannot write.
+    #[test]
+    fn an_explorer_inherits_the_parents_mode_and_stays_read_only() {
+        let parent = harness_tools::ToolPolicy::new(1, Vec::new())
+            .with_mode(harness_tools::PolicyMode::FullAuto);
+        let policy = explorer_policy(&parent);
+        let read = CodingToolAction::ReadFile {
+            path: "src/lib.rs".to_owned(),
+            offset: None,
+            limit: None,
+        };
+        assert!(
+            matches!(policy.decide(&read), harness_tools::Decision::Allow { .. }),
+            "{:?}",
+            policy.decide(&read)
+        );
+        let write = CodingToolAction::WriteFile {
+            path: "src/lib.rs".to_owned(),
+            content: "x".to_owned(),
+            expected_hash: None,
+        };
+        assert!(policy.denial_for(&write).is_some());
     }
 
     #[test]
@@ -1501,6 +1525,7 @@ mod tests {
             token_usage: std::sync::Mutex::new((0, 0)),
             cost_tracker: std::sync::Mutex::new(CostTracker::default()),
             summary_status: Arc::new(std::sync::Mutex::new(Vec::new())),
+            max_steps: 8,
         };
         observer.observe(TurnProgress::StepStarted { step: 2 });
         assert_eq!(ledger.requests_used(), 2);
@@ -1887,7 +1912,8 @@ mod real_worker_tests {
             harness_tools::observe_workspace(ProjectId::generate(), &repo).expect("observe"),
             temporary.path().join("delegation"),
             Vec::new(),
-            Vec::new(),
+            harness_tools::ToolPolicy::new(1, Vec::new()),
+            harness_tools::TurnLimits::default(),
             None,
             gate,
             channel.sender(),
