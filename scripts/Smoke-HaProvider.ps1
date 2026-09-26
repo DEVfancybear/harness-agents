@@ -10,7 +10,7 @@ comes from wherever the app takes it:
   the saved credentials file          the app's own credential store, if one exists
 
 The endpoint and the model fall back to DeepSeek's documented values
-(`https://api.deepseek.com`, `deepseek-flash`), so one API key is a complete setup.
+(`https://api.deepseek.com`, `deepseek-v4-flash`), so one API key is a complete setup.
 Set `HA_PROVIDER_ENDPOINT` or `HA_PROVIDER_MODEL` to use another provider or model.
 
 **The app is the authority.** This script never decides that a live call is
@@ -54,7 +54,7 @@ $executableName = if ([System.IO.Path]::DirectorySeparatorChar -eq '\') { 'ha.ex
 # The values DeepSeek documents, mirrored from the CLI's own defaults so the smoke
 # and the app agree on what "configured" means.
 $script:DeepSeekEndpoint = 'https://api.deepseek.com'
-$script:DeepSeekModel = 'deepseek-flash'
+$script:DeepSeekModel = 'deepseek-v4-flash'
 
 function Get-SmokeConfiguration {
     $endpoint = [string] [Environment]::GetEnvironmentVariable('HA_PROVIDER_ENDPOINT')

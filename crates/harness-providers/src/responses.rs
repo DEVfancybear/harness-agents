@@ -274,6 +274,7 @@ impl ModelProvider for OpenAiResponsesAdapter {
         let body = self.request_body(&request);
         let token = credentials.resolve();
         let headers = token.and_then(|token| self.headers(&token));
+        let provider_id = self.capabilities.provider_id.clone();
         Box::pin(async move {
             let headers = headers?;
             let mut post = client.post(endpoint).json(&body);
@@ -290,6 +291,7 @@ impl ModelProvider for OpenAiResponsesAdapter {
                 })?,
                 () = cancellation.cancelled() => return Err(ProviderError::new(ErrorCode::ProviderCanceled, "provider request canceled")),
             };
+            super::limits::record(&provider_id, response.headers());
             if !response.status().is_success() {
                 return Err(super::http_response_error(response).await);
             }

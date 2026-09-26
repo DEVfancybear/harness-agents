@@ -793,7 +793,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
                 explicit_data_dir: None,
             })?;
             let user_config = config.unwrap_or(defaults.config_file);
-            let effective = interactive::config::resolve_layers(
+            let mut effective = interactive::config::resolve_layers(
                 &user_config,
                 &caller_dir,
                 &environment,
@@ -805,6 +805,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
                 },
             )
             .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+            interactive::config::apply_catalog_context_window(&mut effective, &defaults.data_dir);
             let result = serde_json::json!({
                 "schema_version": 2,
                 "effective_config": {

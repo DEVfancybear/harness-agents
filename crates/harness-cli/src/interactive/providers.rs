@@ -45,6 +45,8 @@ pub struct Provider {
     pub login: Login,
     /// The model selected right after logging in, when none is chosen yet.
     pub default_model: &'static str,
+    /// Where the provider answers with the account's balance, if it has one.
+    pub balance_url: Option<&'static str>,
 }
 
 /// The providers, in the order `/login` lists them: sign-in first, then by name,
@@ -56,6 +58,7 @@ pub const PROVIDERS: [Provider; 6] = [
         env: &[],
         login: Login::OAuth,
         default_model: "gpt-5.5",
+        balance_url: None,
     },
     Provider {
         id: "anthropic",
@@ -63,6 +66,7 @@ pub const PROVIDERS: [Provider; 6] = [
         env: &["ANTHROPIC_API_KEY"],
         login: Login::ApiKey,
         default_model: "claude-fable-5",
+        balance_url: None,
     },
     Provider {
         id: "deepseek",
@@ -70,6 +74,7 @@ pub const PROVIDERS: [Provider; 6] = [
         env: &["DEEPSEEK_API_KEY", "HA_API_KEY"],
         login: Login::ApiKey,
         default_model: "deepseek-v4-flash",
+        balance_url: Some("https://api.deepseek.com/user/balance"),
     },
     Provider {
         id: "openai",
@@ -77,6 +82,7 @@ pub const PROVIDERS: [Provider; 6] = [
         env: &["OPENAI_API_KEY"],
         login: Login::ApiKey,
         default_model: "gpt-5.5",
+        balance_url: None,
     },
     Provider {
         id: "opencode",
@@ -84,6 +90,7 @@ pub const PROVIDERS: [Provider; 6] = [
         env: &["OPENCODE_API_KEY"],
         login: Login::ApiKey,
         default_model: "kimi-k2.6",
+        balance_url: None,
     },
     Provider {
         id: "opencode-go",
@@ -91,8 +98,51 @@ pub const PROVIDERS: [Provider; 6] = [
         env: &["OPENCODE_API_KEY"],
         login: Login::ApiKey,
         default_model: "kimi-k2.6",
+        balance_url: None,
     },
 ];
+
+/// The account balance a provider reports (`DeepSeek`'s `/user/balance`), one
+/// line per currency.
+pub async fn fetch_balance(
+    url: &str,
+    credential: &dyn harness_providers::CredentialResolver,
+) -> Result<Vec<String>, String> {
+    let token = credential.resolve().map_err(|error| error.to_string())?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .bearer_auth(token)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|error| error.without_url().to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {}", status.as_u16()));
+    }
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| error.without_url().to_string())?;
+    let mut lines = Vec::new();
+    if body["is_available"] == false {
+        lines.push("the balance is not enough to make requests".to_owned());
+    }
+    for info in body["balance_infos"].as_array().into_iter().flatten() {
+        let field = |name: &str| info[name].as_str().unwrap_or("?").to_owned();
+        lines.push(format!(
+            "{} {} (granted {}, topped up {})",
+            field("total_balance"),
+            field("currency"),
+            field("granted_balance"),
+            field("topped_up_balance")
+        ));
+    }
+    if lines.is_empty() {
+        lines.push("the provider reported no balance".to_owned());
+    }
+    Ok(lines)
+}
 
 /// The provider with this id.
 #[must_use]

@@ -196,6 +196,7 @@ impl ModelProvider for AnthropicMessagesAdapter {
         let credentials = Arc::clone(&self.credentials);
         let thinking = self.thinking;
         let headers = self.headers.clone();
+        let provider_id = self.capabilities.provider_id.clone();
         Box::pin(async move {
             let token = credentials.resolve()?;
             let response = tokio::select! {
@@ -215,6 +216,7 @@ impl ModelProvider for AnthropicMessagesAdapter {
                     })?,
                 () = cancellation.cancelled() => return Err(ProviderError::new(ErrorCode::ProviderCanceled, "provider request canceled")),
             };
+            super::limits::record(&provider_id, response.headers());
             if !response.status().is_success() {
                 return Err(super::http_response_error(response).await);
             }
@@ -333,10 +335,16 @@ impl AnthropicSseDecoder {
             .map_err(|_| protocol("provider SSE data is invalid JSON"))?;
         match event_name.as_str() {
             "message_start" => {
-                self.prompt_tokens = value
-                    .pointer("/message/usage/input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
+                // The prompt is the uncached input plus what was read from or
+                // written to the cache, as prime-agent counts a context's tokens.
+                self.prompt_tokens = [
+                    "input_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                ]
+                .iter()
+                .filter_map(|field| value["message"]["usage"][field].as_u64())
+                .sum();
             }
             "content_block_start" => {
                 let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);

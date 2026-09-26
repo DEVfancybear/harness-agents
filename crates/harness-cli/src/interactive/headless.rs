@@ -212,12 +212,13 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         disallowed_tools: request.options.disallowed_tools.clone(),
         ..ConfigOverrides::default()
     };
-    let resolved_config = super::config::resolve_layers(
+    let mut resolved_config = super::config::resolve_layers(
         &context.paths.config_file,
         &context.project.root,
         &environment,
         &config_overrides,
     )?;
+    super::config::apply_catalog_context_window(&mut resolved_config, &context.paths.data_dir);
     let tool_policy = super::permissions::build_tool_policy(
         &resolved_config.approval,
         &resolved_config.allow_rules,

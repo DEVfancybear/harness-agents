@@ -37,7 +37,7 @@ pub const DEEPSEEK_PRESET: ProviderPreset = ProviderPreset {
     id: "deepseek",
     protocol: "openai_chat",
     endpoint: "https://api.deepseek.com/chat/completions",
-    model: "deepseek-flash",
+    model: "deepseek-v4-flash",
     api_key_env: "DEEPSEEK_API_KEY",
     thinking: "off",
 };
@@ -547,12 +547,6 @@ pub fn resolve_layers(
         model_context_windows.get(&provider.model).copied()
     {
         (value, layer, None)
-    } else if let Some(value) = known_context_window(&provider.id, &provider.model) {
-        (
-            value,
-            ConfigLayer::Default,
-            Some("resolved from the built-in model table".to_owned()),
-        )
     } else {
         (
             UNKNOWN_MODEL_CONTEXT_WINDOW,
@@ -827,10 +821,27 @@ fn apply_context_limits(
     }
 }
 
-fn known_context_window(provider: &str, model: &str) -> Option<u64> {
-    match (provider, model) {
-        ("deepseek", "deepseek-flash" | "deepseek-v4-pro") => Some(1_048_576),
-        _ => None,
+/// A model's context window from the model catalog, when the configuration did
+/// not set one: the notice a missing window leaves is how that is told apart.
+pub fn apply_catalog_context_window(resolved: &mut ResolvedConfig, data_dir: &Path) {
+    if resolved.context_window_notice.is_none() {
+        return;
+    }
+    let reference = format!("{}/{}", resolved.provider.id, resolved.provider.model);
+    if let Some(window) = super::providers::Catalog::load(data_dir)
+        .find(&reference)
+        .and_then(|model| model.context_window)
+    {
+        resolved.context_window_tokens = window;
+        resolved.context_window_notice = None;
+        if let Some(entry) = resolved
+            .explain
+            .iter_mut()
+            .find(|entry| entry.key == "runtime.context_window_tokens")
+        {
+            entry.value = window.to_string();
+            entry.reason = Some("from the model catalog".to_owned());
+        }
     }
 }
 
@@ -1283,14 +1294,14 @@ mod tests {
     }
 
     #[test]
-    fn g07_context_window_comes_from_config_then_table_then_default_with_notice() {
+    fn g07_context_window_comes_from_config_then_catalog_then_default_with_notice() {
         let temp = tempfile::tempdir().expect("temp root");
         let root = temp.path().join("project");
         std::fs::create_dir_all(&root).expect("project root");
         let user = temp.path().join("user.toml");
         std::fs::write(
             &user,
-            "schema_version = 2\n[models.deepseek-flash]\ncontext_window = 24576\n",
+            "schema_version = 2\n[models.deepseek-v4-flash]\ncontext_window = 24576\n",
         )
         .expect("configured model window");
         let configured = resolve_layers(
@@ -1313,24 +1324,27 @@ mod tests {
             "schema_version = 2\n[provider]\nmodel = 'deepseek-v4-pro'\n",
         )
         .expect("known model");
-        let known = resolve_layers(
+        let mut known = resolve_layers(
             &user,
             &root,
             &super::super::paths::LaunchEnvironment::default(),
             &ConfigOverrides::default(),
         )
         .expect("known model window resolves");
+        // The window of a model the configuration does not size is the catalog's.
+        super::apply_catalog_context_window(&mut known, &temp.path().join("data"));
         let source = known
             .explain
             .iter()
             .find(|entry| entry.key == "runtime.context_window_tokens")
             .expect("known model window is explained");
-        assert_eq!(source.value, "1048576");
+        assert_eq!(source.value, "1000000");
+        assert!(known.context_window_notice.is_none());
         assert!(
             source
                 .reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("table"))
+                .is_some_and(|reason| reason.contains("catalog"))
         );
 
         let unknown = resolve_layers(

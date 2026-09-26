@@ -892,21 +892,12 @@ impl TurnDriver {
                 break TurnStop::LoopDetected;
             }
 
-            let names: Vec<String> = result
-                .tool_calls
-                .iter()
-                .map(|call| call.name.clone())
-                .collect();
-            // The assistant turn keeps its own words as well as its typed calls:
-            // the text is where the model states what it is doing and why, and
-            // replacing it with a list of tool names throws away the only record
-            // of its plan. The list is the fallback for a call-only response,
-            // which still needs non-empty content.
-            let assistant_text = if result.response.trim().is_empty() {
-                format!("requested tool calls: {}", names.join(", "))
-            } else {
-                result.response.clone()
-            };
+            // The assistant turn keeps its own words and its typed calls, and
+            // nothing else: a call-only response stays empty, as prime-agent keeps
+            // it. A placeholder naming the tools was sent back as the model's own
+            // words, and the model learned to write tool names instead of calling
+            // them - which ended turns with nothing done and no answer.
+            let assistant_text = result.response.trim().to_owned();
             // A transcript that keeps every step can meet the same call id
             // twice, because a provider only promises an id is unique inside one
             // response. Two announcements of one id is an invalid transcript, so
@@ -1437,8 +1428,16 @@ async fn gate_action(
         ));
     }
     notify_action_approval_required(tools, &prepared, &decision, observer, cancellation).await;
-    let (approval, granted_gate) =
-        resolve_action_approval(tools, &prepared, decision, options, sequence, observer).await?;
+    let (approval, granted_gate) = resolve_action_approval(
+        tools,
+        &prepared,
+        decision,
+        options,
+        sequence,
+        observer,
+        cancellation,
+    )
+    .await?;
     match tools.begin(prepared.clone(), approval, cancellation).await {
         Ok(crate::service::Begun::Ready(begun)) => Ok(Gated::Ready(Box::new(ReadyAction {
             begun,
@@ -1543,6 +1542,7 @@ async fn resolve_action_approval(
     options: &TurnOptions,
     sequence: u32,
     observer: &Arc<dyn TurnObserver>,
+    cancellation: &CancellationToken,
 ) -> Result<
     (
         Option<ApprovalGrant>,
@@ -1571,7 +1571,18 @@ async fn resolve_action_approval(
                     ToolExecutionService::approval_diff(prepared)?,
                 );
                 let request_id = proposal.request_id.clone();
-                match gate.request(proposal).await {
+                // A canceled turn does not wait for an answer nobody will give: the
+                // action is refused and the cancellation ends the turn.
+                let answer = tokio::select! {
+                    answer = gate.request(proposal) => answer,
+                    () = cancellation.cancelled() => {
+                        return Err(HarnessError::new(
+                            ErrorCode::ProviderCanceled,
+                            "the turn was canceled while the action waited for approval; it was not executed",
+                        ));
+                    }
+                };
+                match answer {
                     ApprovalAnswer::Granted => {
                         granted_gate = Some((Arc::clone(gate), request_id));
                         Some(tools.approve(prepared).await?)

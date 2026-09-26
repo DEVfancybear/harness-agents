@@ -27,6 +27,7 @@ pub use tokio_util::sync::CancellationToken;
 pub(crate) static LOOPBACK_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub mod anthropic;
+pub mod limits;
 pub mod responses;
 mod streaming;
 pub mod thinking;
@@ -451,7 +452,7 @@ impl ProviderMessage {
 /// The `messages` array as the API accepts it.
 #[must_use]
 pub fn wire_messages(messages: &[ProviderMessage]) -> Vec<Value> {
-    messages.iter().map(ProviderMessage::to_wire).collect()
+    chat_messages(messages, false)
 }
 
 /// The `messages` array for a thinking endpoint that wants every assistant message's
@@ -459,21 +460,102 @@ pub fn wire_messages(messages: &[ProviderMessage]) -> Vec<Value> {
 /// `DeepSeek` (`requiresReasoningContentOnAssistantMessages`).
 #[must_use]
 pub fn wire_messages_with_reasoning(messages: &[ProviderMessage]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|message| {
-            let mut wire = message.to_wire();
-            if message.role == MessageRole::Assistant {
-                wire["reasoning_content"] = json!(
+    chat_messages(messages, true)
+}
+
+/// prime-agent's `convertMessages` for Chat Completions: an assistant message
+/// carries its calls as `tool_calls`, and each result answers its call as a
+/// `tool` message with that `tool_call_id`.
+///
+/// The model must see its own calls as calls. Sent as text - a line naming the
+/// tools, and the results as user messages - the transcript teaches the model
+/// that a step is *written*, and it starts writing tool names instead of calling
+/// them, which ends the turn with nothing done.
+///
+/// A call no result answers gets `No result provided` (`transformMessages`), so
+/// an interrupted step never leaves the API an unanswered call. A result whose
+/// call was never announced has nothing to answer and goes as a user message.
+fn chat_messages(messages: &[ProviderMessage], with_reasoning: bool) -> Vec<Value> {
+    let mut wire = Vec::with_capacity(messages.len());
+    // Calls announced and not answered yet, in the order they were made.
+    let mut open: Vec<String> = Vec::new();
+    // Images tool results returned, shown after the run of results they came with.
+    let mut images: Vec<Value> = Vec::new();
+    let close = |wire: &mut Vec<Value>, open: &mut Vec<String>, images: &mut Vec<Value>| {
+        for id in open.drain(..) {
+            wire.push(json!({"role": "tool", "tool_call_id": id, "content": "No result provided"}));
+        }
+        if !images.is_empty() {
+            let mut content =
+                vec![json!({"type": "text", "text": "Attached image(s) from tool result:"})];
+            content.append(images);
+            wire.push(json!({"role": "user", "content": content}));
+        }
+    };
+    for message in messages {
+        let answers_open = message.role == MessageRole::Tool
+            && message
+                .tool_call_id
+                .as_ref()
+                .is_some_and(|id| open.contains(id));
+        if answers_open {
+            let id = message.tool_call_id.clone().unwrap_or_default();
+            open.retain(|open| *open != id);
+            let content = if message.content.is_empty() && !message.attachments.is_empty() {
+                "(see attached image)".to_owned()
+            } else {
+                message.content.clone()
+            };
+            wire.push(json!({"role": "tool", "tool_call_id": id, "content": content}));
+            images.extend(message.attachments.iter().map(|image| {
+                json!({"type": "image_url", "image_url": {"url": image.url(), "detail": "auto"}})
+            }));
+            continue;
+        }
+        close(&mut wire, &mut open, &mut images);
+        if message.role == MessageRole::Assistant {
+            let mut entry = json!({"role": "assistant"});
+            if message.tool_calls.is_empty() {
+                // Some providers refuse an assistant message with neither content
+                // nor calls; an aborted, empty answer is left out.
+                if message.content.is_empty() {
+                    continue;
+                }
+                entry["content"] = json!(message.content);
+            } else {
+                entry["content"] = if message.content.is_empty() {
+                    Value::Null
+                } else {
+                    json!(message.content)
+                };
+                entry["tool_calls"] = message
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        json!({
+                            "id": call.call_id,
+                            "type": "function",
+                            "function": {"name": call.name, "arguments": call.arguments},
+                        })
+                    })
+                    .collect();
+                open.extend(message.tool_calls.iter().map(|call| call.call_id.clone()));
+            }
+            if with_reasoning {
+                entry["reasoning_content"] = json!(
                     message
                         .reasoning
                         .as_ref()
                         .map_or("", |reasoning| reasoning.text.as_str())
                 );
             }
-            wire
-        })
-        .collect()
+            wire.push(entry);
+        } else {
+            wire.push(message.to_wire());
+        }
+    }
+    close(&mut wire, &mut open, &mut images);
+    wire
 }
 
 /// Validate the paired transcript before anything is dispatched.
@@ -1135,11 +1217,7 @@ impl OpenAiChatAdapter {
 
 /// The Chat Completions body before transport options: messages - with their
 /// reasoning when the endpoint wants it back - and the thinking level.
-pub(crate) fn chat_body(
-    request: &ProviderRequest,
-    thinking: Option<&Thinking>,
-    provider_id: &str,
-) -> Value {
+pub(crate) fn chat_body(request: &ProviderRequest, thinking: Option<&Thinking>) -> Value {
     let messages = if thinking.is_some_and(Thinking::replays_reasoning_content) {
         wire_messages_with_reasoning(&request.messages)
     } else {
@@ -1155,7 +1233,7 @@ pub(crate) fn chat_body(
         body["temperature"] = json!(temperature);
     }
     if let Some(thinking) = thinking {
-        thinking.apply_chat(&mut body, provider_id, &request.model);
+        thinking.apply_chat(&mut body);
     }
     body
 }
@@ -1259,7 +1337,7 @@ impl ModelProvider for OpenAiChatAdapter {
         let headers = self.headers.clone();
         Box::pin(async move {
             let token = credentials.resolve()?;
-            let mut body = chat_body(&request, thinking.as_ref(), &provider_id);
+            let mut body = chat_body(&request, thinking.as_ref());
             if let Some(max_tokens) = request.max_output_tokens {
                 body["max_tokens"] = json!(max_tokens);
             }
@@ -1286,6 +1364,7 @@ impl ModelProvider for OpenAiChatAdapter {
                 })?,
                 () = cancellation.cancelled() => return Err(ProviderError::new(ErrorCode::ProviderCanceled, "provider request canceled")),
             };
+            limits::record(&provider_id, response.headers());
             if !response.status().is_success() {
                 return Err(http_response_error(response).await);
             }
@@ -2498,5 +2577,58 @@ mod wire_tests {
             .is_none(),
             "a link past the documented 8192 characters is refused"
         );
+    }
+}
+
+#[cfg(test)]
+mod chat_message_tests {
+    use super::{MessageRole, ProviderMessage, ProviderToolCall, wire_messages};
+    use serde_json::json;
+
+    /// The model sees its own calls as calls and each result as the answer to one,
+    /// as prime-agent sends them; a call nothing answered is closed for it.
+    #[test]
+    fn calls_and_results_travel_as_calls_and_results() {
+        let messages = vec![
+            ProviderMessage::new(MessageRole::User, "read both"),
+            ProviderMessage::assistant_with_calls(
+                "",
+                vec![
+                    ProviderToolCall::new("call_a", "read_file", r#"{"path":"a"}"#),
+                    ProviderToolCall::new("call_b", "read_file", r#"{"path":"b"}"#),
+                ],
+            ),
+            ProviderMessage::tool_result("call_a", "A"),
+            ProviderMessage::new(MessageRole::User, "stop"),
+        ];
+        let wire = wire_messages(&messages);
+        assert_eq!(wire[1]["role"], "assistant");
+        assert_eq!(wire[1]["content"], serde_json::Value::Null);
+        assert_eq!(wire[1]["tool_calls"][1]["function"]["name"], "read_file");
+        assert_eq!(
+            wire[2],
+            json!({"role": "tool", "tool_call_id": "call_a", "content": "A"})
+        );
+        assert_eq!(
+            wire[3],
+            json!({"role": "tool", "tool_call_id": "call_b", "content": "No result provided"})
+        );
+        assert_eq!(wire[4]["role"], "user");
+        assert!(
+            !wire.iter().any(|message| message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("requested tool calls"))),
+            "no call is ever written out as text"
+        );
+    }
+
+    /// An empty assistant answer with no calls is left out, as prime-agent does.
+    #[test]
+    fn an_empty_answer_without_calls_is_not_sent() {
+        let wire = wire_messages(&[
+            ProviderMessage::new(MessageRole::User, "hi"),
+            ProviderMessage::new(MessageRole::Assistant, ""),
+        ]);
+        assert_eq!(wire.len(), 1);
     }
 }

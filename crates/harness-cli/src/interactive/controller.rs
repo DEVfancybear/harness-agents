@@ -510,6 +510,26 @@ impl InteractiveController {
         );
         self.editor
             .set_argument_options("/model", self.service.model_options());
+        // The modes with what each lets through, the one in force marked.
+        let current = self
+            .service
+            .permissions_summary()
+            .first()
+            .and_then(|line| line.strip_prefix("mode: ").map(str::to_owned));
+        self.editor.set_argument_options(
+            "/permissions",
+            PERMISSION_MODES
+                .iter()
+                .map(|(mode, meaning)| {
+                    let marker = if current.as_deref() == Some(*mode) {
+                        " · current"
+                    } else {
+                        ""
+                    };
+                    ((*mode).to_owned(), format!("{meaning}{marker}"))
+                })
+                .collect(),
+        );
     }
 
     /// Apply one key.
@@ -837,6 +857,19 @@ impl InteractiveController {
                 // gathering until the answer starts or the step ends.
                 self.flush_text(effects);
                 self.pending_thinking.push_str(&text);
+                effects.push(Effect::Redraw);
+            }
+            SessionEvent::UsageUpdated { label } => {
+                let line = format!("Context: {label}");
+                if let Some(existing) = self
+                    .header
+                    .iter_mut()
+                    .find(|entry| entry.starts_with("Context:"))
+                {
+                    *existing = line;
+                } else {
+                    self.header.push(line);
+                }
                 effects.push(Effect::Redraw);
             }
             SessionEvent::CostUpdated { label } => {
@@ -1843,8 +1876,29 @@ impl InteractiveController {
                 self.reference("/config", lines, &mut effects);
             }
             "/permissions" => {
-                let lines = self.service.permissions_summary();
-                self.reference("/permissions", lines, &mut effects);
+                if let Some(mode) = argument {
+                    if self.phase.has_active_run() {
+                        self.push_history(
+                            &mut effects,
+                            HistoryItem::Notice {
+                                message: "permission mode changes apply between turns; wait for this run to finish".to_owned(),
+                            },
+                        );
+                    } else {
+                        match self.service.set_mode(mode) {
+                            Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
+                            Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                        }
+                        self.refresh_menu();
+                    }
+                } else {
+                    let mut lines = self.service.permissions_summary();
+                    lines.push(
+                        "choose a mode: /permissions ask|auto-edit|full-auto (Tab or Enter opens the list)"
+                            .to_owned(),
+                    );
+                    self.reference("/permissions", lines, &mut effects);
+                }
             }
             "/hooks" => {
                 self.reference("/hooks", self.service.hooks_summary(), &mut effects);
@@ -1891,40 +1945,6 @@ impl InteractiveController {
                         }
                         Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
                     }
-                }
-            }
-            "/mode" => {
-                if self.phase.has_active_run() {
-                    self.push_history(
-                        &mut effects,
-                        HistoryItem::Notice {
-                            message: "permission mode changes apply between turns; wait for this run to finish".to_owned(),
-                        },
-                    );
-                } else if let Some(mode) = argument {
-                    if raw_argument.is_some_and(|raw| raw.split_whitespace().count() != 1) {
-                        self.push_history(
-                            &mut effects,
-                            HistoryItem::Error {
-                                message: "usage: /mode ask|auto-edit|full-auto".to_owned(),
-                            },
-                        );
-                    } else {
-                        match self.service.set_mode(mode) {
-                            Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
-                            Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
-                        }
-                    }
-                } else {
-                    self.reference(
-                        "/mode",
-                        vec![
-                            "ask: prompt for each gated action".to_owned(),
-                            "auto-edit: workspace reads and edits run without a prompt; process, shell and extension tools still ask".to_owned(),
-                            "full-auto: built-in workspace tools run without a prompt; extension tools still ask".to_owned(),
-                        ],
-                        &mut effects,
-                    );
                 }
             }
             "/steer" => {
@@ -2155,7 +2175,9 @@ impl InteractiveController {
                         Effect::Redraw,
                     ];
                 } else {
-                    // A new conversation starts without the old one's goal.
+                    // A new conversation starts without the old one's goal, and
+                    // with nothing in its context.
+                    self.header.retain(|line| !line.starts_with("Context:"));
                     self.goal = None;
                     self.service.set_goal(None);
                     self.session_candidates.clear();
@@ -2536,14 +2558,23 @@ impl InteractiveController {
             None => self.header.push(label),
         }
         self.thinking_label = self.service.thinking_level();
-        // prime-agent rewrites `/effort`'s hint to the levels the model offers.
+        // prime-agent rewrites `/effort`'s hint to the levels the model offers,
+        // each under the name its provider uses; the one in force is marked.
         let levels = self.service.thinking_levels();
         if !levels.is_empty() {
+            let current = self.thinking_label.clone();
             self.editor.set_argument_options(
                 "/effort",
                 levels
                     .into_iter()
-                    .map(|level| (level, String::new()))
+                    .map(|level| {
+                        let marker = if current.as_deref() == Some(level.as_str()) {
+                            "current".to_owned()
+                        } else {
+                            String::new()
+                        };
+                        (level, marker)
+                    })
                     .collect(),
             );
         }
@@ -3194,6 +3225,19 @@ fn parse_shell_prefix(text: &str) -> Result<Option<ShellPrefix>, String> {
         mode,
     }))
 }
+
+/// The permission modes `/permissions` offers, with what each lets run unasked.
+const PERMISSION_MODES: [(&str, &str); 3] = [
+    ("ask", "prompt for each gated action"),
+    (
+        "auto-edit",
+        "workspace reads and edits run unasked; process, shell and extension tools ask",
+    ),
+    (
+        "full-auto",
+        "built-in workspace tools run unasked; extension tools still ask",
+    ),
+];
 
 #[cfg(test)]
 mod tests {

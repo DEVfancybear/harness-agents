@@ -478,6 +478,11 @@ pub enum SessionEvent {
     CostUpdated {
         label: String,
     },
+    /// How full the context window is and the provider's tightest limit, after
+    /// a response reported its usage (`12% · 123k/1M · 5h 34%`).
+    UsageUpdated {
+        label: String,
+    },
     /// A model step started; the status bar counts these.
     StepStarted {
         step: u32,

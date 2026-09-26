@@ -183,14 +183,7 @@ pub fn help_card_lines() -> Vec<String> {
         ),
         (
             "Run",
-            &[
-                "/goal",
-                "/steer",
-                "/mode",
-                "/permissions",
-                "/agents",
-                "/more",
-            ],
+            &["/goal", "/steer", "/permissions", "/agents", "/more"],
         ),
         (
             "Tools",

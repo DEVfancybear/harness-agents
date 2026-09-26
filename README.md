@@ -78,7 +78,7 @@ Settings merge default → user `config.toml` → trusted project `.harness/conf
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENCODE_API_KEY` | — | Provider keys; a key saved with `/login` (in `auth.json`) wins over them |
 | `HA_PROVIDER_ENDPOINT` | `https://api.deepseek.com/chat/completions` | Any OpenAI-compatible chat endpoint |
-| `HA_PROVIDER_MODEL` | `deepseek-flash` | Model name |
+| `HA_PROVIDER_MODEL` | `deepseek-v4-flash` | Model name |
 | `HA_TURN_MAX_STEPS` / `HA_TURN_MAX_TOOL_CALLS` | 30 / 80 | Model calls and tool calls per turn before it pauses |
 | `HA_TURN_DEADLINE_SECONDS` / `HA_TURN_CONTINUATIONS` | 900 / 2 | Time per turn; automatic continuations after a bound |
 | `HA_SKILL_PATHS` | — | Extra skill directories, separated like `PATH` |
@@ -180,7 +180,7 @@ Cấu hình được gộp theo thứ tự mặc định → `config.toml` của
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENCODE_API_KEY` | — | Khóa provider; khóa lưu bằng `/login` (trong `auth.json`) được ưu tiên hơn |
 | `HA_PROVIDER_ENDPOINT` | `https://api.deepseek.com/chat/completions` | Bất kỳ endpoint chat tương thích OpenAI |
-| `HA_PROVIDER_MODEL` | `deepseek-flash` | Tên model |
+| `HA_PROVIDER_MODEL` | `deepseek-v4-flash` | Tên model |
 | `HA_TURN_MAX_STEPS` / `HA_TURN_MAX_TOOL_CALLS` | 30 / 80 | Số lời gọi model và tool mỗi lượt trước khi tạm dừng |
 | `HA_TURN_DEADLINE_SECONDS` / `HA_TURN_CONTINUATIONS` | 900 / 2 | Thời gian mỗi lượt; số lần tự tiếp tục sau khi chạm giới hạn |
 | `HA_SKILL_PATHS` | — | Thư mục skill bổ sung, phân tách như `PATH` |

@@ -164,6 +164,9 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
                 let label = format!(" · cost {cost}");
                 push(Span::styled(label, theme.dim));
             }
+            if let Some(context) = context_label(state) {
+                push(Span::styled(format!(" · ctx {context}"), theme.dim));
+            }
             if let Some(model) = short_model(state) {
                 push(Span::styled(format!(" · {model}"), theme.dim));
             }
@@ -192,6 +195,9 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
                 let label = format!(" · {cost}");
                 push(Span::styled(label, theme.dim));
             }
+            if let Some(context) = context_label(state) {
+                push(Span::styled(format!(" · ctx {context}"), theme.dim));
+            }
             push(Span::styled(
                 format!(" · {}", state.detail.hint()),
                 theme.dim,
@@ -204,6 +210,14 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
     }
 
     Line::from(spans)
+}
+
+/// How full the context is, once a response has said.
+fn context_label(state: &UiState) -> Option<String> {
+    state
+        .header
+        .iter()
+        .find_map(|line| line.strip_prefix("Context: ").map(str::to_owned))
 }
 
 fn cost_label(state: &UiState) -> Option<String> {

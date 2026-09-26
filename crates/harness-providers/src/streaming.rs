@@ -157,7 +157,7 @@ pub(crate) fn adapter_stream(
                     return;
                 }
             };
-            let mut body = crate::chat_body(&request, thinking.as_ref(), &provider_id);
+            let mut body = crate::chat_body(&request, thinking.as_ref());
             if !request.tool_schemas.is_empty()
                 && let Some(object) = body.as_object_mut()
             {
@@ -195,6 +195,7 @@ pub(crate) fn adapter_stream(
                     return;
                 }
             };
+            crate::limits::record(&provider_id, response.headers());
             if !response.status().is_success() {
                 // The taxonomy (401 no retry, 429/5xx transient, Retry-After) is
                 // decided here, and the retry owner is the runtime.

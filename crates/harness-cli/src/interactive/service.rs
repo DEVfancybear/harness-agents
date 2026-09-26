@@ -401,6 +401,22 @@ impl ChannelApprovalGate {
         }
     }
 
+    /// Close every approval still waiting: the turn was canceled, so each is
+    /// refused and its panel closed rather than left counting down.
+    pub fn cancel_pending(&self) {
+        let pending = self
+            .pending
+            .lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default();
+        for (request_id, answer) in pending {
+            let _ = answer.send(ApprovalAnswer::Denied);
+            let _ = self
+                .sender
+                .send(SessionEvent::ApprovalExpired { request_id });
+        }
+    }
+
     /// The rule set shared with this turn's existing `ToolPolicy`.
     #[must_use]
     pub fn turn_rules(&self) -> ToolPolicyRules {
@@ -691,8 +707,10 @@ pub(super) fn resolve_provider_with_overrides(
     data_dir: &Path,
     overrides: &ConfigOverrides,
 ) -> Result<ProviderConfig, String> {
-    let resolved = super::config::resolve_layers(user_path, project_root, environment, overrides)
-        .map_err(|error| error.to_string())?;
+    let mut resolved =
+        super::config::resolve_layers(user_path, project_root, environment, overrides)
+            .map_err(|error| error.to_string())?;
+    super::config::apply_catalog_context_window(&mut resolved, data_dir);
     if !matches!(
         resolved.provider.protocol.as_str(),
         "openai_chat" | "anthropic_messages" | "openai_responses" | "openai_codex"
@@ -1115,11 +1133,29 @@ fn strip_front_matter(content: &str) -> &str {
     })
 }
 
+/// The usage line: how full the context is, and the provider's tightest limit
+/// when its responses report one.
+fn usage_label(context_tokens: u64, window: u64, provider_id: &str) -> String {
+    use std::fmt::Write as _;
+    let mut label = super::cost::context_label(context_tokens, window);
+    if let Some(snapshot) = harness_providers::limits::latest(provider_id)
+        && let Some(window) = snapshot.tightest()
+        && let Some(used) = window.used_percent
+    {
+        let _ = write!(label, " · {} {used:.0}%", window.label);
+    }
+    label
+}
+
 /// Maps turn progress onto the UI vocabulary.
 struct ChannelObserver {
     sender: UnboundedSender<SessionEvent>,
     cost_tracker: Arc<Mutex<CostTracker>>,
     model_price: Option<ModelPrice>,
+    /// The model's context window, for the usage line.
+    context_window: u64,
+    /// Whose limits the usage line names.
+    provider_id: String,
     auto_allowed_count: Arc<AtomicUsize>,
     bell: bool,
     /// Calls are executed serially by the turn driver. Keeping the current
@@ -1155,6 +1191,13 @@ impl TurnObserver for ChannelObserver {
                 } else {
                     "n/a".to_owned()
                 };
+                let _ = self.sender.send(SessionEvent::UsageUpdated {
+                    label: usage_label(
+                        prompt_tokens.saturating_add(completion_tokens),
+                        self.context_window,
+                        &self.provider_id,
+                    ),
+                });
                 Some(SessionEvent::CostUpdated { label })
             }
             // Step boundaries are what the status bar counts (`step 2/8`).
@@ -1747,6 +1790,89 @@ impl AgentSessionService {
         }
     }
 
+    /// How full the context is, what the session has used, and the limits the
+    /// provider reported on its responses - prime-agent's `/context`, plus the
+    /// account limits a provider sends with every answer.
+    fn usage_lines(&self) -> Vec<String> {
+        let config = self.configured().ok();
+        let (input, output, context, cost) = self.cost_tracker.lock().map_or_else(
+            |_| (0, 0, None, "n/a".to_owned()),
+            |tracker| {
+                let (input, output) = tracker.tokens();
+                (input, output, tracker.context_tokens(), tracker.display())
+            },
+        );
+        let mut lines = Vec::new();
+        match (&config, context) {
+            (Some(config), Some(used)) => lines.push(format!(
+                "Context:  {} of {}'s window ({used} tokens at the last response)",
+                super::cost::context_label(used, config.context_window_tokens),
+                config.model
+            )),
+            (Some(config), None) => lines.push(format!(
+                "Context:  no response yet; {}'s window is {} tokens",
+                config.model,
+                super::cost::format_tokens(config.context_window_tokens)
+            )),
+            (None, _) => lines.push("Context:  no provider is configured".to_owned()),
+        }
+        lines.push(format!(
+            "Session:  {} in, {} out · cost {cost}",
+            super::cost::format_tokens(input),
+            super::cost::format_tokens(output)
+        ));
+        if let Some(config) = &config {
+            match harness_providers::limits::latest(&config.provider_id) {
+                Some(snapshot) => {
+                    let age = snapshot.at.elapsed().unwrap_or_default();
+                    lines.push(format!(
+                        "Limits:   as {} reported them {} ago",
+                        config.provider_id,
+                        harness_providers::limits::duration_label(age)
+                    ));
+                    lines.extend(snapshot.lines().into_iter().map(|line| format!("  {line}")));
+                }
+                None => lines.push(format!(
+                    "Limits:   {} has not reported any on its responses in this session",
+                    config.provider_id
+                )),
+            }
+        }
+        lines
+    }
+
+    /// The account balance of a provider that has an endpoint for it, sent as
+    /// its own card when the answer comes.
+    fn fetch_balance(&self) {
+        let Ok(config) = self.configured() else {
+            return;
+        };
+        let Some(url) =
+            super::providers::provider(&config.provider_id).and_then(|entry| entry.balance_url)
+        else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let credential = EnvironmentCredential::new(
+            config.provider_id.clone(),
+            config.credential_variable(),
+            self.data_dir.clone(),
+        );
+        let sender = self.sender.clone();
+        handle.spawn(async move {
+            let lines = match super::providers::fetch_balance(url, &credential).await {
+                Ok(lines) => lines,
+                Err(error) => vec![format!("balance unavailable: {error}")],
+            };
+            let _ = sender.send(SessionEvent::Reference {
+                title: format!("{} balance", config.provider_id),
+                lines,
+            });
+        });
+    }
+
     /// Resolve the project identity by opening this project's store read-only.
     ///
     /// Read-only is what keeps `/status` from becoming a second writer: it needs the
@@ -1788,12 +1914,11 @@ impl AgentSessionService {
         &self,
         config: &ProviderConfig,
     ) -> Option<harness_providers::thinking::ReasoningModel> {
+        // The catalog is the only source: a model it does not know is not assumed
+        // to reason, whatever its name looks like.
         super::providers::Catalog::load(&self.data_dir)
             .find(&format!("{}/{}", config.provider_id, config.model))
             .map(super::providers::Model::reasoning_model)
-            .or_else(|| {
-                harness_providers::thinking::reasoning_model(&config.provider_id, &config.model)
-            })
     }
 
     fn configured(&self) -> Result<ProviderConfig, String> {
@@ -2392,7 +2517,9 @@ impl SessionPort for AgentSessionService {
     }
 
     fn context_summary(&self) -> Vec<String> {
-        self.context_summary.lock().map_or_else(
+        let mut lines = self.usage_lines();
+        lines.push(String::new());
+        lines.extend(self.context_summary.lock().map_or_else(
             |_| vec!["context details are unavailable".to_owned()],
             |lines| {
                 if lines.is_empty() {
@@ -2401,7 +2528,9 @@ impl SessionPort for AgentSessionService {
                     lines.clone()
                 }
             },
-        )
+        ));
+        self.fetch_balance();
+        lines
     }
 
     fn git_diff(&mut self) -> Result<(), String> {
@@ -2541,24 +2670,31 @@ impl SessionPort for AgentSessionService {
     }
 
     fn set_thinking(&mut self, level: &str) -> Result<String, String> {
-        let requested = harness_providers::ThinkingLevel::parse(level).ok_or_else(|| {
+        let config = self.configured()?;
+        let model = self.reasoning_of(&config);
+        // The provider's spelling (`max`) or this app's level name (`xhigh`).
+        let requested = harness_providers::thinking::resolve(model, level).ok_or_else(|| {
+            let names = harness_providers::thinking::offered(model)
+                .into_iter()
+                .map(|(_, name)| name)
+                .collect::<Vec<_>>();
             format!(
-                "unknown thinking level {level:?}; choose one of {}",
-                harness_providers::ThinkingLevel::ALL
-                    .map(harness_providers::ThinkingLevel::as_str)
-                    .join(", ")
+                "unknown thinking level {level:?}; {} offers {}",
+                config.model,
+                names.join(", ")
             )
         })?;
         self.thinking = Some(requested);
-        let config = self.configured()?;
-        let model = self.reasoning_of(&config);
         let used = harness_providers::thinking::clamp(model, requested);
+        let name = |level| harness_providers::thinking::provider_name(model, level);
         Ok(if used == requested {
-            format!("thinking {requested} selected for the next turn")
+            format!("thinking {} selected for the next turn", name(requested))
         } else {
             format!(
-                "thinking {requested} selected for the next turn; {} uses {used}, the nearest level it offers",
-                config.model
+                "thinking {} selected for the next turn; {} uses {}, the nearest level it offers",
+                name(requested),
+                config.model,
+                name(used)
             )
         })
     }
@@ -2567,9 +2703,9 @@ impl SessionPort for AgentSessionService {
         let Ok(config) = self.configured() else {
             return Vec::new();
         };
-        harness_providers::thinking::supported_levels(self.reasoning_of(&config))
+        harness_providers::thinking::offered(self.reasoning_of(&config))
             .into_iter()
-            .map(|level| level.as_str().to_owned())
+            .map(|(_, name)| name)
             .collect()
     }
 
@@ -2580,11 +2716,10 @@ impl SessionPort for AgentSessionService {
             .thinking
             .or_else(|| harness_providers::ThinkingLevel::parse(&config.thinking))
             .unwrap_or_default();
-        Some(
-            harness_providers::thinking::clamp(model, chosen)
-                .as_str()
-                .to_owned(),
-        )
+        Some(harness_providers::thinking::provider_name(
+            model,
+            harness_providers::thinking::clamp(model, chosen),
+        ))
     }
 
     fn thinking_status(&self) -> Vec<String> {
@@ -2596,15 +2731,31 @@ impl SessionPort for AgentSessionService {
             .thinking
             .or_else(|| harness_providers::ThinkingLevel::parse(&config.thinking))
             .unwrap_or_default();
-        let offered = harness_providers::thinking::supported_levels(model)
+        let names = harness_providers::thinking::offered(model)
             .into_iter()
-            .map(harness_providers::ThinkingLevel::as_str)
-            .collect::<Vec<_>>()
-            .join(", ");
+            .map(|(_, name)| name)
+            .collect::<Vec<_>>();
+        let used = harness_providers::thinking::provider_name(
+            model,
+            harness_providers::thinking::clamp(model, chosen),
+        );
         vec![
-            format!("Thinking: {chosen} (next turn uses {})", harness_providers::thinking::clamp(model, chosen)),
-            format!("Model:    {} offers {offered}", config.model),
-            "/thinking <off|minimal|low|medium|high|xhigh|max> changes it; provider.thinking or HA_PROVIDER_THINKING sets the default".to_owned(),
+            format!(
+                "Thinking: {} (next turn uses {used})",
+                harness_providers::thinking::provider_name(model, chosen)
+            ),
+            if model.is_some() {
+                format!("Model:    {} offers {}", config.model, names.join(", "))
+            } else {
+                format!(
+                    "Model:    {} is not in the model catalog, so no thinking level is sent",
+                    config.model
+                )
+            },
+            format!(
+                "/thinking <{}> changes it; provider.thinking or HA_PROVIDER_THINKING sets the default",
+                names.join("|")
+            ),
         ]
     }
 
@@ -2900,6 +3051,9 @@ impl SessionPort for AgentSessionService {
         // The turn validates ownership in this project's store before dispatch.
         if source.is_none() {
             self.task_id = TaskId::generate();
+            if let Ok(mut tracker) = self.cost_tracker.lock() {
+                tracker.forget_context();
+            }
         }
         previous.clone_from(&source);
         drop(previous);
@@ -2913,6 +3067,7 @@ impl SessionPort for AgentSessionService {
         if let Some(token) = self.cancellation.take() {
             token.cancel();
         }
+        self.gate.cancel_pending();
     }
 
     fn steer(&mut self, text: &str) -> Result<(), String> {
@@ -3959,6 +4114,8 @@ async fn run_turn(
         sender: sender.clone(),
         cost_tracker,
         model_price: config.model_price,
+        context_window: config.context_window_tokens,
+        provider_id: config.provider_id.clone(),
         auto_allowed_count,
         bell: config.bell,
         tool_started: Mutex::new(Vec::new()),
@@ -4062,8 +4219,9 @@ async fn run_turn(
     drop(driver);
     // prime-agent refines at the turn boundary: what the `refine` skill asked for, and
     // every twenty-five turns an automatic review that refines when the trajectory
-    // holds something worth keeping.
-    if outcome.is_ok() {
+    // holds something worth keeping. A canceled turn ends now: no model call runs
+    // after the user asked it to stop.
+    if outcome.is_ok() && !cancellation.is_cancelled() {
         let requested = refine_request
             .lock()
             .ok()
@@ -4402,6 +4560,8 @@ async fn run_session_file_action_inner(
         sender: sender.clone(),
         cost_tracker,
         model_price: config.model_prices.get(&config.provider.model).copied(),
+        context_window: config.context_window_tokens,
+        provider_id: config.provider.id.clone(),
         auto_allowed_count,
         bell: config.bell,
         tool_started: Mutex::new(Vec::new()),
@@ -4819,6 +4979,8 @@ async fn run_shell_prefix_turn(
         sender: sender.clone(),
         cost_tracker,
         model_price: config.model_prices.get(&config.provider.model).copied(),
+        context_window: config.context_window_tokens,
+        provider_id: config.provider.id.clone(),
         auto_allowed_count,
         bell: config.bell,
         tool_started: Mutex::new(Vec::new()),

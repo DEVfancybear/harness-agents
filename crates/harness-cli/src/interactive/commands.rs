@@ -56,7 +56,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 35] = [
+pub const SLASH_COMMANDS: [SlashCommand; 34] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -147,18 +147,14 @@ pub const SLASH_COMMANDS: [SlashCommand; 35] = [
         "Send a correction to the active run at its next safe step",
     ),
     SlashCommand {
+        aliases: &["/permission", "/mode"],
         options: &["ask", "auto-edit", "full-auto"],
         ..command(
-            "/mode",
-            "<ask|auto-edit|full-auto>",
-            "Set the permission mode for this session",
+            "/permissions",
+            "[mode]",
+            "Choose the permission mode, or show it with the rules and auto-allowed count",
         )
     },
-    command(
-        "/permissions",
-        "",
-        "Show the permission mode, rules and auto-allowed count",
-    ),
     command("/cost", "", "Show the session cost from model prices"),
     command(
         "/diff",

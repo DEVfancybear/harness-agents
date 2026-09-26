@@ -96,59 +96,6 @@ pub struct ReasoningModel {
     pub map: &'static [(ThinkingLevel, Option<&'static str>)],
 }
 
-const DEEPSEEK_V4: &[(ThinkingLevel, Option<&str>)] = &[
-    (ThinkingLevel::Minimal, None),
-    (ThinkingLevel::Low, None),
-    (ThinkingLevel::Medium, None),
-    (ThinkingLevel::High, Some("high")),
-    (ThinkingLevel::Xhigh, Some("max")),
-    (ThinkingLevel::Max, None),
-];
-
-const CLAUDE_ADAPTIVE: &[(ThinkingLevel, Option<&str>)] = &[
-    (ThinkingLevel::Xhigh, Some("xhigh")),
-    (ThinkingLevel::Max, Some("max")),
-];
-
-/// The reasoning description of a model, from `pi-ai`'s generated table.
-#[must_use]
-pub fn reasoning_model(provider_id: &str, model: &str) -> Option<ReasoningModel> {
-    let model = model.to_ascii_lowercase();
-    if provider_id == "deepseek" || model.starts_with("deepseek") {
-        // `deepseek-v4-flash` and `deepseek-v4-pro` (and the `deepseek-flash` alias
-        // this app's preset uses) share `pi-ai`'s DeepSeek V4 map.
-        if model.contains("v4") || model.contains("flash") || model.contains("pro") {
-            return Some(ReasoningModel {
-                reasoning: true,
-                map: DEEPSEEK_V4,
-            });
-        }
-        if model.contains("reasoner") {
-            return Some(ReasoningModel {
-                reasoning: true,
-                map: &[],
-            });
-        }
-        return None;
-    }
-    if model.contains("claude") {
-        if supports_adaptive_thinking(&model) {
-            return Some(ReasoningModel {
-                reasoning: true,
-                map: CLAUDE_ADAPTIVE,
-            });
-        }
-        // Budget-based thinking on the Claude 3.7 / 4 generation.
-        if model.contains("3-7") || model.contains("-4") {
-            return Some(ReasoningModel {
-                reasoning: true,
-                map: &[],
-            });
-        }
-    }
-    None
-}
-
 /// The levels a model offers (`pi-ai`'s `getSupportedThinkingLevels`).
 #[must_use]
 pub fn supported_levels(model: Option<ReasoningModel>) -> Vec<ThinkingLevel> {
@@ -196,6 +143,44 @@ fn mapped(model: Option<ReasoningModel>, level: ThinkingLevel) -> String {
         })
         .unwrap_or(level.as_str())
         .to_owned()
+}
+
+/// The name the provider knows `level` by: its catalog map's spelling when the
+/// map renames it (`DeepSeek` calls `xhigh` `max`), else the level's own name.
+#[must_use]
+pub fn provider_name(model: Option<ReasoningModel>, level: ThinkingLevel) -> String {
+    if level == ThinkingLevel::Off {
+        return level.as_str().to_owned();
+    }
+    mapped(model, level)
+}
+
+/// The levels a model offers, each under the name its provider uses, once per
+/// name: a map that sends two levels to one spelling offers that spelling once.
+#[must_use]
+pub fn offered(model: Option<ReasoningModel>) -> Vec<(ThinkingLevel, String)> {
+    let mut offered: Vec<(ThinkingLevel, String)> = Vec::new();
+    for level in supported_levels(model) {
+        let name = provider_name(model, level);
+        if !offered.iter().any(|(_, known)| *known == name) {
+            offered.push((level, name));
+        }
+    }
+    offered
+}
+
+/// The level a name asks for: one of this app's level names, or the provider's
+/// own spelling of a level the model offers (`max` for `DeepSeek`'s `xhigh`).
+#[must_use]
+pub fn resolve(model: Option<ReasoningModel>, name: &str) -> Option<ThinkingLevel> {
+    let wanted = name.trim().to_ascii_lowercase();
+    let offered = offered(model);
+    offered
+        .iter()
+        .find(|(level, _)| level.as_str() == wanted)
+        .or_else(|| offered.iter().find(|(_, spelled)| *spelled == wanted))
+        .map(|(level, _)| *level)
+        .or_else(|| ThinkingLevel::parse(&wanted))
 }
 
 /// Adaptive-thinking Claude models (`pi-ai`'s `supportsAdaptiveThinking`).
@@ -274,8 +259,11 @@ pub fn reasoning_from_catalog(
 
 impl Thinking {
     /// The model's reasoning description: the catalog's, else the built-in table's.
-    fn describe(&self, provider_id: &str, model: &str) -> Option<ReasoningModel> {
-        self.model.or_else(|| reasoning_model(provider_id, model))
+    /// The model's reasoning as its catalog entry describes it. A model the
+    /// catalog does not know is not assumed to reason, as prime-agent treats a
+    /// model it has no registry entry for.
+    const fn describe(&self) -> Option<ReasoningModel> {
+        self.model
     }
 
     /// Whether assistant messages must carry their reasoning back.
@@ -286,8 +274,8 @@ impl Thinking {
 
     /// Fill the request body's reasoning fields for `model` (`pi-ai`'s
     /// `buildParams` for Chat Completions).
-    pub fn apply_chat(&self, body: &mut Value, provider_id: &str, model: &str) {
-        let description = self.describe(provider_id, model);
+    pub fn apply_chat(&self, body: &mut Value) {
+        let description = self.describe();
         let level = clamp(description, self.level);
         let reasons = description.is_some_and(|model| model.reasoning);
         match self.format {
@@ -314,7 +302,7 @@ impl Thinking {
     /// thinking with an effort on the models that have it, a token budget - raising
     /// `max_tokens` to make room - on the others, and nothing when thinking is off.
     pub fn apply_anthropic(&self, body: &mut Value, model: &str) {
-        let description = self.describe("anthropic", model);
+        let description = self.describe();
         let level = clamp(description, self.level);
         if !description.is_some_and(|model| model.reasoning) {
             return;
@@ -368,13 +356,38 @@ pub fn chat_format(provider_id: &str, endpoint: &str) -> ThinkingFormat {
 #[cfg(test)]
 mod tests {
     use super::{
-        Thinking, ThinkingFormat, ThinkingLevel, clamp, reasoning_model, supported_levels,
+        ReasoningModel, Thinking, ThinkingFormat, ThinkingLevel, clamp, offered, provider_name,
+        resolve, supported_levels,
     };
     use serde_json::json;
 
+    /// A catalog entry's reasoning: `reasoning` plus its `thinkingLevelMap`.
+    fn catalog(reasoning: bool, pairs: &[(&str, Option<&str>)]) -> ReasoningModel {
+        let map = pairs
+            .iter()
+            .map(|(level, value)| ((*level).to_owned(), value.map(str::to_owned)))
+            .collect();
+        super::reasoning_from_catalog(reasoning, &map)
+    }
+
+    /// prime-agent's catalog map for the `DeepSeek` V4 family.
+    fn deepseek_v4() -> ReasoningModel {
+        catalog(
+            true,
+            &[
+                ("minimal", None),
+                ("low", None),
+                ("medium", None),
+                ("high", Some("high")),
+                ("xhigh", Some("max")),
+                ("max", None),
+            ],
+        )
+    }
+
     #[test]
     fn deepseek_v4_offers_off_high_and_xhigh_as_pi_ai_maps_it() {
-        let model = reasoning_model("deepseek", "deepseek-v4-flash");
+        let model = Some(deepseek_v4());
         assert_eq!(
             supported_levels(model),
             [
@@ -390,9 +403,9 @@ mod tests {
         Thinking {
             level: ThinkingLevel::Xhigh,
             format: ThinkingFormat::DeepSeek,
-            model: None,
+            model,
         }
-        .apply_chat(&mut body, "deepseek", "deepseek-v4-flash");
+        .apply_chat(&mut body);
         assert_eq!(
             body,
             json!({"thinking": {"type": "enabled"}, "reasoning_effort": "max"})
@@ -401,10 +414,37 @@ mod tests {
         Thinking {
             level: ThinkingLevel::Off,
             format: ThinkingFormat::DeepSeek,
-            model: None,
+            model,
         }
-        .apply_chat(&mut body, "deepseek", "deepseek-v4-flash");
+        .apply_chat(&mut body);
         assert_eq!(body, json!({"thinking": {"type": "disabled"}}));
+    }
+
+    /// The user sees and types the provider's names: `DeepSeek` offers
+    /// off, high and max, and `max` is the level the map spells that way.
+    #[test]
+    fn levels_are_named_and_chosen_the_way_the_provider_spells_them() {
+        let model = Some(deepseek_v4());
+        let names = offered(model)
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["off", "high", "max"]);
+        assert_eq!(provider_name(model, ThinkingLevel::Xhigh), "max");
+        assert_eq!(resolve(model, "max"), Some(ThinkingLevel::Xhigh));
+        assert_eq!(resolve(model, "xhigh"), Some(ThinkingLevel::Xhigh));
+        assert_eq!(resolve(model, "medium"), Some(ThinkingLevel::Medium));
+        assert_eq!(resolve(model, "huge"), None);
+        // Two levels sent under one name are offered once.
+        let shared = Some(catalog(
+            true,
+            &[("minimal", Some("medium")), ("low", Some("medium"))],
+        ));
+        let names = offered(shared)
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["off", "medium", "high"]);
     }
 
     #[test]
@@ -417,7 +457,7 @@ mod tests {
             format: ThinkingFormat::ReasoningEffort,
             model: None,
         }
-        .apply_chat(&mut body, "openai", "local-model");
+        .apply_chat(&mut body);
         assert_eq!(body, json!({}));
     }
 
@@ -427,7 +467,7 @@ mod tests {
         Thinking {
             level: ThinkingLevel::Medium,
             format: ThinkingFormat::Anthropic,
-            model: None,
+            model: Some(catalog(true, &[])),
         }
         .apply_anthropic(&mut body, "claude-sonnet-4-5");
         assert_eq!(body["thinking"]["budget_tokens"], 8192);
@@ -437,7 +477,10 @@ mod tests {
         Thinking {
             level: ThinkingLevel::Max,
             format: ThinkingFormat::Anthropic,
-            model: None,
+            model: Some(catalog(
+                true,
+                &[("xhigh", Some("xhigh")), ("max", Some("max"))],
+            )),
         }
         .apply_anthropic(&mut body, "claude-opus-5-5");
         assert_eq!(body["thinking"]["type"], "adaptive");
@@ -473,7 +516,7 @@ mod tests {
             format: ThinkingFormat::DeepSeek,
             model: Some(model),
         }
-        .apply_chat(&mut body, "opencode-go", "deepseek-v4.1-flash");
+        .apply_chat(&mut body);
         assert_eq!(body["reasoning_effort"], "max");
     }
 
