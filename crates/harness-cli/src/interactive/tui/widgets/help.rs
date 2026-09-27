@@ -126,7 +126,11 @@ mod tests {
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        let text: String = buffer
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         assert!(text.contains("Store: final entry"), "{text}");
     }
 

@@ -71,8 +71,8 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
             modal: None,
             suggest: None,
             composer: area,
-            hints: empty,
             status: empty,
+            hints: empty,
             cursor: None,
             composer_scroll: 0,
             composer_lines: Vec::new(),
@@ -98,10 +98,8 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
     };
     let reserved = if state.modal.is_some() {
         2
-    } else if !state.suggestions.is_empty() {
-        1
     } else {
-        0
+        u16::from(!state.suggestions.is_empty())
     };
     let shown_rows = wanted_rows
         .max(minimum)
@@ -165,8 +163,8 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
         modal,
         suggest,
         composer,
-        hints,
         status,
+        hints,
         cursor,
         composer_scroll,
         composer_lines,

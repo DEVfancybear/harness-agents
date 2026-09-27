@@ -30,17 +30,7 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
         HistoryItem::Banner { lines } => banner_rows(lines, width, theme),
         HistoryItem::User { text } => user_box(text, width, theme),
         HistoryItem::Automatic { text } => injected_prompt(text, width, theme),
-        HistoryItem::Assistant { text } => {
-            let mut rows = vec![
-                Line::default(),
-                Line::from(Span::styled(
-                    format!("{RAIL}HA"),
-                    theme.rail_assistant.add_modifier(Modifier::BOLD),
-                )),
-            ];
-            rows.extend(assistant_rows(text, width, theme));
-            rows
-        }
+        HistoryItem::Assistant { text } => assistant_message(text, width, theme),
         // Collapsed mode hides reasoning, as prime-agent's overview does.
         HistoryItem::Thinking { .. } if detail == Detail::Collapsed => Vec::new(),
         HistoryItem::Thinking { text } => {
@@ -133,6 +123,18 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
             .map(|line| Line::from(Span::raw(line.clone())))
             .collect(),
     }
+}
+
+fn assistant_message(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let mut rows = vec![
+        Line::default(),
+        Line::from(Span::styled(
+            format!("{RAIL}HA"),
+            theme.rail_assistant.add_modifier(Modifier::BOLD),
+        )),
+    ];
+    rows.extend(assistant_rows(text, width, theme));
+    rows
 }
 
 /// Indent rendered rows by one cell, as prime-agent pads assistant text.
