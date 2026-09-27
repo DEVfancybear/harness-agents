@@ -25,14 +25,35 @@ pub fn render(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
 }
 
 /// Build the one status row.
+///
+/// The row has two ends. What the app is doing - the spinner, the clock, the keys
+/// that interrupt it, the counters, and anything that needs a decision - stays on
+/// the left, where it is read first. The telemetry that is only worth a glance
+/// (model, thinking level, cost, context, detail mode) is pushed to the right
+/// edge, so a wide console spends its extra cells on the gap between them instead
+/// of on a longer line of dim text.
 #[must_use]
-#[allow(clippy::too_many_lines, reason = "one arm per phase and panel")]
 pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
+    let (left, tails) = zones(state, theme);
+    compose(left, &tails, width, theme)
+}
+
+/// Lay the two ends of the status row out on one line.
+///
+/// The left end is truncated, never dropped: a narrow console must still say which
+/// model is selected. The right end is chosen from `tails`, richest first: a console
+/// with room for the whole readout gets it, and one without gets the part that still
+/// fits beside the left end rather than a half-written number.
+fn compose(
+    left: Vec<Span<'static>>,
+    tails: &[Vec<Span<'static>>],
+    width: u16,
+    theme: &Theme,
+) -> Line<'static> {
     let budget = usize::from(width);
+    let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0_usize;
-    // A span that does not fit is truncated, never dropped: a narrow console must
-    // still say which model is selected.
+    // A span that does not fit is truncated, never dropped.
     let mut push = |mut span: Span<'static>| {
         let cost = super::composer::display_width(&span.content);
         if used >= budget {
@@ -64,7 +85,62 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
         spans.push(span);
         used += cost;
     };
+    for span in left {
+        push(span);
+    }
 
+    let fits = |tail: &[Span<'static>]| -> Option<usize> {
+        // A kept readout costs its own cells plus the ` · ` that joins it to the
+        // one before it.
+        let cells: usize = tail
+            .iter()
+            .map(|span| super::composer::display_width(&span.content))
+            .sum::<usize>()
+            + tail.len().saturating_sub(1) * 3;
+        (used + cells < budget).then(|| budget - used - cells)
+    };
+    if let Some(tail) = tails.iter().find(|tail| fits(tail).is_some()) {
+        let gap = fits(tail).unwrap_or(0);
+        spans.push(Span::raw(" ".repeat(gap)));
+        for (index, span) in tail.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(" · ", theme.dim));
+            }
+            spans.push(span.clone());
+        }
+    }
+    Line::from(spans)
+}
+
+/// The two ends of the status row, before the width decides what fits.
+#[must_use]
+#[allow(clippy::too_many_lines, reason = "one arm per phase and panel")]
+fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'static>>>) {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    // What the session has spent and how full its context is are readouts, not
+    // activities: they belong at the right edge, where they can be found without
+    // reading the line. The model and the thinking level stay on the left, next to
+    // what the app is doing with them.
+    // The readouts, richest set first. What a narrow console keeps is the context
+    // gauge, because it is the one number nothing else on the screen repeats.
+    let telemetry = |theme: &Theme| -> Vec<Vec<Span<'static>>> {
+        let cost = cost_label(state).map(|cost| Span::styled(cost, theme.dim));
+        let context =
+            context_label(state).map(|value| Span::styled(format!("ctx {value}"), theme.dim));
+        let detail = (matches!(state.phase, AppPhase::Ready | AppPhase::WaitingInput)
+            && state.modal.is_none())
+        .then(|| Span::styled(state.detail.hint(), theme.dim));
+        let joined = |parts: Vec<Option<Span<'static>>>| -> Vec<Span<'static>> {
+            parts.into_iter().flatten().collect()
+        };
+        vec![
+            joined(vec![cost.clone(), context.clone(), detail]),
+            joined(vec![cost, context.clone()]),
+            joined(vec![context]),
+            Vec::new(),
+        ]
+    };
+    let mut push = |span: Span<'static>| spans.push(span);
     match (&state.modal, state.phase) {
         (Some(Modal::Approval { expires_at, .. }), _) => {
             let remaining = expires_at.saturating_duration_since(std::time::Instant::now());
@@ -168,22 +244,14 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
                 },
                 theme.dim,
             ));
-            if let Some(cost) = cost_label(state) {
-                let label = format!(" · cost {cost}");
-                push(Span::styled(label, theme.dim));
-            }
-            if let Some(context) = context_label(state) {
-                push(Span::styled(format!(" · ctx {context}"), theme.dim));
-            }
-            if let Some(model) = short_model(state) {
-                push(Span::styled(format!(" · {model}"), theme.dim));
-            }
-            if let Some(level) = &state.thinking {
-                push(Span::styled(format!(" · thinking {level}"), theme.dim));
-            }
+            // The model and the thinking level are left to the idle line: mid-turn
+            // the row's job is what the agent is doing, how long it has been at it,
+            // and the two counters that end the turn - and the cells a model name
+            // would take are the cells the cost and context readouts need.
             if let Some(goal) = &state.goal {
                 push(Span::styled(format!(" · {goal}"), theme.accent));
             }
+            // Readouts are the same in every phase.
         }
         (None, AppPhase::SetupRequired) => {
             push(Span::styled(" setup required".to_owned(), theme.error));
@@ -193,9 +261,9 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
             }
         }
         (None, _) => {
-            // prime-agent's line above the prompt: quiet, dim, and it names the
-            // detail mode ctrl+o cycles.
-            // The model and the thinking level the next turn uses.
+            // The idle line names the model and the thinking level the next turn
+            // will use; the detail mode and what the session has spent sit at the
+            // right edge.
             if let Some(model) = short_model(state) {
                 push(Span::styled(model, theme.muted));
             }
@@ -205,25 +273,14 @@ pub fn row(state: &UiState, theme: &Theme, width: u16) -> Line<'static> {
             if let Some(goal) = &state.goal {
                 push(Span::styled(format!(" · {goal}"), theme.accent));
             }
-            if let Some(cost) = cost_label(state) {
-                let label = format!(" · {cost}");
-                push(Span::styled(label, theme.dim));
-            }
-            if let Some(context) = context_label(state) {
-                push(Span::styled(format!(" · ctx {context}"), theme.dim));
-            }
-            push(Span::styled(
-                format!(" · {}", state.detail.hint()),
-                theme.dim,
-            ));
+            // Readouts are the same in every phase.
         }
     }
 
     if let Some(reason) = &state.fallback_reason {
         push(Span::styled(format!(" · {reason}"), theme.error));
     }
-
-    Line::from(spans)
+    (spans, telemetry(theme))
 }
 
 /// How full the context is, once a response has said.

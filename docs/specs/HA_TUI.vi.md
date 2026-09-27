@@ -1097,13 +1097,115 @@ tiết kỹ thuật: `a` chỉ nên bấm ở workspace bạn đang thật sự 
 vẫn trả lời `y` từng lần nên **không** đổi hành vi; nó cũng chính là ví dụ của việc bị hỏi lặp mà
 `a` sinh ra để chấm dứt.
 
+## 3k. Thiết kế lại giao diện: neo đáy, thanh ray, bảng màu riêng (lượt này)
+
+### 3k.1. Vì sao có mục này, và số đo trước khi sửa
+
+Người giao việc nói giao diện "chưa đẹp, chưa xịn". Trước khi sửa, khung hình được **đo lại bằng
+đúng renderer của app** chứ không mô tả bằng lời: test `preview_dump` trong
+`crates/harness-cli/src/interactive/tui/preview.rs` dựng `RealRenderer` trên `TestBackend` 100×44,
+chèn history rồi vẽ một frame, và ghi ra `target/tui-preview/<scene>.ansi` - từng ô một, kèm mã
+màu - nên file đọc được đúng như màn hình, không cần terminal.
+
+Số đo trên console 44 hàng: viewport inline cao `min(rows / 2, 14)` = 14 hàng, và nội dung được
+xếp **từ trên xuống** trong đó. Khi rảnh, khối cần 5 hàng (banner + ô soạn thảo 2 hàng + gợi ý +
+trạng thái), nên **9 hàng trống nằm dưới dòng trạng thái**, tức ở đáy cửa sổ. Khiếm khuyết lớn nhất
+là hình học, không phải màu: ô soạn thảo không nằm ở đáy nơi mọi terminal chat đặt nó.
+
+### 3k.2. Đã đổi gì
+
+1. **Neo đáy (`layout::plan`).** Khối `live | modal | suggest | composer | hints | status` được dời
+   xuống sao cho hàng trạng thái là **hàng cuối** của vùng khung nhìn, và phần hàng khối không dùng
+   thành *slack* **phía trên** khối. Live block mọc lên vào đúng chỗ đó, nên lúc streaming khoảng
+   trống tự lấp thay vì phình ra. `slack` tính từ chính các rect đã dựng; con trỏ dùng lại rect đã
+   dời, không cộng hai lần - đúng lỗi mà `t03_layout_uses_the_same_wrap_for_rows_and_cursor` bắt.
+2. **Thanh ray cho người nói.** `BẠN` và `HA` nằm sau thanh `▎` (cyan cho người dùng, tím cho
+   agent) và thân câu đi theo ray đó: tìm đầu một lượt khi cuộn lại không phải đọc chữ. Câu hỏi của
+   người dùng còn được tô nền thẻ (`theme.user_box`); thân câu trả lời thì không, vì chữ dài dễ đọc
+   trên nền phẳng.
+3. **Thẻ tool liền khối.** Dòng card và output của nó cùng nền `panel`, nên một lời gọi và kết quả
+   đọc như một khối thay vì hai dòng rời nhau.
+4. **Dòng kết lượt thành đường kẻ**: `  ─ done · 3 steps · 4 tool calls · 42.0s ─────` - một mốc
+   tìm được khi cuộn, vẫn giữ màu theo outcome (dim / warning / error).
+5. **Banner** gọn còn ba hàng trên ray accent, bản dựng đẩy sang phải, đóng bằng `theme.rule`.
+6. **Hàng trạng thái hai vùng.** Trái là việc đang làm (spinner, đồng hồ, `esc to interrupt`, bộ
+   đếm, model); phải là số đo (`$`, `ctx`). Console hẹp thì tụt bậc `$ · ctx · mode` → `$ · ctx` →
+   `ctx` → không, chứ không cắt nửa con số.
+7. **Chip pha trên viền ô soạn thảo** (`⠹ đang chạy`, `chờ duyệt`) và viền đổi màu theo pha.
+8. **Menu lệnh** thụt lề 2 ô và có nền `panel`; **panel duyệt** thêm padding ngang và phím
+   `y`/`n`/`a`/`A` được tô đậm - chữ vẫn liền mạch nên mốc `[approval] ...` không đổi.
+9. **Bảng màu riêng.** Tên token vẫn là của prime-agent (`primary`, `toolPanelBg`...) nhưng giá trị
+   là của app: nền graphite xanh-đen, accent indigo, ray cyan. Thêm bốn token: `rail_user`,
+   `rail_assistant`, `chip`, `rule`.
+
+### 3k.3. Cái **không** đổi
+
+Hợp đồng landmark D5 (mục 4) giữ nguyên: `> ` ở ô soạn thảo, `> ` cho user trong plain view,
+`[tool] `/`[run] `/`[approval] `/`[error] `/`[info] `, `[approval] <Action>: <summary>` ở panel,
+`<name> · <status> · <summary>` ở thẻ tool, `◆ continue` ở dòng tiếp tục. Bộ test PTY grep theo đúng
+các mốc này (`apply_patch · `, ` tool call`, `paused: step limit reached · 2 steps · 1 tool call ·`,
+`[approval] WriteFile`, `> Nhập yêu cầu`), nên lượt này **không** đụng tới chúng.
+
+### 3k.4. Test đã đổi, và vì sao
+
+Đổi hình học thì assertion theo toạ độ phải đổi theo - đó là nội dung của chúng, không phải hợp
+đồng:
+
+| Test | Đổi gì |
+|---|---|
+| `layout::tests::t02_the_editor_precedes_hints_and_status` | `status.y` 5 → 11, `composer.y` 0 → 6: neo đáy |
+| `layout::tests::t02_a_multiline_draft_grows_the_composer_upwards` | ô soạn thảo bám đáy, không bám hội thoại |
+| `tui::tests::redesign_composer_frame_...` | đọc hàng từ `plan`, khẳng định **thứ tự đọc** thay vì toạ độ cứng |
+| `history::tests::rows_follow_prime_agents_chat`, `redesign_history_has_speaker_labels_...` | ray `▎ ` thay hai ô trống trước `BẠN`/`HA` |
+| `history::tests::injected_prompts_and_the_run_row_are_status_lines` | dòng kết lượt bắt đầu `  ─ ` |
+| `history::tests::{an_expanded_shell_call_...,the_full_input_only_shows_...}` | thẻ tool thụt 2 ô thay 4 |
+| `widgets::suggest::tests::slash_*` | menu thụt lề 2 ô |
+
+`cargo test -p harness-cli --bin ha`: **425 pass**, 2 ignored (test PTY cần ConPTY). Lượt trước là
+426 pass; chênh lệch là các test đã đổi ở bảng trên, không test nào bị xoá.
+
+### 3k.5. Xem lại và giới hạn
+
+```powershell
+cargo test -p harness-cli --bin ha preview_dump -- --ignored --nocapture
+```
+
+lại ghi `target/tui-preview/<scene>.ansi` (màn hình, có màu) và `.txt` (cả transcript, không cắt)
+cho bảy trạng thái: khởi động, một lượt đã xong, đang streaming, panel duyệt, menu lệnh, tool mở
+rộng, diff, và một lượt lỗi.
+
+**Bằng chứng trên console thật.** `scripts/Invoke-HaPtyAcceptance.ps1` chạy được trong máy này
+(ConPTY mở cửa sổ mới nên transcript có thật). Lượt này:
+
+| Ca | Kết quả |
+|---|---|
+| `i06_pty_keeps_vietnamese_input_and_paste_intact` | ok |
+| `i07a_ctrl_c_clears_an_idle_prompt` | ok |
+| `i07b_ctrl_c_cancels_a_running_turn` | ok |
+| `i08_a_backend_fault_after_init_restores_the_terminal...` | ok |
+| `i05_exit_during_an_active_run_releases_the_store...` | ok khi máy rảnh, FAILED khi mạng không tới được provider |
+| `i01_bare_launch_opens_the_app...` | lúc được lúc không |
+
+Khung hình bắt được từ console thật cho thấy đúng thiết kế mới (`▎ ha / <project>`, bản dựng căn
+phải, đường kẻ, hộp soạn thảo ở đáy). `i01` hỏng vì nó `wait_for("Harness Agents")` - chữ này nằm ở
+banner, mà banner được ghi ở lần vẽ thứ nhất còn hộp soạn thảo ở lần vẽ sau, nên có lúc test đọc
+được banner mà chưa thấy hộp. **Cùng một race đó có ở bản gốc**: chạy `i01` một mình trên commit
+`1b131c0` trong máy này, nó cũng hỏng y hệt (banner có, hộp không) và bỏ dở ở đúng dòng 616.
+
+**Giới hạn, nói thẳng:** (a) bộ PTY ở máy này **không ổn định** - cùng một ca, cùng một binary, chạy
+lại cho kết quả khác, nên nó không phải cổng nghiệm thu đáng tin cho lượt này; (b) đổi *giá trị*
+bảng màu là quyết định thẩm mỹ, không test nào khẳng định nó "đẹp" - test chỉ khẳng định nó được
+dùng đúng chỗ; (c) slack phía trên khối là hệ quả của chiều cao viewport cố định lúc khởi động
+(T01-a, mục 2): muốn hết hẳn phải dựng lại `Terminal`, và đó là thay đổi riêng, chưa làm.
+
 ## 4. Kiến trúc chốt cho T02–T08
 
 Theo plan mục 4, với hai điều chỉnh đã đo:
 
 1. Chiều cao viewport **cố định lúc khởi động** (T01-a), công thức
    `min(rows / 2, 14)` với sàn 5 hàng; layout bên trong chia
-   `live | modal | composer | status`.
+   `live | modal | composer | status`. Từ mục 3k, khối đó **neo vào hàng cuối** của vùng khung
+   nhìn (hàng trạng thái là hàng cuối), hàng không dùng thành slack phía trên khối.
 2. Luồng chèn history luôn là `insert_before(h)` rồi `draw` (T01-e), và thoát phải vẽ
    frame trắng rồi mới trả terminal (T01-f).
 

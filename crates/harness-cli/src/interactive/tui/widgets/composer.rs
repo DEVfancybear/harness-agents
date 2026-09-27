@@ -20,7 +20,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::super::layout::Plan;
 use super::super::theme::Theme;
-use crate::interactive::events::{Modal, UiState};
+use crate::interactive::events::{AppPhase, Modal, UiState};
 use crate::interactive::view;
 
 /// Cells one character occupies, after NFC.
@@ -163,10 +163,16 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
             lines.push(Line::from(body));
         }
     }
+    // The border is the box's state: an idle box is the accent, a working one is
+    // the colour of work in progress, and one that cannot take input is quiet.
     let border_style = if state.modal.is_some() {
         theme.border
     } else {
-        theme.accent
+        match state.phase {
+            AppPhase::Running | AppPhase::Canceling => theme.info,
+            AppPhase::WaitingApproval | AppPhase::WaitingInput => theme.warning,
+            _ => theme.accent,
+        }
     };
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -174,6 +180,12 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
         .padding(Padding::horizontal(1))
         .border_style(border_style)
         .title(Span::styled("─ Yêu cầu ", border_style));
+    // The top-right corner says what the box is doing, so a glance at the input
+    // answers "is it still working?" without reading the status row. A narrow
+    // console drops it rather than letting it eat the title.
+    if let Some(chip) = phase_chip(state, theme).filter(|_| plan.composer.width >= 44) {
+        block = block.title_top(Line::from(chip).right_aligned());
+    }
     if plan.composer_scroll > 0 {
         block = block.title(Span::styled(
             format!(" ↑ {} more ", plan.composer_scroll),
@@ -191,6 +203,30 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
         hint(state)
     };
     frame.render_widget(Paragraph::new(keys).style(theme.dim), plan.hints);
+}
+
+/// The chip in the composer's top-right corner: what the box is doing now.
+///
+/// `None` while the app is idle: a chip that always says something is a chip the
+/// eye learns to skip, and the idle box already says it can take a draft.
+fn phase_chip(state: &UiState, theme: &Theme) -> Option<Span<'static>> {
+    // On the chip background, so the phase reads as a pill on the border instead of
+    // as more border text.
+    match state.phase {
+        AppPhase::Running | AppPhase::Canceling => Some(Span::styled(
+            format!(" {} đang chạy ", Theme::spinner(state.tick)),
+            theme.info.patch(theme.chip),
+        )),
+        AppPhase::WaitingApproval => Some(Span::styled(
+            " chờ duyệt ".to_owned(),
+            theme.warning.patch(theme.chip),
+        )),
+        AppPhase::WaitingInput => Some(Span::styled(
+            " chờ trả lời ".to_owned(),
+            theme.warning.patch(theme.chip),
+        )),
+        _ => None,
+    }
 }
 
 /// The contextual keyboard hint shown below the composer.

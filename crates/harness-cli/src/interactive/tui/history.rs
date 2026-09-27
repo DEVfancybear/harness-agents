@@ -33,7 +33,10 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
         HistoryItem::Assistant { text } => {
             let mut rows = vec![
                 Line::default(),
-                Line::from(Span::styled("  HA", theme.title)),
+                Line::from(Span::styled(
+                    format!("{RAIL}HA"),
+                    theme.rail_assistant.add_modifier(Modifier::BOLD),
+                )),
             ];
             rows.extend(assistant_rows(text, width, theme));
             rows
@@ -94,10 +97,7 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
             tool_calls,
             elapsed,
             // A failed turn's reason can be long; it wraps rather than being cut off.
-        } => wrap_spans(
-            run_row(outcome, *steps, *tool_calls, *elapsed, theme).spans,
-            width,
-        ),
+        } => run_rows(outcome, *steps, *tool_calls, *elapsed, width, theme),
         // prime-agent shows no row for an admitted input: the user box is the record.
         HistoryItem::RunAccepted { .. } => Vec::new(),
         HistoryItem::Error { message } => error_rows(message, width, theme),
@@ -141,7 +141,10 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
 /// wrapping when the answer is committed to the scrollback.
 #[must_use]
 pub fn assistant_rows(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-    padded(markdown::render(text, width.saturating_sub(2), theme))
+    railed(
+        markdown::render(text, width.saturating_sub(RAIL_CELLS), theme),
+        theme.rail_assistant,
+    )
 }
 
 /// Streaming flushes are fragments of one answer, not new speakers.
@@ -174,22 +177,85 @@ fn padded(rows: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// A speaker label and unshaded text, with two cells of padding on each side.
+/// The operator's own turn: a rail with the label on it, then the text on the
+/// message card.
+///
+/// The rail is what makes a turn's start findable while scrolling, and the card -
+/// the row's own style, so it reaches the right edge of the console - is what
+/// separates what the operator asked for from what the agent answered.
 fn user_box(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-    let inner = width.saturating_sub(4).max(1);
+    let inner = width.saturating_sub(RAIL_CELLS).max(1);
     let mut rows = vec![
         Line::default(),
-        Line::from(Span::styled("  BẠN", theme.title)),
+        Line::from(Span::styled(
+            format!("{RAIL}BẠN"),
+            theme.rail_user.add_modifier(Modifier::BOLD),
+        )),
     ];
     for line in text.split('\n') {
         for row in wrap_spans(vec![Span::styled(line.to_owned(), theme.user)], inner) {
-            let mut spans = vec![Span::raw("  ")];
+            let mut spans = vec![Span::styled(RAIL, theme.rail_user)];
             spans.extend(row.spans);
-            rows.push(Line::from(spans));
+            rows.push(Line::from(spans).style(theme.user_box));
         }
     }
     rows.push(Line::default());
     rows
+}
+
+/// The rail in front of a turn's label and body: two cells of margin, the rail,
+/// and the cell that separates it from the text.
+const RAIL: &str = "  ▎ ";
+/// Cells [`RAIL`] occupies, and therefore what a railed body gives up.
+const RAIL_CELLS: u16 = 4;
+
+/// Prefix every row of a body with the rail, so an answer is as findable as the
+/// question above it.
+fn railed(rows: Vec<Line<'static>>, style: Style) -> Vec<Line<'static>> {
+    rows.into_iter()
+        .map(|line| {
+            let mut spans = vec![Span::styled(RAIL, style)];
+            spans.extend(line.spans);
+            Line::from(spans).style(line.style)
+        })
+        .collect()
+}
+
+/// The two cells every history row starts with.
+///
+/// One left edge for the whole transcript: a notice or an error is not the only
+/// thing touching the console's border, and a wrapped one keeps the margin on its
+/// continuation rows too.
+const MARGIN: &str = "  ";
+
+/// Wrap a row that starts at the margin, hanging its continuations under the text.
+fn margined(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
+    let mut all = vec![Span::raw(MARGIN)];
+    all.extend(spans);
+    wrap_words(all, usize::from(width.saturating_sub(2)), 2)
+}
+
+/// Cells a row's spans occupy.
+fn spans_cells(spans: &[Span<'static>]) -> usize {
+    spans
+        .iter()
+        .map(|span| super::widgets::composer::display_width(&span.content))
+        .sum()
+}
+
+/// A row of `head` spans with `tail` pushed to the right edge.
+///
+/// The banner uses it for the version: a console wide enough shows it on the same
+/// row as the identity, and a narrow one lets the row wrap instead of dropping it.
+fn tail_row(head: Vec<Span<'static>>, tail: Span<'static>, width: u16) -> Line<'static> {
+    let used = spans_cells(&head) + super::widgets::composer::display_width(&tail.content);
+    let mut spans = head;
+    let fill = usize::from(width).saturating_sub(used + 1);
+    if fill > 0 {
+        spans.push(Span::raw(" ".repeat(fill)));
+    }
+    spans.push(tail);
+    Line::from(spans)
 }
 
 /// prime-agent's injected prompts (`injected-prompt-message.ts`): a heartbeat is
@@ -206,7 +272,7 @@ fn injected_prompt(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> 
         ("◆ ", theme.accent, first.to_owned())
     };
     let mut rows = vec![Line::default()];
-    rows.extend(wrap_spans(
+    rows.extend(margined(
         vec![
             Span::styled(marker, marker_style),
             Span::styled(label, theme.muted),
@@ -219,7 +285,7 @@ fn injected_prompt(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> 
 /// prime-agent's `⚠ Error: msg`, after a blank row.
 fn error_rows(message: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let mut rows = vec![Line::default()];
-    rows.extend(wrap_spans(
+    rows.extend(margined(
         vec![Span::styled(format!("⚠ Error: {message}"), theme.error)],
         width,
     ));
@@ -267,11 +333,11 @@ fn notice_rows(message: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
                         }
                     })
                     .collect::<Vec<_>>();
-                wrap_spans(spans, width)
+                margined(spans, width)
             })
             .collect();
     };
-    wrap_spans(spans, width)
+    margined(spans, width)
 }
 
 /// Rows on the tool panel background, padded to the full width.
@@ -946,14 +1012,19 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
         .unwrap_or("workspace");
     let version = lines.iter().find(|line| line.starts_with("Harness Agents"));
     let mut rows = vec![Line::default()];
-    rows.extend(wrap_spans(
+    // One card of identity rows on the accent rail: which workspace this session
+    // belongs to, the build it runs, the model it will ask and how much it may do
+    // without being asked. The version sits at the right edge, out of the way of
+    // the three things a reader actually looks for.
+    rows.push(tail_row(
         vec![
-            Span::styled(format!("  ha / {name}"), theme.title),
-            Span::styled(
-                version.map_or(String::new(), |value| format!("  · {value}")),
-                theme.dim,
-            ),
+            Span::styled(RAIL, theme.accent),
+            Span::styled(format!("ha / {name}"), theme.title),
         ],
+        version.map_or_else(
+            || Span::raw(String::new()),
+            |value| Span::styled(value.to_owned(), theme.dim),
+        ),
         width,
     ));
     if let Some(model) = lines.iter().find_map(|line| line.strip_prefix("Service: ")) {
@@ -964,13 +1035,19 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
         let label =
             permissions.map_or_else(|| model.to_owned(), |mode| format!("{model} · {mode}"));
         rows.extend(wrap_spans(
-            vec![Span::styled(format!("  {label}"), theme.muted)],
+            vec![
+                Span::styled(RAIL, theme.accent),
+                Span::styled(label, theme.muted),
+            ],
             width,
         ));
     }
     if let Some(project) = project {
         rows.extend(wrap_spans(
-            vec![Span::styled(format!("  Project: {project}"), theme.dim)],
+            vec![
+                Span::styled(RAIL, theme.accent),
+                Span::styled(format!("Project: {project}"), theme.dim),
+            ],
             width,
         ));
     }
@@ -1001,7 +1078,7 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
     }
     rows.push(Line::from(Span::styled(
         "─".repeat(usize::from(width)),
-        theme.border,
+        theme.rule,
     )));
     rows
 }
@@ -1040,7 +1117,9 @@ pub fn running_card(
         ),
     };
     let separator = || Span::styled(" · ", theme.dim);
-    let mut spans = vec![Span::raw("    ")];
+    // The card and the output under it share the panel background, so a call and
+    // what it returned read as one block instead of two unrelated rows.
+    let mut spans = vec![Span::styled("  ", theme.panel)];
     if name == "ipython" {
         let code = summary.strip_prefix("code=").unwrap_or(summary);
         spans.push(Span::styled(format!("{marker} "), style));
@@ -1063,19 +1142,24 @@ pub fn running_card(
         spans.push(separator());
         spans.push(Span::styled(duration, theme.dim));
     }
-    Line::from(spans)
+    Line::from(spans).style(theme.panel)
 }
 
-/// The end-of-turn line: a dim status, as prime-agent's `showStatus`, in the
-/// warning colour when the turn stopped short and the error colour when it failed.
-#[must_use]
-pub fn run_row(
+/// The end-of-turn line: a rule that closes the turn, the outcome, and the
+/// counters, in the warning colour when the turn stopped short and the error
+/// colour when it failed.
+///
+/// The rule is what makes the end of a turn findable while scrolling back through
+/// a long session, and the counters stay in dim so the outcome is what the eye
+/// lands on.
+fn run_rows(
     outcome: &RunOutcome,
     steps: u32,
     tool_calls: u32,
     elapsed: std::time::Duration,
+    width: u16,
     theme: &Theme,
-) -> Line<'static> {
+) -> Vec<Line<'static>> {
     let style = match outcome {
         RunOutcome::Done => theme.dim,
         RunOutcome::Canceled
@@ -1084,18 +1168,24 @@ pub fn run_row(
         | RunOutcome::ExternalWait => theme.warning,
         RunOutcome::Blocked(_) | RunOutcome::Failed(_) => theme.error,
     };
-    Line::from(vec![
-        Span::styled(outcome.label(), style),
+    let mut spans = vec![
+        Span::styled("  ─ ", theme.rule),
+        Span::styled(outcome.label(), style.add_modifier(Modifier::BOLD)),
         Span::styled(
             format!(
-                " · {} · {} · {}",
+                " · {} · {} · {} ",
                 counted(u64::from(steps), "step", "steps"),
                 counted(u64::from(tool_calls), "tool call", "tool calls"),
                 view::seconds_label(elapsed)
             ),
             theme.dim,
         ),
-    ])
+    ];
+    let fill = usize::from(width).saturating_sub(spans_cells(&spans) + 1);
+    if fill > 0 {
+        spans.push(Span::styled("─".repeat(fill), theme.rule));
+    }
+    wrap_spans(spans, width)
 }
 
 /// Break spans into rows of at most `width` cells.
@@ -1219,7 +1309,7 @@ mod tests {
             &theme,
             Detail::Collapsed,
         ));
-        assert!(user.contains("  sửa lỗi parser"), "{user}");
+        assert!(user.contains("  ▎ sửa lỗi parser"), "{user}");
         let card = plain_text(&render(
             &HistoryItem::Tool {
                 name: "read_file".to_owned(),
@@ -1281,7 +1371,7 @@ mod tests {
             &theme,
             Detail::Collapsed,
         ));
-        assert_eq!(user, "\n  BẠN\n  sửa lỗi\n");
+        assert_eq!(user, "\n  ▎ BẠN\n  ▎ sửa lỗi\n");
         let answer = plain_text(&render(
             &HistoryItem::Assistant {
                 text: "Đã sửa.".into(),
@@ -1290,7 +1380,7 @@ mod tests {
             &theme,
             Detail::Collapsed,
         ));
-        assert!(answer.starts_with("\n  HA\n"), "{answer}");
+        assert!(answer.starts_with("\n  ▎ HA\n"), "{answer}");
         let tool = plain_text(&render(
             &HistoryItem::Tool {
                 name: "read_file".into(),
@@ -1304,7 +1394,10 @@ mod tests {
             &theme,
             Detail::Collapsed,
         ));
-        assert!(tool.contains("    ✓ read_file"), "{tool}");
+        assert!(
+            tool.contains("  ✓ read_file · done · src/auth.rs · 12ms"),
+            "{tool}"
+        );
     }
 
     #[test]
@@ -1404,8 +1497,8 @@ mod tests {
             Detail::Collapsed,
         ));
         assert!(
-            row.starts_with("done · 3 steps · 2 tool calls · 14.2s"),
-            "{row}"
+            row.starts_with("  ─ done · 3 steps · 2 tool calls · 14.2s"),
+            "the turn closes on a rule that names its outcome: {row}"
         );
     }
 
@@ -1423,13 +1516,14 @@ mod tests {
         );
         assert_eq!(
             plain_text(&rows),
-            "Sign in:\nhttps://auth.example/authorize?x=1\nEsc cancels."
+            "  Sign in:\n  https://auth.example/authorize?x=1\n  Esc cancels."
         );
-        let link = &rows[1].spans[0];
-        assert!(
-            link.style.add_modifier.contains(Modifier::UNDERLINED),
-            "{link:?}"
-        );
+        let link = rows[1]
+            .spans
+            .iter()
+            .find(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
+            .expect("the URL is drawn as a link");
+        assert!(link.content.starts_with("https://"), "{link:?}");
     }
 
     /// ctrl+o: collapsed hides reasoning; expanded shows every output line.
@@ -1495,7 +1589,7 @@ mod tests {
         let rows = text.lines().collect::<Vec<_>>();
         assert_eq!(rows[0], "", "a blank row separates calls");
         assert!(
-            rows[1].starts_with("    ▾ ✓ run_shell · done · command=cargo test"),
+            rows[1].starts_with("  ▾ ✓ run_shell · done · command=cargo test"),
             "{text}"
         );
         assert!(rows[1].ends_with(" · 1.2s"), "{text}");
@@ -1536,7 +1630,7 @@ mod tests {
             let text = plain_text(&render(&shell_call(), 100, &Theme::plain(), detail));
             assert_eq!(
                 text,
-                "\n    ✓ run_shell · done · command=cargo test --workspace --locked timeout_ms=60000 · 1.2s"
+                "\n  ✓ run_shell · done · command=cargo test --workspace --locked timeout_ms=60000 · 1.2s"
             );
         }
     }

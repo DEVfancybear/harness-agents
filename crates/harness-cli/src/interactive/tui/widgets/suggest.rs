@@ -42,7 +42,11 @@ pub fn rows(state: &UiState, theme: &Theme) -> Vec<Line<'static>> {
         let selected = index == state.suggestion_selected;
         let style = if selected { theme.selection } else { theme.dim };
         let marker = if selected { "❯ " } else { "  " };
+        // The menu is indented like the conversation it interrupts, and drawn on
+        // the panel background so it reads as a list floating over the transcript
+        // rather than as another line of it.
         let mut spans = vec![
+            Span::styled("  ".to_owned(), theme.panel),
             Span::styled(marker.to_owned(), style),
             Span::styled(format!("{:<column$}", item.label), style),
             Span::styled(item.description.clone(), style),
@@ -50,7 +54,7 @@ pub fn rows(state: &UiState, theme: &Theme) -> Vec<Line<'static>> {
         if let Some(tag) = &item.tag {
             spans.push(Span::styled(format!(" ({tag})"), theme.dim));
         }
-        lines.push(Line::from(spans));
+        lines.push(Line::from(spans).style(theme.panel));
     }
     lines
 }
@@ -137,7 +141,7 @@ mod tests {
             );
         }
         assert!(
-            plain_text(&rows(&state("/", 0), &Theme::plain())).starts_with("❯ /model"),
+            plain_text(&rows(&state("/", 0), &Theme::plain())).starts_with("  ❯ /model"),
             "the arrow starts on the first match"
         );
     }
@@ -149,7 +153,7 @@ mod tests {
         let text = plain_text(&rows(&state("/at", 0), &Theme::plain()));
         assert!(text.contains("/attach <path>"), "{text}");
         assert_eq!(
-            plain_text(&rows(&state("/res", 0), &Theme::plain())).trim_start_matches("❯ "),
+            plain_text(&rows(&state("/res", 0), &Theme::plain())).trim_start_matches("  ❯ "),
             format!(
                 "{:<NAME_COLUMN$}{}",
                 "/resume [id]", "Open the session picker, or resume a session by id"
@@ -164,9 +168,9 @@ mod tests {
     fn slash_the_highlight_moves_with_the_selection() {
         let first = plain_text(&rows(&state("/", 0), &Theme::plain()));
         let second = plain_text(&rows(&state("/", 1), &Theme::plain()));
-        assert!(first.starts_with("❯ /model"), "{first}");
-        assert!(second.starts_with("  /model"), "{second}");
-        assert!(second.contains("\n❯ /effort"), "{second}");
+        assert!(first.starts_with("  ❯ /model"), "{first}");
+        assert!(second.starts_with("    /model"), "{second}");
+        assert!(second.contains("\n  ❯ /effort"), "{second}");
         assert_eq!(
             first.matches('❯').count(),
             1,

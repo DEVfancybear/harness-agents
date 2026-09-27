@@ -1,14 +1,19 @@
 //! Viewport geometry.
 //!
-//! One frame is laid out top to bottom inside the inline viewport:
+//! One frame is laid out inside the inline viewport and **anchored to its last
+//! row**, so the composer sits at the bottom of the console - where every other
+//! terminal chat puts it - and the rows a short frame does not need stay empty
+//! *above* the conversation block instead of below the status line:
 //!
 //! ```text
 //! +--------------------------------------+
+//! | (slack: empty rows the frame did not  |  the live block grows up into it
+//! |  need; the live block grows into it)  |
 //! | live block (text still streaming)    |  hidden when there is none
 //! | modal (approval, picker, reference)  |  replaces the live block
 //! | rounded composer (1..8 input rows)  |
 //! | contextual keyboard hints           |
-//! | status (exactly one row)             |
+//! | status (exactly one row)             |  the last row of the console
 //! +--------------------------------------+
 //! ```
 //!
@@ -125,10 +130,29 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
     let composer = take(composer_height);
     let hints = take(1);
     let status = take(STATUS_ROWS);
+    // Anchor the block to the bottom of the area: what the frame did not use is
+    // slack above the live block, never a gap between the status line and the
+    // bottom of the console.
+    let slack = area
+        .height
+        .saturating_sub(live.map_or(0, |rect| rect.height))
+        .saturating_sub(modal.map_or(0, |rect| rect.height))
+        .saturating_sub(suggest.map_or(0, |rect| rect.height))
+        .saturating_sub(composer.height + 1 + STATUS_ROWS);
+    let (live, modal, suggest, composer, hints, status) = (
+        live.map(|rect| drop_rows(rect, slack)),
+        modal.map(|rect| drop_rows(rect, slack)),
+        suggest.map(|rect| drop_rows(rect, slack)),
+        drop_rows(composer, slack),
+        drop_rows(hints, slack),
+        drop_rows(status, slack),
+    );
     // Follow the cursor even when editing an earlier line in a long draft.
     let composer_scroll = wanted_rows
         .saturating_sub(shown_rows)
         .min(composer_cursor.row);
+    // `composer` is already shifted by the anchor, so the cell the cursor lands in
+    // is already in screen coordinates too.
     let cursor = cursor_cell(
         state,
         composer,
@@ -148,6 +172,11 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
         composer_lines,
     }
 }
+/// The same rect `rows` further down: how the bottom anchor moves a block.
+fn drop_rows(rect: Rect, rows: u16) -> Rect {
+    Rect::new(rect.x, rect.y.saturating_add(rows), rect.width, rect.height)
+}
+
 /// Rows a wrapped draft occupies, never less than one.
 ///
 /// The draft is wrapped once in [`plan`], and this is the only place its height is
@@ -281,16 +310,22 @@ mod tests {
     fn t02_the_editor_precedes_hints_and_status() {
         let area = Rect::new(0, 0, 80, 12);
         let outline = plan(area, &state(AppPhase::Ready), &Theme::plain());
-        assert_eq!(outline.status.y, 5, "status follows the input and hints");
+        assert_eq!(
+            outline.status.y, 11,
+            "status is the last row: the block is anchored to the bottom"
+        );
         assert_eq!(outline.status.height, 1);
         assert_eq!(
             outline.composer.height, 4,
             "two content rows inside the rounded box"
         );
-        assert_eq!(outline.composer.y, 0);
+        assert_eq!(
+            outline.composer.y, 6,
+            "the rows the frame did not need are slack above the block"
+        );
         assert_eq!(
             outline.cursor,
-            Some((4, 1)),
+            Some((4, 7)),
             "the marker sits on the content row"
         );
     }
@@ -303,9 +338,12 @@ mod tests {
 
         let outline = plan(Rect::new(0, 0, 80, 12), &state, &Theme::plain());
         assert_eq!(outline.composer.height, 5);
-        assert_eq!(outline.status.y, 6);
-        assert_eq!(outline.composer.y, 0, "the editor follows the conversation");
-        assert_eq!(outline.cursor.map(|(_, y)| y), Some(3));
+        assert_eq!(outline.status.y, 11);
+        assert_eq!(
+            outline.composer.y, 5,
+            "the editor is anchored to the bottom, not to the conversation"
+        );
+        assert_eq!(outline.cursor.map(|(_, y)| y), Some(8));
     }
 
     #[test]

@@ -1,8 +1,10 @@
-//! Palette and glyphs for the TUI: prime-agent's `prime` theme.
+//! Palette and glyphs for the TUI: the app's own `aurora` theme.
 //!
-//! Ported from prime-agent's `modes/interactive/theme/prime.json` and `theme.ts`: a
-//! dark palette in true colour, quantised to the 256-colour cube when the terminal
-//! does not say it renders true colour (`COLORTERM=truecolor|24bit`, Windows
+//! The token names are prime-agent's (`prime.json` "vars", so a style keeps its
+//! meaning: `toolPanelBg` is still the panel behind a tool), but the values are the
+//! app's own: a graphite surface with an indigo accent and a cyan rail for the
+//! operator's own turns. A dark palette in true colour, quantised to the 256-colour
+//! cube when the terminal does not say it renders true colour (`COLORTERM=truecolor|24bit`, Windows
 //! Terminal's `WT_SESSION`, and the terminals that set `TERM_PROGRAM`). `NO_COLOR` or
 //! `TERM=dumb` selects [`Theme::plain`], which keeps every glyph and the layout but
 //! drops every SGR colour attribute - that is what the T07 `NO_COLOR` case asserts on.
@@ -11,28 +13,36 @@ use ratatui::style::{Color, Modifier, Style};
 
 /// prime-agent's base colours (`prime.json` "vars").
 mod palette {
-    pub const FG: u32 = 0xf4_f4_f5;
-    pub const MUTED: u32 = 0xa1_a1_aa;
-    pub const DIM: u32 = 0x71_71_7a;
-    pub const GRID: u32 = 0x52_52_5b;
-    pub const SURFACE: u32 = 0x0d_0d_10;
-    pub const SELECTED_BG: u32 = 0x22_22_26;
-    pub const USER_MSG_BG: u32 = 0x1a_1a_1f;
-    pub const PRIMARY: u32 = 0x7c_6f_af;
-    pub const PRIMARY_SOFT: u32 = 0x8d_7f_c0;
-    pub const SUCCESS: u32 = 0x7d_a8_76;
-    pub const WARNING: u32 = 0xf5_9e_0b;
-    pub const ERROR: u32 = 0xd0_6f_82;
+    pub const FG: u32 = 0xe8_ea_f2;
+    pub const MUTED: u32 = 0x9c_a4_b8;
+    pub const DIM: u32 = 0x6b_73_85;
+    pub const GRID: u32 = 0x2c_33_42;
+    pub const SURFACE: u32 = 0x0e_11_17;
+    pub const SELECTED_BG: u32 = 0x1e_24_31;
+    pub const USER_MSG_BG: u32 = 0x14_19_23;
+    pub const PRIMARY: u32 = 0x8b_7c_f6;
+    pub const PRIMARY_SOFT: u32 = 0xba_b0_fb;
+    pub const SUCCESS: u32 = 0x4a_de_80;
+    pub const WARNING: u32 = 0xfb_bf_24;
+    pub const ERROR: u32 = 0xf8_71_71;
     pub const INFO: u32 = 0x38_bd_f8;
-    pub const STRING_MINT: u32 = 0x8b_a8_88;
-    pub const MD_BODY: u32 = 0xd8_d8_dc;
-    pub const MD_CODE: u32 = 0xc8_c8_cd;
-    pub const DIFF_ADDED: u32 = 0x3f_b9_50;
-    pub const DIFF_REMOVED: u32 = 0xf8_51_49;
-    pub const REFINEMENT: u32 = 0x95_75_cd;
-    pub const NEUTRAL: u32 = 0xd4_d4_d8;
-    pub const DIFF_ADDED_BG: u32 = 0x01_5f_00;
-    pub const DIFF_REMOVED_BG: u32 = 0x5e_00_00;
+    pub const STRING_MINT: u32 = 0x7d_d3_a8;
+    pub const MD_BODY: u32 = 0xd6_da_e4;
+    pub const MD_CODE: u32 = 0xc8_ce_da;
+    pub const DIFF_ADDED: u32 = 0x4a_de_80;
+    pub const DIFF_REMOVED: u32 = 0xf8_71_71;
+    pub const REFINEMENT: u32 = 0xa7_8b_fa;
+    pub const NEUTRAL: u32 = 0xd6_da_e4;
+    /// A changed line's block behind it: a tint dark enough to read text on.
+    pub const DIFF_ADDED_BG: u32 = 0x11_2e_1c;
+    pub const DIFF_REMOVED_BG: u32 = 0x30_16_1a;
+    /// The rail before a user turn, and the one before an answer.
+    pub const USER_RAIL: u32 = 0x38_bd_f8;
+    pub const ASSISTANT_RAIL: u32 = 0x8b_7c_f6;
+    /// A pill's background: one step above the panel.
+    pub const CHIP_BG: u32 = 0x1c_22_2e;
+    /// The rule that closes a turn, and the one under the banner.
+    pub const RULE: u32 = 0x23_29_36;
 }
 
 /// prime-agent's `syntax*` tokens: how highlighted code is coloured.
@@ -177,6 +187,14 @@ pub struct Theme {
     pub refinement: Style,
     /// `info`.
     pub info: Style,
+    /// The rail drawn before a user turn's label and body.
+    pub rail_user: Style,
+    /// The rail drawn before an answer's label and body.
+    pub rail_assistant: Style,
+    /// A pill: a short label on its own background.
+    pub chip: Style,
+    /// A quieter rule than `border`: the one that closes a turn.
+    pub rule: Style,
 }
 
 impl Theme {
@@ -237,6 +255,10 @@ impl Theme {
             },
             refinement: fg(palette::REFINEMENT),
             info: fg(palette::INFO),
+            rail_user: fg(palette::USER_RAIL),
+            rail_assistant: fg(palette::ASSISTANT_RAIL),
+            chip: fg(palette::FG).bg(color(palette::CHIP_BG, depth)),
+            rule: fg(palette::RULE),
         }
     }
 
@@ -308,6 +330,10 @@ impl Theme {
             syntax: SyntaxStyles::uniform(none),
             refinement: none,
             info: none,
+            rail_user: none,
+            rail_assistant: none,
+            chip: none,
+            rule: none,
         }
     }
 

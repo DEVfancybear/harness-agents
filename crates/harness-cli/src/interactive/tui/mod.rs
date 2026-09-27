@@ -16,6 +16,8 @@ pub mod highlight;
 pub mod history;
 pub mod layout;
 pub mod markdown;
+#[cfg(test)]
+mod preview;
 pub mod theme;
 pub mod widgets;
 
@@ -141,6 +143,22 @@ where
     /// # Errors
     /// Fails when the backend cannot report its size or cannot be initialised.
     pub fn open(backend: B) -> io::Result<Self> {
+        Self::with_theme(backend, &Theme::detect())
+    }
+
+    /// Open the viewport with an explicit palette.
+    ///
+    /// The console decides the palette ([`Theme::detect`]); the preview dump passes
+    /// one, so a frame it writes does not change with the terminal it was rendered in.
+    ///
+    /// # Errors
+    /// Fails when the backend cannot report its size or cannot be initialised.
+    #[cfg(test)]
+    pub fn open_with(backend: B, theme: &Theme) -> io::Result<Self> {
+        Self::with_theme(backend, theme)
+    }
+
+    fn with_theme(backend: B, theme: &Theme) -> io::Result<Self> {
         let size = backend.size().map_err(to_io)?;
         let terminal = Terminal::with_options(
             backend,
@@ -151,7 +169,7 @@ where
         .map_err(to_io)?;
         Ok(Self {
             terminal,
-            theme: Theme::detect(),
+            theme: *theme,
             detail: super::events::Detail::default(),
             shown: std::collections::VecDeque::new(),
             assistant_continuing: false,
@@ -737,12 +755,13 @@ mod tests {
         let mut draft = state(AppPhase::Ready);
         draft.live_text.clear();
         draft.header = vec!["Service: deepseek-v4-flash".to_owned()];
+        let theme = super::theme::Theme::plain();
+        let area = ratatui::layout::Rect::new(0, 0, 80, 12);
+        let plan = super::layout::plan(area, &draft, &theme);
         let backend = ratatui::backend::TestBackend::new(80, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                let theme = super::theme::Theme::plain();
-                let plan = super::layout::plan(frame.area(), &draft, &theme);
                 super::widgets::render(frame, &plan, &draft, &theme);
             })
             .unwrap();
@@ -756,15 +775,24 @@ mod tests {
                     .to_owned()
             })
             .collect();
-        assert!(rows[0].starts_with("╭─ Yêu cầu "), "{rows:#?}");
-        assert!(rows[1].starts_with("│ > sửa lỗi"), "{rows:#?}");
+        // The frame is read from the plan, so the assertion is about the reading
+        // order - box, then hints, then status - and not about where the anchor
+        // happens to put the block.
+        let top = usize::from(plan.composer.y);
+        assert!(rows[top].starts_with("╭─ Yêu cầu "), "{rows:#?}");
+        assert!(rows[top + 1].starts_with("│ > sửa lỗi"), "{rows:#?}");
         assert!(
-            rows[2].starts_with('│'),
+            rows[top + 2].starts_with('│'),
             "the empty input row gives the draft room"
         );
-        assert!(rows[3].starts_with('╰'));
-        assert!(rows[4].contains("Enter gửi") && rows[4].contains("@ file"));
-        assert!(rows[5].contains("deepseek-v4-flash"));
+        assert!(rows[top + 3].starts_with('╰'));
+        let hints = &rows[usize::from(plan.hints.y)];
+        assert!(
+            hints.contains("Enter gửi") && hints.contains("@ file"),
+            "{rows:#?}"
+        );
+        let status = &rows[usize::from(plan.status.y)];
+        assert!(status.contains("deepseek-v4-flash"), "{rows:#?}");
     }
 
     #[test]
@@ -804,7 +832,7 @@ mod tests {
                 .unwrap();
         }
         let output = renderer.backend().output();
-        assert_eq!(output.matches("  HA\r\n").count(), 1, "{output}");
+        assert_eq!(output.matches("  ▎ HA\r\n").count(), 1, "{output}");
         assert!(output.contains("line 0") && output.contains("line 19"));
     }
 

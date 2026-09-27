@@ -9,8 +9,9 @@ use std::time::Instant;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 
 use super::super::theme::Theme;
 use crate::interactive::view;
@@ -62,8 +63,12 @@ pub fn render(frame: &mut Frame, area: Rect, request: Proposal<'_>, theme: &Them
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
         .border_style(theme.warning)
-        .title(Span::styled(" DUYỆT HÀNH ĐỘNG ", theme.warning));
+        .title(Span::styled(
+            " ◆ DUYỆT HÀNH ĐỘNG ",
+            theme.warning.add_modifier(Modifier::BOLD),
+        ));
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -120,19 +125,36 @@ pub fn rows(request: &Proposal<'_>, theme: &Theme) -> Vec<Line<'static>> {
             request.scope, request.request_id
         )),
     ]));
-    lines.push(Line::from(vec![Span::styled(
-        "y chạy một lần · n từ chối · hết hạn thì không chạy".to_owned(),
-        theme.dim,
-    )]));
+    // The keys are the only thing the panel is waiting for, so they are the only
+    // thing on the row that is not dim: a reader looking for "what do I press"
+    // finds it without reading the sentence.
+    lines.push(Line::from(vec![
+        Span::styled("y", theme.accent.add_modifier(Modifier::BOLD)),
+        Span::styled(" chạy một lần · ".to_owned(), theme.dim),
+        Span::styled("n", theme.accent.add_modifier(Modifier::BOLD)),
+        Span::styled(" từ chối · hết hạn thì không chạy".to_owned(), theme.dim),
+    ]));
     // `a` is offered on every panel, read-only or not, and it says exactly how far
     // it reaches: from here on this turn runs without asking, including file writes
     // and commands. A key whose text promised less than it did would be worse than
     // no key at all.
-    lines.push(Line::from(vec![Span::styled(
-        "a cho phép mọi thao tác trong lượt này · A đề xuất rule lâu dài, Enter để xác nhận"
-            .to_owned(),
-        theme.dim,
-    )]));
+    // One row, not two: the layout reserves the panel's height from the rows it
+    // declares (`requested_rows`), and a row that wraps at a narrow width is
+    // clipped rather than making the box taller. Splitting this row in two would
+    // push a row of the diff out of the viewport on a 40-row console, which is the
+    // height the panel's own test pins.
+    lines.push(Line::from(vec![
+        Span::styled("a", theme.accent.add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " cho phép mọi thao tác trong lượt này · ".to_owned(),
+            theme.dim,
+        ),
+        Span::styled("A", theme.accent.add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " đề xuất rule lâu dài, Enter để xác nhận".to_owned(),
+            theme.dim,
+        ),
+    ]));
     if let Some(confirmation) = confirmation {
         lines.extend(
             confirmation
@@ -157,6 +179,10 @@ pub fn rows(request: &Proposal<'_>, theme: &Theme) -> Vec<Line<'static>> {
 }
 
 /// Height requested by the panel, including its border and fixed approval rows.
+///
+/// The count is the rows [`rows`] actually produces: two borders and the five
+/// rows of the proposal. A row added to the panel without raising the count here
+/// is a row the layout clips instead of showing.
 #[must_use]
 pub fn requested_rows(summary: &str) -> u16 {
     let confirmation_lines = summary

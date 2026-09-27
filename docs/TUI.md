@@ -1,9 +1,22 @@
 # Terminal interface
 
-`ha` keeps the conversation in the terminal's scrollback. The input dock sits
-directly below it, with a rounded input box, contextual keyboard hints, and a
-status line. User and assistant messages carry `BẠN` and `HA` labels; tool rows
-use status symbols as well as color. Ctrl-O cycles tool detail.
+`ha` keeps the conversation in the terminal's scrollback. The input dock is
+anchored to the bottom of the window: a rounded input box, contextual keyboard
+hints, and a status line.
+
+Each turn is drawn on one left margin. `BẠN` and `HA` sit on a colored rail, and
+the operator's own message is shaded as a card, so the start of a turn is
+findable while scrolling without reading the text. A tool call and its output
+share one panel block; a diff keeps its added and removed tints inside it. Each
+turn closes on a rule that names its outcome and counters. Ctrl-O cycles tool
+detail.
+
+The status line has two ends: what the app is doing on the left (spinner, clock,
+`esc to interrupt`, counters, model) and the telemetry that is only worth a glance
+on the right (cost, context, detail mode). A narrow console drops the telemetry
+before it truncates the activity. While a turn runs, the input box border changes
+color and carries a phase chip, so a glance at the box answers "is it still
+working?".
 
 ## Run
 
@@ -61,6 +74,17 @@ cargo fmt --all -- --check
 cargo test -p harness-cli --bin ha interactive::tui
 cargo test --workspace --locked
 ```
+
+To look at the interface without a console, dump the frames the renderer paints:
+
+```powershell
+cargo test -p harness-cli --bin ha preview_dump -- --ignored --nocapture
+```
+
+That writes `target/tui-preview/<scene>.ansi` (the screen, with colors) and
+`<scene>.txt` (the whole transcript, unclipped) for a fresh session, a finished
+turn, a streaming turn, an approval, the command menu, an expanded tool, a diff,
+and a failed turn - each at 100x44 and at 80x24.
 
 Real console checks live in `crates/harness-cli/tests/interactive_terminal.rs`.
 They cover launch, paste, resize, approvals, cancellation, plain mode and color
