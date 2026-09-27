@@ -50,6 +50,11 @@ changes during the session.
 Hints change when a menu or approval panel owns the keyboard. Approval choices
 are `y` (once), `a` (the rest of this turn), and `n` (refuse).
 
+Type `/` at the start of the draft or after a space to open command suggestions.
+After `skill /`, skills appear first. Tab or Enter inserts the selected name at
+the cursor. Inside a sentence, Enter sends the draft after completion is finished.
+A complete slash command on its own runs when selected.
+
 ## Terminal compatibility
 
 Windows 10/11 is the supported platform; Windows Terminal is recommended.

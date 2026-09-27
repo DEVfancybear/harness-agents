@@ -746,8 +746,10 @@ impl InteractiveController {
                     return vec![Effect::Redraw];
                 }
                 Key::Enter => {
+                    let embedded = self.editor.suggestion_is_embedded();
                     self.editor.accept_suggestion();
-                    if self.editor.display_buffer().ends_with(' ')
+                    if embedded
+                        || self.editor.display_buffer().ends_with(' ')
                         || !self.editor.suggestions().is_empty()
                     {
                         return vec![Effect::Redraw];
@@ -4807,6 +4809,29 @@ mod tests {
         let _ = harness.controller.handle_key(Key::Down);
         let _ = harness.controller.handle_key(Key::Tab);
         assert_eq!(harness.controller.ui_state().buffer, "/export ");
+    }
+
+    #[test]
+    fn inline_slash_enter_accepts_a_command_without_sending_the_sentence() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        type_text(&mut harness.controller, "hãy dùng /cop");
+        assert!(
+            harness
+                .controller
+                .ui_state()
+                .suggestions
+                .iter()
+                .any(|item| item.name() == "/copy")
+        );
+
+        let effects = harness.controller.handle_key(Key::Enter);
+        assert_eq!(effects, vec![Effect::Redraw]);
+        assert_eq!(harness.controller.ui_state().buffer, "hãy dùng /copy");
+        assert!(submissions(&harness).is_empty());
+
+        let _ = harness.controller.handle_key(Key::Enter);
+        assert_eq!(submissions(&harness), ["hãy dùng /copy"]);
     }
 
     /// Enter on the menu picks the row: a whole command runs at once, a command

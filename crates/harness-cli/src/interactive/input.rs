@@ -228,10 +228,24 @@ impl LineEditor {
         let Some(item) = self.suggestion.get(self.suggestion_index) else {
             return false;
         };
-        self.buffer.clone_from(&item.completion);
-        self.cursor = self.char_len();
+        let completion = item.completion.clone();
+        let Some((start, end)) = self.active_slash_range() else {
+            return false;
+        };
+        let prefix_chars = self.buffer[..start].chars().count();
+        self.buffer.replace_range(start..end, &completion);
+        self.cursor = prefix_chars + completion.chars().count();
         self.refresh_suggestion();
         true
+    }
+
+    /// A slash inside a message is a reference in the draft. Selecting it must
+    /// leave the sentence in the composer instead of submitting a command.
+    #[must_use]
+    pub fn suggestion_is_embedded(&self) -> bool {
+        self.active_slash_range().is_some_and(|(start, end)| {
+            !self.buffer[..start].trim().is_empty() || !self.buffer[end..].trim().is_empty()
+        })
     }
 
     /// Open the session picker with one label per candidate.
@@ -423,6 +437,7 @@ impl LineEditor {
                 if self.buffer.chars().nth(self.cursor) == Some('\n') {
                     self.cursor -= 1;
                 }
+                self.refresh_suggestion();
                 InputOutcome::Redraw
             }
             Key::Right => {
@@ -430,6 +445,7 @@ impl LineEditor {
                     return InputOutcome::Unchanged;
                 }
                 self.cursor += 1;
+                self.refresh_suggestion();
                 InputOutcome::Redraw
             }
             Key::Home | Key::LineStart => {
@@ -438,6 +454,7 @@ impl LineEditor {
                 } else {
                     self.cursor = 0;
                 }
+                self.refresh_suggestion();
                 InputOutcome::Redraw
             }
             Key::End | Key::LineEnd => {
@@ -446,6 +463,7 @@ impl LineEditor {
                 } else {
                     self.cursor = self.char_len();
                 }
+                self.refresh_suggestion();
                 InputOutcome::Redraw
             }
             Key::EraseToLineStart => {
@@ -478,10 +496,7 @@ impl LineEditor {
                 // longer than what is typed. Accepting the *highlighted* row of a
                 // drawn menu is the host's call, because only the host knows
                 // whether the menu is on screen at all.
-                if let Some(only) = self.unique_suggestion() {
-                    self.buffer = only;
-                    self.cursor = self.char_len();
-                    self.refresh_suggestion();
+                if self.unique_suggestion().is_some() && self.accept_suggestion() {
                     return InputOutcome::CompleteSuggestion;
                 }
                 InputOutcome::Unchanged
@@ -513,6 +528,7 @@ impl LineEditor {
                     && let Some(previous) = self.row_start_before_cursor()
                 {
                     self.cursor = previous;
+                    self.refresh_suggestion();
                     return InputOutcome::Redraw;
                 }
                 self.recall(true)
@@ -522,6 +538,7 @@ impl LineEditor {
                     && let Some(next) = self.row_start_after_cursor()
                 {
                     self.cursor = next;
+                    self.refresh_suggestion();
                     return InputOutcome::Redraw;
                 }
                 self.recall(false)
@@ -611,17 +628,54 @@ impl LineEditor {
         if self.secret {
             return;
         }
-        self.suggestion =
-            super::commands::suggest(&self.buffer, &self.menu_commands, &self.argument_options);
+        if let Some((start, end)) = self.active_slash_range() {
+            let fragment = &self.buffer[start..end];
+            self.suggestion =
+                super::commands::suggest(fragment, &self.menu_commands, &self.argument_options);
+            if fragment == "/"
+                && self.buffer[..start]
+                    .split_whitespace()
+                    .last()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("skill"))
+            {
+                // The viewport only shows the first six rows. Put the skills
+                // the user just asked for where they can see them immediately.
+                self.suggestion
+                    .sort_by_key(|item| item.tag.as_deref() != Some("skill"));
+            }
+        }
     }
 
     /// The one command Tab may accept: exactly one candidate, and it is longer
     /// than what is typed.
     fn unique_suggestion(&self) -> Option<String> {
         match self.suggestion.as_slice() {
-            [only] if only.completion != self.buffer => Some(only.completion.clone()),
+            [only]
+                if self
+                    .active_slash_range()
+                    .is_some_and(|(start, end)| only.completion != self.buffer[start..end]) =>
+            {
+                Some(only.completion.clone())
+            }
             _ => None,
         }
+    }
+
+    /// Byte range of the slash command being edited immediately before the cursor.
+    /// A URL or path segment does not open the command menu.
+    fn active_slash_range(&self) -> Option<(usize, usize)> {
+        let end = self.byte_offset(self.cursor);
+        let prefix = &self.buffer[..end];
+        let start = prefix.char_indices().rev().find_map(|(index, character)| {
+            (character == '/'
+                && (index == 0
+                    || prefix[..index]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace)))
+            .then_some(index)
+        })?;
+        Some((start, end))
     }
 
     fn char_len(&self) -> usize {
@@ -772,6 +826,7 @@ fn normalize_paste(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{InputOutcome, LineEditor, SECRET_MASK};
+    use crate::interactive::commands::MenuCommand;
     use crate::interactive::events::Key;
 
     fn type_text(editor: &mut LineEditor, text: &str) {
@@ -1140,6 +1195,42 @@ mod tests {
         let mut unknown = LineEditor::new();
         type_text(&mut unknown, "/zzz");
         assert!(unknown.suggestions().is_empty());
+    }
+
+    #[test]
+    fn inline_slash_suggests_skills_and_preserves_the_message_on_accept() {
+        let mut editor = LineEditor::new();
+        editor.set_menu_commands(vec![MenuCommand {
+            name: "/skill:review".to_owned(),
+            description: "Review code".to_owned(),
+            argument_hint: "[task]".to_owned(),
+            tag: "skill",
+        }]);
+        type_text(&mut editor, "tôi muốn sử dụng skill /");
+        assert_eq!(
+            names(&editor).first().map(String::as_str),
+            Some("/skill:review")
+        );
+        assert!(names(&editor).contains(&"/help".to_owned()));
+        assert!(names(&editor).contains(&"/skill:review".to_owned()));
+
+        type_text(&mut editor, "skill:re");
+        assert_eq!(editor.handle(Key::Tab), InputOutcome::CompleteSuggestion);
+        assert_eq!(editor.buffer(), "tôi muốn sử dụng skill /skill:review ");
+        assert_eq!(editor.cursor(), editor.buffer().chars().count());
+    }
+
+    #[test]
+    fn inline_slash_completion_only_replaces_text_at_the_cursor() {
+        let mut editor = LineEditor::new();
+        type_text(&mut editor, "Mở /he sau");
+        for _ in 0..4 {
+            let _ = editor.handle(Key::Left);
+        }
+        assert!(names(&editor).contains(&"/help".to_owned()));
+        assert!(editor.accept_suggestion());
+        assert_eq!(editor.buffer(), "Mở /help sau");
+        assert_eq!(editor.cursor(), "Mở /help".chars().count());
     }
 
     /// The highlight is what Tab and Enter accept, so it has to move with the
