@@ -892,10 +892,13 @@ impl InteractiveController {
             }
             SessionEvent::ThinkingDelta { text } => {
                 // Reasoning is one row, not one row per delta: it is gathered and
-                // committed when the answer starts or the step ends.
-                // Answer text before it is committed first; the reasoning keeps
-                // gathering until the answer starts or the step ends.
-                self.flush_text(effects);
+                // committed when answer text arrives or the step ends. Providers
+                // can interleave reasoning with answer tokens. Keep the TUI's
+                // unfinished answer live so this cannot split a word into two
+                // permanent history blocks. Plain output preserves event order.
+                if self.plain {
+                    self.flush_text(effects);
+                }
                 self.pending_thinking.push_str(&text);
                 effects.push(Effect::Redraw);
             }
@@ -6779,6 +6782,50 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(thinking, ["Let me keep it short"]);
+    }
+
+    #[test]
+    fn interleaved_reasoning_keeps_streamed_answer_together() {
+        let mut harness = tui_bench(true);
+        let mut effects = Vec::new();
+        for event in [
+            SessionEvent::TextDelta { text: "T".into() },
+            SessionEvent::ThinkingDelta {
+                text: "checking the workspace".into(),
+            },
+            SessionEvent::TextDelta {
+                text: "ôi sẽ tiếp tục nâng cấp TUI.".into(),
+            },
+        ] {
+            harness.events.send(event).expect("stream event");
+            effects.extend(harness.controller.pump_events());
+        }
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Stream(_))),
+            "reasoning must not commit an unfinished answer: {effects:?}"
+        );
+        assert_eq!(
+            harness.controller.ui_state().live_text,
+            "Tôi sẽ tiếp tục nâng cấp TUI."
+        );
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .unwrap();
+        effects.extend(harness.controller.pump_events());
+        let answers: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Stream(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answers, ["Tôi sẽ tiếp tục nâng cấp TUI."]);
+        assert!(effects.contains(&Effect::Thinking("checking the workspace".into())));
     }
 
     #[test]
