@@ -848,7 +848,7 @@ impl ProviderError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
-            message: message.into(),
+            message: harness_types::without_code_prefix(code, message.into()),
             retry_after: None,
         }
     }

@@ -666,6 +666,10 @@ impl TurnDriver {
         let mut pending_question: Option<QuestionId> = None;
         // Recent tool signatures for the loop detector.
         let mut loop_signatures: Vec<String> = Vec::new();
+        // How often each read has been made with the same arguments since the last
+        // call that could change what a read returns.
+        let mut unchanged_reads: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         // Everything this turn has already said and executed. Each continuation
         // sends the whole transcript, not just the newest step: a model that is
         // handed back only the last tool result has no record of what it already
@@ -952,6 +956,18 @@ impl TurnDriver {
                 loop_signatures.drain(0..drain);
             }
             if repeated_tail(&loop_signatures) {
+                break TurnStop::LoopDetected;
+            }
+            // A read made again with the same arguments, with nothing changed since,
+            // returns what it returned before. Repeating it is a loop even when
+            // other calls come between the repeats: a model cycling through the same
+            // fifteen files read them 1,488 times in one delegated turn, and the
+            // tail check above, which only sees back-to-back repeats, never fired.
+            if let Some(call) = repeated_read(&mut unchanged_reads, &result.tool_calls) {
+                observer.observe(TurnProgress::Notice(format!(
+                    "stopped: {} was called {LOOP_REPEAT_LIMIT} times with the same arguments and nothing changed in between",
+                    call.name
+                )));
                 break TurnStop::LoopDetected;
             }
 
@@ -1877,6 +1893,36 @@ fn call_signature(call: &NormalizedToolCall) -> String {
     format!("{}|{}", call.name, call.arguments)
 }
 
+/// The first call of a batch that repeats a read to the limit, counting every
+/// read since the last call that could change what a read returns.
+///
+/// Only a read whose answer depends on nothing but the workspace counts: a file,
+/// a listing, a search, the repository's state. Reading a running process's
+/// output again is how a model follows it, so it is not a repeat; and any call
+/// that is not a read - an edit, a command, an external tool - may change what
+/// the next read returns, so it starts the count again.
+fn repeated_read<'a>(
+    counts: &mut std::collections::HashMap<String, usize>,
+    calls: &'a [NormalizedToolCall],
+) -> Option<&'a NormalizedToolCall> {
+    for call in calls {
+        let pure_read = matches!(
+            crate::contracts::effect_class_for(&call.name),
+            crate::contracts::EffectClass::ReadOnly
+        ) && call.name != "read_process_output";
+        if !pure_read {
+            counts.clear();
+            continue;
+        }
+        let count = counts.entry(call_signature(call)).or_insert(0);
+        *count += 1;
+        if *count >= LOOP_REPEAT_LIMIT {
+            return Some(call);
+        }
+    }
+    None
+}
+
 /// Whether the tail of the window is one signature repeated to the limit.
 fn repeated_tail(signatures: &[String]) -> bool {
     let Some(last) = signatures.last() else {
@@ -2508,5 +2554,68 @@ mod transcript_budget_tests {
         let before = transcript.clone();
         assert_eq!(trim_transcript(&mut transcript, 200_000, 6), 0);
         assert_eq!(transcript, before);
+    }
+}
+
+#[cfg(test)]
+mod repeated_read_tests {
+    use std::collections::HashMap;
+
+    use harness_providers::NormalizedToolCall;
+
+    use super::repeated_read;
+
+    fn call(name: &str, arguments: &str) -> NormalizedToolCall {
+        NormalizedToolCall {
+            call_id: format!("{name}-{arguments}"),
+            name: name.to_owned(),
+            arguments: arguments.to_owned(),
+        }
+    }
+
+    /// The delegated turn in the report: five files read round-robin, one per
+    /// step. No two steps repeat back to back, and the third read of a file with
+    /// nothing changed is the loop.
+    #[test]
+    fn reads_cycling_through_the_same_files_are_a_loop() {
+        let mut counts = HashMap::new();
+        let files = ["a", "b", "c", "d", "e"];
+        let mut stopped_at = None;
+        for step in 0..20 {
+            let arguments = format!(r#"{{"path":"{}.txt"}}"#, files[step % files.len()]);
+            if repeated_read(&mut counts, &[call("read_file", &arguments)]).is_some() {
+                stopped_at = Some(step);
+                break;
+            }
+        }
+        assert_eq!(
+            stopped_at,
+            Some(10),
+            "the third read of a.txt stops the turn"
+        );
+    }
+
+    /// A read after an edit may see something new, so the count starts again; and
+    /// reading a running process's output again is how a model follows it.
+    #[test]
+    fn a_change_resets_the_count_and_process_output_is_not_a_repeat() {
+        let mut counts = HashMap::new();
+        let read = call("read_file", r#"{"path":"a.txt"}"#);
+        let edit = call("edit_file", r#"{"path":"a.txt"}"#);
+        for _ in 0..5 {
+            assert!(repeated_read(&mut counts, &[read.clone(), edit.clone()]).is_none());
+        }
+        let follow = call("read_process_output", r#"{"artifact_id":"x"}"#);
+        for _ in 0..5 {
+            assert!(repeated_read(&mut counts, std::slice::from_ref(&follow)).is_none());
+        }
+        // Different arguments are different reads.
+        for offset in 0..5 {
+            let page = call(
+                "read_file",
+                &format!(r#"{{"path":"a.txt","offset":{offset}}}"#),
+            );
+            assert!(repeated_read(&mut counts, &[page]).is_none());
+        }
     }
 }

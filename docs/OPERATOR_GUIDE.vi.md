@@ -357,7 +357,7 @@ Khi có delegation, object `rlm` trong kernel chạy agent con trên worker củ
 | Lịch sử | `history_search`, `history_read` | Tìm và đọc journal của task |
 | Người dùng | `ask_user` | Tạm dừng và hỏi, không cấp quyền tool |
 
-`delegate` giới hạn một tầng, tối đa ba child. Explorer chỉ đọc cùng workspace; coder làm việc trên worktree Git sạch do host cấp. Nếu không thể cấp worktree, tool trả `role_unavailable`; `/agents` cho thấy tiến độ, Ctrl-C của cha hủy child.
+`delegate` giới hạn một tầng, tối đa ba child. Explorer chỉ đọc cùng workspace; coder làm việc trên worktree Git sạch do host cấp. Nếu không thể cấp worktree, tool trả `role_unavailable`; `/agents` cho thấy tiến độ, Ctrl-C của cha hủy child. Nhiều lời gọi `delegate` trong một phản hồi chạy song song. Child thừa hưởng tool web của cha (`web_search`, `web_fetch`). Child gặp sự cố - lỗi provider, vòng lặp, phản hồi rỗng - được trả về cho cha dưới dạng kết quả thất bại mà cha có thể xử lý, `[child-failed explorer] <code>: <lý do>`, không bao giờ báo là đã xong. Mọi lượt, của cha hay của child, dừng với `loop_detected` khi đọc cùng một thứ (cùng tool, cùng tham số) ba lần mà ở giữa không có gì thay đổi, kể cả khi các lần lặp bị xen bởi lời gọi khác.
 
 ### 12.2. Lệnh trong chat và bàn phím
 

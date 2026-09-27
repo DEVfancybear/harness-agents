@@ -14,7 +14,7 @@ impl StoreError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
-            message: message.into(),
+            message: harness_types::without_code_prefix(code, message.into()),
         }
     }
 

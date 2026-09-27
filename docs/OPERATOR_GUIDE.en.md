@@ -352,7 +352,7 @@ With delegation available, the kernel's `rlm` object runs children on the turn's
 | History | `history_search`, `history_read` | Search and read the task journal |
 | Human | `ask_user` | Pause to ask; does not grant tool permission |
 
-`delegate` has depth one and at most three concurrent children. Explorer is read only in the same workspace; coder works in a host provisioned clean Git worktree. If a worktree cannot be provisioned, the tool returns `role_unavailable`. `/agents` shows progress; parent Ctrl-C cancels children.
+`delegate` has depth one and at most three concurrent children. Explorer is read only in the same workspace; coder works in a host provisioned clean Git worktree. If a worktree cannot be provisioned, the tool returns `role_unavailable`. `/agents` shows progress; parent Ctrl-C cancels children. Several `delegate` calls in one response run side by side. A child inherits the parent's web tools (`web_search`, `web_fetch`). A child that breaks - a provider error, a loop, an empty reply - comes back as a failed result the parent can act on, `[child-failed explorer] <code>: <reason>`, never as completed. Any turn, parent or child, stops as `loop_detected` when it reads the same thing (same tool, same arguments) three times with nothing changed in between, even when other calls come between the repeats.
 
 ### 12.2. Chat commands and keys
 

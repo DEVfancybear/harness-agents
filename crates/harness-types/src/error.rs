@@ -521,12 +521,34 @@ pub struct HarnessError {
     message: String,
 }
 
+/// A message without the `code: ` prefixes it picks up when an error is wrapped
+/// again with its own `to_string()`.
+///
+/// Every error type here displays as `code: message`, and a layer that passes an
+/// error on as `Error::new(error.code(), error.to_string())` put the code in front
+/// once more: a provider failure that crossed the runtime, the turn driver and a
+/// delegated worker reached the parent as `provider_protocol: provider_protocol:
+/// provider_protocol: provider_protocol: ...`. Only the error's own code is
+/// removed; a different code in front is information and stays.
+#[must_use]
+pub fn without_code_prefix(code: ErrorCode, message: String) -> String {
+    let prefix = format!("{}: ", code.as_str());
+    if !message.starts_with(&prefix) {
+        return message;
+    }
+    let mut rest = message.as_str();
+    while let Some(next) = rest.strip_prefix(prefix.as_str()) {
+        rest = next;
+    }
+    rest.to_owned()
+}
+
 impl HarnessError {
     #[must_use]
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
-            message: message.into(),
+            message: without_code_prefix(code, message.into()),
         }
     }
 
@@ -556,5 +578,36 @@ impl HarnessError {
     #[must_use]
     pub fn report(&self) -> ErrorReport {
         ErrorReport::from_error(self, None, None)
+    }
+}
+
+#[cfg(test)]
+mod code_prefix_tests {
+    use super::{ErrorCode, HarnessError, without_code_prefix};
+
+    /// The exact text a failed delegated explorer reached its parent with: one
+    /// code per layer the error was passed through.
+    #[test]
+    fn an_error_passed_on_keeps_its_code_once() {
+        let inner = HarnessError::new(ErrorCode::ProviderProtocol, "malformed provider SSE JSON");
+        let mut error = inner.clone();
+        for _ in 0..4 {
+            error = HarnessError::new(error.code(), error.to_string());
+        }
+        assert_eq!(error, inner);
+        assert_eq!(
+            error.to_string(),
+            "provider_protocol: malformed provider SSE JSON"
+        );
+    }
+
+    /// A different code in front says where the error came from, so it stays.
+    #[test]
+    fn another_code_in_front_is_kept() {
+        let message = "provider_protocol: stream failed".to_owned();
+        assert_eq!(
+            without_code_prefix(ErrorCode::ResultIncomplete, message.clone()),
+            message
+        );
     }
 }

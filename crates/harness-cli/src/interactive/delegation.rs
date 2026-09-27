@@ -57,6 +57,9 @@ const EXPLORER_DENY_TOOLS: &[&str] = &[
     "ask_user",
 ];
 
+/// The parent's web tools, which a child inherits: its catalog and dispatcher.
+pub type ChildWebTools = (ExternalTools, Arc<dyn ExternalToolDispatcher>);
+
 /// Creates the per-turn worker scheduler and the external-tool adapter for it.
 pub struct DelegateHost {
     inner: Arc<DelegateDispatcher>,
@@ -84,6 +87,7 @@ impl DelegateHost {
         sender: UnboundedSender<SessionEvent>,
         parent_cancellation: CancellationToken,
         status: Arc<Mutex<Vec<String>>>,
+        web: Option<ChildWebTools>,
     ) -> Result<Self, HarnessError> {
         let worker_status = Arc::new(Mutex::new(BTreeMap::new()));
         let ledger_slot = Arc::new(Mutex::new(None));
@@ -99,6 +103,7 @@ impl DelegateHost {
             model_price,
             approval_gate,
             sender,
+            web,
             worker_status: Arc::clone(&worker_status),
             ledger_slot: Arc::clone(&ledger_slot),
             status: Arc::clone(&status),
@@ -458,6 +463,7 @@ impl DelegateDispatcher {
             .unwrap_or("sha256:unavailable");
         Ok(json!({
             "role": role.as_str(),
+            "status": "completed",
             "text": report.summary,
             "receipts_digest": receipt_digest,
             "steps": report.detail["steps"],
@@ -466,6 +472,22 @@ impl DelegateDispatcher {
             "worktree_path": report.detail["worktree_path"],
             "branch": report.detail["branch"],
         }))
+    }
+
+    /// The `delegate` result for a child that failed: one line saying so, with
+    /// the error it failed on.
+    fn failure(role: AgentRole, error: &HarnessError) -> Value {
+        json!({
+            "role": role.as_str(),
+            "status": "failed",
+            "error": {"code": error.code().as_str(), "message": error.message()},
+            "text": format!(
+                "[child-failed {}] {}: {}",
+                role.as_str(),
+                error.code().as_str(),
+                error.message()
+            ),
+        })
     }
 
     fn arguments(arguments: &Value) -> Result<(AgentRole, String), HarnessError> {
@@ -503,6 +525,21 @@ impl DelegateDispatcher {
         }
         Ok((role, brief.to_owned()))
     }
+}
+
+/// Why a child's turn ended without an answer, or `None` when it answered.
+fn stopped_short(stop: TurnStop) -> Option<String> {
+    let reason = match stop {
+        TurnStop::Final | TurnStop::Canceled => return None,
+        TurnStop::LoopDetected => {
+            "it kept making the same tool call with nothing changed (loop_detected)".to_owned()
+        }
+        TurnStop::Unverified => {
+            "its last reply was empty or cut off, so it cannot be trusted (unverified)".to_owned()
+        }
+        other => format!("the turn stopped: {}", other.as_str()),
+    };
+    Some(reason)
 }
 
 fn coder_unavailable_error(reason: impl std::fmt::Display) -> HarnessError {
@@ -659,10 +696,17 @@ impl ExternalToolDispatcher for DelegateDispatcher {
                     "explorer result channel closed",
                 )
             })?;
+            // A child that failed is still an answer: the parent is told plainly
+            // that it failed and why, as prime-agent's `[child-failed ...]`
+            // notice does. Returned as an error, the call was recorded as an
+            // uncertain side effect ("do not rerun automatically") and the reason
+            // reached the model only as a debug dump.
+            let payload = Self::report(started.role, outcome)
+                .unwrap_or_else(|error| Self::failure(started.role, &error));
             Ok(ToolOutput::ExternalTool {
                 plugin_id: "delegate".to_owned(),
                 tool_name: "delegate".to_owned(),
-                payload: Self::report(started.role, outcome)?,
+                payload,
                 inflight: 1,
             })
         })
@@ -1061,6 +1105,10 @@ struct InteractiveWorkerBackend {
     model_price: Option<ModelPrice>,
     approval_gate: Arc<dyn ApprovalGate>,
     sender: UnboundedSender<SessionEvent>,
+    /// The parent's web tools. A child inherits them, as a prime-agent child
+    /// inherits its parent's tools: a research brief sent to an explorer without
+    /// them could only be answered from the local files.
+    web: Option<ChildWebTools>,
     worker_status: Arc<Mutex<BTreeMap<String, String>>>,
     ledger_slot: Arc<Mutex<Option<Arc<BudgetLedger>>>>,
     status: Arc<Mutex<Vec<String>>>,
@@ -1081,7 +1129,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     self.workspace_root.clone(),
                     explorer_policy(&self.parent_policy),
                     explorer_tool_schemas(),
-                    "You are a read-only explorer. Inspect the current workspace and answer the brief. You cannot edit files, run commands, call external tools, or delegate again.",
+                    "You are a read-only explorer. Inspect the current workspace - and the web, when web tools are offered - and answer the brief. You cannot edit files, run commands or delegate again.",
                 ),
                 AgentRole::Coder => {
                     let Some(worktree) = request.worktree.as_ref() else {
@@ -1142,9 +1190,14 @@ impl WorkerBackend for InteractiveWorkerBackend {
             // under one input id, and every child failed with
             // `idempotency_conflict` before its first step.
             let input_id = InputId::generate();
-            let tools = ToolExecutionService::new(Arc::clone(&self.store))
+            let mut tools = ToolExecutionService::new(Arc::clone(&self.store))
                 .with_policy(policy)
                 .with_hooks(self.hooks.clone());
+            let mut schemas = schemas;
+            if let Some((catalog, dispatcher)) = &self.web {
+                tools = tools.with_external(Arc::clone(dispatcher));
+                schemas.extend(catalog.schemas());
+            }
             let runtime = Arc::new(RuntimeService::new(
                 Arc::clone(&self.store),
                 Arc::clone(&self.provider),
@@ -1164,6 +1217,10 @@ impl WorkerBackend for InteractiveWorkerBackend {
             .with_tool_schemas(schemas)
             .with_authority(SourceAuthority::ModelProposed);
             let driver = TurnDriver::new(Arc::clone(&runtime), tools);
+            let driver = match &self.web {
+                Some((catalog, _)) => driver.with_external(catalog.clone()),
+                None => driver,
+            };
             let observer = Arc::new(ExplorerObserver {
                 task_key: task_key.clone(),
                 role_name: role_name.clone(),
@@ -1220,12 +1277,36 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     reason: "parent turn canceled the explorer".to_owned(),
                 };
             }
+            // A child that stopped short of an answer - a loop, an unverifiable
+            // reply, a bound - failed, and says why. It used to be reported as
+            // completed ("Explorer completed without a final text answer"), so the
+            // parent could not tell a child that broke from one that finished.
+            if let Some(reason) = stopped_short(outcome.stop) {
+                if let Ok(mut status) = self.worker_status.lock() {
+                    status.insert(
+                        task_key.clone(),
+                        format!("{role_name} {task_key}: failed, {reason}"),
+                    );
+                    if let Ok(mut last_status) = self.status.lock() {
+                        *last_status = status.values().cloned().collect();
+                    }
+                }
+                return WorkerOutcome::Failed {
+                    error: OrchestratorError::new(
+                        ErrorCode::ResultIncomplete,
+                        format!(
+                            "{role_name} stopped without an answer: {reason} ({} step(s), {} tool call(s))",
+                            outcome.steps, outcome.tool_calls
+                        ),
+                    ),
+                };
+            }
             let receipts = serde_json::to_vec(&outcome.executions).unwrap_or_default();
             let receipts_digest = ContentHash::from_bytes(&receipts).as_str().to_owned();
             let (prompt_tokens, completion_tokens) =
                 observer.token_usage.lock().map_or((0, 0), |usage| *usage);
             let summary = if outcome.final_text.trim().is_empty() {
-                "Explorer completed without a final text answer.".to_owned()
+                format!("[no answer] the {role_name} finished without writing an answer.")
             } else {
                 outcome.final_text
             };
@@ -1410,8 +1491,8 @@ mod tests {
     use harness_types::{AgentRunId, ErrorCode, ProjectId, TaskId};
 
     use super::{
-        DelegateCatalog, ExplorerObserver, explorer_policy, explorer_tool_schemas,
-        inspect_coder_input, watch_parent_cancellation,
+        DelegateCatalog, DelegateDispatcher, ExplorerObserver, explorer_policy,
+        explorer_tool_schemas, inspect_coder_input, stopped_short, watch_parent_cancellation,
     };
     use crate::interactive::cost::CostTracker;
 
@@ -1530,6 +1611,40 @@ mod tests {
         observer.observe(TurnProgress::StepStarted { step: 2 });
         assert_eq!(ledger.requests_used(), 2);
         assert_eq!(ledger.remaining_requests(), 0);
+    }
+
+    /// A child that broke is reported as failed, in one line, with the error it
+    /// failed on - not as an uncertain side effect, and not as completed.
+    #[test]
+    fn a_failed_child_is_reported_as_failed_with_its_reason() {
+        use harness_orchestrator::{AgentRole, OrchestratorError, WorkerOutcome};
+        use harness_tools::TurnStop;
+
+        let failed = WorkerOutcome::Failed {
+            error: OrchestratorError::new(
+                ErrorCode::ProviderProtocol,
+                "provider_protocol: provider_protocol: malformed provider SSE JSON",
+            ),
+        };
+        let error = DelegateDispatcher::report(AgentRole::Explorer, failed)
+            .expect_err("a failed child has no report");
+        let payload = DelegateDispatcher::failure(AgentRole::Explorer, &error);
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(
+            payload["text"],
+            "[child-failed explorer] provider_protocol: malformed provider SSE JSON"
+        );
+
+        assert!(stopped_short(TurnStop::Final).is_none());
+        assert!(stopped_short(TurnStop::Canceled).is_none());
+        for stop in [
+            TurnStop::LoopDetected,
+            TurnStop::Unverified,
+            TurnStop::StepLimit,
+            TurnStop::Deadline,
+        ] {
+            assert!(stopped_short(stop).is_some(), "{stop:?} is not an answer");
+        }
     }
 
     #[tokio::test]
@@ -1919,6 +2034,7 @@ mod real_worker_tests {
             channel.sender(),
             CancellationToken::new(),
             Arc::new(std::sync::Mutex::new(Vec::new())),
+            None,
         )
         .expect("delegate host");
         let children = host.rlm_requests("fixture-model".to_owned());

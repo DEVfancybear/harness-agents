@@ -3992,6 +3992,7 @@ async fn run_turn(
             return;
         }
     };
+    let web_host = super::web::WebHost::from_environment(&environment);
     let delegate_host = match super::delegation::DelegateHost::new(
         &store,
         Arc::clone(&provider),
@@ -4013,6 +4014,9 @@ async fn run_turn(
         sender.clone(),
         cancellation.clone(),
         Arc::clone(&agents_status),
+        web_host
+            .as_ref()
+            .map(|host| (host.tools(), host.dispatcher())),
     ) {
         Ok(host) => Some(host),
         Err(error) => {
@@ -4039,7 +4043,6 @@ async fn run_turn(
     let skill_host = skill_catalog
         .as_ref()
         .map(|catalog| super::skills::SkillHost::new(catalog.clone(), Arc::clone(&active_skills)));
-    let web_host = super::web::WebHost::from_environment(&environment);
     let goal_host =
         matches!(goal, GoalRecord::Active(_)).then(|| super::goal::GoalHost::new(sender.clone()));
     let kernel_skills = skill_catalog

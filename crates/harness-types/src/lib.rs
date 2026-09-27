@@ -31,7 +31,7 @@ pub use contracts::{
     ToolOutcomeState, TrustConfigV2, UiConfigV2, Validity, WorkingState, WorkspaceChange,
     WorkspaceObservation, validate_schema_version,
 };
-pub use error::{ErrorCode, ErrorReport, HarnessError, RetryClass};
+pub use error::{ErrorCode, ErrorReport, HarnessError, RetryClass, without_code_prefix};
 pub use fixture::{ContinuationFixtureReport, verify_continuation_fixture};
 pub use hash::{ContentHash, canonical_json_bytes};
 pub use ids::{
