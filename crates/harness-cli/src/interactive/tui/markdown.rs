@@ -256,7 +256,7 @@ type Glyph = (char, Style);
 /// The whitespace a break lands on belongs to neither row: leaving it would pad the
 /// finished row or indent the next one, so it is consumed. Whitespace is the only
 /// thing wrapping ever removes.
-fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
+pub(super) fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
     let limit = usize::from(width.max(1));
 
     // Flatten to characters first: a row must be able to break *inside* a span,

@@ -129,6 +129,7 @@ pub struct RealRenderer<B: Backend> {
     detail: super::events::Detail,
     /// What was pushed into the scrollback, newest last, for a reprint.
     shown: std::collections::VecDeque<HistoryItem>,
+    assistant_continuing: bool,
 }
 
 impl<B: Backend> RealRenderer<B>
@@ -153,6 +154,7 @@ where
             theme: Theme::detect(),
             detail: super::events::Detail::default(),
             shown: std::collections::VecDeque::new(),
+            assistant_continuing: false,
         })
     }
 
@@ -167,8 +169,10 @@ where
         let mut blocks = Vec::new();
         let mut total = 0_usize;
         let mut cut = false;
-        for item in self.shown.iter().rev() {
-            let rows = history::render(item, width, &theme, detail);
+        for (index, item) in self.shown.iter().enumerate().rev() {
+            let continuing =
+                index > 0 && matches!(self.shown[index - 1], HistoryItem::Assistant { .. });
+            let rows = history::render_fragment(item, width, &theme, detail, continuing);
             if total + rows.len() > REPRINT_ROWS && total > 0 {
                 cut = true;
                 break;
@@ -251,7 +255,9 @@ where
     fn draw_history(&mut self, item: &HistoryItem) -> io::Result<()> {
         let theme = self.theme;
         let width = self.columns();
-        let rows = history::render(item, width, &theme, self.detail);
+        let rows =
+            history::render_fragment(item, width, &theme, self.detail, self.assistant_continuing);
+        self.assistant_continuing = matches!(item, HistoryItem::Assistant { .. });
         if rows.is_empty() {
             return Ok(());
         }
@@ -474,7 +480,14 @@ impl<T: TerminalBackend> TuiRenderer for ScriptedRenderer<T> {
 
     fn insert_history(&mut self, item: &HistoryItem) -> io::Result<()> {
         let width = self.inner.columns();
-        let rows = history::render(item, width, &self.inner.theme, self.inner.detail);
+        let rows = history::render_fragment(
+            item,
+            width,
+            &self.inner.theme,
+            self.inner.detail,
+            self.inner.assistant_continuing,
+        );
+        self.inner.assistant_continuing = matches!(item, HistoryItem::Assistant { .. });
         for line in &rows {
             self.backend.write(&line.to_string())?;
             self.backend.write("\r\n")?;
@@ -717,6 +730,113 @@ mod tests {
             thinking: None,
             goal: None,
         }
+    }
+
+    #[test]
+    fn redesign_composer_frame_has_rounded_box_hints_and_status_in_reading_order() {
+        let mut draft = state(AppPhase::Ready);
+        draft.live_text.clear();
+        draft.header = vec!["Service: deepseek-v4-flash".to_owned()];
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let theme = super::theme::Theme::plain();
+                let plan = super::layout::plan(frame.area(), &draft, &theme);
+                super::widgets::render(frame, &plan, &draft, &theme);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..12)
+            .map(|y| {
+                (0..80)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect();
+        assert!(rows[0].starts_with("╭─ Yêu cầu "), "{rows:#?}");
+        assert!(rows[1].starts_with("│ > sửa lỗi"), "{rows:#?}");
+        assert!(
+            rows[2].starts_with('│'),
+            "the empty input row gives the draft room"
+        );
+        assert!(rows[3].starts_with('╰'));
+        assert!(rows[4].contains("Enter gửi") && rows[4].contains("@ file"));
+        assert!(rows[5].contains("deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn redesign_layout_keeps_cursor_inside_the_box_at_every_size() {
+        let mut draft = state(AppPhase::Ready);
+        draft.live_text.clear();
+        draft.buffer = "sửa lỗi\n日本語\nمرحبا Rust\ne\u{301} 😀".to_owned();
+        draft.cursor = draft.buffer.chars().count();
+        for width in 0..85 {
+            for height in 0..25 {
+                let area = ratatui::layout::Rect::new(3, 2, width, height);
+                let plan = super::layout::plan(area, &draft, &super::theme::Theme::plain());
+                for rect in [plan.composer, plan.status] {
+                    assert!(rect.x >= area.x && rect.y >= area.y);
+                    assert!(
+                        rect.right() <= area.right() && rect.bottom() <= area.bottom(),
+                        "{area:?}: {plan:?}"
+                    );
+                }
+                if let Some((x, y)) = plan.cursor {
+                    assert!(x > plan.composer.x && x < plan.composer.right() - 1);
+                    assert!(y > plan.composer.y && y < plan.composer.bottom() - 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn redesign_stream_fragments_have_one_speaker_label() {
+        let backend = ScriptedBackend::new(Vec::new());
+        let mut renderer = ScriptedRenderer::open(backend, 80, 24).unwrap();
+        for i in 0..20 {
+            renderer
+                .insert_history(&HistoryItem::Assistant {
+                    text: format!("line {i}\n"),
+                })
+                .unwrap();
+        }
+        let output = renderer.backend().output();
+        assert_eq!(output.matches("  HA\r\n").count(), 1, "{output}");
+        assert!(output.contains("line 0") && output.contains("line 19"));
+    }
+
+    #[test]
+    fn redesign_picker_keeps_the_selected_last_item_visible() {
+        let backend = ScriptedBackend::new(Vec::new());
+        let mut renderer = ScriptedRenderer::open(backend, 80, 24).unwrap();
+        let mut picking = state(AppPhase::Ready);
+        picking.modal = Some(crate::interactive::events::Modal::Picker {
+            items: (0..12).map(|i| format!("session_{i}")).collect(),
+            selected: 11,
+        });
+        renderer.draw_state(&picking).unwrap();
+        assert!(renderer.painted().join("\n").contains("❯ session_11"));
+    }
+
+    #[test]
+    fn redesign_short_question_panel_keeps_its_prompt_visible() {
+        let backend = ScriptedBackend::new(Vec::new());
+        let mut renderer = ScriptedRenderer::open(backend, 80, 14).unwrap();
+        let mut asking = state(AppPhase::WaitingInput);
+        asking.modal = Some(crate::interactive::events::Modal::Question {
+            prompt: "Which file should I update?".into(),
+            options: Vec::new(),
+        });
+        renderer.draw_state(&asking).unwrap();
+        assert!(
+            renderer
+                .painted()
+                .join("\n")
+                .contains("Which file should I update?")
+        );
     }
 
     #[test]
@@ -1218,7 +1338,7 @@ mod tests {
             .expect("a menu row");
         let composer_row = painted
             .iter()
-            .position(|row| row.starts_with("> /"))
+            .position(|row| row.starts_with("│ > /"))
             .expect("the composer row");
         assert!(
             menu_row < composer_row,

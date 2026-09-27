@@ -7,7 +7,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 use super::super::theme::Theme;
 
@@ -25,11 +25,25 @@ pub fn render(
     scroll: usize,
     theme: &Theme,
 ) {
-    let rows = rows(lines, theme);
-    let height = usize::from(area.height.saturating_sub(2)).max(1);
+    let compact = area.height <= 3;
+    let width = area.width.saturating_sub(if compact { 0 } else { 2 });
+    let rows: Vec<_> = rows(lines, theme)
+        .into_iter()
+        .flat_map(|line| super::super::markdown::wrap_spans(line.spans, width))
+        .collect();
+    let height = usize::from(if compact {
+        area.height
+    } else {
+        area.height - 2
+    })
+    .max(1);
     let max_scroll = rows.len().saturating_sub(height);
     let offset = scroll.min(max_scroll);
     let visible: Vec<Line<'static>> = rows.into_iter().skip(offset).take(height).collect();
+    if compact {
+        frame.render_widget(Paragraph::new(visible), area);
+        return;
+    }
     // The keys named here are exactly the ones the controller handles for an open
     // panel: PageUp/PageDown by a page, Home to the first row, End to the last. The
     // arrows are deliberately absent - they belong to the editor, so a panel opened
@@ -50,15 +64,11 @@ pub fn render(
     };
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(theme.border)
         .title(Span::styled(format!(" {title} "), theme.title))
         .title_bottom(Span::styled(hint, theme.dim));
-    frame.render_widget(
-        Paragraph::new(visible)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    frame.render_widget(Paragraph::new(visible).block(block), area);
 }
 
 /// The overlay rows.
@@ -94,6 +104,31 @@ mod tests {
     use super::rows;
     use crate::interactive::tui::markdown::plain_text;
     use crate::interactive::tui::theme::Theme;
+
+    #[test]
+    fn end_reaches_the_last_row_after_long_paths_wrap() {
+        let backend = ratatui::backend::TestBackend::new(30, 7);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let lines = vec![
+            "a long configuration path ".repeat(12),
+            "Store: final entry".into(),
+        ];
+        terminal
+            .draw(|frame| {
+                super::render(
+                    frame,
+                    frame.area(),
+                    "/config",
+                    &lines,
+                    usize::MAX,
+                    &Theme::plain(),
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("Store: final entry"), "{text}");
+    }
 
     #[test]
     fn t06_overlay_rows_keep_the_help_text_verbatim() {

@@ -18,13 +18,9 @@ use crate::interactive::view;
 /// `tool-execution.ts`).
 const TOOL_OUTPUT_PREVIEW_LINES: usize = 3;
 
-/// Render one history item into styled rows, the way prime-agent's interactive
-/// mode draws its chat (`modes/interactive/components`): a user message is a box on
-/// `userMessageBg`, assistant prose is markdown with one cell of padding, a tool is
-/// a panel on `toolPanelBg` headed `label · status`, its output collapsed to three
-/// lines, and notices, errors and injected prompts are single styled lines. In
-/// [`Detail::Expanded`] a tool is drawn as Claude Code's transcript view draws it:
-/// its whole input and its whole output, each in a box.
+/// Render history with speaker labels and indented tool rows. Collapsed tools
+/// show three output lines; [`Detail::Expanded`] shows the complete input and
+/// output in separate boxes. Notices and errors retain their own styles.
 ///
 /// The plain renderer keeps its own transcript format ([`view::plain_lines`]); this
 /// is only how the TUI shows the same items.
@@ -35,7 +31,10 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
         HistoryItem::User { text } => user_box(text, width, theme),
         HistoryItem::Automatic { text } => injected_prompt(text, width, theme),
         HistoryItem::Assistant { text } => {
-            let mut rows = vec![Line::default()];
+            let mut rows = vec![
+                Line::default(),
+                Line::from(Span::styled("  HA", theme.title)),
+            ];
             rows.extend(assistant_rows(text, width, theme));
             rows
         }
@@ -145,6 +144,21 @@ pub fn assistant_rows(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static
     padded(markdown::render(text, width.saturating_sub(2), theme))
 }
 
+/// Streaming flushes are fragments of one answer, not new speakers.
+pub fn render_fragment(
+    item: &HistoryItem,
+    width: u16,
+    theme: &Theme,
+    detail: Detail,
+    continuing: bool,
+) -> Vec<Line<'static>> {
+    if continuing && let HistoryItem::Assistant { text } = item {
+        assistant_rows(text, width, theme)
+    } else {
+        render(item, width, theme, detail)
+    }
+}
+
 /// `1 step`, `3 steps`.
 fn counted(count: u64, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
@@ -160,19 +174,21 @@ fn padded(rows: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// prime-agent's `UserMessageComponent`: a box on `userMessageBg`, two cells of
-/// padding on each side and one row above and below.
+/// A speaker label and unshaded text, with two cells of padding on each side.
 fn user_box(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let inner = width.saturating_sub(4).max(1);
-    let mut rows = vec![Line::default(), Line::default().style(theme.user_box)];
+    let mut rows = vec![
+        Line::default(),
+        Line::from(Span::styled("  BẠN", theme.title)),
+    ];
     for line in text.split('\n') {
-        for row in wrap_spans(vec![Span::styled(line.to_owned(), theme.user_box)], inner) {
-            let mut spans = vec![Span::styled("  ", theme.user_box)];
+        for row in wrap_spans(vec![Span::styled(line.to_owned(), theme.user)], inner) {
+            let mut spans = vec![Span::raw("  ")];
             spans.extend(row.spans);
-            rows.push(Line::from(spans).style(theme.user_box));
+            rows.push(Line::from(spans));
         }
     }
-    rows.push(Line::default().style(theme.user_box));
+    rows.push(Line::default());
     rows
 }
 
@@ -914,45 +930,81 @@ fn clip_spans(spans: Vec<Span<'static>>, cells: usize) -> Vec<Span<'static>> {
     out
 }
 
-/// A compact welcome card in scrollback. Keep every original header value visible
-/// and wrap long paths before inserting rows; the left rail is only decoration.
+/// The session heading: project, model, permission mode and any setup guidance.
 fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>> {
-    let mut rows = Vec::new();
-    let rule_width = usize::from(width.saturating_sub(2).min(48));
-    if rule_width > 0 {
-        rows.push(Line::from(Span::styled(
-            format!("  {}", "─".repeat(rule_width)),
-            theme.border,
-        )));
+    let project = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("Project: "))
+        .map(|value| value.split("    Provider:").next().unwrap_or(value));
+    let name = project
+        .and_then(|path| {
+            path.trim_end_matches(['/', '\\'])
+                .rsplit(['/', '\\'])
+                .next()
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or("workspace");
+    let version = lines.iter().find(|line| line.starts_with("Harness Agents"));
+    let mut rows = vec![Line::default()];
+    rows.extend(wrap_spans(
+        vec![
+            Span::styled(format!("  ha / {name}"), theme.title),
+            Span::styled(
+                version.map_or(String::new(), |value| format!("  · {value}")),
+                theme.dim,
+            ),
+        ],
+        width,
+    ));
+    if let Some(model) = lines.iter().find_map(|line| line.strip_prefix("Service: ")) {
+        let model = model.split(" via ").next().unwrap_or(model);
+        let permissions = lines
+            .iter()
+            .find_map(|line| line.strip_prefix("Permissions: "));
+        let label =
+            permissions.map_or_else(|| model.to_owned(), |mode| format!("{model} · {mode}"));
+        rows.extend(wrap_spans(
+            vec![Span::styled(format!("  {label}"), theme.muted)],
+            width,
+        ));
     }
-    for (index, line) in lines.iter().enumerate() {
-        let mut spans = vec![Span::styled(
-            if index == 0 { "  ◆  " } else { "  │  " },
-            if index == 0 {
-                theme.accent
-            } else {
-                theme.border
-            },
-        )];
-        if index == 0 {
-            spans.push(Span::styled(line.clone(), theme.title));
-        } else if let Some((label, value)) = line.split_once(':') {
-            spans.push(Span::styled(format!("{label}:"), theme.muted));
-            spans.push(Span::styled(value.to_owned(), theme.dim));
-        } else {
-            spans.push(Span::styled(line.clone(), theme.dim));
-        }
-        rows.extend(wrap_spans(spans, width));
+    if let Some(project) = project {
+        rows.extend(wrap_spans(
+            vec![Span::styled(format!("  Project: {project}"), theme.dim)],
+            width,
+        ));
     }
-    if rule_width > 0 {
-        rows.push(Line::from(Span::styled(
-            format!("  {}", "─".repeat(rule_width)),
-            theme.border,
-        )));
+    // Setup errors and sign-in instructions stay visible. Configuration paths
+    // are available through /config rather than filling the opening screen.
+    for line in lines.iter().filter(|line| {
+        !line.is_empty()
+            && ![
+                "Harness Agents",
+                "Project:",
+                "Session:",
+                "Git:",
+                "AGENTS.md:",
+                "Config:",
+                "Data:",
+                "Store:",
+                "Service:",
+                "Permissions:",
+                "Nhập yêu cầu.",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+    }) {
+        rows.extend(wrap_spans(
+            vec![Span::styled(format!("  {line}"), theme.warning)],
+            width,
+        ));
     }
+    rows.push(Line::from(Span::styled(
+        "─".repeat(usize::from(width)),
+        theme.border,
+    )));
     rows
 }
-
 /// A tool panel header: prime-agent's `label · status` on `toolPanelBg` - `running`
 /// with its diamond marker in `bashMode`, `done` in `success`, `error` in `error` -
 /// followed by the arguments and the duration in dim. The Python REPL gets
@@ -988,7 +1040,7 @@ pub fn running_card(
         ),
     };
     let separator = || Span::styled(" · ", theme.dim);
-    let mut spans = vec![Span::raw("  ")];
+    let mut spans = vec![Span::raw("    ")];
     if name == "ipython" {
         let code = summary.strip_prefix("code=").unwrap_or(summary);
         spans.push(Span::styled(format!("{marker} "), style));
@@ -998,11 +1050,9 @@ pub fn running_card(
             spans.push(Span::styled(code.to_owned(), theme.dim));
         }
     } else {
+        spans.push(Span::styled(format!("{marker} "), style));
         spans.push(Span::styled(name.to_owned(), theme.muted));
         spans.push(separator());
-        if matches!(state, ToolState::Started) {
-            spans.push(Span::styled(format!("{marker} "), style));
-        }
         spans.push(Span::styled(status, style));
         if !summary.is_empty() {
             spans.push(separator());
@@ -1013,7 +1063,7 @@ pub fn running_card(
         spans.push(separator());
         spans.push(Span::styled(duration, theme.dim));
     }
-    Line::from(spans).style(theme.panel)
+    Line::from(spans)
 }
 
 /// The end-of-turn line: a dim status, as prime-agent's `showStatus`, in the
@@ -1221,6 +1271,62 @@ mod tests {
     }
 
     #[test]
+    fn redesign_history_has_speaker_labels_and_tool_markers() {
+        let theme = Theme::plain();
+        let user = plain_text(&render(
+            &HistoryItem::User {
+                text: "sửa lỗi".into(),
+            },
+            80,
+            &theme,
+            Detail::Collapsed,
+        ));
+        assert_eq!(user, "\n  BẠN\n  sửa lỗi\n");
+        let answer = plain_text(&render(
+            &HistoryItem::Assistant {
+                text: "Đã sửa.".into(),
+            },
+            80,
+            &theme,
+            Detail::Collapsed,
+        ));
+        assert!(answer.starts_with("\n  HA\n"), "{answer}");
+        let tool = plain_text(&render(
+            &HistoryItem::Tool {
+                name: "read_file".into(),
+                summary: "src/auth.rs".into(),
+                input: String::new(),
+                state: ToolState::Ok {
+                    elapsed: Duration::from_millis(12),
+                },
+            },
+            80,
+            &theme,
+            Detail::Collapsed,
+        ));
+        assert!(tool.contains("    ✓ read_file"), "{tool}");
+    }
+
+    #[test]
+    fn redesign_banner_is_compact_and_preserves_setup_guidance() {
+        let lines = vec![
+            String::new(),
+            "Harness Agents 0.1.0".into(),
+            "Project: C:/work/harness-agents    Provider: credential present".into(),
+            "Config: C:/config.toml".into(),
+            "Store: C:/store".into(),
+            "Service: deepseek-v4-flash via https://api.deepseek.com".into(),
+            "Log in with /login".into(),
+        ];
+        let rows = super::banner_rows(&lines, 80, &Theme::plain());
+        let text = plain_text(&rows);
+        assert!(text.contains("ha / harness-agents"), "{text}");
+        assert!(text.contains("deepseek-v4-flash"));
+        assert!(text.contains("Log in with /login"));
+        assert!(!text.contains("Store:") && !text.contains("Config:"));
+    }
+
+    #[test]
     fn a_failed_tool_card_carries_its_duration_and_reason() {
         let text = plain_text(&render(
             &HistoryItem::Tool {
@@ -1389,7 +1495,7 @@ mod tests {
         let rows = text.lines().collect::<Vec<_>>();
         assert_eq!(rows[0], "", "a blank row separates calls");
         assert!(
-            rows[1].starts_with("  ▾ run_shell · done · command=cargo test"),
+            rows[1].starts_with("    ▾ ✓ run_shell · done · command=cargo test"),
             "{text}"
         );
         assert!(rows[1].ends_with(" · 1.2s"), "{text}");
@@ -1430,7 +1536,7 @@ mod tests {
             let text = plain_text(&render(&shell_call(), 100, &Theme::plain(), detail));
             assert_eq!(
                 text,
-                "\n  run_shell · done · command=cargo test --workspace --locked timeout_ms=60000 · 1.2s"
+                "\n    ✓ run_shell · done · command=cargo test --workspace --locked timeout_ms=60000 · 1.2s"
             );
         }
     }
@@ -1451,7 +1557,10 @@ mod tests {
             &Theme::plain(),
             Detail::Expanded,
         ));
-        assert!(text.contains("▾ Bash · done · List files · 5ms"), "{text}");
+        assert!(
+            text.contains("▾ ✓ Bash · done · List files · 5ms"),
+            "{text}"
+        );
         assert!(text.contains("│ $ ls -la"), "{text}");
         assert_eq!(text.matches("List files").count(), 1, "{text}");
     }

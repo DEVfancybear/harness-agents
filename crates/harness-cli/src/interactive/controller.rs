@@ -542,6 +542,11 @@ impl InteractiveController {
             .permissions_summary()
             .first()
             .and_then(|line| line.strip_prefix("mode: ").map(str::to_owned));
+        self.header
+            .retain(|line| !line.starts_with("Permissions: "));
+        if let Some(mode) = &current {
+            self.header.push(format!("Permissions: {mode}"));
+        }
         self.editor.set_argument_options(
             "/permissions",
             PERMISSION_MODES
@@ -1938,7 +1943,7 @@ impl InteractiveController {
                 lines.extend(self
                     .header
                     .iter()
-                    .filter(|line| line.starts_with("Config:") || line.starts_with("Data:"))
+                    .filter(|line| ["Config:", "Data:", "Store:"].iter().any(|prefix| line.starts_with(prefix)))
                     .cloned());
                 self.reference("/config", lines, &mut effects);
             }

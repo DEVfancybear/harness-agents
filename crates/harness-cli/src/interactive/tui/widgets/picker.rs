@@ -6,7 +6,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 use super::super::theme::Theme;
 
@@ -34,9 +34,26 @@ fn render_named(
     theme: &Theme,
     title: &'static str,
 ) {
-    let lines = rows(items, selected, theme);
+    let compact = area.height <= 3;
+    let height = usize::from(if compact {
+        area.height
+    } else {
+        area.height - 2
+    });
+    let selected = selected.min(items.len().saturating_sub(1));
+    let offset = selected.saturating_add(1).saturating_sub(height);
+    let lines: Vec<_> = rows(items, selected, theme)
+        .into_iter()
+        .skip(offset)
+        .take(height)
+        .collect();
+    if compact {
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(theme.border)
         .title(Span::styled(title, theme.title));
     frame.render_widget(Paragraph::new(lines).block(block), area);

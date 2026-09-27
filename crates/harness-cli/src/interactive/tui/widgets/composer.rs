@@ -14,7 +14,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 use unicode_normalization::UnicodeNormalization;
 use unicode_width::UnicodeWidthChar;
 
@@ -75,13 +75,13 @@ pub fn wrap_with_prefix(
     let mut characters = 0_usize;
     for character in buffer.nfc() {
         let index = characters;
-        if index == cursor {
-            cursor_cell = Cell {
-                row: u16::try_from(rows.len()).unwrap_or(u16::MAX),
-                column: u16::try_from(used).unwrap_or(u16::MAX),
-            };
-        }
         if character == '\n' {
+            if index == cursor {
+                cursor_cell = Cell {
+                    row: u16::try_from(rows.len()).unwrap_or(u16::MAX),
+                    column: u16::try_from(used).unwrap_or(u16::MAX),
+                };
+            }
             rows.push(std::mem::take(&mut current));
             used = 0;
             characters += 1;
@@ -92,6 +92,12 @@ pub fn wrap_with_prefix(
         if used > 0 && used + cells > row_limit {
             rows.push(std::mem::take(&mut current));
             used = 0;
+        }
+        if index == cursor {
+            cursor_cell = Cell {
+                row: u16::try_from(rows.len()).unwrap_or(u16::MAX),
+                column: u16::try_from(used).unwrap_or(u16::MAX),
+            };
         }
         current.push(character);
         used += cells;
@@ -115,6 +121,13 @@ pub fn wrap_with_prefix(
 /// Draw the composer box.
 pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
     if plan.composer.height == 0 {
+        return;
+    }
+    if plan.hints.height == 0 {
+        frame.render_widget(
+            Paragraph::new("Hãy mở rộng terminal").style(theme.dim),
+            plan.composer,
+        );
         return;
     }
     let prefix = view::prompt_prefix(state.phase);
@@ -153,28 +166,34 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
     let border_style = if state.modal.is_some() {
         theme.border
     } else {
-        theme.composer_border
+        theme.accent
     };
-    // prime-agent's editor sits between two plain rules; a draft taller than the
-    // box says how many rows are scrolled out of view, on the rule.
     let mut block = Block::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(border_style);
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
+        .border_style(border_style)
+        .title(Span::styled("─ Yêu cầu ", border_style));
     if plan.composer_scroll > 0 {
         block = block.title(Span::styled(
-            format!("─── ↑ {} more ", plan.composer_scroll),
+            format!(" ↑ {} more ", plan.composer_scroll),
             theme.border,
         ));
     }
-    // A panel or the menu owns the keyboard, so its keys go on the lower rule, the
-    // way prime-agent's selectors name theirs; the idle editor stays bare.
-    if state.modal.is_some() || !state.suggestions.is_empty() {
-        block = block.title_bottom(Span::styled(hint(state), theme.dim));
-    }
     frame.render_widget(Paragraph::new(lines).block(block), plan.composer);
+    let keys = if plan.hints.width < 60 && state.modal.is_none() && state.suggestions.is_empty() {
+        if state.phase.has_active_run() {
+            " Esc dừng · nhập để xếp hàng ".to_owned()
+        } else {
+            " Enter gửi · / lệnh · @ file ".to_owned()
+        }
+    } else {
+        hint(state)
+    };
+    frame.render_widget(Paragraph::new(keys).style(theme.dim), plan.hints);
 }
 
-/// The short hint shown on the composer's lower rule while a panel or the menu is up.
+/// The contextual keyboard hint shown below the composer.
 ///
 /// The composer is not focused while a panel owns the keyboard, so the hint names
 /// the panel and the keys that close it instead of describing the composer's own
@@ -218,7 +237,7 @@ pub fn hint(state: &UiState) -> String {
             if state.phase.has_active_run() {
                 return " ĐANG CHẠY · Ctrl-C hủy · nhập để xếp hàng ".to_owned();
             }
-            " SOẠN THẢO · Enter gửi · Ctrl-J xuống dòng · /help ".to_owned()
+            " Enter gửi · Alt+Enter/Ctrl-J xuống dòng · / lệnh · @ file ".to_owned()
         }
     }
 }
@@ -301,6 +320,8 @@ mod tests {
         let (rows, cursor) = wrap("abcdef", 0, 4);
         assert_eq!(rows, vec!["abcd".to_owned(), "ef".to_owned()]);
         assert_eq!(cursor, Cell { row: 0, column: 0 });
+        let (_, cursor) = wrap("abcdef", 4, 4);
+        assert_eq!(cursor, Cell { row: 1, column: 0 });
 
         let (_, cursor) = wrap("abcdef", 5, 4);
         assert_eq!(cursor, Cell { row: 1, column: 1 });

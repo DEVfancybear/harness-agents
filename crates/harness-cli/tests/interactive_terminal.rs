@@ -1059,18 +1059,28 @@ fn i14_the_installed_artifact_opens_the_app_in_a_real_terminal() {
         text.contains(&format!("Project: {}", project.display())),
         "the header names the caller project: {text}"
     );
-    // The state root is the caller's HA_HOME, not anything next to the binary. The
-    // store itself is created on the first request, so boot only resolves the path.
+    // The compact header leaves storage diagnostics in /config. Jump to the
+    // last rows to inspect the resolved paths, including the caller's HA_HOME.
+    session.send("/config\r");
+    session.wait_for("THAM KHẢO", Duration::from_secs(10));
+    session.send("\u{1b}[F");
+    // A resize requests a complete repaint. Ordinary frame diffs may omit
+    // unchanged letters, which this transcript normalizer cannot reconstruct.
+    std::thread::sleep(Duration::from_millis(150));
+    session.resize(160, 34);
     let data_root = ha_home(&temp).join("data");
+    let text = wait_for_normalized(&session, "Store:", Duration::from_secs(10));
     assert!(
         text.contains(&format!("Data: {} [HA_HOME]", data_root.display())),
-        "the header reports the caller's data root with its origin: {text}"
+        "configuration reports the caller's data root with its origin: {text}"
     );
     assert!(
         text.contains(&format!("Store: {}", data_root.join("projects").display())),
         "the store is scoped to the caller project under HA_HOME: {text}"
     );
 
+    session.send("\u{1b}");
+    std::thread::sleep(Duration::from_millis(100));
     session.send("/exit\r");
     assert_eq!(
         session.wait_exit(Duration::from_secs(20)),

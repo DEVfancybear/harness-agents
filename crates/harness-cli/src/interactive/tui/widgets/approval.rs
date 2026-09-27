@@ -10,7 +10,7 @@ use std::time::Instant;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 
 use super::super::theme::Theme;
 use crate::interactive::view;
@@ -61,6 +61,7 @@ pub fn render(frame: &mut Frame, area: Rect, request: Proposal<'_>, theme: &Them
     let scroll = request.scroll.min(max_scroll);
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(theme.warning)
         .title(Span::styled(" DUYỆT HÀNH ĐỘNG ", theme.warning));
     frame.render_widget(
