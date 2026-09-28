@@ -165,7 +165,7 @@ pub fn help_lines() -> Vec<String> {
 /// while typing `/`, and `/help all` opens the full table.
 #[must_use]
 pub fn help_card_lines() -> Vec<String> {
-    let groups: [(&str, &[&str]); 5] = [
+    let groups: [(&str, &[&str]); 6] = [
         (
             "Session",
             &[
@@ -184,9 +184,18 @@ pub fn help_card_lines() -> Vec<String> {
                 "/system-prompt",
             ],
         ),
+        ("Branch", &["/fork", "/clone", "/tree", "/btw"]),
         (
             "Run",
-            &["/goal", "/steer", "/permissions", "/agents", "/more"],
+            &[
+                "/goal",
+                "/steer",
+                "/queue",
+                "/stash",
+                "/permissions",
+                "/agents",
+                "/more",
+            ],
         ),
         (
             "Tools",
@@ -234,6 +243,7 @@ pub fn hotkey_lines() -> Vec<String> {
         ("Ctrl-C", "cancel the run; twice on an empty prompt quits"),
         ("Ctrl-D", "quit on an empty prompt"),
         ("Ctrl-O", "cycle collapsed / details / expanded"),
+        ("Ctrl-S", "put the draft aside; again on an empty prompt brings it back"),
         ("Ctrl-L", "redraw"),
         ("Ctrl-U / Ctrl-W", "erase to line start / erase a word"),
         ("Ctrl-V", "paste an image or path from the clipboard"),

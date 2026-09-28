@@ -324,6 +324,19 @@ impl LineEditor {
         self.suggestion_index = 0;
     }
 
+    /// What is typed, for putting a draft aside.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.buffer.clone()
+    }
+
+    /// Replace the draft with `text`, the cursor at its end.
+    pub fn set_text(&mut self, text: &str) {
+        self.clear();
+        text.clone_into(&mut self.buffer);
+        self.cursor = text.chars().count();
+    }
+
     /// Start collecting a secret: one masked line, no completion, no picker.
     ///
     /// Called only from an explicit user request. Nothing here touches the
@@ -559,6 +572,7 @@ impl LineEditor {
             | Key::PageDown
             | Key::Redraw
             | Key::CycleDetail
+            | Key::Stash
             | Key::Resize { .. }
             // Ctrl-V reaches the controller as its own key because the terminal forwards
             // it there, and the controller reads the clipboard. Attaching an image is not

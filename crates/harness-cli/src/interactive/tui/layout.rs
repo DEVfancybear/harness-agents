@@ -286,6 +286,7 @@ mod tests {
             modal: None,
             granted_for_run: false,
             queued_input: false,
+            queued_count: 0,
             last_request: None,
             run_started_at: None,
             last_run_elapsed: Duration::ZERO,

@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 34] = [
+pub const SLASH_COMMANDS: [SlashCommand; 40] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -150,13 +150,49 @@ pub const SLASH_COMMANDS: [SlashCommand; 34] = [
     command(
         "/agents",
         "",
-        "Show delegated workers, steps and current status",
+        "Show delegated children; /agents stop [name] stops them",
     ),
     command(
         "/steer",
         "<text>",
         "Send a correction to the active run at its next safe step",
     ),
+    SlashCommand {
+        aliases: &["/followup"],
+        ..command(
+            "/queue",
+            "[text|list|edit|drop|up|down]",
+            "Queue a follow-up for after the active run, or list and edit the queue",
+        )
+    },
+    command(
+        "/stash",
+        "",
+        "Put the draft aside, or bring it back (Ctrl-S)",
+    ),
+    command(
+        "/fork",
+        "[number]",
+        "Start a new conversation before one of your messages",
+    ),
+    command(
+        "/clone",
+        "",
+        "Start a new conversation with this one's whole history",
+    ),
+    command(
+        "/tree",
+        "[number]",
+        "Show this conversation's turns, or continue after one of them",
+    ),
+    SlashCommand {
+        aliases: &["/side"],
+        ..command(
+            "/btw",
+            "<question>",
+            "Ask a side question about the conversation without adding it to the session",
+        )
+    },
     SlashCommand {
         aliases: &["/permission", "/mode"],
         options: &["ask", "auto-edit", "full-auto"],

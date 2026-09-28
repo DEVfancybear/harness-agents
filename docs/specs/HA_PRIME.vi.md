@@ -51,3 +51,27 @@ Assignment: CP-1 (Q00–Q04) của `docs/HA_PRIME_PLAN.vi.md`; base revision `48
 - `SessionEvent::{ChildSettled, AgentMessage}`; `SessionPort::{deliver_message, stop_agents}` (mặc định trả lỗi).
 - Tool schema `delegate` thêm `wait`; con có thêm tool `agent_message`, `progress_note`.
 - Store: hàm mới `release_task_lease`, không đổi schema SQL.
+
+
+# CP-2 (Q05–Q09): hàng đợi, cất nháp, `/btw`, rẽ nhánh, xuất HTML
+
+Base `93bc8d4`; thực hiện 28/09/2026.
+
+| Item | Trạng thái trước | Làm gì | Bằng chứng |
+|---|---|---|---|
+| Q05 hàng đợi 2 lane | `adapt`: một `queued_input` | `interactive/queue.rs` (`Lane`, `QueueMode`, `InputQueue`); controller: steer không nhận được → lane Steer; `/queue` (`/followup`) → lane FollowUp; sau `RunTerminal`: steer → follow-up → thông báo con → heartbeat; config `[queue] steering_mode/follow_up_mode` | `q05_*`, PTY `q05_pty_follow_up_runs_after_the_turn` |
+| Q05 sau Ctrl+C | Ctrl+C lần đầu xoá input chờ | hàng đợi được giữ, chờ lượt tiếp theo của người dùng (cùng cờ với thông báo con) | `q05_the_queue_survives_an_interrupt` |
+| Q06 sửa hàng đợi, cất nháp | `missing` | `/queue list|edit n text|drop n|up n|down n`; Ctrl-S (`Key::Stash`) và `/stash` với chuỗi của prime | `q06_*` |
+| Q07 `/btw` | `missing` | `interactive/side_question.rs` (chuỗi `SIDE_QUESTION_INSTRUCTION` nguyên văn prime); service gọi provider **không tool** với system prompt + lịch sử + các lượt bên lề; không ghi store; `SessionEvent::SideAnswer` mở bảng | `q07_*`, PTY `q07_pty_btw_answers_in_a_panel` |
+| Q08 `/fork`, `/clone`, `/tree` | `missing` | Bước 0 đo: runtime từ chối nối lượt sang task khác (`continuation task does not match source session`) → **phương án B**: task mới + setting `forked_from`; `previous_in_conversation` / `conversation_turns` trong runtime; lượt đầu của nhánh nạp lịch sử tới điểm rẽ; `/tree n` tiếp tục sau lượt n trong cùng task | `q08_*`, PTY `q08_pty_fork_then_answer` |
+| Q09 xuất HTML | `missing` | `interactive/export_html.rs`: một trang tự chứa, CSS nội tuyến, không script/không tải mạng, escape mọi chữ, che secret; `/export x.html` | `q09_*` |
+
+**Khác plan / prime (có chủ đích):**
+- Dòng trạng thái hiện `queued (n)`; danh sách từng tin xem bằng `/queue` (layout TUI cố định số dòng). Không có Alt+Up/Ctrl+Alt+Up: sửa/xoá/đổi chỗ bằng `/queue edit|drop|up|down`.
+- `/btw` gửi request **không có tool** thay vì gửi tool rồi chặn (prime chặn tool call và tối đa 3 vòng); không huỷ được bằng Esc giữa chừng (câu trả lời tới thì mở bảng).
+- `/fork`, `/tree` dùng danh sách đánh số trong bảng + `/fork <n>`, `/tree <n>` thay cho bộ chọn cây; chưa có nhãn và tóm tắt nhánh khi chuyển (plan mục 11).
+- `/tree n` = tiếp tục **sau** lượt n (như chọn entry assistant ở prime).
+- Như mọi lệnh có tham số tuỳ chọn, Enter đầu tiên ở menu gõ `/fork ` và Enter thứ hai chạy nó.
+- HTML export dựng từ lịch sử hội thoại (tin người dùng, trả lời, lời gọi tool), không phải toàn bộ event log như prime.
+
+Hợp đồng: `HarnessConfigV2.queue: Option<QueueConfigV2 { steering_mode, follow_up_mode }>` (schema sinh lại); `SessionEvent::{SideAnswer, TurnsListed}`, `TurnsPurpose`; `SessionPort::{queue_modes, side_question, list_turns, fork, clone_conversation, switch_to}`; `Key::Stash`; runtime `FORKED_FROM_SETTING`, `previous_in_conversation`, `conversation_turns`. 40 lệnh slash.

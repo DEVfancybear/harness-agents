@@ -180,8 +180,16 @@ pub struct InteractiveController {
     granted_for_run: bool,
     /// Last resume listing, so a number can select from it.
     session_candidates: Vec<SessionCandidate>,
-    /// At most one input waits for the active run to release its session writer.
-    queued_input: Option<String>,
+    /// What the user queued while the agent worked: prime-agent's steering and
+    /// follow-up lanes.
+    queue: super::queue::InputQueue,
+    /// prime-agent's prompt stash (Ctrl-S): one draft put aside.
+    stash: Option<String>,
+    /// A `/btw` side question is being answered.
+    side_pending: bool,
+    /// The conversation's turns from the last `/fork` or `/tree` listing:
+    /// session id and the message that opened the turn.
+    turn_points: Vec<(String, String)>,
     /// Bounded shell output blocks waiting to ride with the next model message.
     pending_shell_outputs: Vec<String>,
     /// The shared editor picker is showing files instead of persisted sessions.
@@ -258,6 +266,7 @@ impl InteractiveController {
         let mut header = context.header_lines();
         header.push(format!("Service: {}", service.label()));
         let bounds = service.limits();
+        let (steering_mode, follow_up_mode) = service.queue_modes();
         Self {
             // The app boots before it can render; boot_lines performs the
             // transition once the header has actually been produced.
@@ -280,7 +289,10 @@ impl InteractiveController {
             pending_mcp_elicitation: None,
             granted_for_run: false,
             session_candidates: Vec::new(),
-            queued_input: None,
+            queue: super::queue::InputQueue::new(steering_mode, follow_up_mode),
+            stash: None,
+            side_pending: false,
+            turn_points: Vec::new(),
             pending_shell_outputs: Vec::new(),
             file_picker_active: false,
             file_picker_query: String::new(),
@@ -403,7 +415,8 @@ impl InteractiveController {
                 .collect(),
             modal: self.modal(),
             granted_for_run: self.granted_for_run,
-            queued_input: self.queued_input.is_some(),
+            queued_input: !self.queue.is_empty(),
+            queued_count: self.queue.len(),
             last_request: self.last_request.clone(),
             run_started_at: self.run_started_at,
             last_run_elapsed: self.last_run_elapsed,
@@ -580,6 +593,9 @@ impl InteractiveController {
     pub fn handle_key(&mut self, key: Key) -> Vec<Effect> {
         if key == Key::Redraw {
             return vec![Effect::Redraw];
+        }
+        if key == Key::Stash && self.pending_approval.is_none() && self.pending_question.is_none() {
+            return self.stash_prompt();
         }
         if key == Key::CycleDetail {
             self.detail = self.detail.next();
@@ -843,6 +859,205 @@ impl InteractiveController {
     /// Send the agent's heartbeats that came due (prime-agent's RLM heartbeats): a
     /// free session runs one at once; a running turn gets a `steer` heartbeat through
     /// the `/steer` inbox, and a `follow_up` one waits for the turn to end.
+    /// `/fork [n]` and `/tree [n]`: list the conversation's turns, or act on one.
+    fn branch_command(&mut self, name: &str, argument: Option<&str>, effects: &mut Vec<Effect>) {
+        let purpose = if name == "/fork" {
+            super::events::TurnsPurpose::Fork
+        } else {
+            super::events::TurnsPurpose::Tree
+        };
+        let chosen = argument
+            .and_then(|number| number.parse::<usize>().ok())
+            .and_then(|number| number.checked_sub(1));
+        let Some(index) = chosen else {
+            if let Err(message) = self.service.list_turns(purpose) {
+                self.push_history(effects, HistoryItem::Error { message });
+            }
+            effects.push(Effect::Redraw);
+            return;
+        };
+        let Some((session, text)) = self.turn_points.get(index).cloned() else {
+            self.push_history(
+                effects,
+                HistoryItem::Error {
+                    message: format!("no turn {}; list them with {name}", index + 1),
+                },
+            );
+            effects.push(Effect::Redraw);
+            return;
+        };
+        let result = match purpose {
+            // prime-agent's /fork: a new conversation up to just before the chosen
+            // message, which goes back into the editor to be sent again or edited.
+            super::events::TurnsPurpose::Fork => self.service.fork(&session, true).map(|()| {
+                self.editor.set_text(&text);
+                "Forked to new session".to_owned()
+            }),
+            super::events::TurnsPurpose::Tree if index + 1 == self.turn_points.len() => {
+                Ok("Already at this point".to_owned())
+            }
+            super::events::TurnsPurpose::Tree => self.service.switch_to(&session).map(|()| {
+                format!(
+                    "continuing from turn {}; the next message follows it, and the later turns leave this conversation",
+                    index + 1
+                )
+            }),
+        };
+        match result {
+            Ok(message) => self.push_history(effects, HistoryItem::Notice { message }),
+            Err(message) => self.push_history(effects, HistoryItem::Error { message }),
+        }
+        effects.push(Effect::Redraw);
+    }
+
+    fn show_turns(
+        &mut self,
+        purpose: super::events::TurnsPurpose,
+        turns: Vec<(String, String)>,
+        effects: &mut Vec<Effect>,
+    ) {
+        if turns.is_empty() {
+            let message = match purpose {
+                super::events::TurnsPurpose::Fork => "No messages to fork from",
+                super::events::TurnsPurpose::Tree => "Nothing to show yet",
+            };
+            self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: message.to_owned(),
+                },
+            );
+            effects.push(Effect::Redraw);
+            return;
+        }
+        let last = turns.len();
+        let mut lines: Vec<String> = turns
+            .iter()
+            .enumerate()
+            .map(|(index, (_, text))| {
+                let first = text.lines().next().unwrap_or_default();
+                let clipped: String = first.chars().take(100).collect();
+                let current = if index + 1 == last && purpose == super::events::TurnsPurpose::Tree {
+                    "  ← current"
+                } else {
+                    ""
+                };
+                format!("{}. {clipped}{current}", index + 1)
+            })
+            .collect();
+        lines.push(String::new());
+        lines.push(match purpose {
+            super::events::TurnsPurpose::Fork => {
+                "fork before a message with /fork <number>; it comes back into the editor"
+                    .to_owned()
+            }
+            super::events::TurnsPurpose::Tree => {
+                "continue after a turn with /tree <number>".to_owned()
+            }
+        });
+        self.turn_points = turns;
+        let title = match purpose {
+            super::events::TurnsPurpose::Fork => "/fork",
+            super::events::TurnsPurpose::Tree => "/tree",
+        };
+        self.reference(title, lines, effects);
+        effects.push(Effect::Redraw);
+    }
+
+    /// prime-agent's prompt stash (Ctrl-S): a draft is put aside, and an empty
+    /// prompt brings it back.
+    fn stash_prompt(&mut self) -> Vec<Effect> {
+        let draft = self.editor.text();
+        let message = if draft.trim().is_empty() {
+            match self.stash.take() {
+                Some(stashed) => {
+                    self.editor.set_text(&stashed);
+                    "Restored stashed prompt"
+                }
+                None => "No prompt to stash",
+            }
+        } else if self.stash.is_some() {
+            "Prompt stash already has a draft"
+        } else {
+            self.stash = Some(draft);
+            self.editor.clear();
+            "Stashed prompt"
+        };
+        vec![
+            Effect::History(HistoryItem::Notice {
+                message: message.to_owned(),
+            }),
+            Effect::Redraw,
+        ]
+    }
+
+    /// `/queue`: list the queue, add a follow-up, or edit, drop and reorder it.
+    fn queue_command(&mut self, argument: Option<&str>, effects: &mut Vec<Effect>) {
+        let argument = argument.map(str::trim).unwrap_or_default();
+        let (verb, rest) = argument.split_once(' ').unwrap_or((argument, ""));
+        let index = |text: &str| {
+            text.split_whitespace()
+                .next()
+                .and_then(|number| number.parse::<usize>().ok())
+                .and_then(|number| number.checked_sub(1))
+        };
+        let message = match verb {
+            "" | "list" => {
+                let lines = self.queue.lines();
+                if lines.is_empty() {
+                    "the queue is empty".to_owned()
+                } else {
+                    self.reference("/queue", lines, effects);
+                    return;
+                }
+            }
+            "drop" | "up" | "down" | "edit" => {
+                let Some(at) = index(rest) else {
+                    self.push_history(
+                        effects,
+                        HistoryItem::Error {
+                            message: format!("usage: /queue {verb} <number>"),
+                        },
+                    );
+                    return;
+                };
+                let done = match verb {
+                    "drop" => self.queue.remove(at).is_some(),
+                    "up" => self.queue.move_up(at),
+                    "down" => self.queue.move_down(at),
+                    _ => {
+                        let text = rest
+                            .trim_start()
+                            .split_once(' ')
+                            .map_or("", |(_, text)| text)
+                            .to_owned();
+                        self.queue.edit(at, text)
+                    }
+                };
+                if done {
+                    format!("queue: {} ({} waiting)", verb, self.queue.len())
+                } else {
+                    format!("no queued message {}", at + 1)
+                }
+            }
+            _ if self.phase.has_active_run() => {
+                self.queue
+                    .push(super::queue::Lane::FollowUp, argument.to_owned());
+                format!(
+                    "follow-up queued ({}): it runs after the active run finishes",
+                    self.queue.len()
+                )
+            }
+            // Nothing is running: a follow-up is simply the next message.
+            _ => {
+                effects.extend(self.dispatch(argument.to_owned(), false));
+                return;
+            }
+        };
+        self.push_history(effects, HistoryItem::Notice { message });
+        effects.push(Effect::Redraw);
+    }
+
     /// Whether the parent can start a turn of its own right now.
     fn free_for_automatic_turn(&self) -> bool {
         !self.phase.has_active_run()
@@ -1350,6 +1565,31 @@ impl InteractiveController {
                 });
                 self.phase = AppPhase::WaitingMcpInput;
             }
+            SessionEvent::TurnsListed { purpose, turns } => {
+                self.show_turns(purpose, turns, effects);
+            }
+            SessionEvent::SideAnswer { question, answer } => {
+                self.side_pending = false;
+                match answer {
+                    Ok(answer) => {
+                        let mut lines = vec![format!("Q: {question}"), String::new()];
+                        lines.extend(answer.lines().map(str::to_owned));
+                        lines.push(String::new());
+                        lines.push(
+                            "reply with /btw <question> to follow up · esc to return to session"
+                                .to_owned(),
+                        );
+                        self.reference("/btw", lines, effects);
+                    }
+                    Err(message) => self.push_history(
+                        effects,
+                        HistoryItem::Error {
+                            message: format!("side question failed: {message}"),
+                        },
+                    ),
+                }
+                effects.push(Effect::Redraw);
+            }
             SessionEvent::ChildSettled { name, notice } => {
                 self.deliver_notice(&name, notice, effects);
             }
@@ -1414,13 +1654,22 @@ impl InteractiveController {
                     },
                 );
                 self.finish_run();
-                if let Some(text) = self.queued_input.take() {
+                // After the user stopped a turn, what waits - their queue and the
+                // children's reports - waits for their next turn, as prime-agent
+                // pauses queued work after an abort.
+                if matches!(outcome, RunOutcome::Canceled) {
+                    self.notices_held = true;
+                }
+                // What the user queued runs first: steering, then follow-ups.
+                if !self.notices_held
+                    && let Some(text) = self
+                        .queue
+                        .take_next(super::queue::Lane::Steer)
+                        .or_else(|| self.queue.take_next(super::queue::Lane::FollowUp))
+                {
                     self.close_run_grant();
                     effects.extend(self.dispatch(text, false));
                     return;
-                }
-                if matches!(outcome, RunOutcome::Canceled) {
-                    self.notices_held = true;
                 }
                 // What a child reported while this turn ran is read now, one turn
                 // for each report.
@@ -1500,22 +1749,15 @@ impl InteractiveController {
                 Effect::Redraw,
             ];
         }
-        if self.phase == AppPhase::Running && self.queued_input.is_none() {
-            self.queued_input = Some(text);
-            return vec![
-                Effect::History(HistoryItem::Notice {
-                    message: "queued (1): sent after the active run finishes".to_owned(),
-                }),
-                Effect::Redraw,
-            ];
-        }
+        // The turn cannot take it yet: it waits in the steering lane and is sent
+        // when the turn ends, as prime-agent queues a steer it cannot deliver.
+        self.queue.push(super::queue::Lane::Steer, text);
         vec![
             Effect::History(HistoryItem::Notice {
-                message: if self.queued_input.is_some() {
-                    "one input is already queued; wait for the active run to finish".to_owned()
-                } else {
-                    "a run is already active; wait for it or press Ctrl-C to cancel".to_owned()
-                },
+                message: format!(
+                    "queued ({}): sent after the active run finishes",
+                    self.queue.len()
+                ),
             }),
             Effect::Redraw,
         ]
@@ -1859,16 +2101,8 @@ impl InteractiveController {
 
     fn interrupt(&mut self) -> Vec<Effect> {
         if self.phase.has_active_run() {
-            if self.queued_input.take().is_some() {
-                return vec![
-                    Effect::History(HistoryItem::Notice {
-                        message:
-                            "queued input cleared; press Ctrl-C again to cancel the active run"
-                                .to_owned(),
-                    }),
-                    Effect::Redraw,
-                ];
-            }
+            // The queue survives the interrupt, as prime-agent keeps it: what
+            // the user queued is still theirs to send (`/queue drop` removes it).
             self.service.cancel();
             // Ctrl-C also means "do not start another one": the budget is spent, so the
             // bound that ends the canceled turn is a real stop until the user speaks.
@@ -2081,6 +2315,55 @@ impl InteractiveController {
                     }
                 }
             }
+            "/queue" => self.queue_command(raw_argument, &mut effects),
+            "/stash" => return self.stash_prompt(),
+            "/fork" | "/clone" | "/tree" if self.phase.has_active_run() => {
+                self.push_history(
+                    &mut effects,
+                    HistoryItem::Error {
+                        message: format!("{name} waits for the active run to finish"),
+                    },
+                );
+                effects.push(Effect::Redraw);
+            }
+            "/fork" | "/tree" => self.branch_command(name, argument, &mut effects),
+            "/clone" => {
+                match self.service.clone_conversation() {
+                    Ok(()) => {
+                        self.editor.clear();
+                        self.push_history(
+                            &mut effects,
+                            HistoryItem::Notice {
+                                message: "Cloned to new session".to_owned(),
+                            },
+                        );
+                    }
+                    Err(message) => {
+                        self.push_history(&mut effects, HistoryItem::Notice { message });
+                    }
+                }
+                effects.push(Effect::Redraw);
+            }
+            // prime-agent's side question: answered from the conversation, kept
+            // out of it. It may run while the agent works.
+            "/btw" => {
+                let message = if self.side_pending {
+                    Err("Wait for the current side question to finish or cancel it first."
+                        .to_owned())
+                } else {
+                    self.service
+                        .side_question(raw_argument.unwrap_or_default())
+                        .map(|()| {
+                            self.side_pending = true;
+                            "btw: asking on the side; the answer opens in a panel".to_owned()
+                        })
+                };
+                match message {
+                    Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
+                    Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                }
+                effects.push(Effect::Redraw);
+            }
             "/agents" => match raw_argument.map(|rest| rest.split_once(' ').unwrap_or((rest, ""))) {
                 // prime-agent stops a child with `rlm.delete_subagent`; the user
                 // stops one here, and it reports as cancelled.
@@ -2190,9 +2473,9 @@ impl InteractiveController {
                     self.push_history(&mut effects, HistoryItem::Error {
                         message: "export path must stay inside the workspace".to_owned(),
                     });
-                } else if !matches!(path_value.extension().and_then(|ext| ext.to_str()), Some("md" | "jsonl")) {
+                } else if !matches!(path_value.extension().and_then(|ext| ext.to_str()), Some("md" | "jsonl" | "html")) {
                     self.push_history(&mut effects, HistoryItem::Error {
-                        message: "usage: /export [path.md|path.jsonl]".to_owned(),
+                        message: "usage: /export [path.md|path.jsonl|path.html]".to_owned(),
                     });
                 } else {
                     self.start_host_action(format!("/export {path}"), &mut effects);
@@ -3529,6 +3812,10 @@ mod tests {
         delivered: Arc<Mutex<Vec<String>>>,
         /// Every `/agents stop` target.
         stops: Arc<Mutex<Vec<String>>>,
+        /// Every `/btw` question.
+        side_questions: Arc<Mutex<Vec<String>>>,
+        /// Every fork, clone (`"clone"`) and switch, in order.
+        branches: Arc<Mutex<Vec<String>>>,
     }
 
     impl SessionPort for RecordingPort {
@@ -3588,6 +3875,49 @@ mod tests {
                 .lock()
                 .expect("delivery log")
                 .push(text.to_owned());
+            Ok(())
+        }
+
+        fn list_turns(
+            &mut self,
+            purpose: crate::interactive::events::TurnsPurpose,
+        ) -> Result<(), String> {
+            self.branches
+                .lock()
+                .expect("branch log")
+                .push(format!("list {purpose:?}"));
+            Ok(())
+        }
+
+        fn fork(&mut self, session: &str, before: bool) -> Result<(), String> {
+            self.branches
+                .lock()
+                .expect("branch log")
+                .push(format!("fork {session} before={before}"));
+            Ok(())
+        }
+
+        fn clone_conversation(&mut self) -> Result<(), String> {
+            self.branches
+                .lock()
+                .expect("branch log")
+                .push("clone".to_owned());
+            Ok(())
+        }
+
+        fn switch_to(&mut self, session: &str) -> Result<(), String> {
+            self.branches
+                .lock()
+                .expect("branch log")
+                .push(format!("switch {session}"));
+            Ok(())
+        }
+
+        fn side_question(&mut self, question: &str) -> Result<(), String> {
+            self.side_questions
+                .lock()
+                .expect("side question log")
+                .push(question.to_owned());
             Ok(())
         }
 
@@ -3864,6 +4194,248 @@ mod tests {
             *harness.port.submissions.lock().expect("submissions"),
             ["first input", "queued input"]
         );
+    }
+
+    fn refusing_bench() -> Bench {
+        let port = RecordingPort {
+            refuse_steer: true,
+            ..RecordingPort::default()
+        };
+        bench_with(true, port, false)
+    }
+
+    fn done(harness: &mut Bench) {
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("terminal event");
+        let _ = harness.controller.pump_events();
+    }
+
+    /// Q05: steering the turn could not take runs first, then follow-ups, one
+    /// turn each.
+    #[test]
+    fn q05_follow_up_waits_for_the_turn_and_runs_after_steers() {
+        let mut harness = refusing_bench();
+        submit_text(&mut harness.controller, "first");
+        submit_text(&mut harness.controller, "/queue then summarize");
+        submit_text(&mut harness.controller, "steer me");
+        submit_text(&mut harness.controller, "/followup then translate");
+        assert_eq!(harness.controller.ui_state().queued_count, 3);
+        assert_eq!(submissions(&harness), ["first"]);
+        done(&mut harness);
+        assert_eq!(submissions(&harness), ["first", "steer me"]);
+        done(&mut harness);
+        done(&mut harness);
+        assert_eq!(
+            submissions(&harness),
+            ["first", "steer me", "then summarize", "then translate"]
+        );
+        assert!(!harness.controller.ui_state().queued_input);
+    }
+
+    /// Q05: in `all` mode the lane's follow-ups go in one turn.
+    #[test]
+    fn q05_all_mode_batches_the_follow_ups_into_one_turn() {
+        use crate::interactive::queue::{InputQueue, QueueMode};
+        let mut harness = refusing_bench();
+        harness.controller.queue = InputQueue::new(QueueMode::OneAtATime, QueueMode::All);
+        submit_text(&mut harness.controller, "first");
+        submit_text(&mut harness.controller, "/queue one");
+        submit_text(&mut harness.controller, "/queue two");
+        done(&mut harness);
+        assert_eq!(submissions(&harness), ["first", "one\n\ntwo"]);
+    }
+
+    /// Q05: the queue survives Ctrl-C and waits for the user's next turn.
+    #[test]
+    fn q05_the_queue_survives_an_interrupt() {
+        let mut harness = refusing_bench();
+        submit_text(&mut harness.controller, "first");
+        submit_text(&mut harness.controller, "/queue keep me");
+        let _ = harness.controller.interrupt();
+        assert!(harness.controller.ui_state().queued_input, "still queued");
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Canceled,
+            })
+            .expect("terminal event");
+        let _ = harness.controller.pump_events();
+        assert_eq!(submissions(&harness), ["first"], "held after the interrupt");
+        submit_text(&mut harness.controller, "next");
+        done(&mut harness);
+        assert_eq!(submissions(&harness), ["first", "next", "keep me"]);
+    }
+
+    /// Q06: the queue is listed, edited, reordered and dropped by number.
+    #[test]
+    fn q06_browse_edits_and_deletes_queued_items() {
+        let mut harness = refusing_bench();
+        submit_text(&mut harness.controller, "first");
+        for text in ["/queue a", "/queue b", "/queue c"] {
+            submit_text(&mut harness.controller, text);
+        }
+        submit_text(&mut harness.controller, "/queue up 3");
+        submit_text(&mut harness.controller, "/queue edit 1 A!");
+        submit_text(&mut harness.controller, "/queue drop 2");
+        assert_eq!(
+            harness.controller.queue.lines(),
+            ["1. Follow-up: A!", "2. Follow-up: b"]
+        );
+        let plain = effects_to_plain(&submit_text(&mut harness.controller, "/queue drop 9"));
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("no queued message 9")),
+            "{plain:#?}"
+        );
+    }
+
+    /// Q07: one side question at a time; the answer opens a panel and nothing is
+    /// submitted to the conversation.
+    #[test]
+    fn q07_btw_asks_on_the_side_one_at_a_time() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        submit_text(&mut harness.controller, "/btw which file did we change?");
+        let plain = effects_to_plain(&submit_text(&mut harness.controller, "/side and why?"));
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("Wait for the current side question")),
+            "{plain:#?}"
+        );
+        assert_eq!(
+            harness
+                .port
+                .side_questions
+                .lock()
+                .expect("questions")
+                .as_slice(),
+            ["which file did we change?".to_owned()]
+        );
+        harness
+            .events
+            .send(SessionEvent::SideAnswer {
+                question: "which file did we change?".to_owned(),
+                answer: Ok("src/parser.rs".to_owned()),
+            })
+            .expect("answer");
+        let _ = harness.controller.pump_events();
+        assert!(
+            submissions(&harness).is_empty(),
+            "nothing enters the conversation"
+        );
+        submit_text(&mut harness.controller, "/btw and why?");
+        assert_eq!(
+            harness.port.side_questions.lock().expect("questions").len(),
+            2
+        );
+    }
+
+    fn turns_listed(harness: &mut Bench, purpose: crate::interactive::events::TurnsPurpose) {
+        harness
+            .events
+            .send(SessionEvent::TurnsListed {
+                purpose,
+                turns: vec![
+                    ("s1".to_owned(), "first ask".to_owned()),
+                    ("s2".to_owned(), "second ask".to_owned()),
+                    ("s3".to_owned(), "third ask".to_owned()),
+                ],
+            })
+            .expect("turns");
+        let _ = harness.controller.pump_events();
+    }
+
+    /// Q08: /fork lists the user's messages, then forks before the chosen one and
+    /// puts it back in the editor.
+    #[test]
+    fn q08_fork_starts_before_the_chosen_turn() {
+        use crate::interactive::events::TurnsPurpose;
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        submit_text(&mut harness.controller, "/fork");
+        turns_listed(&mut harness, TurnsPurpose::Fork);
+        submit_text(&mut harness.controller, "/fork 2");
+        assert_eq!(
+            harness.port.branches.lock().expect("branches").as_slice(),
+            ["list Fork".to_owned(), "fork s2 before=true".to_owned()]
+        );
+        assert_eq!(harness.controller.editor.text(), "second ask");
+        harness.controller.editor.clear();
+        let plain = effects_to_plain(&submit_text(&mut harness.controller, "/fork 9"));
+        assert!(
+            plain.iter().any(|line| line.contains("no turn 9")),
+            "{plain:#?}"
+        );
+    }
+
+    /// Q08: /clone forks after the last turn; /tree switches, or says it is
+    /// already there; none of them runs while the agent works.
+    #[test]
+    fn q08_clone_and_tree_move_the_conversation() {
+        use crate::interactive::events::TurnsPurpose;
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let plain = effects_to_plain(&submit_text(&mut harness.controller, "/clone"));
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("Cloned to new session")),
+            "{plain:#?}"
+        );
+        submit_text(&mut harness.controller, "/tree");
+        turns_listed(&mut harness, TurnsPurpose::Tree);
+        let plain = effects_to_plain(&submit_text(&mut harness.controller, "/tree 3"));
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("Already at this point")),
+            "{plain:#?}"
+        );
+        submit_text(&mut harness.controller, "/tree 1");
+        assert_eq!(
+            harness.port.branches.lock().expect("branches").as_slice(),
+            [
+                "clone".to_owned(),
+                "list Tree".to_owned(),
+                "switch s1".to_owned()
+            ]
+        );
+        submit_text(&mut harness.controller, "a request");
+        let plain = effects_to_plain(&submit_text(&mut harness.controller, "/fork"));
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("waits for the active run")),
+            "{plain:#?}"
+        );
+    }
+
+    /// Q06: prime-agent's prompt stash, with its messages.
+    #[test]
+    fn q06_stash_and_restore_follow_prime_messages() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let said = |effects: Vec<Effect>| effects_to_plain(&effects).join("\n");
+        assert!(said(harness.controller.handle_key(Key::Stash)).contains("No prompt to stash"));
+        type_text(&mut harness.controller, "half a thought");
+        assert!(said(harness.controller.handle_key(Key::Stash)).contains("Stashed prompt"));
+        assert_eq!(harness.controller.editor.text(), "");
+        type_text(&mut harness.controller, "another");
+        assert!(
+            said(harness.controller.handle_key(Key::Stash))
+                .contains("Prompt stash already has a draft")
+        );
+        harness.controller.editor.clear();
+        assert!(
+            said(harness.controller.handle_key(Key::Stash)).contains("Restored stashed prompt")
+        );
+        assert_eq!(harness.controller.editor.text(), "half a thought");
     }
 
     #[test]

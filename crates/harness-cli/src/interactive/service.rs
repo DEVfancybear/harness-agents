@@ -358,6 +358,33 @@ pub trait SessionPort: Send {
     fn stop_agents(&mut self, _selector: &str) -> Result<String, String> {
         Err("this backend has no delegated children".to_owned())
     }
+    /// How the steering and follow-up lanes are drained (`[queue]`).
+    fn queue_modes(&self) -> (super::queue::QueueMode, super::queue::QueueMode) {
+        Default::default()
+    }
+    /// List the turns of this conversation, oldest first; they arrive as
+    /// [`SessionEvent::TurnsListed`].
+    fn list_turns(&mut self, _purpose: super::events::TurnsPurpose) -> Result<(), String> {
+        Err("this backend keeps no conversation".to_owned())
+    }
+    /// Start a new conversation that continues from the turn of `session`:
+    /// before it (`/fork`), or after it (`/clone`).
+    fn fork(&mut self, _session: &str, _before: bool) -> Result<(), String> {
+        Err("this backend keeps no conversation".to_owned())
+    }
+    /// `/clone`: a new conversation with this one's whole history.
+    fn clone_conversation(&mut self) -> Result<(), String> {
+        Err("this backend keeps no conversation".to_owned())
+    }
+    /// `/tree`: continue this conversation from after the turn of `session`.
+    fn switch_to(&mut self, _session: &str) -> Result<(), String> {
+        Err("this backend keeps no conversation".to_owned())
+    }
+    /// Ask a `/btw` side question; the answer arrives as
+    /// [`SessionEvent::SideAnswer`].
+    fn side_question(&mut self, _question: &str) -> Result<(), String> {
+        Err("side questions are not available here".to_owned())
+    }
     /// Start a browser sign-in; returns the URL to open. The outcome arrives as
     /// [`SessionEvent::LoginFinished`].
     fn begin_sign_in(&mut self, _provider: &str) -> Result<String, String> {
@@ -659,6 +686,8 @@ pub struct ProviderConfig {
     pub bell: bool,
     /// `[agents] default_model`: the model a delegated child runs on by default.
     pub agents_default_model: Option<String>,
+    /// `[queue]` modes, as written.
+    pub queue_modes: (Option<String>, Option<String>),
     /// Name of the source that holds the key; never the key.
     pub credential: CredentialSource,
 }
@@ -794,6 +823,7 @@ pub(super) fn resolve_provider_with_overrides(
         project_trusted: resolved.project_trusted,
         bell: resolved.bell,
         agents_default_model: resolved.agents_default_model,
+        queue_modes: resolved.queue_modes,
         credential,
     })
 }
@@ -1514,6 +1544,10 @@ pub struct AgentSessionService {
     mcp_status: Arc<Mutex<Vec<String>>>,
     /// The session's delegated children and the store they share with its turns.
     agents: Arc<super::delegation::SessionAgents>,
+    /// The `/btw` side thread of this conversation: its questions and answers.
+    side_thread: Arc<Mutex<Vec<(String, String)>>>,
+    /// The fork the next turn starts, set by `/fork` and `/clone`.
+    fork_plan: Option<ForkPlan>,
     /// Held by a turn for as long as it owns the project store, and by `/rename` while
     /// it writes, so the two never want the writer at the same time.
     writer_gate: Arc<tokio::sync::Mutex<()>>,
@@ -2021,6 +2055,8 @@ impl AgentSessionService {
             pending_mcp_elicitations: Arc::new(Mutex::new(HashMap::new())),
             mcp_status: Arc::new(Mutex::new(Vec::new())),
             agents,
+            side_thread: Arc::new(Mutex::new(Vec::new())),
+            fork_plan: None,
             writer_gate,
             goal: None,
             goal_forgotten: false,
@@ -2324,6 +2360,7 @@ impl SessionPort for AgentSessionService {
         let pending_mcp_elicitations = Arc::clone(&self.pending_mcp_elicitations);
         let mcp_status = Arc::clone(&self.mcp_status);
         let agents = Arc::clone(&self.agents);
+        let fork_plan = self.fork_plan.take();
         let task_id = self.task_id.clone();
         let previous_session = Arc::clone(&self.previous_session);
         let active_inbox = Arc::clone(&self.active_inbox);
@@ -2365,6 +2402,7 @@ impl SessionPort for AgentSessionService {
                 pending_mcp_elicitations,
                 mcp_status,
                 agents,
+                fork_plan,
                 session_id,
                 task_id,
                 previous_session,
@@ -3310,6 +3348,10 @@ impl SessionPort for AgentSessionService {
         // The turn validates ownership in this project's store before dispatch.
         // The children worked for the conversation being left; they stop quietly.
         self.agents.reset();
+        self.fork_plan = None;
+        if let Ok(mut thread) = self.side_thread.lock() {
+            thread.clear();
+        }
         if source.is_none() {
             self.task_id = TaskId::generate();
             if let Ok(mut tracker) = self.cost_tracker.lock() {
@@ -3339,6 +3381,166 @@ impl SessionPort for AgentSessionService {
         self.queue_into_run(text, true)
     }
 
+    fn list_turns(&mut self, purpose: super::events::TurnsPurpose) -> Result<(), String> {
+        let source = self
+            .previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.clone());
+        let store_dir = self.store_dir.clone();
+        let sender = self.sender.clone();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            let turns = match source {
+                None => Ok(Vec::new()),
+                Some(source) => match SqliteStore::open_read_only(store_dir).await {
+                    Ok(store) => harness_runtime::conversation_turns(&store, &source)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                },
+            };
+            match turns {
+                Ok(turns) => {
+                    let _ = sender.send(SessionEvent::TurnsListed {
+                        purpose,
+                        turns: turns
+                            .into_iter()
+                            .map(|(session, question)| (session.as_str().to_owned(), question))
+                            .collect(),
+                    });
+                }
+                Err(error) => {
+                    let _ = sender.send(SessionEvent::Notice {
+                        message: format!("the conversation could not be read: {error}"),
+                    });
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn fork(&mut self, session: &str, before: bool) -> Result<(), String> {
+        let from = SessionId::parse(session.to_owned()).map_err(|error| error.to_string())?;
+        self.start_fork(ForkPlan { from, before });
+        Ok(())
+    }
+
+    fn clone_conversation(&mut self) -> Result<(), String> {
+        let from = self
+            .previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.clone())
+            .ok_or_else(|| "Nothing to clone yet".to_owned())?;
+        self.start_fork(ForkPlan {
+            from,
+            before: false,
+        });
+        Ok(())
+    }
+
+    fn switch_to(&mut self, session: &str) -> Result<(), String> {
+        let session = SessionId::parse(session.to_owned()).map_err(|error| error.to_string())?;
+        let mut previous = self
+            .previous_session
+            .lock()
+            .map_err(|_| "conversation state is unavailable".to_owned())?;
+        *previous = Some(session);
+        Ok(())
+    }
+
+    fn side_question(&mut self, question: &str) -> Result<(), String> {
+        let question = question.trim().to_owned();
+        if question.is_empty() {
+            return Err("usage: /btw <question>".to_owned());
+        }
+        let config = self.configured()?;
+        let level = self
+            .thinking
+            .or_else(|| harness_providers::ThinkingLevel::parse(&config.thinking))
+            .unwrap_or_default();
+        let provider = LiveProvider::build(&config, level, self.task_id.as_ref(), &self.data_dir)
+            .map_err(|error| error.to_string())?;
+        let source = self
+            .previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.clone());
+        let system_prompt = self
+            .system_prompt
+            .lock()
+            .map(|prompt| prompt.clone())
+            .unwrap_or_default();
+        let thread = Arc::clone(&self.side_thread);
+        let store_dir = self.store_dir.clone();
+        let sender = self.sender.clone();
+        let model = config.model;
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            let answer = async {
+                let (summary, history) = match &source {
+                    Some(source) => {
+                        let store = SqliteStore::open_read_only(store_dir)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let history = harness_runtime::conversation_history(&store, source)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        (history.summary, history.messages)
+                    }
+                    None => (None, Vec::new()),
+                };
+                let earlier = thread.lock().map(|turns| turns.clone()).unwrap_or_default();
+                let messages = super::side_question::messages(
+                    &system_prompt,
+                    summary.as_deref(),
+                    history,
+                    &earlier,
+                    &question,
+                );
+                // No tools: the side thread answers from the conversation alone.
+                let request =
+                    harness_providers::ProviderRequest::new(RequestId::generate(), model, messages);
+                let events = provider
+                    .stream(request, CancellationToken::new())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let response = harness_providers::assemble_stream(&events)
+                    .map_err(|error| error.to_string())?;
+                let answer = response.text.trim().to_owned();
+                if answer.is_empty() {
+                    return Err("the model gave no answer".to_owned());
+                }
+                if let Ok(mut turns) = thread.lock() {
+                    turns.push((question.clone(), answer.clone()));
+                }
+                Ok(answer)
+            }
+            .await;
+            let _ = sender.send(SessionEvent::SideAnswer { question, answer });
+        });
+        Ok(())
+    }
+
+    fn queue_modes(&self) -> (super::queue::QueueMode, super::queue::QueueMode) {
+        let parse = |mode: Option<&String>| {
+            mode.and_then(|mode| super::queue::QueueMode::parse(mode))
+                .unwrap_or_default()
+        };
+        self.configured().map_or_else(
+            |_| Default::default(),
+            |config| {
+                (
+                    parse(config.queue_modes.0.as_ref()),
+                    parse(config.queue_modes.1.as_ref()),
+                )
+            },
+        )
+    }
+
     fn stop_agents(&mut self, selector: &str) -> Result<String, String> {
         let stopped = self
             .agents
@@ -3351,7 +3553,32 @@ impl SessionPort for AgentSessionService {
     }
 }
 
+/// Where a forked conversation starts: at the turn of `from`, before it
+/// (`/fork`) or after it (`/clone`).
+#[derive(Clone, Debug)]
+struct ForkPlan {
+    from: SessionId,
+    before: bool,
+}
+
 impl AgentSessionService {
+    /// A new conversation, as `/new` starts one, that its first turn will
+    /// continue from the fork point.
+    fn start_fork(&mut self, plan: ForkPlan) {
+        self.agents.reset();
+        if let Ok(mut thread) = self.side_thread.lock() {
+            thread.clear();
+        }
+        self.task_id = TaskId::generate();
+        if let Ok(mut tracker) = self.cost_tracker.lock() {
+            tracker.forget_context();
+        }
+        if let Ok(mut previous) = self.previous_session.lock() {
+            *previous = None;
+        }
+        self.fork_plan = Some(plan);
+    }
+
     /// Queue `text` into the running turn for its next step: as the user's
     /// steering correction, or - `verbatim` - as another agent's message that
     /// already says who it is from.
@@ -3519,6 +3746,7 @@ async fn run_turn(
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
     agents: Arc<super::delegation::SessionAgents>,
+    fork_plan: Option<ForkPlan>,
     session_id: SessionId,
     task_id: TaskId,
     previous_session: Arc<Mutex<Option<SessionId>>>,
@@ -3591,6 +3819,40 @@ async fn run_turn(
         },
         None => task_id,
     };
+    // The first turn of a fork reads the conversation up to the fork point; its
+    // later turns continue it through the `forked_from` setting.
+    let mut fork_history = None;
+    if source.is_none()
+        && let Some(plan) = &fork_plan
+    {
+        let forked_from = if plan.before {
+            harness_runtime::previous_in_conversation(&store, &plan.from)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            Some(plan.from.clone())
+        };
+        if let Some(forked_from) = forked_from {
+            let _ = store
+                .set_session_setting(
+                    &task_id,
+                    harness_runtime::FORKED_FROM_SETTING,
+                    forked_from.as_str(),
+                )
+                .await;
+            if let Ok(Some(parent_task)) = store.session_task(&forked_from).await
+                && let Ok(Some(title)) = store.session_setting(&parent_task, "title").await
+            {
+                let _ = store
+                    .set_session_setting(&task_id, "title", &format!("{title} (fork)"))
+                    .await;
+            }
+            fork_history = harness_runtime::conversation_history(&store, &forked_from)
+                .await
+                .ok();
+        }
+    }
     // The previous turn of this conversation may still hold the task in this
     // open store (a child kept it open); this turn takes the task over, as it did
     // when every turn opened the store anew.
@@ -4408,6 +4670,14 @@ async fn run_turn(
     })
     .with_project_rules(project_blocks)
     .with_tool_schemas(tool_schemas);
+    // A fork's first turn carries the conversation up to its fork point, as a
+    // continued turn carries the one before it.
+    if let Some(history) = fork_history {
+        if let Some(summary) = history.summary {
+            run_request = run_request.with_continuation_context(summary);
+        }
+        run_request = run_request.with_conversation(history.messages);
+    }
     if !attached.is_empty() {
         for notice in attachments::attachment_notices(&attached.images, &attached.files) {
             send(SessionEvent::Notice { message: notice });
@@ -4814,12 +5084,13 @@ async fn run_session_file_action_inner(
             .strip_prefix("/export ")
             .map(str::trim)
             .filter(|path| !path.is_empty())
-            .ok_or_else(|| "usage: /export [path.md|path.jsonl]".to_owned())?;
+            .ok_or_else(|| "usage: /export [path.md|path.jsonl|path.html]".to_owned())?;
         let extension = Path::new(path).extension();
         let jsonl = extension.is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"));
         let markdown = extension.is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
-        if !jsonl && !markdown {
-            return Err("usage: /export [path.md|path.jsonl]".to_owned());
+        let html = extension.is_some_and(|extension| extension.eq_ignore_ascii_case("html"));
+        if !jsonl && !markdown && !html {
+            return Err("usage: /export [path.md|path.jsonl|path.html]".to_owned());
         }
         if Path::new(path).is_absolute()
             || Path::new(path)
@@ -4828,15 +5099,28 @@ async fn run_session_file_action_inner(
         {
             return Err("export path must stay inside the workspace".to_owned());
         }
-        let content = render_session_export(
-            &store,
-            &task_id,
-            &environment,
-            &data_dir,
-            &config.provider.api_key_env,
-            jsonl,
-        )
-        .await?;
+        let content = if html {
+            render_session_html(
+                &store,
+                &task_id,
+                source.as_ref(),
+                &environment,
+                &data_dir,
+                &config.provider.api_key_env,
+                &config.provider.model,
+            )
+            .await?
+        } else {
+            render_session_export(
+                &store,
+                &task_id,
+                &environment,
+                &data_dir,
+                &config.provider.api_key_env,
+                jsonl,
+            )
+            .await?
+        };
         let expected_hash = if workspace_root.join(path).exists() {
             Some(observed_file_hash(&workspace_root, path).map_err(|error| error.to_string())?)
         } else {
@@ -5027,6 +5311,68 @@ async fn latest_undo_action(
         }
     }
     Err("no reversible file change with a before artifact was found in this session".to_owned())
+}
+
+/// The secrets an export must not contain: the credential variables and the
+/// saved credentials.
+fn export_secrets(
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+    provider_key_variable: &str,
+) -> Vec<String> {
+    let mut secrets = super::bootstrap::CREDENTIAL_VARIABLES
+        .iter()
+        .filter_map(|name| environment.value(name))
+        .map(|value| value.to_string_lossy().into_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if let Some(value) = environment.value(provider_key_variable) {
+        let value = value.to_string_lossy().into_owned();
+        if !value.is_empty() {
+            secrets.push(value);
+        }
+    }
+    secrets.extend(credentials::secrets(&credentials::resolve_file(
+        environment,
+        data_dir,
+    )));
+    secrets
+}
+
+/// `/export session.html`: the conversation as one self-contained page.
+async fn render_session_html(
+    store: &SqliteStore,
+    task_id: &TaskId,
+    source: Option<&SessionId>,
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+    provider_key_variable: &str,
+    model: &str,
+) -> Result<String, String> {
+    const EXPORT_LIMIT: usize = 1024 * 1024;
+    let source =
+        source.ok_or_else(|| "Nothing to export yet - start a conversation first".to_owned())?;
+    let history = harness_runtime::conversation_history(store, source)
+        .await
+        .map_err(|error| error.to_string())?;
+    let title = store
+        .session_setting(task_id, "title")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "Harness session".to_owned());
+    let secrets = export_secrets(environment, data_dir, provider_key_variable);
+    let page = super::export_html::render(
+        &title,
+        model,
+        history.summary.as_deref(),
+        &history.messages,
+        &secrets,
+    );
+    if page.len() > EXPORT_LIMIT {
+        return Err("session export exceeds the 1 MiB file limit".to_owned());
+    }
+    Ok(page)
 }
 
 async fn render_session_export(

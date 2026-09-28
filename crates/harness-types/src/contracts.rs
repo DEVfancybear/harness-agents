@@ -659,6 +659,10 @@ pub struct HarnessConfigV2 {
     /// Delegated children: prime-agent's `subagentDefaultModel`.
     #[serde(default)]
     pub agents: Option<AgentsConfigV2>,
+    /// Messages queued while the agent works: prime-agent's `steeringMode` and
+    /// `followUpMode`.
+    #[serde(default)]
+    pub queue: Option<QueueConfigV2>,
 }
 
 impl HarnessConfigV2 {
@@ -960,6 +964,17 @@ pub struct UiConfigV2 {
     pub bell: Option<bool>,
     #[serde(default)]
     pub notify_command: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueConfigV2 {
+    /// `all` or `one-at-a-time` (the default).
+    #[serde(default)]
+    pub steering_mode: Option<String>,
+    /// `all` or `one-at-a-time` (the default).
+    #[serde(default)]
+    pub follow_up_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

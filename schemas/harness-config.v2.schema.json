@@ -360,6 +360,28 @@
       },
       "type": "object"
     },
+    "QueueConfigV2": {
+      "additionalProperties": false,
+      "properties": {
+        "follow_up_mode": {
+          "default": null,
+          "description": "`all` or `one-at-a-time` (the default).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "steering_mode": {
+          "default": null,
+          "description": "`all` or `one-at-a-time` (the default).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "TrustConfigV2": {
       "additionalProperties": false,
       "properties": {
@@ -494,6 +516,18 @@
         }
       ],
       "default": null
+    },
+    "queue": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/QueueConfigV2"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Messages queued while the agent works: prime-agent's `steeringMode` and\n`followUpMode`."
     },
     "schema_version": {
       "const": 2,

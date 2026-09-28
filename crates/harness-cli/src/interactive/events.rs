@@ -50,6 +50,8 @@ pub enum Key {
     Redraw,
     /// Ctrl-O: cycle prime-agent's detail modes.
     CycleDetail,
+    /// Ctrl-S: prime-agent's prompt stash - put the draft aside, or bring it back.
+    Stash,
     PageUp,
     PageDown,
     Enter,
@@ -409,6 +411,8 @@ pub struct UiState {
     pub granted_for_run: bool,
     /// One next user input held until the active run releases its session writer.
     pub queued_input: bool,
+    /// How many messages wait in the queue.
+    pub queued_count: usize,
     /// The last submitted request, so the status bar can name it.
     pub last_request: Option<String>,
     /// When the active run started, for the elapsed clock.
@@ -474,6 +478,13 @@ impl Detail {
 }
 
 /// Events the controller consumes from the session port.
+/// Why a conversation's turns were listed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TurnsPurpose {
+    Fork,
+    Tree,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionEvent {
     Accepted {
@@ -607,6 +618,17 @@ pub enum SessionEvent {
     ChildSettled {
         name: String,
         notice: String,
+    },
+    /// The turns of this conversation, oldest first: each turn's session id and
+    /// the input that opened it.
+    TurnsListed {
+        purpose: TurnsPurpose,
+        turns: Vec<(String, String)>,
+    },
+    /// The answer to a `/btw` side question, or why there is none.
+    SideAnswer {
+        question: String,
+        answer: Result<String, String>,
     },
     /// A child sent its parent a message (`[agent-message from child:...]`): read
     /// at the running turn's next step, or in a turn of its own when idle.

@@ -2419,3 +2419,145 @@ fn q04_pty_agents_stop_cancels_a_running_child() {
     session.wait_for("parent saw the stop", Duration::from_mins(1));
     finish(session);
 }
+
+// ---------------------------------------------------------------------------
+// HA_PRIME Q05-Q09 - the queue, /btw and /fork in a real TUI
+// ---------------------------------------------------------------------------
+
+/// The newest user message of a request.
+fn last_user_text(request: &serde_json::Value) -> String {
+    request["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "user")
+                .and_then(|message| message["content"].as_str())
+        })
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Q05: a follow-up queued while the agent works runs after the turn.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn q05_pty_follow_up_runs_after_the_turn() {
+    let provider = ScriptedSse::start(|request| {
+        if last_user_text(request).contains("next thing") {
+            Reply::Text("follow-up done".to_owned())
+        } else {
+            Reply::Delay(
+                Duration::from_secs(3),
+                Box::new(Reply::Text("first done".to_owned())),
+            )
+        }
+    });
+    let (_temp, mut session) = scripted_session(&provider);
+    session.send("start\r");
+    session.wait_for("esc to interrupt", Duration::from_secs(30));
+    session.send("/queue next thing\r");
+    session.wait_for("follow-up queued (1)", Duration::from_secs(20));
+    session.wait_for("first done", Duration::from_mins(1));
+    session.wait_for("follow-up done", Duration::from_mins(1));
+    finish(session);
+}
+
+/// Q07: /btw answers in a panel from the conversation, and the conversation
+/// never sees it.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn q07_pty_btw_answers_in_a_panel() {
+    let provider = ScriptedSse::start(|request| {
+        let text = request_text(request);
+        if text.contains("<side_question>") {
+            if text.contains("main-answer-one") {
+                Reply::Text("side-answer-42".to_owned())
+            } else {
+                Reply::Text("side-answer-without-context".to_owned())
+            }
+        } else if text.contains("side-answer") || text.contains("side_question") {
+            Reply::Text("main-saw-the-side-thread".to_owned())
+        } else if last_user_text(request).contains("second") {
+            Reply::Text("main-answer-two".to_owned())
+        } else {
+            Reply::Text("main-answer-one".to_owned())
+        }
+    });
+    let (_temp, mut session) = scripted_session(&provider);
+    session.send("first\r");
+    session.wait_for("main-answer-one", Duration::from_mins(1));
+    session.send("/btw what did you say?\r");
+    session.wait_for("side-answer-42", Duration::from_mins(1));
+    session.send("\u{1b}");
+    std::thread::sleep(Duration::from_millis(300));
+    session.send("second\r");
+    session.wait_for("main-answer-two", Duration::from_mins(1));
+    let side = provider
+        .requests()
+        .iter()
+        .find(|(_, request)| request_text(request).contains("<side_question>"))
+        .map(|(_, request)| request.clone())
+        .expect("the side question reached the provider");
+    assert!(
+        side["tools"].as_array().is_none_or(Vec::is_empty),
+        "a side question has no tools"
+    );
+    finish(session);
+}
+
+/// Q08: /fork starts a new conversation before the chosen message; the model
+/// sees what came before it and nothing after.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn q08_pty_fork_then_answer() {
+    let provider = ScriptedSse::start(|request| {
+        let text = request_text(request);
+        let last = last_user_text(request);
+        if last.contains("third ask") {
+            Reply::Text("answer-three".to_owned())
+        } else if last.contains("second ask") && text.contains("answer-three") {
+            Reply::Text("fork-saw-too-much".to_owned())
+        } else if last.contains("second ask") && text.contains("answer-one") {
+            Reply::Text("answer-two".to_owned())
+        } else if last.contains("second ask") {
+            Reply::Text("fork-lost-the-history".to_owned())
+        } else {
+            Reply::Text("answer-one".to_owned())
+        }
+    });
+    let (_temp, mut session) = scripted_session(&provider);
+    session.send("first ask\r");
+    session.wait_for("answer-one", Duration::from_mins(1));
+    session.send("second ask\r");
+    session.wait_for("answer-two", Duration::from_mins(1));
+    session.send("third ask\r");
+    session.wait_for("answer-three", Duration::from_mins(1));
+    // Like every command with an optional argument, the first Enter types
+    // `/fork ` from the menu and the second runs it.
+    session.send("/fork\r");
+    std::thread::sleep(Duration::from_millis(300));
+    session.send("\r");
+    session.wait_for("<number>", Duration::from_secs(30));
+    session.send("\u{1b}");
+    std::thread::sleep(Duration::from_millis(300));
+    session.send("/fork 2\r");
+    session.wait_for("Forked", Duration::from_secs(30));
+    session.send("\r");
+    let deadline = Instant::now() + Duration::from_mins(1);
+    while session.transcript().matches("answer-two").count() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the fork was answered: {}",
+            session.transcript()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let transcript = session.transcript();
+    assert!(!transcript.contains("fork-saw-too-much"), "{transcript}");
+    assert!(
+        !transcript.contains("fork-lost-the-history"),
+        "{transcript}"
+    );
+    finish(session);
+}

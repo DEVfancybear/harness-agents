@@ -226,7 +226,10 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
                 push(Span::styled(" · tự động cả lượt", theme.warning));
             }
             if state.queued_input {
-                push(Span::styled(" · queued (1)", theme.accent));
+                push(Span::styled(
+                    format!(" · queued ({})", state.queued_count.max(1)),
+                    theme.accent,
+                ));
             }
             push(Span::styled(
                 if state.max_steps == crate::interactive::bounds::UNLIMITED {
@@ -352,6 +355,7 @@ mod tests {
             modal: None,
             granted_for_run: false,
             queued_input: false,
+            queued_count: 0,
             last_request: None,
             run_started_at: None,
             last_run_elapsed: Duration::ZERO,

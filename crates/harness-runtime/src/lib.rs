@@ -1136,6 +1136,53 @@ fn clip_turn(text: &str) -> String {
 ///
 /// # Errors
 /// Fails only when the store cannot be read.
+/// The task setting that names the session a forked conversation starts from.
+pub const FORKED_FROM_SETTING: &str = "forked_from";
+
+/// The session before `session_id` in its conversation: its continuation link,
+/// or - for the first turn of a fork, which starts a conversation of its own -
+/// the session the fork was made from.
+pub async fn previous_in_conversation(
+    store: &SqliteStore,
+    session_id: &SessionId,
+) -> Result<Option<SessionId>, RuntimeError> {
+    if let Some(link) = store.continuation_link(session_id).await? {
+        return Ok(Some(link.source_session_id));
+    }
+    let Some(task) = store.session_task(session_id).await? else {
+        return Ok(None);
+    };
+    Ok(store
+        .session_setting(&task, FORKED_FROM_SETTING)
+        .await?
+        .and_then(|session| SessionId::parse(session).ok())
+        .filter(|forked_from| forked_from != session_id))
+}
+
+/// The turns of the conversation `session_id` ends, oldest first: each turn's
+/// session and the input that opened it. A fork's turns continue into the
+/// conversation it was made from.
+pub async fn conversation_turns(
+    store: &SqliteStore,
+    session_id: &SessionId,
+) -> Result<Vec<(SessionId, String)>, RuntimeError> {
+    let mut turns = Vec::new();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut current = Some(session_id.clone());
+    while let Some(session) = current.take() {
+        if !visited.insert(session.as_str().to_owned()) || visited.len() > CONVERSATION_MAX_SESSIONS
+        {
+            break;
+        }
+        if let Some((_, question)) = store.session_admitted_input(&session).await? {
+            turns.push((session.clone(), question));
+        }
+        current = previous_in_conversation(store, &session).await?;
+    }
+    turns.reverse();
+    Ok(turns)
+}
+
 pub async fn conversation_history(
     store: &SqliteStore,
     session_id: &SessionId,
@@ -1167,10 +1214,7 @@ pub async fn conversation_history(
             };
             turns.push((question, body));
         }
-        current = store
-            .continuation_link(&session)
-            .await?
-            .map(|link| link.source_session_id);
+        current = previous_in_conversation(store, &session).await?;
     }
     // `turns` is newest first; keep what fits, then restore speaking order.
     let interrupted_replayed = matches!(turns.first(), Some((_, TurnBody::Steps(_))));

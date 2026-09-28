@@ -5,9 +5,10 @@
 ## Trạng thái
 
 - **CP-1 (Q00–Q04): xong**, verified local ngày 28/09/2026 (xem evidence). Agent con thuộc session, sống quá lượt, báo kết quả bằng thông báo prime, nhắn tin hai chiều, chọn được model; `/agents stop`.
-- **CP-2 (Q05–Q09): chưa bắt đầu.**
+- **CP-2 (Q05–Q09): xong** ngày 28/09/2026 — hàng đợi 2 lane + `/queue`, Ctrl-S/`/stash`, `/btw`, `/fork`/`/clone`/`/tree` (task mới + `forked_from`), `/export x.html`.
+- **CP-3 (Q10–Q13): chưa bắt đầu.**
 
-## Điều người làm CP-2 cần biết
+## Điều người làm checkpoint sau cần biết
 
 - Store giờ là `SharedStore` của session (`interactive/store_lease.rs`). **Không** mở `SqliteStore::open_writer` riêng trong code mới của app tương tác; lấy `agents.store().lease().await` (hoặc truyền store của lượt).
 - Controller có hai hàng chờ lượt tự động: `pending_notices` (thông báo/tin của agent con) và `pending_heartbeats`. Q05 thay `queued_input` bằng hàng đợi 2 lane — giữ thứ tự sau `RunTerminal`: input người dùng đang chờ → thông báo agent con → heartbeat → compact → continuation/goal, và giữ cờ `notices_held` (sau Ctrl+C thông báo chờ lượt tiếp theo của người dùng).
@@ -17,4 +18,4 @@
 
 ## Exact next action
 
-Bắt đầu Q05 theo plan: tạo `interactive/queue.rs` (`Lane`, `QueueMode`, `InputQueue`) với test thuần `q05_queue_take_next_respects_the_mode` trước, rồi thay `queued_input` trong `controller.rs`.
+Bắt đầu Q10 theo plan: `interactive/custom_models.rs` đọc `<config dir>/models.json` (schema prime), test `q10_custom_model_is_added_with_defaults` trước, rồi gộp vào `Catalog::load` trong `providers.rs`. Trước khi đóng track: chạy một lượt toàn bộ workspace + PTY đầy đủ (người dùng đã dặn).

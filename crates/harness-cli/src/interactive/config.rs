@@ -175,6 +175,8 @@ pub struct ResolvedConfig {
     pub bell: bool,
     /// `[agents] default_model`: the model a delegated child runs on by default.
     pub agents_default_model: Option<String>,
+    /// `[queue] steering_mode` and `follow_up_mode`, as written.
+    pub queue_modes: (Option<String>, Option<String>),
     pub explain: Vec<ConfigExplainEntry>,
     pub project_config_reason: Option<String>,
 }
@@ -206,6 +208,7 @@ pub fn resolve_layers(
     let mut notify_command = None;
     let mut bell = false;
     let mut agents_default_model: Option<String> = None;
+    let mut queue_modes: (Option<String>, Option<String>) = (None, None);
     let mut approval = "ask".to_owned();
     let mut approval_layer = ConfigLayer::Default;
     let mut allow_rules = Vec::new();
@@ -287,6 +290,7 @@ pub fn resolve_layers(
             ConfigLayer::User,
             &mut entries,
         );
+        apply_queue(&mut queue_modes, config, ConfigLayer::User, &mut entries)?;
         mcp_servers.extend(config.mcp_servers.clone());
     }
     // The servers `/mcp add` saved beside the user config, at the user layer: a
@@ -369,6 +373,12 @@ pub fn resolve_layers(
                 ConfigLayer::Project,
                 &mut entries,
             );
+            apply_queue(
+                &mut queue_modes,
+                &config,
+                ConfigLayer::Project,
+                &mut entries,
+            )?;
             mcp_servers.extend(config.mcp_servers.clone());
         }
     } else if project_path.exists() {
@@ -441,6 +451,7 @@ pub fn resolve_layers(
             ConfigLayer::Local,
             &mut entries,
         );
+        apply_queue(&mut queue_modes, &config, ConfigLayer::Local, &mut entries)?;
     }
 
     let mut profile = overrides.profile.clone().or_else(|| {
@@ -622,6 +633,7 @@ pub fn resolve_layers(
         project_trusted: trusted,
         bell,
         agents_default_model,
+        queue_modes,
         explain,
         project_config_reason: project_reason,
     })
@@ -684,6 +696,36 @@ fn apply_permissions(
         );
     }
     explain_permission_rules(entries, "permissions.deny", &permissions.deny, layer);
+    Ok(())
+}
+
+/// `[queue]` of one layer; a later layer wins. Only prime-agent's two modes are
+/// accepted.
+fn apply_queue(
+    modes: &mut (Option<String>, Option<String>),
+    config: &HarnessConfigV2,
+    layer: ConfigLayer,
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+) -> Result<(), HarnessError> {
+    let Some(queue) = &config.queue else {
+        return Ok(());
+    };
+    for (key, value, slot) in [
+        ("queue.steering_mode", &queue.steering_mode, &mut modes.0),
+        ("queue.follow_up_mode", &queue.follow_up_mode, &mut modes.1),
+    ] {
+        let Some(value) = value.as_deref().map(str::trim) else {
+            continue;
+        };
+        if super::queue::QueueMode::parse(value).is_none() {
+            return Err(HarnessError::new(
+                ErrorCode::ConfigParseError,
+                format!("{key} must be \"all\" or \"one-at-a-time\""),
+            ));
+        }
+        *slot = Some(value.to_owned());
+        set_explain(entries, key, value, layer, None);
+    }
     Ok(())
 }
 

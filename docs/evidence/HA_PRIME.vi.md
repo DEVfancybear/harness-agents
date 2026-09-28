@@ -23,3 +23,20 @@
 - `cargo test --workspace --locked --no-fail-fast` trên bản cuối (có `p0_f03` kiểm schema).
 - PTY đầy đủ 25 ca cũ + 4 ca q0 trong một lần (`-TimeoutSeconds 900`).
 - Live smoke với provider thật.
+
+
+# Evidence CP-2 (Q05–Q09)
+
+- **Trạng thái:** `implemented_partially_verified` — như CP-1, toàn bộ test workspace và 25 ca PTY cũ để chạy một lượt khi xong các checkpoint (theo người dùng).
+- **Base:** `93bc8d4`; Windows 11; 28/09/2026.
+
+| Lệnh | Kết quả |
+|---|---|
+| `cargo test -p harness-cli --bin ha -- q05 q06 g06` | 18 passed |
+| `cargo test -p harness-cli --bin ha -- q07` / `q08` / `q09` | 2 / 2 / 2 passed |
+| `cargo test -p harness-cli --bin ha` | 456 passed, 2 failed → sau khi thêm lệnh vào thẻ `/help` chỉ còn `g09_hook_cannot_turn_ask_into_allow` (chập chờn đã biết) |
+| `Invoke-HaPtyAcceptance.ps1 -Filter q0` | lần 1: q07, q08 đỏ vì kịch bản test (chữ có dấu cách bị vẽ bằng lệnh dời con trỏ; kịch bản fork không phân biệt được nhánh) → sửa kịch bản; q00–q07 xanh; `q08_pty_fork_then_answer` xanh riêng (`PTY_EXIT: 0`): nhánh thấy lượt 1, không thấy lượt 3 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | sạch |
+| `generate_schemas` | `harness-config.v2.schema.json` thêm `queue` |
+
+**not_run:** toàn bộ workspace, 25 ca PTY cũ, live smoke.
