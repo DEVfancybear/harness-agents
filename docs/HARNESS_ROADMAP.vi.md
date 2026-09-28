@@ -10,6 +10,8 @@
 
 **Ưu tiên trải nghiệm khởi động:** [track H01–H08](HA_LAUNCH_PLAN.vi.md) xử lý yêu cầu gõ `ha` để mở CLI tương tác, trên binary/CLI hiện tại. Track H có [prompt riêng](HA_LAUNCH_PROMPT.vi.md) và là lát cắt ưu tiên của cùng sản phẩm; không phải ngoại lệ kiến trúc. Các phần H đã triển khai được đối chiếu/test và reuse ở M2/M3/M4/M9; không bắt làm lại hoặc chờ toàn roadmap. Đọc evidence H hiện tại để biết trạng thái, không suy từ ngày lập plan.
 
+**Đóng khoảng cách với prime-agent:** [track Q01–Q15](HA_PRIME_PLAN.vi.md) (agent con chạy nền, hàng đợi, `/btw`, fork/tree, models.json, định tuyến model, chờ quota, `/autonomous`, lịch bền) có [prompt riêng](HA_PRIME_PROMPT.vi.md), chia bước nhỏ kèm test cho DeepSeek.
+
 Đây là roadmap **nâng cấp code hiện tại**. IDs M mô tả yêu cầu/coverage cần đối chiếu, không tuyên bố source chưa có tính năng tương ứng. Trước mỗi assignment phải phân loại từng requirement reuse_verified/adapt/missing/incompatible; giữ P/H regressions, bổ sung test cho gap và nối vào luồng `ha` hiện tại. Nhãn planned của tài liệu không reset tiến độ implementation.
 
 Giả định một developer có kinh nghiệm Rust, model qua API, Windows/Linux, một local user và một writable host. Ngày công gồm code + integration tests + docs/handoff, chưa có số liệu velocity thực tế. Các công việc compatibility/live-provider cần re-estimate sau prototype.
