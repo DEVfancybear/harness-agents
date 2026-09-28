@@ -8,7 +8,8 @@
 - **CP-2 (Q05–Q09): xong** ngày 28/09/2026 — hàng đợi 2 lane + `/queue`, Ctrl-S/`/stash`, `/btw`, `/fork`/`/clone`/`/tree` (task mới + `forked_from`), `/export x.html`.
 - **CP-3 (Q10–Q13): xong** ngày 28/09/2026 — `models.json` (apiKey = tên biến môi trường), `[routing] scoped` + `/scoped-models` + `/model next|prev` + Alt+M, model phụ/dự phòng/ảnh (`routing::Router` trong `LiveProvider`, `AuxiliarySummary`), `ErrorCode::RateLimited` + chờ hạn mức.
 - **CP-4 (Q14–Q15): xong** ngày 28/09/2026 — `/autonomous` (port `autonomous.ts`, cổng kiểm tra chạy thật, snapshot git), `/schedule` bền theo hội thoại (port parser + cron của `cron-jobs.ts`). Track Q00–Q15 xong.
-- **Lượt chạy toàn bộ:** workspace 958 passed / 2 đỏ chập chờn đã biết; PTY 37/38 — còn `i12` đỏ từ trước track (xem evidence). Sửa kèm: tin tới sau bước cuối bị mất (Q03), `/scoped-models` chỉ nhận mẫu đầu (Q11), 2 test PTY chập chờn.
+- **Lượt chạy toàn bộ:** workspace 958 passed / 2 đỏ chập chờn đã biết; PTY đầy đủ 39/39 sau khi sửa `i12` (lỗi gửi request nêu host:port) và 3 test PTY chập chờn. Sửa kèm: tin tới sau bước cuối bị mất (Q03), `/scoped-models` chỉ nhận mẫu đầu (Q11).
+- **Quyết định của người dùng (28/09/2026):** agent con **giữ quyền như hiện tại** - `explorer` chỉ đọc (không shell, không ghi), chỉ `coder` có shell trong worktree riêng - để dễ kiểm soát. Đây là khác biệt có chủ đích với prime (`rlm.spawn` của prime tạo con đầy đủ tool); không đề xuất lại.
 
 ## Điều người làm checkpoint sau cần biết
 
@@ -22,4 +23,4 @@
 
 ## Exact next action
 
-PTY đầy đủ 39/39 xanh. Chờ người dùng quyết: agent con của `rlm.spawn`/`delegate explorer` có nên có shell và quyền ghi như prime-agent (con đầy đủ tool) hay giữ chỉ đọc. Nhắc người dùng cài lại `ha` (`scripts/Install-Ha.ps1`) - chuỗi mã lỗi lặp họ thấy là của bản cũ.
+Track HA_PRIME xong, PTY đầy đủ 39/39 xanh. Việc tiếp theo chỉ khi được giao: các mục ngoài phạm vi ở plan mục 11. Người dùng cần cài lại `ha` (`scripts/Install-Ha.ps1`) - chuỗi mã lỗi lặp họ thấy là của bản cũ.
