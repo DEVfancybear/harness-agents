@@ -251,6 +251,12 @@ pub struct InteractiveController {
     thinking_label: Option<String>,
     /// The provider whose browser sign-in waits; a pasted redirect URL finishes it.
     signing_in: Option<String>,
+    /// prime-agent's autonomous mode (`/autonomous`).
+    autonomous: super::autonomous::Autonomous,
+    /// The autonomous quality gates are running; their verdict decides what follows.
+    gates_pending: bool,
+    /// The session's tokens when the running turn started, for its share.
+    turn_tokens_start: u64,
 }
 
 impl InteractiveController {
@@ -326,6 +332,9 @@ impl InteractiveController {
             signing_in: None,
             pending_thinking: String::new(),
             thinking_label: None,
+            autonomous: super::autonomous::Autonomous::default(),
+            gates_pending: false,
+            turn_tokens_start: 0,
         }
     }
 
@@ -1603,6 +1612,37 @@ impl InteractiveController {
             SessionEvent::TurnsListed { purpose, turns } => {
                 self.show_turns(purpose, turns, effects);
             }
+            SessionEvent::UnreadMessage { text, verbatim } => {
+                // It arrived as the turn was ending: another agent's message is read
+                // like a child's report, the user's steer waits in the steering lane.
+                if verbatim {
+                    self.pending_notices.push_back(text);
+                } else {
+                    self.queue.push(super::queue::Lane::Steer, text);
+                }
+                self.push_history(
+                    effects,
+                    HistoryItem::Notice {
+                        message: "a message arrived as the turn ended; it is read next".to_owned(),
+                    },
+                );
+            }
+            SessionEvent::GatesChecked { result, state } => {
+                self.gates_pending = false;
+                // A turn the user started meanwhile owns the session now; the gates'
+                // memory is kept for the next check.
+                if self.phase.has_active_run() || !self.autonomous.enabled {
+                    self.autonomous.gate_state = state;
+                } else {
+                    let decision = self.autonomous.decide(
+                        true,
+                        Some((result, state)),
+                        Instant::now(),
+                        &autonomous_timestamp(),
+                    );
+                    effects.extend(self.apply_autonomous(decision));
+                }
+            }
             SessionEvent::ProviderWaiting { line } => {
                 // The plain transcript is a log: each wait is a line of it.
                 if self.plain
@@ -1704,6 +1744,12 @@ impl InteractiveController {
                     },
                 );
                 self.finish_run();
+                // Every turn counts against an autonomous run's budgets.
+                let used = self
+                    .service
+                    .session_tokens()
+                    .saturating_sub(self.turn_tokens_start);
+                self.autonomous.record_turn(used);
                 // After the user stopped a turn, what waits - their queue and the
                 // children's reports - waits for their next turn, as prime-agent
                 // pauses queued work after an abort.
@@ -1755,6 +1801,9 @@ impl InteractiveController {
                 if !self.phase.has_active_run() {
                     effects.extend(self.continue_goal(&outcome));
                 }
+                if !self.phase.has_active_run() {
+                    effects.extend(self.continue_autonomous(&outcome));
+                }
                 // The phase above is what tells the two cases apart: a continuation is the
                 // *same* user turn carrying on, so the grant the user gave for this turn
                 // stays open across it - revoking here would ask again in the middle of
@@ -1781,6 +1830,12 @@ impl InteractiveController {
         // A request the user typed starts a fresh continuation budget: the app may carry
         // this one on by itself when a bound stops it.
         self.continuations = 0;
+        // The user took the session over while the gates ran: their verdict
+        // would judge a turn that is no longer the last one.
+        if self.gates_pending {
+            self.gates_pending = false;
+            self.service.cancel_gates();
+        }
         self.dispatch(text, false)
     }
 
@@ -2048,6 +2103,139 @@ impl InteractiveController {
         effects
     }
 
+    /// prime-agent's autonomous continuation after a turn: the gates run first
+    /// when there are any, and their verdict (`GatesChecked`) decides.
+    fn continue_autonomous(&mut self, outcome: &RunOutcome) -> Vec<Effect> {
+        if !self.autonomous.enabled || !matches!(outcome, RunOutcome::Done) {
+            return Vec::new();
+        }
+        let mut effects = Vec::new();
+        // prime-agent holds its continuation while children run: their reports
+        // wake the parent, and the turn those reports start is judged in turn.
+        let running = self.service.running_children();
+        if running > 0 {
+            self.push_history(
+                &mut effects,
+                HistoryItem::Notice {
+                    message: format!(
+                        "autonomous: {running} child(ren) still working; their reports carry the run on"
+                    ),
+                },
+            );
+            return effects;
+        }
+        if let Some(job) = self.autonomous.gate_job() {
+            let commands = job.commands.len();
+            match self.service.run_gates(job) {
+                Ok(()) => {
+                    self.gates_pending = true;
+                    self.push_history(
+                        &mut effects,
+                        HistoryItem::Notice {
+                            message: format!("autonomous: running {commands} quality gate(s)..."),
+                        },
+                    );
+                }
+                Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+            }
+            return effects;
+        }
+        let decision = self
+            .autonomous
+            .decide(true, None, Instant::now(), &autonomous_timestamp());
+        effects.extend(self.apply_autonomous(decision));
+        effects
+    }
+
+    /// Continue the run, or say why autonomous mode stopped carrying it.
+    fn apply_autonomous(&mut self, decision: super::autonomous::Decision) -> Vec<Effect> {
+        use super::autonomous::{Decision, Stop};
+        let message = match decision {
+            Decision::Continue(text) => {
+                let limit = self.autonomous.limits.max_continuations;
+                let mut effects = vec![Effect::History(HistoryItem::Notice {
+                    message: format!(
+                        "autonomous: continuing ({}/{}) - /autonomous off stops this",
+                        self.autonomous.continuations_used,
+                        if limit >= super::autonomous::UNLIMITED {
+                            "unlimited".to_owned()
+                        } else {
+                            limit.to_string()
+                        }
+                    ),
+                })];
+                self.continuations = 0;
+                effects.extend(self.dispatch(text, true));
+                return effects;
+            }
+            Decision::Stop(Stop::NotNeeded) => return Vec::new(),
+            Decision::Stop(Stop::GatesPassed) => "autonomous: quality gates passed".to_owned(),
+            Decision::Stop(Stop::GateRetriesExhausted) => format!(
+                "autonomous: stopped; a quality gate failed more than {} time(s)",
+                self.autonomous.gates.max_retries
+            ),
+            Decision::Stop(Stop::Limit(reason)) => format!("autonomous: stopped; {reason} reached"),
+        };
+        vec![
+            Effect::History(HistoryItem::Notice { message }),
+            Effect::Redraw,
+        ]
+    }
+
+    /// `/autonomous [status|off]` and `/autonomous on [flags]`.
+    fn autonomous_command(&mut self, argument: Option<&str>, effects: &mut Vec<Effect>) {
+        match super::autonomous::parse(argument.unwrap_or_default()) {
+            Err(message) => self.push_history(effects, HistoryItem::Error { message }),
+            Ok(command) => {
+                match command {
+                    super::autonomous::Command::On(options) => {
+                        // One driver at a time: autonomous mode and a goal both
+                        // carry the conversation on by themselves.
+                        if let Some(goal) = &mut self.goal
+                            && goal.status == GoalStatus::Active
+                        {
+                            goal.status = GoalStatus::Paused;
+                            self.service.set_goal(None);
+                            self.push_history(effects, HistoryItem::Notice {
+                                message: "goal paused: autonomous mode drives this conversation now; /goal resume brings it back".to_owned(),
+                            });
+                        }
+                        self.autonomous.turn_on(&options, Instant::now());
+                    }
+                    super::autonomous::Command::Off => {
+                        self.autonomous.turn_off();
+                        if self.gates_pending {
+                            self.gates_pending = false;
+                            self.service.cancel_gates();
+                        }
+                    }
+                    super::autonomous::Command::Status => {}
+                }
+                let message = self.autonomous.status(Instant::now());
+                self.push_history(effects, HistoryItem::Notice { message });
+            }
+        }
+    }
+
+    /// A goal takes over from autonomous mode.
+    fn autonomous_yields_to_goal(&mut self, effects: &mut Vec<Effect>) {
+        if !self.autonomous.enabled {
+            return;
+        }
+        self.autonomous.turn_off();
+        if self.gates_pending {
+            self.gates_pending = false;
+            self.service.cancel_gates();
+        }
+        self.push_history(
+            effects,
+            HistoryItem::Notice {
+                message: "autonomous mode turned off: the goal drives this conversation now"
+                    .to_owned(),
+            },
+        );
+    }
+
     /// `/goal` and its subcommands.
     fn goal_command(&mut self, raw_argument: Option<&str>, effects: &mut Vec<Effect>) {
         match raw_argument.map(str::trim).unwrap_or_default() {
@@ -2088,6 +2276,7 @@ impl InteractiveController {
                 goal.status = GoalStatus::Active;
                 goal.continuations = 0;
                 let objective = goal.objective.clone();
+                self.autonomous_yields_to_goal(effects);
                 self.service.set_goal(Some(objective.clone()));
                 self.push_history(effects, HistoryItem::Notice {
                     message: format!("goal resumed: {objective}"),
@@ -2110,6 +2299,7 @@ impl InteractiveController {
             }
             objective => {
                 let objective = objective.to_owned();
+                self.autonomous_yields_to_goal(effects);
                 self.goal = Some(GoalState::new(objective.clone()));
                 self.service.set_goal(Some(objective.clone()));
                 if self.phase.has_active_run() {
@@ -2126,6 +2316,7 @@ impl InteractiveController {
 
     /// Start the accounting for a new turn.
     fn fresh_run(&mut self, now: Instant, request: Option<String>) {
+        self.turn_tokens_start = self.service.session_tokens();
         self.pending_text.clear();
         self.pending_newlines = 0;
         self.last_answer.clear();
@@ -2367,7 +2558,12 @@ impl InteractiveController {
             }
             "/queue" => self.queue_command(raw_argument, &mut effects),
             "/stash" => return self.stash_prompt(),
-            "/scoped-models" => match self.service.scoped_models(argument) {
+            "/autonomous" => self.autonomous_command(raw_argument, &mut effects),
+            "/schedule" => match self.service.schedule(raw_argument) {
+                Ok(lines) => self.reference("/schedule", lines, &mut effects),
+                Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+            },
+            "/scoped-models" => match self.service.scoped_models(raw_argument) {
                 Ok(lines) => {
                     self.reference("/scoped-models", lines, &mut effects);
                     self.refresh_status();
@@ -3783,6 +3979,11 @@ fn with_rule_confirmation(summary: &str, pattern: &str) -> String {
     }
 }
 
+/// Now, as JavaScript's `toISOString` writes it, for prime-agent's gate prompt.
+fn autonomous_timestamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 fn without_rule_confirmation(summary: &str) -> String {
     let Some((summary, remainder)) = summary.split_once("\n[always-allow]\n") else {
         return summary.to_owned();
@@ -3875,11 +4076,36 @@ mod tests {
         side_questions: Arc<Mutex<Vec<String>>>,
         /// Every fork, clone (`"clone"`) and switch, in order.
         branches: Arc<Mutex<Vec<String>>>,
+        /// Every run of the autonomous quality gates, and how often they were stopped.
+        gate_jobs: Arc<Mutex<Vec<crate::interactive::autonomous::GateJob>>>,
+        gate_cancels: Arc<Mutex<u32>>,
+        /// Every `/scoped-models` argument, as the port received it.
+        scopes: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     impl SessionPort for RecordingPort {
         fn label(&self) -> String {
             "recording port".to_owned()
+        }
+
+        fn run_gates(
+            &mut self,
+            job: crate::interactive::autonomous::GateJob,
+        ) -> Result<(), String> {
+            self.gate_jobs.lock().expect("gate log").push(job);
+            Ok(())
+        }
+
+        fn cancel_gates(&mut self) {
+            *self.gate_cancels.lock().expect("gate cancel log") += 1;
+        }
+
+        fn scoped_models(&mut self, argument: Option<&str>) -> Result<Vec<String>, String> {
+            self.scopes
+                .lock()
+                .expect("scope log")
+                .push(argument.map(str::to_owned));
+            Ok(Vec::new())
         }
 
         fn submit(&mut self, request: SubmitRequest) {
@@ -7535,6 +7761,211 @@ mod tests {
         assert_eq!(
             submissions(&harness).last().map(String::as_str),
             Some("after the turn")
+        );
+    }
+
+    /// Q03: what reached the turn's inbox after its last step runs next - a
+    /// child's message as a report, the user's steer first in the steering lane.
+    #[test]
+    fn q03_unread_messages_run_after_the_turn() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "ask a child");
+        for (text, verbatim) in [
+            ("[agent-message from child:c]\n\nlate", true),
+            ("and the lexer", false),
+        ] {
+            harness
+                .events
+                .send(SessionEvent::UnreadMessage {
+                    text: text.to_owned(),
+                    verbatim,
+                })
+                .expect("unread");
+        }
+        done(&mut harness);
+        assert_eq!(
+            submissions(&harness).last().map(String::as_str),
+            Some("and the lexer")
+        );
+        done(&mut harness);
+        assert_eq!(
+            submissions(&harness).last().map(String::as_str),
+            Some("[agent-message from child:c]\n\nlate")
+        );
+    }
+
+    /// Q11: every pattern of `/scoped-models` reaches the port, not the first alone.
+    #[test]
+    fn q11_scoped_models_takes_every_pattern() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(
+            &mut harness.controller,
+            "/scoped-models deepseek/* openai/gpt-5*:high",
+        );
+        assert_eq!(
+            *harness.port.scopes.lock().expect("scopes"),
+            [Some("deepseek/* openai/gpt-5*:high".to_owned())]
+        );
+    }
+
+    /// Q14: with a gate, each finished turn runs it; a failure continues the run
+    /// with prime-agent's gate prompt, and a pass ends it.
+    #[test]
+    fn q14_autonomous_continues_until_the_gate_passes() {
+        use crate::interactive::autonomous::{GateFailure, GateResult, GateState};
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let plain = effects_to_plain(&submit_text(
+            &mut harness.controller,
+            "/autonomous on --gate \"cargo test\"",
+        ))
+        .join("\n");
+        assert!(plain.contains("[autonomous-status: on]"), "{plain}");
+        assert!(plain.contains("Gates: \"cargo test\"."), "{plain}");
+        let _ = submit_text(&mut harness.controller, "fix the parser");
+        assert_eq!(submissions(&harness), ["fix the parser"]);
+
+        done(&mut harness);
+        assert_eq!(
+            harness.port.gate_jobs.lock().expect("gates").len(),
+            1,
+            "the gate runs after the turn"
+        );
+        assert_eq!(
+            submissions(&harness).len(),
+            1,
+            "nothing continues before the verdict"
+        );
+
+        let failed = GateState {
+            last_failure: Some(GateFailure {
+                command: "cargo test".to_owned(),
+                attempt: 1,
+                exit_text: "exited 101".to_owned(),
+                output: "1 failed".to_owned(),
+            }),
+            ..GateState::default()
+        };
+        harness
+            .events
+            .send(SessionEvent::GatesChecked {
+                result: GateResult::Failed,
+                state: failed.clone(),
+            })
+            .expect("verdict");
+        let plain = effects_to_plain(&harness.controller.pump_events()).join("\n");
+        assert!(plain.contains("autonomous: continuing (1/3)"), "{plain}");
+        let continued = submissions(&harness);
+        assert_eq!(continued.len(), 2);
+        assert!(continued[1].starts_with(
+            "[autonomous-continuation: gate-failed]\n\nAutonomous quality gate failed (attempt 1/3): `cargo test` exited 101.\n\nOutput:\n1 failed\n"
+        ));
+
+        done(&mut harness);
+        let jobs = harness.port.gate_jobs.lock().expect("gates").clone();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[1].state, failed, "the gate remembers the last failure");
+        harness
+            .events
+            .send(SessionEvent::GatesChecked {
+                result: GateResult::Passed,
+                state: GateState::default(),
+            })
+            .expect("verdict");
+        let plain = effects_to_plain(&harness.controller.pump_events()).join("\n");
+        assert!(
+            plain.contains("autonomous: quality gates passed"),
+            "{plain}"
+        );
+        assert_eq!(submissions(&harness).len(), 2, "a pass ends the run");
+    }
+
+    /// Q14: without gates the run continues until a budget is spent, and a turn
+    /// that failed or was stopped is not carried on.
+    #[test]
+    fn q14_autonomous_without_gates_stops_at_its_limit() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(
+            &mut harness.controller,
+            "/autonomous on --max-continuations 2",
+        );
+        let _ = submit_text(&mut harness.controller, "work");
+        done(&mut harness);
+        done(&mut harness);
+        assert_eq!(submissions(&harness).len(), 3);
+        assert!(
+            submissions(&harness)[1]
+                .starts_with("[autonomous-continuation]\n\nNo human input is available")
+        );
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            })
+            .expect("terminal");
+        let plain = effects_to_plain(&harness.controller.pump_events()).join("\n");
+        assert!(
+            plain.contains("autonomous: stopped; maxContinuations reached"),
+            "{plain}"
+        );
+        assert_eq!(submissions(&harness).len(), 3);
+
+        let _ = submit_text(&mut harness.controller, "/autonomous on");
+        let _ = submit_text(&mut harness.controller, "again");
+        harness
+            .events
+            .send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Canceled,
+            })
+            .expect("terminal");
+        let _ = harness.controller.pump_events();
+        assert_eq!(
+            submissions(&harness).last().map(String::as_str),
+            Some("again"),
+            "a stopped turn is not carried on"
+        );
+        let status =
+            effects_to_plain(&submit_text(&mut harness.controller, "/autonomous")).join("\n");
+        // A limit not named again keeps its last value, as prime-agent's
+        // `setAutonomousLimits` does; only the counts start over.
+        assert!(
+            status.contains("Continuations: 0/2. Turns: 1/unlimited."),
+            "{status}"
+        );
+    }
+
+    /// Q14: a goal and autonomous mode do not drive the conversation together;
+    /// turning autonomous mode off stops gates that are running.
+    #[test]
+    fn q14_goal_and_autonomous_take_turns() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "/autonomous on --gate true");
+        let _ = submit_text(&mut harness.controller, "work");
+        done(&mut harness);
+        assert_eq!(harness.port.gate_jobs.lock().expect("gates").len(), 1);
+        let plain =
+            effects_to_plain(&submit_text(&mut harness.controller, "/goal ship it")).join("\n");
+        assert!(plain.contains("autonomous mode turned off"), "{plain}");
+        assert_eq!(*harness.port.gate_cancels.lock().expect("cancels"), 1);
+        done(&mut harness);
+        let plain =
+            effects_to_plain(&submit_text(&mut harness.controller, "/autonomous on")).join("\n");
+        assert!(
+            plain.contains("goal paused: autonomous mode drives this conversation now"),
+            "{plain}"
+        );
+        let error = effects_to_plain(&submit_text(
+            &mut harness.controller,
+            "/autonomous on --nope 1",
+        ))
+        .join("\n");
+        assert!(
+            error.contains("Unknown autonomous budget flag: --nope"),
+            "{error}"
         );
     }
 

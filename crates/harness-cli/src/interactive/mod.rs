@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod attachments;
+pub mod autonomous;
 pub mod bootstrap;
 pub mod bounds;
 pub mod commands;
@@ -38,6 +39,7 @@ pub mod queue;
 pub mod refine;
 pub mod repl;
 pub mod routing;
+pub mod schedules;
 pub mod service;
 pub mod side_question;
 pub mod skill_requests;

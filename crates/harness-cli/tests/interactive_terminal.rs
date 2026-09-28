@@ -611,7 +611,9 @@ fn i01_bare_launch_opens_the_app_in_a_real_terminal_and_exits_cleanly() {
     let (temp, project) = sandbox();
     let mut session = PtySession::spawn(&project, &base_env(&temp));
 
-    let text = session.wait_for("Harness Agents", Duration::from_secs(30));
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+    // The header is drawn before the composer: wait for the frame to finish.
+    let text = session.wait_for("Nhập yêu cầu", Duration::from_secs(10));
     assert!(session.is_alive(), "the app stays alive at the prompt");
     assert!(
         text.contains("Nhập yêu cầu"),
@@ -950,7 +952,9 @@ fn t07_pty_plain_flag() {
     let (temp, project) = sandbox();
     let mut session =
         PtySession::spawn_process(&project, &base_env(&temp), &["chat", "--plain"], &[]);
-    let transcript = session.wait_for("using the plain renderer", Duration::from_secs(30));
+    session.wait_for("using the plain renderer", Duration::from_secs(30));
+    // The reason follows on the same line, written after the first chunk.
+    let transcript = session.wait_for("plain renderer requested", Duration::from_secs(10));
     assert!(
         transcript.contains("plain renderer requested"),
         "{transcript}"
@@ -2396,6 +2400,50 @@ fn q03_pty_child_reports_to_its_parent() {
     finish(session);
 }
 
+/// Q03: a child's message that reaches the parent while the parent's last model
+/// call is already running is not lost with the turn: the next turn reads it.
+/// (Measured in the full PTY run: the message "reached the running turn" after
+/// its last step and was never read.)
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn q03b_pty_a_message_after_the_last_step_is_read_next() {
+    let provider = ScriptedSse::start(|request| {
+        if !from_parent(request) {
+            return if tool_results(request) == 0 {
+                Reply::Delay(
+                    Duration::from_millis(500),
+                    Box::new(Reply::Tool(
+                        "agent_message",
+                        serde_json::json!({"message": "late news"}),
+                    )),
+                )
+            } else {
+                Reply::Text("child done".to_owned())
+            };
+        }
+        let text = request_text(request);
+        if text.contains("[agent-message from child:") {
+            Reply::Text("parent-read-late-news".to_owned())
+        } else if tool_results(request) == 0 {
+            Reply::Tool(
+                "delegate",
+                serde_json::json!({"role": "explorer", "brief": "report late", "wait": false}),
+            )
+        } else {
+            // The parent's last call is in flight while the child's message lands.
+            Reply::Delay(
+                Duration::from_secs(3),
+                Box::new(Reply::Text("parent-turn-ends".to_owned())),
+            )
+        }
+    });
+    let (_temp, mut session) = scripted_session(&provider);
+    session.send("ask a child\r");
+    session.wait_for("parent-turn-ends", Duration::from_mins(1));
+    session.wait_for("parent-read-late-news", Duration::from_secs(30));
+    finish(session);
+}
+
 /// Q01+Q04: a child keeps running after its parent's turn; `/agents` lists it and
 /// `/agents stop` stops it, and the parent hears it was cancelled.
 #[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
@@ -2722,5 +2770,88 @@ fn q13_pty_waiting_line_is_shown() {
     session.wait_for("(1/30)", Duration::from_secs(30));
     session.wait_for("recovered-q13", Duration::from_mins(1));
     assert_eq!(calls.load(Ordering::SeqCst), 3);
+    finish(session);
+}
+
+/// Q14: a quality gate that fails carries the run on with prime-agent's gate
+/// prompt; the model fixes it, the gate passes, and the run stops there.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn q14_pty_gate_passes_after_one_fix() {
+    let provider = ScriptedSse::start(|request| {
+        let text = request_text(request);
+        if !text.contains("[autonomous-continuation: gate-failed]") {
+            Reply::Text("first-q14".to_owned())
+        } else if tool_results(request) == 0 {
+            Reply::Tool(
+                "write_file",
+                serde_json::json!({"path": "ok.txt", "content": "ok\n"}),
+            )
+        } else {
+            Reply::Text("fixed-q14".to_owned())
+        }
+    });
+    let (temp, mut session) = scripted_session(&provider);
+    #[cfg(windows)]
+    let gate = "if (Test-Path ok.txt) { exit 0 } else { exit 1 }";
+    #[cfg(not(windows))]
+    let gate = "test -f ok.txt";
+    session.send(&format!("/autonomous on --gate \"{gate}\"\r"));
+    session.wait_for("[autonomous-status:", Duration::from_secs(20));
+    session.send("go\r");
+    session.wait_for("first-q14", Duration::from_mins(1));
+    session.wait_for("fixed-q14", Duration::from_mins(2));
+    session.wait_for("passed", Duration::from_mins(1));
+    assert!(
+        temp.path()
+            .join("project with spaces")
+            .join("ok.txt")
+            .is_file()
+    );
+    let requests = provider.requests();
+    let continued = requests
+        .iter()
+        .filter(|(_, request)| {
+            last_user_text(request).contains("[autonomous-continuation: gate-failed]")
+        })
+        .count();
+    assert!(continued >= 1, "the gate failure was sent to the model");
+    assert!(
+        requests
+            .iter()
+            .any(|(_, request)| last_user_text(request).contains("(attempt 1/3)")),
+        "prime-agent's gate prompt names the attempt"
+    );
+    finish(session);
+}
+
+/// Q15: a scheduled job runs on its own while the app is open, and it is kept
+/// on disk for the conversation.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn q15_pty_scheduled_job_fires() {
+    let provider = ScriptedSse::start(|request| {
+        if last_user_text(request).contains("say-q15") {
+            Reply::Text("scheduled-ran-q15".to_owned())
+        } else {
+            Reply::Text("hello-q15".to_owned())
+        }
+    });
+    let (temp, mut session) = scripted_session(&provider);
+    session.send("/schedule add every 10s -- say-q15\r");
+    session.wait_for("job-1", Duration::from_secs(20));
+    session.send("\u{1b}");
+    session.wait_for("scheduled-ran-q15", Duration::from_mins(1));
+    let schedules = ha_home(&temp).join("data").join("schedules");
+    let saved = std::fs::read_dir(&schedules)
+        .expect("the schedules directory")
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .collect::<String>();
+    assert!(saved.contains("say-q15"), "{saved}");
+    assert!(
+        saved.contains("\"runCount\": 1") || saved.contains("\"runCount\": 2"),
+        "{saved}"
+    );
     finish(session);
 }

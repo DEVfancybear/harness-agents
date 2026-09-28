@@ -325,6 +325,41 @@ pub async fn run_hook_command_with_host(
     })
 }
 
+/// Run a shell command the user wrote themselves - an autonomous quality gate -
+/// in the workspace, with the same shell and scrubbed environment the model's
+/// shell tool gets, bounded by `timeout_ms` and stopped (tree and all) on
+/// cancellation.
+pub async fn run_user_command(
+    root: &Path,
+    command: &str,
+    timeout_ms: u64,
+    cancellation: CancellationToken,
+) -> Result<HookProcessResult, HarnessError> {
+    let result = run_shell(
+        root,
+        command,
+        timeout_ms,
+        cancellation,
+        &ProcessEnvironment::empty(),
+        &ProcessSpoolConfig::default(),
+    )
+    .await?;
+    Ok(HookProcessResult {
+        exit_code: result.exit_code,
+        status: if result.timed_out {
+            HookProcessStatus::TimedOut
+        } else if result.canceled {
+            HookProcessStatus::Canceled
+        } else {
+            HookProcessStatus::Exited
+        },
+        stdout: result.stdout,
+        stderr: result.stderr,
+        stdout_truncated: result.stdout_truncated,
+        stderr_truncated: result.stderr_truncated,
+    })
+}
+
 /// Bounded output and status from one hook process.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HookProcessResult {

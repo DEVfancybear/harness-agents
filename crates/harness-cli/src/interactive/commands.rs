@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 41] = [
+pub const SLASH_COMMANDS: [SlashCommand; 43] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -128,6 +128,22 @@ pub const SLASH_COMMANDS: [SlashCommand; 41] = [
             "/goal",
             "[objective]",
             "Set or view a persistent goal; supports pause, resume, and clear",
+        )
+    },
+    SlashCommand {
+        options: &["status", "on", "off"],
+        ..command(
+            "/autonomous",
+            "[status|off|on [--max-continuations <n>] [--max-turns <n>] [--max-tokens <n>] [--timeout-ms <n>] [--gate <command>]]",
+            "Set or view autonomous mode with an optional budget",
+        )
+    },
+    SlashCommand {
+        options: &["list", "add", "pause", "resume", "cancel"],
+        ..command(
+            "/schedule",
+            "[list|add <when> -- <prompt>|pause|resume|cancel <id>]",
+            "Schedule prompts for this conversation (in 10m, every 1h, at <date>, cron)",
         )
     },
     command(

@@ -60,3 +60,25 @@
 | `generate_schemas` | `harness-config.v2.schema.json` thêm `routing`; `error-report.v1.schema.json` thêm `rate_limited` |
 
 **not_run:** toàn bộ workspace, 25 ca PTY cũ, live smoke với provider thật (429 thật, model phụ thật).
+
+
+# Evidence CP-4 (Q14–Q15) và lượt chạy toàn bộ của track
+
+- **Trạng thái:** `implemented_verified_with_known_failure` — toàn workspace và PTY đầy đủ đã chạy; còn `i12` đỏ **từ trước track** (xem dưới).
+- **Base:** `3f423c1`; Windows 11, PowerShell 7.6.6; 28/09/2026.
+
+| Lệnh | Kết quả |
+|---|---|
+| `cargo test -p harness-cli --bin ha -- q14 q15` | 9 unit (có `q14_unchanged_worktree_skips_the_gate` chạy git + pwsh thật) + 3 controller xanh; lần đầu `/autonomous`, `/schedule` và **`/scoped-models` (CP-3)** chỉ nhận từ đầu tiên của tham số → `q11_scoped_models_takes_every_pattern` đỏ (port nhận `deepseek/*`), sửa dùng `raw_argument`, xanh; `q14_autonomous_without_gates_stops_at_its_limit` đỏ vì kỳ vọng sai (prime giữ giới hạn cũ khi bật lại) → sửa test |
+| `Invoke-HaPtyAcceptance.ps1 -Filter q1` | 5 passed (q10, q11, q13, q14, q15), `PTY_EXIT: 0` |
+| `cargo test --workspace --locked --no-fail-fast` | **958 passed, 2 failed, 39 ignored**; 2 đỏ là hai test chập chờn đã biết (`g09_hook_cannot_turn_ask_into_allow`, `a_dead_owners_journal_is_reaped_and_removed`) — chạy riêng: 2 passed; `p0_f03_contract_schemas_are_generated_from_real_types` xanh; không crate nào lỗi biên dịch |
+| PTY đầy đủ lần 1 (`-TimeoutSeconds 1500`) | 35 passed, 2 failed: `q03_pty_child_reports_to_its_parent` (lỗi thật: tin tới sau bước cuối bị mất - chạy riêng 3/3 xanh, xem SPEC) và `i12` |
+| PTY đầy đủ lần 2 (sau bản sửa inbox + ca q03b) | 35 passed, 3 failed: `i12`, `i01`, `t07_pty_plain_flag`; `i01`/`t07` chạy riêng: đỏ 1/3 và 1/3 (test chờ chữ đầu khung rồi kiểm chữ vẽ sau) → sửa test chờ đúng chữ; sau sửa 4/4 và 4/4 xanh |
+| **PTY đầy đủ lần 3 (bản cuối)** | **37 passed, 1 failed (`i12`)**, 38 ca = 25 cũ + 13 ca q |
+| `i12` ở mốc `48676b6` (worktree riêng, trước track) | **đỏ cùng dòng 2020** → không do track này |
+| `cargo test -p harness-cli --bin ha` (bản cuối) | 491 passed, 0 failed |
+| `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`, `Verify-Docs.ps1` | sạch, `FMT_OK`, `DOCS_OK` |
+
+**Lỗi còn lại, có từ trước:** `i12_a_prompt_with_an_unreachable_provider_is_reported_and_the_app_stays_alive` đòi thông báo lỗi nêu endpoint (`127.0.0.1:<port>`), nhưng commit `7a1dcc5` (audit 22/09) cố ý bỏ URL khỏi lỗi gửi request (`error.without_url()`), và đầu TUI không còn in endpoint. Thông báo hiện là `failed: service_unavailable: provider request failed: error sending request`. Chọn một: nêu host:port (không path/query) trong lỗi kết nối, hoặc sửa kỳ vọng của test — cần người dùng quyết (không tự nới test).
+
+**not_run:** live smoke với provider thật (429 thật, model phụ thật, gate dài).

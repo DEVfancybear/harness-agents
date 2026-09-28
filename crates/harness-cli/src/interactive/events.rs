@@ -636,6 +636,17 @@ pub enum SessionEvent {
     ProviderWaiting {
         line: Option<String>,
     },
+    /// A message reached the turn's inbox after its last step: the user's steer
+    /// or (`verbatim`) another agent's message, for the next turn.
+    UnreadMessage {
+        text: String,
+        verbatim: bool,
+    },
+    /// The autonomous quality gates ran: their verdict and what they remember.
+    GatesChecked {
+        result: super::autonomous::GateResult,
+        state: super::autonomous::GateState,
+    },
     /// The answer to a `/btw` side question, or why there is none.
     SideAnswer {
         question: String,

@@ -856,6 +856,17 @@ impl SessionAgents {
         }
     }
 
+    /// How many children are still working.
+    #[must_use]
+    pub fn running(&self) -> usize {
+        self.shared.children.lock().map_or(0, |children| {
+            children
+                .iter()
+                .filter(|child| !child.deleted && !child.state.settled())
+                .count()
+        })
+    }
+
     /// Stop the running child named `selector` - or every one, for `all` - with
     /// `reason` in its notice. Returns how many were stopped.
     ///

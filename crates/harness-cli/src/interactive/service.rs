@@ -279,6 +279,25 @@ pub trait SessionPort: Send {
     fn due_heartbeats(&mut self) -> Vec<super::heartbeat::Due> {
         Vec::new()
     }
+    /// `/schedule`: list, add, pause, resume or cancel this conversation's jobs.
+    fn schedule(&mut self, _argument: Option<&str>) -> Result<Vec<String>, String> {
+        Err("this backend keeps no schedules".to_owned())
+    }
+    /// The session's input and output tokens so far, for autonomous budgets.
+    fn session_tokens(&self) -> u64 {
+        0
+    }
+    /// How many delegated children are still working.
+    fn running_children(&self) -> usize {
+        0
+    }
+    /// Run autonomous quality gates in the workspace; the verdict arrives as
+    /// [`SessionEvent::GatesChecked`].
+    fn run_gates(&mut self, _job: super::autonomous::GateJob) -> Result<(), String> {
+        Err("this backend cannot run quality gates".to_owned())
+    }
+    /// Stop quality gates that are running.
+    fn cancel_gates(&mut self) {}
     /// Choose the thinking level for the next turns.
     fn set_thinking(&mut self, _level: &str) -> Result<String, String> {
         Err("this backend does not support thinking levels".to_owned())
@@ -1621,6 +1640,10 @@ pub struct AgentSessionService {
     turns_since_review: Arc<std::sync::atomic::AtomicU32>,
     /// The agent's own recurring prompts (`rlm_heartbeat`), for the whole session.
     heartbeats: Arc<super::heartbeat::Heartbeats>,
+    /// `/schedule` jobs of the conversation in use, kept on disk.
+    schedules: Arc<super::schedules::Schedules>,
+    /// Stops the autonomous quality gates that are running.
+    gate_cancellation: Option<CancellationToken>,
     /// `HA_AUTO_REFINE=off` turns the automatic review off (prime-agent's
     /// `autoRefine.enabled`, on by default).
     auto_refine: bool,
@@ -1949,6 +1972,42 @@ struct ActiveTurnInbox {
     inbox: RunInbox,
     store: Arc<SqliteStore>,
     session_id: SessionId,
+    /// Messages on their way into the inbox, so the turn that ends waits for
+    /// them before it hands what it did not read to the next turn.
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// The messages that reached a turn's inbox after its last step: prime-agent
+/// keeps a steer the run did not take for the next one, so they are handed back
+/// instead of being dropped with the run.
+async fn carry_unread_messages(active: ActiveTurnInbox, sender: &UnboundedSender<SessionEvent>) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while active.in_flight.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let Ok(Some(run)) = active.store.latest_run(&active.session_id).await else {
+        return;
+    };
+    let now = harness_runtime::now_unix_ms();
+    let Ok(commands) = active.inbox.claim(&run, 64, now).await else {
+        return;
+    };
+    for command in commands {
+        if command.kind != harness_store_sqlite::RunCommandKind::Steer {
+            continue;
+        }
+        let Some(text) = RunInbox::steering_text(&command) else {
+            continue;
+        };
+        let _ = active
+            .inbox
+            .apply(&command, "carried to the next turn", now)
+            .await;
+        let _ = sender.send(SessionEvent::UnreadMessage {
+            text,
+            verbatim: RunInbox::is_verbatim(&command),
+        });
+    }
 }
 
 /// How long a gated action waits for the user before it expires.
@@ -2053,7 +2112,10 @@ impl AgentSessionService {
     ) -> Self {
         let gate = Arc::new(ChannelApprovalGate::new(sender.clone(), APPROVAL_TIMEOUT));
         super::custom_models::use_beside(&context.paths.config_file);
-        if let Err(error) = super::providers::Catalog::bundled().apply_custom() {
+        // Checked only when there is a file: startup does not pay for the catalog.
+        if super::custom_models::path().is_some_and(|path| path.is_file())
+            && let Err(error) = super::providers::Catalog::bundled().apply_custom()
+        {
             let _ = sender.send(SessionEvent::Notice {
                 message: format!(
                     "{}: {error} - using built-in models only",
@@ -2089,6 +2151,12 @@ impl AgentSessionService {
             context.paths.data_dir.join("delegation"),
         )
         .expect("the delegation scheduler starts with a fixed, valid configuration");
+        let task_id = TaskId::generate();
+        let schedules = Arc::new(super::schedules::Schedules::default());
+        schedules.bind(super::schedules::path_for(
+            &context.paths.data_dir,
+            task_id.as_str(),
+        ));
         Self {
             sender,
             store_dir: context.project_store_dir(),
@@ -2108,7 +2176,7 @@ impl AgentSessionService {
             cost_tracker: Arc::new(Mutex::new(CostTracker::default())),
             session_mode: Arc::new(Mutex::new(None)),
             auto_allowed_count: Arc::new(AtomicUsize::new(0)),
-            task_id: TaskId::generate(),
+            task_id,
             previous_session: Arc::new(Mutex::new(None)),
             active_inbox: Arc::new(Mutex::new(None)),
             gate,
@@ -2131,9 +2199,19 @@ impl AgentSessionService {
             thinking: None,
             turns_since_review: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             heartbeats: Arc::new(super::heartbeat::Heartbeats::default()),
+            schedules,
+            gate_cancellation: None,
             live: Arc::new(LiveTurn::default()),
             auto_refine,
         }
+    }
+
+    /// The jobs of the conversation this session is now in.
+    fn follow_schedules(&self) {
+        self.schedules.bind(super::schedules::path_for(
+            &self.data_dir,
+            self.task_id.as_str(),
+        ));
     }
 
     /// How full the context is, what the session has used, and the limits the
@@ -2292,6 +2370,8 @@ impl AgentSessionService {
     fn show_conversation(&self, source: SessionId) {
         let sender = self.sender.clone();
         let store_dir = self.store_dir.clone();
+        let schedules = Arc::clone(&self.schedules);
+        let data_dir = self.data_dir.clone();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -2306,12 +2386,16 @@ impl AgentSessionService {
                 }
             };
             let goal = match store.session_task(&source).await {
-                Ok(Some(task)) => store
-                    .session_setting(&task, super::goal::GOAL_SETTING)
-                    .await
-                    .ok()
-                    .flatten()
-                    .filter(|objective| !objective.trim().is_empty()),
+                Ok(Some(task)) => {
+                    // The resumed conversation's scheduled jobs come back with it.
+                    schedules.bind(super::schedules::path_for(&data_dir, task.as_str()));
+                    store
+                        .session_setting(&task, super::goal::GOAL_SETTING)
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|objective| !objective.trim().is_empty())
+                }
                 _ => None,
             };
             match harness_runtime::conversation_history(&store, &source).await {
@@ -3073,7 +3157,45 @@ impl SessionPort for AgentSessionService {
     }
 
     fn due_heartbeats(&mut self) -> Vec<super::heartbeat::Due> {
-        self.heartbeats.due(std::time::Instant::now())
+        let mut due = self.heartbeats.due(std::time::Instant::now());
+        due.extend(self.schedules.due(chrono::Utc::now()));
+        due
+    }
+
+    fn schedule(&mut self, argument: Option<&str>) -> Result<Vec<String>, String> {
+        super::schedules::command(&self.schedules, argument)
+    }
+
+    fn session_tokens(&self) -> u64 {
+        self.cost_tracker.lock().map_or(0, |tracker| {
+            let (input, output) = tracker.tokens();
+            input.saturating_add(output)
+        })
+    }
+
+    fn running_children(&self) -> usize {
+        self.agents.running()
+    }
+
+    fn run_gates(&mut self, job: super::autonomous::GateJob) -> Result<(), String> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        self.cancel_gates();
+        let cancellation = CancellationToken::new();
+        self.gate_cancellation = Some(cancellation.clone());
+        let sender = self.sender.clone();
+        let root = self.workspace_root.clone();
+        handle.spawn(async move {
+            let (result, state) = super::autonomous::run_gates(&root, job, cancellation).await;
+            let _ = sender.send(SessionEvent::GatesChecked { result, state });
+        });
+        Ok(())
+    }
+
+    fn cancel_gates(&mut self) {
+        if let Some(token) = self.gate_cancellation.take() {
+            token.cancel();
+        }
     }
 
     fn cycle_model(&mut self, forward: bool) -> Result<String, String> {
@@ -3545,6 +3667,7 @@ impl SessionPort for AgentSessionService {
         }
         if source.is_none() {
             self.task_id = TaskId::generate();
+            self.follow_schedules();
             if let Ok(mut tracker) = self.cost_tracker.lock() {
                 tracker.forget_context();
             }
@@ -3761,6 +3884,7 @@ impl AgentSessionService {
             thread.clear();
         }
         self.task_id = TaskId::generate();
+        self.follow_schedules();
         if let Ok(mut tracker) = self.cost_tracker.lock() {
             tracker.forget_context();
         }
@@ -3787,6 +3911,9 @@ impl AgentSessionService {
         let text = text.to_owned();
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        // Counted while the inbox is still the running turn's, so a turn that ends
+        // meanwhile waits for this message before it looks for unread ones.
+        active.in_flight.fetch_add(1, Ordering::SeqCst);
         handle.spawn(async move {
             let result = async {
                 let deadline = Instant::now() + Duration::from_secs(2);
@@ -3819,6 +3946,7 @@ impl AgentSessionService {
                 Ok::<(), String>(())
             }
             .await;
+            active.in_flight.fetch_sub(1, Ordering::SeqCst);
             if let Err(error) = result {
                 let _ = sender.send(SessionEvent::Notice {
                     message: format!("steering note was not queued: {error}"),
@@ -4971,6 +5099,7 @@ async fn run_turn(
             inbox: run_inbox.clone(),
             store: Arc::clone(&store),
             session_id: session_id.clone(),
+            in_flight: Arc::new(AtomicUsize::new(0)),
         });
     }
     let driver = driver.with_inbox(run_inbox);
@@ -5049,8 +5178,14 @@ async fn run_turn(
         }
     }
 
-    if let Ok(mut active) = active_inbox.lock() {
-        *active = None;
+    // No message enters this turn's inbox from here on; what came after its last
+    // step goes to the next turn.
+    let finished_inbox = active_inbox
+        .lock()
+        .ok()
+        .and_then(|mut active| active.take());
+    if let Some(finished) = finished_inbox {
+        carry_unread_messages(finished, &sender).await;
     }
 
     // Release the writer before announcing the terminal event: the next turn takes
@@ -6602,6 +6737,85 @@ mod tests {
             .close()
             .await
             .expect("close store");
+    }
+
+    /// A message that lands in a turn's inbox after its last step - or is still
+    /// on its way there when the turn ends - goes to the next turn instead of
+    /// being dropped with the run. (Measured in the full PTY run: a child's
+    /// message "reached the running turn" and was never read.)
+    #[tokio::test]
+    async fn q03_unread_inbox_messages_are_carried_to_the_next_turn() {
+        use super::{ActiveTurnInbox, carry_unread_messages};
+        use harness_runtime::RunInbox;
+        use harness_types::{InputId, SessionId, TaskId};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+        let temp = tempfile::tempdir().expect("temporary root");
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                temp.path().join("data"),
+                harness_types::HostId::generate(),
+            ))
+            .await
+            .expect("store opens"),
+        );
+        let session = SessionId::generate();
+        let task = TaskId::generate();
+        let run = store
+            .start_run(&session, &task, &InputId::generate(), None)
+            .await
+            .expect("run starts");
+        let inbox = RunInbox::new(Arc::clone(&store));
+        inbox
+            .deliver(
+                &run,
+                "[agent-message from child:explorer-1]\n\nlate news",
+                1,
+            )
+            .await
+            .expect("delivered");
+        let active = ActiveTurnInbox {
+            inbox: inbox.clone(),
+            store: Arc::clone(&store),
+            session_id: session.clone(),
+            in_flight: Arc::new(AtomicUsize::new(1)),
+        };
+        // A user's steer still on its way when the turn ends.
+        let late = active.clone();
+        let late_run = run.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            late.inbox
+                .steer(&late_run, "also check the lexer", 2)
+                .await
+                .expect("steered");
+            late.in_flight.fetch_sub(1, Ordering::SeqCst);
+        });
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        carry_unread_messages(active.clone(), &sender).await;
+        writer.await.expect("writer");
+        let mut carried = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let SessionEvent::UnreadMessage { text, verbatim } = event {
+                carried.push((text, verbatim));
+            }
+        }
+        assert_eq!(
+            carried,
+            [
+                (
+                    "[agent-message from child:explorer-1]\n\nlate news".to_owned(),
+                    true
+                ),
+                ("also check the lexer".to_owned(), false),
+            ]
+        );
+        // Handed over once: nothing is left for another sweep.
+        carry_unread_messages(active, &sender).await;
+        assert!(receiver.try_recv().is_err());
+        drop(inbox);
+        drop(store);
     }
 
     #[tokio::test]

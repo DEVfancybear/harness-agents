@@ -56,7 +56,7 @@ pub use policy::{
 // sandbox it does not have.
 pub use process::{
     HookProcessResult, HookProcessStatus, HostEnvironment, PROCESS_ENVIRONMENT_ALLOWLIST,
-    run_hook_command, run_hook_command_with_host,
+    run_hook_command, run_hook_command_with_host, run_user_command,
 };
 // Re-exported so a CLI that drives the loop reads acceptance from the same
 // place the driver writes it.
