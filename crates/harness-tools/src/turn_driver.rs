@@ -505,10 +505,12 @@ impl TurnDriver {
                 }
                 RunCommandKind::Steer => {
                     if let Some(text) = RunInbox::steering_text(command) {
-                        appended.push(ProviderMessage::new(
-                            MessageRole::User,
-                            format!("[steering correction from the user]\n{text}"),
-                        ));
+                        let text = if RunInbox::is_verbatim(command) {
+                            text
+                        } else {
+                            format!("[steering correction from the user]\n{text}")
+                        };
+                        appended.push(ProviderMessage::new(MessageRole::User, text));
                     }
                     inbox
                         .apply(

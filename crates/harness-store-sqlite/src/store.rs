@@ -2547,6 +2547,36 @@ impl SqliteStore {
         })
     }
 
+    /// Hand a task this open store holds to the task's next session.
+    ///
+    /// A task lease belongs to one session of one store instance. A conversation
+    /// used to open the store for each turn, so each turn came with a new host
+    /// and took the task over from the one before. When the store stays open
+    /// across turns (a delegated child still writes through it), the next turn is
+    /// the same host at the same generation, and the previous turn's lease would
+    /// refuse it. Only this instance's own lease is released; one another host
+    /// holds is left to the claim's usual rules.
+    pub async fn release_task_lease(&self, task_id: &TaskId) -> Result<(), StoreError> {
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        sqlx::query("DELETE FROM task_leases WHERE task_id = ? AND host_id = ? AND generation = ?")
+            .bind(task_id.as_str())
+            .bind(fence.host_id.as_str())
+            .bind(to_i64(fence.generation, "task lease generation")?)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::StorageWriteFailed, "release task lease", error)
+            })?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit task lease release",
+                error,
+            )
+        })
+    }
+
     /// Open the session a fork will read its lineage from.
     ///
     /// A fork copies a view of the parent's indexed sources, never an

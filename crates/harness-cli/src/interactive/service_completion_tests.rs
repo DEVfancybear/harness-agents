@@ -2,7 +2,8 @@
 use super::*;
 use crate::interactive::bootstrap::{self, LaunchRequest};
 use crate::interactive::paths::HostPlatform;
-use harness_types::ProjectId;
+use harness_store_sqlite::WriterOpenOptions;
+use harness_types::{HostId, ProjectId};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::Instant;

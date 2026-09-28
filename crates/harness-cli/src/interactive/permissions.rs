@@ -230,6 +230,7 @@ mod tests {
             mcp_servers: BTreeMap::new(),
             project_trusted: false,
             bell: false,
+            agents_default_model: None,
             explain: vec![ConfigExplainEntry {
                 key: "approval".to_owned(),
                 value: approval.to_owned(),

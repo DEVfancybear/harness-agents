@@ -37,6 +37,7 @@ pub mod repl;
 pub mod service;
 pub mod skill_requests;
 pub mod skills;
+pub mod store_lease;
 pub mod terminal;
 pub mod tui;
 pub mod view;

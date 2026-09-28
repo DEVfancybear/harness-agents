@@ -173,6 +173,8 @@ pub struct ResolvedConfig {
     pub mcp_servers: BTreeMap<String, McpServerConfigV2>,
     pub project_trusted: bool,
     pub bell: bool,
+    /// `[agents] default_model`: the model a delegated child runs on by default.
+    pub agents_default_model: Option<String>,
     pub explain: Vec<ConfigExplainEntry>,
     pub project_config_reason: Option<String>,
 }
@@ -203,6 +205,7 @@ pub fn resolve_layers(
     let mut mcp_servers = BTreeMap::new();
     let mut notify_command = None;
     let mut bell = false;
+    let mut agents_default_model: Option<String> = None;
     let mut approval = "ask".to_owned();
     let mut approval_layer = ConfigLayer::Default;
     let mut allow_rules = Vec::new();
@@ -278,6 +281,12 @@ pub fn resolve_layers(
             config,
             ConfigLayer::User,
         )?;
+        apply_agents(
+            &mut agents_default_model,
+            config,
+            ConfigLayer::User,
+            &mut entries,
+        );
         mcp_servers.extend(config.mcp_servers.clone());
     }
     // The servers `/mcp add` saved beside the user config, at the user layer: a
@@ -354,6 +363,12 @@ pub fn resolve_layers(
                 &config,
                 ConfigLayer::Project,
             )?;
+            apply_agents(
+                &mut agents_default_model,
+                &config,
+                ConfigLayer::Project,
+                &mut entries,
+            );
             mcp_servers.extend(config.mcp_servers.clone());
         }
     } else if project_path.exists() {
@@ -420,6 +435,12 @@ pub fn resolve_layers(
         if let Some(value) = config.ui.as_ref().and_then(|ui| ui.bell) {
             bell = value;
         }
+        apply_agents(
+            &mut agents_default_model,
+            &config,
+            ConfigLayer::Local,
+            &mut entries,
+        );
     }
 
     let mut profile = overrides.profile.clone().or_else(|| {
@@ -600,6 +621,7 @@ pub fn resolve_layers(
         mcp_servers,
         project_trusted: trusted,
         bell,
+        agents_default_model,
         explain,
         project_config_reason: project_reason,
     })
@@ -663,6 +685,25 @@ fn apply_permissions(
     }
     explain_permission_rules(entries, "permissions.deny", &permissions.deny, layer);
     Ok(())
+}
+
+/// `[agents] default_model` of one layer; a later layer wins.
+fn apply_agents(
+    default_model: &mut Option<String>,
+    config: &HarnessConfigV2,
+    layer: ConfigLayer,
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+) {
+    if let Some(model) = config
+        .agents
+        .as_ref()
+        .and_then(|agents| agents.default_model.as_deref())
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        *default_model = Some(model.to_owned());
+        set_explain(entries, "agents.default_model", model, layer, None);
+    }
 }
 
 fn apply_hooks(

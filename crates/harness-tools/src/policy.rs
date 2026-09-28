@@ -341,7 +341,11 @@ impl ToolPolicy {
                     "list_skills" | "activate_skill" | "read_skill_file"
                 ))
                 // Marking the user's own goal complete changes only host state.
-                || (plugin_id == "goal" && tool_name == "goal_complete"))
+                || (plugin_id == "goal" && tool_name == "goal_complete")
+                // A delegated child's message to its family and its progress note
+                // stay inside the session, as prime-agent's agent messages do.
+                || (plugin_id == "agent"
+                    && matches!(tool_name.as_str(), "agent_message" | "progress_note")))
         {
             return Decision::Allow {
                 reason: "skill catalogue (read-only)".to_owned(),

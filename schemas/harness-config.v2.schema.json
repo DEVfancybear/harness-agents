@@ -1,5 +1,19 @@
 {
   "$defs": {
+    "AgentsConfigV2": {
+      "additionalProperties": false,
+      "properties": {
+        "default_model": {
+          "default": null,
+          "description": "The model a child runs on when it does not ask for one, as `provider/id`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "CliOutputFormat": {
       "enum": [
         "text",
@@ -399,6 +413,18 @@
   "additionalProperties": false,
   "description": "Additive user configuration contract for the interactive agent.\n\nThe v1 [`HarnessConfig`] remains frozen for P0 consumers and keeps generating\n`harness-config.v1.schema.json`; this v2 contract is emitted separately.",
   "properties": {
+    "agents": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AgentsConfigV2"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Delegated children: prime-agent's `subagentDefaultModel`."
+    },
     "cli": {
       "$ref": "#/$defs/CliPresentationConfig",
       "default": {

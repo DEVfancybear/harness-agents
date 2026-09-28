@@ -50,6 +50,37 @@ impl RunInbox {
         .await
     }
 
+    /// Queue a message the next step reads as it is written - another agent's
+    /// message, which already says who it is from - rather than as the user's
+    /// steering correction.
+    pub async fn deliver(
+        &self,
+        run: &RunRecord,
+        text: impl Into<String>,
+        now_unix_ms: u64,
+    ) -> Result<RunCommandRecord, RuntimeError> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(RuntimeError::new(
+                ErrorCode::InvalidPayload,
+                "a message needs text",
+            ));
+        }
+        self.enqueue(
+            run,
+            RunCommandKind::Steer,
+            json!({"text": text, "verbatim": true}),
+            now_unix_ms,
+        )
+        .await
+    }
+
+    /// Whether a steering command is delivered as written ([`Self::deliver`]).
+    #[must_use]
+    pub fn is_verbatim(command: &RunCommandRecord) -> bool {
+        command.payload["verbatim"].as_bool() == Some(true)
+    }
+
     /// Queue a cancel. The run stops at the next boundary without dispatching.
     pub async fn cancel(
         &self,

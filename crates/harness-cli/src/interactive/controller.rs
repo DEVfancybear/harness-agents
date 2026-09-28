@@ -219,6 +219,13 @@ pub struct InteractiveController {
     pending_compact: Option<String>,
     /// Heartbeats that came due while the session was busy, sent when it is free.
     pending_heartbeats: std::collections::VecDeque<String>,
+    /// What delegated children sent while the parent was busy - prime-agent's
+    /// terminal notices and child messages - read in turns of their own once it is
+    /// free, as prime-agent queues them on its follow-up lane.
+    pending_notices: std::collections::VecDeque<String>,
+    /// After the user stopped a turn, children's notices wait for the user's next
+    /// turn to end rather than starting work the user just interrupted.
+    notices_held: bool,
     /// What the tool about to settle returned, shown under its card in the TUI.
     pending_tool_output: Option<String>,
     /// prime-agent's detail mode, cycled with ctrl+o.
@@ -295,6 +302,8 @@ impl InteractiveController {
             goal: None,
             pending_compact: None,
             pending_heartbeats: std::collections::VecDeque::new(),
+            pending_notices: std::collections::VecDeque::new(),
+            notices_held: false,
             pending_tool_output: None,
             detail: super::events::Detail::default(),
             exit_armed_at: None,
@@ -834,6 +843,52 @@ impl InteractiveController {
     /// Send the agent's heartbeats that came due (prime-agent's RLM heartbeats): a
     /// free session runs one at once; a running turn gets a `steer` heartbeat through
     /// the `/steer` inbox, and a `follow_up` one waits for the turn to end.
+    /// Whether the parent can start a turn of its own right now.
+    fn free_for_automatic_turn(&self) -> bool {
+        !self.phase.has_active_run()
+            && self.pending_approval.is_none()
+            && self.pending_question.is_none()
+    }
+
+    /// A child's terminal notice: a turn of its own when the parent is free,
+    /// otherwise it waits for the running turn to end. It is never steered into
+    /// the running turn, as prime-agent's notices ride its follow-up lane.
+    fn deliver_notice(&mut self, name: &str, notice: String, effects: &mut Vec<Effect>) {
+        if self.free_for_automatic_turn() && !self.notices_held && self.pending_notices.is_empty() {
+            effects.extend(self.dispatch(notice, true));
+        } else {
+            self.pending_notices.push_back(notice);
+            self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: format!(
+                        "child {name} finished; its report is read when this turn ends"
+                    ),
+                },
+            );
+        }
+    }
+
+    /// A child's message to its parent, delivered as prime-agent delivers agent
+    /// messages: into the running turn at its next step, or as a turn of its own.
+    fn deliver_agent_message(&mut self, text: String, effects: &mut Vec<Effect>) {
+        if self.phase.has_active_run() && self.service.deliver_message(&text).is_ok() {
+            self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: "a child's message reached the running turn".to_owned(),
+                },
+            );
+        } else if self.free_for_automatic_turn()
+            && !self.notices_held
+            && self.pending_notices.is_empty()
+        {
+            effects.extend(self.dispatch(text, true));
+        } else {
+            self.pending_notices.push_back(text);
+        }
+    }
+
     fn deliver_heartbeats(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
         for due in self.service.due_heartbeats() {
@@ -1295,6 +1350,12 @@ impl InteractiveController {
                 });
                 self.phase = AppPhase::WaitingMcpInput;
             }
+            SessionEvent::ChildSettled { name, notice } => {
+                self.deliver_notice(&name, notice, effects);
+            }
+            SessionEvent::AgentMessage { text } => {
+                self.deliver_agent_message(text, effects);
+            }
             SessionEvent::GoalCompleted { summary } => {
                 self.flush_stream(effects);
                 if let Some(goal) = &mut self.goal {
@@ -1356,6 +1417,19 @@ impl InteractiveController {
                 if let Some(text) = self.queued_input.take() {
                     self.close_run_grant();
                     effects.extend(self.dispatch(text, false));
+                    return;
+                }
+                if matches!(outcome, RunOutcome::Canceled) {
+                    self.notices_held = true;
+                }
+                // What a child reported while this turn ran is read now, one turn
+                // for each report.
+                if !self.notices_held
+                    && let Some(text) = self.pending_notices.pop_front()
+                {
+                    self.close_run_grant();
+                    effects.extend(self.dispatch(text, true));
+                    self.finish_pending_exit(effects);
                     return;
                 }
                 // A heartbeat that waited for this turn runs now.
@@ -1516,6 +1590,9 @@ impl InteractiveController {
             ];
         }
         let text = self.attach_pending_shell_outputs(text);
+        if !automatic {
+            self.notices_held = false;
+        }
         let input_id = InputId::generate();
         self.fresh_run(Instant::now(), Some(text.clone()));
         self.service.submit(SubmitRequest {
@@ -2004,9 +2081,24 @@ impl InteractiveController {
                     }
                 }
             }
-            "/agents" => {
-                self.reference("/agents", self.service.agents_summary(), &mut effects);
-            }
+            "/agents" => match raw_argument.map(|rest| rest.split_once(' ').unwrap_or((rest, ""))) {
+                // prime-agent stops a child with `rlm.delete_subagent`; the user
+                // stops one here, and it reports as cancelled.
+                Some(("stop", target)) => {
+                    let target = if target.trim().is_empty() { "all" } else { target.trim() };
+                    match self.service.stop_agents(target) {
+                        Ok(message) => self.push_history(
+                            &mut effects,
+                            HistoryItem::Notice { message },
+                        ),
+                        Err(message) => {
+                            self.push_history(&mut effects, HistoryItem::Error { message });
+                        }
+                    }
+                    effects.push(Effect::Redraw);
+                }
+                _ => self.reference("/agents", self.service.agents_summary(), &mut effects),
+            },
             "/skills" => {
                 self.reference("/skills", self.service.skills_summary(), &mut effects);
             }
@@ -3433,6 +3525,10 @@ mod tests {
         goals: Arc<Mutex<Vec<Option<String>>>>,
         /// Heartbeats the next pump finds due.
         heartbeats_due: Arc<Mutex<Vec<crate::interactive::heartbeat::Due>>>,
+        /// Child messages delivered into the running turn.
+        delivered: Arc<Mutex<Vec<String>>>,
+        /// Every `/agents stop` target.
+        stops: Arc<Mutex<Vec<String>>>,
     }
 
     impl SessionPort for RecordingPort {
@@ -3482,6 +3578,25 @@ mod tests {
             }
             self.steers.lock().expect("steer log").push(text.to_owned());
             Ok(())
+        }
+
+        fn deliver_message(&mut self, text: &str) -> Result<(), String> {
+            if self.refuse_steer {
+                return Err("no active run inbox is available".to_owned());
+            }
+            self.delivered
+                .lock()
+                .expect("delivery log")
+                .push(text.to_owned());
+            Ok(())
+        }
+
+        fn stop_agents(&mut self, selector: &str) -> Result<String, String> {
+            self.stops
+                .lock()
+                .expect("stop log")
+                .push(selector.to_owned());
+            Ok(format!("stopping {selector}"))
         }
 
         fn answer(&mut self, request_id: &str, decision: ApprovalDecision) -> bool {
@@ -6267,6 +6382,137 @@ mod tests {
                 "missing {landmark:?} in:\n{joined}"
             );
         }
+    }
+
+    fn end_with(harness: &mut Bench, outcome: RunOutcome) {
+        harness
+            .events
+            .send(SessionEvent::RunTerminal { outcome })
+            .expect("terminal event");
+        let _ = harness.controller.pump_events();
+    }
+
+    fn child_settled(harness: &mut Bench, notice: &str) -> Vec<String> {
+        harness
+            .events
+            .send(SessionEvent::ChildSettled {
+                name: "scout".to_owned(),
+                notice: notice.to_owned(),
+            })
+            .expect("child event");
+        effects_to_plain(&harness.controller.pump_events())
+    }
+
+    /// Q02: an idle parent reads a child's notice in a turn of its own, at once.
+    #[test]
+    fn q02_a_notice_wakes_an_idle_parent() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let notice = "[child-exited: no-reply child:scout]\n\nLast assistant text: found it";
+        let _ = child_settled(&mut harness, notice);
+        assert_eq!(submissions(&harness), vec![notice.to_owned()]);
+    }
+
+    /// Q02: a busy parent reads it after the running turn - never steered in.
+    #[test]
+    fn q02_a_notice_waits_for_the_running_turn() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "first");
+        let plain = child_settled(&mut harness, "[child-failed child:scout]\n\nboom");
+        assert_eq!(submissions(&harness), vec!["first".to_owned()]);
+        assert!(harness.port.steers.lock().expect("steers").is_empty());
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("its report is read when this turn ends")),
+            "{plain:#?}"
+        );
+        end_with(&mut harness, RunOutcome::Done);
+        assert_eq!(
+            submissions(&harness),
+            vec![
+                "first".to_owned(),
+                "[child-failed child:scout]\n\nboom".to_owned()
+            ]
+        );
+    }
+
+    /// Q02: after the user stops a turn, notices wait for the user's next turn.
+    #[test]
+    fn q02_a_notice_after_ctrl_c_waits_for_the_next_user_turn() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "first");
+        end_with(&mut harness, RunOutcome::Canceled);
+        let _ = child_settled(&mut harness, "[child-exited: no-reply child:scout]");
+        assert_eq!(submissions(&harness), vec!["first".to_owned()], "held");
+        let _ = submit_text(&mut harness.controller, "second");
+        end_with(&mut harness, RunOutcome::Done);
+        assert_eq!(
+            submissions(&harness),
+            vec![
+                "first".to_owned(),
+                "second".to_owned(),
+                "[child-exited: no-reply child:scout]".to_owned()
+            ]
+        );
+    }
+
+    /// Q03: a child's message reaches a running parent at its next step, as
+    /// written; an idle parent reads it in a turn of its own.
+    #[test]
+    fn q03_an_agent_message_reaches_the_parent() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "first");
+        let message = "[agent-message from child:scout]\n\nfound it";
+        harness
+            .events
+            .send(SessionEvent::AgentMessage {
+                text: message.to_owned(),
+            })
+            .expect("child event");
+        let _ = harness.controller.pump_events();
+        assert_eq!(
+            harness
+                .port
+                .delivered
+                .lock()
+                .expect("deliveries")
+                .as_slice(),
+            [message.to_owned()]
+        );
+        assert!(harness.port.steers.lock().expect("steers").is_empty());
+        end_with(&mut harness, RunOutcome::Done);
+        harness
+            .events
+            .send(SessionEvent::AgentMessage {
+                text: "second message".to_owned(),
+            })
+            .expect("child event");
+        let _ = harness.controller.pump_events();
+        assert_eq!(
+            submissions(&harness).last().map(String::as_str),
+            Some("second message")
+        );
+    }
+
+    /// Q01: Ctrl+C stops the turn, not the children; `/agents stop` stops them.
+    #[test]
+    fn q01_ctrl_c_cancels_the_turn_but_not_its_children() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "first");
+        let _ = harness.controller.interrupt();
+        assert!(harness.port.stops.lock().expect("stops").is_empty());
+        end_with(&mut harness, RunOutcome::Canceled);
+        let _ = submit_text(&mut harness.controller, "/agents stop scout");
+        let _ = submit_text(&mut harness.controller, "/agents stop");
+        assert_eq!(
+            harness.port.stops.lock().expect("stops").as_slice(),
+            ["scout".to_owned(), "all".to_owned()]
+        );
     }
 
     /// Send the terminal event the service sends when a turn stops at a bound.

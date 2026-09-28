@@ -2125,3 +2125,297 @@ fn g4_a_step_bound_continues_the_turn_by_itself() {
         session.transcript()
     );
 }
+
+// ---------------------------------------------------------------------------
+// HA_PRIME Q00-Q04 - a scripted provider and the delegated children in a real TUI
+// ---------------------------------------------------------------------------
+
+/// One reply of [`ScriptedSse`].
+#[derive(Clone)]
+enum Reply {
+    Text(String),
+    Tool(&'static str, serde_json::Value),
+    /// A body no decoder can read: a provider stream that breaks.
+    Garbage,
+    Delay(Duration, Box<Reply>),
+}
+
+/// A loopback provider that answers each request by a script, on its own thread
+/// (a parent and its children talk to it at the same time), and keeps every
+/// request with the moment it arrived.
+struct ScriptedSse {
+    address: std::net::SocketAddr,
+    requests: Arc<Mutex<Vec<(Instant, serde_json::Value)>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl ScriptedSse {
+    fn start(script: impl Fn(&serde_json::Value) -> Reply + Send + Sync + 'static) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("scripted listener");
+        listener
+            .set_nonblocking(true)
+            .expect("the scripted listener is non-blocking");
+        let address = listener.local_addr().expect("scripted address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let script = Arc::new(script);
+        let seen = Arc::clone(&requests);
+        let stopped = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stopped.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        let script = Arc::clone(&script);
+                        let seen = Arc::clone(&seen);
+                        std::thread::spawn(move || {
+                            let _ = socket.set_nonblocking(false);
+                            let Ok(request) = read_http_request(&mut socket) else {
+                                return;
+                            };
+                            let Some((_, body)) = request.split_once("\r\n\r\n") else {
+                                return;
+                            };
+                            let Ok(body) = serde_json::from_str::<serde_json::Value>(body) else {
+                                return;
+                            };
+                            seen.lock()
+                                .expect("request log")
+                                .push((Instant::now(), body.clone()));
+                            let mut reply = script(&body);
+                            while let Reply::Delay(wait, next) = reply {
+                                std::thread::sleep(wait);
+                                reply = *next;
+                            }
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                write_sse(&mut socket, &reply_body(&reply));
+                            }));
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        Self {
+            address,
+            requests,
+            stop,
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        format!("http://{}/chat/completions", self.address)
+    }
+
+    fn requests(&self) -> Vec<(Instant, serde_json::Value)> {
+        self.requests.lock().expect("request log").clone()
+    }
+}
+
+impl Drop for ScriptedSse {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+fn reply_body(reply: &Reply) -> String {
+    let frame = |value: serde_json::Value| format!("data: {value}\n\n");
+    match reply {
+        Reply::Text(text) => format!(
+            "{}{}data: [DONE]\n\n",
+            frame(
+                serde_json::json!({"choices": [{"delta": {"content": text}, "finish_reason": null}]})
+            ),
+            frame(serde_json::json!({"choices": [{"delta": {}, "finish_reason": "stop"}]})),
+        ),
+        Reply::Tool(name, arguments) => format!(
+            "{}{}data: [DONE]\n\n",
+            frame(serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": format!("call-{name}-{}", Instant::now().elapsed().as_nanos()),
+                "type": "function",
+                "function": {"name": name, "arguments": arguments.to_string()}
+            }]}, "finish_reason": null}]})),
+            frame(serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})),
+        ),
+        Reply::Garbage => "data: {not json at all\n\n".to_owned(),
+        Reply::Delay(..) => unreachable!("delays are played before the reply"),
+    }
+}
+
+/// Whether a request is the parent's: only the parent is offered `delegate`.
+fn from_parent(request: &serde_json::Value) -> bool {
+    request["tools"].as_array().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "delegate")
+    })
+}
+
+/// Everything a request's messages say, joined.
+fn request_text(request: &serde_json::Value) -> String {
+    request["messages"]
+        .as_array()
+        .map(|messages| {
+            messages
+                .iter()
+                .filter_map(|message| message["content"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+fn tool_results(request: &serde_json::Value) -> usize {
+    request["messages"].as_array().map_or(0, |messages| {
+        messages
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .count()
+    })
+}
+
+/// A PTY session on `provider`, in full-auto so children read without a panel.
+fn scripted_session(provider: &ScriptedSse) -> (tempfile::TempDir, PtySession) {
+    let (temp, project) = sandbox();
+    std::fs::write(project.join("a.txt"), "alpha\n").expect("fixture file");
+    let mut env = provider_env(&temp, &provider.endpoint());
+    env.push(("HA_APPROVAL", "full-auto".to_owned()));
+    let session = PtySession::spawn(&project, &env);
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+    (temp, session)
+}
+
+fn finish(mut session: PtySession) {
+    session.send("/exit\r");
+    let _ = session.wait_exit(Duration::from_secs(20));
+}
+
+/// Q00: the scripted provider serves a tool call and then an answer.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn q00_scripted_sse_serves_text_and_tool_calls() {
+    let provider = ScriptedSse::start(|request| {
+        if tool_results(request) == 0 {
+            Reply::Tool("list_files", serde_json::json!({}))
+        } else {
+            Reply::Text("done-q00".to_owned())
+        }
+    });
+    let (_temp, mut session) = scripted_session(&provider);
+    session.send("go\r");
+    session.wait_for("done-q00", Duration::from_mins(1));
+    let requests = provider.requests();
+    assert!(requests.len() >= 2, "{} request(s)", requests.len());
+    assert!(tool_results(&requests[requests.len() - 1].1) >= 1);
+    finish(session);
+}
+
+/// Q01+Q02: the parent starts a child without waiting and ends its turn; the
+/// child's stream breaks later, and the parent is woken with the failure.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn q02_pty_parent_is_woken_when_its_child_fails() {
+    let provider = ScriptedSse::start(|request| {
+        if !from_parent(request) {
+            return Reply::Delay(Duration::from_millis(1500), Box::new(Reply::Garbage));
+        }
+        let text = request_text(request);
+        if text.contains("[child-failed child:") {
+            Reply::Text("parent saw the failure".to_owned())
+        } else if tool_results(request) == 0 {
+            Reply::Tool(
+                "delegate",
+                serde_json::json!({"role": "explorer", "brief": "read a.txt", "wait": false}),
+            )
+        } else {
+            Reply::Text("parent turn ends".to_owned())
+        }
+    });
+    let (_temp, mut session) = scripted_session(&provider);
+    session.send("start a child\r");
+    session.wait_for("parent turn ends", Duration::from_mins(1));
+    session.wait_for("parent saw the failure", Duration::from_secs(90));
+    let transcript = session.transcript();
+    assert!(transcript.contains("[child-failed child:"), "{transcript}");
+    finish(session);
+}
+
+/// Q03: the child reports to its parent with `agent_message`.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn q03_pty_child_reports_to_its_parent() {
+    let provider = ScriptedSse::start(|request| {
+        if !from_parent(request) {
+            return if tool_results(request) == 0 {
+                Reply::Tool(
+                    "agent_message",
+                    serde_json::json!({"message": "found alpha in a.txt"}),
+                )
+            } else {
+                Reply::Text("child done".to_owned())
+            };
+        }
+        let text = request_text(request);
+        if text.contains("[agent-message from child:") {
+            Reply::Text("parent got the message".to_owned())
+        } else if tool_results(request) == 0 {
+            Reply::Tool(
+                "delegate",
+                serde_json::json!({"role": "explorer", "brief": "find alpha", "wait": false}),
+            )
+        } else {
+            Reply::Text("parent turn ends".to_owned())
+        }
+    });
+    let (_temp, mut session) = scripted_session(&provider);
+    session.send("ask a child\r");
+    session.wait_for("parent got the message", Duration::from_secs(90));
+    assert!(
+        provider
+            .requests()
+            .iter()
+            .any(|(_, request)| request_text(request)
+                .contains("[agent-message from child:explorer-")),
+        "the parent read the child's message"
+    );
+    finish(session);
+}
+
+/// Q01+Q04: a child keeps running after its parent's turn; `/agents` lists it and
+/// `/agents stop` stops it, and the parent hears it was cancelled.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn q04_pty_agents_stop_cancels_a_running_child() {
+    let provider = ScriptedSse::start(|request| {
+        if !from_parent(request) {
+            return Reply::Delay(
+                Duration::from_secs(30),
+                Box::new(Reply::Text("late".to_owned())),
+            );
+        }
+        let text = request_text(request);
+        if text.contains("[child-exited: cancelled child:") {
+            Reply::Text("parent saw the stop".to_owned())
+        } else if tool_results(request) == 0 {
+            Reply::Tool(
+                "delegate",
+                serde_json::json!({"role": "explorer", "brief": "take a long look", "wait": false}),
+            )
+        } else {
+            Reply::Text("parent turn ends".to_owned())
+        }
+    });
+    let (_temp, mut session) = scripted_session(&provider);
+    session.send("start a slow child\r");
+    session.wait_for("parent turn ends", Duration::from_mins(1));
+    session.send("/agents\r");
+    session.wait_for("running", Duration::from_secs(20));
+    session.send("\u{1b}");
+    std::thread::sleep(Duration::from_millis(300));
+    session.send("/agents stop\r");
+    session.wait_for("parent saw the stop", Duration::from_mins(1));
+    finish(session);
+}

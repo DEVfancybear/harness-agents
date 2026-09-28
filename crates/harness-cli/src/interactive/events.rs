@@ -601,6 +601,18 @@ pub enum SessionEvent {
         output: String,
         attach_to_next_message: bool,
     },
+    /// A delegated child settled and nobody was waiting for its result:
+    /// prime-agent's terminal notice (`[child-failed ...]`, `[child-exited ...]`),
+    /// which the parent reads in a turn of its own once it is idle.
+    ChildSettled {
+        name: String,
+        notice: String,
+    },
+    /// A child sent its parent a message (`[agent-message from child:...]`): read
+    /// at the running turn's next step, or in a turn of its own when idle.
+    AgentMessage {
+        text: String,
+    },
     RunTerminal {
         outcome: RunOutcome,
     },

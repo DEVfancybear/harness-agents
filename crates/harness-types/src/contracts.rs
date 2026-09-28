@@ -656,6 +656,9 @@ pub struct HarnessConfigV2 {
     pub ui: Option<UiConfigV2>,
     #[serde(default)]
     pub trust: Option<TrustConfigV2>,
+    /// Delegated children: prime-agent's `subagentDefaultModel`.
+    #[serde(default)]
+    pub agents: Option<AgentsConfigV2>,
 }
 
 impl HarnessConfigV2 {
@@ -957,6 +960,14 @@ pub struct UiConfigV2 {
     pub bell: Option<bool>,
     #[serde(default)]
     pub notify_command: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsConfigV2 {
+    /// The model a child runs on when it does not ask for one, as `provider/id`.
+    #[serde(default)]
+    pub default_model: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

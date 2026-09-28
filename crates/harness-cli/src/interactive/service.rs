@@ -23,7 +23,7 @@ use harness_providers::{
 };
 use harness_runtime::{HumanInputService, RunInbox, RunRequest, RuntimeConfig, RuntimeService};
 use harness_session::{AdmitInputRequest, SessionService};
-use harness_store_sqlite::{SqliteStore, WriterOpenOptions};
+use harness_store_sqlite::SqliteStore;
 use harness_tools::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CodingToolAction, IsolationMode,
     PolicyMode, ToolExecutionService, ToolOutput, ToolPatternRule, ToolPolicyRules, TurnDriver,
@@ -31,7 +31,7 @@ use harness_tools::{
     execute_action_with_approval, observe_workspace, observed_file_hash, validate_tool_pattern,
 };
 use harness_types::{
-    ErrorCode, HostId, InputId, QuestionId, RequestId, SessionId, SourceAuthority, TaskId,
+    ErrorCode, InputId, QuestionId, RequestId, SessionId, SourceAuthority, TaskId,
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
@@ -349,6 +349,15 @@ pub trait SessionPort: Send {
     fn model_options(&self) -> Vec<(String, String)> {
         Vec::new()
     }
+    /// Deliver another agent's message into the running turn at its next step,
+    /// read as written rather than as the user's steering correction.
+    fn deliver_message(&mut self, _text: &str) -> Result<(), String> {
+        Err("no running turn can take a message".to_owned())
+    }
+    /// Stop the delegated child named `selector`, or every one for `all`.
+    fn stop_agents(&mut self, _selector: &str) -> Result<String, String> {
+        Err("this backend has no delegated children".to_owned())
+    }
     /// Start a browser sign-in; returns the URL to open. The outcome arrives as
     /// [`SessionEvent::LoginFinished`].
     fn begin_sign_in(&mut self, _provider: &str) -> Result<String, String> {
@@ -648,6 +657,8 @@ pub struct ProviderConfig {
     pub mcp_servers: BTreeMap<String, harness_types::McpServerConfigV2>,
     pub project_trusted: bool,
     pub bell: bool,
+    /// `[agents] default_model`: the model a delegated child runs on by default.
+    pub agents_default_model: Option<String>,
     /// Name of the source that holds the key; never the key.
     pub credential: CredentialSource,
 }
@@ -782,6 +793,7 @@ pub(super) fn resolve_provider_with_overrides(
         mcp_servers: resolved.mcp_servers,
         project_trusted: resolved.project_trusted,
         bell: resolved.bell,
+        agents_default_model: resolved.agents_default_model,
         credential,
     })
 }
@@ -1065,6 +1077,73 @@ impl LiveTurn {
         if let Ok(mut current) = self.config.lock() {
             *current = Some(config);
         }
+    }
+}
+
+/// The models a delegated child may ask for: any catalog model whose provider
+/// has a credential, as prime-agent's `_resolveRlmSubagentModel` accepts any
+/// authenticated catalog model.
+struct ServiceChildModels {
+    base: ProviderConfig,
+    level: harness_providers::ThinkingLevel,
+    environment: LaunchEnvironment,
+    data_dir: PathBuf,
+    session: String,
+    default_model: Option<String>,
+}
+
+impl super::delegation::ChildModels for ServiceChildModels {
+    fn default_model(&self) -> Option<String> {
+        self.default_model.clone()
+    }
+
+    fn resolve(&self, reference: &str) -> Result<super::delegation::ChildModel, String> {
+        let catalog = super::providers::Catalog::load(&self.data_dir);
+        let entry = catalog
+            .find(reference)
+            .ok_or_else(|| format!("Requested subagent model \"{reference}\" is not available"))?;
+        let credential =
+            credentials::source_for(&self.environment, &self.data_dir, &entry.provider, "")
+                .ok_or_else(|| {
+                    format!(
+                        "Requested subagent model \"{reference}\" failed authentication preflight: log in to {} with /login",
+                        entry.provider
+                    )
+                })?;
+        let price = entry
+            .cost
+            .filter(|cost| cost.input > 0.0 || cost.output > 0.0)
+            .map(|cost| ModelPrice {
+                input_per_mtok: cost.input,
+                output_per_mtok: cost.output,
+            });
+        let mut config = self.base.clone();
+        config.provider_id.clone_from(&entry.provider);
+        entry
+            .protocol()
+            .unwrap_or("openai_chat")
+            .clone_into(&mut config.protocol);
+        config.endpoint = entry.endpoint();
+        config.model.clone_from(&entry.id);
+        config.api_key_env = super::providers::env_variables(&entry.provider)
+            .first()
+            .map_or_else(String::new, |variable| (*variable).to_owned());
+        config.thinking_format = entry
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.thinking_format.clone());
+        config.credential = credential;
+        config.model_price = price;
+        if let Some(window) = entry.context_window {
+            config.context_window_tokens = window;
+        }
+        let provider = LiveProvider::build(&config, self.level, &self.session, &self.data_dir)
+            .map_err(|error| error.to_string())?;
+        Ok(super::delegation::ChildModel {
+            provider,
+            reference: entry.reference(),
+            price,
+        })
     }
 }
 
@@ -1433,7 +1512,8 @@ pub struct AgentSessionService {
     active_skills: Arc<Mutex<BTreeMap<String, harness_extensions::SkillActivation>>>,
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
-    agents_status: Arc<Mutex<Vec<String>>>,
+    /// The session's delegated children and the store they share with its turns.
+    agents: Arc<super::delegation::SessionAgents>,
     /// Held by a turn for as long as it owns the project store, and by `/rename` while
     /// it writes, so the two never want the writer at the same time.
     writer_gate: Arc<tokio::sync::Mutex<()>>,
@@ -1901,6 +1981,13 @@ impl AgentSessionService {
             &context.paths.data_dir,
             &context.project.root,
         );
+        let agents = super::delegation::SessionAgents::new(
+            super::store_lease::SharedStore::new(context.project_store_dir()),
+            sender.clone(),
+            Arc::clone(&gate) as Arc<dyn ApprovalGate>,
+            context.paths.data_dir.join("delegation"),
+        )
+        .expect("the delegation scheduler starts with a fixed, valid configuration");
         Self {
             sender,
             store_dir: context.project_store_dir(),
@@ -1933,7 +2020,7 @@ impl AgentSessionService {
             active_skills: Arc::new(Mutex::new(BTreeMap::new())),
             pending_mcp_elicitations: Arc::new(Mutex::new(HashMap::new())),
             mcp_status: Arc::new(Mutex::new(Vec::new())),
-            agents_status: Arc::new(Mutex::new(Vec::new())),
+            agents,
             writer_gate,
             goal: None,
             goal_forgotten: false,
@@ -2236,7 +2323,7 @@ impl SessionPort for AgentSessionService {
         let active_skills = Arc::clone(&self.active_skills);
         let pending_mcp_elicitations = Arc::clone(&self.pending_mcp_elicitations);
         let mcp_status = Arc::clone(&self.mcp_status);
-        let agents_status = Arc::clone(&self.agents_status);
+        let agents = Arc::clone(&self.agents);
         let task_id = self.task_id.clone();
         let previous_session = Arc::clone(&self.previous_session);
         let active_inbox = Arc::clone(&self.active_inbox);
@@ -2277,7 +2364,7 @@ impl SessionPort for AgentSessionService {
                 active_skills,
                 pending_mcp_elicitations,
                 mcp_status,
-                agents_status,
+                agents,
                 session_id,
                 task_id,
                 previous_session,
@@ -2487,16 +2574,7 @@ impl SessionPort for AgentSessionService {
     }
 
     fn agents_summary(&self) -> Vec<String> {
-        self.agents_status.lock().map_or_else(
-            |_| vec!["delegated worker status is unavailable".to_owned()],
-            |status| {
-                if status.is_empty() {
-                    vec!["no delegated workers have run in this session".to_owned()]
-                } else {
-                    status.clone()
-                }
-            },
-        )
+        self.agents.summary()
     }
 
     fn menu_commands(&self) -> Vec<super::commands::MenuCommand> {
@@ -2762,21 +2840,22 @@ impl SessionPort for AgentSessionService {
         let sender = self.sender.clone();
         let title_for_write = title.clone();
         let writer_gate = Arc::clone(&self.writer_gate);
+        let shared_store = self.agents.store();
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| "the application service needs an async runtime".to_owned())?;
         handle.spawn(async move {
+            let _ = store_dir;
             let result = async {
                 let _writer = writer_gate.lock().await;
-                let store =
-                    SqliteStore::open_writer(WriterOpenOptions::new(store_dir, HostId::generate()))
-                        .await
-                        .map_err(|error| error.to_string())?;
-                let write = store
+                let lease = shared_store
+                    .lease()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                lease
+                    .store()
                     .set_session_setting(&task_id, "title", &title_for_write)
                     .await
-                    .map_err(|error| error.to_string());
-                let _ = store.close().await;
-                write
+                    .map_err(|error| error.to_string())
             }
             .await;
             let _ = sender.send(SessionEvent::Notice {
@@ -3229,6 +3308,8 @@ impl SessionPort for AgentSessionService {
             .map_err(|_| "conversation state is unavailable; nothing was resumed".to_owned())?;
         // Selection is synchronous: submit cannot overtake a background lookup.
         // The turn validates ownership in this project's store before dispatch.
+        // The children worked for the conversation being left; they stop quietly.
+        self.agents.reset();
         if source.is_none() {
             self.task_id = TaskId::generate();
             if let Ok(mut tracker) = self.cost_tracker.lock() {
@@ -3251,6 +3332,30 @@ impl SessionPort for AgentSessionService {
     }
 
     fn steer(&mut self, text: &str) -> Result<(), String> {
+        self.queue_into_run(text, false)
+    }
+
+    fn deliver_message(&mut self, text: &str) -> Result<(), String> {
+        self.queue_into_run(text, true)
+    }
+
+    fn stop_agents(&mut self, selector: &str) -> Result<String, String> {
+        let stopped = self
+            .agents
+            .stop(selector, "Stopped by the user with /agents stop")?;
+        Ok(match stopped {
+            0 => "no delegated child is running".to_owned(),
+            1 => "stopping 1 delegated child".to_owned(),
+            count => format!("stopping {count} delegated children"),
+        })
+    }
+}
+
+impl AgentSessionService {
+    /// Queue `text` into the running turn for its next step: as the user's
+    /// steering correction, or - `verbatim` - as another agent's message that
+    /// already says who it is from.
+    fn queue_into_run(&mut self, text: &str, verbatim: bool) -> Result<(), String> {
         if text.trim().is_empty() {
             return Err("usage: /steer <text>".to_owned());
         }
@@ -3280,11 +3385,19 @@ impl SessionPort for AgentSessionService {
                         Err(error) => return Err(error.to_string()),
                     }
                 };
-                active
-                    .inbox
-                    .steer(&run, text, harness_runtime::now_unix_ms())
-                    .await
-                    .map_err(|error| error.to_string())?;
+                if verbatim {
+                    active
+                        .inbox
+                        .deliver(&run, text, harness_runtime::now_unix_ms())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                } else {
+                    active
+                        .inbox
+                        .steer(&run, text, harness_runtime::now_unix_ms())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
                 Ok::<(), String>(())
             }
             .await;
@@ -3405,7 +3518,7 @@ async fn run_turn(
     active_skills: Arc<Mutex<BTreeMap<String, harness_extensions::SkillActivation>>>,
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
-    agents_status: Arc<Mutex<Vec<String>>>,
+    agents: Arc<super::delegation::SessionAgents>,
     session_id: SessionId,
     task_id: TaskId,
     previous_session: Arc<Mutex<Option<SessionId>>>,
@@ -3433,13 +3546,11 @@ async fn run_turn(
     // `/rename` writes between turns under this gate; a turn waits the moment it takes
     // to finish rather than failing to open the store.
     let _writer_turn = writer_gate.lock().await;
-    let store = match SqliteStore::open_writer(WriterOpenOptions::new(
-        store_dir.clone(),
-        HostId::generate(),
-    ))
-    .await
-    {
-        Ok(store) => Arc::new(store),
+    // The store is the session's, shared with the children that outlive this
+    // turn; the lease keeps it open for the turn and lets it close when nobody
+    // holds it.
+    let lease = match agents.store().lease().await {
+        Ok(lease) => lease,
         Err(error) => {
             send(SessionEvent::RecoverableError {
                 message: format!(
@@ -3450,6 +3561,7 @@ async fn run_turn(
             return;
         }
     };
+    let store = lease.store();
 
     let source = if let Ok(previous) = previous_session.lock() {
         previous.clone()
@@ -3479,6 +3591,14 @@ async fn run_turn(
         },
         None => task_id,
     };
+    // The previous turn of this conversation may still hold the task in this
+    // open store (a child kept it open); this turn takes the task over, as it did
+    // when every turn opened the store anew.
+    if let Err(error) = store.release_task_lease(&task_id).await {
+        send(SessionEvent::Notice {
+            message: format!("the previous turn's hold on this conversation was kept: {error}"),
+        });
+    }
 
     if store
         .session_setting(&task_id, "git_base")
@@ -3993,39 +4113,44 @@ async fn run_turn(
         }
     };
     let web_host = super::web::WebHost::from_environment(&environment);
-    let delegate_host = match super::delegation::DelegateHost::new(
-        &store,
-        Arc::clone(&provider),
-        RuntimeConfig {
-            context_window_tokens: config.context_window_tokens,
-            output_reservation_tokens: config.output_reservation_tokens,
-            compaction_reserve_tokens: config.compaction_reserve_tokens,
-            max_retry_after_seconds: config.max_retry_after_seconds,
-            ..RuntimeConfig::default()
+    // Children run on a provider of their own, fixed at the model this turn
+    // started with: `/model` in a later turn does not switch a child mid-task.
+    let child_provider = LiveProvider::build(&config, thinking_level, task_id.as_ref(), &data_dir)
+        .unwrap_or_else(|_| Arc::clone(&provider));
+    let delegate_host = Some(super::delegation::DelegateHost::new(
+        &agents,
+        super::delegation::ChildLaunch {
+            model: super::delegation::ChildModel {
+                provider: child_provider,
+                reference: format!("{}/{}", config.provider_id, config.model),
+                price: config.model_price,
+            },
+            models: Some(Arc::new(ServiceChildModels {
+                base: config.clone(),
+                level: thinking_level,
+                environment: environment.clone(),
+                data_dir: data_dir.clone(),
+                session: task_id.as_ref().to_owned(),
+                default_model: config.agents_default_model.clone(),
+            })),
+            runtime_config: RuntimeConfig {
+                context_window_tokens: config.context_window_tokens,
+                output_reservation_tokens: config.output_reservation_tokens,
+                compaction_reserve_tokens: config.compaction_reserve_tokens,
+                max_retry_after_seconds: config.max_retry_after_seconds,
+                ..RuntimeConfig::default()
+            },
+            workspace_root: workspace_root.clone(),
+            workspace: observation.clone(),
+            hooks: config.hooks.clone(),
+            parent_policy: tool_policy.clone(),
+            child_limits: limits,
+            web: web_host
+                .as_ref()
+                .map(|host| (host.tools(), host.dispatcher())),
         },
-        workspace_root.clone(),
-        observation.clone(),
-        data_dir.join("delegation"),
-        config.hooks.clone(),
-        tool_policy.clone(),
-        limits,
-        config.model_price,
-        Arc::clone(&gate) as Arc<dyn ApprovalGate>,
-        sender.clone(),
         cancellation.clone(),
-        Arc::clone(&agents_status),
-        web_host
-            .as_ref()
-            .map(|host| (host.tools(), host.dispatcher())),
-    ) {
-        Ok(host) => Some(host),
-        Err(error) => {
-            send(SessionEvent::Notice {
-                message: format!("delegation unavailable: {error}"),
-            });
-            None
-        }
-    };
+    ));
     let skill_catalog = match super::skills::discover(
         &global_config_dir,
         &workspace_root,
@@ -4088,7 +4213,7 @@ async fn run_turn(
                 Arc::clone(&heartbeats) as Arc<dyn super::repl::HostRequests>,
             ];
             if let Some(host) = &delegate_host {
-                chain.push(host.rlm_requests(config.model.clone()));
+                chain.push(host.rlm_requests());
             }
             // Always answered, even with no server configured: an unanswered
             // `mcp.list_connections` reached the model as "request failed", and it
@@ -4338,14 +4463,9 @@ async fn run_turn(
         }
     };
 
-    if let Some(delegate) = &delegate_host {
-        let unknown = delegate.shutdown().await;
-        for item in unknown {
-            send(SessionEvent::Notice {
-                message: format!("delegated worker ended without a settled outcome: {item}"),
-            });
-        }
-    }
+    // The turn's children belong to the session: they keep running, and what they
+    // find reaches the parent as a notice.
+    drop(delegate_host);
 
     if let Some(built) = runtime.context_result(&session_id) {
         let mut lines = vec![
