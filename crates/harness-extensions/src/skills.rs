@@ -494,8 +494,12 @@ impl SkillCatalogEntry {
         let root = self
             .directory()
             .ok_or_else(|| refuse(format!("skill {} has no directory", self.name)))?;
-        let candidate = Path::new(relative.trim());
-        if relative.trim().is_empty()
+        // Interpret both separators the same way on every host. Otherwise a
+        // Windows-style parent path is just a filename on Unix.
+        let normalized = relative.trim().replace('\\', "/");
+        let candidate = Path::new(&normalized);
+        if normalized.is_empty()
+            || normalized.contains(':')
             || candidate.is_absolute()
             || candidate.components().any(|part| {
                 !matches!(

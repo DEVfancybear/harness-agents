@@ -632,6 +632,9 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Search three angles.")
         );
+        dispatcher
+            .read_file(&serde_json::json!({ "name": "research", "path": "references\\method.md" }))
+            .expect("a Windows-style separator is readable on every host");
 
         for escape in [
             "../secret.txt",
