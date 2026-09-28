@@ -243,7 +243,10 @@ pub fn hotkey_lines() -> Vec<String> {
         ("Ctrl-C", "cancel the run; twice on an empty prompt quits"),
         ("Ctrl-D", "quit on an empty prompt"),
         ("Ctrl-O", "cycle collapsed / details / expanded"),
-        ("Ctrl-S", "put the draft aside; again on an empty prompt brings it back"),
+        (
+            "Ctrl-S",
+            "put the draft aside; again on an empty prompt brings it back",
+        ),
         ("Ctrl-L", "redraw"),
         ("Ctrl-U / Ctrl-W", "erase to line start / erase a word"),
         ("Ctrl-V", "paste an image or path from the clipboard"),
