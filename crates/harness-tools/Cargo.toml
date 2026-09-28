@@ -25,6 +25,9 @@ tokio.workspace = true
 tokio-util.workspace = true
 unicode-normalization.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.28", features = ["process", "signal"] }
+
 [dev-dependencies]
 # Already in Cargo.lock; the M12 probe unit tests need a disposable root.
 tempfile.workspace = true

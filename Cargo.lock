@@ -1334,6 +1334,7 @@ dependencies = [
  "harness-store-sqlite",
  "harness-types",
  "ignore",
+ "nix 0.28.0",
  "process-wrap",
  "regex",
  "serde",

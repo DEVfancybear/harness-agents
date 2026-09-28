@@ -8,6 +8,8 @@ use std::{
 
 use harness_providers::CancellationToken;
 use harness_types::{ErrorCode, HarnessError};
+#[cfg(unix)]
+use nix::{errno::Errno, sys::signal::killpg, unistd::Pid};
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
 #[cfg(unix)]
@@ -556,6 +558,13 @@ async fn run(
             format!("cannot spawn structured process: {error}"),
         )
     })?;
+    #[cfg(unix)]
+    let process_group_id = child.id().ok_or_else(|| {
+        HarnessError::new(
+            ErrorCode::ProcessOutcomeUnknown,
+            "spawned process has no process group ID",
+        )
+    })?;
     if let Some(input) = stdin {
         let mut child_stdin = child.stdin().take().ok_or_else(|| {
             HarnessError::new(
@@ -624,11 +633,14 @@ async fn run(
                     format!("cannot confirm process tree completion: {error}"),
                 )
             })?;
-            // This only proves that the direct child exited. The Windows job
-            // wrapper can report its root process before detached descendants
-            // finish; dropping the wrapper requests kill-on-close, but that is
-            // not a backend confirmation that the job is empty.
-            (status, false, false, TreeCleanup::ReapedOnExit)
+            // The Unix wrapper can report ECHILD after the group leader exits
+            // even while orphaned descendants still run in its process group.
+            // Kill any such descendants and wait until the group disappears.
+            #[cfg(unix)]
+            let cleanup = finish_exited_group(&mut child, process_group_id).await?;
+            #[cfg(not(unix))]
+            let cleanup = TreeCleanup::ReapedOnExit;
+            (status, false, false, cleanup)
         }
         WaitSignal::TimedOut => (
             terminate_and_reap(&mut child, "timed-out").await?,
@@ -666,6 +678,60 @@ async fn run(
         stderr_tail: capture.stderr_tail.clone(),
         capture: Some(capture),
     })
+}
+
+/// A Unix process group may outlive its leader. The wrapper's `wait` only
+/// confirms that our direct child was reaped, so verify the whole group here.
+#[cfg(unix)]
+async fn finish_exited_group(
+    child: &mut Box<dyn process_wrap::tokio::ChildWrapper>,
+    group_id: u32,
+) -> Result<TreeCleanup, HarnessError> {
+    let group = Pid::from_raw(i32::try_from(group_id).map_err(|_| {
+        HarnessError::new(
+            ErrorCode::ProcessOutcomeUnknown,
+            "process group ID exceeds i32",
+        )
+    })?);
+    match killpg(group, None) {
+        Err(Errno::ESRCH) => return Ok(TreeCleanup::ReapedOnExit),
+        Err(error) => {
+            return Err(HarnessError::new(
+                ErrorCode::ProcessOutcomeUnknown,
+                format!("cannot inspect exited process group: {error}"),
+            ));
+        }
+        Ok(()) => {}
+    }
+    match child.start_kill() {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(Errno::ESRCH as i32) => {}
+        Err(error) => {
+            return Err(HarnessError::new(
+                ErrorCode::ProcessOutcomeUnknown,
+                format!("cannot terminate descendants of exited process: {error}"),
+            ));
+        }
+    }
+    let deadline = Instant::now() + CLEANUP_BOUND;
+    loop {
+        match killpg(group, None) {
+            Err(Errno::ESRCH) => return Ok(TreeCleanup::KilledAndReaped),
+            Err(error) => {
+                return Err(HarnessError::new(
+                    ErrorCode::ProcessOutcomeUnknown,
+                    format!("cannot confirm exited process group cleanup: {error}"),
+                ));
+            }
+            Ok(()) if Instant::now() >= deadline => {
+                return Err(HarnessError::new(
+                    ErrorCode::ProcessOutcomeUnknown,
+                    "descendants of exited process were not confirmed gone",
+                ));
+            }
+            Ok(()) => sleep(Duration::from_millis(25)).await,
+        }
+    }
 }
 
 /// A call withdrawn while it was queued (or the moment its permit arrived).
