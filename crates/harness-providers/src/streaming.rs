@@ -182,7 +182,7 @@ pub(crate) fn adapter_stream(
                             } else {
                                 ErrorCode::ServiceUnavailable
                             },
-                            format!("provider request failed: {error}"),
+                            format!("provider request failed: {error}{}", crate::endpoint_target(&endpoint)),
                         ))).await;
                         return;
                     }

@@ -1092,7 +1092,13 @@ fn i14_the_installed_artifact_opens_the_app_in_a_real_terminal() {
         "transcript:\n{}",
         session.transcript()
     );
-    let transcript = session.transcript();
+    // The reader thread may still be draining the last bytes after the exit.
+    let drained = Instant::now() + Duration::from_secs(2);
+    let mut transcript = session.transcript();
+    while !ends_on_a_fresh_line(&transcript) && Instant::now() < drained {
+        std::thread::sleep(Duration::from_millis(50));
+        transcript = session.transcript();
+    }
     assert!(
         ends_on_a_fresh_line(&transcript),
         "the installed app restores the terminal before exiting: {transcript:?}"
@@ -2143,6 +2149,9 @@ enum Reply {
     Garbage,
     /// HTTP 429 with this `Retry-After`, in seconds.
     RateLimited(u64),
+    /// A body cut short: the connection closes before the length it announced,
+    /// so the client fails decoding the response body.
+    Truncated,
     Delay(Duration, Box<Reply>),
 }
 
@@ -2200,6 +2209,13 @@ impl ScriptedSse {
                                         body.len()
                                     ).as_bytes());
                                     let _ = socket.flush();
+                                } else if let Reply::Truncated = reply {
+                                    let part = "data: {\"choices\":[{\"delta\":{\"content\":\"half\"},\"finish_reason\":null}]}\n\n";
+                                    let _ = socket.write_all(format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n{part}"
+                                    ).as_bytes());
+                                    let _ = socket.flush();
+                                    let _ = socket.shutdown(std::net::Shutdown::Both);
                                 } else {
                                     write_sse(&mut socket, &reply_body(&reply));
                                 }
@@ -2256,7 +2272,7 @@ fn reply_body(reply: &Reply) -> String {
             frame(serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})),
         ),
         Reply::Garbage => "data: {not json at all\n\n".to_owned(),
-        Reply::RateLimited(_) => unreachable!("a rate limit is not a stream"),
+        Reply::RateLimited(_) | Reply::Truncated => unreachable!("written by the server loop"),
         Reply::Delay(..) => unreachable!("delays are played before the reply"),
     }
 }
@@ -2770,6 +2786,32 @@ fn q13_pty_waiting_line_is_shown() {
     session.wait_for("(1/30)", Duration::from_secs(30));
     session.wait_for("recovered-q13", Duration::from_mins(1));
     assert_eq!(calls.load(Ordering::SeqCst), 3);
+    finish(session);
+}
+
+/// A stream cut short fails the turn with its error code named once (the user
+/// saw `provider_protocol: provider_protocol: provider_protocol: provider
+/// stream failed: error decoding response body`).
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn e01_pty_a_broken_stream_names_its_code_once() {
+    let provider = ScriptedSse::start(|_| Reply::Truncated);
+    let (temp, project) = sandbox();
+    let mut env = provider_env(&temp, &provider.endpoint());
+    // The plain renderer writes text as it is, so the words can be matched.
+    env.push(("HA_UI", "plain".to_owned()));
+    let mut session = PtySession::spawn(&project, &env);
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+    session.send("go\r");
+    let transcript = session.wait_for("decoding", Duration::from_mins(2));
+    assert!(
+        transcript.contains("provider_protocol: provider stream failed"),
+        "the failure is shown:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("provider_protocol: provider_protocol"),
+        "the code is repeated:\n{transcript}"
+    );
     finish(session);
 }
 

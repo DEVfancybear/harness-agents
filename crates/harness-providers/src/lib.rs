@@ -924,6 +924,22 @@ pub(crate) async fn http_response_error(response: reqwest::Response) -> Provider
     }
 }
 
+/// ` (to host:port)` for a request that could not be sent, so the user can tell
+/// which server did not answer. Only the host and port: a query-string token
+/// or userinfo in the URL never reaches the message (hence `without_url`).
+pub(crate) fn endpoint_target(endpoint: impl AsRef<str>) -> String {
+    reqwest::Url::parse(endpoint.as_ref())
+        .ok()
+        .and_then(|url| {
+            let host = url.host_str()?.to_owned();
+            Some(match url.port_or_known_default() {
+                Some(port) => format!(" (to {host}:{port})"),
+                None => format!(" (to {host})"),
+            })
+        })
+        .unwrap_or_default()
+}
+
 /// Whether a JSON error body's code or type is one of the documented rate and
 /// quota limit codes (`OpenAI`'s `rate_limit_exceeded` and `insufficient_quota`,
 /// Anthropic's `rate_limit_error`).
@@ -1356,6 +1372,7 @@ impl ModelProvider for OpenAiChatAdapter {
 
     fn stream(&self, request: ProviderRequest, cancellation: CancellationToken) -> ProviderFuture {
         let endpoint = self.endpoint.clone();
+        let target = endpoint_target(&endpoint);
         let credentials = Arc::clone(&self.credentials);
         let client = self.client.clone();
         let thinking = self.thinking;
@@ -1383,9 +1400,9 @@ impl ModelProvider for OpenAiChatAdapter {
                     // the message the runtime persists and renders.
                     let error = error.without_url();
                     if error.is_timeout() {
-                        ProviderError::new(ErrorCode::ProcessTimedOut, format!("provider request timed out: {error}"))
+                        ProviderError::new(ErrorCode::ProcessTimedOut, format!("provider request timed out: {error}{target}"))
                     } else {
-                        ProviderError::new(ErrorCode::ServiceUnavailable, format!("provider request failed: {error}"))
+                        ProviderError::new(ErrorCode::ServiceUnavailable, format!("provider request failed: {error}{target}"))
                     }
                 })?,
                 () = cancellation.cancelled() => return Err(ProviderError::new(ErrorCode::ProviderCanceled, "provider request canceled")),
@@ -2662,6 +2679,21 @@ mod chat_message_tests {
 #[cfg(test)]
 mod usage_limit_tests {
     use super::{ErrorCode, http_status_error, names_a_usage_limit};
+
+    /// A request that could not be sent names the server, and nothing else of
+    /// the URL: no userinfo, path or query-string token.
+    #[test]
+    fn a_send_failure_names_host_and_port_only() {
+        assert_eq!(
+            super::endpoint_target("https://user:pw@api.example.com/v1/chat?key=sk-secret"),
+            " (to api.example.com:443)"
+        );
+        assert_eq!(
+            super::endpoint_target("http://127.0.0.1:5099/chat/completions"),
+            " (to 127.0.0.1:5099)"
+        );
+        assert_eq!(super::endpoint_target("not a url"), "");
+    }
 
     #[test]
     fn q13_429_maps_to_rate_limited() {

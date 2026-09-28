@@ -22,4 +22,4 @@
 
 ## Exact next action
 
-Người dùng quyết `i12`: nêu host:port của endpoint trong lỗi kết nối, hoặc đổi kỳ vọng của test. Sau đó là các mục ngoài phạm vi (plan mục 11) nếu được giao.
+PTY đầy đủ 39/39 xanh. Chờ người dùng quyết: agent con của `rlm.spawn`/`delegate explorer` có nên có shell và quyền ghi như prime-agent (con đầy đủ tool) hay giữ chỉ đọc. Nhắc người dùng cài lại `ha` (`scripts/Install-Ha.ps1`) - chuỗi mã lỗi lặp họ thấy là của bản cũ.

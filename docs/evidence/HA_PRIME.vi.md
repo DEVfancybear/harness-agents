@@ -82,3 +82,12 @@
 **Lỗi còn lại, có từ trước:** `i12_a_prompt_with_an_unreachable_provider_is_reported_and_the_app_stays_alive` đòi thông báo lỗi nêu endpoint (`127.0.0.1:<port>`), nhưng commit `7a1dcc5` (audit 22/09) cố ý bỏ URL khỏi lỗi gửi request (`error.without_url()`), và đầu TUI không còn in endpoint. Thông báo hiện là `failed: service_unavailable: provider request failed: error sending request`. Chọn một: nêu host:port (không path/query) trong lỗi kết nối, hoặc sửa kỳ vọng của test — cần người dùng quyết (không tự nới test).
 
 **not_run:** live smoke với provider thật (429 thật, model phụ thật, gate dài).
+
+
+## Sau khi người dùng chọn hướng cho `i12` (28/09/2026)
+
+- **`i12`:** lỗi không gửi được request giờ nêu `(to host:port)` của endpoint - chỉ host và port, không userinfo/path/query (`without_url` vẫn giữ). Cả bốn adapter (chat, streaming, Anthropic, Responses). Test: `a_send_failure_names_host_and_port_only` (userinfo `user:pw` và `?key=sk-secret` không lọt vào), PTY `i12` xanh (trước đó đỏ từ `7a1dcc5`). Câu vẫn bắt đầu bằng `provider request failed: error sending request`, nên `phase_p2` (khớp chuỗi đó) vẫn xanh.
+- **Báo cáo `provider_protocol: provider_protocol: provider_protocol: provider stream failed: error decoding response body`:** tái hiện bằng PTY `e01_pty_a_broken_stream_names_its_code_once` (server khai `Content-Length` lớn hơn body rồi đóng → đúng lỗi `error decoding response body`; renderer plain để khớp chữ) → bản hiện tại hiện **một** mã (`provider_protocol: provider stream failed: …`). Mọi loại lỗi `code: message` đã bỏ mã trùng từ `bae5cc7`, trừ `ContextError` - nay thêm. Chuỗi lặp người dùng thấy đến từ bản `ha` đã cài trước đó; cần cài lại.
+- **Test PTY chập chờn thứ ba:** `i14` đọc transcript ngay khi tiến trình thoát, trước khi luồng đọc nhận hết byte cuối (đỏ 1/3) → chờ tối đa 2 s cho transcript kết thúc dòng; khẳng định không đổi; 5/5 xanh.
+- **PTY đầy đủ (bản cuối): 39 passed, 0 failed, `PTY_EXIT: 0`.** `cargo test -p harness-cli --bin ha`: 491 passed + `g09_hook_cannot_turn_ask_into_allow` chập chờn đã biết (chạy riêng xanh); `phase_p2`, `harness-providers`, `harness-session`, `harness-types` xanh; clippy sạch.
+- **"reviewer không có shell":** không phải lỗi - `ha` cố ý cho agent con `explorer` chỉ đọc (chỉ `coder` có shell, trong worktree riêng), còn prime `rlm.spawn` tạo agent con đầy đủ tool. Đổi sang như prime là quyết định của người dùng (con sẽ ghi và chạy lệnh trong workspace chung).

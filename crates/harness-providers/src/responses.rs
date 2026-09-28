@@ -269,6 +269,7 @@ impl ModelProvider for OpenAiResponsesAdapter {
 
     fn stream(&self, request: ProviderRequest, cancellation: CancellationToken) -> ProviderFuture {
         let endpoint = self.endpoint.clone();
+        let target = crate::endpoint_target(&endpoint);
         let client = self.client.clone();
         let credentials = Arc::clone(&self.credentials);
         let body = self.request_body(&request);
@@ -286,7 +287,7 @@ impl ModelProvider for OpenAiResponsesAdapter {
                     let error = error.without_url();
                     ProviderError::new(
                         if error.is_timeout() { ErrorCode::ProcessTimedOut } else { ErrorCode::ServiceUnavailable },
-                        format!("provider request failed: {error}"),
+                        format!("provider request failed: {error}{target}"),
                     )
                 })?,
                 () = cancellation.cancelled() => return Err(ProviderError::new(ErrorCode::ProviderCanceled, "provider request canceled")),
