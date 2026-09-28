@@ -1463,7 +1463,12 @@ impl InteractiveController {
                 }
             }
             SessionEvent::Notice { message } => {
-                self.flush_stream(effects);
+                // Child progress can arrive between two tokens of the parent's
+                // answer. Keep the TUI's live text together so markdown spans
+                // across those tokens render as one assistant message.
+                if self.plain || !message.starts_with("[child ") {
+                    self.flush_stream(effects);
+                }
                 // An action that ran without a panel is announced before it runs. In
                 // the TUI that was one `[info] allowed by ...` row above every tool
                 // card - half the transcript of a read-heavy turn. The reason now rides
@@ -6529,6 +6534,53 @@ mod tests {
         let effects = harness.controller.pump_events();
         assert!(matches!(effects.first(), Some(Effect::Stream(text)) if text == "partial answer"));
         assert!(harness.controller.ui_state().live_text.is_empty());
+    }
+
+    #[test]
+    fn t04_child_progress_does_not_split_streamed_markdown() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "investigate the UI");
+        let mut effects = Vec::new();
+
+        for event in [
+            SessionEvent::TextDelta {
+                text: "Xác nhận thêm: trang success **crash render".to_owned(),
+            },
+            SessionEvent::Notice {
+                message: "[child explorer] read_file: path=src/lib/config.ts".to_owned(),
+            },
+            SessionEvent::TextDelta {
+                text: "** với `note` dạng object".to_owned(),
+            },
+            SessionEvent::Notice {
+                message: "[child explorer] search_text: path=node_modules".to_owned(),
+            },
+            SessionEvent::TextDelta {
+                text: " (log server có `Objects are not valid as a React child`).".to_owned(),
+            },
+            SessionEvent::RunTerminal {
+                outcome: RunOutcome::Done,
+            },
+        ] {
+            harness.events.send(event).expect("event");
+            effects.extend(harness.controller.pump_events());
+        }
+
+        let streamed = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Stream(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            streamed,
+            [
+                "Xác nhận thêm: trang success **crash render** với `note` dạng object (log server có `Objects are not valid as a React child`)."
+            ],
+            "child progress must not create separate assistant fragments"
+        );
     }
 
     #[test]
