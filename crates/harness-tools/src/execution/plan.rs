@@ -226,11 +226,16 @@ pub fn resolve_within(root: &Path, relative: &str) -> Result<PathBuf, HarnessErr
             "a stored relative path must not be empty",
         ));
     }
-    let candidate = Path::new(trimmed);
-    if candidate.is_absolute() {
+    // Stored names may come from another OS. Interpret both separators before
+    // checking components, so `..\\file` cannot become a harmless Unix name.
+    let normalized = trimmed.replace('\\', "/");
+    let candidate = Path::new(&normalized);
+    if candidate.is_absolute() || normalized.contains(':') {
         return Err(HarnessError::new(
             ErrorCode::ArtifactWriteFailed,
-            format!("path {trimmed} is absolute; only a path inside the artifact root is allowed"),
+            format!(
+                "path {trimmed} is absolute or drive-qualified; only a path inside the artifact root is allowed"
+            ),
         ));
     }
     let mut resolved = root.to_owned();

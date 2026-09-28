@@ -223,6 +223,10 @@ mod tests {
         }
         assert!(resolve_within(root, "artifact_ok.bin").is_ok());
         assert!(resolve_within(root, "./artifact_ok.bin").is_ok());
+        assert_eq!(
+            resolve_within(root, "nested\\artifact_ok.bin").unwrap(),
+            root.join("nested").join("artifact_ok.bin")
+        );
         assert!(resolve_within(root, "   ").is_err());
     }
 }
