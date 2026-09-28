@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 40] = [
+pub const SLASH_COMMANDS: [SlashCommand; 41] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -165,6 +165,11 @@ pub const SLASH_COMMANDS: [SlashCommand; 40] = [
             "Queue a follow-up for after the active run, or list and edit the queue",
         )
     },
+    command(
+        "/scoped-models",
+        "[pattern...|clear]",
+        "Choose the models /model next and Alt+M cycle through",
+    ),
     command(
         "/stash",
         "",

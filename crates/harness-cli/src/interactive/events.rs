@@ -52,6 +52,10 @@ pub enum Key {
     CycleDetail,
     /// Ctrl-S: prime-agent's prompt stash - put the draft aside, or bring it back.
     Stash,
+    /// Alt+M (forward) or Shift+Alt+M: prime-agent's scoped model cycling.
+    CycleModel {
+        forward: bool,
+    },
     PageUp,
     PageDown,
     Enter,
@@ -413,6 +417,8 @@ pub struct UiState {
     pub queued_input: bool,
     /// How many messages wait in the queue.
     pub queued_count: usize,
+    /// The provider-usage wait line, while a rate-limited turn waits.
+    pub provider_wait: Option<String>,
     /// The last submitted request, so the status bar can name it.
     pub last_request: Option<String>,
     /// When the active run started, for the elapsed clock.
@@ -624,6 +630,11 @@ pub enum SessionEvent {
     TurnsListed {
         purpose: TurnsPurpose,
         turns: Vec<(String, String)>,
+    },
+    /// The provider is rate limited and the turn waits for it to recover:
+    /// the line to show instead of the working line, or `None` when the wait ended.
+    ProviderWaiting {
+        line: Option<String>,
     },
     /// The answer to a `/btw` side question, or why there is none.
     SideAnswer {

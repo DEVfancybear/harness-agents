@@ -75,3 +75,28 @@ Base `93bc8d4`; thực hiện 28/09/2026.
 - HTML export dựng từ lịch sử hội thoại (tin người dùng, trả lời, lời gọi tool), không phải toàn bộ event log như prime.
 
 Hợp đồng: `HarnessConfigV2.queue: Option<QueueConfigV2 { steering_mode, follow_up_mode }>` (schema sinh lại); `SessionEvent::{SideAnswer, TurnsListed}`, `TurnsPurpose`; `SessionPort::{queue_modes, side_question, list_turns, fork, clone_conversation, switch_to}`; `Key::Stash`; runtime `FORKED_FROM_SETTING`, `previous_in_conversation`, `conversation_turns`. 40 lệnh slash.
+
+
+# CP-3 (Q10–Q13): `models.json`, model trong phạm vi, định tuyến model, chờ hạn mức
+
+Base `5d7efd9`; thực hiện 28/09/2026.
+
+| Item | Trạng thái trước | Làm gì | Bằng chứng |
+|---|---|---|---|
+| Q10 `models.json` | `missing` | `interactive/custom_models.rs`: schema prime (`providers`/`models`/`modelOverrides`, comment `//` `/* */`), kiểm tra như prime (provider mới cần `baseUrl` + `apiKey`; `api` phải là wire format `ha` nói được; `contextWindow`/`maxTokens` > 0; trường lạ bị từ chối và được nêu tên), mặc định prime; `Catalog::load` áp file; `Model.key_variable`, `Selection.api_key_env`; `/model` liệt kê provider tuỳ chỉnh có key; lỗi → notice một lần | `q10_*` (5 unit), PTY `q10_pty_custom_model_is_selectable` |
+| Q11 phạm vi + đổi nhanh | `missing` | `[routing] scoped` (glob `*`/`?`, không phân biệt hoa thường, `:level`); `/scoped-models [pattern…\|clear]` lưu `scoped-models.json` cạnh config; `/model next\|prev`; **đo được** Alt+M / Shift+Alt+M qua ConPTY (`Key::CycleModel`) | `q11_scope_patterns_match_like_prime`, `q11_step_wraps_around_both_ways`, PTY `q11_pty_cycle_changes_the_footer_model` |
+| Q12 phụ trợ | `missing` | `[routing] auxiliary`: `RuntimeService::with_summarizer(AuxiliarySummary)` cho compaction; `/refine` và review tự động gọi model phụ; không dựng được hoặc tóm tắt lỗi → model phiên + notice `auxiliaryModel "<x>" unusable for …; using the session model.` (một lần) | `q12_auxiliary_model_writes_the_summary`, `q12_unusable_auxiliary_falls_back_with_notice` |
+| Q12 dự phòng | `missing` | `routing::Router` trong `LiveProvider`: lỗi `rate_limited`/`service_unavailable` trước khi có output, tới lần thử cuối của runtime (hoặc ngay khi `rate_limited`) → lượt chuyển sang `backup`, notice prime; lượt sau về model chính, thành công thì `Primary provider recovered — back on <x>` | `q12_backup_takes_over_after_retries_and_hands_back`, `q13_a_rate_limit_goes_to_the_backup_before_any_wait` |
+| Q12 ảnh | `missing` | request có ảnh + `Model.input` của model phiên không có `image` → `image` model; không có → lỗi `IncompatibleService` rõ ràng, ảnh không tới model chữ | `q12_images_route_to_the_image_model`, `q12_images_without_an_image_model_fail_clearly` |
+| Q13 mã lỗi | `incompatible`: 429 = `service_unavailable` | `ErrorCode::RateLimited` (`rate_limited`, retry `Transient`, exit như `service_unavailable`); 429 → `RateLimited`; mã lỗi JSON có cấu trúc `rate_limit_exceeded`/`insufficient_quota`/`rate_limit_error` (ở `/error/code`, `/error/type`, `/code`, `/type`) → `RateLimited`, không đọc câu chữ tự do | `q13_429_maps_to_rate_limited`, `q13_a_structured_quota_code_names_a_usage_limit` |
+| Q13 chờ hạn mức | `missing` | trong `Router`: 1 s gấp đôi tới 300 s, 30 lần, tổng 15 phút (hằng của prime), `Retry-After` ≤ 300 s được ưu tiên; `SessionEvent::ProviderWaiting` → dòng trạng thái prime thay dòng "Thinking"; Esc huỷ (`provider_canceled`); quá giới hạn → `Provider recovery wait gave up after N pings`; `[routing] wait_for_usage = false` tắt | `q13_rate_limit_waits_and_recovers`, `q13_rate_limit_wait_is_cancelable`, `q13_wait_gives_up_after_the_bound`, PTY `q13_pty_waiting_line_is_shown` |
+
+**Khác plan / prime (có chủ đích):**
+- Bảng config là `[routing]`, không phải `[models]` như plan: `[models]` đã là bảng theo từng model (`[models."<id>"] context_window`), không thể thêm khoá `enabled`. Khoá: `scoped`, `auxiliary`, `backup`, `image`, `wait_for_usage`.
+- `apiKey` trong `models.json` chỉ nhận **tên biến môi trường** (prime nhận cả giá trị): key không bao giờ nằm trong file; giá trị không giống tên biến bị từ chối mà không in lại. Không hỗ trợ `headers` (trường lạ → lỗi nêu tên).
+- `/scoped-models` là lệnh có tham số, không phải picker nhiều lựa chọn; lưu vào `scoped-models.json` (không viết lại `config.toml` để không mất comment).
+- Chờ hạn mức và dự phòng nằm ở `LiveProvider` (lớp đổi model của phiên), không trong vòng retry của runtime: vòng đó gắn với store và ngân sách mỗi lần gọi. Hệ quả: `rate_limited` có backup thì chuyển ngay, không chờ; sau khi bỏ cuộc, các lần thử lại của runtime trong cùng lượt không chờ lại.
+- Model ảnh được chọn cho **mọi request có ảnh** (kể cả khi ảnh nằm ở lượt trước trong lịch sử), để không bao giờ gửi ảnh cho model chữ; model không có trong catalog được coi là nhận ảnh.
+- Không "park qua đêm" khi hết 15 phút (cần lịch bền - CP-4 Q15).
+
+Hợp đồng: `ErrorCode::RateLimited` (`schemas/error-report.v1.schema.json`); `HarnessConfigV2.routing: Option<RoutingConfigV2>` (`harness-config.v2.schema.json`); `SessionEvent::ProviderWaiting`, `UiState.provider_wait`, `Key::CycleModel`; `SessionPort::{cycle_model, scoped_models}`; file mới cạnh config: `models.json`, `scoped-models.json`; `Selection.api_key_env` (tuỳ chọn). 41 lệnh slash.

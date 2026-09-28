@@ -187,6 +187,8 @@ pub struct InteractiveController {
     stash: Option<String>,
     /// A `/btw` side question is being answered.
     side_pending: bool,
+    /// The provider-usage wait line, while the running turn waits.
+    provider_wait: Option<String>,
     /// The conversation's turns from the last `/fork` or `/tree` listing:
     /// session id and the message that opened the turn.
     turn_points: Vec<(String, String)>,
@@ -292,6 +294,7 @@ impl InteractiveController {
             queue: super::queue::InputQueue::new(steering_mode, follow_up_mode),
             stash: None,
             side_pending: false,
+            provider_wait: None,
             turn_points: Vec::new(),
             pending_shell_outputs: Vec::new(),
             file_picker_active: false,
@@ -417,6 +420,7 @@ impl InteractiveController {
             granted_for_run: self.granted_for_run,
             queued_input: !self.queue.is_empty(),
             queued_count: self.queue.len(),
+            provider_wait: self.provider_wait.clone(),
             last_request: self.last_request.clone(),
             run_started_at: self.run_started_at,
             last_run_elapsed: self.last_run_elapsed,
@@ -596,6 +600,14 @@ impl InteractiveController {
         }
         if key == Key::Stash && self.pending_approval.is_none() && self.pending_question.is_none() {
             return self.stash_prompt();
+        }
+        if let Key::CycleModel { forward } = key
+            && self.pending_approval.is_none()
+            && self.pending_question.is_none()
+        {
+            let mut effects = Vec::new();
+            self.cycle_model(forward, &mut effects);
+            return effects;
         }
         if key == Key::CycleDetail {
             self.detail = self.detail.next();
@@ -962,6 +974,24 @@ impl InteractiveController {
         };
         self.reference(title, lines, effects);
         effects.push(Effect::Redraw);
+    }
+
+    /// `/model next|prev`, Alt+M: the next scoped model, applied as `/model` is.
+    fn cycle_model(&mut self, forward: bool, effects: &mut Vec<Effect>) {
+        match self.service.cycle_model(forward) {
+            Ok(message) => self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: if self.phase.has_active_run() {
+                        format!("{message}; the running turn switches at its next step")
+                    } else {
+                        message
+                    },
+                },
+            ),
+            Err(message) => self.push_history(effects, HistoryItem::Error { message }),
+        }
+        self.refresh_status();
     }
 
     /// prime-agent's prompt stash (Ctrl-S): a draft is put aside, and an empty
@@ -1568,6 +1598,20 @@ impl InteractiveController {
             SessionEvent::TurnsListed { purpose, turns } => {
                 self.show_turns(purpose, turns, effects);
             }
+            SessionEvent::ProviderWaiting { line } => {
+                // The plain transcript is a log: each wait is a line of it.
+                if self.plain
+                    && let Some(line) = &line
+                {
+                    self.push_history(
+                        effects,
+                        HistoryItem::Notice {
+                            message: line.clone(),
+                        },
+                    );
+                }
+                self.provider_wait = line;
+            }
             SessionEvent::SideAnswer { question, answer } => {
                 self.side_pending = false;
                 match answer {
@@ -1641,6 +1685,7 @@ impl InteractiveController {
                 self.goal = Some(goal);
             }
             SessionEvent::RunTerminal { outcome } => {
+                self.provider_wait = None;
                 self.refresh_menu();
                 self.flush_stream(effects);
                 self.settle_run(Some(outcome.clone()));
@@ -2317,6 +2362,13 @@ impl InteractiveController {
             }
             "/queue" => self.queue_command(raw_argument, &mut effects),
             "/stash" => return self.stash_prompt(),
+            "/scoped-models" => match self.service.scoped_models(argument) {
+                Ok(lines) => {
+                    self.reference("/scoped-models", lines, &mut effects);
+                    self.refresh_status();
+                }
+                Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+            },
             "/fork" | "/clone" | "/tree" if self.phase.has_active_run() => {
                 self.push_history(
                     &mut effects,
@@ -2681,7 +2733,9 @@ impl InteractiveController {
                 // is required; it never claims a model that was not resolved. The
                 // provider facts follow it, so a surprising answer can be diagnosed
                 // without leaving the app.
-                if let Some(model) = argument {
+                if let Some(direction @ ("next" | "prev")) = argument {
+                    self.cycle_model(direction == "next", &mut effects);
+                } else if let Some(model) = argument {
                     // Allowed while the agent works, as prime-agent's model
                     // selector is: the running turn switches at its next call.
                     match self.service.set_model(model) {

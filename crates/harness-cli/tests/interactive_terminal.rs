@@ -2137,6 +2137,8 @@ enum Reply {
     Tool(&'static str, serde_json::Value),
     /// A body no decoder can read: a provider stream that breaks.
     Garbage,
+    /// HTTP 429 with this `Retry-After`, in seconds.
+    RateLimited(u64),
     Delay(Duration, Box<Reply>),
 }
 
@@ -2187,7 +2189,16 @@ impl ScriptedSse {
                                 reply = *next;
                             }
                             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                write_sse(&mut socket, &reply_body(&reply));
+                                if let Reply::RateLimited(seconds) = reply {
+                                    let body = r#"{"error":{"message":"slow down","type":"rate_limit_exceeded"}}"#;
+                                    let _ = socket.write_all(format!(
+                                        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {seconds}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                        body.len()
+                                    ).as_bytes());
+                                    let _ = socket.flush();
+                                } else {
+                                    write_sse(&mut socket, &reply_body(&reply));
+                                }
                             }));
                         });
                     }
@@ -2241,6 +2252,7 @@ fn reply_body(reply: &Reply) -> String {
             frame(serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})),
         ),
         Reply::Garbage => "data: {not json at all\n\n".to_owned(),
+        Reply::RateLimited(_) => unreachable!("a rate limit is not a stream"),
         Reply::Delay(..) => unreachable!("delays are played before the reply"),
     }
 }
@@ -2559,5 +2571,156 @@ fn q08_pty_fork_then_answer() {
         !transcript.contains("fork-lost-the-history"),
         "{transcript}"
     );
+    finish(session);
+}
+
+/// Q10: a model `models.json` adds is offered by `/model` and answers turns.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn q10_pty_custom_model_is_selectable() {
+    let provider = ScriptedSse::start(|request| {
+        Reply::Text(format!(
+            "served-by-{}",
+            request["model"].as_str().unwrap_or("?")
+        ))
+    });
+    let (temp, project) = sandbox();
+    let home = ha_home(&temp);
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::write(
+        home.join("models.json"),
+        format!(
+            r#"{{
+  // a local server
+  "providers": {{ "local": {{
+    "baseUrl": "http://{}",
+    "apiKey": "LOCAL_Q10_KEY",
+    "api": "openai-completions",
+    "models": [{{ "id": "tiny-q10" }}]
+  }} }}
+}}"#,
+            provider.address
+        ),
+    )
+    .expect("models.json");
+    let mut env = base_env(&temp);
+    env.push(("LOCAL_Q10_KEY", "fixture-secret-value".to_owned()));
+    env.push(("HA_APPROVAL", "full-auto".to_owned()));
+    let mut session = PtySession::spawn(&project, &env);
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+    session.send("/model local/tiny-q10\r");
+    session.wait_for("selected", Duration::from_secs(20));
+    session.send("hello\r");
+    session.wait_for("served-by-tiny-q10", Duration::from_mins(1));
+    let requests = provider.requests();
+    assert!(
+        requests
+            .iter()
+            .all(|(_, request)| request["model"] == "tiny-q10"),
+        "every request names the custom model"
+    );
+    finish(session);
+}
+
+/// A session whose models come from `models.json`, all served by `provider`.
+fn custom_models_session(
+    provider: &ScriptedSse,
+    ids: &[&str],
+    config: &str,
+) -> (tempfile::TempDir, PtySession) {
+    let (temp, project) = sandbox();
+    let home = ha_home(&temp);
+    std::fs::create_dir_all(&home).expect("home");
+    let models = ids
+        .iter()
+        .map(|id| format!(r#"{{ "id": "{id}" }}"#))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        home.join("models.json"),
+        format!(
+            r#"{{ "providers": {{ "local": {{
+    "baseUrl": "http://{}", "apiKey": "LOCAL_Q_KEY", "api": "openai-completions",
+    "models": [{models}] }} }} }}"#,
+            provider.address
+        ),
+    )
+    .expect("models.json");
+    std::fs::write(
+        home.join("config.toml"),
+        format!("schema_version = 2\n{config}"),
+    )
+    .expect("config.toml");
+    let mut env = base_env(&temp);
+    env.push(("LOCAL_Q_KEY", "fixture-secret-value".to_owned()));
+    env.push(("HA_APPROVAL", "full-auto".to_owned()));
+    let session = PtySession::spawn(&project, &env);
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+    (temp, session)
+}
+
+/// Q11: Alt+M moves to the next scoped model, and the next turn runs on it.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn q11_pty_cycle_changes_the_footer_model() {
+    let provider = ScriptedSse::start(|request| {
+        Reply::Text(format!(
+            "served-by-{}",
+            request["model"].as_str().unwrap_or("?")
+        ))
+    });
+    let (_temp, mut session) = custom_models_session(
+        &provider,
+        &["alpha-q11", "beta-q11"],
+        "[routing]\nscoped = [\"local/*\"]\n",
+    );
+    session.send("/model local/alpha-q11\r");
+    session.wait_for("selected", Duration::from_secs(20));
+    session.send("one\r");
+    session.wait_for("served-by-alpha-q11", Duration::from_mins(1));
+    // Alt+M, as a console sends it: Esc then the letter.
+    session.send("\u{1b}m");
+    session.wait_for("beta-q11", Duration::from_secs(20));
+    session.send("two\r");
+    session.wait_for("served-by-beta-q11", Duration::from_mins(1));
+    session.send("/model prev\r");
+    std::thread::sleep(Duration::from_millis(500));
+    session.send("three\r");
+    // "served-by-alpha-q11" is already on screen from the first turn: wait for
+    // the request itself.
+    let deadline = Instant::now() + Duration::from_mins(1);
+    while provider.requests().len() < 3 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let models = provider
+        .requests()
+        .iter()
+        .map(|(_, request)| request["model"].as_str().unwrap_or("?").to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(models, ["alpha-q11", "beta-q11", "alpha-q11"]);
+    finish(session);
+}
+
+/// Q13: a rate-limited provider is waited out with prime-agent's line, and the
+/// answer arrives after it recovers.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn q13_pty_waiting_line_is_shown() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let provider = ScriptedSse::start(move |_| {
+        if counter.fetch_add(1, Ordering::SeqCst) < 2 {
+            Reply::RateLimited(2)
+        } else {
+            Reply::Text("recovered-q13".to_owned())
+        }
+    });
+    let (_temp, mut session) = custom_models_session(&provider, &["tiny-q13"], "");
+    session.send("/model local/tiny-q13\r");
+    session.wait_for("selected", Duration::from_secs(20));
+    session.send("go\r");
+    session.wait_for("(1/30)", Duration::from_secs(30));
+    session.wait_for("recovered-q13", Duration::from_mins(1));
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
     finish(session);
 }

@@ -267,6 +267,14 @@ pub trait SessionPort: Send {
     fn set_model(&mut self, _model: &str) -> Result<String, String> {
         Err("this backend does not support model switching".to_owned())
     }
+    /// Move to the next (or previous) scoped model: `/model next|prev`, Alt+M.
+    fn cycle_model(&mut self, _forward: bool) -> Result<String, String> {
+        Err("this backend does not support model switching".to_owned())
+    }
+    /// `/scoped-models`: show the scope, or save a new one (`clear` drops it).
+    fn scoped_models(&mut self, _argument: Option<&str>) -> Result<Vec<String>, String> {
+        Err("this backend does not support model switching".to_owned())
+    }
     /// The agent's heartbeats whose time has come, advanced to their next run.
     fn due_heartbeats(&mut self) -> Vec<super::heartbeat::Due> {
         Vec::new()
@@ -688,6 +696,8 @@ pub struct ProviderConfig {
     pub agents_default_model: Option<String>,
     /// `[queue]` modes, as written.
     pub queue_modes: (Option<String>, Option<String>),
+    /// `[routing]`: scoped, auxiliary, backup and image models.
+    pub routing: super::config::Routing,
     /// Name of the source that holds the key; never the key.
     pub credential: CredentialSource,
 }
@@ -824,6 +834,7 @@ pub(super) fn resolve_provider_with_overrides(
         bell: resolved.bell,
         agents_default_model: resolved.agents_default_model,
         queue_modes: resolved.queue_modes,
+        routing: resolved.routing,
         credential,
     })
 }
@@ -1084,6 +1095,8 @@ impl CredentialResolver for EnvironmentCredential {
 pub struct LiveTurn {
     level: Mutex<Option<harness_providers::ThinkingLevel>>,
     config: Mutex<Option<ProviderConfig>>,
+    /// The session model a turn left for the backup model, until it answers again.
+    left_primary: Arc<Mutex<Option<String>>>,
 }
 
 impl LiveTurn {
@@ -1128,45 +1141,17 @@ impl super::delegation::ChildModels for ServiceChildModels {
     }
 
     fn resolve(&self, reference: &str) -> Result<super::delegation::ChildModel, String> {
-        let catalog = super::providers::Catalog::load(&self.data_dir);
-        let entry = catalog
-            .find(reference)
-            .ok_or_else(|| format!("Requested subagent model \"{reference}\" is not available"))?;
-        let credential =
-            credentials::source_for(&self.environment, &self.data_dir, &entry.provider, "")
-                .ok_or_else(|| {
-                    format!(
-                        "Requested subagent model \"{reference}\" failed authentication preflight: log in to {} with /login",
-                        entry.provider
-                    )
+        let (config, entry) =
+            super::routing::resolve(&self.base, reference, &self.environment, &self.data_dir)
+                .map_err(|unusable| match unusable {
+                    super::routing::Unusable::NotInCatalog => {
+                        format!("Requested subagent model \"{reference}\" is not available")
+                    }
+                    super::routing::Unusable::NoCredential(provider) => format!(
+                        "Requested subagent model \"{reference}\" failed authentication preflight: log in to {provider} with /login"
+                    ),
                 })?;
-        let price = entry
-            .cost
-            .filter(|cost| cost.input > 0.0 || cost.output > 0.0)
-            .map(|cost| ModelPrice {
-                input_per_mtok: cost.input,
-                output_per_mtok: cost.output,
-            });
-        let mut config = self.base.clone();
-        config.provider_id.clone_from(&entry.provider);
-        entry
-            .protocol()
-            .unwrap_or("openai_chat")
-            .clone_into(&mut config.protocol);
-        config.endpoint = entry.endpoint();
-        config.model.clone_from(&entry.id);
-        config.api_key_env = super::providers::env_variables(&entry.provider)
-            .first()
-            .map_or_else(String::new, |variable| (*variable).to_owned());
-        config.thinking_format = entry
-            .compat
-            .as_ref()
-            .and_then(|compat| compat.thinking_format.clone());
-        config.credential = credential;
-        config.model_price = price;
-        if let Some(window) = entry.context_window {
-            config.context_window_tokens = window;
-        }
+        let price = config.model_price;
         let provider = LiveProvider::build(&config, self.level, &self.session, &self.data_dir)
             .map_err(|error| error.to_string())?;
         Ok(super::delegation::ChildModel {
@@ -1185,6 +1170,8 @@ struct LiveProvider {
     session: String,
     data_dir: PathBuf,
     current: Mutex<(String, Arc<dyn ModelProvider>)>,
+    /// Where calls go when the session model cannot take them.
+    router: Option<Arc<super::routing::Router>>,
 }
 
 impl LiveProvider {
@@ -1202,7 +1189,68 @@ impl LiveProvider {
             base,
             session,
             data_dir,
+            router: None,
         })
+    }
+
+    fn with_router(mut self, router: super::routing::Router) -> Self {
+        self.router = Some(Arc::new(router));
+        self
+    }
+
+    /// The router for this turn, from `[routing]`: the backup and image models
+    /// when they can be used, and the usage wait.
+    fn router_for(
+        &self,
+        sender: UnboundedSender<SessionEvent>,
+        environment: &LaunchEnvironment,
+        level: harness_providers::ThinkingLevel,
+        max_attempts: u32,
+    ) -> super::routing::Router {
+        let routing = &self.base.routing;
+        let primary = format!("{}/{}", self.base.provider_id, self.base.model);
+        let catalog = super::providers::Catalog::load(&self.data_dir);
+        // A model the catalog does not describe is taken at its word.
+        let primary_takes_images = catalog
+            .find(&primary)
+            .is_none_or(|model| model.input.iter().any(|input| input == "image"));
+        let handoff = |reference: &Option<String>| {
+            reference.as_deref().map(|reference| {
+                let (config, entry) = super::routing::resolve(
+                    &self.base,
+                    reference,
+                    environment,
+                    &self.data_dir,
+                )
+                .map_err(|unusable| match unusable {
+                    super::routing::Unusable::NotInCatalog => {
+                        format!("\"{reference}\" is not in the model catalog")
+                    }
+                    super::routing::Unusable::NoCredential(provider) => {
+                        format!(
+                            "\"{reference}\" has no credential; log in to {provider} with /login"
+                        )
+                    }
+                })?;
+                let provider = Self::build(&config, level, &self.session, &self.data_dir)
+                    .map_err(|error| format!("\"{reference}\": {error}"))?;
+                Ok((entry.reference(), provider))
+            })
+        };
+        let backup = handoff(&routing.backup)
+            .filter(|backup| !matches!(backup, Ok((reference, _)) if *reference == primary));
+        super::routing::Router::new(
+            sender,
+            primary,
+            primary_takes_images,
+            backup,
+            handoff(&routing.image),
+            routing
+                .wait_for_usage
+                .then_some(super::routing::UsageWait::PRIME),
+            max_attempts,
+            Arc::clone(&self.live.left_primary),
+        )
     }
 
     fn key(config: &ProviderConfig, level: harness_providers::ThinkingLevel) -> String {
@@ -1273,7 +1321,14 @@ impl ModelProvider for LiveProvider {
         request: ProviderRequest,
         cancellation: CancellationToken,
     ) -> harness_providers::ProviderFuture {
-        self.provider().stream(request, cancellation)
+        match &self.router {
+            Some(router) => super::routing::collect(router.stream_events(
+                self.provider(),
+                request,
+                cancellation,
+            )),
+            None => self.provider().stream(request, cancellation),
+        }
     }
 
     fn stream_events(
@@ -1281,7 +1336,10 @@ impl ModelProvider for LiveProvider {
         request: ProviderRequest,
         cancellation: CancellationToken,
     ) -> harness_providers::ProviderEventStream {
-        self.provider().stream_events(request, cancellation)
+        match &self.router {
+            Some(router) => router.stream_events(self.provider(), request, cancellation),
+            None => self.provider().stream_events(request, cancellation),
+        }
     }
 }
 
@@ -1994,6 +2052,15 @@ impl AgentSessionService {
         config_overrides: ConfigOverrides,
     ) -> Self {
         let gate = Arc::new(ChannelApprovalGate::new(sender.clone(), APPROVAL_TIMEOUT));
+        super::custom_models::use_beside(&context.paths.config_file);
+        if let Err(error) = super::providers::Catalog::bundled().apply_custom() {
+            let _ = sender.send(SessionEvent::Notice {
+                message: format!(
+                    "{}: {error} - using built-in models only",
+                    super::custom_models::FILE_NAME
+                ),
+            });
+        }
         // The bounds are the environment's, not a constant here: a long task needs a
         // real way to raise them, and `/status` reports what is in force.
         let limits = bounds::limits_from_environment(&environment);
@@ -2315,6 +2382,49 @@ impl Drop for AgentSessionService {
         }
         tokio::task::block_in_place(|| handle.block_on(repl.dispose()));
     }
+}
+
+/// The scoped models whose provider has a credential, in scope order.
+fn scoped_entries(
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+    config: &ProviderConfig,
+) -> Vec<super::routing::ScopeEntry> {
+    let catalog = super::providers::Catalog::load(data_dir);
+    let usable = catalog
+        .models()
+        .iter()
+        .filter(|model| {
+            credentials::source_for(environment, data_dir, &model.provider, &model.key_env())
+                .is_some()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    super::routing::scope(&config.routing.scoped, &usable)
+}
+
+/// Every catalog model `/model` offers: those whose provider has a credential.
+fn catalog_options(environment: &LaunchEnvironment, data_dir: &Path) -> Vec<(String, String)> {
+    // Built-in providers in `/login` order, then those `models.json` adds.
+    let catalog = super::providers::Catalog::load(data_dir);
+    let mut providers = super::providers::PROVIDERS
+        .iter()
+        .map(|provider| provider.id.to_owned())
+        .collect::<Vec<_>>();
+    for model in catalog.models() {
+        if !providers.contains(&model.provider) {
+            providers.push(model.provider.clone());
+        }
+    }
+    providers
+        .iter()
+        .flat_map(|provider| catalog.for_provider(provider))
+        .filter(|model| {
+            credentials::source_for(environment, data_dir, &model.provider, &model.key_env())
+                .is_some()
+        })
+        .map(|model| (model.reference(), model.name.clone()))
+        .collect()
 }
 
 impl SessionPort for AgentSessionService {
@@ -2925,15 +3035,20 @@ impl SessionPort for AgentSessionService {
                     .compat
                     .as_ref()
                     .and_then(|compat| compat.thinking_format.clone()),
+                api_key_env: entry.key_variable.clone(),
             };
             super::config::save_selection(&self.config_file, &selection)
                 .map_err(|error| error.to_string())?;
             if let Ok(mut selection) = self.model_selection.lock() {
                 *selection = TurnModelSelection::default();
             }
-            let ready =
-                credentials::source_for(&self.environment, &self.data_dir, &entry.provider, "")
-                    .is_some();
+            let ready = credentials::source_for(
+                &self.environment,
+                &self.data_dir,
+                &entry.provider,
+                &entry.key_env(),
+            )
+            .is_some();
             let provider_name = super::providers::provider(&entry.provider)
                 .map_or(entry.provider.as_str(), |provider| provider.name);
             // A running turn switches at its next model call, as prime-agent's
@@ -2959,6 +3074,87 @@ impl SessionPort for AgentSessionService {
 
     fn due_heartbeats(&mut self) -> Vec<super::heartbeat::Due> {
         self.heartbeats.due(std::time::Instant::now())
+    }
+
+    fn cycle_model(&mut self, forward: bool) -> Result<String, String> {
+        let config = self.configured()?;
+        if config.routing.scoped.is_empty() {
+            return Err(
+                "no scoped models: choose them with /scoped-models <pattern>... or [routing] scoped"
+                    .to_owned(),
+            );
+        }
+        let entries = scoped_entries(&self.environment, &self.data_dir, &config);
+        if entries.len() < 2 {
+            return Err(format!(
+                "cycling needs two scoped models with a credential; {} matched",
+                entries.len()
+            ));
+        }
+        let current = format!("{}/{}", config.provider_id, config.model);
+        let next = super::routing::step(&entries, &current, forward)
+            .cloned()
+            .ok_or_else(|| "no scoped model to move to".to_owned())?;
+        let mut message = self.set_model(&next.reference)?;
+        if let Some(level) = next.level {
+            match self.set_thinking(level.as_str()) {
+                Ok(thinking) => message = format!("{message}; {thinking}"),
+                Err(error) => message = format!("{message}; {error}"),
+            }
+        }
+        Ok(message)
+    }
+
+    fn scoped_models(&mut self, argument: Option<&str>) -> Result<Vec<String>, String> {
+        match argument
+            .map(str::trim)
+            .filter(|argument| !argument.is_empty())
+        {
+            None => {}
+            Some("clear") => {
+                super::config::save_scoped_models(&self.config_file, &[])?;
+            }
+            Some(patterns) => {
+                let patterns = patterns
+                    .split([' ', ','])
+                    .filter(|pattern| !pattern.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let catalog = super::providers::Catalog::load(&self.data_dir);
+                if let Some(unmatched) = patterns.iter().find(|pattern| {
+                    super::routing::scope(std::slice::from_ref(*pattern), catalog.models())
+                        .is_empty()
+                }) {
+                    return Err(format!("{unmatched} matches no model in the catalog"));
+                }
+                super::config::save_scoped_models(&self.config_file, &patterns)?;
+            }
+        }
+        let config = self.configured()?;
+        if config.routing.scoped.is_empty() {
+            return Ok(vec![
+                "no scoped models; /scoped-models <pattern>... chooses them (e.g. deepseek/* openai/gpt-5*:high)".to_owned(),
+            ]);
+        }
+        let current = format!("{}/{}", config.provider_id, config.model);
+        let mut lines = vec![format!("patterns: {}", config.routing.scoped.join(" "))];
+        let entries = scoped_entries(&self.environment, &self.data_dir, &config);
+        if entries.is_empty() {
+            lines.push("no model with a credential matches; log in with /login".to_owned());
+        }
+        for entry in entries {
+            lines.push(format!(
+                "{} {}{}",
+                if entry.reference == current { "*" } else { " " },
+                entry.reference,
+                entry
+                    .level
+                    .map(|level| format!(":{}", level.as_str()))
+                    .unwrap_or_default()
+            ));
+        }
+        lines.push("/model next and /model prev (Alt+M, Shift+Alt+M) move through them".to_owned());
+        Ok(lines)
     }
 
     fn set_thinking(&mut self, level: &str) -> Result<String, String> {
@@ -3252,20 +3448,15 @@ impl SessionPort for AgentSessionService {
     }
 
     fn model_options(&self) -> Vec<(String, String)> {
-        let catalog = super::providers::Catalog::load(&self.data_dir);
-        super::providers::PROVIDERS
-            .iter()
-            .filter(|provider| {
-                credentials::source_for(&self.environment, &self.data_dir, provider.id, "")
-                    .is_some()
-            })
-            .flat_map(|provider| {
-                catalog
-                    .for_provider(provider.id)
-                    .map(|model| (model.reference(), model.name.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+        let mut options = vec![
+            ("next".to_owned(), "next scoped model (Alt+M)".to_owned()),
+            (
+                "prev".to_owned(),
+                "previous scoped model (Shift+Alt+M)".to_owned(),
+            ),
+        ];
+        options.extend(catalog_options(&self.environment, &self.data_dir));
+        options
     }
 
     fn list_sessions(&mut self) {
@@ -4120,7 +4311,15 @@ async fn run_turn(
         task_id.as_ref().to_owned(),
         data_dir.clone(),
     )
-    .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>);
+    .map(|provider| {
+        let router = provider.router_for(
+            sender.clone(),
+            &environment,
+            thinking_level,
+            RuntimeConfig::default().max_attempts,
+        );
+        Arc::new(provider.with_router(router)) as Arc<dyn ModelProvider>
+    });
     let provider = match provider {
         Ok(provider) => provider,
         Err(error) => {
@@ -4163,7 +4362,45 @@ async fn run_turn(
         })
     });
 
-    let runtime = Arc::new(RuntimeService::new(
+    // `[routing] auxiliary`: the model that writes summaries and `/refine`
+    // reviews, when it can be used; the session model otherwise.
+    let auxiliary = config.routing.auxiliary.as_deref().and_then(|reference| {
+        let built = super::routing::resolve(&config, reference, &environment, &data_dir)
+            .map_err(|unusable| match unusable {
+                super::routing::Unusable::NotInCatalog => "not in the model catalog".to_owned(),
+                super::routing::Unusable::NoCredential(provider) => {
+                    format!("no credential for {provider}")
+                }
+            })
+            .and_then(|(auxiliary_config, entry)| {
+                LiveProvider::build(
+                    &auxiliary_config,
+                    thinking_level,
+                    task_id.as_ref(),
+                    &data_dir,
+                )
+                .map(|provider| (provider, entry))
+                .map_err(|error| error.to_string())
+            });
+        match built {
+            Ok(built) => Some(built),
+            Err(reason) => {
+                send(SessionEvent::Notice {
+                    message: super::routing::unusable_auxiliary(
+                        reference,
+                        "summaries and /refine",
+                        &reason,
+                    ),
+                });
+                None
+            }
+        }
+    });
+    let (helper_provider, helper_model) = auxiliary.as_ref().map_or_else(
+        || (Arc::clone(&provider), config.model.clone()),
+        |(auxiliary, entry)| (Arc::clone(auxiliary), entry.id.clone()),
+    );
+    let mut runtime = RuntimeService::new(
         Arc::clone(&store),
         Arc::clone(&provider),
         RuntimeConfig {
@@ -4173,7 +4410,20 @@ async fn run_turn(
             max_retry_after_seconds: config.max_retry_after_seconds,
             ..RuntimeConfig::default()
         },
-    ));
+    );
+    if let Some((auxiliary, entry)) = &auxiliary {
+        runtime = runtime.with_summarizer(Arc::new(super::routing::AuxiliarySummary::new(
+            entry.reference(),
+            Arc::new(harness_runtime::ModelSummaryProvider::new(Arc::clone(
+                auxiliary,
+            ))),
+            Arc::new(harness_runtime::ModelSummaryProvider::new(Arc::clone(
+                &provider,
+            ))),
+            sender.clone(),
+        )));
+    }
+    let runtime = Arc::new(runtime);
     if let Some(guidance) = request.compact_guidance.as_deref() {
         let result = match source.as_ref() {
             Some(source_session) => runtime
@@ -4235,8 +4485,14 @@ async fn run_turn(
                 .unwrap_or_default(),
             None => String::new(),
         };
-        let result =
-            super::refine::refine(&provider, &config.model, &conversation, &scopes, &options).await;
+        let result = super::refine::refine(
+            &helper_provider,
+            &helper_model,
+            &conversation,
+            &scopes,
+            &options,
+        )
+        .await;
         drop(runtime);
         if let Ok(store) = Arc::try_unwrap(store) {
             let _ = store.close().await;
@@ -4824,8 +5080,14 @@ async fn run_turn(
                 Some(options)
             } else {
                 turns_since_review.store(0, std::sync::atomic::Ordering::SeqCst);
-                match super::refine::review(&provider, &config.model, &conversation, &scopes, turns)
-                    .await
+                match super::refine::review(
+                    &helper_provider,
+                    &helper_model,
+                    &conversation,
+                    &scopes,
+                    turns,
+                )
+                .await
                 {
                     Ok(review) if review.should_refine => Some(super::refine::RefineOptions {
                         instructions: review.instructions,

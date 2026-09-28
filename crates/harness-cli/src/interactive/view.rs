@@ -177,6 +177,7 @@ pub fn help_card_lines() -> Vec<String> {
             "Model",
             &[
                 "/model",
+                "/scoped-models",
                 "/effort",
                 "/login",
                 "/logout",
@@ -247,6 +248,7 @@ pub fn hotkey_lines() -> Vec<String> {
             "Ctrl-S",
             "put the draft aside; again on an empty prompt brings it back",
         ),
+        ("Alt+M / Shift+Alt+M", "next / previous scoped model"),
         ("Ctrl-L", "redraw"),
         ("Ctrl-U / Ctrl-W", "erase to line start / erase a word"),
         ("Ctrl-V", "paste an image or path from the clipboard"),

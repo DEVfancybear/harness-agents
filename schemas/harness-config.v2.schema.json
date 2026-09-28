@@ -382,6 +382,55 @@
       },
       "type": "object"
     },
+    "RoutingConfigV2": {
+      "additionalProperties": false,
+      "properties": {
+        "auxiliary": {
+          "default": null,
+          "description": "The model that writes compaction summaries and `/refine` reviews.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "backup": {
+          "default": null,
+          "description": "The model a turn moves to when the session model keeps failing.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "image": {
+          "default": null,
+          "description": "The model a request with images goes to when the session model takes text only.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scoped": {
+          "default": null,
+          "description": "Patterns over `provider/id` or `id` (`*` and `?`, any case, optional\n`:level`) naming the models `/model next` and Alt+M cycle through.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "wait_for_usage": {
+          "default": null,
+          "description": "Wait for a rate-limited provider to recover instead of failing (default true).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "TrustConfigV2": {
       "additionalProperties": false,
       "properties": {
@@ -528,6 +577,18 @@
       ],
       "default": null,
       "description": "Messages queued while the agent works: prime-agent's `steeringMode` and\n`followUpMode`."
+    },
+    "routing": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RoutingConfigV2"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Which models the session cycles through and which it hands work to:\nprime-agent's `enabledModels`, `auxiliaryModel`, `backupModel` and\n`imageModel`."
     },
     "schema_version": {
       "const": 2,

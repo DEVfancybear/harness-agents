@@ -112,6 +112,9 @@ pub struct Selection {
     pub context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_format: Option<String>,
+    /// The variable the key is read from, for a `models.json` provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
 }
 
 /// The file the selection lives in, beside the user config.
@@ -148,6 +151,39 @@ pub fn save_selection(user_path: &Path, selection: &Selection) -> Result<(), Har
     std::fs::rename(&staged, &path).map_err(|error| failed(&error))
 }
 
+/// The file `/scoped-models` saves the scope in, beside the user config: it
+/// stands above `[routing] scoped` of the user config, as the `/model` selection
+/// does.
+#[must_use]
+pub fn scoped_models_path(user_path: &Path) -> PathBuf {
+    user_path.with_file_name("scoped-models.json")
+}
+
+/// The scope `/scoped-models` saved, if any.
+#[must_use]
+pub fn load_scoped_models(user_path: &Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(scoped_models_path(user_path)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Save the scope; an empty one removes the file, so the config decides again.
+pub fn save_scoped_models(user_path: &Path, patterns: &[String]) -> Result<(), String> {
+    let path = scoped_models_path(user_path);
+    if patterns.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
+            _ => Ok(()),
+        };
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let text = serde_json::to_string_pretty(patterns).map_err(|error| error.to_string())?;
+    let staged = path.with_extension("json.staged");
+    std::fs::write(&staged, text).map_err(|error| error.to_string())?;
+    std::fs::rename(&staged, &path).map_err(|error| error.to_string())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ConfigExplainEntry {
     pub key: String,
@@ -177,6 +213,8 @@ pub struct ResolvedConfig {
     pub agents_default_model: Option<String>,
     /// `[queue] steering_mode` and `follow_up_mode`, as written.
     pub queue_modes: (Option<String>, Option<String>),
+    /// `[routing]`, merged across layers key by key.
+    pub routing: Routing,
     pub explain: Vec<ConfigExplainEntry>,
     pub project_config_reason: Option<String>,
 }
@@ -209,6 +247,7 @@ pub fn resolve_layers(
     let mut bell = false;
     let mut agents_default_model: Option<String> = None;
     let mut queue_modes: (Option<String>, Option<String>) = (None, None);
+    let mut routing = Routing::new();
     let mut approval = "ask".to_owned();
     let mut approval_layer = ConfigLayer::Default;
     let mut allow_rules = Vec::new();
@@ -291,11 +330,22 @@ pub fn resolve_layers(
             &mut entries,
         );
         apply_queue(&mut queue_modes, config, ConfigLayer::User, &mut entries)?;
+        apply_routing(&mut routing, config, ConfigLayer::User, &mut entries);
         mcp_servers.extend(config.mcp_servers.clone());
     }
     // The servers `/mcp add` saved beside the user config, at the user layer: a
     // trusted project's servers still override them.
     mcp_servers.extend(super::mcp_config::load(user_path));
+    if let Some(scoped) = load_scoped_models(user_path) {
+        set_explain(
+            &mut entries,
+            "routing.scoped",
+            &scoped.join(", "),
+            ConfigLayer::Selection,
+            Some("chosen with /scoped-models".to_owned()),
+        );
+        routing.scoped = scoped;
+    }
     if let Some(selection) = load_selection(user_path) {
         apply_selection(
             &mut provider,
@@ -379,6 +429,7 @@ pub fn resolve_layers(
                 ConfigLayer::Project,
                 &mut entries,
             )?;
+            apply_routing(&mut routing, &config, ConfigLayer::Project, &mut entries);
             mcp_servers.extend(config.mcp_servers.clone());
         }
     } else if project_path.exists() {
@@ -452,6 +503,7 @@ pub fn resolve_layers(
             &mut entries,
         );
         apply_queue(&mut queue_modes, &config, ConfigLayer::Local, &mut entries)?;
+        apply_routing(&mut routing, &config, ConfigLayer::Local, &mut entries);
     }
 
     let mut profile = overrides.profile.clone().or_else(|| {
@@ -634,6 +686,7 @@ pub fn resolve_layers(
         bell,
         agents_default_model,
         queue_modes,
+        routing,
         explain,
         project_config_reason: project_reason,
     })
@@ -730,6 +783,74 @@ fn apply_queue(
 }
 
 /// `[agents] default_model` of one layer; a later layer wins.
+/// `[routing]`: which models the session cycles through and hands work to.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Routing {
+    pub scoped: Vec<String>,
+    pub auxiliary: Option<String>,
+    pub backup: Option<String>,
+    pub image: Option<String>,
+    pub wait_for_usage: bool,
+}
+
+impl Routing {
+    fn new() -> Self {
+        Self {
+            wait_for_usage: true,
+            ..Self::default()
+        }
+    }
+}
+
+fn apply_routing(
+    routing: &mut Routing,
+    config: &HarnessConfigV2,
+    layer: ConfigLayer,
+    entries: &mut BTreeMap<String, ConfigExplainEntry>,
+) {
+    let Some(section) = &config.routing else {
+        return;
+    };
+    if let Some(scoped) = &section.scoped {
+        routing.scoped = scoped
+            .iter()
+            .map(|pattern| pattern.trim().to_owned())
+            .filter(|pattern| !pattern.is_empty())
+            .collect();
+        set_explain(
+            entries,
+            "routing.scoped",
+            &routing.scoped.join(", "),
+            layer,
+            None,
+        );
+    }
+    for (key, value, slot) in [
+        (
+            "routing.auxiliary",
+            &section.auxiliary,
+            &mut routing.auxiliary,
+        ),
+        ("routing.backup", &section.backup, &mut routing.backup),
+        ("routing.image", &section.image, &mut routing.image),
+    ] {
+        if let Some(value) = value.as_deref().map(str::trim) {
+            *slot = (!value.is_empty()).then(|| value.to_owned());
+            set_explain(entries, key, value, layer, None);
+        }
+    }
+    if let Some(wait) = section.wait_for_usage {
+        routing.wait_for_usage = wait;
+        set_explain(
+            entries,
+            "routing.wait_for_usage",
+            &wait.to_string(),
+            layer,
+            None,
+        );
+    }
+}
+
 fn apply_agents(
     default_model: &mut Option<String>,
     config: &HarnessConfigV2,
@@ -1037,9 +1158,11 @@ fn apply_selection(
     provider.protocol.clone_from(&selection.protocol);
     provider.endpoint.clone_from(&selection.endpoint);
     provider.model.clone_from(&selection.model);
-    provider.api_key_env = super::providers::env_variables(&selection.provider)
-        .first()
-        .map_or_else(String::new, |variable| (*variable).to_owned());
+    provider.api_key_env = selection.api_key_env.clone().unwrap_or_else(|| {
+        super::providers::env_variables(&selection.provider)
+            .first()
+            .map_or_else(String::new, |variable| (*variable).to_owned())
+    });
     provider
         .thinking_format
         .clone_from(&selection.thinking_format);

@@ -181,6 +181,9 @@ pub struct Model {
     /// offer, a string for how the provider spells it.
     #[serde(default)]
     pub thinking_level_map: Option<std::collections::BTreeMap<String, Option<String>>>,
+    /// The environment variable a `models.json` provider reads its key from.
+    #[serde(skip)]
+    pub key_variable: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -212,6 +215,17 @@ impl Model {
             self.reasoning,
             &self.thinking_level_map.clone().unwrap_or_default(),
         )
+    }
+
+    /// The environment variable the key is read from: the one `models.json`
+    /// names, else the provider's first.
+    #[must_use]
+    pub fn key_env(&self) -> String {
+        self.key_variable.clone().unwrap_or_else(|| {
+            env_variables(&self.provider)
+                .first()
+                .map_or_else(String::new, |variable| (*variable).to_owned())
+        })
     }
 
     /// `provider/id`, the form `/model` takes and shows.
@@ -287,6 +301,8 @@ impl Catalog {
             };
             catalog.add_listed(provider.0, &ids);
         }
+        // A broken models.json is reported where the session starts.
+        let _ = catalog.apply_custom();
         catalog
     }
 
@@ -333,6 +349,24 @@ impl Catalog {
                     })
             })
             .collect()
+    }
+
+    /// Every model, in catalog order.
+    #[must_use]
+    pub fn models(&self) -> &[Model] {
+        &self.models
+    }
+
+    /// Add what `models.json` beside the user config defines. A file that cannot
+    /// be used changes nothing and its problem is returned.
+    pub fn apply_custom(&mut self) -> Result<(), String> {
+        let Some(path) = super::custom_models::path() else {
+            return Ok(());
+        };
+        if let Some(custom) = super::custom_models::load(&path, &self.models)? {
+            custom.apply(&mut self.models);
+        }
+        Ok(())
     }
 
     /// The models of one provider, in catalog order.

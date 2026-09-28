@@ -663,6 +663,11 @@ pub struct HarnessConfigV2 {
     /// `followUpMode`.
     #[serde(default)]
     pub queue: Option<QueueConfigV2>,
+    /// Which models the session cycles through and which it hands work to:
+    /// prime-agent's `enabledModels`, `auxiliaryModel`, `backupModel` and
+    /// `imageModel`.
+    #[serde(default)]
+    pub routing: Option<RoutingConfigV2>,
 }
 
 impl HarnessConfigV2 {
@@ -975,6 +980,27 @@ pub struct QueueConfigV2 {
     /// `all` or `one-at-a-time` (the default).
     #[serde(default)]
     pub follow_up_mode: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingConfigV2 {
+    /// Patterns over `provider/id` or `id` (`*` and `?`, any case, optional
+    /// `:level`) naming the models `/model next` and Alt+M cycle through.
+    #[serde(default)]
+    pub scoped: Option<Vec<String>>,
+    /// The model that writes compaction summaries and `/refine` reviews.
+    #[serde(default)]
+    pub auxiliary: Option<String>,
+    /// The model a turn moves to when the session model keeps failing.
+    #[serde(default)]
+    pub backup: Option<String>,
+    /// The model a request with images goes to when the session model takes text only.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Wait for a rate-limited provider to recover instead of failing (default true).
+    #[serde(default)]
+    pub wait_for_usage: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

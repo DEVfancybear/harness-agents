@@ -573,6 +573,7 @@ impl LineEditor {
             | Key::Redraw
             | Key::CycleDetail
             | Key::Stash
+            | Key::CycleModel { .. }
             | Key::Resize { .. }
             // Ctrl-V reaches the controller as its own key because the terminal forwards
             // it there, and the controller reads the clipboard. Attaching an image is not

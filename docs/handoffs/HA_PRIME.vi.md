@@ -6,7 +6,8 @@
 
 - **CP-1 (Q00–Q04): xong**, verified local ngày 28/09/2026 (xem evidence). Agent con thuộc session, sống quá lượt, báo kết quả bằng thông báo prime, nhắn tin hai chiều, chọn được model; `/agents stop`.
 - **CP-2 (Q05–Q09): xong** ngày 28/09/2026 — hàng đợi 2 lane + `/queue`, Ctrl-S/`/stash`, `/btw`, `/fork`/`/clone`/`/tree` (task mới + `forked_from`), `/export x.html`.
-- **CP-3 (Q10–Q13): chưa bắt đầu.**
+- **CP-3 (Q10–Q13): xong** ngày 28/09/2026 — `models.json` (apiKey = tên biến môi trường), `[routing] scoped` + `/scoped-models` + `/model next|prev` + Alt+M, model phụ/dự phòng/ảnh (`routing::Router` trong `LiveProvider`, `AuxiliarySummary`), `ErrorCode::RateLimited` + chờ hạn mức.
+- **CP-4 (Q14–Q15): chưa bắt đầu.**
 
 ## Điều người làm checkpoint sau cần biết
 
@@ -15,7 +16,9 @@
 - Q08 (fork/tree): đầu mỗi lượt `run_turn` gọi `store.release_task_lease(task_id)`; nếu fork tạo task mới thì không ảnh hưởng, nhưng bước 0 của Q08 vẫn phải đo nguồn khác task như plan.
 - Test PTY mới dùng `ScriptedSse` + `Reply` + `from_parent`/`request_text`/`tool_results` + `scripted_session` ở cuối `tests/interactive_terminal.rs`.
 - Chưa làm (ghi trong SPEC): cap 20 tin chờ mỗi đích.
+- Q12/Q13 sống trong `interactive/routing.rs` (`Router`, `UsageWait`, `AuxiliarySummary`); `LiveProvider::router_for` dựng nó mỗi lượt từ `ProviderConfig.routing`. Muốn đổi model theo `provider/id` thì dùng `routing::resolve` (catalog + credential), đừng tự dựng `ProviderConfig`.
+- Config dùng bảng `[routing]` (không phải `[models]`, bảng đó đã là context window theo model).
 
 ## Exact next action
 
-Bắt đầu Q10 theo plan: `interactive/custom_models.rs` đọc `<config dir>/models.json` (schema prime), test `q10_custom_model_is_added_with_defaults` trước, rồi gộp vào `Catalog::load` trong `providers.rs`. Trước khi đóng track: chạy một lượt toàn bộ workspace + PTY đầy đủ (người dùng đã dặn).
+CP-4 nếu người dùng yêu cầu: Q14 `/autonomous` rồi Q15 lịch bền theo plan. Trước khi đóng track: chạy một lượt `cargo test --workspace --locked --no-fail-fast` + PTY đầy đủ (`Invoke-HaPtyAcceptance.ps1 -TimeoutSeconds 900`) (người dùng đã dặn).

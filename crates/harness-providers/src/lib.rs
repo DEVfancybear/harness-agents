@@ -880,8 +880,8 @@ impl ProviderError {
 /// Map one HTTP status from the provider onto the typed error taxonomy.
 ///
 /// The codes come from the provider's own documented table: 400 and 422 are
-/// request defects, 401 is authority, 402 is balance, 429/500/503 are transient
-/// and worth a bounded retry. A `Retry-After` header is carried on the error so
+/// request defects, 401 is authority, 402 is balance, 429 is a rate or quota
+/// limit worth waiting out, 500/503 are transient and worth a bounded retry. A `Retry-After` header is carried on the error so
 /// the retry owner can honour it instead of guessing.
 #[must_use]
 pub fn http_status_error(status: u16, retry_after: Option<Duration>) -> ProviderError {
@@ -889,7 +889,8 @@ pub fn http_status_error(status: u16, retry_after: Option<Duration>) -> Provider
         400 | 422 => ErrorCode::InvalidPayload,
         401 => ErrorCode::MissingAuthority,
         402 => ErrorCode::BudgetExhausted,
-        429 | 500 | 502 | 503 | 504 => ErrorCode::ServiceUnavailable,
+        429 => ErrorCode::RateLimited,
+        500 | 502 | 503 | 504 => ErrorCode::ServiceUnavailable,
         _ => ErrorCode::ProviderProtocol,
     };
     ProviderError::new(code, format!("provider returned HTTP {status}"))
@@ -901,8 +902,15 @@ pub fn http_status_error(status: u16, retry_after: Option<Duration>) -> Provider
 pub(crate) async fn http_response_error(response: reqwest::Response) -> ProviderError {
     let status = response.status().as_u16();
     let retry = retry_after_seconds(response.headers());
-    let error = http_status_error(status, retry);
-    let detail = response.text().await.ok().and_then(|body| {
+    let mut error = http_status_error(status, retry);
+    let body = response.text().await.ok();
+    // A provider that names a rate or quota limit in its structured error code
+    // is rate limited whatever status it chose.
+    if body.as_deref().is_some_and(names_a_usage_limit) {
+        error = ProviderError::new(ErrorCode::RateLimited, error.message.clone())
+            .with_retry_after(error.retry_after());
+    }
+    let detail = body.and_then(|body| {
         // A JSON error names its message; anything else is shown as sent.
         error_message(&body).or_else(|| {
             let text = body.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -914,6 +922,24 @@ pub(crate) async fn http_response_error(response: reqwest::Response) -> Provider
             .with_retry_after(error.retry_after()),
         None => error,
     }
+}
+
+/// Whether a JSON error body's code or type is one of the documented rate and
+/// quota limit codes (`OpenAI`'s `rate_limit_exceeded` and `insufficient_quota`,
+/// Anthropic's `rate_limit_error`).
+pub(crate) fn names_a_usage_limit(body: &str) -> bool {
+    const CODES: [&str; 3] = [
+        "rate_limit_exceeded",
+        "insufficient_quota",
+        "rate_limit_error",
+    ];
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    ["/error/code", "/error/type", "/code", "/type"]
+        .iter()
+        .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .any(|code| CODES.contains(&code))
 }
 
 /// The message of a JSON error body, cut to one line.
@@ -2630,5 +2656,36 @@ mod chat_message_tests {
             ProviderMessage::new(MessageRole::Assistant, ""),
         ]);
         assert_eq!(wire.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod usage_limit_tests {
+    use super::{ErrorCode, http_status_error, names_a_usage_limit};
+
+    #[test]
+    fn q13_429_maps_to_rate_limited() {
+        let error = http_status_error(429, None);
+        assert_eq!(error.code(), ErrorCode::RateLimited);
+        assert!(error.is_retryable());
+        assert_eq!(
+            http_status_error(503, None).code(),
+            ErrorCode::ServiceUnavailable
+        );
+    }
+
+    #[test]
+    fn q13_a_structured_quota_code_names_a_usage_limit() {
+        assert!(names_a_usage_limit(
+            r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota"}}"#
+        ));
+        assert!(names_a_usage_limit(
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#
+        ));
+        // Free text alone is not read.
+        assert!(!names_a_usage_limit(
+            r#"{"error":{"message":"rate limit exceeded","type":"server_error"}}"#
+        ));
+        assert!(!names_a_usage_limit("rate_limit_exceeded"));
     }
 }

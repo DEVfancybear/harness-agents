@@ -103,6 +103,11 @@
           "type": "string"
         },
         {
+          "const": "rate_limited",
+          "description": "The provider refused for rate or quota (HTTP 429, or a structured\nquota code in its error body): waiting may help.",
+          "type": "string"
+        },
+        {
           "const": "role_unavailable",
           "description": "A requested worker role cannot run with the host's current isolation capabilities.",
           "type": "string"

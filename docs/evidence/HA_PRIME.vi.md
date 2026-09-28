@@ -40,3 +40,23 @@
 | `generate_schemas` | `harness-config.v2.schema.json` thêm `queue` |
 
 **not_run:** toàn bộ workspace, 25 ca PTY cũ, live smoke.
+
+
+# Evidence CP-3 (Q10–Q13)
+
+- **Trạng thái:** `implemented_partially_verified` — như CP-1/CP-2, toàn bộ workspace và 25 ca PTY cũ để chạy một lượt khi xong các checkpoint (theo người dùng).
+- **Base:** `5d7efd9`; Windows 11; 28/09/2026.
+
+| Lệnh | Kết quả |
+|---|---|
+| `cargo test -p harness-cli --bin ha -- q10 comments_inside` | 6 passed |
+| `cargo test -p harness-providers q13` | 2 passed (`429 → rate_limited`, mã quota có cấu trúc; chữ tự do không được đọc) |
+| `cargo test -p harness-cli --bin ha -- q11 q12 q13` | 10 passed; thêm 2 test `AuxiliarySummary` → 2 passed |
+| `cargo test -p harness-cli --bin ha` | lần 1: 471 passed, 5 failed — 3 test menu slash (do `/scoped-models` chèn ngay sau `/model` làm lệch thứ tự menu → dời xuống cạnh `/stash`) + 2 test g09 chập chờn đã biết (`g09_hook_receives_bounded_json_without_secrets` chạy riêng xanh); lần 2: **476 passed, 0 failed** |
+| `cargo test -p harness-types -p harness-providers`, `--test phase_p0` | xanh |
+| `Invoke-HaPtyAcceptance.ps1 -Filter q10` | 1 passed (`PTY_EXIT: 0`): `/model local/tiny-q10` từ `models.json`, server nhận đúng model id |
+| `Invoke-HaPtyAcceptance.ps1 -Filter q1` | lần 1: q11 đỏ vì kịch bản (lần chờ cuối khớp chữ cũ của lượt 1 trên màn hình) → chờ theo số request; lần cuối **3 passed** (`PTY_EXIT: 0`): Alt+M (Esc m) tới được app qua ConPTY và đổi model; 429 + `Retry-After: 2` hai lần → dòng `(1/30)` rồi câu trả lời |
+| `cargo clippy --workspace --all-targets -- -D warnings` | sạch |
+| `generate_schemas` | `harness-config.v2.schema.json` thêm `routing`; `error-report.v1.schema.json` thêm `rate_limited` |
+
+**not_run:** toàn bộ workspace, 25 ca PTY cũ, live smoke với provider thật (429 thật, model phụ thật).

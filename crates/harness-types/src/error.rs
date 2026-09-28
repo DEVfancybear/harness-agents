@@ -38,6 +38,9 @@ pub enum ErrorCode {
     PluginCycle,
     DuplicateRegistration,
     ServiceUnavailable,
+    /// The provider refused for rate or quota (HTTP 429, or a structured
+    /// quota code in its error body): waiting may help.
+    RateLimited,
     ShutdownFailed,
     InvalidStateTransition,
     MandatoryContextOverflow,
@@ -150,6 +153,7 @@ impl ErrorCode {
             Self::PluginCycle => "plugin_cycle",
             Self::DuplicateRegistration => "duplicate_registration",
             Self::ServiceUnavailable => "service_unavailable",
+            Self::RateLimited => "rate_limited",
             Self::ShutdownFailed => "shutdown_failed",
             Self::InvalidStateTransition => "invalid_state_transition",
             Self::MandatoryContextOverflow => "mandatory_context_overflow",
@@ -268,6 +272,7 @@ impl ErrorCode {
             | Self::StorageWriteFailed
             | Self::ArtifactWriteFailed
             | Self::ServiceUnavailable
+            | Self::RateLimited
             | Self::ShutdownFailed
             | Self::SchedulerShutdown
             | Self::InflightLimitExceeded => RetryClass::Transient,
@@ -420,6 +425,7 @@ impl ErrorCode {
             | Self::UnknownCriticalEvent
             | Self::ArtifactWriteFailed
             | Self::ServiceUnavailable
+            | Self::RateLimited
             | Self::ShutdownFailed
             | Self::SchedulerShutdown
             | Self::InvalidStateTransition

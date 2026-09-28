@@ -211,14 +211,20 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
                     theme.accent
                 },
             ));
-            push(Span::styled(activity.to_owned(), theme.muted));
-            if let Some(started) = state.run_started_at {
-                push(Span::styled(
-                    format!(" · {}", view::clock_label(started.elapsed())),
-                    theme.muted,
-                ));
+            if let Some(line) = &state.provider_wait {
+                // prime-agent's recovery line replaces the working line; it
+                // carries its own "esc to cancel".
+                push(Span::styled(line.clone(), theme.warning));
+            } else {
+                push(Span::styled(activity.to_owned(), theme.muted));
+                if let Some(started) = state.run_started_at {
+                    push(Span::styled(
+                        format!(" · {}", view::clock_label(started.elapsed())),
+                        theme.muted,
+                    ));
+                }
+                push(Span::styled(" · esc to interrupt".to_owned(), theme.dim));
             }
-            push(Span::styled(" · esc to interrupt".to_owned(), theme.dim));
             // Put decisions and queued work before progress counters. At 60 cells
             // the right edge may be clipped, but the operator must still see when
             // the approval gate is open for the rest of this turn.
@@ -356,6 +362,7 @@ mod tests {
             granted_for_run: false,
             queued_input: false,
             queued_count: 0,
+            provider_wait: None,
             last_request: None,
             run_started_at: None,
             last_run_elapsed: Duration::ZERO,
