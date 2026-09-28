@@ -67,25 +67,34 @@ strict_profile_full=refused
 <!-- support-matrix:end -->
 ```
 
-## 3. Nền tảng khác
+## 3. Linux (GitHub Actions `ubuntu-latest`)
+
+Probe M12 chạy trên runner Ubuntu của [run 36423142320](https://github.com/DEVfancybear/harness-agents/actions/runs/36423142320). Năm capability của vòng đời tiến trình, môi trường, deadline và output đạt `enforced`; các giới hạn filesystem, mạng, credential socket và tài nguyên vẫn `unsupported`. `full` tiếp tục bị từ chối.
 
 ```text
 <!-- support-matrix:begin -->
 platform=linux
 backend=process-wrap
 backend_version=10.0.0
-measured=false
+measured=true
+process_containment=enforced
+process_tree_kill=enforced
+environment_allowlist=enforced
+deadline_enforced=enforced
+output_bounds=enforced
+filesystem_read_confinement=unsupported
+filesystem_write_confinement=unsupported
+network_egress_denial=unsupported
+credential_socket_denial=unsupported
+resource_limit_memory=unsupported
+resource_limit_process_count=unsupported
 strict_profile_full=refused
 <!-- support-matrix:end -->
 ```
 
-**Linux chưa được đo lần nào và chưa thuộc phạm vi CI hiện tại.** Cho tới khi có một lần probe thật trên Linux, mọi
-capability ở đó được coi là `unsupported` và strict bị từ chối. Test A36 **cố ý đỏ** nếu nó chạy trên một nền tảng
-có khối `measured=false`: chạy được probe ở đâu thì phải ghi kết quả ở đó. Các GitHub workflows hiện chỉ chạy trên
-Windows; nếu Linux support được đưa vào phạm vi sau này, hãy đo probe và cập nhật ma trận trước khi bật runner Linux.
-
-`posix_process_session` (process group + `kill`) là cơ chế containment tương ứng trên Unix và đã nằm trong đường chạy
-từ M4, nhưng **chưa** được đo trên host Unix nào — nên nó không được ghi là `enforced` ở đâu cả.
+`posix_process_session` tạo process group riêng. Khi tiến trình cha thoát trước các tiến trình con, runner kết thúc
+nhóm còn sống và chờ nó biến mất. Probe `P-CONT` đo cả nhánh hủy và nhánh cha thoát tự nhiên. Test A36 đối chiếu từng
+verdict ở trên với lần probe mới trên chính runner đang chạy.
 
 ## 4. Residual risk (nói ra, không giấu)
 
@@ -98,7 +107,7 @@ từ M4, nhưng **chưa** được đo trên host Unix nào — nên nó không 
   trước khi drain output**; probe `P-CONT` ghi lại điều này.
 - `tree_cleanup = reaped_on_exit` **không** chứng minh job rỗng khi direct child thoát trước descendant — xem SPEC M12
   §4b. Không rò rỉ orphan (đã đo), nhưng nhãn thì mạnh hơn bằng chứng.
-- Chưa có bằng chứng đa nền tảng, chưa có E2E trong browser/CI, và **chưa** có connector/thông báo ra ngoài.
+- Windows và Linux đã được đo trong CI; chưa có E2E trong browser/CI hoặc connector/thông báo ra ngoài.
 
 ## 5. Điều gì sẽ đổi ma trận này
 
