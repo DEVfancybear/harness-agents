@@ -3035,7 +3035,7 @@ fn q13b_pty_a_far_reset_parks_the_session() {
         .map(|entry| std::fs::read_to_string(entry.path()).expect("job file"))
         .collect::<String>();
     assert_eq!(
-        jobs.matches("provider_quota_resumed").count(),
+        jobs.matches("<provider_quota_resumed>").count(),
         1,
         "one resume job, whatever the runtime retried: {jobs}"
     );
