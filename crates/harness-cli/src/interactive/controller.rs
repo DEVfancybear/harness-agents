@@ -2721,6 +2721,8 @@ impl InteractiveController {
                 }
                 effects.push(Effect::Redraw);
             }
+            // prime-agent's `/logs`.
+            "/logs" => self.reference("Logs", self.service.logs(), &mut effects),
             "/skills" => {
                 self.reference("/skills", self.service.skills_summary(), &mut effects);
             }

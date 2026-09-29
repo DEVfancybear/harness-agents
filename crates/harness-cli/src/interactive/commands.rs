@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 45] = [
+pub const SLASH_COMMANDS: [SlashCommand; 46] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -163,6 +163,7 @@ pub const SLASH_COMMANDS: [SlashCommand; 45] = [
         "Reopen the recent transcript in a scrollable panel",
     ),
     command("/skills", "", "List discovered and active skills"),
+    command("/logs", "", "Show where logs are written"),
     command(
         "/agents",
         "",

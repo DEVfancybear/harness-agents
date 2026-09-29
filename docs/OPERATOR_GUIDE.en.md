@@ -162,9 +162,9 @@ ha maintenance tombstones --data-dir <DATA_DIR> --json
 
 A `tombstone` is the durable record that a source was deliberately forgotten,
 together with every external or backup copy that may still contain its data. The
-source-level `invalidate`/`archive`/`forget` retention actions were removed with
-the scoped-memory subsystem, so this build no longer writes new tombstones; the
-ones an older store holds survive backup and restore unchanged, and
+source-level `invalidate`/`archive`/`forget` retention actions are not part of
+the current command surface, so this build does not write new tombstones; older
+store records survive backup and restore unchanged, and
 `ha maintenance tombstones` lists them.
 
 ## 7. Garbage collection
@@ -358,7 +358,7 @@ As in prime-agent, children nest up to `RLM_MAX_DEPTH`, 2 by default: a child of
 
 | Group | Commands |
 | --- | --- |
-| Help and state | `/help`, `/hotkeys`, `/session` (`/status`), `/config`, `/model [search]`, `/effort [level]` (`/thinking`), `/cost`, `/context` (`/usage`), `/system-prompt`, `/permissions`, `/hooks`, `/mcp`, `/agents`, `/rlm-max-depth`, `/skills` |
+| Help and state | `/help`, `/hotkeys`, `/session` (`/status`), `/config`, `/model [search]`, `/effort [level]` (`/thinking`), `/cost`, `/context` (`/usage`), `/system-prompt`, `/permissions`, `/hooks`, `/mcp`, `/agents`, `/rlm-max-depth`, `/skills`, `/logs` (where the logs are: every `*.log` under the data directory) |
 | Session and answer | `/new` (`/clear` also clears the viewport), `/resume [id]`, `/name [name]` (`/rename`), `/more`, `/compact [instructions]`, `/export [path]` (`.md`, `.jsonl`, or `.html` for one self-contained page), `/copy`, `/fork [n]`, `/clone`, `/tree [n]`, `/btw <question>` (`/side`), `/quit` (`/exit`) |
 | Workspace and control | `/undo`, `/trust [yes]`, `/init`, `/permissions [ask|auto-edit|full-auto]` (`/permission`, `/mode`), `/steer <text>`, `/queue [text|list|edit n text|drop n|up n|down n]` (`/followup`), `/stash`, `/goal <objective>|status|pause|resume|clear`, `/autonomous [status|off|on ...]`, `/schedule [list|add <when> -- <prompt>|pause|resume|cancel <id>]` |
 
@@ -401,7 +401,7 @@ ha exec "Continue the task" --continue --goal "Task complete" --max-turns 4 --ou
 
 When the model asks for several tools at once they run side by side, as in prime-agent; a batch holding `ipython`, a file write, `run_process`, `run_shell` or `ask_user` runs one call at a time. Approvals, intents and receipts stay in call order. Read-only tools no longer fingerprint the workspace, and a fingerprint rehashes only files whose size or modification time changed. On Windows `run_shell` uses `pwsh`, falling back to `powershell.exe` when pwsh is missing; the receipt records the selected shell. Strict isolation is claimed only where a measured backend supports it. Start with `/status` and `/config` when provider or permissions differ from expectations. As in prime-agent, a turn has no step, tool-call or time bound: it runs until the model is done, you stop it, or the tokens run out; `HA_TURN_MAX_STEPS`, `HA_TURN_MAX_TOOL_CALLS` and `HA_TURN_DEADLINE_SECONDS` set one, and a turn that hits it is continued automatically up to twice (`HA_TURN_CONTINUATIONS`). The whole conversation is kept, and when a request nears the model's window (the window minus the answer's room and a reserve of up to 16384 tokens) it is compacted as prime-agent does: the earlier turns become a summary the model writes while the recent end (about 20000 tokens) stays word for word, then the turn's oldest tool results are shortened, and the turn goes on. `/compact` and the automatic checkpoint summarise the whole conversation, not only the last turn. Only a request that still cannot fit the window fails. If `ha` behaves like an older build, `Get-Command ha -All` shows which executable runs; reinstall with `scripts/Install-Ha.ps1`. M0–M6, H, and PTY gates have separate evidence. Linux support is pending: its CI job does not gate a push, and no Linux claim is made from it.
 
-### 12.6. Memory and `/resume`
+### 12.6. `/resume`
 
-Memory follows prime-agent's continual harness state: the model keeps memories, prompt notes, skills and subagent specs itself through `rlm.harness` in the Python REPL, global ones shared by every conversation and local ones per conversation, and every turn carries a digest of them ranked for the task. Nothing is stored by keyword. `/refine` (or `refine.run()` in the kernel) turns the conversation into validated edits, `/refine --rollback <id>` undoes one, and every 25 turns an automatic review refines locally when there is something worth keeping (`HA_AUTO_REFINE=off` turns it off). `/resume` replays the conversation's own turns to the model and shows them on screen. See `MEMORY_AND_CONTINUITY` sections 19 and 20.
+`/resume` replays the selected conversation's durable turns to the model and shows them on screen. It does not infer or create an additional cross-session data source.
 

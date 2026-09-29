@@ -159,9 +159,9 @@ ha maintenance tombstones --data-dir <DATA_DIR> --json
 
 `tombstone` là bản ghi bền vững rằng một nguồn đã bị cố ý quên, kèm mọi bản sao bên
 ngoài hoặc bản sao lưu có thể còn chứa dữ liệu của nó. Các thao tác retention theo
-nguồn `invalidate`/`archive`/`forget` đã bị gỡ cùng hệ thống memory có phạm vi, nên
-bản này không còn ghi tombstone mới; những tombstone mà store cũ đang giữ vẫn tồn tại
-nguyên vẹn qua sao lưu và phục hồi, và `ha maintenance tombstones` liệt kê chúng.
+nguồn `invalidate`/`archive`/`forget` không thuộc command surface hiện tại, nên bản này
+không ghi tombstone mới; record mà store cũ đang giữ vẫn tồn tại nguyên vẹn qua sao lưu
+và phục hồi, và `ha maintenance tombstones` liệt kê chúng.
 
 ## 7. Thu gom rác
 
@@ -363,7 +363,7 @@ Như prime-agent, child lồng nhau tới `RLM_MAX_DEPTH`, mặc định 2: chil
 
 | Nhóm | Lệnh |
 | --- | --- |
-| Trợ giúp và trạng thái | `/help`, `/hotkeys`, `/session` (`/status`), `/config`, `/model [search]`, `/effort [level]` (`/thinking`), `/cost`, `/context` (`/usage`), `/system-prompt`, `/permissions`, `/hooks`, `/mcp`, `/agents`, `/skills` |
+| Trợ giúp và trạng thái | `/help`, `/hotkeys`, `/session` (`/status`), `/config`, `/model [search]`, `/effort [level]` (`/thinking`), `/cost`, `/context` (`/usage`), `/system-prompt`, `/permissions`, `/hooks`, `/mcp`, `/agents`, `/rlm-max-depth`, `/skills`, `/logs` (nơi ghi log: mọi file `*.log` trong thư mục data) |
 | Phiên và câu trả lời | `/new` (`/clear` xóa cả viewport), `/resume [id]`, `/name [name]` (`/rename`), `/more`, `/compact [instructions]`, `/export [path]` (`.md`, `.jsonl`, hoặc `.html` cho một trang tự chứa), `/copy`, `/fork [n]`, `/clone`, `/tree [n]`, `/btw <câu hỏi>` (`/side`), `/quit` (`/exit`) |
 | Workspace và điều khiển | `/undo`, `/trust [yes]`, `/init`, `/permissions [ask|auto-edit|full-auto]` (`/permission`, `/mode`), `/steer <text>`, `/queue [text|list|edit n text|drop n|up n|down n]` (`/followup`), `/stash`, `/goal <objective>|status|pause|resume|clear`, `/autonomous [status|off|on ...]`, `/schedule [list|add <khi nào> -- <prompt>|pause|resume|cancel <id>]` |
 
@@ -406,7 +406,7 @@ ha exec "Continue the task" --continue --goal "Task complete" --max-turns 4 --ou
 
 Khi model gọi nhiều tool một lúc, chúng chạy song song như prime-agent; một lô có `ipython`, tool ghi file, `run_process`, `run_shell` hoặc `ask_user` thì chạy lần lượt từng lệnh. Phê duyệt, intent và receipt vẫn theo đúng thứ tự gọi. Tool chỉ đọc không còn lấy fingerprint workspace, và fingerprint chỉ hash lại những file đổi kích thước hoặc thời gian sửa. `run_shell` dùng `pwsh` trên Windows và `powershell.exe` khi thiếu `pwsh`; receipt ghi shell được chọn. Strict isolation chỉ được báo khi backend đã đo hỗ trợ. `/status` và `/config` là điểm bắt đầu khi provider hoặc quyền không như dự kiến. Giống prime-agent, một lượt không bị giới hạn số bước, số tool call hay thời gian: lượt chạy tới khi model xong, bạn dừng, hoặc hết token; `HA_TURN_MAX_STEPS`, `HA_TURN_MAX_TOOL_CALLS` và `HA_TURN_DEADLINE_SECONDS` đặt giới hạn nếu cần, và lượt chạm giới hạn được tự tiếp tục tối đa hai lần (`HA_TURN_CONTINUATIONS`). Toàn bộ hội thoại được giữ, và khi một yêu cầu gần đầy cửa sổ của model (cửa sổ trừ phần dành cho câu trả lời và phần dự trữ tối đa 16384 token) thì được compact như prime-agent: các lượt cũ thành bản tóm tắt do model viết, phần gần nhất (khoảng 20000 token) giữ nguyên văn, sau đó các kết quả tool cũ của lượt được rút gọn, rồi lượt chạy tiếp. `/compact` và checkpoint tự động tóm tắt toàn bộ hội thoại, không chỉ lượt cuối. Chỉ yêu cầu vẫn không vừa cửa sổ mới báo lỗi. Nếu `ha` chạy như bản cũ, `Get-Command ha -All` cho biết file thực thi nào đang chạy; cài lại bằng `scripts/Install-Ha.ps1`. Các gate M0–M6, H và PTY có evidence riêng. Linux đang chờ hỗ trợ: job CI của Linux không chặn push, và không có tuyên bố nào về Linux được suy ra từ nó.
 
-### 12.6. Memory và `/resume`
+### 12.6. `/resume`
 
-Memory theo harness state của prime-agent: model tự giữ memory, ghi chú prompt, skill và đặc tả subagent qua `rlm.harness` trong Python REPL, loại global dùng chung cho mọi hội thoại và loại local theo từng hội thoại, và mỗi lượt mang theo digest của chúng xếp theo mức liên quan. Không có gì được lưu theo từ khoá. `/refine` (hoặc `refine.run()` trong kernel) biến hội thoại thành các chỉnh sửa đã kiểm tra, `/refine --rollback <id>` hoàn tác một lần, và cứ 25 lượt một bước review tự động refine local khi có điều đáng giữ (`HA_AUTO_REFINE=off` để tắt). `/resume` phát lại chính các lượt của hội thoại cho model và hiện chúng trên màn hình. Xem mục 19 và 20 của `MEMORY_AND_CONTINUITY`.
+`/resume` phát lại các lượt durable của hội thoại được chọn cho model và hiện chúng trên màn hình. Nó không suy luận hoặc tạo thêm data source cross-session.
 

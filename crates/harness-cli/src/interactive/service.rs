@@ -221,6 +221,10 @@ pub trait SessionPort: Send {
     fn skills_summary(&self) -> Vec<String> {
         vec!["skill catalog is unavailable".to_owned()]
     }
+    /// prime-agent's `/logs`: where the app writes its logs and what is there.
+    fn logs(&self) -> Vec<String> {
+        vec!["No logs written yet.".to_owned()]
+    }
     /// Skills and prompt commands, for the slash-command menu.
     fn menu_commands(&self) -> Vec<super::commands::MenuCommand> {
         Vec::new()
@@ -2099,6 +2103,55 @@ fn sort_newest_first(sessions: &mut [harness_store_sqlite::SessionSummary]) {
     });
 }
 
+/// prime-agent's `/logs` listing over ha's data directory: every `*.log` the
+/// app wrote there (the kernel's stderr logs), as `• name (N.N KB)`, sorted.
+/// prime-agent keeps its logs in one directory; ha writes them next to what
+/// they log, so the names are paths under the data directory.
+fn log_lines(data_dir: &Path) -> Vec<String> {
+    fn walk(dir: &Path, depth: usize, found: &mut Vec<(String, u64)>, root: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() && depth > 0 {
+                walk(&path, depth - 1, found, root);
+            } else if kind.is_file() && path.extension().is_some_and(|extension| extension == "log")
+            {
+                let size = entry.metadata().map_or(0, |metadata| metadata.len());
+                let shown = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string()
+                    .replace('\\', "/");
+                found.push((shown, size));
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(data_dir, 4, &mut found, data_dir);
+    found.sort();
+    let mut lines = vec![format!("Directory: {}", data_dir.display())];
+    if found.is_empty() {
+        lines.push("No logs written yet.".to_owned());
+    } else {
+        lines.extend(found.into_iter().map(|(name, size)| {
+            #[allow(clippy::cast_precision_loss, reason = "a size shown to one decimal")]
+            let kib = size as f64 / 1024.0;
+            format!("• {name} ({kib:.1} KB)")
+        }));
+    }
+    lines
+}
+
 /// The session setting a conversation's `/rlm-max-depth` is kept in.
 const RLM_MAX_DEPTH_SETTING: &str = "rlm_max_depth";
 
@@ -3004,6 +3057,10 @@ impl SessionPort for AgentSessionService {
             );
         }
         commands
+    }
+
+    fn logs(&self) -> Vec<String> {
+        log_lines(&self.data_dir)
     }
 
     fn skills_summary(&self) -> Vec<String> {
@@ -8738,6 +8795,45 @@ mod tests {
         assert_eq!(
             refused,
             "Service tier 'priority' is not available for the current model. Available: default"
+        );
+    }
+
+    /// prime-agent's `/logs` shows the directory and each log as
+    /// `• name (N.N KB)`; ha's logs sit under the data directory.
+    #[test]
+    fn logs_lists_every_log_under_the_data_directory() {
+        let temp = tempfile::tempdir().expect("temp");
+        let data = temp.path();
+        assert_eq!(
+            super::log_lines(data),
+            [
+                format!("Directory: {}", data.display()),
+                "No logs written yet.".to_owned()
+            ]
+        );
+        std::fs::create_dir_all(data.join("repl")).expect("repl");
+        std::fs::write(
+            data.join("repl").join("kernel-stderr.log"),
+            vec![b'x'; 2048],
+        )
+        .expect("log");
+        std::fs::create_dir_all(data.join("sessions").join("c1").join("kernel")).expect("kernel");
+        std::fs::write(
+            data.join("sessions")
+                .join("c1")
+                .join("kernel")
+                .join("kernel-stderr.log"),
+            "boom",
+        )
+        .expect("log");
+        std::fs::write(data.join(".hidden.log"), "x").expect("hidden");
+        std::fs::write(data.join("notes.txt"), "x").expect("not a log");
+        assert_eq!(
+            super::log_lines(data)[1..],
+            [
+                "• repl/kernel-stderr.log (2.0 KB)".to_owned(),
+                "• sessions/c1/kernel/kernel-stderr.log (0.0 KB)".to_owned(),
+            ]
         );
     }
 }

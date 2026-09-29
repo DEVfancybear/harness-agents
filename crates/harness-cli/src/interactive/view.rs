@@ -239,6 +239,7 @@ pub fn help_card_lines() -> Vec<String> {
                 "@file",
                 "!command",
                 "/hotkeys",
+                "/logs",
                 "/quit",
             ],
         ),
