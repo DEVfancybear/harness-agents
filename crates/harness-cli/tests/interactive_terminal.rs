@@ -2967,3 +2967,48 @@ fn q15_pty_scheduled_job_fires() {
     );
     finish(session);
 }
+
+/// prime-agent's `/import`: a conversation exported with `/export <file>.jsonl`
+/// is imported into a new conversation, and the model is sent the imported
+/// turns - on the first message after the import and on the ones after it.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn m01_pty_import_continues_an_exported_conversation() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let provider = ScriptedSse::start(move |_| {
+        let call = counter.fetch_add(1, Ordering::SeqCst);
+        Reply::Text(format!("reply-m01-{call}"))
+    });
+    let (temp, mut session) = scripted_session(&provider);
+    session.send("remember-the-word-kiwi\r");
+    session.wait_for("reply-m01-0", Duration::from_mins(1));
+    session.send("/export saved.jsonl\r");
+    let file = temp.path().join("project with spaces").join("saved.jsonl");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !file.is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(file.is_file(), "the export was written");
+    // The export is a turn of its own; /new waits for it to end.
+    session.wait_for("session export written", Duration::from_secs(20));
+    std::thread::sleep(Duration::from_millis(500));
+    session.send("/new\r");
+    session.wait_for("starting a fresh conversation", Duration::from_secs(20));
+    session.send("/import saved.jsonl\r");
+    session.wait_for("Session imported from", Duration::from_secs(20));
+    session.send("what-was-the-word\r");
+    session.wait_for("reply-m01-1", Duration::from_mins(1));
+    session.send("and-again\r");
+    session.wait_for("reply-m01-2", Duration::from_mins(1));
+    let requests = provider.requests();
+    for (index, (_, request)) in requests.iter().enumerate().skip(1) {
+        let text = request_text(request);
+        assert!(
+            text.contains("remember-the-word-kiwi") && text.contains("reply-m01-0"),
+            "request {index} carries the imported turn: {text}"
+        );
+    }
+    assert_eq!(requests.len(), 3);
+    finish(session);
+}

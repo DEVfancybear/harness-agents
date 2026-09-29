@@ -221,6 +221,11 @@ pub trait SessionPort: Send {
     fn skills_summary(&self) -> Vec<String> {
         vec!["skill catalog is unavailable".to_owned()]
     }
+    /// prime-agent's `/import <path.jsonl>`: start a new conversation that
+    /// continues the session file at `path`.
+    fn import_session(&mut self, _path: &str) -> Result<String, String> {
+        Err("this backend cannot import sessions".to_owned())
+    }
     /// prime-agent's `/logs`: where the app writes its logs and what is there.
     fn logs(&self) -> Vec<String> {
         vec!["No logs written yet.".to_owned()]
@@ -3063,6 +3068,64 @@ impl SessionPort for AgentSessionService {
         log_lines(&self.data_dir)
     }
 
+    fn import_session(&mut self, path: &str) -> Result<String, String> {
+        // prime-agent resolves the path against the working directory, takes a
+        // quoted one, and copies the file beside its sessions.
+        let path = path.trim().trim_matches(['"', '\'']);
+        let source = self.workspace_root.join(path);
+        let text = std::fs::read_to_string(&source).map_err(|_| {
+            format!(
+                "Failed to import session: File not found: {}",
+                source.display()
+            )
+        })?;
+        let (header, messages) = harness_runtime::session_file::read_session_file(&text)
+            .map_err(|error| format!("Failed to import session: {error}"))?;
+        self.resume(None)?;
+        let imports = self.data_dir.join("imports");
+        std::fs::create_dir_all(&imports).map_err(|error| error.to_string())?;
+        let kept = imports.join(format!("{}.jsonl", self.task_id.as_str()));
+        std::fs::write(&kept, &text).map_err(|error| error.to_string())?;
+        let task_id = self.task_id.clone();
+        let agents = Arc::clone(&self.agents);
+        let sender = self.sender.clone();
+        let title = header
+            .title
+            .clone()
+            .unwrap_or_else(|| format!("imported {path}"));
+        let kept_value = kept.display().to_string();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            // The new conversation's task names the file its turns continue.
+            match agents.store().lease().await {
+                Ok(lease) => {
+                    let store = lease.store();
+                    let _ = store
+                        .set_session_setting(
+                            &task_id,
+                            harness_runtime::session_file::IMPORTED_HISTORY_SETTING,
+                            &kept_value,
+                        )
+                        .await;
+                    let _ = store.set_session_setting(&task_id, "title", &title).await;
+                }
+                Err(error) => {
+                    let _ = sender.send(SessionEvent::RecoverableError {
+                        message: format!("the imported session could not be recorded: {error}"),
+                    });
+                }
+            }
+        });
+        let _ = self.sender.send(SessionEvent::Notice {
+            message: format!(
+                "{} message(s) imported; the next message continues that conversation",
+                messages.len()
+            ),
+        });
+        Ok(format!("Session imported from: {path}"))
+    }
+
     fn skills_summary(&self) -> Vec<String> {
         let mut lines = match super::skills::discover(
             &self.global_config_dir,
@@ -5365,6 +5428,16 @@ async fn run_turn(
             &super::harness::weighted_terms(goal_objective, &[request.text.as_str()]),
         ),
     ));
+    // The first turn of an imported conversation carries the imported messages;
+    // later turns reach them through the conversation's first session.
+    let imported = if source.is_none() && fork_history.is_none() {
+        harness_runtime::imported_messages(&store, &task_id)
+            .await
+            .ok()
+            .filter(|messages| !messages.is_empty())
+    } else {
+        None
+    };
     let mut run_request = RunRequest::new(
         session_id.clone(),
         task_id,
@@ -5380,6 +5453,9 @@ async fn run_turn(
     })
     .with_project_rules(project_blocks)
     .with_tool_schemas(tool_schemas);
+    if let Some(imported) = imported {
+        run_request = run_request.with_conversation(imported);
+    }
     // A fork's first turn carries the conversation up to its fork point, as a
     // continued turn carries the one before it.
     if let Some(history) = fork_history {
@@ -5820,7 +5896,18 @@ async fn run_session_file_action_inner(
         {
             return Err("export path must stay inside the workspace".to_owned());
         }
-        let content = if html {
+        let content = if jsonl {
+            render_session_file(
+                &store,
+                &task_id,
+                source.as_ref(),
+                &workspace_root,
+                &environment,
+                &data_dir,
+                &config.provider.api_key_env,
+            )
+            .await?
+        } else if html {
             render_session_html(
                 &store,
                 &task_id,
@@ -6094,6 +6181,42 @@ async fn render_session_html(
         return Err("session export exceeds the 1 MiB file limit".to_owned());
     }
     Ok(page)
+}
+
+/// `/export session.jsonl`: ha's session file (prime-agent's JSONL shape) -
+/// what the model is sent for this conversation, which `/import` reads back.
+async fn render_session_file(
+    store: &SqliteStore,
+    task_id: &TaskId,
+    source: Option<&SessionId>,
+    workspace_root: &Path,
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+    provider_key_variable: &str,
+) -> Result<String, String> {
+    let source = source.ok_or("nothing to export yet: this conversation has no turn")?;
+    let history = harness_runtime::conversation_history(store, source)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut messages = Vec::new();
+    if let Some(summary) = history.summary {
+        messages.push(harness_providers::ProviderMessage::new(
+            harness_providers::MessageRole::System,
+            format!("Summary of the earlier conversation:\n{summary}"),
+        ));
+    }
+    messages.extend(history.messages);
+    let header = harness_runtime::session_file::SessionFileHeader {
+        id: task_id.as_str().to_owned(),
+        timestamp_ms: i64::try_from(harness_runtime::now_unix_ms()).unwrap_or(i64::MAX),
+        cwd: workspace_root.display().to_string(),
+        title: store.session_setting(task_id, "title").await.ok().flatten(),
+    };
+    let mut text = harness_runtime::session_file::write_session_file(&header, &messages)?;
+    for secret in export_secrets(environment, data_dir, provider_key_variable) {
+        text = text.replace(&secret, "[REDACTED]");
+    }
+    Ok(text)
 }
 
 async fn render_session_export(

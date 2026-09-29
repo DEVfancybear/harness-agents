@@ -2721,6 +2721,32 @@ impl InteractiveController {
                 }
                 effects.push(Effect::Redraw);
             }
+            // prime-agent's `/import <path.jsonl>`.
+            "/import" => {
+                match raw_argument.map(str::trim).filter(|path| !path.is_empty()) {
+                    None => self.push_history(&mut effects, HistoryItem::Error {
+                        message: "Usage: /import <path.jsonl>".to_owned(),
+                    }),
+                    Some(_) if self.phase.has_active_run() => {
+                        self.push_history(&mut effects, HistoryItem::Notice {
+                            message: "cannot import a session while a run is active; press Ctrl-C to cancel it first".to_owned(),
+                        });
+                    }
+                    Some(path) => match self.service.import_session(path) {
+                        Ok(message) => {
+                            // A new conversation starts, as `/new` starts one.
+                            self.header.retain(|line| !line.starts_with("Context:"));
+                            self.goal = None;
+                            self.session_candidates.clear();
+                            self.push_history(&mut effects, HistoryItem::Notice { message });
+                        }
+                        Err(message) => {
+                            self.push_history(&mut effects, HistoryItem::Error { message });
+                        }
+                    },
+                }
+                effects.push(Effect::Redraw);
+            }
             // prime-agent's `/logs`.
             "/logs" => self.reference("Logs", self.service.logs(), &mut effects),
             "/skills" => {

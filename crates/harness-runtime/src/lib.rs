@@ -36,6 +36,7 @@ pub mod budget;
 pub mod goal;
 pub mod human_input;
 pub mod inbox;
+pub mod session_file;
 
 pub use budget::{BudgetLedger, BudgetView, Usage};
 pub use goal::{
@@ -1191,7 +1192,9 @@ pub async fn conversation_history(
     let mut summary = None;
     let mut visited = std::collections::BTreeSet::new();
     let mut current = Some(session_id.clone());
+    let mut root = None;
     while let Some(session) = current.take() {
+        root = Some(session.clone());
         // A link cycle is a damaged store, not a longer conversation.
         if !visited.insert(session.as_str().to_owned()) || visited.len() > CONVERSATION_MAX_SESSIONS
         {
@@ -1243,6 +1246,15 @@ pub async fn conversation_history(
     }
     let omitted = turns.len() - kept.len();
     let mut messages = Vec::new();
+    // A conversation that began with `/import` continues the imported messages:
+    // they come before its first turn, unless a summary or the bound already
+    // stands for everything before the turns that follow.
+    if summary.is_none()
+        && omitted == 0
+        && let Some(root) = &root
+    {
+        messages.extend(imported_history(store, root).await?);
+    }
     if omitted > 0 {
         messages.push(ProviderMessage::new(
             MessageRole::System,
@@ -1261,6 +1273,47 @@ pub async fn conversation_history(
         omitted,
         interrupted_replayed,
     })
+}
+
+/// The messages of the session file the conversation of `root` was imported
+/// from, led by a note saying so; none when it was not imported or the file
+/// can no longer be read.
+async fn imported_history(
+    store: &SqliteStore,
+    root: &SessionId,
+) -> Result<Vec<ProviderMessage>, RuntimeError> {
+    let Some(task) = store.session_task(root).await? else {
+        return Ok(Vec::new());
+    };
+    imported_messages(store, &task).await
+}
+
+/// The messages a conversation imported with `/import` begins with, led by a
+/// note saying so; none when the task was not imported or its file is gone.
+///
+/// # Errors
+/// The store cannot be read.
+pub async fn imported_messages(
+    store: &SqliteStore,
+    task: &TaskId,
+) -> Result<Vec<ProviderMessage>, RuntimeError> {
+    let Some(path) = store
+        .session_setting(task, session_file::IMPORTED_HISTORY_SETTING)
+        .await?
+    else {
+        return Ok(Vec::new());
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(Vec::new());
+    };
+    Ok(session_file::read_session_file(&text).map_or_else(
+        |_| Vec::new(),
+        |(header, messages)| {
+            let mut all = vec![session_file::imported_note(&header)];
+            all.extend(messages);
+            all
+        },
+    ))
 }
 
 /// What one replayed turn contributes after its question.
