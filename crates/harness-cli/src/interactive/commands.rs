@@ -220,8 +220,8 @@ pub const SLASH_COMMANDS: [SlashCommand; 47] = [
     ),
     command(
         "/tree",
-        "[number]",
-        "Show this conversation's turns, or continue after one of them",
+        "[number [--summarize [focus]]|label <number> [text]]",
+        "Show this conversation's turns, continue after one (summarizing the rest), or label one",
     ),
     SlashCommand {
         aliases: &["/side"],

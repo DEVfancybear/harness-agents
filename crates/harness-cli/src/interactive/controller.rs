@@ -884,6 +884,52 @@ impl InteractiveController {
     /// free session runs one at once; a running turn gets a `steer` heartbeat through
     /// the `/steer` inbox, and a `follow_up` one waits for the turn to end.
     /// `/fork [n]` and `/tree [n]`: list the conversation's turns, or act on one.
+    /// `/tree`: prime-agent's tree, driven by arguments rather than a selector:
+    /// `/tree` lists the turns (labels shown as `[label] `), `/tree <n>` continues
+    /// after turn n, `/tree <n> --summarize [focus]` also summarises the turns it
+    /// leaves (prime-agent's "Summarize" / "Summarize with custom prompt"), and
+    /// `/tree label <n> [text]` labels a turn (an empty text clears it).
+    fn tree_command(&mut self, raw_argument: Option<&str>, effects: &mut Vec<Effect>) {
+        let words = raw_argument
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        if let ["label", number, label @ ..] = words.as_slice() {
+            let chosen = number
+                .parse::<usize>()
+                .ok()
+                .and_then(|number| number.checked_sub(1))
+                .and_then(|index| self.turn_points.get(index).cloned());
+            let result = match chosen {
+                Some((session, _)) => self.service.label_turn(&session, &label.join(" ")),
+                None => Err(format!("no turn {number}; list them with /tree")),
+            };
+            if let Err(message) = result {
+                self.push_history(effects, HistoryItem::Error { message });
+            }
+            effects.push(Effect::Redraw);
+            return;
+        }
+        if let [number, "--summarize", focus @ ..] = words.as_slice() {
+            let chosen = number
+                .parse::<usize>()
+                .ok()
+                .and_then(|number| number.checked_sub(1));
+            let at_leaf = chosen.is_some_and(|index| index + 1 == self.turn_points.len());
+            if chosen.is_some_and(|index| index < self.turn_points.len()) && !at_leaf {
+                let focus = (!focus.is_empty()).then(|| focus.join(" "));
+                if let Err(message) = self.service.plan_branch_summary(focus) {
+                    self.push_history(effects, HistoryItem::Error { message });
+                    effects.push(Effect::Redraw);
+                    return;
+                }
+            }
+            self.branch_command("/tree", Some(number), effects);
+            return;
+        }
+        self.branch_command("/tree", words.first().copied(), effects);
+    }
+
     fn branch_command(&mut self, name: &str, argument: Option<&str>, effects: &mut Vec<Effect>) {
         let purpose = if name == "/fork" {
             super::events::TurnsPurpose::Fork
@@ -970,15 +1016,17 @@ impl InteractiveController {
             })
             .collect();
         lines.push(String::new());
-        lines.push(match purpose {
-            super::events::TurnsPurpose::Fork => {
+        match purpose {
+            super::events::TurnsPurpose::Fork => lines.push(
                 "fork before a message with /fork <number>; it comes back into the editor"
-                    .to_owned()
-            }
-            super::events::TurnsPurpose::Tree => {
-                "continue after a turn with /tree <number>".to_owned()
-            }
-        });
+                    .to_owned(),
+            ),
+            super::events::TurnsPurpose::Tree => lines.extend([
+                "continue after a turn with /tree <number>".to_owned(),
+                "  add --summarize [focus] to summarize the turns it leaves".to_owned(),
+                "label a turn with /tree label <number> [text]".to_owned(),
+            ]),
+        }
         self.turn_points = turns;
         let title = match purpose {
             super::events::TurnsPurpose::Fork => "/fork",
@@ -2607,7 +2655,8 @@ impl InteractiveController {
                 );
                 effects.push(Effect::Redraw);
             }
-            "/fork" | "/tree" => self.branch_command(name, argument, &mut effects),
+            "/fork" => self.branch_command(name, argument, &mut effects),
+            "/tree" => self.tree_command(raw_argument, &mut effects),
             "/clone" => {
                 match self.service.clone_conversation() {
                     Ok(()) => {

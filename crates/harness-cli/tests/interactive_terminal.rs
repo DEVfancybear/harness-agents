@@ -3041,3 +3041,61 @@ fn q13b_pty_a_far_reset_parks_the_session() {
     );
     assert!(provider.requests().len() <= 3, "the park ends the turn");
 }
+
+/// prime-agent's tree labels and branch summary. A label shows in `/tree` as
+/// `[label] `; going back with `--summarize` has the model summarise the turns
+/// left behind (prime-agent's branch prompt), and the next message is read with
+/// that summary ahead of it, while the abandoned turns themselves are gone.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn q08b_pty_tree_labels_and_summarizes_the_branch_it_leaves() {
+    let provider = ScriptedSse::start(|request| {
+        let text = request_text(request);
+        let last = last_user_text(request);
+        if text.contains("Create a structured summary of this conversation branch") {
+            Reply::Text("## Goal\nSUMMARY-OF-BRANCH-Q08B".to_owned())
+        } else if last.contains("after the switch") {
+            Reply::Text("answer-after-switch".to_owned())
+        } else if last.contains("second ask") {
+            Reply::Text("answer-two-q08b".to_owned())
+        } else {
+            Reply::Text("answer-one-q08b".to_owned())
+        }
+    });
+    let (_temp, mut session) = scripted_session(&provider);
+    session.send("first ask\r");
+    session.wait_for("answer-one-q08b", Duration::from_mins(1));
+    session.send("second ask\r");
+    session.wait_for("answer-two-q08b", Duration::from_mins(1));
+    session.send("/tree\r");
+    std::thread::sleep(Duration::from_millis(300));
+    session.send("\r");
+    session.wait_for("current", Duration::from_secs(30));
+    session.send("\u{1b}");
+    std::thread::sleep(Duration::from_millis(300));
+    session.send("/tree label 1 start-here\r");
+    session.wait_for("Label set: start-here", Duration::from_secs(30));
+    session.send("/tree\r");
+    std::thread::sleep(Duration::from_millis(300));
+    session.send("\r");
+    session.wait_for("[start-here]", Duration::from_secs(30));
+    session.send("\u{1b}");
+    std::thread::sleep(Duration::from_millis(300));
+    session.send("/tree 1 --summarize\r");
+    session.wait_for("continuing from turn 1", Duration::from_secs(30));
+    session.send("after the switch\r");
+    session.wait_for("answer-after-switch", Duration::from_mins(1));
+    let requests = provider.requests();
+    let (_, last) = requests.last().expect("the turn after the switch");
+    let text = request_text(last);
+    assert!(
+        text.contains("[branch-summary]") && text.contains("SUMMARY-OF-BRANCH-Q08B"),
+        "the summary is read ahead of the message: {text}"
+    );
+    assert!(
+        !text.contains("answer-two-q08b"),
+        "the abandoned turn is not replayed: {text}"
+    );
+    assert!(text.contains("answer-one-q08b"), "the kept turn is: {text}");
+    finish(session);
+}

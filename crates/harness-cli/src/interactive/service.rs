@@ -231,6 +231,15 @@ pub trait SessionPort: Send {
     fn park_until(&mut self, _until: chrono::DateTime<chrono::Utc>) -> Result<String, String> {
         Err("this backend cannot park a session".to_owned())
     }
+    /// `/tree <n> --summarize [focus]`: the next turn summarises the turns the
+    /// switch leaves. Called before [`Self::switch_to`].
+    fn plan_branch_summary(&mut self, _focus: Option<String>) -> Result<(), String> {
+        Err("this backend keeps no conversation".to_owned())
+    }
+    /// prime-agent's tree label on the turn of `session`; an empty label clears it.
+    fn label_turn(&mut self, _session: &str, _label: &str) -> Result<(), String> {
+        Err("this backend keeps no conversation".to_owned())
+    }
     /// prime-agent's `/logs`: where the app writes its logs and what is there.
     fn logs(&self) -> Vec<String> {
         vec!["No logs written yet.".to_owned()]
@@ -1668,6 +1677,8 @@ pub struct AgentSessionService {
     side_thread: Arc<Mutex<Vec<(String, String)>>>,
     /// The fork the next turn starts, set by `/fork` and `/clone`.
     fork_plan: Option<ForkPlan>,
+    /// The branch summary the next turn writes, set by `/tree <n> --summarize`.
+    branch_plan: Option<super::branch_summary::BranchPlan>,
     /// Held by a turn for as long as it owns the project store, and by `/rename` while
     /// it writes, so the two never want the writer at the same time.
     writer_gate: Arc<tokio::sync::Mutex<()>>,
@@ -2162,6 +2173,9 @@ fn log_lines(data_dir: &Path) -> Vec<String> {
     lines
 }
 
+/// The session setting a turn's tree label is kept in, followed by its session id.
+const TURN_LABEL_PREFIX: &str = "label:";
+
 /// The session setting a conversation's `/rlm-max-depth` is kept in.
 const RLM_MAX_DEPTH_SETTING: &str = "rlm_max_depth";
 
@@ -2402,6 +2416,7 @@ impl AgentSessionService {
             agents,
             side_thread: Arc::new(Mutex::new(Vec::new())),
             fork_plan: None,
+            branch_plan: None,
             writer_gate,
             goal: None,
             goal_forgotten: false,
@@ -2769,6 +2784,7 @@ impl SessionPort for AgentSessionService {
         let mcp_status = Arc::clone(&self.mcp_status);
         let agents = Arc::clone(&self.agents);
         let fork_plan = self.fork_plan.take();
+        let branch_plan = self.branch_plan.take();
         let task_id = self.task_id.clone();
         let previous_session = Arc::clone(&self.previous_session);
         let active_inbox = Arc::clone(&self.active_inbox);
@@ -2812,6 +2828,7 @@ impl SessionPort for AgentSessionService {
                 mcp_status,
                 agents,
                 fork_plan,
+                branch_plan,
                 session_id,
                 task_id,
                 previous_session,
@@ -3071,6 +3088,49 @@ impl SessionPort for AgentSessionService {
 
     fn logs(&self) -> Vec<String> {
         log_lines(&self.data_dir)
+    }
+
+    fn plan_branch_summary(&mut self, focus: Option<String>) -> Result<(), String> {
+        let leaf = self
+            .previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.clone())
+            .ok_or("this conversation has no turn to summarize yet")?;
+        self.branch_plan = Some(super::branch_summary::BranchPlan { leaf, focus });
+        Ok(())
+    }
+
+    fn label_turn(&mut self, session: &str, label: &str) -> Result<(), String> {
+        SessionId::parse(session.to_owned()).map_err(|error| error.to_string())?;
+        let previous = self
+            .previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.clone());
+        let task_id = self.task_id.clone();
+        let agents = Arc::clone(&self.agents);
+        let sender = self.sender.clone();
+        let key = format!("{TURN_LABEL_PREFIX}{session}");
+        let label = label.trim().to_owned();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            let message = match agents.store().lease().await {
+                Ok(lease) => {
+                    let store = lease.store();
+                    let task = conversation_task(&store, previous.as_ref(), task_id).await;
+                    match store.set_session_setting(&task, &key, &label).await {
+                        Ok(()) if label.is_empty() => "Label cleared".to_owned(),
+                        Ok(()) => format!("Label set: {label}"),
+                        Err(error) => format!("the label could not be saved: {error}"),
+                    }
+                }
+                Err(error) => format!("the label could not be saved: {error}"),
+            };
+            let _ = sender.send(SessionEvent::Notice { message });
+        });
+        Ok(())
     }
 
     fn park_until(&mut self, until: chrono::DateTime<chrono::Utc>) -> Result<String, String> {
@@ -3978,6 +4038,7 @@ impl SessionPort for AgentSessionService {
             *tier = None;
         }
         self.fork_plan = None;
+        self.branch_plan = None;
         if let Ok(mut thread) = self.side_thread.lock() {
             thread.clear();
         }
@@ -4025,9 +4086,38 @@ impl SessionPort for AgentSessionService {
             let turns = match source {
                 None => Ok(Vec::new()),
                 Some(source) => match SqliteStore::open_read_only(store_dir).await {
-                    Ok(store) => harness_runtime::conversation_turns(&store, &source)
-                        .await
-                        .map_err(|error| error.to_string()),
+                    Ok(store) => {
+                        let turns = harness_runtime::conversation_turns(&store, &source)
+                            .await
+                            .map_err(|error| error.to_string());
+                        // prime-agent's tree shows each labelled entry as `[label] `.
+                        let task = store.session_task(&source).await.ok().flatten();
+                        match (turns, task) {
+                            (Ok(turns), Some(task))
+                                if purpose == super::events::TurnsPurpose::Tree =>
+                            {
+                                let mut labelled = Vec::new();
+                                for (session, question) in turns {
+                                    let label = store
+                                        .session_setting(
+                                            &task,
+                                            &format!("{TURN_LABEL_PREFIX}{}", session.as_str()),
+                                        )
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                        .filter(|label| !label.is_empty());
+                                    let question = match label {
+                                        Some(label) => format!("[{label}] {question}"),
+                                        None => question,
+                                    };
+                                    labelled.push((session, question));
+                                }
+                                Ok(labelled)
+                            }
+                            (turns, _) => turns,
+                        }
+                    }
                     Err(error) => Err(error.to_string()),
                 },
             };
@@ -4252,6 +4342,7 @@ impl AgentSessionService {
     /// A new conversation, as `/new` starts one, that its first turn will
     /// continue from the fork point.
     fn start_fork(&mut self, plan: ForkPlan) {
+        self.branch_plan = None;
         self.agents.reset();
         // The next conversation reads its own tier.
         if let Ok(mut tier) = self.service_tier.lock() {
@@ -4452,6 +4543,7 @@ async fn run_turn(
     mcp_status: Arc<Mutex<Vec<String>>>,
     agents: Arc<super::delegation::SessionAgents>,
     fork_plan: Option<ForkPlan>,
+    branch_plan: Option<super::branch_summary::BranchPlan>,
     session_id: SessionId,
     task_id: TaskId,
     previous_session: Arc<Mutex<Option<SessionId>>>,
@@ -5342,11 +5434,34 @@ async fn run_turn(
     }
     // The file text becomes part of the message itself, so what runs is what the user
     // handed over: the API has no file block, and text is the only shape a file travels in.
-    let prompt = format!(
+    let mut prompt = format!(
         "{}{}",
         request.text,
         attachments::attachment_blocks(&attached.files)
     );
+    // prime-agent's branch summary: the turns `/tree` left are summarised by the
+    // auxiliary model (else the session model) and read ahead of this message,
+    // so the conversation keeps what that branch found.
+    if let (Some(plan), Some(target)) = (&branch_plan, source.as_ref()) {
+        match super::branch_summary::summarize(&store, plan, target, Arc::clone(&helper_provider))
+            .await
+        {
+            Ok(Some(summary)) => {
+                send(SessionEvent::Notice {
+                    message: "Summarized the branch left by /tree".to_owned(),
+                });
+                prompt = super::branch_summary::wrap(&summary, &prompt);
+            }
+            Ok(None) => send(SessionEvent::Notice {
+                message: "No content to summarize".to_owned(),
+            }),
+            Err(error) => send(SessionEvent::Notice {
+                message: format!(
+                    "the branch could not be summarized ({error}); continuing without it"
+                ),
+            }),
+        }
+    }
     let loaded_instructions =
         super::instructions::load(&global_config_dir, &workspace_root, &caller_dir);
     for notice in &loaded_instructions.notices {

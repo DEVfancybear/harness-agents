@@ -10,6 +10,7 @@ pub mod attachments;
 pub mod autonomous;
 pub mod bootstrap;
 pub mod bounds;
+pub mod branch_summary;
 pub mod commands;
 pub mod config;
 pub mod controller;
