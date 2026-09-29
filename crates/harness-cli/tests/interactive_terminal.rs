@@ -2297,13 +2297,11 @@ fn reply_body(reply: &Reply) -> String {
     }
 }
 
-/// Whether a request is the parent's: only the parent is offered `delegate`.
+/// Whether a request is the parent's. A child's task opens with the app's
+/// `[task from parent]` frame; with nesting (prime-agent's default depth of 2)
+/// a child is offered `delegate` too, so the tools no longer tell them apart.
 fn from_parent(request: &serde_json::Value) -> bool {
-    request["tools"].as_array().is_some_and(|tools| {
-        tools
-            .iter()
-            .any(|tool| tool["function"]["name"] == "delegate")
-    })
+    !request_text(request).contains("[task from parent]")
 }
 
 /// Everything a request's messages say, joined.

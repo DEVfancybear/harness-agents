@@ -531,10 +531,13 @@ mod tests {
             )
             .await;
         let error = result.expect_err("429 response");
-        assert_eq!(
-            error.retry_after(),
-            Some(Duration::from_secs(30)),
-            "future HTTP date is capped at 30 seconds"
+        // The error keeps the provider's reset (bounded to a week): the runtime
+        // caps its own retry sleep at 30 seconds, and a reset beyond the usage
+        // wait is what parks the session (prime-agent's quota park).
+        let kept = error.retry_after().expect("the HTTP date is read");
+        assert!(
+            kept > Duration::from_secs(100) && kept <= Duration::from_mins(2),
+            "a future HTTP date is kept as the wait until it: {kept:?}"
         );
         fixture.join().expect("fixture thread");
     }
