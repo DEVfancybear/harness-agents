@@ -184,7 +184,7 @@ pub fn help_card_lines() -> Vec<String> {
             "Session",
             &[
                 "/new", "/resume", "/name", "/session", "/compact", "/refine", "/context", "/copy",
-                "/export", "/undo", "/diff",
+                "/export", "/undo",
             ],
         ),
         (

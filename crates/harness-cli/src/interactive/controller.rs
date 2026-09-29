@@ -2787,19 +2787,6 @@ impl InteractiveController {
             "/context" => {
                 self.reference("/context", self.service.context_summary(), &mut effects);
             }
-            "/diff" => {
-                if self.phase.has_active_run() {
-                    self.push_history(&mut effects, HistoryItem::Notice {
-                        message: "cannot show the session diff while a run is active".to_owned(),
-                    });
-                } else if let Err(message) = self.service.git_diff() {
-                    self.push_history(&mut effects, HistoryItem::Error { message });
-                } else {
-                    self.push_history(&mut effects, HistoryItem::Notice {
-                        message: "reading tracked changes since this session started...".to_owned(),
-                    });
-                }
-            }
             "/undo" => self.start_host_action("/undo".to_owned(), &mut effects),
             "/export" => {
                 let path = raw_argument.unwrap_or("session-export.md");
@@ -8353,7 +8340,7 @@ mod tests {
 
     #[test]
     fn g08_session_commands_are_listed_and_not_reported_as_unknown() {
-        for command in ["/diff", "/undo", "/export", "/copy", "/hooks"] {
+        for command in ["/undo", "/export", "/copy", "/hooks"] {
             assert!(
                 SLASH_COMMANDS.iter().any(|entry| entry.name == command),
                 "{command} is missing from the help and suggestion table"

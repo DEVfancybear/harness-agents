@@ -254,9 +254,6 @@ pub trait SessionPort: Send {
     fn system_prompt(&self) -> Vec<String> {
         vec!["no turn has run in this session yet".to_owned()]
     }
-    fn git_diff(&mut self) -> Result<(), String> {
-        Err("this backend does not support session diffs".to_owned())
-    }
     fn rename(&mut self, _title: &str) -> Result<String, String> {
         Err("this backend does not support session titles".to_owned())
     }
@@ -3167,55 +3164,6 @@ impl SessionPort for AgentSessionService {
         ));
         self.fetch_balance();
         lines
-    }
-
-    fn git_diff(&mut self) -> Result<(), String> {
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| "the application service needs an async runtime".to_owned())?;
-        let sender = self.sender.clone();
-        let store_dir = self.store_dir.clone();
-        let workspace_root = self.workspace_root.clone();
-        let task_id = self.task_id.clone();
-        handle.spawn(async move {
-            let result = async {
-                let store = SqliteStore::open_read_only(store_dir)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let base = store
-                    .session_setting(&task_id, "git_base")
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let lines = if let Some(base) = base {
-                    let diff = harness_tools::git_diff_from(&workspace_root, &base)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    if diff.is_empty() {
-                        vec!["no tracked changes since this session started".to_owned()]
-                    } else {
-                        let mut lines = diff
-                            .lines()
-                            .take(512)
-                            .map(ToOwned::to_owned)
-                            .collect::<Vec<_>>();
-                        if diff.lines().count() > 512 {
-                            lines.push("[diff truncated after 512 lines]".to_owned());
-                        }
-                        lines
-                    }
-                } else {
-                    vec!["no Git commit was recorded when this session started".to_owned()]
-                };
-                let _ = store.close().await;
-                Ok::<_, String>(lines)
-            }
-            .await;
-            let lines = result.unwrap_or_else(|error| vec![format!("git diff failed: {error}")]);
-            let _ = sender.send(SessionEvent::Reference {
-                title: "/diff".to_owned(),
-                lines,
-            });
-        });
-        Ok(())
     }
 
     fn rename(&mut self, title: &str) -> Result<String, String> {

@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 46] = [
+pub const SLASH_COMMANDS: [SlashCommand; 45] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -235,11 +235,6 @@ pub const SLASH_COMMANDS: [SlashCommand; 46] = [
         )
     },
     command("/cost", "", "Show the session cost from model prices"),
-    command(
-        "/diff",
-        "",
-        "Show tracked changes since this session started",
-    ),
     command(
         "/undo",
         "",
