@@ -845,6 +845,7 @@ mod tests {
             tick: 0,
             detail: crate::interactive::events::Detail::default(),
             thinking: None,
+            service_tier: None,
             goal: None,
         }
     }

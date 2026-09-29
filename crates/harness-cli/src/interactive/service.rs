@@ -310,6 +310,15 @@ pub trait SessionPort: Send {
     fn thinking_levels(&self) -> Vec<String> {
         Vec::new()
     }
+    /// prime-agent's `/tier <tier>` (and `/fast`): the tier for the next model
+    /// calls, kept with the conversation and as the global default.
+    fn set_service_tier(&mut self, _tier: &str) -> Result<String, String> {
+        Err("Current model does not support service tiers".to_owned())
+    }
+    /// The tier in force (clamped to the model) and the tiers the model takes.
+    fn service_tier(&self) -> (String, Vec<&'static str>) {
+        ("default".to_owned(), vec!["default"])
+    }
     /// The thinking level in force and the levels the model offers.
     fn thinking_status(&self) -> Vec<String> {
         vec!["this backend does not support thinking levels".to_owned()]
@@ -725,6 +734,9 @@ pub struct ProviderConfig {
     pub routing: super::config::Routing,
     /// Name of the source that holds the key; never the key.
     pub credential: CredentialSource,
+    /// The service tier the session asked for (`/tier`, `/fast`), before it is
+    /// clamped to what the model takes; `None` sends no tier.
+    pub service_tier: Option<String>,
 }
 
 impl ProviderConfig {
@@ -861,6 +873,7 @@ pub(super) fn resolve_provider_with_overrides(
         queue_modes: resolved.queue_modes,
         routing: resolved.routing,
         credential,
+        service_tier: None,
     })
 }
 
@@ -1279,7 +1292,13 @@ impl LiveProvider {
     }
 
     fn key(config: &ProviderConfig, level: harness_providers::ThinkingLevel) -> String {
-        format!("{}/{}/{}", config.provider_id, config.model, level.as_str())
+        format!(
+            "{}/{}/{}/{}",
+            config.provider_id,
+            config.model,
+            level.as_str(),
+            config.service_tier.as_deref().unwrap_or_default()
+        )
     }
 
     fn build(
@@ -1446,6 +1465,13 @@ pub(super) fn build_provider(
                     .map(|model| harness_providers::thinking::clamp(Some(model), thinking_level)),
                 headers: extra_headers,
                 session_id: Some(session.to_owned()),
+                // A tier the model does not take is sent as `default`.
+                service_tier: super::service_tier::clamp(
+                    config.service_tier.as_deref(),
+                    &config.provider_id,
+                    &config.protocol,
+                    &config.model,
+                ),
             },
         )
         .map(|adapter| Arc::new(adapter) as Arc<dyn ModelProvider>),
@@ -1642,6 +1668,9 @@ pub struct AgentSessionService {
     repl: Option<Arc<super::repl::ReplShared>>,
     /// The thinking level `/thinking` chose, for the next turns.
     thinking: Option<harness_providers::ThinkingLevel>,
+    /// The service tier `/tier` or `/fast` chose - or, once a turn has read it,
+    /// the one the conversation keeps - for the next model calls.
+    service_tier: Arc<Mutex<Option<String>>>,
     /// Turns since the last automatic refine review.
     turns_since_review: Arc<std::sync::atomic::AtomicU32>,
     /// The agent's own recurring prompts (`rlm_heartbeat`), for the whole session.
@@ -2076,6 +2105,16 @@ fn sort_newest_first(sessions: &mut [harness_store_sqlite::SessionSummary]) {
 /// The session setting a conversation's `/rlm-max-depth` is kept in.
 const RLM_MAX_DEPTH_SETTING: &str = "rlm_max_depth";
 
+/// The session setting a conversation's service tier is kept in.
+const SERVICE_TIER_SETTING: &str = "service_tier";
+
+/// prime-agent's global `defaultServiceTier`, from `settings.json`.
+fn default_service_tier(config_file: &Path) -> Option<String> {
+    super::config::load_setting(config_file, "defaultServiceTier")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|tier| super::service_tier::CHOICES.contains(&tier.as_str()))
+}
+
 /// The task of the conversation `previous` continues, or `fallback` (the task a
 /// new conversation's first turn will use).
 async fn conversation_task(
@@ -2308,6 +2347,7 @@ impl AgentSessionService {
             goal_forgotten: false,
             repl,
             thinking: None,
+            service_tier: Arc::new(Mutex::new(None)),
             turns_since_review: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             heartbeats: Arc::new(super::heartbeat::Heartbeats::default()),
             schedules,
@@ -2682,6 +2722,7 @@ impl SessionPort for AgentSessionService {
         };
         let repl = self.repl.clone();
         let thinking = self.thinking;
+        let service_tier = Arc::clone(&self.service_tier);
         let turns_since_review = Arc::clone(&self.turns_since_review);
         let heartbeats = Arc::clone(&self.heartbeats);
         let live = Arc::clone(&self.live);
@@ -2723,6 +2764,7 @@ impl SessionPort for AgentSessionService {
                 goal,
                 repl,
                 thinking,
+                service_tier,
                 turns_since_review,
                 auto_refine,
                 heartbeats,
@@ -3425,6 +3467,61 @@ impl SessionPort for AgentSessionService {
         })
     }
 
+    fn set_service_tier(&mut self, tier: &str) -> Result<String, String> {
+        let config = self.configured()?;
+        let available =
+            super::service_tier::available(&config.provider_id, &config.protocol, &config.model);
+        if !available.contains(&tier) {
+            return Err(format!(
+                "Service tier '{tier}' is not available for the current model. Available: {}",
+                available.join(", ")
+            ));
+        }
+        if let Ok(mut current) = self.service_tier.lock() {
+            *current = Some(tier.to_owned());
+        }
+        // A running turn uses the new tier from its next model call.
+        let mut live = self
+            .live
+            .config
+            .lock()
+            .ok()
+            .and_then(|config| config.clone())
+            .unwrap_or(config);
+        live.service_tier = Some(tier.to_owned());
+        self.live.set_config(live);
+        // prime-agent also keeps the tier as the default for new sessions.
+        let _ = super::config::save_setting(
+            &self.config_file,
+            "defaultServiceTier",
+            Some(serde_json::json!(tier)),
+        );
+        Ok(format!("Service tier: {tier}"))
+    }
+
+    fn service_tier(&self) -> (String, Vec<&'static str>) {
+        let Ok(config) = self.configured() else {
+            return ("default".to_owned(), vec!["default"]);
+        };
+        let requested = self
+            .service_tier
+            .lock()
+            .ok()
+            .and_then(|tier| tier.clone())
+            .or_else(|| default_service_tier(&self.config_file));
+        let current = super::service_tier::clamp(
+            requested.as_deref(),
+            &config.provider_id,
+            &config.protocol,
+            &config.model,
+        )
+        .unwrap_or_else(|| "default".to_owned());
+        (
+            current,
+            super::service_tier::available(&config.provider_id, &config.protocol, &config.model),
+        )
+    }
+
     fn thinking_levels(&self) -> Vec<String> {
         let Ok(config) = self.configured() else {
             return Vec::new();
@@ -3787,6 +3884,10 @@ impl SessionPort for AgentSessionService {
         // The turn validates ownership in this project's store before dispatch.
         // The children worked for the conversation being left; they stop quietly.
         self.agents.reset();
+        // The next conversation reads its own tier.
+        if let Ok(mut tier) = self.service_tier.lock() {
+            *tier = None;
+        }
         self.fork_plan = None;
         if let Ok(mut thread) = self.side_thread.lock() {
             thread.clear();
@@ -4063,6 +4164,10 @@ impl AgentSessionService {
     /// continue from the fork point.
     fn start_fork(&mut self, plan: ForkPlan) {
         self.agents.reset();
+        // The next conversation reads its own tier.
+        if let Ok(mut tier) = self.service_tier.lock() {
+            *tier = None;
+        }
         if let Ok(mut thread) = self.side_thread.lock() {
             thread.clear();
         }
@@ -4270,6 +4375,7 @@ async fn run_turn(
     goal: GoalRecord,
     repl: Option<Arc<super::repl::ReplShared>>,
     thinking: Option<harness_providers::ThinkingLevel>,
+    service_tier: Arc<Mutex<Option<String>>>,
     turns_since_review: Arc<std::sync::atomic::AtomicU32>,
     auto_refine: bool,
     heartbeats: Arc<super::heartbeat::Heartbeats>,
@@ -4542,7 +4648,7 @@ async fn run_turn(
             return;
         }
     }
-    let config = match resolve_provider_with_overrides(
+    let mut config = match resolve_provider_with_overrides(
         &config_file,
         &workspace_root,
         &environment,
@@ -4559,6 +4665,27 @@ async fn run_turn(
         }
     };
     gate.set_bell(config.bell);
+    // The service tier: what `/tier` or `/fast` chose (kept with the task), else
+    // what the task last used, else the global `defaultServiceTier`, as
+    // prime-agent's session entry stands above its default.
+    let chosen_tier = service_tier.lock().ok().and_then(|tier| tier.clone());
+    config.service_tier = match chosen_tier {
+        Some(tier) => {
+            let _ = store
+                .set_session_setting(&task_id, SERVICE_TIER_SETTING, &tier)
+                .await;
+            Some(tier)
+        }
+        None => store
+            .session_setting(&task_id, SERVICE_TIER_SETTING)
+            .await
+            .ok()
+            .flatten()
+            .or_else(|| default_service_tier(&config_file)),
+    };
+    if let Ok(mut tier) = service_tier.lock() {
+        tier.clone_from(&config.service_tier);
+    }
 
     // A workspace root keeps one project identity, whether or not memory is on: a
     // generated id per turn would put every project-scoped record this turn writes
@@ -8648,6 +8775,21 @@ mod tests {
         assert!(
             !service.label().contains("fixture-secret"),
             "the label never renders the credential"
+        );
+
+        // A DeepSeek model takes the default tier only, as in prime-agent: `/tier
+        // priority` is refused with the tiers it does take.
+        let mut service = service;
+        assert_eq!(
+            service.service_tier(),
+            ("default".to_owned(), vec!["default"])
+        );
+        let refused = service
+            .set_service_tier("priority")
+            .expect_err("deepseek has no priority tier");
+        assert_eq!(
+            refused,
+            "Service tier 'priority' is not available for the current model. Available: default"
         );
     }
 }

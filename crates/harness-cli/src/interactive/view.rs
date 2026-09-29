@@ -193,6 +193,8 @@ pub fn help_card_lines() -> Vec<String> {
                 "/model",
                 "/scoped-models",
                 "/effort",
+                "/fast",
+                "/tier",
                 "/login",
                 "/logout",
                 "/cost",

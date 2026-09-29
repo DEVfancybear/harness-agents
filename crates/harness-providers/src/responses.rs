@@ -53,6 +53,10 @@ pub struct ResponsesOptions {
     pub headers: Vec<(String, String)>,
     /// Identifies the conversation, for prompt caching and the Codex session header.
     pub session_id: Option<String>,
+    /// prime-agent's `service_tier` (`default`, `flex`, `priority`, `auto`), sent
+    /// as the request's top-level field when the session chose one; without it
+    /// the account's own tier applies.
+    pub service_tier: Option<String>,
 }
 
 pub struct OpenAiResponsesAdapter {
@@ -136,6 +140,9 @@ impl OpenAiResponsesAdapter {
             };
             body["reasoning"] = json!({"effort": effort, "summary": "auto"});
             body["include"] = json!(["reasoning.encrypted_content"]);
+        }
+        if let Some(tier) = &self.options.service_tier {
+            body["service_tier"] = json!(tier);
         }
         if codex {
             body["text"] = json!({"verbosity": "low"});
@@ -556,9 +563,28 @@ mod tests {
                 reasoning: Some(ThinkingLevel::High),
                 headers: Vec::new(),
                 session_id: Some("session-1".to_owned()),
+                service_tier: None,
             },
         )
         .expect("adapter")
+    }
+
+    /// prime-agent sends the chosen tier as the top-level `service_tier`, and
+    /// nothing when none was chosen.
+    #[test]
+    fn a_chosen_service_tier_is_the_top_level_field() {
+        let request = ProviderRequest::new(
+            RequestId::generate(),
+            "gpt-5.5",
+            vec![ProviderMessage::new(MessageRole::User, "hi")],
+        );
+        let plain = adapter(ResponsesFlavor::Api).request_body(&request);
+        assert!(plain.get("service_tier").is_none(), "{plain}");
+        let mut fast = adapter(ResponsesFlavor::Codex {
+            originator: "ha".to_owned(),
+        });
+        fast.options.service_tier = Some("priority".to_owned());
+        assert_eq!(fast.request_body(&request)["service_tier"], "priority");
     }
 
     /// A provider that sends a call's arguments only when the call is done, or

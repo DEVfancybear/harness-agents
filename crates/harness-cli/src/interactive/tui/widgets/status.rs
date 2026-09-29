@@ -279,6 +279,9 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
             if let Some(level) = &state.thinking {
                 push(Span::styled(format!(" · thinking {level}"), theme.dim));
             }
+            if let Some(tier) = &state.service_tier {
+                push(Span::styled(format!(" · {tier}"), theme.dim));
+            }
             if let Some(goal) = &state.goal {
                 push(Span::styled(format!(" · {goal}"), theme.accent));
             }
@@ -376,6 +379,7 @@ mod tests {
             tick: 0,
             detail: crate::interactive::events::Detail::default(),
             thinking: None,
+            service_tier: None,
             goal: None,
         }
     }

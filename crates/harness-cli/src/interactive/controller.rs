@@ -249,6 +249,7 @@ pub struct InteractiveController {
     pending_thinking: String,
     /// The thinking level the next turn uses, for the status line.
     thinking_label: Option<String>,
+    tier_label: Option<String>,
     /// The provider whose browser sign-in waits; a pasted redirect URL finishes it.
     signing_in: Option<String>,
     /// prime-agent's autonomous mode (`/autonomous`).
@@ -332,6 +333,7 @@ impl InteractiveController {
             signing_in: None,
             pending_thinking: String::new(),
             thinking_label: None,
+            tier_label: None,
             autonomous: super::autonomous::Autonomous::default(),
             gates_pending: false,
             turn_tokens_start: 0,
@@ -443,6 +445,7 @@ impl InteractiveController {
             tick: self.tick,
             detail: self.detail,
             thinking: self.thinking_label.clone(),
+            service_tier: self.tier_label.clone(),
             goal: self.goal.as_ref().and_then(GoalState::tray_label),
         }
     }
@@ -2653,6 +2656,35 @@ impl InteractiveController {
                 }
                 _ => self.reference("/agents", self.service.agents_summary(), &mut effects),
             },
+            // prime-agent's `/fast`: priority on, or back to the default tier.
+            "/fast" => {
+                let (current, available) = self.service.service_tier();
+                if available.contains(&"priority") {
+                    let next = if current == "priority" { "default" } else { "priority" };
+                    self.apply_tier(next, true, &mut effects);
+                } else {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "Current model does not support fast mode (priority tier)".to_owned(),
+                    });
+                }
+                effects.push(Effect::Redraw);
+            }
+            // prime-agent's `/tier [default|flex|priority|auto]`.
+            "/tier" => {
+                match raw_argument.map(str::trim).filter(|tier| !tier.is_empty()) {
+                    None => {
+                        let (current, available) = self.service.service_tier();
+                        self.push_history(&mut effects, HistoryItem::Notice {
+                            message: format!(
+                                "Service tier: {current} (available: {})",
+                                available.join(", ")
+                            ),
+                        });
+                    }
+                    Some(tier) => self.apply_tier(tier, false, &mut effects),
+                }
+                effects.push(Effect::Redraw);
+            }
             // prime-agent's `/rlm-max-depth [<int> [--global]]`.
             "/rlm-max-depth" => {
                 let words = raw_argument
@@ -3336,6 +3368,45 @@ impl InteractiveController {
 
     /// The model and thinking level the status line names; they change with
     /// `/model`, `/effort`, `/login` and `/logout`, so they are read again then.
+    /// The tier mark of the status line and `/tier`'s argument menu, as
+    /// prime-agent lists the tiers the model takes with the current one marked.
+    fn refresh_tier(&mut self) {
+        let (current, available) = self.service.service_tier();
+        self.tier_label = super::service_tier::status_label(Some(&current));
+        self.editor.set_argument_options(
+            "/tier",
+            available
+                .into_iter()
+                .map(|tier| {
+                    let marker = if tier == current { " (current)" } else { "" };
+                    (
+                        tier.to_owned(),
+                        format!("{}{marker}", super::service_tier::description(tier)),
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    /// `/tier <tier>` and `/fast`: set the tier and report it.
+    fn apply_tier(&mut self, tier: &str, fast: bool, effects: &mut Vec<Effect>) {
+        match self.service.set_service_tier(tier) {
+            Ok(message) => {
+                let message = if fast {
+                    format!(
+                        "Fast mode: {}",
+                        if tier == "priority" { "on" } else { "off" }
+                    )
+                } else {
+                    message
+                };
+                self.push_history(effects, HistoryItem::Notice { message });
+            }
+            Err(message) => self.push_history(effects, HistoryItem::Error { message }),
+        }
+        self.refresh_tier();
+    }
+
     fn refresh_status(&mut self) {
         let label = format!("Service: {}", self.service.label());
         match self
@@ -3347,6 +3418,7 @@ impl InteractiveController {
             None => self.header.push(label),
         }
         self.thinking_label = self.service.thinking_level();
+        self.refresh_tier();
         // prime-agent rewrites `/effort`'s hint to the levels the model offers,
         // each under the name its provider uses; the one in force is marked.
         let levels = self.service.thinking_levels();
@@ -4140,6 +4212,8 @@ mod tests {
         scopes: Arc<Mutex<Vec<Option<String>>>>,
         /// Every `/rlm-max-depth` change the port received.
         depths: Arc<Mutex<Vec<DepthChange>>>,
+        /// The service tier in force, as `/tier` and `/fast` set it.
+        tier: Arc<Mutex<Option<String>>>,
     }
 
     impl SessionPort for RecordingPort {
@@ -4263,6 +4337,27 @@ mod tests {
                 .expect("side question log")
                 .push(question.to_owned());
             Ok(())
+        }
+
+        fn set_service_tier(&mut self, tier: &str) -> Result<String, String> {
+            if !["default", "priority", "auto"].contains(&tier) {
+                return Err(format!(
+                    "Service tier '{tier}' is not available for the current model. Available: default, priority, auto"
+                ));
+            }
+            *self.tier.lock().expect("tier") = Some(tier.to_owned());
+            Ok(format!("Service tier: {tier}"))
+        }
+
+        fn service_tier(&self) -> (String, Vec<&'static str>) {
+            (
+                self.tier
+                    .lock()
+                    .expect("tier")
+                    .clone()
+                    .unwrap_or_else(|| "default".to_owned()),
+                vec!["default", "priority", "auto"],
+            )
         }
 
         fn rlm_max_depth(&mut self, change: Option<(u32, bool)>) -> Result<(), String> {
@@ -8160,6 +8255,53 @@ mod tests {
             super::quote_for_composer("\"C:\\work\\shot.png\""),
             "\"C:\\work\\shot.png\"",
             "an already quoted path is not quoted twice"
+        );
+    }
+
+    /// prime-agent's `/fast` toggles the priority tier, `/tier` shows or sets the
+    /// tier, and the status line marks priority as `fast`.
+    #[test]
+    fn fast_and_tier_follow_prime_agent() {
+        let mut harness = bench(true);
+        let on = effects_to_plain(&submit_text(&mut harness.controller, "/fast")).join(
+            "
+",
+        );
+        assert!(on.contains("Fast mode: on"), "{on}");
+        assert_eq!(
+            harness.controller.ui_state().service_tier.as_deref(),
+            Some("fast")
+        );
+        let off = effects_to_plain(&submit_text(&mut harness.controller, "/fast")).join(
+            "
+",
+        );
+        assert!(off.contains("Fast mode: off"), "{off}");
+        assert_eq!(harness.controller.ui_state().service_tier, None);
+        let shown = effects_to_plain(&submit_text(&mut harness.controller, "/tier")).join(
+            "
+",
+        );
+        assert!(
+            shown.contains("Service tier: default (available: default, priority, auto)"),
+            "{shown}"
+        );
+        let refused = effects_to_plain(&submit_text(&mut harness.controller, "/tier flex")).join(
+            "
+",
+        );
+        assert!(
+            refused.contains("Service tier 'flex' is not available for the current model"),
+            "{refused}"
+        );
+        let auto = effects_to_plain(&submit_text(&mut harness.controller, "/tier auto")).join(
+            "
+",
+        );
+        assert!(auto.contains("Service tier: auto"), "{auto}");
+        assert_eq!(
+            harness.controller.ui_state().service_tier.as_deref(),
+            Some("auto")
         );
     }
 

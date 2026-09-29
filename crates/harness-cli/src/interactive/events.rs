@@ -452,6 +452,9 @@ pub struct UiState {
     pub detail: Detail,
     /// The thinking level the next turn uses, when the service knows it.
     pub thinking: Option<String>,
+    /// prime-agent's tier mark after the model: `fast` for priority, the tier's
+    /// name for another non-default one.
+    pub service_tier: Option<String>,
     /// The goal being pursued, as the status line names it.
     pub goal: Option<String>,
 }

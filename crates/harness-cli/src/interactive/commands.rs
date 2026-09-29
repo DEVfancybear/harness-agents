@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 44] = [
+pub const SLASH_COMMANDS: [SlashCommand; 46] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -167,6 +167,12 @@ pub const SLASH_COMMANDS: [SlashCommand; 44] = [
         "/agents",
         "",
         "Show delegated children; /agents stop [name] stops them",
+    ),
+    command("/fast", "", "Toggle OpenAI Fast mode"),
+    command(
+        "/tier",
+        "[default|flex|priority|auto]",
+        "Show or set the service tier",
     ),
     command(
         "/rlm-max-depth",

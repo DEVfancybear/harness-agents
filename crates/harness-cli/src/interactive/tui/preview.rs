@@ -546,6 +546,7 @@ fn state(phase: AppPhase) -> UiState {
         tick: 2,
         detail: crate::interactive::events::Detail::Collapsed,
         thinking: Some("high".to_owned()),
+        service_tier: None,
         goal: None,
     }
 }

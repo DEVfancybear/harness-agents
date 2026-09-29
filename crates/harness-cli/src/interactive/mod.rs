@@ -41,6 +41,7 @@ pub mod repl;
 pub mod routing;
 pub mod schedules;
 pub mod service;
+pub mod service_tier;
 pub mod side_question;
 pub mod skill_requests;
 pub mod skills;

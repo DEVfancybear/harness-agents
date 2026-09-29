@@ -317,7 +317,7 @@ fn workspace_tool_schemas() -> Vec<Value> {
                 "regex": {"type": "boolean"},
                 "case_insensitive": {"type": "boolean"},
                 "glob": nullable_string_schema(),
-                "context_lines": {"type": "integer", "minimum": 0, "maximum": SEARCH_CONTEXT_MAX_LINES}
+                "context_lines": {"type": "integer", "minimum": 0, "maximum": SEARCH_CONTEXT_MAX_LINES, "description": "Lines of context around each match, at most 3; more is read as 3."}
             }),
             &["query"],
         ),
@@ -847,12 +847,12 @@ impl CodingToolAction {
                 regex: parse_optional_bool(object, "regex")?.unwrap_or(false),
                 case_insensitive: parse_optional_bool(object, "case_insensitive")?.unwrap_or(false),
                 glob: parse_optional_string(object, "glob")?,
-                context_lines: parse_optional_bounded_u32(
-                    object,
-                    "context_lines",
-                    0,
-                    SEARCH_CONTEXT_MAX_LINES,
-                )?,
+                // Models ask for 4 or 5 lines of context despite the schema's
+                // maximum; measured in a real store, every such search was
+                // refused and cost the model a step. More context than the bound
+                // is a request for the most there is, so it is read as the bound.
+                context_lines: parse_optional_bounded_u32(object, "context_lines", 0, u32::MAX)?
+                    .map(|lines| lines.min(SEARCH_CONTEXT_MAX_LINES)),
             }),
             "apply_patch" => Ok(Self::ApplyPatch {
                 path: required_string(object, "path")?,
@@ -1647,5 +1647,30 @@ pub(crate) fn observation(
         worktree_id,
         base_commit,
         observed_fingerprint: fingerprint,
+    }
+}
+
+#[cfg(test)]
+mod search_context_tests {
+    use super::{CodingToolAction, SEARCH_CONTEXT_MAX_LINES};
+
+    fn context_of(arguments: &str) -> Option<u32> {
+        match CodingToolAction::from_provider_call("search_text", arguments).expect("parses") {
+            CodingToolAction::SearchText { context_lines, .. } => context_lines,
+            other => panic!("not a search: {other:?}"),
+        }
+    }
+
+    /// Seen in a real store: 470 searches asked for 4 or 5 context lines and all
+    /// were refused (`context_lines must be an integer between 0 and 3`). They are
+    /// read as the bound; a value that is not a count is still refused.
+    #[test]
+    fn more_context_than_the_bound_is_read_as_the_bound() {
+        assert_eq!(context_of(r#"{"query":"x","context_lines":5}"#), Some(SEARCH_CONTEXT_MAX_LINES));
+        assert_eq!(context_of(r#"{"query":"x","context_lines":2}"#), Some(2));
+        assert_eq!(context_of(r#"{"query":"x"}"#), None);
+        for bad in [r#"{"query":"x","context_lines":-1}"#, r#"{"query":"x","context_lines":"2"}"#] {
+            assert!(CodingToolAction::from_provider_call("search_text", bad).is_err(), "{bad}");
+        }
     }
 }
