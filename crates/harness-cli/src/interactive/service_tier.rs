@@ -17,11 +17,11 @@ pub fn description(tier: &str) -> &'static str {
     }
 }
 
-/// prime-agent's `supportsServiceTier`. OpenAI's Responses API and the ChatGPT
-/// (Codex) backend take a tier; `auto` is valid for every model there, `priority`
-/// for the models OpenAI lists for it, and `flex` for those same models on the
-/// API only. Every other provider takes the default only. (prime-agent also
-/// sends OpenRouter tiers, a provider ha does not have.)
+/// prime-agent's `supportsServiceTier`. The `OpenAI` Responses API and the
+/// `ChatGPT` (Codex) backend take a tier; `auto` is valid for every model there,
+/// `priority` for the models `OpenAI` lists for it, and `flex` for those same
+/// models on the API only. Every other provider takes the default only.
+/// (prime-agent also sends `OpenRouter` tiers, a provider ha does not have.)
 #[must_use]
 pub fn supports(provider_id: &str, protocol: &str, model: &str, tier: &str) -> bool {
     if tier == "default" {

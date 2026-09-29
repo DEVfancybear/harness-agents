@@ -410,6 +410,10 @@ impl ResponsesSseDecoder {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one match over the Responses event types keeps every event the stream can send in one place"
+    )]
     fn frame(
         &mut self,
         frame: &[u8],

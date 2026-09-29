@@ -3667,3 +3667,92 @@ async fn g06_bang_prefix_goes_through_the_same_approval_gate() {
     drop(tools);
     close(store).await;
 }
+
+/// Seen in a real session: a model overwrote files with `write_file` and left
+/// `expected_hash` out, and each write was refused as `stale_workspace`. A file
+/// the turn has read is overwritten against the hash that read reported; a file
+/// it never read still needs the hash, so an unseen file is never clobbered.
+#[tokio::test]
+async fn write_file_after_a_read_needs_no_hash_from_the_model() {
+    let bench = bench();
+    std::fs::write(bench.workspace.join("src").join("unread.txt"), "keep\n").expect("unread");
+    let store = bench.open_store().await;
+    let write = |id: &str, path: &str, content: &str| {
+        ProviderStreamEvent::tool_delta(
+            id,
+            "write_file",
+            serde_json::json!({"path": path, "content": content}).to_string(),
+        )
+    };
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                "call-1",
+                "read_file",
+                serde_json::json!({"path": "src/parser.txt"}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            write("call-2", "src/parser.txt", "fixed parser\n"),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            write("call-3", "src/parser.txt", "fixed again\n"),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            write("call-4", "src/unread.txt", "clobbered\n"),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("done"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)));
+    let request = RunRequest::new(
+        SessionId::generate(),
+        TaskId::generate(),
+        InputId::generate(),
+        "fix the parser".to_owned(),
+        observe_workspace(bench.project_id.clone(), &bench.workspace).unwrap(),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    driver
+        .run_turn(
+            request,
+            TurnOptions {
+                workspace_root: bench.workspace.clone(),
+                actor_id: "m4.test".to_owned(),
+                approvals: ApprovalMode::Auto,
+                limits: TurnLimits::default(),
+            },
+            Arc::new(SilentObserver),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn runs");
+    assert_eq!(
+        std::fs::read_to_string(bench.workspace.join("src").join("parser.txt")).expect("read"),
+        "fixed again\n",
+        "a read file is overwritten, and so is one the turn itself wrote"
+    );
+    assert_eq!(
+        std::fs::read_to_string(bench.workspace.join("src").join("unread.txt")).expect("read"),
+        "keep\n",
+        "a file the turn never read is not overwritten without its hash"
+    );
+    drop(driver);
+    close(store).await;
+}

@@ -153,10 +153,19 @@ pub(crate) fn apply_edit_to_normalized_content(
         _ => normalized_content.to_owned(),
     };
     let Some(found) = fuzzy_find_text(&base_content, &old_text) else {
+        // Measured: a model whose earlier results were shortened sent an edit it
+        // had already made, and read only "could not find" - so it tried again.
+        // When the replacement text is what the file holds, it is told so.
+        let applied = !new_text.is_empty() && fuzzy_find_text(&base_content, &new_text).is_some();
         return Err(HarnessError::new(
             ErrorCode::EditNotFound,
             format!(
-                "Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines."
+                "Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines.{}",
+                if applied {
+                    " The new text is already in the file: this edit looks applied already; read the file before editing it again."
+                } else {
+                    ""
+                }
             ),
         ));
     };
@@ -439,6 +448,14 @@ mod tests {
                 .to_string()
                 .contains("Could not find the exact text in f.txt."),
             "{missing}"
+        );
+
+        assert!(!missing.to_string().contains("already"), "{missing}");
+        let done = plan("keep\nnew\n", "old", "new").expect_err("already applied");
+        assert!(
+            done.to_string()
+                .contains("The new text is already in the file: this edit looks applied already"),
+            "{done}"
         );
 
         let ambiguous = plan("x\nx\n", "x", "y").expect_err("ambiguous");

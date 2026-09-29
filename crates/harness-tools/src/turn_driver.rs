@@ -465,9 +465,39 @@ pub struct TurnDriver {
     goal: Option<GoalSpec>,
     /// Durable steering/cancel inbox, when the host attached one.
     inbox: Option<RunInbox>,
+    /// The hash of each file as this driver last saw it: read by `read_file`,
+    /// or written by a tool. It stands in for a `write_file` call that leaves
+    /// `expected_hash` out.
+    seen: Arc<std::sync::Mutex<std::collections::HashMap<String, harness_types::ContentHash>>>,
+}
+
+/// A workspace path as a key: one separator, no leading `./`.
+fn seen_key(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    path.trim_start_matches("./").to_owned()
 }
 
 impl TurnDriver {
+    /// Remember the hash a finished tool reported for its file.
+    fn remember_hash(&self, output: &ToolOutput) {
+        let (path, hash) = match output {
+            ToolOutput::ReadFile { path, hash, .. } => (path, hash),
+            ToolOutput::WriteFile {
+                path, after_hash, ..
+            }
+            | ToolOutput::ApplyPatch {
+                path, after_hash, ..
+            }
+            | ToolOutput::EditFile {
+                path, after_hash, ..
+            } => (path, after_hash),
+            _ => return,
+        };
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.insert(seen_key(path), hash.clone());
+        }
+    }
+
     /// Claim what the user sent to the running turn: steering notes, as user
     /// messages for the next model call, and a cancel with its reason.
     async fn claim_inbox(
@@ -537,6 +567,7 @@ impl TurnDriver {
             external: None,
             goal: None,
             inbox: None,
+            seen: Arc::default(),
         }
     }
 
@@ -1194,6 +1225,7 @@ impl TurnDriver {
                         appended.push(ProviderMessage::tool_result(transcript_id, message));
                     }
                     Slot::Done(Ok(view)) => {
+                        self.remember_hash(&view.output);
                         let blocked = match &view.output {
                             ToolOutput::Denied { code, reason } => {
                                 Some(format!("{code}: {reason}"))
@@ -1442,7 +1474,21 @@ impl TurnDriver {
     /// not advertise stays the unsupported-tool denial it always was.
     fn resolve_action(&self, call: &NormalizedToolCall) -> Result<CodingToolAction, HarnessError> {
         if coding_tool_names().contains(&call.name.as_str()) {
-            return CodingToolAction::from_provider_call(&call.name, &call.arguments);
+            let mut action = CodingToolAction::from_provider_call(&call.name, &call.arguments)?;
+            // Overwriting a file the turn has read, or written, needs no hash from
+            // the model: the host checks the file is still what the turn last saw,
+            // as Claude Code checks a write against the last read. Models left the
+            // hash out, or computed their own, and every such write was refused.
+            if let CodingToolAction::WriteFile {
+                path,
+                expected_hash: expected_hash @ None,
+                ..
+            } = &mut action
+                && let Ok(seen) = self.seen.lock()
+            {
+                expected_hash.clone_from(&seen.get(&seen_key(path)).cloned());
+            }
+            return Ok(action);
         }
         let Some(external) = &self.external else {
             return CodingToolAction::from_provider_call(&call.name, &call.arguments);

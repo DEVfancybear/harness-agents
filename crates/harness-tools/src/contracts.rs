@@ -1666,11 +1666,20 @@ mod search_context_tests {
     /// read as the bound; a value that is not a count is still refused.
     #[test]
     fn more_context_than_the_bound_is_read_as_the_bound() {
-        assert_eq!(context_of(r#"{"query":"x","context_lines":5}"#), Some(SEARCH_CONTEXT_MAX_LINES));
+        assert_eq!(
+            context_of(r#"{"query":"x","context_lines":5}"#),
+            Some(SEARCH_CONTEXT_MAX_LINES)
+        );
         assert_eq!(context_of(r#"{"query":"x","context_lines":2}"#), Some(2));
         assert_eq!(context_of(r#"{"query":"x"}"#), None);
-        for bad in [r#"{"query":"x","context_lines":-1}"#, r#"{"query":"x","context_lines":"2"}"#] {
-            assert!(CodingToolAction::from_provider_call("search_text", bad).is_err(), "{bad}");
+        for bad in [
+            r#"{"query":"x","context_lines":-1}"#,
+            r#"{"query":"x","context_lines":"2"}"#,
+        ] {
+            assert!(
+                CodingToolAction::from_provider_call("search_text", bad).is_err(),
+                "{bad}"
+            );
         }
     }
 }
