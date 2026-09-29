@@ -1615,6 +1615,21 @@ impl InteractiveController {
             SessionEvent::TurnsListed { purpose, turns } => {
                 self.show_turns(purpose, turns, effects);
             }
+            SessionEvent::Refined {
+                header,
+                summary,
+                details,
+            } => {
+                self.flush_stream(effects);
+                self.push_history(
+                    effects,
+                    HistoryItem::Refinement {
+                        header,
+                        summary,
+                        details,
+                    },
+                );
+            }
             SessionEvent::UnreadMessage { text, verbatim } => {
                 // It arrived as the turn was ending: another agent's message is read
                 // like a child's report, the user's steer waits in the steering lane.

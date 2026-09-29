@@ -328,6 +328,13 @@ pub enum HistoryItem {
     /// Something worth knowing that is not a failure; the plain line is
     /// `[info] <message>`.
     Notice { message: String },
+    /// prime-agent's refinement outcome: `◆ header`, the summary, and - in the
+    /// details and expanded modes - the refinement's id, scope and each edit.
+    Refinement {
+        header: String,
+        summary: String,
+        details: Vec<String>,
+    },
     /// One gated action, recorded when the user answered it.
     Approval {
         action: String,
@@ -576,6 +583,12 @@ pub enum SessionEvent {
     /// The answer to a resume listing.
     SessionsListed {
         sessions: Vec<SessionCandidate>,
+    },
+    /// A refinement was applied (`/refine`, or the automatic review).
+    Refined {
+        header: String,
+        summary: String,
+        details: Vec<String>,
     },
     /// The model called `goal_complete`: the active goal is done.
     GoalCompleted {

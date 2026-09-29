@@ -68,26 +68,8 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
             }
             rows
         }
-        // prime-agent's `setChatDetail`: overview previews every output; details
-        // also opens the edit tools' diffs (`editDiffsExpanded`); all opens every
-        // output (`toolOutputExpanded`).
         HistoryItem::ToolOutput { name, text, path } => {
-            let whole = match detail {
-                Detail::Collapsed => false,
-                Detail::Details => is_edit_tool(name),
-                Detail::Expanded => true,
-            };
-            if whole {
-                whole_output_rows(text, path.as_deref(), width, theme)
-            } else {
-                tool_output_rows(
-                    text,
-                    path.as_deref(),
-                    width,
-                    theme,
-                    TOOL_OUTPUT_PREVIEW_LINES,
-                )
-            }
+            output_rows(name, text, path.as_deref(), width, theme, detail)
         }
         HistoryItem::Run {
             outcome,
@@ -101,6 +83,11 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
         HistoryItem::Error { message } => error_rows(message, width, theme),
         HistoryItem::Message { text } => vec![Line::from(Span::raw(text.clone()))],
         HistoryItem::Notice { message } => notice_rows(message, width, theme),
+        HistoryItem::Refinement {
+            header,
+            summary,
+            details,
+        } => refinement_rows(header, summary, details, width, theme, detail),
         HistoryItem::Approval {
             action,
             summary,
@@ -155,6 +142,29 @@ pub fn assistant_rows(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static
         markdown::render(text, width.saturating_sub(RAIL_CELLS), theme),
         theme.rail_assistant,
     )
+}
+
+/// prime-agent's `setChatDetail`: overview previews every output; details also
+/// opens the edit tools' diffs (`editDiffsExpanded`); all opens every output
+/// (`toolOutputExpanded`).
+fn output_rows(
+    name: &str,
+    text: &str,
+    path: Option<&str>,
+    width: u16,
+    theme: &Theme,
+    detail: Detail,
+) -> Vec<Line<'static>> {
+    let whole = match detail {
+        Detail::Collapsed => false,
+        Detail::Details => is_edit_tool(name),
+        Detail::Expanded => true,
+    };
+    if whole {
+        whole_output_rows(text, path, width, theme)
+    } else {
+        tool_output_rows(text, path, width, theme, TOOL_OUTPUT_PREVIEW_LINES)
+    }
 }
 
 /// The tools whose output is a diff of the file they changed: prime-agent's
@@ -354,6 +364,39 @@ fn notice_rows(message: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
             .collect();
     };
     margined(spans, width)
+}
+
+/// prime-agent's `RefinementOutcomeMessageComponent`: `◆ header` and the summary;
+/// the details and expanded modes add the refinement's id and every edit.
+fn refinement_rows(
+    header: &str,
+    summary: &str,
+    details: &[String],
+    width: u16,
+    theme: &Theme,
+    detail: Detail,
+) -> Vec<Line<'static>> {
+    let mut rows = vec![Line::default()];
+    rows.extend(margined(
+        vec![Span::styled(
+            format!("◆ {header}"),
+            theme.refinement.add_modifier(Modifier::BOLD),
+        )],
+        width,
+    ));
+    for line in summary.lines() {
+        rows.extend(margined(
+            vec![Span::styled(line.to_owned(), theme.muted)],
+            width,
+        ));
+    }
+    if detail != Detail::Collapsed && !details.is_empty() {
+        rows.push(Line::default());
+        for line in details {
+            rows.extend(margined(vec![Span::styled(line.clone(), theme.dim)], width));
+        }
+    }
+    rows
 }
 
 /// Rows on the tool panel background, padded to the full width.
@@ -1526,6 +1569,40 @@ fn main() {}",
                 .flat_map(|row| row.spans.iter())
                 .all(|span| span.style.fg.is_none() && span.style.bg.is_none())
         );
+    }
+
+    /// A refinement is prime-agent's row: `◆ Harness refined` and its summary;
+    /// the id and the edits, one per line, only in details and expanded. (The
+    /// screenshot showed one notice paragraph with the id in front and every edit
+    /// run together, cut mid-word.)
+    #[test]
+    fn a_refinement_is_a_header_a_summary_and_details_on_demand() {
+        let item = HistoryItem::Refinement {
+            header: "Harness refined".to_owned(),
+            summary: "Consolidated the review into memory".to_owned(),
+            details: vec![
+                "Harness refined · 2 edits applied · Refinement refine_179 · local".to_owned(),
+                "Updated local memory `review_v3`".to_owned(),
+                "Created local prompt `verify_claims`".to_owned(),
+            ],
+        };
+        let theme = Theme::plain();
+        let collapsed = plain_text(&render(&item, 80, &theme, Detail::Collapsed));
+        assert_eq!(
+            collapsed,
+            "\n  ◆ Harness refined\n  Consolidated the review into memory"
+        );
+        let details = plain_text(&render(&item, 80, &theme, Detail::Details));
+        let rows = details.lines().collect::<Vec<_>>();
+        assert!(
+            rows.contains(&"  Updated local memory `review_v3`"),
+            "{details}"
+        );
+        assert!(
+            rows.contains(&"  Created local prompt `verify_claims`"),
+            "{details}"
+        );
+        assert!(details.contains("refine_179"), "{details}");
     }
 
     #[test]

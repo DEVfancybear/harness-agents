@@ -45,6 +45,14 @@ pub fn plain_lines(item: &HistoryItem) -> Vec<String> {
         }
         HistoryItem::Error { message } => vec![format!("[error] {message}")],
         HistoryItem::Notice { message } => vec![format!("[info] {message}")],
+        // The plain transcript is a log: the refinement's details go in whole.
+        HistoryItem::Refinement {
+            header,
+            summary,
+            details,
+        } => std::iter::once(format!("[refine] {header} · {summary}"))
+            .chain(details.iter().map(|line| format!("[refine]   {line}")))
+            .collect(),
         HistoryItem::Approval {
             action,
             summary,
@@ -62,10 +70,16 @@ pub fn plain_lines(item: &HistoryItem) -> Vec<String> {
 #[must_use]
 pub fn seconds_label(elapsed: Duration) -> String {
     let millis = elapsed.as_millis();
+    let seconds = elapsed.as_secs();
     if millis < 1000 {
         format!("{millis}ms")
-    } else {
+    } else if seconds < 60 {
         format!("{:.1}s", elapsed.as_secs_f64())
+    } else if seconds < 3600 {
+        // `1996.7s` is a number to work out; `33m 16s` is a time.
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3600, seconds % 3600 / 60)
     }
 }
 
@@ -328,6 +342,17 @@ mod tests {
     use crate::interactive::events::{AppPhase, HistoryItem, PauseReason, RunOutcome, ToolState};
     use crate::interactive::input::SLASH_COMMANDS;
     use std::time::Duration;
+
+    /// A long turn reads as a time, not a count of seconds (`1996.7s`).
+    #[test]
+    fn a_long_duration_reads_as_minutes_and_hours() {
+        use super::seconds_label;
+        assert_eq!(seconds_label(Duration::from_millis(40)), "40ms");
+        assert_eq!(seconds_label(Duration::from_millis(1200)), "1.2s");
+        assert_eq!(seconds_label(Duration::from_millis(59_900)), "59.9s");
+        assert_eq!(seconds_label(Duration::from_millis(1_996_700)), "33m 16s");
+        assert_eq!(seconds_label(Duration::from_mins(65)), "1h 5m");
+    }
 
     #[test]
     fn g03_thinking_delta_never_enters_plain_transcript() {

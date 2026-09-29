@@ -3957,6 +3957,15 @@ impl AgentSessionService {
     }
 }
 
+/// prime-agent's refinement outcome row, from what `/refine` applied.
+fn refined_event(refinement: &super::refine::Refinement) -> SessionEvent {
+    SessionEvent::Refined {
+        header: refinement.header(),
+        summary: refinement.summary(),
+        details: refinement.details(),
+    }
+}
+
 fn trust_project_config(user_path: &Path, canonical_root: &Path) -> Result<(), String> {
     if user_path.exists() {
         super::config::load(user_path).map_err(|error| error.to_string())?;
@@ -4627,9 +4636,7 @@ async fn run_turn(
         }
         match result {
             Ok(refinement) => {
-                send(SessionEvent::Notice {
-                    message: format!("refine {}: {}", refinement.id(), refinement.notice()),
-                });
+                send(refined_event(&refinement));
                 send(SessionEvent::RunTerminal {
                     outcome: RunOutcome::Done,
                 });
@@ -5256,9 +5263,7 @@ async fn run_turn(
                 )
                 .await
                 {
-                    Ok(refinement) => send(SessionEvent::Notice {
-                        message: format!("refine {}: {}", refinement.id(), refinement.notice()),
-                    }),
+                    Ok(refinement) => send(refined_event(&refinement)),
                     Err(error) => send(SessionEvent::Notice {
                         message: format!("refine failed: {error}"),
                     }),

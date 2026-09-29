@@ -488,52 +488,163 @@ pub struct Refinement {
 }
 
 impl Refinement {
-    /// `formatRefinementNoticeBody`.
-    #[must_use]
-    pub fn notice(&self) -> String {
-        let compact = |text: &str| {
-            let folded = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            if folded.chars().count() <= 180 {
-                folded
-            } else {
-                format!("{}...", folded.chars().take(177).collect::<String>())
-            }
-        };
-        let mut lines = vec![compact(self.record["summary"].as_str().unwrap_or(""))];
-        let scope = self.record["scope"].as_str().unwrap_or("local");
-        for edit in self.record["appliedEdits"].as_array().into_iter().flatten() {
-            if edit["applied"] != true {
-                continue;
-            }
-            let entry = if edit["after"].is_object() {
-                &edit["after"]
-            } else {
-                &edit["before"]
-            };
-            lines.push(format!(
-                "- {} {} [{}:{}] {}: {}",
-                edit["action"].as_str().unwrap_or("?"),
-                edit["kind"].as_str().unwrap_or("?"),
-                entry["scope"].as_str().unwrap_or(scope),
-                edit["id"].as_str().unwrap_or("?"),
-                entry["title"]
-                    .as_str()
-                    .unwrap_or(edit["id"].as_str().unwrap_or("?")),
-                compact(entry["content"].as_str().unwrap_or(""))
-            ));
-        }
-        let failed = self.record["appliedEdits"].as_array().map_or(0, |edits| {
-            edits.iter().filter(|edit| edit["applied"] != true).count()
-        });
-        if failed > 0 {
-            lines.push(format!("({failed} edit(s) were refused)"));
-        }
-        lines.join("\n")
-    }
-
     #[must_use]
     pub fn id(&self) -> &str {
         self.record["id"].as_str().unwrap_or_default()
+    }
+
+    fn edits(&self) -> Vec<&Value> {
+        self.record["appliedEdits"]
+            .as_array()
+            .map(|edits| edits.iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// prime-agent's `refinementHeader`: what the refinement did, in one line.
+    #[must_use]
+    pub fn outcome(&self) -> String {
+        let edits = self.edits();
+        let applied = edits
+            .iter()
+            .filter(|edit| edit["applied"] == true)
+            .collect::<Vec<_>>();
+        let rollback = self.record["rollbackOf"].is_string();
+        let operation = if rollback {
+            "Harness rollback"
+        } else {
+            "Harness refinement"
+        };
+        let plural = |count: usize| if count == 1 { "" } else { "s" };
+        if edits.is_empty() {
+            return format!(
+                "{} · no edits applied",
+                if rollback {
+                    "Harness rollback unchanged"
+                } else {
+                    "Harness unchanged"
+                }
+            );
+        }
+        if applied.is_empty() {
+            return format!("{operation} failed · 0/{} edits applied", edits.len());
+        }
+        if applied.len() < edits.len() {
+            return format!(
+                "{} · {}/{} edits applied",
+                if rollback {
+                    "Harness partially rolled back"
+                } else {
+                    "Harness partially refined"
+                },
+                applied.len(),
+                edits.len()
+            );
+        }
+        if rollback {
+            return format!(
+                "Harness rollback completed · {} edit{} applied",
+                applied.len(),
+                plural(applied.len())
+            );
+        }
+        let kind = applied[0]["kind"].as_str().unwrap_or("edit");
+        if applied
+            .iter()
+            .all(|edit| edit["kind"].as_str() == Some(kind))
+        {
+            let noun = if kind == "memory" {
+                if applied.len() == 1 {
+                    "memory"
+                } else {
+                    "memories"
+                }
+                .to_owned()
+            } else {
+                format!("{kind}{}", plural(applied.len()))
+            };
+            let action = applied[0]["action"].as_str().unwrap_or("");
+            let verb = if applied
+                .iter()
+                .all(|edit| edit["action"].as_str() == Some(action))
+            {
+                match action {
+                    "create" => "created",
+                    "update" => "updated",
+                    "delete" => "deleted",
+                    _ => "changed",
+                }
+            } else {
+                "changed"
+            };
+            return format!("Harness refined · {} {noun} {verb}", applied.len());
+        }
+        format!("Harness refined · {} edits applied", applied.len())
+    }
+
+    /// The header prime-agent's refinement row shows: the outcome, shortened to
+    /// `Harness refined` when everything applied.
+    #[must_use]
+    pub fn header(&self) -> String {
+        let outcome = self.outcome();
+        if outcome.starts_with("Harness refined ·") {
+            "Harness refined".to_owned()
+        } else {
+            outcome
+        }
+    }
+
+    /// The summary line under the header.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let summary = self.record["summary"].as_str().unwrap_or("").trim();
+        if summary.is_empty() {
+            "No summary was recorded for this harness change.".to_owned()
+        } else {
+            summary.to_owned()
+        }
+    }
+
+    /// What the expanded row adds (`RefinementOutcomeMessageComponent`): the
+    /// outcome with the refinement's id and scope, then one line per edit and
+    /// its reason.
+    #[must_use]
+    pub fn details(&self) -> Vec<String> {
+        let scope = self.record["scope"].as_str().unwrap_or("local");
+        let mut first = format!("{} · Refinement {} · {scope}", self.outcome(), self.id());
+        if let Some(target) = self.record["rollbackOf"].as_str() {
+            first = format!("{first} · rollback of {target}");
+        }
+        let mut lines = vec![first];
+        for edit in self.edits() {
+            let entry_scope = edit["after"]["scope"]
+                .as_str()
+                .or_else(|| edit["before"]["scope"].as_str())
+                .unwrap_or(scope);
+            let action = edit["action"].as_str().unwrap_or("change");
+            let kind = edit["kind"].as_str().unwrap_or("entry");
+            let id = edit["id"].as_str().unwrap_or("?");
+            if edit["applied"] == true {
+                let verb = match action {
+                    "create" => "Created",
+                    "update" => "Updated",
+                    "delete" => "Deleted",
+                    _ => "Changed",
+                };
+                lines.push(format!("{verb} {entry_scope} {kind} `{id}`"));
+            } else {
+                let error = edit["error"]
+                    .as_str()
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "Failed to {action} {entry_scope} {kind} `{id}`{error}"
+                ));
+            }
+            if let Some(reason) = edit["reason"].as_str().filter(|reason| !reason.is_empty()) {
+                lines.push(format!("  Reason: {reason}"));
+            }
+        }
+        lines
     }
 }
 
@@ -1011,14 +1122,23 @@ mod tests {
         assert_eq!(edits[1]["error"], "create skill requires arguments");
         assert_eq!(edits[2]["error"], "base system prompt is not editable");
         assert_eq!(edits[3]["error"], "entry not found");
-        assert!(
-            result
-                .notice()
-                .contains("create memory [local:indentation] Indentation"),
-            "{}",
-            result.notice()
+        // prime-agent's header for a refinement that applied part of its edits.
+        assert_eq!(
+            result.header(),
+            "Harness partially refined · 1/4 edits applied"
         );
-        assert!(result.notice().contains("(3 edit(s) were refused)"));
+        let details = result.details();
+        assert!(details[0].contains(result.id()), "{details:?}");
+        assert!(
+            details.contains(&"Created local memory `indentation`".to_owned()),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|line| line.starts_with("Failed to") && line.contains("entry not found")),
+            "{details:?}"
+        );
         // The digest reads what refine wrote.
         let digest_state = crate::interactive::harness::load(&scopes.local, "local");
         assert_eq!(digest_state.entries["memory"].len(), 1);
