@@ -93,6 +93,24 @@ pub trait TuiRenderer {
     fn draw_state(&mut self, state: &UiState) -> io::Result<()>;
     /// Push one finished history entry into the scrollback above the viewport.
     fn insert_history(&mut self, item: &HistoryItem) -> io::Result<()>;
+    /// Push several entries at once. Every insert erases the viewport, so the
+    /// entries one loop step produced go in as one insert, not one each.
+    fn insert_history_batch(&mut self, items: &[HistoryItem]) -> io::Result<()> {
+        for item in items {
+            self.insert_history(item)?;
+        }
+        Ok(())
+    }
+    /// Start one frame's worth of output: the terminal shows nothing of it until
+    /// [`Self::end_update`], so an insert that erases the viewport and the draw
+    /// that repaints it reach the screen together instead of as a flash.
+    fn begin_update(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    /// Show what was written since [`Self::begin_update`].
+    fn end_update(&mut self) -> io::Result<()> {
+        Ok(())
+    }
     /// Clear only the inline viewport; terminal scrollback remains intact.
     fn clear_viewport(&mut self) -> io::Result<()> {
         Ok(())
@@ -263,19 +281,28 @@ where
     }
 
     fn insert_history(&mut self, item: &HistoryItem) -> io::Result<()> {
-        if self.shown.len() == REPRINT_ENTRIES {
-            self.shown.pop_front();
-        }
-        self.shown.push_back(item.clone());
-        self.draw_history(item)
+        self.insert_history_batch(std::slice::from_ref(item))
     }
 
-    fn draw_history(&mut self, item: &HistoryItem) -> io::Result<()> {
+    /// Render every entry, then insert all their rows in one go.
+    fn insert_history_batch(&mut self, items: &[HistoryItem]) -> io::Result<()> {
         let theme = self.theme;
         let width = self.columns();
-        let rows =
-            history::render_fragment(item, width, &theme, self.detail, self.assistant_continuing);
-        self.assistant_continuing = matches!(item, HistoryItem::Assistant { .. });
+        let mut rows = Vec::new();
+        for item in items {
+            if self.shown.len() == REPRINT_ENTRIES {
+                self.shown.pop_front();
+            }
+            self.shown.push_back(item.clone());
+            rows.extend(history::render_fragment(
+                item,
+                width,
+                &theme,
+                self.detail,
+                self.assistant_continuing,
+            ));
+            self.assistant_continuing = matches!(item, HistoryItem::Assistant { .. });
+        }
         if rows.is_empty() {
             return Ok(());
         }
@@ -354,6 +381,22 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
 
     fn insert_history(&mut self, item: &HistoryItem) -> io::Result<()> {
         self.inner.insert_history(item)
+    }
+
+    fn insert_history_batch(&mut self, items: &[HistoryItem]) -> io::Result<()> {
+        self.inner.insert_history_batch(items)
+    }
+
+    // DEC mode 2026, synchronized output: a terminal that knows it holds the
+    // frame until the end mark; one that does not ignores both marks.
+    fn begin_update(&mut self) -> io::Result<()> {
+        self.backend.write("\x1b[?2026h")?;
+        self.backend.flush()
+    }
+
+    fn end_update(&mut self) -> io::Result<()> {
+        self.backend.write("\x1b[?2026l")?;
+        self.backend.flush()
     }
 
     fn clear_viewport(&mut self) -> io::Result<()> {
@@ -606,6 +649,10 @@ fn run_loop_inner(
     let mut last_tick = Instant::now();
     loop {
         let mut redraw = false;
+        // Everything one step produced is gathered first and painted as one
+        // frame: rows pushed into the scrollback erase the viewport, and the draw
+        // that repaints it must reach the screen with them (no flash).
+        let mut effects = Vec::new();
         if let Some(key) = renderer
             .poll_key(POLL_INTERVAL)
             .map_err(|error| terminal_error(&error))?
@@ -616,52 +663,75 @@ fn run_loop_inner(
                 controller.set_columns(columns);
                 redraw = true;
             } else {
-                let effects = controller.handle_key(key);
-                redraw = !effects.is_empty();
-                if let Step::Exit(code) = apply(renderer, effects)? {
-                    return Ok(code);
-                }
+                let from_key = controller.handle_key(key);
+                redraw = !from_key.is_empty();
+                effects.extend(from_key);
             }
         }
-        let effects = controller.pump_events();
-        redraw = redraw || !effects.is_empty();
-        if let Step::Exit(code) = apply(renderer, effects)? {
-            return Ok(code);
-        }
-
-        // The spinner and the clock only need repainting while something runs: an
-        // idle app returns no effect, so it never draws (acceptance U06).
-        if last_tick.elapsed() >= TICK_INTERVAL {
-            last_tick = Instant::now();
-            let effects = controller.tick();
-            redraw = redraw || !effects.is_empty();
-            if let Step::Exit(code) = apply(renderer, effects)? {
-                return Ok(code);
+        // A key that exits must not wait for the session's events.
+        let exiting = effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Exit(_)));
+        if !exiting {
+            let pumped = controller.pump_events();
+            redraw = redraw || !pumped.is_empty();
+            effects.extend(pumped);
+            // The spinner and the clock only need repainting while something runs:
+            // an idle app returns no effect, so it never draws (acceptance U06).
+            if last_tick.elapsed() >= TICK_INTERVAL {
+                last_tick = Instant::now();
+                let ticked = controller.tick();
+                redraw = redraw || !ticked.is_empty();
+                effects.extend(ticked);
             }
         }
-        if redraw {
-            renderer
+        if !redraw && effects.is_empty() {
+            continue;
+        }
+        renderer
+            .begin_update()
+            .map_err(|error| terminal_error(&error))?;
+        let step = apply(renderer, effects);
+        let drawn = match step {
+            Ok(Step::Continue) if redraw => renderer
                 .draw_state(&controller.ui_state())
-                .map_err(|error| terminal_error(&error))?;
+                .map_err(|error| terminal_error(&error)),
+            _ => Ok(()),
+        };
+        renderer
+            .end_update()
+            .map_err(|error| terminal_error(&error))?;
+        drawn?;
+        if let Step::Exit(code) = step? {
+            return Ok(code);
         }
     }
 }
 
-/// Apply one batch of effects.
+/// Apply one batch of effects. Consecutive history rows go into the scrollback
+/// as one insert.
 fn apply(renderer: &mut impl TuiRenderer, effects: Vec<Effect>) -> Result<Step, HarnessError> {
+    let mut pending: Vec<HistoryItem> = Vec::new();
     for effect in effects {
         match effect {
-            Effect::History(item) => renderer
-                .insert_history(&item)
-                .map_err(|error| terminal_error(&error))?,
+            Effect::History(item) => {
+                pending.push(item);
+                continue;
+            }
             // Streamed text is committed to the scrollback as it is flushed: the
             // live block already showed it, and the history renderer styles it.
-            Effect::Stream(text) => renderer
-                .insert_history(&HistoryItem::Assistant { text })
-                .map_err(|error| terminal_error(&error))?,
-            Effect::Thinking(text) => renderer
-                .insert_history(&HistoryItem::Thinking { text })
-                .map_err(|error| terminal_error(&error))?,
+            Effect::Stream(text) => {
+                pending.push(HistoryItem::Assistant { text });
+                continue;
+            }
+            Effect::Thinking(text) => {
+                pending.push(HistoryItem::Thinking { text });
+                continue;
+            }
+            _ => {}
+        }
+        flush_history(renderer, &mut pending)?;
+        match effect {
             Effect::Copy(text) => {
                 renderer
                     .copy_text(&text)
@@ -679,14 +749,29 @@ fn apply(renderer: &mut impl TuiRenderer, effects: Vec<Effect>) -> Result<Step, 
             Effect::ClearViewport => renderer
                 .clear_viewport()
                 .map_err(|error| terminal_error(&error))?,
-            Effect::Redraw => {}
+            // History rows were gathered above; a redraw is the frame's own draw.
+            Effect::History(_) | Effect::Stream(_) | Effect::Thinking(_) | Effect::Redraw => {}
             Effect::Exit(code) => {
                 renderer.finish().map_err(|error| terminal_error(&error))?;
                 return Ok(Step::Exit(code));
             }
         }
     }
+    flush_history(renderer, &mut pending)?;
     Ok(Step::Continue)
+}
+
+fn flush_history(
+    renderer: &mut impl TuiRenderer,
+    pending: &mut Vec<HistoryItem>,
+) -> Result<(), HarnessError> {
+    if !pending.is_empty() {
+        renderer
+            .insert_history_batch(pending)
+            .map_err(|error| terminal_error(&error))?;
+        pending.clear();
+    }
+    Ok(())
 }
 
 fn terminal_error(error: &io::Error) -> HarnessError {

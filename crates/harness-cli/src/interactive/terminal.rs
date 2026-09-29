@@ -259,7 +259,15 @@ fn map_key(key: KeyEvent) -> Key {
         // Ctrl+Char('j'), so both spellings are accepted as the multiline key.
         // Alt+Enter is the second multiline key; it arrives as Enter with ALT,
         // also measured, so it never collides with a plain Enter.
-        KeyCode::Enter if control || key.modifiers.contains(KeyModifiers::ALT) => Key::Newline,
+        // Shift+Enter too, where the console reports the Shift (the key most
+        // people try first); where it does not, it arrives as Enter.
+        KeyCode::Enter
+            if control
+                || key.modifiers.contains(KeyModifiers::ALT)
+                || key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            Key::Newline
+        }
         KeyCode::Char('j') if control => Key::Newline,
         KeyCode::Char(character) => Key::Char(character),
         KeyCode::Backspace => Key::Backspace,

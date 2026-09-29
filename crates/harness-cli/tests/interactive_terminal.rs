@@ -2152,6 +2152,9 @@ enum Reply {
     /// A body cut short: the connection closes before the length it announced,
     /// so the client fails decoding the response body.
     Truncated,
+    /// DeepSeek-style reasoning: one frame per token, each with `"content": ""`,
+    /// then the answer.
+    Reasoning(Vec<&'static str>, String),
     Delay(Duration, Box<Reply>),
 }
 
@@ -2272,6 +2275,21 @@ fn reply_body(reply: &Reply) -> String {
             frame(serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})),
         ),
         Reply::Garbage => "data: {not json at all\n\n".to_owned(),
+        Reply::Reasoning(tokens, answer) => {
+            let mut body = String::new();
+            for token in tokens {
+                body.push_str(&frame(serde_json::json!({"choices": [{
+                    "delta": {"content": "", "reasoning_content": token},
+                    "finish_reason": null
+                }]})));
+            }
+            body.push_str(&frame(serde_json::json!({"choices": [{"delta": {"content": answer}, "finish_reason": null}]})));
+            body.push_str(&frame(
+                serde_json::json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            ));
+            body.push_str("data: [DONE]\n\n");
+            body
+        }
         Reply::RateLimited(_) | Reply::Truncated => unreachable!("written by the server loop"),
         Reply::Delay(..) => unreachable!("delays are played before the reply"),
     }
@@ -2786,6 +2804,56 @@ fn q13_pty_waiting_line_is_shown() {
     session.wait_for("(1/30)", Duration::from_secs(30));
     session.wait_for("recovered-q13", Duration::from_mins(1));
     assert_eq!(calls.load(Ordering::SeqCst), 3);
+    finish(session);
+}
+
+/// Ctrl+O expanded, with DeepSeek-style reasoning frames (`"content": ""` next to
+/// every token). Measured by the user: the trace printed one token per row and
+/// the input box was gone. The trace must be one paragraph and the box stays.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn u01_pty_expanded_reasoning_is_one_paragraph() {
+    let provider = ScriptedSse::start(|request| {
+        if tool_results(request) == 0 {
+            Reply::Tool("list_files", serde_json::json!({}))
+        } else {
+            Reply::Reasoning(
+                vec!["alpha", "beta", "gamma", "delta", "epsilon"],
+                "answer-u01".to_owned(),
+            )
+        }
+    });
+    let (_temp, mut session) = scripted_session(&provider);
+    // ctrl+o twice: collapsed -> details -> expanded.
+    session.send("\u{f}");
+    std::thread::sleep(Duration::from_millis(200));
+    session.send("\u{f}");
+    // (The mode hint can be clipped from the status row; collapsed mode would
+    // hide the reasoning, which the assertion below would catch.)
+    std::thread::sleep(Duration::from_millis(500));
+    session.send("go\r");
+    let transcript = session.wait_for("answer-u01", Duration::from_mins(1));
+    assert!(
+        transcript.contains("alphabetagammadeltaepsilon"),
+        "the reasoning is one paragraph, not one row per token"
+    );
+    // The frame after the answer still has the input box.
+    std::thread::sleep(Duration::from_millis(500));
+    let after = session.transcript();
+    let tail = &after[after.rfind("answer-u01").unwrap_or(0)..];
+    assert!(
+        tail.contains("Yêu cầu"),
+        "the input box is drawn after the turn"
+    );
+    // Every frame (scrollback rows + viewport repaint) is one synchronized
+    // update, so the console shows it whole instead of flashing the erase.
+    let opened = after.matches("\u{1b}[?2026h").count();
+    assert!(opened > 0, "frames are sent as synchronized updates");
+    assert_eq!(
+        opened,
+        after.matches("\u{1b}[?2026l").count(),
+        "each update is closed"
+    );
     finish(session);
 }
 

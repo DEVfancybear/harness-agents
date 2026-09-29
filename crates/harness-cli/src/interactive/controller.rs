@@ -1194,6 +1194,9 @@ impl InteractiveController {
                     },
                 );
             }
+            // An empty answer delta (a frame that carries only reasoning) is not
+            // answer text: it must not commit the reasoning gathered so far.
+            SessionEvent::TextDelta { text } if text.is_empty() => {}
             SessionEvent::TextDelta { text } => {
                 self.flush_thinking(effects);
                 self.pending_newlines = self
@@ -8146,6 +8149,41 @@ mod tests {
                     text: token.to_owned(),
                 })
                 .expect("thinking");
+        }
+        harness
+            .events
+            .send(SessionEvent::TextDelta {
+                text: "answer".to_owned(),
+            })
+            .expect("text");
+        let effects = harness.controller.pump_events();
+        let thinking = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Thinking(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(thinking, ["Let me keep it short"]);
+    }
+
+    /// DeepSeek-style frames carry `"content": ""` next to every reasoning token.
+    /// Measured in the TUI (ctrl+o): each empty answer delta committed the
+    /// reasoning gathered so far, so the trace printed one word per row.
+    #[test]
+    fn empty_answer_deltas_do_not_split_reasoning() {
+        let mut harness = tui_bench(true);
+        for token in ["Let", " me", " keep", " it", " short"] {
+            for event in [
+                SessionEvent::TextDelta {
+                    text: String::new(),
+                },
+                SessionEvent::ThinkingDelta {
+                    text: token.to_owned(),
+                },
+            ] {
+                harness.events.send(event).expect("stream event");
+            }
         }
         harness
             .events

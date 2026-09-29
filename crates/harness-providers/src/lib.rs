@@ -1651,7 +1651,13 @@ impl SseDecoder {
         for (choice_index, choice) in choices.iter().enumerate() {
             let choice_index = u64::try_from(choice_index).unwrap_or(u64::MAX);
             let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
-            if let Some(content) = delta.get("content").and_then(Value::as_str) {
+            // `"content": ""` rides along with every reasoning token on DeepSeek-style
+            // endpoints; it is no answer text.
+            if let Some(content) = delta
+                .get("content")
+                .and_then(Value::as_str)
+                .filter(|content| !content.is_empty())
+            {
                 self.note_output(content.len())?;
                 events.push(ProviderStreamEvent::text(content));
             }

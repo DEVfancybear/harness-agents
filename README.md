@@ -68,7 +68,7 @@ Building a release package (checksums, manifest) is described in [docs/BUILD_AND
 | Shrink a long conversation | `/compact [what to keep]` |
 | See cost, context, permissions | `/cost`, `/context`, `/permissions` |
 
-Keys: Enter sends, Ctrl-J or Alt+Enter adds a line, Ctrl-V (or Alt-V where the terminal keeps Ctrl-V) pastes a screenshot or files copied in Explorer as attachments, ↑↓ recall history or move in a menu, Esc closes a panel or interrupts a run, Ctrl-C cancels a run (pressed twice on an empty prompt it exits), Ctrl-O cycles the detail mode (collapsed, details, expanded), Ctrl-S puts the draft aside and brings it back, Alt+M / Shift+Alt+M move through the scoped models, Ctrl-D on an empty line exits. The TUI labels user and assistant messages, indents tool calls with status symbols, and puts keyboard hints and status below a rounded input box. See [Terminal interface](docs/TUI.md) for layout, compatibility and testing.
+Keys: Enter sends, Ctrl-J, Alt+Enter or Shift+Enter (where the terminal reports Shift) adds a line, Ctrl-V (or Alt-V where the terminal keeps Ctrl-V) pastes a screenshot or files copied in Explorer as attachments, ↑↓ recall history or move in a menu, Esc closes a panel or interrupts a run, Ctrl-C cancels a run (pressed twice on an empty prompt it exits), Ctrl-O cycles the detail mode (collapsed, details, expanded), Ctrl-S puts the draft aside and brings it back, Alt+M / Shift+Alt+M move through the scoped models, Ctrl-D on an empty line exits. The TUI labels user and assistant messages, indents tool calls with status symbols, and puts keyboard hints and status below a rounded input box. See [Terminal interface](docs/TUI.md) for layout, compatibility and testing.
 
 ### Configuration
 
