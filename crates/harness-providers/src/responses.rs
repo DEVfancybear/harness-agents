@@ -327,6 +327,9 @@ struct ResponsesSseDecoder {
     finished: bool,
     /// Output item id -> (call id, tool name), for argument deltas.
     calls: BTreeMap<String, (String, String)>,
+    /// Output item id -> the arguments streamed so far, so the complete text a
+    /// provider sends at the end can fill in what the deltas did not carry.
+    streamed: BTreeMap<String, String>,
     saw_call: bool,
 }
 
@@ -373,6 +376,33 @@ impl ResponsesSseDecoder {
         Ok(())
     }
 
+    /// A call's complete arguments arrive again when the call is done. A provider
+    /// may send its arguments in one piece there without deltas, or lose a delta on
+    /// the way; either leaves the streamed text short, and a call whose arguments
+    /// are not complete JSON can never run. The part the deltas did not carry is
+    /// added; text that does not extend what was streamed is not guessed at.
+    fn complete_arguments(
+        &mut self,
+        item_id: &str,
+        full: &str,
+        events: &mut Vec<ProviderStreamEvent>,
+    ) {
+        let Some((call_id, name)) = self.calls.get(item_id) else {
+            return;
+        };
+        let streamed = self.streamed.entry(item_id.to_owned()).or_default();
+        if let Some(rest) = full.strip_prefix(streamed.as_str())
+            && !rest.is_empty()
+        {
+            events.push(ProviderStreamEvent::tool_delta(
+                call_id.clone(),
+                name.clone(),
+                rest,
+            ));
+            streamed.push_str(rest);
+        }
+    }
+
     fn frame(
         &mut self,
         frame: &[u8],
@@ -415,7 +445,9 @@ impl ResponsesSseDecoder {
                     let call_id = item["call_id"].as_str().unwrap_or(&item_id).to_owned();
                     let name = item["name"].as_str().unwrap_or_default().to_owned();
                     let arguments = item["arguments"].as_str().unwrap_or_default().to_owned();
-                    self.calls.insert(item_id, (call_id.clone(), name.clone()));
+                    self.calls
+                        .insert(item_id.clone(), (call_id.clone(), name.clone()));
+                    self.streamed.insert(item_id, arguments.clone());
                     self.saw_call = true;
                     events.push(ProviderStreamEvent::tool_delta(call_id, name, arguments));
                 }
@@ -425,6 +457,10 @@ impl ResponsesSseDecoder {
                 if let Some((call_id, name)) = self.calls.get(item_id)
                     && let Some(delta) = value["delta"].as_str()
                 {
+                    self.streamed
+                        .entry(item_id.to_owned())
+                        .or_default()
+                        .push_str(delta);
                     events.push(ProviderStreamEvent::tool_delta(
                         call_id.clone(),
                         name.clone(),
@@ -432,8 +468,20 @@ impl ResponsesSseDecoder {
                     ));
                 }
             }
+            "response.function_call_arguments.done" => {
+                let item_id = value["item_id"].as_str().unwrap_or_default().to_owned();
+                if let Some(full) = value["arguments"].as_str() {
+                    self.complete_arguments(&item_id, full, events);
+                }
+            }
             "response.output_item.done" => {
                 let item = &value["item"];
+                if item["type"] == "function_call"
+                    && let (Some(item_id), Some(full)) =
+                        (item["id"].as_str(), item["arguments"].as_str())
+                {
+                    self.complete_arguments(item_id, full, events);
+                }
                 if item["type"] == "reasoning" {
                     // Kept whole, so the next request of the turn can send it back.
                     let kept = json!({
@@ -511,6 +559,45 @@ mod tests {
             },
         )
         .expect("adapter")
+    }
+
+    /// A provider that sends a call's arguments only when the call is done, or
+    /// drops the last delta, still yields arguments that are complete JSON.
+    #[test]
+    fn the_arguments_sent_at_the_end_fill_in_what_the_deltas_lacked() {
+        let mut decoder = ResponsesSseDecoder::default();
+        let mut events = Vec::new();
+        for value in [
+            json!({"type": "response.output_item.added", "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "delegate", "arguments": ""}}),
+            json!({"type": "response.output_item.done", "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "delegate", "arguments": "{\"role\":\"explorer\"}"}}),
+            json!({"type": "response.output_item.added", "item": {"type": "function_call", "id": "fc_2", "call_id": "call_2", "name": "delegate", "arguments": ""}}),
+            json!({"type": "response.function_call_arguments.delta", "item_id": "fc_2", "delta": "{\"role\":"}),
+            json!({"type": "response.function_call_arguments.done", "item_id": "fc_2", "arguments": "{\"role\":\"coder\"}"}),
+            json!({"type": "response.output_item.done", "item": {"type": "function_call", "id": "fc_2", "call_id": "call_2", "name": "delegate", "arguments": "{\"role\":\"coder\"}"}}),
+        ] {
+            let frame = format!(
+                "data: {value}
+
+"
+            );
+            decoder.feed(frame.as_bytes(), &mut events).expect("frame");
+        }
+        let mut arguments: BTreeMap<String, String> = BTreeMap::new();
+        for event in &events {
+            if let ProviderStreamEvent::ToolCallDelta {
+                call_id,
+                arguments: delta,
+                ..
+            } = event
+            {
+                arguments
+                    .entry(call_id.clone())
+                    .or_default()
+                    .push_str(delta);
+            }
+        }
+        assert_eq!(arguments["call_1"], "{\"role\":\"explorer\"}");
+        assert_eq!(arguments["call_2"], "{\"role\":\"coder\"}");
     }
 
     #[test]

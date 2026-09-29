@@ -452,6 +452,9 @@ const LOOP_WINDOW: usize = 6;
 /// retry the model is allowed to make.
 const LOOP_REPEAT_LIMIT: usize = 3;
 
+/// What the model is told the first time it repeats a call with nothing changed.
+const LOOP_WARNING: &str = "You have made the same tool call several times and nothing has changed, so calling it again returns the same result. Stop repeating it. Answer now from what you have already read, and say plainly what you could not find.";
+
 /// Bounded model -> tool -> model loop.
 #[derive(Clone)]
 pub struct TurnDriver {
@@ -672,6 +675,8 @@ impl TurnDriver {
         // call that could change what a read returns.
         let mut unchanged_reads: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
+        // Whether the model has already been told it is repeating itself.
+        let mut loop_warned = false;
         // Everything this turn has already said and executed. Each continuation
         // sends the whole transcript, not just the newest step: a model that is
         // handed back only the last tool result has no record of what it already
@@ -957,8 +962,15 @@ impl TurnDriver {
                 let drain = loop_signatures.len() - LOOP_WINDOW;
                 loop_signatures.drain(0..drain);
             }
+            // The first repeat is a warning, not the end: the turn ends with no answer
+            // and its whole cost wasted, when one sentence can send the model back to
+            // answering from what it already read. The second repeat stops the turn.
+            let mut loop_warning: Option<String> = None;
             if repeated_tail(&loop_signatures) {
-                break TurnStop::LoopDetected;
+                if loop_warned {
+                    break TurnStop::LoopDetected;
+                }
+                loop_warning = Some(LOOP_WARNING.to_owned());
             }
             // A read made again with the same arguments, with nothing changed since,
             // returns what it returned before. Repeating it is a loop even when
@@ -966,11 +978,17 @@ impl TurnDriver {
             // fifteen files read them 1,488 times in one delegated turn, and the
             // tail check above, which only sees back-to-back repeats, never fired.
             if let Some(call) = repeated_read(&mut unchanged_reads, &result.tool_calls) {
-                observer.observe(TurnProgress::Notice(format!(
-                    "stopped: {} was called {LOOP_REPEAT_LIMIT} times with the same arguments and nothing changed in between",
-                    call.name
-                )));
-                break TurnStop::LoopDetected;
+                if loop_warned {
+                    observer.observe(TurnProgress::Notice(format!(
+                        "stopped: {} was called {LOOP_REPEAT_LIMIT} times with the same arguments and nothing changed in between",
+                        call.name
+                    )));
+                    break TurnStop::LoopDetected;
+                }
+                loop_warning = Some(LOOP_WARNING.to_owned());
+            }
+            if loop_warning.is_some() {
+                loop_warned = true;
             }
 
             // The assistant turn keeps its own words and its typed calls, and
@@ -1226,6 +1244,13 @@ impl TurnDriver {
                 break TurnStop::Deadline;
             }
             observer.observe(TurnProgress::StepStarted { step: steps });
+            if let Some(warning) = loop_warning {
+                observer.observe(TurnProgress::Notice(
+                    "the same read repeated with nothing changed; asking the model to answer"
+                        .to_owned(),
+                ));
+                appended.push(ProviderMessage::new(MessageRole::User, warning));
+            }
             transcript.extend(appended);
             let elided = trim_transcript(
                 &mut transcript,

@@ -1023,7 +1023,8 @@ async fn m3_03_loop_detection() {
     let bench = bench();
     let store = bench.open_store().await;
     // The model repeats one identical call forever; only the loop detector can
-    // stop it, and the third identical request must not execute.
+    // stop it. The third identical request executes and is answered with a
+    // warning; the fourth must not execute.
     let provider = Arc::new(ScriptedProvider::new(vec![ScriptStep::Events(vec![
         ProviderStreamEvent::started(),
         ProviderStreamEvent::tool_delta(
@@ -1051,10 +1052,17 @@ async fn m3_03_loop_detection() {
     assert_eq!(outcome.stop, TurnStop::LoopDetected);
     assert_eq!(
         outcome.executions.len(),
-        2,
-        "the repeated third call is not executed"
+        3,
+        "the first repeat is a warning; the fourth call is not executed"
     );
-    assert_eq!(provider.calls(), 3, "detection happens before dispatch");
+    assert_eq!(provider.calls(), 4, "detection happens before dispatch");
+    // The first repeat reached the model as a plain instruction to answer.
+    let warned = provider.seen()[3]
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .any(|message| message.content.contains("Stop repeating it"));
+    assert!(warned, "the model was told to stop repeating and answer");
     drop(driver);
     close(store).await;
 }
