@@ -107,6 +107,20 @@ pub(crate) fn fuzzy_find_text(content: &str, old_text: &str) -> Option<FuzzyMatc
 
 /// Occurrences of `old_text`, counted in normalized form so that two regions
 /// differing only in what normalization erases still count as ambiguous.
+/// The line each occurrence of `old_text` starts on, in the space
+/// [`count_occurrences`] counts in.
+fn occurrence_lines(content: &str, old_text: &str) -> Vec<usize> {
+    let fuzzy_old = normalize_for_fuzzy_match(old_text);
+    if fuzzy_old.is_empty() {
+        return Vec::new();
+    }
+    let content = normalize_for_fuzzy_match(content);
+    content
+        .match_indices(fuzzy_old.as_str())
+        .map(|(index, _)| content[..index].matches('\n').count() + 1)
+        .collect()
+}
+
 fn count_occurrences(content: &str, old_text: &str) -> usize {
     let fuzzy_old = normalize_for_fuzzy_match(old_text);
     if fuzzy_old.is_empty() {
@@ -173,10 +187,17 @@ pub(crate) fn apply_edit_to_normalized_content(
     if occurrences > 1 && !replace_all {
         // ha's edit_file has `replace_all`, which prime's does not; the model is
         // told about it here because it is the other way out of an ambiguity.
+        // The lines say where the copies are, so the context it adds can be the
+        // lines around the one it means.
+        let lines = occurrence_lines(&base_content, &old_text)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(HarnessError::new(
             ErrorCode::EditAmbiguous,
             format!(
-                "Found {occurrences} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique, or set replace_all to change every occurrence."
+                "Found {occurrences} occurrences of the text in {path} (lines {lines}). The text must be unique. Please provide more context to make it unique, or set replace_all to change every occurrence."
             ),
         ));
     }
@@ -463,7 +484,7 @@ mod tests {
         assert!(
             ambiguous
                 .to_string()
-                .contains("Found 2 occurrences of the text in f.txt."),
+                .contains("Found 2 occurrences of the text in f.txt (lines 1, 2)."),
             "{ambiguous}"
         );
 
