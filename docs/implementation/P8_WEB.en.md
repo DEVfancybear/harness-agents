@@ -10,11 +10,11 @@ Ship an optional local Web interface after [P7](P7_RELEASE.en.md) is accepted an
 
 The default is a foreground `ha web` host bound to loopback, for one local user. It owns the same data-directory writer lock as CLI execution. Starting it while another writer owns that directory returns a clear busy error. Remote hosting, a background daemon and multiple user accounts require a separate design and authorization.
 
-Read the [handbook](README.en.md), [plan](../RUST_HARNESS_PLAN.en.md), [plugin contract](../PLUGIN_ARCHITECTURE.en.md), [memory contract](../MEMORY_AND_CONTINUITY.en.md) and [acceptance map](ACCEPTANCE_MAP.en.md). Inspect actual predecessor evidence before coding.
+Read the [handbook](README.en.md), [plan](../RUST_HARNESS_PLAN.en.md), [plugin contract](../PLUGIN_ARCHITECTURE.en.md), [architecture overview](../ARCHITECTURE_OVERVIEW.en.md) and [acceptance map](ACCEPTANCE_MAP.en.md). Inspect actual predecessor evidence before coding.
 
 ## 2. Owned scope and target files
 
-Own the thin `harness-web` adapter and a frontend directory selected in the P8 SPEC, plus Web integration tests, static packaging and operator docs. Extend application-service interfaces only where an equivalent CLI operation already exists or a reviewed read API is needed. Keep storage SQL, context composition, task ownership, approvals and memory policy in their established owners.
+Own the thin `harness-web` adapter and a frontend directory selected in the P8 SPEC, plus Web integration tests, static packaging and operator docs. Extend application-service interfaces only where an equivalent CLI operation already exists or a reviewed read API is needed. Keep storage SQL, context composition, task ownership and approvals in their established owners.
 
 Target outputs: the Web adapter crate/module, frontend source and locked dependencies, `crates/harness-cli/tests/phase_p8.rs`, browser E2E tests, and W01–W06 entries in the acceptance registry. Choose a minimal frontend stack explicitly; no framework is mandated by this runbook.
 
@@ -30,7 +30,7 @@ Loopback is not authentication. Define a user bootstrap/session flow with high-e
 
 Depends on: accepted P7.
 
-Inspect CLI handlers and list the underlying commands/queries needed for sessions, chat, tasks, tool approvals, context and memory. Define the browser's authenticated principal at the host boundary. Set request/response limits, supported browser/platform matrix and local bootstrap UX. Record service gaps in the SPEC before changing contracts.
+Inspect CLI handlers and list the underlying commands/queries needed for sessions, chat, tasks, tool approvals and context. Define the browser's authenticated principal at the host boundary. Set request/response limits, supported browser/platform matrix and local bootstrap UX. Record service gaps in the SPEC before changing contracts.
 
 Evidence: Route-to-service matrix, threat cases and a screen inventory with explicit non-goals; no second authority in the design.
 
@@ -54,17 +54,17 @@ Evidence: Disconnect/reconnect tests recover ordered visible events, report expi
 
 Depends on: P8-S03.
 
-Add session/task selection, message entry, progress/tool timeline and bound approval dialogs. Keep client-generated command IDs stable across retry. Render persisted receipts, uncertainty, blocked states and stale approval errors explicitly. Treat model/tool/memory output as untrusted content: safe Markdown, no raw script execution, and allowlisted link schemes.
+Add session/task selection, message entry, progress/tool timeline and bound approval dialogs. Keep client-generated command IDs stable across retry. Render persisted receipts, uncertainty, blocked states and stale approval errors explicitly. Treat model/tool output as untrusted content: safe Markdown, no raw script execution, and allowlisted link schemes.
 
 Evidence: Browser tests cover an admitted input retry, denied and expired approval, script-bearing tool output and a restored task with pending work.
 
-### 4.5. P8-S05 — Add task, memory and context inspection
+### 4.5. P8-S05 — Add task and context inspection
 
 Depends on: P8-S04.
 
-Show the task tree, child handoffs, effective scopes, memory source/version, extraction job status and exact sanitized context packet inspection. Use existing read/invalidate APIs and permission checks; do not add direct table editors. Explain missing/forgotten evidence and degraded retrieval. Every destructive or authority-changing action uses the established confirmation and service contract.
+Show the task tree, child handoffs, effective scopes and exact sanitized context packet inspection. Use existing read APIs and permission checks; do not add direct table editors. Explain missing evidence and degraded retrieval. Every destructive or authority-changing action uses the established confirmation and service contract.
 
-Evidence: UI and API assertions agree with CLI for the same task IDs, receipts, memory scope and pending jobs; cross-scope IDs and hashes disclose no content.
+Evidence: UI and API assertions agree with CLI for the same task IDs, receipts and pending jobs; cross-scope IDs and hashes disclose no content.
 
 ### 4.6. P8-S06 — Run Web acceptance and retained CLI regressions
 
@@ -80,7 +80,7 @@ Depends on: P8-S06.
 
 Build and serve version-matched static assets without a development server dependency. Smoke-test the packaged foreground host and browser flow from a clean task-owned directory. Document safe bootstrap, local binding, close-browser versus stop-host behavior, writer-lock conflicts and how to return to CLI. Keep remote deployment and package publishing outside this assignment unless explicitly requested.
 
-Evidence: Bilingual evidence/handoff, local startup instructions and artifact checksums bound to tested source; no claim of external deployment.
+Verification: local startup instructions and artifact checksums remain bound to tested source; no claim of external deployment.
 
 ## 5. Tests and verification commands
 
@@ -113,7 +113,7 @@ Do not advance phases on a summary alone. Bind results to the final tested revis
 
 If the user explicitly assigns parallel work, the backend adapter owner and frontend owner may work concurrently only after P8-S01 freezes API/security contracts. One integrator owns dependency locks, browser fixtures and shared-service changes. Do not split authentication responsibility between teams without one reviewer of the complete flow.
 
-Deliver `docs/evidence/P8.en.md` and `P8.vi.md`, plus a resumable handoff under `docs/handoffs/`, following the handbook. Include completed step IDs, pending failures, schema changes, commands and next action. Publication requires explicit authorization in the coding assignment.
+Record the focused command, source revision, platform, test count and any pending failure in the change or CI log. Do not create a historical evidence or handoff file for this phase.
 
 ## 9. Ready-to-use agent prompt
 

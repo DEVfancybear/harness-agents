@@ -2,7 +2,7 @@
 
 **Trạng thái:** accepted trong M12 · **Ngày:** 23/09/2026 · **Phạm vi:** M12-01..M12-04
 
-[Runbook M12](../implementation-next/M12.vi.md) · [SPEC M12](../specs/M12.vi.md) · [Support matrix](../support/STRICT_EXECUTION_SUPPORT.vi.md) · [ADR-N11](ADR-N11-SCHEDULE-AND-DAEMON-SEMANTICS.vi.md)
+[Implementation handbook](../implementation/README.vi.md) · [Support matrix](../support/STRICT_EXECUTION_SUPPORT.vi.md) · [ADR-N11](ADR-N11-SCHEDULE-AND-DAEMON-SEMANTICS.vi.md)
 
 > Runbook M12 gọi ADR đến hạn là "ADR-N11"; đó là cách đánh số ở thời điểm lập kế hoạch. M11 đã dùng N11, nên ADR của
 > M12 là **N12**. Không có ADR nào bị bỏ qua.

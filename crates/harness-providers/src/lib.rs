@@ -1280,10 +1280,14 @@ pub(crate) fn chat_body(request: &ProviderRequest, thinking: Option<&Thinking>) 
     body
 }
 
-/// The wait a `Retry-After` header asks for, in seconds; other forms are ignored.
+/// The wait a `Retry-After` header asks for, up to a week.
+///
+/// The error keeps what the provider said: a runtime retry bounds its own sleep
+/// (to 30 seconds), and a usage reset hours away is what lets the session park
+/// until then instead of polling (prime-agent's `MAX_PROVIDER_PAUSE_MS`).
 #[must_use]
 pub fn retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    retry_after_bounded(headers, Duration::from_secs(30))
+    retry_after_bounded(headers, Duration::from_hours(7 * 24))
 }
 
 /// Parse delta-seconds or an RFC 7231 HTTP-date and bound the result.

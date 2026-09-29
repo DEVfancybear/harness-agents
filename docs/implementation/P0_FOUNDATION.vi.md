@@ -2,13 +2,13 @@
 
 [English](P0_FOUNDATION.en.md) | Tiếng Việt
 
-Runbook triển khai; implementation P0–P7 đã được ghi nhận sau bản kế hoạch này. Dùng [evidence audit P0–P7](../evidence/P0-P7_AUDIT.vi.md) để xem kiểm chứng và giới hạn hiện tại; runbook này không tự là bằng chứng hoàn tất. Dự toán ban đầu: 3–4 ngày công.
+Runbook triển khai cho boundary ownership P0 hiện tại. Kiểm tra hành vi theo source hiện tại và workspace gate. Dự toán ban đầu: 3–4 ngày công.
 
 ## 1. Kết quả và điều kiện vào phase
 
 Bàn giao skeleton build được, không cần key, cùng nền contracts/fixtures chạy kiểm tra được. Không có phase tiền nhiệm. Kiểm tra docs kiến trúc và Git state sạch/bẩn thật; không giả định đã cài Rust hoặc C toolchain.
 
-Đọc [sổ tay](README.vi.md), [plan](../RUST_HARNESS_PLAN.vi.md), [hợp đồng plugin](../PLUGIN_ARCHITECTURE.vi.md), [hợp đồng memory](../MEMORY_AND_CONTINUITY.vi.md), [bảng nghiệm thu](ACCEPTANCE_MAP.vi.md). Inspect evidence tiền nhiệm thật trước khi code.
+Đọc [sổ tay](README.vi.md), [plan](../RUST_HARNESS_PLAN.vi.md), [hợp đồng plugin](../PLUGIN_ARCHITECTURE.vi.md), [tổng quan kiến trúc](../ARCHITECTURE_OVERVIEW.vi.md), [bảng nghiệm thu](ACCEPTANCE_MAP.vi.md). Inspect evidence tiền nhiệm thật trước khi code.
 
 ## 2. Scope sở hữu và target files
 
@@ -40,7 +40,7 @@ Bằng chứng: `cargo check --workspace --locked` và CLI help chạy; options/
 
 Phụ thuộc: P0-S01, P0-S02.
 
-Tạo schema có version cho event envelope, WorkingState, instructions, tool receipts, memory versions, plugin manifest, context/composition packet. Giữ domain ownership rõ dù types đầu nằm chung module. Có serialization fixtures hợp lệ/sai.
+Tạo schema có version cho event envelope, WorkingState, instructions, tool receipts, session/workspace versions, plugin manifest, context/composition packet. Giữ domain ownership rõ dù types đầu nằm chung module. Có serialization fixtures hợp lệ/sai.
 
 Bằng chứng: Round trip giữ đúng giá trị; chặn IDs/versions sai, thiếu authority, payload lỗi.
 
@@ -99,7 +99,7 @@ Full gate gồm formatting, clippy, workspace tests, kiểm tra test discovery v
 
 ## 7. Exit gate và các cách làm không được phép
 
-Xong bảy steps; workspace build, P0 tests chạy thật, gate phát hiện known-bad inputs, schemas/fixtures có version. Không thêm LLM loop, SQLite runtime, memory extraction, orchestration hay Web. Không cài tools global diện rộng nếu setup assignment chưa cho phép.
+Xong bảy steps; workspace build, P0 tests chạy thật, gate phát hiện known-bad inputs, schemas/fixtures có version. Không thêm LLM loop, SQLite runtime, orchestration hay Web. Không cài tools global diện rộng nếu setup assignment chưa cho phép.
 
 Không chuyển phase chỉ dựa trên summary. Gắn kết quả với revision cuối đã test, báo checks chưa chạy, giữ mọi regressions tiền nhiệm. Không sửa fixture expectations chỉ để implementation pass.
 
@@ -107,7 +107,7 @@ Không chuyển phase chỉ dựa trên summary. Gắn kết quả với revisio
 
 Integrator sở hữu root manifests/lockfile và tên schema. Sau S03, fixture author được giao riêng có thể chuẩn bị tests trong lúc integrator làm gate; chỉ merge khi IDs/fixtures thống nhất. Handoff P1 có continuation fixture, contract revisions, test-discovery format, build instructions chính xác.
 
-Bàn giao `docs/evidence/P0.en.md`, `P0.vi.md`, cùng handoff tiếp tục được trong `docs/handoffs/` theo sổ tay. Ghi step IDs đã xong, lỗi còn lại, schema changes, commands và next action. Publish cần được cấp quyền rõ trong assignment coding.
+Ghi command focused, source revision, platform, test count và lỗi còn lại trong change hoặc CI log. Không tạo file evidence lịch sử hay handoff cho phase này.
 
 ## 9. Prompt giao agent
 

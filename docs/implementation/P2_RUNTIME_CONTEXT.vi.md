@@ -2,17 +2,17 @@
 
 [English](P2_RUNTIME_CONTEXT.en.md) | Tiếng Việt
 
-Runbook triển khai; implementation P0–P7 đã được ghi nhận sau bản kế hoạch này. Dùng [evidence audit P0–P7](../evidence/P0-P7_AUDIT.vi.md) để xem kiểm chứng và giới hạn hiện tại; runbook này không tự là bằng chứng hoàn tất. Dự toán ban đầu: 7–10 ngày công.
+Runbook triển khai cho boundary ownership P2 hiện tại. Kiểm tra hành vi theo source hiện tại và workspace gate. Dự toán ban đầu: 7–10 ngày công.
 
 ## 1. Kết quả và điều kiện vào phase
 
 Cần [P1](P1_KERNEL_STORAGE.vi.md) được chấp nhận. Bàn giao model loop một agent có durable request history, context inspection, compaction nhiều lần và resume. Dùng fixture tools xác định được; filesystem/process tools sản phẩm thuộc P3.
 
-Đọc [sổ tay](README.vi.md), [plan](../RUST_HARNESS_PLAN.vi.md), [hợp đồng plugin](../PLUGIN_ARCHITECTURE.vi.md), [hợp đồng memory](../MEMORY_AND_CONTINUITY.vi.md), [bảng nghiệm thu](ACCEPTANCE_MAP.vi.md). Inspect evidence tiền nhiệm thật trước khi code.
+Đọc [sổ tay](README.vi.md), [plan](../RUST_HARNESS_PLAN.vi.md), [hợp đồng plugin](../PLUGIN_ARCHITECTURE.vi.md), [tổng quan kiến trúc](../ARCHITECTURE_OVERVIEW.vi.md), [bảng nghiệm thu](ACCEPTANCE_MAP.vi.md). Inspect evidence tiền nhiệm thật trước khi code.
 
 ## 2. Scope sở hữu và target files
 
-Sở hữu `crates/harness-runtime/`, `crates/harness-providers/`, context/projection modules trong `harness-session`, packet/composition migrations, `crates/harness-cli/tests/phase_p2.rs`, HTTP/SSE mock fixtures, CLI `run`, `resume`, `continue`, `context inspect`, `session replay --offline`. Reusable-memory service vẫn tùy chọn qua implementation rỗng/test.
+Sở hữu `crates/harness-runtime/`, `crates/harness-providers/`, context/projection modules trong `harness-session`, packet/composition migrations, `crates/harness-cli/tests/phase_p2.rs`, HTTP/SSE mock fixtures, CLI `run`, `resume`, `continue`, `context inspect`, `session replay --offline`. Integration tùy chọn phải nằm sau service requirement và test fixture rõ ràng.
 
 ## 3. Contracts cần chốt trước implementation
 
@@ -99,7 +99,7 @@ Full gate gồm formatting, clippy, workspace tests, kiểm tra test discovery v
 
 ## 7. Exit gate và các cách làm không được phép
 
-Gates single-agent loop/context/compaction/resume pass. Thiếu optional memory không chặn restore. Không bỏ mandatory instructions ngầm, inject prompt không snapshot, chạy tool từ JSON dở, retry uncertain call mù. Phase này chưa có bộ coding tools thật hoặc multi-agent scheduler.
+Gates single-agent loop/context/compaction/resume pass. Thiếu integration tùy chọn không chặn restore. Không bỏ mandatory instructions ngầm, inject prompt không snapshot, chạy tool từ JSON dở, retry uncertain call mù. Phase này chưa có bộ coding tools thật hoặc multi-agent scheduler.
 
 Không chuyển phase chỉ dựa trên summary. Gắn kết quả với revision cuối đã test, báo checks chưa chạy, giữ mọi regressions tiền nhiệm. Không sửa fixture expectations chỉ để implementation pass.
 
@@ -107,7 +107,7 @@ Không chuyển phase chỉ dựa trên summary. Gắn kết quả với revisio
 
 Sau S01 có thể giao providers S02/context S03 cho owners riêng. Runtime integrator sở hữu S04 và packet schema integration. P3 nhận execution boundary, actor cancellation contract, model/tool schemas, recovery receipts, fixture transcript.
 
-Bàn giao `docs/evidence/P2.en.md`, `P2.vi.md`, cùng handoff tiếp tục được trong `docs/handoffs/` theo sổ tay. Ghi step IDs đã xong, lỗi còn lại, schema changes, commands và next action. Publish cần được cấp quyền rõ trong assignment coding.
+Ghi command focused, source revision, platform, test count và lỗi còn lại trong change hoặc CI log. Không tạo file evidence lịch sử hay handoff cho phase này.
 
 ## 9. Prompt giao agent
 

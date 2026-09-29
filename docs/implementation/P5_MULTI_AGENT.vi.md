@@ -2,17 +2,17 @@
 
 [English](P5_MULTI_AGENT.en.md) | Tiếng Việt
 
-Runbook triển khai; implementation P0–P7 đã được ghi nhận sau bản kế hoạch này. Dùng [evidence audit P0–P7](../evidence/P0-P7_AUDIT.vi.md) để xem kiểm chứng và giới hạn hiện tại; runbook này không tự là bằng chứng hoàn tất. Dự toán ban đầu: 8–12 ngày công.
+Runbook triển khai cho boundary ownership P5 hiện tại. Kiểm tra hành vi theo source hiện tại và workspace gate. Dự toán ban đầu: 8–12 ngày công.
 
 ## 1. Kết quả và điều kiện vào phase
 
-Cần [P4](P4_MEMORY.vi.md) được chấp nhận. Bàn giao một coordinator và tối đa ba workers có contexts riêng, task ownership/results bền vững, editing worktrees riêng. Tất cả trong cùng writable host; daemon/remote workers ngoài phase.
+Cần các gate durable runtime và coding-tool của P0–P3. Bàn giao một coordinator và tối đa ba workers có contexts riêng, task ownership/results bền vững, editing worktrees riêng. Tất cả trong cùng writable host; daemon/remote workers ngoài phase.
 
-Đọc [sổ tay](README.vi.md), [plan](../RUST_HARNESS_PLAN.vi.md), [hợp đồng plugin](../PLUGIN_ARCHITECTURE.vi.md), [hợp đồng memory](../MEMORY_AND_CONTINUITY.vi.md), [bảng nghiệm thu](ACCEPTANCE_MAP.vi.md). Inspect evidence tiền nhiệm thật trước khi code.
+Đọc [sổ tay](README.vi.md), [tổng quan kiến trúc](../ARCHITECTURE_OVERVIEW.vi.md), [plan](../RUST_HARNESS_PLAN.vi.md), [hợp đồng plugin](../PLUGIN_ARCHITECTURE.vi.md) và [bảng nghiệm thu](ACCEPTANCE_MAP.vi.md). Inspect evidence tiền nhiệm thật trước khi code.
 
 ## 2. Scope sở hữu và target files
 
-Sở hữu `crates/harness-orchestrator/`, host task/DAG/delivery commands, tích hợp `WorkspaceManager`, agent profiles/presets, `crates/harness-cli/tests/phase_p5.rs`, clean/dirty repo fixtures, CLI `run --agents`, task status/cancel/handoff views. Mở rộng memory grants/runtime factory hiện có, không tạo agent engine riêng.
+Sở hữu `crates/harness-orchestrator/`, host task/DAG/delivery commands, tích hợp `WorkspaceManager`, agent profiles/presets, `crates/harness-cli/tests/phase_p5.rs`, clean/dirty repo fixtures, CLI `run --agents`, task status/cancel/handoff views. Mở rộng runtime factory hiện có, không tạo agent engine riêng.
 
 ## 3. Contracts cần chốt trước implementation
 
@@ -22,7 +22,7 @@ Sở hữu `crates/harness-orchestrator/`, host task/DAG/delivery commands, tíc
 
 ### 4.1. P5-S01 — Chốt delegation/task contracts
 
-Phụ thuộc: P4 đã được chấp nhận.
+Phụ thuộc: các gate P0–P3 đã được chấp nhận.
 
 Viết task brief/result schemas: objective, acceptance criteria, inputs, base snapshot, grants, budget, deadline, artifacts, exact checked revisions. Tách worker report khỏi host-accepted completion. Chốt parent cancel/pause, depth/slots tối đa.
 
@@ -60,13 +60,13 @@ Validate scope/artifacts/receipts, integrate theo dependencies trong integration
 
 Bằng chứng: Test pass từng branch không thay integrated-revision pass; worker không tự push/integrate.
 
-### 4.6. P5-S06 — Nối scoped memory và crash recovery
+### 4.6. P5-S06 — Nối runtime recovery và xử lý crash
 
 Phụ thuộc: P5-S03, P5-S05.
 
-Bind task/profile assets khi spawn; handoff ghi exact source versions. Updates sau vào qua logged boundary. Crash ở child completion, parent delivery, integration; reconcile uncertain side effects, dựng lại DAG progress từ durable state.
+Bind task/profile inputs khi spawn; handoff ghi exact source revisions. Updates sau vào qua logged boundary. Crash ở child completion, parent delivery, integration; reconcile side effect chưa chắc chắn, dựng lại DAG progress từ durable state.
 
-Bằng chứng: C07/C08/C24 đúng với delegated actors thật; semantic memory không quyết định task completed.
+Bằng chứng: delegated actor giữ ownership và delivery qua restart; task state, không phải model prose, quyết định task đã hoàn tất hay chưa.
 
 ### 4.7. P5-S07 — Mở delegation CLI và chạy demo đầy đủ
 
@@ -99,7 +99,7 @@ Full gate gồm formatting, clippy, workspace tests, kiểm tra test discovery v
 
 ## 7. Exit gate và các cách làm không được phép
 
-Delegation/durable coordination/final-revision checks pass; không mất child result, trùng ownership, DAG deadlock, memory leak giữa agents. Editing clean repo bắt buộc; dirty support phải có preservation tests hoặc bị từ chối rõ. Không nhận agent chạy sau CLI exit, không remote agents/marketplace.
+Delegation/durable coordination/final-revision checks pass; không mất child result, trùng ownership hoặc DAG deadlock. Editing clean repo bắt buộc; dirty support phải có preservation tests hoặc bị từ chối rõ. Không nhận agent chạy sau CLI exit, không remote agents/marketplace.
 
 Không chuyển phase chỉ dựa trên summary. Gắn kết quả với revision cuối đã test, báo checks chưa chạy, giữ mọi regressions tiền nhiệm. Không sửa fixture expectations chỉ để implementation pass.
 
@@ -107,7 +107,7 @@ Không chuyển phase chỉ dựa trên summary. Gắn kết quả với revisio
 
 Sau S01 có thể giao workspace S04/task store S02 riêng; runtime S03 cần S02. Integrator sở hữu S05. P6 nhận entry points spawn/tool, scope/authority propagation, cross-agent recovery fixtures để extensions không bỏ qua.
 
-Bàn giao `docs/evidence/P5.en.md`, `P5.vi.md`, cùng handoff tiếp tục được trong `docs/handoffs/` theo sổ tay. Ghi step IDs đã xong, lỗi còn lại, schema changes, commands và next action. Publish cần được cấp quyền rõ trong assignment coding.
+Ghi command focused, source revision, platform, test count và lỗi còn lại trong change hoặc CI log. Không tạo file evidence lịch sử hay handoff cho phase này.
 
 ## 9. Prompt giao agent
 

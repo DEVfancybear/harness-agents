@@ -2,17 +2,17 @@
 
 [English](P7_RELEASE.en.md) | Tiếng Việt
 
-Runbook triển khai; implementation P0–P7 đã được ghi nhận sau bản kế hoạch này. Dùng [evidence audit P0–P7](../evidence/P0-P7_AUDIT.vi.md) để xem kiểm chứng và giới hạn hiện tại; runbook này không tự là bằng chứng hoàn tất. Dự toán ban đầu: 8–11 ngày công.
+Runbook triển khai cho boundary ownership P7 hiện tại. Kiểm tra hành vi theo source hiện tại và workspace gate. Dự toán ban đầu: 8–11 ngày công.
 
 ## 1. Kết quả và điều kiện vào phase
 
 Cần [P6](P6_EXTENSIONS.vi.md) được chấp nhận. Gia cố/đóng gói CLI; chứng minh backup/migration nhất quán và retention rõ. Đây là CLI release gate, không phải quyền deploy lên production host hay publish GitHub release.
 
-Đọc [sổ tay](README.vi.md), [plan](../RUST_HARNESS_PLAN.vi.md), [hợp đồng plugin](../PLUGIN_ARCHITECTURE.vi.md), [hợp đồng memory](../MEMORY_AND_CONTINUITY.vi.md), [bảng nghiệm thu](ACCEPTANCE_MAP.vi.md). Inspect evidence tiền nhiệm thật trước khi code.
+Đọc [sổ tay](README.vi.md), [plan](../RUST_HARNESS_PLAN.vi.md), [hợp đồng plugin](../PLUGIN_ARCHITECTURE.vi.md), [tổng quan kiến trúc](../ARCHITECTURE_OVERVIEW.vi.md), [bảng nghiệm thu](ACCEPTANCE_MAP.vi.md). Inspect evidence tiền nhiệm thật trước khi code.
 
 ## 2. Scope sở hữu và target files
 
-Sở hữu backup/restore/migration/retention qua `harness-store-sqlite`, memory/session APIs, `ha doctor`, maintenance commands, `crates/harness-cli/tests/phase_p7.rs`, packaging/release automation, continuity eval fixtures, operator docs. Giữ toàn bộ contracts runtime/plugin trước.
+Sở hữu backup/restore/migration/retention qua `harness-store-sqlite`, session APIs, `ha doctor`, maintenance commands, `crates/harness-cli/tests/phase_p7.rs`, packaging/release automation, continuity eval fixtures, operator docs. Giữ toàn bộ contracts runtime/plugin trước.
 
 ## 3. Contracts cần chốt trước implementation
 
@@ -68,7 +68,7 @@ Phụ thuộc: P7-S05.
 
 Bằng chứng: Công bố mục tiêu hiệu năng chưa đạt; không làm yếu durability. Tách keyless tests/live-model results.
 
-### 4.7. P7-S07 — Chuẩn bị release evidence/operator handoff
+### 4.7. P7-S07 — Chuẩn bị release/operator notes
 
 Phụ thuộc: P7-S01..P7-S06.
 
@@ -94,7 +94,7 @@ Full gate gồm formatting, clippy, workspace tests, kiểm tra test discovery v
 1. Bắt đầu task hai bước xong, check fail, child còn việc và extraction backlog.
 2. Backup nhất quán khi còn việc; restore vào fresh data directory.
 3. Resume, verify source state/task ownership/pending jobs không lặp side effects.
-4. Forget một source đã chọn trên disposable copy; memory dẫn xuất không quay lại, old replay báo thiếu.
+4. Restore disposable copy, kiểm tra retention marker và cho thấy replay báo record không có thay vì tự bịa nội dung.
 5. Chạy recovery bằng packaged Windows/Linux binary; ghi checksums/evidence chính xác.
 
 ## 7. Exit gate và các cách làm không được phép
@@ -107,7 +107,7 @@ Không chuyển phase chỉ dựa trên summary. Gắn kết quả với revisio
 
 Sau S01 có thể giao S02 backup/restore và thiết kế retention riêng, nhưng GC implementation đợi backup pin contracts. Một store owner giữ migrations. Evals/packaging hội tụ về một exact release candidate revision. P8 nhận application services ổn định, command/error schemas, CLI baseline phải bảo toàn.
 
-Bàn giao `docs/evidence/P7.en.md`, `P7.vi.md`, cùng handoff tiếp tục được trong `docs/handoffs/` theo sổ tay. Ghi step IDs đã xong, lỗi còn lại, schema changes, commands và next action. Publish cần được cấp quyền rõ trong assignment coding.
+Ghi command focused, source revision, platform, test count và lỗi còn lại trong change hoặc CI log. Không tạo file evidence lịch sử hay handoff cho phase này.
 
 ## 9. Prompt giao agent
 

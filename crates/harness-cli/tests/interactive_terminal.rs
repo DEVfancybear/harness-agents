@@ -3012,3 +3012,32 @@ fn m01_pty_import_continues_an_exported_conversation() {
     assert_eq!(requests.len(), 3);
     finish(session);
 }
+
+/// prime-agent's quota park: a provider that reports its usage resets in two
+/// hours is not polled for fifteen minutes. The turn ends saying the session is
+/// parked, and one durable one-shot job - kept with the conversation, so it
+/// outlives the app - will wake it with prime-agent's resume prompt.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn q13b_pty_a_far_reset_parks_the_session() {
+    let provider = ScriptedSse::start(|_| Reply::RateLimited(7200));
+    let (temp, mut session) = custom_models_session(&provider, &["tiny-park"], "");
+    session.send("/model local/tiny-park\r");
+    session.wait_for("selected", Duration::from_secs(20));
+    session.send("go\r");
+    session.wait_for("Session parked until", Duration::from_mins(2));
+    session.wait_for("resumes automatically", Duration::from_secs(20));
+    finish(session);
+    let schedules = ha_home(&temp).join("data").join("schedules");
+    let jobs = std::fs::read_dir(&schedules)
+        .expect("the conversation's jobs are kept on disk")
+        .flatten()
+        .map(|entry| std::fs::read_to_string(entry.path()).expect("job file"))
+        .collect::<String>();
+    assert_eq!(
+        jobs.matches("provider_quota_resumed").count(),
+        1,
+        "one resume job, whatever the runtime retried: {jobs}"
+    );
+    assert!(provider.requests().len() <= 3, "the park ends the turn");
+}

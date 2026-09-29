@@ -6,15 +6,15 @@
     "P/H cases stay owned and reported there. A selector is listed here only when the test exists.",
     "`status` uses the plan vocabulary: planned, in_progress, implemented_unverified, verified_local,",
     "accepted, blocked. `implemented_unverified` means the test exists and runs; it is not a verdict.",
-    "A01-A36 are cross-layer acceptance cases from docs/implementation-next/ACCEPTANCE.vi.md and stay",
-    "`planned` until their owner milestone implements them. M7 (scoped memory) was removed with the",
-    "harness-memory crate; its cases A25/A26 are `retired` and name no selector."
+    "A01-A36 are cross-layer acceptance cases from docs/implementation/ACCEPTANCE_MAP.vi.md and stay",
+    "`planned` until their owner milestone implements them. Removed capabilities have no active milestone owner;",
+    "retired acceptance cases name no selector."
   ],
   "milestones": [
     {
       "id": "M0",
       "title": "Foundation và executable contracts",
-      "runbook": "docs/implementation-next/M0.vi.md",
+      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": [],
       "status": "implemented_unverified",
       "integration_target": "milestone_m0",
@@ -118,7 +118,7 @@
     {
       "id": "M1",
       "title": "SQLite store, journal và recovery",
-      "runbook": "docs/implementation-next/M1.vi.md",
+      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M0"],
       "status": "implemented_unverified",
       "integration_target": "milestone_m1",
@@ -199,7 +199,7 @@
     {
       "id": "M2",
       "title": "Provider protocol và incremental stream",
-      "runbook": "docs/implementation-next/M2.vi.md",
+      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M0"],
       "status": "implemented_unverified",
       "integration_target": "milestone_m2",
@@ -290,7 +290,7 @@
     {
       "id": "M3",
       "title": "TurnDriver, human input và bounded goals",
-      "runbook": "docs/implementation-next/M3.vi.md",
+      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M1", "M2"],
       "status": "verified_local",
       "integration_target": "milestone_m3",
@@ -386,7 +386,7 @@
     {
       "id": "M4",
       "title": "Coding tools và host runner",
-      "runbook": "docs/implementation-next/M4.vi.md",
+      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M3"],
       "status": "in_progress",
       "integration_target": "milestone_m4",
@@ -460,7 +460,7 @@
     {
       "id": "M5",
       "title": "Context, compaction và source continuity",
-      "runbook": "docs/implementation-next/M5.vi.md",
+      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M4"],
       "status": "in_progress",
       "integration_target": "milestone_m5",
@@ -550,7 +550,7 @@
     {
       "id": "M6",
       "title": "Skills, MCP và versioned extensions",
-      "runbook": "docs/implementation-next/M6.vi.md",
+      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M5"],
       "status": "in_progress",
       "integration_target": "milestone_m6",
@@ -636,7 +636,7 @@
     {
       "id": "M8",
       "title": "Durable DAG và worktree integration",
-      "runbook": "docs/implementation-next/M8.vi.md",
+      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M6"],
       "status": "in_progress",
       "integration_target": "milestone_m8",
@@ -681,7 +681,7 @@
       "unit_tests": [],
       "fixtures": [
         "crates/harness-cli/tests/milestone_m8.rs",
-        "docs/adr/ADR-N08-DELEGATION-CAPACITY-DELIVERY.vi.md"
+        "docs/ARCHITECTURE_REVIEW.vi.md"
       ],
       "gate": {
         "script": "scripts/Verify-Milestone.ps1",
@@ -708,7 +708,7 @@
     {
       "id": "M9",
       "title": "Data lifecycle và CLI release",
-      "runbook": "docs/implementation-next/M9.vi.md",
+      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M8"],
       "status": "in_progress",
       "integration_target": "milestone_m9",
@@ -752,7 +752,7 @@
       "unit_tests": [],
       "fixtures": [
         "crates/harness-cli/tests/milestone_m9.rs",
-        "docs/adr/ADR-N09-DATA-LIFECYCLE-AND-RELEASE.vi.md"
+        "docs/ARCHITECTURE_REVIEW.vi.md"
       ],
       "gate": {
         "script": "scripts/Verify-Milestone.ps1",
@@ -780,7 +780,7 @@
     {
       "id": "M10",
       "title": "Web API và durable event projections",
-      "runbook": "docs/implementation-next/M10.vi.md",
+      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M9"],
       "status": "in_progress",
       "integration_target": "milestone_m10",
@@ -815,7 +815,7 @@
       "fixtures": [
         "crates/harness-cli/tests/milestone_m10.rs",
         "crates/harness-cli/src/web/assets/app.js",
-        "docs/adr/ADR-N10-WEB-STACK-AND-IDENTITY.vi.md"
+        "docs/ARCHITECTURE_OVERVIEW.vi.md"
       ],
       "gate": {
         "script": "scripts/Verify-Milestone.ps1",
@@ -844,7 +844,7 @@
     {
       "id": "M11",
       "title": "Daemon, schedules và external tasks",
-      "runbook": "docs/implementation-next/M11.vi.md",
+      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M9"],
       "status": "in_progress",
       "integration_target": "milestone_m11",
@@ -905,8 +905,8 @@
         "crates/harness-store-sqlite/src/store/approvals.rs",
         "crates/harness-store-sqlite/src/store/external_jobs.rs",
         "crates/harness-store-sqlite/src/store/notifications.rs",
-        "docs/adr/ADR-N11-SCHEDULE-AND-DAEMON-SEMANTICS.vi.md",
-        "docs/specs/M11.vi.md"
+        "docs/ARCHITECTURE_REVIEW.vi.md",
+        "docs/implementation/README.vi.md"
       ],
       "gate": {
         "script": "scripts/Verify-Milestone.ps1",
@@ -935,7 +935,7 @@
     {
       "id": "M12",
       "title": "Strict execution backend",
-      "runbook": "docs/implementation-next/M12.vi.md",
+      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M4"],
       "status": "in_progress",
       "integration_target": "milestone_m12",
@@ -1005,8 +1005,8 @@
         "crates/harness-tools/src/execution/plan.rs",
         "crates/harness-tools/src/execution/probe.rs",
         "crates/harness-tools/src/execution/probe_control.rs",
-        "docs/adr/ADR-N12-STRICT-BACKEND-AND-CAPABILITIES.vi.md",
-        "docs/specs/M12.vi.md",
+        "docs/PLUGIN_ARCHITECTURE.vi.md",
+        "docs/implementation/README.vi.md",
         "docs/support/STRICT_EXECUTION_SUPPORT.vi.md"
       ],
       "gate": {
@@ -1198,7 +1198,7 @@
       "selectors": [
         "milestone_m5::a19_summary_failure_falls_back_to_the_mandatory_state"
       ],
-      "note": "a summarizer that fails or returns nothing is not a summary, so the checkpoint holds the deterministic rendering of the mandatory state. The former M7 half (memory extraction) was retired with the harness-memory crate"
+      "note": "a summarizer that fails or returns nothing is not a summary, so the checkpoint holds the deterministic rendering of the mandatory state. The former optional background branch was retired"
     },
     {
       "id": "A20",
@@ -1246,7 +1246,7 @@
       "planned_test": "a25_memory_job_cas",
       "status": "retired",
       "selectors": null,
-      "note": "retired with the harness-memory crate and milestone M7; the scoped-memory extraction and provenance it covered no longer exist"
+      "note": "retired; the optional background extraction and provenance branch it covered is not part of the current host"
     },
     {
       "id": "A26",
@@ -1254,7 +1254,7 @@
       "planned_test": "a26_memory_provenance",
       "status": "retired",
       "selectors": null,
-      "note": "retired with the harness-memory crate and milestone M7; the scoped-memory extraction and provenance it covered no longer exist"
+      "note": "retired; the optional background extraction and provenance branch it covered is not part of the current host"
     },
     {
       "id": "A27",

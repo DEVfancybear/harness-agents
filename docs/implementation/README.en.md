@@ -2,145 +2,90 @@
 
 English | [Tiếng Việt](README.vi.md)
 
-Runbook revision 1 — September 10, 2026. Derived from architecture revision 2 at commit `b636208`. These documents were written before implementation; P0–P7 now have implementations and evidence tied to separate source revisions. The table below is the known status, not acceptance evidence for the current HEAD. P8 has not started.
+**Status:** current implementation map, 29 September 2026. This handbook follows the source tree and executable gates. It is not a promise that every planned item is complete.
 
-## 1. How to use this pack
+## 1. Source of truth
 
-For implemented P0–P7 phases, use their evidence and handoffs to check the tested revision and open items; do not treat them as new assignments. Use the section 9 prompt for an unimplemented phase. Merely reading these docs does not authorize worker spawning, arbitrary tool installation or release publication.
+Use the [architecture overview](../ARCHITECTURE_OVERVIEW.en.md) for current boundaries, the [plugin architecture](../PLUGIN_ARCHITECTURE.en.md) for kernel/extension contracts, and the source/tests for behavior. The phase runbooks below describe ownership and verification; they do not create capabilities absent from the workspace.
 
-Every phase contains seven ordered work items, proposed file ownership, contract decisions, tests, a demonstration, an exit gate and handoff requirements. The 63 step IDs are stable task identifiers. Target paths describe files to create or extend after inspecting actual code; do not replace existing implementations with fresh scaffolding blindly.
+When a runbook conflicts with Rust code, `Cargo.toml`, or a test, report the conflict and follow current source. Historical evidence is revision-bound and must not be reused as a fresh release claim.
 
-Source of truth: [architecture plan](../RUST_HARNESS_PLAN.en.md), [plugin contracts](../PLUGIN_ARCHITECTURE.en.md), [memory contracts](../MEMORY_AND_CONTINUITY.en.md), then these runbooks. A runbook decomposes those contracts; it does not silently weaken them. Escalate genuine contradictions with a concrete proposed resolution.
+## 2. Current workspace
 
-## 2. Phase order and scope
+The workspace has eleven Rust crates:
 
-| Phase | Runbook | Prerequisite | Person-days | Current status |
+- `harness-types` — shared IDs, contracts, errors and schemas;
+- `harness-kernel` — composition, scoped registration, leases and shutdown;
+- `harness-store-sqlite` — SQLite authority, migrations and durable records;
+- `harness-session` — admission, projections, snapshots and recovery views;
+- `harness-providers` — provider adapters, mock provider and streaming;
+- `harness-runtime` — run lifecycle, budgets and context admission;
+- `harness-tools` — policy, approvals, filesystem/Git/process tools and receipts;
+- `harness-orchestrator` — delegated tasks, workers, DAGs and workspaces;
+- `harness-extensions` — MCP/extension negotiation and bounded transport;
+- `harness-maintenance` — backup, migration, retention and diagnostics;
+- `harness-cli` — `ha` composition, terminal UI, headless mode and loopback web.
+
+## 3. Phase map
+
+The active sequence follows executable test targets and current crate boundaries; removed capabilities are not implementation dependencies.
+
+| Phase | Scope | Depends on | Estimate | Current source anchor |
 |---|---|---|---:|---|
-| P0 | [Foundation, contracts and test scaffolding](P0_FOUNDATION.en.md) | — | 3–4 | implemented; see [P0 evidence](../evidence/P0.en.md) |
-| P1 | [Plugin kernel and durable storage](P1_KERNEL_STORAGE.en.md) | P0 | 8–11 | implemented; see [P1 evidence](../evidence/P1.en.md) |
-| P2 | [Agent runtime, context and compaction](P2_RUNTIME_CONTEXT.en.md) | P1 | 7–10 | implemented; see [P2 evidence](../evidence/P2.en.md) |
-| P3 | [Coding tools, execution policy and receipts](P3_CODING_TOOLS.en.md) | P2 | 7–10 | implemented; see [P3 evidence](../evidence/P3.en.md) |
-| P4 | [Reusable memory and recovery-safe extraction](P4_MEMORY.en.md) | P3 | 7–10 | implemented; check current status in [P4 evidence](../evidence/P4.en.md) |
-| P5 | [Delegation, task DAG and isolated workspaces](P5_MULTI_AGENT.en.md) | P4 | 8–12 | implemented; historical CI in [P5 evidence](../evidence/P5.en.md) |
-| P6 | [Skills, MCP and external plugin protocol](P6_EXTENSIONS.en.md) | P5 | 5–8 | implemented; historical CI in [P6 evidence](../evidence/P6.en.md) |
-| P7 | [Recovery hardening and CLI release](P7_RELEASE.en.md) | P6 | 8–11 | implemented; historical CI in [P7 evidence](../evidence/P7.en.md) |
-| P8 | [Web UI over the same host services](P8_WEB.en.md) | P7 | 10–15 | not_started |
+| P0 | Foundation, IDs and test fixtures | — | 3–4 | `harness-types`, CLI fixtures |
+| P1 | Kernel, storage ownership and durable records | P0 | 8–11 | `harness-kernel`, `harness-store-sqlite` |
+| P2 | Runtime, context admission and recovery | P1 | 7–10 | `harness-runtime`, `harness-session` |
+| P3 | Coding tools, policy and receipts | P2 | 7–10 | `harness-tools` |
+| P5 | Delegation, task DAG and isolated workspaces | P3 | 8–12 | `harness-orchestrator` |
+| P6 | Extensions, skills and MCP | P5 | 5–8 | `harness-extensions` |
+| P7 | Backup, migration, release and support evidence | P6 | 8–11 | `harness-maintenance`, CLI release checks |
+| P8 | Loopback Web adapter | P7 | 10–15 | optional `harness-cli` web surface |
 
-P0 → P1 → P2 → P3 → P4 → P5 → P6 → P7 → optional P8. A phase starts after its predecessor's integration gate is accepted. Design review and fixture preparation may overlap, but do not merge code against an unaccepted predecessor interface.
+P0–P7 planning range: **46–66 person-days**. P8 remains optional. The absent phase row is intentional: a deleted subsystem must not remain as a false implementation dependency.
 
-P0–P7 remain 53–76 person-days before contingency; P8 is additional. These estimates are not agent execution deadlines. Multiple agents do not automatically divide the calendar estimate by their count.
+## 4. Execution rules
 
-`manifest.json` is a planning catalog of dependencies, steps and case ownership. It is **not** the live product task database; its phases intentionally retain `not_started` under the docs-validator contract and do not reflect implementation status. Future completion status requires evidence at a source revision, not an edited JSON status alone.
+1. Read current source and predecessor evidence before changing a phase.
+2. Keep one durable authority per domain. Do not add a second SQLite writer through a facade.
+3. Treat provider output as a proposal; only host policy and receipts establish execution evidence.
+4. Preserve sequence, fencing, budget, workspace and recovery invariants when adding a UI or extension path.
+5. Stop at the phase boundary. Do not report a filtered or empty test selection as acceptance.
 
-P0–P7 evidence records gates on historical revisions; do not infer that every gate has been rerun on the current audit source tree. Linux verification remains pending in the current handoff.
+## 5. Verification commands
 
-## 3. Common startup procedure for every coding agent
-
-1. Read applicable repository instructions, current Git status, assigned phase and predecessor handoff/evidence. Preserve unrelated edits.
-2. Verify the predecessor source revision and relevant tests in the actual checkout. A prose “done” from another agent is insufficient.
-3. Write a short phase SPEC under `docs/specs/Pn.en.md` and `Pn.vi.md`: selected scope, test mapping, failure modes, dependencies, environment changes and unresolved decisions. These paths are future outputs, not existing links.
-4. Confirm material contract/security/storage changes with the user before expanding scope. Never infer approval for data deletion, paid unlimited API calls, public releases or host activation from “implement phase.”
-5. Claim the exact step/file ownership agreed with the coordinator. Implement one testable slice at a time; first reproduce expected failure where practical.
-6. Run the phase gate and the existing regression suite after the last change. Inspect actual test discovery: a zero-test successful Cargo filter is not proof.
-7. Produce source-bound evidence and a continuation handoff even if blocked or interrupted. Do not mark the phase complete when a required gate has not run.
-
-## 4. Contracts shared across phases
-
-P0 fixes serialization versions, ID formats, typed error conventions, test registry format and public CLI naming. Feature-specific fields/behaviors are then finalized in the owning phase SPEC. Revisions are explicit: preserve event decoding, migrate storage, update both languages and test old fixtures.
-
-Default ownership:
-
-- `harness-types`: shared IDs and event envelopes; no business policy.
-- `harness-kernel`: plugin graph, scoped registries, leases and resource lifecycle.
-- `harness-session`: instruction ledger, task/session projections, WorkingState and recovery.
-- `harness-store-sqlite`: migrations, transaction coordinator, durable queues, artifacts and query storage.
-- `harness-runtime`: agent actor, application services, context admission and request lifecycle.
-- `harness-providers`: mock and DeepSeek adapters.
-- `harness-tools`: policy gate, receipts, filesystem/Git/process adapters.
-- `harness-memory`: assets, extraction, retrieval, provenance and invalidation.
-- `harness-orchestrator`: task DAG, agent ownership, workspaces and handoff integration.
-- `harness-cli`: CLI presentation/composition and cross-crate acceptance fixtures.
-
-Initially modules may stand in for crates, but the P0 handoff must map each logical owner to a real path. Domain records have a single authoritative writer; a new crate does not create a second database authority. The future Web adapter calls application services, never CLI internals or direct mutation SQL.
-
-## 5. Verification contract
-
-The only currently executable command in this pack is:
+From the repository root:
 
 ```powershell
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
 pwsh -NoProfile -File scripts/Verify-Docs.ps1 -SelfTest
 ```
 
-P0 must create the following **future** interface. All later phase commands assume that gate exists:
+For a phase with an executable target, run its focused gate and then the full workspace gate. A result is source-bound only when command, revision, platform and count are recorded together.
 
-```powershell
-pwsh -NoProfile -File scripts/Verify-Phase.ps1 -Phase P0
-```
+## 6. Evidence and recovery
 
-The phase runner must fail closed and run:
+The current Git revision and command output are the source for verification. Recovery must use committed store records, snapshots and receipts; prose cannot replace an execution record.
 
-- `cargo fmt --all -- --check`.
-- `cargo clippy --workspace --all-targets --locked -- -D warnings`.
-- `cargo test --workspace --all-targets --locked`.
-- The declared phase acceptance target, with nonempty test discovery and no ignored required cases.
-- Documentation checks, plus additional OS/process/crash/migration gates introduced by that phase.
+## 7. Adding a phase or crate
 
-P0 creates `crates/harness-cli/tests/phase_p0.rs`; each later phase adds `phase_pN.rs`. These cross-crate acceptance targets orchestrate the real implementation; unit tests remain near their owning modules. Do not mock the transaction engine, policy gate or component being verified. Mock only boundaries such as model/network/clock where appropriate.
+Before adding a phase, update the source map, dependency graph, bilingual runbook, manifest, acceptance ownership and docs verifier in one change. Before adding a crate, state its authority, inputs, outputs and shutdown behavior. A crate that only forwards calls must not become a new domain owner.
 
-Create `tests/acceptance/registry.json` in P0: case ID, owning phase, target/test names, fixture, required platforms and readiness. Tests introduced in future phases remain `not_implemented`, never green or silently skipped. `Verify-Phase` checks the selected phase and previously accepted gates; P7 requires all C01–C30/K01–K14. P8 additionally defines its own W01–W06 cases.
+## 8. Review checklist
 
-A component fixture may precede an end-to-end strengthening test; [acceptance ownership](ACCEPTANCE_MAP.en.md) states that distinction. Passing a P1 synthetic receipt fixture does not claim the P3 process runner works.
+- Does the change match the current crate map?
+- Is every side effect preceded by policy and, where required, approval?
+- Is the durable ACK emitted only after the authoritative write?
+- Are uncertain external outcomes visible and non-replayed by default?
+- Are Windows support claims separated from Linux/macOS pending evidence?
+- Do English and Vietnamese headings, links and command examples stay aligned?
 
-## 6. Evidence and handoff format
+## 9. Related documents
 
-At phase completion, create paired `docs/evidence/Pn.en.md` and `Pn.vi.md`. Store machine-readable run results/artifacts under a task-owned location chosen in P0; keep credentials and raw private project content out of Git. Evidence includes:
-
-```text
-phase / assigned steps / result: passed | failed | blocked | partial
-base revision / tested revision or source-tree digest
-changed files and ownership
-contract/schema/dependency changes
-case ID -> exact test -> command -> observed result
-platform and toolchain versions
-demo command and artifact references
-skipped checks with reason; known limitations
-remaining steps and blockers
-next safe action and prerequisite for the next phase
-commit/push/CI state: actual outcome or not requested
-```
-
-The result is source-specific. Tests from before the last code change are stale. If the environment lacks an OS or provider credential, report the gap; a required release gate remains incomplete. Documentation validation is not runtime verification.
-
-Keep a small task handoff while working: `docs/handoffs/Pn.en.md` and `Pn.vi.md`, including completed step IDs, failures, exact commands, file fingerprints, pending operations and next action. This is development handoff material, not a substitute for the harness's eventual durable memory.
-
-## 7. Multiple implementation agents
-
-The user/coordinator assigns parallel work explicitly. Within a phase, workers may implement disjoint modules only after shared contracts are accepted. One integrator owns root Cargo files/lockfile, shared schemas, migrations numbering and acceptance registry. No two workers edit the same file without an agreed handoff.
-
-Restrictions on spawning agents refer to additional implementation assistants. They do not prohibit running isolated product-agent actors that the assigned phase's acceptance tests require.
-
-Worker assignment must state phase/step IDs, input revision, owned paths, allowed dependencies, acceptance tests and forbidden changes. Workers return results and evidence; the integrator resolves overlaps, tests the integrated revision and authorizes the phase transition. Do not launch agents for P0–P8 simultaneously.
-
-Optional isolated branches/workspaces preserve the user's existing changes. Follow the actual environment's worktree tooling; this pack does not authorize manipulating Orca-managed state. No blanket commit/push permission: each coding assignment must state whether publication is requested.
-
-## 8. Stop and recovery rules
-
-Stop the affected work when a required predecessor is absent, a schema/security contract conflicts, tests expose data loss, a mutation outcome is unknown, or protected user data would be overwritten. Continue safe diagnosis and isolated fixtures; do not bypass the failing guard.
-
-On context exhaustion or agent replacement, the next agent reads the handoff, Git diff and evidence, reruns the necessary baseline, and continues the next unfinished step. It must not regenerate a completed phase merely because its conversation history is missing.
-
-The first useful delivery is P1's kill/reopen demonstration; P3 adds actual coding, P5 adds delegated agents, P7 is the CLI release gate. Web remains separate.
-
-## 9. Initial assignment prompt
-
-```text
-Implement P0 only in this repository.
-Read docs/implementation/README.en.md and P0_FOUNDATION.en.md in that directory,
-then the linked architecture contracts and any repository instructions.
-Inspect the current checkout; create the P0 SPEC and implement P0-S01..P0-S07.
-Do not implement the runtime, memory extractor, multi-agent scheduler or Web UI.
-Use fixtures without real credentials. Prove test discovery and negative controls.
-Deliver bilingual evidence and a handoff bound to the tested source revision.
-Do not start P1 or spawn additional agents unless I explicitly assign that work.
-Do not commit or push unless I request publication in this assignment.
-```
+- [Architecture overview](../ARCHITECTURE_OVERVIEW.en.md)
+- [Architecture review](../ARCHITECTURE_REVIEW.en.md)
+- [Plugin architecture](../PLUGIN_ARCHITECTURE.en.md)
+- [Acceptance map](ACCEPTANCE_MAP.en.md)
+- [Operator guide](../OPERATOR_GUIDE.en.md)
+- [Build and release](../BUILD_AND_RELEASE.md)

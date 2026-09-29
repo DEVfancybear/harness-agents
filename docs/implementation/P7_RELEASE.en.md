@@ -2,17 +2,17 @@
 
 English | [Tiếng Việt](P7_RELEASE.vi.md)
 
-Implementation runbook; P0–P7 implementation was delivered after this plan was written. See [P0–P7 audit evidence](../evidence/P0-P7_AUDIT.en.md) for verification and current limits; this runbook is not completion evidence. Original estimate: 8–11 person-days.
+Implementation runbook for the current P7 ownership boundary. Verify behavior against the current source and workspace gate. Original estimate: 8–11 person-days.
 
 ## 1. Outcome and entry gate
 
 Require accepted [P6](P6_EXTENSIONS.en.md). Harden and package the CLI; prove consistent backups/migrations and explicit data retention. This is the CLI release gate, not permission to deploy software to a production host or publish a GitHub release.
 
-Read the [handbook](README.en.md), [plan](../RUST_HARNESS_PLAN.en.md), [plugin contract](../PLUGIN_ARCHITECTURE.en.md), [memory contract](../MEMORY_AND_CONTINUITY.en.md) and [acceptance map](ACCEPTANCE_MAP.en.md). Inspect actual predecessor evidence before coding.
+Read the [handbook](README.en.md), [plan](../RUST_HARNESS_PLAN.en.md), [plugin contract](../PLUGIN_ARCHITECTURE.en.md), [architecture overview](../ARCHITECTURE_OVERVIEW.en.md) and [acceptance map](ACCEPTANCE_MAP.en.md). Inspect actual predecessor evidence before coding.
 
 ## 2. Owned scope and target files
 
-Own backup/restore/migration/retention modules through `harness-store-sqlite` and memory/session APIs, `ha doctor` and maintenance commands, `crates/harness-cli/tests/phase_p7.rs`, packaging/release automation, continuity eval fixtures and operator documentation. Preserve all earlier runtime and plugin contracts.
+Own backup/restore/migration/retention modules through `harness-store-sqlite` and session APIs, `ha doctor` and maintenance commands, `crates/harness-cli/tests/phase_p7.rs`, packaging/release automation, continuity eval fixtures and operator documentation. Preserve all earlier runtime and plugin contracts.
 
 ## 3. Contracts to settle before implementation
 
@@ -94,7 +94,7 @@ The full gate includes the handbook's formatting, clippy, workspace tests, test-
 1. Start a task with two completed steps, a failed check, pending child work and extraction backlog.
 2. Create a consistent backup while work is present; restore into a fresh data directory.
 3. Resume and verify source state, task ownership and pending jobs without duplicate side effects.
-4. Forget one selected source in a disposable copy; show its derived memory cannot reappear and old replay reports the gap.
+4. Restore a disposable copy, verify retention markers and show that replay reports unavailable records without inventing content.
 5. Run the same recovery from the packaged Windows/Linux binary, then record checksums and exact evidence.
 
 ## 7. Exit gate and forbidden shortcuts
@@ -107,7 +107,7 @@ Do not advance phases on a summary alone. Bind results to the final tested revis
 
 Backup/restore S02 and retention design can be assigned after S01, but GC implementation waits for backup pin contracts. One store owner controls migrations. Evaluations/packaging work follows tested contracts and converges on one exact release candidate revision. P8 receives stable application services, command/error schemas and the CLI baseline to protect.
 
-Deliver `docs/evidence/P7.en.md` and `P7.vi.md`, plus a resumable handoff under `docs/handoffs/`, following the handbook. Include completed step IDs, pending failures, schema changes, commands and next action. Publication requires explicit authorization in the coding assignment.
+Record the focused command, source revision, platform, test count and any pending failure in the change or CI log. Do not create a historical evidence or handoff file for this phase.
 
 ## 9. Ready-to-use agent prompt
 

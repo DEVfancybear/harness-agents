@@ -2,13 +2,13 @@
 
 English | [Tiếng Việt](P0_FOUNDATION.vi.md)
 
-Implementation runbook; P0–P7 implementation was delivered after this plan was written. See [P0–P7 audit evidence](../evidence/P0-P7_AUDIT.en.md) for verification and current limits; this runbook is not completion evidence. Original estimate: 3–4 person-days.
+Implementation runbook for the current P0 ownership boundary. Verify behavior against the current source and workspace gate. Original estimate: 3–4 person-days.
 
 ## 1. Outcome and entry gate
 
 Deliver a buildable, keyless skeleton and an executable contract/fixture foundation. No predecessor phase. Verify the architecture documents and current clean/dirty Git state; do not assume Rust or a C toolchain is already installed.
 
-Read the [handbook](README.en.md), [plan](../RUST_HARNESS_PLAN.en.md), [plugin contract](../PLUGIN_ARCHITECTURE.en.md), [memory contract](../MEMORY_AND_CONTINUITY.en.md) and [acceptance map](ACCEPTANCE_MAP.en.md). Inspect actual predecessor evidence before coding.
+Read the [handbook](README.en.md), [plan](../RUST_HARNESS_PLAN.en.md), [plugin contract](../PLUGIN_ARCHITECTURE.en.md), [architecture overview](../ARCHITECTURE_OVERVIEW.en.md) and [acceptance map](ACCEPTANCE_MAP.en.md). Inspect actual predecessor evidence before coding.
 
 ## 2. Owned scope and target files
 
@@ -40,7 +40,7 @@ Evidence: `cargo check --workspace --locked` and CLI help run; unknown options/c
 
 Depends on: P0-S01, P0-S02.
 
-Create versioned schema definitions for event envelope, WorkingState, instructions, tool receipts, memory versions, plugin manifest and context/composition packet. Keep domain ownership explicit even if early types share a module. Add representative valid/invalid serialization fixtures.
+Create versioned schema definitions for event envelope, WorkingState, instructions, tool receipts, session/workspace versions, plugin manifest and context/composition packet. Keep domain ownership explicit even if early types share a module. Add representative valid/invalid serialization fixtures.
 
 Evidence: Round trips preserve values; invalid IDs, versions, missing authority and malformed payloads are rejected.
 
@@ -99,7 +99,7 @@ The full gate includes the handbook's formatting, clippy, workspace tests, test-
 
 ## 7. Exit gate and forbidden shortcuts
 
-All seven steps complete; the workspace builds, P0 tests execute, the gate detects known-bad inputs and schemas/fixtures are versioned. Do not add an LLM loop, SQLite runtime, memory extraction, orchestration or Web. Do not install broad global tooling without the assignment's setup authorization.
+All seven steps complete; the workspace builds, P0 tests execute, the gate detects known-bad inputs and schemas/fixtures are versioned. Do not add an LLM loop, SQLite runtime, cross-session extraction, orchestration or Web. Do not install broad global tooling without the assignment's setup authorization.
 
 Do not advance phases on a summary alone. Bind results to the final tested revision, report missing checks, and preserve all predecessor regressions. Never alter fixture expectations merely to make implementation pass.
 
@@ -107,7 +107,7 @@ Do not advance phases on a summary alone. Bind results to the final tested revis
 
 An integrator owns root manifests/lockfile and schema naming. After S03, a separately assigned fixture author may prepare tests while the integrator builds the gate; merge only after IDs/fixtures agree. Handoff to P1 includes the continuation fixture, contract revisions, test-discovery format and exact build instructions.
 
-Deliver `docs/evidence/P0.en.md` and `P0.vi.md`, plus a resumable handoff under `docs/handoffs/`, following the handbook. Include completed step IDs, pending failures, schema changes, commands and next action. Publication requires explicit authorization in the coding assignment.
+Record the focused command, source revision, platform, test count and any pending failure in the change or CI log. Do not create a historical evidence or handoff file for this phase.
 
 ## 9. Ready-to-use agent prompt
 

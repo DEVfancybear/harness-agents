@@ -2,7 +2,7 @@
 
 **Trạng thái:** accepted trong M8 · **Ngày:** 23/09/2026 · **Phạm vi:** M8-01..M8-04
 
-[Runbook M8](../implementation-next/M8.vi.md) · [Contracts](../implementation-next/CONTRACTS.vi.md) §8 · [SPEC M8](../specs/M8.vi.md) · [ADR-N02](ADR-N02-STORE-OWNERSHIP-DURABILITY.vi.md)
+[Architecture overview](../ARCHITECTURE_OVERVIEW.vi.md) · [Implementation handbook](../implementation/README.vi.md) · [ADR-N02](ADR-N02-STORE-OWNERSHIP-DURABILITY.vi.md)
 
 ## 1. Bối cảnh
 

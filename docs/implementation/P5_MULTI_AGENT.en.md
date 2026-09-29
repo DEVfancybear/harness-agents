@@ -2,17 +2,17 @@
 
 English | [Tiếng Việt](P5_MULTI_AGENT.vi.md)
 
-Implementation runbook; P0–P7 implementation was delivered after this plan was written. See [P0–P7 audit evidence](../evidence/P0-P7_AUDIT.en.md) for verification and current limits; this runbook is not completion evidence. Original estimate: 8–12 person-days.
+Implementation runbook for the current P5 ownership boundary. Verify behavior against the current source and workspace gate. Original estimate: 8–12 person-days.
 
 ## 1. Outcome and entry gate
 
-Require accepted [P4](P4_MEMORY.en.md). Deliver one coordinator plus up to three workers with independent contexts, durable task ownership/results and isolated editing worktrees. All run in the same writable host; a daemon and remote workers are outside this phase.
+Require the durable runtime and coding-tool gates from P0–P3. Deliver one coordinator plus up to three workers with independent contexts, durable task ownership/results and isolated editing worktrees. All run in the same writable host; a daemon and remote workers are outside this phase.
 
-Read the [handbook](README.en.md), [plan](../RUST_HARNESS_PLAN.en.md), [plugin contract](../PLUGIN_ARCHITECTURE.en.md), [memory contract](../MEMORY_AND_CONTINUITY.en.md) and [acceptance map](ACCEPTANCE_MAP.en.md). Inspect actual predecessor evidence before coding.
+Read the [handbook](README.en.md), [architecture overview](../ARCHITECTURE_OVERVIEW.en.md), [plan](../RUST_HARNESS_PLAN.en.md), [plugin contract](../PLUGIN_ARCHITECTURE.en.md) and [acceptance map](ACCEPTANCE_MAP.en.md). Inspect actual predecessor evidence before coding.
 
 ## 2. Owned scope and target files
 
-Own `crates/harness-orchestrator/`, host task/DAG/delivery commands, `WorkspaceManager` integration, agent profiles/presets, `crates/harness-cli/tests/phase_p5.rs`, clean/dirty repository fixtures and CLI `run --agents`, task status/cancel/handoff views. Extend existing memory grants and runtime factory, not separate agent engines.
+Own `crates/harness-orchestrator/`, host task/DAG/delivery commands, `WorkspaceManager` integration, agent profiles/presets, `crates/harness-cli/tests/phase_p5.rs`, clean/dirty repository fixtures and CLI `run --agents`, task status/cancel/handoff views. Extend the existing runtime factory, not separate agent engines.
 
 ## 3. Contracts to settle before implementation
 
@@ -60,13 +60,13 @@ Validate result scope/artifacts/receipts, integrate in dependency order in an in
 
 Evidence: Per-branch test success cannot stand in for integrated-revision success; no worker pushes or integrates unilaterally.
 
-### 4.6. P5-S06 — Connect scoped memory and crash recovery
+### 4.6. P5-S06 — Connect runtime recovery and crash handling
 
 Depends on: P5-S03, P5-S05.
 
-Bind task/profile assets at spawn; record exact source versions in handoffs. Later updates enter at logged boundaries. Crash at child completion, parent delivery and integration boundaries; reconcile uncertain side effects and rebuild DAG progress from durable state.
+Bind task/profile inputs at spawn and record exact source revisions in handoffs. Later updates enter at logged boundaries. Crash at child completion, parent delivery and integration boundaries; reconcile uncertain side effects and rebuild DAG progress from durable state.
 
-Evidence: C07/C08/C24 hold with real delegated actors; semantic memory cannot decide whether a task completed.
+Evidence: delegated actors preserve ownership and delivery across restart; task state, not model prose, decides whether a task completed.
 
 ### 4.7. P5-S07 — Expose delegation and run the complete demonstration
 
@@ -99,7 +99,7 @@ The full gate includes the handbook's formatting, clippy, workspace tests, test-
 
 ## 7. Exit gate and forbidden shortcuts
 
-Delegation, durable coordination and final-revision checks pass; no lost child result, duplicate ownership, DAG deadlock or cross-agent memory leak. Clean-repo editing is mandatory; dirty support is either preservation-tested or clearly rejected. No background-after-CLI-exit claim, remote agents or marketplace.
+Delegation, durable coordination and final-revision checks pass; no lost child result, duplicate ownership or DAG deadlock. Clean-repo editing is mandatory; dirty support is either preservation-tested or clearly rejected. No background-after-CLI-exit claim, remote agents or marketplace.
 
 Do not advance phases on a summary alone. Bind results to the final tested revision, report missing checks, and preserve all predecessor regressions. Never alter fixture expectations merely to make implementation pass.
 
@@ -107,7 +107,7 @@ Do not advance phases on a summary alone. Bind results to the final tested revis
 
 After S01, workspace S04 and task store S02 can have separate owners; runtime S03 requires S02. Integration S05 is integrator-owned. P6 receives spawn/tool entry points, scope/authority propagation and cross-agent recovery fixtures so extensions cannot bypass them.
 
-Deliver `docs/evidence/P5.en.md` and `P5.vi.md`, plus a resumable handoff under `docs/handoffs/`, following the handbook. Include completed step IDs, pending failures, schema changes, commands and next action. Publication requires explicit authorization in the coding assignment.
+Record the focused command, source revision, platform, test count and any pending failure in the change or CI log. Do not create a historical evidence or handoff file for this phase.
 
 ## 9. Ready-to-use agent prompt
 

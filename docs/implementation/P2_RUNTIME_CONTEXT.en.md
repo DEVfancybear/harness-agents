@@ -2,17 +2,17 @@
 
 English | [Tiếng Việt](P2_RUNTIME_CONTEXT.vi.md)
 
-Implementation runbook; P0–P7 implementation was delivered after this plan was written. See [P0–P7 audit evidence](../evidence/P0-P7_AUDIT.en.md) for verification and current limits; this runbook is not completion evidence. Original estimate: 7–10 person-days.
+Implementation runbook for the current P2 ownership boundary. Verify behavior against the current source and workspace gate. Original estimate: 7–10 person-days.
 
 ## 1. Outcome and entry gate
 
 Require accepted [P1](P1_KERNEL_STORAGE.en.md). Deliver a single-agent model loop with durable request history, context inspection, repeated compaction and resume. It can use deterministic fixture tools; production filesystem/process tools belong to P3.
 
-Read the [handbook](README.en.md), [plan](../RUST_HARNESS_PLAN.en.md), [plugin contract](../PLUGIN_ARCHITECTURE.en.md), [memory contract](../MEMORY_AND_CONTINUITY.en.md) and [acceptance map](ACCEPTANCE_MAP.en.md). Inspect actual predecessor evidence before coding.
+Read the [handbook](README.en.md), [plan](../RUST_HARNESS_PLAN.en.md), [plugin contract](../PLUGIN_ARCHITECTURE.en.md), [architecture overview](../ARCHITECTURE_OVERVIEW.en.md) and [acceptance map](ACCEPTANCE_MAP.en.md). Inspect actual predecessor evidence before coding.
 
 ## 2. Owned scope and target files
 
-Own `crates/harness-runtime/`, `crates/harness-providers/`, context/projection modules in `harness-session`, packet/composition migrations, `crates/harness-cli/tests/phase_p2.rs`, mock HTTP/SSE fixtures and CLI `run`, `resume`, `continue`, `context inspect`, `session replay --offline`. Keep reusable-memory service optional through an empty/test implementation.
+Own `crates/harness-runtime/`, `crates/harness-providers/`, context/projection modules in `harness-session`, packet/composition migrations, `crates/harness-cli/tests/phase_p2.rs`, mock HTTP/SSE fixtures and CLI `run`, `resume`, `continue`, `context inspect`, `session replay --offline`. Keep optional integrations behind explicit service requirements and test fixtures.
 
 ## 3. Contracts to settle before implementation
 
@@ -99,7 +99,7 @@ The full gate includes the handbook's formatting, clippy, workspace tests, test-
 
 ## 7. Exit gate and forbidden shortcuts
 
-Single-agent loop, context/compaction and resume gates pass. Missing optional memory cannot block restoration. No silent discard of mandatory instructions, no unsnapshotted prompt injection, no tool execution from partial JSON and no blind retry of an uncertain call. No real coding toolset or multi-agent scheduler in this phase.
+Single-agent loop, context/compaction and resume gates pass. Missing optional integrations cannot block restoration. No silent discard of mandatory instructions, no unsnapshotted prompt injection, no tool execution from partial JSON and no blind retry of an uncertain call. No real coding toolset or multi-agent scheduler in this phase.
 
 Do not advance phases on a summary alone. Bind results to the final tested revision, report missing checks, and preserve all predecessor regressions. Never alter fixture expectations merely to make implementation pass.
 
@@ -107,7 +107,7 @@ Do not advance phases on a summary alone. Bind results to the final tested revis
 
 After S01, providers S02 and context S03 can have separate assigned owners. One runtime integrator owns S04 and packet schema integration. P3 receives the execution boundary, actor cancellation contract, model/tool schemas, recovery receipts and fixture transcript.
 
-Deliver `docs/evidence/P2.en.md` and `P2.vi.md`, plus a resumable handoff under `docs/handoffs/`, following the handbook. Include completed step IDs, pending failures, schema changes, commands and next action. Publication requires explicit authorization in the coding assignment.
+Record the focused command, source revision, platform, test count and any pending failure in the change or CI log. Do not create a historical evidence or handoff file for this phase.
 
 ## 9. Ready-to-use agent prompt
 

@@ -2,13 +2,13 @@
 
 English | [Tiếng Việt](P3_CODING_TOOLS.vi.md)
 
-Implementation runbook; P0–P7 implementation was delivered after this plan was written. See [P0–P7 audit evidence](../evidence/P0-P7_AUDIT.en.md) for verification and current limits; this runbook is not completion evidence. Original estimate: 7–10 person-days.
+Implementation runbook for the current P3 ownership boundary. Verify behavior against the current source and workspace gate. Original estimate: 7–10 person-days.
 
 ## 1. Outcome and entry gate
 
 Require accepted [P2](P2_RUNTIME_CONTEXT.en.md). Deliver a useful single-agent coding CLI that reads/edits a fixture repository, runs checks and resumes with trustworthy execution evidence. Host-development mode must report its actual protection level.
 
-Read the [handbook](README.en.md), [plan](../RUST_HARNESS_PLAN.en.md), [plugin contract](../PLUGIN_ARCHITECTURE.en.md), [memory contract](../MEMORY_AND_CONTINUITY.en.md) and [acceptance map](ACCEPTANCE_MAP.en.md). Inspect actual predecessor evidence before coding.
+Read the [handbook](README.en.md), [plan](../RUST_HARNESS_PLAN.en.md), [plugin contract](../PLUGIN_ARCHITECTURE.en.md), [architecture overview](../ARCHITECTURE_OVERVIEW.en.md) and [acceptance map](ACCEPTANCE_MAP.en.md). Inspect actual predecessor evidence before coding.
 
 ## 2. Owned scope and target files
 
@@ -107,7 +107,7 @@ Do not advance phases on a summary alone. Bind results to the final tested revis
 
 After S02, filesystem S03 and process S04 can be assigned separately; Git observation S05 integrates both. The policy/receipt owner controls shared types. P4 receives trusted source receipts, sensitive-data handling, project fingerprints and the common execution gate.
 
-Deliver `docs/evidence/P3.en.md` and `P3.vi.md`, plus a resumable handoff under `docs/handoffs/`, following the handbook. Include completed step IDs, pending failures, schema changes, commands and next action. Publication requires explicit authorization in the coding assignment.
+Record the focused command, source revision, platform, test count and any pending failure in the change or CI log. Do not create a historical evidence or handoff file for this phase.
 
 ## 9. Ready-to-use agent prompt
 

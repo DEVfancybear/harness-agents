@@ -14,7 +14,7 @@ path = "src/main.rs"
 # T01 measurement switch: builds the TUI against ratatui's `scrolling-regions`
 # path so `insert_before` can be compared byte-for-byte against the default path.
 # The plan requires the decision to be measured, not assumed; the measurement and
-# its verdict are recorded in docs/specs/HA_TUI.vi.md.
+# its verdict are recorded in docs/ARCHITECTURE_OVERVIEW.vi.md.
 #
 # The name is deliberately the same as ratatui-core's feature: the extra
 # `Backend` trait methods that `scrolling-regions` introduces are gated on that

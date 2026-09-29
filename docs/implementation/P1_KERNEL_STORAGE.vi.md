@@ -2,13 +2,13 @@
 
 [English](P1_KERNEL_STORAGE.en.md) | Tiếng Việt
 
-Runbook triển khai; implementation P0–P7 đã được ghi nhận sau bản kế hoạch này. Dùng [evidence audit P0–P7](../evidence/P0-P7_AUDIT.vi.md) để xem kiểm chứng và giới hạn hiện tại; runbook này không tự là bằng chứng hoàn tất. Dự toán ban đầu: 8–11 ngày công.
+Runbook triển khai cho boundary ownership P1 hiện tại. Kiểm tra hành vi theo source hiện tại và workspace gate. Dự toán ban đầu: 8–11 ngày công.
 
 ## 1. Kết quả và điều kiện vào phase
 
 Cần gate [P0](P0_FOUNDATION.vi.md) được chấp nhận. Bàn giao lát cắt tiếp tục công việc bền vững nhỏ nhất: ACK sau commit, giữ nguyên instructions, restore snapshot+tail, một writer, plugin ownership có scope. Dùng scripted actors, chưa làm production LLM loop.
 
-Đọc [sổ tay](README.vi.md), [plan](../RUST_HARNESS_PLAN.vi.md), [hợp đồng plugin](../PLUGIN_ARCHITECTURE.vi.md), [hợp đồng memory](../MEMORY_AND_CONTINUITY.vi.md), [bảng nghiệm thu](ACCEPTANCE_MAP.vi.md). Inspect evidence tiền nhiệm thật trước khi code.
+Đọc [sổ tay](README.vi.md), [plan](../RUST_HARNESS_PLAN.vi.md), [hợp đồng plugin](../PLUGIN_ARCHITECTURE.vi.md), [tổng quan kiến trúc](../ARCHITECTURE_OVERVIEW.vi.md), [bảng nghiệm thu](ACCEPTANCE_MAP.vi.md). Inspect evidence tiền nhiệm thật trước khi code.
 
 ## 2. Scope sở hữu và target files
 
@@ -16,7 +16,7 @@ Sở hữu `crates/harness-kernel/`, `crates/harness-store-sqlite/`, `crates/har
 
 ## 3. Contracts cần chốt trước implementation
 
-Chốt API SQLite transaction coordinator, host/session/task ownership trước khi consumers code theo. Quy định input idempotency, event sequence CAS, instruction ledger updates, snapshot coverage/version/hash, durable source-work markers, typed storage failures. Test được shutdown phases/generations kernel không cần model. Chuẩn bị schema memory jobs nhưng chưa làm extraction.
+Chốt API SQLite transaction coordinator, host/session/task ownership trước khi consumers code theo. Quy định input idempotency, event sequence CAS, instruction ledger updates, snapshot coverage/version/hash, durable source-work markers, typed storage failures. Test được shutdown phases/generations kernel không cần model. Không đưa background-work schema chưa có owner vào phase này.
 
 ## 4. Work items theo thứ tự
 
@@ -99,7 +99,7 @@ Full gate gồm formatting, clippy, workspace tests, kiểm tra test discovery v
 
 ## 7. Exit gate và các cách làm không được phép
 
-Primary cases và predecessor checks chạy thật; crash recovery dùng disposable process thật. Không để queue RAM là bản duy nhất của công việc, không ACK trước commit, không cleanup async chỉ bằng `Drop`. Chưa thêm memory LLM extraction, shell execution hay multi-agent scheduling.
+Primary cases và predecessor checks chạy thật; crash recovery dùng disposable process thật. Không để queue RAM là bản duy nhất của công việc, không ACK trước commit, không cleanup async chỉ bằng `Drop`. Chưa thêm shell execution hay multi-agent scheduling.
 
 Không chuyển phase chỉ dựa trên summary. Gắn kết quả với revision cuối đã test, báo checks chưa chạy, giữ mọi regressions tiền nhiệm. Không sửa fixture expectations chỉ để implementation pass.
 
@@ -107,7 +107,7 @@ Không chuyển phase chỉ dựa trên summary. Gắn kết quả với revisio
 
 Sau S01 có thể giao S03 kernel và S02 store song song cho owners không trùng. S04–S06 tích hợp sau dependencies. Một integrator giữ migration numbering/shared contracts. P2 nhận APIs transaction/recovery, snapshot format, plugin leases, failure-injection protocol.
 
-Bàn giao `docs/evidence/P1.en.md`, `P1.vi.md`, cùng handoff tiếp tục được trong `docs/handoffs/` theo sổ tay. Ghi step IDs đã xong, lỗi còn lại, schema changes, commands và next action. Publish cần được cấp quyền rõ trong assignment coding.
+Ghi command focused, source revision, platform, test count và lỗi còn lại trong change hoặc CI log. Không tạo file evidence lịch sử hay handoff cho phase này.
 
 ## 9. Prompt giao agent
 

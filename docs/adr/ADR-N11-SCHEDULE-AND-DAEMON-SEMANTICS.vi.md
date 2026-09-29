@@ -2,7 +2,7 @@
 
 **Trạng thái:** accepted trong M11 · **Ngày:** 23/09/2026 · **Phạm vi:** M11-01..M11-04
 
-[Runbook M11](../implementation-next/M11.vi.md) · [SPEC M11](../specs/M11.vi.md) · [ADR-N10](ADR-N10-WEB-STACK-AND-IDENTITY.vi.md)
+[Implementation handbook](../implementation/README.vi.md) · [Architecture review](../ARCHITECTURE_REVIEW.vi.md) · [ADR-N10](ADR-N10-WEB-STACK-AND-IDENTITY.vi.md)
 
 ## 1. Bối cảnh
 

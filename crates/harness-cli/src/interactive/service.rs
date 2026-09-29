@@ -226,6 +226,11 @@ pub trait SessionPort: Send {
     fn import_session(&mut self, _path: &str) -> Result<String, String> {
         Err("this backend cannot import sessions".to_owned())
     }
+    /// Park the conversation until `until`: prime-agent's quota park, as a
+    /// durable one-shot job that wakes it with the resume prompt.
+    fn park_until(&mut self, _until: chrono::DateTime<chrono::Utc>) -> Result<String, String> {
+        Err("this backend cannot park a session".to_owned())
+    }
     /// prime-agent's `/logs`: where the app writes its logs and what is there.
     fn logs(&self) -> Vec<String> {
         vec!["No logs written yet.".to_owned()]
@@ -3066,6 +3071,22 @@ impl SessionPort for AgentSessionService {
 
     fn logs(&self) -> Vec<String> {
         log_lines(&self.data_dir)
+    }
+
+    fn park_until(&mut self, until: chrono::DateTime<chrono::Utc>) -> Result<String, String> {
+        let at = until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        // A job kept with the conversation survives quitting the app: it runs
+        // when the app is open again, or once when the conversation is resumed.
+        let job = self.schedules.add(
+            &format!("at {at}"),
+            super::routing::QUOTA_RESUME_PROMPT,
+            super::heartbeat::Delivery::FollowUp,
+            chrono::Utc::now(),
+        )?;
+        Ok(format!(
+            "Session parked until {at}; it resumes automatically ({} - /schedule cancel {} stops it)",
+            job.id, job.id
+        ))
     }
 
     fn import_session(&mut self, path: &str) -> Result<String, String> {

@@ -634,6 +634,11 @@ pub enum SessionEvent {
         output: String,
         attach_to_next_message: bool,
     },
+    /// The provider reported a usage reset beyond the wait bound: the session is
+    /// parked until `until`, when prime-agent's resume prompt runs it again.
+    QuotaParked {
+        until: chrono::DateTime<chrono::Utc>,
+    },
     /// A delegated child settled and nobody was waiting for its result:
     /// prime-agent's terminal notice (`[child-failed ...]`, `[child-exited ...]`),
     /// which the parent reads in a turn of its own once it is idle.

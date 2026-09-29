@@ -1017,7 +1017,7 @@ mod tests {
     /// The H03 contract flattened them because the prompt was one line. The T03
     /// composer is multi-row, so a pasted code block stays one message **with**
     /// its newlines - still exactly one submit, which is the part that must never
-    /// change. Recorded in `docs/specs/HA_TUI.vi.md`.
+    /// change. Recorded in `docs/ARCHITECTURE_OVERVIEW.vi.md`.
     #[test]
     fn t03_paste_keeps_newlines_and_submits_once() {
         let mut editor = LineEditor::new();

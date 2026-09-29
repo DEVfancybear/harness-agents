@@ -1703,6 +1703,13 @@ impl InteractiveController {
             SessionEvent::ChildSettled { name, notice } => {
                 self.deliver_notice(&name, notice, effects);
             }
+            SessionEvent::QuotaParked { until } => {
+                let item = match self.service.park_until(until) {
+                    Ok(message) => HistoryItem::Notice { message },
+                    Err(message) => HistoryItem::Error { message },
+                };
+                self.push_history(effects, item);
+            }
             SessionEvent::AgentMessage { text } => {
                 self.deliver_agent_message(text, effects);
             }

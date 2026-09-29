@@ -2,13 +2,13 @@
 
 English | [Tiếng Việt](P6_EXTENSIONS.vi.md)
 
-Implementation runbook; P0–P7 implementation was delivered after this plan was written. See [P0–P7 audit evidence](../evidence/P0-P7_AUDIT.en.md) for verification and current limits; this runbook is not completion evidence. Original estimate: 5–8 person-days.
+Implementation runbook for the current P6 ownership boundary. Verify behavior against the current source and workspace gate. Original estimate: 5–8 person-days.
 
 ## 1. Outcome and entry gate
 
-Require accepted [P5](P5_MULTI_AGENT.en.md). Deliver controlled extension points—versioned skills, an MCP client and bounded stdio tool/provider bridges—without weakening durability, policy or scoped memory.
+Require accepted [P5](P5_MULTI_AGENT.en.md). Deliver controlled extension points—versioned skills, an MCP client and bounded stdio tool/provider bridges—without weakening durability, policy or scope isolation.
 
-Read the [handbook](README.en.md), [plan](../RUST_HARNESS_PLAN.en.md), [plugin contract](../PLUGIN_ARCHITECTURE.en.md), [memory contract](../MEMORY_AND_CONTINUITY.en.md) and [acceptance map](ACCEPTANCE_MAP.en.md). Inspect actual predecessor evidence before coding.
+Read the [handbook](README.en.md), [plan](../RUST_HARNESS_PLAN.en.md), [plugin contract](../PLUGIN_ARCHITECTURE.en.md), [architecture overview](../ARCHITECTURE_OVERVIEW.en.md) and [acceptance map](ACCEPTANCE_MAP.en.md). Inspect actual predecessor evidence before coding.
 
 ## 2. Owned scope and target files
 
@@ -64,7 +64,7 @@ Evidence: K14 rejects untrusted repo executable/secret requests; skill updates b
 
 Depends on: P6-S03, P6-S04, P6-S05.
 
-Unload an extractor/tool/provider during fixtures, restart allowed plugins with new generations and retain jobs/session evidence. Preserve old packets for replay; reject unsupported critical event/schema changes. Recheck memory revocation and sensitive data across extension paths.
+Unload a tool/provider during fixtures, restart allowed plugins with new generations and retain task/session evidence. Preserve old packets for replay; reject unsupported critical event/schema changes. Recheck revocation and sensitive data across extension paths.
 
 Evidence: K01/K03/K05/K08/K10/K11 regressions remain valid with real extension processes.
 
@@ -107,7 +107,7 @@ Do not advance phases on a summary alone. Bind results to the final tested revis
 
 Transport S02 is owned centrally. After its contract stabilizes, bridge S03, MCP S04 and skills S05 can be assigned to distinct paths. The integrator owns shared protocol versions and config registry. P7 receives compatibility fixtures, supported-method inventory and shutdown/error evidence.
 
-Deliver `docs/evidence/P6.en.md` and `P6.vi.md`, plus a resumable handoff under `docs/handoffs/`, following the handbook. Include completed step IDs, pending failures, schema changes, commands and next action. Publication requires explicit authorization in the coding assignment.
+Record the focused command, source revision, platform, test count and any pending failure in the change or CI log. Do not create a historical evidence or handoff file for this phase.
 
 ## 9. Ready-to-use agent prompt
 

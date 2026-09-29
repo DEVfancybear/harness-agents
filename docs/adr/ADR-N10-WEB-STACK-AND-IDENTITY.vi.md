@@ -2,7 +2,7 @@
 
 **Trạng thái:** accepted trong M10 · **Ngày:** 23/09/2026 · **Phạm vi:** M10-01..M10-04
 
-[Runbook M10](../implementation-next/M10.vi.md) · [P8 web plan](../implementation/P8_WEB.vi.md) · [SPEC M10](../specs/M10.vi.md)
+[P8 web plan](../implementation/P8_WEB.vi.md) · [Architecture overview](../ARCHITECTURE_OVERVIEW.vi.md)
 
 ## 1. Bối cảnh
 

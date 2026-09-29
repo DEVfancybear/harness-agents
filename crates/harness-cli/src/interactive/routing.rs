@@ -194,6 +194,69 @@ impl UsageWait {
     }
 }
 
+/// prime-agent's `PROVIDER_RESUME_GRACE_MS`: a park wakes a little after the
+/// reported reset, so the window has really rolled over.
+pub const RESUME_GRACE: Duration = Duration::from_secs(30);
+
+/// prime-agent's default `maxPauseMs`: the longest one park lasts.
+pub const MAX_PAUSE: Duration = Duration::from_hours(24);
+
+/// prime-agent's `QUOTA_RESUME_MARKER_TEXT`: the prompt a parked session wakes with.
+pub const QUOTA_RESUME_PROMPT: &str = "<provider_quota_resumed>\nThe provider usage limit that paused this session has been reported as reset; this resume is automatic. Continue the interrupted task from where it stopped.\n</provider_quota_resumed>";
+
+/// prime-agent's `parseProviderResetMs`: a recovery window the provider names
+/// in its error text, such as the ChatGPT plan's "Try again in ~7272 min."
+#[must_use]
+pub fn parse_reset(text: &str) -> Option<Duration> {
+    let lowered = text.to_ascii_lowercase();
+    for anchor in ["try again", "reset", "available"] {
+        let mut from = 0;
+        while let Some(found) = lowered[from..].find(anchor) {
+            let start = from + found + anchor.len();
+            from = start;
+            // Within 80 characters, before a sentence ends: an optional `~`,
+            // a number and a unit.
+            let window = lowered[start..]
+                .char_indices()
+                .take_while(|(index, character)| *index < 80 && *character != '.')
+                .map(|(_, character)| character)
+                .collect::<String>();
+            let Some(digits_at) = window.find(|character: char| character.is_ascii_digit())
+            else {
+                continue;
+            };
+            let rest = &window[digits_at..];
+            let digits = rest
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>();
+            let unit = rest[digits.len()..]
+                .trim_start()
+                .chars()
+                .take_while(char::is_ascii_alphabetic)
+                .collect::<String>();
+            let seconds = match unit.trim_end_matches('s') {
+                "second" | "sec" => 1,
+                "minute" | "min" => 60,
+                "hour" | "hr" => 3_600,
+                "day" => 86_400,
+                _ => continue,
+            };
+            let amount = digits.parse::<u64>().ok()?;
+            return Some(Duration::from_secs(amount.saturating_mul(seconds)));
+        }
+    }
+    None
+}
+
+/// The provider's reported recovery: its `Retry-After`, else a window named in
+/// its error text.
+fn reported_reset(error: &ProviderError) -> Option<Duration> {
+    error
+        .retry_after()
+        .or_else(|| parse_reset(&error.to_string()))
+}
+
 /// The line shown while waiting, prime-agent's.
 #[must_use]
 pub fn waiting_line(attempt: u32, max_attempts: u32, wait: Duration) -> String {
@@ -394,16 +457,45 @@ impl Router {
                     None => {}
                 }
             }
-            let Some(wait) = self
-                .wait
-                .filter(|_| rate_limited && !self.gave_up.load(Ordering::SeqCst))
-            else {
+            if rate_limited && self.gave_up.load(Ordering::SeqCst) {
+                // The wait already gave up or parked this turn: the runtime's own
+                // retries end at once instead of sleeping on the provider's reset.
+                return failed(error.with_retry_after(None));
+            }
+            let Some(wait) = self.wait.filter(|_| rate_limited) else {
                 return Box::pin(futures_util::stream::iter(
                     head.into_iter().chain([Err(error)]),
                 ));
             };
             pings += 1;
-            let delay = wait.delay(pings, error.retry_after());
+            // prime-agent's `providerWaitDecision`: a reported reset within the
+            // remaining bound is waited for exactly; one beyond it parks the
+            // session until then (plus a grace), as a durable one-shot job.
+            let reset = reported_reset(&error);
+            if let Some(reset) = reset
+                && reset > wait.max_total.saturating_sub(waited)
+            {
+                self.waiting(None);
+                self.gave_up.store(true, Ordering::SeqCst);
+                let pause = (reset + RESUME_GRACE).min(MAX_PAUSE);
+                let until = chrono::Utc::now()
+                    + chrono::Duration::from_std(pause).unwrap_or(chrono::Duration::zero());
+                let at = until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                let _ = self.sender.send(SessionEvent::QuotaParked { until });
+                return failed(ProviderError::new(
+                    ErrorCode::RateLimited,
+                    format!(
+                        "Retry failed after {} attempts: provider reported recovery in {}s, beyond the wait bound of {}s. Session parked until {at} and will resume automatically: {error}",
+                        pings - 1,
+                        reset.as_secs(),
+                        wait.max_total.as_secs()
+                    ),
+                ));
+            }
+            let delay = match reset {
+                Some(reset) => reset,
+                None => wait.delay(pings, None),
+            };
             if pings > wait.max_attempts || waited + delay > wait.max_total {
                 self.gave_up.store(true, Ordering::SeqCst);
                 self.waiting(None);
@@ -591,6 +683,24 @@ mod tests {
         assert_eq!(step(&entries, "a/1", false).unwrap().reference, "c/3");
         assert_eq!(step(&entries, "x/9", true).unwrap().reference, "a/1");
         assert!(step(&[], "a/1", true).is_none());
+    }
+
+    /// prime-agent's `parseProviderResetMs`: the window a provider names in its
+    /// error text.
+    #[test]
+    fn a_reset_named_in_the_error_text_is_read() {
+        use super::parse_reset;
+        use std::time::Duration;
+        assert_eq!(
+            parse_reset("You have hit your ChatGPT usage limit (plus plan). Try again in ~7272 min."),
+            Some(Duration::from_secs(7272 * 60))
+        );
+        assert_eq!(
+            parse_reset("quota exceeded; resets in 2 hours"),
+            Some(Duration::from_secs(7200))
+        );
+        assert_eq!(parse_reset("rate limited. Try later"), None);
+        assert_eq!(parse_reset("provider returned HTTP 429"), None);
     }
 
     #[test]

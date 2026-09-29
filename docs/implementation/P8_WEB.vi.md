@@ -10,11 +10,11 @@ Bổ sung Web UI local sau khi [P7](P7_RELEASE.vi.md) được nghiệm thu và 
 
 Mặc định là foreground host `ha web`, bind loopback, phục vụ một người dùng local. Host giữ cùng writer lock của data directory như CLI execution. Nếu CLI writer khác đang giữ directory, trả lỗi busy rõ ràng. Remote hosting, daemon nền và nhiều tài khoản cần thiết kế cùng quyền triển khai riêng.
 
-Đọc [sổ tay](README.vi.md), [plan](../RUST_HARNESS_PLAN.vi.md), [hợp đồng plugin](../PLUGIN_ARCHITECTURE.vi.md), [hợp đồng memory](../MEMORY_AND_CONTINUITY.vi.md), [bảng nghiệm thu](ACCEPTANCE_MAP.vi.md). Inspect evidence tiền nhiệm thật trước khi code.
+Đọc [sổ tay](README.vi.md), [plan](../RUST_HARNESS_PLAN.vi.md), [hợp đồng plugin](../PLUGIN_ARCHITECTURE.vi.md), [tổng quan kiến trúc](../ARCHITECTURE_OVERVIEW.vi.md), [bảng nghiệm thu](ACCEPTANCE_MAP.vi.md). Inspect evidence tiền nhiệm thật trước khi code.
 
 ## 2. Scope sở hữu và target files
 
-Sở hữu adapter mỏng `harness-web`, thư mục frontend được chọn trong SPEC P8, Web integration tests, đóng gói static assets và tài liệu vận hành. Chỉ mở rộng application-service interfaces khi đã có thao tác CLI tương đương hoặc read API đã được review. SQL storage, context composition, task ownership, approvals và memory policy vẫn thuộc owner hiện có.
+Sở hữu adapter mỏng `harness-web`, thư mục frontend được chọn trong SPEC P8, Web integration tests, đóng gói static assets và tài liệu vận hành. Chỉ mở rộng application-service interfaces khi đã có thao tác CLI tương đương hoặc read API đã được review. SQL storage, context composition, task ownership và approvals vẫn thuộc owner hiện có.
 
 Outputs: crate/module Web adapter, frontend source cùng dependencies đã khóa, `crates/harness-cli/tests/phase_p8.rs`, browser E2E tests và W01–W06 trong acceptance registry. Chọn frontend stack tối thiểu một cách rõ ràng; runbook không ép framework.
 
@@ -30,7 +30,7 @@ Loopback không thay thế authentication. Chốt bootstrap/session flow cho ng�
 
 Phụ thuộc: P7 đã nghiệm thu.
 
-Inspect CLI handlers và liệt kê commands/queries gốc cho sessions, chat, tasks, tool approvals, context, memory. Xác định authenticated principal của browser tại host boundary. Chốt request/response limits, ma trận browser/platform hỗ trợ và UX bootstrap local. Ghi khoảng trống service trong SPEC trước khi sửa contract.
+Inspect CLI handlers và liệt kê commands/queries gốc cho sessions, chat, tasks, tool approvals và context. Xác định authenticated principal của browser tại host boundary. Chốt request/response limits, ma trận browser/platform hỗ trợ và UX bootstrap local. Ghi khoảng trống service trong SPEC trước khi sửa contract.
 
 Bằng chứng: Ma trận route → service, threat cases và danh sách màn hình với non-goals rõ; thiết kế không có authority thứ hai.
 
@@ -54,17 +54,17 @@ Bằng chứng: Tests disconnect/reconnect lấy lại visible events có thứ 
 
 Phụ thuộc: P8-S03.
 
-Thêm chọn session/task, nhập message, progress/tool timeline và approval dialogs có bindings. Giữ command ID do client tạo qua các lần retry. Hiển thị persisted receipts, uncertainty, blocked states, stale approval errors rõ. Coi model/tool/memory output là dữ liệu không tin cậy: safe Markdown, không chạy raw script, allowlist link schemes.
+Thêm chọn session/task, nhập message, progress/tool timeline và approval dialogs có bindings. Giữ command ID do client tạo qua các lần retry. Hiển thị persisted receipts, uncertainty, blocked states, stale approval errors rõ. Coi model/tool output là dữ liệu không tin cậy: safe Markdown, không chạy raw script, allowlist link schemes.
 
 Bằng chứng: Browser tests bao phủ retry input đã nhận, approval bị deny/hết hiệu lực, tool output chứa script và task phục hồi còn pending work.
 
-### 4.5. P8-S05 — Thêm màn hình task, memory và context
+### 4.5. P8-S05 — Thêm màn hình task và context
 
 Phụ thuộc: P8-S04.
 
-Hiển thị task tree, child handoffs, effective scopes, source/version memory, trạng thái extraction jobs và inspection exact sanitized context packet. Gọi read/invalidate APIs cùng permission checks hiện có, không thêm trình sửa bảng trực tiếp. Giải thích evidence thiếu/bị forget và retrieval degraded. Mọi thao tác phá hủy hoặc đổi quyền dùng confirmation cùng service contract đã có.
+Hiển thị task tree, child handoffs, effective scopes và inspection exact sanitized context packet. Gọi read APIs cùng permission checks hiện có, không thêm trình sửa bảng trực tiếp. Giải thích evidence thiếu và retrieval degraded. Mọi thao tác phá hủy hoặc đổi quyền dùng confirmation cùng service contract đã có.
 
-Bằng chứng: Assertions UI/API khớp CLI về task IDs, receipts, memory scope và pending jobs; IDs/hash khác scope không lộ nội dung.
+Bằng chứng: Assertions UI/API khớp CLI về task IDs, receipts và pending jobs; IDs/hash khác scope không lộ nội dung.
 
 ### 4.6. P8-S06 — Chạy Web acceptance và regressions CLI
 
@@ -113,7 +113,7 @@ Không chuyển phase chỉ dựa trên summary. Gắn kết quả với revisio
 
 Nếu người dùng giao parallel work rõ ràng, backend adapter owner và frontend owner có thể làm song song sau khi P8-S01 chốt API/security contracts. Một integrator giữ dependency locks, browser fixtures và shared-service changes. Không chia authentication thành các mảnh thiếu một người review toàn bộ flow.
 
-Bàn giao `docs/evidence/P8.en.md`, `P8.vi.md`, cùng handoff tiếp tục được trong `docs/handoffs/` theo sổ tay. Ghi step IDs đã xong, lỗi còn lại, schema changes, commands và next action. Publish cần được cấp quyền rõ trong assignment coding.
+Ghi command focused, source revision, platform, test count và lỗi còn lại trong change hoặc CI log. Không tạo file evidence lịch sử hay handoff cho phase này.
 
 ## 9. Prompt giao agent
 

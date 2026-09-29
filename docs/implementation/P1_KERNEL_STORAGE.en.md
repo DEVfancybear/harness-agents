@@ -2,13 +2,13 @@
 
 English | [Tiếng Việt](P1_KERNEL_STORAGE.vi.md)
 
-Implementation runbook; P0–P7 implementation was delivered after this plan was written. See [P0–P7 audit evidence](../evidence/P0-P7_AUDIT.en.md) for verification and current limits; this runbook is not completion evidence. Original estimate: 8–11 person-days.
+Implementation runbook for the current P1 ownership boundary. Verify behavior against the current source and workspace gate. Original estimate: 8–11 person-days.
 
 ## 1. Outcome and entry gate
 
 Require an accepted [P0](P0_FOUNDATION.en.md) gate. Deliver the smallest durable work-continuation slice: input ACK only after commit, exact instruction retention, snapshot+tail restoration, one writer and scoped plugin ownership. Use scripted actors, not a production LLM loop.
 
-Read the [handbook](README.en.md), [plan](../RUST_HARNESS_PLAN.en.md), [plugin contract](../PLUGIN_ARCHITECTURE.en.md), [memory contract](../MEMORY_AND_CONTINUITY.en.md) and [acceptance map](ACCEPTANCE_MAP.en.md). Inspect actual predecessor evidence before coding.
+Read the [handbook](README.en.md), [plan](../RUST_HARNESS_PLAN.en.md), [plugin contract](../PLUGIN_ARCHITECTURE.en.md), [architecture overview](../ARCHITECTURE_OVERVIEW.en.md) and [acceptance map](ACCEPTANCE_MAP.en.md). Inspect actual predecessor evidence before coding.
 
 ## 2. Owned scope and target files
 
@@ -16,7 +16,7 @@ Own `crates/harness-kernel/`, `crates/harness-store-sqlite/`, `crates/harness-se
 
 ## 3. Contracts to settle before implementation
 
-Set the SQLite transaction coordinator API and host/session/task ownership rules before consumers code against them. Define input idempotency, event sequence CAS, instruction ledger updates, snapshot coverage/version/hash, durable source-work markers and typed storage failures. Kernel shutdown phases and plugin generations must be testable without model calls. Reserve memory job schema but do not implement extraction here.
+Set the SQLite transaction coordinator API and host/session/task ownership rules before consumers code against them. Define input idempotency, event sequence CAS, instruction ledger updates, snapshot coverage/version/hash, durable source-work markers and typed storage failures. Kernel shutdown phases and plugin generations must be testable without model calls. Keep unfinished background-work schemas out of this phase.
 
 ## 4. Ordered work items
 
@@ -99,7 +99,7 @@ The full gate includes the handbook's formatting, clippy, workspace tests, test-
 
 ## 7. Exit gate and forbidden shortcuts
 
-All primary cases and predecessor checks run; crash recovery uses a real disposable process. No in-memory-only queue may be the sole work record, no success ACK before commit, no `Drop`-only async cleanup. Do not add memory LLM extraction, shell tool execution or multi-agent scheduling.
+All primary cases and predecessor checks run; crash recovery uses a real disposable process. No ephemeral-only queue may be the sole work record, no success ACK before commit, no `Drop`-only async cleanup. Do not add shell tool execution or multi-agent scheduling.
 
 Do not advance phases on a summary alone. Bind results to the final tested revision, report missing checks, and preserve all predecessor regressions. Never alter fixture expectations merely to make implementation pass.
 
@@ -107,7 +107,7 @@ Do not advance phases on a summary alone. Bind results to the final tested revis
 
 After S01, kernel S03 and store S02 may be assigned in parallel to disjoint owners. S04–S06 integrate after their dependencies. One integrator owns migration numbering and shared contracts. P2 receives transaction/recovery APIs, snapshot format, plugin leases and the failure-injection protocol.
 
-Deliver `docs/evidence/P1.en.md` and `P1.vi.md`, plus a resumable handoff under `docs/handoffs/`, following the handbook. Include completed step IDs, pending failures, schema changes, commands and next action. Publication requires explicit authorization in the coding assignment.
+Record the focused command, source revision, platform, test count and any pending failure in the change or CI log. Do not create a historical evidence or handoff file for this phase.
 
 ## 9. Ready-to-use agent prompt
 

@@ -2,13 +2,13 @@
 
 [English](P6_EXTENSIONS.en.md) | Tiếng Việt
 
-Runbook triển khai; implementation P0–P7 đã được ghi nhận sau bản kế hoạch này. Dùng [evidence audit P0–P7](../evidence/P0-P7_AUDIT.vi.md) để xem kiểm chứng và giới hạn hiện tại; runbook này không tự là bằng chứng hoàn tất. Dự toán ban đầu: 5–8 ngày công.
+Runbook triển khai cho boundary ownership P6 hiện tại. Kiểm tra hành vi theo source hiện tại và workspace gate. Dự toán ban đầu: 5–8 ngày công.
 
 ## 1. Kết quả và điều kiện vào phase
 
-Cần [P5](P5_MULTI_AGENT.vi.md) được chấp nhận. Bàn giao extension points có kiểm soát: skills có version, MCP client, stdio bridges tool/provider bounded; không làm yếu durability, policy hoặc scoped memory.
+Cần [P5](P5_MULTI_AGENT.vi.md) được chấp nhận. Bàn giao extension points có kiểm soát: skills có version, MCP client, stdio bridges tool/provider bounded; không làm yếu durability, policy hoặc scope isolation.
 
-Đọc [sổ tay](README.vi.md), [plan](../RUST_HARNESS_PLAN.vi.md), [hợp đồng plugin](../PLUGIN_ARCHITECTURE.vi.md), [hợp đồng memory](../MEMORY_AND_CONTINUITY.vi.md), [bảng nghiệm thu](ACCEPTANCE_MAP.vi.md). Inspect evidence tiền nhiệm thật trước khi code.
+Đọc [sổ tay](README.vi.md), [plan](../RUST_HARNESS_PLAN.vi.md), [hợp đồng plugin](../PLUGIN_ARCHITECTURE.vi.md), [tổng quan kiến trúc](../ARCHITECTURE_OVERVIEW.vi.md), [bảng nghiệm thu](ACCEPTANCE_MAP.vi.md). Inspect evidence tiền nhiệm thật trước khi code.
 
 ## 2. Scope sở hữu và target files
 
@@ -64,7 +64,7 @@ Bằng chứng: K14 chặn repo không trust xin executable/secret; skill update
 
 Phụ thuộc: P6-S03, P6-S04, P6-S05.
 
-Unload extractor/tool/provider trong fixtures, restart plugin được phép bằng generation mới, giữ jobs/session evidence. Giữ packets cũ để replay; chặn critical event/schema không hỗ trợ. Recheck memory revocation/sensitive data qua extensions.
+Unload tool/provider trong fixtures, restart plugin được phép bằng generation mới, giữ task/session evidence. Giữ packet cũ để replay; chặn critical event/schema không hỗ trợ. Recheck revocation/sensitive data qua extensions.
 
 Bằng chứng: K01/K03/K05/K08/K10/K11 vẫn đúng với extension processes thật.
 
@@ -107,7 +107,7 @@ Không chuyển phase chỉ dựa trên summary. Gắn kết quả với revisio
 
 S02 transport có owner chung. Khi contract ổn định có thể giao S03 bridge/S04 MCP/S05 skills vào paths riêng. Integrator giữ protocol versions/config registry. P7 nhận compatibility fixtures, inventory supported methods, shutdown/error evidence.
 
-Bàn giao `docs/evidence/P6.en.md`, `P6.vi.md`, cùng handoff tiếp tục được trong `docs/handoffs/` theo sổ tay. Ghi step IDs đã xong, lỗi còn lại, schema changes, commands và next action. Publish cần được cấp quyền rõ trong assignment coding.
+Ghi command focused, source revision, platform, test count và lỗi còn lại trong change hoặc CI log. Không tạo file evidence lịch sử hay handoff cho phase này.
 
 ## 9. Prompt giao agent
 
