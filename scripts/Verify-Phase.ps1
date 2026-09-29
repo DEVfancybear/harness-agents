@@ -1,46 +1,392 @@
 #Requires -Version 7.0
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)] [ValidatePattern('^P[0-9]+$')] [string] $Phase,
-    [switch] $SelfTest
+    [ValidateSet('P0', 'P1', 'P2', 'P3', 'P5', 'P6', 'P7')]
+    [string] $Phase = 'P0',
+    [string] $RepositoryRoot = (Join-Path $PSScriptRoot '..'),
+    [switch] $SelfTest,
+    [switch] $Json
 )
 
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$repoRoot = Split-Path -Parent $PSScriptRoot
-$activePhases = @('P0', 'P1', 'P2', 'P3', 'P5', 'P6', 'P7', 'P8')
-if ($Phase -notin $activePhases) {
-    Write-Error "Unknown or retired phase: $Phase"
-    exit 2
+. (Join-Path $PSScriptRoot 'GateTestIsolation.ps1')
+
+function New-GateError {
+    param(
+        [Parameter(Mandatory)] [string] $Code,
+        [Parameter(Mandatory)] [string] $Message
+    )
+    return "$Code`: $Message"
 }
 
-$runbook = Get-ChildItem -LiteralPath (Join-Path $repoRoot 'docs/implementation') -Filter "$Phase`_*.en.md" -File | Select-Object -First 1
-$runbookVi = Get-ChildItem -LiteralPath (Join-Path $repoRoot 'docs/implementation') -Filter "$Phase`_*.vi.md" -File | Select-Object -First 1
-if ($null -eq $runbook -or $null -eq $runbookVi) {
-    Write-Error "Bilingual runbook missing for $Phase"
-    exit 2
-}
+function Invoke-CheckedCommand {
+    param(
+        [Parameter(Mandatory)] [string] $Name,
+        [Parameter(Mandatory)] [string] $FilePath,
+        [Parameter(Mandatory)] [string[]] $Arguments
+    )
 
-$manifest = Get-Content -LiteralPath (Join-Path $repoRoot 'docs/implementation/manifest.json') -Raw | ConvertFrom-Json
-$entry = @($manifest.phases | Where-Object { $_.id -eq $Phase })[0]
-if ($null -eq $entry) {
-    Write-Error "Manifest entry missing for $Phase"
-    exit 2
-}
-foreach ($required in @($entry.en, $entry.vi)) {
-    if (-not (Test-Path -LiteralPath (Join-Path $repoRoot "docs/implementation/$required") -PathType Leaf)) {
-        Write-Error "Manifest runbook missing: $required"
-        exit 2
+    $output = @(& $FilePath @Arguments 2>&1 | ForEach-Object { $_.ToString() })
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "$Name exited $exitCode`n$($output -join [Environment]::NewLine)")
+    }
+    return [pscustomobject]@{
+        Name = $Name
+        Arguments = $Arguments
+        Output = $output
     }
 }
 
-$rustTests = Get-ChildItem -LiteralPath (Join-Path $repoRoot 'crates') -Recurse -Filter "phase_$($Phase.Substring(1)).rs" -File -ErrorAction SilentlyContinue
-if (-not $SelfTest -and $null -eq $rustTests) {
-    Write-Warning "No focused Rust target named phase_$($Phase.Substring(1)).rs was found; run the workspace gate before accepting this phase."
+function Get-DiscoveredTestNames {
+    param([Parameter(Mandatory)] [AllowEmptyCollection()] [AllowEmptyString()] [string[]] $Output)
+
+    $names = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($line in $Output) {
+        if ($line -match '^\s*(?<name>[A-Za-z0-9_:-]+): test$') {
+            [void] $names.Add($Matches.name)
+        }
+    }
+    return @($names | Sort-Object)
+}
+
+function Get-TargetTestEntries {
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]] $Tests,
+        [string] $DefaultTarget = ''
+    )
+
+    # An entry may be plain ("name", proven by the case's own target) or
+    # qualified ("phase_p5::name", proven by a later acceptance target).
+    $entries = [System.Collections.Generic.List[object]]::new()
+    foreach ($test in $Tests) {
+        $separator = $test.IndexOf('::')
+        if ($separator -gt 0) {
+            $entries.Add([pscustomobject]@{
+                Target = $test.Substring(0, $separator)
+                ShortName = $test.Substring($separator + 2)
+                Qualified = $test
+            })
+        } else {
+            $entries.Add([pscustomobject]@{
+                Target = $DefaultTarget
+                ShortName = $test
+                Qualified = $test
+            })
+        }
+    }
+    return @($entries)
+}
+function Assert-RequiredTestDiscovery {
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]] $Discovered,
+        [Parameter(Mandatory)] [string[]] $Required
+    )
+
+    if ($Required.Count -eq 0) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message 'registry has no required tests for this phase')
+    }
+    if ($Discovered.Count -eq 0) {
+        throw (New-GateError -Code 'gate_test_discovery_empty' -Message 'cargo test discovery returned zero tests')
+    }
+    foreach ($testName in $Required) {
+        if ($testName -notin $Discovered) {
+            throw (New-GateError -Code 'gate_configuration_error' -Message "required test was not discovered: $testName")
+        }
+    }
+}
+
+function Assert-RequiredTestResult {
+    param(
+        [Parameter(Mandatory)] [string] $TestName,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [AllowEmptyString()] [string[]] $Output
+    )
+
+    $escaped = [regex]::Escape($TestName)
+    if (($Output -join "`n") -match "(?m)^test\s+$escaped\s+\.\.\.\s+ignored\b") {
+        throw (New-GateError -Code 'gate_required_test_ignored' -Message "required test is ignored: $TestName")
+    }
+    if (($Output -join "`n") -notmatch "(?m)^test\s+$escaped\s+\.\.\.\s+ok\b") {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "required test did not report success: $TestName")
+    }
+}
+
+function Resolve-RepositoryFile {
+    param(
+        [Parameter(Mandatory)] [string] $Root,
+        [Parameter(Mandatory)] [string] $RelativePath
+    )
+
+    $candidate = [System.IO.Path]::GetFullPath((Join-Path $Root $RelativePath))
+    $relative = [System.IO.Path]::GetRelativePath($Root, $candidate)
+    if ($relative -eq '..' -or $relative.StartsWith("..$([System.IO.Path]::DirectorySeparatorChar)") -or [System.IO.Path]::IsPathRooted($relative)) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "registry path escapes repository: $RelativePath")
+    }
+    if (-not (Test-Path -LiteralPath $candidate)) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "required fixture or artifact is missing: $RelativePath")
+    }
+    return $candidate
+}
+
+function Get-SourceTreeDigest {
+    param(
+        [Parameter(Mandatory)] [string] $Root,
+        [Parameter(Mandatory)] [string] $Phase
+    )
+
+    $paths = @(& git -C $Root ls-files --cached --others --exclude-standard)
+    if ($LASTEXITCODE -ne 0) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message 'git could not enumerate the source tree')
+    }
+    if ($paths.Count -eq 0) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message 'source tree enumeration returned zero files')
+    }
+    [string[]] $metadataPaths = @(
+        "docs/evidence/$Phase.en.md",
+        "docs/evidence/$Phase.vi.md",
+        "docs/handoffs/$Phase.en.md",
+        "docs/handoffs/$Phase.vi.md"
+    )
+    [string[]] $normalizedPaths = @($paths | ForEach-Object { ([string] $_).Replace('\', '/') })
+    [string[]] $excludedPaths = @($normalizedPaths | Where-Object { $metadataPaths -contains $_ })
+    [string[]] $orderedPaths = @($normalizedPaths | Where-Object { $metadataPaths -notcontains $_ })
+    if ($orderedPaths.Count -eq 0) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message 'source tree has no non-metadata files to hash')
+    }
+    [System.Array]::Sort($orderedPaths, [System.StringComparer]::Ordinal)
+    [System.Array]::Sort($excludedPaths, [System.StringComparer]::Ordinal)
+
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $utf8 = [System.Text.UTF8Encoding]::new($false)
+        $fileCount = 0
+        foreach ($relativePath in $orderedPaths) {
+            if ([string]::IsNullOrWhiteSpace($relativePath)) {
+                throw (New-GateError -Code 'gate_configuration_error' -Message 'source tree contains an empty path')
+            }
+            $absolutePath = [System.IO.Path]::GetFullPath((Join-Path $Root $relativePath))
+            $relativeCheck = [System.IO.Path]::GetRelativePath($Root, $absolutePath)
+            if ($relativeCheck -eq '..' -or $relativeCheck.StartsWith("..$([System.IO.Path]::DirectorySeparatorChar)") -or
+                [System.IO.Path]::IsPathRooted($relativeCheck) -or -not (Test-Path -LiteralPath $absolutePath -PathType Leaf)) {
+                throw (New-GateError -Code 'gate_configuration_error' -Message "source tree path is unsafe or missing: $relativePath")
+            }
+            $contentHash = (Get-FileHash -LiteralPath $absolutePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $record = $relativePath.Replace('\', '/') + [char]0 + $contentHash + "`n"
+            $bytes = $utf8.GetBytes($record)
+            $buffer = [byte[]]::new($bytes.Length)
+            [void] $hasher.TransformBlock($bytes, 0, $bytes.Length, $buffer, 0)
+            $fileCount++
+        }
+        [void] $hasher.TransformFinalBlock([byte[]]::new(0), 0, 0)
+        $digest = [Convert]::ToHexString($hasher.Hash).ToLowerInvariant()
+        return [pscustomobject]@{
+            algorithm = 'sha256'
+            file_count = $fileCount
+            digest = "sha256:$digest"
+            scope = 'workspace source excluding phase evidence and handoff metadata'
+            excluded_paths = $excludedPaths
+        }
+    } finally {
+        $hasher.Dispose()
+    }
+}
+
+function Invoke-NegativeControl {
+    param(
+        [Parameter(Mandatory)] [string] $Name,
+        [Parameter(Mandatory)] [string] $ExpectedCode,
+        [Parameter(Mandatory)] [scriptblock] $Action
+    )
+
+    try {
+        & $Action
+    } catch {
+        if ($_.Exception.Message.StartsWith("$ExpectedCode`:")) {
+            Write-Output "NEGATIVE_CONTROL_OK: $Name"
+            return
+        }
+        throw
+    }
+    throw "NEGATIVE_CONTROL_FAILED: $Name"
+}
+
+function Invoke-GateSelfTest {
+    $expectedTest = 'p0_f01_cli_help_and_version_run_without_credentials'
+    Invoke-NegativeControl -Name 'zero-test-discovery' -ExpectedCode 'gate_test_discovery_empty' -Action {
+        Assert-RequiredTestDiscovery -Discovered @() -Required @($expectedTest)
+    }
+    Invoke-NegativeControl -Name 'test-command-failure' -ExpectedCode 'gate_configuration_error' -Action {
+        Invoke-CheckedCommand -Name 'synthetic-test' -FilePath (Join-Path $PSHOME 'pwsh') -Arguments @('-NoProfile', '-Command', 'exit 17')
+    }
+    Invoke-NegativeControl -Name 'missing-fixture' -ExpectedCode 'gate_configuration_error' -Action {
+        $missingRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('harness-agents-p0-missing-' + [guid]::NewGuid().ToString('N'))
+        Resolve-RepositoryFile -Root $missingRoot -RelativePath 'missing-fixture.json'
+    }
+    Invoke-NegativeControl -Name 'required-test-ignored' -ExpectedCode 'gate_required_test_ignored' -Action {
+        Assert-RequiredTestResult -TestName $expectedTest -Output @("test $expectedTest ... ignored")
+    }
+    Write-Output "PHASE_GATE_SELFTEST_OK: $Phase"
 }
 
 if ($SelfTest) {
-    Write-Host "PASS Verify-Phase self-test: $Phase is an active bilingual phase with a manifest entry."
-} else {
-    Write-Host "PASS Verify-Phase: $Phase runbook and manifest are present."
+    Invoke-GateSelfTest
+    exit 0
 }
-exit 0
+
+$repoRoot = (Resolve-Path -LiteralPath $RepositoryRoot).Path
+$registryPath = Resolve-RepositoryFile -Root $repoRoot -RelativePath 'tests/acceptance/registry.json'
+try {
+    $registry = Get-Content -LiteralPath $registryPath -Raw -Encoding utf8 | ConvertFrom-Json
+} catch {
+    throw (New-GateError -Code 'gate_configuration_error' -Message 'acceptance registry is not valid JSON')
+}
+if ($registry.schema_version -ne 1 -or $registry.registry_kind -cne 'acceptance') {
+    throw (New-GateError -Code 'gate_configuration_error' -Message 'acceptance registry has an unsupported schema or kind')
+}
+
+$phaseCases = @($registry.cases | Where-Object { $_.phase -ceq $Phase -and $_.required -eq $true })
+if ($phaseCases.Count -eq 0) {
+    throw (New-GateError -Code 'gate_configuration_error' -Message "registry has no required cases for $Phase")
+}
+foreach ($case in $phaseCases) {
+    if ($case.readiness -cne 'implemented') {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "required case is not implemented: $($case.id)")
+    }
+    if ([string]::IsNullOrWhiteSpace($case.target) -or @($case.test_names).Count -eq 0) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "required case lacks target or test name: $($case.id)")
+    }
+    if ($null -ne $case.fixture) {
+        [void] (Resolve-RepositoryFile -Root $repoRoot -RelativePath $case.fixture)
+    }
+}
+
+# P4 (scoped memory) was retired with the harness-memory crate.
+$activePhases = @('P0', 'P1', 'P2', 'P3', 'P5', 'P6', 'P7')
+$activeCases = @($registry.cases | Where-Object { $_.phase -in $activePhases })
+foreach ($activeCase in $activeCases) {
+    if ($activeCase.readiness -cne 'implemented' -or $activeCase.required -ne $true) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "accepted case is not implemented and required: $($activeCase.id)")
+    }
+}
+$futureCases = @($registry.cases | Where-Object { $_.id -match '^[CK]\d{2}$' })
+if ($futureCases.Count -ne 32) {
+    throw (New-GateError -Code 'gate_configuration_error' -Message 'registry must contain all 32 active C/K cases')
+}
+foreach ($futureCase in $futureCases) {
+    if ($futureCase.phase -notin $activePhases -and
+        ($futureCase.readiness -cne 'not_implemented' -or $futureCase.required -ne $false)) {
+        throw (New-GateError -Code 'gate_configuration_error' -Message "future case is falsely marked ready: $($futureCase.id)")
+    }
+}
+
+$targets = @($phaseCases | ForEach-Object { $_.target } | Sort-Object -Unique)
+$expectedTarget = "phase_$($Phase.ToLowerInvariant())"
+if ($targets.Count -ne 1 -or $targets[0] -cne $expectedTarget) {
+    throw (New-GateError -Code 'gate_configuration_error' -Message "$Phase registry must use the $expectedTarget target only")
+}
+$requiredTests = @($phaseCases | ForEach-Object { $_.test_names } | Sort-Object -Unique)
+$phaseTestFile = "phase_$($Phase.ToLowerInvariant())"
+
+$results = [System.Collections.Generic.List[object]]::new()
+Push-Location -LiteralPath $repoRoot
+try {
+    # This step keeps cargo's default parallelism. It was changed to fully
+    # serialised (`--jobs 1` plus `--test-threads=1`) while investigating CI
+    # failures, and that was reverted on measurement, not on preference:
+    #   - serialised: green in 3 of 3 direct runs, but it pushed this gate to
+    #     862 s, past the 10-minute job timeout CI gives P0, and the gate still
+    #     went red once on the same revision while the identical cargo command run
+    #     by hand passed;
+    #   - parallel: the failing suites bind a loopback fixture and are green
+    #     whenever their own binary runs alone, so the instability is in this
+    #     machine's handling of many concurrent loopback connections.
+    # Serialising therefore bought no guarantee for a large time cost. Do not add
+    # either flag without a measurement showing parallelism itself is the cause.
+    foreach ($step in @(
+        @{ Name = 'format'; File = 'cargo'; Arguments = @('fmt', '--all', '--', '--check') },
+        @{ Name = 'clippy'; File = 'cargo'; Arguments = @('clippy', '--workspace', '--all-targets', '--locked', '--', '-D', 'warnings') },
+        # This case consumes the release candidate prepared by the dedicated M9
+        # job. Phase gates run the broad suite without building that artifact;
+        # the M9 milestone gate runs this case explicitly after preparing it.
+        @{ Name = 'workspace-tests'; File = 'cargo'; Arguments = @('test', '--workspace', '--all-targets', '--locked', '--', '--skip', 'm9_04_release_candidate_has_checksums_and_is_not_published') }
+    )) {
+        # The broad suite re-runs a failure alone before calling it one; see
+        # GateTestIsolation.ps1 for why and for what still fails the gate.
+        $result = if ($step.Name -ceq 'workspace-tests') {
+            Invoke-WorkspaceTestsIsolating -Name $step.Name -Arguments $step.Arguments
+        } else {
+            Invoke-CheckedCommand -Name $step.Name -FilePath $step.File -Arguments $step.Arguments
+        }
+        $results.Add([pscustomobject]@{ name = $step.Name; result = 'passed' })
+        if (-not $Json) { Write-Output "GATE_STEP_OK: $($step.Name)" }
+    }
+
+    $predecessorPhases = switch ($Phase) {
+        'P1' { @('P0') }
+        'P2' { @('P0', 'P1') }
+        'P3' { @('P0', 'P1', 'P2') }
+        'P5' { @('P0', 'P1', 'P2', 'P3') }
+        'P6' { @('P0', 'P1', 'P2', 'P3', 'P5') }
+        'P7' { @('P0', 'P1', 'P2', 'P3', 'P5', 'P6') }
+        default { @() }
+    }
+    foreach ($predecessorPhase in $predecessorPhases) {
+        $predecessorCases = @($registry.cases | Where-Object { $_.phase -ceq $predecessorPhase -and $_.required -eq $true })
+        $predecessorTests = @($predecessorCases | ForEach-Object { $_.test_names } | Sort-Object -Unique)
+        $predecessorTestFile = "phase_$($predecessorPhase.ToLowerInvariant())"
+        $predecessorDiscovery = Invoke-CheckedCommand -Name "predecessor-$predecessorPhase-test-discovery" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $predecessorTestFile, '--locked', '--', '--list')
+        $predecessorDiscovered = Get-DiscoveredTestNames -Output $predecessorDiscovery.Output
+        $predecessorLocal = @($predecessorTests | Where-Object { $_ -notmatch '::' })
+        Assert-RequiredTestDiscovery -Discovered $predecessorDiscovered -Required $predecessorLocal
+        foreach ($testName in $predecessorLocal) {
+            $result = Invoke-CheckedCommand -Name "predecessor-$predecessorPhase-test:$testName" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $predecessorTestFile, '--locked', $testName, '--', '--exact')
+            Assert-RequiredTestResult -TestName $testName -Output $result.Output
+        }
+        # A case may also be proven by a test in a later acceptance target. Such
+        # entries are qualified with their target and run here as regressions.
+        foreach ($entry in (Get-TargetTestEntries -Tests $predecessorTests -DefaultTarget $predecessorTestFile)) {
+            $result = Invoke-CheckedCommand -Name "predecessor-$predecessorPhase-test:$($entry.Qualified)" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $entry.Target, '--locked', $entry.ShortName, '--', '--exact')
+            Assert-RequiredTestResult -TestName $entry.ShortName -Output $result.Output
+        }
+        $results.Add([pscustomobject]@{ name = "predecessor-$predecessorPhase-regression"; result = 'passed'; count = $predecessorTests.Count })
+        if (-not $Json) { Write-Output "GATE_STEP_OK: predecessor-$predecessorPhase-regression ($($predecessorTests.Count) tests)" }
+    }
+
+    $phaseEntries = @(Get-TargetTestEntries -Tests $requiredTests -DefaultTarget $phaseTestFile)
+    $discovery = Invoke-CheckedCommand -Name 'phase-test-discovery' -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $phaseTestFile, '--locked', '--', '--list')
+    $discoveredTests = Get-DiscoveredTestNames -Output $discovery.Output
+    Assert-RequiredTestDiscovery -Discovered $discoveredTests -Required @($phaseEntries | Where-Object { $_.Target -ceq $phaseTestFile } | ForEach-Object { $_.ShortName })
+    $results.Add([pscustomobject]@{ name = 'phase-test-discovery'; result = 'passed'; tests = $discoveredTests })
+    if (-not $Json) { Write-Output "GATE_STEP_OK: phase-test-discovery ($($discoveredTests.Count) tests)" }
+
+    foreach ($entry in $phaseEntries) {
+        $result = Invoke-CheckedCommand -Name "required-test:$($entry.Qualified)" -FilePath 'cargo' -Arguments @('test', '-p', 'harness-cli', '--test', $entry.Target, '--locked', $entry.ShortName, '--', '--exact')
+        Assert-RequiredTestResult -TestName $entry.ShortName -Output $result.Output
+    }
+    $results.Add([pscustomobject]@{ name = 'required-tests'; result = 'passed'; count = $requiredTests.Count })
+    if (-not $Json) { Write-Output "GATE_STEP_OK: required-tests ($($requiredTests.Count) tests)" }
+
+    $docs = Invoke-CheckedCommand -Name 'documentation-checks' -FilePath 'pwsh' -Arguments @('-NoProfile', '-File', 'scripts/Verify-Docs.ps1', '-SelfTest')
+    $results.Add([pscustomobject]@{ name = 'documentation-checks'; result = 'passed' })
+    if (-not $Json) { Write-Output 'GATE_STEP_OK: documentation-checks' }
+} finally {
+    Pop-Location
+}
+
+$sourceTree = Get-SourceTreeDigest -Root $repoRoot -Phase $Phase
+$summary = [ordered]@{
+    schema_version = 1
+    phase = $Phase
+    result = 'passed'
+    source_tree = $sourceTree
+    required_case_ids = @($phaseCases | ForEach-Object { $_.id } | Sort-Object)
+    required_test_count = $requiredTests.Count
+    discovered_test_count = $discoveredTests.Count
+    steps = @($results)
+}
+if ($Json) {
+    $summary | ConvertTo-Json -Depth 8 -Compress
+} else {
+    Write-Output "GATE_RESULT_JSON: $($summary | ConvertTo-Json -Depth 8 -Compress)"
+}
