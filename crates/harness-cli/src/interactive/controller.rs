@@ -2653,6 +2653,42 @@ impl InteractiveController {
                 }
                 _ => self.reference("/agents", self.service.agents_summary(), &mut effects),
             },
+            // prime-agent's `/rlm-max-depth [<int> [--global]]`.
+            "/rlm-max-depth" => {
+                let words = raw_argument
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .collect::<Vec<_>>();
+                // `Err(())`: the words are not `[<int> [--global]]`.
+                let change: Result<Option<(u32, bool)>, ()> = match words.as_slice() {
+                    [] => Ok(None),
+                    [depth] => depth.parse().map(|depth| Some((depth, false))).map_err(drop),
+                    [depth, "--global"] => {
+                        depth.parse().map(|depth| Some((depth, true))).map_err(drop)
+                    }
+                    _ => Err(()),
+                };
+                match change {
+                    Ok(Some((depth, _))) if depth > super::delegation::RLM_MAX_DEPTH_CAP => {
+                        self.push_history(&mut effects, HistoryItem::Error {
+                            message: format!(
+                                "ha runs children at most {} levels deep; /rlm-max-depth takes 0..={}",
+                                super::delegation::RLM_MAX_DEPTH_CAP,
+                                super::delegation::RLM_MAX_DEPTH_CAP
+                            ),
+                        });
+                    }
+                    Ok(change) => {
+                        if let Err(message) = self.service.rlm_max_depth(change) {
+                            self.push_history(&mut effects, HistoryItem::Error { message });
+                        }
+                    }
+                    Err(()) => self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "Usage: /rlm-max-depth [<non-negative integer> [--global]]".to_owned(),
+                    }),
+                }
+                effects.push(Effect::Redraw);
+            }
             "/skills" => {
                 self.reference("/skills", self.service.skills_summary(), &mut effects);
             }
@@ -4062,6 +4098,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    /// A `/rlm-max-depth` change as the port receives it.
+    type DepthChange = Option<(u32, bool)>;
+
     /// Test port that records what the controller admitted.
     #[derive(Clone, Default)]
     struct RecordingPort {
@@ -4099,6 +4138,8 @@ mod tests {
         gate_cancels: Arc<Mutex<u32>>,
         /// Every `/scoped-models` argument, as the port received it.
         scopes: Arc<Mutex<Vec<Option<String>>>>,
+        /// Every `/rlm-max-depth` change the port received.
+        depths: Arc<Mutex<Vec<DepthChange>>>,
     }
 
     impl SessionPort for RecordingPort {
@@ -4221,6 +4262,11 @@ mod tests {
                 .lock()
                 .expect("side question log")
                 .push(question.to_owned());
+            Ok(())
+        }
+
+        fn rlm_max_depth(&mut self, change: Option<(u32, bool)>) -> Result<(), String> {
+            self.depths.lock().expect("depth log").push(change);
             Ok(())
         }
 
@@ -8115,6 +8161,33 @@ mod tests {
             "\"C:\\work\\shot.png\"",
             "an already quoted path is not quoted twice"
         );
+    }
+
+    /// prime-agent's `/rlm-max-depth [<int> [--global]]`, and its usage line.
+    #[test]
+    fn rlm_max_depth_reads_prime_agents_arguments() {
+        let mut harness = bench(true);
+        for line in [
+            "/rlm-max-depth",
+            "/rlm-max-depth 1",
+            "/rlm-max-depth 0 --global",
+        ] {
+            submit_text(&mut harness.controller, line);
+        }
+        assert_eq!(
+            *harness.port.depths.lock().expect("depths"),
+            [None, Some((1, false)), Some((0, true))]
+        );
+        let usage = effects_to_plain(&submit_text(&mut harness.controller, "/rlm-max-depth two"))
+            .join("\n");
+        assert!(
+            usage.contains("Usage: /rlm-max-depth [<non-negative integer> [--global]]"),
+            "{usage}"
+        );
+        let over =
+            effects_to_plain(&submit_text(&mut harness.controller, "/rlm-max-depth 5")).join("\n");
+        assert!(over.contains("0..=2"), "{over}");
+        assert_eq!(harness.port.depths.lock().expect("depths").len(), 3);
     }
 
     #[test]

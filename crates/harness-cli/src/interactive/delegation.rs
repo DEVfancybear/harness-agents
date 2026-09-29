@@ -28,7 +28,7 @@ use harness_orchestrator::{
     SchedulerConfig, TaskBrief, VerifiedSnapshot, WorkerBackend, WorkerOutcome, WorkerRequest,
     WorkerScheduler, WorkspaceManager, WorktreeRecord,
 };
-use harness_providers::{CancellationToken, ModelProvider};
+use harness_providers::{CancellationToken, MessageRole, ModelProvider, ProviderMessage};
 use harness_runtime::{RunInbox, RunRequest, RuntimeConfig, RuntimeService};
 use harness_store_sqlite::{SqliteStore, WorktreeRecordRow};
 use harness_tools::{
@@ -88,6 +88,41 @@ const AGENT_FAMILY_REACH_ERROR: &str = "Agent reach is limited to parent, siblin
 const MAX_NOTE_CHARS: usize = 512;
 const NOTE_INTERVAL: Duration = Duration::from_secs(10);
 const NOTE_RING: usize = 5;
+
+/// prime-agent's default `RLM_MAX_DEPTH`: the root's children may spawn children
+/// of their own, whose children may not.
+pub const DEFAULT_RLM_MAX_DEPTH: u32 = 2;
+
+/// The deepest `RLM_MAX_DEPTH` this host runs: the delegation contract's depth
+/// cap. prime-agent takes any non-negative integer.
+pub const RLM_MAX_DEPTH_CAP: u32 = harness_orchestrator::DEFAULT_MAX_DEPTH;
+
+/// Where the session's `RLM_MAX_DEPTH` came from, in prime-agent's words
+/// (`core/rlm-max-depth.ts`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaxDepthSource {
+    Chat,
+    Global,
+    Env,
+    Default,
+}
+
+impl MaxDepthSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Global => "global",
+            Self::Env => "env",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// prime-agent's refusal of a spawn past the depth limit.
+fn depth_limit_error(depth: u32, max_depth: u32) -> String {
+    format!("RLM recursion depth limit reached (RLM_DEPTH={depth}, RLM_MAX_DEPTH={max_depth})")
+}
 
 /// The parent's web tools, which a child inherits: its catalog and dispatcher.
 pub type ChildWebTools = (ExternalTools, Arc<dyn ExternalToolDispatcher>);
@@ -214,6 +249,18 @@ struct ChildRecord {
     activity: String,
     tool_calls: u32,
     cost: String,
+    /// The child that spawned this one; `None` for the root agent's children.
+    parent: Option<TaskId>,
+    /// prime-agent's `rlmDepth`: 1 for the root's children.
+    depth: u32,
+    /// The `RLM_MAX_DEPTH` fixed when this child was created, as prime-agent
+    /// hands a child its parent's value.
+    max_depth: u32,
+    /// The child is inside a turn: a message reaches it through its run's inbox.
+    in_turn: bool,
+    /// Messages and its own children's notices that arrived between its turns;
+    /// its next turn opens with them.
+    pending: Vec<String>,
 }
 
 impl ChildRecord {
@@ -275,8 +322,9 @@ impl ChildRecord {
             ChildState::Failed { error } => format!("failed: {}", first_line(error)),
             ChildState::Cancelled { reason } => format!("cancelled: {}", first_line(reason)),
         };
+        let indent = "  ".repeat(usize::try_from(self.depth.saturating_sub(1)).unwrap_or(0));
         let mut line = format!(
-            "{} · {} · {} · {state} · {}s · {} tool call(s) · cost {}",
+            "{indent}{} · {} · {} · {state} · {}s · {} tool call(s) · cost {}",
             self.name,
             self.role.as_str(),
             self.model,
@@ -329,9 +377,61 @@ struct AgentsShared {
     children: Mutex<Vec<ChildRecord>>,
     changed: tokio::sync::Notify,
     buckets: Mutex<HashMap<String, (f64, Instant)>>,
+    /// The session's `RLM_MAX_DEPTH` and where it came from.
+    max_depth: Mutex<(u32, MaxDepthSource)>,
+    /// The session's children, for a child that spawns children of its own.
+    agents: std::sync::OnceLock<std::sync::Weak<SessionAgents>>,
 }
 
 impl AgentsShared {
+    fn new(
+        store: Arc<SharedStore>,
+        sender: UnboundedSender<SessionEvent>,
+        approval_gate: Arc<dyn ApprovalGate>,
+    ) -> Self {
+        Self {
+            store,
+            sender,
+            approval_gate,
+            ledger: Mutex::new(None),
+            launches: Mutex::new(HashMap::new()),
+            children: Mutex::new(Vec::new()),
+            changed: tokio::sync::Notify::new(),
+            buckets: Mutex::new(HashMap::new()),
+            max_depth: Mutex::new((DEFAULT_RLM_MAX_DEPTH, MaxDepthSource::Default)),
+            agents: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn max_depth(&self) -> (u32, MaxDepthSource) {
+        self.max_depth
+            .lock()
+            .map_or((DEFAULT_RLM_MAX_DEPTH, MaxDepthSource::Default), |value| {
+                *value
+            })
+    }
+
+    /// Stop `task_id`'s running descendants: a child that is gone takes its
+    /// children with it, as closing a prime-agent session closes its subtree.
+    fn cancel_descendants(&self, task_id: &TaskId, reason: &str) {
+        let Ok(mut children) = self.children.lock() else {
+            return;
+        };
+        let mut parents = vec![task_id.clone()];
+        while let Some(parent) = parents.pop() {
+            for child in children
+                .iter_mut()
+                .filter(|child| child.parent.as_ref() == Some(&parent))
+            {
+                parents.push(child.task_id.clone());
+                if !child.state.settled() {
+                    child.cancel_reason = Some(reason.to_owned());
+                    child.cancellation.cancel();
+                }
+            }
+        }
+    }
+
     fn update<R>(&self, task_id: &TaskId, change: impl FnOnce(&mut ChildRecord) -> R) -> Option<R> {
         let mut children = self.children.lock().ok()?;
         let child = children
@@ -359,14 +459,26 @@ impl AgentsShared {
             let notice = (child.waiters == 0 && !child.suppress_notice)
                 .then(|| terminal_notice(&child.name, &child.state, child.replied))
                 .flatten();
-            notice.map(|notice| (child.name.clone(), notice))
+            (
+                child.parent.clone(),
+                notice.map(|notice| (child.name.clone(), notice)),
+            )
         });
-        self.changed.notify_waiters();
-        if let Some(Some((name, notice))) = notice {
-            let _ = self
-                .sender
-                .send(SessionEvent::ChildSettled { name, notice });
+        self.cancel_descendants(task_id, "its parent agent finished");
+        match notice {
+            // A nested child reports to the child that spawned it, which reads
+            // the notice when its turn ends (prime-agent's `waitForRlmQuiescence`).
+            Some((Some(parent), Some((_, notice)))) => {
+                self.update(&parent, |parent| parent.pending.push(notice));
+            }
+            Some((None, Some((name, notice)))) => {
+                let _ = self
+                    .sender
+                    .send(SessionEvent::ChildSettled { name, notice });
+            }
+            _ => {}
         }
+        self.changed.notify_waiters();
     }
 
     /// Wait until `task_id` settles, `deadline` passes or `cancel` fires.
@@ -417,6 +529,39 @@ impl AgentsShared {
         }
     }
 
+    /// After a turn of `task_id`: wait until it has something to read - its own
+    /// children's notices, messages that arrived between turns - and return it,
+    /// or return `None` once none of its children is running and nothing is
+    /// waiting (prime-agent's `waitForRlmQuiescence`), or when it is stopped.
+    async fn quiet(&self, task_id: &TaskId, cancel: &CancellationToken) -> Option<Vec<String>> {
+        loop {
+            let changed = self.changed.notified();
+            let (pending, open) = {
+                let mut children = self.children.lock().ok()?;
+                let open = children
+                    .iter()
+                    .filter(|child| child.parent.as_ref() == Some(task_id))
+                    .any(|child| !child.state.settled());
+                let pending = children
+                    .iter_mut()
+                    .find(|child| &child.task_id == task_id)
+                    .map(|child| std::mem::take(&mut child.pending))
+                    .unwrap_or_default();
+                (pending, open)
+            };
+            if !pending.is_empty() {
+                return Some(pending);
+            }
+            if !open {
+                return None;
+            }
+            tokio::select! {
+                () = changed => {}
+                () = cancel.cancelled() => return None,
+            }
+        }
+    }
+
     /// prime-agent's per-sender token bucket: three messages, one more each second.
     fn take_token(&self, sender: &str) -> Result<(), String> {
         let mut buckets = self
@@ -451,15 +596,23 @@ impl AgentsShared {
                 if child.state.settled() {
                     return Err("the child has finished; spawn a new one".to_owned());
                 }
-                if let Some(session) = &child.session_id {
-                    Ok(Some(session.clone()))
-                } else {
-                    child.backlog.push(text.clone());
-                    Ok(None)
+                match &child.session_id {
+                    None => {
+                        child.backlog.push(text.clone());
+                        Ok(None)
+                    }
+                    // Between turns - waiting for its own children - the child
+                    // reads it when its next turn opens.
+                    Some(_) if !child.in_turn => {
+                        child.pending.push(text.clone());
+                        Ok(None)
+                    }
+                    Some(session) => Ok(Some(session.clone())),
                 }
             })
             .ok_or_else(|| "no such child".to_owned())??;
         let Some(session) = session else {
+            self.changed.notify_waiters();
             return Ok("queued");
         };
         let lease = self
@@ -486,13 +639,14 @@ impl AgentsShared {
         Ok("delivered")
     }
 
-    fn names(&self) -> Vec<(TaskId, String, bool)> {
+    /// The children of `parent` (`None`: the root agent's own children).
+    fn names(&self, parent: Option<&TaskId>) -> Vec<(TaskId, String, bool)> {
         self.children.lock().map_or_else(
             |_| Vec::new(),
             |children| {
                 children
                     .iter()
-                    .filter(|child| !child.deleted)
+                    .filter(|child| !child.deleted && child.parent.as_ref() == parent)
                     .map(|child| {
                         (
                             child.task_id.clone(),
@@ -505,8 +659,8 @@ impl AgentsShared {
         )
     }
 
-    fn find(&self, selector: &str) -> Option<TaskId> {
-        self.names()
+    fn find(&self, parent: Option<&TaskId>, selector: &str) -> Option<TaskId> {
+        self.names(parent)
             .into_iter()
             .find(|(task_id, name, _)| task_id.as_str() == selector || name == selector)
             .map(|(task_id, ..)| task_id)
@@ -520,12 +674,12 @@ impl AgentsShared {
             "child" => {
                 let name = name.ok_or("receiver_name is required for a child")?;
                 let task_id = self
-                    .find(&name)
+                    .find(None, &name)
                     .ok_or_else(|| format!("no child named {name:?}"))?;
                 vec![(task_id, name)]
             }
             "all" => self
-                .names()
+                .names(None)
                 .into_iter()
                 .filter(|(_, _, settled)| !settled)
                 .map(|(task_id, name, _)| (task_id, name))
@@ -546,49 +700,76 @@ impl AgentsShared {
     /// A message a child sends with its `agent_message` tool.
     async fn send_from_child(&self, from: &TaskId, arguments: &Value) -> Result<Value, String> {
         let (message, role, name) = message_arguments(arguments)?;
-        let sender_name = self
-            .update(from, |child| child.name.clone())
+        let (sender_name, parent) = self
+            .update(from, |child| (child.name.clone(), child.parent.clone()))
             .ok_or("the sending child is gone")?;
         self.take_token(from.as_str())?;
-        let to_parent = |text: String| {
+        // prime-agent's reach: the parent, the siblings (the parent's other
+        // children) and this child's own children.
+        let to_parent = async |text: String| -> Result<&'static str, String> {
             self.update(from, |child| child.replied = true);
-            let _ = self.sender.send(SessionEvent::AgentMessage { text });
+            match &parent {
+                None => {
+                    let _ = self.sender.send(SessionEvent::AgentMessage { text });
+                    Ok("delivered")
+                }
+                Some(parent) => self.deliver_to_child(parent, text).await,
+            }
         };
         let mut receipts = Vec::new();
         match role.as_str() {
             "parent" => {
-                to_parent(format!(
+                let status = to_parent(format!(
                     "[agent-message from child:{sender_name}]\n\n{message}"
-                ));
-                receipts.push(receipt("parent", &sender_name, &message, "delivered"));
+                ))
+                .await?;
+                receipts.push(receipt("parent", &sender_name, &message, status));
             }
             "sibling" => {
                 let name = name.ok_or("receiver_name is required for a sibling")?;
                 let task_id = self
-                    .find(&name)
+                    .find(parent.as_ref(), &name)
                     .filter(|task_id| task_id != from)
                     .ok_or_else(|| format!("no sibling named {name:?}"))?;
                 let text = format!("[agent-message from sibling:{sender_name}]\n\n{message}");
                 let status = self.deliver_to_child(&task_id, text).await?;
                 receipts.push(receipt(&name, &sender_name, &message, status));
             }
+            "child" => {
+                let name = name.ok_or("receiver_name is required for a child")?;
+                let task_id = self
+                    .find(Some(from), &name)
+                    .ok_or_else(|| format!("no child named {name:?}"))?;
+                let text = format!("[agent-message from parent:{sender_name}]\n\n{message}");
+                let status = self.deliver_to_child(&task_id, text).await?;
+                receipts.push(receipt(&name, &sender_name, &message, status));
+            }
             "all" => {
-                to_parent(format!(
+                let status = to_parent(format!(
                     "[agent-message from child:{sender_name}]\n\n{message}"
-                ));
-                receipts.push(receipt("parent", &sender_name, &message, "delivered"));
-                for (task_id, name, settled) in self.names() {
+                ))
+                .await?;
+                receipts.push(receipt("parent", &sender_name, &message, status));
+                let siblings = self
+                    .names(parent.as_ref())
+                    .into_iter()
+                    .map(|entry| (entry, "sibling"));
+                let children = self
+                    .names(Some(from))
+                    .into_iter()
+                    .map(|entry| (entry, "parent"));
+                for ((task_id, name, settled), relation) in siblings.chain(children) {
                     if &task_id == from || settled {
                         continue;
                     }
-                    let text = format!("[agent-message from sibling:{sender_name}]\n\n{message}");
+                    let text =
+                        format!("[agent-message from {relation}:{sender_name}]\n\n{message}");
                     receipts.push(match self.deliver_to_child(&task_id, text).await {
                         Ok(status) => receipt(&name, &sender_name, &message, status),
                         Err(error) => json!({"target": name, "error": error}),
                     });
                 }
             }
-            "child" => return Err("this agent has no children".to_owned()),
             _ => return Err(AGENT_FAMILY_REACH_ERROR.to_owned()),
         }
         Ok(json!({ "receipts": receipts }))
@@ -741,9 +922,12 @@ fn state_payload(role: AgentRole, name: &str, state: &ChildState) -> Value {
 /// The children of one interactive session.
 pub struct SessionAgents {
     shared: Arc<AgentsShared>,
-    scheduler: Arc<WorkerScheduler>,
+    /// One scheduler per depth, the root's children first. A child that waits
+    /// for its own children holds a slot of its level, never one of theirs, so
+    /// a full level cannot starve the level it waits on.
+    schedulers: Vec<Arc<WorkerScheduler>>,
     workspace_manager: Arc<WorkspaceManager>,
-    dispatched: Arc<tokio::sync::Notify>,
+    dispatched: Vec<Arc<tokio::sync::Notify>>,
     pump: AtomicBool,
 }
 
@@ -756,20 +940,28 @@ impl SessionAgents {
         approval_gate: Arc<dyn ApprovalGate>,
         state_root: PathBuf,
     ) -> Result<Arc<Self>, HarnessError> {
-        let shared = Arc::new(AgentsShared {
-            store,
-            sender,
-            approval_gate,
-            ledger: Mutex::new(None),
-            launches: Mutex::new(HashMap::new()),
-            children: Mutex::new(Vec::new()),
-            changed: tokio::sync::Notify::new(),
-            buckets: Mutex::new(HashMap::new()),
-        });
-        let backend = Arc::new(InteractiveWorkerBackend {
+        let shared = Arc::new(AgentsShared::new(store, sender, approval_gate));
+        let backend: Arc<dyn WorkerBackend> = Arc::new(InteractiveWorkerBackend {
             shared: Arc::clone(&shared),
         });
-        Self::assemble(shared, state_root, backend)
+        Self::assemble(shared, state_root, &backend)
+    }
+
+    /// Set the session's `RLM_MAX_DEPTH`; children already running keep the
+    /// value they were created with.
+    pub fn set_max_depth(&self, value: u32, source: MaxDepthSource) {
+        if let Ok(mut max_depth) = self.shared.max_depth.lock() {
+            *max_depth = (value.min(RLM_MAX_DEPTH_CAP), source);
+        }
+    }
+
+    #[must_use]
+    pub fn max_depth(&self) -> (u32, MaxDepthSource) {
+        self.shared.max_depth()
+    }
+
+    fn scheduler(&self) -> &Arc<WorkerScheduler> {
+        &self.schedulers[0]
     }
 
     /// The session's children with a scripted worker in place of the model.
@@ -779,60 +971,58 @@ impl SessionAgents {
         sender: UnboundedSender<SessionEvent>,
         approval_gate: Arc<dyn ApprovalGate>,
         state_root: PathBuf,
-        backend: Arc<dyn WorkerBackend>,
+        backend: &Arc<dyn WorkerBackend>,
     ) -> Arc<Self> {
-        let shared = Arc::new(AgentsShared {
-            store,
-            sender,
-            approval_gate,
-            ledger: Mutex::new(None),
-            launches: Mutex::new(HashMap::new()),
-            children: Mutex::new(Vec::new()),
-            changed: tokio::sync::Notify::new(),
-            buckets: Mutex::new(HashMap::new()),
-        });
+        let shared = Arc::new(AgentsShared::new(store, sender, approval_gate));
         Self::assemble(shared, state_root, backend).expect("scheduler")
     }
 
     fn assemble(
         shared: Arc<AgentsShared>,
         state_root: PathBuf,
-        backend: Arc<dyn WorkerBackend>,
+        backend: &Arc<dyn WorkerBackend>,
     ) -> Result<Arc<Self>, HarnessError> {
         let workspace_manager = Arc::new(WorkspaceManager::new(state_root));
-        let scheduler = Arc::new(
-            WorkerScheduler::new(
-                SchedulerConfig {
-                    max_concurrent_workers: 3,
-                    max_depth: 1,
-                    // Children beyond the running three wait for a slot rather than
-                    // being refused, as prime-agent admits every spawn.
-                    max_queued_workers: 8,
-                    // prime-agent bounds a child by its own turn - its steps, tool
-                    // calls and deadline - and the depth, not by a request pool
-                    // shared across siblings. A pool of 24 ran out after four or
-                    // five children had each read a large file, and every later
-                    // step and spawn of the turn was refused.
-                    budget: DelegationBudget {
-                        max_model_requests: u32::MAX,
-                        ..DelegationBudget::default()
+        let schedulers = (0..RLM_MAX_DEPTH_CAP)
+            .map(|_| {
+                WorkerScheduler::new(
+                    SchedulerConfig {
+                        max_concurrent_workers: 3,
+                        max_depth: RLM_MAX_DEPTH_CAP,
+                        // Children beyond the running three wait for a slot rather
+                        // than being refused, as prime-agent admits every spawn.
+                        max_queued_workers: 8,
+                        // prime-agent bounds a child by its own turn - its steps,
+                        // tool calls and deadline - and the depth, not by a request
+                        // pool shared across siblings. A pool of 24 ran out after
+                        // four or five children had each read a large file, and
+                        // every later step and spawn of the turn was refused.
+                        budget: DelegationBudget {
+                            max_model_requests: u32::MAX,
+                            ..DelegationBudget::default()
+                        },
                     },
-                },
-                backend,
-                Some(Arc::clone(&workspace_manager)),
-            )
-            .map_err(|error| HarnessError::new(error.code(), error.to_string()))?,
-        );
+                    Arc::clone(backend),
+                    Some(Arc::clone(&workspace_manager)),
+                )
+                .map(Arc::new)
+                .map_err(|error| HarnessError::new(error.code(), error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         if let Ok(mut ledger) = shared.ledger.lock() {
-            *ledger = Some(Arc::clone(scheduler.ledger()));
+            *ledger = Some(Arc::clone(schedulers[0].ledger()));
         }
-        Ok(Arc::new(Self {
+        let agents = Arc::new(Self {
             shared,
-            scheduler,
+            schedulers,
             workspace_manager,
-            dispatched: Arc::new(tokio::sync::Notify::new()),
+            dispatched: (0..RLM_MAX_DEPTH_CAP)
+                .map(|_| Arc::new(tokio::sync::Notify::new()))
+                .collect(),
             pump: AtomicBool::new(false),
-        }))
+        });
+        let _ = agents.shared.agents.set(Arc::downgrade(&agents));
+        Ok(agents)
     }
 
     #[must_use]
@@ -856,7 +1046,7 @@ impl SessionAgents {
         if lines.is_empty() {
             vec![format!(
                 "no delegated workers; {} model requests so far",
-                self.scheduler.ledger().requests_used()
+                self.scheduler().ledger().requests_used()
             )]
         } else {
             lines
@@ -885,7 +1075,7 @@ impl SessionAgents {
             .children
             .lock()
             .map_err(|_| "the child registry is unavailable".to_owned())?;
-        let mut stopped = 0;
+        let mut stopped = Vec::new();
         for child in children.iter_mut().filter(|child| {
             !child.deleted
                 && !child.state.settled()
@@ -895,12 +1085,16 @@ impl SessionAgents {
         }) {
             child.cancel_reason = Some(reason.to_owned());
             child.cancellation.cancel();
-            stopped += 1;
+            stopped.push(child.task_id.clone());
         }
-        if stopped == 0 && selector != "all" {
+        drop(children);
+        if stopped.is_empty() && selector != "all" {
             return Err(format!("no running child named {selector:?}"));
         }
-        Ok(stopped)
+        for task_id in &stopped {
+            self.shared.cancel_descendants(task_id, reason);
+        }
+        Ok(stopped.len())
     }
 
     /// Stop every child without notices and forget them: the conversation they
@@ -922,22 +1116,24 @@ impl SessionAgents {
         if self.pump.swap(true, Ordering::SeqCst) {
             return;
         }
-        let scheduler = Arc::clone(&self.scheduler);
-        let shared = Arc::clone(&self.shared);
-        let dispatched = Arc::clone(&self.dispatched);
-        tokio::spawn(async move {
-            loop {
-                match scheduler.next_settled().await {
-                    Some(Ok((task_id, outcome))) => shared.settle(&task_id, outcome),
-                    Some(Err(error)) => {
-                        let _ = shared.sender.send(SessionEvent::Notice {
-                            message: format!("delegated workers stopped: {error}"),
-                        });
+        for (scheduler, dispatched) in self.schedulers.iter().zip(&self.dispatched) {
+            let scheduler = Arc::clone(scheduler);
+            let shared = Arc::clone(&self.shared);
+            let dispatched = Arc::clone(dispatched);
+            tokio::spawn(async move {
+                loop {
+                    match scheduler.next_settled().await {
+                        Some(Ok((task_id, outcome))) => shared.settle(&task_id, outcome),
+                        Some(Err(error)) => {
+                            let _ = shared.sender.send(SessionEvent::Notice {
+                                message: format!("delegated workers stopped: {error}"),
+                            });
+                        }
+                        None => dispatched.notified().await,
                     }
-                    None => dispatched.notified().await,
                 }
-            }
-        });
+            });
+        }
     }
 
     /// Admit and dispatch one child, returning as soon as it is admitted - the part
@@ -949,8 +1145,46 @@ impl SessionAgents {
         brief_text: String,
         name: Option<String>,
         launch: &ChildLaunch,
+        parent: Option<&TaskId>,
     ) -> Result<(TaskId, String), HarnessError> {
-        self.scheduler
+        // prime-agent's spawn check: an agent at depth d spawns only while
+        // d < RLM_MAX_DEPTH, the root reading the session's value and a child
+        // the value it was created with.
+        let (parent_depth, max_depth) = match parent {
+            None => (0, self.shared.max_depth().0),
+            Some(parent) => self
+                .shared
+                .update(parent, |child| (child.depth, child.max_depth))
+                .ok_or_else(|| {
+                    HarnessError::new(ErrorCode::InvalidPayload, "the spawning child is gone")
+                })?,
+        };
+        if parent_depth >= max_depth {
+            return Err(HarnessError::new(
+                ErrorCode::DelegationDepthExceeded,
+                depth_limit_error(parent_depth, max_depth),
+            ));
+        }
+        let depth = parent_depth + 1;
+        // A coder's worktree comes from the user's checkout, which only the root
+        // agent works in; a child's own children are read-only explorers.
+        if parent.is_some() && role != AgentRole::Explorer {
+            return Err(HarnessError::new(
+                ErrorCode::RoleUnavailable,
+                "a child agent can spawn read-only explorers only",
+            ));
+        }
+        let scheduler = Arc::clone(
+            self.schedulers
+                .get(usize::try_from(depth - 1).unwrap_or(usize::MAX))
+                .ok_or_else(|| {
+                    HarnessError::new(
+                        ErrorCode::DelegationDepthExceeded,
+                        depth_limit_error(parent_depth, max_depth),
+                    )
+                })?,
+        );
+        scheduler
             .require_admission(1)
             .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
         let task_id = TaskId::generate();
@@ -958,12 +1192,11 @@ impl SessionAgents {
             let id = task_id.as_str();
             format!("{}-{}", role.as_str(), &id[id.len().saturating_sub(8)..])
         });
-        if self
-            .shared
-            .names()
-            .iter()
-            .any(|(_, existing, _)| existing == &name)
-        {
+        if self.shared.children.lock().is_ok_and(|children| {
+            children
+                .iter()
+                .any(|child| !child.deleted && child.name == name)
+        }) {
             return Err(HarnessError::new(
                 ErrorCode::InvalidPayload,
                 format!("a child named {name:?} already exists"),
@@ -985,8 +1218,7 @@ impl SessionAgents {
                 )
                 .await?;
                 let write_scope = vec![".".to_owned()];
-                let record = self
-                    .scheduler
+                let record = scheduler
                     .create_worktree(&snapshot, &task_id, &run_id, &write_scope, 1)
                     .await
                     .map_err(coder_unavailable_error)?;
@@ -1036,7 +1268,7 @@ impl SessionAgents {
                     .as_ref()
                     .map_or_else(Vec::new, |record| record.write_scope.clone()),
                 edit_workspace: role == AgentRole::Coder,
-                max_depth: 1,
+                max_depth: RLM_MAX_DEPTH_CAP,
                 budget: DelegationBudget::default(),
             },
             expected_artifacts: Vec::new(),
@@ -1069,17 +1301,22 @@ impl SessionAgents {
                 activity: "queued".to_owned(),
                 tool_calls: 0,
                 cost: "n/a".to_owned(),
+                parent: parent.cloned(),
+                depth,
+                max_depth,
+                in_turn: false,
+                pending: Vec::new(),
             });
         }
         if let Ok(mut launches) = self.shared.launches.lock() {
             launches.insert(task_id.clone(), launch.clone());
         }
         self.ensure_pump();
-        let dispatched = self.scheduler.dispatch(WorkerRequest {
+        let dispatched = scheduler.dispatch(WorkerRequest {
             task_id: task_id.clone(),
             run_id,
             generation: 1,
-            depth: 1,
+            depth,
             brief,
             worktree,
             cancellation,
@@ -1093,7 +1330,12 @@ impl SessionAgents {
             }
             return Err(HarnessError::new(error.code(), error.to_string()));
         }
-        self.dispatched.notify_one();
+        if let Some(dispatched) = self
+            .dispatched
+            .get(usize::try_from(depth - 1).unwrap_or(usize::MAX))
+        {
+            dispatched.notify_one();
+        }
         Ok((task_id, name))
     }
 }
@@ -1259,7 +1501,7 @@ impl DelegateTool {
             .launch
             .for_model(None)
             .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error))?;
-        let (task_id, name) = self.agents.start(role, brief, None, &launch).await?;
+        let (task_id, name) = self.agents.start(role, brief, None, &launch, None).await?;
         let payload = if wait {
             match self
                 .agents
@@ -1313,7 +1555,7 @@ impl ExternalToolDispatcher for DelegateTool {
                 .await?;
             }
             self.agents
-                .scheduler
+                .scheduler()
                 .require_admission(1)
                 .map_err(|error| HarnessError::new(error.code(), error.to_string()))
         })
@@ -1452,21 +1694,99 @@ struct ChildTools {
     shared: Arc<AgentsShared>,
     task_id: TaskId,
     web: Option<ChildWebTools>,
+    /// How this child starts children of its own; `None` at the depth limit.
+    spawn: Option<ChildSpawn>,
+}
+
+/// What a child that may spawn gives its own children.
+struct ChildSpawn {
+    launch: ChildLaunch,
+    /// The child's own cancellation: waiting for a child of its own stops with it.
+    cancellation: CancellationToken,
 }
 
 impl ChildTools {
+    fn delegate_schema() -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "description": "Start a read-only explorer child of your own to investigate part of your task. By default the call waits for its answer; with wait=false it returns at once and the result arrives later as a [child-exited ...] or [child-failed ...] message - you are not finished until your children are.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "role": {"type": "string", "enum": ["explorer"]},
+                        "brief": {"type": "string", "minLength": 1, "maxLength": MAX_BRIEF_BYTES},
+                        "wait": {"type": "boolean", "description": "Wait for the child's answer (default true)."}
+                    },
+                    "required": ["role", "brief"],
+                    "additionalProperties": false
+                }
+            }
+        })
+    }
+
+    /// Start a child of this child and, unless told not to, wait for it.
+    async fn delegate(&self, arguments: &Value) -> Result<Value, HarnessError> {
+        let spawn = self.spawn.as_ref().ok_or_else(|| {
+            let (depth, max_depth) = self
+                .shared
+                .update(&self.task_id, |child| (child.depth, child.max_depth))
+                .unwrap_or((1, DEFAULT_RLM_MAX_DEPTH));
+            HarnessError::new(
+                ErrorCode::DelegationDepthExceeded,
+                depth_limit_error(depth, max_depth),
+            )
+        })?;
+        let (role, brief, wait) = DelegateTool::arguments(arguments)?;
+        let agents = self
+            .shared
+            .agents
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| {
+                HarnessError::new(
+                    ErrorCode::ServiceUnavailable,
+                    "the session's agents are gone",
+                )
+            })?;
+        let (task_id, name) = agents
+            .start(role, brief, None, &spawn.launch, Some(&self.task_id))
+            .await?;
+        if !wait {
+            return Ok(json!({
+                "role": role.as_str(),
+                "status": "started",
+                "name": name,
+                "task_id": task_id.as_str(),
+                "text": format!("started {} {name}; its result arrives as a message when it finishes", role.as_str()),
+            }));
+        }
+        match self
+            .shared
+            .wait(&task_id, None, Some(&spawn.cancellation))
+            .await?
+        {
+            Some(state) => Ok(state_payload(role, &name, &state)),
+            None => Err(HarnessError::new(
+                ErrorCode::ServiceUnavailable,
+                "the child's record is gone",
+            )),
+        }
+    }
+
     fn agent_schemas() -> Vec<Value> {
         vec![
             json!({
                 "type": "function",
                 "function": {
                     "name": "agent_message",
-                    "description": "Send a message to your parent agent (receiver_role \"parent\", the default), to a sibling child by name (\"sibling\" with receiver_name), or to all (\"all\"). The parent reads it at its next step, or it wakes the parent when the parent is idle. Use it to report what you found before you finish.",
+                    "description": "Send a message to your parent agent (receiver_role \"parent\", the default), to a sibling by name (\"sibling\" with receiver_name), to one of your own children by name (\"child\" with receiver_name), or to all of them (\"all\"). The receiver reads it at its next step, or it wakes the root agent when that agent is idle. Use it to report what you found before you finish.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "message": {"type": "string", "minLength": 1, "maxLength": MAX_MESSAGE_CHARS},
-                            "receiver_role": {"type": "string", "enum": ["parent", "sibling", "all"]},
+                            "receiver_role": {"type": "string", "enum": ["parent", "sibling", "child", "all"]},
                             "receiver_name": {"type": "string"}
                         },
                         "required": ["message"],
@@ -1496,6 +1816,9 @@ impl ChildTools {
 impl ExternalToolCatalog for ChildTools {
     fn schemas(&self) -> Vec<Value> {
         let mut schemas = Self::agent_schemas();
+        if self.spawn.is_some() {
+            schemas.push(Self::delegate_schema());
+        }
         if let Some((catalog, _)) = &self.web {
             schemas.extend(catalog.schemas());
         }
@@ -1503,6 +1826,15 @@ impl ExternalToolCatalog for ChildTools {
     }
 
     fn resolve(&self, name: &str, arguments: &Value) -> Option<CodingToolAction> {
+        if name == "delegate" && self.spawn.is_some() {
+            return Some(CodingToolAction::ExternalTool {
+                plugin_id: "agent".to_owned(),
+                tool_name: name.to_owned(),
+                arguments: arguments.clone(),
+                parent_invocation_id: None,
+                timeout_ms: 120_000,
+            });
+        }
         if matches!(name, "agent_message" | "progress_note") {
             return Some(CodingToolAction::ExternalTool {
                 plugin_id: "agent".to_owned(),
@@ -1574,6 +1906,15 @@ impl ExternalToolDispatcher for ChildTools {
                     )),
                 };
             }
+            if tool_name == "delegate" {
+                let payload = self.delegate(arguments).await?;
+                return Ok(ToolOutput::ExternalTool {
+                    plugin_id: "agent".to_owned(),
+                    tool_name: tool_name.to_owned(),
+                    payload,
+                    inflight: 1,
+                });
+            }
             let result = match tool_name {
                 "agent_message" => self.shared.send_from_child(&self.task_id, arguments).await,
                 "progress_note" => self.shared.progress_note(&self.task_id, arguments),
@@ -1609,7 +1950,7 @@ impl RlmChildren {
 
     /// Find children by id or name; an empty selection means every child.
     fn select(&self, selectors: &[String]) -> Result<Vec<TaskId>, String> {
-        let names = self.agents.shared.names();
+        let names = self.agents.shared.names(None);
         if selectors.is_empty() {
             return Ok(names.into_iter().map(|(task_id, ..)| task_id).collect());
         }
@@ -1618,7 +1959,7 @@ impl RlmChildren {
             .map(|selector| {
                 self.agents
                     .shared
-                    .find(selector)
+                    .find(None, selector)
                     .ok_or_else(|| format!("no child named or numbered {selector:?}"))
             })
             .collect()
@@ -1664,7 +2005,13 @@ impl RlmChildren {
         let launch = self.launch.for_model(kwargs["model"].as_str())?;
         let (task_id, name) = self
             .agents
-            .start(AgentRole::Explorer, prompt.to_owned(), Some(name), &launch)
+            .start(
+                AgentRole::Explorer,
+                prompt.to_owned(),
+                Some(name),
+                &launch,
+                None,
+            )
             .await
             .map_err(|error| error.message().to_owned())?;
         Ok(json!({
@@ -1709,7 +2056,8 @@ impl RlmChildren {
             .pop()
             .ok_or("no such child")?;
         let dir = self.session_dir();
-        self.agents
+        let row = self
+            .agents
             .shared
             .update(&task_id, |child| {
                 if !child.state.settled() {
@@ -1719,7 +2067,11 @@ impl RlmChildren {
                 child.deleted = true;
                 json!({ "subagent": child.row(&dir) })
             })
-            .ok_or_else(|| "no such child".to_owned())
+            .ok_or_else(|| "no such child".to_owned());
+        self.agents
+            .shared
+            .cancel_descendants(&task_id, "Deleted by parent orchestrator");
+        row
     }
 
     fn models(&self, request: &Value) -> Value {
@@ -1828,12 +2180,30 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     ),
                 };
             };
+            let (can_spawn, depth) = self
+                .shared
+                .update(&task_id, |child| {
+                    (child.depth < child.max_depth, child.depth)
+                })
+                .unwrap_or((false, 1));
+            let spawn_line = if can_spawn {
+                " You can split your work with the delegate tool: it starts read-only explorer children of your own, and you are not finished until they are - their results reach you as [child-exited ...] or [child-failed ...] messages."
+            } else {
+                ""
+            };
             let (workspace_root, policy, schemas, system_policy) = match request.brief.role {
                 AgentRole::Explorer => (
                     launch.workspace_root.clone(),
                     explorer_policy(&launch.parent_policy),
                     explorer_tool_schemas(),
-                    "You are a read-only explorer. Inspect the current workspace - and the web, when web tools are offered - and answer the brief. You cannot edit files, run commands or delegate again. Use agent_message to tell your parent what you found when it helps before you finish.",
+                    format!(
+                        "You are a read-only explorer. Inspect the current workspace - and the web, when web tools are offered - and answer the brief. You cannot edit files or run commands.{} Use agent_message to tell your parent what you found when it helps before you finish.",
+                        if can_spawn {
+                            spawn_line
+                        } else {
+                            " You cannot delegate again."
+                        }
+                    ),
                 ),
                 AgentRole::Coder => {
                     let Some(worktree) = request.worktree.as_ref() else {
@@ -1861,7 +2231,9 @@ impl WorkerBackend for InteractiveWorkerBackend {
                         PathBuf::from(&worktree.path),
                         coder_policy(&launch.parent_policy),
                         coding_tool_schemas(),
-                        "You are a delegated coder. Work only in the assigned isolated M8-03 worktree and follow the brief. Tool calls use the host approval and policy service. Leave your changes in that worktree and report what changed; do not claim the changes were merged into the user's checkout.",
+                        format!(
+                            "You are a delegated coder. Work only in the assigned isolated M8-03 worktree and follow the brief. Tool calls use the host approval and policy service. Leave your changes in that worktree and report what changed; do not claim the changes were merged into the user's checkout.{spawn_line}"
+                        ),
                     )
                 }
                 _ => {
@@ -1887,7 +2259,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 }
             };
             let store = lease.store();
-            let session_id = SessionId::generate();
+            let mut session_id = SessionId::generate();
             let backlog = self
                 .shared
                 .update(&task_id, |child| {
@@ -1896,16 +2268,22 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     std::mem::take(&mut child.backlog)
                 })
                 .unwrap_or_default();
-            // The run admits the brief once, as the child's input and as proposed
-            // by the parent's model. Admitting it here as well - with the brief's
-            // text, while the run admits the prompt around it - put two contents
-            // under one input id, and every child failed with
-            // `idempotency_conflict` before its first step.
-            let input_id = InputId::generate();
+            // A child's own children work where it works, under its policy, as
+            // read-only explorers.
+            let spawn = can_spawn.then(|| ChildSpawn {
+                launch: ChildLaunch {
+                    workspace_root: workspace_root.clone(),
+                    workspace: request.brief.workspace.clone(),
+                    parent_policy: policy.clone(),
+                    ..launch.clone()
+                },
+                cancellation: request.cancellation.clone(),
+            });
             let child_tools = Arc::new(ChildTools {
                 shared: Arc::clone(&self.shared),
                 task_id: task_id.clone(),
                 web: launch.web.clone(),
+                spawn,
             });
             let tools = ToolExecutionService::new(Arc::clone(&store))
                 .with_policy(policy)
@@ -1932,16 +2310,6 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 prompt.push_str("\n\n");
                 prompt.push_str(&message);
             }
-            let run_request = RunRequest::new(
-                session_id,
-                task_id.clone(),
-                input_id,
-                prompt,
-                request.brief.workspace.clone(),
-            )
-            .with_system_policy(system_policy)
-            .with_tool_schemas(schemas)
-            .with_authority(SourceAuthority::ModelProposed);
             let driver = TurnDriver::new(Arc::clone(&runtime), tools)
                 .with_external(ExternalTools::new(
                     Arc::clone(&child_tools) as Arc<dyn ExternalToolCatalog>
@@ -1968,63 +2336,111 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 role: role_name.clone(),
                 inner: Arc::clone(&self.shared.approval_gate),
             });
-            let result = driver
-                .run_turn(
-                    run_request,
-                    TurnOptions {
-                        workspace_root: workspace_root.clone(),
-                        actor_id: format!("interactive.child.{role_name}"),
-                        approvals: ApprovalMode::Ask(approval),
-                        limits: launch.child_limits,
-                    },
-                    observer.clone(),
-                    request.cancellation.clone(),
+            // The child's turns: its task, then - while children of its own
+            // report back - one more turn over what they said, until its whole
+            // subtree is quiet (prime-agent's `waitForRlmQuiescence`).
+            let mut conversation = Vec::new();
+            let mut steps = 0_u32;
+            let mut tool_calls = 0_u32;
+            let mut executions = Vec::new();
+            let outcome = loop {
+                self.shared.update(&task_id, |child| child.in_turn = true);
+                let run_request = RunRequest::new(
+                    session_id.clone(),
+                    task_id.clone(),
+                    // The run admits the prompt once, as the child's input and as
+                    // proposed by the parent's model. Admitting the brief here as
+                    // well put two contents under one input id, and every child
+                    // failed with `idempotency_conflict` before its first step.
+                    InputId::generate(),
+                    prompt.clone(),
+                    request.brief.workspace.clone(),
                 )
-                .await;
-            let cost = observer
-                .cost_tracker
-                .lock()
-                .map_or_else(|_| "n/a".to_owned(), |tracker| tracker.display());
-            self.shared.update(&task_id, |child| child.cost = cost);
-            if let Some(error) = observer
-                .budget_error
-                .lock()
-                .ok()
-                .and_then(|error| error.clone())
-            {
-                return WorkerOutcome::Failed { error };
-            }
-            let outcome = match result {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    return WorkerOutcome::Failed {
-                        error: OrchestratorError::new(error.code(), error.to_string()),
+                .with_system_policy(system_policy.clone())
+                .with_tool_schemas(schemas.clone())
+                .with_authority(SourceAuthority::ModelProposed)
+                .with_conversation(conversation.clone());
+                let result = driver
+                    .run_turn(
+                        run_request,
+                        TurnOptions {
+                            workspace_root: workspace_root.clone(),
+                            actor_id: format!("interactive.child.{role_name}"),
+                            approvals: ApprovalMode::Ask(Arc::clone(&approval)),
+                            limits: launch.child_limits,
+                        },
+                        observer.clone(),
+                        request.cancellation.clone(),
+                    )
+                    .await;
+                self.shared.update(&task_id, |child| child.in_turn = false);
+                let cost = observer
+                    .cost_tracker
+                    .lock()
+                    .map_or_else(|_| "n/a".to_owned(), |tracker| tracker.display());
+                self.shared.update(&task_id, |child| child.cost = cost);
+                if let Some(error) = observer
+                    .budget_error
+                    .lock()
+                    .ok()
+                    .and_then(|error| error.clone())
+                {
+                    return WorkerOutcome::Failed { error };
+                }
+                let outcome = match result {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return WorkerOutcome::Failed {
+                            error: OrchestratorError::new(error.code(), error.to_string()),
+                        };
+                    }
+                };
+                steps += outcome.steps;
+                tool_calls += outcome.tool_calls;
+                executions.extend(outcome.executions.iter().cloned());
+                self.shared
+                    .update(&task_id, |child| child.tool_calls = tool_calls);
+                if outcome.stop == TurnStop::Canceled || request.cancellation.is_cancelled() {
+                    return WorkerOutcome::OutcomeUnknown {
+                        reason: "the child was stopped".to_owned(),
                     };
                 }
+                // A child that stopped short of an answer - a loop, an
+                // unverifiable reply, a bound - failed, and says why. It used to be
+                // reported as completed ("Explorer completed without a final text
+                // answer"), so the parent could not tell a child that broke from one
+                // that finished.
+                if let Some(reason) = stopped_short(outcome.stop) {
+                    return WorkerOutcome::Failed {
+                        error: OrchestratorError::new(
+                            ErrorCode::ResultIncomplete,
+                            format!(
+                                "{role_name} stopped without an answer: {reason} ({steps} step(s), {tool_calls} tool call(s))"
+                            ),
+                        ),
+                    };
+                }
+                let Some(next) = self.shared.quiet(&task_id, &request.cancellation).await else {
+                    break outcome;
+                };
+                conversation.push(ProviderMessage::new(MessageRole::User, prompt));
+                conversation.push(ProviderMessage::new(
+                    MessageRole::Assistant,
+                    outcome.final_text.clone(),
+                ));
+                prompt = next.join("\n\n");
+                session_id = SessionId::generate();
+                let _ = store.release_task_lease(&task_id).await;
+                self.shared.update(&task_id, |child| {
+                    child.session_id = Some(session_id.clone());
+                });
             };
-            self.shared
-                .update(&task_id, |child| child.tool_calls = outcome.tool_calls);
-            if outcome.stop == TurnStop::Canceled || request.cancellation.is_cancelled() {
+            if request.cancellation.is_cancelled() {
                 return WorkerOutcome::OutcomeUnknown {
                     reason: "the child was stopped".to_owned(),
                 };
             }
-            // A child that stopped short of an answer - a loop, an unverifiable
-            // reply, a bound - failed, and says why. It used to be reported as
-            // completed ("Explorer completed without a final text answer"), so the
-            // parent could not tell a child that broke from one that finished.
-            if let Some(reason) = stopped_short(outcome.stop) {
-                return WorkerOutcome::Failed {
-                    error: OrchestratorError::new(
-                        ErrorCode::ResultIncomplete,
-                        format!(
-                            "{role_name} stopped without an answer: {reason} ({} step(s), {} tool call(s))",
-                            outcome.steps, outcome.tool_calls
-                        ),
-                    ),
-                };
-            }
-            let receipts = serde_json::to_vec(&outcome.executions).unwrap_or_default();
+            let receipts = serde_json::to_vec(&executions).unwrap_or_default();
             let receipts_digest = ContentHash::from_bytes(&receipts).as_str().to_owned();
             let (prompt_tokens, completion_tokens) =
                 observer.token_usage.lock().map_or((0, 0), |usage| *usage);
@@ -2051,13 +2467,14 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 checked_revisions: Vec::new(),
                 check_receipts: Vec::new(),
                 usage: BudgetUsage {
-                    model_requests: outcome.steps,
+                    model_requests: steps,
                     retries: 0,
                 },
                 detail: json!({
                     "session_id": outcome.session_id,
-                    "steps": outcome.steps,
-                    "tool_calls": outcome.tool_calls,
+                    "depth": depth,
+                    "steps": steps,
+                    "tool_calls": tool_calls,
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "receipts_digest": receipts_digest,
@@ -2292,16 +2709,11 @@ pub(super) mod tests {
             sender.clone(),
             Duration::from_secs(5),
         ));
-        Arc::new(AgentsShared {
-            store: SharedStore::new(std::env::temp_dir().join("ha-unused-store")),
+        Arc::new(AgentsShared::new(
+            SharedStore::new(std::env::temp_dir().join("ha-unused-store")),
             sender,
-            approval_gate: gate,
-            ledger: std::sync::Mutex::new(None),
-            launches: std::sync::Mutex::new(std::collections::HashMap::new()),
-            children: std::sync::Mutex::new(Vec::new()),
-            changed: tokio::sync::Notify::new(),
-            buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
-        })
+            gate,
+        ))
     }
 
     #[test]
@@ -2671,7 +3083,7 @@ pub(super) mod tests {
             sender,
             gate,
             temporary.path().join("delegation"),
-            Arc::new(ScriptedBackend),
+            &(Arc::new(ScriptedBackend) as Arc<dyn harness_orchestrator::WorkerBackend>),
         );
         let children = RlmChildren {
             agents,
@@ -2975,7 +3387,7 @@ mod real_worker_tests {
     /// The child's state once it settles, read without waiting on it: a result
     /// somebody waits for sends no notice, and these tests watch the notices.
     async fn state_of(agents: &SessionAgents, name: &str) -> ChildState {
-        let task_id = agents.shared.find(name).expect("child");
+        let task_id = agents.shared.find(None, name).expect("child");
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
             let state = agents
@@ -3224,7 +3636,7 @@ mod real_worker_tests {
             state_of(&bench.agents, "noter").await,
             ChildState::Done { .. }
         ));
-        let task_id = bench.agents.shared.find("noter").expect("child");
+        let task_id = bench.agents.shared.find(None, "noter").expect("child");
         let notes = bench
             .agents
             .shared
@@ -3250,5 +3662,199 @@ mod real_worker_tests {
             }
             other => panic!("no message is sent for a note: {other:?}"),
         }
+    }
+
+    /// Answers by what a request is about, so children running side by side
+    /// get their own replies whatever order their requests arrive in.
+    struct Routed {
+        route: Box<dyn Fn(&ProviderRequest) -> Reply + Send + Sync>,
+        seen: Mutex<Vec<ProviderRequest>>,
+    }
+
+    impl Routed {
+        fn new(route: impl Fn(&ProviderRequest) -> Reply + Send + Sync + 'static) -> Arc<Self> {
+            Arc::new(Self {
+                route: Box::new(route),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// The requests of the child whose brief is `brief`.
+        fn requests_of(&self, brief: &str) -> Vec<ProviderRequest> {
+            self.seen
+                .lock()
+                .expect("seen")
+                .iter()
+                .filter(|request| is_child(request, brief))
+                .cloned()
+                .collect()
+        }
+    }
+
+    fn is_child(request: &ProviderRequest, brief: &str) -> bool {
+        request
+            .messages
+            .iter()
+            .any(|message| message.content.contains(&format!("Brief:\n{brief}")))
+    }
+
+    fn offers(request: &ProviderRequest, tool: &str) -> bool {
+        request
+            .tool_schemas
+            .iter()
+            .any(|schema| schema["function"]["name"] == tool)
+    }
+
+    fn last_text(request: &ProviderRequest) -> String {
+        request
+            .messages
+            .last()
+            .map(|message| message.content.clone())
+            .unwrap_or_default()
+    }
+
+    fn tool_results(request: &ProviderRequest) -> usize {
+        request
+            .messages
+            .iter()
+            .filter(|message| message.role == harness_providers::MessageRole::Tool)
+            .count()
+    }
+
+    impl ModelProvider for Routed {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::deepseek_fixture()
+        }
+
+        fn stream(&self, request: ProviderRequest, cancel: CancellationToken) -> ProviderFuture {
+            let reply = (self.route)(&request);
+            self.seen.lock().expect("seen").push(request.clone());
+            let scripted = Scripted::new(vec![reply]);
+            scripted.stream(request, cancel)
+        }
+    }
+
+    /// prime-agent's nesting: with the default depth of 2 the root's child
+    /// spawns a child of its own, whose answer comes back to the child - not to
+    /// the root - and the root hears only from its own child.
+    #[tokio::test]
+    async fn a_child_spawns_a_grandchild_and_hears_its_answer() {
+        let mut bench = bench();
+        let provider = Routed::new(|request| {
+            if is_child(request, "inner task") {
+                Reply::Text("inner answer")
+            } else if tool_results(request) == 0 {
+                Reply::Tool(
+                    "delegate",
+                    json!({"role": "explorer", "brief": "inner task"}),
+                )
+            } else {
+                Reply::Text("outer answer")
+            }
+        });
+        let host = host(&bench, provider.clone());
+        spawn(&host, "outer", "outer task").await;
+        match next_child_event(&mut bench.events).await {
+            SessionEvent::ChildSettled { name, notice } => {
+                assert_eq!(name, "outer", "the root hears only from its own child");
+                assert!(notice.contains("outer answer"), "{notice}");
+            }
+            other => panic!("expected the child's notice: {other:?}"),
+        }
+        let outer = provider.requests_of("outer task");
+        assert!(offers(&outer[0], "delegate"), "depth 1 of 2 may spawn");
+        assert!(
+            last_text(outer.last().expect("outer requests")).contains("inner answer"),
+            "the grandchild's answer is the delegate result"
+        );
+        let inner = provider.requests_of("inner task");
+        assert!(!offers(&inner[0], "delegate"), "depth 2 of 2 may not spawn");
+        let task_id = bench
+            .agents
+            .shared
+            .children
+            .lock()
+            .expect("children")
+            .iter()
+            .find(|child| child.depth == 2)
+            .map(|child| (child.parent.clone(), child.task_id.clone()));
+        let (parent, _) = task_id.expect("the grandchild is recorded");
+        assert_eq!(parent, bench.agents.shared.find(None, "outer"));
+        assert!(
+            bench
+                .agents
+                .summary()
+                .iter()
+                .any(|line| line.starts_with("  ")),
+            "/agents shows the grandchild under its parent"
+        );
+    }
+
+    /// A child whose own child runs past its turn is not finished: it waits,
+    /// reads the grandchild's notice in one more turn, and only then reports to
+    /// the root (prime-agent's `waitForRlmQuiescence`).
+    #[tokio::test]
+    async fn a_child_waits_for_its_subtree_before_it_reports() {
+        let mut bench = bench();
+        let provider = Routed::new(|request| {
+            if is_child(request, "inner task") {
+                Reply::Delay(400, Box::new(Reply::Text("inner late")))
+            } else if last_text(request).contains("[child-exited") {
+                Reply::Text("outer final")
+            } else if tool_results(request) == 0 {
+                Reply::Tool(
+                    "delegate",
+                    json!({"role": "explorer", "brief": "inner task", "wait": false}),
+                )
+            } else {
+                Reply::Text("outer first")
+            }
+        });
+        let host = host(&bench, provider.clone());
+        spawn(&host, "outer", "outer task").await;
+        match next_child_event(&mut bench.events).await {
+            SessionEvent::ChildSettled { name, notice } => {
+                assert_eq!(name, "outer");
+                assert!(
+                    notice.contains("outer final"),
+                    "the child reported after its subtree: {notice}"
+                );
+            }
+            other => panic!("expected the child's notice: {other:?}"),
+        }
+        let outer = provider.requests_of("outer task");
+        let last = last_text(outer.last().expect("outer requests"));
+        assert!(
+            last.contains("[child-exited: no-reply child:") && last.contains("inner late"),
+            "the grandchild's notice opened the child's last turn: {last}"
+        );
+    }
+
+    /// `RLM_MAX_DEPTH` 0 stops the root from spawning, with prime-agent's error;
+    /// 1 keeps the root's children from spawning.
+    #[tokio::test]
+    async fn the_max_depth_bounds_who_may_spawn() {
+        let bench = bench();
+        let provider = Routed::new(|_| Reply::Text("leaf"));
+        let host = host(&bench, provider.clone());
+        bench.agents.set_max_depth(0, super::MaxDepthSource::Chat);
+        let refused = host
+            .rlm_requests()
+            .handle(&json!({"type": "rlm.run", "prompt": "t", "kwargs": {"name": "x"}}))
+            .await
+            .expect("known request")
+            .expect_err("depth 0 spawns nothing");
+        assert_eq!(
+            refused,
+            "RLM recursion depth limit reached (RLM_DEPTH=0, RLM_MAX_DEPTH=0)"
+        );
+        bench.agents.set_max_depth(1, super::MaxDepthSource::Chat);
+        spawn(&host, "only", "only task").await;
+        assert!(matches!(
+            state_of(&bench.agents, "only").await,
+            ChildState::Done { .. }
+        ));
+        let only = provider.requests_of("only task");
+        assert!(!offers(&only[0], "delegate"), "depth 1 of 1 may not spawn");
     }
 }

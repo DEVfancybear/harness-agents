@@ -211,6 +211,7 @@ pub fn help_card_lines() -> Vec<String> {
                 "/stash",
                 "/permissions",
                 "/agents",
+                "/rlm-max-depth",
                 "/more",
             ],
         ),

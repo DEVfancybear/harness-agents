@@ -151,6 +151,54 @@ pub fn save_selection(user_path: &Path, selection: &Selection) -> Result<(), Har
     std::fs::rename(&staged, &path).map_err(|error| failed(&error))
 }
 
+/// The user's global settings, beside the user config: prime-agent's
+/// `settings.json` keys that ha keeps (`rlmMaxDepth`, `defaultServiceTier`,
+/// `branchSummary`).
+#[must_use]
+pub fn settings_path(user_path: &Path) -> PathBuf {
+    user_path.with_file_name("settings.json")
+}
+
+/// One global setting; a missing or unreadable file has none.
+#[must_use]
+pub fn load_setting(user_path: &Path, key: &str) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(settings_path(user_path)).ok()?;
+    let settings: serde_json::Value = serde_json::from_str(&text).ok()?;
+    settings.get(key).cloned().filter(|value| !value.is_null())
+}
+
+/// Set one global setting (`None` removes it), keeping the others.
+pub fn save_setting(
+    user_path: &Path,
+    key: &str,
+    value: Option<serde_json::Value>,
+) -> Result<(), String> {
+    let path = settings_path(user_path);
+    let mut settings = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let object = settings
+        .as_object_mut()
+        .ok_or_else(|| "settings are not an object".to_owned())?;
+    match value {
+        Some(value) => {
+            object.insert(key.to_owned(), value);
+        }
+        None => {
+            object.remove(key);
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let text = serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?;
+    let staged = path.with_extension("json.staged");
+    std::fs::write(&staged, text).map_err(|error| error.to_string())?;
+    std::fs::rename(&staged, &path).map_err(|error| error.to_string())
+}
+
 /// The file `/scoped-models` saves the scope in, beside the user config: it
 /// stands above `[routing] scoped` of the user config, as the `/model` selection
 /// does.

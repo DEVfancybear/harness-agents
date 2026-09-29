@@ -385,6 +385,12 @@ pub trait SessionPort: Send {
     fn stop_agents(&mut self, _selector: &str) -> Result<String, String> {
         Err("this backend has no delegated children".to_owned())
     }
+    /// prime-agent's `/rlm-max-depth`: `None` reports the value and its source,
+    /// `Some((n, global))` sets it for this chat (and as the global default).
+    /// The outcome arrives as a notice.
+    fn rlm_max_depth(&mut self, _change: Option<(u32, bool)>) -> Result<(), String> {
+        Err("this backend has no delegated children".to_owned())
+    }
     /// How the steering and follow-up lanes are drained (`[queue]`).
     fn queue_modes(&self) -> (super::queue::QueueMode, super::queue::QueueMode) {
         Default::default()
@@ -2067,13 +2073,62 @@ fn sort_newest_first(sessions: &mut [harness_store_sqlite::SessionSummary]) {
     });
 }
 
-/// One entry per conversation: its newest session, with how many turns it has.
-///
-/// Every turn is stored as its own session linked to the one before, and the picker
-/// used to list each of them. A ten-turn conversation filled half the list with ten
-/// rows of the same title, and choosing any row but the newest resumed the
-/// conversation from the middle, as if the later turns had never happened. A
-/// conversation is a task, so the list keeps the newest session of each task.
+/// The session setting a conversation's `/rlm-max-depth` is kept in.
+const RLM_MAX_DEPTH_SETTING: &str = "rlm_max_depth";
+
+/// The task of the conversation `previous` continues, or `fallback` (the task a
+/// new conversation's first turn will use).
+async fn conversation_task(
+    store: &SqliteStore,
+    previous: Option<&SessionId>,
+    fallback: TaskId,
+) -> TaskId {
+    match previous {
+        Some(previous) => store
+            .session_task(previous)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(fallback),
+        None => fallback,
+    }
+}
+
+/// prime-agent's `_resolveRlmMaxDepth`: the chat's own value, else the global
+/// `rlmMaxDepth` setting, else `RLM_MAX_DEPTH`, else 2. ha has no parent session
+/// to inherit from: a child takes its value from the host when it is created.
+async fn resolve_rlm_max_depth(
+    store: &SqliteStore,
+    task_id: &TaskId,
+    config_file: &Path,
+    environment: &LaunchEnvironment,
+) -> (u32, super::delegation::MaxDepthSource) {
+    use super::delegation::{DEFAULT_RLM_MAX_DEPTH, MaxDepthSource};
+    if let Some(depth) = store
+        .session_setting(task_id, RLM_MAX_DEPTH_SETTING)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    {
+        return (depth, MaxDepthSource::Chat);
+    }
+    if let Some(depth) = super::config::load_setting(config_file, "rlmMaxDepth")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+    {
+        return (depth, MaxDepthSource::Global);
+    }
+    if let Some(depth) = environment.value("RLM_MAX_DEPTH").and_then(|value| {
+        value
+            .to_str()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+    }) {
+        return (depth, MaxDepthSource::Env);
+    }
+    (DEFAULT_RLM_MAX_DEPTH, MaxDepthSource::Default)
+}
+
 /// The sessions of the user's own conversations: a delegated child's task
 /// shares the project store, but it is the parent's work, not a conversation to
 /// resume. A child is marked with [`super::delegation::DELEGATED_CHILD_SETTING`]
@@ -2123,6 +2178,13 @@ pub(super) async fn user_conversation_sessions(
         .collect()
 }
 
+/// One entry per conversation: its newest session, with how many turns it has.
+///
+/// Every turn is stored as its own session linked to the one before, and the picker
+/// used to list each of them. A ten-turn conversation filled half the list with ten
+/// rows of the same title, and choosing any row but the newest resumed the
+/// conversation from the middle, as if the later turns had never happened. A
+/// conversation is a task, so the list keeps the newest session of each task.
 fn conversation_heads(
     mut sessions: Vec<harness_store_sqlite::SessionSummary>,
 ) -> (
@@ -3919,6 +3981,63 @@ impl SessionPort for AgentSessionService {
         )
     }
 
+    fn rlm_max_depth(&mut self, change: Option<(u32, bool)>) -> Result<(), String> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        let previous = self
+            .previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.clone());
+        let task_id = self.task_id.clone();
+        let config_file = self.config_file.clone();
+        let environment = self.environment.clone();
+        let agents = Arc::clone(&self.agents);
+        let sender = self.sender.clone();
+        handle.spawn(async move {
+            let message = match change {
+                None => {
+                    let resolved = match agents.store().lease().await {
+                        Ok(lease) => {
+                            let store = lease.store();
+                            let task = conversation_task(&store, previous.as_ref(), task_id).await;
+                            resolve_rlm_max_depth(&store, &task, &config_file, &environment).await
+                        }
+                        Err(_) => agents.max_depth(),
+                    };
+                    format!("RLM max depth: {} ({})", resolved.0, resolved.1.as_str())
+                }
+                Some((depth, global)) => {
+                    agents.set_max_depth(depth, super::delegation::MaxDepthSource::Chat);
+                    // The chat keeps its value: the conversation's task carries it.
+                    if let Ok(lease) = agents.store().lease().await {
+                        let store = lease.store();
+                        let task = conversation_task(&store, previous.as_ref(), task_id).await;
+                        let _ = store
+                            .set_session_setting(&task, RLM_MAX_DEPTH_SETTING, &depth.to_string())
+                            .await;
+                    }
+                    if global {
+                        match super::config::save_setting(
+                            &config_file,
+                            "rlmMaxDepth",
+                            Some(serde_json::json!(depth)),
+                        ) {
+                            Ok(()) => format!("RLM max depth set: {depth} and saved as global default"),
+                            Err(error) => format!(
+                                "RLM max depth set for this chat, but the global default was not saved: {error}"
+                            ),
+                        }
+                    } else {
+                        format!("RLM max depth set: {depth}")
+                    }
+                }
+            };
+            let _ = sender.send(SessionEvent::Notice { message });
+        });
+        Ok(())
+    }
+
     fn stop_agents(&mut self, selector: &str) -> Result<String, String> {
         let stopped = self
             .agents
@@ -4834,6 +4953,10 @@ async fn run_turn(
     // started with: `/model` in a later turn does not switch a child mid-task.
     let child_provider = LiveProvider::build(&config, thinking_level, task_id.as_ref(), &data_dir)
         .unwrap_or_else(|_| Arc::clone(&provider));
+    // The depth children of this turn may spawn to, read for this conversation.
+    let (max_depth, depth_source) =
+        resolve_rlm_max_depth(&store, &task_id, &config_file, &environment).await;
+    agents.set_max_depth(max_depth, depth_source);
     let delegate_host = Some(super::delegation::DelegateHost::new(
         &agents,
         super::delegation::ChildLaunch {
