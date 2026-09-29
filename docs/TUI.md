@@ -8,8 +8,9 @@ Each turn is drawn on one left margin. `BẠN` and `HA` sit on a colored rail, a
 the operator's own message is shaded as a card, so the start of a turn is
 findable while scrolling without reading the text. A tool call and its output
 share one panel block; a diff keeps its added and removed tints inside it. Each
-turn closes on a rule that names its outcome and counters. Ctrl-O cycles tool
-detail.
+turn closes on a rule that names its outcome and counters. Ctrl-O cycles the
+detail mode as prime-agent does: collapsed (reasoning hidden, three output
+lines), details (reasoning and full edit diffs), expanded (every output line).
 
 The status line has two ends: what the app is doing on the left (spinner, clock,
 `esc to interrupt`, counters, model) and the telemetry that is only worth a glance

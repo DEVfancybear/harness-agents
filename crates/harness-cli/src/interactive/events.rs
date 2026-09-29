@@ -449,11 +449,11 @@ pub struct UiState {
     pub goal: Option<String>,
 }
 
-/// prime-agent's detail modes, cycled with ctrl+o: collapsed hides reasoning and
-/// cuts tool output to three lines, details shows reasoning, expanded draws each
-/// call as Claude Code's transcript view does - its whole input in a box (a shell
-/// command as `$ command`) and every line it returned in another. Rows already in
-/// the scrollback keep the mode they were drawn in until ctrl+o reprints them.
+/// prime-agent's detail modes, cycled with ctrl+o (`setChatDetail`): collapsed
+/// (overview) hides reasoning and cuts every tool output to three lines; details
+/// shows reasoning and opens the edit tools' diffs; expanded (all) opens every
+/// tool output. A call's card looks the same in all three. Rows already in the
+/// scrollback keep the mode they were drawn in until ctrl+o reprints them.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Detail {
     #[default]

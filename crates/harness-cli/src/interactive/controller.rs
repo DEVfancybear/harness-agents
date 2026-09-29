@@ -6525,8 +6525,8 @@ mod tests {
     }
 
     /// Looking back in expanded mode: `/more` draws a tool call the way ctrl+o's
-    /// reprint does - the whole command and every output line - while collapsed
-    /// mode keeps the transcript's one `[tool]` line.
+    /// reprint does - every output line under the call's card - while collapsed
+    /// mode keeps the preview.
     #[test]
     fn more_in_expanded_mode_shows_the_whole_tool_call() {
         let mut harness = tui_bench(true);
@@ -6577,19 +6577,12 @@ mod tests {
             )),
             "ctrl+o redraws the scrollback in expanded mode: {effects:?}"
         );
+        // prime-agent's "all output": every line of what the call returned, under
+        // the same one-line card - no boxes.
         let expanded = more(&mut harness.controller);
-        assert!(
-            expanded.contains("│ $ cargo test --workspace --locked"),
-            "{expanded}"
-        );
-        assert!(expanded.contains("│ line 5"), "{expanded}");
-        for row in expanded.lines().filter(|row| row.contains('│')) {
-            assert_eq!(
-                crate::interactive::tui::widgets::composer::display_width(row),
-                58,
-                "a row fits the panel inside its border: {row:?}"
-            );
-        }
+        assert!(expanded.contains("  line 5"), "{expanded}");
+        assert!(expanded.contains("✓ run_shell · done"), "{expanded}");
+        assert!(!expanded.contains('│'), "{expanded}");
     }
 
     /// K04: `/more` reopens what the live viewport clipped, from its first line.

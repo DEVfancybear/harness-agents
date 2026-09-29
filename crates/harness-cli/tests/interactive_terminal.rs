@@ -1259,6 +1259,8 @@ fn i07a_ctrl_c_clears_an_idle_prompt() {
     let (temp, project) = sandbox();
     let mut session = PtySession::spawn(&project, &base_env(&temp));
     session.wait_for("Harness Agents", Duration::from_secs(30));
+    // The banner is drawn before the loop reads keys; the composer is drawn by it.
+    session.wait_for("Nhập yêu cầu", Duration::from_secs(15));
 
     session.send("typo");
     wait_for_normalized(&session, "typo", Duration::from_secs(15));
