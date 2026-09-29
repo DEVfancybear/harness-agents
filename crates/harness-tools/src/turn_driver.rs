@@ -391,8 +391,13 @@ const ELIDED_RESULT: &str =
 /// the oldest tool results, which are the bulk of it and the part a model can always
 /// ask for again, are replaced by a one-line note, newest last. The call/result pairs
 /// stay whole, so the transcript remains valid, and the newest results and every
-/// assistant message are never touched. Returns how many results were shortened.
-fn trim_transcript(transcript: &mut [ProviderMessage], budget: usize, keep_recent: usize) -> usize {
+/// assistant message are never touched. Returns the signature (`name|arguments`)
+/// of each call whose result was shortened.
+fn trim_transcript(
+    transcript: &mut [ProviderMessage],
+    budget: usize,
+    keep_recent: usize,
+) -> Vec<String> {
     let size = |messages: &[ProviderMessage]| -> usize {
         messages
             .iter()
@@ -408,7 +413,7 @@ fn trim_transcript(transcript: &mut [ProviderMessage], budget: usize, keep_recen
     };
     let mut total = size(transcript);
     if total <= budget {
-        return 0;
+        return Vec::new();
     }
     let results = transcript
         .iter()
@@ -417,7 +422,7 @@ fn trim_transcript(transcript: &mut [ProviderMessage], budget: usize, keep_recen
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let eligible = results.len().saturating_sub(keep_recent);
-    let mut elided = 0;
+    let mut elided = Vec::new();
     for &index in results.iter().take(eligible) {
         if total <= budget {
             break;
@@ -428,7 +433,15 @@ fn trim_transcript(transcript: &mut [ProviderMessage], budget: usize, keep_recen
         }
         total -= message.content.len() - ELIDED_RESULT.len();
         ELIDED_RESULT.clone_into(&mut message.content);
-        elided += 1;
+        let call_id = message.tool_call_id.clone();
+        let signature = transcript[..index]
+            .iter()
+            .rev()
+            .flat_map(|message| message.tool_calls.iter())
+            .find(|call| Some(&call.call_id) == call_id.as_ref())
+            .map(|call| format!("{}|{}", call.name, call.arguments))
+            .unwrap_or_default();
+        elided.push(signature);
     }
     elided
 }
@@ -1289,9 +1302,17 @@ impl TurnDriver {
                 TRANSCRIPT_BUDGET_BYTES,
                 KEEP_RECENT_RESULTS,
             );
-            if elided > 0 {
+            // A shortened result tells the model to call the tool again; that call
+            // reads what the model can no longer see, so it is not a repeat. Measured:
+            // an explorer whose 38 results were shortened re-read 31 of them as told,
+            // and the repeated-read check stopped it as `loop_detected`.
+            for signature in &elided {
+                unchanged_reads.remove(signature);
+            }
+            if !elided.is_empty() {
                 observer.observe(TurnProgress::Notice(format!(
-                    "context: {elided} older tool result(s) in this turn were shortened to stay within budget"
+                    "context: {} older tool result(s) in this turn were shortened to stay within budget",
+                    elided.len()
                 )));
             }
             result = self
@@ -2602,7 +2623,7 @@ mod transcript_budget_tests {
         let mut transcript = (0..10)
             .flat_map(|index| step(index, 30_000))
             .collect::<Vec<_>>();
-        let elided = trim_transcript(&mut transcript, 200_000, 6);
+        let elided = trim_transcript(&mut transcript, 200_000, 6).len();
         assert!(elided > 0);
         let results = transcript
             .iter()
@@ -2627,7 +2648,7 @@ mod transcript_budget_tests {
             .flat_map(|index| step(index, 1_000))
             .collect::<Vec<_>>();
         let before = transcript.clone();
-        assert_eq!(trim_transcript(&mut transcript, 200_000, 6), 0);
+        assert!(trim_transcript(&mut transcript, 200_000, 6).is_empty());
         assert_eq!(transcript, before);
     }
 }

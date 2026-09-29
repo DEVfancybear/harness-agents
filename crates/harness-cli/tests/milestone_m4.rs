@@ -3756,3 +3756,91 @@ async fn write_file_after_a_read_needs_no_hash_from_the_model() {
     drop(driver);
     close(store).await;
 }
+
+/// Measured: an explorer whose 38 tool results were shortened to fit the turn's
+/// budget re-read 31 of them - as the shortened result tells it to - and the
+/// repeated-read check stopped it as `loop_detected` after 61 calls. A read whose
+/// earlier result was shortened is not a repeat: the model cannot see it.
+#[tokio::test]
+async fn a_read_whose_result_was_shortened_may_be_made_again() {
+    let bench = bench();
+    let line = format!("{}\n", "x".repeat(99));
+    let big = line.repeat(600);
+    std::fs::write(bench.workspace.join("a.txt"), &big).expect("a");
+    for step in 0..4 {
+        for file in 0..6 {
+            std::fs::write(bench.workspace.join(format!("f{step}_{file}.txt")), &big)
+                .expect("filler");
+        }
+    }
+    let store = bench.open_store().await;
+    let read = |id: String, path: &str| {
+        ProviderStreamEvent::tool_delta(
+            id,
+            "read_file",
+            serde_json::json!({"path": path}).to_string(),
+        )
+    };
+    let mut script = Vec::new();
+    for step in 0..4 {
+        let mut events = vec![ProviderStreamEvent::started()];
+        events.push(read(format!("a-{step}"), "a.txt"));
+        for file in 0..6 {
+            events.push(read(
+                format!("f-{step}-{file}"),
+                &format!("f{step}_{file}.txt"),
+            ));
+        }
+        events.push(ProviderStreamEvent::completed("tool_calls"));
+        script.push(events);
+    }
+    script.push(vec![
+        ProviderStreamEvent::started(),
+        ProviderStreamEvent::text("read everything"),
+        ProviderStreamEvent::completed("stop"),
+    ]);
+    let provider = Arc::new(ScriptedProvider::new(script));
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig {
+            context_window_tokens: 1_000_000,
+            ..RuntimeConfig::default()
+        },
+    ));
+    let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)));
+    let request = RunRequest::new(
+        SessionId::generate(),
+        TaskId::generate(),
+        InputId::generate(),
+        "read the files".to_owned(),
+        observe_workspace(bench.project_id.clone(), &bench.workspace).unwrap(),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    let outcome = driver
+        .run_turn(
+            request,
+            TurnOptions {
+                workspace_root: bench.workspace.clone(),
+                actor_id: "m4.test".to_owned(),
+                approvals: ApprovalMode::Auto,
+                limits: TurnLimits {
+                    max_tool_calls: 100,
+                    ..TurnLimits::default()
+                },
+            },
+            Arc::new(SilentObserver),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn runs");
+    assert_eq!(
+        outcome.stop,
+        harness_tools::TurnStop::Final,
+        "re-reading a shortened result is not a loop ({} calls)",
+        outcome.tool_calls
+    );
+    assert_eq!(outcome.final_text, "read everything");
+    drop(driver);
+    close(store).await;
+}
