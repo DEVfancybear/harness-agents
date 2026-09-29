@@ -2074,6 +2074,55 @@ fn sort_newest_first(sessions: &mut [harness_store_sqlite::SessionSummary]) {
 /// rows of the same title, and choosing any row but the newest resumed the
 /// conversation from the middle, as if the later turns had never happened. A
 /// conversation is a task, so the list keeps the newest session of each task.
+/// The sessions of the user's own conversations: a delegated child's task
+/// shares the project store, but it is the parent's work, not a conversation to
+/// resume. A child is marked with [`super::delegation::DELEGATED_CHILD_SETTING`]
+/// when it starts; one from before the mark is told by the frame the app itself
+/// writes around a brief (`[task from parent]`) on its task's first input, when
+/// no title was ever given to the task (a user who typed into one - it happened
+/// through "latest" - keeps it listed).
+pub(super) async fn user_conversation_sessions(
+    store: &SqliteStore,
+    sessions: Vec<harness_store_sqlite::SessionSummary>,
+) -> Vec<harness_store_sqlite::SessionSummary> {
+    let mut first_session = std::collections::HashMap::<String, SessionId>::new();
+    for session in &sessions {
+        let entry = first_session
+            .entry(session.task_id.as_str().to_owned())
+            .or_insert_with(|| session.session_id.clone());
+        if session.session_id.as_str() < entry.as_str() {
+            *entry = session.session_id.clone();
+        }
+    }
+    let mut children = std::collections::HashSet::new();
+    for (task, first) in &first_session {
+        let Ok(task_id) = TaskId::parse(task.clone()) else {
+            continue;
+        };
+        let setting = |key: &'static str| store.session_setting(&task_id, key);
+        let marked = setting(super::delegation::DELEGATED_CHILD_SETTING)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        let legacy = !marked
+            && setting("title").await.ok().flatten().is_none()
+            && store
+                .session_admitted_input(first)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|(_, text)| text.starts_with(super::delegation::CHILD_PROMPT_HEAD));
+        if marked || legacy {
+            children.insert(task.clone());
+        }
+    }
+    sessions
+        .into_iter()
+        .filter(|session| !children.contains(session.task_id.as_str()))
+        .collect()
+}
+
 fn conversation_heads(
     mut sessions: Vec<harness_store_sqlite::SessionSummary>,
 ) -> (
@@ -2430,10 +2479,13 @@ impl AgentSessionService {
                 let store = SqliteStore::open_read_only(store_dir)
                     .await
                     .map_err(|error| format!("project session store could not open: {error}"))?;
-                let mut sessions = store
+                let sessions = store
                     .list_sessions()
                     .await
                     .map_err(|error| format!("project sessions could not be listed: {error}"))?;
+                // "latest" is the user's latest conversation, never a child that
+                // happened to write last.
+                let mut sessions = user_conversation_sessions(&store, sessions).await;
                 sort_newest_first(&mut sessions);
                 let latest = sessions
                     .into_iter()
@@ -3591,6 +3643,7 @@ impl SessionPort for AgentSessionService {
             match SqliteStore::open_read_only(store_dir.clone()).await {
                 Ok(store) => match store.list_sessions().await {
                     Ok(summaries) => {
+                        let summaries = user_conversation_sessions(&store, summaries).await;
                         // Newest first, bounded: a resume list is a menu, not a dump.
                         let (summaries, turns_per_task) = conversation_heads(summaries);
                         let mut sessions = Vec::new();
@@ -3605,12 +3658,23 @@ impl SessionPort for AgentSessionService {
                                 .ok()
                                 .flatten()
                                 .unwrap_or_else(|| "untitled session".to_owned());
-                            let model = store
-                                .session_setting(&summary.task_id, "model")
+                            // The model the conversation last talked to, read off its
+                            // last request; a model chosen for the task comes next.
+                            let sent = store
+                                .session_model(&summary.session_id)
                                 .await
                                 .ok()
                                 .flatten()
-                                .unwrap_or_else(|| "model unknown".to_owned());
+                                .map(|(provider, model)| format!("{provider}/{model}"));
+                            let model = match sent {
+                                Some(model) => model,
+                                None => store
+                                    .session_setting(&summary.task_id, "model")
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_else(|| "model unknown".to_owned()),
+                            };
                             let created = chrono::NaiveDateTime::parse_from_str(
                                 &summary.created_at,
                                 "%Y-%m-%d %H:%M:%S",
@@ -7671,6 +7735,129 @@ mod tests {
             service_a.newest_project_session().expect("repeat lookup"),
             foreign
         );
+    }
+
+    /// Measured in the user's store: a conversation that delegated to children
+    /// showed as seven sessions in `/resume`, and "latest" after a restart
+    /// continued a child's task instead of the conversation. A child's task is the
+    /// parent's work: marked ones, and ones from before the mark (framed
+    /// `[task from parent]`, never titled), are left out.
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one store holding the user's conversation and three kinds of child"
+    )]
+    async fn resume_lists_and_continues_the_users_conversations_not_children() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&project).expect("project");
+        let environment =
+            LaunchEnvironment::from_pairs([("HA_HOME", home.to_string_lossy().into_owned())]);
+        let context = bootstrap::resolve(LaunchRequest {
+            cwd: None,
+            caller_dir: project.clone(),
+            platform: HostPlatform::current(),
+            environment: environment.clone(),
+            explicit_data_dir: None,
+        })
+        .expect("context");
+        let channel = SessionChannel::new();
+        let service = AgentSessionService::new(&context, environment.clone(), channel.sender());
+        let store = Arc::new(
+            SqliteStore::open_writer(WriterOpenOptions::new(
+                context.project_store_dir(),
+                harness_types::HostId::generate(),
+            ))
+            .await
+            .expect("store"),
+        );
+        let admit = |text: &'static str, task: harness_types::TaskId| {
+            let store = Arc::clone(&store);
+            let project = project.clone();
+            async move {
+                let session = harness_types::SessionId::generate();
+                let project_id = crate::interactive::project::resolve_project_id(&store, &project)
+                    .await
+                    .expect("project id");
+                SessionService::new(Arc::clone(&store))
+                    .admit_input(AdmitInputRequest {
+                        session_id: session.clone(),
+                        task_id: task,
+                        input_id: InputId::generate(),
+                        expected_sequence: 1,
+                        authority: SourceAuthority::User,
+                        raw_text: text.to_owned(),
+                        workspace: observe_workspace(project_id, &project).expect("workspace"),
+                        initial_plan_items: Vec::new(),
+                    })
+                    .await
+                    .expect("admitted");
+                session
+            }
+        };
+        let user_task = harness_types::TaskId::generate();
+        let conversation = admit("ls", user_task.clone()).await;
+        store
+            .set_session_setting(&user_task, "title", "agents test")
+            .await
+            .expect("title");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // A child the user typed into through "latest" before this fix: kept.
+        let typed_into = harness_types::TaskId::generate();
+        let typed_session = admit(
+            "[task from parent]\n\nAnswer the delegated task below.",
+            typed_into.clone(),
+        )
+        .await;
+        store
+            .set_session_setting(&typed_into, "title", "tiếp tục")
+            .await
+            .expect("title");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Children delegated later: the newest sessions in the store.
+        let marked = harness_types::TaskId::generate();
+        admit(
+            "[task from parent]\n\nAnswer the delegated task below.",
+            marked.clone(),
+        )
+        .await;
+        store
+            .set_session_setting(
+                &marked,
+                super::super::delegation::DELEGATED_CHILD_SETTING,
+                "explorer",
+            )
+            .await
+            .expect("mark");
+        let legacy = harness_types::TaskId::generate();
+        admit(
+            "[task from parent]\n\nAnswer the delegated task below.",
+            legacy.clone(),
+        )
+        .await;
+
+        let listed =
+            super::user_conversation_sessions(&store, store.list_sessions().await.expect("list"))
+                .await
+                .into_iter()
+                .map(|session| session.task_id)
+                .collect::<std::collections::HashSet<_>>();
+        assert!(listed.contains(&user_task));
+        assert!(listed.contains(&typed_into));
+        assert!(!listed.contains(&marked), "a marked child is left out");
+        assert!(!listed.contains(&legacy), "an unmarked child is left out");
+        Arc::try_unwrap(store)
+            .expect("store consumers released")
+            .close()
+            .await
+            .expect("close store");
+        // "latest" is the newest conversation of the user's, not the children
+        // that wrote after it.
+        let latest = service.newest_project_session().expect("latest");
+        assert_eq!(latest, typed_session);
+        let _ = conversation;
     }
 
     #[tokio::test]

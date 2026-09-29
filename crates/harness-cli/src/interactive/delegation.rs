@@ -116,6 +116,13 @@ pub trait ChildModels: Send + Sync {
 }
 
 /// What a turn gives the children it starts.
+/// The session setting a delegated child's task carries (its role): the task is
+/// the parent's work, so `/resume` does not offer it as a conversation.
+pub const DELEGATED_CHILD_SETTING: &str = "delegated_child";
+
+/// How the app frames a child's first input, prime-agent's `[task from parent]`.
+pub const CHILD_PROMPT_HEAD: &str = "[task from parent]";
+
 #[derive(Clone)]
 pub struct ChildLaunch {
     /// The parent's model; a child runs on it unless it asks for another.
@@ -1911,9 +1918,14 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 Arc::clone(&launch.model.provider),
                 launch.runtime_config.clone(),
             ));
+            // The child's task is the parent's work, not a conversation of the
+            // user's: `/resume` and "latest" leave it out.
+            let _ = store
+                .set_session_setting(&task_id, DELEGATED_CHILD_SETTING, &role_name)
+                .await;
             // prime-agent frames a child's task as `[task from parent]`.
             let mut prompt = format!(
-                "[task from parent]\n\nAnswer the delegated task below. Return concise results and identify changed files or findings with paths.\n\nBrief:\n{}",
+                "{CHILD_PROMPT_HEAD}\n\nAnswer the delegated task below. Return concise results and identify changed files or findings with paths.\n\nBrief:\n{}",
                 request.brief.objective
             );
             for message in backlog {

@@ -2339,6 +2339,28 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// The provider and model of the last request a session sent, when it sent
+    /// one: what `/resume` shows as the conversation's model.
+    pub async fn session_model(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<(String, String)>, StoreError> {
+        let row = sqlx::query(
+            "SELECT provider_id, model FROM frozen_requests WHERE session_id = ? ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(session_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| database_error(ErrorCode::StorageWriteFailed, "read session model", error))?;
+        row.map(|row| {
+            Ok((
+                row_get::<String>(&row, "provider_id")?,
+                row_get::<String>(&row, "model")?,
+            ))
+        })
+        .transpose()
+    }
+
     pub async fn list_frozen_requests(
         &self,
         session_id: &SessionId,
