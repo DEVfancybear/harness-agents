@@ -32,8 +32,9 @@ use ratatui::widgets::Widget;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use self::theme::Theme;
-use super::controller::{Effect, InteractiveController};
+use super::controller::Effect;
 use super::events::{HistoryItem, Key, UiState};
+use super::frontend::Frontend;
 use super::terminal::TerminalBackend;
 
 /// How long one render-loop iteration waits for a key before draining events.
@@ -129,6 +130,10 @@ pub trait TuiRenderer {
     /// scrollback keeps what it already had.
     fn reprint(&mut self, _detail: super::events::Detail) -> io::Result<()> {
         Ok(())
+    }
+    /// Take over a conversation another process drew (`ha attach`).
+    fn restore(&mut self, items: &[HistoryItem]) -> io::Result<()> {
+        self.insert_history_batch(items)
     }
     /// Erase the viewport footprint and leave the cursor on a fresh line.
     fn finish(&mut self) -> io::Result<()>;
@@ -238,6 +243,20 @@ where
         }
         let rows = blocks.into_iter().rev().flatten().collect::<Vec<_>>();
         self.insert_rows(&rows)
+    }
+
+    /// Take over a conversation another process drew (`ha attach`): keep its
+    /// entries for ctrl+o and draw only the newest that fit, as a reprint does,
+    /// rather than pushing the whole conversation through the scrollback.
+    fn restore(&mut self, items: &[HistoryItem]) -> io::Result<()> {
+        self.shown = items
+            .iter()
+            .skip(items.len().saturating_sub(REPRINT_ENTRIES))
+            .cloned()
+            .collect();
+        self.assistant_continuing =
+            matches!(self.shown.back(), Some(HistoryItem::Assistant { .. }));
+        self.repaint_screen(self.detail)
     }
 
     /// Push rows above the viewport in screen-sized batches: one insert per batch
@@ -420,6 +439,10 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
         self.inner.repaint_screen(detail)
     }
 
+    fn restore(&mut self, items: &[HistoryItem]) -> io::Result<()> {
+        self.inner.restore(items)
+    }
+
     fn copy_text(&mut self, text: &str) -> io::Result<()> {
         let mut clipboard =
             arboard::Clipboard::new().map_err(|error| io::Error::other(error.to_string()))?;
@@ -548,6 +571,11 @@ impl<T: TerminalBackend> TuiRenderer for ScriptedRenderer<T> {
         self.inner.repaint_screen(detail)
     }
 
+    fn restore(&mut self, items: &[HistoryItem]) -> io::Result<()> {
+        self.inner.restore(items)?;
+        self.mirror()
+    }
+
     fn insert_history(&mut self, item: &HistoryItem) -> io::Result<()> {
         let width = self.inner.columns();
         let rows = history::render_fragment(
@@ -599,7 +627,7 @@ fn to_io<E: std::error::Error + Send + Sync + 'static>(error: E) -> io::Error {
 /// renderer: the I08 guarantee does not depend on which renderer is active.
 pub fn run(
     backend: impl TerminalBackend,
-    controller: &mut InteractiveController,
+    controller: &mut impl Frontend,
     notice: Option<&str>,
 ) -> Result<u8, HarnessError> {
     let renderer = RuntimeRenderer::open(backend).map_err(|error| terminal_error(&error))?;
@@ -615,7 +643,7 @@ pub fn run(
 /// A terminal failure propagates as a typed error.
 pub fn run_loop<R: TuiRenderer>(
     mut renderer: R,
-    controller: &mut InteractiveController,
+    controller: &mut impl Frontend,
     notice: Option<&str>,
 ) -> Result<Outcome<R>, HarnessError> {
     let result = run_loop_inner(&mut renderer, controller, notice);
@@ -629,7 +657,7 @@ pub fn run_loop<R: TuiRenderer>(
 
 fn run_loop_inner(
     renderer: &mut impl TuiRenderer,
-    controller: &mut InteractiveController,
+    controller: &mut impl Frontend,
     notice: Option<&str>,
 ) -> Result<u8, HarnessError> {
     if let Some(source) = notice {
@@ -760,6 +788,9 @@ fn apply(renderer: &mut impl TuiRenderer, effects: Vec<Effect>) -> Result<Step, 
                 .map_err(|error| terminal_error(&error))?,
             Effect::ClearViewport => renderer
                 .clear_viewport()
+                .map_err(|error| terminal_error(&error))?,
+            Effect::Restore(items) => renderer
+                .restore(&items)
                 .map_err(|error| terminal_error(&error))?,
             // History rows were gathered above; a redraw is the frame's own draw.
             Effect::History(_) | Effect::Stream(_) | Effect::Thinking(_) | Effect::Redraw => {}

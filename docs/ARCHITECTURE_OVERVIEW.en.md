@@ -102,7 +102,7 @@ Some higher-level crates depend on more than one sibling because they compose a 
 4. The kernel validates required service contracts before work is admitted. A missing required provider or incompatible generation is a composition error, not a degraded successful run.
 5. The interactive UI or headless command starts the selected run mode.
 
-The product is foreground and single-host. There is no daemon that continues work after the host exits, and one writable host owns a data directory at a time.
+The product is single-host. An interactive session runs in a background worker, one per project, that the terminal attaches to (prime-agent's daemon, [OPERATOR_GUIDE 12.7](OPERATOR_GUIDE.en.md#127-background-agents)): closing the terminal leaves the session working, and the worker holds the project's store for all of its agents. Headless runs and maintenance stay in the foreground, and one writable host owns a data directory at a time.
 
 ### 5.2 User turn and provider attempt
 
@@ -213,7 +213,7 @@ The repository documents Windows 10/11 x64 as the supported platform. Linux is v
 
 Current limits to preserve in code and docs:
 
-- no daemon that resumes work after process exit;
+- a background agent lives as long as its worker process: a worker that dies or a reboot ends its agents, and nothing restarts them (the conversation stays in the store);
 - one writable host per data directory;
 - no guarantee of perfect model reasoning or unlimited context retention;
 - no claim that transport isolation is an OS sandbox;

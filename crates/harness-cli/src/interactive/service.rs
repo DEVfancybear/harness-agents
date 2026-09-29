@@ -311,6 +311,17 @@ pub trait SessionPort: Send {
     fn running_children(&self) -> usize {
         0
     }
+    /// Whether a schedule or a heartbeat will start a turn on its own.
+    fn has_scheduled_work(&self) -> bool {
+        false
+    }
+    /// The conversation this session is in.
+    fn conversation_id(&self) -> Option<String> {
+        None
+    }
+    /// Where `rlm.create_session` starts a separate top-level session; only a
+    /// background agent has one.
+    fn set_session_host(&mut self, _host: Arc<dyn super::agents::SessionHost>) {}
     /// Run autonomous quality gates in the workspace; the verdict arrives as
     /// [`SessionEvent::GatesChecked`].
     fn run_gates(&mut self, _job: super::autonomous::GateJob) -> Result<(), String> {
@@ -2369,7 +2380,7 @@ impl AgentSessionService {
             &context.project.root,
         );
         let agents = super::delegation::SessionAgents::new(
-            super::store_lease::SharedStore::new(context.project_store_dir()),
+            super::store_lease::SharedStore::for_dir(context.project_store_dir()),
             sender.clone(),
             Arc::clone(&gate) as Arc<dyn ApprovalGate>,
             context.paths.data_dir.join("delegation"),
@@ -3480,6 +3491,18 @@ impl SessionPort for AgentSessionService {
 
     fn running_children(&self) -> usize {
         self.agents.running()
+    }
+
+    fn has_scheduled_work(&self) -> bool {
+        self.schedules.has_active() || self.heartbeats.has_active()
+    }
+
+    fn conversation_id(&self) -> Option<String> {
+        Some(self.task_id.as_str().to_owned())
+    }
+
+    fn set_session_host(&mut self, host: Arc<dyn super::agents::SessionHost>) {
+        self.agents.set_session_host(host);
     }
 
     fn run_gates(&mut self, job: super::autonomous::GateJob) -> Result<(), String> {

@@ -102,7 +102,7 @@ Một số crate tầng trên phụ thuộc nhiều sibling để compose một 
 4. Kernel validate required service contracts trước khi nhận việc. Provider bắt buộc bị thiếu hoặc generation không tương thích là composition error, không phải một run thành công ở chế độ degraded.
 5. UI tương tác hoặc command headless khởi động mode được chọn.
 
-Sản phẩm chạy foreground trên một host. Không có daemon tiếp tục công việc sau khi host thoát, và mỗi thời điểm chỉ một writable host sở hữu data directory.
+Sản phẩm chạy trên một host. Phiên tương tác chạy trong một worker nền, mỗi project một worker, và terminal gắn vào nó (daemon của prime-agent, [OPERATOR_GUIDE 12.7](OPERATOR_GUIDE.vi.md#127-agent-chạy-nền)): đóng terminal thì phiên vẫn làm việc, và worker giữ store của project cho mọi agent của nó. Chạy headless và bảo trì vẫn foreground, và mỗi thời điểm chỉ một writable host sở hữu data directory.
 
 ### 5.2 User turn và provider attempt
 
@@ -213,7 +213,7 @@ Repository ghi Windows 10/11 x64 là platform được hỗ trợ. Linux xuất 
 
 Các giới hạn phải được giữ nhất quán trong code và docs:
 
-- không có daemon resume công việc sau khi process thoát;
+- agent chạy nền sống cùng tiến trình worker của nó: worker chết hay máy khởi động lại thì agent kết thúc, và không gì khởi động lại chúng (hội thoại vẫn nằm trong store);
 - một writable host cho mỗi data directory;
 - không bảo đảm model reasoning hoàn hảo hoặc giữ context không giới hạn;
 - không tuyên bố transport isolation là OS sandbox;

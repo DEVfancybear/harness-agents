@@ -58,6 +58,22 @@ impl LaunchEnvironment {
         }
     }
 
+    /// Every variable as text, for a background agent started with this
+    /// environment (`ha`'s worker). It travels over the worker's socket and is
+    /// never written anywhere.
+    #[must_use]
+    pub fn pairs(&self) -> Vec<(String, String)> {
+        self.vars
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect()
+    }
+
     /// Raw value for one variable; used for presence checks only.
     #[must_use]
     pub fn value(&self, name: &str) -> Option<&OsStr> {

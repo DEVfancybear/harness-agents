@@ -49,6 +49,9 @@ struct PtySession {
     /// The master handle must outlive the session: dropping it closes the
     /// pseudo-console, which silently stops output and leaves the child blocked.
     master: Box<dyn portable_pty::MasterPty + Send>,
+    /// The session's `HA_HOME`: its background workers are shut down with it,
+    /// so a case never leaves an agent running (`ha shutdown --force`).
+    home: Option<String>,
 }
 
 /// Terminal emulator duties the harness must perform.
@@ -185,7 +188,17 @@ impl PtySession {
             input,
             transcript,
             master,
+            home: env
+                .iter()
+                .find(|(name, _)| *name == "HA_HOME")
+                .map(|(_, value)| value.clone()),
         }
+    }
+
+    /// Keep the background workers when this session goes: another session of
+    /// the case still uses them.
+    fn keep_workers(&mut self) {
+        self.home = None;
     }
 
     fn send(&mut self, text: &str) {
@@ -284,6 +297,12 @@ impl PtySession {
 impl Drop for PtySession {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        if let Some(home) = &self.home {
+            let _ = std::process::Command::new(cli_binary())
+                .args(["shutdown", "--force"])
+                .env("HA_HOME", home)
+                .output();
+        }
         // `portable_pty::Child::kill` is asynchronous on ConPTY. Reap the child
         // before the test binary exits, otherwise a failed case can keep ha.exe
         // locked and make the next cargo build fail with Access denied.
@@ -311,6 +330,22 @@ impl Drop for PtySession {
                 .to_owned();
             let _ = std::fs::write(format!("{name}/{label}.txt"), buffer.as_slice());
             buffer.clear();
+            // The background workers' logs, for a case that lost its agent.
+            if let Some(home) = &self.home
+                && let Ok(entries) = std::fs::read_dir(Path::new(home).join("data").join("workers"))
+            {
+                let logs = entries
+                    .flatten()
+                    .filter(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "log")
+                    })
+                    .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                    .collect::<String>();
+                let _ = std::fs::write(format!("{name}/{label}-workers.log"), logs);
+            }
         }
     }
 }
@@ -1659,7 +1694,11 @@ fn i13_a_settled_tool_receipt_survives_a_hard_kill_mid_turn() {
         patch_then_stall_endpoint(expected, replacement.to_owned());
     warm_up_loopback(&endpoint);
 
-    let mut session = PtySession::spawn(&project, &provider_env(&temp, &endpoint));
+    // The kill must reach the process running the turn, so the session runs in
+    // this terminal (`HA_DAEMON=off`); a background agent outlives its terminal.
+    let mut env = provider_env(&temp, &endpoint);
+    env.push(("HA_DAEMON", "off".to_owned()));
+    let mut session = PtySession::spawn(&project, &env);
     session.wait_for("Harness Agents", Duration::from_secs(30));
     session.send("fix the parser\r");
     // The proposal is rendered with the contract action name, not the tool name.
@@ -1852,7 +1891,11 @@ fn i05_exit_during_an_active_run_releases_the_store_for_the_next_host() {
     // and store ownership. The proof for ownership is that the next host can write.
     let (temp, project) = sandbox();
     let (endpoint, contacted, release, server) = stalling_provider();
-    let mut session = PtySession::spawn(&project, &provider_env(&temp, &endpoint));
+    // The session runs in this terminal (`HA_DAEMON=off`): a background agent's
+    // `/exit` detaches and leaves the run going (d01 covers that).
+    let mut env = provider_env(&temp, &endpoint);
+    env.push(("HA_DAEMON", "off".to_owned()));
+    let mut session = PtySession::spawn(&project, &env);
     session.wait_for("Harness Agents", Duration::from_secs(30));
 
     session.send("hold the turn open\r");
@@ -3095,5 +3138,171 @@ fn q08b_pty_tree_labels_and_summarizes_the_branch_it_leaves() {
         "the abandoned turn is not replayed: {text}"
     );
     assert!(text.contains("answer-one-q08b"), "the kept turn is: {text}");
+    finish(session);
+}
+
+// ---------------------------------------------------------------------------
+// Background agents (prime-agent's daemon)
+// ---------------------------------------------------------------------------
+
+/// The one background agent `ha agents --json` lists for this state root.
+fn only_agent(temp: &tempfile::TempDir, project: &Path) -> serde_json::Value {
+    let listed = run_cli_json(temp, project, &["agents", "--json"]);
+    let agents = listed["agents"].as_array().cloned().unwrap_or_default();
+    assert_eq!(agents.len(), 1, "one background agent: {listed}");
+    agents[0].clone()
+}
+
+/// Wait until the listed agent has nothing running: its app is ready (a
+/// state root with no config file is ready as `setup_required`) and no child works.
+fn wait_for_idle_agent(
+    temp: &tempfile::TempDir,
+    project: &Path,
+    timeout: Duration,
+) -> serde_json::Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let agent = only_agent(temp, project);
+        let ready = agent["status"] == "ready" || agent["status"] == "setup_required";
+        if ready && agent["busy"] == false {
+            return agent;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the agent never became idle: {agent}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// prime-agent's daemon: closing the terminal detaches it, and the turn it was
+/// running finishes in the background. `ha agents` lists the agent, `ha send`
+/// starts its next turn, and `ha attach` brings the whole conversation back to a
+/// new terminal, which can go on typing; `ha stop` ends it.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn d01_pty_a_closed_terminal_leaves_the_agent_running() {
+    let provider = ScriptedSse::start(|request| {
+        let last = last_user_text(request);
+        if last.contains("third ask") {
+            Reply::Text("answer-three-d01".to_owned())
+        } else if last.contains("second ask") {
+            Reply::Text("answer-two-d01".to_owned())
+        } else {
+            Reply::Delay(
+                Duration::from_secs(4),
+                Box::new(Reply::Text("answer-one-d01".to_owned())),
+            )
+        }
+    });
+    let (temp, project) = sandbox();
+    let mut env = provider_env(&temp, &provider.endpoint());
+    env.push(("HA_APPROVAL", "full-auto".to_owned()));
+    let mut first = PtySession::spawn(&project, &env);
+    first.keep_workers();
+    first.wait_for("Harness Agents", Duration::from_secs(30));
+    first.send("first ask\r");
+    std::thread::sleep(Duration::from_millis(800));
+    // The turn is still waiting on the model when the terminal goes.
+    first.send("/quit\r");
+    assert_eq!(first.wait_exit(Duration::from_secs(20)), Some(0));
+    let closed = normalized(&first.transcript());
+    assert!(
+        closed.contains("keepsrunninginthebackground")
+            || closed.contains("keeps running in the background"),
+        "the terminal says the agent carries on: {closed}"
+    );
+    drop(first);
+
+    let agent = wait_for_idle_agent(&temp, &project, Duration::from_mins(1));
+    assert_eq!(agent["attached"], false);
+    let id = agent["id"].as_str().expect("an agent id").to_owned();
+    assert!(
+        provider
+            .requests()
+            .iter()
+            .any(|(_, request)| last_user_text(request).contains("first ask")),
+        "the turn reached the model after the terminal closed"
+    );
+
+    let sent = run_cli_json(&temp, &project, &["send", &id, "second ask", "--json"]);
+    assert_eq!(sent["deliveryStatus"], "delivered", "{sent}");
+    wait_for_idle_agent(&temp, &project, Duration::from_mins(1));
+
+    let mut attached = PtySession::spawn_process(&project, &env, &["attach", &id], &[]);
+    attached.wait_for("answer-one-d01", Duration::from_secs(30));
+    attached.wait_for("answer-two-d01", Duration::from_secs(30));
+    attached.send("third ask\r");
+    attached.wait_for("answer-three-d01", Duration::from_mins(1));
+    assert_eq!(only_agent(&temp, &project)["attached"], true);
+    attached.send("/quit\r");
+    assert_eq!(attached.wait_exit(Duration::from_secs(20)), Some(0));
+
+    let stopped = run_cli_json(&temp, &project, &["stop", &id, "--json"]);
+    assert_eq!(stopped["stopped"], id.as_str());
+    let listed = run_cli_json(&temp, &project, &["agents", "--json"]);
+    assert_eq!(listed["agents"], serde_json::json!([]), "{listed}");
+}
+
+/// prime-agent's `rlm.create_session`: code in the agent's Python REPL starts a
+/// separate top-level agent in the same worker; it gets its own conversation,
+/// runs the prompt it was given, and is listed, named, beside its creator.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn d02_pty_create_session_starts_a_top_level_agent() {
+    let provider = ScriptedSse::start(|request| {
+        let last = last_user_text(request);
+        if last.contains("helper-task-d02") {
+            Reply::Text("helper-done-d02".to_owned())
+        } else if tool_results(request) == 0 {
+            Reply::Tool(
+                "ipython",
+                serde_json::json!({"code": "h = await rlm.create_session('helper-task-d02', name='helper')\nprint('created', h.name, h.active_session_id)"}),
+            )
+        } else {
+            Reply::Text("creator-done-d02".to_owned())
+        }
+    });
+    let (temp, project) = sandbox();
+    let mut env = provider_env(&temp, &provider.endpoint());
+    env.push(("HA_APPROVAL", "full-auto".to_owned()));
+    let mut session = PtySession::spawn(&project, &env);
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+    session.send("start a helper\r");
+    session.wait_for("creator-done-d02", Duration::from_mins(2));
+    let deadline = Instant::now() + Duration::from_mins(1);
+    let helper = loop {
+        let listed = run_cli_json(&temp, &project, &["agents", "--json"]);
+        let helper = listed["agents"].as_array().and_then(|agents| {
+            agents
+                .iter()
+                .find(|agent| agent["name"] == "helper")
+                .cloned()
+        });
+        if let Some(helper) = helper
+            && helper["last_request"]
+                .as_str()
+                .is_some_and(|request| request.contains("helper-task-d02"))
+            && helper["status"] != "running"
+        {
+            break helper;
+        }
+        assert!(Instant::now() < deadline, "no helper agent: {listed}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(
+        run_cli_json(&temp, &project, &["agents", "--json"])["agents"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert!(
+        provider
+            .requests()
+            .iter()
+            .any(|(_, request)| last_user_text(request).contains("helper-task-d02")),
+        "the helper ran its prompt"
+    );
+    assert_ne!(helper["conversation"], serde_json::Value::Null);
     finish(session);
 }

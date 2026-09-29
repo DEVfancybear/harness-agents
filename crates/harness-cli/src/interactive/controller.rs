@@ -53,7 +53,7 @@ pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_mins(5);
 ///
 /// The exit code is a plain number so effects stay comparable in tests; the host
 /// maps it to a process exit code.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Effect {
     /// Add one entry to the scrollback.
     History(HistoryItem),
@@ -63,6 +63,9 @@ pub enum Effect {
     Thinking(String),
     /// Draw the whole scrollback again in this detail mode (ctrl+o).
     Reprint(super::events::Detail),
+    /// Take over a conversation a background agent already drew (`ha attach`):
+    /// the renderer keeps these rows for ctrl+o and draws the newest that fit.
+    Restore(Vec<HistoryItem>),
     /// Copy the latest assistant answer (TUI mode only).
     Copy(String),
     /// Emit BEL in the interactive terminal.
@@ -222,6 +225,9 @@ pub struct InteractiveController {
     /// A quit requested during a run is completed only after the service emits
     /// its terminal event and releases the writer it owns.
     exit_after_run: bool,
+    /// The app runs as a background agent (`ha attach`): `/quit` closes the
+    /// client and leaves the agent working, as prime-agent's daemon does.
+    detachable: bool,
     /// The persistent goal of this conversation, set by `/goal`.
     goal: Option<GoalState>,
     /// A compaction the `compact` skill asked for (with its guidance, possibly empty),
@@ -321,6 +327,7 @@ impl InteractiveController {
             fallback_reason: None,
             tick: 0,
             exit_after_run: false,
+            detachable: false,
             goal: None,
             pending_compact: None,
             pending_heartbeats: std::collections::VecDeque::new(),
@@ -338,6 +345,102 @@ impl InteractiveController {
             gates_pending: false,
             turn_tokens_start: 0,
         }
+    }
+
+    /// Run as a background agent: `/quit` detaches the client instead of ending
+    /// the run, and the agent keeps its turns, children and schedules.
+    pub const fn set_detachable(&mut self) {
+        self.detachable = true;
+    }
+
+    /// What keeps a background agent from being idle: a run, a question or an
+    /// approval it waits on, a child still working, or a job it will start.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        self.phase.has_active_run()
+            || self.pending_approval.is_some()
+            || self.pending_question.is_some()
+            || self.service.running_children() > 0
+    }
+
+    /// Whether a schedule or a heartbeat will start a turn on its own.
+    #[must_use]
+    pub fn has_scheduled_work(&self) -> bool {
+        self.service.has_scheduled_work()
+    }
+
+    /// The model this agent's turns use, as the session port names it.
+    #[must_use]
+    pub fn model_label(&self) -> String {
+        self.service.label()
+    }
+
+    /// The conversation the agent is in, once it has one.
+    #[must_use]
+    pub fn conversation_id(&self) -> Option<String> {
+        self.service.conversation_id()
+    }
+
+    /// Choose the thinking level, as `/effort` does.
+    ///
+    /// # Errors
+    /// The model does not have that level.
+    pub fn set_thinking(&mut self, level: &str) -> Result<String, String> {
+        self.service.set_thinking(level)
+    }
+
+    /// Let the agent's code start separate top-level sessions
+    /// (`rlm.create_session`).
+    pub fn set_session_host(&mut self, host: std::sync::Arc<dyn super::agents::SessionHost>) {
+        self.service.set_session_host(host);
+    }
+
+    /// A message from outside the terminal (`ha send`), delivered as
+    /// prime-agent's daemon delivers one: an idle agent starts a turn with it, a
+    /// busy one reads it at its next step (`auto`, `steer`) or after the turn
+    /// (`follow_up`). Returns what happened: `delivered` or `queued`.
+    pub fn deliver_external(
+        &mut self,
+        text: String,
+        steer: bool,
+        effects: &mut Vec<Effect>,
+    ) -> &'static str {
+        if self.free_for_automatic_turn() {
+            effects.extend(self.submit(text));
+            return "delivered";
+        }
+        if steer && self.phase == AppPhase::Running && self.service.steer(&text).is_ok() {
+            effects.push(Effect::History(HistoryItem::User { text }));
+            effects.push(Effect::History(HistoryItem::Notice {
+                message: "a message reached the running agent; it reads this at its next step"
+                    .to_owned(),
+            }));
+            effects.push(Effect::Redraw);
+            return "delivered";
+        }
+        let lane = if steer {
+            super::queue::Lane::Steer
+        } else {
+            super::queue::Lane::FollowUp
+        };
+        self.queue.push(lane, text);
+        effects.push(Effect::History(HistoryItem::Notice {
+            message: format!(
+                "a message is queued ({}): sent after the active run finishes",
+                self.queue.len()
+            ),
+        }));
+        effects.push(Effect::Redraw);
+        "queued"
+    }
+
+    /// Stop the agent's work before it goes away: the running turn and every
+    /// child it delegated.
+    pub fn shut_down(&mut self) {
+        if self.phase.has_active_run() {
+            self.service.cancel();
+        }
+        let _ = self.service.stop_agents("all");
     }
 
     /// Record why the host is using the plain renderer instead of the TUI.
@@ -2504,6 +2607,11 @@ impl InteractiveController {
         let name = super::commands::canonical(typed);
         match name {
             "/quit" => {
+                // A background agent keeps working: only this client goes away.
+                if self.detachable {
+                    effects.push(Effect::Exit(EXIT_SUCCESS));
+                    return effects;
+                }
                 if self.phase.has_active_run() {
                     self.service.cancel();
                     self.exit_after_run = true;
@@ -5384,6 +5492,7 @@ mod tests {
                 }
                 Effect::Thinking(_)
                 | Effect::Reprint(_)
+                | Effect::Restore(_)
                 | Effect::Copy(_)
                 | Effect::Bell
                 | Effect::Redraw

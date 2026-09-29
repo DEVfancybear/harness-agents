@@ -525,6 +525,14 @@ impl Schedules {
         })
     }
 
+    /// Whether a job will still run.
+    #[must_use]
+    pub fn has_active(&self) -> bool {
+        self.inner
+            .lock()
+            .is_ok_and(|inner| inner.jobs.iter().any(|job| job.status == Status::Active))
+    }
+
     /// One line per job.
     #[must_use]
     pub fn list(&self) -> Vec<String> {

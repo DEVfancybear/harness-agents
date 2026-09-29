@@ -5,6 +5,7 @@
 //! minimal boot shell with the controller/renderer pair. Nothing here starts a
 //! provider, a store writer or a network call.
 
+pub mod agents;
 pub mod app;
 pub mod attachments;
 pub mod autonomous;
@@ -22,6 +23,7 @@ pub mod detector;
 pub mod events;
 pub mod export_html;
 pub mod extensions;
+pub mod frontend;
 pub mod goal;
 pub mod harness;
 pub mod headless;

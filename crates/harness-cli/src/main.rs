@@ -124,6 +124,66 @@ enum Command {
     Mcp(mcp_cli::McpCommand),
     /// P7 recovery hardening: doctor, backup, restore, retention, GC and release matrix.
     Maintenance(maintenance_cli::MaintenanceCommand),
+    /// List the background agents (sessions keep running after the terminal closes).
+    #[command(alias = "list")]
+    Agents {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Attach this terminal to a background agent.
+    Attach {
+        /// The agent's id, name or id prefix.
+        agent: String,
+    },
+    /// Send a message to a background agent.
+    Send {
+        /// Identify the sending agent.
+        #[arg(long)]
+        from: Option<String>,
+        /// Deliver as steering when the agent is busy.
+        #[arg(long, conflicts_with = "follow_up")]
+        steer: bool,
+        /// Queue the message after the current turn.
+        #[arg(long)]
+        follow_up: bool,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+        agent: String,
+        message: String,
+    },
+    /// Stop a background agent.
+    Stop {
+        agent: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename a background agent.
+    Rename {
+        agent: String,
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop every background agent and worker.
+    Shutdown {
+        /// Skip the confirmation.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run one project's background worker; `ha` starts it.
+    #[command(hide = true)]
+    Worker {
+        #[arg(long)]
+        registry: PathBuf,
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        root: PathBuf,
+    },
 }
 
 /// Options for the interactive entrypoint (`HA_LAUNCH` H01).
@@ -614,7 +674,17 @@ fn json_requested() -> bool {
 fn legacy_command(cli: &Cli) -> bool {
     !matches!(
         cli.command,
-        None | Some(Command::Chat(_) | Command::Exec(_))
+        None | Some(
+            Command::Chat(_)
+                | Command::Exec(_)
+                | Command::Agents { .. }
+                | Command::Attach { .. }
+                | Command::Send { .. }
+                | Command::Stop { .. }
+                | Command::Rename { .. }
+                | Command::Shutdown { .. }
+                | Command::Worker { .. }
+        )
     )
 }
 
@@ -689,6 +759,50 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
         Some(Command::Exec(args)) => {
             let stdin_dash = args.prompt.as_deref() == Some("-");
             run_chat(args.into(), stdin_dash).await
+        }
+        Some(Command::Agents { json }) => interactive::agents::list_command(json),
+        Some(Command::Attach { agent }) => interactive::app::attach(&agent),
+        Some(Command::Send {
+            from,
+            steer,
+            follow_up,
+            json,
+            agent,
+            message,
+        }) => {
+            let mode = if follow_up {
+                interactive::agents::protocol::SendMode::FollowUp
+            } else if steer {
+                interactive::agents::protocol::SendMode::Steer
+            } else {
+                interactive::agents::protocol::SendMode::Auto
+            };
+            interactive::agents::send_command(&agent, message, from, mode, json)
+        }
+        Some(Command::Stop { agent, json }) => interactive::agents::stop_command(&agent, json),
+        Some(Command::Rename { agent, name, json }) => {
+            interactive::agents::rename_command(&agent, &name, json)
+        }
+        Some(Command::Shutdown { force, json }) => {
+            interactive::agents::shutdown_command(force, json)
+        }
+        Some(Command::Worker {
+            registry,
+            store,
+            root,
+        }) => {
+            let result =
+                interactive::agents::worker_command(&interactive::agents::worker::WorkerArgs {
+                    registry,
+                    store_dir: store,
+                    project_root: root,
+                });
+            if let Err(error) = &result {
+                eprintln!("ha worker: {error}");
+            }
+            // The worker's threads (its listener among them) end with the
+            // process; waiting for them would keep it alive.
+            std::process::exit(i32::from(result.is_err()));
         }
         Some(command) => {
             Box::pin(legacy_run(Cli {
@@ -925,7 +1039,17 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
         Some(Command::Maintenance(command)) => maintenance_cli::run(command).await,
         // The interactive entrypoint is routed by run() before legacy dispatch;
         // reaching this arm would mean the launch contract was bypassed.
-        Some(Command::Chat(_) | Command::Exec(_)) => Err(HarnessError::new(
+        Some(
+            Command::Chat(_)
+            | Command::Exec(_)
+            | Command::Agents { .. }
+            | Command::Attach { .. }
+            | Command::Send { .. }
+            | Command::Stop { .. }
+            | Command::Rename { .. }
+            | Command::Shutdown { .. }
+            | Command::Worker { .. },
+        ) => Err(HarnessError::new(
             ErrorCode::InvalidStateTransition,
             "interactive chat must be routed by run()",
         )),

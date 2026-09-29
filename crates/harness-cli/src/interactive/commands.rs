@@ -313,7 +313,7 @@ pub struct MenuCommand {
 }
 
 /// One row of the menu.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MenuItem {
     /// What the row reads as: the command with its placeholder, or an argument.
     pub label: String,

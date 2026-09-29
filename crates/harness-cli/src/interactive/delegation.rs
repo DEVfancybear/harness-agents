@@ -381,6 +381,9 @@ struct AgentsShared {
     max_depth: Mutex<(u32, MaxDepthSource)>,
     /// The session's children, for a child that spawns children of its own.
     agents: std::sync::OnceLock<std::sync::Weak<SessionAgents>>,
+    /// Where `rlm.create_session` starts a top-level agent, when the session
+    /// runs in a background worker.
+    session_host: Mutex<Option<Arc<dyn super::agents::SessionHost>>>,
 }
 
 impl AgentsShared {
@@ -400,6 +403,7 @@ impl AgentsShared {
             buckets: Mutex::new(HashMap::new()),
             max_depth: Mutex::new((DEFAULT_RLM_MAX_DEPTH, MaxDepthSource::Default)),
             agents: std::sync::OnceLock::new(),
+            session_host: Mutex::new(None),
         }
     }
 
@@ -1050,6 +1054,13 @@ impl SessionAgents {
             )]
         } else {
             lines
+        }
+    }
+
+    /// Let `rlm.create_session` start top-level agents through `host`.
+    pub fn set_session_host(&self, host: Arc<dyn super::agents::SessionHost>) {
+        if let Ok(mut slot) = self.shared.session_host.lock() {
+            *slot = Some(host);
         }
     }
 
@@ -1944,6 +1955,59 @@ struct RlmChildren {
 }
 
 impl RlmChildren {
+    /// prime-agent's `createRlmSession`: a separate top-level agent with its
+    /// own conversation, started with `prompt`. Only a session that runs in a
+    /// background worker can start one.
+    async fn create_session(&self, request: &Value) -> Result<Value, String> {
+        const SUPPORTED: [&str; 4] = ["name", "model", "thinking", "cwd"];
+        let prompt = request["prompt"].as_str().unwrap_or_default();
+        let kwargs = request["kwargs"].as_object().cloned().unwrap_or_default();
+        let mut unsupported = kwargs
+            .keys()
+            .filter(|key| !SUPPORTED.contains(&key.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unsupported.is_empty() {
+            unsupported.sort();
+            return Err(format!(
+                "Unsupported rlm.create_session kwargs: {}",
+                unsupported.join(", ")
+            ));
+        }
+        if prompt.trim().is_empty() {
+            return Err("rlm.create_session prompt must not be empty".to_owned());
+        }
+        let host = self
+            .agents
+            .shared
+            .session_host
+            .lock()
+            .ok()
+            .and_then(|host| host.clone())
+            .ok_or("rlm.create_session requires a daemon-backed depth-0 session")?;
+        let text = |key: &str| -> Result<Option<String>, String> {
+            match kwargs.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(value)) if !value.trim().is_empty() => {
+                    Ok(Some(value.trim().to_owned()))
+                }
+                Some(_) => Err(format!(
+                    "rlm.create_session {key} must be a non-empty string"
+                )),
+            }
+        };
+        let session = super::agents::CreateSession {
+            prompt: prompt.to_owned(),
+            name: text("name")?,
+            model: text("model")?,
+            thinking: text("thinking")?,
+            cwd: text("cwd")?.map(|cwd| self.launch.workspace_root.join(cwd)),
+        };
+        tokio::task::spawn_blocking(move || host.create_session(session))
+            .await
+            .map_err(|_| "rlm.create_session did not complete".to_owned())?
+    }
+
     fn session_dir(&self) -> String {
         self.launch.workspace_root.display().to_string()
     }
@@ -2135,9 +2199,7 @@ impl HostRequests for RlmChildren {
                 "rlm.progress.note" => Err(
                     "progress notes are sent by child agents; this is the root agent".to_owned(),
                 ),
-                "rlm.create_session" => {
-                    Err("separate top-level sessions are not available in ha".to_owned())
-                }
+                "rlm.create_session" => self.create_session(request).await,
                 // prime-agent's `agent_observe` skill over this session's children:
                 // the only family the root agent has here.
                 "agent_observe.list" | "agent_observe.get" | "agent_observe.recent" => {
@@ -3190,6 +3252,87 @@ pub(super) mod tests {
                 .handle(&json!({"type": "custom.thing"}))
                 .await
                 .is_none()
+        );
+    }
+
+    /// prime-agent's `rlm.create_session` from the root: it needs a background
+    /// worker, checks its arguments as prime-agent does, and hands the rest to
+    /// the worker's session host with `cwd` read from the workspace.
+    #[tokio::test]
+    async fn rlm_create_session_goes_to_the_session_host() {
+        use super::RlmChildren;
+        use crate::interactive::repl::HostRequests;
+        use serde_json::json;
+
+        struct Host(std::sync::Mutex<Vec<crate::interactive::agents::CreateSession>>);
+        impl crate::interactive::agents::SessionHost for Host {
+            fn create_session(
+                &self,
+                request: crate::interactive::agents::CreateSession,
+            ) -> Result<serde_json::Value, String> {
+                let name = request.name.clone().unwrap_or_default();
+                self.0.lock().expect("requests").push(request);
+                Ok(json!({"active_session_id": "a1", "name": name}))
+            }
+        }
+
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let repo = temporary.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo directory");
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(crate::interactive::service::ChannelApprovalGate::new(
+            sender.clone(),
+            Duration::from_secs(5),
+        ));
+        let agents = SessionAgents::with_backend(
+            SharedStore::new(temporary.path().join("store")),
+            sender,
+            gate,
+            temporary.path().join("delegation"),
+            &(Arc::new(ScriptedBackend) as Arc<dyn harness_orchestrator::WorkerBackend>),
+        );
+        let children = RlmChildren {
+            agents: Arc::clone(&agents),
+            launch: launch_for(
+                &repo,
+                Arc::new(harness_providers::MockProvider::scripted(Vec::new())),
+            ),
+        };
+        let ask = |request: serde_json::Value| {
+            let children = &children;
+            async move { children.handle(&request).await.expect("a known request") }
+        };
+        let request = json!({"type": "rlm.create_session", "prompt": "review", "kwargs": {"name": "rev", "cwd": "sub"}});
+        assert_eq!(
+            ask(request.clone()).await.expect_err("no worker"),
+            "rlm.create_session requires a daemon-backed depth-0 session"
+        );
+        let host = Arc::new(Host(std::sync::Mutex::new(Vec::new())));
+        agents.set_session_host(Arc::clone(&host) as Arc<dyn crate::interactive::agents::SessionHost>);
+        let created = ask(request).await.expect("created");
+        assert_eq!(created["active_session_id"], "a1");
+        let seen = host.0.lock().expect("requests").clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].prompt, "review");
+        assert_eq!(seen[0].name.as_deref(), Some("rev"));
+        assert_eq!(seen[0].cwd.as_deref(), Some(repo.join("sub").as_path()));
+        assert_eq!(
+            ask(json!({"type": "rlm.create_session", "prompt": "x", "kwargs": {"color": "red", "age": 1}}))
+                .await
+                .expect_err("unknown kwargs"),
+            "Unsupported rlm.create_session kwargs: age, color"
+        );
+        assert_eq!(
+            ask(json!({"type": "rlm.create_session", "prompt": "  ", "kwargs": {}}))
+                .await
+                .expect_err("an empty prompt"),
+            "rlm.create_session prompt must not be empty"
+        );
+        assert!(
+            ask(json!({"type": "rlm.create_session", "prompt": "x", "kwargs": {"model": 3}}))
+                .await
+                .expect_err("a model that is not text")
+                .contains("model must be a non-empty string")
         );
     }
 

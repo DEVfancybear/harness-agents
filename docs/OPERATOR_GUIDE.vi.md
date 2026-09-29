@@ -17,9 +17,9 @@ phải một dịch vụ mạng.
 
 Điều đó nghĩa là:
 
-- **Không có daemon.** Công việc dừng khi tiến trình host thoát. Không có dịch vụ
-  nền nào tự chạy tiếp, tự thử lại hay tự thu gom. Mọi thao tác bảo trì dưới đây
-  là lệnh chạy nền trước do người vận hành gọi.
+- **Bảo trì không có daemon.** Mọi thao tác bảo trì dưới đây là lệnh chạy nền
+  trước do người vận hành gọi; không gì tự thử lại hay tự thu gom. Còn phiên
+  tương tác thì chạy trong worker nền ([12.7](#127-agent-chạy-nền)).
 - **Không có server để kết nối.** Endpoint MCP từ xa và sandbox cấp hệ điều hành
   được công bố là không hỗ trợ trong ma trận phát hành; cô lập transport không
   phải là sandbox.
@@ -313,8 +313,9 @@ pwsh -NoProfile -File scripts/Install-Ha.ps1 -Uninstall -Destination <DIR> -Remo
 
 Hai điều cần biết sau khi cài:
 
-- **`ha` chạy nền trước.** Không có daemon: không có gì chạy giữa các lệnh của bạn,
-  nên backup, thu gom hay thao tác retention xảy ra đúng lúc bạn gọi và không lúc nào khác.
+- **Bảo trì chạy nền trước.** Không daemon nào chạy nó: backup, thu gom hay thao tác
+  retention xảy ra đúng lúc bạn gọi và không lúc nào khác. (Phiên tương tác thì vẫn
+  chạy trong worker nền sau khi terminal đóng; xem [12.7](#127-agent-chạy-nền).)
 - **Thư mục mới là đích hợp lệ.** `ha maintenance doctor --data-dir <DIR>` chạy được
   trên thư mục chưa có store và báo nó là chưa khởi tạo — đúng trạng thái mà binary
   này được phép tạo store trong đó. Nó không giả vờ rằng store đã tồn tại, và việc
@@ -339,7 +340,7 @@ Build từ source vẫn dùng được cho phát triển:
 
 **Python REPL.** Tool `ipython` chạy cell trong một kernel Python bền - chính runtime của prime-agent, được vendor tại `crates/harness-cli/python` và ghi ra `<data-dir>/runtime` ở lần dùng đầu. Dùng được `await` ở top-level; biến và import được giữ qua các cell và các lượt; kernel chết thì được khởi động lại ở lần gọi sau và kết quả báo rằng state cũ đã mất. `bash('cmd')` chạy lệnh nền và trả về handle (`tail`, `output`, `poll`, `kill`, `await`); trên Windows lệnh chạy trong Git Bash, tìm ở vị trí cài mặc định hoặc đặt bằng `HA_REPL_SHELL`. Một cell chạy tối đa 10 phút rồi bị ngắt; trên Windows chỉ ngắt được cell đang chờ ở `await`, cell kẹt trong code đồng bộ sẽ khiến kernel khởi động lại. Chạy Python là chạy code, nên mỗi cell hỏi phê duyệt như `run_shell`, trừ chế độ `full-auto`. Kernel dùng project root làm thư mục làm việc và dùng môi trường của người dùng. Cần Python 3.11+ (`HA_PYTHON`, nếu không thì `python3`, `python`, `py -3`); không có thì tool không được đưa ra. `HA_REPL=off` gỡ tool.
 
-Khi có delegation, object `rlm` trong kernel chạy agent con như prime-agent: `await rlm.spawn('task', name='worker')` khởi động một explorer chỉ-đọc và trả về ngay khi được nhận; `await rlm.collect([...], timeout_ms=...)` chờ câu trả lời; `rlm.list_subagents()`, `rlm.delete_subagent(...)` và `rlm.find_models()` hoạt động như ở prime-agent. Agent con thuộc session chứ không thuộc lượt đã khởi động nó: lượt có thể kết thúc trong khi agent con vẫn làm việc. Khi agent con xong mà không ai đang chờ kết quả, agent cha được báo bằng thông báo của prime-agent - `[child-failed child:<tên>]`, `[child-exited: cancelled child:<tên>]` hoặc `[child-exited: no-reply child:<tên>]` kèm câu trả lời cuối - trong một lượt riêng nếu cha đang rảnh, hoặc sau khi lượt đang chạy kết thúc (không chen vào lượt đang chạy). Ctrl-C dừng lượt của cha, không dừng agent con; `/agents stop <tên>` (hoặc `/agents stop` cho tất cả) dừng chúng, còn `/new` hay resume sang hội thoại khác dừng chúng mà không báo. Agent con chạy trên model của cha trừ khi `rlm.spawn(..., model='provider/id')` hoặc `[agents] default_model` chỉ một model khác trong catalog có credential; model không dùng được thì spawn thất bại. `rlm.create_session` (session daemon) không khả dụng.
+Khi có delegation, object `rlm` trong kernel chạy agent con như prime-agent: `await rlm.spawn('task', name='worker')` khởi động một explorer chỉ-đọc và trả về ngay khi được nhận; `await rlm.collect([...], timeout_ms=...)` chờ câu trả lời; `rlm.list_subagents()`, `rlm.delete_subagent(...)` và `rlm.find_models()` hoạt động như ở prime-agent. Agent con thuộc session chứ không thuộc lượt đã khởi động nó: lượt có thể kết thúc trong khi agent con vẫn làm việc. Khi agent con xong mà không ai đang chờ kết quả, agent cha được báo bằng thông báo của prime-agent - `[child-failed child:<tên>]`, `[child-exited: cancelled child:<tên>]` hoặc `[child-exited: no-reply child:<tên>]` kèm câu trả lời cuối - trong một lượt riêng nếu cha đang rảnh, hoặc sau khi lượt đang chạy kết thúc (không chen vào lượt đang chạy). Ctrl-C dừng lượt của cha, không dừng agent con; `/agents stop <tên>` (hoặc `/agents stop` cho tất cả) dừng chúng, còn `/new` hay resume sang hội thoại khác dừng chúng mà không báo. Agent con chạy trên model của cha trừ khi `rlm.spawn(..., model='provider/id')` hoặc `[agents] default_model` chỉ một model khác trong catalog có credential; model không dùng được thì spawn thất bại. `rlm.create_session` khởi động một agent top-level riêng ([12.7](#127-agent-chạy-nền)).
 
 **Python skill.** Các skill của prime-agent đi kèm ứng dụng (`.agents/skills`, MIT; xem `.agents/PRIME-AGENT-SOURCE.md`): `edit`, `websearch`, `attach_image`, `goal`, `compact`, `refine`, `agent_message`, `agent_observe`, `rlm_heartbeat`, cùng các hướng dẫn `mcp` và `skill-creator`. Skill có package Python được import vào kernel theo tên khi kernel khởi động - `await edit(path=..., old_str=..., new_str=...)`, `await goal.complete()`, `await compact.run()` - và được liệt kê trong prompt kèm `python_import`. Skill import lỗi được thay bằng một stub nói rõ lý do, và cell đầu tiên báo điều đó. Host trả lời các yêu cầu của skill: `goal.*` điều khiển `/goal` (mục tiêu model tạo được xử lý như mục tiêu bạn đặt; ha không có token budget), `compact.run` hẹn `/compact` chạy khi lượt kết thúc, `model.info` cho biết model, `agent_observe` đọc các agent con của session, `rlm_heartbeat` giữ các lời nhắc lặp lại cho session (mặc định `every 5m`; loại `steer` chen vào lượt đang chạy qua hộp `/steer`, loại `follow_up` đợi lượt kết thúc), và ảnh mà `attach_image` nạp được gửi cho model cùng kết quả tool. `agent_message.send(message, receiver_role='child', receiver_name=...)` (hoặc `'all'`) nhắn cho agent con đang chạy; agent con nhắn cho cha hoặc anh em bằng tool `agent_message` của nó, và để lại một dòng `progress_note` mà cha đọc trong `list_subagents` và `/agents`. Như prime-agent, một tin tối đa 16 384 ký tự, mỗi người gửi được ba tin liền rồi thêm một tin mỗi giây, và tin tới dưới dạng `[agent-message from <quan hệ>:<tên>]` ở bước kế tiếp của người nhận - hoặc, với cha đang rảnh, thành một lượt riêng. Tin gửi cho agent con đã xong bị từ chối (agent con đã xong không được đánh thức lại).
 
@@ -410,3 +411,23 @@ Khi model gọi nhiều tool một lúc, chúng chạy song song như prime-agen
 
 `/resume` phát lại các lượt durable của hội thoại được chọn cho model và hiện chúng trên màn hình. Nó không suy luận hoặc tạo thêm data source cross-session.
 
+### 12.7. Agent chạy nền
+
+Như daemon của prime-agent, một phiên tương tác chạy trong một worker nền và terminal gắn vào nó. Đóng terminal - `/quit`, ctrl+d, đóng cửa sổ - chỉ tách terminal ra: lượt đang chạy vẫn chạy xong, còn goal, các cổng autonomous, tin nhắn đang xếp hàng, heartbeat, job `/schedule` và agent con vẫn tiếp tục. Terminal báo điều đó khi thoát (`agent <id> keeps running in the background`).
+
+| Lệnh | Tác dụng |
+| --- | --- |
+| `ha agents` (`ha list`) | Mọi agent đang chạy: id, tên, trạng thái, thời gian rảnh, project và yêu cầu gần nhất; `*` đánh dấu agent đang có terminal gắn vào. `--json` cho script. |
+| `ha attach <agent>` | Đưa agent về terminal này: hội thoại đến giờ được vẽ lại và bạn gõ tiếp. Terminal thứ hai gắn vào sẽ lấy agent đi. |
+| `ha send <agent> "<tin nhắn>"` | `send` của prime-agent: agent rảnh bắt đầu một lượt với tin nhắn; agent đang bận đọc nó ở bước kế tiếp (`--steer`, mặc định) hoặc sau lượt (`--follow-up`). `--from <agent>` ghi tên người gửi. |
+| `ha rename <agent> <tên>` | Đặt tên để `attach`, `send` và `stop` dùng. |
+| `ha stop <agent>` | Dừng agent: lượt và agent con của nó bị hủy. Hội thoại vẫn nằm trong store. |
+| `ha shutdown [--force]` | Dừng mọi agent và worker; không có `--force` thì hỏi trước. |
+
+`<agent>` là id, tên hoặc tiền tố id mà không agent nào khác trùng.
+
+Mỗi project có một worker, và các agent của project dùng chung store của nó, nên hai agent cùng project chạy song song thay vì chờ writer lock của store. Trong Python REPL của agent, `await rlm.create_session('<prompt>', name=..., model=..., thinking=..., cwd=...)` khởi động một agent top-level riêng (API của prime-agent): trong cùng worker, hoặc trong worker của project mà `cwd` thuộc về.
+
+Agent không có terminal, không có việc đang chạy và không có lịch sẽ dừng sau `idleEvictionMinutes` của prime-agent (mặc định 90; đặt một số hoặc `"off"` trong `settings.json`). Worker thoát khi agent cuối cùng không còn. Descriptor của nó (port và token, chỉ chủ sở hữu đọc được) và log nằm trong `<data-dir>/workers/`; kết nối phải trình token, còn môi trường của client - nơi lấy credential - đi qua socket loopback và không bao giờ được ghi ra file.
+
+Khác prime-agent ở chỗ: mỗi project một worker thay vì mỗi session, không có tiến trình supervisor, worker chết thì agent của nó mất theo (hội thoại vẫn trong store: `ha --resume` chạy tiếp), và agent không sống qua lần khởi động lại máy. `HA_DAEMON=off` hoặc `"daemon": false` trong `settings.json` chạy phiên ngay trong terminal như trước; renderer plain luôn chạy như vậy.

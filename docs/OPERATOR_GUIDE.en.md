@@ -16,9 +16,9 @@ plus a fencing generation recorded in the database, not a network service.
 
 What that means in practice:
 
-- **There is no daemon.** Work stops when the host process exits. No background
-  service keeps running, retries, or collects anything on its own. Every
-  maintenance action below is a foreground command an operator runs.
+- **Maintenance has no daemon.** Every maintenance action below is a foreground
+  command an operator runs; nothing retries or collects on its own. Interactive
+  sessions do run in background workers ([12.7](#127-background-agents)).
 - **There is no server to connect to.** Remote MCP endpoints and OS-level
   sandboxing are declared unsupported in the release matrix; transport isolation
   is not a sandbox.
@@ -307,9 +307,10 @@ pwsh -NoProfile -File scripts/Install-Ha.ps1 -Uninstall -Destination <DIR> -Remo
 
 Two things to know after installing:
 
-- **`ha` is foreground.** There is no daemon: nothing runs between your commands,
-  so a backup, a collection or a retention action happens exactly when you ask for
-  it and at no other time.
+- **Maintenance is foreground.** No daemon runs it: a backup, a collection or a
+  retention action happens exactly when you ask for it and at no other time. (An
+  interactive session keeps running in a background worker after its terminal
+  closes; see [12.7](#127-background-agents).)
 - **A fresh directory is a valid target.** `ha maintenance doctor --data-dir <DIR>`
   works on a directory that holds no store yet and reports it as uninitialized,
   which is the state this binary may create a store in. It does not pretend a
@@ -334,7 +335,7 @@ The 18 core tools cross the host policy and receipt gate. Skill tools (`list_ski
 
 **Python REPL.** The `ipython` tool runs cells in one persistent Python kernel - prime-agent's own runtime, vendored under `crates/harness-cli/python` and written to `<data-dir>/runtime` on first use. Top-level `await` works; variables and imports persist across cells and turns; a kernel that dies is restarted on the next call and the result says the old state is gone. `bash('cmd')` starts a command in the background and returns a handle (`tail`, `output`, `poll`, `kill`, `await`); on Windows it runs in Git Bash, found in its default location or set with `HA_REPL_SHELL`. A cell runs for at most 10 minutes, then it is interrupted; on Windows only a cell waiting at an `await` can be interrupted, so a cell stuck in synchronous code restarts the kernel. Running Python is running code, so each cell asks like `run_shell`, unless the mode is `full-auto`. The kernel starts with the project root as its working directory and the user's environment. It needs Python 3.11+ (`HA_PYTHON`, else `python3`, `python`, `py -3`); without one the tool is not offered. `HA_REPL=off` removes it.
 
-With delegation available, the kernel's `rlm` object runs children as prime-agent does: `await rlm.spawn('task', name='worker')` starts a read-only explorer and returns at admission; `await rlm.collect([...], timeout_ms=...)` waits for their answers; `rlm.list_subagents()`, `rlm.delete_subagent(...)` and `rlm.find_models()` work as in prime-agent. A child belongs to the session, not to the turn that started it: the turn may end while its children keep working. When a child settles and nobody is waiting for it, the parent is told with prime-agent's notice - `[child-failed child:<name>]`, `[child-exited: cancelled child:<name>]` or `[child-exited: no-reply child:<name>]` with its last answer - in a turn of its own when the parent is idle, or after the running turn ends (never steered into it). Ctrl-C stops the parent's turn, not its children; `/agents stop <name>` (or `/agents stop` for all) stops them, and `/new` or a resume into another conversation stops them quietly. A child runs on the parent's model unless `rlm.spawn(..., model='provider/id')` or `[agents] default_model` names another catalog model with a credential; a model that cannot be used fails the spawn. `rlm.create_session` (daemon sessions) is not available.
+With delegation available, the kernel's `rlm` object runs children as prime-agent does: `await rlm.spawn('task', name='worker')` starts a read-only explorer and returns at admission; `await rlm.collect([...], timeout_ms=...)` waits for their answers; `rlm.list_subagents()`, `rlm.delete_subagent(...)` and `rlm.find_models()` work as in prime-agent. A child belongs to the session, not to the turn that started it: the turn may end while its children keep working. When a child settles and nobody is waiting for it, the parent is told with prime-agent's notice - `[child-failed child:<name>]`, `[child-exited: cancelled child:<name>]` or `[child-exited: no-reply child:<name>]` with its last answer - in a turn of its own when the parent is idle, or after the running turn ends (never steered into it). Ctrl-C stops the parent's turn, not its children; `/agents stop <name>` (or `/agents stop` for all) stops them, and `/new` or a resume into another conversation stops them quietly. A child runs on the parent's model unless `rlm.spawn(..., model='provider/id')` or `[agents] default_model` names another catalog model with a credential; a model that cannot be used fails the spawn. `rlm.create_session` starts a separate top-level agent ([12.7](#127-background-agents)).
 
 **Python skills.** prime-agent's skills ship with the app (`.agents/skills`, MIT; see `.agents/PRIME-AGENT-SOURCE.md`): `edit`, `websearch`, `attach_image`, `goal`, `compact`, `refine`, `agent_message`, `agent_observe`, `rlm_heartbeat`, plus the `mcp` and `skill-creator` guides. A skill with a Python package is imported into the kernel by its name when the kernel starts - `await edit(path=..., old_str=..., new_str=...)`, `await goal.complete()`, `await compact.run()` - and listed in the prompt with its `python_import`. A skill whose import fails is replaced by a stub that says why, and the first cell reports it. The host answers the skills' requests: `goal.*` drives `/goal` (a goal the model creates is carried like one you set; ha keeps no token budget), `compact.run` schedules `/compact` for the end of the turn, `model.info` names the model, `agent_observe` reads the session's children, `rlm_heartbeat` keeps recurring prompts for the session (`every 5m` by default; a `steer` one reaches a running turn through the `/steer` inbox, a `follow_up` one waits for it to end), and the images `attach_image` loads are shown to the model with the tool result. `agent_message.send(message, receiver_role='child', receiver_name=...)` (or `'all'`) messages running children; a child messages its parent or a sibling with its own `agent_message` tool, and leaves a one-line `progress_note` its parent reads in `list_subagents` and `/agents`. As in prime-agent a message holds at most 16 384 characters, a sender gets three at once and one more each second, and it arrives as `[agent-message from <relationship>:<name>]` at the recipient's next step - or, for an idle parent, as a turn of its own. A message to a child that has finished is refused (a finished child is not woken again).
 
@@ -405,3 +406,23 @@ When the model asks for several tools at once they run side by side, as in prime
 
 `/resume` replays the selected conversation's durable turns to the model and shows them on screen. It does not infer or create an additional cross-session data source.
 
+### 12.7. Background agents
+
+Like prime-agent's daemon, an interactive session runs in a background worker and the terminal attaches to it. Closing the terminal - `/quit`, ctrl+d, closing the window - detaches it: the running turn finishes, and a goal, the autonomous gates, queued messages, heartbeats, `/schedule` jobs and delegated children carry on. The terminal says so on the way out (`agent <id> keeps running in the background`).
+
+| Command | What it does |
+| --- | --- |
+| `ha agents` (`ha list`) | Every running agent: id, name, status, idle time, project and last request; `*` marks one a terminal is attached to. `--json` for scripts. |
+| `ha attach <agent>` | Bring the agent back to this terminal: the conversation so far is drawn, and typing goes on. A second terminal that attaches takes the agent over. |
+| `ha send <agent> "<message>"` | prime-agent's `send`: an idle agent starts a turn with it; a busy one reads it at its next step (`--steer`, the default) or after its turn (`--follow-up`). `--from <agent>` names the sender. |
+| `ha rename <agent> <name>` | A name `attach`, `send` and `stop` accept. |
+| `ha stop <agent>` | Stop the agent: its turn and its children are cancelled. The conversation stays in the store. |
+| `ha shutdown [--force]` | Stop every agent and worker; without `--force` it asks first. |
+
+`<agent>` is an id, a name or an id prefix no other agent shares.
+
+One worker serves one project, and all of that project's agents share its store, so two agents of a project run side by side instead of waiting on the store's writer lock. In the agent's Python REPL, `await rlm.create_session('<prompt>', name=..., model=..., thinking=..., cwd=...)` starts a separate top-level agent (prime-agent's API): in the same worker, or in the worker of the project `cwd` belongs to.
+
+An agent with no terminal, no running work and no schedule stops after prime-agent's `idleEvictionMinutes` (90 by default; set a number or `"off"` in `settings.json`). The worker leaves when its last agent is gone. Its descriptor (port and token, owner-only) and its log are in `<data-dir>/workers/`; a connection must present the token, and the client's environment - where the credentials come from - travels over the loopback socket and is never written.
+
+Where ha differs from prime-agent: there is one worker per project rather than per session and no supervisor process, a worker that dies takes its agents with it (their conversations are in the store: `ha --resume` continues one), and agents do not survive a reboot. `HA_DAEMON=off` or `"daemon": false` in `settings.json` runs the session inside the terminal as before; the plain renderer always does.

@@ -323,6 +323,14 @@ impl Heartbeats {
         }
     }
 
+    /// Whether a heartbeat will still run.
+    #[must_use]
+    pub fn has_active(&self) -> bool {
+        self.items
+            .lock()
+            .is_ok_and(|items| items.iter().any(|heartbeat| !heartbeat.paused))
+    }
+
     /// The heartbeats due at `now`, each advanced to its next run, as the message
     /// prime-agent's `createHeartbeatPromptMessage` writes.
     pub fn due(&self, now: Instant) -> Vec<Due> {

@@ -40,6 +40,32 @@ impl SharedStore {
         })
     }
 
+    /// The one shared store of `dir` in this process.
+    ///
+    /// A background worker runs several agents of one project; each opening
+    /// its own writer would make the second wait on the first one's lock for
+    /// as long as its turn runs. Sharing the store, as a turn shares it with its
+    /// children, lets them work side by side.
+    #[must_use]
+    pub fn for_dir(dir: PathBuf) -> Arc<Self> {
+        static OPEN: std::sync::Mutex<Vec<(PathBuf, std::sync::Weak<SharedStore>)>> =
+            std::sync::Mutex::new(Vec::new());
+        let Ok(mut open) = OPEN.lock() else {
+            return Self::new(dir);
+        };
+        open.retain(|(_, store)| store.strong_count() > 0);
+        if let Some(store) = open
+            .iter()
+            .find(|(open_dir, _)| *open_dir == dir)
+            .and_then(|(_, store)| store.upgrade())
+        {
+            return store;
+        }
+        let store = Self::new(dir.clone());
+        open.push((dir, Arc::downgrade(&store)));
+        store
+    }
+
     /// A lease on the open store, opening it if nobody holds one.
     ///
     /// # Errors

@@ -128,6 +128,24 @@ fn run_terminal(
     let mut backend = CrosstermBackend;
     let size = backend.size().unwrap_or((TUI_MIN_COLUMNS, TUI_MIN_ROWS));
     let fallback = tui_fallback_reason(launch.plain, environment, size.0, size.1);
+    // prime-agent's daemon: the session runs in a background worker and this
+    // terminal attaches to it, so closing the terminal leaves the work running.
+    if fallback.is_none() && super::agents::enabled(environment, &context.paths.config_file) {
+        let spec = super::agents::spec_for_launch(
+            context,
+            environment,
+            launch.cwd.clone(),
+            launch.resume.clone(),
+            launch.fixture,
+            &launch.config_overrides,
+        );
+        match super::agents::client::start_attached(context, spec, size.0) {
+            Ok(mut remote) => return run_remote(backend, &mut remote),
+            Err(error) => eprintln!(
+                "ha: the background agent could not start ({error}); this terminal runs the session\r"
+            ),
+        }
+    }
     // The plain renderer is the pre-T02 host and stays authoritative: the TUI is
     // chosen only when the console can hold it, and every refusal says why.
     let mut controller = controller_for_with_overrides(
@@ -143,6 +161,48 @@ fn run_terminal(
         return run_loop(&mut backend, &mut controller, notice);
     }
     super::tui::run(backend, &mut controller, notice)
+}
+
+/// Draw a background agent in this terminal until it detaches.
+fn run_remote(
+    backend: CrosstermBackend,
+    remote: &mut super::agents::client::RemoteFrontend,
+) -> Result<u8, HarnessError> {
+    let code = super::tui::run(backend, remote, None)?;
+    if let Some(hint) = super::agents::detach_hint(remote) {
+        eprintln!("{hint}");
+    }
+    Ok(code)
+}
+
+/// `ha attach <agent>`: this terminal becomes the agent's.
+///
+/// # Errors
+/// The agent is gone, or the console cannot hold the TUI.
+pub fn attach(selector: &str) -> Result<ExitCode, HarnessError> {
+    let refused = |message: String| HarnessError::new(ErrorCode::RuntimeBlocked, message);
+    let registry = super::agents::client::user_registry().map_err(refused)?;
+    let listed = super::agents::client::find(&registry, selector).map_err(refused)?;
+    if listed.descriptor.build != super::agents::registry::build_identity() {
+        return Err(refused(
+            "the agent's worker runs another build of ha; `ha shutdown` replaces it".to_owned(),
+        ));
+    }
+    let environment = LaunchEnvironment::capture();
+    let guard = RawModeGuard::enter()
+        .map_err(|error| refused(format!("ha attach needs an interactive terminal ({error})")))?;
+    let backend = CrosstermBackend;
+    let size = backend.size().unwrap_or((TUI_MIN_COLUMNS, TUI_MIN_ROWS));
+    if let Some(reason) = tui_fallback_reason(false, &environment, size.0, size.1) {
+        drop(guard);
+        return Err(refused(format!("ha attach needs the TUI, and {reason}")));
+    }
+    let mut remote =
+        super::agents::client::RemoteFrontend::attach(&listed.descriptor, &listed.agent.id, size.0)
+            .map_err(refused)?;
+    let code = run_remote(backend, &mut remote)?;
+    drop(guard);
+    Ok(ExitCode::from(code))
 }
 
 /// Build the controller.
@@ -167,7 +227,7 @@ fn controller_for(
     )
 }
 
-fn controller_for_with_overrides(
+pub(super) fn controller_for_with_overrides(
     context: &LaunchContext,
     environment: &LaunchEnvironment,
     fixture: bool,
@@ -296,7 +356,11 @@ fn step(
                     .map_err(|error| terminal_error(&error))?;
                 cursor.at_line_start = false;
             }
-            Effect::Thinking(_) | Effect::Reprint(_) | Effect::Bell | Effect::ClearViewport => {}
+            Effect::Thinking(_)
+            | Effect::Reprint(_)
+            | Effect::Restore(_)
+            | Effect::Bell
+            | Effect::ClearViewport => {}
             Effect::Copy(_) => {
                 backend
                     .write("/copy is available in TUI mode; the plain renderer does not access the clipboard\r\n")
@@ -530,7 +594,11 @@ fn render_line_mode(
             Effect::Stream(text) => {
                 write!(output, "{}", terminal_safe(&text)).map_err(|error| io_error(&error))?;
             }
-            Effect::Thinking(_) | Effect::Reprint(_) | Effect::Bell | Effect::ClearViewport => {}
+            Effect::Thinking(_)
+            | Effect::Reprint(_)
+            | Effect::Restore(_)
+            | Effect::Bell
+            | Effect::ClearViewport => {}
             Effect::Copy(_) => writeln!(
                 output,
                 "/copy is available in TUI mode; the plain renderer does not access the clipboard"

@@ -18,12 +18,72 @@ use serde_json::Value;
 
 use super::commands::MenuItem;
 
+/// An `Instant` on the wire to a background agent's client (`ha attach`): the
+/// signed milliseconds from the moment it is written, read back against the
+/// reader's own clock. Two processes share no `Instant` origin, but they share
+/// the passage of time, which is all a countdown or an elapsed clock needs.
+mod wire_instant {
+    use std::time::{Duration, Instant};
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    fn offset(instant: Instant) -> i64 {
+        let now = Instant::now();
+        if instant >= now {
+            i64::try_from(instant.duration_since(now).as_millis()).unwrap_or(i64::MAX)
+        } else {
+            -i64::try_from(now.duration_since(instant).as_millis()).unwrap_or(i64::MAX)
+        }
+    }
+
+    fn instant(offset: i64) -> Instant {
+        let now = Instant::now();
+        let span = Duration::from_millis(offset.unsigned_abs());
+        if offset >= 0 {
+            now + span
+        } else {
+            now.checked_sub(span).unwrap_or(now)
+        }
+    }
+
+    pub fn serialize<S: Serializer>(value: &Instant, serializer: S) -> Result<S::Ok, S::Error> {
+        offset(*value).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Instant, D::Error> {
+        i64::deserialize(deserializer).map(instant)
+    }
+
+    pub mod optional {
+        use std::time::Instant;
+
+        use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+        #[allow(
+            clippy::ref_option,
+            reason = "serde's `with` passes the field by reference"
+        )]
+        pub fn serialize<S: Serializer>(
+            value: &Option<Instant>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            value.map(super::offset).serialize(serializer)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Instant>, D::Error> {
+            Option::<i64>::deserialize(deserializer).map(|offset| offset.map(super::instant))
+        }
+    }
+}
+
 /// One normalized terminal input event.
 ///
 /// The T03 key set is defined here in T02 so the vocabulary is complete in one
 /// place; the editor starts consuming the new variants in T03.
 #[allow(dead_code, reason = "T03 consumes the composer keys")]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Key {
     Char(char),
     Backspace,
@@ -87,7 +147,7 @@ pub enum Key {
 }
 
 /// Phase of the interactive app, as described in the `HA_LAUNCH` plan.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AppPhase {
     Booting,
     Ready,
@@ -134,7 +194,7 @@ impl AppPhase {
 /// A bound is a safety net for a loop that has gone wrong, not the task's budget, so
 /// the app distinguishes the bounds it may carry on past from the one it may not: the
 /// deadline is a real stop, while a step or tool-call bound can be continued.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PauseReason {
     StepLimit,
     ToolLimit,
@@ -174,7 +234,7 @@ impl PauseReason {
 }
 
 /// How one user turn ended.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RunOutcome {
     Done,
     /// The turn stopped at a bound — steps, tool calls or the deadline — rather than
@@ -236,7 +296,7 @@ pub struct SessionCandidate {
 /// `ok 12ms` / `failed 3.1s` and the plain writer can keep its old two lines. A
 /// failure also carries the reason, because a card that only says `failed 962ms`
 /// leaves the reader unable to tell a malformed call from a policy denial.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ToolState {
     /// The card is open; nothing has settled yet.
     Started,
@@ -264,7 +324,7 @@ impl ToolState {
 /// The controller emits these instead of pre-rendered strings, so the TUI can
 /// style a user turn differently from a tool card while the plain renderer keeps
 /// printing exactly what it printed before T02.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum HistoryItem {
     /// The one-time header printed at startup.
     ///
@@ -351,7 +411,7 @@ pub enum HistoryItem {
 
 /// One temporary panel that replaces the live block instead of joining the
 /// scrollback.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Modal {
     /// A gated action waiting for the user's answer.
     Approval {
@@ -361,6 +421,7 @@ pub enum Modal {
         workspace: String,
         scope: String,
         /// When the pending request expires, so the panel can count down.
+        #[serde(with = "wire_instant")]
         expires_at: Instant,
         /// Whether the action only reads, so the panel offers the wider grant only
         /// where it would cover something.
@@ -398,7 +459,7 @@ pub enum Modal {
 ///
 /// Pure data: the renderer never reaches back into the controller, so a frame is
 /// a function of this snapshot plus the theme.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UiState {
     pub phase: AppPhase,
     pub setup_required: bool,
@@ -429,6 +490,7 @@ pub struct UiState {
     /// The last submitted request, so the status bar can name it.
     pub last_request: Option<String>,
     /// When the active run started, for the elapsed clock.
+    #[serde(with = "wire_instant::optional")]
     pub run_started_at: Option<Instant>,
     /// When the last run ended, for the `[run]` summary line.
     pub last_run_elapsed: Duration,
@@ -464,7 +526,7 @@ pub struct UiState {
 /// shows reasoning and opens the edit tools' diffs; expanded (all) opens every
 /// tool output. A call's card looks the same in all three. Rows already in the
 /// scrollback keep the mode they were drawn in until ctrl+o reprints them.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Detail {
     #[default]
     Collapsed,

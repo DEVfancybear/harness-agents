@@ -46,7 +46,7 @@ changes during the session.
 | Tab | Complete a suggestion |
 | Esc | Close a panel or interrupt the running turn |
 | Ctrl-C | Cancel; twice on an empty prompt exits |
-| Ctrl-D | Exit on an empty prompt |
+| Ctrl-D | Exit on an empty prompt (a background agent keeps running: `ha attach` brings it back) |
 | Ctrl-O | Cycle tool detail |
 | Ctrl-V / Alt-V | Paste clipboard images or files |
 
