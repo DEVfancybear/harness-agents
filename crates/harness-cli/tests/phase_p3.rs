@@ -1717,3 +1717,79 @@ async fn a_root_that_becomes_a_repository_keeps_its_project() {
     drop(tools);
     close_writer(store).await;
 }
+
+/// The user saw a model overwrite a file with `write_file`, get
+/// `stale_workspace`, compute the hash itself with node and fail again with
+/// `invalid_hash: hash must start with sha256:`: nothing it could read carried
+/// the hash `expected_hash` wants. `read_file` now shows the whole file's hash,
+/// even for a partial range, and that value is what `write_file` accepts.
+#[tokio::test]
+async fn read_file_shows_the_hash_write_file_takes() {
+    let temp = TempDir::new().expect("temporary store");
+    let root = setup_workspace(&temp);
+    fs::write(root.join("page.ts"), "one\ntwo\nthree\n").expect("fixture file");
+    let store = writer(&temp).await;
+    let (session_id, task_id, _project_id) = admit(&store, &root).await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+
+    let (prepared, approval) = prepared_and_approved(
+        &tools,
+        &session_id,
+        &task_id,
+        &root,
+        CodingToolAction::ReadFile {
+            path: "page.ts".to_owned(),
+            offset: None,
+            limit: Some(1),
+        },
+    )
+    .await;
+    let view = tools
+        .execute(prepared, Some(approval))
+        .await
+        .expect("read settles");
+    let ToolOutput::ReadFile { hash, .. } = &view.output else {
+        panic!("read tool returned an unexpected output");
+    };
+    assert_eq!(*hash, ContentHash::from_bytes(b"one\ntwo\nthree\n"));
+
+    // Without the hash the error says where to get it.
+    let refused = tools
+        .prepare(request(
+            &session_id,
+            &task_id,
+            &root,
+            "p3-hash",
+            CodingToolAction::WriteFile {
+                path: "page.ts".to_owned(),
+                content: "new\n".to_owned(),
+                expected_hash: None,
+            },
+        ))
+        .await
+        .expect_err("an overwrite without the hash is refused");
+    assert!(refused.to_string().contains("read_file"), "{refused}");
+
+    let (prepared, approval) = prepared_and_approved(
+        &tools,
+        &session_id,
+        &task_id,
+        &root,
+        CodingToolAction::WriteFile {
+            path: "page.ts".to_owned(),
+            content: "new\n".to_owned(),
+            expected_hash: Some(hash.clone()),
+        },
+    )
+    .await;
+    tools
+        .execute(prepared, Some(approval))
+        .await
+        .expect("the hash read_file showed overwrites the file");
+    assert_eq!(
+        fs::read_to_string(root.join("page.ts")).expect("rewritten"),
+        "new\n"
+    );
+    drop(tools);
+    close_writer(store).await;
+}

@@ -30,8 +30,9 @@ use crate::{
     secrets::{HostEnvironmentSecrets, ProcessEnvironment, SecretResolver},
     workspace::{
         apply_text_patch, edit_text, glob_files, inspect_workspace, inspect_workspace_for_read,
-        list_files, plan_edit_text, read_file_range, read_text, redact_text, resolve_relative,
-        search_text, validate_glob, validate_search, write_text_checked,
+        list_files, plan_edit_text, read_file_range, read_file_range_with_hash, read_text,
+        redact_text, resolve_relative, search_text, validate_glob, validate_search,
+        write_text_checked,
     },
 };
 use harness_store_sqlite::HistoryScope;
@@ -1247,7 +1248,7 @@ impl ToolExecutionService {
                     if expected_hash.as_ref() != Some(&current_hash) {
                         return Err(HarnessError::new(
                             ErrorCode::StaleWorkspace,
-                            "overwriting an existing file requires its matching expected_hash",
+                            "overwriting an existing file requires expected_hash: pass the [hash sha256:...] shown by read_file for this path",
                         ));
                     }
                 } else if expected_hash.is_some() {
@@ -1338,7 +1339,7 @@ impl ToolExecutionService {
                 if ContentHash::from_bytes(current.as_bytes()) != *expected_hash {
                     return Err(HarnessError::new(
                         ErrorCode::StaleWorkspace,
-                        "patch expected hash does not match current file content",
+                        "patch expected hash does not match current file content: read_file the path again for its current hash",
                     ));
                 }
             }
@@ -1354,7 +1355,7 @@ impl ToolExecutionService {
                         if expected_hash.as_ref() != Some(&current_hash) {
                             return Err(HarnessError::new(
                                 ErrorCode::StaleWorkspace,
-                                "write_file expected_hash does not match current file content",
+                                "write_file expected_hash does not match current file content: read_file the path again for its current hash",
                             ));
                         }
                     }
@@ -1518,7 +1519,7 @@ impl ToolExecutionService {
                 limit,
             } => {
                 let target = resolve_relative(root, path, false)?;
-                let output = read_file_range(
+                let (output, hash) = read_file_range_with_hash(
                     &target,
                     offset.unwrap_or(0),
                     limit.unwrap_or(crate::contracts::READ_FILE_DEFAULT_LINES),
@@ -1527,6 +1528,7 @@ impl ToolExecutionService {
                     path: path.replace('\\', "/"),
                     content: output.text,
                     truncated: output.truncated,
+                    hash,
                 }))
             }
             CodingToolAction::ListFiles { path } => {

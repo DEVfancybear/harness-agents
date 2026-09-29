@@ -11,6 +11,8 @@ share one panel block; a diff keeps its added and removed tints inside it. Each
 turn closes on a rule that names its outcome and counters. Ctrl-O cycles the
 detail mode as prime-agent does: collapsed (reasoning hidden, three output
 lines), details (reasoning and full edit diffs), expanded (every output line).
+Like prime-agent, a mode change and a terminal resize redraw only the visible
+screen; rows already in the scrollback keep the mode they were drawn in.
 
 The status line has two ends: what the app is doing on the left (spinner, clock,
 `esc to interrupt`, counters, model) and the telemetry that is only worth a glance

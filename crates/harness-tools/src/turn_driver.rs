@@ -2023,9 +2023,11 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             path,
             content,
             truncated,
+            hash,
         } => format!(
-            "read_file {path}{}:\n{}",
+            "read_file {path}{} [hash {}]:\n{}",
             if *truncated { " (truncated)" } else { "" },
+            hash.as_str(),
             content
         ),
         ToolOutput::ListFiles { paths, truncated } => format!(

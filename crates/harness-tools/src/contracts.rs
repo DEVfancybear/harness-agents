@@ -323,7 +323,7 @@ fn workspace_tool_schemas() -> Vec<Value> {
         ),
         function_schema(
             "apply_patch",
-            "Replace one UTF-8 text file only when its exact expected hash still matches.",
+            "Replace one UTF-8 text file only when its exact expected hash still matches. expected_hash is the [hash sha256:...] value read_file shows for the file.",
             json!({
                 "path": string_schema(),
                 "expected_hash": string_schema(),
@@ -333,7 +333,7 @@ fn workspace_tool_schemas() -> Vec<Value> {
         ),
         function_schema(
             "write_file",
-            "Create a UTF-8 file, or overwrite it only when expected_hash matches its current content.",
+            "Create a UTF-8 file, or overwrite it only when expected_hash matches its current content. expected_hash is the [hash sha256:...] value read_file shows for the file; omit it for a new file.",
             json!({
                 "path": string_schema(),
                 "content": string_schema(),
@@ -1470,6 +1470,9 @@ pub enum ToolOutput {
         path: String,
         content: String,
         truncated: bool,
+        /// Hash of the whole file, whatever range was shown: the value
+        /// `write_file` and `apply_patch` take as `expected_hash`.
+        hash: ContentHash,
     },
     ListFiles {
         paths: Vec<String>,

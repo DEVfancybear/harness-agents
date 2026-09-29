@@ -25,9 +25,9 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use harness_types::{ErrorCode, HarnessError};
-use ratatui::backend::Backend;
+use ratatui::backend::{Backend, ClearType};
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::Widget;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
@@ -123,8 +123,10 @@ pub trait TuiRenderer {
     fn bell(&mut self) -> io::Result<()> {
         Ok(())
     }
-    /// Clear the screen and draw every row again in this detail mode, as
-    /// prime-agent re-renders its chat when ctrl+o changes what rows show.
+    /// Redraw what the screen shows in this detail mode: the newest rows that
+    /// fit above the viewport. prime-agent does this for ctrl+o
+    /// (`requestRenderPreservingViewport`) and when the terminal is resized; the
+    /// scrollback keeps what it already had.
     fn reprint(&mut self, _detail: super::events::Detail) -> io::Result<()> {
         Ok(())
     }
@@ -135,15 +137,11 @@ pub trait TuiRenderer {
 /// How many history entries a renderer keeps for ctrl+o to draw again.
 const REPRINT_ENTRIES: usize = 4000;
 
-/// How many rows ctrl+o draws again: the recent end of the conversation, which
-/// is what the scrollback shows. Drawing every entry of a long session one
-/// insert at a time - each insert repaints the viewport - kept the console busy
-/// for long enough that the app looked frozen; `/more` still reaches the rest.
-const REPRINT_ROWS: usize = 3000;
-
 /// The terminal-side half of a renderer: a ratatui `Terminal` over some backend.
 pub struct RealRenderer<B: Backend> {
     terminal: Terminal<B>,
+    /// The inline viewport's height, fixed when the terminal was opened (T01).
+    viewport_height: u16,
     theme: Theme,
     /// The detail mode of the last frame, which history rows are drawn in.
     detail: super::events::Detail,
@@ -178,15 +176,17 @@ where
 
     fn with_theme(backend: B, theme: &Theme) -> io::Result<Self> {
         let size = backend.size().map_err(to_io)?;
+        let viewport_height = viewport_rows(size.height);
         let terminal = Terminal::with_options(
             backend,
             TerminalOptions {
-                viewport: Viewport::Inline(viewport_rows(size.height)),
+                viewport: Viewport::Inline(viewport_height),
             },
         )
         .map_err(to_io)?;
         Ok(Self {
             terminal,
+            viewport_height,
             theme: *theme,
             detail: super::events::Detail::default(),
             shown: std::collections::VecDeque::new(),
@@ -194,36 +194,49 @@ where
         })
     }
 
-    /// Draw every remembered entry again, in `detail`.
-    fn replay(&mut self, detail: super::events::Detail) -> io::Result<()> {
+    /// Redraw the visible screen in `detail`: erase it, put the viewport back at
+    /// its top, and push the newest rows that fit above the viewport.
+    ///
+    /// prime-agent repaints only the visible screen for ctrl+o
+    /// (`requestRenderPreservingViewport`) and for a resize (its full render starts
+    /// at `newLines.length - height`); the scrollback keeps what it had. Drawing
+    /// every remembered entry instead - thousands of rows pushed through the
+    /// scrollback - is what made the view jump for a moment before it settled.
+    /// A resize needs the same: an inline viewport the terminal re-wrapped at the
+    /// new width stays on screen as a broken second input box otherwise.
+    fn repaint_screen(&mut self, detail: super::events::Detail) -> io::Result<()> {
         self.detail = detail;
-        self.terminal.clear().map_err(to_io)?;
+        let size = self.terminal.size().map_err(to_io)?;
+        self.terminal.set_cursor_position((0, 0)).map_err(to_io)?;
+        self.terminal
+            .backend_mut()
+            .clear_region(ClearType::AfterCursor)
+            .map_err(to_io)?;
+        // The cursor is at the top of an erased screen, so the viewport is
+        // placed there; the rows pushed below then move it down to the bottom.
+        self.terminal
+            .resize(Rect::new(0, 0, size.width, size.height))
+            .map_err(to_io)?;
+        let budget = usize::from(size.height.saturating_sub(self.viewport_height));
         let theme = self.theme;
-        let width = self.columns();
-        // Newest first until the budget is spent, then back into reading order,
-        // so the rows drawn are the end of the conversation.
+        // Newest first until the screen is full, then back into reading order.
         let mut blocks = Vec::new();
         let mut total = 0_usize;
-        let mut cut = false;
         for (index, item) in self.shown.iter().enumerate().rev() {
+            if total == budget {
+                break;
+            }
             let continuing =
                 index > 0 && matches!(self.shown[index - 1], HistoryItem::Assistant { .. });
-            let rows = history::render_fragment(item, width, &theme, detail, continuing);
-            if total + rows.len() > REPRINT_ROWS && total > 0 {
-                cut = true;
-                break;
+            let mut rows = history::render_fragment(item, size.width, &theme, detail, continuing);
+            let room = budget - total;
+            if rows.len() > room {
+                rows.drain(..rows.len() - room);
             }
             total += rows.len();
             blocks.push(rows);
         }
-        let mut rows = Vec::with_capacity(total + 1);
-        if cut {
-            rows.push(Line::from(Span::styled(
-                "… earlier conversation: /more",
-                theme.dim,
-            )));
-        }
-        rows.extend(blocks.into_iter().rev().flatten());
+        let rows = blocks.into_iter().rev().flatten().collect::<Vec<_>>();
         self.insert_rows(&rows)
     }
 
@@ -404,11 +417,7 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
     }
 
     fn reprint(&mut self, detail: super::events::Detail) -> io::Result<()> {
-        // The rows already in the scrollback were drawn in the old mode; erase the
-        // screen and the scrollback, then draw them all again.
-        self.backend.write("\x1b[2J\x1b[3J\x1b[H")?;
-        self.backend.flush()?;
-        self.inner.replay(detail)
+        self.inner.repaint_screen(detail)
     }
 
     fn copy_text(&mut self, text: &str) -> io::Result<()> {
@@ -536,7 +545,7 @@ impl<T: TerminalBackend> TuiRenderer for ScriptedRenderer<T> {
     }
 
     fn reprint(&mut self, detail: super::events::Detail) -> io::Result<()> {
-        self.inner.replay(detail)
+        self.inner.repaint_screen(detail)
     }
 
     fn insert_history(&mut self, item: &HistoryItem) -> io::Result<()> {
@@ -658,9 +667,12 @@ fn run_loop_inner(
             .map_err(|error| terminal_error(&error))?
         {
             if let Key::Resize { columns, .. } = key {
-                // The viewport height cannot change (T01), so a resize only
-                // repaints the layout at the new size; the draft is untouched.
+                // The viewport height cannot change (T01). The terminal re-wraps
+                // what it shows at the new size, the last viewport included, so
+                // the screen is drawn again as prime-agent does on a resize; the
+                // draft is untouched.
                 controller.set_columns(columns);
+                effects.push(Effect::Reprint(controller.ui_state().detail));
                 redraw = true;
             } else {
                 let from_key = controller.handle_key(key);
@@ -1586,5 +1598,76 @@ mod tests {
             "only the initial frame is painted while ready"
         );
         assert!(outcome.renderer.finished);
+    }
+
+    fn screen(renderer: &super::RealRenderer<ratatui::backend::TestBackend>) -> Vec<String> {
+        let buffer = renderer.terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .filter_map(|x| buffer.cell((x, y)).map(ratatui::buffer::Cell::symbol))
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// Ctrl+O and a resize redraw the visible screen only, as prime-agent does:
+    /// the newest rows fill the screen above the viewport and one input box sits
+    /// at the bottom. The user saw the view jump while thousands of rows were
+    /// pushed again, and, after the terminal was resized, a broken second input
+    /// box left on screen above the real one.
+    #[test]
+    fn a_repaint_draws_only_the_screen_with_one_input_box_at_the_bottom() {
+        let theme = super::theme::Theme::plain();
+        let mut renderer =
+            super::RealRenderer::open_with(ratatui::backend::TestBackend::new(60, 20), &theme)
+                .expect("renderer opens");
+        let items = (0..200)
+            .map(|index| HistoryItem::Notice {
+                message: format!("row {index}"),
+            })
+            .collect::<Vec<_>>();
+        renderer
+            .insert_history_batch(&items)
+            .expect("history goes in");
+        let mut ready = state(AppPhase::Ready);
+        ready.live_text.clear();
+        renderer.draw_state(&ready).expect("frame draws");
+
+        renderer.terminal.backend_mut().resize(90, 20);
+        renderer
+            .repaint_screen(crate::interactive::events::Detail::default())
+            .expect("screen repaints");
+        renderer.draw_state(&ready).expect("frame draws");
+
+        let rows = screen(&renderer);
+        let joined = rows.join(
+            "
+",
+        );
+        assert_eq!(
+            joined.matches("sửa lỗi").count(),
+            1,
+            "one input box on screen:
+{joined}"
+        );
+        let above = usize::from(20 - super::viewport_rows(20));
+        assert!(
+            rows[above - 1].contains("row 199"),
+            "the newest row sits right above the viewport:
+{joined}"
+        );
+        assert!(
+            rows[..above].iter().all(|row| row.contains("row ")),
+            "history fills the screen above the viewport:
+{joined}"
+        );
+        assert!(
+            !joined.contains("row 150"),
+            "only what fits on screen is drawn again:
+{joined}"
+        );
     }
 }

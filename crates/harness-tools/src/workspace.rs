@@ -708,7 +708,23 @@ pub(crate) fn read_file_range(
     offset: u64,
     limit: u32,
 ) -> Result<TextOutput, HarnessError> {
+    Ok(numbered_range(&read_text(path)?, offset, limit))
+}
+
+/// Read a file once and return its numbered range together with the hash of
+/// its whole content. The hash is what `write_file` and `apply_patch` take as
+/// `expected_hash`, so the model gets it from the read instead of computing it.
+pub(crate) fn read_file_range_with_hash(
+    path: &Path,
+    offset: u64,
+    limit: u32,
+) -> Result<(TextOutput, ContentHash), HarnessError> {
     let text = read_text(path)?;
+    let hash = ContentHash::from_bytes(text.as_bytes());
+    Ok((numbered_range(&text, offset, limit), hash))
+}
+
+fn numbered_range(text: &str, offset: u64, limit: u32) -> TextOutput {
     let lines = text.lines().collect::<Vec<_>>();
     let total = lines.len();
     let start = usize::try_from(offset).unwrap_or(usize::MAX).min(total);
@@ -732,34 +748,34 @@ pub(crate) fn read_file_range(
             kept -= 1;
         }
         let limit_size = format_size(limits.max_bytes as u64);
-        return Ok(TextOutput {
+        return TextOutput {
             text: format!(
                 "{}\n\n[Line {first} is {}, exceeds {limit_size} limit; showing its first {limit_size}. Use offset={first} to continue after it.]",
                 &line[..kept],
                 format_size(line.len() as u64),
             ),
             truncated: true,
-        });
+        };
     }
     let shown_end = start + cut.output_lines;
     if !cut.truncated && end == total {
-        return Ok(TextOutput {
+        return TextOutput {
             text: cut.content,
             truncated: false,
-        });
+        };
     }
     let limit_note = if cut.truncated_by == Some(TruncatedBy::Bytes) {
         format!(" ({} limit)", format_size(limits.max_bytes as u64))
     } else {
         String::new()
     };
-    Ok(TextOutput {
+    TextOutput {
         text: format!(
             "{}\n\n[Showing lines {first}-{shown_end} of {total}{limit_note}. Use offset={shown_end} to continue.]",
             cut.content
         ),
         truncated: true,
-    })
+    }
 }
 
 pub(crate) fn apply_text_patch(
