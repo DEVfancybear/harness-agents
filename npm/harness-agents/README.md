@@ -8,6 +8,8 @@ ha --version
 ha            # open the app, then /login to pick a provider
 ```
 
+npm puts `ha` in its global directory (`npm prefix -g`); if `ha` is not found in a new terminal, add that directory to your PATH.
+
 Windows 10/11 x64 only for now; Linux is not supported yet. The package carries `ha.exe`, the pinned `uv.exe` its Python kernel uses, `ha.release.json` (version, rustc, source revision and the executable's digest) and `checksums.txt`.
 
 Documentation, source and releases: https://github.com/DEVfancybear/harness-agents

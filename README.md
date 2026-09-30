@@ -34,7 +34,7 @@ npm install -g harness-agents
 ha --version
 ```
 
-This installs the Windows x64 release build and puts `ha` on your PATH. To build from source instead, follow the quick start below.
+This installs the Windows x64 release build; npm puts `ha` in its global directory (`npm prefix -g`), which Node's installer keeps on your PATH. If `ha` is not found in a new terminal, add that directory to your PATH. To build from source instead, follow the quick start below.
 
 ### Quick start (Windows, PowerShell 7)
 
@@ -141,7 +141,7 @@ npm install -g harness-agents
 ha --version
 ```
 
-Lệnh này cài bản release Windows x64 và đưa `ha` vào PATH. Muốn build từ mã nguồn thì làm theo phần bắt đầu nhanh bên dưới.
+Lệnh này cài bản release Windows x64; npm đặt `ha` vào thư mục global của nó (`npm prefix -g`), thư mục mà trình cài Node giữ trong PATH. Nếu mở terminal mới mà không thấy `ha`, hãy thêm thư mục đó vào PATH. Muốn build từ mã nguồn thì làm theo phần bắt đầu nhanh bên dưới.
 
 ### Bắt đầu nhanh (Windows, PowerShell 7)
 
