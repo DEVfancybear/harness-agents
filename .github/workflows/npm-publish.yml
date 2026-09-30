@@ -1,0 +1,79 @@
+name: Publish to npm
+
+# Publishes `harness-agents` to npm from a GitHub release, with no npm token stored
+# anywhere: npm trusts this workflow (Trusted Publisher, OpenID Connect) and records
+# a provenance statement that links the package to this repository and run.
+#
+# One-time setup on npmjs.com, package `harness-agents` > Settings > Trusted
+# Publisher > GitHub Actions: owner `DEVfancybear`, repository `harness-agents`,
+# workflow filename `npm-publish.yml`.
+#
+# The package is packed from the release's own zip, never from a fresh build, so
+# npm ships the bytes the release checksums cover (scripts/New-HaNpmPackages.ps1
+# refuses a file that does not match checksums.txt).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag whose zip is packed (for example ha-v0.1.0)'
+        required: true
+      package_version:
+        description: 'npm version when it must differ from the release (npm never accepts a version twice)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write # the OIDC token npm exchanges for a publish credential
+
+jobs:
+  publish:
+    name: npm publish
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      PACKAGE_VERSION: ${{ inputs.package_version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted publishing needs npm 11.5.1 or newer.
+      - name: Check npm
+        shell: pwsh
+        run: |
+          $version = [version](npm --version)
+          if ($version -lt [version]'11.5.1') { throw "npm $version cannot publish with OIDC; 11.5.1 or newer is required" }
+          npm --version
+
+      - name: Download the release zip
+        shell: pwsh
+        run: |
+          if (-not $env:TAG) { throw 'no release tag' }
+          gh release download $env:TAG --repo "${{ github.repository }}" --pattern 'ha-*-windows-x64.zip' --dir "$env:RUNNER_TEMP/release"
+          $zip = Get-ChildItem "$env:RUNNER_TEMP/release" -Filter 'ha-*-windows-x64.zip' | Select-Object -First 1
+          if (-not $zip) { throw "release $env:TAG has no ha-*-windows-x64.zip" }
+          $bundle = Join-Path $env:RUNNER_TEMP ($zip.BaseName)
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $bundle
+          "BUNDLE=$bundle" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Pack
+        shell: pwsh
+        run: |
+          $arguments = @{ BundleDirectory = $env:BUNDLE; OutputDirectory = "$env:RUNNER_TEMP/npm" }
+          if ($env:PACKAGE_VERSION) { $arguments.PackageVersion = $env:PACKAGE_VERSION }
+          ./scripts/New-HaNpmPackages.ps1 @arguments
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          $tarball = Get-ChildItem "$env:RUNNER_TEMP/npm" -Filter 'harness-agents-*.tgz' | Select-Object -First 1
+          npm publish $tarball.FullName --access public --provenance

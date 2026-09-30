@@ -102,6 +102,10 @@ npm publish target\npm\harness-agents-<version>.tgz --access public
 
 The script prints the exact command. The package takes the bundle's version; `-PackageVersion` sets a higher one to republish the same build, because npm never accepts a version twice. The sources are in [`npm/`](../npm/harness-agents/package.json).
 
+#### Publishing from GitHub
+
+[`npm-publish.yml`](../.github/workflows/npm-publish.yml) publishes the same package when a GitHub release is published (or when run by hand with a tag), with no npm token stored: npm trusts the workflow through OpenID Connect and records a provenance statement linking the package to this repository. It downloads the release's zip, packs it with `New-HaNpmPackages.ps1` and runs `npm publish --provenance`. Set it up once on npmjs.com: package `harness-agents` > Settings > Trusted Publisher > GitHub Actions, owner `DEVfancybear`, repository `harness-agents`, workflow `npm-publish.yml`. The first publish of a name and any version that differs from the release (`package_version`) still work from your terminal as above.
+
 ## Tiếng Việt
 
 ### 1. Cần có
@@ -202,3 +206,6 @@ npm publish target\npm\harness-agents-<version>.tgz --access public
 
 Script in đúng lệnh này. Package lấy version của bundle; `-PackageVersion` đặt version cao hơn để phát lại cùng một bản build, vì npm không bao giờ nhận một version hai lần. Mã nguồn nằm ở [`npm/`](../npm/harness-agents/package.json).
 
+#### Phát hành từ GitHub
+
+[`npm-publish.yml`](../.github/workflows/npm-publish.yml) phát hành cùng package đó khi một GitHub release được publish (hoặc khi chạy tay với một tag), không lưu token npm nào: npm tin workflow qua OpenID Connect và ghi một bản provenance nối package với repo này. Workflow tải zip của release, đóng bằng `New-HaNpmPackages.ps1` rồi chạy `npm publish --provenance`. Thiết lập một lần trên npmjs.com: package `harness-agents` > Settings > Trusted Publisher > GitHub Actions, owner `DEVfancybear`, repository `harness-agents`, workflow `npm-publish.yml`. Lần publish đầu của một tên và mọi version khác với release (`package_version`) vẫn làm được từ terminal như trên.
