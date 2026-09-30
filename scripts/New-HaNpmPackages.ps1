@@ -40,7 +40,12 @@ if (-not $BundleDirectory) {
     $BundleDirectory = $newest.FullName
 }
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path $repositoryRoot 'target/npm' }
+# Paths are used from inside the staged package, so they must not be relative.
+$OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
+$BundleDirectory = [System.IO.Path]::GetFullPath($BundleDirectory)
 
+# npm's update check calls the network and can stall a pack for minutes.
+$env:NPM_CONFIG_UPDATE_NOTIFIER = 'false'
 foreach ($tool in 'npm', 'node') {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool is required" }
 }
@@ -79,9 +84,16 @@ $package | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $packageJson -Enco
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 Push-Location $packageStage
 try {
-    # npm prints warnings on stderr; only stdout is the JSON.
-    $packed = & npm pack --pack-destination $OutputDirectory --json
-    if ($LASTEXITCODE -ne 0) { throw 'npm pack failed' }
+    # npm prints warnings on stderr; only stdout is the JSON. stderr goes to a file
+    # so it is neither mixed into the JSON nor left unread on a pipe.
+    $errorFile = Join-Path $OutputDirectory 'npm-pack.stderr.txt'
+    $packed = & npm pack --pack-destination $OutputDirectory --json 2>$errorFile
+    $exit = $LASTEXITCODE
+    if (Test-Path -LiteralPath $errorFile) {
+        Get-Content -LiteralPath $errorFile | ForEach-Object { Write-Host "npm: $_" }
+        Remove-Item -LiteralPath $errorFile -Force
+    }
+    if ($exit -ne 0) { throw 'npm pack failed' }
     $tarball = Join-Path $OutputDirectory (($packed | ConvertFrom-Json)[0].filename)
 } finally {
     Pop-Location
