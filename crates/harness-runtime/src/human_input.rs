@@ -10,9 +10,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use harness_store_sqlite::{
-    QuestionOutcome, QuestionRecord, QuestionState, RunRecord, SqliteStore,
-};
+use harness_store_sqlite::{QuestionOutcome, QuestionRecord, QuestionState, SqliteStore};
 use harness_types::{AgentRunId, ContentHash, ErrorCode, QuestionId, SessionId, TaskId};
 use serde_json::Value;
 
@@ -166,28 +164,6 @@ impl HumanInputService {
             .cancel_question(question_id)
             .await
             .map_err(RuntimeError::from)
-    }
-
-    /// Open questions of one run, oldest first.
-    pub async fn open_for_run(
-        &self,
-        run_id: &AgentRunId,
-    ) -> Result<Vec<QuestionRecord>, RuntimeError> {
-        let session_id = self
-            .store
-            .run_by_id(run_id)
-            .await
-            .map_err(RuntimeError::from)?
-            .map(|run: RunRecord| run.session_id)
-            .ok_or_else(|| RuntimeError::new(ErrorCode::InvalidPayload, "run does not exist"))?;
-        Ok(self
-            .questions(&session_id)
-            .await?
-            .into_iter()
-            .filter(|question| {
-                question.state == QuestionState::Open && question.run_id.as_ref() == Some(run_id)
-            })
-            .collect())
     }
 }
 

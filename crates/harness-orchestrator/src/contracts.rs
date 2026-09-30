@@ -194,11 +194,6 @@ impl DelegationGrants {
         self.actions.contains(&action)
     }
 
-    #[must_use]
-    pub fn may_write(&self) -> bool {
-        self.edit_workspace && !self.write_scope.is_empty()
-    }
-
     pub fn validate(&self) -> Result<(), OrchestratorError> {
         if self.max_depth > DEFAULT_MAX_DEPTH {
             return Err(OrchestratorError::new(
@@ -763,29 +758,6 @@ impl TaskPlan {
     pub fn node(&self, task_id: &TaskId) -> Option<&TaskNode> {
         self.nodes.get(task_id)
     }
-
-    /// Tasks whose dependencies all completed and which may be dispatched now.
-    #[must_use]
-    pub fn ready_tasks(&self) -> Vec<TaskId> {
-        let mut ready = Vec::new();
-        for task_id in &self.topological_order {
-            let Some(node) = self.nodes.get(task_id) else {
-                continue;
-            };
-            if node.status != TaskStatus::Pending && node.status != TaskStatus::Ready {
-                continue;
-            }
-            let dependencies_ready = node.depends_on.iter().all(|dependency| {
-                self.nodes
-                    .get(dependency)
-                    .is_some_and(|dep| dep.status == TaskStatus::Completed)
-            });
-            if dependencies_ready {
-                ready.push(task_id.clone());
-            }
-        }
-        ready
-    }
 }
 
 /// Depth of a task inside its own graph. A parent outside the graph is the host
@@ -1279,19 +1251,6 @@ impl SchedulerConfig {
                     "the delegation queue is full: {reserved} worker(s) are dispatched and at most \
                      {capacity} may be ({} running, {} waiting)",
                     self.max_concurrent_workers, self.max_queued_workers
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    pub fn require_slot(&self, in_use: u32) -> Result<(), OrchestratorError> {
-        if in_use >= self.max_concurrent_workers {
-            return Err(OrchestratorError::new(
-                ErrorCode::BudgetExhausted,
-                format!(
-                    "all {} worker slots are in use",
-                    self.max_concurrent_workers
                 ),
             ));
         }

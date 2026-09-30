@@ -637,19 +637,6 @@ impl McpClient {
         Ok(client)
     }
 
-    /// Connect to an MCP Streamable HTTP endpoint. Redirects are disabled by
-    /// RMCP's reqwest client so an authorization header is never replayed to a
-    /// different origin. Plain HTTP is accepted only for loopback fixtures.
-    pub async fn connect_streamable_http(
-        url: &str,
-        bearer_token: Option<&str>,
-        scope_id: ScopeId,
-        generation: u64,
-    ) -> Result<Self, ExtensionError> {
-        Self::connect_streamable_http_with_callbacks(url, bearer_token, None, scope_id, generation)
-            .await
-    }
-
     /// Connect to Streamable HTTP with server-to-client callbacks enabled.
     pub async fn connect_streamable_http_with_callbacks(
         url: &str,

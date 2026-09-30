@@ -669,9 +669,3 @@ pub fn read_manifest(path: &Path) -> Result<ExtensionManifest, ExtensionError> {
     })?;
     ExtensionManifest::from_json_bytes(&bytes)
 }
-
-/// The instance id of an extension's registration token, for assertions.
-#[must_use]
-pub fn token_instance(token: &RegistrationToken) -> &PluginInstanceId {
-    &token.instance_id
-}

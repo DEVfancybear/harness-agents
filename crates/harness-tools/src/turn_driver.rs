@@ -155,21 +155,6 @@ impl TurnStop {
             Self::Unverified => "unverified",
         }
     }
-
-    /// Whether the run can be continued by a later turn without new input.
-    #[must_use]
-    pub const fn is_resumable(self) -> bool {
-        matches!(
-            self,
-            Self::StepLimit
-                | Self::ToolLimit
-                | Self::NoProgress
-                | Self::GoalLimit
-                | Self::BudgetExhausted
-                | Self::NeedsInput
-                | Self::ExternalWait
-        )
-    }
 }
 
 /// One gated action waiting for the user's decision.

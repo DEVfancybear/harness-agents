@@ -573,12 +573,6 @@ impl Drop for RestoreStagingDir {
     }
 }
 
-/// Open the restored store read-only so the caller can decide whether to
-/// activate it. This is the explicit step a restore deliberately does not take.
-pub async fn open_restored(destination: impl AsRef<Path>) -> Result<SqliteStore, MaintenanceError> {
-    Ok(SqliteStore::open_read_only(destination.as_ref()).await?)
-}
-
 /// Mark a restored directory as active by opening it writable exactly once.
 ///
 /// The caller must have decided to activate; nothing else in this module does.
@@ -654,25 +648,4 @@ async fn read_retention_pins(store: &SqliteStore) -> Result<Vec<RetentionPin>, M
         .into_iter()
         .map(|(reason, task_id)| RetentionPin { reason, task_id })
         .collect())
-}
-
-/// The data directory a restored copy was taken from, for operator reporting.
-pub fn backup_source(manifest: &BackupManifest) -> &str {
-    &manifest.source_data_dir
-}
-
-/// A backup directory that exists and holds a manifest.
-#[must_use]
-pub fn is_backup_dir(path: impl AsRef<Path>) -> bool {
-    path.as_ref().join(BACKUP_MANIFEST_NAME).is_file()
-}
-
-/// Convenience: the paths a caller needs when describing a backup.
-#[must_use]
-pub fn backup_paths(backup_dir: impl AsRef<Path>) -> (PathBuf, PathBuf) {
-    let dir = backup_dir.as_ref();
-    (
-        dir.join(BACKUP_MANIFEST_NAME),
-        dir.join(BACKUP_DATABASE_NAME),
-    )
 }

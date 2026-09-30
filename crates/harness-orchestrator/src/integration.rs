@@ -17,9 +17,7 @@ use tokio::sync::Mutex;
 use crate::contracts::{
     CheckedRevision, IntegrationReport, IntegrationStep, OrchestratorError, VerifiedSnapshot,
 };
-use crate::workspace::{
-    ChangeSet, ScopeViolation, WorkspaceManager, fingerprint_locked, scope_violations,
-};
+use crate::workspace::{WorkspaceManager, fingerprint_locked};
 
 /// Verdict for one integration attempt.
 #[derive(Clone, Debug, PartialEq)]
@@ -87,12 +85,6 @@ impl ResultIntegrator {
             workspace,
             git_lock,
         }
-    }
-
-    /// Reject a branch whose files fall outside its own declared write scope.
-    #[must_use]
-    pub fn scope_check(candidate: &BranchCandidate, write_scope: &[String]) -> Vec<ScopeViolation> {
-        scope_violations(&candidate.files, write_scope)
     }
 
     /// Integrate candidates in dependency order inside one integration worktree.
@@ -181,16 +173,6 @@ impl ResultIntegrator {
             });
         }
         Ok(IntegrationOutcome::Ready(Box::new(report)))
-    }
-
-    /// Change set of an integrated branch relative to the snapshot base.
-    pub async fn integrated_changes(
-        &self,
-        report: &IntegrationReport,
-    ) -> Result<ChangeSet, OrchestratorError> {
-        self.workspace
-            .branch_changes(&report.integration_root, &report.base_commit)
-            .await
     }
 
     /// Recheck the user's workspace before anything is applied there. A changed

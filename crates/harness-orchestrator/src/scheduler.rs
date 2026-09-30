@@ -15,7 +15,7 @@ use std::{
     },
 };
 
-use harness_kernel::{KernelError, ManagedResource, ShutdownReport};
+use harness_kernel::{KernelError, ManagedResource};
 use harness_providers::CancellationToken;
 use harness_types::{AgentRunId, ErrorCode, TaskId};
 use tokio::sync::{Semaphore, mpsc};
@@ -104,10 +104,8 @@ impl WorkerBackend for RefusingBackend {
 #[derive(Debug)]
 pub struct BudgetLedger {
     max_model_requests: u32,
-    max_retries: u32,
     max_workers: u32,
     requests: AtomicU32,
-    retries: AtomicU32,
     cost: AtomicU64,
     observed: Mutex<BTreeMap<String, BudgetUsage>>,
 }
@@ -117,10 +115,8 @@ impl BudgetLedger {
     pub fn new(config: &SchedulerConfig) -> Self {
         Self {
             max_model_requests: config.budget.max_model_requests,
-            max_retries: config.budget.max_retries,
             max_workers: config.max_concurrent_workers,
             requests: AtomicU32::new(0),
-            retries: AtomicU32::new(0),
             cost: AtomicU64::new(0),
             observed: Mutex::new(BTreeMap::new()),
         }
@@ -143,18 +139,6 @@ impl BudgetLedger {
         Ok(())
     }
 
-    pub fn charge_retry(&self) -> Result<(), OrchestratorError> {
-        let previous = self.retries.fetch_add(1, Ordering::SeqCst);
-        if previous >= self.max_retries {
-            self.retries.fetch_sub(1, Ordering::SeqCst);
-            return Err(OrchestratorError::new(
-                ErrorCode::BudgetExhausted,
-                "retry budget is exhausted",
-            ));
-        }
-        Ok(())
-    }
-
     /// Record the usage a worker reported. It never lowers what was charged.
     pub fn observe_usage(&self, task_id: &TaskId, usage: BudgetUsage) {
         if let Ok(mut observed) = self.observed.lock() {
@@ -170,16 +154,6 @@ impl BudgetLedger {
     }
 
     #[must_use]
-    pub fn retries_used(&self) -> u32 {
-        self.retries.load(Ordering::SeqCst)
-    }
-
-    #[must_use]
-    pub fn cost_used(&self) -> u64 {
-        self.cost.load(Ordering::SeqCst)
-    }
-
-    #[must_use]
     pub const fn max_workers(&self) -> u32 {
         self.max_workers
     }
@@ -188,14 +162,6 @@ impl BudgetLedger {
     pub fn remaining_requests(&self) -> u32 {
         self.max_model_requests
             .saturating_sub(self.requests.load(Ordering::SeqCst))
-    }
-
-    #[must_use]
-    pub fn observed_usage(&self, task_id: &TaskId) -> Option<BudgetUsage> {
-        self.observed
-            .lock()
-            .ok()
-            .and_then(|observed| observed.get(task_id.as_str()).copied())
     }
 }
 
@@ -572,25 +538,6 @@ impl WorkerScheduler {
     pub fn outstanding_workers(&self) -> u32 {
         self.outstanding.load(Ordering::SeqCst)
     }
-
-    /// Wait until no dispatched worker is outstanding, consuming the outcomes
-    /// so the stream stays consistent for later readers.
-    pub async fn wait_until_idle(&self) -> Vec<String> {
-        let mut unknowns = Vec::new();
-        let mut receiver = self.settled_rx.lock().await;
-        while self.outstanding.load(Ordering::SeqCst) > 0 {
-            match receiver.recv().await {
-                Some(Ok((task_id, outcome))) => {
-                    if let WorkerOutcome::OutcomeUnknown { reason } = outcome {
-                        unknowns.push(format!("{}: {reason}", task_id.as_str()));
-                    }
-                }
-                Some(Err(error)) => unknowns.push(format!("join-error: {error}")),
-                None => break,
-            }
-        }
-        unknowns
-    }
 }
 
 /// A handle to one dispatched worker.
@@ -655,15 +602,5 @@ impl ManagedResource for WorkerScheduler {
             self.drain_descendants().await;
             Ok(())
         })
-    }
-}
-
-/// Convenience report for callers that drive shutdown themselves.
-#[must_use]
-pub fn shutdown_report(drained: &[String]) -> ShutdownReport {
-    ShutdownReport {
-        closed: vec!["shutdown:p5-worker-scheduler".to_owned()],
-        errors: Vec::new(),
-        outcome_uncertainties: drained.to_vec(),
     }
 }

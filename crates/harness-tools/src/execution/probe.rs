@@ -93,17 +93,6 @@ impl ProbeChild {
         }
     }
 
-    /// The fixture shipped beside this binary.
-    pub fn for_current_executable(prefix: Vec<String>) -> Result<Self, HarnessError> {
-        let executable = std::env::current_exe().map_err(|error| {
-            HarnessError::new(
-                ErrorCode::ServiceUnavailable,
-                format!("cannot locate the running executable for the probe fixture: {error}"),
-            )
-        })?;
-        Ok(Self::new(executable, prefix))
-    }
-
     #[must_use]
     pub fn executable(&self) -> &Path {
         &self.executable
@@ -165,13 +154,6 @@ impl CapabilityProbe {
             host,
             nonce,
         }
-    }
-
-    /// Replace the host environment the probes measure the allowlist against.
-    #[must_use]
-    pub fn with_host_environment(mut self, host: HostEnvironment) -> Self {
-        self.host = host;
-        self
     }
 
     #[must_use]

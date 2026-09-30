@@ -1,10 +1,7 @@
 //! The delegation coordinator: durable admission, budgeted dispatch, result
 //! acceptance and dependency-ordered progress over one proven DAG.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use harness_providers::CancellationToken;
 use harness_store_sqlite::{
@@ -143,12 +140,6 @@ impl DelegationCoordinator {
             verifier: Arc::new(EvidenceVerifier),
             generation,
         }
-    }
-
-    #[must_use]
-    pub fn with_verifier(mut self, verifier: Arc<dyn ResultVerifier>) -> Self {
-        self.verifier = verifier;
-        self
     }
 
     #[must_use]
@@ -356,35 +347,6 @@ impl DelegationCoordinator {
                 })
             }
         }
-    }
-
-    /// Tasks that became blocked or failed. Dependents must not run when a
-    /// dependency did not complete.
-    #[must_use]
-    pub fn failed_tasks(plan: &TaskPlan, outcomes: &[StepOutcome]) -> Vec<TaskId> {
-        let mut failed = BTreeSet::new();
-        for outcome in outcomes {
-            if matches!(outcome.status, TaskStatus::Failed | TaskStatus::Canceled)
-                || (outcome.status == TaskStatus::Blocked && !outcome.accepted)
-            {
-                failed.insert(outcome.task_id.clone());
-            }
-        }
-        let mut propagation = failed.clone();
-        for task_id in &plan.topological_order {
-            let Some(node) = plan.node(task_id) else {
-                continue;
-            };
-            if node
-                .depends_on
-                .iter()
-                .any(|dependency| propagation.contains(dependency))
-            {
-                propagation.insert(task_id.clone());
-                failed.insert(task_id.clone());
-            }
-        }
-        failed.into_iter().collect()
     }
 
     /// Progress view built only from durable state, so a restarted host has the

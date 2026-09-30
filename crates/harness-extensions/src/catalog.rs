@@ -138,12 +138,6 @@ impl CatalogEntry {
     pub const fn is_promoted(&self) -> bool {
         self.schema.is_some()
     }
-
-    /// Whether this entry's definition was dropped by a revoke or a reload.
-    #[must_use]
-    pub const fn is_revoked(&self) -> bool {
-        self.revoked
-    }
 }
 
 /// What a listing may reveal: identity and metadata, never a schema.
@@ -419,20 +413,6 @@ impl ToolCatalog {
         let rebuilt = Self::build(revision, entries)?;
         *self = rebuilt;
         Ok(())
-    }
-
-    /// A stable digest of what the caller may see, for a report.
-    pub fn authorized_digest(&self, held: &[String]) -> Result<ContentHash, ExtensionError> {
-        ContentHash::from_canonical_json(&serde_json::json!({
-            "domain": "tool-catalog-view.v1",
-            "catalog_digest": self.catalog_digest.as_str(),
-            "visible": self
-                .list_authorized(held)
-                .iter()
-                .map(|view| view.id.clone())
-                .collect::<Vec<_>>(),
-        }))
-        .map_err(|error| ExtensionError::new(error.code(), error.to_string()))
     }
 }
 

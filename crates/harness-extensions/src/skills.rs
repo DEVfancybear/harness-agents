@@ -791,11 +791,6 @@ pub struct SkillActivation {
 }
 
 impl SkillActivation {
-    #[must_use]
-    pub fn content_digest(&self) -> ContentHash {
-        ContentHash::from_bytes(self.content.as_bytes())
-    }
-
     /// The pinned bytes, for persistence and replay. Never re-read from disk.
     #[must_use]
     pub fn replay_content(&self) -> &str {

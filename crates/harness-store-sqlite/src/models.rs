@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeSet,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -82,13 +82,6 @@ impl StorePaths {
     #[must_use]
     pub fn marker_path(&self) -> PathBuf {
         self.data_dir.join(DATA_DIRECTORY_MARKER_FILE_NAME)
-    }
-
-    #[must_use]
-    pub fn from_database_path(path: impl AsRef<Path>) -> Option<Self> {
-        path.as_ref()
-            .parent()
-            .map(|parent| Self::new(parent.to_owned()))
     }
 }
 

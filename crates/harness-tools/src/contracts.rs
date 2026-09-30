@@ -714,19 +714,6 @@ impl CodingToolAction {
         }
     }
 
-    #[must_use]
-    pub const fn has_external_side_effect(&self) -> bool {
-        matches!(
-            self,
-            Self::ApplyPatch { .. }
-                | Self::WriteFile { .. }
-                | Self::EditFile { .. }
-                | Self::RunProcess { .. }
-                | Self::RunShell { .. }
-                | Self::ExternalTool { .. }
-        )
-    }
-
     pub fn canonical_value(&self) -> Result<Value, harness_types::HarnessError> {
         serde_json::to_value(self).map_err(|_| {
             harness_types::HarnessError::new(

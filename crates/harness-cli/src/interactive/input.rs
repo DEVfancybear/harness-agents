@@ -308,12 +308,6 @@ impl LineEditor {
         true
     }
 
-    /// Close the reference overlay.
-    #[allow(dead_code, reason = "T06 closes the overlay from the controller")]
-    pub fn close_overlay(&mut self) {
-        self.overlay = None;
-    }
-
     /// Drop the current input without touching the history.
     pub fn clear(&mut self) {
         self.buffer.clear();

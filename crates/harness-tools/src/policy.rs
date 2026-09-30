@@ -379,12 +379,6 @@ impl ToolPolicy {
         }
     }
 
-    #[must_use]
-    pub fn with_process_timeout_cap(mut self, timeout_ms: u64) -> Self {
-        self.max_process_timeout_ms = timeout_ms;
-        self
-    }
-
     /// Expose secret references to this host's tool processes.
     #[must_use]
     pub fn with_granted_secrets(mut self, secrets: Vec<String>) -> Self {
