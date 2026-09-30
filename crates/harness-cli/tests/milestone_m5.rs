@@ -1016,6 +1016,23 @@ async fn m5_03_index_rebuild_is_identical_and_scope_is_a_filter() {
         .expect("page");
     assert_eq!(page.bytes.len(), 8);
     assert!(page.total_bytes > 8);
+
+    // A garbled tail is refused, and the refusal names the in-scope id with the
+    // same head so the model can correct itself; a foreign id is never named.
+    let garbled = format!("{}8a4a5bf83b", &own[0][..own[0].len() - 12]);
+    let error = store
+        .history_read(&scope, &garbled, 0, 8)
+        .await
+        .expect_err("a garbled id is refused");
+    assert_eq!(error.code(), ErrorCode::InvalidPayload);
+    assert!(
+        error.to_string().contains(&own[0]),
+        "the refusal names the closest id: {error}"
+    );
+    assert!(
+        !error.to_string().contains(&foreign[0]),
+        "a foreign id is never offered: {error}"
+    );
     assert_eq!(
         page.content_hash,
         ContentHash::from_bytes(

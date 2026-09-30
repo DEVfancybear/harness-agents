@@ -2143,17 +2143,21 @@ fn sort_newest_first(sessions: &mut [harness_store_sqlite::SessionSummary]) {
 }
 
 /// prime-agent's `/logs` listing over ha's data directory: every `*.log` the
-/// app wrote there (the kernel's stderr logs), as `• name (N.N KB)`, sorted.
-/// prime-agent keeps its logs in one directory; ha writes them next to what
-/// they log, so the names are paths under the data directory.
+/// app wrote there (the kernel's stderr logs, the workers' logs), as
+/// `• name (N.N KB)`, sorted. prime-agent keeps its logs in one directory; ha
+/// writes them next to what they log, so the names are paths under the data
+/// directory. An empty log says nothing and is not listed (older builds left
+/// one per kernel), and the directories that never hold a log - the kernel's
+/// virtual environment, the project stores - are not walked.
 fn log_lines(data_dir: &Path) -> Vec<String> {
+    const NO_LOGS: &[&str] = &["kernel-venv", "projects", "cache", "attachments"];
     fn walk(dir: &Path, depth: usize, found: &mut Vec<(String, u64)>, root: &Path) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
+            if name.starts_with('.') || (dir == root && NO_LOGS.contains(&name.as_str())) {
                 continue;
             }
             let path = entry.path();
@@ -2165,6 +2169,9 @@ fn log_lines(data_dir: &Path) -> Vec<String> {
             } else if kind.is_file() && path.extension().is_some_and(|extension| extension == "log")
             {
                 let size = entry.metadata().map_or(0, |metadata| metadata.len());
+                if size == 0 {
+                    continue;
+                }
                 let shown = path
                     .strip_prefix(root)
                     .unwrap_or(&path)
@@ -9230,6 +9237,18 @@ mod tests {
         )
         .expect("log");
         std::fs::write(data.join(".hidden.log"), "x").expect("hidden");
+        std::fs::create_dir_all(data.join("sessions").join("c2").join("kernel")).expect("kernel");
+        std::fs::write(
+            data.join("sessions")
+                .join("c2")
+                .join("kernel")
+                .join("kernel-stderr.log"),
+            "",
+        )
+        .expect("an empty log");
+        std::fs::create_dir_all(data.join("kernel-venv").join("Lib")).expect("venv");
+        std::fs::write(data.join("kernel-venv").join("Lib").join("pip.log"), "x")
+            .expect("a log in the venv");
         std::fs::write(data.join("notes.txt"), "x").expect("not a log");
         assert_eq!(
             super::log_lines(data)[1..],

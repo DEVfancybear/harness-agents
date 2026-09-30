@@ -449,10 +449,17 @@ impl SqliteStore {
             database_error(ErrorCode::StorageWriteFailed, "read history source", error)
         })?;
         let Some(row) = row else {
-            return Err(StoreError::new(
-                ErrorCode::InvalidPayload,
-                "no indexed source has that id",
-            ));
+            let nearest = self.nearest_source_ids(scope, source_id).await?;
+            let reason = if nearest.is_empty() {
+                "no indexed source has that id; copy a source id whole from a history_search hit"
+                    .to_owned()
+            } else {
+                format!(
+                    "no indexed source has that id; copy a source id whole from a history_search hit (the closest ids in this task: {})",
+                    nearest.join(", ")
+                )
+            };
+            return Err(StoreError::new(ErrorCode::InvalidPayload, reason));
         };
         let project_id = row_get::<String>(&row, "project_id")?;
         let task_id = row_get::<String>(&row, "task_id")?;
@@ -503,6 +510,50 @@ impl SqliteStore {
                 .unwrap_or_default(),
             total_bytes,
         })
+    }
+
+    /// In-scope source ids that share the longest prefix with a mistyped one.
+    ///
+    /// A source id is a UUIDv7 whose head is its creation time, so a model that
+    /// garbled the tail of an id it was shown still has the head right (seen: a
+    /// read of `event_01a0f16c-740a-7185-8a4a5bf83b` for `…-a8bf-5ae151e600bf`).
+    async fn nearest_source_ids(
+        &self,
+        scope: &HistoryScope,
+        source_id: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        const HEAD_CHARS: usize = "event_01a0f16c".len();
+        const MOST: usize = 3;
+        let Some(head) = source_id.get(..HEAD_CHARS) else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query(
+            "SELECT source_id FROM history_sources
+             WHERE project_id = ? AND task_id = ? AND substr(source_id, 1, ?) = ?",
+        )
+        .bind(scope.project_id.as_str())
+        .bind(scope.task_id.as_str())
+        .bind(i64::try_from(HEAD_CHARS).unwrap_or(i64::MAX))
+        .bind(head)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "list history sources", error)
+        })?;
+        let mut candidates = rows
+            .iter()
+            .map(|row| row_get::<String>(row, "source_id"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let shared = |candidate: &str| {
+            candidate
+                .bytes()
+                .zip(source_id.bytes())
+                .take_while(|(left, right)| left == right)
+                .count()
+        };
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(shared(candidate)));
+        candidates.truncate(MOST);
+        Ok(candidates)
     }
 
     /// The project a session belongs to.
