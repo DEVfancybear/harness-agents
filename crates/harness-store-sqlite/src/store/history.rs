@@ -514,7 +514,7 @@ impl SqliteStore {
 
     /// In-scope source ids that share the longest prefix with a mistyped one.
     ///
-    /// A source id is a UUIDv7 whose head is its creation time, so a model that
+    /// A source id is a v7 UUID whose head is its creation time, so a model that
     /// garbled the tail of an id it was shown still has the head right (seen: a
     /// read of `event_01a0f16c-740a-7185-8a4a5bf83b` for `…-a8bf-5ae151e600bf`).
     async fn nearest_source_ids(
