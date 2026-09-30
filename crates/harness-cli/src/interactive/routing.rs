@@ -150,14 +150,36 @@ pub fn resolve(
     environment: &LaunchEnvironment,
     data_dir: &Path,
 ) -> Result<(ProviderConfig, Model), Unusable> {
+    resolve_scoped(
+        base,
+        reference,
+        environment,
+        data_dir,
+        super::credentials::Scope::Main,
+    )
+}
+
+/// [`resolve`] with the key a scope reads: a delegated child's own login first.
+pub fn resolve_scoped(
+    base: &ProviderConfig,
+    reference: &str,
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+    scope: super::credentials::Scope,
+) -> Result<(ProviderConfig, Model), Unusable> {
     let catalog = Catalog::load(data_dir);
     let entry = catalog
         .find(reference)
         .cloned()
         .ok_or(Unusable::NotInCatalog)?;
-    let credential =
-        super::credentials::source_for(environment, data_dir, &entry.provider, &entry.key_env())
-            .ok_or_else(|| Unusable::NoCredential(entry.provider.clone()))?;
+    let credential = super::credentials::source_for_scope(
+        environment,
+        data_dir,
+        &entry.provider,
+        &entry.key_env(),
+        scope,
+    )
+    .ok_or_else(|| Unusable::NoCredential(entry.provider.clone()))?;
     Ok((config_for(base, &entry, credential), entry))
 }
 

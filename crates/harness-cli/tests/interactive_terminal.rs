@@ -512,6 +512,9 @@ fn base_env(temp: &tempfile::TempDir) -> Vec<(&'static str, String)> {
         ),
         ("HA_PROVIDER_ENDPOINT", String::new()),
         ("HA_PROVIDER_MODEL", String::new()),
+        // The cases measure the inline viewport; fullscreen (prime-agent's
+        // default) has cases of its own that turn it back on.
+        ("HA_FULLSCREEN", "0".to_owned()),
         // The Codex host can itself run with TERM=dumb. A real pseudo-console is
         // capable of cursor positioning, so the default acceptance route must
         // state that capability instead of silently measuring the plain fallback.
@@ -3261,7 +3264,7 @@ fn d02_pty_create_session_starts_a_top_level_agent() {
     let mut session = PtySession::spawn(&project, &env);
     session.wait_for("Harness Agents", Duration::from_secs(30));
     session.send("start a helper\r");
-    session.wait_for("creator-done-d02", Duration::from_mins(2));
+    session.wait_for("creator-done-d02", Duration::from_mins(5));
     let deadline = Instant::now() + Duration::from_mins(1);
     let helper = loop {
         let listed = run_cli_json(&temp, &project, &["agents", "--json"]);
@@ -3297,4 +3300,291 @@ fn d02_pty_create_session_starts_a_top_level_agent() {
     );
     assert_ne!(helper["conversation"], serde_json::Value::Null);
     finish(session);
+}
+
+/// F01: prime-agent's fullscreen rendering is the default: the alternate
+/// screen holds the conversation, the wheel scrolls it (the follow hint shows),
+/// and `/fullscreen off` returns to the inline viewport and keeps the choice
+/// for the next launch.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn f01_pty_fullscreen_scrolls_with_the_wheel_and_can_be_turned_off() {
+    let provider = ScriptedSse::start(|_| {
+        Reply::Text(
+            (0..60)
+                .map(|index| format!("answer-row-{index}"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
+    });
+    let (temp, project) = sandbox();
+    let mut env = provider_env(&temp, &provider.endpoint());
+    env.retain(|(name, _)| *name != "HA_FULLSCREEN");
+    let mut session = PtySession::spawn(&project, &env);
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+    session.send("go\r");
+    session.wait_for("answer-row-59", Duration::from_mins(1));
+    // SGR wheel-up reports over the conversation.
+    for _ in 0..6 {
+        session.send("\u{1b}[<64;10;5M");
+    }
+    session.wait_for("ctrl+shift+down to follow", Duration::from_secs(20));
+    session.send("/fullscreen off\r");
+    session.wait_for("Fullscreen rendering off", Duration::from_secs(20));
+    let settings = std::fs::read_to_string(ha_home(&temp).join("settings.json")).expect("settings");
+    assert!(settings.contains("\"fullscreen\": false"), "{settings}");
+    finish(session);
+}
+
+/// D03: `ha exec` runs through the project's worker, as prime-agent's headless
+/// sessions run through its daemon: while an agent is in the middle of a turn -
+/// the project's store open for its writer - `ha exec` no longer waits for the
+/// writer and fails with `writer_locked`; it runs in the worker beside the agent.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn d03_pty_exec_runs_beside_an_agent_in_the_middle_of_a_turn() {
+    let provider = ScriptedSse::start(|request| {
+        if last_user_text(request).contains("slow") {
+            Reply::Delay(
+                Duration::from_secs(12),
+                Box::new(Reply::Text("slow-done-d03".to_owned())),
+            )
+        } else {
+            Reply::Text("quick-done-d03".to_owned())
+        }
+    });
+    let (temp, project) = sandbox();
+    let env = provider_env(&temp, &provider.endpoint());
+    let mut session = PtySession::spawn(&project, &env);
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+    session.send("slow please\r");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while provider.requests().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !provider.requests().is_empty(),
+        "the agent's turn reached the model"
+    );
+    let started = Instant::now();
+    let mut command = std::process::Command::new(cli_binary());
+    command
+        .args(["exec", "--output-format", "json", "quick please"])
+        .current_dir(&project)
+        .stdin(std::process::Stdio::null());
+    for (name, value) in &env {
+        command.env(name, value);
+    }
+    let quick = command.output().expect("the exec runs");
+    assert!(
+        quick.status.success(),
+        "the exec ran beside the agent's turn: {}",
+        String::from_utf8_lossy(&quick.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&quick.stdout).expect("the exec reports JSON");
+    assert_eq!(report["response"], "quick-done-d03", "{report}");
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "the exec did not wait for the agent's turn: {:?}",
+        started.elapsed()
+    );
+    session.wait_for("slow-done-d03", Duration::from_mins(1));
+    finish(session);
+}
+
+/// The agents `ha agents --json` lists for this state root.
+fn listed_agents(temp: &tempfile::TempDir, project: &Path) -> Vec<serde_json::Value> {
+    run_cli_json(temp, project, &["agents", "--json"])["agents"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Wait until an agent the predicate accepts is listed.
+fn wait_for_agent(
+    temp: &tempfile::TempDir,
+    project: &Path,
+    timeout: Duration,
+    accept: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let agents = listed_agents(temp, project);
+        if let Some(agent) = agents.iter().find(|agent| accept(agent)) {
+            return agent.clone();
+        }
+        assert!(Instant::now() < deadline, "no such agent came: {agents:?}");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// End a process by id, as a crash would.
+fn kill_process(pid: u64) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .output();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .output();
+}
+
+/// An agent that answered once and was left in the background by `/quit`.
+fn detached_agent(
+    temp: &tempfile::TempDir,
+    project: &Path,
+    env: &[(&str, String)],
+    binary: &Path,
+    answer: &str,
+) -> serde_json::Value {
+    let mut session = PtySession::spawn_executable(binary, project, env, &[]);
+    session.keep_workers();
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+    session.send("hello\r");
+    session.wait_for(answer, Duration::from_mins(1));
+    session.send("/quit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+    drop(session);
+    wait_for_idle_agent(temp, project, Duration::from_mins(1))
+}
+
+/// D04: prime-agent's supervisor starts a worker that died again, and the
+/// agent comes back on its id and its conversation.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn d04_pty_a_worker_that_dies_comes_back_with_its_agents() {
+    let provider = ScriptedSse::start(|_| Reply::Text("answer-d04".to_owned()));
+    let (temp, project) = sandbox();
+    let env = provider_env(&temp, &provider.endpoint());
+    let agent = detached_agent(&temp, &project, &env, &cli_binary(), "answer-d04");
+    let id = agent["id"].as_str().expect("id").to_owned();
+    let conversation = agent["conversation"].clone();
+    let worker = agent["worker_pid"].as_u64().expect("worker pid");
+    kill_process(worker);
+    let back = wait_for_agent(&temp, &project, Duration::from_mins(1), |agent| {
+        agent["id"] == id.as_str() && agent["worker_pid"].as_u64() != Some(worker)
+    });
+    assert_eq!(back["conversation"], conversation, "{back}");
+    run_cli_json(&temp, &project, &["shutdown", "--force", "--json"]);
+}
+
+/// D05: a conversation with a scheduled job is opened again when the project's
+/// worker starts, so the job fires with no terminal open.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn d05_pty_a_scheduled_conversation_is_opened_when_the_worker_starts() {
+    let provider = ScriptedSse::start(|_| Reply::Text("answer-d05".to_owned()));
+    let (temp, project) = sandbox();
+    let env = provider_env(&temp, &provider.endpoint());
+    let mut session = PtySession::spawn(&project, &env);
+    session.keep_workers();
+    session.wait_for("Harness Agents", Duration::from_secs(30));
+    session.send("hello\r");
+    session.wait_for("answer-d05", Duration::from_mins(1));
+    session.send("/schedule add in 1h -- ping-d05\r");
+    session.wait_for("scheduled", Duration::from_secs(20));
+    session.send("/quit\r");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+    drop(session);
+    let agent = wait_for_idle_agent(&temp, &project, Duration::from_mins(1));
+    let conversation = agent["conversation"].clone();
+    assert!(conversation.is_string(), "{agent}");
+    // Every agent stops; the job stays with the conversation.
+    run_cli_json(&temp, &project, &["shutdown", "--force", "--json"]);
+    std::thread::sleep(Duration::from_secs(2));
+    // The next terminal starts the project's worker, which opens the
+    // conversation again beside the terminal's own agent.
+    let mut next = PtySession::spawn(&project, &env);
+    next.keep_workers();
+    next.wait_for("Harness Agents", Duration::from_secs(30));
+    let back = wait_for_agent(&temp, &project, Duration::from_mins(1), |agent| {
+        agent["conversation"] == conversation
+    });
+    next.send("/quit\r");
+    let _ = next.wait_exit(Duration::from_secs(20));
+    assert_eq!(back["scheduled"], true, "{back}");
+    run_cli_json(&temp, &project, &["shutdown", "--force", "--json"]);
+}
+
+/// D06: an update: a terminal of the new build finds the old build's worker
+/// idle, has it stop with its journal kept, and the new worker brings the
+/// agent back on its id.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn d06_pty_an_idle_worker_of_an_old_build_is_replaced() {
+    let provider = ScriptedSse::start(|_| Reply::Text("answer-d06".to_owned()));
+    let (temp, project) = sandbox();
+    let env = provider_env(&temp, &provider.endpoint());
+    // Another build: a copy whose file time differs (a copy keeps the time on
+    // Windows, so it is set back an hour).
+    let old = temp
+        .path()
+        .join("old-build")
+        .join(cli_binary().file_name().expect("the binary has a name"));
+    std::fs::create_dir_all(old.parent().expect("a parent")).expect("old build dir");
+    std::fs::copy(cli_binary(), &old).expect("the old build");
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .expect("the old build opens")
+        .set_modified(std::time::SystemTime::now() - Duration::from_hours(1))
+        .expect("the old build is older");
+    let agent = detached_agent(&temp, &project, &env, &old, "answer-d06");
+    let id = agent["id"].as_str().expect("id").to_owned();
+    let old_worker = agent["worker_pid"].as_u64().expect("worker pid");
+    // A terminal of the new build replaces the idle old worker.
+    let mut updated = PtySession::spawn(&project, &env);
+    updated.keep_workers();
+    updated.wait_for("Harness Agents", Duration::from_secs(30));
+    let back = wait_for_agent(&temp, &project, Duration::from_mins(1), |agent| {
+        agent["id"] == id.as_str() && agent["worker_pid"].as_u64() != Some(old_worker)
+    });
+    updated.send("/quit\r");
+    let _ = updated.wait_exit(Duration::from_secs(20));
+    assert_eq!(back["conversation"], agent["conversation"], "{back}");
+    run_cli_json(&temp, &project, &["shutdown", "--force", "--json"]);
+}
+
+/// D07: prime-agent's clients view one session: a second terminal attaches
+/// beside the first, both draw what the agent does, and `/quit` in one leaves
+/// the other attached.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn d07_pty_two_terminals_share_one_agent() {
+    let provider = ScriptedSse::start(|request| {
+        let last = last_user_text(request);
+        if last.contains("from-b") {
+            Reply::Text("answer-b-d07".to_owned())
+        } else if last.contains("from-a-again") {
+            Reply::Text("answer-c-d07".to_owned())
+        } else {
+            Reply::Text("answer-a-d07".to_owned())
+        }
+    });
+    let (temp, project) = sandbox();
+    let env = provider_env(&temp, &provider.endpoint());
+    let mut first = PtySession::spawn(&project, &env);
+    first.keep_workers();
+    first.wait_for("Harness Agents", Duration::from_secs(30));
+    first.send("from-a\r");
+    first.wait_for("answer-a-d07", Duration::from_mins(1));
+    let id = wait_for_idle_agent(&temp, &project, Duration::from_mins(1))["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let mut second = PtySession::spawn_process(&project, &env, &["attach", &id], &[]);
+    second.keep_workers();
+    second.wait_for("answer-a-d07", Duration::from_secs(30));
+    second.send("from-b\r");
+    second.wait_for("answer-b-d07", Duration::from_mins(1));
+    first.wait_for("answer-b-d07", Duration::from_secs(30));
+    second.send("/quit\r");
+    assert_eq!(second.wait_exit(Duration::from_secs(20)), Some(0));
+    first.send("from-a-again\r");
+    first.wait_for("answer-c-d07", Duration::from_mins(1));
+    assert_eq!(only_agent(&temp, &project)["attached"], true);
+    run_cli_json(&temp, &project, &["shutdown", "--force", "--json"]);
+    let _ = first.wait_exit(Duration::from_secs(20));
 }

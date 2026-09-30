@@ -575,6 +575,9 @@ impl LineEditor {
             // only need the redraw the host already performs on its own.
             Key::Char(_)
             | Key::PageUp
+            | Key::Mouse(_)
+            | Key::ViewportTop
+            | Key::ViewportFollow
             | Key::PageDown
             | Key::Redraw
             | Key::CycleDetail

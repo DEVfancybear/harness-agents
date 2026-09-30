@@ -139,8 +139,9 @@ fn run_terminal(
             launch.fixture,
             &launch.config_overrides,
         );
+        let prefs = super::tui::fullscreen::prefs(environment, &context.paths.config_file);
         match super::agents::client::start_attached(context, spec, size.0) {
-            Ok(mut remote) => return run_remote(backend, &mut remote),
+            Ok(mut remote) => return run_remote(backend, &mut remote, prefs),
             Err(error) => eprintln!(
                 "ha: the background agent could not start ({error}); this terminal runs the session\r"
             ),
@@ -160,15 +161,17 @@ fn run_terminal(
         controller.set_fallback_reason(reason.clone());
         return run_loop(&mut backend, &mut controller, notice);
     }
-    super::tui::run(backend, &mut controller, notice)
+    let prefs = super::tui::fullscreen::prefs(environment, &context.paths.config_file);
+    super::tui::run(backend, &mut controller, notice, prefs)
 }
 
 /// Draw a background agent in this terminal until it detaches.
 fn run_remote(
     backend: CrosstermBackend,
     remote: &mut super::agents::client::RemoteFrontend,
+    prefs: super::tui::fullscreen::Prefs,
 ) -> Result<u8, HarnessError> {
-    let code = super::tui::run(backend, remote, None)?;
+    let code = super::tui::run(backend, remote, None, prefs)?;
     if let Some(hint) = super::agents::detach_hint(remote) {
         eprintln!("{hint}");
     }
@@ -200,7 +203,19 @@ pub fn attach(selector: &str) -> Result<ExitCode, HarnessError> {
     let mut remote =
         super::agents::client::RemoteFrontend::attach(&listed.descriptor, &listed.agent.id, size.0)
             .map_err(refused)?;
-    let code = run_remote(backend, &mut remote)?;
+    let prefs = super::paths::resolve(&super::paths::PathRequest {
+        platform: HostPlatform::current(),
+        environment: &environment,
+        explicit_data_dir: None,
+    })
+    .map_or(
+        super::tui::fullscreen::Prefs {
+            enabled: false,
+            mouse: false,
+        },
+        |paths| super::tui::fullscreen::prefs(&environment, &paths.config_file),
+    );
+    let code = run_remote(backend, &mut remote, prefs)?;
     drop(guard);
     Ok(ExitCode::from(code))
 }
@@ -360,7 +375,8 @@ fn step(
             | Effect::Reprint(_)
             | Effect::Restore(_)
             | Effect::Bell
-            | Effect::ClearViewport => {}
+            | Effect::ClearViewport
+            | Effect::Fullscreen(_) => {}
             Effect::Copy(_) => {
                 backend
                     .write("/copy is available in TUI mode; the plain renderer does not access the clipboard\r\n")
@@ -598,7 +614,8 @@ fn render_line_mode(
             | Effect::Reprint(_)
             | Effect::Restore(_)
             | Effect::Bell
-            | Effect::ClearViewport => {}
+            | Effect::ClearViewport
+            | Effect::Fullscreen(_) => {}
             Effect::Copy(_) => writeln!(
                 output,
                 "/copy is available in TUI mode; the plain renderer does not access the clipboard"

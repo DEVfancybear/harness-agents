@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 47] = [
+pub const SLASH_COMMANDS: [SlashCommand; 51] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -156,6 +156,11 @@ pub const SLASH_COMMANDS: [SlashCommand; 47] = [
         "",
         "Reload skills, prompt commands and instruction files",
     ),
+    command(
+        "/fullscreen",
+        "[on|off]",
+        "Toggle fullscreen (alternate screen) rendering with scrollable transcript",
+    ),
     command("/help", "", "List every command"),
     command(
         "/more",
@@ -179,6 +184,21 @@ pub const SLASH_COMMANDS: [SlashCommand; 47] = [
         "/tier",
         "[default|flex|priority|auto]",
         "Show or set the service tier",
+    ),
+    command(
+        "/subagent-login",
+        "[provider]",
+        "Log the delegated children in to a provider with their own account",
+    ),
+    command(
+        "/subagent-logout",
+        "[provider]",
+        "Remove the delegated children's own login for a provider",
+    ),
+    command(
+        "/subagent-model",
+        "[<provider/model>|inherit]",
+        "Show or set the model delegated children run on (subagentDefaultModel)",
     ),
     command(
         "/rlm-max-depth",

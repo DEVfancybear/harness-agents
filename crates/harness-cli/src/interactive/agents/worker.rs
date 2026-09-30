@@ -11,16 +11,19 @@
 //! Differences from prime-agent, where ha's design makes them:
 //! - one worker per project store rather than per root session: the agents of
 //!   a project share its store, which takes a single writer;
-//! - there is no supervisor process: `ha agents` reads the workers'
-//!   descriptors, and a worker that dies takes its agents with it (their
-//!   conversations are in the store, and `ha --resume` continues them);
-//! - one terminal at a time: a second `attach` takes the agent over.
+//! - the supervisor is per project too: `ha worker` starts the worker as its
+//!   child and starts it again when it dies (prime-agent's 250 ms, 1 s, 5 s),
+//!   and the worker's journal brings its agents back on their ids;
+//! - several terminals may attach to one agent, as prime-agent's clients
+//!   view one session: each key is answered to the terminal that typed it,
+//!   what the agent draws reaches all of them, and `/quit` detaches only the
+//!   terminal that typed it.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufReader, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
@@ -33,7 +36,7 @@ use super::super::config::ConfigOverrides;
 use super::super::controller::{Effect, InteractiveController};
 use super::super::events::{HistoryItem, Key};
 use super::super::paths::{HostPlatform, LaunchEnvironment};
-use super::protocol::{self, AgentInfo, CreateAgent, Reply, Request, SendMode};
+use super::protocol::{self, AgentInfo, CreateAgent, ExecSpec, Reply, Request, SendMode};
 use super::registry::{self, Descriptor};
 use super::{CreateSession, SessionHost};
 
@@ -51,6 +54,16 @@ const EMPTY_GRACE: Duration = Duration::from_secs(30);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long an agent may take to start.
 const CREATE_TIMEOUT: Duration = Duration::from_mins(2);
+/// prime-agent's supervisor retries a worker that died after these delays
+/// (`WORKER_RETRY_DELAYS_MS`).
+const RESTART_DELAYS: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+];
+/// A worker that served this long before it died is not a crash loop: its
+/// retries start over.
+const STABLE_AFTER: Duration = Duration::from_mins(1);
 /// prime-agent's `idleEvictionMinutes` default.
 pub const DEFAULT_IDLE_EVICTION_MINUTES: u64 = 90;
 /// How many history entries an agent keeps for a terminal that attaches, as
@@ -63,6 +76,51 @@ pub struct WorkerArgs {
     pub registry: PathBuf,
     pub store_dir: PathBuf,
     pub project_root: PathBuf,
+    /// Serve the project; without it the process is the worker's supervisor.
+    pub serve: bool,
+}
+
+/// prime-agent's supervisor: run the worker as a child process and start it
+/// again when it dies - after 250 ms, 1 s and 5 s - so the agents it ran come
+/// back from its journal. A worker that ends on its own (no agent left,
+/// `ha shutdown`) ends the supervisor too.
+///
+/// # Errors
+/// The worker cannot be started, or keeps dying.
+pub fn supervise_process(args: &WorkerArgs) -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let mut failures = 0_usize;
+    loop {
+        let started = Instant::now();
+        let status = std::process::Command::new(&executable)
+            .arg("worker")
+            .arg("--serve")
+            .arg("--registry")
+            .arg(&args.registry)
+            .arg("--store")
+            .arg(&args.store_dir)
+            .arg("--root")
+            .arg(&args.project_root)
+            .current_dir(&args.project_root)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map_err(|error| format!("the worker could not be started: {error}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        if started.elapsed() >= STABLE_AFTER {
+            failures = 0;
+        }
+        let Some(delay) = RESTART_DELAYS.get(failures) else {
+            log("the worker keeps dying; the supervisor stops");
+            return Err(format!("the worker died {failures} times in a row"));
+        };
+        log(&format!(
+            "the worker ended ({status}); starting it again in {delay:?}"
+        ));
+        failures += 1;
+        std::thread::sleep(*delay);
+    }
 }
 
 enum Command {
@@ -107,12 +165,17 @@ pub struct Worker {
     key: String,
     registry: PathBuf,
     store_dir: PathBuf,
+    project_root: PathBuf,
     token: String,
     agents: Mutex<BTreeMap<String, AgentHandle>>,
+    /// `Restart`: stop, but keep the journal for the next worker.
+    preserve: AtomicBool,
     /// When the worker last had no agent.
     empty_since: Mutex<Option<Instant>>,
     stopping: AtomicBool,
     connections: AtomicU64,
+    /// `ha exec` runs in progress: a worker running one is not empty.
+    execs: AtomicUsize,
     /// The user configuration of the agents, where `idleEvictionMinutes` is.
     config_file: Mutex<Option<PathBuf>>,
     runtime: tokio::runtime::Handle,
@@ -134,7 +197,9 @@ pub fn run(args: &WorkerArgs) -> Result<(), String> {
         .open(registry::lock_path(&args.registry, &key))
         .map_err(|error| error.to_string())?;
     if lock.try_lock().is_err() {
-        return Err("another worker serves this project".to_owned());
+        // Not a failure the supervisor should retry: the project is served.
+        log("another worker serves this project");
+        return Ok(());
     }
     let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
     let port = listener
@@ -148,11 +213,14 @@ pub fn run(args: &WorkerArgs) -> Result<(), String> {
         key: key.clone(),
         registry: args.registry.clone(),
         store_dir: args.store_dir.clone(),
+        project_root: args.project_root.clone(),
         token: new_token(),
         agents: Mutex::new(BTreeMap::new()),
+        preserve: AtomicBool::new(false),
         empty_since: Mutex::new(Some(Instant::now())),
         stopping: AtomicBool::new(false),
         connections: AtomicU64::new(0),
+        execs: AtomicUsize::new(0),
         config_file: Mutex::new(None),
         runtime,
     });
@@ -184,8 +252,18 @@ pub fn run(args: &WorkerArgs) -> Result<(), String> {
             std::thread::spawn(move || serve(&serving, stream));
         }
     });
+    // The agents the last worker ran - it died, or a newer build replaced it -
+    // and the conversations with a job to run come back.
+    let recovering = Arc::clone(&worker);
+    std::thread::spawn(move || recovering.recover());
     supervise(&worker);
-    worker.stop_all();
+    if worker.preserve.load(Ordering::SeqCst) {
+        worker.keep_journal();
+        worker.stop_all();
+    } else {
+        worker.stop_all();
+        worker.keep_journal();
+    }
     registry::remove_if_owned(&args.registry, &key, std::process::id());
     log("worker stopped");
     drop(lock);
@@ -209,6 +287,7 @@ fn supervise(worker: &Arc<Worker>) {
         }
         worker.evict_idle();
         worker.reap();
+        worker.keep_journal();
         let empty = worker
             .empty_since
             .lock()
@@ -223,6 +302,131 @@ fn supervise(worker: &Arc<Worker>) {
 }
 
 impl Worker {
+    /// Write the journal of the agents running now.
+    fn keep_journal(&self) {
+        let journal = registry::Journal {
+            schema_version: registry::SCHEMA_VERSION,
+            store_dir: self.store_dir.clone(),
+            project_root: self.project_root.clone(),
+            agents: self
+                .list()
+                .into_iter()
+                .map(|agent| registry::JournalAgent {
+                    id: agent.id,
+                    name: agent.name,
+                    conversation: agent.conversation,
+                })
+                .collect(),
+        };
+        if let Err(error) = registry::write_journal(&self.registry, &self.key, &journal) {
+            log(&format!("the journal could not be written: {error}"));
+        }
+    }
+
+    /// Start again what the last worker left, as prime-agent's supervisor
+    /// restores a dead worker's sessions: the journal's agents on their ids
+    /// and conversations, then every conversation of this project with a
+    /// scheduled job (a `/schedule` job or a quota park) that is not open.
+    /// They run on this worker's environment - the one the terminal that
+    /// started it had - since an agent's own is never written.
+    fn recover(self: &Arc<Self>) {
+        let environment = LaunchEnvironment::capture().pairs();
+        let spec = |conversation: String, name: Option<String>, id: Option<String>| CreateAgent {
+            caller_dir: self.project_root.clone(),
+            cwd: Some(self.project_root.clone()),
+            environment: environment.clone(),
+            resume: Some(conversation),
+            name,
+            id,
+            ..CreateAgent::default()
+        };
+        let journal = registry::read_journal(&self.registry, &self.key);
+        let scheduled = self
+            .registry
+            .parent()
+            .map(super::super::schedules::tasks_with_active_jobs)
+            .unwrap_or_default();
+        let wanted = journal
+            .as_ref()
+            .map(|journal| journal.agents.clone())
+            .unwrap_or_default();
+        if wanted.is_empty() && scheduled.is_empty() {
+            return;
+        }
+        let newest = self.newest_sessions();
+        let mut open = std::collections::BTreeSet::new();
+        for agent in wanted {
+            let Some(session) = agent
+                .conversation
+                .as_ref()
+                .and_then(|task| newest.get(task))
+            else {
+                continue;
+            };
+            match self.create(spec(session.clone(), agent.name, Some(agent.id.clone()))) {
+                Ok(info) => {
+                    log(&format!("agent {} recovered", info.id));
+                    open.extend(agent.conversation);
+                }
+                Err(error) => log(&format!(
+                    "agent {} could not be recovered: {error}",
+                    agent.id
+                )),
+            }
+        }
+        let live = self
+            .list()
+            .into_iter()
+            .filter_map(|agent| agent.conversation)
+            .collect::<std::collections::BTreeSet<_>>();
+        for task in scheduled {
+            if open.contains(&task) || live.contains(&task) {
+                continue;
+            }
+            // A task of another project's store has no session here.
+            let Some(session) = newest.get(&task) else {
+                continue;
+            };
+            match self.create(spec(session.clone(), None, None)) {
+                Ok(info) => log(&format!(
+                    "agent {} opened a conversation with scheduled work",
+                    info.id
+                )),
+                Err(error) => log(&format!(
+                    "a conversation with scheduled work could not be opened: {error}"
+                )),
+            }
+        }
+        self.keep_journal();
+    }
+
+    /// The newest session of every task in this worker's store.
+    fn newest_sessions(&self) -> BTreeMap<String, String> {
+        let shared = super::super::store_lease::SharedStore::for_dir(self.store_dir.clone());
+        self.runtime.block_on(async move {
+            let Ok(lease) = shared.lease().await else {
+                return BTreeMap::new();
+            };
+            let Ok(mut sessions) = lease.store().list_sessions().await else {
+                return BTreeMap::new();
+            };
+            sessions.sort_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.session_id.as_str().cmp(right.session_id.as_str()))
+            });
+            sessions
+                .into_iter()
+                .map(|summary| {
+                    (
+                        summary.task_id.as_str().to_owned(),
+                        summary.session_id.as_str().to_owned(),
+                    )
+                })
+                .collect()
+        })
+    }
+
     fn idle_eviction(&self) -> Option<Duration> {
         let config = self.config_file.lock().ok().and_then(|path| path.clone());
         let setting = config
@@ -275,7 +479,7 @@ impl Worker {
 
     fn note_empty(&self, agents: &BTreeMap<String, AgentHandle>) {
         if let Ok(mut since) = self.empty_since.lock() {
-            if agents.is_empty() {
+            if agents.is_empty() && self.execs.load(Ordering::SeqCst) == 0 {
                 since.get_or_insert_with(Instant::now);
             } else {
                 *since = None;
@@ -336,7 +540,12 @@ impl Worker {
                 return Err(format!("an agent is already named {name:?}"));
             }
         }
-        let id = new_id();
+        // A recovered agent keeps its id, unless another agent has it now.
+        let id = spec
+            .id
+            .clone()
+            .filter(|id| self.list().iter().all(|agent| agent.id != *id))
+            .unwrap_or_else(new_id);
         let (inbox, commands) = mpsc::channel();
         let (ready, started) = mpsc::channel::<Result<Arc<Mutex<Status>>, String>>();
         let worker = Arc::downgrade(self);
@@ -375,7 +584,9 @@ impl Worker {
             },
         );
         self.note_empty(&agents);
+        drop(agents);
         log(&format!("agent {} started", info.id));
+        self.keep_journal();
         Ok(info)
     }
 
@@ -411,7 +622,11 @@ impl Worker {
             .lock()
             .map_err(|_| "the agent is unavailable".to_owned())?;
         status.info.name = Some(name.to_owned());
-        Ok(status.info.clone())
+        let info = status.info.clone();
+        drop(status);
+        drop(agents);
+        self.keep_journal();
+        Ok(info)
     }
 
     fn stop(&self, selector: &str) -> Result<AgentInfo, String> {
@@ -431,6 +646,7 @@ impl Worker {
             });
         }
         log(&format!("agent {id} stopped"));
+        self.keep_journal();
         Ok(info)
     }
 
@@ -504,7 +720,8 @@ struct Agent {
     status: Arc<Mutex<Status>>,
     banner: Vec<String>,
     history: VecDeque<HistoryItem>,
-    client: Option<Client>,
+    /// The terminals attached to it.
+    clients: Vec<Client>,
     last_status: Instant,
 }
 
@@ -547,6 +764,7 @@ impl Agent {
                 name: None,
                 resume: None,
                 thinking: None,
+                id: None,
                 cwd: Some(context.project.root.clone()),
                 caller_dir: context.project.root.clone(),
                 ..spec.clone()
@@ -592,7 +810,7 @@ impl Agent {
             status,
             banner,
             history,
-            client: None,
+            clients: Vec::new(),
             last_status: Instant::now(),
         };
         if let Some(prompt) = spec.prompt {
@@ -600,7 +818,7 @@ impl Agent {
             agent
                 .controller
                 .deliver_external(prompt, true, &mut effects);
-            agent.forward(effects, None);
+            agent.forward(&effects, None);
         }
         agent.refresh_status();
         Ok(agent)
@@ -618,7 +836,7 @@ impl Agent {
                 stop = self.handle(command);
             }
             if stop {
-                if let Some(client) = self.client.take() {
+                for client in self.clients.drain(..) {
                     let _ = client.out.send(Reply::Detached {
                         reason: "the agent was stopped".to_owned(),
                     });
@@ -632,7 +850,7 @@ impl Agent {
             }
             if !effects.is_empty() {
                 self.touch();
-                self.forward(effects, None);
+                self.forward(&effects, None);
             }
             if self.last_status.elapsed() >= STATUS_EVERY {
                 self.refresh_status();
@@ -649,11 +867,6 @@ impl Agent {
                 out,
                 columns,
             } => {
-                if let Some(previous) = self.client.take() {
-                    let _ = previous.out.send(Reply::Detached {
-                        reason: "another terminal attached to this agent".to_owned(),
-                    });
-                }
                 self.controller.set_columns(columns);
                 let state = self.controller.ui_state();
                 let last_state = serde_json::to_string(&state).unwrap_or_default();
@@ -667,7 +880,7 @@ impl Agent {
                     state: Box::new(state),
                 };
                 if out.send(attached).is_ok() {
-                    self.client = Some(Client {
+                    self.clients.push(Client {
                         connection,
                         out,
                         last_state,
@@ -676,12 +889,10 @@ impl Agent {
                 self.refresh_status();
             }
             Command::Detach { connection } => {
-                if self
-                    .client
-                    .as_ref()
-                    .is_some_and(|client| client.connection == connection)
-                {
-                    self.client = None;
+                let before = self.clients.len();
+                self.clients
+                    .retain(|client| client.connection != connection);
+                if self.clients.len() != before {
                     self.refresh_status();
                 }
             }
@@ -691,24 +902,17 @@ impl Agent {
                 key,
             } => {
                 let effects = self.controller.handle_key(key);
-                if self
-                    .client
-                    .as_ref()
-                    .is_some_and(|client| client.connection == connection)
-                {
-                    self.forward(effects, Some(seq));
-                } else {
-                    self.forward(effects, None);
-                }
+                self.forward(&effects, Some((connection, seq)));
             }
             Command::Columns {
                 connection,
                 columns,
             } => {
+                // The terminal that last changed its size decides the wrapping.
                 if self
-                    .client
-                    .as_ref()
-                    .is_some_and(|client| client.connection == connection)
+                    .clients
+                    .iter()
+                    .any(|client| client.connection == connection)
                 {
                     self.controller.set_columns(columns);
                 }
@@ -720,7 +924,7 @@ impl Agent {
                     mode != SendMode::FollowUp,
                     &mut effects,
                 );
-                self.forward(effects, None);
+                self.forward(&effects, None);
                 let _ = reply.send(outcome);
             }
             Command::Stop => return true,
@@ -744,17 +948,19 @@ impl Agent {
             state.phase.label().clone_into(&mut status.info.status);
             status.info.busy = busy;
             status.info.scheduled = scheduled;
-            status.info.attached = self.client.is_some();
+            status.info.attached = !self.clients.is_empty();
             status.info.last_request = state.last_request;
             status.info.conversation = conversation;
         }
     }
 
     /// Keep what the effects add to the conversation, and send them to the
-    /// attached terminal: as the answer to key `ack`, or as a frame.
-    fn forward(&mut self, effects: Vec<Effect>, ack: Option<u64>) {
+    /// attached terminals: to the one that typed key `ack` as its answer, and
+    /// to the others as a frame. `/quit` detaches only the terminal that typed
+    /// it; the agent carries on.
+    fn forward(&mut self, effects: &[Effect], ack: Option<(u64, u64)>) {
         let mut exit = false;
-        for effect in &effects {
+        for effect in effects {
             let item = match effect {
                 Effect::History(item) => Some(item.clone()),
                 Effect::Stream(text) => Some(HistoryItem::Assistant { text: text.clone() }),
@@ -772,35 +978,65 @@ impl Agent {
                 self.history.push_back(item);
             }
         }
-        let Some(client) = &mut self.client else {
-            return;
-        };
-        let state = self.controller.ui_state();
-        let text = serde_json::to_string(&state).unwrap_or_default();
-        let state = (text != client.last_state).then(|| {
-            client.last_state = text;
-            Box::new(state)
-        });
-        if ack.is_none() && effects.is_empty() && state.is_none() {
+        if self.clients.is_empty() {
             return;
         }
-        let reply = match ack {
-            Some(seq) => Reply::Ack {
-                seq,
-                effects,
-                state,
-            },
-            None => Reply::Frame { effects, state },
-        };
-        let sent = client.out.send(reply).is_ok();
-        if !sent || exit {
-            log(&format!(
-                "terminal {} {}",
-                client.connection,
-                if sent { "detached (/quit)" } else { "is gone" }
-            ));
-            // `/quit` closes the terminal; the agent carries on.
-            self.client = None;
+        let state = self.controller.ui_state();
+        let text = serde_json::to_string(&state).unwrap_or_default();
+        // What the other terminals draw: the effects without the exit.
+        let shared = effects
+            .iter()
+            .filter(|effect| !matches!(effect, Effect::Exit(_)))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut gone = Vec::new();
+        for client in &mut self.clients {
+            let changed = (text != client.last_state).then(|| {
+                client.last_state.clone_from(&text);
+                Box::new(state.clone())
+            });
+            let typed =
+                ack.and_then(|(connection, seq)| (connection == client.connection).then_some(seq));
+            let reply = match typed {
+                Some(seq) => Reply::Ack {
+                    seq,
+                    effects: effects.to_vec(),
+                    state: changed,
+                },
+                // Exits the agent itself produces reach every terminal.
+                None if ack.is_none() => {
+                    if effects.is_empty() && changed.is_none() {
+                        continue;
+                    }
+                    Reply::Frame {
+                        effects: effects.to_vec(),
+                        state: changed,
+                    }
+                }
+                None => {
+                    if shared.is_empty() && changed.is_none() {
+                        continue;
+                    }
+                    Reply::Frame {
+                        effects: shared.clone(),
+                        state: changed,
+                    }
+                }
+            };
+            let sent = client.out.send(reply).is_ok();
+            let leaves = exit && (typed.is_some() || ack.is_none());
+            if !sent || leaves {
+                log(&format!(
+                    "terminal {} {}",
+                    client.connection,
+                    if sent { "detached (/quit)" } else { "is gone" }
+                ));
+                gone.push(client.connection);
+            }
+        }
+        if !gone.is_empty() {
+            self.clients
+                .retain(|client| !gone.contains(&client.connection));
             self.refresh_status();
         }
     }
@@ -894,13 +1130,21 @@ fn serve(worker: &Arc<Worker>, stream: TcpStream) {
                     .rename(&agent, &name)
                     .map(|info| serde_json::to_value(info).unwrap_or_default()),
             ),
-            Request::Shutdown => {
+            Request::Shutdown | Request::Restart => {
+                if matches!(request, Request::Restart) {
+                    log("a newer build replaces this worker; its agents are kept");
+                    worker.preserve.store(true, Ordering::SeqCst);
+                }
                 worker.stopping.store(true, Ordering::SeqCst);
                 let _ = protocol::write_line(&mut writer, &Reply::Ok { value: json!({}) });
                 return;
             }
             Request::Attach { agent, columns } => {
                 attach(worker, &agent, columns, reader, writer);
+                return;
+            }
+            Request::Exec(spec) => {
+                exec(worker, *spec, reader, writer);
                 return;
             }
             Request::Hello { .. }
@@ -993,6 +1237,110 @@ fn attach(
             return;
         }
     }
+}
+
+/// An `ha exec` run's lines, sent to the terminal that asked for it.
+struct ExecOutput(Sender<Reply>);
+
+impl super::super::headless::Output for ExecOutput {
+    fn stdout(&self, line: &str) {
+        let _ = self.0.send(Reply::Output {
+            stderr: false,
+            text: line.to_owned(),
+        });
+    }
+
+    fn stderr(&self, line: &str) {
+        let _ = self.0.send(Reply::Output {
+            stderr: true,
+            text: line.to_owned(),
+        });
+    }
+}
+
+/// Run one `ha exec` turn on the store the agents share, and send its lines
+/// back as they come. The terminal going away cancels the turn.
+fn exec(
+    worker: &Arc<Worker>,
+    spec: ExecSpec,
+    mut reader: BufReader<TcpStream>,
+    mut writer: TcpStream,
+) {
+    let environment = LaunchEnvironment::from_pairs(spec.environment);
+    let context = match bootstrap::resolve(LaunchRequest {
+        cwd: spec.request.cwd.clone(),
+        caller_dir: spec.caller_dir,
+        platform: HostPlatform::current(),
+        environment: environment.clone(),
+        explicit_data_dir: None,
+    }) {
+        Ok(context) if context.project_store_dir() == worker.store_dir => context,
+        Ok(_) => {
+            let _ = protocol::write_line(
+                &mut writer,
+                &Reply::Error {
+                    message: "this worker serves another project".to_owned(),
+                },
+            );
+            return;
+        }
+        Err(error) => {
+            let _ = protocol::write_line(
+                &mut writer,
+                &Reply::Failed {
+                    code: error.code(),
+                    message: error.message().to_owned(),
+                },
+            );
+            return;
+        }
+    };
+    worker.execs.fetch_add(1, Ordering::SeqCst);
+    if let Ok(agents) = worker.agents.lock() {
+        worker.note_empty(&agents);
+    }
+    log("exec run started");
+    let cancellation = harness_providers::CancellationToken::new();
+    let canceled = cancellation.clone();
+    std::thread::spawn(move || {
+        // Nothing more is read: the end of the stream is the terminal leaving.
+        let mut rest = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut reader, &mut rest);
+        canceled.cancel();
+    });
+    let (sender, lines) = mpsc::channel::<Reply>();
+    let done = sender.clone();
+    let shared = super::super::store_lease::SharedStore::for_dir(worker.store_dir.clone());
+    worker.runtime.spawn(async move {
+        let result = super::super::headless::run_with(
+            spec.request,
+            &context,
+            &environment,
+            super::super::headless::RunStore::Shared(shared),
+            Arc::new(ExecOutput(sender)),
+            cancellation,
+        )
+        .await;
+        let _ = done.send(match result {
+            Ok(code) => Reply::Exited { code },
+            Err(error) => Reply::Failed {
+                code: error.code(),
+                message: error.message().to_owned(),
+            },
+        });
+    });
+    for reply in lines {
+        let last = matches!(reply, Reply::Exited { .. } | Reply::Failed { .. });
+        if protocol::write_line(&mut writer, &reply).is_err() || last {
+            break;
+        }
+    }
+    let _ = writer.shutdown(Shutdown::Both);
+    worker.execs.fetch_sub(1, Ordering::SeqCst);
+    if let Ok(agents) = worker.agents.lock() {
+        worker.note_empty(&agents);
+    }
+    log("exec run ended");
 }
 
 /// `rlm.create_session` from an agent of this worker: a new agent here, or in

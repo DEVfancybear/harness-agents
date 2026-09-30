@@ -183,6 +183,9 @@ enum Command {
         store: PathBuf,
         #[arg(long)]
         root: PathBuf,
+        /// Serve the project (the supervisor starts the worker this way).
+        #[arg(long)]
+        serve: bool,
     },
 }
 
@@ -790,12 +793,14 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
             registry,
             store,
             root,
+            serve,
         }) => {
             let result =
                 interactive::agents::worker_command(&interactive::agents::worker::WorkerArgs {
                     registry,
                     store_dir: store,
                     project_root: root,
+                    serve,
                 });
             if let Err(error) = &result {
                 eprintln!("ha worker: {error}");

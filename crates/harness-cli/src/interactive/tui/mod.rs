@@ -13,6 +13,7 @@
 //! screen above the shell prompt.
 
 pub mod card;
+pub mod fullscreen;
 pub mod highlight;
 pub mod history;
 pub mod icons;
@@ -139,6 +140,30 @@ pub trait TuiRenderer {
     /// Take over a conversation another process drew (`ha attach`).
     fn restore(&mut self, items: &[HistoryItem]) -> io::Result<()> {
         self.insert_history_batch(items)
+    }
+    /// Whether prime-agent's fullscreen rendering is up.
+    fn fullscreen(&self) -> bool {
+        false
+    }
+    /// Enter or leave prime-agent's fullscreen rendering (`/fullscreen`).
+    fn set_fullscreen(&mut self, _on: bool) -> io::Result<()> {
+        Ok(())
+    }
+    /// One mouse report, while fullscreen tracks the mouse.
+    fn mouse(
+        &mut self,
+        _input: super::events::MouseInput,
+        _panel_open: bool,
+    ) -> fullscreen::MouseOutcome {
+        fullscreen::MouseOutcome::default()
+    }
+    /// prime-agent's fullscreen viewport keys; false when the key is not one.
+    fn viewport_key(&mut self, _key: &Key) -> bool {
+        false
+    }
+    /// Let a drag held at an edge scroll on; true when the frame changed.
+    fn tick_viewport(&mut self) -> bool {
+        false
     }
     /// Erase the viewport footprint and leave the cursor on a fresh line.
     fn finish(&mut self) -> io::Result<()>;
@@ -336,6 +361,7 @@ where
             .map_err(to_io)
     }
 
+    #[cfg(test)]
     fn insert_history(&mut self, item: &HistoryItem) -> io::Result<()> {
         self.insert_history_batch(std::slice::from_ref(item))
     }
@@ -388,13 +414,22 @@ where
     }
 }
 
+/// What the real console shows: prime-agent's inline viewport, or its
+/// fullscreen screen.
+enum Screen {
+    Inline(Box<RealRenderer<ratatui::backend::CrosstermBackend<io::Stdout>>>),
+    Fullscreen(Box<fullscreen::FullscreenScreen<ratatui::backend::CrosstermBackend<io::Stdout>>>),
+}
+
 /// The real renderer: keys through the host backend, frames through ratatui.
 ///
 /// It owns the host backend, so the loop reads keys through the same object that
 /// draws: there is only ever one reader of the console.
 pub struct RuntimeRenderer<T: TerminalBackend> {
     backend: T,
-    inner: RealRenderer<ratatui::backend::CrosstermBackend<io::Stdout>>,
+    screen: Screen,
+    /// prime-agent's `fullscreenMouse`: fullscreen tracks the mouse.
+    mouse: bool,
 }
 
 impl<T: TerminalBackend> RuntimeRenderer<T> {
@@ -404,20 +439,49 @@ impl<T: TerminalBackend> RuntimeRenderer<T> {
     /// Fails when the console cannot be reached or measured.
     #[allow(dead_code, reason = "T07 opens the viewport from the fallback probe")]
     pub fn open(backend: T) -> io::Result<Self> {
-        Ok(Self {
+        Self::open_with(
             backend,
-            inner: RealRenderer::open(ratatui::backend::CrosstermBackend::new(io::stdout()))?,
-        })
+            fullscreen::Prefs {
+                enabled: false,
+                mouse: false,
+            },
+        )
+    }
+
+    /// Open the console in prime-agent's fullscreen rendering when `prefs`
+    /// asks for it, and in the inline viewport otherwise - or when the console
+    /// refuses the alternate screen.
+    ///
+    /// # Errors
+    /// Fails when the console cannot be reached or measured.
+    pub fn open_with(backend: T, prefs: fullscreen::Prefs) -> io::Result<Self> {
+        let mut renderer = Self {
+            backend,
+            screen: Screen::Inline(Box::new(RealRenderer::open(
+                ratatui::backend::CrosstermBackend::new(io::stdout()),
+            )?)),
+            mouse: prefs.mouse,
+        };
+        if prefs.enabled {
+            renderer.set_fullscreen(true)?;
+        }
+        Ok(renderer)
     }
 }
 
 impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
     fn columns(&self) -> u16 {
-        self.inner.columns()
+        match &self.screen {
+            Screen::Inline(inline) => inline.columns(),
+            Screen::Fullscreen(screen) => screen.columns(),
+        }
     }
 
     fn rows(&self) -> u16 {
-        self.inner.rows()
+        match &self.screen {
+            Screen::Inline(inline) => inline.rows(),
+            Screen::Fullscreen(screen) => screen.rows_count(),
+        }
     }
 
     fn poll_key(&mut self, timeout: Duration) -> io::Result<Option<Key>> {
@@ -433,15 +497,24 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
 
     fn draw_state(&mut self, state: &UiState) -> io::Result<()> {
         super::terminal::injected_fault()?;
-        self.inner.draw_state(state)
+        match &mut self.screen {
+            Screen::Inline(inline) => inline.draw_state(state),
+            Screen::Fullscreen(screen) => screen.draw(state),
+        }
     }
 
     fn insert_history(&mut self, item: &HistoryItem) -> io::Result<()> {
-        self.inner.insert_history(item)
+        self.insert_history_batch(std::slice::from_ref(item))
     }
 
     fn insert_history_batch(&mut self, items: &[HistoryItem]) -> io::Result<()> {
-        self.inner.insert_history_batch(items)
+        match &mut self.screen {
+            Screen::Inline(inline) => inline.insert_history_batch(items),
+            Screen::Fullscreen(screen) => {
+                screen.insert_history_batch(items);
+                Ok(())
+            }
+        }
     }
 
     // DEC mode 2026, synchronized output: a terminal that knows it holds the
@@ -457,15 +530,105 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
     }
 
     fn clear_viewport(&mut self) -> io::Result<()> {
-        self.inner.clear_viewport()
+        match &mut self.screen {
+            Screen::Inline(inline) => inline.clear_viewport(),
+            Screen::Fullscreen(screen) => screen.clear(),
+        }
     }
 
     fn reprint(&mut self, detail: super::events::Detail) -> io::Result<()> {
-        self.inner.repaint_screen(detail)
+        match &mut self.screen {
+            Screen::Inline(inline) => inline.repaint_screen(detail),
+            Screen::Fullscreen(screen) => {
+                screen.reprint(detail);
+                Ok(())
+            }
+        }
     }
 
     fn restore(&mut self, items: &[HistoryItem]) -> io::Result<()> {
-        self.inner.restore(items)
+        match &mut self.screen {
+            Screen::Inline(inline) => inline.restore(items),
+            Screen::Fullscreen(screen) => {
+                screen.restore(items);
+                Ok(())
+            }
+        }
+    }
+
+    fn fullscreen(&self) -> bool {
+        matches!(self.screen, Screen::Fullscreen(_))
+    }
+
+    /// prime-agent's `enterFullscreen` / `exitFullscreen`: the alternate screen
+    /// takes the conversation over, and leaving it prints what arrived while it
+    /// was up into the primary screen's scrollback.
+    fn set_fullscreen(&mut self, on: bool) -> io::Result<()> {
+        if on == self.fullscreen() {
+            return Ok(());
+        }
+        let backend = || ratatui::backend::CrosstermBackend::new(io::stdout());
+        if on {
+            let Screen::Inline(inline) = &mut self.screen else {
+                return Ok(());
+            };
+            let shown = std::mem::take(&mut inline.shown);
+            let (theme, detail) = (inline.theme, inline.detail);
+            // The inline viewport is erased, as leaving the app erases it.
+            inline.finish()?;
+            if let Err(error) = super::terminal::enter_fullscreen(self.mouse) {
+                inline.shown = shown;
+                return Err(error);
+            }
+            let screen = fullscreen::FullscreenScreen::open(backend(), &theme, detail, shown)?;
+            self.screen = Screen::Fullscreen(Box::new(screen));
+        } else {
+            let placeholder = Screen::Inline(Box::new(RealRenderer::open(backend())?));
+            let Screen::Fullscreen(screen) = std::mem::replace(&mut self.screen, placeholder)
+            else {
+                return Ok(());
+            };
+            let (mut shown, arrived) = screen.into_shown();
+            super::terminal::leave_fullscreen(self.mouse)?;
+            let mut printed = shown.split_off(shown.len() - arrived.min(shown.len()));
+            let mut inline = RealRenderer::open(backend())?;
+            inline.shown = shown;
+            inline.insert_history_batch(printed.make_contiguous())?;
+            self.screen = Screen::Inline(Box::new(inline));
+        }
+        Ok(())
+    }
+
+    fn mouse(
+        &mut self,
+        input: super::events::MouseInput,
+        panel_open: bool,
+    ) -> fullscreen::MouseOutcome {
+        match &mut self.screen {
+            Screen::Fullscreen(screen) => screen.mouse(input, panel_open),
+            Screen::Inline(_) => fullscreen::MouseOutcome::default(),
+        }
+    }
+
+    fn viewport_key(&mut self, key: &Key) -> bool {
+        let Screen::Fullscreen(screen) = &mut self.screen else {
+            return false;
+        };
+        match key {
+            Key::PageUp => screen.page(false),
+            Key::PageDown => screen.page(true),
+            Key::ViewportTop => screen.scroll_to_top(),
+            Key::ViewportFollow => screen.follow(),
+            _ => return false,
+        }
+        true
+    }
+
+    fn tick_viewport(&mut self) -> bool {
+        match &mut self.screen {
+            Screen::Fullscreen(screen) => screen.tick(),
+            Screen::Inline(_) => false,
+        }
     }
 
     fn copy_text(&mut self, text: &str) -> io::Result<()> {
@@ -482,7 +645,11 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
     }
 
     fn finish(&mut self) -> io::Result<()> {
-        self.inner.finish()?;
+        // Fullscreen is left first, so what it showed reaches the scrollback.
+        self.set_fullscreen(false)?;
+        if let Screen::Inline(inline) = &mut self.screen {
+            inline.finish()?;
+        }
         // Leave the cursor at column zero of a fresh line, so the shell prompt
         // that follows the app is not parked inside the viewport's last row.
         self.backend.write("\r\n")?;
@@ -654,8 +821,10 @@ pub fn run(
     backend: impl TerminalBackend,
     controller: &mut impl Frontend,
     notice: Option<&str>,
+    prefs: fullscreen::Prefs,
 ) -> Result<u8, HarnessError> {
-    let renderer = RuntimeRenderer::open(backend).map_err(|error| terminal_error(&error))?;
+    let renderer =
+        RuntimeRenderer::open_with(backend, prefs).map_err(|error| terminal_error(&error))?;
     if Theme::detect().color {
         highlight::warm_up();
     }
@@ -723,7 +892,9 @@ fn run_loop_inner(
             .poll_key(POLL_INTERVAL)
             .map_err(|error| terminal_error(&error))?
         {
-            if let Key::Resize { columns, .. } = key {
+            if let Some(handled) = fullscreen_input(renderer, controller, &key, &mut effects) {
+                redraw = handled;
+            } else if let Key::Resize { columns, .. } = key {
                 // The viewport height cannot change (T01). The terminal re-wraps
                 // what it shows at the new size, the last viewport included, so
                 // the screen is drawn again as prime-agent does on a resize; the
@@ -737,6 +908,9 @@ fn run_loop_inner(
                 redraw = !from_key.is_empty();
                 effects.extend(from_key);
             }
+        }
+        if renderer.tick_viewport() {
+            redraw = true;
         }
         if resized_at.is_some_and(|at| at.elapsed() >= RESIZE_SETTLE) {
             resized_at = None;
@@ -783,6 +957,46 @@ fn run_loop_inner(
     }
 }
 
+/// prime-agent's `handleFullscreenInput`: a mouse report is consumed here and
+/// never typed, and the viewport keys scroll the transcript unless a panel or a
+/// menu keeps its own PageUp/PageDown. `None` when the key is not the viewport's;
+/// else whether the frame changed.
+fn fullscreen_input(
+    renderer: &mut impl TuiRenderer,
+    controller: &mut impl Frontend,
+    key: &Key,
+    effects: &mut Vec<Effect>,
+) -> Option<bool> {
+    if let Key::Mouse(input) = key {
+        let panel_open = controller.ui_state().modal.is_some();
+        let outcome = renderer.mouse(*input, panel_open);
+        if let Some(text) = outcome.copied {
+            effects.push(match renderer.copy_text(&text) {
+                Ok(()) => Effect::History(HistoryItem::Notice {
+                    message: "Copied selection to clipboard".to_owned(),
+                }),
+                Err(error) => Effect::History(HistoryItem::Error {
+                    message: format!("Failed to copy selection: {error}"),
+                }),
+            });
+        }
+        return Some(outcome.redraw);
+    }
+    if !renderer.fullscreen()
+        || !matches!(
+            key,
+            Key::PageUp | Key::PageDown | Key::ViewportTop | Key::ViewportFollow
+        )
+    {
+        return None;
+    }
+    let state = controller.ui_state();
+    if state.modal.is_some() || !state.suggestions.is_empty() {
+        return None;
+    }
+    Some(renderer.viewport_key(key))
+}
+
 /// Apply one batch of effects. Consecutive history rows go into the scrollback
 /// as one insert.
 fn apply(renderer: &mut impl TuiRenderer, effects: Vec<Effect>) -> Result<Step, HarnessError> {
@@ -824,6 +1038,9 @@ fn apply(renderer: &mut impl TuiRenderer, effects: Vec<Effect>) -> Result<Step, 
             Effect::ClearViewport => renderer
                 .clear_viewport()
                 .map_err(|error| terminal_error(&error))?,
+            Effect::Fullscreen(on) => renderer
+                .set_fullscreen(on)
+                .map_err(|error| terminal_error(&error))?,
             Effect::Restore(items) => renderer
                 .restore(&items)
                 .map_err(|error| terminal_error(&error))?,
@@ -862,7 +1079,7 @@ fn terminal_error(error: &io::Error) -> HarnessError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         MAX_VIEWPORT_ROWS, MIN_VIEWPORT_ROWS, ScriptedRenderer, TuiRenderer, viewport_rows,
     };
@@ -881,6 +1098,15 @@ mod tests {
         assert_eq!(viewport_rows(10), MIN_VIEWPORT_ROWS);
         assert_eq!(viewport_rows(4), MIN_VIEWPORT_ROWS);
         assert_eq!(viewport_rows(20), 10, "half of the console");
+    }
+
+    /// An idle frame with an empty composer.
+    pub(crate) fn idle_state() -> UiState {
+        let mut idle = state(AppPhase::Ready);
+        idle.buffer.clear();
+        idle.cursor = 0;
+        idle.live_text.clear();
+        idle
     }
 
     fn state(phase: AppPhase) -> UiState {

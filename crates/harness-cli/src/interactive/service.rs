@@ -414,6 +414,18 @@ pub trait SessionPort: Send {
     fn stored_credentials(&self) -> Vec<(String, &'static str)> {
         Vec::new()
     }
+    /// The providers the delegated children have a login of their own for.
+    fn stored_subagent_credentials(&self) -> Vec<(String, &'static str)> {
+        Vec::new()
+    }
+    /// Whose login `/login`, `/logout` and a browser sign-in act on from now:
+    /// the main model's, or the delegated children's own.
+    fn set_credential_scope(&mut self, _scope: credentials::Scope) {}
+    /// The catalog models a delegated child can use: those with a key in its
+    /// own login or the main one.
+    fn subagent_model_options(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
     /// The provider the next turn uses.
     fn provider_id(&self) -> Option<String> {
         None
@@ -430,6 +442,23 @@ pub trait SessionPort: Send {
     }
     /// Stop the delegated child named `selector`, or every one for `all`.
     fn stop_agents(&mut self, _selector: &str) -> Result<String, String> {
+        Err("this backend has no delegated children".to_owned())
+    }
+    /// prime-agent's `getFullscreen` / `getFullscreenMouse` for this launch.
+    fn fullscreen_prefs(&self) -> super::tui::fullscreen::Prefs {
+        super::tui::fullscreen::Prefs {
+            enabled: false,
+            mouse: false,
+        }
+    }
+    /// prime-agent's `setFullscreen`: keep the choice for later launches.
+    fn set_fullscreen(&mut self, _enabled: bool) -> Result<(), String> {
+        Ok(())
+    }
+    /// `/subagent-model`: report the model children run on and where it comes
+    /// from, save prime-agent's `subagentDefaultModel`, or remove it so children
+    /// run on this agent's model.
+    fn subagent_model(&mut self, _change: SubagentModel) -> Result<String, String> {
         Err("this backend has no delegated children".to_owned())
     }
     /// prime-agent's `/rlm-max-depth`: `None` reports the value and its source,
@@ -1091,6 +1120,7 @@ pub struct EnvironmentCredential {
     variable: String,
     data_dir: PathBuf,
     environment: LaunchEnvironment,
+    scope: credentials::Scope,
 }
 
 impl EnvironmentCredential {
@@ -1106,7 +1136,15 @@ impl EnvironmentCredential {
             variable: variable.into(),
             data_dir,
             environment: LaunchEnvironment::capture(),
+            scope: credentials::Scope::Main,
         }
+    }
+
+    /// Read a delegated child's own login first.
+    #[must_use]
+    pub const fn with_scope(mut self, scope: credentials::Scope) -> Self {
+        self.scope = scope;
+        self
     }
 
     /// The file `/login` saves to and this resolver reads first.
@@ -1118,6 +1156,17 @@ impl EnvironmentCredential {
 
 impl CredentialResolver for EnvironmentCredential {
     fn resolve(&self) -> Result<String, ProviderError> {
+        if self.scope == credentials::Scope::Subagent {
+            let own = credentials::scoped_file(
+                &self.environment,
+                &self.data_dir,
+                credentials::Scope::Subagent,
+            );
+            if let Ok(Some(credential)) = credentials::load(&own, &self.provider) {
+                return super::oauth::current_secret(&own, &self.provider, credential)
+                    .map_err(|message| ProviderError::new(ErrorCode::SecretNotGranted, message));
+            }
+        }
         let path = self.file();
         match credentials::load(&path, &self.provider) {
             Ok(Some(credential)) => {
@@ -1208,18 +1257,27 @@ struct ServiceChildModels {
     environment: LaunchEnvironment,
     data_dir: PathBuf,
     session: String,
-    default_model: Option<String>,
+    /// Where `settings.json` is: `subagentDefaultModel` is read at every spawn,
+    /// so `/subagent-model` takes effect for the next child.
+    config_file: PathBuf,
+    /// `[agents] default_model`, read after the setting.
+    configured: Option<String>,
 }
 
 impl super::delegation::ChildModels for ServiceChildModels {
     fn default_model(&self) -> Option<String> {
-        self.default_model.clone()
+        subagent_default_model(&self.config_file).or_else(|| self.configured.clone())
     }
 
     fn resolve(&self, reference: &str) -> Result<super::delegation::ChildModel, String> {
-        let (config, entry) =
-            super::routing::resolve(&self.base, reference, &self.environment, &self.data_dir)
-                .map_err(|unusable| match unusable {
+        let (config, entry) = super::routing::resolve_scoped(
+            &self.base,
+            reference,
+            &self.environment,
+            &self.data_dir,
+            credentials::Scope::Subagent,
+        )
+        .map_err(|unusable| match unusable {
                     super::routing::Unusable::NotInCatalog => {
                         format!("Requested subagent model \"{reference}\" is not available")
                     }
@@ -1228,8 +1286,14 @@ impl super::delegation::ChildModels for ServiceChildModels {
                     ),
                 })?;
         let price = config.model_price;
-        let provider = LiveProvider::build(&config, self.level, &self.session, &self.data_dir)
-            .map_err(|error| error.to_string())?;
+        let provider = LiveProvider::build_scoped(
+            &config,
+            self.level,
+            &self.session,
+            &self.data_dir,
+            credentials::Scope::Subagent,
+        )
+        .map_err(|error| error.to_string())?;
         Ok(super::delegation::ChildModel {
             provider,
             reference: entry.reference(),
@@ -1345,6 +1409,18 @@ impl LiveProvider {
         session: &str,
         data_dir: &Path,
     ) -> Result<Arc<dyn ModelProvider>, ProviderError> {
+        Self::build_scoped(config, level, session, data_dir, credentials::Scope::Main)
+    }
+
+    /// The provider as a scope's login reaches it: a delegated child's own
+    /// login first.
+    fn build_scoped(
+        config: &ProviderConfig,
+        level: harness_providers::ThinkingLevel,
+        session: &str,
+        data_dir: &Path,
+        scope: credentials::Scope,
+    ) -> Result<Arc<dyn ModelProvider>, ProviderError> {
         let capabilities = ModelCapabilities {
             provider_id: config.provider_id.clone(),
             model: config.model.clone(),
@@ -1352,11 +1428,14 @@ impl LiveProvider {
             supports_tools: true,
             fixture: false,
         };
-        let credentials = Arc::new(EnvironmentCredential::new(
-            config.provider_id.clone(),
-            config.credential_variable(),
-            data_dir.to_path_buf(),
-        ));
+        let credentials = Arc::new(
+            EnvironmentCredential::new(
+                config.provider_id.clone(),
+                config.credential_variable(),
+                data_dir.to_path_buf(),
+            )
+            .with_scope(scope),
+        );
         build_provider(config, credentials, capabilities, level, session, data_dir)
     }
 
@@ -1656,6 +1735,11 @@ pub struct AgentSessionService {
     sender: UnboundedSender<SessionEvent>,
     /// The browser sign-in waiting for its code, if any.
     sign_in: Option<Arc<super::oauth::PendingLogin>>,
+    /// Whose login the credential commands act on.
+    credential_scope: credentials::Scope,
+    /// The task of the conversation `/resume` opened, once it is read: that
+    /// is the conversation this service continues, not `task_id`.
+    resumed_task: Arc<Mutex<Option<String>>>,
     store_dir: PathBuf,
     /// Root that owns the credential file `/login` writes.
     data_dir: PathBuf,
@@ -2207,6 +2291,36 @@ const RLM_MAX_DEPTH_SETTING: &str = "rlm_max_depth";
 /// The session setting a conversation's service tier is kept in.
 const SERVICE_TIER_SETTING: &str = "service_tier";
 
+/// What `/subagent-model` does.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SubagentModel {
+    Show,
+    /// Save this `provider/model` as `subagentDefaultModel`.
+    Set(String),
+    /// Remove `subagentDefaultModel`: children run on their parent's model.
+    Inherit,
+}
+
+/// prime-agent's `subagentDefaultModel` from `settings.json`: the model a child
+/// runs on when its spawn names none. A value that is not a non-blank string is
+/// unset, as prime-agent's `getSubagentDefaultModel` reads it; ha's own
+/// `[agents] default_model` is read next.
+fn subagent_default_model(config_file: &Path) -> Option<String> {
+    super::config::load_setting(config_file, "subagentDefaultModel")
+        .and_then(|value| value.as_str().map(str::trim).map(str::to_owned))
+        .filter(|reference| !reference.is_empty())
+}
+
+/// prime-agent's global `defaultThinkingLevel`, from `settings.json`: the level
+/// a conversation starts with when it has none of its own.
+fn default_thinking_level(config_file: &Path) -> Option<harness_providers::ThinkingLevel> {
+    super::config::load_setting(config_file, "defaultThinkingLevel").and_then(|value| {
+        value
+            .as_str()
+            .and_then(harness_providers::ThinkingLevel::parse)
+    })
+}
+
 /// prime-agent's global `defaultServiceTier`, from `settings.json`.
 fn default_service_tier(config_file: &Path) -> Option<String> {
     super::config::load_setting(config_file, "defaultServiceTier")
@@ -2439,6 +2553,8 @@ impl AgentSessionService {
             project_id: Arc::new(Mutex::new(None)),
             context_summary: Arc::new(Mutex::new(Vec::new())),
             sign_in: None,
+            credential_scope: credentials::Scope::Main,
+            resumed_task: Arc::new(Mutex::new(None)),
             system_prompt: Arc::new(Mutex::new(String::new())),
             active_skills: Arc::new(Mutex::new(BTreeMap::new())),
             pending_mcp_elicitations: Arc::new(Mutex::new(HashMap::new())),
@@ -2625,6 +2741,7 @@ impl AgentSessionService {
     /// request, so the screen and the model agree on what the conversation was.
     fn show_conversation(&self, source: SessionId) {
         let sender = self.sender.clone();
+        let resumed_task = Arc::clone(&self.resumed_task);
         let store_dir = self.store_dir.clone();
         let schedules = Arc::clone(&self.schedules);
         let data_dir = self.data_dir.clone();
@@ -2643,6 +2760,9 @@ impl AgentSessionService {
             };
             let goal = match store.session_task(&source).await {
                 Ok(Some(task)) => {
+                    if let Ok(mut resumed) = resumed_task.lock() {
+                        *resumed = Some(task.as_str().to_owned());
+                    }
                     // The resumed conversation's scheduled jobs come back with it.
                     schedules.bind(super::schedules::path_for(&data_dir, task.as_str()));
                     store
@@ -2748,6 +2868,15 @@ fn scoped_entries(
 
 /// Every catalog model `/model` offers: those whose provider has a credential.
 fn catalog_options(environment: &LaunchEnvironment, data_dir: &Path) -> Vec<(String, String)> {
+    catalog_options_scoped(environment, data_dir, credentials::Scope::Main)
+}
+
+/// The catalog models with a key as `scope` reads it.
+fn catalog_options_scoped(
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+    scope: credentials::Scope,
+) -> Vec<(String, String)> {
     // Built-in providers in `/login` order, then those `models.json` adds.
     let catalog = super::providers::Catalog::load(data_dir);
     let mut providers = super::providers::PROVIDERS
@@ -2763,8 +2892,14 @@ fn catalog_options(environment: &LaunchEnvironment, data_dir: &Path) -> Vec<(Str
         .iter()
         .flat_map(|provider| catalog.for_provider(provider))
         .filter(|model| {
-            credentials::source_for(environment, data_dir, &model.provider, &model.key_env())
-                .is_some()
+            credentials::source_for_scope(
+                environment,
+                data_dir,
+                &model.provider,
+                &model.key_env(),
+                scope,
+            )
+            .is_some()
         })
         .map(|model| (model.reference(), model.name.clone()))
         .collect()
@@ -3626,7 +3761,11 @@ impl SessionPort for AgentSessionService {
     }
 
     fn conversation_id(&self) -> Option<String> {
-        Some(self.task_id.as_str().to_owned())
+        self.resumed_task
+            .lock()
+            .ok()
+            .and_then(|task| task.clone())
+            .or_else(|| Some(self.task_id.as_str().to_owned()))
     }
 
     fn set_session_host(&mut self, host: Arc<dyn super::agents::SessionHost>) {
@@ -3753,6 +3892,17 @@ impl SessionPort for AgentSessionService {
         self.thinking = Some(requested);
         // A running turn uses the new level from its next model call.
         self.live.set_level(requested);
+        // prime-agent's `setThinkingLevel` keeps the level as the default for new
+        // sessions, unless it is `off` on a model that does not think.
+        if model.is_some_and(|model| model.reasoning)
+            || requested != harness_providers::ThinkingLevel::Off
+        {
+            let _ = super::config::save_setting(
+                &self.config_file,
+                "defaultThinkingLevel",
+                Some(serde_json::json!(requested.as_str())),
+            );
+        }
         let used = harness_providers::thinking::clamp(model, requested);
         let name = |level| harness_providers::thinking::provider_name(model, level);
         Ok(if used == requested {
@@ -3837,6 +3987,7 @@ impl SessionPort for AgentSessionService {
         let model = self.reasoning_of(&config);
         let chosen = self
             .thinking
+            .or_else(|| default_thinking_level(&self.config_file))
             .or_else(|| harness_providers::ThinkingLevel::parse(&config.thinking))
             .unwrap_or_default();
         Some(harness_providers::thinking::provider_name(
@@ -3852,6 +4003,7 @@ impl SessionPort for AgentSessionService {
         let model = self.reasoning_of(&config);
         let chosen = self
             .thinking
+            .or_else(|| default_thinking_level(&self.config_file))
             .or_else(|| harness_providers::ThinkingLevel::parse(&config.thinking))
             .unwrap_or_default();
         let names = harness_providers::thinking::offered(model)
@@ -3988,14 +4140,16 @@ impl SessionPort for AgentSessionService {
         provider: &str,
         credential: &credentials::Credential,
     ) -> Result<CredentialSource, String> {
-        let path = credentials::resolve_file(&self.environment, &self.data_dir);
+        let path =
+            credentials::scoped_file(&self.environment, &self.data_dir, self.credential_scope);
         credentials::save(&path, provider, credential)
             .map(|protection| CredentialSource::File { path, protection })
             .map_err(|error| format!("the credential could not be saved: {error}"))
     }
 
     fn remove_credential(&mut self, provider: &str) -> Result<bool, String> {
-        let path = credentials::resolve_file(&self.environment, &self.data_dir);
+        let path =
+            credentials::scoped_file(&self.environment, &self.data_dir, self.credential_scope);
         credentials::remove(&path, provider).map_err(|error| error.to_string())
     }
 
@@ -4006,7 +4160,8 @@ impl SessionPort for AgentSessionService {
         if pending.listening() {
             let waiting = Arc::clone(&pending);
             let sender = self.sender.clone();
-            let path = credentials::resolve_file(&self.environment, &self.data_dir);
+            let path =
+                credentials::scoped_file(&self.environment, &self.data_dir, self.credential_scope);
             std::thread::spawn(move || {
                 let Some(code) = super::oauth::wait_for_code(&waiting) else {
                     return;
@@ -4045,7 +4200,8 @@ impl SessionPort for AgentSessionService {
             .canceller()
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let sender = self.sender.clone();
-        let path = credentials::resolve_file(&self.environment, &self.data_dir);
+        let path =
+            credentials::scoped_file(&self.environment, &self.data_dir, self.credential_scope);
         std::thread::spawn(move || {
             let result = super::oauth::finish(&pending, &code, &path);
             let _ = sender.send(SessionEvent::LoginFinished {
@@ -4065,8 +4221,30 @@ impl SessionPort for AgentSessionService {
     }
 
     fn stored_credentials(&self) -> Vec<(String, &'static str)> {
-        let path = credentials::resolve_file(&self.environment, &self.data_dir);
+        let path =
+            credentials::scoped_file(&self.environment, &self.data_dir, self.credential_scope);
         credentials::stored(&path).unwrap_or_default()
+    }
+
+    fn set_credential_scope(&mut self, scope: credentials::Scope) {
+        self.credential_scope = scope;
+    }
+
+    fn stored_subagent_credentials(&self) -> Vec<(String, &'static str)> {
+        let path = credentials::scoped_file(
+            &self.environment,
+            &self.data_dir,
+            credentials::Scope::Subagent,
+        );
+        credentials::stored(&path).unwrap_or_default()
+    }
+
+    fn subagent_model_options(&self) -> Vec<(String, String)> {
+        catalog_options_scoped(
+            &self.environment,
+            &self.data_dir,
+            credentials::Scope::Subagent,
+        )
     }
 
     fn provider_id(&self) -> Option<String> {
@@ -4192,6 +4370,9 @@ impl SessionPort for AgentSessionService {
         self.branch_plan = None;
         if let Ok(mut thread) = self.side_thread.lock() {
             thread.clear();
+        }
+        if let Ok(mut resumed) = self.resumed_task.lock() {
+            *resumed = None;
         }
         if source.is_none() {
             self.task_id = TaskId::generate();
@@ -4410,6 +4591,68 @@ impl SessionPort for AgentSessionService {
                 )
             },
         )
+    }
+
+    fn fullscreen_prefs(&self) -> super::tui::fullscreen::Prefs {
+        super::tui::fullscreen::prefs(&self.environment, &self.config_file)
+    }
+
+    fn set_fullscreen(&mut self, enabled: bool) -> Result<(), String> {
+        super::tui::fullscreen::save(&self.config_file, enabled)
+    }
+
+    fn subagent_model(&mut self, change: SubagentModel) -> Result<String, String> {
+        match change {
+            SubagentModel::Show => {
+                let (model, source) = if let Some(model) = subagent_default_model(&self.config_file)
+                {
+                    (model, "settings.json subagentDefaultModel")
+                } else if let Some(model) = self
+                    .configured()
+                    .ok()
+                    .and_then(|config| config.agents_default_model)
+                {
+                    (model, "[agents] default_model")
+                } else {
+                    return Ok(
+                        "Subagent model: this agent's model (subagentDefaultModel is not set)"
+                            .to_owned(),
+                    );
+                };
+                Ok(format!("Subagent model: {model} ({source})"))
+            }
+            SubagentModel::Inherit => {
+                super::config::save_setting(&self.config_file, "subagentDefaultModel", None)?;
+                Ok("Subagent model cleared: children run on this agent's model".to_owned())
+            }
+            SubagentModel::Set(reference) => {
+                let base = self.configured()?;
+                let (_, entry) = super::routing::resolve_scoped(
+                    &base,
+                    &reference,
+                    &self.environment,
+                    &self.data_dir,
+                    credentials::Scope::Subagent,
+                )
+                .map_err(|unusable| match unusable {
+                    super::routing::Unusable::NotInCatalog => {
+                        format!("model \"{reference}\" is not in the catalog")
+                    }
+                    super::routing::Unusable::NoCredential(provider) => {
+                        format!("model \"{reference}\" has no credential: log in to {provider} with /login")
+                    }
+                })?;
+                let model = entry.reference();
+                super::config::save_setting(
+                    &self.config_file,
+                    "subagentDefaultModel",
+                    Some(serde_json::json!(model)),
+                )?;
+                Ok(format!(
+                    "Subagent model set: {model} (saved as subagentDefaultModel); the next child runs on it"
+                ))
+            }
+        }
     }
 
     fn rlm_max_depth(&mut self, change: Option<(u32, bool)>) -> Result<(), String> {
@@ -5062,7 +5305,8 @@ async fn run_turn(
         data_dir.clone(),
     ));
     // The thinking level: what `/thinking` chose (kept with the task), else what the
-    // task last used, else the configuration's.
+    // task last used, else prime-agent's `defaultThinkingLevel`, else the
+    // configuration's.
     let thinking_level = match thinking {
         Some(level) => {
             let _ = store
@@ -5076,6 +5320,7 @@ async fn run_turn(
             .ok()
             .flatten()
             .and_then(|value| harness_providers::ThinkingLevel::parse(&value))
+            .or_else(|| default_thinking_level(&config_file))
             .or_else(|| harness_providers::ThinkingLevel::parse(&config.thinking))
             .unwrap_or_default(),
     };
@@ -5410,8 +5655,14 @@ async fn run_turn(
     let web_host = super::web::WebHost::from_environment(&environment);
     // Children run on a provider of their own, fixed at the model this turn
     // started with: `/model` in a later turn does not switch a child mid-task.
-    let child_provider = LiveProvider::build(&config, thinking_level, task_id.as_ref(), &data_dir)
-        .unwrap_or_else(|_| Arc::clone(&provider));
+    let child_provider = LiveProvider::build_scoped(
+        &config,
+        thinking_level,
+        task_id.as_ref(),
+        &data_dir,
+        credentials::Scope::Subagent,
+    )
+    .unwrap_or_else(|_| Arc::clone(&provider));
     // The depth children of this turn may spawn to, read for this conversation.
     let (max_depth, depth_source) =
         resolve_rlm_max_depth(&store, &task_id, &config_file, &environment).await;
@@ -5430,7 +5681,8 @@ async fn run_turn(
                 environment: environment.clone(),
                 data_dir: data_dir.clone(),
                 session: task_id.as_ref().to_owned(),
-                default_model: config.agents_default_model.clone(),
+                config_file: config_file.clone(),
+                configured: config.agents_default_model.clone(),
             })),
             runtime_config: RuntimeConfig {
                 context_window_tokens: config.context_window_tokens,
@@ -9206,6 +9458,155 @@ mod tests {
             refused,
             "Service tier 'priority' is not available for the current model. Available: default"
         );
+    }
+
+    /// `/subagent-model` saves prime-agent's `subagentDefaultModel` for a catalog
+    /// model with a credential, reports it, and `inherit` removes it.
+    #[test]
+    fn the_subagent_model_command_saves_prime_agents_setting() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&project).expect("project");
+        std::fs::write(
+            home.join("config.toml"),
+            "schema_version = 2
+",
+        )
+        .expect("config");
+        let environment = LaunchEnvironment::from_pairs([
+            ("HA_HOME", home.to_string_lossy().into_owned()),
+            ("DEEPSEEK_API_KEY", "fixture-secret-value".to_owned()),
+        ]);
+        let context = bootstrap::resolve(LaunchRequest {
+            cwd: None,
+            caller_dir: project,
+            platform: HostPlatform::current(),
+            environment: environment.clone(),
+            explicit_data_dir: None,
+        })
+        .expect("context");
+        let channel = SessionChannel::new();
+        let mut service = AgentSessionService::new(&context, environment, channel.sender());
+        let shown = service
+            .subagent_model(super::SubagentModel::Show)
+            .expect("shown");
+        assert!(shown.contains("this agent's model"), "{shown}");
+        let set = service
+            .subagent_model(super::SubagentModel::Set(
+                "deepseek/deepseek-v4-pro".to_owned(),
+            ))
+            .expect("saved");
+        assert!(set.contains("deepseek/deepseek-v4-pro"), "{set}");
+        assert_eq!(
+            super::subagent_default_model(&context.paths.config_file).as_deref(),
+            Some("deepseek/deepseek-v4-pro")
+        );
+        let shown = service
+            .subagent_model(super::SubagentModel::Show)
+            .expect("shown");
+        assert!(
+            shown.contains("deepseek/deepseek-v4-pro (settings.json"),
+            "{shown}"
+        );
+        assert!(
+            service
+                .subagent_model(super::SubagentModel::Set("nowhere/no-model".to_owned()))
+                .is_err()
+        );
+        service
+            .subagent_model(super::SubagentModel::Inherit)
+            .expect("cleared");
+        assert_eq!(
+            super::subagent_default_model(&context.paths.config_file),
+            None
+        );
+    }
+
+    /// prime-agent's `defaultThinkingLevel`: a level name from `settings.json`,
+    /// anything else is unset.
+    #[test]
+    fn the_default_thinking_level_is_prime_agents_setting() {
+        let home = tempfile::tempdir().expect("temp");
+        let config = home.path().join("config.toml");
+        assert_eq!(super::default_thinking_level(&config), None);
+        std::fs::write(
+            home.path().join("settings.json"),
+            r#"{"defaultThinkingLevel": "xhigh"}"#,
+        )
+        .expect("settings");
+        assert_eq!(
+            super::default_thinking_level(&config),
+            Some(harness_providers::ThinkingLevel::Xhigh)
+        );
+        std::fs::write(
+            home.path().join("settings.json"),
+            r#"{"defaultThinkingLevel": "huge"}"#,
+        )
+        .expect("settings");
+        assert_eq!(super::default_thinking_level(&config), None);
+    }
+
+    /// `/subagent-login`: a delegated child reads its own login for a
+    /// provider first and the main one otherwise; the main model never reads
+    /// the children's.
+    #[test]
+    fn a_child_uses_its_own_login_and_the_main_model_never_does() {
+        use harness_providers::CredentialResolver;
+        let temp = tempfile::tempdir().expect("temp");
+        let data_dir = temp.path().to_path_buf();
+        let environment = LaunchEnvironment::capture();
+        let main = credentials::scoped_file(&environment, &data_dir, credentials::Scope::Main);
+        let own = credentials::scoped_file(&environment, &data_dir, credentials::Scope::Subagent);
+        assert_ne!(main, own);
+        credentials::save(
+            &main,
+            "deepseek",
+            &credentials::Credential::api_key("main-key"),
+        )
+        .expect("main login");
+        let child = EnvironmentCredential::new("deepseek", "", data_dir.clone())
+            .with_scope(credentials::Scope::Subagent);
+        assert_eq!(child.resolve().expect("falls back"), "main-key");
+        credentials::save(
+            &own,
+            "deepseek",
+            &credentials::Credential::api_key("child-key"),
+        )
+        .expect("child login");
+        assert_eq!(child.resolve().expect("its own"), "child-key");
+        let parent = EnvironmentCredential::new("deepseek", "", data_dir.clone());
+        assert_eq!(parent.resolve().expect("main"), "main-key");
+        assert!(matches!(
+            credentials::source_for_scope(&environment, &data_dir, "deepseek", "", credentials::Scope::Subagent),
+            Some(CredentialSource::File { path, .. }) if path == own
+        ));
+    }
+
+    /// prime-agent's `subagentDefaultModel`: a trimmed string from
+    /// `settings.json`, anything else is unset.
+    #[test]
+    fn the_subagent_default_model_is_prime_agents_setting() {
+        let home = tempfile::tempdir().expect("temp");
+        let config = home.path().join("config.toml");
+        assert_eq!(super::subagent_default_model(&config), None);
+        std::fs::write(
+            home.path().join("settings.json"),
+            r#"{"subagentDefaultModel": " openai/gpt-5.5 "}"#,
+        )
+        .expect("settings");
+        assert_eq!(
+            super::subagent_default_model(&config).as_deref(),
+            Some("openai/gpt-5.5")
+        );
+        for unset in [
+            r#"{"subagentDefaultModel": 42}"#,
+            r#"{"subagentDefaultModel": "  "}"#,
+        ] {
+            std::fs::write(home.path().join("settings.json"), unset).expect("settings");
+            assert_eq!(super::subagent_default_model(&config), None, "{unset}");
+        }
     }
 
     /// prime-agent's `/logs` shows the directory and each log as

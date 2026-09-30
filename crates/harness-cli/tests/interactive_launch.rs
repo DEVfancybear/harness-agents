@@ -1127,6 +1127,9 @@ fn i09_an_invalid_project_directory_stops_the_run_with_an_actionable_error() {
     );
 }
 
+/// With the background workers off, each run opens the project's writer itself,
+/// so a second one is refused; with them on (the default) both run in the
+/// project's worker, which `interactive_terminal`'s D03 covers.
 #[test]
 fn i16_a_second_run_in_the_same_project_is_refused_while_the_first_holds_the_store() {
     let (endpoint, accepted, hold) = hanging_endpoint();
@@ -1144,6 +1147,7 @@ fn i16_a_second_run_in_the_same_project_is_refused_while_the_first_holds_the_sto
         ])
         .current_dir(&project)
         .env("HA_HOME", sandbox.path())
+        .env("HA_DAEMON", "off")
         .env("HA_PROVIDER_ENDPOINT", &endpoint)
         .env("HA_PROVIDER_MODEL", "fixture-model")
         .env("DEEPSEEK_API_KEY", "fixture-secret-value")
@@ -1164,11 +1168,18 @@ fn i16_a_second_run_in_the_same_project_is_refused_while_the_first_holds_the_sto
         std::thread::sleep(Duration::from_millis(25));
     }
 
-    let second = run_headless_raw(
-        &sandbox,
-        &project,
-        &["chat", "--headless", "--prompt", "second writer", "--json"],
-        Some((&endpoint, "fixture-model", "fixture-secret-value")),
+    let second = CliRun::from_output(
+        &std::process::Command::new(cli_binary())
+            .args(["chat", "--headless", "--prompt", "second writer", "--json"])
+            .current_dir(&project)
+            .env("HA_HOME", sandbox.path())
+            .env("HA_DAEMON", "off")
+            .env("HA_PROVIDER_ENDPOINT", &endpoint)
+            .env("HA_PROVIDER_MODEL", "fixture-model")
+            .env("DEEPSEEK_API_KEY", "fixture-secret-value")
+            .stdin(Stdio::null())
+            .output()
+            .expect("ha binary runs"),
     );
 
     let _ = first.kill();

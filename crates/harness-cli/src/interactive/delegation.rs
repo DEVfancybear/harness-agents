@@ -34,8 +34,8 @@ use harness_store_sqlite::{SqliteStore, WorktreeRecordRow};
 use harness_tools::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CodingToolAction,
     ExternalToolCatalog, ExternalToolDispatcher, ExternalTools, ToolExecutionService, ToolOutput,
-    ToolPatternRule, ToolPolicy, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnProgress,
-    TurnStop, coding_tool_schemas,
+    ToolPolicy, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnProgress, TurnStop,
+    coding_tool_schemas,
 };
 use harness_types::{
     AgentProfileId, AgentRunId, ContentHash, ErrorCode, HarnessError, InputId, SessionId,
@@ -50,28 +50,6 @@ use super::repl::{HostReply, HostRequests};
 use super::store_lease::SharedStore;
 
 const MAX_BRIEF_BYTES: usize = 8 * 1024;
-const CHILD_READ_TOOLS: &[&str] = &[
-    "read_file",
-    "list_files",
-    "search_text",
-    "glob",
-    "git_status",
-    "git_diff",
-    "git_log",
-];
-const EXPLORER_DENY_TOOLS: &[&str] = &[
-    "apply_patch",
-    "write_file",
-    "edit_file",
-    "run_process",
-    "run_shell",
-    "read_process_output",
-    "history_search",
-    "history_read",
-    "task_update",
-    "external_tool",
-    "ask_user",
-];
 
 /// Longest child answer a notice, `rlm.collect` and `rlm.list_subagents` carry.
 /// prime-agent's notice keeps 160 characters and leaves the rest to `collect`; a
@@ -1216,11 +1194,11 @@ impl SessionAgents {
         }
         let depth = parent_depth + 1;
         // A coder's worktree comes from the user's checkout, which only the root
-        // agent works in; a child's own children are read-only explorers.
+        // agent hands out; a child's own children are explorers.
         if parent.is_some() && role != AgentRole::Explorer {
             return Err(HarnessError::new(
                 ErrorCode::RoleUnavailable,
-                "a child agent can spawn read-only explorers only",
+                "a child agent can spawn explorers only",
             ));
         }
         let scheduler = Arc::clone(
@@ -1709,32 +1687,11 @@ async fn persist_worktree(
         .map_err(|error| HarnessError::new(error.code(), error.to_string()))
 }
 
-/// An explorer works under its parent's policy - the permission mode, the allow
-/// and deny rules and what the user allowed for this turn - with every tool that
-/// changes anything denied on top, as prime-agent's children inherit their
-/// parent's permissions. A child that asked for each read in a `full-auto`
-/// session stopped at a panel nobody expected.
-fn explorer_policy(parent: &ToolPolicy) -> ToolPolicy {
-    let denies = EXPLORER_DENY_TOOLS
-        .iter()
-        .map(|name| ToolPatternRule::deny(format!("{name}*"), "explorer is read-only"))
-        .collect::<Vec<_>>();
-    parent.clone().with_tool_rules(denies)
-}
-
-fn explorer_tool_schemas() -> Vec<Value> {
-    coding_tool_schemas()
-        .into_iter()
-        .filter(|schema| {
-            schema["function"]["name"]
-                .as_str()
-                .is_some_and(|name| CHILD_READ_TOOLS.contains(&name))
-        })
-        .collect()
-}
-
-/// A coder works in its own worktree under its parent's policy.
-fn coder_policy(parent: &ToolPolicy) -> ToolPolicy {
+/// A child works under its parent's policy - the permission mode, the allow and
+/// deny rules and what the user allowed for this turn - with its parent's tools,
+/// as prime-agent's children inherit their parent's permissions and tool set.
+/// An explorer does it in its parent's workspace, a coder in its own worktree.
+fn child_policy(parent: &ToolPolicy) -> ToolPolicy {
     parent.clone()
 }
 
@@ -1762,7 +1719,7 @@ impl ChildTools {
             "type": "function",
             "function": {
                 "name": "delegate",
-                "description": "Start a read-only explorer child of your own to investigate part of your task. By default the call waits for its answer; with wait=false it returns at once and the result arrives later as a [child-exited ...] or [child-failed ...] message - you are not finished until your children are.",
+                "description": "Start an explorer child of your own for part of your task. By default the call waits for its answer; with wait=false it returns at once and the result arrives later as a [child-exited ...] or [child-failed ...] message - you are not finished until your children are.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2304,17 +2261,17 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 })
                 .unwrap_or((false, 1));
             let spawn_line = if can_spawn {
-                " You can split your work with the delegate tool: it starts read-only explorer children of your own, and you are not finished until they are - their results reach you as [child-exited ...] or [child-failed ...] messages."
+                " You can split your work with the delegate tool: it starts explorer children of your own, and you are not finished until they are - their results reach you as [child-exited ...] or [child-failed ...] messages."
             } else {
                 ""
             };
             let (workspace_root, policy, schemas, system_policy) = match request.brief.role {
                 AgentRole::Explorer => (
                     launch.workspace_root.clone(),
-                    explorer_policy(&launch.parent_policy),
-                    explorer_tool_schemas(),
+                    child_policy(&launch.parent_policy),
+                    coding_tool_schemas(),
                     format!(
-                        "You are a read-only explorer. Inspect the current workspace - and the web, when web tools are offered - and answer the brief. You cannot edit files or run commands.{} Use agent_message to tell your parent what you found when it helps before you finish.",
+                        "You are a child agent spawned by your parent agent. Task prompts are labeled `[task from parent]`.{} Use agent_message to tell your parent what you found when it helps before you finish.",
                         if can_spawn {
                             spawn_line
                         } else {
@@ -2346,7 +2303,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     }
                     (
                         PathBuf::from(&worktree.path),
-                        coder_policy(&launch.parent_policy),
+                        child_policy(&launch.parent_policy),
                         coding_tool_schemas(),
                         format!(
                             "You are a delegated coder. Work only in the assigned isolated M8-03 worktree and follow the brief. Tool calls use the host approval and policy service. Leave your changes in that worktree and report what changed; do not claim the changes were merged into the user's checkout.{spawn_line}"
@@ -2385,8 +2342,8 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     std::mem::take(&mut child.backlog)
                 })
                 .unwrap_or_default();
-            // A child's own children work where it works, under its policy, as
-            // read-only explorers.
+            // A child's own children work where it works, under its policy and
+            // with its tools.
             let spawn = can_spawn.then(|| ChildSpawn {
                 launch: ChildLaunch {
                     workspace_root: workspace_root.clone(),
@@ -2717,14 +2674,15 @@ pub(super) mod tests {
         BudgetLedger, RefusingBackend, SchedulerConfig, WorkerScheduler, WorkspaceManager,
     };
     use harness_providers::CancellationToken;
-    use harness_tools::{CodingToolAction, TurnObserver, TurnProgress};
+    use harness_tools::{
+        CodingToolAction, ToolPatternRule, TurnObserver, TurnProgress, coding_tool_schemas,
+    };
     use harness_types::{AgentRunId, ErrorCode, ProjectId, TaskId};
 
     use super::{
-        AgentsShared, ChildLaunch, ChildModel, ChildModels, ChildState, DelegateCatalog,
-        ExplorerObserver, SessionAgents, explorer_policy, explorer_tool_schemas,
-        inspect_coder_input, message_arguments, outcome_state, state_payload, stopped_short,
-        terminal_notice,
+        AgentsShared, ChildLaunch, ChildModel, ChildModels, ChildState, ChildTools,
+        DelegateCatalog, ExplorerObserver, SessionAgents, child_policy, inspect_coder_input,
+        message_arguments, outcome_state, state_payload, stopped_short, terminal_notice,
     };
     use crate::interactive::cost::CostTracker;
     use crate::interactive::store_lease::SharedStore;
@@ -2752,72 +2710,59 @@ pub(super) mod tests {
         git(repo, &["commit", "-m", "seed"]);
     }
 
+    /// A child has its parent's permissions, as a prime-agent child does: in a
+    /// `full-auto` session it reads, writes and runs commands without a panel,
+    /// and what the parent may not do it may not do either.
     #[test]
-    fn g12_explorer_child_cannot_call_mutating_tools() {
-        let policy = explorer_policy(&harness_tools::ToolPolicy::new(1, Vec::new()));
-        let writes = [
+    fn a_child_has_its_parents_permissions() {
+        let parent = harness_tools::ToolPolicy::new(1, Vec::new())
+            .with_mode(harness_tools::PolicyMode::FullAuto);
+        let policy = child_policy(&parent);
+        let actions = [
+            CodingToolAction::ReadFile {
+                path: "src/lib.rs".to_owned(),
+                offset: None,
+                limit: None,
+            },
             CodingToolAction::WriteFile {
                 path: "note.txt".to_owned(),
-                content: "bad".to_owned(),
+                content: "x".to_owned(),
                 expected_hash: None,
             },
             CodingToolAction::RunShell {
-                command: "echo bad".to_owned(),
+                command: "echo hi".to_owned(),
                 timeout_ms: 1000,
                 isolation: harness_tools::IsolationMode::BestEffort,
                 env: Vec::new(),
             },
-            CodingToolAction::TaskUpdate {
-                note: "recursive state change".to_owned(),
-            },
         ];
-        for action in writes {
-            assert!(policy.denial_for(&action).is_some(), "{action:?}");
+        for action in &actions {
+            assert_eq!(
+                format!("{:?}", policy.decide(action)),
+                format!("{:?}", parent.decide(action)),
+                "{action:?}"
+            );
+            assert!(policy.denial_for(action).is_none(), "{action:?}");
         }
-        let read = CodingToolAction::ReadFile {
-            path: "src/lib.rs".to_owned(),
-            offset: None,
-            limit: None,
-        };
-        assert!(policy.denial_for(&read).is_none());
-    }
-
-    /// A child works under its parent's permission mode: in a `full-auto` session
-    /// an explorer reads without a panel, and it still cannot write.
-    #[test]
-    fn an_explorer_inherits_the_parents_mode_and_stays_read_only() {
-        let parent = harness_tools::ToolPolicy::new(1, Vec::new())
-            .with_mode(harness_tools::PolicyMode::FullAuto);
-        let policy = explorer_policy(&parent);
-        let read = CodingToolAction::ReadFile {
-            path: "src/lib.rs".to_owned(),
-            offset: None,
-            limit: None,
-        };
-        assert!(
-            matches!(policy.decide(&read), harness_tools::Decision::Allow { .. }),
-            "{:?}",
-            policy.decide(&read)
-        );
-        let write = CodingToolAction::WriteFile {
-            path: "src/lib.rs".to_owned(),
-            content: "x".to_owned(),
-            expected_hash: None,
-        };
-        assert!(policy.denial_for(&write).is_some());
+        let denied = harness_tools::ToolPolicy::new(1, Vec::new())
+            .with_tool_rules(vec![ToolPatternRule::deny("run_shell*", "not here")]);
+        assert!(child_policy(&denied).denial_for(&actions[2]).is_some());
     }
 
     #[test]
-    fn g12_child_cannot_delegate_again() {
-        let schemas = explorer_tool_schemas();
-        let names = schemas
+    fn a_child_has_its_parents_tools() {
+        let names = coding_tool_schemas()
             .iter()
-            .filter_map(|schema| schema["function"]["name"].as_str())
+            .filter_map(|schema| schema["function"]["name"].as_str().map(str::to_owned))
             .collect::<Vec<_>>();
-        assert!(names.contains(&"read_file"));
-        assert!(!names.contains(&"delegate"));
-        assert!(!names.contains(&"write_file"));
-        assert!(!names.contains(&"run_shell"));
+        for tool in ["read_file", "write_file", "run_shell", "apply_patch"] {
+            assert!(names.iter().any(|name| name == tool), "{tool}");
+        }
+        let delegate = ChildTools::delegate_schema();
+        assert_eq!(
+            delegate["function"]["parameters"]["properties"]["role"]["enum"],
+            serde_json::json!(["explorer"])
+        );
     }
 
     /// The parts of a session's children that need no running worker.

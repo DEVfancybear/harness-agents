@@ -112,7 +112,7 @@ pub enum LaunchMode {
 }
 
 /// Optional headless-run inputs that shape the goal, budget and backend.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HeadlessOptions {
     /// Output protocol for automation. `None` keeps the original --json behavior.
     pub output_format: Option<headless::OutputFormat>,

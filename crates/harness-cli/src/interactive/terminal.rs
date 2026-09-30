@@ -8,11 +8,14 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{cursor, execute};
 
-use super::events::Key;
+use super::events::{Key, MouseInput, MouseKind};
 
 /// Everything the render loop needs from a terminal.
 pub trait TerminalBackend {
@@ -178,6 +181,8 @@ pub fn install_panic_hook() {
             let _ = execute!(
                 io::stdout(),
                 event::DisableBracketedPaste,
+                event::DisableMouseCapture,
+                terminal::LeaveAlternateScreen,
                 crossterm::style::Print("\u{1b}[?1007l"),
                 cursor::Show
             );
@@ -221,13 +226,62 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// Enter prime-agent's fullscreen rendering: the alternate screen (`?1049h`),
+/// and the mouse reports when `mouse` is on. prime-agent asks for button-event
+/// tracking so a drag is reported and passive movement is not; crossterm turns
+/// the same request into the console's mouse input on Windows.
+///
+/// # Errors
+/// The console refused the mode.
+pub fn enter_fullscreen(mouse: bool) -> io::Result<()> {
+    execute!(io::stdout(), terminal::EnterAlternateScreen)?;
+    if mouse {
+        execute!(io::stdout(), event::EnableMouseCapture)?;
+    }
+    Ok(())
+}
+
+/// Leave fullscreen rendering: the mouse first, then the alternate screen, so
+/// the primary screen is back as it was.
+///
+/// # Errors
+/// The console refused the mode.
+pub fn leave_fullscreen(mouse: bool) -> io::Result<()> {
+    if mouse {
+        execute!(io::stdout(), event::DisableMouseCapture)?;
+    }
+    execute!(io::stdout(), terminal::LeaveAlternateScreen)
+}
+
 fn map_event(event: Event) -> Key {
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => map_key(key),
         Event::Paste(text) => Key::Paste(text),
         Event::Resize(columns, rows) => Key::Resize { columns, rows },
+        Event::Mouse(mouse) => map_mouse(mouse).map_or(Key::Unknown, Key::Mouse),
         _ => Key::Unknown,
     }
+}
+
+/// The reports prime-agent's fullscreen viewport reads: the wheel and the left
+/// button. Movement without a button is never asked for, and ignored.
+fn map_mouse(mouse: MouseEvent) -> Option<MouseInput> {
+    let kind = match mouse.kind {
+        MouseEventKind::ScrollUp => MouseKind::WheelUp,
+        MouseEventKind::ScrollDown => MouseKind::WheelDown,
+        MouseEventKind::Down(MouseButton::Left) => MouseKind::Press,
+        MouseEventKind::Drag(MouseButton::Left) => MouseKind::Drag,
+        MouseEventKind::Up(MouseButton::Left) => MouseKind::Release,
+        _ => return None,
+    };
+    Some(MouseInput {
+        kind,
+        column: mouse.column,
+        row: mouse.row,
+        modified: mouse
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL),
+    })
 }
 
 fn map_key(key: KeyEvent) -> Key {
@@ -276,6 +330,12 @@ fn map_key(key: KeyEvent) -> Key {
         KeyCode::Esc => Key::Esc,
         KeyCode::Left => Key::Left,
         KeyCode::Right => Key::Right,
+        // prime-agent's fullscreen viewport keys: Shift+Alt+Up to the top,
+        // Ctrl+Shift+Down back to the end, following.
+        KeyCode::Up if alt && key.modifiers.contains(KeyModifiers::SHIFT) => Key::ViewportTop,
+        KeyCode::Down if control && key.modifiers.contains(KeyModifiers::SHIFT) => {
+            Key::ViewportFollow
+        }
         KeyCode::Up => Key::Up,
         KeyCode::Down => Key::Down,
         KeyCode::PageUp => Key::PageUp,

@@ -398,6 +398,27 @@ pub fn path_for(data_dir: &Path, task: &str) -> PathBuf {
     data_dir.join("schedules").join(format!("{task}.json"))
 }
 
+/// The conversations (task ids) with a job still to run: what a background
+/// worker opens again when it starts, so their jobs fire with no terminal open.
+#[must_use]
+pub fn tasks_with_active_jobs(data_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(data_dir.join("schedules")) else {
+        return Vec::new();
+    };
+    let mut tasks = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .filter(|path| load(path).iter().any(|job| job.status == Status::Active))
+        .filter_map(|path| Some(path.file_stem()?.to_str()?.to_owned()))
+        .collect::<Vec<_>>();
+    tasks.sort();
+    tasks
+}
+
 fn load(path: &Path) -> Vec<Job> {
     std::fs::read_to_string(path)
         .ok()

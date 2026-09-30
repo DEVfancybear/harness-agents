@@ -143,7 +143,35 @@ pub enum Key {
         columns: u16,
         rows: u16,
     },
+    /// A mouse report, while fullscreen rendering tracks the mouse.
+    Mouse(MouseInput),
+    /// prime-agent's `tui.viewport.top` (Shift+Alt+Up): scroll the fullscreen
+    /// transcript to its top.
+    ViewportTop,
+    /// prime-agent's `tui.viewport.follow` (Ctrl+Shift+Down): scroll the
+    /// fullscreen transcript to its end and follow the output.
+    ViewportFollow,
     Unknown,
+}
+
+/// One mouse report, in zero-based screen cells.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MouseInput {
+    pub kind: MouseKind,
+    pub column: u16,
+    pub row: u16,
+    /// Shift, Alt or Ctrl was held: a click is then selection only.
+    pub modified: bool,
+}
+
+/// What the mouse did: prime-agent's SGR reports, left button only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum MouseKind {
+    Press,
+    Drag,
+    Release,
+    WheelUp,
+    WheelDown,
 }
 
 /// Phase of the interactive app, as described in the `HA_LAUNCH` plan.

@@ -85,6 +85,7 @@ pub fn spec_for_launch(
         name: None,
         prompt: None,
         thinking: None,
+        id: None,
     }
 }
 
@@ -119,6 +120,10 @@ fn print_json(value: &serde_json::Value) {
 /// The data directory cannot be resolved.
 pub fn list_command(json: bool) -> Result<ExitCode, HarnessError> {
     let registry = client::user_registry().map_err(failure)?;
+    // Agents a reboot or a dead worker left in a journal come back first.
+    if client::recover_journals(&registry) > 0 {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
     let listed = client::list_all(&registry);
     if json {
         print_json(&serde_json::json!({
@@ -325,7 +330,11 @@ pub fn shutdown_command(force: bool, json: bool) -> Result<ExitCode, HarnessErro
 /// # Errors
 /// The worker could not start.
 pub fn worker_command(args: &worker::WorkerArgs) -> Result<ExitCode, HarnessError> {
-    worker::run(args).map_err(failure)?;
+    if args.serve {
+        worker::run(args).map_err(failure)?;
+    } else {
+        worker::supervise_process(args).map_err(failure)?;
+    }
     Ok(ExitCode::SUCCESS)
 }
 

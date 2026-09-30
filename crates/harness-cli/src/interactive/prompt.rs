@@ -72,7 +72,7 @@ Python state in the kernel persists across cells: named variables, helper functi
 ///
 /// ha's children are explorer workers that write through the turn's store, so unlike
 /// prime-agent's they cannot outlive the turn; the block says so.
-const REPL_RECURSION: &str = "An `rlm` object is already in your global namespace. `await rlm.spawn('sub-task', name='api-reviewer')` spawns a read-only explorer child and returns immediately after task admission with `rlm_child_id`, `name`, `session_dir`, and `model`; it never waits for or returns the child's answer.
+const REPL_RECURSION: &str = "An `rlm` object is already in your global namespace. `await rlm.spawn('sub-task', name='api-reviewer')` spawns a child and returns immediately after task admission with `rlm_child_id`, `name`, `session_dir`, and `model`; it never waits for or returns the child's answer.
 `name` is required: choose a stable child name that is unique among siblings.
 A child runs on your model; omit `model`, or pass exactly the selector `await rlm.find_models()` returns.
 Use `await rlm.list_subagents()` to recover direct child handles after admission.

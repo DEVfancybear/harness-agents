@@ -60,6 +60,22 @@ pub enum Request {
     },
     /// Stop every agent and the worker.
     Shutdown,
+    /// Stop the worker but keep its journal: the next worker - of a newer
+    /// build - starts its agents again.
+    Restart,
+    /// prime-agent's headless session through the daemon: run one `ha exec`
+    /// turn here, on the store the agents share. The replies are its output
+    /// lines, then `exited` or `failed`; closing the connection cancels it.
+    Exec(Box<ExecSpec>),
+}
+
+/// An `ha exec` run: the client's launch and its request.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExecSpec {
+    pub caller_dir: PathBuf,
+    /// The client's environment, held in memory for the run and never written.
+    pub environment: Vec<(String, String)>,
+    pub request: super::super::headless::HeadlessRequest,
 }
 
 /// prime-agent's delivery modes for `send`.
@@ -93,6 +109,9 @@ pub struct CreateAgent {
     /// The first message, sent as soon as the agent starts (`rlm.create_session`).
     pub prompt: Option<String>,
     pub thinking: Option<String>,
+    /// The id a recovered agent keeps; a new agent gets one.
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 /// One agent, as `ha agents` lists it.
@@ -153,6 +172,20 @@ pub enum Reply {
     /// This terminal is no longer the agent's.
     Detached {
         reason: String,
+    },
+    /// One line an `exec` run wrote, to stdout or to stderr.
+    Output {
+        stderr: bool,
+        text: String,
+    },
+    /// The `exec` run ended with this exit code.
+    Exited {
+        code: u8,
+    },
+    /// The `exec` run failed with this error.
+    Failed {
+        code: harness_types::ErrorCode,
+        message: String,
     },
 }
 

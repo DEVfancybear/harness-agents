@@ -30,7 +30,7 @@ use harness_types::{
 
 use super::HeadlessOptions;
 use super::attachments;
-use super::bootstrap::{self, LaunchRequest};
+use super::bootstrap::{self, LaunchContext, LaunchRequest};
 use super::bounds;
 use super::config::ConfigOverrides;
 use super::extensions;
@@ -41,7 +41,7 @@ use super::service::{
 };
 
 /// A validated single-turn headless request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HeadlessRequest {
     pub prompt: String,
     pub json: bool,
@@ -51,7 +51,7 @@ pub struct HeadlessRequest {
 }
 
 /// Machine output stays line-oriented and contains no terminal control codes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum OutputFormat {
     Text,
     Json,
@@ -69,19 +69,48 @@ impl OutputFormat {
     }
 }
 
+/// Where a headless run's lines go: this process's stdout and stderr, or - for
+/// a run a background worker carries out - the terminal that asked for it.
+pub trait Output: Send + Sync {
+    fn stdout(&self, line: &str);
+    fn stderr(&self, line: &str);
+}
+
+/// This process's own stdout and stderr.
+pub struct Console;
+
+impl Output for Console {
+    fn stdout(&self, line: &str) {
+        println!("{line}");
+    }
+
+    fn stderr(&self, line: &str) {
+        eprintln!("{line}");
+    }
+}
+
+/// The store a headless run writes through.
+pub enum RunStore {
+    /// Open the project's writer for this run and close it afterwards.
+    Own,
+    /// The store a background worker shares with its agents.
+    Shared(Arc<super::store_lease::SharedStore>),
+}
+
 /// Auto-allowed actions remain visible in headless JSON and plain output.
-#[derive(Default)]
 struct HeadlessObserver {
     auto_allowed: Mutex<Vec<String>>,
     notices: Mutex<Vec<String>>,
     stream_json: bool,
     approval_blocked: AtomicBool,
+    out: Arc<dyn Output>,
 }
 
 impl HeadlessObserver {
     fn stream_event(&self, kind: &str, fields: &serde_json::Value) {
         if self.stream_json {
-            println!("{}", serde_json::json!({"type": kind, "data": fields}));
+            self.out
+                .stdout(&serde_json::json!({"type": kind, "data": fields}).to_string());
         }
     }
 }
@@ -179,13 +208,13 @@ async fn run_state_label(store: &SqliteStore, outcome: &harness_tools::TurnOutco
 ///
 /// The body is a linear sequence: resolve, run exactly one turn, shut down. It is
 /// long because it wires real components, not because it branches.
-#[allow(clippy::too_many_lines)]
+///
+/// As prime-agent runs a headless session through its daemon, the turn runs in
+/// the project's background worker, which shares the project store with the
+/// agents it runs: an agent busy in a turn no longer leaves `ha exec` waiting
+/// for the store's writer. `HA_DAEMON=off`, or a worker that cannot be reached,
+/// runs the turn in this process as before.
 pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
-    let format = request.options.output_format.unwrap_or(if request.json {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Text
-    });
     acceptance_trace("start");
     let caller_dir = std::env::current_dir().map_err(|error| {
         HarnessError::new(
@@ -196,12 +225,82 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     let environment = LaunchEnvironment::capture();
     let context = bootstrap::resolve(LaunchRequest {
         cwd: request.cwd.clone(),
-        caller_dir,
+        caller_dir: caller_dir.clone(),
         platform: HostPlatform::current(),
         environment: environment.clone(),
         explicit_data_dir: None,
     })?;
     acceptance_trace("bootstrap_resolved");
+    // An unconfigured provider fails here, before a worker is started: a run
+    // that cannot reach a model must not leave state behind.
+    if !request.options.mock {
+        resolve_provider_with_overrides(
+            &context.paths.config_file,
+            &context.project.root,
+            &environment,
+            &context.paths.data_dir,
+            &ConfigOverrides {
+                approval: request.options.approval.clone(),
+                allowed_tools: request.options.allowed_tools.clone(),
+                disallowed_tools: request.options.disallowed_tools.clone(),
+                ..ConfigOverrides::default()
+            },
+        )
+        .map_err(|message| HarnessError::new(ErrorCode::ServiceUnavailable, message))?;
+        validate_credential_file(&environment, &context.paths.data_dir)
+            .map_err(|message| HarnessError::new(ErrorCode::SecretNotGranted, message))?;
+    }
+    if super::agents::enabled(&environment, &context.paths.config_file) {
+        match super::agents::client::exec(&context, &environment, &request, caller_dir).await {
+            Ok(code) => return Ok(ExitCode::from(code)),
+            Err(super::agents::client::ExecError::Failed(error)) => return Err(error),
+            Err(super::agents::client::ExecError::Unavailable(reason)) => {
+                eprintln!("ha: {reason}; this process runs the turn");
+            }
+        }
+    }
+    let cancellation = CancellationToken::new();
+    let signal_cancellation = cancellation.clone();
+    let signal_listener = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_cancellation.cancel();
+        }
+    });
+    let result = run_with(
+        request,
+        &context,
+        &environment,
+        RunStore::Own,
+        Arc::new(Console),
+        cancellation,
+    )
+    .await;
+    signal_listener.abort();
+    result.map(ExitCode::from)
+}
+
+/// Run one bounded headless turn through `run_store`, writing its lines to
+/// `out`; the exit code is the result.
+///
+/// The body is a linear sequence: resolve, run exactly one turn, shut down. It is
+/// long because it wires real components, not because it branches.
+///
+/// # Errors
+/// The provider, the store or the turn failed.
+#[allow(clippy::too_many_lines)]
+pub async fn run_with(
+    request: HeadlessRequest,
+    context: &LaunchContext,
+    environment: &LaunchEnvironment,
+    run_store: RunStore,
+    out: Arc<dyn Output>,
+    cancellation: CancellationToken,
+) -> Result<u8, HarnessError> {
+    let format = request.options.output_format.unwrap_or(if request.json {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Text
+    });
     // Resolve the provider before opening anything: an unconfigured environment
     // must fail fast with instructions and must not create state. The explicit
     // mock profile skips the provider configuration entirely, and the JSON
@@ -215,7 +314,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     let mut resolved_config = super::config::resolve_layers(
         &context.paths.config_file,
         &context.project.root,
-        &environment,
+        environment,
         &config_overrides,
     )?;
     super::config::apply_catalog_context_window(&mut resolved_config, &context.paths.data_dir);
@@ -231,7 +330,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         let config = resolve_provider_with_overrides(
             &context.paths.config_file,
             &context.project.root,
-            &environment,
+            environment,
             &context.paths.data_dir,
             &config_overrides,
         )
@@ -239,7 +338,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         // A key the app saved is read by the resolver at call time. Prove that here,
         // before a store is opened or a turn is admitted, so a saved-but-unreadable
         // key fails with an actionable message instead of mid-turn.
-        validate_credential_file(&environment, &context.paths.data_dir)
+        validate_credential_file(environment, &context.paths.data_dir)
             .map_err(|message| HarnessError::new(ErrorCode::SecretNotGranted, message))?;
         Some(config)
     };
@@ -247,22 +346,33 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     // Name the directory that could not be opened: an operator has to know which
     // path failed, and the typed code must survive the extra context.
     let store_dir = context.project_store_dir();
-    let store = Arc::new(
-        SqliteStore::open_writer(WriterOpenOptions::new(
-            store_dir.clone(),
-            HostId::generate(),
-        ))
-        .await
-        .map_err(|error| {
-            HarnessError::new(
-                error.code(),
-                format!(
-                    "cannot open the project store at {}: {error}",
-                    store_dir.display()
-                ),
-            )
-        })?,
-    );
+    // A worker's run leases the store its agents share; the lease is held until
+    // the run is done.
+    let (store, lease) = match &run_store {
+        RunStore::Own => (
+            Arc::new(
+                SqliteStore::open_writer(WriterOpenOptions::new(
+                    store_dir.clone(),
+                    HostId::generate(),
+                ))
+                .await
+                .map_err(|error| {
+                    HarnessError::new(
+                        error.code(),
+                        format!(
+                            "cannot open the project store at {}: {error}",
+                            store_dir.display()
+                        ),
+                    )
+                })?,
+            ),
+            None,
+        ),
+        RunStore::Shared(shared) => {
+            let lease = shared.lease().await?;
+            (lease.store(), Some(lease))
+        }
+    };
     acceptance_trace("writer_opened");
     // Resuming continues the task of the named session: the new turn runs in a
     // fresh session linked to it, exactly like a follow-up in the interactive app.
@@ -369,15 +479,15 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     }
     let runtime = Arc::new(runtime);
     // Local extensions are opt-in, loaded for this one turn and stopped afterwards.
-    let extension_root = extensions::extensions_root(&environment, &context.paths.data_dir);
-    let active_extensions = if extensions::extensions_requested_from_environment(&environment) {
+    let extension_root = extensions::extensions_root(environment, &context.paths.data_dir);
+    let active_extensions = if extensions::extensions_requested_from_environment(environment) {
         match extensions::load_active(&extension_root).await {
             Ok(active) => {
-                eprintln!("{}", active.report().message(&extension_root));
+                out.stderr(&active.report().message(&extension_root));
                 Some(active)
             }
             Err(error) => {
-                eprintln!("extensions: not loaded ({error})");
+                out.stderr(&format!("extensions: not loaded ({error})"));
                 None
             }
         }
@@ -435,10 +545,10 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
     // therefore look at a screenshot or read a log the same way a person can.
     let attached = attachments::from_message(&request.prompt, &context.project.root);
     for note in &attached.notes {
-        eprintln!("not attached ({note})");
+        out.stderr(&format!("not attached ({note})"));
     }
     for notice in attachments::attachment_notices(&attached.images, &attached.files) {
-        eprintln!("{notice}");
+        out.stderr(&notice);
     }
     let prompt = format!(
         "{}{}",
@@ -510,24 +620,20 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         // One turn, bounded as the environment asks: a script reads `stop` in the JSON
         // and resumes with `--resume` when it wants more, so the app never continues
         // silently in the middle of somebody's pipeline.
-        limits: bounds::limits_from_environment(&environment),
+        limits: bounds::limits_from_environment(environment),
     };
     let observer = Arc::new(HeadlessObserver {
+        auto_allowed: Mutex::new(Vec::new()),
+        notices: Mutex::new(Vec::new()),
         stream_json: format == OutputFormat::StreamJson,
-        ..HeadlessObserver::default()
+        approval_blocked: AtomicBool::new(false),
+        out: Arc::clone(&out),
     });
     observer.stream_event(
         "turn.started",
         &serde_json::json!({"session_id": session_id, "task_id": task_id}),
     );
     let turn_observer: Arc<dyn TurnObserver> = observer.clone();
-    let cancellation = CancellationToken::new();
-    let signal_cancellation = cancellation.clone();
-    let signal_listener = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal_cancellation.cancel();
-        }
-    });
     let outcome = match &resumed_from {
         Some((source, _)) => {
             driver
@@ -551,7 +657,6 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
                 .await?
         }
     };
-    signal_listener.abort();
     if let Some(question_id) = &outcome.pending_question {
         observer.stream_event("ask_user", &serde_json::json!({"question_id": question_id}));
     }
@@ -688,30 +793,35 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         active.shutdown().await;
     }
     drop(runtime);
-    Arc::try_unwrap(store)
-        .map_err(|_| {
-            HarnessError::new(
-                ErrorCode::StorageWriteFailed,
-                "headless store consumers were not released",
-            )
-        })?
-        .close()
-        .await
-        .map_err(StoreError::into_harness_error)?;
+    if lease.is_none() {
+        Arc::try_unwrap(store)
+            .map_err(|_| {
+                HarnessError::new(
+                    ErrorCode::StorageWriteFailed,
+                    "headless store consumers were not released",
+                )
+            })?
+            .close()
+            .await
+            .map_err(StoreError::into_harness_error)?;
+    } else {
+        drop(store);
+        drop(lease);
+    }
     acceptance_trace("writer_closed");
 
     if format == OutputFormat::Json {
-        println!("{output}");
+        out.stdout(&output.to_string());
     } else if format == OutputFormat::StreamJson {
         observer.stream_event("run.terminal", &output);
     } else {
         for message in notices {
-            println!("[info] {message}");
+            out.stdout(&format!("[info] {message}"));
         }
         for message in auto_allowed {
-            println!("[info] {message}");
+            out.stdout(&format!("[info] {message}"));
         }
-        println!("{}", output["response"].as_str().unwrap_or_default());
+        out.stdout(output["response"].as_str().unwrap_or_default());
     }
     let exit = match outcome.stop {
         _ if request.options.output_format.is_none() => 0,
@@ -727,7 +837,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
         }
         _ => 4,
     };
-    Ok(ExitCode::from(exit))
+    Ok(exit)
 }
 
 /// Convert the goal evaluator's proven evidence into M0's durable command input.

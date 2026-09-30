@@ -191,6 +191,9 @@ pub fn help_card_lines() -> Vec<String> {
             "Model",
             &[
                 "/model",
+                "/subagent-model",
+                "/subagent-login",
+                "/subagent-logout",
                 "/scoped-models",
                 "/effort",
                 "/fast",
@@ -239,6 +242,7 @@ pub fn help_card_lines() -> Vec<String> {
                 "@file",
                 "!command",
                 "/hotkeys",
+                "/fullscreen",
                 "/logs",
                 "/quit",
             ],
@@ -272,7 +276,22 @@ pub fn hotkey_lines() -> Vec<String> {
         ("Ctrl-L", "redraw"),
         ("Ctrl-U / Ctrl-W", "erase to line start / erase a word"),
         ("Ctrl-V", "paste an image or path from the clipboard"),
-        ("PgUp / PgDn", "scroll a panel"),
+        (
+            "PgUp / PgDn",
+            "scroll a panel; in fullscreen, the transcript by page",
+        ),
+        (
+            "Shift+Alt+↑",
+            "fullscreen: scroll the transcript to its top",
+        ),
+        (
+            "Ctrl+Shift+↓",
+            "fullscreen: scroll to the bottom and follow output",
+        ),
+        (
+            "mouse wheel / drag",
+            "fullscreen: scroll the transcript / select and copy text",
+        ),
         ("@", "pick a file to mention"),
         ("!cmd / !!cmd", "run a shell command / only show its output"),
     ]

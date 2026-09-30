@@ -233,6 +233,50 @@ impl CredentialSource {
     }
 }
 
+/// The file the delegated children's own logins are kept in, beside the main
+/// one (`/subagent-login`).
+pub const SUBAGENT_CREDENTIAL_FILE_NAME: &str = "subagent-auth.json";
+
+/// Whose login a credential is: the main model's (`/login`), or the delegated
+/// children's own (`/subagent-login`). A child uses its own login for a
+/// provider when there is one, and the main one otherwise.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Scope {
+    #[default]
+    Main,
+    Subagent,
+}
+
+/// The credential file of one scope.
+#[must_use]
+pub fn scoped_file(environment: &LaunchEnvironment, data_dir: &Path, scope: Scope) -> PathBuf {
+    match scope {
+        Scope::Main => resolve_file(environment, data_dir),
+        Scope::Subagent => resolve_path(environment, data_dir).join(SUBAGENT_CREDENTIAL_FILE_NAME),
+    }
+}
+
+/// [`source_for`] as a scope sees it: a child's own login first.
+#[must_use]
+pub fn source_for_scope(
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+    provider: &str,
+    variable: &str,
+    scope: Scope,
+) -> Option<CredentialSource> {
+    if scope == Scope::Subagent {
+        let path = scoped_file(environment, data_dir, Scope::Subagent);
+        if read_all(&path).is_ok_and(|entries| entries.contains_key(provider)) {
+            return Some(CredentialSource::File {
+                path,
+                protection: Protection::NotReverified,
+            });
+        }
+    }
+    source_for(environment, data_dir, provider, variable)
+}
+
 /// Resolve the credential file for one launch.
 ///
 /// [`CREDENTIAL_DIRECTORY_VARIABLE`] wins over the data root so a test can point

@@ -74,6 +74,8 @@ pub enum Effect {
     ClearViewport,
     /// Repaint the viewport (the composer, the live block and the status bar).
     Redraw,
+    /// Enter or leave prime-agent's fullscreen rendering (`/fullscreen`).
+    Fullscreen(bool),
     /// Leave the app with this exit code.
     Exit(u8),
 }
@@ -205,6 +207,10 @@ pub struct InteractiveController {
     file_picker_candidates: Vec<String>,
     /// The plain renderer prints slash-command output; the TUI opens an overlay.
     plain: bool,
+    /// Whether the terminal renders fullscreen, for `/fullscreen` to toggle.
+    fullscreen: bool,
+    /// The chat's name `/name` gave it, for prime-agent's fullscreen top bar.
+    chat_title: Option<String>,
     /// The tool cards still open, so each settles in place: name, one-line summary
     /// and the full input the settled row carries for the expanded view.
     open_tools: Vec<(String, String, String)>,
@@ -253,6 +259,8 @@ pub struct InteractiveController {
     exit_armed_at: Option<Instant>,
     /// The provider whose API key the masked prompt is collecting.
     login_provider: Option<String>,
+    /// Whose login the running `/login` or `/subagent-login` saves.
+    login_scope: super::credentials::Scope,
     /// Reasoning received since the last committed row.
     pending_thinking: String,
     /// The thinking level the next turn uses, for the status line.
@@ -284,7 +292,10 @@ impl InteractiveController {
         header.push(format!("Service: {}", service.label()));
         let bounds = service.limits();
         let (steering_mode, follow_up_mode) = service.queue_modes();
+        let fullscreen = !plain && service.fullscreen_prefs().enabled;
         Self {
+            fullscreen,
+            chat_title: None,
             // The app boots before it can render; boot_lines performs the
             // transition once the header has actually been produced.
             phase: AppPhase::Booting,
@@ -339,6 +350,7 @@ impl InteractiveController {
             detail: super::events::Detail::default(),
             exit_armed_at: None,
             login_provider: None,
+            login_scope: super::credentials::Scope::Main,
             signing_in: None,
             pending_thinking: String::new(),
             thinking_label: None,
@@ -522,7 +534,21 @@ impl InteractiveController {
             phase: self.phase,
             setup_required: self.setup_required,
             setup_hint: self.setup_hint.clone(),
-            header: self.header.clone(),
+            header: {
+                // prime-agent's top bar names the chat: its name, else the
+                // workspace directory.
+                let mut header = self.header.clone();
+                let name = self.chat_title.clone().unwrap_or_else(|| {
+                    self.context
+                        .project
+                        .root
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                });
+                header.push(format!("Chat: {name}"));
+                header
+            },
             buffer: self.display_buffer(),
             cursor: self.editor.cursor(),
             live_text: self.pending_text.clone(),
@@ -673,8 +699,42 @@ impl InteractiveController {
                 })
                 .collect(),
         );
+        let models = self.service.model_options();
+        // A child runs on a catalog model it has a login for - its own or the
+        // main one - or on this agent's.
+        let mut subagent_models = vec![(
+            "inherit".to_owned(),
+            "children run on this agent's model".to_owned(),
+        )];
+        subagent_models.extend(self.service.subagent_model_options());
+        let own = self.service.stored_subagent_credentials();
+        self.editor.set_argument_options(
+            "/subagent-login",
+            super::providers::PROVIDERS
+                .iter()
+                .map(|entry| {
+                    let state = if own.iter().any(|(id, _)| id == entry.id) {
+                        " · logged in for subagents"
+                    } else {
+                        ""
+                    };
+                    (entry.id.to_owned(), format!("{}{state}", entry.name))
+                })
+                .collect(),
+        );
+        self.editor.set_argument_options(
+            "/subagent-logout",
+            own.iter()
+                .map(|(id, kind)| {
+                    let name =
+                        super::providers::provider(id).map_or(id.as_str(), |entry| entry.name);
+                    (id.clone(), format!("{name} · {kind}"))
+                })
+                .collect(),
+        );
         self.editor
-            .set_argument_options("/model", self.service.model_options());
+            .set_argument_options("/subagent-model", subagent_models);
+        self.editor.set_argument_options("/model", models);
         // The modes with what each lets through, the one in force marked.
         let current = self
             .service
@@ -1657,7 +1717,20 @@ impl InteractiveController {
                 let name = super::providers::provider(&provider)
                     .map_or(provider.as_str(), |entry| entry.name)
                     .to_owned();
+                let for_subagents = self.login_scope == super::credentials::Scope::Subagent;
+                self.credential_scope(super::credentials::Scope::Main);
                 match result {
+                    Ok(()) if for_subagents => {
+                        self.push_history(
+                            effects,
+                            HistoryItem::Notice {
+                                message: format!(
+                                    "Logged in to {name} for subagents; the main model's login is unchanged."
+                                ),
+                            },
+                        );
+                        self.refresh_menu();
+                    }
                     Ok(()) => {
                         let path = super::credentials::resolve_file(
                             &super::paths::LaunchEnvironment::capture(),
@@ -2899,6 +2972,59 @@ impl InteractiveController {
                 }
                 effects.push(Effect::Redraw);
             }
+            // prime-agent's `/fullscreen [on|off]`, kept as `terminal.fullscreen`.
+            "/fullscreen" => {
+                let enable = match argument {
+                    None => Some(!self.fullscreen),
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    Some(_) => None,
+                };
+                match enable {
+                    None => self.push_history(&mut effects, HistoryItem::Error {
+                        message: "Usage: /fullscreen [on|off]".to_owned(),
+                    }),
+                    Some(enable) => {
+                        if let Err(message) = self.service.set_fullscreen(enable) {
+                            self.push_history(&mut effects, HistoryItem::Error { message });
+                        }
+                        if self.plain {
+                            self.push_history(&mut effects, HistoryItem::Notice {
+                                message: "Fullscreen rendering requires an interactive terminal"
+                                    .to_owned(),
+                            });
+                        } else {
+                            self.fullscreen = enable;
+                            effects.push(Effect::Fullscreen(enable));
+                            self.push_history(&mut effects, HistoryItem::Notice {
+                                message: if enable {
+                                    format!(
+                                        "Fullscreen rendering on — wheel/pageUp scroll, {} follows output",
+                                        super::tui::fullscreen::FOLLOW_KEY
+                                    )
+                                } else {
+                                    "Fullscreen rendering off".to_owned()
+                                },
+                            });
+                        }
+                    }
+                }
+                effects.push(Effect::Redraw);
+            }
+            "/subagent-model" => {
+                let change = match argument {
+                    None => super::service::SubagentModel::Show,
+                    Some("inherit") => super::service::SubagentModel::Inherit,
+                    Some(model) => super::service::SubagentModel::Set(model.to_owned()),
+                };
+                match self.service.subagent_model(change) {
+                    Ok(message) => {
+                        self.push_history(&mut effects, HistoryItem::Notice { message });
+                    }
+                    Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                }
+                effects.push(Effect::Redraw);
+            }
             // prime-agent's `/rlm-max-depth [<int> [--global]]`.
             "/rlm-max-depth" => {
                 let words = raw_argument
@@ -3094,7 +3220,11 @@ impl InteractiveController {
                     });
                 } else if let Some(title) = raw_argument {
                     match self.service.rename(title) {
-                        Ok(message) => self.push_history(&mut effects, HistoryItem::Notice { message }),
+                        Ok(message) => {
+                            self.chat_title =
+                                Some(title.split_whitespace().collect::<Vec<_>>().join(" "));
+                            self.push_history(&mut effects, HistoryItem::Notice { message });
+                        }
                         Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
                     }
                 } else {
@@ -3203,8 +3333,25 @@ impl InteractiveController {
                 // beginning is exactly the problem this command exists to fix.
                 self.reference("/more", self.recall_lines(), &mut effects);
             }
-            "/login" => self.login_command(argument, &mut effects),
-            "/logout" => self.logout_command(argument, &mut effects),
+            "/login" => {
+                self.credential_scope(super::credentials::Scope::Main);
+                self.login_command(argument, &mut effects);
+            }
+            "/logout" => {
+                self.credential_scope(super::credentials::Scope::Main);
+                self.logout_command(argument, &mut effects);
+            }
+            // The delegated children's own logins: a child uses its own for a
+            // provider when there is one, and the main one otherwise.
+            "/subagent-login" => {
+                self.credential_scope(super::credentials::Scope::Subagent);
+                self.login_command(argument, &mut effects);
+            }
+            "/subagent-logout" => {
+                self.credential_scope(super::credentials::Scope::Subagent);
+                self.logout_command(argument, &mut effects);
+                self.credential_scope(super::credentials::Scope::Main);
+            }
             "/new" => {
                 // A new conversation never abandons a running one: the run is
                 // settled first, exactly like Ctrl-C.
@@ -3447,6 +3594,25 @@ impl InteractiveController {
                 ];
             }
         };
+        if self.login_scope == super::credentials::Scope::Subagent {
+            self.credential_scope(super::credentials::Scope::Main);
+            let name = super::providers::provider(&provider)
+                .map_or(provider.as_str(), |entry| entry.name)
+                .to_owned();
+            let mut effects = Vec::new();
+            self.push_history(
+                &mut effects,
+                HistoryItem::Notice {
+                    message: format!(
+                        "Saved API key for {name} for subagents. Credentials saved to {}; the main model's login is unchanged, and the value is never shown, logged or kept in history.",
+                        source.describe()
+                    ),
+                },
+            );
+            self.refresh_menu();
+            effects.push(Effect::Redraw);
+            return effects;
+        }
         match self.activate_credential(source.clone()) {
             Ok(()) => {
                 let mut effects = Vec::new();
@@ -3481,6 +3647,12 @@ impl InteractiveController {
         }
     }
 
+    /// Whose login the credential commands act on, here and in the service.
+    fn credential_scope(&mut self, scope: super::credentials::Scope) {
+        self.login_scope = scope;
+        self.service.set_credential_scope(scope);
+    }
+
     /// Refresh every controller view of provider readiness from one saved source.
     /// Phase, setup hint and header are refreshed together so they cannot disagree.
     fn activate_credential(&mut self, source: CredentialSource) -> Result<(), String> {
@@ -3512,9 +3684,23 @@ impl InteractiveController {
             );
             return;
         }
+        let for_subagents = self.login_scope == super::credentials::Scope::Subagent;
         let Some(provider) = argument.and_then(super::providers::provider) else {
-            let stored = self.service.stored_credentials();
-            let mut lines = vec!["/login <provider>:".to_owned()];
+            let (stored, command) = if for_subagents {
+                (
+                    self.service.stored_subagent_credentials(),
+                    "/subagent-login",
+                )
+            } else {
+                (self.service.stored_credentials(), "/login")
+            };
+            let mut lines = vec![format!("{command} <provider>:")];
+            if for_subagents {
+                lines.push(
+                    "  the delegated children's own logins; a child without one uses the main model's"
+                        .to_owned(),
+                );
+            }
             for entry in &super::providers::PROVIDERS {
                 let state = stored
                     .iter()
@@ -3526,7 +3712,7 @@ impl InteractiveController {
                 };
                 lines.push(format!("  {:<14}{} · {how}{state}", entry.id, entry.name));
             }
-            self.reference("/login", lines, effects);
+            self.reference(command, lines, effects);
             return;
         };
         match provider.login {
@@ -3537,8 +3723,9 @@ impl InteractiveController {
                     effects,
                     HistoryItem::Notice {
                         message: format!(
-                            "Enter API key for {}: it is masked, never kept in history, and saved to the credential file. Esc cancels.",
-                            provider.name
+                            "Enter API key for {}{}: it is masked, never kept in history, and saved to the credential file. Esc cancels.",
+                            provider.name,
+                            if for_subagents { " (subagents)" } else { "" }
                         ),
                     },
                 );
@@ -3572,13 +3759,23 @@ impl InteractiveController {
     /// prime-agent's `/logout`: remove a saved credential; environment variables
     /// are left alone.
     fn logout_command(&mut self, argument: Option<&str>, effects: &mut Vec<Effect>) {
-        let stored = self.service.stored_credentials();
+        let for_subagents = self.login_scope == super::credentials::Scope::Subagent;
+        let stored = if for_subagents {
+            self.service.stored_subagent_credentials()
+        } else {
+            self.service.stored_credentials()
+        };
         let Some(provider) = argument else {
             let message = if stored.is_empty() {
                 "No stored credentials to remove; environment variables are unchanged.".to_owned()
             } else {
                 format!(
-                    "/logout <provider>: stored credentials for {}",
+                    "{} <provider>: stored credentials for {}",
+                    if for_subagents {
+                        "/subagent-logout"
+                    } else {
+                        "/logout"
+                    },
                     stored
                         .iter()
                         .map(|(id, kind)| format!("{id} ({kind})"))
@@ -3595,12 +3792,20 @@ impl InteractiveController {
                 self.push_history(
                     effects,
                     HistoryItem::Notice {
-                        message: format!(
-                            "Removed stored credential for {name}. Environment variables and config files are unchanged."
-                        ),
+                        message: if for_subagents {
+                            format!(
+                                "Removed the subagents' own credential for {name}; they use the main model's login for it now."
+                            )
+                        } else {
+                            format!(
+                                "Removed stored credential for {name}. Environment variables and config files are unchanged."
+                            )
+                        },
                     },
                 );
-                self.after_logout(effects);
+                if !for_subagents {
+                    self.after_logout(effects);
+                }
             }
             Ok(false) => self.push_history(
                 effects,
@@ -5704,6 +5909,7 @@ Command: \"npm run build\""
                 | Effect::Bell
                 | Effect::Redraw
                 | Effect::ClearViewport
+                | Effect::Fullscreen(_)
                 | Effect::Exit(_) => {}
             }
         }

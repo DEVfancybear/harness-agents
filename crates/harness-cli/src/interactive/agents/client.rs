@@ -22,6 +22,101 @@ const START_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a key waits for what it produced before the frame is drawn.
 const KEY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Why `ha exec` did not run through the project's worker.
+#[derive(Debug)]
+pub enum ExecError {
+    /// No worker could be reached or started: the turn runs in this process.
+    Unavailable(String),
+    /// The worker ran the turn, and it failed.
+    Failed(harness_types::HarnessError),
+}
+
+/// prime-agent's headless session through its daemon: run one `ha exec` turn
+/// in the project's worker - started when there is none - and write its lines
+/// here as they come. Ctrl-C closes the connection, which cancels the turn.
+///
+/// # Errors
+/// `Unavailable` when no worker of this build can take the run; `Failed` when
+/// the run failed.
+pub async fn exec(
+    context: &LaunchContext,
+    environment: &super::super::paths::LaunchEnvironment,
+    request: &super::super::headless::HeadlessRequest,
+    caller_dir: PathBuf,
+) -> Result<u8, ExecError> {
+    let directory = registry::directory(&context.paths.data_dir);
+    let store_dir = context.project_store_dir();
+    let root = context.project.root.clone();
+    let spec = protocol::ExecSpec {
+        caller_dir,
+        environment: environment.pairs(),
+        request: request.clone(),
+    };
+    let unavailable = |error: tokio::task::JoinError| ExecError::Unavailable(error.to_string());
+    let (connection, closer) = tokio::task::spawn_blocking(move || {
+        let (_, mut connection) = ensure(&directory, &store_dir, &root)?;
+        protocol::write_line(&mut connection.writer, &Request::Exec(Box::new(spec)))
+            .map_err(|error| format!("the worker went away: {error}"))?;
+        // The run takes as long as the turn does.
+        let _ = connection.reader.get_ref().set_read_timeout(None);
+        let closer = connection
+            .writer
+            .try_clone()
+            .map_err(|error| error.to_string())?;
+        Ok::<_, String>((connection, closer))
+    })
+    .await
+    .map_err(unavailable)?
+    .map_err(ExecError::Unavailable)?;
+    let relay = tokio::task::spawn_blocking(move || relay_exec(connection));
+    tokio::select! {
+        result = relay => result.map_err(|error| ExecError::Failed(lost_run(&error.to_string())))?,
+        _ = tokio::signal::ctrl_c() => {
+            let _ = closer.shutdown(Shutdown::Both);
+            Ok(130)
+        }
+    }
+}
+
+fn lost_run(reason: &str) -> harness_types::HarnessError {
+    harness_types::HarnessError::new(
+        harness_types::ErrorCode::RuntimeBlocked,
+        format!("the background worker went away during the run ({reason})"),
+    )
+}
+
+/// Write an `exec` run's lines until it ends.
+fn relay_exec(mut connection: Connection) -> Result<u8, ExecError> {
+    use std::io::Write as _;
+    loop {
+        match protocol::read_line::<Reply>(&mut connection.reader) {
+            Ok(Some(Reply::Output { stderr: true, text })) => eprintln!("{text}"),
+            Ok(Some(Reply::Output {
+                stderr: false,
+                text,
+            })) => {
+                println!("{text}");
+                let _ = std::io::stdout().flush();
+            }
+            Ok(Some(Reply::Exited { code })) => return Ok(code),
+            Ok(Some(Reply::Failed { code, message })) => {
+                return Err(ExecError::Failed(harness_types::HarnessError::new(
+                    code, message,
+                )));
+            }
+            Ok(Some(Reply::Error { message })) => {
+                return Err(ExecError::Failed(harness_types::HarnessError::new(
+                    harness_types::ErrorCode::RuntimeBlocked,
+                    message,
+                )));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(ExecError::Failed(lost_run("it closed the connection"))),
+            Err(error) => return Err(ExecError::Failed(lost_run(&error.to_string()))),
+        }
+    }
+}
+
 /// A connection that presented the worker's token.
 pub struct Connection {
     reader: BufReader<TcpStream>,
@@ -94,13 +189,10 @@ pub fn ensure(
 ) -> Result<(Descriptor, Connection), String> {
     let key = registry::project_key(store_dir);
     if let Some(found) = connect(directory, &key) {
-        if found.0.build != registry::build_identity() {
-            return Err(
-                "the project's background worker runs another build of ha; `ha shutdown` replaces it"
-                    .to_owned(),
-            );
+        if found.0.build == registry::build_identity() {
+            return Ok(found);
         }
-        return Ok(found);
+        replace_old_worker(directory, &key, found)?;
     }
     spawn_worker(directory, &key, store_dir, project_root)?;
     let deadline = Instant::now() + START_TIMEOUT;
@@ -116,6 +208,86 @@ pub fn ensure(
     ))
 }
 
+/// Whether this process may start a worker. A child inherits every
+/// inheritable handle of this process - on Windows there is no safe way to say
+/// otherwise - so a worker started by a command whose output is a pipe would
+/// keep that pipe open for as long as it runs, and `ha exec ... | tool` would
+/// never end. A terminal passes only its console.
+fn can_start_worker() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stdout())
+        && std::io::IsTerminal::is_terminal(&std::io::stderr())
+}
+
+/// How long an old build's worker has to stop when it is replaced.
+const REPLACE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// prime-agent's coordinated update: a worker of another build (`ha` was
+/// updated) that is idle stops, keeping its journal, and the worker this build
+/// starts brings its agents back. One whose agents are working is left alone.
+fn replace_old_worker(
+    directory: &Path,
+    key: &str,
+    (descriptor, mut connection): (Descriptor, Connection),
+) -> Result<(), String> {
+    let agents: Vec<AgentInfo> = connection
+        .call(&Request::List)
+        .ok()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    let working = agents
+        .iter()
+        .filter(|agent| {
+            agent.attached
+                || agent.busy
+                || !matches!(agent.status.as_str(), "ready" | "setup_required")
+        })
+        .count();
+    if working > 0 {
+        return Err(format!(
+            "the project's background worker runs another build of ha and {working} of its agents are working; `ha shutdown` replaces it once they are done"
+        ));
+    }
+    if !can_start_worker() {
+        return Err(
+            "the project's background worker runs another build of ha; a terminal replaces it"
+                .to_owned(),
+        );
+    }
+    // A worker older than `restart` knows only `shutdown`; it has no journal.
+    if connection.call(&Request::Restart).is_err() {
+        let mut again = Connection::open(&descriptor)?;
+        again.call(&Request::Shutdown)?;
+    }
+    let deadline = Instant::now() + REPLACE_TIMEOUT;
+    while Instant::now() < deadline {
+        let path = registry::descriptor_path(directory, key);
+        if registry::read(&path).is_none_or(|current| current.pid != descriptor.pid)
+            || !registry::process_is_alive(descriptor.pid)
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err("the old background worker did not stop in time".to_owned())
+}
+
+/// Start the worker of every project whose agents wait in a journal - after
+/// a reboot, or a worker that died and was not started again - so they come
+/// back. Returns how many workers were started.
+#[must_use]
+pub fn recover_journals(directory: &Path) -> usize {
+    let mut started = 0;
+    for (key, journal) in registry::journals(directory) {
+        if connect(directory, &key).is_some() || !journal.project_root.is_dir() {
+            continue;
+        }
+        if spawn_worker(directory, &key, &journal.store_dir, &journal.project_root).is_ok() {
+            started += 1;
+        }
+    }
+    started
+}
+
 /// Start `ha worker` for a project, apart from this terminal: closing the
 /// terminal must not end it.
 fn spawn_worker(
@@ -124,6 +296,12 @@ fn spawn_worker(
     store_dir: &Path,
     project_root: &Path,
 ) -> Result<(), String> {
+    if !can_start_worker() {
+        return Err(
+            "no background worker runs for this project, and one is started from a terminal only"
+                .to_owned(),
+        );
+    }
     std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     // Appended to: two terminals may start a worker at once, and the one that
@@ -399,7 +577,14 @@ impl RemoteFrontend {
                     Effect::Exit(0),
                 ]
             }
-            Ok(Reply::Attached { .. } | Reply::Ok { .. } | Reply::Error { .. }) => Vec::new(),
+            Ok(
+                Reply::Attached { .. }
+                | Reply::Ok { .. }
+                | Reply::Error { .. }
+                | Reply::Output { .. }
+                | Reply::Exited { .. }
+                | Reply::Failed { .. },
+            ) => Vec::new(),
             Err(reason) => self.lost(&reason),
         }
     }
@@ -539,17 +724,30 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
-                let mut line = String::new();
-                let _ = reader.read_line(&mut line);
                 let mut writer = stream;
-                let _ = writer.write_all(b"{\"type\":\"ok\",\"value\":{}}\n");
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
+                    // One agent with a terminal attached: the worker is busy.
+                    let reply = if line.contains("\"op\":\"list\"") {
+                        serde_json::json!({"type": "ok", "value": [{
+                            "id": "a1", "name": null, "status": "ready", "busy": false,
+                            "scheduled": false, "attached": true, "project_root": ".",
+                            "model": "m", "conversation": null, "last_request": null,
+                            "idle_seconds": 0, "worker_pid": 1
+                        }]})
+                    } else {
+                        serde_json::json!({"type": "ok", "value": {}})
+                    };
+                    let _ = writer.write_all(format!("{reply}\n").as_bytes());
+                    line.clear();
+                }
             }
         });
         port
     }
 
     #[test]
-    fn a_worker_of_another_build_is_not_used() {
+    fn a_busy_worker_of_another_build_is_left_alone() {
         let directory = tempfile::tempdir().expect("temp dir");
         let store = directory.path().join("store");
         let key = registry::project_key(&store);
@@ -568,7 +766,10 @@ mod tests {
         let refused = ensure(directory.path(), &store, directory.path())
             .err()
             .expect("another build is refused");
-        assert!(refused.contains("another build of ha"), "{refused}");
+        assert!(
+            refused.contains("another build of ha") && refused.contains("working"),
+            "{refused}"
+        );
         descriptor.build = registry::build_identity();
         registry::write(directory.path(), &key, &descriptor).expect("written");
         assert!(ensure(directory.path(), &store, directory.path()).is_ok());

@@ -84,6 +84,81 @@ pub fn log_path(directory: &Path, key: &str) -> PathBuf {
     directory.join(format!("{key}.log"))
 }
 
+/// prime-agent's worker recovery journal: the agents a worker runs, kept so
+/// a worker that crashed - or was replaced by a new build - starts them
+/// again, on the same ids and conversations.
+#[must_use]
+pub fn journal_path(directory: &Path, key: &str) -> PathBuf {
+    directory.join(format!("{key}.journal"))
+}
+
+/// One agent in the journal. The environment it was started with is not
+/// here: credentials are never written.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct JournalAgent {
+    pub id: String,
+    pub name: Option<String>,
+    pub conversation: Option<String>,
+}
+
+/// A worker's journal.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Journal {
+    pub schema_version: u16,
+    pub store_dir: PathBuf,
+    pub project_root: PathBuf,
+    pub agents: Vec<JournalAgent>,
+}
+
+/// Keep the journal, or remove it when there is no agent to keep.
+///
+/// # Errors
+/// The file cannot be written.
+pub fn write_journal(directory: &Path, key: &str, journal: &Journal) -> std::io::Result<()> {
+    let path = journal_path(directory, key);
+    if journal.agents.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+    }
+    std::fs::create_dir_all(directory)?;
+    let text = serde_json::to_string_pretty(journal).map_err(std::io::Error::other)?;
+    let staged = path.with_extension("journal.staged");
+    std::fs::write(&staged, text)?;
+    restrict_to_owner(&staged)?;
+    std::fs::rename(&staged, &path)
+}
+
+/// The journal a worker left, if any.
+#[must_use]
+pub fn read_journal(directory: &Path, key: &str) -> Option<Journal> {
+    let text = std::fs::read_to_string(journal_path(directory, key)).ok()?;
+    serde_json::from_str::<Journal>(&text)
+        .ok()
+        .filter(|journal| journal.schema_version == SCHEMA_VERSION)
+}
+
+/// Every journal in the directory, with its project key: the projects whose
+/// agents are waiting for a worker.
+#[must_use]
+pub fn journals(directory: &Path) -> Vec<(String, Journal)> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("journal") {
+                return None;
+            }
+            let key = path.file_stem()?.to_str()?.to_owned();
+            read_journal(directory, &key).map(|journal| (key, journal))
+        })
+        .collect()
+}
+
 /// Write the descriptor through a staged copy, for its owner only.
 ///
 /// # Errors
@@ -273,6 +348,33 @@ fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
 #[allow(clippy::unnecessary_wraps, reason = "the Unix version can fail")]
 const fn restrict_to_owner(_path: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::{Journal, JournalAgent, SCHEMA_VERSION, journals, read_journal, write_journal};
+
+    #[test]
+    fn a_journal_keeps_the_agents_and_goes_when_they_do() {
+        let directory = tempfile::tempdir().expect("temp");
+        let mut journal = Journal {
+            schema_version: SCHEMA_VERSION,
+            store_dir: directory.path().join("store"),
+            project_root: directory.path().join("project"),
+            agents: vec![JournalAgent {
+                id: "ab12cd34".to_owned(),
+                name: Some("api".to_owned()),
+                conversation: Some("session_x".to_owned()),
+            }],
+        };
+        write_journal(directory.path(), "k1", &journal).expect("written");
+        assert_eq!(read_journal(directory.path(), "k1"), Some(journal.clone()));
+        assert_eq!(journals(directory.path()).len(), 1);
+        journal.agents.clear();
+        write_journal(directory.path(), "k1", &journal).expect("removed");
+        assert_eq!(read_journal(directory.path(), "k1"), None);
+        assert!(journals(directory.path()).is_empty());
+    }
 }
 
 #[cfg(test)]
