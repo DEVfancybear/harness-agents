@@ -8,6 +8,6 @@ ha --version
 ha            # open the app, then /login to pick a provider
 ```
 
-Windows 10/11 x64 only for now; Linux is not supported yet. The executable comes from the `harness-agents-win32-x64` package, which npm installs as an optional dependency, so do not install with `--omit=optional`.
+Windows 10/11 x64 only for now; Linux is not supported yet. The package carries `ha.exe`, the pinned `uv.exe` its Python kernel uses, `ha.release.json` (version, rustc, source revision and the executable's digest) and `checksums.txt`.
 
 Documentation, source and releases: https://github.com/DEVfancybear/harness-agents

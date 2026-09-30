@@ -10,19 +10,22 @@
   "homepage": "https://github.com/DEVfancybear/harness-agents#readme",
   "bugs": "https://github.com/DEVfancybear/harness-agents/issues",
   "keywords": ["coding-agent", "ai-agent", "llm", "cli", "tui", "deepseek", "mcp", "rust"],
+  "os": ["win32"],
+  "cpu": ["x64"],
   "bin": {
     "ha": "bin/ha.js"
   },
   "files": [
     "bin/ha.js",
+    "ha.exe",
+    "uv.exe",
+    "ha.release.json",
+    "checksums.txt",
     "README.md",
     "LICENSE"
   ],
   "engines": {
     "node": ">=18"
-  },
-  "optionalDependencies": {
-    "harness-agents-win32-x64": "0.1.0"
   },
   "publishConfig": {
     "access": "public"
