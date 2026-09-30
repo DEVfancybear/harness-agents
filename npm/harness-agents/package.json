@@ -1,0 +1,30 @@
+{
+  "name": "harness-agents",
+  "version": "0.1.0",
+  "description": "ha - a local coding agent in Rust: terminal app, approval-gated tools, persistent memory in SQLite, resumable sessions.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DEVfancybear/harness-agents.git"
+  },
+  "homepage": "https://github.com/DEVfancybear/harness-agents#readme",
+  "bugs": "https://github.com/DEVfancybear/harness-agents/issues",
+  "keywords": ["coding-agent", "ai-agent", "llm", "cli", "tui", "deepseek", "mcp", "rust"],
+  "bin": {
+    "ha": "bin/ha.js"
+  },
+  "files": [
+    "bin/ha.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "harness-agents-win32-x64": "0.1.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

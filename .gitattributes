@@ -6,3 +6,6 @@ schemas/*.json text eol=lf
 *.tar.gz binary
 *.tgz binary
 *.zip binary
+
+# The npm launcher starts with a shebang, so it keeps LF on every checkout.
+npm/harness-agents/bin/ha.js text eol=lf

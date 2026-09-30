@@ -89,6 +89,20 @@ Options: `-Profile Debug` for a quick local candidate, `-OutputDirectory <dir>`,
 
 Nothing publishes automatically: there is no registry and no release job. `-PublishDryRun` prints the tag (`ha-v<version>`) and the exact `git tag`, `git push` and `gh release create` commands, and whether `gh` or `GH_TOKEN` is available. Run those yourself after the gates are green, and upload `checksums.txt` next to the archive.
 
+### 7. Publish to npm
+
+`ha` is installed with `npm install -g harness-agents` (Windows x64 only). Two packages carry it: `harness-agents-win32-x64` holds `ha.exe`, `uv.exe` and the release manifest, and `harness-agents` is the `ha` launcher that finds it (it is an optional dependency, so `--omit=optional` breaks the install). Both are built from the release bundle, never from a fresh build, so npm ships the bytes the GitHub release checksums cover.
+
+```powershell
+pwsh -NoProfile -File scripts/New-HaRelease.ps1      # the bundle
+pwsh -NoProfile -File scripts/New-HaNpmPackages.ps1  # checks the bundle's checksums, writes target\npm\*.tgz
+npm login
+npm publish target\npm\harness-agents-win32-x64-<version>.tgz --access public   # this one first
+npm publish target\npm\harness-agents-<version>.tgz --access public
+```
+
+The script prints the exact commands. Both packages take the bundle's version; the sources are in [`npm/`](../npm/harness-agents/package.json).
+
 ## Tiếng Việt
 
 ### 1. Cần có
@@ -175,3 +189,17 @@ Tùy chọn: `-Profile Debug` cho bản thử nhanh, `-OutputDirectory <dir>`, `
 ### 6. Phát hành
 
 Không có gì tự động phát hành: không có registry, không có job release. `-PublishDryRun` in ra tag (`ha-v<version>`), đúng các lệnh `git tag`, `git push`, `gh release create`, và cho biết `gh` hoặc `GH_TOKEN` có sẵn không. Tự chạy các lệnh đó sau khi các gate xanh, và tải `checksums.txt` lên cạnh file zip.
+
+### 7. Phát hành lên npm
+
+`ha` được cài bằng `npm install -g harness-agents` (chỉ Windows x64). Hai package cùng mang nó: `harness-agents-win32-x64` chứa `ha.exe`, `uv.exe` và manifest của bản release, còn `harness-agents` là launcher `ha` tìm package đó (nó là optional dependency, nên `--omit=optional` làm hỏng bản cài). Cả hai được đóng từ bundle release chứ không build lại, để npm phát đúng các byte mà checksum của GitHub release bao phủ.
+
+```powershell
+pwsh -NoProfile -File scripts/New-HaRelease.ps1      # bundle
+pwsh -NoProfile -File scripts/New-HaNpmPackages.ps1  # kiểm checksum của bundle, ghi target\npm\*.tgz
+npm login
+npm publish target\npm\harness-agents-win32-x64-<version>.tgz --access public   # gói này trước
+npm publish target\npm\harness-agents-<version>.tgz --access public
+```
+
+Script in đúng các lệnh này. Hai package lấy version của bundle; mã nguồn nằm ở [`npm/`](../npm/harness-agents/package.json).

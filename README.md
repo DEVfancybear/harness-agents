@@ -27,6 +27,15 @@
 | Linux | **Pending support.** It builds and its CI job runs for visibility, but it is not a supported platform yet and does not block CI |
 | macOS | Not tested |
 
+### Install from npm
+
+```powershell
+npm install -g harness-agents
+ha --version
+```
+
+This installs the Windows x64 release build and puts `ha` on your PATH. To build from source instead, follow the quick start below.
+
 ### Quick start (Windows, PowerShell 7)
 
 Prerequisites: [Rust](https://rustup.rs) (the toolchain in [`rust-toolchain.toml`](rust-toolchain.toml) is installed automatically), Git, and PowerShell 7 (`pwsh`).
@@ -124,6 +133,15 @@ CI (`.github/workflows/ci.yml`) runs the phase gates (`scripts/Verify-Phase.ps1`
 | Windows 10/11 x64 | Hỗ trợ; mọi gate CI chạy trên Windows |
 | Linux | **Đang chờ hỗ trợ.** Vẫn build được và job CI vẫn chạy để theo dõi, nhưng chưa phải nền tảng được hỗ trợ và không chặn CI |
 | macOS | Chưa kiểm thử |
+
+### Cài từ npm
+
+```powershell
+npm install -g harness-agents
+ha --version
+```
+
+Lệnh này cài bản release Windows x64 và đưa `ha` vào PATH. Muốn build từ mã nguồn thì làm theo phần bắt đầu nhanh bên dưới.
 
 ### Bắt đầu nhanh (Windows, PowerShell 7)
 
