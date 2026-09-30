@@ -79,8 +79,9 @@ $package | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $packageJson -Enco
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 Push-Location $packageStage
 try {
-    $packed = & npm pack --pack-destination $OutputDirectory --json 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "npm pack failed: $packed" }
+    # npm prints warnings on stderr; only stdout is the JSON.
+    $packed = & npm pack --pack-destination $OutputDirectory --json
+    if ($LASTEXITCODE -ne 0) { throw 'npm pack failed' }
     $tarball = Join-Path $OutputDirectory (($packed | ConvertFrom-Json)[0].filename)
 } finally {
     Pop-Location
