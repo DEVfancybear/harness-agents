@@ -136,6 +136,131 @@ pub fn remove_if_owned(directory: &Path, key: &str, pid: u32) {
     }
 }
 
+/// Whether a process id is still alive.
+///
+/// Used only to decide whether a worker descriptor is stale. It is deliberately
+/// conservative: an unknown answer is treated as "alive", because removing the
+/// descriptor of a running worker would leave its agents unreachable.
+#[must_use]
+pub fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // This process is necessarily alive, even when the host policy prevents
+    // querying the process table (as it does in some Windows sandboxes).
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // `tasklist` is the portable check on Windows. A missing tool, access
+        // denial, failed command, or unrecognized output is unknown and must
+        // answer "alive": a descriptor removed on an unknown result could be
+        // a live worker's.
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output();
+        output
+            .ok()
+            .and_then(|output| {
+                tasklist_pid_status(
+                    pid,
+                    output.status.success(),
+                    &String::from_utf8_lossy(&output.stdout),
+                    &String::from_utf8_lossy(&output.stderr),
+                )
+            })
+            .unwrap_or(true)
+    }
+    #[cfg(unix)]
+    {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+#[cfg(windows)]
+fn tasklist_pid_status(pid: u32, success: bool, stdout: &str, stderr: &str) -> Option<bool> {
+    if !success || !stderr.trim().is_empty() {
+        return None;
+    }
+    for line in stdout.lines() {
+        // CSV rows start with the image name and then the PID. Compare the
+        // complete second field, not a substring that could confuse PID 12
+        // with PID 123.
+        if let Some((_, rest)) = line
+            .trim()
+            .strip_prefix('"')
+            .and_then(|line| line.split_once("\",\""))
+            && let Some((reported_pid, _)) = rest.split_once("\",\"")
+            && reported_pid.parse::<u32>().ok() == Some(pid)
+        {
+            return Some(true);
+        }
+    }
+    let lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    (!lines.is_empty()
+        && lines
+            .iter()
+            .all(|line| line.to_ascii_uppercase().starts_with("INFO:")))
+    .then_some(false)
+}
+
+#[cfg(all(test, windows))]
+mod process_probe_tests {
+    use super::tasklist_pid_status;
+
+    #[test]
+    fn exact_csv_pid_is_alive_and_nonmatching_substrings_are_not_matches() {
+        assert_eq!(
+            tasklist_pid_status(
+                123,
+                true,
+                "\"ha.exe\",\"123\",\"Console\",\"1\",\"10,000 K\"",
+                ""
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            tasklist_pid_status(
+                12,
+                true,
+                "\"ha.exe\",\"123\",\"Console\",\"1\",\"10,000 K\"",
+                ""
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_no_match_is_dead_and_unknown_results_stay_unknown() {
+        assert_eq!(
+            tasklist_pid_status(
+                123,
+                true,
+                "INFO: No tasks are running which match the specified criteria.",
+                ""
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            tasklist_pid_status(123, true, "ERROR: Access denied", ""),
+            None
+        );
+        assert_eq!(tasklist_pid_status(123, true, "", "access denied"), None);
+        assert_eq!(tasklist_pid_status(123, true, "", ""), None);
+        assert_eq!(tasklist_pid_status(123, false, "", ""), None);
+    }
+}
+
 #[cfg(unix)]
 fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;

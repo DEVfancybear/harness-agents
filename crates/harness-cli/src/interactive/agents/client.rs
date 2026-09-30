@@ -77,7 +77,7 @@ pub fn connect(directory: &Path, key: &str) -> Option<(Descriptor, Connection)> 
     if let Ok(connection) = Connection::open(&descriptor) {
         return Some((descriptor, connection));
     }
-    if !harness_cli::daemon::process_is_alive(descriptor.pid) {
+    if !super::registry::process_is_alive(descriptor.pid) {
         registry::remove_if_owned(directory, key, descriptor.pid);
     }
     None

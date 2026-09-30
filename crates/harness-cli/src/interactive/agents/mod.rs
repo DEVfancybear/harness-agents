@@ -302,7 +302,7 @@ pub fn shutdown_command(force: bool, json: bool) -> Result<ExitCode, HarnessErro
             && connection.call(&protocol::Request::Shutdown).is_ok()
         {
             stopped += 1;
-        } else if force && harness_cli::daemon::process_is_alive(descriptor.pid) {
+        } else if force && registry::process_is_alive(descriptor.pid) {
             // An unresponsive worker: the descriptor goes, and the worker
             // stops when it next finds it gone.
             registry::remove_if_owned(&registry, &key, descriptor.pid);

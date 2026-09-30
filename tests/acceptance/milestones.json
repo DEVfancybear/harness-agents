@@ -842,97 +842,6 @@
       }
     },
     {
-      "id": "M11",
-      "title": "Daemon, schedules và external tasks",
-      "runbook": "docs/implementation/README.vi.md",
-      "prerequisites": ["M9"],
-      "status": "in_progress",
-      "integration_target": "milestone_m11",
-      "work_items": [
-        {
-          "id": "M11-01",
-          "title": "Daemon host và IPC",
-          "status": "implemented_unverified",
-          "tests": ["m11_01_daemon_ownership_and_control", "m11_01_a_stale_endpoint_is_cleaned_up"]
-        },
-        {
-          "id": "M11-02",
-          "title": "Durable schedules/occurrences",
-          "status": "implemented_unverified",
-          "tests": ["a34_schedule_occurrences", "m11_02_a_once_schedule_fires_once"]
-        },
-        {
-          "id": "M11-03",
-          "title": "External task driver và polling",
-          "status": "implemented_unverified",
-          "tests": [
-            "a35_external_task_ambiguity",
-            "m11_03_the_tasks_declaration_is_load_bearing",
-            "m11_03_the_daemon_polls_external_work_on_its_own_tick"
-          ]
-        },
-        {
-          "id": "M11-04",
-          "title": "Non-interactive policy và notifications",
-          "status": "implemented_unverified",
-          "tests": [
-            "m11_04_a_scheduled_launch_without_a_human_waits",
-            "m11_04_the_outbox_is_durable_and_sends_nothing_without_a_connector"
-          ]
-        }
-      ],
-      "required_tests": [
-        "a34_schedule_occurrences",
-        "milestone_m11_daemon::m11_01_daemon_ownership_and_control",
-        "milestone_m11_daemon::m11_01_a_stale_endpoint_is_cleaned_up",
-        "milestone_m11_external::a35_external_task_ambiguity",
-        "milestone_m11_external::m11_03_the_tasks_declaration_is_load_bearing",
-        "milestone_m11_policy::m11_04_a_scheduled_launch_without_a_human_waits"
-      ],
-      "unit_tests": [],
-      "fixtures": [
-        "crates/harness-cli/tests/milestone_m11.rs",
-        "crates/harness-cli/tests/milestone_m11_daemon.rs",
-        "crates/harness-cli/tests/milestone_m11_external.rs",
-        "crates/harness-cli/tests/milestone_m11_policy.rs",
-        "crates/harness-cli/src/bin/m11_fixture_task_server.rs",
-        "crates/harness-cli/src/daemon/delivery.rs",
-        "crates/harness-cli/src/daemon/external.rs",
-        "crates/harness-cli/src/daemon/host.rs",
-        "crates/harness-cli/src/daemon/policy.rs",
-        "crates/harness-cli/src/daemon/schedule.rs",
-        "crates/harness-extensions/src/tasks.rs",
-        "crates/harness-store-sqlite/src/store/approvals.rs",
-        "crates/harness-store-sqlite/src/store/external_jobs.rs",
-        "crates/harness-store-sqlite/src/store/notifications.rs",
-        "docs/ARCHITECTURE_REVIEW.vi.md",
-        "docs/implementation/README.vi.md"
-      ],
-      "gate": {
-        "script": "scripts/Verify-Milestone.ps1",
-        "dependency_check_bin": "dependency_check",
-        "steps": [
-          "format",
-          "clippy",
-          "build",
-          "workspace-tests",
-          "dependency-allowlist",
-          "required-test-discovery",
-          "required-tests",
-          "closure-M9",
-          "closure-M8",
-          "closure-M7",
-          "closure-M6",
-          "closure-M5",
-          "closure-M4",
-          "closure-M3",
-          "closure-M1",
-          "closure-M2",
-          "closure-M0"
-        ]
-      }
-    },
-    {
       "id": "M12",
       "title": "Strict execution backend",
       "runbook": "docs/implementation/README.vi.md",
@@ -1319,17 +1228,17 @@
       "id": "A34",
       "owner_milestones": ["M11"],
       "planned_test": "a34_schedule_occurrences",
-      "status": "implemented",
-      "selectors": ["milestone_m11::a34_schedule_occurrences"],
-      "note": "the occurrence key is (schedule, revision, nominal due) and carries no wall-clock stamp, so two hosts agree on it and a re-claim cannot look new; a spring-forward gap skips the occurrence rather than moving it; a fall-back repeat fires once, which needed the cron walk to advance on the local clock because a UTC step lands on the same local minute again; the misfire backlog is bounded at one occurrence with the skipped count reported; a manual trigger is its own occurrence and leaves the next due where the evaluator put it; a pause bumps the revision and a stale claim is refused; a claimed-but-unlaunched occurrence is canceled on restart rather than relaunched; and a schedule never carries auto-approval"
+      "status": "retired",
+      "selectors": null,
+      "note": "retired; the M11 schedule, external-task and notification daemon was removed. Interactive schedules are /schedule (a conversation's jobs file), and background work runs in the agent workers (OPERATOR_GUIDE 12.7)."
     },
     {
       "id": "A35",
       "owner_milestones": ["M11"],
       "planned_test": "a35_external_task_ambiguity",
-      "status": "implemented",
-      "selectors": ["milestone_m11_external::a35_external_task_ambiguity"],
-      "note": "a real MCP server process declaring the SEP-2663 tasks extension is asked to start work and dies before answering: the host records the request digest before sending, marks the submission ambiguous, refuses to send it again (idempotency_conflict, and the fixture is called exactly once), and only an explicit reconciliation with the handle the remote persisted resumes polling to one settlement and one delivery; a terminal result observed twice is delivered once; a restarted host resumes polling from the durable handle without resubmitting; a cancel acknowledged while the work was already finishing settles as completed, not cancelled, because a cancel is a request and never a rollback; a remote that never finishes runs out of deadline, records unresolved: true with its last observation, and stops polling after a bounded number of asks; and a client that does not declare the extension is refused a task handle even though the remote created one, which is why every post-send failure is ambiguous"
+      "status": "retired",
+      "selectors": null,
+      "note": "retired; the M11 schedule, external-task and notification daemon was removed. Interactive schedules are /schedule (a conversation's jobs file), and background work runs in the agent workers (OPERATOR_GUIDE 12.7)."
     },
     {
       "id": "A36",

@@ -310,15 +310,6 @@ pub enum ToolState {
     },
 }
 
-impl ToolState {
-    /// Whether the card has settled.
-    #[allow(dead_code, reason = "T04 decides whether a card is updated in place")]
-    #[must_use]
-    pub const fn is_settled(&self) -> bool {
-        !matches!(self, Self::Started)
-    }
-}
-
 /// One entry of the conversation history.
 ///
 /// The controller emits these instead of pre-rendered strings, so the TUI can

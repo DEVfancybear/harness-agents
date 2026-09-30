@@ -1,6 +1,6 @@
 # ADR-N11 — Schedule occurrences, clock semantics và daemon ownership
 
-**Trạng thái:** accepted trong M11 · **Ngày:** 23/09/2026 · **Phạm vi:** M11-01..M11-04
+**Trạng thái:** superseded (30/09/2026) — daemon M11 (`crates/harness-cli/src/daemon`, bảng schedule/occurrence/external job/notification) đã bị gỡ; lịch chạy là `/schedule` của hội thoại và việc nền chạy trong worker của agent ([OPERATOR_GUIDE 12.7](../OPERATOR_GUIDE.vi.md#127-agent-chạy-nền)). Các bảng SQLite cũ vẫn được migration tạo để store đã có không bị hỏng. · **Ngày:** 23/09/2026 · **Phạm vi:** M11-01..M11-04
 
 [Implementation handbook](../implementation/README.vi.md) · [Architecture review](../ARCHITECTURE_REVIEW.vi.md) · [ADR-N10](ADR-N10-WEB-STACK-AND-IDENTITY.vi.md)
 

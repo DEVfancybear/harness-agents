@@ -30,16 +30,12 @@ use crate::{
     ToolTaskUpdateCommit, WriterOpenOptions,
 };
 
-pub mod approvals;
 pub mod backend_leases;
 pub mod delegation;
-pub mod external_jobs;
 pub mod history;
 mod maintenance;
-pub mod notifications;
 pub mod port;
 pub mod run;
-pub mod schedules;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
