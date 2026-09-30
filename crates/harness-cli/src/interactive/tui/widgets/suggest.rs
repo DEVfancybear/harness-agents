@@ -40,21 +40,31 @@ pub fn rows(state: &UiState, theme: &Theme) -> Vec<Line<'static>> {
     for index in start..end {
         let item = &state.suggestions[index];
         let selected = index == state.suggestion_selected;
-        let style = if selected { theme.selection } else { theme.dim };
+        // The highlighted row is the only one on a background; the others are told
+        // apart by colour - a skill in its own, a command in the accent - so the
+        // list reads as a list of names, not as a wall of dim text.
+        let name_style = if selected {
+            theme.selection
+        } else if item.label.starts_with("/skill:") {
+            super::super::icons::ToolKind::Skill.style(theme)
+        } else {
+            theme.accent
+        };
+        let text_style = if selected { theme.selection } else { theme.dim };
         let marker = if selected { "❯ " } else { "  " };
-        // The menu is indented like the conversation it interrupts, and drawn on
-        // the panel background so it reads as a list floating over the transcript
-        // rather than as another line of it.
         let mut spans = vec![
-            Span::styled("  ".to_owned(), theme.panel),
-            Span::styled(marker.to_owned(), style),
-            Span::styled(format!("{:<column$}", item.label), style),
-            Span::styled(item.description.clone(), style),
+            Span::raw("  "),
+            Span::styled(
+                marker.to_owned(),
+                if selected { theme.selection } else { theme.dim },
+            ),
+            Span::styled(format!("{:<column$}", item.label), name_style),
+            Span::styled(item.description.clone(), text_style),
         ];
         if let Some(tag) = &item.tag {
             spans.push(Span::styled(format!(" ({tag})"), theme.dim));
         }
-        lines.push(Line::from(spans).style(theme.panel));
+        lines.push(Line::from(spans));
     }
     lines
 }

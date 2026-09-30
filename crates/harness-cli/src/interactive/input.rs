@@ -64,6 +64,7 @@ impl Picker {
 pub struct Overlay {
     pub title: String,
     pub lines: Vec<String>,
+    pub rich: Option<Vec<super::events::RefLine>>,
     scroll: usize,
 }
 
@@ -279,6 +280,17 @@ impl LineEditor {
         self.overlay = Some(Overlay {
             title: title.to_owned(),
             lines,
+            rich: None,
+            scroll: 0,
+        });
+    }
+
+    /// Open a panel of structured rows; its plain text is kept beside them.
+    pub fn open_rich_overlay(&mut self, title: &str, rows: Vec<super::events::RefLine>) {
+        self.overlay = Some(Overlay {
+            title: title.to_owned(),
+            lines: rows.iter().map(super::events::RefLine::plain).collect(),
+            rich: Some(rows),
             scroll: 0,
         });
     }

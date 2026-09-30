@@ -76,14 +76,15 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
                         "complete the URL action, then enter done · decline · cancel".to_owned(),
                     );
                 }
-                help::render(frame, area, "MCP input", &lines, 0, theme);
+                help::render(frame, area, "MCP input", &lines, None, 0, theme);
             }
             Some(crate::interactive::events::Modal::Overlay {
                 title,
                 lines,
+                rich,
                 scroll,
             }) => {
-                help::render(frame, area, title, lines, *scroll, theme);
+                help::render(frame, area, title, lines, rich.as_deref(), *scroll, theme);
             }
             None => {}
         }

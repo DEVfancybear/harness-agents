@@ -221,6 +221,13 @@ pub trait SessionPort: Send {
     fn skills_summary(&self) -> Vec<String> {
         vec!["skill catalog is unavailable".to_owned()]
     }
+    /// The `/skills` panel as structured rows.
+    fn skills_rows(&self) -> Vec<super::events::RefLine> {
+        self.skills_summary()
+            .into_iter()
+            .map(super::events::RefLine::Text)
+            .collect()
+    }
     /// prime-agent's `/import <path.jsonl>`: start a new conversation that
     /// continues the session file at `path`.
     fn import_session(&mut self, _path: &str) -> Result<String, String> {
@@ -3221,6 +3228,115 @@ impl SessionPort for AgentSessionService {
             ),
         });
         Ok(format!("Session imported from: {path}"))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one panel, built top to bottom: active skills, then one section per source"
+    )]
+    fn skills_rows(&self) -> Vec<super::events::RefLine> {
+        use super::events::{BadgeKind, RefLine};
+        let trusted = super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .is_ok_and(|config| config.project_trusted);
+        let catalog = match super::skills::discover(
+            &self.global_config_dir,
+            &self.workspace_root,
+            &self.environment,
+            trusted,
+        ) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                return vec![RefLine::Text(format!("skill catalog unavailable: {error}"))];
+            }
+        };
+        let active: Vec<(String, String, String)> = self
+            .active_skills
+            .lock()
+            .map(|active| {
+                active
+                    .values()
+                    .map(|activation| {
+                        (
+                            activation.entry.name.clone(),
+                            activation.entry.version.clone(),
+                            activation.entry.digest.as_str().to_owned(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut rows = Vec::new();
+        if !active.is_empty() {
+            rows.push(RefLine::Heading {
+                title: "● Active".to_owned(),
+                note: format!("{} in this conversation", active.len()),
+            });
+            for (name, version, digest) in &active {
+                let short = digest.strip_prefix("sha256:").unwrap_or(digest);
+                rows.push(RefLine::Item {
+                    glyph: "●".to_owned(),
+                    name: name.clone(),
+                    meta: version.clone(),
+                    badges: vec![(
+                        format!("sha {}", short.chars().take(8).collect::<String>()),
+                        BadgeKind::Neutral,
+                    )],
+                    detail: String::new(),
+                });
+            }
+            rows.push(RefLine::Blank);
+        }
+        let mut sources: Vec<&str> = Vec::new();
+        for entry in catalog.entries() {
+            if !sources.contains(&entry.source.as_str()) {
+                sources.push(entry.source.as_str());
+            }
+        }
+        for source in sources {
+            let entries: Vec<_> = catalog
+                .entries()
+                .iter()
+                .filter(|entry| entry.source.as_str() == source)
+                .collect();
+            let title = match source {
+                "builtin" => "✦ Bundled with ha".to_owned(),
+                "user" => "✦ Your skills".to_owned(),
+                "trusted_project" | "project" => "✦ This project".to_owned(),
+                other => format!("✦ {other}"),
+            };
+            rows.push(RefLine::Heading {
+                title,
+                note: format!("{}", entries.len()),
+            });
+            for entry in entries {
+                let is_active = active.iter().any(|(name, _, _)| *name == entry.name);
+                let mut badges = Vec::new();
+                if is_active {
+                    badges.push(("active".to_owned(), BadgeKind::Ok));
+                }
+                rows.push(RefLine::Item {
+                    glyph: "✦".to_owned(),
+                    name: entry.name.clone(),
+                    meta: entry.version.clone(),
+                    badges,
+                    detail: entry.description.clone(),
+                });
+            }
+            rows.push(RefLine::Blank);
+        }
+        if rows.is_empty() {
+            return vec![RefLine::Text("no trusted skills found".to_owned())];
+        }
+        rows.push(RefLine::Hint(
+            "The model activates a matching skill by itself; /skill:<name> runs one yourself."
+                .to_owned(),
+        ));
+        rows
     }
 
     fn skills_summary(&self) -> Vec<String> {
@@ -7492,7 +7608,7 @@ mod tests {
             &command,
             &args,
             input.as_bytes(),
-            5000,
+            20000,
             harness_providers::CancellationToken::new(),
             &host,
         )

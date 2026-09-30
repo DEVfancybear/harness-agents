@@ -43,6 +43,27 @@ mod palette {
     pub const CHIP_BG: u32 = 0x1c_22_2e;
     /// The rule that closes a turn, and the one under the banner.
     pub const RULE: u32 = 0x23_29_36;
+    /// One colour per family of tool, chosen to stay apart from each other and
+    /// from the status colours: a call is recognised by its colour before its words.
+    pub const KIND_READ: u32 = 0x60_a5_fa;
+    pub const KIND_LIST: u32 = 0x2d_d4_bf;
+    pub const KIND_SEARCH: u32 = 0xfb_bf_24;
+    pub const KIND_EDIT: u32 = 0xfb_92_3c;
+    pub const KIND_WRITE: u32 = 0xf4_72_b6;
+    pub const KIND_SHELL: u32 = 0xe8_79_f9;
+    pub const KIND_GIT: u32 = 0xa3_e6_35;
+    pub const KIND_WEB: u32 = 0x38_bd_f8;
+    pub const KIND_AGENT: u32 = 0xa7_8b_fa;
+    pub const KIND_PYTHON: u32 = 0xfd_e0_47;
+    pub const KIND_MCP: u32 = 0xfd_a4_af;
+    pub const KIND_SKILL: u32 = 0xc4_b5_fd;
+    pub const KIND_ASK: u32 = 0xfc_d3_4d;
+    /// The background behind a badge, one tint per meaning.
+    pub const BADGE_OK_BG: u32 = 0x14_3d_24;
+    pub const BADGE_ACCENT_BG: u32 = 0x2b_24_5c;
+    pub const BADGE_WARN_BG: u32 = 0x45_35_0f;
+    pub const BADGE_ERROR_BG: u32 = 0x4a_1d_22;
+    pub const BADGE_INFO_BG: u32 = 0x0c_33_46;
 }
 
 /// prime-agent's `syntax*` tokens: how highlighted code is coloured.
@@ -195,6 +216,20 @@ pub struct Theme {
     pub chip: Style,
     /// A quieter rule than `border`: the one that closes a turn.
     pub rule: Style,
+    /// The colour of each family of tool ([`super::icons::ToolKind`]), by index.
+    pub kinds: [Style; super::icons::ToolKind::COUNT],
+    /// A short label on a green tint: active, done.
+    pub badge_ok: Style,
+    /// A short label on an indigo tint: where something comes from.
+    pub badge_accent: Style,
+    /// A short label on an amber tint: something to watch.
+    pub badge_warn: Style,
+    /// A short label on a red tint: something that failed.
+    pub badge_error: Style,
+    /// A short label on a blue tint: the operator, and plain information.
+    pub badge_info: Style,
+    /// Bold body text: names and headings inside a panel.
+    pub strong: Style,
 }
 
 impl Theme {
@@ -259,6 +294,38 @@ impl Theme {
             rail_assistant: fg(palette::ASSISTANT_RAIL),
             chip: fg(palette::FG).bg(color(palette::CHIP_BG, depth)),
             rule: fg(palette::RULE),
+            kinds: [
+                fg(palette::KIND_READ),
+                fg(palette::KIND_LIST),
+                fg(palette::KIND_SEARCH),
+                fg(palette::KIND_EDIT),
+                fg(palette::KIND_WRITE),
+                fg(palette::KIND_SHELL),
+                fg(palette::KIND_GIT),
+                fg(palette::KIND_WEB),
+                fg(palette::KIND_AGENT),
+                fg(palette::KIND_PYTHON),
+                fg(palette::KIND_MCP),
+                fg(palette::KIND_SKILL),
+                fg(palette::KIND_ASK),
+                fg(palette::MUTED),
+            ],
+            badge_ok: fg(palette::SUCCESS)
+                .bg(color(palette::BADGE_OK_BG, depth))
+                .add_modifier(Modifier::BOLD),
+            badge_accent: fg(palette::PRIMARY_SOFT)
+                .bg(color(palette::BADGE_ACCENT_BG, depth))
+                .add_modifier(Modifier::BOLD),
+            badge_warn: fg(palette::WARNING)
+                .bg(color(palette::BADGE_WARN_BG, depth))
+                .add_modifier(Modifier::BOLD),
+            badge_error: fg(palette::ERROR)
+                .bg(color(palette::BADGE_ERROR_BG, depth))
+                .add_modifier(Modifier::BOLD),
+            badge_info: fg(palette::INFO)
+                .bg(color(palette::BADGE_INFO_BG, depth))
+                .add_modifier(Modifier::BOLD),
+            strong: fg(palette::FG).add_modifier(Modifier::BOLD),
         }
     }
 
@@ -334,6 +401,13 @@ impl Theme {
             rail_assistant: none,
             chip: none,
             rule: none,
+            kinds: [none; super::icons::ToolKind::COUNT],
+            badge_ok: Style::new().add_modifier(Modifier::BOLD),
+            badge_accent: Style::new().add_modifier(Modifier::BOLD),
+            badge_warn: Style::new().add_modifier(Modifier::BOLD),
+            badge_error: Style::new().add_modifier(Modifier::BOLD),
+            badge_info: Style::new().add_modifier(Modifier::BOLD),
+            strong: Style::new().add_modifier(Modifier::BOLD),
         }
     }
 
@@ -366,18 +440,6 @@ impl Theme {
     pub const fn spinner(tick: u64) -> &'static str {
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         // The modulo bounds the value to the frame count, so the cast is exact.
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "bounded by the frame count"
-        )]
-        let index = (tick % FRAMES.len() as u64) as usize;
-        FRAMES[index]
-    }
-
-    /// prime-agent's running marker (`working-icon.ts`): a diamond that pulses.
-    #[must_use]
-    pub const fn working(tick: u64) -> &'static str {
-        const FRAMES: [&str; 4] = ["◇", "◈", "◆", "◈"];
         #[allow(
             clippy::cast_possible_truncation,
             reason = "bounded by the frame count"

@@ -748,7 +748,7 @@ fn t06_pty_approval_y_key() {
         "approval granted fixture-approval-1",
         Duration::from_secs(30),
     );
-    wait_for_normalized(&session, "fixture_action · done", Duration::from_secs(30));
+    wait_for_normalized(&session, "Fixture action", Duration::from_secs(30));
     session.wait_for(" tool call", Duration::from_secs(30));
     session.send("/exit\r");
     assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
@@ -876,7 +876,7 @@ fn h05_pty_approval_denial_is_fail_closed() {
     session.send("n\r");
     let denied = wait_for_normalized(&session, "approval denied", Duration::from_secs(30));
     assert!(
-        denied.contains("apply_patch · ") || denied.contains(" tool call"),
+        denied.contains("Apply patch") || denied.contains(" tool call"),
         "the real host reports the denied tool result:\n{denied}"
     );
     session.wait_for(" tool call", Duration::from_secs(30));
@@ -1095,7 +1095,7 @@ fn i14_the_installed_artifact_opens_the_app_in_a_real_terminal() {
         "the prompt is Vietnamese: {text}"
     );
     assert!(
-        text.contains(&format!("Project: {}", project.display())),
+        text.contains(&format!("⌂ {}", project.display())),
         "the header names the caller project: {text}"
     );
     // The compact header leaves storage diagnostics in /config. Jump to the
@@ -2125,12 +2125,7 @@ fn g4_a_step_bound_continues_the_turn_by_itself() {
     // answer a panel that is no longer there.
     wait_for_occurrences(&session, "[approval] ListFiles", 1, Duration::from_secs(40));
     session.send("y\r");
-    wait_for_occurrences(
-        &session,
-        "list_files · done · path=.",
-        1,
-        Duration::from_secs(40),
-    );
+    wait_for_occurrences(&session, "▥ List files", 1, Duration::from_secs(40));
 
     let continued = wait_for_normalized(
         &session,
@@ -2142,19 +2137,16 @@ fn g4_a_step_bound_continues_the_turn_by_itself() {
         "the app says why it spoke:\n{continued}"
     );
     assert!(
-        continued.contains("paused: step limit reached · 2 steps · 1 tool call ·"),
+        continued.contains("paused: step limit reached")
+            && continued.contains("⟳ 2 steps")
+            && continued.contains("⚙ 1 tool call"),
         "the pause is still on the record before the continuation:\n{continued}"
     );
 
     // The continuation runs, and this time the budget is spent: the pause stands.
     wait_for_occurrences(&session, "[approval] ListFiles", 2, Duration::from_secs(40));
     session.send("y\r");
-    wait_for_occurrences(
-        &session,
-        "list_files · done · path=.",
-        2,
-        Duration::from_secs(40),
-    );
+    wait_for_occurrences(&session, "▥ List files", 2, Duration::from_secs(40));
     let paused = wait_for_occurrences(
         &session,
         "paused: step limit reached",

@@ -25,6 +25,10 @@ const TOOL_OUTPUT_PREVIEW_LINES: usize = 3;
 /// The plain renderer keeps its own transcript format ([`view::plain_lines`]); this
 /// is only how the TUI shows the same items.
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per kind of history item, each short"
+)]
 pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> Vec<Line<'static>> {
     match item {
         HistoryItem::Banner { lines } => banner_rows(lines, width, theme),
@@ -45,24 +49,54 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
                 syntax: super::theme::SyntaxStyles::uniform(theme.dim),
                 ..*theme
             };
-            padded(markdown::render(text, width.saturating_sub(2), &dim))
+            let mut rows = vec![
+                Line::default(),
+                Line::from(vec![
+                    Span::styled("  ✧ ", theme.refinement),
+                    Span::styled("suy nghĩ", theme.refinement.add_modifier(Modifier::ITALIC)),
+                ]),
+            ];
+            rows.extend(
+                markdown::render(text, width.saturating_sub(RAIL_CELLS), &dim)
+                    .into_iter()
+                    .map(|line| {
+                        let mut spans = vec![Span::styled("  ┆ ", theme.dim)];
+                        spans.extend(line.spans);
+                        Line::from(spans).style(line.style)
+                    }),
+            );
+            rows
         }
         // prime-agent's ctrl+o changes how much of a call's output is shown, not
         // how the call looks: the card is the same in every mode.
         HistoryItem::Tool {
             name,
             summary,
-            input: _,
+            input,
             state,
         } => {
-            let mut rows = vec![Line::default(), tool_card(name, summary, state, theme)];
+            let mut rows = vec![
+                Line::default(),
+                tool_card(name, summary, state, width, theme),
+            ];
             if let ToolState::Failed { detail, .. } = state
                 && !detail.trim().is_empty()
             {
-                rows.extend(panel_rows(
-                    &format!("  {detail}"),
+                rows.extend(railed_body(
+                    vec![vec![Span::styled(detail.clone(), theme.error)]],
                     width,
                     theme.error,
+                    theme,
+                ));
+            }
+            // Expanded mode opens a call: what it was asked to do, then (in the
+            // output row that follows) what it returned.
+            if detail == Detail::Expanded && !input.trim().is_empty() {
+                rows.extend(labeled_body(
+                    "input",
+                    input_lines(input, theme),
+                    width,
+                    rail_style(name, theme),
                     theme,
                 ));
             }
@@ -121,13 +155,7 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
 }
 
 fn assistant_message(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-    let mut rows = vec![
-        Line::default(),
-        Line::from(Span::styled(
-            format!("{RAIL}HA"),
-            theme.rail_assistant.add_modifier(Modifier::BOLD),
-        )),
-    ];
+    let mut rows = vec![Line::default()];
     rows.extend(assistant_rows(text, width, theme));
     rows
 }
@@ -160,10 +188,24 @@ fn output_rows(
         Detail::Details => is_edit_tool(name),
         Detail::Expanded => true,
     };
-    if whole {
-        whole_output_rows(text, path, width, theme)
+    let rail = rail_style(name, theme);
+    if detail == Detail::Expanded {
+        let body = text
+            .split_once('\n')
+            .filter(|(first, _)| first.trim_end().ends_with(':'))
+            .map_or(text, |(_, body)| body)
+            .trim_end();
+        labeled_body(
+            "output",
+            styled_lines(body, path, theme.muted, theme),
+            width,
+            rail,
+            theme,
+        )
+    } else if whole {
+        whole_output_rows(text, path, width, theme, rail)
     } else {
-        tool_output_rows(text, path, width, theme, TOOL_OUTPUT_PREVIEW_LINES)
+        tool_output_rows(text, path, width, theme, TOOL_OUTPUT_PREVIEW_LINES, rail)
     }
 }
 
@@ -193,16 +235,6 @@ fn counted(count: u64, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
-fn padded(rows: Vec<Line<'static>>) -> Vec<Line<'static>> {
-    rows.into_iter()
-        .map(|line| {
-            let mut spans = vec![Span::raw(" ")];
-            spans.extend(line.spans);
-            Line::from(spans).style(line.style)
-        })
-        .collect()
-}
-
 /// The operator's own turn: a rail with the label on it, then the text on the
 /// message card.
 ///
@@ -211,13 +243,7 @@ fn padded(rows: Vec<Line<'static>>) -> Vec<Line<'static>> {
 /// separates what the operator asked for from what the agent answered.
 fn user_box(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let inner = width.saturating_sub(RAIL_CELLS).max(1);
-    let mut rows = vec![
-        Line::default(),
-        Line::from(Span::styled(
-            format!("{RAIL}BẠN"),
-            theme.rail_user.add_modifier(Modifier::BOLD),
-        )),
-    ];
+    let mut rows = vec![Line::default()];
     for line in text.split('\n') {
         for row in wrap_spans(vec![Span::styled(line.to_owned(), theme.user)], inner) {
             let mut spans = vec![Span::styled(RAIL, theme.rail_user)];
@@ -312,7 +338,10 @@ fn injected_prompt(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> 
 fn error_rows(message: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let mut rows = vec![Line::default()];
     rows.extend(margined(
-        vec![Span::styled(format!("⚠ Error: {message}"), theme.error)],
+        vec![
+            Span::styled(" ✗ ERROR ", theme.badge_error),
+            Span::styled(format!("  {message}"), theme.error),
+        ],
         width,
     ));
     rows
@@ -339,13 +368,17 @@ fn notice_rows(message: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
         || lowered.contains("could not")
         || lowered.contains("skipped")
     {
-        vec![Span::styled(format!("⚠ {message}"), theme.warning)]
+        vec![
+            Span::styled("⚠ ", theme.warning),
+            Span::styled(message.to_owned(), theme.warning),
+        ]
     } else {
         // A notice can span lines (a sign-in shows its URL on a line of its own),
         // and a URL is drawn as a link so it stands out from the text around it.
         return message
             .lines()
-            .flat_map(|line| {
+            .enumerate()
+            .flat_map(|(index, line)| {
                 let spans = line
                     .split_inclusive(' ')
                     .map(|word| {
@@ -359,7 +392,13 @@ fn notice_rows(message: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
                         }
                     })
                     .collect::<Vec<_>>();
-                margined(spans, width)
+                let mut with_icon = vec![if index == 0 {
+                    Span::styled("ℹ ", theme.info)
+                } else {
+                    Span::raw("  ")
+                }];
+                with_icon.extend(spans);
+                margined(with_icon, width)
             })
             .collect();
     };
@@ -399,12 +438,93 @@ fn refinement_rows(
     rows
 }
 
-/// Rows on the tool panel background, padded to the full width.
-fn panel_rows(text: &str, width: u16, style: Style, theme: &Theme) -> Vec<Line<'static>> {
-    wrap_spans(vec![Span::styled(text.to_owned(), style)], width)
-        .into_iter()
-        .map(|line| line.style(theme.panel))
+/// The rail down a card's body: its family's colour, dimmed, so a body reads as
+/// belonging to its header without competing with it.
+fn rail_style(name: &str, theme: &Theme) -> Style {
+    super::icons::ToolKind::of(name)
+        .style(theme)
+        .add_modifier(Modifier::DIM)
+}
+
+/// Lines of a card's body hung from its rail: every row but the last after `│`, the
+/// last after `╰─`, so the body visibly ends where the card does.
+fn railed_body(
+    lines: Vec<Vec<Span<'static>>>,
+    width: u16,
+    rail: Style,
+    _theme: &Theme,
+) -> Vec<Line<'static>> {
+    let room = usize::from(width)
+        .saturating_sub(super::card::RAIL_CELLS + 1)
+        .max(1);
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    for spans in lines {
+        for row in wrap_words(spans, room, 0) {
+            rows.push(row.spans);
+        }
+    }
+    let last = rows.len().saturating_sub(1);
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, spans)| {
+            let prefix = if index == last {
+                super::card::RAIL_END
+            } else {
+                super::card::RAIL
+            };
+            let mut all = vec![Span::styled(prefix, rail)];
+            all.extend(spans);
+            Line::from(all)
+        })
         .collect()
+}
+
+/// A body with a small label as its first row: `⌥ input`, `⌥ output`.
+fn labeled_body(
+    label: &str,
+    mut lines: Vec<Vec<Span<'static>>>,
+    width: u16,
+    rail: Style,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    lines.insert(
+        0,
+        vec![Span::styled(
+            format!("⌥ {label}"),
+            theme.dim.add_modifier(Modifier::ITALIC),
+        )],
+    );
+    railed_body(lines, width, rail, theme)
+}
+
+/// A call's input, one `key: value` row per argument when it is a JSON object, and
+/// as it came otherwise. A multi-line value (a patch, a script) keeps its lines.
+fn input_lines(input: &str, theme: &Theme) -> Vec<Vec<Span<'static>>> {
+    let key = theme.md_heading;
+    let value = theme.muted;
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(input)
+    else {
+        return input
+            .lines()
+            .map(|line| vec![Span::styled(line.to_owned(), value)])
+            .collect();
+    };
+    let mut rows = Vec::new();
+    for (name, field) in fields {
+        let text = match field {
+            serde_json::Value::String(text) => text,
+            other => other.to_string(),
+        };
+        let mut parts = text.lines();
+        rows.push(vec![
+            Span::styled(format!("{name}: "), key),
+            Span::styled(parts.next().unwrap_or_default().to_owned(), value),
+        ]);
+        for more in parts {
+            rows.push(vec![Span::raw("  "), Span::styled(more.to_owned(), value)]);
+        }
+    }
+    rows
 }
 
 /// What a tool returned, all of it, under its card: prime-agent's expanded tool
@@ -415,6 +535,7 @@ fn whole_output_rows(
     path: Option<&str>,
     width: u16,
     theme: &Theme,
+    rail: Style,
 ) -> Vec<Line<'static>> {
     // As in the preview, the first line repeats the call (`read_file src/a.rs:`).
     let body = text
@@ -422,19 +543,15 @@ fn whole_output_rows(
         .filter(|(first, _)| first.trim_end().ends_with(':'))
         .map_or(text, |(_, body)| body)
         .trim_end();
-    let limit = usize::from(width.saturating_sub(4)).max(1);
-    let mut rows = Vec::new();
-    for line in styled_lines(body, path, theme.muted, theme) {
-        for row in wrap_words(line, limit, 0) {
-            let mut spans = vec![Span::raw("  ")];
-            spans.extend(row.spans);
-            rows.push(Line::from(spans).style(theme.panel));
-        }
-    }
-    rows
+    railed_body(
+        styled_lines(body, path, theme.muted, theme),
+        width,
+        rail,
+        theme,
+    )
 }
 
-/// The collapsed body of a tool panel: the first lines of what the tool returned,
+/// The collapsed body of a tool card: the first lines of what the tool returned,
 /// then `… N more lines` - prime-agent's collapsed tool output.
 fn tool_output_rows(
     text: &str,
@@ -442,6 +559,7 @@ fn tool_output_rows(
     width: u16,
     theme: &Theme,
     shown: usize,
+    rail: Style,
 ) -> Vec<Line<'static>> {
     // The first line repeats the tool's name (`read_file src/a.rs:`), which the
     // header says.
@@ -464,27 +582,21 @@ fn tool_output_rows(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let mut rows = Vec::new();
-    for line in styled_lines(&head, path, theme.muted, theme)
+    let room = usize::from(width).saturating_sub(super::card::RAIL_CELLS + 1);
+    let mut lines: Vec<Vec<Span<'static>>> = styled_lines(&head, path, theme.muted, theme)
         .into_iter()
         .filter(|spans| spans.iter().any(|span| !span.content.trim().is_empty()))
         .take(shown)
-    {
-        let mut spans = vec![Span::raw("  ")];
-        spans.extend(clip_spans(line, usize::from(width.saturating_sub(4))));
-        rows.push(Line::from(spans).style(theme.panel));
-    }
+        .map(|line| clip_spans(line, room))
+        .collect();
     let more = total.saturating_sub(shown);
     if more > 0 {
-        rows.push(
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled(format!("… {more} more lines"), theme.dim),
-            ])
-            .style(theme.panel),
-        );
+        lines.push(vec![Span::styled(
+            format!("… {more} more lines"),
+            theme.dim,
+        )]);
     }
-    rows
+    railed_body(lines, width, rail, theme)
 }
 
 /// The language code in `path` is written in, when the theme has colours to
@@ -812,6 +924,7 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
     rows.push(tail_row(
         vec![
             Span::styled(RAIL, theme.accent),
+            Span::styled("✦ ", theme.accent),
             Span::styled(format!("ha / {name}"), theme.title),
         ],
         version.map_or_else(
@@ -825,21 +938,27 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
         let permissions = lines
             .iter()
             .find_map(|line| line.strip_prefix("Permissions: "));
-        let label =
-            permissions.map_or_else(|| model.to_owned(), |mode| format!("{model} · {mode}"));
-        rows.extend(wrap_spans(
-            vec![
-                Span::styled(RAIL, theme.accent),
-                Span::styled(label, theme.muted),
-            ],
-            width,
-        ));
+        let mut spans = vec![
+            Span::styled(RAIL, theme.accent),
+            Span::styled(format!(" ◆ {model} "), theme.badge_accent),
+        ];
+        if let Some(mode) = permissions {
+            let style = if mode.contains("full-auto") {
+                theme.badge_warn
+            } else {
+                theme.badge_ok
+            };
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(format!(" ⚙ {mode} "), style));
+        }
+        rows.extend(wrap_spans(spans, width));
     }
     if let Some(project) = project {
         rows.extend(wrap_spans(
             vec![
                 Span::styled(RAIL, theme.accent),
-                Span::styled(format!("Project: {project}"), theme.dim),
+                Span::styled("⌂ ", theme.dim),
+                Span::styled(project.to_owned(), theme.dim),
             ],
             width,
         ));
@@ -865,7 +984,10 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
             .any(|prefix| line.starts_with(prefix))
     }) {
         rows.extend(wrap_spans(
-            vec![Span::styled(format!("  {line}"), theme.warning)],
+            vec![
+                Span::styled("  ⚠ ", theme.warning),
+                Span::styled(line.clone(), theme.warning),
+            ],
             width,
         ));
     }
@@ -880,62 +1002,34 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
 /// followed by the arguments and the duration in dim. The Python REPL gets
 /// prime-agent's ipython-cell summary: `✓ python · <code> · <duration>`.
 #[must_use]
-pub fn tool_card(name: &str, summary: &str, state: &ToolState, theme: &Theme) -> Line<'static> {
-    running_card(name, summary, state, 1, theme)
+pub fn tool_card(
+    name: &str,
+    summary: &str,
+    state: &ToolState,
+    width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    running_card(name, summary, state, 1, width, theme)
 }
 
-/// [`tool_card`] at animation frame `tick`: a running tool's diamond pulses, as
-/// prime-agent's working icon does.
+/// [`tool_card`] at animation frame `tick`: a running tool's spinner turns.
 #[must_use]
 pub fn running_card(
     name: &str,
     summary: &str,
     state: &ToolState,
     tick: u64,
+    width: u16,
     theme: &Theme,
 ) -> Line<'static> {
-    let (marker, status, style, duration) = match state {
-        ToolState::Started => (Theme::working(tick), "running", theme.bash, None),
-        ToolState::Ok { elapsed } => (
-            "✓",
-            "done",
-            theme.tool_ok,
-            Some(view::seconds_label(*elapsed)),
-        ),
-        ToolState::Failed { elapsed, .. } => (
-            "✗",
-            "error",
-            theme.tool_failed,
-            Some(view::seconds_label(*elapsed)),
-        ),
+    let outcome = match state {
+        ToolState::Started => super::card::Outcome::Running(Theme::spinner(tick)),
+        ToolState::Ok { elapsed } => super::card::Outcome::Done(view::seconds_label(*elapsed)),
+        ToolState::Failed { elapsed, .. } => {
+            super::card::Outcome::Failed(view::seconds_label(*elapsed))
+        }
     };
-    let separator = || Span::styled(" · ", theme.dim);
-    // The card and the output under it share the panel background, so a call and
-    // what it returned read as one block instead of two unrelated rows.
-    let mut spans = vec![Span::styled("  ", theme.panel)];
-    if name == "ipython" {
-        let code = summary.strip_prefix("code=").unwrap_or(summary);
-        spans.push(Span::styled(format!("{marker} "), style));
-        spans.push(Span::styled("python", theme.muted));
-        if !code.is_empty() {
-            spans.push(separator());
-            spans.push(Span::styled(code.to_owned(), theme.dim));
-        }
-    } else {
-        spans.push(Span::styled(format!("{marker} "), style));
-        spans.push(Span::styled(name.to_owned(), theme.muted));
-        spans.push(separator());
-        spans.push(Span::styled(status, style));
-        if !summary.is_empty() {
-            spans.push(separator());
-            spans.push(Span::styled(summary.to_owned(), theme.dim));
-        }
-    }
-    if let Some(duration) = duration {
-        spans.push(separator());
-        spans.push(Span::styled(duration, theme.dim));
-    }
-    Line::from(spans).style(theme.panel)
+    super::card::header(name, summary, &outcome, width, theme)
 }
 
 /// The end-of-turn line: a rule that closes the turn, the outcome, and the
@@ -953,20 +1047,20 @@ fn run_rows(
     width: u16,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
-    let style = match outcome {
-        RunOutcome::Done => theme.dim,
+    let (glyph, badge) = match outcome {
+        RunOutcome::Done => ("✓", theme.badge_ok),
         RunOutcome::Canceled
         | RunOutcome::Paused(_)
         | RunOutcome::WaitingInput { .. }
-        | RunOutcome::ExternalWait => theme.warning,
-        RunOutcome::Blocked(_) | RunOutcome::Failed(_) => theme.error,
+        | RunOutcome::ExternalWait => ("◐", theme.badge_warn),
+        RunOutcome::Blocked(_) | RunOutcome::Failed(_) => ("✗", theme.badge_error),
     };
     let mut spans = vec![
-        Span::styled("  ─ ", theme.rule),
-        Span::styled(outcome.label(), style.add_modifier(Modifier::BOLD)),
+        Span::styled("  ", theme.rule),
+        Span::styled(format!(" {glyph} {} ", outcome.label()), badge),
         Span::styled(
             format!(
-                " · {} · {} · {} ",
+                "  ⟳ {}  ⚙ {}  ◷ {} ",
                 counted(u64::from(steps), "step", "steps"),
                 counted(u64::from(tool_calls), "tool call", "tool calls"),
                 view::seconds_label(elapsed)
@@ -1116,10 +1210,8 @@ mod tests {
             &theme,
             Detail::Collapsed,
         ));
-        assert!(
-            card.contains("read_file · done · path=a.rs · 12ms"),
-            "{card}"
-        );
+        assert!(card.contains("▤ Read file  a.rs"), "{card}");
+        assert!(card.trim_end().ends_with("✓ 12ms"), "{card}");
         let output = plain_text(&render(
             &HistoryItem::ToolOutput {
                 name: "read_file".to_owned(),
@@ -1130,7 +1222,7 @@ mod tests {
             &theme,
             Detail::Collapsed,
         ));
-        assert_eq!(output, "  one\n  two\n  three\n  … 2 more lines");
+        assert_eq!(output, "  │ one\n  │ two\n  │ three\n  ╰─ … 2 more lines");
         let error = plain_text(&render(
             &HistoryItem::Error {
                 message: "boom".to_owned(),
@@ -1139,7 +1231,10 @@ mod tests {
             &theme,
             Detail::Collapsed,
         ));
-        assert!(error.ends_with("⚠ Error: boom"), "{error}");
+        assert!(
+            error.contains("✗ ERROR") && error.trim_end().ends_with("boom"),
+            "{error}"
+        );
         assert!(
             render(
                 &HistoryItem::RunAccepted {
@@ -1164,7 +1259,7 @@ mod tests {
             &theme,
             Detail::Collapsed,
         ));
-        assert_eq!(user, "\n  ▎ BẠN\n  ▎ sửa lỗi\n");
+        assert_eq!(user, "\n  ▎ sửa lỗi\n");
         let answer = plain_text(&render(
             &HistoryItem::Assistant {
                 text: "Đã sửa.".into(),
@@ -1173,7 +1268,7 @@ mod tests {
             &theme,
             Detail::Collapsed,
         ));
-        assert!(answer.starts_with("\n  ▎ HA\n"), "{answer}");
+        assert!(answer.starts_with("\n  ▎ Đã sửa."), "{answer}");
         let tool = plain_text(&render(
             &HistoryItem::Tool {
                 name: "read_file".into(),
@@ -1187,10 +1282,8 @@ mod tests {
             &theme,
             Detail::Collapsed,
         ));
-        assert!(
-            tool.contains("  ✓ read_file · done · src/auth.rs · 12ms"),
-            "{tool}"
-        );
+        assert!(tool.contains("  ▤ Read file  src/auth.rs"), "{tool}");
+        assert!(tool.trim_end().ends_with("✓ 12ms"), "{tool}");
     }
 
     #[test]
@@ -1228,10 +1321,8 @@ mod tests {
             &Theme::plain(),
             Detail::Collapsed,
         ));
-        assert!(
-            text.contains("list_files · error · path= · 962ms"),
-            "{text}"
-        );
+        assert!(text.contains("▥ List files"), "{text}");
+        assert!(text.contains("✗ 962ms"), "{text}");
         assert!(
             text.contains("invalid_payload: optional tool path must not be blank"),
             "{text}"
@@ -1254,7 +1345,8 @@ mod tests {
             &Theme::plain(),
             Detail::Collapsed,
         ));
-        assert!(text.contains("✓ python · print(1) · 1.2s"), "{text}");
+        assert!(text.contains("λ Python  print(1)"), "{text}");
+        assert!(text.trim_end().ends_with("✓ 1.2s"), "{text}");
     }
 
     #[test]
@@ -1290,9 +1382,10 @@ mod tests {
             Detail::Collapsed,
         ));
         assert!(
-            row.starts_with("  ─ done · 3 steps · 2 tool calls · 14.2s"),
-            "the turn closes on a rule that names its outcome: {row}"
+            row.contains("✓ done") && row.contains("3 steps") && row.contains("2 tool calls"),
+            "the turn closes on a row that names its outcome: {row}"
         );
+        assert!(row.contains("14.2s") && row.contains('─'), "{row}");
     }
 
     /// A sign-in notice keeps its lines, and the URL is its own, underlined row.
@@ -1309,7 +1402,7 @@ mod tests {
         );
         assert_eq!(
             plain_text(&rows),
-            "  Sign in:\n  https://auth.example/authorize?x=1\n  Esc cancels."
+            "  ℹ Sign in:\n    https://auth.example/authorize?x=1\n    Esc cancels."
         );
         let link = rows[1]
             .spans
@@ -1336,15 +1429,16 @@ mod tests {
             path: None,
             text: "t:\n1\n2\n3\n4".to_owned(),
         };
-        let preview = "  1\n  2\n  3\n  … 1 more lines";
-        let whole = "  1\n  2\n  3\n  4";
+        let preview = "  │ 1\n  │ 2\n  │ 3\n  ╰─ … 1 more lines";
+        let whole = "  │ 1\n  │ 2\n  │ 3\n  ╰─ 4";
+        let opened = "  │ ⌥ output\n  │ 1\n  │ 2\n  │ 3\n  ╰─ 4";
         for (name, detail, expected) in [
             ("read_file", Detail::Collapsed, preview),
             ("read_file", Detail::Details, preview),
-            ("read_file", Detail::Expanded, whole),
+            ("read_file", Detail::Expanded, opened),
             ("edit_file", Detail::Collapsed, preview),
             ("edit_file", Detail::Details, whole),
-            ("edit_file", Detail::Expanded, whole),
+            ("edit_file", Detail::Expanded, opened),
         ] {
             assert_eq!(
                 plain_text(&render(&output(name), 80, &theme, detail)),
@@ -1372,11 +1466,22 @@ mod tests {
     fn a_call_is_the_same_card_in_every_mode() {
         for detail in [Detail::Collapsed, Detail::Details, Detail::Expanded] {
             let text = plain_text(&render(&shell_call(), 100, &Theme::plain(), detail));
-            assert_eq!(
-                text,
-                "\n  ✓ run_shell · done · command=cargo test --workspace --locked timeout_ms=60000 · 1.2s",
-                "{detail:?}"
+            assert!(
+                text.contains("\n  ❯ Run shell  cargo test --workspace --locked  timeout_ms=60000"),
+                "{detail:?}: {text}"
             );
+            // Only Expanded goes on to open the call: its input, under the card.
+            assert_eq!(
+                text.contains("⌥ input"),
+                detail == Detail::Expanded,
+                "{detail:?}: {text}"
+            );
+            if detail == Detail::Expanded {
+                assert!(text.contains("timeout_ms: 60000"), "{text}");
+                assert!(text.contains("--no-fail-fast"), "{text}");
+            } else {
+                assert!(text.trim_end().ends_with("✓ 1.2s"), "{detail:?}: {text}");
+            }
         }
     }
 
@@ -1397,8 +1502,14 @@ mod tests {
         ));
         let rows = text.lines().collect::<Vec<_>>();
         assert_eq!(
-            &rows[..4],
-            ["  fn a() {}", "  ", "  fn b() {}", "  fn c() {}"],
+            &rows[..5],
+            [
+                "  │ ⌥ output",
+                "  │ fn a() {}",
+                "  │ ",
+                "  │ fn b() {}",
+                "  │ fn c() {}"
+            ],
             "{text}"
         );
         assert!(rows.len() > 5, "the long line wraps: {text}");
@@ -1456,7 +1567,7 @@ diff --git a/src/lib.rs b/src/lib.rs
         );
         let text = plain_text(&rows);
         assert!(
-            text.contains("  +let x = \"two\";"),
+            text.contains("  │ +let x = \"two\";"),
             "text is unchanged: {text}"
         );
         let keyword = rows
@@ -1514,8 +1625,8 @@ diff --git a/src/lib.rs b/src/lib.rs
         );
         assert_eq!(
             plain_text(&collapsed),
-            "  1: def run():
-  2:     return 42"
+            "  │ 1: def run():
+  ╰─ 2:     return 42"
         );
         assert_eq!(span_with(&collapsed, "def").style, theme.syntax.keyword);
     }

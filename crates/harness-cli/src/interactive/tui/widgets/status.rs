@@ -126,7 +126,7 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
     let telemetry = |theme: &Theme| -> Vec<Vec<Span<'static>>> {
         let cost = cost_label(state).map(|cost| Span::styled(cost, theme.dim));
         let context =
-            context_label(state).map(|value| Span::styled(format!("ctx {value}"), theme.dim));
+            context_label(state).map(|value| Span::styled(format!("◔ ctx {value}"), theme.dim));
         let detail = (matches!(state.phase, AppPhase::Ready | AppPhase::WaitingInput)
             && state.modal.is_none())
         .then(|| Span::styled(state.detail.hint(), theme.dim));
@@ -219,7 +219,7 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
                 push(Span::styled(activity.to_owned(), theme.muted));
                 if let Some(started) = state.run_started_at {
                     push(Span::styled(
-                        format!(" · {}", view::clock_label(started.elapsed())),
+                        format!(" · ◷ {}", view::clock_label(started.elapsed())),
                         theme.muted,
                     ));
                 }
@@ -233,23 +233,23 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
             }
             if state.queued_input {
                 push(Span::styled(
-                    format!(" · queued ({})", state.queued_count.max(1)),
+                    format!(" · ⧗ queued ({})", state.queued_count.max(1)),
                     theme.accent,
                 ));
             }
             push(Span::styled(
                 if state.max_steps == crate::interactive::bounds::UNLIMITED {
-                    format!(" · step {}", state.steps)
+                    format!(" · ⟳ step {}", state.steps)
                 } else {
-                    format!(" · step {}/{}", state.steps, state.max_steps)
+                    format!(" · ⟳ step {}/{}", state.steps, state.max_steps)
                 },
                 theme.dim,
             ));
             push(Span::styled(
                 if state.max_tool_calls == crate::interactive::bounds::UNLIMITED {
-                    format!(" · tools {}", state.tool_calls)
+                    format!(" · ⚙ tools {}", state.tool_calls)
                 } else {
-                    format!(" · tools {}/{}", state.tool_calls, state.max_tool_calls)
+                    format!(" · ⚙ tools {}/{}", state.tool_calls, state.max_tool_calls)
                 },
                 theme.dim,
             ));
@@ -274,10 +274,11 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
             // will use; the detail mode and what the session has spent sit at the
             // right edge.
             if let Some(model) = short_model(state) {
+                push(Span::styled(" ◆ ", theme.accent));
                 push(Span::styled(model, theme.muted));
             }
             if let Some(level) = &state.thinking {
-                push(Span::styled(format!(" · thinking {level}"), theme.dim));
+                push(Span::styled(format!(" · ✧ thinking {level}"), theme.dim));
             }
             if let Some(tier) = &state.service_tier {
                 push(Span::styled(format!(" · {tier}"), theme.dim));

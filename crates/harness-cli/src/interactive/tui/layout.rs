@@ -229,7 +229,19 @@ fn modal_rows(modal: &Modal, available: u16) -> u16 {
                 .map_or(0, |schema| schema.lines().count());
             u16::try_from(message.lines().count() + schema_lines + 4).unwrap_or(u16::MAX)
         }
-        Modal::Overlay { lines, .. } => u16::try_from(lines.len() + 2).unwrap_or(u16::MAX),
+        Modal::Overlay { lines, rich, .. } => {
+            let rows = rich.as_ref().map_or(lines.len(), |rich| {
+                rich.iter()
+                    .map(|row| match row {
+                        crate::interactive::events::RefLine::Item { detail, .. } => {
+                            if detail.is_empty() { 1 } else { 2 }
+                        }
+                        _ => 1,
+                    })
+                    .sum()
+            });
+            u16::try_from(rows + 2).unwrap_or(u16::MAX)
+        }
     };
     content.min(available)
 }
@@ -501,6 +513,7 @@ mod tests {
         state.modal = Some(Modal::Overlay {
             title: "/help".to_owned(),
             lines: vec!["/help  list these commands".to_owned()],
+            rich: None,
             scroll: 0,
         });
         let outline = plan(Rect::new(0, 0, 80, 12), &state, &Theme::plain());

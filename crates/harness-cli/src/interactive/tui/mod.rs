@@ -12,8 +12,10 @@
 //! viewport needs a blank frame, otherwise rows an earlier frame painted stay on
 //! screen above the shell prompt.
 
+pub mod card;
 pub mod highlight;
 pub mod history;
+pub mod icons;
 pub mod layout;
 pub mod markdown;
 #[cfg(test)]
@@ -47,6 +49,9 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// The spinner and the elapsed clock need a repaint; an idle app needs none, and
 /// that is what acceptance U06 measures.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long after the last resize the screen is repainted once more.
+const RESIZE_SETTLE: Duration = Duration::from_millis(250);
 
 /// The status bar always takes exactly one row.
 pub const STATUS_ROWS: u16 = 1;
@@ -153,6 +158,11 @@ pub struct RealRenderer<B: Backend> {
     /// What was pushed into the scrollback, newest last, for a reprint.
     shown: std::collections::VecDeque<HistoryItem>,
     assistant_continuing: bool,
+    /// The console size the last paint was made for. A paint or an insert at any
+    /// other size first repaints the whole screen: a terminal that is being dragged
+    /// bigger or smaller re-wraps what it shows, and drawing only what changed on
+    /// top of that leaves the old frame behind and a second one a row away.
+    known: (u16, u16),
 }
 
 impl<B: Backend> RealRenderer<B>
@@ -196,6 +206,7 @@ where
             detail: super::events::Detail::default(),
             shown: std::collections::VecDeque::new(),
             assistant_continuing: false,
+            known: (size.width, size.height),
         })
     }
 
@@ -212,10 +223,13 @@ where
     fn repaint_screen(&mut self, detail: super::events::Detail) -> io::Result<()> {
         self.detail = detail;
         let size = self.terminal.size().map_err(to_io)?;
+        self.known = (size.width, size.height);
         self.terminal.set_cursor_position((0, 0)).map_err(to_io)?;
+        // The whole screen, not what follows the cursor: after a resize the
+        // cursor's own position is the least trustworthy thing the terminal reports.
         self.terminal
             .backend_mut()
-            .clear_region(ClearType::AfterCursor)
+            .clear_region(ClearType::All)
             .map_err(to_io)?;
         // The cursor is at the top of an erased screen, so the viewport is
         // placed there; the rows pushed below then move it down to the bottom.
@@ -243,6 +257,15 @@ where
         }
         let rows = blocks.into_iter().rev().flatten().collect::<Vec<_>>();
         self.insert_rows(&rows)
+    }
+
+    /// Repaint the screen first when the console changed size since the last paint.
+    fn resynced(&mut self) -> io::Result<()> {
+        let size = self.terminal.size().map_err(to_io)?;
+        if (size.width, size.height) != self.known {
+            self.repaint_screen(self.detail)?;
+        }
+        Ok(())
     }
 
     /// Take over a conversation another process drew (`ha attach`): keep its
@@ -300,6 +323,7 @@ where
     fn draw_state(&mut self, state: &UiState) -> io::Result<()> {
         let theme = self.theme;
         self.detail = state.detail;
+        self.resynced()?;
         self.terminal
             .draw(|frame| {
                 let plan = layout::plan(frame.area(), state, &theme);
@@ -318,6 +342,7 @@ where
 
     /// Render every entry, then insert all their rows in one go.
     fn insert_history_batch(&mut self, items: &[HistoryItem]) -> io::Result<()> {
+        self.resynced()?;
         let theme = self.theme;
         let width = self.columns();
         let mut rows = Vec::new();
@@ -684,6 +709,10 @@ fn run_loop_inner(
         .map_err(|error| terminal_error(&error))?;
 
     let mut last_tick = Instant::now();
+    // When the console was last resized. A terminal keeps re-wrapping for a moment
+    // after the size event, so once no further resize has come the screen is
+    // repainted one more time, at the size it settled on.
+    let mut resized_at: Option<Instant> = None;
     loop {
         let mut redraw = false;
         // Everything one step produced is gathered first and painted as one
@@ -702,11 +731,17 @@ fn run_loop_inner(
                 controller.set_columns(columns);
                 effects.push(Effect::Reprint(controller.ui_state().detail));
                 redraw = true;
+                resized_at = Some(Instant::now());
             } else {
                 let from_key = controller.handle_key(key);
                 redraw = !from_key.is_empty();
                 effects.extend(from_key);
             }
+        }
+        if resized_at.is_some_and(|at| at.elapsed() >= RESIZE_SETTLE) {
+            resized_at = None;
+            effects.push(Effect::Reprint(controller.ui_state().detail));
+            redraw = true;
         }
         // A key that exits must not wait for the session's events.
         let exiting = effects
@@ -952,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn redesign_stream_fragments_have_one_speaker_label() {
+    fn redesign_stream_fragments_have_no_speaker_label() {
         let backend = ScriptedBackend::new(Vec::new());
         let mut renderer = ScriptedRenderer::open(backend, 80, 24).unwrap();
         for i in 0..20 {
@@ -963,7 +998,7 @@ mod tests {
                 .unwrap();
         }
         let output = renderer.backend().output();
-        assert_eq!(output.matches("  ▎ HA\r\n").count(), 1, "{output}");
+        assert_eq!(output.matches("▎ HA").count(), 0, "{output}");
         assert!(output.contains("line 0") && output.contains("line 19"));
     }
 
@@ -1338,7 +1373,7 @@ mod tests {
             output.contains("fixture answer for: hi"),
             "the streamed answer reached the scrollback: {output}"
         );
-        assert!(output.contains("done · "), "{output}");
+        assert!(output.contains("✓ done"), "{output}");
         assert!(
             renderer.painted().join("\n").contains('>'),
             "the last frame keeps the composer marker"
@@ -1733,6 +1768,60 @@ mod tests {
             !joined.contains("row 150"),
             "only what fits on screen is drawn again:
 {joined}"
+        );
+    }
+
+    /// A terminal dragged to another size re-wraps what it shows. Whatever the
+    /// order its events arrive in, the next paint must notice the new size and
+    /// repaint the screen, not draw a frame over the re-wrapped old one: the user
+    /// saw two input boxes a row apart, at two widths, after dragging a window.
+    #[test]
+    fn a_paint_at_a_new_size_repaints_the_screen_by_itself() {
+        let theme = super::theme::Theme::plain();
+        let mut renderer =
+            super::RealRenderer::open_with(ratatui::backend::TestBackend::new(60, 20), &theme)
+                .expect("renderer opens");
+        let items = (0..200)
+            .map(|index| HistoryItem::Notice {
+                message: format!("row {index}"),
+            })
+            .collect::<Vec<_>>();
+        renderer
+            .insert_history_batch(&items)
+            .expect("history goes in");
+        let mut ready = state(AppPhase::Ready);
+        ready.live_text.clear();
+        renderer.draw_state(&ready).expect("frame draws");
+
+        // Taller and wider, with no resize event and no explicit repaint.
+        renderer.terminal.backend_mut().resize(100, 34);
+        renderer.draw_state(&ready).expect("frame draws");
+        let rows = screen(&renderer);
+        let joined = rows.join("\n");
+        assert_eq!(
+            joined.matches("sửa lỗi").count(),
+            1,
+            "one input box on screen:\n{joined}"
+        );
+
+        // Then narrower and shorter, and a history row arrives before the frame.
+        renderer.terminal.backend_mut().resize(50, 16);
+        renderer
+            .insert_history(&HistoryItem::Notice {
+                message: "row 200".to_owned(),
+            })
+            .expect("history goes in");
+        renderer.draw_state(&ready).expect("frame draws");
+        let rows = screen(&renderer);
+        let joined = rows.join("\n");
+        assert_eq!(
+            joined.matches("sửa lỗi").count(),
+            1,
+            "still one input box:\n{joined}"
+        );
+        assert!(
+            joined.contains("row 200"),
+            "the new row is shown:\n{joined}"
         );
     }
 }

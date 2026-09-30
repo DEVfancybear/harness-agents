@@ -297,6 +297,7 @@ pub fn render_live(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme
             summary,
             &crate::interactive::events::ToolState::Started,
             state.tick,
+            area.width,
             theme,
         ));
     }

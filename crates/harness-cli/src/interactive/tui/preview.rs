@@ -184,6 +184,8 @@ fn scenes() -> Vec<Scene> {
         expanded(),
         diff(),
         failure(),
+        skills(),
+        busy(),
     ]
 }
 
@@ -341,6 +343,156 @@ fn approval() -> Scene {
 }
 
 /// The slash-command menu, which belongs to the draft above the composer.
+/// The `/skills` panel: grouped, with glyphs, versions, badges and wrapped text.
+fn skills() -> Scene {
+    use crate::interactive::events::{BadgeKind, RefLine};
+    let item = |name: &str, meta: &str, active: bool, detail: &str| RefLine::Item {
+        glyph: "✦".to_owned(),
+        name: name.to_owned(),
+        meta: meta.to_owned(),
+        badges: if active {
+            vec![("active".to_owned(), BadgeKind::Ok)]
+        } else {
+            Vec::new()
+        },
+        detail: detail.to_owned(),
+    };
+    let rich = vec![
+        RefLine::Heading {
+            title: "● Active".to_owned(),
+            note: "2 in this conversation".to_owned(),
+        },
+        RefLine::Item {
+            glyph: "●".to_owned(),
+            name: "brainstorming".to_owned(),
+            meta: "6.4.1".to_owned(),
+            badges: vec![("sha 2eb74439".to_owned(), BadgeKind::Neutral)],
+            detail: String::new(),
+        },
+        RefLine::Blank,
+        RefLine::Heading {
+            title: "✦ Bundled with ha".to_owned(),
+            note: "4".to_owned(),
+        },
+        item(
+            "brainstorming",
+            "6.4.1",
+            true,
+            "You MUST use this before any creative work - creating features, building components, adding functionality, or modifying behavior. Explores user intent first.",
+        ),
+        item(
+            "websearch",
+            "e260085",
+            false,
+            "Search Google via the Serper API. Takes one query and returns titles, URLs, snippets and knowledge-graph data.",
+        ),
+        item(
+            "writing-plans",
+            "6.4.1",
+            false,
+            "Use when you have a spec or requirements for a multi-step task, before touching code",
+        ),
+        RefLine::Blank,
+        RefLine::Hint(
+            "The model activates a matching skill by itself; /skill:<name> runs one yourself."
+                .to_owned(),
+        ),
+    ];
+    let lines = rich.iter().map(RefLine::plain).collect();
+    let mut state = state(AppPhase::Ready);
+    state.modal = Some(Modal::Overlay {
+        title: "/skills".to_owned(),
+        lines,
+        rich: Some(rich),
+        scroll: 0,
+    });
+    Scene {
+        name: "09-skills",
+        items: vec![banner()],
+        state,
+    }
+}
+
+/// Several tool cards in a row, of every family: the case where cards ran together.
+fn busy() -> Scene {
+    let call = |name: &str, summary: &str, millis: u64| HistoryItem::Tool {
+        name: name.to_owned(),
+        summary: summary.to_owned(),
+        input: String::new(),
+        state: ToolState::Ok {
+            elapsed: Duration::from_millis(millis),
+        },
+    };
+    let out = |name: &str, path: Option<&str>, text: &str| HistoryItem::ToolOutput {
+        name: name.to_owned(),
+        path: path.map(str::to_owned),
+        text: text.to_owned(),
+    };
+    Scene {
+        name: "10-busy",
+        items: vec![
+            banner(),
+            HistoryItem::User {
+                text: "Rà soát dự án và sửa lỗi giỏ hàng".to_owned(),
+            },
+            call(
+                "read_file",
+                "limit=260 offset=130 path=docs/REVIEW-2026-09-28.md · allowed by mode full-auto",
+                206,
+            ),
+            out(
+                "read_file",
+                Some("docs/REVIEW-2026-09-28.md"),
+                "read_file docs/REVIEW-2026-09-28.md:
+131: |---|---|---|
+132: | P0 | **SEO**: `sitemap.ts` | Cao |
+133: | P0 | **Lưu đơn bền vững (SQLite)** | Cao |
+134: | P1 | Voucher | Trung bình |",
+            ),
+            call("git_status", "", 202),
+            out(
+                "git_status",
+                None,
+                "git_status:
+## master...origin/master [behind 3]
+ M .gitignore
+ M README.md
+ M src/app/page.tsx",
+            ),
+            call("list_files", "path=src", 199),
+            out(
+                "list_files",
+                None,
+                "list_files: src/app/api/categories/route.ts, src/app/api/orders/route.ts, src/app/api/products/route.ts",
+            ),
+            call(
+                "search_text",
+                "query=globalThis.__shopHaOrders path=src",
+                88,
+            ),
+            call("run_shell", "command=npm test timeout_ms=60000", 1400),
+            out(
+                "run_shell",
+                None,
+                "run_shell:
+> demo-shop@0.1.0 test
+> vitest run
+ Test Files  1 passed (1)
+      Tests  12 passed (12)",
+            ),
+            call("delegate", "role=explorer task=Map the order flow", 40),
+            call("web_search", "query=next.js sqlite orders", 610),
+            HistoryItem::Run {
+                outcome: RunOutcome::Done,
+                steps: 4,
+                tool_calls: 6,
+                elapsed: Duration::from_secs(21),
+            },
+        ],
+        state: state(AppPhase::Ready),
+    }
+}
+
 fn menu() -> Scene {
     let mut state = state(AppPhase::Ready);
     state.buffer = "/re".to_owned();

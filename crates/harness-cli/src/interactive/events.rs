@@ -444,9 +444,85 @@ pub enum Modal {
     /// the only place that knows how many rows fit.
     Overlay {
         title: String,
+        /// The panel as plain text: what the plain renderer prints and what tests read.
         lines: Vec<String>,
+        /// The same panel as structured rows, when the command has them; the TUI
+        /// draws these with headings, glyphs and badges instead of `lines`.
+        rich: Option<Vec<RefLine>>,
         scroll: usize,
     },
+}
+
+/// What a badge on a reference row means, which decides its colour.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum BadgeKind {
+    /// Good or active.
+    Ok,
+    /// Where something comes from, or which one it is.
+    Accent,
+    /// Something to watch.
+    Warn,
+    /// Plain information.
+    Neutral,
+}
+
+/// One row of a reference panel (`/skills`, ...), described by what it is so the
+/// renderer decides how it looks.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum RefLine {
+    /// A section title with a count or a note.
+    Heading { title: String, note: String },
+    /// One thing in a list: a glyph, a name, a version, badges, and a description
+    /// that wraps under it.
+    Item {
+        glyph: String,
+        name: String,
+        meta: String,
+        badges: Vec<(String, BadgeKind)>,
+        detail: String,
+    },
+    /// Running text.
+    Text(String),
+    /// A quiet line: a hint at the end of a panel.
+    Hint(String),
+    /// A gap.
+    Blank,
+}
+
+impl RefLine {
+    /// The row as one line of plain text.
+    #[must_use]
+    pub fn plain(&self) -> String {
+        match self {
+            Self::Heading { title, note } if note.is_empty() => title.clone(),
+            Self::Heading { title, note } => format!("{title} ({note})"),
+            Self::Item {
+                name,
+                meta,
+                badges,
+                detail,
+                ..
+            } => {
+                let mut line = name.clone();
+                if !meta.is_empty() {
+                    line.push('@');
+                    line.push_str(meta);
+                }
+                if !detail.is_empty() {
+                    line.push_str(" — ");
+                    line.push_str(detail);
+                }
+                for (badge, _) in badges {
+                    line.push_str(" [");
+                    line.push_str(badge);
+                    line.push(']');
+                }
+                line
+            }
+            Self::Text(text) | Self::Hint(text) => text.clone(),
+            Self::Blank => String::new(),
+        }
+    }
 }
 
 impl Modal {

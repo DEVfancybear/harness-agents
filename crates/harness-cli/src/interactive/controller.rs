@@ -597,6 +597,7 @@ impl InteractiveController {
         self.editor.overlay().map(|overlay| Modal::Overlay {
             title: overlay.title.clone(),
             lines: overlay.lines.clone(),
+            rich: overlay.rich.clone(),
             scroll: overlay.scroll(),
         })
     }
@@ -2963,7 +2964,8 @@ impl InteractiveController {
             // prime-agent's `/logs`.
             "/logs" => self.reference("Logs", self.service.logs(), &mut effects),
             "/skills" => {
-                self.reference("/skills", self.service.skills_summary(), &mut effects);
+                let rows = self.service.skills_rows();
+                self.reference_rows("/skills", rows, &mut effects);
             }
             "/reload" => {
                 if self.phase.has_active_run() {
@@ -3389,6 +3391,23 @@ impl InteractiveController {
 
     /// Deliver reference output: as an overlay in the TUI, as history in plain
     /// mode.
+    /// A reference panel of structured rows: the TUI draws them richly, the plain
+    /// renderer prints their text.
+    fn reference_rows(
+        &mut self,
+        title: &str,
+        rows: Vec<super::events::RefLine>,
+        effects: &mut Vec<Effect>,
+    ) {
+        if self.plain {
+            for row in &rows {
+                self.push_history(effects, HistoryItem::Message { text: row.plain() });
+            }
+            return;
+        }
+        self.editor.open_rich_overlay(title, rows);
+    }
+
     fn reference(&mut self, title: &str, lines: Vec<String>, effects: &mut Vec<Effect>) {
         if self.plain {
             for text in lines {
@@ -7104,9 +7123,15 @@ Command: \"npm run build\""
         // prime-agent's "all output": every line of what the call returned, under
         // the same one-line card - no boxes.
         let expanded = more(&mut harness.controller);
-        assert!(expanded.contains("  line 5"), "{expanded}");
-        assert!(expanded.contains("✓ run_shell · done"), "{expanded}");
-        assert!(!expanded.contains('│'), "{expanded}");
+        assert!(expanded.contains("line 5"), "{expanded}");
+        assert!(
+            expanded.contains("❯ Run shell") && expanded.contains("✓ 40ms"),
+            "{expanded}"
+        );
+        assert!(
+            !expanded.contains('┌') && !expanded.contains('╭'),
+            "{expanded}"
+        );
     }
 
     /// K04: `/more` reopens what the live viewport clipped, from its first line.
@@ -7136,6 +7161,7 @@ Command: \"npm run build\""
             title,
             lines,
             scroll,
+            ..
         }) = harness.controller.ui_state().modal
         else {
             panic!("the TUI opens a panel, not history: {effects:#?}");
