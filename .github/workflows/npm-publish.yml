@@ -58,14 +58,21 @@ jobs:
         shell: pwsh
         run: |
           if (-not $env:TAG) { throw 'no release tag' }
+          # A release without the bundle zip (a notes-only release) has nothing to pack.
+          $assets = gh release view $env:TAG --repo "${{ github.repository }}" --json assets --jq '.assets[].name'
+          if (-not ($assets | Where-Object { $_ -like 'ha-*-windows-x64.zip' })) {
+            Write-Host "::notice::release $env:TAG has no ha-*-windows-x64.zip, so there is nothing to publish to npm"
+            "SKIP=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            exit 0
+          }
           gh release download $env:TAG --repo "${{ github.repository }}" --pattern 'ha-*-windows-x64.zip' --dir "$env:RUNNER_TEMP/release"
           $zip = Get-ChildItem "$env:RUNNER_TEMP/release" -Filter 'ha-*-windows-x64.zip' | Select-Object -First 1
-          if (-not $zip) { throw "release $env:TAG has no ha-*-windows-x64.zip" }
           $bundle = Join-Path $env:RUNNER_TEMP ($zip.BaseName)
           Expand-Archive -LiteralPath $zip.FullName -DestinationPath $bundle
           "BUNDLE=$bundle" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Pack
+        if: env.SKIP != '1'
         shell: pwsh
         run: |
           $arguments = @{ BundleDirectory = $env:BUNDLE; OutputDirectory = "$env:RUNNER_TEMP/npm" }
@@ -73,7 +80,16 @@ jobs:
           ./scripts/New-HaNpmPackages.ps1 @arguments
 
       - name: Publish
+        if: env.SKIP != '1'
         shell: pwsh
         run: |
           $tarball = Get-ChildItem "$env:RUNNER_TEMP/npm" -Filter 'harness-agents-*.tgz' | Select-Object -First 1
+          $version = $tarball.BaseName -replace '^harness-agents-', ''
+          # npm never accepts a version twice, so a run for a version that is already
+          # there is a no-op rather than a failure.
+          $existing = npm view "harness-agents@$version" version 2>$null
+          if ($existing) {
+            Write-Host "::notice::harness-agents@$version is already on npm; nothing to publish"
+            exit 0
+          }
           npm publish $tarball.FullName --access public --provenance
