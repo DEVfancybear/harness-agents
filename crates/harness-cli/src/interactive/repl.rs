@@ -525,6 +525,8 @@ pub struct ReplShared {
     link: std::sync::Mutex<Option<Arc<Link>>>,
     /// The journals a crashed `ha` left were reaped once for this app session.
     reaped: AtomicBool,
+    /// The session's own kernel requests, answered between turns too.
+    session_host: std::sync::Mutex<Option<Arc<dyn HostRequests>>>,
 }
 
 #[derive(Default)]
@@ -557,7 +559,23 @@ impl ReplShared {
             snapshot_debounce: SNAPSHOT_DEBOUNCE,
             link: std::sync::Mutex::new(None),
             reaped: AtomicBool::new(false),
+            session_host: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Bind the session's own handlers ([`LinkState::session`]).
+    pub fn set_session_host(&self, host: Arc<dyn HostRequests>) {
+        *self
+            .session_host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(host);
+    }
+
+    fn session_host(&self) -> Option<Arc<dyn HostRequests>> {
+        self.session_host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The REPL as the environment configures it, or `None` when turned off.
@@ -705,38 +723,23 @@ impl ReplShared {
             self.set_link(None);
             previous.shutdown(true).await;
         }
-        let notice = if slot.kernel.is_none() {
-            self.start_kernel(&mut slot, &python, setup, target).await?
+        let (notice, mut setup_note) = if slot.kernel.is_none() {
+            self.start_kernel(&mut slot, &python, setup, target, harness)
+                .await?
         } else {
-            None
+            (None, None)
         };
         let kernel = slot.kernel.as_mut().expect("the kernel was just started");
         // Host requests - a cell's own and those of tasks it left running - are
         // answered by the latest turn's handlers.
         kernel.link.set_host(Arc::clone(&host));
+        kernel.link.set_session(self.session_host());
         // The conversation decides which local memory the kernel writes and which
         // skills it imports; a change is applied before the cell runs.
-        let mut setup_note = None;
         if let Some(context) = harness
             && kernel.harness.as_ref() != Some(context)
         {
-            let applied = kernel
-                .execute(&context.setup_code(), READY_TIMEOUT, false)
-                .await;
-            if let Ok((output, _)) = &applied {
-                kernel.harness = Some(context.clone());
-                let missing = unavailable_skills(output);
-                if !missing.is_empty() {
-                    setup_note = Some(format!(
-                        "[Python skills unavailable in this kernel: {}]",
-                        missing
-                            .iter()
-                            .map(|(name, error)| format!("{name} ({error})"))
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ));
-                }
-            }
+            setup_note = kernel.apply_harness(context).await;
         }
         let outcome = kernel.execute(code, timeout, true).await;
         let images = std::mem::take(&mut kernel.images);
@@ -770,13 +773,16 @@ impl ReplShared {
 
     /// Start the conversation's kernel into `slot`: spawned, its snapshot revived,
     /// the runtime bootstrapped. What comes back is what the model is told first.
+    /// Start a kernel: its runtime, then the conversation's memory and skills,
+    /// then the snapshot. Returns the start notice and the skills note.
     async fn start_kernel(
         &self,
         slot: &mut KernelSlot,
         python: &Path,
         setup: Option<String>,
         target: Option<SnapshotTarget>,
-    ) -> Result<Option<String>, HarnessError> {
+        harness: Option<&KernelContext>,
+    ) -> Result<(Option<String>, Option<String>), HarnessError> {
         let lost = std::mem::take(&mut slot.lost);
         let setup = (!lost && !std::mem::replace(&mut slot.announced, true))
             .then_some(setup)
@@ -795,16 +801,17 @@ impl ReplShared {
         )
         .await
         .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error))?;
-        let revival = kernel
-            .provision()
+        let (revival, skills) = kernel
+            .provision(harness)
             .await
             .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error))?;
         self.set_link(Some(Arc::clone(&kernel.link)));
         slot.kernel = Some(kernel);
-        Ok(match (setup, start_notice(lost, &revival)) {
+        let notice = match (setup, start_notice(lost, &revival)) {
             (Some(setup), Some(start)) => Some(format!("{setup}\n{start}")),
             (setup, start) => setup.or(start),
-        })
+        };
+        Ok((notice, skills))
     }
 
     /// prime-agent's `scheduleSnapshot`: one snapshot a moment after the last cell of
@@ -929,6 +936,9 @@ struct LinkState {
     handled_ids: HashSet<String>,
     /// The latest turn's handlers.
     host: Option<Arc<dyn HostRequests>>,
+    /// The session's own handlers, bound for the kernel's whole life: requests
+    /// a task sends between turns reach them (`bash.completed`).
+    session: Option<Arc<dyn HostRequests>>,
     stderr: stderr::Tail,
     /// Why the protocol stream ended, once it has.
     closed: Option<String>,
@@ -1042,6 +1052,10 @@ impl Link {
 
     fn set_host(&self, host: Arc<dyn HostRequests>) {
         self.state().host = Some(host);
+    }
+
+    fn set_session(&self, session: Option<Arc<dyn HostRequests>>) {
+        self.state().session = session;
     }
 
     fn take_background(&self) -> String {
@@ -1256,17 +1270,17 @@ fn start_host_request(link: &Arc<Link>, event: &Value) {
     let Some(id) = event["id"].as_str().map(str::to_owned) else {
         return;
     };
-    let host = {
+    let (host, session) = {
         let mut state = link.state();
         if !state.remember(&id) {
             return;
         }
-        state.host.clone()
+        (state.host.clone(), state.session.clone())
     };
     let data = event.get("data").cloned().unwrap_or(Value::Null);
     let task = HostTask::new(Arc::clone(link));
     tokio::spawn(async move {
-        let reply = answer_host_request(host.as_deref(), &data).await;
+        let reply = answer_host_request(host.as_deref(), session.as_deref(), &data).await;
         if let Err(error) = task
             .link
             .write(&json!({"type": "host_reply", "id": id, "data": reply}))
@@ -1280,7 +1294,11 @@ fn start_host_request(link: &Arc<Link>, event: &Value) {
     });
 }
 
-async fn answer_host_request(host: Option<&dyn HostRequests>, data: &Value) -> Value {
+async fn answer_host_request(
+    host: Option<&dyn HostRequests>,
+    session: Option<&dyn HostRequests>,
+    data: &Value,
+) -> Value {
     let Some(kind) = data
         .get("type")
         .and_then(Value::as_str)
@@ -1293,10 +1311,15 @@ async fn answer_host_request(host: Option<&dyn HostRequests>, data: &Value) -> V
         };
         return json!({"status": "error", "error": error});
     };
-    let answer = match host {
+    let mut answer = match host {
         Some(host) => host.handle(data).await,
         None => None,
     };
+    if answer.is_none()
+        && let Some(session) = session
+    {
+        answer = session.handle(data).await;
+    }
     match answer {
         Some(Ok(result)) => json!({"status": "ok", "result": result}),
         Some(Err(error)) => json!({"status": "error", "error": error}),
@@ -1475,7 +1498,26 @@ impl Kernel {
     /// Prepare a new kernel: revive the conversation's snapshot when there is one,
     /// then run the runtime bootstrap, which sets the live handles (`rlm`, `bash`)
     /// over anything restored, as prime-agent orders the two.
-    async fn provision(&mut self) -> Result<Revival, String> {
+    /// The runtime and the conversation's skills first, then the snapshot, as
+    /// prime-agent boots its kernel: restoring skips a name the namespace already
+    /// has, so the preloaded skills are never reported as state that "could not
+    /// be restored and must be recreated" - which sent the model re-importing
+    /// modules that were there all along.
+    async fn provision(
+        &mut self,
+        harness: Option<&KernelContext>,
+    ) -> Result<(Revival, Option<String>), String> {
+        let (boot, _) = self
+            .execute(BOOTSTRAP_CODE, READY_TIMEOUT, false)
+            .await
+            .map_err(|error| format!("the Python kernel failed to start: {error}"))?;
+        if boot.contains("Traceback") {
+            return Err(format!("the REPL runtime failed to load: {boot}"));
+        }
+        let skills = match harness {
+            Some(context) => self.apply_harness(context).await,
+            None => None,
+        };
         let existed = self
             .snapshot
             .as_ref()
@@ -1487,14 +1529,28 @@ impl Kernel {
         } else {
             Revival::NoSnapshot
         };
-        let (boot, _) = self
-            .execute(BOOTSTRAP_CODE, READY_TIMEOUT, false)
+        Ok((restore, skills))
+    }
+
+    /// Point the kernel at a conversation's memory and import its skills; the
+    /// note names the skills that could not be imported.
+    async fn apply_harness(&mut self, context: &KernelContext) -> Option<String> {
+        let (output, _) = self
+            .execute(&context.setup_code(), READY_TIMEOUT, false)
             .await
-            .map_err(|error| format!("the Python kernel failed to start: {error}"))?;
-        if boot.contains("Traceback") {
-            return Err(format!("the REPL runtime failed to load: {boot}"));
-        }
-        Ok(restore)
+            .ok()?;
+        self.harness = Some(context.clone());
+        let missing = unavailable_skills(&output);
+        (!missing.is_empty()).then(|| {
+            format!(
+                "[Python skills unavailable in this kernel: {}]",
+                missing
+                    .iter()
+                    .map(|(name, error)| format!("{name} ({error})"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        })
     }
 
     /// The protocol's `restore`. `Ok(None)` when the snapshot could not be revived;
@@ -2347,6 +2403,12 @@ impl ExternalToolDispatcher for ReplHost {
 
 #[cfg(test)]
 mod tests {
+    /// The kernel log is created by the first byte written to it, never empty.
+    fn assert_no_empty_log(kernel_dir: &std::path::Path) {
+        let log = kernel_dir.join("kernel-stderr.log");
+        assert!(!log.exists() || std::fs::metadata(&log).is_ok_and(|m| m.len() > 0));
+    }
+
     use super::{
         CellText, Frame, HostReply, HostRequests, Kernel, KernelContext, LinkState,
         MAX_BACKGROUND_OUTPUT_CHARS, MAX_HANDLED_HOST_REQUEST_IDS, NoHostRequests, ReplShared,
@@ -2492,6 +2554,10 @@ mod tests {
                 "async def run(name):\n    return f'hello {name}'\n",
             ),
             ("broken_skill", "import not_a_module_anywhere\n"),
+            // A plain module, as `agent_message` and `goal` are: a snapshot keeps
+            // it by name, and a kernel that read the snapshot before importing
+            // the skills could not load it back.
+            ("plain_skill", "def ping():\n    return 'pong'\n"),
         ] {
             let package = skills_root.join("src").join(name);
             std::fs::create_dir_all(&package).expect("package");
@@ -2504,7 +2570,7 @@ mod tests {
             skills: super::python_skill_packages(&skills_root.join("SKILL.md")),
             kernel_dir: directory.path().join("kernel-a"),
         };
-        assert_eq!(dirs.skills.len(), 2);
+        assert_eq!(dirs.skills.len(), 3);
         let run = |code: &'static str, seconds: u64, context: KernelContext| {
             let shared = Arc::clone(&shared);
             async move {
@@ -2618,7 +2684,7 @@ mod tests {
         .await;
         run("kept = [1, 2, 3]", 60, dirs.clone()).await;
         shared.dispose().await;
-        assert!(dirs.kernel_dir.join("kernel-stderr.log").is_file());
+        assert_no_empty_log(&dirs.kernel_dir);
         if has_dill != "True" {
             let fresh = run("'kept' in globals()", 60, dirs.clone()).await;
             assert!(
@@ -2630,13 +2696,24 @@ mod tests {
             return;
         }
         assert!(dirs.kernel_dir.join("kernel-state.dill").is_file());
-        assert!(dirs.kernel_dir.join("kernel-stderr.log").is_file());
+        assert_no_empty_log(&dirs.kernel_dir);
         let revived = run("kept", 60, dirs.clone()).await;
         assert!(
             revived.contains("[python-state-restored]")
                 && revived.contains("kept")
                 && revived.ends_with("[1, 2, 3]"),
             "{revived}"
+        );
+        // The skills are imported before the snapshot is read, so reviving never
+        // lists them as lost, and they work (prime-agent's boot order).
+        assert!(
+            !revived.contains("could not be restored"),
+            "a preloaded skill is not reported as lost: {revived}"
+        );
+        assert_eq!(run("plain_skill.ping()", 60, dirs.clone()).await, "'pong'");
+        assert_eq!(
+            run("await hello_skill('again')", 60, dirs.clone()).await,
+            "'hello again'"
         );
         // Another conversation gets its own kernel, with none of this one's state.
         let other = KernelContext {
@@ -2734,6 +2811,35 @@ mod tests {
                 }
             })
         }
+    }
+
+    /// prime-agent's `bash.completed` usually arrives after the turn that
+    /// started the command, when no turn's handlers are bound: the session's own
+    /// handlers answer it, and it reaches the app as an event.
+    #[tokio::test]
+    async fn a_background_completion_is_accepted_between_turns() {
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let session = super::super::skill_requests::BashCompletions { sender };
+        let request = serde_json::json!({"type": "bash.completed", "pid": 42, "command": "npm test", "exitCode": 1});
+        let reply = super::answer_host_request(None, Some(&session), &request).await;
+        assert_eq!(reply["status"], "ok", "{reply}");
+        assert!(matches!(
+            events.try_recv(),
+            Ok(super::super::events::SessionEvent::BashCompleted { pid: 42, exit_code: 1, ref command })
+                if command == "npm test"
+        ));
+        let refused = super::answer_host_request(None, None, &request).await;
+        assert_eq!(
+            refused["status"], "error",
+            "without the session's handlers: {refused}"
+        );
+        let bad =
+            serde_json::json!({"type": "bash.completed", "pid": 0, "command": "x", "exitCode": 0});
+        let reply = super::answer_host_request(None, Some(&session), &bad).await;
+        assert_eq!(
+            reply["error"],
+            "bash.completed pid must be a positive integer"
+        );
     }
 
     #[tokio::test]

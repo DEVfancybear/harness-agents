@@ -988,6 +988,7 @@ mod tests {
         asking.modal = Some(crate::interactive::events::Modal::Question {
             prompt: "Which file should I update?".into(),
             options: Vec::new(),
+            selected: 0,
         });
         renderer.draw_state(&asking).unwrap();
         assert!(
@@ -1029,6 +1030,7 @@ mod tests {
         asking.modal = Some(crate::interactive::events::Modal::Question {
             prompt: "Which color should I use?".to_owned(),
             options: vec!["blue".to_owned(), "green".to_owned()],
+            selected: 0,
         });
         renderer.draw_state(&asking).expect("question panel draws");
         let painted = renderer.painted().join("\n");
@@ -1041,6 +1043,37 @@ mod tests {
             "options: {painted}"
         );
         assert!(painted.contains("nhấn Enter"), "free-text hint: {painted}");
+    }
+
+    /// A long option list scrolls with the highlight: the chosen option is
+    /// always drawn, even past the rows the panel can hold. The composer keeps
+    /// the cursor, since the question can be answered by typing.
+    #[test]
+    fn a_long_question_keeps_the_highlight_in_view_and_the_cursor_in_the_composer() {
+        let options = (1..=20)
+            .map(|n| format!("option-{n:02}"))
+            .collect::<Vec<_>>();
+        let mut asking = state(AppPhase::WaitingInput);
+        asking.live_text.clear();
+        asking.modal = Some(crate::interactive::events::Modal::Question {
+            prompt: "Which one?".to_owned(),
+            options,
+            selected: 17,
+        });
+        let painted = {
+            let backend = ScriptedBackend::new(Vec::new());
+            let mut renderer = ScriptedRenderer::open(backend, 100, 20).expect("renderer opens");
+            renderer.draw_state(&asking).expect("question panel draws");
+            renderer.painted().join("\n")
+        };
+        assert!(painted.contains("❯ 18. option-18"), "highlight: {painted}");
+        assert!(painted.contains("18/20"), "position: {painted}");
+        let plan = super::layout::plan(
+            ratatui::layout::Rect::new(0, 0, 100, 20),
+            &asking,
+            &super::theme::Theme::plain(),
+        );
+        assert!(plan.cursor.is_some(), "the composer keeps the focus");
     }
 
     /// K01: a masked buffer reaches the screen as a mask, never as the key.

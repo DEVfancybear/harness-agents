@@ -324,12 +324,6 @@ impl ToolExecutionService {
         self
     }
 
-    /// What this host has been measured to enforce, when it has been measured.
-    #[must_use]
-    pub fn capability_matrix(&self) -> Option<&Arc<crate::CapabilityMatrix>> {
-        self.capabilities.as_ref()
-    }
-
     /// The reason a strict action is refused here, in terms of what was
     /// measured rather than in terms of what was assumed.
     fn strict_refusal_reason(&self) -> String {
@@ -1257,13 +1251,16 @@ impl ToolExecutionService {
                         "expected_hash was supplied but the target file does not exist",
                     ));
                 }
+                // A missing parent is created by the write, inside the workspace
+                // (the path has no `..` and crosses no link), as Claude Code's
+                // Write does; refusing it sent the model into a mkdir detour.
                 let parent = target.parent().ok_or_else(|| {
                     HarnessError::new(ErrorCode::WorkspaceEscape, "write path has no parent")
                 })?;
-                if !parent.is_dir() {
+                if parent.exists() && !parent.is_dir() {
                     return Err(HarnessError::new(
                         ErrorCode::InvalidPayload,
-                        "write_file parent directory does not exist",
+                        "write_file parent path is a file, not a directory",
                     ));
                 }
             }
@@ -1588,6 +1585,19 @@ impl ToolExecutionService {
                     None
                 };
                 let artifact = self.publish_before_content(before.as_deref())?;
+                if let Some(parent) = target.parent()
+                    && !parent.exists()
+                {
+                    std::fs::create_dir_all(parent).map_err(|error| {
+                        HarnessError::new(
+                            ErrorCode::StorageWriteFailed,
+                            format!("write_file could not create its directory: {error}"),
+                        )
+                    })?;
+                    // Created under the root from plain components; confirm it
+                    // still resolves there before anything is written.
+                    resolve_relative(root, path, false)?;
+                }
                 let mutation = write_text_checked(&target, expected_hash.as_ref(), content)?;
                 let output = ToolOutput::WriteFile {
                     path: path.replace('\\', "/"),

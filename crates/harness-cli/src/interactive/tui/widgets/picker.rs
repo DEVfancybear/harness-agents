@@ -26,6 +26,78 @@ pub fn render_files(
     render_named(frame, area, items, selected, theme, " chọn file ");
 }
 
+/// Draw a model question: the prompt, then its options as a menu with the
+/// highlighted one marked, scrolled so the highlight is always in view.
+pub fn render_question(
+    frame: &mut Frame,
+    area: Rect,
+    prompt: &str,
+    options: &[String],
+    selected: usize,
+    theme: &Theme,
+) {
+    let compact = area.height <= 3;
+    let height = usize::from(if compact {
+        area.height
+    } else {
+        area.height - 2
+    });
+    let width = area.width.saturating_sub(if compact { 0 } else { 2 });
+    let mut lines: Vec<Line<'static>> = prompt
+        .lines()
+        .flat_map(|line| {
+            super::super::markdown::wrap_spans(
+                vec![Span::styled(line.to_owned(), theme.title)],
+                width,
+            )
+        })
+        .collect();
+    let first_option = lines.len();
+    let numbered = options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| format!("{}. {option}", index + 1))
+        .collect::<Vec<_>>();
+    if !options.is_empty() {
+        lines.extend(rows(&numbered, selected, theme));
+    }
+    lines.push(Line::from(Span::styled(
+        "hoặc nhập câu trả lời rồi nhấn Enter".to_owned(),
+        theme.dim,
+    )));
+    // Keep the highlighted option in view; the prompt scrolls away first.
+    let target = if options.is_empty() {
+        0
+    } else {
+        first_option + selected.min(options.len() - 1)
+    };
+    let offset = target.saturating_add(1).saturating_sub(height);
+    let visible: Vec<_> = lines.into_iter().skip(offset).take(height).collect();
+    if compact {
+        frame.render_widget(Paragraph::new(visible), area);
+        return;
+    }
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.border)
+        .title(Span::styled(" question ", theme.title));
+    if !options.is_empty() {
+        block = block.title_top(
+            Line::from(Span::styled(
+                format!(
+                    " {}/{} ",
+                    selected.min(options.len() - 1) + 1,
+                    options.len()
+                ),
+                theme.dim,
+            ))
+            .right_aligned(),
+        );
+    }
+    frame.render_widget(Paragraph::new(visible).block(block), area);
+}
+
 fn render_named(
     frame: &mut Frame,
     area: Rect,

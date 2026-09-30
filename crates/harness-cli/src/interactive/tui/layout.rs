@@ -216,9 +216,9 @@ fn modal_rows(modal: &Modal, available: u16) -> u16 {
         Modal::Picker { items, .. } | Modal::FilePicker { items, .. } => {
             u16::try_from(items.len() + 2).unwrap_or(u16::MAX)
         }
-        Modal::Question { prompt, options } => {
-            u16::try_from(prompt.lines().count() + options.len() + 3).unwrap_or(u16::MAX)
-        }
+        Modal::Question {
+            prompt, options, ..
+        } => u16::try_from(prompt.lines().count() + options.len() + 3).unwrap_or(u16::MAX),
         Modal::McpElicitation {
             message,
             requested_schema,
@@ -237,7 +237,8 @@ fn modal_rows(modal: &Modal, available: u16) -> u16 {
 /// Where the cursor belongs inside the composer.
 ///
 /// The composer is not focused while a modal that owns the keyboard is open, so
-/// no cursor is reported and the modal keeps the whole frame.
+/// no cursor is reported and the modal keeps the whole frame. A question or an
+/// MCP form is answered in the composer, which keeps the cursor.
 fn cursor_cell(
     state: &UiState,
     composer: Rect,
@@ -245,7 +246,11 @@ fn cursor_cell(
     cell: crate::interactive::tui::widgets::composer::Cell,
     prefix_width: u16,
 ) -> Option<(u16, u16)> {
-    if state.modal.is_some() {
+    if state
+        .modal
+        .as_ref()
+        .is_some_and(|modal| !modal.takes_typing())
+    {
         return None;
     }
     let visible_row = cell.row.saturating_sub(scroll);

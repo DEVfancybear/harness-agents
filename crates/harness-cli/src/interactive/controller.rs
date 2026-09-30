@@ -116,6 +116,8 @@ struct PendingQuestion {
     question_id: String,
     prompt: String,
     options: Vec<String>,
+    /// The option the arrows have highlighted.
+    selected: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -577,12 +579,7 @@ impl InteractiveController {
             return Some(Modal::Question {
                 prompt: question.prompt.clone(),
                 options: question.options.clone(),
-            });
-        }
-        if let Some(question) = &self.pending_question {
-            return Some(Modal::Question {
-                prompt: question.prompt.clone(),
-                options: question.options.clone(),
+                selected: question.selected,
             });
         }
         if let Some(picker) = self.editor.picker() {
@@ -791,9 +788,36 @@ impl InteractiveController {
                 _ => {}
             }
         } else if self.pending_question.is_some() && self.phase == AppPhase::WaitingInput {
+            // The options are a menu while the composer is empty: the arrows move
+            // the highlight, Enter or an option's number answers. Once the user
+            // types, the composer is theirs - a digit is text, Enter sends it.
+            let choosing = self.editor.is_empty();
+            let count = self
+                .pending_question
+                .as_ref()
+                .map_or(0, |question| question.options.len());
             match key {
                 Key::Esc => return Vec::new(),
-                Key::Char(character @ '1'..='9') => {
+                Key::Up | Key::Down if choosing && count > 0 => {
+                    if let Some(question) = self.pending_question.as_mut() {
+                        question.selected = if key == Key::Up {
+                            question.selected.checked_sub(1).unwrap_or(count - 1)
+                        } else {
+                            (question.selected + 1) % count
+                        };
+                    }
+                    return vec![Effect::Redraw];
+                }
+                Key::Enter if choosing && count > 0 => {
+                    if let Some(option) = self
+                        .pending_question
+                        .as_ref()
+                        .and_then(|question| question.options.get(question.selected))
+                    {
+                        return self.submit_question_answer(option.clone());
+                    }
+                }
+                Key::Char(character @ '1'..='9') if choosing => {
                     let index = usize::from(character as u8 - b'1');
                     if let Some(option) = self
                         .pending_question
@@ -1729,6 +1753,7 @@ impl InteractiveController {
                     question_id,
                     prompt,
                     options,
+                    selected: 0,
                 });
             }
             SessionEvent::McpElicitationRequired {
@@ -1863,6 +1888,28 @@ impl InteractiveController {
             }
             SessionEvent::AgentMessage { text } => {
                 self.deliver_agent_message(text, effects);
+            }
+            // prime-agent delivers the completion as it delivers an agent message:
+            // steered into a running turn, a turn of its own when idle.
+            SessionEvent::BashCompleted {
+                pid,
+                command,
+                exit_code,
+            } => {
+                self.deliver_agent_message(bash_done_notice(pid, &command, exit_code), effects);
+            }
+            SessionEvent::BashConsumed { pid, command } => {
+                // One read withdraws one notice that has not been delivered yet.
+                let exit = |text: &String| {
+                    text.starts_with(&format!("[bash-done pid:{pid} exit:"))
+                        && text.ends_with(&format!(
+                            "\n\nCommand: {}",
+                            serde_json::to_string(&command).unwrap_or_default()
+                        ))
+                };
+                if let Some(index) = self.pending_notices.iter().position(exit) {
+                    self.pending_notices.remove(index);
+                }
             }
             SessionEvent::GoalCompleted { summary } => {
                 self.flush_stream(effects);
@@ -2153,6 +2200,8 @@ impl InteractiveController {
         let Some(question) = self.pending_question.take() else {
             return Vec::new();
         };
+        // The answer is sent: whatever was typed toward it goes with the panel.
+        self.editor.clear();
         self.continuations = 0;
         self.fresh_run(Instant::now(), Some(text.clone()));
         self.service.submit(SubmitRequest {
@@ -4236,6 +4285,14 @@ impl InteractiveController {
     }
 }
 
+/// prime-agent's `createAsyncBashCompletionMessage`.
+fn bash_done_notice(pid: u64, command: &str, exit_code: i64) -> String {
+    format!(
+        "[bash-done pid:{pid} exit:{exit_code}]\n\nCommand: {}",
+        serde_json::to_string(command).unwrap_or_default()
+    )
+}
+
 /// A path as the composer should hold it: quoted, because a path with spaces is one token
 /// and the message scan only sees one that way.
 ///
@@ -5240,7 +5297,7 @@ mod tests {
         assert_eq!(harness.controller.phase(), AppPhase::WaitingInput);
         assert!(matches!(
             harness.controller.ui_state().modal,
-            Some(Modal::Question { ref prompt, ref options })
+            Some(Modal::Question { ref prompt, ref options, .. })
                 if prompt == "Which color should I use?" && options.len() == 2
         ));
         let _ = harness.controller.handle_key(Key::Char('2'));
@@ -5262,6 +5319,137 @@ mod tests {
                 .as_slice(),
             [None, Some("question-g06".to_owned())]
         );
+    }
+
+    /// A question's options are a menu: the arrows move the highlight (and wrap)
+    /// and Enter answers with it. Once text is typed the composer owns the keys -
+    /// a digit is text, not an option - and answering clears what was typed.
+    #[test]
+    fn a_question_is_answered_with_the_arrows_and_typing_is_text() {
+        fn ask(harness: &mut Bench, id: &str, options: &[&str]) {
+            harness
+                .events
+                .send(SessionEvent::QuestionRequired {
+                    question_id: id.to_owned(),
+                    prompt: "Which one?".to_owned(),
+                    options: options.iter().map(|option| (*option).to_owned()).collect(),
+                })
+                .expect("question event");
+            harness
+                .events
+                .send(SessionEvent::RunTerminal {
+                    outcome: RunOutcome::WaitingInput {
+                        question_id: Some(id.to_owned()),
+                    },
+                })
+                .expect("question turn ends");
+            let _ = harness.controller.pump_events();
+        }
+        fn selected(harness: &Bench) -> usize {
+            match harness.controller.ui_state().modal {
+                Some(Modal::Question { selected, .. }) => selected,
+                other => panic!("a question panel, not {other:?}"),
+            }
+        }
+        let options = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"];
+        let mut harness = tui_bench(true);
+        let _ = submit_text(&mut harness.controller, "pick one");
+        ask(&mut harness, "q1", &options);
+        let _ = harness.controller.handle_key(Key::Up);
+        assert_eq!(
+            selected(&harness),
+            11,
+            "up from the first wraps to the last"
+        );
+        for _ in 0..3 {
+            let _ = harness.controller.handle_key(Key::Down);
+        }
+        assert_eq!(selected(&harness), 2);
+        let _ = harness.controller.handle_key(Key::Enter);
+        assert_eq!(
+            harness.port.submissions.lock().expect("submissions").last(),
+            Some(&"c".to_owned())
+        );
+
+        ask(&mut harness, "q2", &options);
+        for key in [
+            Key::Char('x'),
+            Key::Char(' '),
+            Key::Char('1'),
+            Key::Char('0'),
+        ] {
+            let _ = harness.controller.handle_key(key);
+        }
+        assert_eq!(
+            harness.controller.ui_state().buffer,
+            "x 10",
+            "digits are text once typing"
+        );
+        let _ = harness.controller.handle_key(Key::Down);
+        assert_eq!(selected(&harness), 0, "the arrows belong to the draft");
+        let _ = harness.controller.handle_key(Key::Enter);
+        assert_eq!(
+            harness.port.submissions.lock().expect("submissions").last(),
+            Some(&"x 10".to_owned())
+        );
+        assert_eq!(harness.controller.ui_state().buffer, "");
+        assert!(harness.controller.ui_state().modal.is_none());
+    }
+
+    /// prime-agent's background completion: an idle app starts a turn with the
+    /// `[bash-done ...]` notice; one that cannot take it keeps it, and the
+    /// kernel reading the result first withdraws it.
+    #[test]
+    fn a_background_command_completion_is_delivered_or_withdrawn() {
+        let mut harness = tui_bench(true);
+        harness
+            .events
+            .send(SessionEvent::BashCompleted {
+                pid: 7,
+                command: "npm run build".to_owned(),
+                exit_code: 0,
+            })
+            .expect("completion");
+        let _ = harness.controller.pump_events();
+        assert_eq!(
+            harness.port.submissions.lock().expect("submissions").last(),
+            Some(
+                &"[bash-done pid:7 exit:0]
+
+Command: \"npm run build\""
+                    .to_owned()
+            )
+        );
+        harness.controller.notices_held = true;
+        harness.controller.phase = AppPhase::Ready;
+        for event in [
+            SessionEvent::BashCompleted {
+                pid: 8,
+                command: "npm test".to_owned(),
+                exit_code: 1,
+            },
+            SessionEvent::BashConsumed {
+                pid: 9,
+                command: "npm test".to_owned(),
+            },
+        ] {
+            harness.events.send(event).expect("event");
+        }
+        let _ = harness.controller.pump_events();
+        assert_eq!(
+            harness.controller.pending_notices.len(),
+            1,
+            "another pid is kept"
+        );
+        harness
+            .events
+            .send(SessionEvent::BashConsumed {
+                pid: 8,
+                command: "npm test".to_owned(),
+            })
+            .expect("consumed");
+        let _ = harness.controller.pump_events();
+        assert!(harness.controller.pending_notices.is_empty(), "withdrawn");
     }
 
     fn saved_credential_path(context: &LaunchContext) -> std::path::PathBuf {

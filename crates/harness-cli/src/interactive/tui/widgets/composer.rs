@@ -165,7 +165,11 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
     }
     // The border is the box's state: an idle box is the accent, a working one is
     // the colour of work in progress, and one that cannot take input is quiet.
-    let border_style = if state.modal.is_some() {
+    let border_style = if state
+        .modal
+        .as_ref()
+        .is_some_and(|modal| !modal.takes_typing())
+    {
         theme.border
     } else {
         match state.phase {
@@ -247,7 +251,7 @@ pub fn hint(state: &UiState) -> String {
             if options.is_empty() {
                 " TRẢ LỜI · Enter gửi ".to_owned()
             } else {
-                " TRẢ LỜI · phím số hoặc nhập · Enter ".to_owned()
+                " TRẢ LỜI · ↑↓ chọn · Enter · phím số · hoặc nhập ".to_owned()
             }
         }
         Some(Modal::McpElicitation {

@@ -54,16 +54,12 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
             Some(crate::interactive::events::Modal::FilePicker { items, selected }) => {
                 picker::render_files(frame, area, items, *selected, theme);
             }
-            Some(crate::interactive::events::Modal::Question { prompt, options }) => {
-                let mut lines = vec![prompt.clone()];
-                lines.extend(
-                    options
-                        .iter()
-                        .enumerate()
-                        .map(|(index, option)| format!("{}. {option}", index + 1)),
-                );
-                lines.push("hoặc nhập câu trả lời rồi nhấn Enter".to_owned());
-                help::render(frame, area, "question", &lines, 0, theme);
+            Some(crate::interactive::events::Modal::Question {
+                prompt,
+                options,
+                selected,
+            }) => {
+                picker::render_question(frame, area, prompt, options, *selected, theme);
             }
             Some(crate::interactive::events::Modal::McpElicitation {
                 message,

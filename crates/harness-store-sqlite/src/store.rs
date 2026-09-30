@@ -1403,6 +1403,29 @@ impl SqliteStore {
             .collect()
     }
 
+    /// The provider call ids of a session that reached a durable intent: the
+    /// calls that started running. A call without one was refused before it
+    /// could change anything.
+    pub async fn tool_intent_call_ids(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<std::collections::BTreeSet<String>, StoreError> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT call_id FROM tool_intents WHERE session_id = ? AND call_id IS NOT NULL",
+        )
+        .bind(session_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map(|ids| ids.into_iter().collect())
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "list tool intent calls",
+                error,
+            )
+        })
+    }
+
     /// Lookup a tool intent for reconciliation after a restart or storage
     /// fault. It exposes no side effect.
     pub async fn tool_intent(

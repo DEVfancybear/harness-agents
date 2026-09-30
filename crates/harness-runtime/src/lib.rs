@@ -1355,6 +1355,7 @@ async fn interrupted_steps(
         return Ok(None);
     }
     let results = store.recovered_tool_results(session_id).await?;
+    let started = store.tool_intent_call_ids(session_id).await?;
     let mut seen = std::collections::BTreeSet::new();
     let mut steps = Vec::new();
     for response in &responses {
@@ -1386,13 +1387,29 @@ async fn interrupted_steps(
                 .iter()
                 .rfind(|result| result.call_id.as_deref() == Some(call.call_id.as_str()))
                 .map_or_else(
-                    || "(the turn was interrupted before this call returned)".to_owned(),
+                    || unanswered_call(&call.name, started.contains(&call.call_id)).to_owned(),
                     |result| clip_result(&result.text),
                 );
             steps.push(ProviderMessage::tool_result(call.call_id, text));
         }
     }
     Ok(Some(steps))
+}
+
+/// What the model reads for a call of an earlier turn that has no recorded
+/// result. Saying "interrupted" for all of them made a refused `write_file`
+/// look like it might have written, so the model re-read files it had never
+/// changed and trusted writes that never happened. The store tells the cases
+/// apart: a call that reached a durable intent started running; one that did
+/// not was refused (bad arguments, a stale hash, a policy) or never reached.
+fn unanswered_call(name: &str, started: bool) -> &'static str {
+    if name == "ask_user" {
+        "(the question was put to the user; their answer is the next user message)"
+    } else if started {
+        "(the turn was interrupted while this call ran; its outcome is unknown - check the workspace before relying on it)"
+    } else {
+        "(this call did not run: it was refused or never reached, and it changed nothing)"
+    }
 }
 
 fn clip_result(text: &str) -> String {

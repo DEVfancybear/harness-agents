@@ -433,10 +433,13 @@ pub enum Modal {
     Picker { items: Vec<String>, selected: usize },
     /// Git-aware workspace file picker opened by `@` in the composer.
     FilePicker { items: Vec<String>, selected: usize },
-    /// A model question; numbered options select a value, and free text is accepted.
+    /// A model question; an option is picked with the arrows and Enter or by its
+    /// number, and free text typed in the composer is accepted too.
     Question {
         prompt: String,
         options: Vec<String>,
+        /// The highlighted option.
+        selected: usize,
     },
     /// An MCP server requests form input or user confirmation of a URL action.
     McpElicitation {
@@ -453,6 +456,15 @@ pub enum Modal {
         lines: Vec<String>,
         scroll: usize,
     },
+}
+
+impl Modal {
+    /// Whether the composer keeps the keyboard while this panel is up: a
+    /// question and an MCP form are answered by typing into it.
+    #[must_use]
+    pub const fn takes_typing(&self) -> bool {
+        matches!(self, Self::Question { .. } | Self::McpElicitation { .. })
+    }
 }
 
 /// The controller state the TUI viewport draws.
@@ -739,6 +751,19 @@ pub enum SessionEvent {
     /// at the running turn's next step, or in a turn of its own when idle.
     AgentMessage {
         text: String,
+    },
+    /// prime-agent's `bash.completed`: a command the kernel left running in the
+    /// background finished and no cell read its result.
+    BashCompleted {
+        pid: u64,
+        command: String,
+        exit_code: i64,
+    },
+    /// prime-agent's `bash.consumed`: the kernel read that result after all, so
+    /// a completion notice still waiting is withdrawn.
+    BashConsumed {
+        pid: u64,
+        command: String,
     },
     RunTerminal {
         outcome: RunOutcome,

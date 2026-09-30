@@ -2379,6 +2379,11 @@ impl AgentSessionService {
             &context.paths.data_dir,
             &context.project.root,
         );
+        if let Some(repl) = &repl {
+            repl.set_session_host(Arc::new(super::skill_requests::BashCompletions {
+                sender: sender.clone(),
+            }));
+        }
         let agents = super::delegation::SessionAgents::new(
             super::store_lease::SharedStore::for_dir(context.project_store_dir()),
             sender.clone(),

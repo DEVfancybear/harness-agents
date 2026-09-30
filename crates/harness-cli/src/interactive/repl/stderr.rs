@@ -55,9 +55,14 @@ impl Tail {
 /// The on-disk log of one kernel. Its write budget is the file's remaining room,
 /// not a fresh allowance, so the file and its `.old` each stay near the cap even
 /// when rotation fails.
+///
+/// The file is created by the first byte the kernel writes: a kernel that
+/// prints nothing on stderr - almost every one - leaves no empty log behind,
+/// where one was created per conversation before.
 #[derive(Debug)]
 pub struct Log {
-    file: std::fs::File,
+    path: PathBuf,
+    file: Option<std::fs::File>,
     budget: u64,
     writable: bool,
 }
@@ -90,26 +95,41 @@ impl Log {
                 Err(error) => note = Some(format!("cannot rotate kernel stderr log: {error}")),
             }
         }
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
+        if size > 0 {
+            // A loose log from before is tightened.
+            restrict(path);
         }
-        let file = options
-            .open(path)
-            .map_err(|error| format!("cannot open kernel stderr log: {error}"))?;
-        // Exact bits despite the umask, and a loose log from before is tightened.
-        restrict(path);
         Ok((
             Self {
-                file,
+                path: path.to_owned(),
+                file: None,
                 budget: MAX_LOG_BYTES.saturating_sub(size),
                 writable: true,
             },
             note,
         ))
+    }
+
+    /// The file, created on the first write.
+    fn file(&mut self) -> Result<&mut std::fs::File, String> {
+        if self.file.is_none() {
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let file = options
+                .open(&self.path)
+                .map_err(|error| format!("cannot open kernel stderr log: {error}"))?;
+            // Exact bits despite the umask.
+            restrict(&self.path);
+            self.file = Some(file);
+        }
+        self.file
+            .as_mut()
+            .ok_or_else(|| "cannot open kernel stderr log".to_owned())
     }
 
     /// Append what the kernel wrote; once the budget is spent a marker ends the file
@@ -118,14 +138,28 @@ impl Log {
         if !self.writable {
             return Ok(());
         }
+        if bytes.is_empty() {
+            return Ok(());
+        }
         let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        let written = if length <= self.budget {
+        let within = length <= self.budget;
+        let file = match self.file() {
+            Ok(file) => file,
+            Err(error) => {
+                self.writable = false;
+                return Err(error);
+            }
+        };
+        let written = if within {
+            file.write_all(bytes)
+        } else {
+            file.write_all(BUDGET_MARKER.as_bytes())
+        };
+        if within {
             self.budget -= length;
-            self.file.write_all(bytes)
         } else {
             self.writable = false;
-            self.file.write_all(BUDGET_MARKER.as_bytes())
-        };
+        }
         written.map_err(|error| {
             self.writable = false;
             format!("kernel stderr log write failed: {error}")
@@ -200,6 +234,18 @@ mod tests {
         assert_eq!(tail.last(usize::MAX).chars().count(), MAX_TAIL_CHARS);
         assert!(tail.last(usize::MAX).ends_with("ée🙂end"));
         assert_eq!(tail.last(3), "end");
+    }
+
+    /// A kernel that writes nothing on stderr leaves no empty log behind.
+    #[test]
+    fn a_silent_kernel_leaves_no_log() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("kernel").join(LOG_FILE);
+        let (mut log, _) = Log::open(&path).expect("log");
+        log.write(b"").expect("nothing");
+        assert!(!path.exists(), "no bytes, no file");
+        log.write(b"boom\n").expect("write");
+        assert_eq!(std::fs::read_to_string(&path).expect("log"), "boom\n");
     }
 
     #[test]

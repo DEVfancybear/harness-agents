@@ -14,7 +14,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -247,6 +247,11 @@ struct ChildRecord {
     notes: VecDeque<String>,
     last_note: Option<Instant>,
     activity: String,
+    /// The tool the child is running, while it runs one (prime-agent's
+    /// `activity.tool_name`).
+    activity_tool: Option<String>,
+    /// Where the whole answer was saved when it was longer than a notice holds.
+    answer_file: Option<PathBuf>,
     tool_calls: u32,
     cost: String,
     /// The child that spawned this one; `None` for the root agent's children.
@@ -274,7 +279,9 @@ impl ChildRecord {
     fn row(&self, session_dir: &str) -> Value {
         let (status, answer) = match &self.state {
             ChildState::Running => ("running", None),
-            ChildState::Done { answer, .. } => ("completed", Some(clip(answer))),
+            ChildState::Done { answer, .. } => {
+                ("completed", Some(clip(answer, self.answer_file.as_deref())))
+            }
             ChildState::Failed { .. } | ChildState::Cancelled { .. } => ("error", None),
         };
         json!({
@@ -283,7 +290,13 @@ impl ChildRecord {
             "session_dir": session_dir,
             "status": status,
             "model": self.model,
-            "activity": {"kind": self.activity},
+            // prime-agent's `RLMSubagentActivity`: its runtime accepts only
+            // these kinds, and refused the whole list for ha's free text.
+            "activity": match (&self.state, &self.activity_tool) {
+                (ChildState::Running, Some(tool)) => json!({"kind": "executing", "tool_name": tool}),
+                (ChildState::Running, None) => json!({"kind": "waiting"}),
+                _ => Value::Null,
+            },
             "tool_use_count": self.tool_calls,
             "duration_ms": self.elapsed_ms(),
             "answer_preview": answer,
@@ -296,7 +309,11 @@ impl ChildRecord {
     fn result(&self, session_dir: &str) -> Value {
         let (status, answer, error) = match &self.state {
             ChildState::Running => ("running", None, None),
-            ChildState::Done { answer, .. } => ("done", Some(clip(answer)), None),
+            ChildState::Done { answer, .. } => (
+                "done",
+                Some(clip(answer, self.answer_file.as_deref())),
+                None,
+            ),
             ChildState::Failed { error } => ("error", None, Some(error.clone())),
             ChildState::Cancelled { reason } => ("cancelled", None, Some(reason.clone())),
         };
@@ -346,7 +363,12 @@ fn first_line(text: &str) -> &str {
 
 /// prime-agent's terminal notice for a settled child (`core/messages.ts`), or
 /// `None` when the child already told its parent what it found.
-fn terminal_notice(name: &str, state: &ChildState, replied: bool) -> Option<String> {
+fn terminal_notice(
+    name: &str,
+    state: &ChildState,
+    replied: bool,
+    answer_file: Option<&Path>,
+) -> Option<String> {
     match state {
         ChildState::Running => None,
         ChildState::Failed { error } => Some(format!("[child-failed child:{name}]\n\n{error}")),
@@ -361,7 +383,7 @@ fn terminal_notice(name: &str, state: &ChildState, replied: bool) -> Option<Stri
         } else {
             format!(
                 "[child-exited: no-reply child:{name}]\n\nLast assistant text: {}",
-                clip(answer)
+                clip(answer, answer_file)
             )
         }),
     }
@@ -384,6 +406,8 @@ struct AgentsShared {
     /// Where `rlm.create_session` starts a top-level agent, when the session
     /// runs in a background worker.
     session_host: Mutex<Option<Arc<dyn super::agents::SessionHost>>>,
+    /// Where a child's whole answer is kept when it is too long for a notice.
+    answers: std::sync::OnceLock<PathBuf>,
 }
 
 impl AgentsShared {
@@ -404,6 +428,7 @@ impl AgentsShared {
             max_depth: Mutex::new((DEFAULT_RLM_MAX_DEPTH, MaxDepthSource::Default)),
             agents: std::sync::OnceLock::new(),
             session_host: Mutex::new(None),
+            answers: std::sync::OnceLock::new(),
         }
     }
 
@@ -460,8 +485,20 @@ impl AgentsShared {
             {
                 child.tool_calls = u32::try_from(count).unwrap_or(u32::MAX);
             }
+            if let (ChildState::Done { answer, .. }, Some(dir)) = (&child.state, self.answers.get())
+                && answer.chars().count() > RLM_ANSWER_MAX_CHARS
+            {
+                child.answer_file = save_answer(dir, &child.task_id, answer);
+            }
             let notice = (child.waiters == 0 && !child.suppress_notice)
-                .then(|| terminal_notice(&child.name, &child.state, child.replied))
+                .then(|| {
+                    terminal_notice(
+                        &child.name,
+                        &child.state,
+                        child.replied,
+                        child.answer_file.as_deref(),
+                    )
+                })
                 .flatten();
             (
                 child.parent.clone(),
@@ -917,7 +954,7 @@ fn state_payload(role: AgentRole, name: &str, state: &ChildState) -> Value {
             "role": role.as_str(),
             "status": "cancelled",
             "name": name,
-            "text": terminal_notice(name, state, false).unwrap_or_default(),
+            "text": terminal_notice(name, state, false, None).unwrap_or_default(),
             "reason": reason,
         }),
     }
@@ -986,6 +1023,7 @@ impl SessionAgents {
         state_root: PathBuf,
         backend: &Arc<dyn WorkerBackend>,
     ) -> Result<Arc<Self>, HarnessError> {
+        let _ = shared.answers.set(state_root.join("answers"));
         let workspace_manager = Arc::new(WorkspaceManager::new(state_root));
         let schedulers = (0..RLM_MAX_DEPTH_CAP)
             .map(|_| {
@@ -1310,6 +1348,8 @@ impl SessionAgents {
                 notes: VecDeque::new(),
                 last_note: None,
                 activity: "queued".to_owned(),
+                activity_tool: None,
+                answer_file: None,
                 tool_calls: 0,
                 cost: "n/a".to_owned(),
                 parent: parent.cloned(),
@@ -2178,12 +2218,27 @@ impl RlmChildren {
     }
 }
 
-fn clip(text: &str) -> String {
+fn clip(text: &str, whole: Option<&Path>) -> String {
     if text.chars().count() <= RLM_ANSWER_MAX_CHARS {
         return text.to_owned();
     }
     let kept = text.chars().take(RLM_ANSWER_MAX_CHARS).collect::<String>();
-    format!("{kept}\n[answer cut at {RLM_ANSWER_MAX_CHARS} characters]")
+    match whole {
+        Some(path) => format!(
+            "{kept}\n[answer cut at {RLM_ANSWER_MAX_CHARS} characters; the whole answer is in {}]",
+            path.display()
+        ),
+        None => format!("{kept}\n[answer cut at {RLM_ANSWER_MAX_CHARS} characters]"),
+    }
+}
+
+/// Keep a child's whole answer when a notice cannot carry it: the parent reads
+/// the rest from the file instead of losing it (an audit's last half was).
+fn save_answer(dir: &Path, task_id: &TaskId, answer: &str) -> Option<PathBuf> {
+    std::fs::create_dir_all(dir).ok()?;
+    let path = dir.join(format!("{}.md", task_id.as_str()));
+    std::fs::write(&path, answer).ok()?;
+    Some(path)
 }
 
 impl HostRequests for RlmChildren {
@@ -2579,6 +2634,7 @@ impl TurnObserver for ExplorerObserver {
                 }
                 self.shared.update(&self.task_id, |child| {
                     child.activity = format!("step {step}");
+                    child.activity_tool = None;
                 });
             }
             TurnProgress::Usage {
@@ -2605,6 +2661,7 @@ impl TurnObserver for ExplorerObserver {
                 self.shared.update(&self.task_id, |child| {
                     child.tool_calls += 1;
                     child.activity = format!("{name}: {summary}");
+                    child.activity_tool = Some(name.clone());
                 });
                 let _ = self.sender.send(SessionEvent::Notice {
                     message: format!("[child {}] {name}: {summary}", self.role_name),
@@ -2842,21 +2899,21 @@ pub(super) mod tests {
             error: "provider_protocol: stream failed".to_owned(),
         };
         assert_eq!(
-            terminal_notice("scout", &failed, false).as_deref(),
+            terminal_notice("scout", &failed, false, None).as_deref(),
             Some("[child-failed child:scout]\n\nprovider_protocol: stream failed")
         );
         let stopped = ChildState::Cancelled {
             reason: "Deleted by parent orchestrator".to_owned(),
         };
         assert_eq!(
-            terminal_notice("scout", &stopped, false).as_deref(),
+            terminal_notice("scout", &stopped, false, None).as_deref(),
             Some("[child-exited: cancelled child:scout]\n\nDeleted by parent orchestrator")
         );
         let bare = ChildState::Cancelled {
             reason: String::new(),
         };
         assert_eq!(
-            terminal_notice("scout", &bare, false).as_deref(),
+            terminal_notice("scout", &bare, false, None).as_deref(),
             Some("[child-exited: cancelled child:scout]")
         );
         let done = ChildState::Done {
@@ -2864,11 +2921,11 @@ pub(super) mod tests {
             detail: serde_json::Value::Null,
         };
         assert_eq!(
-            terminal_notice("scout", &done, false).as_deref(),
+            terminal_notice("scout", &done, false, None).as_deref(),
             Some("[child-exited: no-reply child:scout]\n\nLast assistant text: found it")
         );
         assert_eq!(
-            terminal_notice("scout", &done, true),
+            terminal_notice("scout", &done, true, None),
             None,
             "a child that replied to its parent needs no notice"
         );
@@ -2877,7 +2934,7 @@ pub(super) mod tests {
             detail: serde_json::Value::Null,
         };
         assert_eq!(
-            terminal_notice("scout", &silent, false).as_deref(),
+            terminal_notice("scout", &silent, false, None).as_deref(),
             Some("[child-exited: no-reply child:scout]")
         );
     }
@@ -3188,6 +3245,22 @@ pub(super) mod tests {
                 .contains("not available")
         );
 
+        // prime-agent's runtime refuses the whole list for an activity kind it
+        // does not know: a running child is waiting or executing, a settled one
+        // has none.
+        let listed = ask(json!({"type": "rlm.list_subagents"}))
+            .await
+            .expect("list");
+        for row in listed["subagents"].as_array().expect("rows") {
+            let activity = &row["activity"];
+            assert!(
+                activity.is_null()
+                    || ["waiting", "writing", "executing"]
+                        .contains(&activity["kind"].as_str().unwrap_or_default()),
+                "{row}"
+            );
+        }
+
         // Collect the slow child first: the quick child's outcome arrives while
         // waiting and must be kept for it.
         let collected = ask(
@@ -3252,6 +3325,62 @@ pub(super) mod tests {
                 .handle(&json!({"type": "custom.thing"}))
                 .await
                 .is_none()
+        );
+    }
+
+    /// A child answer longer than a notice holds is cut there, and the whole of
+    /// it is kept in a file the cut names, so the parent can read the rest.
+    #[tokio::test]
+    async fn a_long_child_answer_is_kept_whole_in_a_file() {
+        use super::RlmChildren;
+        use crate::interactive::repl::HostRequests;
+        use serde_json::json;
+
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let repo = temporary.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo directory");
+        clean_repository(&repo);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(crate::interactive::service::ChannelApprovalGate::new(
+            sender.clone(),
+            Duration::from_secs(5),
+        ));
+        let agents = SessionAgents::with_backend(
+            SharedStore::new(temporary.path().join("store")),
+            sender,
+            gate,
+            temporary.path().join("delegation"),
+            &(Arc::new(ScriptedBackend) as Arc<dyn harness_orchestrator::WorkerBackend>),
+        );
+        let children = RlmChildren {
+            agents,
+            launch: launch_for(
+                &repo,
+                Arc::new(harness_providers::MockProvider::scripted(Vec::new())),
+            ),
+        };
+        let prompt = "x".repeat(8_100);
+        let spawned = children
+            .handle(&json!({"type": "rlm.run", "prompt": prompt, "kwargs": {"name": "long"}}))
+            .await
+            .expect("known")
+            .expect("spawn");
+        let collected = children
+            .handle(&json!({"type": "rlm.collect", "targets": [spawned["rlm_child_id"]], "timeout_ms": 10_000}))
+            .await
+            .expect("known")
+            .expect("collect");
+        let preview = collected["results"][0]["answer_preview"]
+            .as_str()
+            .expect("an answer")
+            .to_owned();
+        let path = preview
+            .rsplit_once("the whole answer is in ")
+            .map(|(_, rest)| rest.trim_end_matches(']'))
+            .expect("the cut names the file");
+        assert_eq!(
+            std::fs::read_to_string(path).expect("the whole answer"),
+            format!("answer: {prompt}")
         );
     }
 

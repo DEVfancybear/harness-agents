@@ -19,6 +19,53 @@ use super::repl::{HostReply, HostRequests};
 /// Several hosts' requests, answered by the first that knows the type.
 pub struct ChainedRequests(pub Vec<Arc<dyn HostRequests>>);
 
+/// The session's own kernel requests, answered between turns too: prime-agent's
+/// `bash.completed` and `bash.consumed`. A background command usually finishes
+/// after the turn that started it, when no turn's handlers are bound; without
+/// these every completion was refused ("... follow-up ... was not accepted").
+pub struct BashCompletions {
+    pub sender: UnboundedSender<SessionEvent>,
+}
+
+impl BashCompletions {
+    fn answer(&self, kind: &str, request: &Value) -> Result<Value, String> {
+        let pid = request["pid"]
+            .as_u64()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| format!("{kind} pid must be a positive integer"))?;
+        let command = request["command"]
+            .as_str()
+            .filter(|command| !command.is_empty())
+            .ok_or_else(|| format!("{kind} command must be a non-empty string"))?
+            .to_owned();
+        let event = if kind == "bash.completed" {
+            let exit_code = request["exitCode"]
+                .as_i64()
+                .ok_or("bash.completed exitCode must be an integer")?;
+            SessionEvent::BashCompleted {
+                pid,
+                command,
+                exit_code,
+            }
+        } else {
+            SessionEvent::BashConsumed { pid, command }
+        };
+        self.sender
+            .send(event)
+            .map_err(|_| "the session is closing".to_owned())?;
+        Ok(json!({}))
+    }
+}
+
+impl HostRequests for BashCompletions {
+    fn handle<'a>(&'a self, request: &'a Value) -> HostReply<'a> {
+        Box::pin(async move {
+            let kind = request["type"].as_str().unwrap_or_default();
+            matches!(kind, "bash.completed" | "bash.consumed").then(|| self.answer(kind, request))
+        })
+    }
+}
+
 impl HostRequests for ChainedRequests {
     fn handle<'a>(&'a self, request: &'a Value) -> HostReply<'a> {
         Box::pin(async move {

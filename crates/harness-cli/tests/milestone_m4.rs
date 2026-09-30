@@ -3239,6 +3239,45 @@ async fn g04_write_file_new_needs_no_hash_but_overwrite_does() {
     close(store).await;
 }
 
+/// `write_file` into a directory that does not exist yet creates it, inside the
+/// workspace, as Claude Code's Write does; leaving the workspace stays refused.
+#[tokio::test]
+async fn write_file_creates_its_missing_directories() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let (session, task) = admit(&store, &bench).await;
+    let path = "src/app/api/products/[slug]/reviews/route.ts";
+    g04_execute_provider_tool(
+        &tools,
+        &bench,
+        &session,
+        &task,
+        "write_file",
+        serde_json::json!({"path": path, "content": "export {};\n"}),
+    )
+    .await
+    .expect("the missing directories are created");
+    assert_eq!(
+        std::fs::read_to_string(bench.workspace.join(path)).unwrap(),
+        "export {};\n"
+    );
+    let escape = g04_execute_provider_tool(
+        &tools,
+        &bench,
+        &session,
+        &task,
+        "write_file",
+        serde_json::json!({"path": "new/../../outside.txt", "content": "x"}),
+    )
+    .await
+    .expect_err("parent traversal is refused");
+    assert_eq!(escape.code(), ErrorCode::WorkspaceEscape);
+    assert!(!bench.workspace.join("new").exists(), "nothing was created");
+    drop(tools);
+    close(store).await;
+}
+
 #[tokio::test]
 async fn g04_glob_respects_gitignore_and_cap() {
     let bench = bench();
