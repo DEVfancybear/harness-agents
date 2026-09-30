@@ -38,7 +38,7 @@ fn p0_f01_cli_help_and_version_run_without_credentials() {
 
     let version = run_ha(&["--version"]);
     assert!(version.status.success());
-    assert!(output_text(&version.stdout).starts_with("ha 0.1.0"));
+    assert!(output_text(&version.stdout).starts_with(&format!("ha {}", env!("CARGO_PKG_VERSION"))));
     assert!(output_text(&version.stderr).is_empty());
 }
 

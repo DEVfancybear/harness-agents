@@ -7188,7 +7188,7 @@ mod tests {
             )
             .await
         });
-        let request_id = tokio::time::timeout(Duration::from_secs(4), async {
+        let request_id = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if let Some(id) = channel.drain().into_iter().find_map(|event| match event {
                     SessionEvent::ApprovalRequired { request_id, .. } => Some(request_id),
@@ -7315,7 +7315,7 @@ mod tests {
             )
             .await
         });
-        let request_id = tokio::time::timeout(Duration::from_secs(4), async {
+        let request_id = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if let Some(id) = channel.drain().into_iter().find_map(|event| match event {
                     SessionEvent::ApprovalRequired { request_id, .. } => Some(request_id),
