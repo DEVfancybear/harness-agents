@@ -74,7 +74,7 @@ Python state in the kernel persists across cells: named variables, helper functi
 /// prime-agent's they cannot outlive the turn; the block says so.
 const REPL_RECURSION: &str = "An `rlm` object is already in your global namespace. `await rlm.spawn('sub-task', name='api-reviewer')` spawns a child and returns immediately after task admission with `rlm_child_id`, `name`, `session_dir`, and `model`; it never waits for or returns the child's answer.
 `name` is required: choose a stable child name that is unique among siblings.
-A child runs on your model; omit `model`, or pass exactly the selector `await rlm.find_models()` returns.
+A child runs on your model; omit `model`, or pass exactly the selector `await rlm.find_models()` returns. Children also inherit your thinking level; the `thinking` option overrides it with any level the resolved child model supports, and an unsupported level fails spawn.
 Use `await rlm.list_subagents()` to recover direct child handles after admission.
 Fan-in results with `await rlm.collect(targets, timeout_ms=0)`: it returns typed snapshots of direct children (status, answer preview, error); an explicit timeout blocks only that call until the children settle or the deadline passes.
 In ha a child cannot outlive the turn: collect the results you need with a positive `timeout_ms` before you end the turn - children still running when the turn ends are canceled.

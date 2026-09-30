@@ -661,6 +661,16 @@ impl InteractiveController {
         lines.push(
             "Nhập yêu cầu. / lệnh · Alt+V dán ảnh/file · /login đăng nhập · /quit thoát".to_owned(),
         );
+        // Codex's launch notice: a newer release is out.
+        if !self.plain
+            && super::update_check::enabled(
+                &super::paths::LaunchEnvironment::capture(),
+                &self.context.paths.config_file,
+            )
+            && let Some(notice) = super::update_check::notice(&self.context.paths.data_dir)
+        {
+            lines.push(notice);
+        }
         lines
     }
 
@@ -700,40 +710,7 @@ impl InteractiveController {
                 .collect(),
         );
         let models = self.service.model_options();
-        // A child runs on a catalog model it has a login for - its own or the
-        // main one - or on this agent's.
-        let mut subagent_models = vec![(
-            "inherit".to_owned(),
-            "children run on this agent's model".to_owned(),
-        )];
-        subagent_models.extend(self.service.subagent_model_options());
-        let own = self.service.stored_subagent_credentials();
-        self.editor.set_argument_options(
-            "/subagent-login",
-            super::providers::PROVIDERS
-                .iter()
-                .map(|entry| {
-                    let state = if own.iter().any(|(id, _)| id == entry.id) {
-                        " · logged in for subagents"
-                    } else {
-                        ""
-                    };
-                    (entry.id.to_owned(), format!("{}{state}", entry.name))
-                })
-                .collect(),
-        );
-        self.editor.set_argument_options(
-            "/subagent-logout",
-            own.iter()
-                .map(|(id, kind)| {
-                    let name =
-                        super::providers::provider(id).map_or(id.as_str(), |entry| entry.name);
-                    (id.clone(), format!("{name} · {kind}"))
-                })
-                .collect(),
-        );
-        self.editor
-            .set_argument_options("/subagent-model", subagent_models);
+        self.refresh_subagent_menus();
         self.editor.set_argument_options("/model", models);
         // The modes with what each lets through, the one in force marked.
         let current = self
@@ -1963,6 +1940,9 @@ impl InteractiveController {
             SessionEvent::AgentMessage { text } => {
                 self.deliver_agent_message(text, effects);
             }
+            SessionEvent::AgentExchange { from, to, text } => {
+                self.push_history(effects, HistoryItem::AgentExchange { from, to, text });
+            }
             // prime-agent delivers the completion as it delivers an agent message:
             // steered into a running turn, a turn of its own when idle.
             SessionEvent::BashCompleted {
@@ -2941,6 +2921,9 @@ impl InteractiveController {
                     }
                     effects.push(Effect::Redraw);
                 }
+                Some(("messages", _)) => {
+                    self.reference("/agents messages", self.service.agent_exchanges(), &mut effects);
+                }
                 _ => self.reference("/agents", self.service.agents_summary(), &mut effects),
             },
             // prime-agent's `/fast`: priority on, or back to the default tier.
@@ -2951,7 +2934,8 @@ impl InteractiveController {
                     self.apply_tier(next, true, &mut effects);
                 } else {
                     self.push_history(&mut effects, HistoryItem::Notice {
-                        message: "Current model does not support fast mode (priority tier)".to_owned(),
+                        // prime-agent's wording for a model without the priority tier.
+                        message: "Fast mode requires GPT-5.4, GPT-5.5, or GPT-5.6 with ChatGPT or OpenAI API key authentication".to_owned(),
                     });
                 }
                 effects.push(Effect::Redraw);
@@ -3011,11 +2995,25 @@ impl InteractiveController {
                 }
                 effects.push(Effect::Redraw);
             }
+            "/subagent-effort" => {
+                let change = match argument {
+                    None => super::service::SubagentSetting::Show,
+                    Some("inherit") => super::service::SubagentSetting::Inherit,
+                    Some(level) => super::service::SubagentSetting::Set(level.to_owned()),
+                };
+                match self.service.subagent_effort(change) {
+                    Ok(message) => {
+                        self.push_history(&mut effects, HistoryItem::Notice { message });
+                    }
+                    Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                }
+                effects.push(Effect::Redraw);
+            }
             "/subagent-model" => {
                 let change = match argument {
-                    None => super::service::SubagentModel::Show,
-                    Some("inherit") => super::service::SubagentModel::Inherit,
-                    Some(model) => super::service::SubagentModel::Set(model.to_owned()),
+                    None => super::service::SubagentSetting::Show,
+                    Some("inherit") => super::service::SubagentSetting::Inherit,
+                    Some(model) => super::service::SubagentSetting::Set(model.to_owned()),
                 };
                 match self.service.subagent_model(change) {
                     Ok(message) => {
@@ -3645,6 +3643,57 @@ impl InteractiveController {
                 effects
             }
         }
+    }
+
+    /// The argument menus of the subagent commands: the models, levels and
+    /// logins the delegated children can be given.
+    fn refresh_subagent_menus(&mut self) {
+        // A child runs on a catalog model it has a login for - its own or the
+        // main one - or on this agent's.
+        let mut subagent_models = vec![(
+            "inherit".to_owned(),
+            "children run on this agent's model".to_owned(),
+        )];
+        subagent_models.extend(self.service.subagent_model_options());
+        let mut subagent_levels = vec![(
+            "inherit".to_owned(),
+            "children run at this agent's level".to_owned(),
+        )];
+        subagent_levels.extend(harness_providers::ThinkingLevel::ALL.iter().map(|level| {
+            (
+                level.as_str().to_owned(),
+                format!("thinking {}", level.as_str()),
+            )
+        }));
+        self.editor
+            .set_argument_options("/subagent-effort", subagent_levels);
+        let own = self.service.stored_subagent_credentials();
+        self.editor.set_argument_options(
+            "/subagent-login",
+            super::providers::PROVIDERS
+                .iter()
+                .map(|entry| {
+                    let state = if own.iter().any(|(id, _)| id == entry.id) {
+                        " · logged in for subagents"
+                    } else {
+                        ""
+                    };
+                    (entry.id.to_owned(), format!("{}{state}", entry.name))
+                })
+                .collect(),
+        );
+        self.editor.set_argument_options(
+            "/subagent-logout",
+            own.iter()
+                .map(|(id, kind)| {
+                    let name =
+                        super::providers::provider(id).map_or(id.as_str(), |entry| entry.name);
+                    (id.clone(), format!("{name} · {kind}"))
+                })
+                .collect(),
+        );
+        self.editor
+            .set_argument_options("/subagent-model", subagent_models);
     }
 
     /// Whose login the credential commands act on, here and in the service.

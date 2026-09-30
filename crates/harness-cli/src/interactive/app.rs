@@ -257,6 +257,9 @@ pub(super) fn controller_for_with_overrides(
         // compiled in keeps working when the download fails.
         super::providers::refresh_in_background(&context.paths.data_dir);
         super::providers::refresh_listed_models_for_logins(environment, &context.paths.data_dir);
+        if super::update_check::enabled(environment, &context.paths.config_file) {
+            super::update_check::refresh_in_background(&context.paths.data_dir);
+        }
         Box::new(AgentSessionService::new_with_overrides(
             context,
             environment.clone(),

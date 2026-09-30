@@ -117,6 +117,9 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
         HistoryItem::Error { message } => error_rows(message, width, theme),
         HistoryItem::Message { text } => vec![Line::from(Span::raw(text.clone()))],
         HistoryItem::Notice { message } => notice_rows(message, width, theme),
+        HistoryItem::AgentExchange { from, to, text } => {
+            agent_exchange_rows(from, to, text, width, theme, detail)
+        }
         HistoryItem::Refinement {
             header,
             summary,
@@ -407,6 +410,51 @@ fn notice_rows(message: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
 
 /// prime-agent's `RefinementOutcomeMessageComponent`: `◆ header` and the summary;
 /// the details and expanded modes add the refinement's id and every edit.
+/// prime-agent's agent message row (`agentMessageSummaryLine`,
+/// `agentMessageBodyLines`): `◆ agent message · from → to · start`, and in the
+/// details and expanded modes the whole message under a `╰─` gutter.
+fn agent_exchange_rows(
+    from: &str,
+    to: &str,
+    text: &str,
+    width: u16,
+    theme: &Theme,
+    detail: Detail,
+) -> Vec<Line<'static>> {
+    const PREVIEW_CHARS: usize = 80;
+    let mut spans = vec![
+        Span::styled("◆ ".to_owned(), theme.accent),
+        Span::styled("agent message".to_owned(), theme.muted),
+        Span::styled(format!(" · {from} → {to}"), theme.dim),
+    ];
+    if detail == Detail::Collapsed {
+        let first = text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default();
+        let mut preview = first.chars().take(PREVIEW_CHARS).collect::<String>();
+        if first.chars().count() > PREVIEW_CHARS || text.lines().nth(1).is_some() {
+            preview.push('…');
+        }
+        spans.push(Span::styled(format!(" · {preview}"), theme.dim));
+    }
+    let mut rows = margined(spans, width);
+    if detail != Detail::Collapsed {
+        let lines = text.lines().collect::<Vec<_>>();
+        for (index, line) in lines.iter().enumerate() {
+            let gutter = if index == 0 { "╰─ " } else { "   " };
+            rows.extend(margined(
+                vec![
+                    Span::styled(gutter.to_owned(), theme.dim),
+                    Span::styled((*line).to_owned(), theme.assistant),
+                ],
+                width,
+            ));
+        }
+    }
+    rows
+}
+
 fn refinement_rows(
     header: &str,
     summary: &str,
@@ -1652,6 +1700,39 @@ diff --git a/src/lib.rs b/src/lib.rs
             theme.diff_added.patch(theme.diff_added_bg)
         );
         assert_eq!(span_with(&rows, "import").style, theme.syntax.keyword);
+    }
+
+    /// prime-agent's agent message row: who talked to whom and the start of
+    /// it; details show the whole message under a gutter.
+    #[test]
+    fn an_agent_exchange_is_one_row_and_its_body_in_details() {
+        let theme = Theme::plain();
+        let item = HistoryItem::AgentExchange {
+            from: "reviewer".to_owned(),
+            to: "coder".to_owned(),
+            text: "found two bugs\nline two".to_owned(),
+        };
+        let text = |detail| {
+            super::render_fragment(&item, 80, &theme, detail, false)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        let collapsed = text(Detail::Collapsed);
+        assert_eq!(collapsed.len(), 1, "{collapsed:?}");
+        assert!(
+            collapsed[0].contains("◆ agent message · reviewer → coder · found two bugs…"),
+            "{collapsed:?}"
+        );
+        let details = text(Detail::Details);
+        assert!(
+            details.iter().any(|row| row.contains("╰─ found two bugs")),
+            "{details:?}"
+        );
+        assert!(
+            details.iter().any(|row| row.contains("line two")),
+            "{details:?}"
+        );
     }
 
     /// Without a language nothing is guessed, and without colour nothing changes.

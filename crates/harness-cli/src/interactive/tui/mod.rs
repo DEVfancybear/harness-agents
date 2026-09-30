@@ -249,12 +249,15 @@ where
         self.detail = detail;
         let size = self.terminal.size().map_err(to_io)?;
         self.known = (size.width, size.height);
+        // The whole screen, erased from its top-left cell down: the cursor is put
+        // there first, since after a resize its own position is the least
+        // trustworthy thing the terminal reports. Not `ED 2`: Windows Terminal
+        // moves what `ED 2` erases into the scrollback, so every repaint of a
+        // drag left one more copy of the screen above it.
         self.terminal.set_cursor_position((0, 0)).map_err(to_io)?;
-        // The whole screen, not what follows the cursor: after a resize the
-        // cursor's own position is the least trustworthy thing the terminal reports.
         self.terminal
             .backend_mut()
-            .clear_region(ClearType::All)
+            .clear_region(ClearType::AfterCursor)
             .map_err(to_io)?;
         // The cursor is at the top of an erased screen, so the viewport is
         // placed there; the rows pushed below then move it down to the bottom.

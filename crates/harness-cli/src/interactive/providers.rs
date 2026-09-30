@@ -550,7 +550,7 @@ pub fn refresh_in_background(data_dir: &Path) {
 }
 
 /// One GET on a private runtime, so the caller's thread needs none.
-fn download(url: &str) -> Option<String> {
+pub(super) fn download(url: &str) -> Option<String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

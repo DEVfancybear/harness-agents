@@ -126,6 +126,27 @@ pub trait ChildModels: Send + Sync {
     /// # Errors
     /// The model is not in the catalog, or its provider has no credential.
     fn resolve(&self, reference: &str) -> Result<ChildModel, String>;
+
+    /// The thinking level children run at when their spawn names none
+    /// (`subagentDefaultThinking`); `None` inherits the parent's.
+    fn default_thinking(&self) -> Option<harness_providers::ThinkingLevel> {
+        None
+    }
+
+    /// [`Self::resolve`] at a thinking level. A level the spawn asked for
+    /// (`strict`) that the model does not offer fails it, as prime-agent's
+    /// `rlm.spawn(thinking=...)` does; a default one is clamped.
+    ///
+    /// # Errors
+    /// The model cannot be used, or does not offer the level asked for.
+    fn resolve_at(
+        &self,
+        reference: &str,
+        _level: Option<harness_providers::ThinkingLevel>,
+        _strict: bool,
+    ) -> Result<ChildModel, String> {
+        self.resolve(reference)
+    }
 }
 
 /// What a turn gives the children it starts.
@@ -160,6 +181,29 @@ impl ChildLaunch {
     /// configured default, else the parent's. A model that cannot be used fails
     /// the spawn rather than running the child on something else.
     fn for_model(&self, requested: Option<&str>) -> Result<Self, String> {
+        self.for_request(requested, None)
+    }
+
+    /// This launch on the model and thinking level a child asked for, as
+    /// prime-agent's `rlm.spawn(model=..., thinking=...)`: the thinking level
+    /// asked for, else `subagentDefaultThinking`, else the parent's.
+    fn for_request(&self, requested: Option<&str>, thinking: Option<&str>) -> Result<Self, String> {
+        let explicit = thinking
+            .map(str::trim)
+            .filter(|thinking| !thinking.is_empty())
+            .map(|thinking| {
+                harness_providers::ThinkingLevel::parse(thinking).ok_or_else(|| {
+                    format!(
+                        "rlm.spawn thinking must be one of: off, minimal, low, medium, high, xhigh, max (got {thinking:?})"
+                    )
+                })
+            })
+            .transpose()?;
+        let level = explicit.or_else(|| {
+            self.models
+                .as_ref()
+                .and_then(|models| models.default_thinking())
+        });
         let reference = requested
             .map(str::trim)
             .filter(|reference| !reference.is_empty())
@@ -169,17 +213,19 @@ impl ChildLaunch {
                     .as_ref()
                     .and_then(|models| models.default_model())
             });
-        let Some(reference) = reference else {
-            return Ok(self.clone());
-        };
-        if reference.eq_ignore_ascii_case(&self.model.reference) {
+        if level.is_none()
+            && reference
+                .as_ref()
+                .is_none_or(|reference| reference.eq_ignore_ascii_case(&self.model.reference))
+        {
             return Ok(self.clone());
         }
+        let reference = reference.unwrap_or_else(|| self.model.reference.clone());
         let models = self
             .models
             .as_ref()
             .ok_or_else(|| format!("Requested subagent model \"{reference}\" is not available"))?;
-        let model = models.resolve(&reference)?;
+        let model = models.resolve_at(&reference, level, explicit.is_some())?;
         Ok(Self {
             model,
             ..self.clone()
@@ -386,7 +432,20 @@ struct AgentsShared {
     session_host: Mutex<Option<Arc<dyn super::agents::SessionHost>>>,
     /// Where a child's whole answer is kept when it is too long for a notice.
     answers: std::sync::OnceLock<PathBuf>,
+    /// The messages the agents of this session sent each other, oldest first.
+    exchanges: Mutex<std::collections::VecDeque<Exchange>>,
 }
+
+/// One message between two agents of the family.
+struct Exchange {
+    at: chrono::DateTime<chrono::Local>,
+    from: String,
+    to: String,
+    text: String,
+}
+
+/// How many exchanges `/agents messages` keeps.
+const EXCHANGES_KEPT: usize = 500;
 
 impl AgentsShared {
     fn new(
@@ -403,6 +462,7 @@ impl AgentsShared {
             children: Mutex::new(Vec::new()),
             changed: tokio::sync::Notify::new(),
             buckets: Mutex::new(HashMap::new()),
+            exchanges: Mutex::new(std::collections::VecDeque::new()),
             max_depth: Mutex::new((DEFAULT_RLM_MAX_DEPTH, MaxDepthSource::Default)),
             agents: std::sync::OnceLock::new(),
             session_host: Mutex::new(None),
@@ -581,6 +641,26 @@ impl AgentsShared {
         }
     }
 
+    /// Keep a delivered message and show it: the user sees the agents talk.
+    fn record(&self, from: &str, to: &str, text: &str) {
+        if let Ok(mut exchanges) = self.exchanges.lock() {
+            if exchanges.len() == EXCHANGES_KEPT {
+                exchanges.pop_front();
+            }
+            exchanges.push_back(Exchange {
+                at: chrono::Local::now(),
+                from: from.to_owned(),
+                to: to.to_owned(),
+                text: text.to_owned(),
+            });
+        }
+        let _ = self.sender.send(SessionEvent::AgentExchange {
+            from: from.to_owned(),
+            to: to.to_owned(),
+            text: text.to_owned(),
+        });
+    }
+
     /// prime-agent's per-sender token bucket: three messages, one more each second.
     fn take_token(&self, sender: &str) -> Result<(), String> {
         let mut buckets = self
@@ -709,7 +789,10 @@ impl AgentsShared {
         for (task_id, name) in targets {
             let text = format!("[agent-message from parent:root]\n\n{message}");
             receipts.push(match self.deliver_to_child(&task_id, text).await {
-                Ok(status) => receipt(&name, "root", &message, status),
+                Ok(status) => {
+                    self.record("main", &name, &message);
+                    receipt(&name, "root", &message, status)
+                }
                 Err(error) => json!({"target": name, "error": error}),
             });
         }
@@ -723,6 +806,10 @@ impl AgentsShared {
             .update(from, |child| (child.name.clone(), child.parent.clone()))
             .ok_or("the sending child is gone")?;
         self.take_token(from.as_str())?;
+        let parent_name = parent
+            .as_ref()
+            .and_then(|parent| self.update(parent, |child| child.name.clone()))
+            .unwrap_or_else(|| "main".to_owned());
         // prime-agent's reach: the parent, the siblings (the parent's other
         // children) and this child's own children.
         let to_parent = async |text: String| -> Result<&'static str, String> {
@@ -742,6 +829,7 @@ impl AgentsShared {
                     "[agent-message from child:{sender_name}]\n\n{message}"
                 ))
                 .await?;
+                self.record(&sender_name, &parent_name, &message);
                 receipts.push(receipt("parent", &sender_name, &message, status));
             }
             "sibling" => {
@@ -752,6 +840,7 @@ impl AgentsShared {
                     .ok_or_else(|| format!("no sibling named {name:?}"))?;
                 let text = format!("[agent-message from sibling:{sender_name}]\n\n{message}");
                 let status = self.deliver_to_child(&task_id, text).await?;
+                self.record(&sender_name, &name, &message);
                 receipts.push(receipt(&name, &sender_name, &message, status));
             }
             "child" => {
@@ -761,6 +850,7 @@ impl AgentsShared {
                     .ok_or_else(|| format!("no child named {name:?}"))?;
                 let text = format!("[agent-message from parent:{sender_name}]\n\n{message}");
                 let status = self.deliver_to_child(&task_id, text).await?;
+                self.record(&sender_name, &name, &message);
                 receipts.push(receipt(&name, &sender_name, &message, status));
             }
             "all" => {
@@ -768,6 +858,7 @@ impl AgentsShared {
                     "[agent-message from child:{sender_name}]\n\n{message}"
                 ))
                 .await?;
+                self.record(&sender_name, &parent_name, &message);
                 receipts.push(receipt("parent", &sender_name, &message, status));
                 let siblings = self
                     .names(parent.as_ref())
@@ -784,7 +875,10 @@ impl AgentsShared {
                     let text =
                         format!("[agent-message from {relation}:{sender_name}]\n\n{message}");
                     receipts.push(match self.deliver_to_child(&task_id, text).await {
-                        Ok(status) => receipt(&name, &sender_name, &message, status),
+                        Ok(status) => {
+                            self.record(&sender_name, &name, &message);
+                            receipt(&name, &sender_name, &message, status)
+                        }
                         Err(error) => json!({"target": name, "error": error}),
                     });
                 }
@@ -1048,6 +1142,32 @@ impl SessionAgents {
     #[must_use]
     pub fn store(&self) -> Arc<SharedStore> {
         Arc::clone(&self.shared.store)
+    }
+
+    /// `/agents messages`: every message the agents of this session sent each
+    /// other, oldest first, whole.
+    #[must_use]
+    pub fn exchanges(&self) -> Vec<String> {
+        let Ok(exchanges) = self.shared.exchanges.lock() else {
+            return Vec::new();
+        };
+        if exchanges.is_empty() {
+            return vec![
+                "the agents of this session have not sent each other a message".to_owned(),
+            ];
+        }
+        let mut lines = Vec::new();
+        for exchange in exchanges.iter() {
+            lines.push(format!(
+                "{}  {} -> {}",
+                exchange.at.format("%H:%M:%S"),
+                exchange.from,
+                exchange.to
+            ));
+            lines.extend(exchange.text.lines().map(|line| format!("    {line}")));
+            lines.push(String::new());
+        }
+        lines
     }
 
     /// `/agents`: one line per child, newest last.
@@ -2060,10 +2180,9 @@ impl RlmChildren {
             .filter(|name| !name.is_empty())
             .ok_or("rlm.spawn needs a name")?
             .to_owned();
-        if !kwargs["thinking"].is_null() {
-            return Err("thinking levels are not configurable in ha".to_owned());
-        }
-        let launch = self.launch.for_model(kwargs["model"].as_str())?;
+        let launch = self
+            .launch
+            .for_request(kwargs["model"].as_str(), kwargs["thinking"].as_str())?;
         let (task_id, name) = self
             .agents
             .start(
@@ -2763,6 +2882,87 @@ pub(super) mod tests {
             delegate["function"]["parameters"]["properties"]["role"]["enum"],
             serde_json::json!(["explorer"])
         );
+    }
+
+    /// Every message between agents is kept for `/agents messages` and shown
+    /// as it is sent.
+    #[test]
+    fn a_message_between_agents_is_kept_and_shown() {
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = shared(sender);
+        shared.record("reviewer", "coder", "check line 4");
+        match events.try_recv() {
+            Ok(crate::interactive::events::SessionEvent::AgentExchange { from, to, text }) => {
+                assert_eq!(
+                    (from.as_str(), to.as_str(), text.as_str()),
+                    ("reviewer", "coder", "check line 4")
+                );
+            }
+            other => panic!("an exchange event: {other:?}"),
+        }
+        let kept = shared.exchanges.lock().expect("exchanges");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].text, "check line 4");
+    }
+
+    /// prime-agent's `rlm.spawn(thinking=...)`: a known level reaches the
+    /// child's model; an unknown one fails the spawn.
+    #[test]
+    fn a_spawn_can_ask_for_a_thinking_level() {
+        struct Levels;
+        impl ChildModels for Levels {
+            fn default_model(&self) -> Option<String> {
+                None
+            }
+            fn resolve(&self, reference: &str) -> Result<ChildModel, String> {
+                self.resolve_at(reference, None, false)
+            }
+            fn resolve_at(
+                &self,
+                reference: &str,
+                level: Option<harness_providers::ThinkingLevel>,
+                strict: bool,
+            ) -> Result<ChildModel, String> {
+                Ok(ChildModel {
+                    provider: Arc::new(harness_providers::MockProvider::scripted(Vec::new())),
+                    reference: format!(
+                        "{reference}@{}{}",
+                        level.map_or("parent", harness_providers::ThinkingLevel::as_str),
+                        if strict { "!" } else { "" }
+                    ),
+                    price: None,
+                })
+            }
+        }
+        let repo = tempfile::tempdir().expect("repo");
+        let mut launch = launch_for(
+            repo.path(),
+            Arc::new(harness_providers::MockProvider::scripted(Vec::new())),
+        );
+        launch.models = Some(Arc::new(Levels));
+        let parent = launch.model.reference.clone();
+        assert_eq!(
+            launch
+                .for_request(None, None)
+                .expect("parent")
+                .model
+                .reference,
+            parent,
+            "nothing asked: the parent's model and level"
+        );
+        assert_eq!(
+            launch
+                .for_request(None, Some("high"))
+                .expect("high")
+                .model
+                .reference,
+            format!("{parent}@high!")
+        );
+        let refused = launch
+            .for_request(None, Some("huge"))
+            .err()
+            .expect("an unknown level fails the spawn");
+        assert!(refused.contains("thinking must be one of"), "{refused}");
     }
 
     /// The parts of a session's children that need no running worker.

@@ -51,6 +51,7 @@ pub mod skills;
 pub mod store_lease;
 pub mod terminal;
 pub mod tui;
+pub mod update_check;
 pub mod view;
 pub mod web;
 

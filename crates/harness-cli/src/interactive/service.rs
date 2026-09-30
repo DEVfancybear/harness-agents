@@ -218,6 +218,10 @@ pub trait SessionPort: Send {
     fn agents_summary(&self) -> Vec<String> {
         vec!["no delegated workers have run in this session".to_owned()]
     }
+    /// `/agents messages`: what the agents of this session told each other.
+    fn agent_exchanges(&self) -> Vec<String> {
+        vec!["no delegated workers have run in this session".to_owned()]
+    }
     fn skills_summary(&self) -> Vec<String> {
         vec!["skill catalog is unavailable".to_owned()]
     }
@@ -455,10 +459,15 @@ pub trait SessionPort: Send {
     fn set_fullscreen(&mut self, _enabled: bool) -> Result<(), String> {
         Ok(())
     }
+    /// `/subagent-effort`: report the thinking level children run at, save
+    /// `subagentDefaultThinking`, or remove it so children run at this agent's.
+    fn subagent_effort(&mut self, _change: SubagentSetting) -> Result<String, String> {
+        Err("this backend has no delegated children".to_owned())
+    }
     /// `/subagent-model`: report the model children run on and where it comes
     /// from, save prime-agent's `subagentDefaultModel`, or remove it so children
     /// run on this agent's model.
-    fn subagent_model(&mut self, _change: SubagentModel) -> Result<String, String> {
+    fn subagent_model(&mut self, _change: SubagentSetting) -> Result<String, String> {
         Err("this backend has no delegated children".to_owned())
     }
     /// prime-agent's `/rlm-max-depth`: `None` reports the value and its source,
@@ -1249,7 +1258,7 @@ impl LiveTurn {
 }
 
 /// The models a delegated child may ask for: any catalog model whose provider
-/// has a credential, as prime-agent's `_resolveRlmSubagentModel` accepts any
+/// has a credential, as prime-agent's `_resolveRlmSubagentSetting` accepts any
 /// authenticated catalog model.
 struct ServiceChildModels {
     base: ProviderConfig,
@@ -1270,6 +1279,19 @@ impl super::delegation::ChildModels for ServiceChildModels {
     }
 
     fn resolve(&self, reference: &str) -> Result<super::delegation::ChildModel, String> {
+        self.resolve_at(reference, None, false)
+    }
+
+    fn default_thinking(&self) -> Option<harness_providers::ThinkingLevel> {
+        subagent_default_thinking(&self.config_file)
+    }
+
+    fn resolve_at(
+        &self,
+        reference: &str,
+        level: Option<harness_providers::ThinkingLevel>,
+        strict: bool,
+    ) -> Result<super::delegation::ChildModel, String> {
         let (config, entry) = super::routing::resolve_scoped(
             &self.base,
             reference,
@@ -1286,9 +1308,29 @@ impl super::delegation::ChildModels for ServiceChildModels {
                     ),
                 })?;
         let price = config.model_price;
+        let reasoning = Some(entry.reasoning_model());
+        let level = match level {
+            None => self.level,
+            Some(level) => {
+                let offered = harness_providers::thinking::supported_levels(reasoning);
+                if strict && !offered.contains(&level) {
+                    return Err(format!(
+                        "Requested subagent thinking level \"{}\" is not supported by {}; it offers {}",
+                        level.as_str(),
+                        entry.reference(),
+                        offered
+                            .iter()
+                            .map(|level| level.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                harness_providers::thinking::clamp(reasoning, level)
+            }
+        };
         let provider = LiveProvider::build_scoped(
             &config,
-            self.level,
+            level,
             &self.session,
             &self.data_dir,
             credentials::Scope::Subagent,
@@ -2293,7 +2335,7 @@ const SERVICE_TIER_SETTING: &str = "service_tier";
 
 /// What `/subagent-model` does.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SubagentModel {
+pub enum SubagentSetting {
     Show,
     /// Save this `provider/model` as `subagentDefaultModel`.
     Set(String),
@@ -2309,6 +2351,16 @@ fn subagent_default_model(config_file: &Path) -> Option<String> {
     super::config::load_setting(config_file, "subagentDefaultModel")
         .and_then(|value| value.as_str().map(str::trim).map(str::to_owned))
         .filter(|reference| !reference.is_empty())
+}
+
+/// `subagentDefaultThinking` from `settings.json`: the level delegated children
+/// run at when their spawn names none, as `subagentDefaultModel` is their model.
+fn subagent_default_thinking(config_file: &Path) -> Option<harness_providers::ThinkingLevel> {
+    super::config::load_setting(config_file, "subagentDefaultThinking").and_then(|value| {
+        value
+            .as_str()
+            .and_then(harness_providers::ThinkingLevel::parse)
+    })
 }
 
 /// prime-agent's global `defaultThinkingLevel`, from `settings.json`: the level
@@ -3205,6 +3257,10 @@ impl SessionPort for AgentSessionService {
 
     fn agents_summary(&self) -> Vec<String> {
         self.agents.summary()
+    }
+
+    fn agent_exchanges(&self) -> Vec<String> {
+        self.agents.exchanges()
     }
 
     fn menu_commands(&self) -> Vec<super::commands::MenuCommand> {
@@ -4601,9 +4657,44 @@ impl SessionPort for AgentSessionService {
         super::tui::fullscreen::save(&self.config_file, enabled)
     }
 
-    fn subagent_model(&mut self, change: SubagentModel) -> Result<String, String> {
+    fn subagent_effort(&mut self, change: SubagentSetting) -> Result<String, String> {
         match change {
-            SubagentModel::Show => {
+            SubagentSetting::Show => Ok(match subagent_default_thinking(&self.config_file) {
+                Some(level) => format!(
+                    "Subagent thinking: {} (settings.json subagentDefaultThinking)",
+                    level.as_str()
+                ),
+                None => {
+                    "Subagent thinking: this agent's level (subagentDefaultThinking is not set)"
+                        .to_owned()
+                }
+            }),
+            SubagentSetting::Inherit => {
+                super::config::save_setting(&self.config_file, "subagentDefaultThinking", None)?;
+                Ok("Subagent thinking cleared: children run at this agent's level".to_owned())
+            }
+            SubagentSetting::Set(level) => {
+                let parsed = harness_providers::ThinkingLevel::parse(&level).ok_or_else(|| {
+                    format!(
+                        "unknown thinking level {level:?}; use off, minimal, low, medium, high, xhigh or max"
+                    )
+                })?;
+                super::config::save_setting(
+                    &self.config_file,
+                    "subagentDefaultThinking",
+                    Some(serde_json::json!(parsed.as_str())),
+                )?;
+                Ok(format!(
+                    "Subagent thinking set: {} (saved as subagentDefaultThinking); a child's model that lacks it uses the nearest level it offers",
+                    parsed.as_str()
+                ))
+            }
+        }
+    }
+
+    fn subagent_model(&mut self, change: SubagentSetting) -> Result<String, String> {
+        match change {
+            SubagentSetting::Show => {
                 let (model, source) = if let Some(model) = subagent_default_model(&self.config_file)
                 {
                     (model, "settings.json subagentDefaultModel")
@@ -4621,11 +4712,11 @@ impl SessionPort for AgentSessionService {
                 };
                 Ok(format!("Subagent model: {model} ({source})"))
             }
-            SubagentModel::Inherit => {
+            SubagentSetting::Inherit => {
                 super::config::save_setting(&self.config_file, "subagentDefaultModel", None)?;
                 Ok("Subagent model cleared: children run on this agent's model".to_owned())
             }
-            SubagentModel::Set(reference) => {
+            SubagentSetting::Set(reference) => {
                 let base = self.configured()?;
                 let (_, entry) = super::routing::resolve_scoped(
                     &base,
@@ -9490,11 +9581,11 @@ mod tests {
         let channel = SessionChannel::new();
         let mut service = AgentSessionService::new(&context, environment, channel.sender());
         let shown = service
-            .subagent_model(super::SubagentModel::Show)
+            .subagent_model(super::SubagentSetting::Show)
             .expect("shown");
         assert!(shown.contains("this agent's model"), "{shown}");
         let set = service
-            .subagent_model(super::SubagentModel::Set(
+            .subagent_model(super::SubagentSetting::Set(
                 "deepseek/deepseek-v4-pro".to_owned(),
             ))
             .expect("saved");
@@ -9504,7 +9595,7 @@ mod tests {
             Some("deepseek/deepseek-v4-pro")
         );
         let shown = service
-            .subagent_model(super::SubagentModel::Show)
+            .subagent_model(super::SubagentSetting::Show)
             .expect("shown");
         assert!(
             shown.contains("deepseek/deepseek-v4-pro (settings.json"),
@@ -9512,11 +9603,11 @@ mod tests {
         );
         assert!(
             service
-                .subagent_model(super::SubagentModel::Set("nowhere/no-model".to_owned()))
+                .subagent_model(super::SubagentSetting::Set("nowhere/no-model".to_owned()))
                 .is_err()
         );
         service
-            .subagent_model(super::SubagentModel::Inherit)
+            .subagent_model(super::SubagentSetting::Inherit)
             .expect("cleared");
         assert_eq!(
             super::subagent_default_model(&context.paths.config_file),

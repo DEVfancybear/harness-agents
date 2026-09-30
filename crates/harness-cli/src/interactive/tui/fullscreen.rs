@@ -681,11 +681,18 @@ where
                     .min()
                     .unwrap_or(dock_area.y)
                     .max(area.y + header);
+                // One blank row between the conversation and the dock, so the
+                // newest row never sits on the composer's border.
+                let window_rows = dock_top - (area.y + header);
                 let window = Rect::new(
                     area.x,
                     area.y + header,
                     area.width,
-                    dock_top - (area.y + header),
+                    if window_rows > 1 {
+                        window_rows - 1
+                    } else {
+                        window_rows
+                    },
                 );
                 let top = viewport.compose(rows.len(), window.y, window.height);
                 let visible = rows

@@ -120,8 +120,12 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
             .unwrap_or(u16::MAX)
             .min(MAX_SUGGEST_ROWS)
             .min(available);
-        let rows = live_rows(state, area.width).min(available - menu_rows);
+        // One blank row keeps the running output off the composer's border,
+        // when there is a row to spare for it.
+        let room = available - menu_rows;
+        let rows = live_rows(state, area.width).min(room.saturating_sub(u16::from(room >= 2)));
         let live = (rows > 0).then(|| take(rows));
+        let _spacer = live.filter(|_| room >= 2).map(|_| take(1));
         let suggest = (menu_rows > 0).then(|| take(menu_rows));
         (live, None, suggest)
     };
@@ -131,12 +135,10 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
     // Anchor the block to the bottom of the area: what the frame did not use is
     // slack above the live block, never a gap between the status line and the
     // bottom of the console.
+    // The rows were taken one after another from the top of the area.
     let slack = area
         .height
-        .saturating_sub(live.map_or(0, |rect| rect.height))
-        .saturating_sub(modal.map_or(0, |rect| rect.height))
-        .saturating_sub(suggest.map_or(0, |rect| rect.height))
-        .saturating_sub(composer.height + 1 + STATUS_ROWS);
+        .saturating_sub(status.y + status.height - area.y);
     let (live, modal, suggest, composer, hints, status) = (
         live.map(|rect| drop_rows(rect, slack)),
         modal.map(|rect| drop_rows(rect, slack)),
@@ -409,7 +411,11 @@ mod tests {
         state.live_text = "streaming".to_owned();
         let outline = plan(Rect::new(0, 0, 80, 12), &state, &Theme::plain());
         let live = outline.live.expect("a live block while text streams");
-        assert_eq!(live.y + live.height, outline.composer.y);
+        assert_eq!(
+            live.y + live.height + 1,
+            outline.composer.y,
+            "one blank row between the running output and the composer"
+        );
         assert_eq!(live.height, 1);
         assert!(outline.modal.is_none());
 

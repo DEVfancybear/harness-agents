@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 51] = [
+pub const SLASH_COMMANDS: [SlashCommand; 52] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -184,6 +184,11 @@ pub const SLASH_COMMANDS: [SlashCommand; 51] = [
         "/tier",
         "[default|flex|priority|auto]",
         "Show or set the service tier",
+    ),
+    command(
+        "/subagent-effort",
+        "[level|inherit]",
+        "Show or set the thinking level delegated children run at",
     ),
     command(
         "/subagent-login",

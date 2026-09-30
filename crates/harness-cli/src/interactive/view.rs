@@ -45,6 +45,12 @@ pub fn plain_lines(item: &HistoryItem) -> Vec<String> {
         }
         HistoryItem::Error { message } => vec![format!("[error] {message}")],
         HistoryItem::Notice { message } => vec![format!("[info] {message}")],
+        // The plain transcript is a log: the message goes in whole.
+        HistoryItem::AgentExchange { from, to, text } => {
+            std::iter::once(format!("[agent] {from} -> {to}"))
+                .chain(text.lines().map(|line| format!("[agent]   {line}")))
+                .collect()
+        }
         // The plain transcript is a log: the refinement's details go in whole.
         HistoryItem::Refinement {
             header,
@@ -192,6 +198,7 @@ pub fn help_card_lines() -> Vec<String> {
             &[
                 "/model",
                 "/subagent-model",
+                "/subagent-effort",
                 "/subagent-login",
                 "/subagent-logout",
                 "/scoped-models",

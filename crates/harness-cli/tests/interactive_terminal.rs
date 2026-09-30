@@ -515,6 +515,8 @@ fn base_env(temp: &tempfile::TempDir) -> Vec<(&'static str, String)> {
         // The cases measure the inline viewport; fullscreen (prime-agent's
         // default) has cases of its own that turn it back on.
         ("HA_FULLSCREEN", "0".to_owned()),
+        // No launch reaches the npm registry for the update notice.
+        ("HA_NO_UPDATE_CHECK", "1".to_owned()),
         // The Codex host can itself run with TERM=dumb. A real pseudo-console is
         // capable of cursor positioning, so the default acceptance route must
         // state that capability instead of silently measuring the plain fallback.

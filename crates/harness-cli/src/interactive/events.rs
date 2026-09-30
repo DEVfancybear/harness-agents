@@ -426,6 +426,14 @@ pub enum HistoryItem {
     ApprovalResolution { label: String, request_id: String },
     /// The session list, as plain lines.
     Sessions { lines: Vec<String> },
+    /// prime-agent's agent message row: one agent of the family sent another a
+    /// message (`agent_message`). The collapsed view shows who talked to whom
+    /// and the start of it; details and expanded show all of it.
+    AgentExchange {
+        from: String,
+        to: String,
+        text: String,
+    },
 }
 
 /// One temporary panel that replaces the live block instead of joining the
@@ -845,6 +853,13 @@ pub enum SessionEvent {
     /// A child sent its parent a message (`[agent-message from child:...]`): read
     /// at the running turn's next step, or in a turn of its own when idle.
     AgentMessage {
+        text: String,
+    },
+    /// One agent of the family sent another a message: shown to the user, who
+    /// otherwise would not see the agents talk.
+    AgentExchange {
+        from: String,
+        to: String,
         text: String,
     },
     /// prime-agent's `bash.completed`: a command the kernel left running in the
