@@ -426,6 +426,19 @@ pub(crate) fn resolve_relative(
 
 pub(crate) fn read_text(path: &Path) -> Result<String, HarnessError> {
     let metadata = fs::metadata(path).map_err(|error| {
+        // A path that is not there is the common case, and the OS text ("The
+        // system cannot find the path specified. (os error 3)") does not say
+        // which path; prime-agent says "File not found: <path>".
+        if error.kind() == ErrorKind::NotFound {
+            let shown = path.to_string_lossy();
+            return HarnessError::new(
+                ErrorCode::InvalidPayload,
+                format!(
+                    "File not found: {}",
+                    shown.strip_prefix(r"\\?\").unwrap_or(&shown)
+                ),
+            );
+        }
         HarnessError::new(
             ErrorCode::InvalidPayload,
             format!("cannot inspect workspace file: {error}"),
@@ -1507,6 +1520,22 @@ fn relative_text(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file that is not there says so and names it, instead of the OS text
+    /// "The system cannot find the path specified. (os error 3)".
+    #[test]
+    fn a_missing_file_is_reported_as_not_found_by_name() {
+        let root = std::env::temp_dir().join(format!("ws-{}", harness_types::InputId::generate()));
+        std::fs::create_dir_all(&root).expect("root");
+        let missing = root.join(".claude-plugin").join("plugin.json");
+        let error = read_text(&missing).expect_err("missing");
+        assert_eq!(error.code(), ErrorCode::InvalidPayload);
+        assert_eq!(
+            error.message(),
+            format!("File not found: {}", missing.display())
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     /// Models name files by the absolute path they were shown; inside the
     /// workspace that is the relative path, outside it stays refused.

@@ -870,13 +870,15 @@ impl ToolExecutionService {
             .await
         {
             let code = error.code();
+            // The message alone: the code travels beside it, and the display
+            // form would name it twice ("invalid_payload: invalid_payload: ...").
             return self
                 .record_denied_begun(
                     &prepared,
                     execution_id,
                     Some(&approval),
                     code,
-                    &error.to_string(),
+                    error.message(),
                 )
                 .await;
         }

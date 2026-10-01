@@ -2302,7 +2302,9 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
             block.digest.as_str(),
             block.channel.as_str()
         ),
-        other => format!("{name}: {other:?}"),
+        // A refusal in words, not the debug form `Denied { code: .., reason: .. }`.
+        ToolOutput::Denied { code, reason } => format!("{name} failed ({code}): {reason}"),
+        other @ ToolOutput::OutcomeUnknown { .. } => format!("{name}: {other:?}"),
     };
     truncate_text(&body, TOOL_RESULT_LIMIT)
 }
