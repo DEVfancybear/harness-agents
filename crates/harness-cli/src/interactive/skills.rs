@@ -691,14 +691,22 @@ mod tests {
             let entry = catalog.entry(name).expect("a swarms skill");
             assert_eq!(entry.source, SkillSource::Builtin, "{name}");
             assert_eq!(entry.version, "1102681", "{name}");
-            assert!(!entry.model_invocable, "{name} starts only with /skill:{name}");
+            assert!(
+                !entry.model_invocable,
+                "{name} starts only with /skill:{name}"
+            );
             assert!(entry.description.contains("Use when"), "{name}");
-            let activation = catalog.activate(name, None, 1).expect("the user can run it");
+            let activation = catalog
+                .activate(name, None, 1)
+                .expect("the user can run it");
             for link in activation.content.split("](").skip(1) {
                 let target = link.split(')').next().expect("link target");
                 if target.starts_with("references/") {
                     assert!(
-                        activation.resources.iter().any(|file| file.ends_with(target)),
+                        activation
+                            .resources
+                            .iter()
+                            .any(|file| file.ends_with(target)),
                         "{name} links {target}, which is not shipped: {:?}",
                         activation.resources
                     );

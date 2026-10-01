@@ -148,7 +148,8 @@ fn find_rlm_model_matches(query: &str, models: &[SearchableModel], limit: usize)
             } else {
                 model.name.clone()
             };
-            let fields = [&selector, &model.id, &name].map(|field| normalize_model_search_text(field));
+            let fields =
+                [&selector, &model.id, &name].map(|field| normalize_model_search_text(field));
             let score = if query.is_empty() {
                 0
             } else if let Some(exact) = fields.iter().position(|field| *field == query) {
@@ -2336,7 +2337,9 @@ impl RlmChildren {
                 .filter(|limit| (1..=MAX_RLM_MODEL_SEARCH_LIMIT).contains(limit)),
         }
         .ok_or_else(|| {
-            format!("rlm.find_models limit must be an integer from 1 to {MAX_RLM_MODEL_SEARCH_LIMIT}")
+            format!(
+                "rlm.find_models limit must be an integer from 1 to {MAX_RLM_MODEL_SEARCH_LIMIT}"
+            )
         })?;
         let mut models = self
             .launch

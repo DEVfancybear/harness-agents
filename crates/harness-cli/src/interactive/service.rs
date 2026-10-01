@@ -1287,14 +1287,18 @@ impl super::delegation::ChildModels for ServiceChildModels {
     }
 
     fn searchable(&self) -> Vec<super::delegation::SearchableModel> {
-        catalog_models_scoped(&self.environment, &self.data_dir, credentials::Scope::Subagent)
-            .into_iter()
-            .map(|model| super::delegation::SearchableModel {
-                provider: model.provider,
-                id: model.id,
-                name: model.name,
-            })
-            .collect()
+        catalog_models_scoped(
+            &self.environment,
+            &self.data_dir,
+            credentials::Scope::Subagent,
+        )
+        .into_iter()
+        .map(|model| super::delegation::SearchableModel {
+            provider: model.provider,
+            id: model.id,
+            name: model.name,
+        })
+        .collect()
     }
 
     fn resolve_at(
