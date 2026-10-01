@@ -141,6 +141,11 @@ pub trait TuiRenderer {
     fn restore(&mut self, items: &[HistoryItem]) -> io::Result<()> {
         self.insert_history_batch(items)
     }
+    /// The opening banner has new lines (the model or the thinking level changed):
+    /// replace what it says and draw the screen again.
+    fn retitle(&mut self, _lines: &[String]) -> io::Result<()> {
+        Ok(())
+    }
     /// Whether prime-agent's fullscreen rendering is up.
     fn fullscreen(&self) -> bool {
         false
@@ -285,6 +290,25 @@ where
         }
         let rows = blocks.into_iter().rev().flatten().collect::<Vec<_>>();
         self.insert_rows(&rows)
+    }
+
+    /// Replace the opening banner's lines in what the screen remembers and draw the
+    /// screen again, so a banner still in view names the model now in use. A banner
+    /// that has scrolled away is left to the status row, which is always current.
+    fn retitle(&mut self, lines: &[String]) -> io::Result<()> {
+        let mut replaced = false;
+        if let Some(HistoryItem::Banner { lines: banner }) = self
+            .shown
+            .iter_mut()
+            .find(|item| matches!(item, HistoryItem::Banner { .. }))
+        {
+            banner.clone_from(&lines.to_vec());
+            replaced = true;
+        }
+        if replaced {
+            self.repaint_screen(self.detail)?;
+        }
+        Ok(())
     }
 
     /// Repaint the screen first when the console changed size since the last paint.
@@ -559,6 +583,16 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
         }
     }
 
+    fn retitle(&mut self, lines: &[String]) -> io::Result<()> {
+        match &mut self.screen {
+            Screen::Inline(inline) => inline.retitle(lines),
+            Screen::Fullscreen(screen) => {
+                screen.retitle(lines);
+                Ok(())
+            }
+        }
+    }
+
     fn fullscreen(&self) -> bool {
         matches!(self.screen, Screen::Fullscreen(_))
     }
@@ -764,6 +798,10 @@ impl<T: TerminalBackend> TuiRenderer for ScriptedRenderer<T> {
 
     fn reprint(&mut self, detail: super::events::Detail) -> io::Result<()> {
         self.inner.repaint_screen(detail)
+    }
+
+    fn retitle(&mut self, lines: &[String]) -> io::Result<()> {
+        self.inner.retitle(lines)
     }
 
     fn restore(&mut self, items: &[HistoryItem]) -> io::Result<()> {
@@ -1046,6 +1084,9 @@ fn apply(renderer: &mut impl TuiRenderer, effects: Vec<Effect>) -> Result<Step, 
                 .map_err(|error| terminal_error(&error))?,
             Effect::Restore(items) => renderer
                 .restore(&items)
+                .map_err(|error| terminal_error(&error))?,
+            Effect::Banner(lines) => renderer
+                .retitle(&lines)
                 .map_err(|error| terminal_error(&error))?,
             // History rows were gathered above; a redraw is the frame's own draw.
             Effect::History(_) | Effect::Stream(_) | Effect::Thinking(_) | Effect::Redraw => {}
@@ -1998,6 +2039,55 @@ pub(crate) mod tests {
             "only what fits on screen is drawn again:
 {joined}"
         );
+    }
+
+    /// A banner still on screen names the model now in use: retitle replaces what the
+    /// renderer remembers of it and draws the screen again, once, with no copy of
+    /// the old one left behind.
+    #[test]
+    fn a_retitled_banner_replaces_the_old_one_on_screen() {
+        let theme = super::theme::Theme::plain();
+        let mut renderer =
+            super::RealRenderer::open_with(ratatui::backend::TestBackend::new(80, 20), &theme)
+                .expect("renderer opens");
+        let lines = |model: &str, level: &str| {
+            vec![
+                String::new(),
+                "Harness Agents 0.1.6".to_owned(),
+                "Project: C:/work/demo".to_owned(),
+                format!("Service: {model} via https://example.test"),
+                "Permissions: ask".to_owned(),
+                format!("Thinking: {level}"),
+            ]
+        };
+        renderer
+            .insert_history(&HistoryItem::Banner {
+                lines: lines("first-model", "low"),
+            })
+            .expect("banner goes in");
+        let mut ready = state(AppPhase::Ready);
+        ready.live_text.clear();
+        renderer.draw_state(&ready).expect("frame draws");
+        let before = screen(&renderer).join("\n");
+        assert!(
+            before.contains("first-model") && before.contains("✧ low"),
+            "{before}"
+        );
+
+        renderer
+            .retitle(&lines("second-model", "high"))
+            .expect("banner is retitled");
+        renderer.draw_state(&ready).expect("frame draws");
+        let after = screen(&renderer).join("\n");
+        assert!(
+            after.contains("second-model") && after.contains("✧ high"),
+            "{after}"
+        );
+        assert!(
+            !after.contains("first-model") && !after.contains("✧ low"),
+            "no copy of the old banner is left: {after}"
+        );
+        assert_eq!(after.matches("second-model").count(), 1, "{after}");
     }
 
     /// A terminal dragged to another size re-wraps what it shows. Whatever the

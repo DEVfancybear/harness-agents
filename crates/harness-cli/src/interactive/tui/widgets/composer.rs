@@ -175,15 +175,21 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
         match state.phase {
             AppPhase::Running | AppPhase::Canceling => theme.info,
             AppPhase::WaitingApproval | AppPhase::WaitingInput => theme.warning,
-            _ => theme.accent,
+            _ => theme.composer_border,
         }
+    };
+    // An idle box names itself in the bright accent; its border stays calm.
+    let title_style = if border_style == theme.composer_border {
+        theme.accent.add_modifier(Modifier::BOLD)
+    } else {
+        border_style
     };
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .padding(Padding::horizontal(1))
         .border_style(border_style)
-        .title(Span::styled("─ Yêu cầu ", border_style));
+        .title(Span::styled("─ Yêu cầu ", title_style));
     // The top-right corner says what the box is doing, so a glance at the input
     // answers "is it still working?" without reading the status row. A narrow
     // console drops it rather than letting it eat the title.

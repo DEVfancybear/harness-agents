@@ -377,6 +377,7 @@ fn step(
             Effect::Thinking(_)
             | Effect::Reprint(_)
             | Effect::Restore(_)
+            | Effect::Banner(_)
             | Effect::Bell
             | Effect::ClearViewport
             | Effect::Fullscreen(_) => {}
@@ -616,6 +617,7 @@ fn render_line_mode(
             Effect::Thinking(_)
             | Effect::Reprint(_)
             | Effect::Restore(_)
+            | Effect::Banner(_)
             | Effect::Bell
             | Effect::ClearViewport
             | Effect::Fullscreen(_) => {}

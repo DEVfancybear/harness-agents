@@ -623,6 +623,18 @@ where
         self.rows_key = None;
     }
 
+    /// Replace the opening banner's lines: the model or the level changed.
+    pub fn retitle(&mut self, lines: &[String]) {
+        if let Some(HistoryItem::Banner { lines: banner }) = self
+            .shown
+            .iter_mut()
+            .find(|item| matches!(item, HistoryItem::Banner { .. }))
+        {
+            banner.clone_from(&lines.to_vec());
+            self.rows_key = None;
+        }
+    }
+
     /// Take over a conversation another process drew (`ha attach`).
     pub fn restore(&mut self, items: &[HistoryItem]) {
         self.shown = items
@@ -866,10 +878,15 @@ fn top_bar(state: &UiState, width: u16, theme: &Theme) -> Line<'static> {
         .find_map(|line| line.strip_prefix("Cost: "))
         .filter(|cost| cost.starts_with('$'))
         .map(str::to_owned);
-    let start = usize::from(width).saturating_sub(name.width()) / 2;
-    let mut spans = vec![Span::raw(" ".repeat(start)), Span::raw(name)];
+    let shown = 2 + name.width();
+    let start = usize::from(width).saturating_sub(shown) / 2;
+    let mut spans = vec![
+        Span::raw(" ".repeat(start)),
+        Span::styled("✦ ", theme.accent),
+        Span::styled(name, theme.strong),
+    ];
     if let Some(cost) = cost {
-        spans.push(Span::styled(format!("  {cost}"), theme.dim));
+        spans.push(Span::styled(format!("  ◎ {cost}"), theme.dim));
     }
     Line::from(spans)
 }

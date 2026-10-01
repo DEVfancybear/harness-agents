@@ -651,10 +651,12 @@ const TEST_OUTPUT: &str = "npm test\n\n> demo-shop@0.1.0 test\n> vitest run\n\n 
 fn banner() -> HistoryItem {
     HistoryItem::Banner {
         lines: vec![
-            "Harness Agents 0.1.0".to_owned(),
+            "Harness Agents 0.1.6".to_owned(),
             "Project: C:/work/demo-shop".to_owned(),
             "Service: deepseek-v4-flash via https://api.deepseek.com".to_owned(),
             "Permissions: ask".to_owned(),
+            "Git: master".to_owned(),
+            "Thinking: high".to_owned(),
             "Nhập yêu cầu.".to_owned(),
         ],
     }

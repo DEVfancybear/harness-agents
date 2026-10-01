@@ -46,8 +46,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     source.push_str("pub const BUNDLED_NOTICES: &[(&str, &[u8])] = &[\n");
     for name in [
-        "LICENSE-superpowers",
-        "SUPERPOWERS-SOURCE.md",
         "LICENSE-deer-flow",
         "DEER-FLOW-SOURCE.md",
         "LICENSE-prime-agent",

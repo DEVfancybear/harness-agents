@@ -76,6 +76,9 @@ pub enum Effect {
     Redraw,
     /// Enter or leave prime-agent's fullscreen rendering (`/fullscreen`).
     Fullscreen(bool),
+    /// The opening banner names a model or a thinking level that has changed: draw
+    /// it again with these lines, wherever the banner still is on screen.
+    Banner(Vec<String>),
     /// Leave the app with this exit code.
     Exit(u8),
 }
@@ -653,11 +656,7 @@ impl InteractiveController {
             AppPhase::Ready
         };
         self.refresh_menu();
-        let mut lines = vec![String::new()];
-        lines.extend(self.header.iter().cloned());
-        if let Some(hint) = &self.setup_hint {
-            lines.push(hint.clone());
-        }
+        let mut lines = self.banner_lines();
         lines.push(
             "Nhập yêu cầu. / lệnh · Alt+V dán ảnh/file · /login đăng nhập · /quit thoát".to_owned(),
         );
@@ -672,6 +671,30 @@ impl InteractiveController {
             lines.push(notice);
         }
         lines
+    }
+
+    /// The lines the opening banner is drawn from: the header, the thinking level in
+    /// force and any setup hint. They are read again when the model or the level
+    /// changes, so the banner never names a model that is no longer the one in use.
+    fn banner_lines(&self) -> Vec<String> {
+        let mut lines = vec![String::new()];
+        lines.extend(self.header.iter().cloned());
+        if !self.plain
+            && let Some(level) = &self.thinking_label
+        {
+            lines.push(format!("Thinking: {level}"));
+        }
+        if let Some(hint) = &self.setup_hint {
+            lines.push(hint.clone());
+        }
+        lines
+    }
+
+    /// Ask the renderer to draw the banner again after the model or the level changed.
+    fn refresh_banner(&self, effects: &mut Vec<Effect>) {
+        if !self.plain {
+            effects.push(Effect::Banner(self.banner_lines()));
+        }
     }
 
     /// What the slash menu offers beyond the built-ins: the skills and prompt
@@ -1217,6 +1240,7 @@ impl InteractiveController {
             Err(message) => self.push_history(effects, HistoryItem::Error { message }),
         }
         self.refresh_status();
+        self.refresh_banner(effects);
     }
 
     /// prime-agent's prompt stash (Ctrl-S): a draft is put aside, and an empty
@@ -3206,6 +3230,7 @@ impl InteractiveController {
                         Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
                     }
                     self.refresh_status();
+                    self.refresh_banner(&mut effects);
                 } else {
                     let lines = self.service.thinking_status();
                     self.reference("/effort", lines, &mut effects);
@@ -3411,6 +3436,7 @@ impl InteractiveController {
                         Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
                     }
                     self.refresh_status();
+                    self.refresh_banner(&mut effects);
                 } else {
                     let label = self.service.label();
                     let mut lines = vec![format!("backend: {label}")];
@@ -5954,6 +5980,7 @@ Command: \"npm run build\""
                 Effect::Thinking(_)
                 | Effect::Reprint(_)
                 | Effect::Restore(_)
+                | Effect::Banner(_)
                 | Effect::Copy(_)
                 | Effect::Bell
                 | Effect::Redraw
@@ -7557,6 +7584,96 @@ Command: \"npm run build\""
             );
             drop(temp);
         }
+    }
+
+    /// Choosing a model or a thinking level must reach the screen: the status row
+    /// reads the header, and the opening banner is drawn again with the new lines.
+    /// The banner used to keep naming the model the session started with.
+    #[test]
+    fn choosing_a_model_or_a_level_updates_the_header_and_redraws_the_banner() {
+        struct ChoicePort {
+            recorded: RecordingPort,
+            model: std::sync::Arc<std::sync::Mutex<(String, String)>>,
+        }
+
+        impl SessionPort for ChoicePort {
+            fn label(&self) -> String {
+                format!("{} via https://example.test", self.model.lock().unwrap().0)
+            }
+            fn submit(&mut self, request: SubmitRequest) {
+                self.recorded.submit(request);
+            }
+            fn cancel(&mut self) {
+                self.recorded.cancel();
+            }
+            fn answer(&mut self, request_id: &str, decision: ApprovalDecision) -> bool {
+                self.recorded.answer(request_id, decision)
+            }
+            fn resume(&mut self, session_id: Option<String>) -> Result<(), String> {
+                self.recorded.resume(session_id)
+            }
+            fn limits(&self) -> TurnBounds {
+                self.recorded.limits()
+            }
+            fn set_model(&mut self, model: &str) -> Result<String, String> {
+                self.model.lock().unwrap().0 = model.to_owned();
+                Ok(format!("model {model} selected"))
+            }
+            fn set_thinking(&mut self, level: &str) -> Result<String, String> {
+                self.model.lock().unwrap().1 = level.to_owned();
+                Ok(format!("thinking level {level} for the next turn"))
+            }
+            fn thinking_level(&self) -> Option<String> {
+                Some(self.model.lock().unwrap().1.clone())
+            }
+        }
+
+        let (temp, context) = context(true);
+        let model = std::sync::Arc::new(std::sync::Mutex::new((
+            "first-model".to_owned(),
+            "low".to_owned(),
+        )));
+        let mut controller = InteractiveController::new(
+            &context,
+            Box::new(ChoicePort {
+                recorded: RecordingPort::default(),
+                model: std::sync::Arc::clone(&model),
+            }),
+            SessionChannel::new(),
+            false,
+        );
+        let opening = controller.boot_lines().join("\n");
+        assert!(opening.contains("first-model"), "{opening}");
+        assert!(opening.contains("Thinking: low"), "{opening}");
+
+        let banner = |effects: &[Effect]| {
+            effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    Effect::Banner(lines) => Some(lines.join("\n")),
+                    _ => None,
+                })
+                .next_back()
+        };
+        let effects = submit_text(&mut controller, "/model second-model");
+        let redrawn = banner(&effects).expect("a model change redraws the banner");
+        assert!(redrawn.contains("Service: second-model"), "{redrawn}");
+        assert!(!redrawn.contains("first-model"), "{redrawn}");
+        let state = controller.ui_state();
+        assert!(
+            state
+                .header
+                .iter()
+                .any(|line| line.starts_with("Service: second-model")),
+            "the status row reads this: {:?}",
+            state.header
+        );
+
+        let effects = submit_text(&mut controller, "/effort high");
+        let redrawn = banner(&effects).expect("a level change redraws the banner");
+        assert!(redrawn.contains("Thinking: high"), "{redrawn}");
+        assert!(!redrawn.contains("Thinking: low"), "{redrawn}");
+        drop(temp);
     }
 
     /// A scrolling overlay keeps the help text verbatim and never clips the top.

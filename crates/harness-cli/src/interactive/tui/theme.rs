@@ -20,8 +20,8 @@ mod palette {
     pub const SURFACE: u32 = 0x0e_11_17;
     pub const SELECTED_BG: u32 = 0x1e_24_31;
     pub const USER_MSG_BG: u32 = 0x14_19_23;
-    pub const PRIMARY: u32 = 0x8b_7c_f6;
-    pub const PRIMARY_SOFT: u32 = 0xba_b0_fb;
+    pub const PRIMARY: u32 = 0x2d_d4_bf;
+    pub const PRIMARY_SOFT: u32 = 0x99_f6_e4;
     pub const SUCCESS: u32 = 0x4a_de_80;
     pub const WARNING: u32 = 0xfb_bf_24;
     pub const ERROR: u32 = 0xf8_71_71;
@@ -31,14 +31,16 @@ mod palette {
     pub const MD_CODE: u32 = 0xc8_ce_da;
     pub const DIFF_ADDED: u32 = 0x4a_de_80;
     pub const DIFF_REMOVED: u32 = 0xf8_71_71;
-    pub const REFINEMENT: u32 = 0xa7_8b_fa;
+    pub const REFINEMENT: u32 = 0x7d_d3_fc;
     pub const NEUTRAL: u32 = 0xd6_da_e4;
     /// A changed line's block behind it: a tint dark enough to read text on.
     pub const DIFF_ADDED_BG: u32 = 0x11_2e_1c;
     pub const DIFF_REMOVED_BG: u32 = 0x30_16_1a;
     /// The rail before a user turn, and the one before an answer.
     pub const USER_RAIL: u32 = 0x38_bd_f8;
-    pub const ASSISTANT_RAIL: u32 = 0x8b_7c_f6;
+    pub const ASSISTANT_RAIL: u32 = 0x2d_d4_bf;
+    /// The border of an idle input box: the accent, quieter.
+    pub const COMPOSER: u32 = 0x2f_8f_86;
     /// A pill's background: one step above the panel.
     pub const CHIP_BG: u32 = 0x1c_22_2e;
     /// The rule that closes a turn, and the one under the banner.
@@ -46,21 +48,21 @@ mod palette {
     /// One colour per family of tool, chosen to stay apart from each other and
     /// from the status colours: a call is recognised by its colour before its words.
     pub const KIND_READ: u32 = 0x60_a5_fa;
-    pub const KIND_LIST: u32 = 0x2d_d4_bf;
+    pub const KIND_LIST: u32 = 0x22_d3_ee;
     pub const KIND_SEARCH: u32 = 0xfb_bf_24;
     pub const KIND_EDIT: u32 = 0xfb_92_3c;
-    pub const KIND_WRITE: u32 = 0xf4_72_b6;
-    pub const KIND_SHELL: u32 = 0xe8_79_f9;
+    pub const KIND_WRITE: u32 = 0xfb_71_85;
+    pub const KIND_SHELL: u32 = 0xf4_72_b6;
     pub const KIND_GIT: u32 = 0xa3_e6_35;
-    pub const KIND_WEB: u32 = 0x38_bd_f8;
-    pub const KIND_AGENT: u32 = 0xa7_8b_fa;
+    pub const KIND_WEB: u32 = 0x5e_ea_d4;
+    pub const KIND_AGENT: u32 = 0xcb_d5_e1;
     pub const KIND_PYTHON: u32 = 0xfd_e0_47;
     pub const KIND_MCP: u32 = 0xfd_a4_af;
-    pub const KIND_SKILL: u32 = 0xc4_b5_fd;
-    pub const KIND_ASK: u32 = 0xfc_d3_4d;
+    pub const KIND_SKILL: u32 = 0x86_ef_ac;
+    pub const KIND_ASK: u32 = 0xfd_ba_74;
     /// The background behind a badge, one tint per meaning.
     pub const BADGE_OK_BG: u32 = 0x14_3d_24;
-    pub const BADGE_ACCENT_BG: u32 = 0x2b_24_5c;
+    pub const BADGE_ACCENT_BG: u32 = 0x0f_3f_3b;
     pub const BADGE_WARN_BG: u32 = 0x45_35_0f;
     pub const BADGE_ERROR_BG: u32 = 0x4a_1d_22;
     pub const BADGE_INFO_BG: u32 = 0x0c_33_46;
@@ -251,7 +253,7 @@ impl Theme {
             border: fg(palette::GRID),
             title: fg(palette::PRIMARY_SOFT).add_modifier(Modifier::BOLD),
             status: fg(palette::MUTED),
-            composer_border: fg(palette::GRID),
+            composer_border: fg(palette::COMPOSER),
             selection: fg(palette::FG)
                 .bg(color(palette::SELECTED_BG, depth))
                 .add_modifier(Modifier::BOLD),

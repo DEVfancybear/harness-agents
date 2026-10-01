@@ -298,21 +298,6 @@ fn spans_cells(spans: &[Span<'static>]) -> usize {
         .sum()
 }
 
-/// A row of `head` spans with `tail` pushed to the right edge.
-///
-/// The banner uses it for the version: a console wide enough shows it on the same
-/// row as the identity, and a narrow one lets the row wrap instead of dropping it.
-fn tail_row(head: Vec<Span<'static>>, tail: Span<'static>, width: u16) -> Line<'static> {
-    let used = spans_cells(&head) + super::widgets::composer::display_width(&tail.content);
-    let mut spans = head;
-    let fill = usize::from(width).saturating_sub(used + 1);
-    if fill > 0 {
-        spans.push(Span::raw(" ".repeat(fill)));
-    }
-    spans.push(tail);
-    Line::from(spans)
-}
-
 /// prime-agent's injected prompts (`injected-prompt-message.ts`): a heartbeat is
 /// `♥ Heartbeat prompt · <schedule>`, a goal continuation `◆ Goal · <objective>`,
 /// anything else the app sent by itself `◆ <first line>`.
@@ -950,6 +935,10 @@ fn clip_spans(spans: Vec<Span<'static>>, cells: usize) -> Vec<Span<'static>> {
 }
 
 /// The session heading: project, model, permission mode and any setup guidance.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one card built top to bottom: title, badges, path, keys, setup notes"
+)]
 fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let project = lines
         .iter()
@@ -963,33 +952,49 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
         })
         .filter(|name| !name.is_empty())
         .unwrap_or("workspace");
-    let version = lines.iter().find(|line| line.starts_with("Harness Agents"));
+    let version = lines
+        .iter()
+        .find(|line| line.starts_with("Harness Agents"))
+        .cloned()
+        .unwrap_or_default();
+    // One card of identity: which workspace this session belongs to, the build it
+    // runs, the model it will ask, how much it may do without being asked, the
+    // branch, and the keys that open everything else.
+    let inner = usize::from(width).saturating_sub(6).clamp(24, 96);
+    let border = theme.composer_border;
     let mut rows = vec![Line::default()];
-    // One card of identity rows on the accent rail: which workspace this session
-    // belongs to, the build it runs, the model it will ask and how much it may do
-    // without being asked. The version sits at the right edge, out of the way of
-    // the three things a reader actually looks for.
-    rows.push(tail_row(
-        vec![
-            Span::styled(RAIL, theme.accent),
-            Span::styled("✦ ", theme.accent),
-            Span::styled(format!("ha / {name}"), theme.title),
-        ],
-        version.map_or_else(
-            || Span::raw(String::new()),
-            |value| Span::styled(value.to_owned(), theme.dim),
-        ),
-        width,
-    ));
+    // The top edge carries the title on the left and the build on the right.
+    let title = format!(" ✦ ha / {name} ");
+    let build = if version.is_empty() {
+        String::new()
+    } else {
+        format!(" {version} ")
+    };
+    let used = 1
+        + super::widgets::composer::display_width(&title)
+        + super::widgets::composer::display_width(&build);
+    let fill = (inner + 2).saturating_sub(used + 1).max(1);
+    rows.push(Line::from(vec![
+        Span::styled("  ╭─", border),
+        Span::styled(title, theme.accent.add_modifier(Modifier::BOLD)),
+        Span::styled("─".repeat(fill), border),
+        Span::styled(build, theme.dim),
+        Span::styled("─╮", border),
+    ]));
+    let row = |spans: Vec<Span<'static>>| -> Line<'static> {
+        let cells = spans_cells(&spans);
+        let mut all = vec![Span::styled("  │ ", border)];
+        all.extend(spans);
+        all.push(Span::raw(" ".repeat(inner.saturating_sub(cells))));
+        all.push(Span::styled(" │", border));
+        Line::from(all)
+    };
     if let Some(model) = lines.iter().find_map(|line| line.strip_prefix("Service: ")) {
         let model = model.split(" via ").next().unwrap_or(model);
         let permissions = lines
             .iter()
             .find_map(|line| line.strip_prefix("Permissions: "));
-        let mut spans = vec![
-            Span::styled(RAIL, theme.accent),
-            Span::styled(format!(" ◆ {model} "), theme.badge_accent),
-        ];
+        let mut spans = vec![Span::styled(format!(" ◆ {model} "), theme.badge_accent)];
         if let Some(mode) = permissions {
             let style = if mode.contains("full-auto") {
                 theme.badge_warn
@@ -999,18 +1004,49 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
             spans.push(Span::raw(" "));
             spans.push(Span::styled(format!(" ⚙ {mode} "), style));
         }
-        rows.extend(wrap_spans(spans, width));
+        if let Some(level) = lines
+            .iter()
+            .find_map(|line| line.strip_prefix("Thinking: "))
+        {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(format!(" ✧ {level} "), theme.badge_info));
+        }
+        if let Some(git) = lines.iter().find_map(|line| line.strip_prefix("Git: "))
+            && !git.trim().is_empty()
+        {
+            let git: String = git.trim().chars().take(28).collect();
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(format!(" ⎇ {git} "), theme.chip));
+        }
+        rows.push(row(spans));
     }
     if let Some(project) = project {
-        rows.extend(wrap_spans(
-            vec![
-                Span::styled(RAIL, theme.accent),
-                Span::styled("⌂ ", theme.dim),
-                Span::styled(project.to_owned(), theme.dim),
-            ],
-            width,
-        ));
+        // A long path wraps onto further rows, never cut: it is what tells two
+        // sessions apart.
+        let room = inner.saturating_sub(2).max(8);
+        let characters: Vec<char> = project.chars().collect();
+        for (index, chunk) in characters.chunks(room).enumerate() {
+            rows.push(row(vec![
+                Span::styled(if index == 0 { "⌂ " } else { "  " }, theme.dim),
+                Span::styled(chunk.iter().collect::<String>(), theme.muted),
+            ]));
+        }
     }
+    rows.push(row(vec![
+        Span::styled("/", theme.accent),
+        Span::styled(" lệnh  ", theme.dim),
+        Span::styled("@", theme.accent),
+        Span::styled(" tệp  ", theme.dim),
+        Span::styled("Ctrl+O", theme.accent),
+        Span::styled(" chi tiết  ", theme.dim),
+        Span::styled("Ctrl+C", theme.accent),
+        Span::styled(" dừng", theme.dim),
+    ]));
+    rows.push(Line::from(vec![
+        Span::styled("  ╰", border),
+        Span::styled("─".repeat(inner + 2), border),
+        Span::styled("╯", border),
+    ]));
     // Setup errors and sign-in instructions stay visible. Configuration paths
     // are available through /config rather than filling the opening screen.
     for line in lines.iter().filter(|line| {
@@ -1026,6 +1062,7 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
                 "Store:",
                 "Service:",
                 "Permissions:",
+                "Thinking:",
                 "Nhập yêu cầu.",
             ]
             .iter()
@@ -1039,10 +1076,6 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
             width,
         ));
     }
-    rows.push(Line::from(Span::styled(
-        "─".repeat(usize::from(width)),
-        theme.rule,
-    )));
     rows
 }
 /// A tool panel header: prime-agent's `label · status` on `toolPanelBg` - `running`
