@@ -1039,6 +1039,7 @@ impl InteractiveController {
             InputOutcome::Interrupt => self.interrupt(),
             InputOutcome::Submit(text) => self.submit(text),
             InputOutcome::Secret(value) => self.save_key(&value),
+            InputOutcome::SecretCanceled => self.cancel_key(),
         }
     }
 
@@ -2831,6 +2832,9 @@ impl InteractiveController {
                         Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
                     }
                     self.refresh_menu();
+                    // The banner's mode badge reads the header refresh_menu just
+                    // updated; without a redraw it kept saying "ask".
+                    self.refresh_banner(&mut effects);
                 } else {
                     let mut lines = self.service.permissions_summary();
                     lines.push(
@@ -3587,6 +3591,28 @@ impl InteractiveController {
             return;
         }
         self.editor.open_overlay(title, lines);
+    }
+
+    /// Esc left the masked key prompt: say so, since the prompt looks like a
+    /// normal one again (measured: with no word, a user took it for stuck and
+    /// typed into it), and leave the subagent login scope.
+    fn cancel_key(&mut self) -> Vec<Effect> {
+        let Some(provider) = self.login_provider.take() else {
+            return vec![Effect::Redraw];
+        };
+        self.credential_scope(super::credentials::Scope::Main);
+        let name = super::providers::provider(&provider)
+            .map_or(provider.as_str(), |entry| entry.name)
+            .to_owned();
+        let mut effects = Vec::new();
+        self.push_history(
+            &mut effects,
+            HistoryItem::Notice {
+                message: format!("API key entry for {name} canceled; nothing was saved."),
+            },
+        );
+        effects.push(Effect::Redraw);
+        effects
     }
 
     /// Save an API key entered in the app, then make it effective at once.
@@ -5882,8 +5908,15 @@ Command: \"npm run build\""
         submit_text(controller, "/login deepseek");
         assert!(controller.editor.secret_entry());
         type_text(controller, "sk-abandoned");
-        let _ = controller.handle_key(Key::Esc);
+        let effects = controller.handle_key(Key::Esc);
         assert!(!controller.editor.secret_entry(), "Esc cancels entry");
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::History(HistoryItem::Notice { message }) if message.contains("canceled; nothing was saved")
+            )),
+            "Esc says the entry ended: {effects:?}"
+        );
         assert_eq!(
             controller.prompt(),
             "> ",

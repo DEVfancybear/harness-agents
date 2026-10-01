@@ -6,7 +6,8 @@
 //! chat's name and its spend) pinned to the top row. The scroll position is
 //! application state, not terminal scrollback: the mouse wheel scrolls three
 //! rows, PageUp/PageDown a page, Shift+Alt+Up goes to the top and
-//! Ctrl+Shift+Down back to the end, following the output again. A drag selects
+//! Ctrl+Shift+Down (or Ctrl+End, which Windows Terminal lets through) back to
+//! the end, following the output again. A drag selects
 //! text - anchored to the conversation's rows, so streaming and scrolling never
 //! shift it, and scrolling on its own when it reaches an edge - and the release
 //! copies it. Leaving fullscreen prints what it showed into the primary
@@ -41,7 +42,7 @@ pub const WHEEL_SCROLL_LINES: isize = 3;
 const AUTO_SCROLL_EVERY: Duration = Duration::from_millis(50);
 
 /// The follow key prime-agent's hint names (`tui.viewport.follow`).
-pub const FOLLOW_KEY: &str = "ctrl+shift+down";
+pub const FOLLOW_KEY: &str = "ctrl+end";
 
 /// Whether this terminal renders fullscreen, and with the mouse.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1055,8 +1056,7 @@ mod tests {
         let rows = painted(&screen);
         assert!(!rows.iter().any(|row| row.contains("line-39")), "{rows:?}");
         assert!(
-            rows.iter()
-                .any(|row| row.contains("ctrl+shift+down to follow")),
+            rows.iter().any(|row| row.contains("ctrl+end to follow")),
             "the follow hint: {rows:?}"
         );
         screen.follow();

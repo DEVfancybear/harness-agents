@@ -26,6 +26,8 @@ pub enum InputOutcome {
     /// The user submitted a secret; it must never be echoed, logged or stored in
     /// the history, so it travels as its own outcome instead of a `Submit`.
     Secret(String),
+    /// Esc left secret entry; nothing was submitted.
+    SecretCanceled,
     /// Ctrl-C was pressed.
     Interrupt,
     /// Ctrl-D was pressed on an empty prompt.
@@ -526,7 +528,7 @@ impl LineEditor {
                 // tells the user Esc cancels it, so Esc has to.
                 if self.secret {
                     self.cancel_secret();
-                    return InputOutcome::Redraw;
+                    return InputOutcome::SecretCanceled;
                 }
                 if self.overlay.is_some() {
                     self.overlay = None;
@@ -996,7 +998,7 @@ mod tests {
         // `cancel_secret` directly would not notice if that promise broke.
         editor.begin_secret_entry();
         type_text(&mut editor, "sk-abandoned");
-        assert_eq!(editor.handle(Key::Esc), InputOutcome::Redraw);
+        assert_eq!(editor.handle(Key::Esc), InputOutcome::SecretCanceled);
         assert!(!editor.secret_entry(), "Esc ends secret entry");
         assert_eq!(editor.buffer(), "");
         assert!(editor.history().is_empty());

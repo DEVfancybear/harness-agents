@@ -292,7 +292,7 @@ pub fn hotkey_lines() -> Vec<String> {
             "fullscreen: scroll the transcript to its top",
         ),
         (
-            "Ctrl+Shift+↓",
+            "Ctrl+End / Ctrl+Shift+↓",
             "fullscreen: scroll to the bottom and follow output",
         ),
         (

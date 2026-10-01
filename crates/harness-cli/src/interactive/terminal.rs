@@ -331,11 +331,14 @@ fn map_key(key: KeyEvent) -> Key {
         KeyCode::Left => Key::Left,
         KeyCode::Right => Key::Right,
         // prime-agent's fullscreen viewport keys: Shift+Alt+Up to the top,
-        // Ctrl+Shift+Down back to the end, following.
+        // Ctrl+Shift+Down back to the end, following. Windows Terminal keeps
+        // Ctrl+Shift+Down for its own scrollback (measured: it never reaches the
+        // app), so Ctrl+End follows too.
         KeyCode::Up if alt && key.modifiers.contains(KeyModifiers::SHIFT) => Key::ViewportTop,
         KeyCode::Down if control && key.modifiers.contains(KeyModifiers::SHIFT) => {
             Key::ViewportFollow
         }
+        KeyCode::End if control => Key::ViewportFollow,
         KeyCode::Up => Key::Up,
         KeyCode::Down => Key::Down,
         KeyCode::PageUp => Key::PageUp,
@@ -505,6 +508,19 @@ mod tests {
         );
         assert_eq!(map_key(key(KeyCode::Enter, KeyModifiers::NONE)), Key::Enter);
         assert_eq!(map_key(key(KeyCode::Home, KeyModifiers::NONE)), Key::Home);
+        assert_eq!(map_key(key(KeyCode::End, KeyModifiers::NONE)), Key::End);
+        // Windows Terminal keeps Ctrl+Shift+Down; Ctrl+End follows as well.
+        assert_eq!(
+            map_key(key(KeyCode::End, KeyModifiers::CONTROL)),
+            Key::ViewportFollow
+        );
+        assert_eq!(
+            map_key(key(
+                KeyCode::Down,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            Key::ViewportFollow
+        );
         assert_eq!(
             map_key(key(KeyCode::F(5), KeyModifiers::NONE)),
             Key::Unknown

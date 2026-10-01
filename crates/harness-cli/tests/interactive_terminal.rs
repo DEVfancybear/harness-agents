@@ -3330,7 +3330,7 @@ fn f01_pty_fullscreen_scrolls_with_the_wheel_and_can_be_turned_off() {
     for _ in 0..6 {
         session.send("\u{1b}[<64;10;5M");
     }
-    session.wait_for("ctrl+shift+down to follow", Duration::from_secs(20));
+    session.wait_for("ctrl+end to follow", Duration::from_secs(20));
     session.send("/fullscreen off\r");
     session.wait_for("Fullscreen rendering off", Duration::from_secs(20));
     let settings = std::fs::read_to_string(ha_home(&temp).join("settings.json")).expect("settings");
