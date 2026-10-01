@@ -1,21 +1,18 @@
 //! A new release, announced at launch as Codex does ("Update available!").
 //!
 //! The newest version the npm registry lists for `harness-agents` is fetched on
-//! a thread of its own at most every 20 hours and kept in
+//! a thread of its own at every launch and kept in
 //! `<data dir>/cache/version.json`; the launch reads what an earlier one saved,
-//! so it never waits on the network. `HA_NO_UPDATE_CHECK=1` or
+//! so it never waits on the network. Codex asks at most every 20 hours; measured,
+//! that hid a release published the morning after a check until the next day. `HA_NO_UPDATE_CHECK=1` or
 //! `"checkForUpdates": false` in `settings.json` turns it off.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
 
 use super::paths::LaunchEnvironment;
 
 /// The npm registry's record of the newest `harness-agents` release.
 pub const LATEST_URL: &str = "https://registry.npmjs.org/harness-agents/latest";
-
-/// How long a saved answer is used before it is asked again.
-const CHECK_AFTER: Duration = Duration::from_hours(20);
 
 /// The version this build is.
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
@@ -37,17 +34,10 @@ pub fn enabled(environment: &LaunchEnvironment, config_file: &Path) -> bool {
         .unwrap_or(true)
 }
 
-/// Ask the registry again when the saved answer is older than 20 hours.
+/// Ask the registry again, on a thread of its own: the next launch shows what
+/// it saved.
 pub fn refresh_in_background(data_dir: &Path) {
     let path = cache_path(data_dir);
-    let fresh = std::fs::metadata(&path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age < CHECK_AFTER);
-    if fresh {
-        return;
-    }
     let _ = std::thread::Builder::new()
         .name("ha-update-check".to_owned())
         .spawn(move || {
