@@ -53,6 +53,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "ANTHROPIC-SKILLS-SOURCE.md",
         "LICENSE-ui-ux-pro-max",
         "UI-UX-PRO-MAX-SOURCE.md",
+        "SWARMS-SOURCE.md",
     ] {
         let path = notices.join(name);
         println!("cargo:rerun-if-changed={}", path.display());

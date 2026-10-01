@@ -1286,6 +1286,17 @@ impl super::delegation::ChildModels for ServiceChildModels {
         subagent_default_thinking(&self.config_file)
     }
 
+    fn searchable(&self) -> Vec<super::delegation::SearchableModel> {
+        catalog_models_scoped(&self.environment, &self.data_dir, credentials::Scope::Subagent)
+            .into_iter()
+            .map(|model| super::delegation::SearchableModel {
+                provider: model.provider,
+                id: model.id,
+                name: model.name,
+            })
+            .collect()
+    }
+
     fn resolve_at(
         &self,
         reference: &str,
@@ -2929,6 +2940,19 @@ fn catalog_options_scoped(
     data_dir: &Path,
     scope: credentials::Scope,
 ) -> Vec<(String, String)> {
+    catalog_models_scoped(environment, data_dir, scope)
+        .into_iter()
+        .map(|model| (model.reference(), model.name))
+        .collect()
+}
+
+/// The catalog entries whose provider has a key as `scope` reads it, built-in
+/// providers in `/login` order first.
+fn catalog_models_scoped(
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+    scope: credentials::Scope,
+) -> Vec<super::providers::Model> {
     // Built-in providers in `/login` order, then those `models.json` adds.
     let catalog = super::providers::Catalog::load(data_dir);
     let mut providers = super::providers::PROVIDERS
@@ -2953,7 +2977,7 @@ fn catalog_options_scoped(
             )
             .is_some()
         })
-        .map(|model| (model.reference(), model.name.clone()))
+        .cloned()
         .collect()
 }
 
@@ -3602,6 +3626,13 @@ impl SessionPort for AgentSessionService {
             .ok_or_else(|| format!("no skill named {name}; /skills lists them"))?;
         let content = std::fs::read_to_string(&entry.path)
             .map_err(|error| format!("skill {name} could not be read: {error}"))?;
+        // The user ran it: it is active for the session, so the model may
+        // activate it and read its files although it cannot start it itself.
+        if let Ok(activation) = catalog.activate(name, None, 0)
+            && let Ok(mut active) = self.active_skills.lock()
+        {
+            active.insert(name.to_owned(), activation);
+        }
         let directory = entry
             .directory()
             .map_or_else(String::new, |directory| directory.display().to_string());

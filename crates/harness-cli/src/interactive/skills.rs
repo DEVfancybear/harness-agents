@@ -307,7 +307,15 @@ impl SkillToolDispatcher {
                 // `sha256:` prefix, was refused, and gave up on the skill. The refusal
                 // now names the current digest so a genuinely stale pin can be retried
                 // in one step.
-                if !entry.model_invocable {
+                // A user-only skill the user already ran with /skill:<name> is in
+                // the conversation: measured, a model asked to activate it again,
+                // was told the user must run it, and told the user to type the
+                // command they had just typed.
+                let user_ran = self
+                    .active
+                    .lock()
+                    .is_ok_and(|active| active.contains_key(name));
+                if !entry.model_invocable && !user_ran {
                     return Err(HarnessError::new(
                         ErrorCode::PolicyDenied,
                         format!("skill {name} is run only by the user, with /skill:{name}"),
@@ -660,6 +668,48 @@ mod tests {
         }
     }
 
+    /// am-will/swarms ships as five user-only skills (`/skill:<name>`), without
+    /// `co-design` or `parallel-task-tmux`, and every file a `SKILL.md` links to
+    /// ships with it.
+    #[test]
+    fn the_swarms_skills_ship_for_the_user_to_start() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let catalog = discover(
+            &temporary.path().join("config"),
+            temporary.path(),
+            &super::LaunchEnvironment::default(),
+            false,
+        )
+        .expect("bundled skills");
+        for name in [
+            "swarm-planner",
+            "parallel-task",
+            "parallel-task-spark",
+            "super-swarm",
+            "super-swarm-spark",
+        ] {
+            let entry = catalog.entry(name).expect("a swarms skill");
+            assert_eq!(entry.source, SkillSource::Builtin, "{name}");
+            assert_eq!(entry.version, "1102681", "{name}");
+            assert!(!entry.model_invocable, "{name} starts only with /skill:{name}");
+            assert!(entry.description.contains("Use when"), "{name}");
+            let activation = catalog.activate(name, None, 1).expect("the user can run it");
+            for link in activation.content.split("](").skip(1) {
+                let target = link.split(')').next().expect("link target");
+                if target.starts_with("references/") {
+                    assert!(
+                        activation.resources.iter().any(|file| file.ends_with(target)),
+                        "{name} links {target}, which is not shipped: {:?}",
+                        activation.resources
+                    );
+                }
+            }
+        }
+        for name in ["co-design", "parallel-task-tmux"] {
+            assert!(catalog.entry(name).is_none(), "{name} is not imported");
+        }
+    }
+
     /// `disable-model-invocation: true` hides a skill from the model - its list, the
     /// tool schema and the prompt - and it stays available to the user as /skill:name.
     #[test]
@@ -690,10 +740,17 @@ mod tests {
             .validate("activate_skill", &serde_json::json!({ "name": "release" }))
             .expect_err("the model cannot activate it");
         assert!(refused.to_string().contains("/skill:release"), "{refused}");
-        assert!(
-            catalog.activate("release", None, 1).is_ok(),
-            "the user still can"
-        );
+        let activation = catalog.activate("release", None, 1);
+        assert!(activation.is_ok(), "the user still can");
+        // Once the user ran it with /skill:release, the model may activate it.
+        dispatcher
+            .active
+            .lock()
+            .expect("active")
+            .insert("release".to_owned(), activation.expect("activation"));
+        dispatcher
+            .validate("activate_skill", &serde_json::json!({ "name": "release" }))
+            .expect("a skill the user ran is active");
     }
 
     #[test]

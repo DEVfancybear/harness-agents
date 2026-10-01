@@ -114,6 +114,68 @@ pub struct ChildModel {
     pub price: Option<ModelPrice>,
 }
 
+/// One model `rlm.find_models` may offer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchableModel {
+    pub provider: String,
+    pub id: String,
+    pub name: String,
+}
+
+/// prime-agent's `rlm.find_models` defaults: eight matches, at most twenty.
+const DEFAULT_RLM_MODEL_SEARCH_LIMIT: u64 = 8;
+const MAX_RLM_MODEL_SEARCH_LIMIT: u64 = 20;
+
+/// prime-agent's `normalizeModelSearchText`: lowercase ASCII letters and digits.
+fn normalize_model_search_text(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect()
+}
+
+/// prime-agent's `findRlmModelMatches`: an exact match, then a prefix, then a
+/// substring of the selector, id or name, then alphabetical by selector.
+fn find_rlm_model_matches(query: &str, models: &[SearchableModel], limit: usize) -> Vec<Value> {
+    let query = normalize_model_search_text(query.trim());
+    let mut candidates = models
+        .iter()
+        .filter_map(|model| {
+            let selector = format!("{}/{}", model.provider, model.id);
+            let name = if model.name.is_empty() {
+                model.id.clone()
+            } else {
+                model.name.clone()
+            };
+            let fields = [&selector, &model.id, &name].map(|field| normalize_model_search_text(field));
+            let score = if query.is_empty() {
+                0
+            } else if let Some(exact) = fields.iter().position(|field| *field == query) {
+                exact
+            } else if let Some(prefix) = fields.iter().position(|field| field.starts_with(&query)) {
+                3 + prefix
+            } else {
+                6 + fields.iter().position(|field| field.contains(&query))?
+            };
+            Some((score, selector, model, name))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    candidates
+        .into_iter()
+        .take(limit)
+        .map(|(_, selector, model, name)| {
+            json!({
+                "provider": model.provider,
+                "id": model.id,
+                "name": name,
+                "selector": selector,
+            })
+        })
+        .collect()
+}
+
 /// Finds the model a child asks for, as prime-agent's
 /// `_resolveRlmSubagentModel` does.
 pub trait ChildModels: Send + Sync {
@@ -131,6 +193,12 @@ pub trait ChildModels: Send + Sync {
     /// (`subagentDefaultThinking`); `None` inherits the parent's.
     fn default_thinking(&self) -> Option<harness_providers::ThinkingLevel> {
         None
+    }
+
+    /// prime-agent's `getRlmSearchableModels`: every catalog model whose
+    /// provider has a credential a child can use, for `rlm.find_models`.
+    fn searchable(&self) -> Vec<SearchableModel> {
+        Vec::new()
     }
 
     /// [`Self::resolve`] at a thinking level. A level the spawn asked for
@@ -2254,20 +2322,39 @@ impl RlmChildren {
         row
     }
 
-    fn models(&self, request: &Value) -> Value {
-        let query = request["query"].as_str().unwrap_or_default().to_lowercase();
-        let reference = &self.launch.model.reference;
-        let models = if query.is_empty() || reference.to_lowercase().contains(&query) {
-            vec![json!({
-                "provider": reference.split('/').next().unwrap_or("ha"),
-                "id": reference,
-                "name": reference,
-                "selector": reference,
-            })]
-        } else {
-            Vec::new()
+    /// prime-agent's `rlm.find_models`: the credential-backed catalog models a
+    /// child can run on, ranked against the query. Without a catalog the
+    /// parent's model is the only one.
+    fn models(&self, request: &Value) -> Result<Value, String> {
+        let Some(query) = request["query"].as_str() else {
+            return Err("rlm.find_models query must be a string".to_owned());
         };
-        json!({ "models": models })
+        let limit = match &request["limit"] {
+            Value::Null => Some(DEFAULT_RLM_MODEL_SEARCH_LIMIT),
+            value => value
+                .as_u64()
+                .filter(|limit| (1..=MAX_RLM_MODEL_SEARCH_LIMIT).contains(limit)),
+        }
+        .ok_or_else(|| {
+            format!("rlm.find_models limit must be an integer from 1 to {MAX_RLM_MODEL_SEARCH_LIMIT}")
+        })?;
+        let mut models = self
+            .launch
+            .models
+            .as_ref()
+            .map(|models| models.searchable())
+            .unwrap_or_default();
+        if models.is_empty() {
+            let reference = &self.launch.model.reference;
+            let (provider, id) = reference.split_once('/').unwrap_or(("ha", reference));
+            models.push(SearchableModel {
+                provider: provider.to_owned(),
+                id: id.to_owned(),
+                name: id.to_owned(),
+            });
+        }
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        Ok(json!({ "models": find_rlm_model_matches(query, &models, limit) }))
     }
 
     fn observe(&self, kind: &str, request: &Value) -> Result<Value, String> {
@@ -2326,7 +2413,7 @@ impl HostRequests for RlmChildren {
                 "rlm.collect" => self.collect(request).await,
                 "rlm.list_subagents" => self.list(),
                 "rlm.delete_subagent" => self.delete(request),
-                "rlm.find_models" => Ok(self.models(request)),
+                "rlm.find_models" => self.models(request),
                 "rlm.progress.note" => Err(
                     "progress notes are sent by child agents; this is the root agent".to_owned(),
                 ),
@@ -2903,6 +2990,39 @@ pub(super) mod tests {
         let kept = shared.exchanges.lock().expect("exchanges");
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].text, "check line 4");
+    }
+
+    /// prime-agent's `find_models_round_trip_through_the_registry`: the exact
+    /// selector first, then a prefix; an empty query lists every model.
+    #[test]
+    fn find_models_ranks_matches_as_prime_does() {
+        let model = |provider: &str, id: &str, name: &str| super::SearchableModel {
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            name: name.to_owned(),
+        };
+        let models = [
+            model("test-provider", "glm-5.3-turbo", "GLM 5.3 Turbo"),
+            model("test-provider", "glm-5.3", "GLM 5.3"),
+            model("openai-codex", "gpt-5.3-codex-spark", "GPT-5.3 Codex Spark"),
+        ];
+        let found = super::find_rlm_model_matches("test-provider/glm-5.3", &models, 8);
+        assert_eq!(
+            found[0],
+            serde_json::json!({
+                "provider": "test-provider",
+                "id": "glm-5.3",
+                "name": "GLM 5.3",
+                "selector": "test-provider/glm-5.3",
+            })
+        );
+        assert_eq!(found[1]["selector"], "test-provider/glm-5.3-turbo");
+        assert_eq!(found.len(), 2);
+        let spark = super::find_rlm_model_matches("codex-spark", &models, 8);
+        assert_eq!(spark[0]["selector"], "openai-codex/gpt-5.3-codex-spark");
+        assert_eq!(super::find_rlm_model_matches("", &models, 8).len(), 3);
+        assert_eq!(super::find_rlm_model_matches("", &models, 2).len(), 2);
+        assert!(super::find_rlm_model_matches("claude", &models, 8).is_empty());
     }
 
     /// prime-agent's `rlm.spawn(thinking=...)`: a known level reaches the
