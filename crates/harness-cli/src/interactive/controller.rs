@@ -2241,6 +2241,9 @@ impl InteractiveController {
                 Effect::Redraw,
             ];
         }
+        if !automatic && let Some(expanded) = self.expand_inline_skills(&text) {
+            return self.submit_prompt_as(expanded, text, Vec::new());
+        }
         let text = self.attach_pending_shell_outputs(text);
         if !automatic {
             self.notices_held = false;
@@ -3526,6 +3529,36 @@ impl InteractiveController {
         self.submit_prompt_as(text, shown, effects)
     }
 
+    /// `/skill:<name>` written inside a message, not at its start: the user
+    /// asked for the agent to read that skill (measured: "... sử dụng
+    /// /skill:swarm-planner" reached the model as plain text, and the model,
+    /// which is not shown user-only skills, answered that no such skill
+    /// exists). Each named skill is expanded as prime-agent expands a leading
+    /// one, and the whole message follows as the request. `None` when the
+    /// message names no skill this session has.
+    fn expand_inline_skills(&self, text: &str) -> Option<String> {
+        let mut names = Vec::new();
+        for word in text.split_whitespace() {
+            let Some(name) = word.strip_prefix("/skill:") else {
+                continue;
+            };
+            let name = name.trim_end_matches(|character: char| {
+                !(character.is_ascii_alphanumeric() || character == '-' || character == '_')
+            });
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        let blocks = names
+            .into_iter()
+            .filter_map(|name| self.service.expand_skill(name, "").ok())
+            .collect::<Vec<_>>();
+        if blocks.is_empty() {
+            return None;
+        }
+        Some(format!("{}\n\n{}", blocks.join("\n\n"), text.trim()))
+    }
+
     /// Send `text` to the model while the transcript shows `shown`.
     fn submit_prompt_as(
         &mut self,
@@ -4782,6 +4815,15 @@ mod tests {
             "recording port".to_owned()
         }
 
+        fn expand_skill(&self, name: &str, arguments: &str) -> Result<String, String> {
+            if name != "review" {
+                return Err(format!("no skill named {name}"));
+            }
+            Ok(format!(
+                "<skill name=\"review\">\nReview it.\n</skill>{arguments}"
+            ))
+        }
+
         fn run_gates(
             &mut self,
             job: crate::interactive::autonomous::GateJob,
@@ -5144,6 +5186,37 @@ mod tests {
         for character in text.chars() {
             let _ = controller.handle_key(Key::Char(character));
         }
+    }
+
+    /// A `/skill:<name>` inside the message reaches the model as the skill,
+    /// with the whole message as the request; an unknown name stays text.
+    #[test]
+    fn a_skill_named_inside_a_message_is_expanded() {
+        let mut harness = bench(true);
+        submit_text(
+            &mut harness.controller,
+            "please check this using /skill:review, and /skill:nope too",
+        );
+        let submissions = harness
+            .port
+            .submissions
+            .lock()
+            .expect("submissions")
+            .clone();
+        assert_eq!(
+            submissions,
+            [
+                "<skill name=\"review\">\nReview it.\n</skill>\n\nplease check this using /skill:review, and /skill:nope too"
+            ]
+        );
+
+        let mut plain = bench(true);
+        submit_text(&mut plain.controller, "no skill /skill:nope here");
+        assert_eq!(
+            *plain.port.submissions.lock().expect("submissions"),
+            ["no skill /skill:nope here"],
+            "a name no skill has is left as text"
+        );
     }
 
     #[test]
