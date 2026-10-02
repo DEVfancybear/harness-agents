@@ -335,7 +335,9 @@ impl WebHost {
             .json(&json!({ "q": query, "num": results }))
             .send()
             .await
-            .map_err(|error| unavailable(format!("the search request failed: {}", with_cause(&error))))?;
+            .map_err(|error| {
+                unavailable(format!("the search request failed: {}", with_cause(&error)))
+            })?;
         let status = response.status();
         let bytes = read_bounded(response).await?;
         if !status.is_success() {
@@ -371,7 +373,9 @@ impl WebHost {
             .body(form)
             .send()
             .await
-            .map_err(|error| unavailable(format!("the search request failed: {}", with_cause(&error))))?;
+            .map_err(|error| {
+                unavailable(format!("the search request failed: {}", with_cause(&error)))
+            })?;
         let status = response.status();
         let bytes = read_bounded(response).await?;
         let page = String::from_utf8_lossy(&bytes);
@@ -404,7 +408,9 @@ impl WebHost {
             .get(url.clone())
             .send()
             .await
-            .map_err(|error| unavailable(format!("{url} could not be opened: {}", with_cause(&error))))?;
+            .map_err(|error| {
+                unavailable(format!("{url} could not be opened: {}", with_cause(&error)))
+            })?;
         let status = response.status();
         let final_url = response.url().clone();
         let content_type = response
@@ -511,11 +517,12 @@ fn unavailable(message: impl Into<String>) -> HarnessError {
 /// Read a response body, stopping at [`MAX_DOWNLOAD_BYTES`].
 async fn read_bounded(mut response: reqwest::Response) -> Result<Vec<u8>, HarnessError> {
     let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| unavailable(format!("the response could not be read: {}", with_cause(&error))))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        unavailable(format!(
+            "the response could not be read: {}",
+            with_cause(&error)
+        ))
+    })? {
         let room = MAX_DOWNLOAD_BYTES.saturating_sub(bytes.len());
         bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
         if bytes.len() >= MAX_DOWNLOAD_BYTES {

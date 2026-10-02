@@ -63,8 +63,8 @@ pub use process::{
 // Re-exported so a CLI that drives the loop reads acceptance from the same
 // place the driver writes it.
 pub use harness_runtime::AcceptanceState;
-pub use secrets::{HostEnvironmentSecrets, SecretResolver};
 pub use hooks::{HOOK_EVENTS, HookResponse, fit_payload, hook_matches, run_hooks};
+pub use secrets::{HostEnvironmentSecrets, SecretResolver};
 pub use service::{
     ConfiguredToolHook, ExternalToolDispatcher, ToolDispatchAuthorization, ToolExecutionService,
     ToolObserver, git_diff_from, git_head_commit,

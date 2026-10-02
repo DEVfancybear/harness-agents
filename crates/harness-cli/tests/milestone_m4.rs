@@ -4372,7 +4372,11 @@ async fn a_read_whose_result_was_shortened_may_be_made_again() {
 // ---------------------------------------------------------------------------
 
 /// A hook that runs `script` (PowerShell on Windows, `sh` elsewhere).
-fn script_hook(event: &str, matcher: Option<&str>, script: &str) -> harness_tools::ConfiguredToolHook {
+fn script_hook(
+    event: &str,
+    matcher: Option<&str>,
+    script: &str,
+) -> harness_tools::ConfiguredToolHook {
     #[cfg(windows)]
     let (command, args) = (
         "pwsh".to_owned(),
@@ -4427,7 +4431,12 @@ async fn hooked_turn(
         limits: TurnLimits::default(),
     };
     let outcome = driver
-        .run_turn(request, options, Arc::new(SilentObserver), CancellationToken::new())
+        .run_turn(
+            request,
+            options,
+            Arc::new(SilentObserver),
+            CancellationToken::new(),
+        )
         .await
         .expect("turn succeeds");
     let seen = provider.seen();
@@ -4472,10 +4481,19 @@ async fn g09_a_stop_hook_that_blocks_sends_the_turn_on() {
     .await;
     assert_eq!(outcome.stop, TurnStop::Final);
     assert_eq!(outcome.final_text, "tests pass");
-    assert_eq!(seen.len(), 2, "one more model call, then the hook let it stop");
+    assert_eq!(
+        seen.len(),
+        2,
+        "one more model call, then the hook let it stop"
+    );
     assert!(
-        seen[1].messages.iter().any(|message| message.role == MessageRole::User
-            && message.content.contains("Stop hook feedback:\nrun the tests first")),
+        seen[1]
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::User
+                && message
+                    .content
+                    .contains("Stop hook feedback:\nrun the tests first")),
         "the reason reaches the model"
     );
 }
@@ -4551,7 +4569,10 @@ async fn g09_pre_tool_use_updated_input_rewrites_the_call() {
         &bench,
         vec![script_hook("pre_tool_use", Some("write_file"), &script)],
         vec![
-            call("write_file", r#"{"path":"src/asked.txt","content":"from the model"}"#),
+            call(
+                "write_file",
+                r#"{"path":"src/asked.txt","content":"from the model"}"#,
+            ),
             answer("written"),
         ],
     )

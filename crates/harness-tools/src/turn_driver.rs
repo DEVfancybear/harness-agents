@@ -1823,7 +1823,15 @@ pub async fn execute_action_with_approval(
         Gated::Done(result) => result,
         Gated::Ready(ready) => {
             let outcome = tools.run_begun(&ready.begun, cancellation.clone()).await;
-            complete_action(tools, ready, outcome, observer, cancellation, &mut hook_note).await
+            complete_action(
+                tools,
+                ready,
+                outcome,
+                observer,
+                cancellation,
+                &mut hook_note,
+            )
+            .await
         }
     }
 }
@@ -1858,15 +1866,13 @@ async fn gate_action(
     cancellation: &CancellationToken,
     hook_note: &mut crate::HookResponse,
 ) -> Result<Gated, HarnessError> {
-    let decide = |prepared: &PreparedToolRequest| match (
-        tools.decision(prepared),
-        &options.approvals,
-    ) {
-        (Decision::Ask, ApprovalMode::Auto) => Decision::Allow {
-            reason: "explicit auto approval".to_owned(),
-        },
-        (decision, _) => decision,
-    };
+    let decide =
+        |prepared: &PreparedToolRequest| match (tools.decision(prepared), &options.approvals) {
+            (Decision::Ask, ApprovalMode::Auto) => Decision::Allow {
+                reason: "explicit auto approval".to_owned(),
+            },
+            (decision, _) => decision,
+        };
     let mut prepared = tools.prepare(request.clone()).await?;
     let mut decision = decide(&prepared);
     if matches!(&decision, Decision::Blocked(_) | Decision::Deny(_)) {
@@ -1883,7 +1889,9 @@ async fn gate_action(
     hook_note.stop.clone_from(&answer.stop);
     if let Some(reason) = &answer.block {
         observer.observe(TurnProgress::Notice(format!("blocked by hook: {reason}")));
-        return Ok(Gated::Done(tools.record_hook_block(&prepared, reason).await));
+        return Ok(Gated::Done(
+            tools.record_hook_block(&prepared, reason).await,
+        ));
     }
     // `updatedInput`: the hook rewrote the call. The new input is the same tool
     // with other arguments, and it is prepared and judged by the policy again,
@@ -1896,7 +1904,9 @@ async fn gate_action(
             let reason =
                 "a pre_tool_use hook returned an updatedInput that is not this tool's input";
             observer.observe(TurnProgress::Notice(format!("blocked by hook: {reason}")));
-            return Ok(Gated::Done(tools.record_hook_block(&prepared, reason).await));
+            return Ok(Gated::Done(
+                tools.record_hook_block(&prepared, reason).await,
+            ));
         };
         observer.observe(TurnProgress::Info(format!(
             "a pre_tool_use hook changed the call: {}",

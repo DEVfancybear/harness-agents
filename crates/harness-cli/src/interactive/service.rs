@@ -6302,7 +6302,10 @@ async fn run_turn(
     // The file text becomes part of the message itself, so what runs is what the user
     // handed over: the API has no file block, and text is the only shape a file travels in.
     if let Some(context) = &hook_context {
-        request.text = format!("{}\n\n<hook_context>\n{context}\n</hook_context>", request.text);
+        request.text = format!(
+            "{}\n\n<hook_context>\n{context}\n</hook_context>",
+            request.text
+        );
     }
     let mut prompt = format!(
         "{}{}",
@@ -8017,7 +8020,12 @@ mod tests {
         let send = |event: SessionEvent| shown.lock().expect("events").push(event);
         let context = super::prompt_hooks(
             &[
-                hook("session_start", None, 30, &hook_read_stdin_script("on branch main", 0)),
+                hook(
+                    "session_start",
+                    None,
+                    30,
+                    &hook_read_stdin_script("on branch main", 0),
+                ),
                 hook(
                     "user_prompt_submit",
                     None,
@@ -8047,7 +8055,10 @@ mod tests {
                 "user_prompt_submit",
                 None,
                 30,
-                &hook_read_stdin_script(r#"{"decision":"block","reason":"no secrets in prompts"}"#, 0),
+                &hook_read_stdin_script(
+                    r#"{"decision":"block","reason":"no secrets in prompts"}"#,
+                    0,
+                ),
             )],
             &request(),
             false,
@@ -8058,7 +8069,10 @@ mod tests {
             &send,
         )
         .await;
-        assert_eq!(blocked, Err("no secrets in prompts (test fixture)".to_owned()));
+        assert_eq!(
+            blocked,
+            Err("no secrets in prompts (test fixture)".to_owned())
+        );
     }
 
     #[tokio::test]

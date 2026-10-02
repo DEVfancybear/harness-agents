@@ -306,7 +306,9 @@ impl ToolExecutionService {
         payload: Value,
         cancellation: CancellationToken,
     ) -> Vec<String> {
-        self.event_hooks(event, &payload, &cancellation).await.notices
+        self.event_hooks(event, &payload, &cancellation)
+            .await
+            .notices
     }
 
     /// Run the hooks of `event` and return what they answered: a block, a

@@ -157,9 +157,10 @@ pub async fn run_hooks(
                 });
                 break;
             }
-            Err(reason) => merged
-                .notices
-                .push(format!("{event} hook from {} failed: {reason}", hook.source)),
+            Err(reason) => merged.notices.push(format!(
+                "{event} hook from {} failed: {reason}",
+                hook.source
+            )),
         }
     }
     merged
