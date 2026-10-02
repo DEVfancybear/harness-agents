@@ -6,7 +6,7 @@
 
 ## 1. Mục đích và phạm vi
 
-Harness Agents là host coding-agent chạy cục bộ. Binary `ha` sở hữu phần composition hướng người dùng: mở ứng dụng terminal tương tác, chạy prompt headless, cung cấp web surface trên loopback và các lệnh maintenance. Ứng dụng được tách thành các crate để provider, tool, storage implementation hoặc extension protocol không thể âm thầm trở thành authority của domain khác.
+Harness Agents là host coding-agent chạy cục bộ. Binary `ha` sở hữu phần composition hướng người dùng: mở ứng dụng terminal tương tác, chạy prompt headless và các lệnh maintenance. Ứng dụng được tách thành các crate để provider, tool, storage implementation hoặc extension protocol không thể âm thầm trở thành authority của domain khác.
 
 Tổng quan này bao quát:
 
@@ -182,15 +182,14 @@ Scheduler và workspace planner tách khỏi coding-tool gate. Worker có thể 
 
 Thiết kế hiện hỗ trợ tích hợp loopback/local. Remote MCP và tuyên bố OS sandbox là các quyết định riêng trong release matrix. Stdio hay child process là transport boundary, không phải bằng chứng native code độc hại đã được cô lập.
 
-## 8. Composition của configuration, UI và web
+## 8. Composition của configuration và UI
 
-`harness-cli` có ba presentation path trên cùng application services:
+`harness-cli` có hai presentation path trên cùng application services:
 
 - interactive terminal chat/TUI hoặc line mode;
-- headless `exec`/run cho script và automation;
-- authenticated loopback `web` surface.
+- headless `exec`/run cho script và automation.
 
-Configuration được resolve trước khi tạo service. Web adapter phải gọi application services thay vì đi vào CLI internals hoặc mutation SQL trực tiếp. Nhờ vậy request từ terminal và request web tương lai chịu cùng admission, policy, persistence và recovery rules.
+Configuration được resolve trước khi tạo service. Mỗi presentation path đều gọi application services thay vì đi vào internals của path khác hoặc mutation SQL trực tiếp, nên mọi request chịu cùng admission, policy, persistence và recovery rules.
 
 UI có thể hiển thị view compact, streaming hoặc redacted. UI không được biến câu provider chưa verify thành execution receipt, cũng không được che refusal, câu hỏi đang chờ trả lời, budget stop hoặc recovery uncertainty.
 

@@ -6,7 +6,7 @@ English | [Tiếng Việt](ARCHITECTURE_OVERVIEW.vi.md)
 
 ## 1. Purpose and scope
 
-Harness Agents is a local coding-agent host. The `ha` binary owns the user-facing composition: it opens an interactive terminal app, runs headless prompts, exposes a loopback web surface, and provides maintenance commands. The application is deliberately split so that a provider, a tool, a storage implementation, or an extension protocol cannot silently become the authority for another domain.
+Harness Agents is a local coding-agent host. The `ha` binary owns the user-facing composition: it opens an interactive terminal app, runs headless prompts, and provides maintenance commands. The application is deliberately split so that a provider, a tool, a storage implementation, or an extension protocol cannot silently become the authority for another domain.
 
 This overview covers:
 
@@ -182,15 +182,14 @@ The scheduler and workspace planner are separate from the coding-tool gate. A wo
 
 The current design supports loopback/local integration. Remote MCP support and OS sandbox claims remain separate release-matrix decisions. Stdio or a child process is a transport boundary, not proof that hostile native code is isolated.
 
-## 8. Configuration, UI and web composition
+## 8. Configuration and UI composition
 
-`harness-cli` has three presentation paths over the same application services:
+`harness-cli` has two presentation paths over the same application services:
 
 - interactive terminal chat/TUI or line mode;
-- headless `exec`/run flows for scripts and automation;
-- the authenticated loopback `web` surface.
+- headless `exec`/run flows for scripts and automation.
 
-Configuration is resolved before service construction. The web adapter must call application services rather than reach into CLI internals or issue mutation SQL directly. This keeps a terminal request and a future web request subject to the same admission, policy, persistence and recovery rules.
+Configuration is resolved before service construction. Each presentation path calls application services rather than reaching into another path's internals or issuing mutation SQL directly, so every request is subject to the same admission, policy, persistence and recovery rules.
 
 The UI may show compact, streaming or redacted views. It must not turn an unverified provider sentence into an execution receipt, and it must not hide a refusal, pending question, budget stop or recovery uncertainty.
 
