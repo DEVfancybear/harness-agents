@@ -79,6 +79,69 @@ impl TurnModelSelection {
 
 #[cfg(test)]
 mod g03_model_selection_tests {
+
+    /// prime-agent's `a_model_switch_updates_the_model_and_level_atomically`:
+    /// every snapshot a model call takes carries a consistent (model, level)
+    /// pair while another thread keeps switching both.
+    #[test]
+    fn a_model_switch_updates_the_model_and_level_atomically() {
+        use harness_providers::ThinkingLevel;
+        let config = |model: &str| super::ProviderConfig {
+            provider_id: "anthropic".to_owned(),
+            protocol: "anthropic_messages".to_owned(),
+            endpoint: String::new(),
+            model: model.to_owned(),
+            api_key_env: String::new(),
+            thinking: String::new(),
+            thinking_format: None,
+            approval: "ask".to_owned(),
+            allow_rules: Vec::new(),
+            deny_rules: Vec::new(),
+            model_price: None,
+            context_window_tokens: 200_000,
+            context_window_notice: None,
+            output_reservation_tokens: 0,
+            compaction_reserve_tokens: 0,
+            max_retry_after_seconds: 0,
+            hooks: Vec::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+            project_trusted: false,
+            bell: false,
+            agents_default_model: None,
+            queue_modes: (None, None),
+            routing: super::super::config::Routing::default(),
+            credential: super::CredentialSource::Environment {
+                variable: String::new(),
+            },
+            service_tier: None,
+        };
+        let live = std::sync::Arc::new(super::LiveTurn::default());
+        live.set_model_and_level(config("model-a"), Some(ThinkingLevel::High));
+        let writer = std::sync::Arc::clone(&live);
+        let switcher = std::thread::spawn(move || {
+            for _ in 0..2_000 {
+                writer.set_model_and_level(config("model-a"), Some(ThinkingLevel::High));
+                writer.set_model_and_level(config("model-b"), Some(ThinkingLevel::Off));
+            }
+        });
+        let mut mixed = 0u32;
+        for _ in 0..20_000 {
+            let snapshot = live.snapshot();
+            let model = snapshot
+                .config
+                .map(|config| config.model)
+                .unwrap_or_default();
+            mixed += u32::from(
+                (model == "model-a" && snapshot.level != Some(ThinkingLevel::High))
+                    || (model == "model-b" && snapshot.level != Some(ThinkingLevel::Off)),
+            );
+        }
+        switcher.join().expect("switcher");
+        assert_eq!(
+            mixed, 0,
+            "every snapshot carries a consistent (model, level) pair"
+        );
+    }
     use super::TurnModelSelection;
 
     #[test]
@@ -1225,35 +1288,74 @@ impl CredentialResolver for EnvironmentCredential {
 /// What the user changed while a turn runs - the thinking level and the model -
 /// which the turn's next model call uses, as prime-agent's agent reads its
 /// model and level for every request.
+///
+/// The model and the level share one lock, as prime-agent's
+/// `set_model_and_thinking_level` keeps them: a model call takes both in one
+/// snapshot, so a switch made while the turn runs never pairs the new model
+/// with the old level.
 #[derive(Debug, Default)]
 pub struct LiveTurn {
-    level: Mutex<Option<harness_providers::ThinkingLevel>>,
-    config: Mutex<Option<ProviderConfig>>,
+    selection: Mutex<LiveSelection>,
     /// The session model a turn left for the backup model, until it answers again.
     left_primary: Arc<Mutex<Option<String>>>,
+}
+
+/// The model and the thinking level a running turn's next call uses.
+#[derive(Clone, Debug, Default)]
+struct LiveSelection {
+    level: Option<harness_providers::ThinkingLevel>,
+    config: Option<ProviderConfig>,
 }
 
 impl LiveTurn {
     /// A new turn starts from what it resolved.
     fn start(&self, level: harness_providers::ThinkingLevel) {
-        if let Ok(mut current) = self.level.lock() {
-            *current = Some(level);
-        }
-        if let Ok(mut current) = self.config.lock() {
-            *current = None;
+        if let Ok(mut current) = self.selection.lock() {
+            *current = LiveSelection {
+                level: Some(level),
+                config: None,
+            };
         }
     }
 
     fn set_level(&self, level: harness_providers::ThinkingLevel) {
-        if let Ok(mut current) = self.level.lock() {
-            *current = Some(level);
+        if let Ok(mut current) = self.selection.lock() {
+            current.level = Some(level);
         }
     }
 
-    fn set_config(&self, config: ProviderConfig) {
-        if let Ok(mut current) = self.config.lock() {
-            *current = Some(config);
+    /// prime-agent's `set_model_and_thinking_level`: the model and the level
+    /// in one lock acquisition, so a call admitted mid-switch never sees the
+    /// new model with the old level. `None` keeps the level in force, as
+    /// prime-agent's `setModel` re-applies it.
+    fn set_model_and_level(
+        &self,
+        config: ProviderConfig,
+        level: Option<harness_providers::ThinkingLevel>,
+    ) {
+        if let Ok(mut current) = self.selection.lock() {
+            current.config = Some(config);
+            if level.is_some() {
+                current.level = level;
+            }
         }
+    }
+
+    /// Change the model the turn is on, from what it holds now (or `base`).
+    fn update_config(&self, base: ProviderConfig, change: impl FnOnce(&mut ProviderConfig)) {
+        if let Ok(mut current) = self.selection.lock() {
+            let mut config = current.config.clone().unwrap_or(base);
+            change(&mut config);
+            current.config = Some(config);
+        }
+    }
+
+    /// The model and the level, read together.
+    fn snapshot(&self) -> LiveSelection {
+        self.selection
+            .lock()
+            .map(|current| current.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -1500,14 +1602,8 @@ impl LiveProvider {
     /// model or level changed. A change that cannot be built keeps the current
     /// provider, so a bad choice never breaks the running turn.
     fn provider(&self) -> Arc<dyn ModelProvider> {
-        let config = self
-            .live
-            .config
-            .lock()
-            .ok()
-            .and_then(|config| config.clone())
-            .unwrap_or_else(|| self.base.clone());
-        let level = self.live.level.lock().ok().and_then(|level| *level);
+        let LiveSelection { level, config } = self.live.snapshot();
+        let config = config.unwrap_or_else(|| self.base.clone());
         let Ok(mut current) = self.current.lock() else {
             return Self::build(
                 &self.base,
@@ -3806,9 +3902,10 @@ impl SessionPort for AgentSessionService {
             let provider_name = super::providers::provider(&entry.provider)
                 .map_or(entry.provider.as_str(), |provider| provider.name);
             // A running turn switches at its next model call, as prime-agent's
-            // model selector does.
+            // model selector does, with the level in force re-applied in the
+            // same step.
             if ready && let Ok(config) = self.configured() {
-                self.live.set_config(config);
+                self.live.set_model_and_level(config, self.thinking);
             }
             return Ok(if ready {
                 format!("model {} ({provider_name}) selected", entry.name)
@@ -4022,15 +4119,8 @@ impl SessionPort for AgentSessionService {
             *current = Some(tier.to_owned());
         }
         // A running turn uses the new tier from its next model call.
-        let mut live = self
-            .live
-            .config
-            .lock()
-            .ok()
-            .and_then(|config| config.clone())
-            .unwrap_or(config);
-        live.service_tier = Some(tier.to_owned());
-        self.live.set_config(live);
+        self.live
+            .update_config(config, |live| live.service_tier = Some(tier.to_owned()));
         // prime-agent also keeps the tier as the default for new sessions.
         let _ = super::config::save_setting(
             &self.config_file,
