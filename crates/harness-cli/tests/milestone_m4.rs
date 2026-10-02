@@ -3448,7 +3448,7 @@ async fn g04_mutating_receipt_has_before_after_hash() {
 async fn steered_turn(
     first_final: bool,
     limits: TurnLimits,
-    steer: &str,
+    steers: &[&str],
 ) -> (TurnOutcome, Vec<ProviderRequest>, Vec<String>) {
     let bench = bench();
     let store = bench.open_store().await;
@@ -3498,10 +3498,12 @@ async fn steered_turn(
         .await
         .expect("latest run query")
         .expect("run is persisted before provider dispatch");
-    inbox
-        .steer(&run, steer, harness_runtime::now_unix_ms())
-        .await
-        .expect("steering command is durably queued");
+    for &steer in steers {
+        inbox
+            .steer(&run, steer, harness_runtime::now_unix_ms())
+            .await
+            .expect("steering command is durably queued");
+    }
     provider.release_first_call.notify_one();
     let outcome = tokio::time::timeout(Duration::from_secs(30), driver_task)
         .await
@@ -3532,7 +3534,7 @@ async fn g06_a_steer_follows_the_tool_results_it_arrived_after() {
     let (outcome, requests, _) = steered_turn(
         false,
         TurnLimits::default(),
-        "Keep the existing parser format",
+        &["Keep the existing parser format"],
     )
     .await;
     assert_eq!(outcome.stop, TurnStop::Final);
@@ -3550,6 +3552,28 @@ async fn g06_a_steer_follows_the_tool_results_it_arrived_after() {
     );
 }
 
+/// pa-agent's default steering mode, `one-at-a-time`: two messages waiting
+/// reach the model one per call, in the order they were sent.
+#[tokio::test]
+async fn g06_steers_reach_the_model_one_at_a_time() {
+    let (outcome, requests, _) = steered_turn(
+        false,
+        TurnLimits::default(),
+        &["first correction", "second correction"],
+    )
+    .await;
+    assert_eq!(outcome.stop, TurnStop::Final);
+    let has = |index: usize, text: &str| {
+        requests[index]
+            .messages
+            .iter()
+            .any(|message| message.content.contains(text))
+    };
+    assert_eq!(requests.len(), 3, "one call per steer after the tools");
+    assert!(has(1, "first correction") && !has(1, "second correction"));
+    assert!(has(2, "second correction"));
+}
+
 /// A steer the turn cannot act on - it already took its last step - stays
 /// unread, so the next turn gets it, instead of being marked delivered and
 /// dropped.
@@ -3559,7 +3583,7 @@ async fn g06_a_steer_at_the_step_limit_is_left_for_the_next_turn() {
         max_steps: 1,
         ..TurnLimits::default()
     };
-    let (outcome, requests, unread) = steered_turn(true, limits, "also update the docs").await;
+    let (outcome, requests, unread) = steered_turn(true, limits, &["also update the docs"]).await;
     assert_eq!(outcome.stop, TurnStop::Final);
     assert_eq!(requests.len(), 1, "no step is left for it");
     assert_eq!(

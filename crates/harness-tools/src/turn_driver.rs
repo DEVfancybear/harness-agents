@@ -476,6 +476,9 @@ pub struct TurnDriver {
     goal: Option<GoalSpec>,
     /// Durable steering/cancel inbox, when the host attached one.
     inbox: Option<RunInbox>,
+    /// The steering queue mode `all`: every waiting message per poll instead
+    /// of pa-agent's default `one-at-a-time`.
+    steer_all_at_once: bool,
     /// The hash of each file as this driver last saw it: read by `read_file`,
     /// or written by a tool. It stands in for a `write_file` call that leaves
     /// `expected_hash` out.
@@ -530,8 +533,11 @@ impl TurnDriver {
         let Some(run) = run else {
             return Ok((appended, None));
         };
+        // pa-agent's steering queue mode: `one-at-a-time` (its default) hands
+        // the model one message per poll, `all` every message waiting.
+        let batch = if self.steer_all_at_once { 8 } else { 1 };
         let commands = inbox
-            .claim(&run, 8, now_unix_ms())
+            .claim(&run, batch, now_unix_ms())
             .await
             .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
         let mut canceled = None;
@@ -578,6 +584,7 @@ impl TurnDriver {
             external: None,
             goal: None,
             inbox: None,
+            steer_all_at_once: false,
             seen: Arc::default(),
         }
     }
@@ -600,6 +607,14 @@ impl TurnDriver {
     #[must_use]
     pub fn with_inbox(mut self, inbox: RunInbox) -> Self {
         self.inbox = Some(inbox);
+        self
+    }
+
+    /// The steering queue mode: `true` for `all`, `false` for
+    /// `one-at-a-time`, pa-agent's default.
+    #[must_use]
+    pub const fn with_steering_all(mut self, all: bool) -> Self {
+        self.steer_all_at_once = all;
         self
     }
 
@@ -1329,7 +1344,13 @@ impl TurnDriver {
 
             // pa-agent's steering poll after the tool batch: what the user sent
             // while the tools ran reaches this next call, not the one after it.
-            let (late_steering, canceled) = self.claim_inbox(&result.run_id).await?;
+            // In `one-at-a-time` a step takes one message: one already read before
+            // the tools is this step's, and the next waits for the next call.
+            let (late_steering, canceled) = if early_steering.is_empty() || self.steer_all_at_once {
+                self.claim_inbox(&result.run_id).await?
+            } else {
+                (Vec::new(), None)
+            };
             appended.extend(early_steering);
             appended.extend(late_steering);
             if let Some(reason) = canceled {

@@ -6275,7 +6275,15 @@ async fn run_turn(
             in_flight: Arc::new(AtomicUsize::new(0)),
         });
     }
-    let driver = driver.with_inbox(run_inbox);
+    // `[queue] steering_mode`: pa-agent's `one-at-a-time` unless set to `all`.
+    let driver = driver.with_inbox(run_inbox).with_steering_all(
+        config
+            .queue_modes
+            .0
+            .as_deref()
+            .and_then(super::queue::QueueMode::parse)
+            == Some(super::queue::QueueMode::All),
+    );
 
     // A follow-up turn continues the previous session; the first turn starts one.
     let outcome = match &source {
