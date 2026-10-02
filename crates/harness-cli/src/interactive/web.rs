@@ -4,7 +4,8 @@
 //! research workflows need a search tool and a page-open tool that the harness never
 //! had. prime-agent ships the same capability as its
 //! `websearch` skill (a Serper call made from the Python kernel, pages fetched with
-//! `httpx`); `ha` has no Python kernel, so the two operations are host tools here:
+//! `httpx`); here the two operations are host tools, so they work in every turn
+//! whether or not the kernel is up:
 //!
 //! - `web_search` asks Google through Serper when `SERPER_API_KEY` is set, formatted
 //!   the way prime-agent formats it (knowledge graph, organic results, people also
@@ -114,8 +115,23 @@ impl WebHost {
                 attempt.follow()
             }
         });
+        // Measured: sites behind a bot check (tradingeconomics.com) answered 403 to a
+        // request without `Accept`/`Accept-Language` and 200 to the same user agent
+        // sending the headers a browser sends, with compressed bodies accepted.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static(
+                "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+            ),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT_LANGUAGE,
+            reqwest::header::HeaderValue::from_static("en-US,en;q=0.9"),
+        );
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
+            .default_headers(headers)
             .timeout(REQUEST_TIMEOUT)
             .redirect(redirect)
             .build()
@@ -319,7 +335,7 @@ impl WebHost {
             .json(&json!({ "q": query, "num": results }))
             .send()
             .await
-            .map_err(|error| unavailable(format!("the search request failed: {error}")))?;
+            .map_err(|error| unavailable(format!("the search request failed: {}", with_cause(&error))))?;
         let status = response.status();
         let bytes = read_bounded(response).await?;
         if !status.is_success() {
@@ -355,7 +371,7 @@ impl WebHost {
             .body(form)
             .send()
             .await
-            .map_err(|error| unavailable(format!("the search request failed: {error}")))?;
+            .map_err(|error| unavailable(format!("the search request failed: {}", with_cause(&error))))?;
         let status = response.status();
         let bytes = read_bounded(response).await?;
         let page = String::from_utf8_lossy(&bytes);
@@ -388,7 +404,7 @@ impl WebHost {
             .get(url.clone())
             .send()
             .await
-            .map_err(|error| unavailable(format!("{url} could not be opened: {error}")))?;
+            .map_err(|error| unavailable(format!("{url} could not be opened: {}", with_cause(&error))))?;
         let status = response.status();
         let final_url = response.url().clone();
         let content_type = response
@@ -401,6 +417,7 @@ impl WebHost {
         if !status.is_success() {
             return Err(unavailable(format!("{final_url} answered {status}")));
         }
+        let declared = charset_of(&content_type, &bytes);
         let looks_like_html = content_type.contains("html")
             || bytes
                 .iter()
@@ -415,7 +432,7 @@ impl WebHost {
             || content_type.contains("xml")
             || content_type.contains("javascript");
         let document = if looks_like_html {
-            let page = html_to_text(&String::from_utf8_lossy(&bytes), &final_url);
+            let page = html_to_text(&decode(&bytes, declared), &final_url);
             let mut document = String::new();
             if !page.title.is_empty() {
                 let _ = writeln!(document, "Title: {}", page.title);
@@ -429,7 +446,7 @@ impl WebHost {
             }
             document
         } else if textual && !bytes.contains(&0) {
-            format!("URL: {final_url}\n\n{}", String::from_utf8_lossy(&bytes))
+            format!("URL: {final_url}\n\n{}", decode(&bytes, declared))
         } else {
             return Err(HarnessError::new(
                 ErrorCode::UnsupportedTextEncoding,
@@ -447,6 +464,46 @@ impl WebHost {
     }
 }
 
+/// The charset a page declares: its `Content-Type`, else a `<meta charset>` near
+/// the top of the document.
+fn charset_of(content_type: &str, bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    let label_after = |text: &str| -> Option<&'static encoding_rs::Encoding> {
+        let start = text.find("charset=")? + "charset=".len();
+        let label = text[start..]
+            .trim_start_matches(['"', '\''])
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .next()?;
+        encoding_rs::Encoding::for_label(label.as_bytes())
+    };
+    label_after(content_type).or_else(|| {
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(2048)]).to_ascii_lowercase();
+        label_after(&head)
+    })
+}
+
+/// A body as text in its declared charset; UTF-8 when none is declared.
+fn decode(bytes: &[u8], declared: Option<&'static encoding_rs::Encoding>) -> String {
+    let (text, _, _) = declared.unwrap_or(encoding_rs::UTF_8).decode(bytes);
+    text.into_owned()
+}
+
+/// A request error with what lies under it: reqwest's own text is only "error
+/// sending request", and the reason (refused, reset, a failed TLS handshake) is
+/// in its sources.
+fn with_cause(error: &reqwest::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !text.contains(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    text
+}
+
 fn unavailable(message: impl Into<String>) -> HarnessError {
     HarnessError::new(ErrorCode::ServiceUnavailable, message)
 }
@@ -457,7 +514,7 @@ async fn read_bounded(mut response: reqwest::Response) -> Result<Vec<u8>, Harnes
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| unavailable(format!("the response could not be read: {error}")))?
+        .map_err(|error| unavailable(format!("the response could not be read: {}", with_cause(&error))))?
     {
         let room = MAX_DOWNLOAD_BYTES.saturating_sub(bytes.len());
         bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
@@ -988,12 +1045,20 @@ impl ExternalToolDispatcher for WebHost {
                 ));
             }
             let call = self.parse(tool_name, arguments)?;
-            let text = self.run(call).await?;
-            Ok(ToolOutput::ExternalTool {
-                plugin_id: "web".to_owned(),
-                tool_name: tool_name.to_owned(),
-                payload: json!({ "text": text }),
-                inflight: 1,
+            // Both tools only read, so a failed request changed nothing: it is
+            // reported as a failure the model can act on (try another source),
+            // not as a run whose side effects are uncertain.
+            Ok(match self.run(call).await {
+                Ok(text) => ToolOutput::ExternalTool {
+                    plugin_id: "web".to_owned(),
+                    tool_name: tool_name.to_owned(),
+                    payload: json!({ "text": text }),
+                    inflight: 1,
+                },
+                Err(error) => ToolOutput::Denied {
+                    code: error.code().as_str().to_owned(),
+                    reason: error.message().to_owned(),
+                },
             })
         })
     }

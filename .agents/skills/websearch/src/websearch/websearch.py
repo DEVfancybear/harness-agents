@@ -148,11 +148,10 @@ async def run(
     api_key = _resolve_api_key()
     if not api_key:
         return (
-            "Web search is not set up yet: no Serper API key is configured.\n"
-            "Tell the user how to enable it:\n"
-            "  1. Get a free API key at https://serper.dev (sign up, copy the key).\n"
-            "  2. In Prime Agent, run /login, switch to MCP Connections, choose \"Serper (web search)\", and paste the key.\n"
-            "Do not ask the user to set environment variables. Once the key is saved, web search works automatically."
+            "This Python skill needs a Serper API key, and none is configured.\n"
+            "Use the web_search tool instead: it needs no key, and web_fetch opens the results.\n"
+            "For Google results here, the user can get a free key at https://serper.dev and set\n"
+            "SERPER_API_KEY in the environment Harness Agents is started from."
         )
 
     if timeout is None:

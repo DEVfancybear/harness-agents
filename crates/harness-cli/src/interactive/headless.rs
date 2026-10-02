@@ -496,18 +496,35 @@ pub async fn run_with(
     } else {
         None
     };
-    let tools = match &active_extensions {
-        Some(active) => ToolExecutionService::new(Arc::clone(&store))
-            .with_policy(tool_policy)
-            .with_hooks(resolved_config.hooks.clone())
-            .with_external(active.dispatcher()),
-        None => ToolExecutionService::new(Arc::clone(&store))
-            .with_policy(tool_policy)
-            .with_hooks(resolved_config.hooks.clone()),
-    };
+    // The web tools, as the app has them: a scripted run that is asked about
+    // current events can search and read pages too. `HA_WEB=off` removes them.
+    let web_host = super::web::WebHost::from_environment(environment);
+    let mut tools = ToolExecutionService::new(Arc::clone(&store))
+        .with_policy(tool_policy)
+        .with_hooks(resolved_config.hooks.clone());
+    if let Some(dispatcher) = super::mcp::combined_dispatcher_with_delegate(
+        None,
+        active_extensions.as_ref(),
+        None,
+        None,
+        web_host.as_ref(),
+        None,
+        None,
+    ) {
+        tools = tools.with_external(dispatcher);
+    }
     let driver = TurnDriver::new(Arc::clone(&runtime), tools);
-    let driver = match &active_extensions {
-        Some(active) => driver.with_external(active.tools()),
+    let external_tools = super::mcp::combined_tools_with_delegate(
+        None,
+        active_extensions.as_ref(),
+        None,
+        None,
+        web_host.as_ref(),
+        None,
+        None,
+    );
+    let driver = match &external_tools {
+        Some(external) => driver.with_external(external.clone()),
         None => driver,
     };
     // The goal, when the caller attached one, is host policy: typed criteria
@@ -534,14 +551,10 @@ pub async fn run_with(
     };
     // The durable steering/cancel inbox shares this turn's store.
     let driver = driver.with_inbox(RunInbox::new(Arc::clone(&store)));
-    let tool_schemas = match &active_extensions {
-        Some(active) => {
-            let mut schemas = coding_tool_schemas();
-            schemas.extend(active.tools().schemas());
-            schemas
-        }
-        None => coding_tool_schemas(),
-    };
+    let mut tool_schemas = coding_tool_schemas();
+    if let Some(external) = &external_tools {
+        tool_schemas.extend(external.schemas());
+    }
     // Content the prompt names rides with it, exactly as it does in the app: an image is
     // shown to the model, and a text file is put in the message. A scripted run can
     // therefore look at a screenshot or read a log the same way a person can.

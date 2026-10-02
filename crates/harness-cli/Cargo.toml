@@ -78,6 +78,9 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
+# `web_fetch` decodes a page in the charset it declares; reqwest's `charset`
+# feature already resolves this version.
+encoding_rs = "=0.8.42"
 sha2.workspace = true
 toml.workspace = true
 tokio.workspace = true

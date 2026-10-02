@@ -1,7 +1,7 @@
 ---
 name: websearch
 version: e260085
-description: Search Google via the Serper API. Configure access via /login, then MCP Connections, then Serper (web search). Takes one query and returns titles, URLs, snippets, and knowledge-graph data.
+description: Search Google via the Serper API from Python (needs SERPER_API_KEY; without it use the web_search tool). Takes one query and returns titles, URLs, snippets, and knowledge-graph data.
 ---
 
 # Web Search
