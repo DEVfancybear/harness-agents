@@ -69,8 +69,8 @@ pub use service::{
 };
 pub use turn_driver::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ExternalToolCatalog,
-    ExternalTools, GoalReport, QuestionHost, TurnDriver, TurnLimits, TurnObserver, TurnOptions, TurnOutcome,
-    TurnProgress, TurnStop, execute_action_with_approval,
+    ExternalTools, GoalReport, QuestionHost, TurnDriver, TurnLimits, TurnObserver, TurnOptions,
+    TurnOutcome, TurnProgress, TurnStop, execute_action_with_approval,
 };
 pub use workspace::{
     is_sensitive_workspace_path, observe_workspace, observed_file_hash, workspace_registration,
