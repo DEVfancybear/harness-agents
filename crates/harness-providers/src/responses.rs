@@ -580,6 +580,12 @@ impl ResponsesSseDecoder {
                 self.finished = true;
             }
             "response.failed" | "error" => {
+                // prime-agent's `mapCodexEvents`: an `error` event can carry the
+                // plan's usage limit, with when it resets.
+                if let Some((friendly, reset)) = crate::usage_limit_reset(&value.to_string()) {
+                    return Err(ProviderError::new(ErrorCode::RateLimited, friendly)
+                        .with_retry_after(Some(reset)));
+                }
                 let message = value
                     .pointer("/response/error/message")
                     .or_else(|| value.pointer("/error/message"))

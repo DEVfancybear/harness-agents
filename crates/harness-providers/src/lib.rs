@@ -918,6 +918,18 @@ pub(crate) async fn http_response_error(response: reqwest::Response) -> Provider
         error = ProviderError::new(ErrorCode::RateLimited, error.message.clone())
             .with_retry_after(error.retry_after());
     }
+    // prime-agent's `codexUsageLimitMessage`: a ChatGPT plan out of usage says
+    // when it resets (`resets_at`), and neither that nor `Retry-After` may
+    // undercut the other. Measured: without it a weekly limit was polled 30
+    // times instead of the session parking until the reset.
+    if let Some((friendly, reset)) = body.as_deref().and_then(usage_limit_reset) {
+        let retry_after = Some(
+            error
+                .retry_after()
+                .map_or(reset, |header| header.max(reset)),
+        );
+        return ProviderError::new(ErrorCode::RateLimited, friendly).with_retry_after(retry_after);
+    }
     let detail = body.and_then(|body| {
         // A JSON error names its message; anything else is shown as sent.
         error_message(&body).or_else(|| {
@@ -964,6 +976,40 @@ pub(crate) fn names_a_usage_limit(body: &str) -> bool {
         .iter()
         .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
         .any(|code| CODES.contains(&code))
+}
+
+/// A `ChatGPT` usage limit with the time it resets, as prime-agent's
+/// `codexUsageLimitMessage` reads it: the friendly message ("Try again in ~N
+/// min.") and the wait until `resets_at`.
+pub(crate) fn usage_limit_reset(body: &str) -> Option<(String, Duration)> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error").filter(|error| error.is_object())?;
+    let code = error
+        .get("code")
+        .or_else(|| error.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !(code.contains("usage_limit_reached")
+        || code.contains("usage_not_included")
+        || code.contains("rate_limit_exceeded"))
+    {
+        return None;
+    }
+    let resets_at = error.get("resets_at").and_then(Value::as_i64)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let wait = Duration::from_secs(u64::try_from(resets_at).unwrap_or(0).saturating_sub(now));
+    let plan = error
+        .get("plan_type")
+        .and_then(Value::as_str)
+        .map(|plan| format!(" ({plan} plan)"))
+        .unwrap_or_default();
+    let minutes = (wait.as_secs() + 30) / 60;
+    Some((
+        format!("You have hit your ChatGPT usage limit{plan}. Try again in ~{minutes} min."),
+        wait,
+    ))
 }
 
 /// The message of a JSON error body, cut to one line.
@@ -2737,6 +2783,29 @@ mod usage_limit_tests {
             r#"{"error":{"message":"rate limit exceeded","type":"server_error"}}"#
         ));
         assert!(!names_a_usage_limit("rate_limit_exceeded"));
+    }
+
+    /// prime-agent's `codexUsageLimitMessage`: a `ChatGPT` plan's usage limit
+    /// says when it resets, and that is the wait the error carries - a weekly
+    /// limit is days, which parks the session instead of polling it.
+    #[test]
+    fn a_chatgpt_usage_limit_carries_its_reset() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let body = format!(
+            r#"{{"error":{{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_at":{}}}}}"#,
+            now + 3 * 86_400
+        );
+        let (message, wait) = super::usage_limit_reset(&body).expect("a usage limit");
+        assert!(
+            message
+                .starts_with("You have hit your ChatGPT usage limit (plus plan). Try again in ~43"),
+            "{message}"
+        );
+        assert!(wait.as_secs() > 3 * 86_400 - 60 && wait.as_secs() <= 3 * 86_400);
+        assert!(super::usage_limit_reset(r#"{"error":{"type":"server_error"}}"#).is_none());
     }
 }
 
