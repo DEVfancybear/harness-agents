@@ -307,6 +307,15 @@ pub fn render_live(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme
             theme,
         ));
     }
+    // What the newest running call printed last, under its card.
+    for line in &state.live_tool_output {
+        let budget = usize::from(area.width.saturating_sub(4));
+        let shown = line.chars().take(budget).collect::<String>();
+        lines.push(Line::from(vec![
+            ratatui::text::Span::styled("  │ ".to_owned(), theme.dim),
+            ratatui::text::Span::styled(shown, theme.dim),
+        ]));
+    }
     let start = lines.len().saturating_sub(usize::from(area.height));
     let visible: Vec<Line<'static>> = lines[start..].to_vec();
     frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), area);
@@ -329,6 +338,7 @@ mod tests {
             cursor: 0,
             live_text: String::new(),
             open_tools: Vec::new(),
+            live_tool_output: Vec::new(),
             modal: None,
             granted_for_run: false,
             queued_input: false,

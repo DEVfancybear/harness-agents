@@ -64,6 +64,14 @@ impl Default for TurnLimits {
 pub enum TurnProgress {
     TextDelta(String),
     ThinkingDelta(String),
+    /// Output a running call has written so far (pa-agent's
+    /// `tool_execution_update`): a long command shows what it prints while it
+    /// runs instead of nothing until it ends.
+    ToolProgress {
+        name: String,
+        call_id: String,
+        text: String,
+    },
     /// The model call started over: a retry after the stream failed part-way
     /// sends the answer again from its start, so what the failed attempt
     /// streamed is no longer the answer.
@@ -1226,9 +1234,11 @@ impl TurnDriver {
                     Ok(Gated::Done(done)) => Slot::Done(done),
                     Ok(Gated::Ready(ready)) if parallel => Slot::Ready(ready),
                     Ok(Gated::Ready(ready)) => {
-                        let outcome = self
-                            .tools
-                            .run_begun(&ready.begun, cancellation.clone())
+                        let outcome = crate::process::TOOL_PROGRESS
+                            .scope(
+                                progress_sink(&observer, &name, &transcript_id),
+                                self.tools.run_begun(&ready.begun, cancellation.clone()),
+                            )
                             .await;
                         Slot::Done(
                             complete_action(&self.tools, ready, outcome, &observer, &cancellation)
@@ -1242,6 +1252,10 @@ impl TurnDriver {
 
             // The side effects of a parallel batch, each on its own task.
             let mut running = tokio::task::JoinSet::new();
+            let slot_names = slots
+                .iter()
+                .map(|(name, transcript_id, _)| (name.clone(), transcript_id.clone()))
+                .collect::<Vec<_>>();
             for (index, (_, _, slot)) in slots.iter_mut().enumerate() {
                 if let Slot::Ready(_) = slot {
                     let Slot::Ready(ready) = std::mem::replace(slot, Slot::Taken) else {
@@ -1249,8 +1263,11 @@ impl TurnDriver {
                     };
                     let tools = self.tools.clone();
                     let cancellation = cancellation.clone();
+                    let sink = progress_sink(&observer, &slot_names[index].0, &slot_names[index].1);
                     running.spawn(async move {
-                        let outcome = tools.run_begun(&ready.begun, cancellation).await;
+                        let outcome = crate::process::TOOL_PROGRESS
+                            .scope(sink, tools.run_begun(&ready.begun, cancellation))
+                            .await;
                         (index, ready, outcome)
                     });
                 }
@@ -1975,6 +1992,24 @@ fn summarize_action(action: &CodingToolAction) -> String {
             ..
         } => format!("extension {plugin_id}/{tool_name}"),
     }
+}
+
+/// Where a running call's process output goes: a progress event for its card.
+fn progress_sink(
+    observer: &Arc<dyn TurnObserver>,
+    name: &str,
+    call_id: &str,
+) -> crate::process::ToolProgressSink {
+    let observer = Arc::clone(observer);
+    let name = name.to_owned();
+    let call_id = call_id.to_owned();
+    Arc::new(move |bytes: &[u8]| {
+        observer.observe(TurnProgress::ToolProgress {
+            name: name.clone(),
+            call_id: call_id.clone(),
+            text: String::from_utf8_lossy(bytes).into_owned(),
+        });
+    })
 }
 
 /// Show one finished call of a parallel batch: its output and its card, as the

@@ -518,6 +518,15 @@ mod windows_shell_tests {
     }
 }
 
+/// Where a running tool's process output goes as it is written: pa-agent's
+/// `tool_execution_update`, which shows a long command's output while it runs.
+/// The turn driver sets it around a tool call; output is redacted first.
+pub type ToolProgressSink = std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+tokio::task_local! {
+    pub static TOOL_PROGRESS: ToolProgressSink;
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)] // one process lifecycle, told in order
 async fn run(
     root: &Path,
@@ -623,6 +632,9 @@ async fn run(
     let stdout = child.stdout().take();
     let stderr = child.stderr().take();
     let limits = spool.limits();
+    // The readers run on tasks of their own, where the caller's task-local
+    // sink is not set: it is taken here and handed to them.
+    let progress = TOOL_PROGRESS.try_with(std::sync::Arc::clone).ok();
     // Both streams stream to their own spool file. Memory holds a bounded head
     // preview per stream and nothing else, so a process that logs a gigabyte
     // costs the same as one that logs a line.
@@ -633,6 +645,7 @@ async fn run(
             limits,
             "stdout",
             environment.redactions().to_vec(),
+            progress.clone(),
         ))
     });
     let stderr_reader = stderr.map(|stream| {
@@ -642,6 +655,7 @@ async fn run(
             limits,
             "stderr",
             environment.redactions().to_vec(),
+            progress.clone(),
         ))
     });
     let deadline = Instant::now()
@@ -835,6 +849,7 @@ async fn read_spooled<R>(
     limits: SpoolLimits,
     label: &'static str,
     secrets: Vec<Vec<u8>>,
+    progress: Option<ToolProgressSink>,
 ) -> Result<SpooledStream, HarnessError>
 where
     R: AsyncRead + Unpin,
@@ -852,9 +867,19 @@ where
         }
         let safe = redactor.push(&buffer[..read]);
         writer.write(&safe)?;
+        if let Some(progress) = &progress
+            && !safe.is_empty()
+        {
+            progress(&safe);
+        }
     }
     let tail = redactor.finish();
     writer.write(&tail)?;
+    if let Some(progress) = &progress
+        && !tail.is_empty()
+    {
+        progress(&tail);
+    }
     Ok(writer.finish())
 }
 

@@ -1803,6 +1803,9 @@ impl TurnObserver for ChannelObserver {
             TurnProgress::TextDelta(text) => Some(SessionEvent::TextDelta { text }),
             TurnProgress::ThinkingDelta(text) => Some(SessionEvent::ThinkingDelta { text }),
             TurnProgress::StreamRestarted => Some(SessionEvent::StreamRestarted),
+            TurnProgress::ToolProgress { call_id, text, .. } => {
+                Some(SessionEvent::ToolProgress { call_id, text })
+            }
             TurnProgress::Info(message) => {
                 self.auto_allowed_count.fetch_add(1, Ordering::Relaxed);
                 Some(SessionEvent::Notice { message })

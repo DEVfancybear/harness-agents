@@ -269,6 +269,38 @@ pub const fn coding_tool_names() -> &'static [&'static str] {
     ]
 }
 
+/// The fields a built-in tool's call may carry, as the parser reads them;
+/// `None` for a name that is no built-in tool. The schema the model is shown
+/// must offer the same fields, or a call the parser takes is refused by the
+/// schema check before it gets here.
+fn allowed_fields(name: &str) -> Option<&'static [&'static str]> {
+    Some(match name {
+        "read_file" => &["path", "offset", "limit"],
+        "list_files" | "git_diff" => &["path"],
+        "search_text" => &[
+            "query",
+            "path",
+            "regex",
+            "case_insensitive",
+            "glob",
+            "context_lines",
+        ],
+        "apply_patch" => &["path", "expected_hash", "replacement"],
+        "write_file" => &["path", "content", "expected_hash"],
+        "edit_file" => &["path", "old_string", "new_string", "replace_all"],
+        "glob" => &["pattern", "path"],
+        "run_process" => &["executable", "args", "timeout_ms", "isolation", "env"],
+        "run_shell" => &["command", "timeout_ms", "isolation", "env"],
+        "git_status" => &[],
+        "read_process_output" => &["artifact_id", "stream", "offset", "length"],
+        "history_search" => &["query", "limit"],
+        "history_read" => &["source_id", "offset", "length"],
+        "git_log" => &["path", "limit"],
+        "task_update" => &["note"],
+        _ => return None,
+    })
+}
+
 /// Return the provider-function schemas accepted by the P3 parser. The
 /// schemas are descriptive input contracts only: every call still crosses the
 /// typed execution gate and its policy/approval checks.
@@ -747,36 +779,12 @@ impl CodingToolAction {
                 "provider tool arguments must be a JSON object",
             )
         })?;
-        let allowed: &[&str] = match name {
-            "read_file" => &["path", "offset", "limit"],
-            "list_files" | "git_diff" => &["path"],
-            "search_text" => &[
-                "query",
-                "path",
-                "regex",
-                "case_insensitive",
-                "glob",
-                "context_lines",
-            ],
-            "apply_patch" => &["path", "expected_hash", "replacement"],
-            "write_file" => &["path", "content", "expected_hash"],
-            "edit_file" => &["path", "old_string", "new_string", "replace_all"],
-            "glob" => &["pattern", "path"],
-            "run_process" => &["executable", "args", "timeout_ms", "isolation", "env"],
-            "run_shell" => &["command", "timeout_ms", "isolation", "env"],
-            "git_status" => &[],
-            "read_process_output" => &["artifact_id", "stream", "offset", "length"],
-            "history_search" => &["query", "limit"],
-            "history_read" => &["source_id", "offset", "length"],
-            "git_log" => &["path", "limit"],
-            "task_update" => &["note"],
-            _ => {
-                return Err(harness_types::HarnessError::new(
-                    harness_types::ErrorCode::PolicyDenied,
-                    "provider requested an unsupported P3 tool",
-                ));
-            }
-        };
+        let allowed = allowed_fields(name).ok_or_else(|| {
+            harness_types::HarnessError::new(
+                harness_types::ErrorCode::PolicyDenied,
+                "provider requested an unsupported P3 tool",
+            )
+        })?;
         if object.keys().any(|key| !allowed.contains(&key.as_str())) {
             return Err(harness_types::HarnessError::new(
                 harness_types::ErrorCode::InvalidPayload,
@@ -1667,6 +1675,43 @@ mod search_context_tests {
                 CodingToolAction::from_provider_call("search_text", bad).is_err(),
                 "{bad}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod schema_parser_agreement_tests {
+    use std::collections::BTreeSet;
+
+    use super::{allowed_fields, coding_tool_schemas};
+
+    /// Every call is checked against the schema the model is shown before the
+    /// parser reads it (pa-agent's `validateToolArguments`), so the two must
+    /// agree: a field only the parser knows would be refused by the schema,
+    /// and a field only the schema offers would be refused by the parser.
+    #[test]
+    fn each_tool_schema_offers_exactly_the_fields_its_parser_reads() {
+        for schema in coding_tool_schemas() {
+            let function = &schema["function"];
+            let name = function["name"].as_str().expect("name");
+            let Some(allowed) = allowed_fields(name) else {
+                continue;
+            };
+            let properties = function["parameters"]["properties"]
+                .as_object()
+                .expect("properties")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            let allowed = allowed.iter().copied().collect::<BTreeSet<_>>();
+            assert_eq!(properties, allowed, "{name}");
+            for required in function["parameters"]["required"]
+                .as_array()
+                .expect("required")
+            {
+                let required = required.as_str().expect("field");
+                assert!(allowed.contains(required), "{name} requires {required}");
+            }
         }
     }
 }

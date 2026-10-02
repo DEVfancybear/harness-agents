@@ -591,6 +591,10 @@ pub struct UiState {
     /// The open tool card, if any: it updates in place until it settles.
     /// Calls started and not yet settled, oldest first (a batch runs side by side).
     pub open_tools: Vec<(String, String)>,
+    /// The last lines a running call printed, shown under its card while it
+    /// runs (pa-agent's `tool_execution_update`).
+    #[serde(default)]
+    pub live_tool_output: Vec<String>,
     pub modal: Option<Modal>,
     /// Whether the user allowed every gated action for the run in flight, so the
     /// status row can say the gate is open instead of leaving a silent widening of
@@ -692,6 +696,11 @@ pub enum SessionEvent {
         text: String,
     },
     ThinkingDelta {
+        text: String,
+    },
+    /// Output a running call has printed so far.
+    ToolProgress {
+        call_id: String,
         text: String,
     },
     /// The model call started over after its stream failed part-way: what it

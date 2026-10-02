@@ -3822,6 +3822,88 @@ async fn g06_parallel_calls_settle_in_completion_order() {
     drop(provider);
     close(store).await;
 }
+#[derive(Default)]
+struct ProgressLog(Mutex<Vec<String>>);
+
+impl TurnObserver for ProgressLog {
+    fn observe(&self, progress: TurnProgress) {
+        let entry = match progress {
+            TurnProgress::ToolProgress { call_id, text, .. } => {
+                format!("progress {call_id} {text}")
+            }
+            TurnProgress::ToolSettled { call_id, .. } => format!("settled {call_id}"),
+            _ => return,
+        };
+        self.0.lock().expect("progress log").push(entry);
+    }
+}
+
+/// pa-agent's `tool_execution_update`: what a running process prints reaches
+/// the observer while the call runs, before the call settles.
+#[tokio::test]
+async fn g06_a_running_process_reports_its_output_before_it_settles() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                "c-git",
+                "run_process",
+                serde_json::json!({"executable": "git", "args": ["--version"], "timeout_ms": 60_000}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("done"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let driver = TurnDriver::new(
+        Arc::clone(&runtime),
+        ToolExecutionService::new(Arc::clone(&store)),
+    );
+    let request = RunRequest::new(
+        SessionId::generate(),
+        TaskId::generate(),
+        InputId::generate(),
+        "check git",
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("workspace"),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    let options = TurnOptions {
+        workspace_root: bench.workspace.clone(),
+        actor_id: "g06.test".to_owned(),
+        approvals: ApprovalMode::Auto,
+        limits: TurnLimits::default(),
+    };
+    let log = Arc::new(ProgressLog::default());
+    let outcome = driver
+        .run_turn(request, options, log.clone(), CancellationToken::new())
+        .await
+        .expect("turn succeeds");
+    assert_eq!(outcome.stop, TurnStop::Final);
+    let log = log.0.lock().expect("progress log").clone();
+    let progress = log
+        .iter()
+        .position(|entry| entry.starts_with("progress c-git ") && entry.contains("git version"))
+        .unwrap_or_else(|| panic!("the process output was reported: {log:?}"));
+    let settled = log
+        .iter()
+        .position(|entry| entry == "settled c-git")
+        .expect("the call settled");
+    assert!(progress < settled, "{log:?}");
+    drop(driver);
+    drop(runtime);
+    drop(provider);
+    close(store).await;
+}
 #[tokio::test]
 async fn g06_steer_reaches_the_driver_mid_run() {
     let bench = bench();

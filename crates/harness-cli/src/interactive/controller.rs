@@ -149,6 +149,30 @@ enum Recalled {
     Tool(HistoryItem),
 }
 
+/// How many lines of a running call's output the live block shows.
+const LIVE_TOOL_LINES: usize = 3;
+/// How much of a running call's output is kept to find those lines.
+const TOOL_PROGRESS_BYTES: usize = 8 * 1024;
+
+/// The last `count` non-empty lines of `text`, a carriage return keeping only
+/// what a progress bar last drew on its line.
+fn last_lines(text: &str, count: usize) -> Vec<String> {
+    let mut lines = text
+        .lines()
+        .map(|line| {
+            line.rsplit('\r')
+                .next()
+                .unwrap_or(line)
+                .trim_end()
+                .to_owned()
+        })
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(count);
+    lines.drain(..start);
+    lines
+}
+
 /// Interactive app state and its transitions.
 pub struct InteractiveController {
     phase: AppPhase,
@@ -220,6 +244,9 @@ pub struct InteractiveController {
     open_tools: Vec<(String, String, String, String)>,
     /// Why the next tool runs without a panel, shown on its card in the TUI.
     pending_allowance: Option<String>,
+    /// What each running call has printed, bounded, by call id: the live
+    /// block shows the last lines of the newest under its card.
+    tool_progress: Vec<(String, String)>,
     // Progress accounting for the status bar.
     steps: u32,
     tool_calls: u32,
@@ -332,6 +359,7 @@ impl InteractiveController {
             file_picker_candidates: Vec::new(),
             plain,
             open_tools: Vec::new(),
+            tool_progress: Vec::new(),
             pending_allowance: None,
             steps: 0,
             tool_calls: 0,
@@ -562,6 +590,11 @@ impl InteractiveController {
                 .iter()
                 .map(|(_, name, summary, _)| (name.clone(), summary.clone()))
                 .collect(),
+            live_tool_output: self
+                .tool_progress
+                .last()
+                .map(|(_, text)| last_lines(text, LIVE_TOOL_LINES))
+                .unwrap_or_default(),
             modal: self.modal(),
             granted_for_run: self.granted_for_run,
             queued_input: !self.queue.is_empty(),
@@ -1531,6 +1564,25 @@ impl InteractiveController {
                     );
                 }
             }
+            SessionEvent::ToolProgress { call_id, text } => {
+                // Newest call last: its lines are the ones shown.
+                let mut buffer = self
+                    .tool_progress
+                    .iter()
+                    .position(|(id, _)| id == &call_id)
+                    .map(|index| self.tool_progress.remove(index).1)
+                    .unwrap_or_default();
+                buffer.push_str(&text);
+                if buffer.len() > TOOL_PROGRESS_BYTES {
+                    let mut cut = buffer.len() - TOOL_PROGRESS_BYTES;
+                    while !buffer.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    buffer.drain(..cut);
+                }
+                self.tool_progress.push((call_id, buffer));
+                effects.push(Effect::Redraw);
+            }
             SessionEvent::ToolOutput { text } => {
                 if !self.plain {
                     self.pending_tool_output = Some(text);
@@ -1544,6 +1596,7 @@ impl InteractiveController {
                 detail,
             } => {
                 self.flush_stream(effects);
+                self.tool_progress.retain(|(id, _)| id != &call_id);
                 // Found by the call's id: calls of a parallel batch settle in
                 // completion order. A host action has none; its name finds it.
                 let (summary, input) = self
@@ -2664,6 +2717,7 @@ impl InteractiveController {
         self.pending_newlines = 0;
         self.last_answer.clear();
         self.open_tools.clear();
+        self.tool_progress.clear();
         self.steps = 0;
         self.tool_calls = 0;
         self.last_run_elapsed = Duration::ZERO;
@@ -2681,6 +2735,7 @@ impl InteractiveController {
             .take()
             .map_or(Duration::ZERO, |started| started.elapsed());
         self.open_tools.clear();
+        self.tool_progress.clear();
     }
 
     fn interrupt(&mut self) -> Vec<Effect> {
@@ -4645,6 +4700,7 @@ impl InteractiveController {
         self.pending_approval = None;
         self.pending_mcp_elicitation = None;
         self.open_tools.clear();
+        self.tool_progress.clear();
         self.phase = if self.pending_question.is_some() {
             AppPhase::WaitingInput
         } else if self.setup_required {
@@ -7850,6 +7906,49 @@ Command: \"npm run build\""
         assert!(!crate::interactive::input::LineEditor::new().scroll_overlay(5));
     }
 
+    /// What a running call prints shows under its card while it runs - the
+    /// last lines, a progress bar's last redraw - and goes when it settles.
+    #[test]
+    fn a_running_calls_output_shows_under_its_card_until_it_settles() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "build it");
+        for event in [
+            SessionEvent::ToolStarted {
+                name: "run_shell".to_owned(),
+                call_id: "c1".to_owned(),
+                summary: "cargo build".to_owned(),
+                input: String::new(),
+            },
+            SessionEvent::ToolProgress {
+                call_id: "c1".to_owned(),
+                text: "Compiling a\nCompiling b\n".to_owned(),
+            },
+            SessionEvent::ToolProgress {
+                call_id: "c1".to_owned(),
+                text: "Compiling c\n  10%\r  90%\n".to_owned(),
+            },
+        ] {
+            harness.events.send(event).expect("event");
+        }
+        let _ = harness.controller.pump_events();
+        assert_eq!(
+            harness.controller.ui_state().live_tool_output,
+            ["Compiling b", "Compiling c", "  90%"]
+        );
+        harness
+            .events
+            .send(SessionEvent::ToolSettled {
+                name: "run_shell".to_owned(),
+                call_id: "c1".to_owned(),
+                ok: true,
+                elapsed: Duration::from_millis(5),
+                detail: String::new(),
+            })
+            .expect("settled");
+        let _ = harness.controller.pump_events();
+        assert!(harness.controller.ui_state().live_tool_output.is_empty());
+    }
     /// A model call retried after its stream failed part-way: the live text of
     /// the failed attempt is dropped, a notice says so, and the retry's answer
     /// is the only one shown.

@@ -682,6 +682,7 @@ fn state(phase: AppPhase) -> UiState {
         cursor: 0,
         live_text: String::new(),
         open_tools: Vec::new(),
+        live_tool_output: Vec::new(),
         modal: None,
         granted_for_run: false,
         queued_input: false,

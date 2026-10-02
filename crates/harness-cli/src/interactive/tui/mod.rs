@@ -1163,6 +1163,7 @@ pub(crate) mod tests {
             cursor: 6,
             live_text: "đang trả lời".to_owned(),
             open_tools: Vec::new(),
+            live_tool_output: Vec::new(),
             modal: None,
             granted_for_run: false,
             queued_input: false,
