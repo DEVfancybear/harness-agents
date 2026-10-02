@@ -6518,6 +6518,9 @@ async fn run_turn(
                 }
             }
         }
+        // Esc while the model answers or before it was asked: the user stopped
+        // the turn, and it says so instead of `failed: provider_canceled`.
+        Err(error) if error.code() == ErrorCode::ProviderCanceled => RunOutcome::Canceled,
         Err(error) => RunOutcome::Failed(error.to_string()),
     };
     send(SessionEvent::RunTerminal { outcome: terminal });

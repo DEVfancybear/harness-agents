@@ -275,6 +275,42 @@ impl ModelProvider for OpenAiResponsesAdapter {
     }
 
     fn stream(&self, request: ProviderRequest, cancellation: CancellationToken) -> ProviderFuture {
+        let events = self.stream_events(request, cancellation);
+        Box::pin(crate::collect_events(events))
+    }
+
+    /// Each decoded event is handed on as soon as its SSE frame arrives, as
+    /// prime-agent streams a Responses answer: text shows while the model
+    /// writes it, and a canceled answer keeps what it had streamed. The whole
+    /// response used to be collected first, so nothing showed until it ended.
+    fn stream_events(
+        &self,
+        request: ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> crate::ProviderEventStream {
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<Result<ProviderStreamEvent, ProviderError>>(64);
+        let call = self.call(request, cancellation, sender.clone());
+        tokio::spawn(async move {
+            if let Err(error) = call.await {
+                let _ = sender.send(Err(error)).await;
+            }
+        });
+        Box::pin(futures_util::stream::poll_fn(move |context| {
+            receiver.poll_recv(context)
+        }))
+    }
+}
+
+impl OpenAiResponsesAdapter {
+    /// One request: decoded events go out through `sender` frame by frame; a
+    /// failure is returned for the caller to send last.
+    fn call(
+        &self,
+        request: ProviderRequest,
+        cancellation: CancellationToken,
+        sender: tokio::sync::mpsc::Sender<Result<ProviderStreamEvent, ProviderError>>,
+    ) -> impl std::future::Future<Output = Result<(), ProviderError>> + Send + 'static {
         let endpoint = self.endpoint.clone();
         let target = crate::endpoint_target(&endpoint);
         let client = self.client.clone();
@@ -283,7 +319,7 @@ impl ModelProvider for OpenAiResponsesAdapter {
         let token = credentials.resolve();
         let headers = token.and_then(|token| self.headers(&token));
         let provider_id = self.capabilities.provider_id.clone();
-        Box::pin(async move {
+        async move {
             let headers = headers?;
             let mut post = client.post(endpoint).json(&body);
             for (name, value) in headers {
@@ -308,6 +344,22 @@ impl ModelProvider for OpenAiResponsesAdapter {
             let mut events = vec![ProviderStreamEvent::Started {
                 request_id: request.request_id.clone(),
             }];
+            // Hand on what is decoded; `false` once the reader went away.
+            let flush = |events: &mut Vec<ProviderStreamEvent>| {
+                let sender = sender.clone();
+                let batch = std::mem::take(events);
+                async move {
+                    for event in batch {
+                        if sender.send(Ok(event)).await.is_err() {
+                            return false;
+                        }
+                    }
+                    true
+                }
+            };
+            if !flush(&mut events).await {
+                return Ok(());
+            }
             loop {
                 let item = tokio::select! {
                     item = stream.next() => item,
@@ -320,10 +372,14 @@ impl ModelProvider for OpenAiResponsesAdapter {
                     protocol(&format!("provider stream failed: {}", error.without_url()))
                 })?;
                 decoder.feed(&chunk, &mut events)?;
+                if !flush(&mut events).await {
+                    return Ok(());
+                }
             }
             decoder.finish(&mut events)?;
-            Ok(events)
-        })
+            flush(&mut events).await;
+            Ok(())
+        }
     }
 }
 
@@ -699,6 +755,86 @@ mod tests {
         assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
     }
 
+    /// The answer's text reaches the caller while the response is still
+    /// open, as prime-agent streams a Responses answer; it used to arrive only
+    /// once the whole response had been read.
+    #[tokio::test]
+    async fn text_streams_before_the_response_completes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut head = vec![0_u8; 64 * 1024];
+            let _ = socket.read(&mut head).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n")
+                .await
+                .expect("head");
+            socket
+                .write_all(
+                    b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"early\"}\n\n",
+                )
+                .await
+                .expect("delta");
+            socket.flush().await.expect("flush");
+            let _ = released.await;
+            socket
+                .write_all(b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+                .await
+                .expect("completed");
+        });
+        let adapter = OpenAiResponsesAdapter::new(
+            format!("http://{address}/v1/responses"),
+            Arc::new(StaticCredentialResolver::new("sk-test")),
+            ModelCapabilities {
+                provider_id: "openai".to_owned(),
+                model: "gpt-5".to_owned(),
+                supports_streaming: true,
+                supports_tools: true,
+                fixture: false,
+            },
+            ResponsesFlavor::Api,
+            ResponsesOptions {
+                reasoning: None,
+                headers: Vec::new(),
+                session_id: None,
+                service_tier: None,
+            },
+        )
+        .expect("adapter");
+        let mut stream = adapter.stream_events(
+            ProviderRequest::new(
+                RequestId::generate(),
+                "gpt-5",
+                vec![ProviderMessage::new(MessageRole::User, "hi")],
+            ),
+            CancellationToken::new(),
+        );
+        let mut early = None;
+        while early.is_none() {
+            let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+                .await
+                .expect("the text arrives while the response is still open")
+                .expect("the stream is open")
+                .expect("the event decodes");
+            if let ProviderStreamEvent::TextDelta { text } = event {
+                early = Some(text);
+            }
+        }
+        assert_eq!(early.as_deref(), Some("early"));
+        release.send(()).expect("release");
+        let rest = crate::collect_events(stream).await.expect("completes");
+        assert!(
+            rest.iter()
+                .any(|event| matches!(event, ProviderStreamEvent::Completed { .. })),
+            "{rest:?}"
+        );
+        server.await.expect("server");
+    }
     #[test]
     fn a_stream_cut_before_completion_is_refused() {
         let mut decoder = ResponsesSseDecoder::default();

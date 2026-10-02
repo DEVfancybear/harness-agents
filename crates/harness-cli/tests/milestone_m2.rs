@@ -766,6 +766,154 @@ async fn a07_errors_never_carry_the_token() {
         .unwrap();
 }
 
+/// pa-agent keeps an aborted assistant message with the text it had streamed:
+/// a turn canceled while the model wrote its answer keeps that text in the
+/// conversation, so the next turn (and `continue`) sees what was said.
+#[tokio::test]
+async fn a07_a_canceled_answer_keeps_what_it_streamed() {
+    let parts = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"},\"finish_reason\":null}]}\n\n"
+            .to_owned(),
+    ];
+    let mut provider = FakeProvider::start(vec![FakeResponse::ok(parts).keeping_open()]).await;
+    provider.wait_ready().await;
+    let (_temp, store) = writer().await;
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        Arc::new(adapter(&provider, "fixture-secret")),
+        RuntimeConfig::default().with_max_attempts(1),
+    );
+    let cancellation = harness_providers::CancellationToken::new();
+    let cancel = cancellation.clone();
+    let sink: harness_runtime::ProviderEventSink = Arc::new(move |event| {
+        if matches!(event, ProviderStreamEvent::TextDelta { .. }) {
+            cancel.cancel();
+        }
+    });
+    let session = SessionId::generate();
+    let _ended = runtime
+        .run_streaming(
+            RunRequest::new(
+                session.clone(),
+                TaskId::generate(),
+                InputId::generate(),
+                "answer slowly",
+                workspace(),
+            ),
+            cancellation,
+            sink,
+        )
+        .await;
+    let history = runtime
+        .conversation_history(&session)
+        .await
+        .expect("history");
+    assert!(
+        history.messages.iter().any(|message| {
+            message.role == MessageRole::Assistant && message.content.contains("partial answer")
+        }),
+        "the streamed text is kept: {:?}",
+        history.messages
+    );
+    drop(runtime);
+    Arc::try_unwrap(store)
+        .expect("store released")
+        .close()
+        .await
+        .unwrap();
+}
+/// A provider that streams some text, then fails with a typed cancellation
+/// when the run is canceled - how the `ChatGPT` (Responses) adapter ends a
+/// canceled stream.
+struct CanceledMidAnswer;
+
+impl ModelProvider for CanceledMidAnswer {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::deepseek_fixture()
+    }
+
+    fn stream(
+        &self,
+        request: ProviderRequest,
+        cancellation: harness_providers::CancellationToken,
+    ) -> harness_providers::ProviderFuture {
+        let stream = self.stream_events(request, cancellation);
+        Box::pin(async move { collect_events(stream).await })
+    }
+
+    fn stream_events(
+        &self,
+        request: ProviderRequest,
+        cancellation: harness_providers::CancellationToken,
+    ) -> harness_providers::ProviderEventStream {
+        let head = futures_util::stream::iter(vec![
+            Ok(ProviderStreamEvent::Started {
+                request_id: request.request_id,
+            }),
+            Ok(ProviderStreamEvent::text("partial answer")),
+        ]);
+        let tail = futures_util::stream::once(async move {
+            cancellation.cancelled().await;
+            Err(harness_providers::ProviderError::new(
+                ErrorCode::ProviderCanceled,
+                "provider stream canceled",
+            ))
+        });
+        Box::pin(futures_util::StreamExt::chain(head, tail))
+    }
+}
+
+/// The same when the adapter ends a canceled stream with an error: the text
+/// streamed before it is kept, and the run reports the cancellation.
+#[tokio::test]
+async fn a07_a_canceled_answer_keeps_its_text_when_the_stream_errors() {
+    let (_temp, store) = writer().await;
+    let runtime = RuntimeService::new(
+        Arc::clone(&store),
+        Arc::new(CanceledMidAnswer),
+        RuntimeConfig::default().with_max_attempts(1),
+    );
+    let cancellation = harness_providers::CancellationToken::new();
+    let cancel = cancellation.clone();
+    let sink: harness_runtime::ProviderEventSink = Arc::new(move |event| {
+        if matches!(event, ProviderStreamEvent::TextDelta { .. }) {
+            cancel.cancel();
+        }
+    });
+    let session = SessionId::generate();
+    let error = runtime
+        .run_streaming(
+            RunRequest::new(
+                session.clone(),
+                TaskId::generate(),
+                InputId::generate(),
+                "answer slowly",
+                workspace(),
+            ),
+            cancellation,
+            sink,
+        )
+        .await
+        .expect_err("the run is canceled");
+    assert_eq!(error.code(), ErrorCode::ProviderCanceled);
+    let history = runtime
+        .conversation_history(&session)
+        .await
+        .expect("history");
+    assert!(
+        history.messages.iter().any(|message| {
+            message.role == MessageRole::Assistant && message.content.contains("partial answer")
+        }),
+        "the streamed text is kept: {:?}",
+        history.messages
+    );
+    drop(runtime);
+    Arc::try_unwrap(store)
+        .expect("store released")
+        .close()
+        .await
+        .unwrap();
+}
 #[tokio::test]
 async fn a07_cancel_settles_the_stream() {
     let parts = vec![

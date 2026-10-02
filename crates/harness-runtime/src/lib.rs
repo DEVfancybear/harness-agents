@@ -999,19 +999,37 @@ async fn stream_with_sink(
     request: ProviderRequest,
     cancellation: CancellationToken,
     sink: ProviderEventSink,
+    streamed: &mut Vec<ProviderStreamEvent>,
 ) -> Result<Vec<ProviderStreamEvent>, ProviderError> {
     let mut stream = provider.stream_events(request, cancellation);
-    let mut events = Vec::new();
     while let Some(item) = stream.next().await {
         match item {
             Ok(event) => {
                 sink(event.clone());
-                events.push(event);
+                streamed.push(event);
             }
             Err(error) => return Err(error),
         }
     }
-    Ok(events)
+    Ok(std::mem::take(streamed))
+}
+
+/// What a canceled attempt had streamed, kept as pa-agent keeps an aborted
+/// assistant message: its answer text and reasoning, never a tool call (a call
+/// cut off mid-stream is not a call).
+fn canceled_partial(events: &[ProviderStreamEvent]) -> Vec<ProviderStreamEvent> {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ProviderStreamEvent::Started { .. }
+                    | ProviderStreamEvent::TextDelta { .. }
+                    | ProviderStreamEvent::ThinkingDelta { .. }
+            )
+        })
+        .cloned()
+        .collect()
 }
 
 /// The usage the provider reported for one attempt, when it reported any.
@@ -1431,7 +1449,9 @@ async fn final_answer(
     session_id: &SessionId,
 ) -> Result<Option<String>, RuntimeError> {
     let mut attempts = store.list_provider_attempts(session_id).await?;
-    attempts.retain(|attempt| attempt.state == "completed");
+    // A canceled attempt keeps what it had streamed (pa-agent's aborted
+    // assistant message), so the answer the user stopped is the turn's reply.
+    attempts.retain(|attempt| matches!(attempt.state.as_str(), "completed" | "canceled"));
     attempts.sort_by(|left, right| left.attempt_id.as_str().cmp(right.attempt_id.as_str()));
     for attempt in attempts.iter().rev() {
         let Ok(events) = serde_json::from_value::<Vec<ProviderStreamEvent>>(attempt.events.clone())
@@ -2015,6 +2035,7 @@ impl RuntimeService {
                     .await?;
                 attempt_reservation = Some(reservation.reservation_id);
             }
+            let mut streamed = Vec::new();
             let result = match &sink {
                 Some(sink) => {
                     stream_with_sink(
@@ -2022,6 +2043,7 @@ impl RuntimeService {
                         provider_request.clone(),
                         cancellation.clone(),
                         Arc::clone(sink),
+                        &mut streamed,
                     )
                     .await
                 }
@@ -2088,7 +2110,15 @@ impl RuntimeService {
                             task_id: request.task_id.clone(),
                             attempt_number,
                             state: if canceled { "canceled" } else { "failed" }.to_owned(),
-                            events: json!([]),
+                            // A canceled answer keeps the text it had streamed.
+                            events: if canceled {
+                                serde_json::to_value(durable_provider_events(&canceled_partial(
+                                    &streamed,
+                                )))
+                                .unwrap_or_else(|_| json!([]))
+                            } else {
+                                json!([])
+                            },
                             response_hash: None,
                             error: Some(error.to_string()),
                         })

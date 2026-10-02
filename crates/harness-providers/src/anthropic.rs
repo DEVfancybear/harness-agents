@@ -191,6 +191,41 @@ impl ModelProvider for AnthropicMessagesAdapter {
     }
 
     fn stream(&self, request: ProviderRequest, cancellation: CancellationToken) -> ProviderFuture {
+        let events = self.stream_events(request, cancellation);
+        Box::pin(crate::collect_events(events))
+    }
+
+    /// Each decoded event is handed on as its SSE frame arrives, as prime-agent
+    /// streams an Anthropic answer; the whole response used to be collected
+    /// first, so nothing showed until it ended.
+    fn stream_events(
+        &self,
+        request: ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> crate::ProviderEventStream {
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<Result<ProviderStreamEvent, ProviderError>>(64);
+        let call = self.call(request, cancellation, sender.clone());
+        tokio::spawn(async move {
+            if let Err(error) = call.await {
+                let _ = sender.send(Err(error)).await;
+            }
+        });
+        Box::pin(futures_util::stream::poll_fn(move |context| {
+            receiver.poll_recv(context)
+        }))
+    }
+}
+
+impl AnthropicMessagesAdapter {
+    /// One request: decoded events go out through `sender` frame by frame; a
+    /// failure is returned for the caller to send last.
+    fn call(
+        &self,
+        request: ProviderRequest,
+        cancellation: CancellationToken,
+        sender: tokio::sync::mpsc::Sender<Result<ProviderStreamEvent, ProviderError>>,
+    ) -> impl std::future::Future<Output = Result<(), ProviderError>> + Send + 'static {
         let endpoint = self.endpoint.clone();
         let target = crate::endpoint_target(&endpoint);
         let client = self.client.clone();
@@ -198,7 +233,7 @@ impl ModelProvider for AnthropicMessagesAdapter {
         let thinking = self.thinking;
         let headers = self.headers.clone();
         let provider_id = self.capabilities.provider_id.clone();
-        Box::pin(async move {
+        async move {
             let token = credentials.resolve()?;
             let response = tokio::select! {
                 result = headers
@@ -226,6 +261,35 @@ impl ModelProvider for AnthropicMessagesAdapter {
             let mut events = vec![ProviderStreamEvent::Started {
                 request_id: request.request_id.clone(),
             }];
+            // Hand on what is decoded; `false` once the reader went away. One
+            // `Started` opens the call: the decoder adds one at the end when it
+            // sees none in what is left, and a second would read as a retry.
+            let mut started = false;
+            let mut flush = |events: &mut Vec<ProviderStreamEvent>| {
+                let sender = sender.clone();
+                let batch = std::mem::take(events)
+                    .into_iter()
+                    .filter(|event| {
+                        let first =
+                            !matches!(event, ProviderStreamEvent::Started { .. }) || !started;
+                        if matches!(event, ProviderStreamEvent::Started { .. }) {
+                            started = true;
+                        }
+                        first
+                    })
+                    .collect::<Vec<_>>();
+                async move {
+                    for event in batch {
+                        if sender.send(Ok(event)).await.is_err() {
+                            return false;
+                        }
+                    }
+                    true
+                }
+            };
+            if !flush(&mut events).await {
+                return Ok(());
+            }
             loop {
                 let item = tokio::select! {
                     item = stream.next() => item,
@@ -241,10 +305,14 @@ impl ModelProvider for AnthropicMessagesAdapter {
                     )
                 })?;
                 decoder.feed(&chunk, &mut events, &request.request_id)?;
+                if !flush(&mut events).await {
+                    return Ok(());
+                }
             }
             decoder.finish(&mut events, &request.request_id)?;
-            Ok(events)
-        })
+            flush(&mut events).await;
+            Ok(())
+        }
     }
 }
 
@@ -509,6 +577,14 @@ mod tests {
             .await;
         fixture.join().expect("fixture thread");
         let events = result.expect("Anthropic fixture stream");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProviderStreamEvent::Started { .. }))
+                .count(),
+            1,
+            "one Started opens the call; a second would read as a retry: {events:?}"
+        );
         assert!(events.iter().any(
             |event| matches!(event, ProviderStreamEvent::TextDelta { text } if text == "hello")
         ));
