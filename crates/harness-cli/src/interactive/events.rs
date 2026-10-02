@@ -698,6 +698,13 @@ pub enum SessionEvent {
     ThinkingDelta {
         text: String,
     },
+    /// A delegated child asked the user (`ask_user`) and waits for the answer:
+    /// it is shown in turn with every other open question and approval.
+    ChildQuestionRequired {
+        request_id: String,
+        prompt: String,
+        options: Vec<String>,
+    },
     /// Output a running call has printed so far.
     ToolProgress {
         call_id: String,

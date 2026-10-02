@@ -503,6 +503,9 @@ struct AgentsShared {
     answers: std::sync::OnceLock<PathBuf>,
     /// The messages the agents of this session sent each other, oldest first.
     exchanges: Mutex<std::collections::VecDeque<Exchange>>,
+    /// Where a child's `ask_user` reaches the user, when the session has a
+    /// screen to ask on.
+    question_host: Mutex<Option<Arc<dyn harness_tools::QuestionHost>>>,
 }
 
 /// One message between two agents of the family.
@@ -532,6 +535,7 @@ impl AgentsShared {
             changed: tokio::sync::Notify::new(),
             buckets: Mutex::new(HashMap::new()),
             exchanges: Mutex::new(std::collections::VecDeque::new()),
+            question_host: Mutex::new(None),
             max_depth: Mutex::new((DEFAULT_RLM_MAX_DEPTH, MaxDepthSource::Default)),
             agents: std::sync::OnceLock::new(),
             session_host: Mutex::new(None),
@@ -1127,6 +1131,14 @@ impl SessionAgents {
             shared: Arc::clone(&shared),
         });
         Self::assemble(shared, state_root, &backend)
+    }
+
+    /// Where children ask the user: their `ask_user` waits for the answer there
+    /// instead of ending the child's turn on a question no one sees.
+    pub fn set_question_host(&self, host: Arc<dyn harness_tools::QuestionHost>) {
+        if let Ok(mut current) = self.shared.question_host.lock() {
+            *current = Some(host);
+        }
     }
 
     /// Set the session's `RLM_MAX_DEPTH`; children already running keep the
@@ -2598,6 +2610,25 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     Arc::clone(&child_tools) as Arc<dyn ExternalToolCatalog>
                 ))
                 .with_inbox(RunInbox::new(Arc::clone(&store)));
+            // A child's question is shown to the user, named after the child, and
+            // the child waits for the answer.
+            let question_host = self
+                .shared
+                .question_host
+                .lock()
+                .ok()
+                .and_then(|host| host.clone());
+            let driver = match question_host {
+                Some(inner) => driver.with_question_host(Arc::new(ChildQuestionHost {
+                    // The child's own name: several children share a role.
+                    role: self
+                        .shared
+                        .update(&task_id, |child| child.name.clone())
+                        .unwrap_or_else(|| role_name.clone()),
+                    inner,
+                })),
+                None => driver,
+            };
             let observer = Arc::new(ExplorerObserver {
                 task_id: task_id.clone(),
                 role_name: role_name.clone(),
@@ -2863,6 +2894,24 @@ impl TurnObserver for ExplorerObserver {
 struct ChildApprovalGate {
     role: String,
     inner: Arc<dyn ApprovalGate>,
+}
+
+/// A child's question, named after the child, as its approvals are.
+struct ChildQuestionHost {
+    role: String,
+    inner: Arc<dyn harness_tools::QuestionHost>,
+}
+
+impl harness_tools::QuestionHost for ChildQuestionHost {
+    fn ask(
+        &self,
+        question: String,
+        options: Vec<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, HarnessError>> + Send>>
+    {
+        self.inner
+            .ask(format!("[child {}] {question}", self.role), options)
+    }
 }
 
 impl ApprovalGate for ChildApprovalGate {

@@ -474,6 +474,24 @@ const LOOP_REPEAT_LIMIT: usize = 3;
 /// What the model is told the first time it repeats a call with nothing changed.
 const LOOP_WARNING: &str = "You have made the same tool call several times and nothing has changed, so calling it again returns the same result. Stop repeating it. Answer now from what you have already read, and say plainly what you could not find.";
 
+/// Asks the user a question while the turn waits for the answer.
+///
+/// A delegated child has no next turn in which an answer could arrive, so its
+/// `ask_user` goes through this host: the question is shown to the user, in
+/// turn with every other open question, and the child goes on with the answer.
+/// A turn without a host keeps the durable question that ends the turn.
+pub trait QuestionHost: Send + Sync {
+    /// The user's answer to `question`, offered `options` when there are any.
+    ///
+    /// # Errors
+    /// The question was withdrawn, or no one can answer it.
+    fn ask(
+        &self,
+        question: String,
+        options: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, HarnessError>> + Send>>;
+}
+
 /// Bounded model -> tool -> model loop.
 #[derive(Clone)]
 pub struct TurnDriver {
@@ -484,6 +502,8 @@ pub struct TurnDriver {
     goal: Option<GoalSpec>,
     /// Durable steering/cancel inbox, when the host attached one.
     inbox: Option<RunInbox>,
+    /// Where `ask_user` asks and waits, for a turn that cannot end on a question.
+    question_host: Option<Arc<dyn QuestionHost>>,
     /// The steering queue mode `all`: every waiting message per poll instead
     /// of pa-agent's default `one-at-a-time`.
     steer_all_at_once: bool,
@@ -592,6 +612,7 @@ impl TurnDriver {
             external: None,
             goal: None,
             inbox: None,
+            question_host: None,
             steer_all_at_once: false,
             seen: Arc::default(),
         }
@@ -615,6 +636,14 @@ impl TurnDriver {
     #[must_use]
     pub fn with_inbox(mut self, inbox: RunInbox) -> Self {
         self.inbox = Some(inbox);
+        self
+    }
+
+    /// Ask the user through `host` and wait, instead of ending the turn on a
+    /// durable question.
+    #[must_use]
+    pub fn with_question_host(mut self, host: Arc<dyn QuestionHost>) -> Self {
+        self.question_host = Some(host);
         self
     }
 
@@ -1179,6 +1208,33 @@ impl TurnDriver {
                     {
                         observer.observe(TurnProgress::Notice(notice));
                     }
+                    if let Some(host) = &self.question_host {
+                        let answered = match crate::contracts::AskUserInput::parse(&call.arguments)
+                        {
+                            Ok(input) => tokio::select! {
+                                answer = host.ask(input.question, input.options) => answer,
+                                () = cancellation.cancelled() => Err(HarnessError::new(
+                                    ErrorCode::ProviderCanceled,
+                                    "the question was withdrawn: the turn was canceled",
+                                )),
+                            },
+                            Err(error) => Err(error),
+                        };
+                        slots.push((
+                            name,
+                            transcript_id,
+                            match answered {
+                                Ok(answer) => {
+                                    Slot::Answered(format!("The user answered: {answer}"))
+                                }
+                                Err(error) => Slot::Failed(
+                                    format!("ask_user failed: {error}"),
+                                    error.to_string(),
+                                ),
+                            },
+                        ));
+                        continue;
+                    }
                     match self.ask_user(&result, &call).await {
                         Ok(question_id) => {
                             pending_question = Some(question_id);
@@ -1354,6 +1410,15 @@ impl TurnDriver {
                             transcript_id,
                             format!("tool {name} failed: {error}"),
                         ));
+                    }
+                    Slot::Answered(text) => {
+                        observer.observe(TurnProgress::ToolSettled {
+                            name,
+                            call_id: transcript_id.clone(),
+                            ok: true,
+                            detail: None,
+                        });
+                        appended.push(ProviderMessage::tool_result(transcript_id, text));
                     }
                     Slot::Ready(_) | Slot::Taken => {}
                 }
@@ -1758,6 +1823,8 @@ async fn complete_action(
 enum Slot {
     /// Refused before any gate: the text the model gets, and the reason shown.
     Failed(String, String),
+    /// `ask_user` answered through the question host: the text the model gets.
+    Answered(String),
     Done(Result<ToolExecutionView, HarnessError>),
     Ready(Box<ReadyAction>),
     Taken,

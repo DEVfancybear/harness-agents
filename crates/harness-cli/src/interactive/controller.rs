@@ -123,6 +123,9 @@ struct PendingQuestion {
     options: Vec<String>,
     /// The option the arrows have highlighted.
     selected: usize,
+    /// A delegated child's question: its answer goes back to the waiting
+    /// child instead of starting a turn.
+    child_request: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,6 +208,12 @@ pub struct InteractiveController {
     pending_newlines: usize,
     pending_approval: Option<PendingApproval>,
     pending_question: Option<PendingQuestion>,
+    /// Questions and approvals that arrived while another was open, oldest
+    /// first: several agents asking at once are asked one after another.
+    question_queue: std::collections::VecDeque<PendingQuestion>,
+    approval_queue: std::collections::VecDeque<PendingApproval>,
+    /// The phase a child's question interrupted, restored once it is answered.
+    phase_before_question: Option<AppPhase>,
     pending_mcp_elicitation: Option<PendingMcpElicitation>,
     /// Whether the user allowed every gated action for the run now in flight.
     ///
@@ -345,6 +354,9 @@ impl InteractiveController {
             pending_newlines: 0,
             pending_approval: None,
             pending_question: None,
+            question_queue: std::collections::VecDeque::new(),
+            approval_queue: std::collections::VecDeque::new(),
+            phase_before_question: None,
             pending_mcp_elicitation: None,
             granted_for_run: false,
             session_candidates: Vec::new(),
@@ -1680,7 +1692,7 @@ impl InteractiveController {
                         },
                     );
                 }
-                self.pending_approval = Some(PendingApproval {
+                let approval = PendingApproval {
                     request_id,
                     action,
                     summary,
@@ -1691,8 +1703,15 @@ impl InteractiveController {
                     expires_at,
                     read_only,
                     scroll: 0,
-                });
-                self.phase = AppPhase::WaitingApproval;
+                };
+                // One panel at a time: a request that arrives while another
+                // is open waits its turn instead of replacing it.
+                if self.pending_approval.is_some() || self.pending_question.is_some() {
+                    self.approval_queue.push_back(approval);
+                } else {
+                    self.pending_approval = Some(approval);
+                    self.phase = AppPhase::WaitingApproval;
+                }
             }
             SessionEvent::ApprovalExpired { request_id } => {
                 self.flush_stream(effects);
@@ -1705,6 +1724,10 @@ impl InteractiveController {
                     if self.phase == AppPhase::WaitingApproval {
                         self.phase = AppPhase::Running;
                     }
+                    self.next_waiting();
+                } else {
+                    self.approval_queue
+                        .retain(|queued| queued.request_id != request_id);
                 }
                 self.push_history(
                     effects,
@@ -1911,12 +1934,48 @@ impl InteractiveController {
                         },
                     );
                 }
-                self.pending_question = Some(PendingQuestion {
+                self.offer_question(PendingQuestion {
                     question_id,
                     prompt,
                     options,
                     selected: 0,
+                    child_request: None,
                 });
+            }
+            SessionEvent::ChildQuestionRequired {
+                request_id,
+                prompt,
+                options,
+            } => {
+                self.flush_stream(effects);
+                if self.plain {
+                    let choices = options
+                        .iter()
+                        .enumerate()
+                        .map(|(index, option)| format!("{}. {option}", index + 1))
+                        .collect::<Vec<_>>();
+                    self.push_history(
+                        effects,
+                        HistoryItem::Message {
+                            text: format!(
+                                "[question] {prompt}{}",
+                                if choices.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("\n{}", choices.join("\n"))
+                                }
+                            ),
+                        },
+                    );
+                }
+                self.offer_question(PendingQuestion {
+                    question_id: request_id.clone(),
+                    prompt,
+                    options,
+                    selected: 0,
+                    child_request: Some(request_id),
+                });
+                effects.push(Effect::Redraw);
             }
             SessionEvent::McpElicitationRequired {
                 request_id,
@@ -2368,6 +2427,24 @@ impl InteractiveController {
         let Some(question) = self.pending_question.take() else {
             return Vec::new();
         };
+        if let Some(request_id) = &question.child_request {
+            // A child waits on this answer; the turn it belongs to goes on.
+            self.editor.clear();
+            let delivered = self.service.answer_child_question(request_id, &text);
+            self.phase = self
+                .phase_before_question
+                .take()
+                .unwrap_or(AppPhase::Running);
+            let mut effects = vec![Effect::History(HistoryItem::User { text })];
+            if !delivered {
+                effects.push(Effect::History(HistoryItem::Notice {
+                    message: "that agent stopped waiting; the answer was not delivered".to_owned(),
+                }));
+            }
+            self.next_waiting();
+            effects.push(Effect::Redraw);
+            return effects;
+        }
         // The answer is sent: whatever was typed toward it goes with the panel.
         self.editor.clear();
         self.continuations = 0;
@@ -2381,6 +2458,32 @@ impl InteractiveController {
             refine: None,
         });
         vec![Effect::History(HistoryItem::User { text }), Effect::Redraw]
+    }
+
+    /// Show `question` now, or after the panel that is open.
+    fn offer_question(&mut self, question: PendingQuestion) {
+        if self.pending_question.is_some() || self.pending_approval.is_some() {
+            self.question_queue.push_back(question);
+            return;
+        }
+        if question.child_request.is_some() {
+            self.phase_before_question = Some(self.phase);
+        }
+        self.pending_question = Some(question);
+        self.phase = AppPhase::WaitingInput;
+    }
+
+    /// Open the next waiting approval or question, oldest approval first.
+    fn next_waiting(&mut self) {
+        if self.pending_approval.is_some() || self.pending_question.is_some() {
+            return;
+        }
+        if let Some(approval) = self.approval_queue.pop_front() {
+            self.pending_approval = Some(approval);
+            self.phase = AppPhase::WaitingApproval;
+        } else if let Some(question) = self.question_queue.pop_front() {
+            self.offer_question(question);
+        }
     }
 
     fn dispatch_shell_prefix(&mut self, text: String, shell_prefix: ShellPrefix) -> Vec<Effect> {
@@ -4577,6 +4680,7 @@ impl InteractiveController {
         let accepted = self.service.answer(&pending.request_id, decision);
         self.pending_approval = None;
         self.phase = AppPhase::Running;
+        self.next_waiting();
         if decision == ApprovalDecision::GrantForRun {
             // The grant is a property of the run, not of this one answer, so it is
             // recorded on the port rather than carried in the decision alone.
@@ -4680,6 +4784,7 @@ impl InteractiveController {
             Ok(message) => {
                 self.pending_approval = None;
                 self.phase = AppPhase::Running;
+                self.next_waiting();
                 vec![
                     Effect::History(HistoryItem::Notice { message }),
                     Effect::History(HistoryItem::ApprovalResolution {
@@ -4698,6 +4803,7 @@ impl InteractiveController {
 
     fn finish_run(&mut self) {
         self.pending_approval = None;
+        self.approval_queue.clear();
         self.pending_mcp_elicitation = None;
         self.open_tools.clear();
         self.tool_progress.clear();
@@ -4897,11 +5003,21 @@ mod tests {
         depths: Arc<Mutex<Vec<DepthChange>>>,
         /// The service tier in force, as `/tier` and `/fast` set it.
         tier: Arc<Mutex<Option<String>>>,
+        /// Every answer handed to a waiting child, by its question id.
+        child_answers: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     impl SessionPort for RecordingPort {
         fn label(&self) -> String {
             "recording port".to_owned()
+        }
+
+        fn answer_child_question(&mut self, request_id: &str, answer: &str) -> bool {
+            self.child_answers
+                .lock()
+                .expect("child answers")
+                .push((request_id.to_owned(), answer.to_owned()));
+            true
         }
 
         fn expand_skill(&self, name: &str, arguments: &str) -> Result<String, String> {
@@ -6199,6 +6315,76 @@ Command: \"npm run build\""
 
     fn input_id(text: &str) -> InputId {
         InputId::parse(text).expect("canonical input id")
+    }
+
+    /// Two children ask at once: the second question waits until the first is
+    /// answered, and each answer goes back to the child that asked it.
+    #[test]
+    fn questions_from_several_children_are_asked_one_after_another() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "plan with two children");
+        for (id, prompt, options) in [
+            ("q-color", "[child color] Which color?", ["red", "blue"]),
+            ("q-size", "[child size] Which size?", ["S", "L"]),
+        ] {
+            harness
+                .events
+                .send(SessionEvent::ChildQuestionRequired {
+                    request_id: id.to_owned(),
+                    prompt: prompt.to_owned(),
+                    options: options.map(str::to_owned).to_vec(),
+                })
+                .expect("question");
+        }
+        let _ = harness.controller.pump_events();
+        let shown = |harness: &Bench| match harness.controller.ui_state().modal {
+            Some(Modal::Question { prompt, .. }) => prompt,
+            other => panic!("a question panel: {other:?}"),
+        };
+        assert_eq!(shown(&harness), "[child color] Which color?");
+        let _ = harness.controller.handle_key(Key::Char('2'));
+        assert_eq!(
+            shown(&harness),
+            "[child size] Which size?",
+            "the next one follows"
+        );
+        let _ = harness.controller.handle_key(Key::Char('1'));
+        assert!(harness.controller.ui_state().modal.is_none());
+        assert_eq!(
+            *harness.port.child_answers.lock().expect("child answers"),
+            [
+                ("q-color".to_owned(), "blue".to_owned()),
+                ("q-size".to_owned(), "S".to_owned())
+            ]
+        );
+        assert_eq!(
+            harness.controller.ui_state().phase,
+            AppPhase::Running,
+            "the turn goes on"
+        );
+    }
+
+    /// Two gated actions at once: the second panel waits for the first.
+    #[test]
+    fn approvals_from_several_agents_are_asked_one_after_another() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "edit two files");
+        harness.events.send(approval_event("a-1")).expect("first");
+        harness.events.send(approval_event("a-2")).expect("second");
+        let _ = harness.controller.pump_events();
+        let open = |harness: &Bench| match harness.controller.ui_state().modal {
+            Some(Modal::Approval { request_id, .. }) => request_id,
+            other => panic!("an approval panel: {other:?}"),
+        };
+        assert_eq!(open(&harness), "a-1");
+        let _ = harness.controller.handle_key(Key::Char('y'));
+        assert_eq!(
+            open(&harness),
+            "a-2",
+            "the second waited, it was not dropped"
+        );
     }
 
     /// A gated **write**, which is the case that keeps its panel.

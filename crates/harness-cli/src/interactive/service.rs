@@ -215,6 +215,10 @@ pub trait SessionPort: Send {
     fn submit(&mut self, request: SubmitRequest);
     fn cancel(&mut self);
     /// Deliver an immediate correction to the run currently in progress.
+    /// Answer a delegated child's question; `false` when none is waiting.
+    fn answer_child_question(&mut self, _request_id: &str, _answer: &str) -> bool {
+        false
+    }
     fn steer(&mut self, _text: &str) -> Result<(), String> {
         Err("this backend does not support steering an active run".to_owned())
     }
@@ -1931,6 +1935,8 @@ pub struct AgentSessionService {
     active_inbox: Arc<Mutex<Option<ActiveTurnInbox>>>,
     /// Asks the user for every gated action; never grants on its own.
     gate: Arc<ChannelApprovalGate>,
+    /// Where delegated children's questions wait for the user's answers.
+    child_questions: Arc<ChannelQuestionHost>,
     cancellation: Option<CancellationToken>,
     /// The limits this service hands to the driver, reported to the UI.
     limits: TurnLimits,
@@ -2306,6 +2312,94 @@ struct ActiveTurnInbox {
     /// Messages on their way into the inbox, so the turn that ends waits for
     /// them before it hands what it did not read to the next turn.
     in_flight: Arc<AtomicUsize>,
+}
+
+/// The session's delegated children, and where their questions reach the user.
+fn session_agents(
+    context: &LaunchContext,
+    sender: &UnboundedSender<SessionEvent>,
+    gate: &Arc<ChannelApprovalGate>,
+) -> (
+    Arc<super::delegation::SessionAgents>,
+    Arc<ChannelQuestionHost>,
+) {
+    let agents = super::delegation::SessionAgents::new(
+        super::store_lease::SharedStore::for_dir(context.project_store_dir()),
+        sender.clone(),
+        Arc::clone(gate) as Arc<dyn ApprovalGate>,
+        context.paths.data_dir.join("delegation"),
+    )
+    .expect("the delegation scheduler starts with a fixed, valid configuration");
+    let child_questions = Arc::new(ChannelQuestionHost::new(sender.clone()));
+    agents.set_question_host(Arc::clone(&child_questions) as Arc<dyn harness_tools::QuestionHost>);
+    (agents, child_questions)
+}
+
+/// Where delegated children ask the user: each question is sent to the screen
+/// and the child waits for its answer, which [`Self::answer`] delivers.
+#[derive(Default)]
+pub struct ChannelQuestionHost {
+    sender: Option<UnboundedSender<SessionEvent>>,
+    pending: Mutex<HashMap<String, oneshot::Sender<String>>>,
+}
+
+impl ChannelQuestionHost {
+    #[must_use]
+    pub fn new(sender: UnboundedSender<SessionEvent>) -> Self {
+        Self {
+            sender: Some(sender),
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Hand the user's answer to the child waiting on `request_id`.
+    pub fn answer(&self, request_id: &str, answer: &str) -> bool {
+        let waiting = self
+            .pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(request_id));
+        waiting.is_some_and(|sender| sender.send(answer.to_owned()).is_ok())
+    }
+}
+
+impl harness_tools::QuestionHost for ChannelQuestionHost {
+    fn ask(
+        &self,
+        question: String,
+        options: Vec<String>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, harness_types::HarnessError>> + Send>,
+    > {
+        let request_id = format!("child-question-{}", InputId::generate().as_str());
+        let (answer, answered) = oneshot::channel();
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.insert(request_id.clone(), answer);
+        }
+        let sent = self.sender.as_ref().is_some_and(|sender| {
+            sender
+                .send(SessionEvent::ChildQuestionRequired {
+                    request_id,
+                    prompt: question,
+                    options,
+                })
+                .is_ok()
+        });
+        Box::pin(async move {
+            if !sent {
+                return Err(harness_types::HarnessError::new(
+                    ErrorCode::ServiceUnavailable,
+                    "no one is there to answer the question",
+                ));
+            }
+            answered.await.map_err(|_| {
+                harness_types::HarnessError::new(
+                    ErrorCode::ProviderCanceled,
+                    "the question was withdrawn before it was answered",
+                )
+            })
+        })
+    }
 }
 
 /// The messages that reached a turn's inbox after its last step: prime-agent
@@ -2694,13 +2788,7 @@ impl AgentSessionService {
                 sender: sender.clone(),
             }));
         }
-        let agents = super::delegation::SessionAgents::new(
-            super::store_lease::SharedStore::for_dir(context.project_store_dir()),
-            sender.clone(),
-            Arc::clone(&gate) as Arc<dyn ApprovalGate>,
-            context.paths.data_dir.join("delegation"),
-        )
-        .expect("the delegation scheduler starts with a fixed, valid configuration");
+        let (agents, child_questions) = session_agents(context, &sender, &gate);
         let task_id = TaskId::generate();
         let schedules = Arc::new(super::schedules::Schedules::default());
         schedules.bind(super::schedules::path_for(
@@ -2730,6 +2818,7 @@ impl AgentSessionService {
             previous_session: Arc::new(Mutex::new(None)),
             active_inbox: Arc::new(Mutex::new(None)),
             gate,
+            child_questions,
             cancellation: None,
             limits,
             project_id: Arc::new(Mutex::new(None)),
@@ -4598,6 +4687,10 @@ impl SessionPort for AgentSessionService {
 
     fn steer(&mut self, text: &str) -> Result<(), String> {
         self.queue_into_run(text, false)
+    }
+
+    fn answer_child_question(&mut self, request_id: &str, answer: &str) -> bool {
+        self.child_questions.answer(request_id, answer)
     }
 
     fn deliver_message(&mut self, text: &str) -> Result<(), String> {
