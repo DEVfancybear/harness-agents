@@ -405,7 +405,7 @@ timeout_seconds = 10
 | `post_tool_use` | sau một lần gọi đã chạy | đọc `tool_input` và `tool_response`; gửi phản hồi cho model (`decision: "block"` + `reason`, `additionalContext`) |
 | `stop` / `subagent_stop` | agent chính / agent con kết thúc | `decision: "block"` + `reason` cho lượt chạy tiếp với lý do đó; lần dừng thứ hai có `stop_hook_active` là `true` |
 | `user_prompt_submit` | trước khi gửi prompt | chặn prompt; stdout hoặc `additionalContext` được thêm vào prompt |
-| `session_start` | trước prompt đầu tiên của cuộc hội thoại | stdout hoặc `additionalContext` được thêm vào prompt |
+| `session_start` | trước prompt đầu tiên của một phiên; `source` là `startup`, `resume` (`/resume`, `/fork`, `/clone`), `clear` (`/new`) hoặc `compact` (sau `/compact`) | stdout hoặc `additionalContext` được thêm vào prompt |
 | `session_end` | app đóng | chỉ quan sát |
 | `pre_compact` | trước `/compact` | chỉ quan sát |
 | `notification` | có câu hỏi hoặc yêu cầu duyệt đang chờ | chỉ quan sát |

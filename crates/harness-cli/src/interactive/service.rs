@@ -1916,6 +1916,10 @@ pub struct AgentSessionService {
     /// The task of the conversation `/resume` opened, once it is read: that
     /// is the conversation this service continues, not `task_id`.
     resumed_task: Arc<Mutex<Option<String>>>,
+    /// Why the next prompt opens a session, for its `session_start` hooks:
+    /// Claude Code's `startup`, `resume`, `clear` or `compact`. `None` once the
+    /// hooks have run for it.
+    session_start: Arc<Mutex<Option<&'static str>>>,
     store_dir: PathBuf,
     /// Root that owns the credential file `/login` writes.
     data_dir: PathBuf,
@@ -2411,7 +2415,7 @@ impl harness_tools::QuestionHost for ChannelQuestionHost {
 async fn prompt_hooks(
     hooks: &[harness_tools::ConfiguredToolHook],
     request: &SubmitRequest,
-    first_prompt: bool,
+    start_source: Option<&str>,
     session_id: &SessionId,
     task_id: &TaskId,
     workspace_root: &Path,
@@ -2448,9 +2452,9 @@ async fn prompt_hooks(
         return Ok(None);
     }
     let mut context = Vec::new();
-    if first_prompt {
+    if let Some(start_source) = start_source {
         let mut payload = base("session_start");
-        payload["source"] = serde_json::json!("startup");
+        payload["source"] = serde_json::json!(start_source);
         let answer =
             harness_tools::run_hooks(hooks, "session_start", None, &payload, false, cancellation)
                 .await;
@@ -2901,6 +2905,7 @@ impl AgentSessionService {
             sign_in: None,
             credential_scope: credentials::Scope::Main,
             resumed_task: Arc::new(Mutex::new(None)),
+            session_start: Arc::new(Mutex::new(Some("startup"))),
             system_prompt: Arc::new(Mutex::new(String::new())),
             active_skills: Arc::new(Mutex::new(BTreeMap::new())),
             pending_mcp_elicitations: Arc::new(Mutex::new(HashMap::new())),
@@ -3345,6 +3350,7 @@ impl SessionPort for AgentSessionService {
         let branch_plan = self.branch_plan.take();
         let task_id = self.task_id.clone();
         let previous_session = Arc::clone(&self.previous_session);
+        let session_start = Arc::clone(&self.session_start);
         let active_inbox = Arc::clone(&self.active_inbox);
         let gate = Arc::clone(&self.gate);
         let limits = self.limits;
@@ -3390,6 +3396,7 @@ impl SessionPort for AgentSessionService {
                 session_id,
                 task_id,
                 previous_session,
+                session_start,
                 active_inbox,
                 gate,
                 limits,
@@ -4781,6 +4788,7 @@ impl SessionPort for AgentSessionService {
         }
         previous.clone_from(&source);
         drop(previous);
+        self.mark_session_start(if source.is_some() { "resume" } else { "clear" });
         if let Some(source) = source {
             self.show_conversation(source);
         }
@@ -5191,6 +5199,15 @@ impl AgentSessionService {
             *previous = None;
         }
         self.fork_plan = Some(plan);
+        // The fork carries the conversation it came from: it is resumed, not new.
+        self.mark_session_start("resume");
+    }
+
+    /// The next prompt opens a session for `source`.
+    fn mark_session_start(&self, source: &'static str) {
+        if let Ok(mut pending) = self.session_start.lock() {
+            *pending = Some(source);
+        }
     }
 
     /// Queue `text` into the running turn for its next step: as the user's
@@ -5378,6 +5395,7 @@ async fn run_turn(
     session_id: SessionId,
     task_id: TaskId,
     previous_session: Arc<Mutex<Option<SessionId>>>,
+    session_start: Arc<Mutex<Option<&'static str>>>,
     active_inbox: Arc<Mutex<Option<ActiveTurnInbox>>>,
     gate: Arc<ChannelApprovalGate>,
     limits: TurnLimits,
@@ -5702,10 +5720,20 @@ async fn run_turn(
     // before a compaction, `session_start` before a conversation's first
     // prompt, `user_prompt_submit` before every prompt. What they add for the
     // model rides with the prompt; a blocked prompt is not sent.
+    // A compaction leaves the source for the prompt after it; any other prompt
+    // takes it.
+    let start_source = if request.compact_guidance.is_some() {
+        None
+    } else {
+        session_start
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take())
+    };
     let hook_context = match prompt_hooks(
         &config.hooks,
         &request,
-        source.is_none(),
+        start_source,
         &session_id,
         &task_id,
         &workspace_root,
@@ -5947,9 +5975,16 @@ async fn run_turn(
             });
         }
         match result {
-            Ok(()) => send(SessionEvent::RunTerminal {
-                outcome: RunOutcome::Done,
-            }),
+            Ok(()) => {
+                // Claude Code's `SessionStart` with `compact`: the prompt after a
+                // compaction starts from the summary.
+                if let Ok(mut pending) = session_start.lock() {
+                    *pending = Some("compact");
+                }
+                send(SessionEvent::RunTerminal {
+                    outcome: RunOutcome::Done,
+                });
+            }
             Err(message) => {
                 send(SessionEvent::RecoverableError { message });
                 send(SessionEvent::RunTerminal {
@@ -8018,14 +8053,14 @@ mod tests {
         let task = harness_types::TaskId::generate();
         let shown = Mutex::new(Vec::new());
         let send = |event: SessionEvent| shown.lock().expect("events").push(event);
+        // The hook prints the `source` it was given: why the session opened.
+        #[cfg(windows)]
+        let echo_source = "$i = [Console]::In.ReadToEnd() | ConvertFrom-Json; Write-Output ('opened by ' + $i.source); exit 0";
+        #[cfg(not(windows))]
+        let echo_source = r#"sed -n 's/.*"source":"\([a-z]*\)".*/opened by \1/p'; exit 0"#;
         let context = super::prompt_hooks(
             &[
-                hook(
-                    "session_start",
-                    None,
-                    30,
-                    &hook_read_stdin_script("on branch main", 0),
-                ),
+                hook("session_start", None, 30, echo_source),
                 hook(
                     "user_prompt_submit",
                     None,
@@ -8037,7 +8072,7 @@ mod tests {
                 ),
             ],
             &request(),
-            true,
+            Some("resume"),
             &session,
             &task,
             workspace.path(),
@@ -8048,7 +8083,7 @@ mod tests {
         .expect("the prompt goes through");
         assert_eq!(
             context.as_deref(),
-            Some("on branch main\nthe parser is in src/")
+            Some("opened by resume\nthe parser is in src/")
         );
         let blocked = super::prompt_hooks(
             &[hook(
@@ -8061,7 +8096,7 @@ mod tests {
                 ),
             )],
             &request(),
-            false,
+            None,
             &session,
             &task,
             workspace.path(),

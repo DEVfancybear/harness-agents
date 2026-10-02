@@ -400,7 +400,7 @@ timeout_seconds = 10
 | `post_tool_use` | after a call that ran | read `tool_input` and `tool_response`; send feedback to the model (`decision: "block"` + `reason`, `additionalContext`) |
 | `stop` / `subagent_stop` | the main agent / a delegated child finishes | `decision: "block"` + `reason` sends the turn on with the reason; `stop_hook_active` is `true` on the second stop |
 | `user_prompt_submit` | before a prompt is sent | block it; stdout or `additionalContext` is added to the prompt |
-| `session_start` | before a conversation's first prompt | stdout or `additionalContext` is added to the prompt |
+| `session_start` | before the first prompt of a session; `source` is `startup`, `resume` (`/resume`, `/fork`, `/clone`), `clear` (`/new`) or `compact` (after `/compact`) | stdout or `additionalContext` is added to the prompt |
 | `session_end` | the app closes | observe only |
 | `pre_compact` | before `/compact` | observe only |
 | `notification` | a question or an approval waits | observe only |
