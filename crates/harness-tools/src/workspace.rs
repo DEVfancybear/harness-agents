@@ -5,7 +5,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{Condvar, Mutex, OnceLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use globset::Glob;
@@ -270,14 +270,38 @@ pub(crate) fn workspace_fingerprint(
             git_output(root, ["status", "--porcelain=v1", "--untracked-files=all"])
                 .unwrap_or_else(|| "not_git".to_owned())
         });
-        let files = walk_files_bounded(root, MAX_FINGERPRINT_ENTRIES)
-            .and_then(|files| hash_files(&files).map(|hashes| (files, hashes)));
+        let files = if too_large(root) {
+            Ok(None)
+        } else {
+            match walk_files_within(
+                root,
+                MAX_FINGERPRINT_ENTRIES,
+                Some(Instant::now() + FINGERPRINT_WALK_DEADLINE),
+            ) {
+                Ok(files) => hash_files(&files).map(|hashes| Some((files, hashes))),
+                Err(error) if error.code() == ErrorCode::OutputLimitExceeded => {
+                    remember_too_large(root);
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            }
+        };
         (
             files,
             status.join().unwrap_or_else(|_| "not_git".to_owned()),
         )
     });
-    let (files, hashes) = files?;
+    let Some((files, hashes)) = files? else {
+        // Measured: started in the user's home folder, the walk took 32 seconds
+        // to reach the bound and then failed every turn before it reached the
+        // model, and Ctrl+C waited for it. A workspace this large is fingerprinted
+        // by its Git state alone, and remembered as such for the process.
+        return ContentHash::from_canonical_json(&json!({
+            "git_head": git_head,
+            "git_status": status,
+            "files": "unobserved: the workspace is too large to walk",
+        }));
+    };
     let mut entries = Vec::with_capacity(files.len());
     for (item, hash) in files.iter().zip(hashes) {
         match hash {
@@ -1046,11 +1070,45 @@ fn walk_files(root: &Path) -> Result<Vec<WalkFile>, HarnessError> {
 /// fingerprinted instead of failing every write.
 const MAX_FINGERPRINT_ENTRIES: usize = 200_000;
 
+/// How long the fingerprint walk may take before the workspace counts as too
+/// large to observe file by file.
+const FINGERPRINT_WALK_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Roots whose walk ran past the bound or the deadline in this process.
+fn too_large_roots() -> &'static Mutex<HashSet<PathBuf>> {
+    static ROOTS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    ROOTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn too_large(root: &Path) -> bool {
+    too_large_roots()
+        .lock()
+        .is_ok_and(|roots| roots.contains(root))
+}
+
+fn remember_too_large(root: &Path) {
+    if let Ok(mut roots) = too_large_roots().lock() {
+        roots.insert(root.to_owned());
+    }
+}
+
 fn walk_files_bounded(root: &Path, bound: usize) -> Result<Vec<WalkFile>, HarnessError> {
+    walk_files_within(root, bound, None)
+}
+
+fn walk_files_within(
+    root: &Path,
+    bound: usize,
+    deadline: Option<Instant>,
+) -> Result<Vec<WalkFile>, HarnessError> {
     let mut files = Vec::new();
+    // `.gitignore` applies outside a Git repository too: a folder that is not a
+    // repository (a home folder, an unpacked project) still names what it keeps
+    // out, `node_modules` first among them.
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .follow_links(false)
+        .require_git(false)
         .git_ignore(true)
         .git_global(false)
         .git_exclude(true)
@@ -1091,6 +1149,12 @@ fn walk_files_bounded(root: &Path, bound: usize) -> Result<Vec<WalkFile>, Harnes
             return Err(HarnessError::new(
                 ErrorCode::OutputLimitExceeded,
                 "workspace walk exceeded the P3 entry bound",
+            ));
+        }
+        if deadline.is_some_and(|deadline| Instant::now() > deadline) {
+            return Err(HarnessError::new(
+                ErrorCode::OutputLimitExceeded,
+                "workspace walk ran past its deadline",
             ));
         }
         files.push(WalkFile {
@@ -1520,6 +1584,47 @@ fn relative_text(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A folder that is not a Git repository still keeps out what its
+    /// `.gitignore` names; a walk past its deadline counts as too large; and a
+    /// root known to be too large is fingerprinted without being walked.
+    #[test]
+    fn a_large_workspace_is_fingerprinted_without_a_walk() {
+        let root = std::env::temp_dir().join(format!("ws-{}", harness_types::InputId::generate()));
+        std::fs::create_dir_all(root.join("node_modules").join("pkg")).expect("root");
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").expect("ignore");
+        std::fs::write(root.join("node_modules").join("pkg").join("a.js"), "x").expect("dep");
+        std::fs::write(root.join("main.py"), "print(1)").expect("file");
+        let walked = walk_files_bounded(&root, 100).expect("walk");
+        let names = walked
+            .iter()
+            .map(|file| file.relative.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"main.py"), "{names:?}");
+        assert!(
+            !names.iter().any(|name| name.starts_with("node_modules")),
+            "outside Git too, .gitignore keeps node_modules out: {names:?}"
+        );
+
+        let late = walk_files_within(
+            &root,
+            100,
+            Instant::now().checked_sub(Duration::from_secs(1)),
+        )
+        .expect_err("past the deadline");
+        assert_eq!(late.code(), ErrorCode::OutputLimitExceeded);
+
+        let walked_print = workspace_fingerprint(&root, "not_git").expect("walked");
+        remember_too_large(&root);
+        let started = Instant::now();
+        let unwalked = workspace_fingerprint(&root, "not_git").expect("not walked");
+        assert!(started.elapsed() < FINGERPRINT_WALK_DEADLINE);
+        assert_ne!(
+            walked_print, unwalked,
+            "the degraded fingerprint is its own"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     /// A file that is not there says so and names it, instead of the OS text
     /// "The system cannot find the path specified. (os error 3)".
