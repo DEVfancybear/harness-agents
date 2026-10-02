@@ -711,6 +711,8 @@ pub enum SessionEvent {
     },
     ToolStarted {
         name: String,
+        /// The model call this card is for; empty for a host action.
+        call_id: String,
         summary: String,
         /// The whole call input (the arguments JSON), for the expanded view.
         input: String,
@@ -721,6 +723,9 @@ pub enum SessionEvent {
     },
     ToolSettled {
         name: String,
+        /// The call that settled. Calls of a parallel batch settle in
+        /// completion order, so the card is found by it, not by name.
+        call_id: String,
         ok: bool,
         /// Measured by the producer that observed both boundaries. Carrying the
         /// value on the event avoids a second name-based lookup that races when
@@ -932,11 +937,13 @@ mod tests {
             },
             SessionEvent::ToolStarted {
                 name: "read_file".to_owned(),
+                call_id: String::new(),
                 summary: "path=a.rs".to_owned(),
                 input: r#"{"path":"a.rs"}"#.to_owned(),
             },
             SessionEvent::ToolSettled {
                 name: "read_file".to_owned(),
+                call_id: String::new(),
                 ok: true,
                 elapsed: Duration::from_millis(12),
                 detail: String::new(),

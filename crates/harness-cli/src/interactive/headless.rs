@@ -123,7 +123,7 @@ impl TurnObserver for HeadlessObserver {
             TurnProgress::StreamRestarted => self.stream_event("stream.restarted", &serde_json::json!({})),
             TurnProgress::Usage { prompt_tokens, completion_tokens } => self.stream_event("usage", &serde_json::json!({"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens})),
             TurnProgress::ToolStarted { name, summary, .. } => self.stream_event("tool.started", &serde_json::json!({"name": name, "summary": summary})),
-            TurnProgress::ToolSettled { name, ok, detail } => {
+            TurnProgress::ToolSettled { name, ok, detail, .. } => {
                 self.stream_event("tool.settled", &serde_json::json!({"name": name, "ok": ok, "detail": detail}));
                 if !ok && detail.as_deref().is_some_and(|text| text.contains("approval") || text.contains("denied by the user")) {
                     self.approval_blocked.store(true, Ordering::SeqCst);

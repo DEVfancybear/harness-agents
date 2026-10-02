@@ -3652,6 +3652,152 @@ async fn g06_tool_arguments_are_coerced_and_validated_against_the_schema() {
     drop(provider);
     close(store).await;
 }
+/// Two external tools: `slow_tool` takes 600 ms, `fast_tool` answers at once.
+struct TimedTools;
+
+impl harness_tools::ExternalToolCatalog for TimedTools {
+    fn schemas(&self) -> Vec<serde_json::Value> {
+        ["slow_tool", "fast_tool"]
+            .into_iter()
+            .map(|name| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": "timing fixture",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                })
+            })
+            .collect()
+    }
+
+    fn resolve(&self, name: &str, arguments: &serde_json::Value) -> Option<CodingToolAction> {
+        matches!(name, "slow_tool" | "fast_tool").then(|| CodingToolAction::ExternalTool {
+            plugin_id: "timing".to_owned(),
+            tool_name: name.to_owned(),
+            arguments: arguments.clone(),
+            parent_invocation_id: None,
+            timeout_ms: 5_000,
+        })
+    }
+}
+
+impl harness_tools::ExternalToolDispatcher for TimedTools {
+    fn validate_external<'a>(
+        &'a self,
+        _plugin_id: &'a str,
+        _tool_name: &'a str,
+        _arguments: &'a serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), HarnessError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn dispatch_external<'a>(
+        &'a self,
+        _authorization: &'a harness_tools::ToolDispatchAuthorization,
+        plugin_id: &'a str,
+        tool_name: &'a str,
+        _arguments: &'a serde_json::Value,
+        _timeout_ms: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, HarnessError>> + Send + 'a>> {
+        Box::pin(async move {
+            if tool_name == "slow_tool" {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+            }
+            Ok(ToolOutput::ExternalTool {
+                plugin_id: plugin_id.to_owned(),
+                tool_name: tool_name.to_owned(),
+                payload: serde_json::json!({"text": format!("{tool_name} done")}),
+                inflight: 1,
+            })
+        })
+    }
+}
+
+#[derive(Default)]
+struct SettledOrder(Mutex<Vec<String>>);
+
+impl TurnObserver for SettledOrder {
+    fn observe(&self, progress: TurnProgress) {
+        if let TurnProgress::ToolSettled { call_id, .. } = progress {
+            self.0.lock().expect("settled log").push(call_id);
+        }
+    }
+}
+
+/// pa-agent emits `tool_execution_end` as each call of a parallel batch
+/// finishes: the fast call's card settles while the slow one still runs, and
+/// the results still reach the model in call order.
+#[tokio::test]
+async fn g06_parallel_calls_settle_in_completion_order() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta("c-slow", "slow_tool", "{}"),
+            ProviderStreamEvent::tool_delta("c-fast", "fast_tool", "{}"),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("done"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let driver = TurnDriver::new(
+        Arc::clone(&runtime),
+        ToolExecutionService::new(Arc::clone(&store)).with_external(Arc::new(TimedTools)),
+    )
+    .with_external(harness_tools::ExternalTools::new(Arc::new(TimedTools)));
+    let mut schemas = coding_tool_schemas();
+    schemas.extend(harness_tools::ExternalToolCatalog::schemas(&TimedTools));
+    let request = RunRequest::new(
+        SessionId::generate(),
+        TaskId::generate(),
+        InputId::generate(),
+        "time the tools",
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("workspace"),
+    )
+    .with_tool_schemas(schemas);
+    let options = TurnOptions {
+        workspace_root: bench.workspace.clone(),
+        actor_id: "g06.test".to_owned(),
+        approvals: ApprovalMode::Auto,
+        limits: TurnLimits::default(),
+    };
+    let order = Arc::new(SettledOrder::default());
+    let outcome = driver
+        .run_turn(request, options, order.clone(), CancellationToken::new())
+        .await
+        .expect("turn succeeds");
+    assert_eq!(outcome.stop, TurnStop::Final);
+    assert_eq!(
+        *order.0.lock().expect("settled log"),
+        ["c-fast", "c-slow"],
+        "the fast call settles first"
+    );
+    let results = provider.seen()[1]
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Tool)
+        .map(|message| message.content.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        results[0].contains("slow_tool done") && results[1].contains("fast_tool done"),
+        "results stay in call order: {results:?}"
+    );
+    drop(driver);
+    drop(runtime);
+    drop(provider);
+    close(store).await;
+}
 #[tokio::test]
 async fn g06_steer_reaches_the_driver_mid_run() {
     let bench = bench();

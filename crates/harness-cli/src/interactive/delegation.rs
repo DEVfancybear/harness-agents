@@ -2833,7 +2833,9 @@ impl TurnObserver for ExplorerObserver {
                     message: format!("[child {}] {name}: {summary}", self.role_name),
                 });
             }
-            TurnProgress::ToolSettled { name, ok, detail } if !ok => {
+            TurnProgress::ToolSettled {
+                name, ok, detail, ..
+            } if !ok => {
                 let _ = self.sender.send(SessionEvent::Notice {
                     message: format!(
                         "[child {}] {name} failed: {}",

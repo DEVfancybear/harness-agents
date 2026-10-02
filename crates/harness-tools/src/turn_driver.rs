@@ -7,6 +7,7 @@
 //! existing policy/approval/receipt gate, and a bounded number of continuation
 //! steps.
 
+use std::collections::HashSet;
 use std::fmt::{self, Write as _};
 use std::future::Future;
 use std::path::PathBuf;
@@ -76,6 +77,10 @@ pub enum TurnProgress {
     },
     ToolStarted {
         name: String,
+        /// The call this card is for; empty for a host action that is no model
+        /// call. Calls of a parallel batch settle in completion order, so cards
+        /// are matched by it rather than by name.
+        call_id: String,
         /// One short line of the arguments, for the collapsed card.
         summary: String,
         /// The call's arguments exactly as the model sent them (normally a JSON
@@ -85,6 +90,8 @@ pub enum TurnProgress {
     },
     ToolSettled {
         name: String,
+        /// The call that settled, as `ToolStarted` named it.
+        call_id: String,
         ok: bool,
         /// Why the call did not execute, for the human reading the transcript.
         ///
@@ -97,6 +104,8 @@ pub enum TurnProgress {
     /// lines under the tool's panel, the way prime-agent's tool panel does.
     ToolOutput {
         name: String,
+        /// The call whose output this is, as `ToolStarted` named it.
+        call_id: String,
         text: String,
     },
     /// An action ran without opening the approval panel; this reason is part of
@@ -1090,6 +1099,7 @@ impl TurnDriver {
                 let name = call.name.clone();
                 observer.observe(TurnProgress::ToolStarted {
                     name: name.clone(),
+                    call_id: transcript_id.clone(),
                     summary: summarize_arguments(&call.arguments),
                     input: call.arguments.clone(),
                 });
@@ -1151,6 +1161,7 @@ impl TurnDriver {
                             pending_question = Some(question_id);
                             observer.observe(TurnProgress::ToolSettled {
                                 name,
+                                call_id: transcript_id.clone(),
                                 ok: true,
                                 detail: None,
                             });
@@ -1215,7 +1226,7 @@ impl TurnDriver {
             }
 
             // The side effects of a parallel batch, each on its own task.
-            let mut running = Vec::new();
+            let mut running = tokio::task::JoinSet::new();
             for (index, (_, _, slot)) in slots.iter_mut().enumerate() {
                 if let Slot::Ready(_) = slot {
                     let Slot::Ready(ready) = std::mem::replace(slot, Slot::Taken) else {
@@ -1223,37 +1234,40 @@ impl TurnDriver {
                     };
                     let tools = self.tools.clone();
                     let cancellation = cancellation.clone();
-                    running.push(tokio::spawn(async move {
+                    running.spawn(async move {
                         let outcome = tools.run_begun(&ready.begun, cancellation).await;
                         (index, ready, outcome)
-                    }));
+                    });
                 }
             }
-            let mut finished = Vec::new();
-            for task in running {
-                match task.await {
-                    Ok(done) => finished.push(done),
-                    Err(error) => {
-                        return Err(HarnessError::new(
-                            ErrorCode::ProviderProtocol,
-                            format!("a tool task stopped unexpectedly: {error}"),
-                        ));
-                    }
-                }
-            }
-            finished.sort_by_key(|(index, _, _)| *index);
-            for (index, ready, outcome) in finished {
+            // pa-agent's `tool_execution_end` in completion order: a call that
+            // finished is settled and shown as soon as it is done, not after the
+            // slowest call of the batch. The results still reach the model in
+            // call order, below.
+            let mut announced = HashSet::new();
+            while let Some(joined) = running.join_next().await {
+                let (index, ready, outcome) = joined.map_err(|error| {
+                    HarnessError::new(
+                        ErrorCode::ProviderProtocol,
+                        format!("a tool task stopped unexpectedly: {error}"),
+                    )
+                })?;
                 let done =
                     complete_action(&self.tools, ready, outcome, &observer, &cancellation).await;
+                let (name, transcript_id, _) = &slots[index];
+                announce_settled(&observer, name, transcript_id, &done);
+                announced.insert(index);
                 slots[index].2 = Slot::Done(done);
             }
 
             // Results in call order.
-            for (name, transcript_id, slot) in slots {
+            for (index, (name, transcript_id, slot)) in slots.into_iter().enumerate() {
+                let shown = announced.contains(&index);
                 match slot {
                     Slot::Failed(message, detail) => {
                         observer.observe(TurnProgress::ToolSettled {
                             name,
+                            call_id: transcript_id.clone(),
                             ok: false,
                             detail: Some(detail),
                         });
@@ -1274,15 +1288,19 @@ impl TurnDriver {
                             request.project_rules.push(block.clone());
                         }
                         let rendered = render_tool_output(&name, &view.output);
-                        observer.observe(TurnProgress::ToolOutput {
-                            name: name.clone(),
-                            text: rendered.clone(),
-                        });
-                        observer.observe(TurnProgress::ToolSettled {
-                            name: name.clone(),
-                            ok: blocked.is_none(),
-                            detail: blocked,
-                        });
+                        if !shown {
+                            observer.observe(TurnProgress::ToolOutput {
+                                name: name.clone(),
+                                call_id: transcript_id.clone(),
+                                text: rendered.clone(),
+                            });
+                            observer.observe(TurnProgress::ToolSettled {
+                                name: name.clone(),
+                                call_id: transcript_id.clone(),
+                                ok: blocked.is_none(),
+                                detail: blocked,
+                            });
+                        }
                         appended.push(
                             ProviderMessage::tool_result(transcript_id, rendered)
                                 .with_attachments(tool_output_images(&view.output)),
@@ -1292,11 +1310,14 @@ impl TurnDriver {
                     Slot::Done(Err(error)) => {
                         // A failed tool is reported back to the model instead of
                         // ending the turn: that is what lets it fix its own call.
-                        observer.observe(TurnProgress::ToolSettled {
-                            name: name.clone(),
-                            ok: false,
-                            detail: Some(error.to_string()),
-                        });
+                        if !shown {
+                            observer.observe(TurnProgress::ToolSettled {
+                                name: name.clone(),
+                                call_id: transcript_id.clone(),
+                                ok: false,
+                                detail: Some(error.to_string()),
+                            });
+                        }
                         appended.push(ProviderMessage::tool_result(
                             transcript_id,
                             format!("tool {name} failed: {error}"),
@@ -1932,6 +1953,41 @@ fn summarize_action(action: &CodingToolAction) -> String {
             tool_name,
             ..
         } => format!("extension {plugin_id}/{tool_name}"),
+    }
+}
+
+/// Show one finished call of a parallel batch: its output and its card, as the
+/// results loop shows a call it settles itself.
+fn announce_settled(
+    observer: &Arc<dyn TurnObserver>,
+    name: &str,
+    call_id: &str,
+    done: &Result<ToolExecutionView, HarnessError>,
+) {
+    match done {
+        Ok(view) => {
+            let blocked = match &view.output {
+                ToolOutput::Denied { code, reason } => Some(format!("{code}: {reason}")),
+                _ => None,
+            };
+            observer.observe(TurnProgress::ToolOutput {
+                name: name.to_owned(),
+                call_id: call_id.to_owned(),
+                text: render_tool_output(name, &view.output),
+            });
+            observer.observe(TurnProgress::ToolSettled {
+                name: name.to_owned(),
+                call_id: call_id.to_owned(),
+                ok: blocked.is_none(),
+                detail: blocked,
+            });
+        }
+        Err(error) => observer.observe(TurnProgress::ToolSettled {
+            name: name.to_owned(),
+            call_id: call_id.to_owned(),
+            ok: false,
+            detail: Some(error.to_string()),
+        }),
     }
 }
 

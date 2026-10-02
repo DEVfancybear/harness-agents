@@ -1794,7 +1794,7 @@ struct ChannelObserver {
     /// Calls are executed serially by the turn driver. Keeping the current
     /// boundary here makes duration delivery O(1) and avoids a process-lifetime
     /// map keyed by a non-unique tool name.
-    tool_started: Mutex<Vec<(String, Instant)>>,
+    tool_started: Mutex<Vec<(String, String, Instant)>>,
 }
 
 impl TurnObserver for ChannelObserver {
@@ -1838,6 +1838,7 @@ impl TurnObserver for ChannelObserver {
             TurnProgress::StepStarted { step } => Some(SessionEvent::StepStarted { step }),
             TurnProgress::ToolStarted {
                 name,
+                call_id,
                 summary,
                 input,
             } => {
@@ -1845,28 +1846,42 @@ impl TurnObserver for ChannelObserver {
                     let _ = self.sender.send(SessionEvent::Bell);
                 }
                 if let Ok(mut started) = self.tool_started.lock() {
-                    started.push((name.clone(), Instant::now()));
+                    started.push((call_id.clone(), name.clone(), Instant::now()));
                 }
                 Some(SessionEvent::ToolStarted {
                     name,
+                    call_id,
                     summary,
                     input,
                 })
             }
-            TurnProgress::ToolSettled { name, ok, detail } => {
-                // Calls of a batch settle in the order they started; the oldest
-                // open call of this name is the one settling.
+            TurnProgress::ToolSettled {
+                name,
+                call_id,
+                ok,
+                detail,
+            } => {
+                // The call settling is found by its id: calls of a parallel batch
+                // settle in completion order. A host action has no id, and the
+                // oldest open call of its name is the one settling.
                 let elapsed = self
                     .tool_started
                     .lock()
                     .ok()
                     .and_then(|mut started| {
-                        let index = started.iter().position(|(open, _)| open == &name)?;
+                        let index = started.iter().position(|(id, open, _)| {
+                            if call_id.is_empty() {
+                                open == &name
+                            } else {
+                                id == &call_id
+                            }
+                        })?;
                         Some(started.remove(index))
                     })
-                    .map_or(Duration::ZERO, |(_, started)| started.elapsed());
+                    .map_or(Duration::ZERO, |(_, _, started)| started.elapsed());
                 Some(SessionEvent::ToolSettled {
                     name,
+                    call_id,
                     ok,
                     elapsed,
                     detail: detail.unwrap_or_default(),
@@ -6731,6 +6746,7 @@ async fn run_session_file_action_inner(
     observer.observe(TurnProgress::StepStarted { step: 1 });
     observer.observe(TurnProgress::ToolStarted {
         name: name.to_owned(),
+        call_id: String::new(),
         summary: if is_undo {
             "restore the most recent changed file".to_owned()
         } else {
@@ -6767,6 +6783,7 @@ async fn run_session_file_action_inner(
             };
             observer.observe(TurnProgress::ToolSettled {
                 name: name.to_owned(),
+                call_id: String::new(),
                 ok: settled,
                 detail: (!settled).then(|| message.to_owned()),
             });
@@ -6783,6 +6800,7 @@ async fn run_session_file_action_inner(
             let message = format!("session action was not run: {error}");
             observer.observe(TurnProgress::ToolSettled {
                 name: name.to_owned(),
+                call_id: String::new(),
                 ok: false,
                 detail: Some(message.clone()),
             });
@@ -7250,6 +7268,7 @@ async fn run_shell_prefix_turn(
     observer.observe(TurnProgress::StepStarted { step: 1 });
     observer.observe(TurnProgress::ToolStarted {
         name: "run_shell".to_owned(),
+        call_id: String::new(),
         summary: format!("shell: {}", shell_prefix.command),
         // The same shape a model's shell call has, so the expanded view shows the
         // command the user typed like any other shell call.
@@ -7283,6 +7302,7 @@ async fn run_shell_prefix_turn(
             };
             observer.observe(TurnProgress::ToolSettled {
                 name: "run_shell".to_owned(),
+                call_id: String::new(),
                 ok: settled && process_result,
                 detail: (!settled || !process_result).then(|| output.clone()),
             });
@@ -7292,6 +7312,7 @@ async fn run_shell_prefix_turn(
             let output = format!("not run: {error}");
             observer.observe(TurnProgress::ToolSettled {
                 name: "run_shell".to_owned(),
+                call_id: String::new(),
                 ok: false,
                 detail: Some(output.clone()),
             });
@@ -7434,12 +7455,14 @@ impl FixtureService {
         let started = Instant::now();
         let _ = self.sender.send(SessionEvent::ToolStarted {
             name: name.to_owned(),
+            call_id: String::new(),
             summary: summary.to_owned(),
             input: String::new(),
         });
         let elapsed = started.elapsed();
         let _ = self.sender.send(SessionEvent::ToolSettled {
             name: name.to_owned(),
+            call_id: String::new(),
             ok,
             elapsed,
             detail: String::new(),

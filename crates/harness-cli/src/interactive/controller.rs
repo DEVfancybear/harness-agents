@@ -214,9 +214,10 @@ pub struct InteractiveController {
     fullscreen: bool,
     /// The chat's name `/name` gave it, for prime-agent's fullscreen top bar.
     chat_title: Option<String>,
-    /// The tool cards still open, so each settles in place: name, one-line summary
-    /// and the full input the settled row carries for the expanded view.
-    open_tools: Vec<(String, String, String)>,
+    /// The tool cards still open, so each settles in place: the call's id, name,
+    /// one-line summary and the full input the settled row carries for the
+    /// expanded view.
+    open_tools: Vec<(String, String, String, String)>,
     /// Why the next tool runs without a panel, shown on its card in the TUI.
     pending_allowance: Option<String>,
     // Progress accounting for the status bar.
@@ -559,7 +560,7 @@ impl InteractiveController {
             open_tools: self
                 .open_tools
                 .iter()
-                .map(|(name, summary, _)| (name.clone(), summary.clone()))
+                .map(|(_, name, summary, _)| (name.clone(), summary.clone()))
                 .collect(),
             modal: self.modal(),
             granted_for_run: self.granted_for_run,
@@ -1510,13 +1511,14 @@ impl InteractiveController {
             }
             SessionEvent::ToolStarted {
                 name,
+                call_id,
                 summary,
                 input,
             } => {
                 self.flush_stream(effects);
                 self.tool_calls = self.tool_calls.saturating_add(1);
                 self.open_tools
-                    .push((name.clone(), summary.clone(), input.clone()));
+                    .push((call_id, name.clone(), summary.clone(), input.clone()));
                 if self.plain {
                     self.push_history(
                         effects,
@@ -1536,19 +1538,28 @@ impl InteractiveController {
             }
             SessionEvent::ToolSettled {
                 name,
+                call_id,
                 ok,
                 elapsed,
                 detail,
             } => {
                 self.flush_stream(effects);
+                // Found by the call's id: calls of a parallel batch settle in
+                // completion order. A host action has none; its name finds it.
                 let (summary, input) = self
                     .open_tools
                     .iter()
-                    .position(|(open_name, _, _)| open_name == &name)
+                    .position(|(id, open_name, _, _)| {
+                        if call_id.is_empty() {
+                            open_name == &name
+                        } else {
+                            id == &call_id
+                        }
+                    })
                     .map_or_else(
                         || (String::new(), String::new()),
                         |index| {
-                            let (_, summary, input) = self.open_tools.remove(index);
+                            let (_, _, summary, input) = self.open_tools.remove(index);
                             (summary, input)
                         },
                     );
@@ -6312,6 +6323,7 @@ Command: \"npm run build\""
             .events
             .send(SessionEvent::ToolStarted {
                 name: "apply_patch".to_owned(),
+                call_id: String::new(),
                 summary: "path=a.rs".to_owned(),
                 input: String::new(),
             })
@@ -6320,6 +6332,7 @@ Command: \"npm run build\""
             .events
             .send(SessionEvent::ToolSettled {
                 name: "apply_patch".to_owned(),
+                call_id: String::new(),
                 ok: false,
                 elapsed: Duration::from_millis(3100),
                 detail: String::new(),
@@ -6358,6 +6371,7 @@ Command: \"npm run build\""
             .events
             .send(SessionEvent::ToolStarted {
                 name: "read_file".to_owned(),
+                call_id: String::new(),
                 summary: "path=a.rs".to_owned(),
                 input: String::new(),
             })
@@ -6366,6 +6380,7 @@ Command: \"npm run build\""
             .events
             .send(SessionEvent::ToolSettled {
                 name: "read_file".to_owned(),
+                call_id: String::new(),
                 ok: true,
                 elapsed: Duration::from_millis(12),
                 detail: String::new(),
@@ -6846,6 +6861,7 @@ Command: \"npm run build\""
             .events
             .send(SessionEvent::ToolStarted {
                 name: "list_files".to_owned(),
+                call_id: String::new(),
                 summary: "path=.".to_owned(),
                 input: String::new(),
             })
@@ -6854,6 +6870,7 @@ Command: \"npm run build\""
             .events
             .send(SessionEvent::ToolSettled {
                 name: "list_files".to_owned(),
+                call_id: String::new(),
                 ok: true,
                 elapsed: Duration::from_millis(900),
                 detail: String::new(),
@@ -7489,6 +7506,7 @@ Command: \"npm run build\""
         for event in [
             SessionEvent::ToolStarted {
                 name: "run_shell".to_owned(),
+                call_id: String::new(),
                 summary: "command=cargo test".to_owned(),
                 input: r#"{"command":"cargo test --workspace --locked"}"#.to_owned(),
             },
@@ -7497,6 +7515,7 @@ Command: \"npm run build\""
             },
             SessionEvent::ToolSettled {
                 name: "run_shell".to_owned(),
+                call_id: String::new(),
                 ok: true,
                 elapsed: Duration::from_millis(40),
                 detail: String::new(),
@@ -7947,6 +7966,7 @@ Command: \"npm run build\""
             .events
             .send(SessionEvent::ToolStarted {
                 name: "read_file".to_owned(),
+                call_id: String::new(),
                 summary: "path=a.rs".to_owned(),
                 input: r#"{"path":"a.rs"}"#.to_owned(),
             })
@@ -7967,6 +7987,7 @@ Command: \"npm run build\""
             .events
             .send(SessionEvent::ToolSettled {
                 name: "read_file".to_owned(),
+                call_id: String::new(),
                 ok: true,
                 elapsed: Duration::from_millis(12),
                 detail: String::new(),
@@ -8029,6 +8050,7 @@ Command: \"npm run build\""
             .events
             .send(SessionEvent::ToolStarted {
                 name: "read_file".to_owned(),
+                call_id: String::new(),
                 summary: "path=a.rs".to_owned(),
                 input: String::new(),
             })
@@ -8037,6 +8059,7 @@ Command: \"npm run build\""
             .events
             .send(SessionEvent::ToolSettled {
                 name: "read_file".to_owned(),
+                call_id: String::new(),
                 ok: true,
                 elapsed: Duration::from_millis(1),
                 detail: String::new(),
