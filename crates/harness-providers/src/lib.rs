@@ -27,6 +27,7 @@ pub use tokio_util::sync::CancellationToken;
 pub(crate) static LOOPBACK_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub mod anthropic;
+pub mod json_repair;
 pub mod limits;
 pub mod responses;
 mod streaming;
@@ -817,6 +818,13 @@ pub fn assemble_stream(events: &[ProviderStreamEvent]) -> Result<ProviderRespons
             ProviderStreamEvent::Completed {
                 finish_reason: reason,
             } => finish_reason = Some(reason.clone()),
+        }
+    }
+    // Almost-JSON - a raw newline in a string, a stray backslash - is repaired as
+    // prime-agent repairs it, instead of failing the whole response.
+    for call in &mut calls {
+        if let Some(repaired) = json_repair::repaired_arguments(&call.arguments) {
+            call.arguments = repaired;
         }
     }
     // A call with no name or with arguments that never completed JSON cannot be
@@ -2729,5 +2737,30 @@ mod usage_limit_tests {
             r#"{"error":{"message":"rate limit exceeded","type":"server_error"}}"#
         ));
         assert!(!names_a_usage_limit("rate_limit_exceeded"));
+    }
+}
+
+#[cfg(test)]
+mod json_repair_assembly_tests {
+    use super::{ProviderStreamEvent, assemble_stream};
+
+    /// A model that writes a file's content with raw newlines in the JSON
+    /// string still gets its call run, as prime-agent repairs the arguments.
+    #[test]
+    fn arguments_with_raw_newlines_are_repaired_and_dispatched() {
+        let response = assemble_stream(&[
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                "call-1",
+                "write_file",
+                "{\"path\": \"a.txt\", \"content\": \"one\ntwo\"}",
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ])
+        .expect("assembled");
+        assert!(response.is_dispatchable(), "{response:?}");
+        let arguments: serde_json::Value =
+            serde_json::from_str(&response.tool_calls[0].arguments).expect("repaired JSON");
+        assert_eq!(arguments["content"], "one\ntwo");
     }
 }
