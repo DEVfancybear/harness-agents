@@ -927,7 +927,15 @@ fn apply_hooks(
     for (event, value) in &config.hooks {
         if !matches!(
             event.as_str(),
-            "pre_tool_use" | "post_tool_use" | "stop" | "notification"
+            "pre_tool_use"
+                | "post_tool_use"
+                | "stop"
+                | "subagent_stop"
+                | "notification"
+                | "user_prompt_submit"
+                | "session_start"
+                | "session_end"
+                | "pre_compact"
         ) {
             return Err(HarnessError::new(
                 ErrorCode::ConfigParseError,

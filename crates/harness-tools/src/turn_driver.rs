@@ -155,6 +155,9 @@ pub enum TurnStop {
     LoopDetected,
     /// The terminal response cannot be trusted (empty or output-capped).
     Unverified,
+    /// A hook answered `continue: false`: the turn ends after the calls it was
+    /// asked about, as prime-agent's `terminate` ends a run after its batch.
+    HookStopped,
 }
 
 impl TurnStop {
@@ -174,6 +177,7 @@ impl TurnStop {
             Self::BudgetExhausted => "budget_exhausted",
             Self::LoopDetected => "loop_detected",
             Self::Unverified => "unverified",
+            Self::HookStopped => "hook_stopped",
         }
     }
 }
@@ -507,6 +511,9 @@ pub struct TurnDriver {
     /// The steering queue mode `all`: every waiting message per poll instead
     /// of pa-agent's default `one-at-a-time`.
     steer_all_at_once: bool,
+    /// The event a finished turn's hooks are run for: `stop`, or
+    /// `subagent_stop` for a delegated child.
+    stop_event: &'static str,
     /// The hash of each file as this driver last saw it: read by `read_file`,
     /// or written by a tool. It stands in for a `write_file` call that leaves
     /// `expected_hash` out.
@@ -614,6 +621,7 @@ impl TurnDriver {
             inbox: None,
             question_host: None,
             steer_all_at_once: false,
+            stop_event: "stop",
             seen: Arc::default(),
         }
     }
@@ -647,6 +655,14 @@ impl TurnDriver {
         self
     }
 
+    /// Run this turn's stop hooks as `subagent_stop`: the turn is a delegated
+    /// child's, as Claude Code names the event for a subagent.
+    #[must_use]
+    pub const fn as_subagent(mut self) -> Self {
+        self.stop_event = "subagent_stop";
+        self
+    }
+
     /// The steering queue mode: `true` for `all`, `false` for
     /// `one-at-a-time`, pa-agent's default.
     #[must_use]
@@ -667,8 +683,12 @@ impl TurnDriver {
         let outcome =
             Box::pin(self.run_turn_inner(None, request, options, observer, cancellation.clone()))
                 .await?;
-        self.run_stop_hooks(&outcome, &hook_observer, cancellation)
-            .await;
+        // A final answer met the stop hooks inside the loop, where one can send
+        // the turn on; every other stop is reported to them here.
+        if outcome.stop != TurnStop::Final {
+            self.run_stop_hooks(&outcome, &hook_observer, cancellation)
+                .await;
+        }
         Ok(outcome)
     }
 
@@ -694,8 +714,12 @@ impl TurnDriver {
             cancellation.clone(),
         ))
         .await?;
-        self.run_stop_hooks(&outcome, &hook_observer, cancellation)
-            .await;
+        // A final answer met the stop hooks inside the loop, where one can send
+        // the turn on; every other stop is reported to them here.
+        if outcome.stop != TurnStop::Final {
+            self.run_stop_hooks(&outcome, &hook_observer, cancellation)
+                .await;
+        }
         Ok(outcome)
     }
 
@@ -708,13 +732,15 @@ impl TurnDriver {
         let notices = self
             .tools
             .run_event_hooks(
-                "stop",
+                self.stop_event,
                 json!({
-                    "event": "stop",
+                    "event": self.stop_event,
                     "session_id": outcome.session_id.as_str(),
                     "task_id": outcome.task_id.as_str(),
                     "stop": outcome.stop.as_str(),
                     "tool_calls": outcome.tool_calls,
+                    "stop_hook_active": false,
+                    "last_assistant_message": outcome.final_text,
                 }),
                 cancellation,
             )
@@ -771,6 +797,9 @@ impl TurnDriver {
             std::collections::HashMap::new();
         // Whether the model has already been told it is repeating itself.
         let mut loop_warned = false;
+        // Whether a stop hook already sent this turn on: Claude Code's
+        // `stop_hook_active`, so a hook can let the second stop through.
+        let mut stop_hook_active = false;
         // Everything this turn has already said and executed. Each continuation
         // sends the whole transcript, not just the newest step: a model that is
         // handed back only the last tool result has no record of what it already
@@ -1027,6 +1056,55 @@ impl TurnDriver {
                         .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
                     continue 'turn;
                 }
+                // Claude Code's Stop hook, prime-agent's continuation hook: a
+                // hook that blocks the stop hands the model its reason and the
+                // turn goes on.
+                let answer = self
+                    .tools
+                    .event_hooks(
+                        self.stop_event,
+                        &json!({
+                            "event": self.stop_event,
+                            "session_id": result.session_id.as_str(),
+                            "task_id": result.task_id.as_str(),
+                            "cwd": options.workspace_root.to_string_lossy(),
+                            "stop": TurnStop::Final.as_str(),
+                            "tool_calls": tool_calls,
+                            "stop_hook_active": stop_hook_active,
+                            "last_assistant_message": result.response,
+                        }),
+                        &cancellation,
+                    )
+                    .await;
+                for notice in &answer.notices {
+                    observer.observe(TurnProgress::Notice(notice.clone()));
+                }
+                if let (Some(reason), None) = (&answer.block, &answer.stop) {
+                    stop_hook_active = true;
+                    steps += 1;
+                    observer.observe(TurnProgress::StepStarted { step: steps });
+                    if !result.response.trim().is_empty() {
+                        transcript.push(
+                            ProviderMessage::new(MessageRole::Assistant, result.response.clone())
+                                .with_reasoning(result.reasoning.clone()),
+                        );
+                    }
+                    transcript.push(ProviderMessage::new(
+                        MessageRole::User,
+                        format!("Stop hook feedback:\n{reason}"),
+                    ));
+                    result = self
+                        .runtime
+                        .continue_run(
+                            request.clone(),
+                            transcript.clone(),
+                            cancellation.clone(),
+                            Some(sink_for(&observer)),
+                        )
+                        .await
+                        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
+                    continue 'turn;
+                }
                 break TurnStop::Final;
             }
             if cancellation.is_cancelled() {
@@ -1144,6 +1222,10 @@ impl TurnDriver {
             let parallel = result.tool_calls.len() > 1
                 && !result.tool_calls.iter().any(|call| runs_alone(&call.name));
             let mut slots: Vec<(String, String, Slot)> = Vec::new();
+            // What the tool hooks of this batch answered, by transcript id: text
+            // for the model under each result, and a stop for the turn.
+            let mut hook_notes: std::collections::HashMap<String, crate::HookResponse> =
+                std::collections::HashMap::new();
             for (mut call, transcript_id) in
                 result.tool_calls.clone().into_iter().zip(transcript_ids)
             {
@@ -1281,6 +1363,7 @@ impl TurnDriver {
                             tool_calls,
                             &observer,
                             &cancellation,
+                            hook_notes.entry(transcript_id.clone()).or_default(),
                         )
                         .await
                     }
@@ -1297,8 +1380,15 @@ impl TurnDriver {
                             )
                             .await;
                         Slot::Done(
-                            complete_action(&self.tools, ready, outcome, &observer, &cancellation)
-                                .await,
+                            complete_action(
+                                &self.tools,
+                                ready,
+                                outcome,
+                                &observer,
+                                &cancellation,
+                                hook_notes.entry(transcript_id.clone()).or_default(),
+                            )
+                            .await,
                         )
                     }
                     Err(error) => Slot::Done(Err(error)),
@@ -1340,9 +1430,16 @@ impl TurnDriver {
                         format!("a tool task stopped unexpectedly: {error}"),
                     )
                 })?;
-                let done =
-                    complete_action(&self.tools, ready, outcome, &observer, &cancellation).await;
                 let (name, transcript_id, _) = &slots[index];
+                let done = complete_action(
+                    &self.tools,
+                    ready,
+                    outcome,
+                    &observer,
+                    &cancellation,
+                    hook_notes.entry(transcript_id.clone()).or_default(),
+                )
+                .await;
                 announce_settled(&observer, name, transcript_id, &done);
                 announced.insert(index);
                 slots[index].2 = Slot::Done(done);
@@ -1363,12 +1460,7 @@ impl TurnDriver {
                     }
                     Slot::Done(Ok(view)) => {
                         self.remember_hash(&view.output);
-                        let blocked = match &view.output {
-                            ToolOutput::Denied { code, reason } => {
-                                Some(format!("{code}: {reason}"))
-                            }
-                            _ => None,
-                        };
+                        let blocked = failure_detail(&view.output);
                         if let ToolOutput::SkillActivated { block } = &view.output {
                             request
                                 .project_rules
@@ -1389,6 +1481,13 @@ impl TurnDriver {
                                 detail: blocked,
                             });
                         }
+                        let rendered = match hook_notes
+                            .get(&transcript_id)
+                            .and_then(crate::HookResponse::context_text)
+                        {
+                            Some(context) => format!("{rendered}\n\nHook feedback:\n{context}"),
+                            None => rendered,
+                        };
                         appended.push(
                             ProviderMessage::tool_result(transcript_id, rendered)
                                 .with_attachments(tool_output_images(&view.output)),
@@ -1435,6 +1534,13 @@ impl TurnDriver {
             };
             appended.extend(early_steering);
             appended.extend(late_steering);
+            // A tool hook that answered `continue: false` ends the turn here, with
+            // every result of the batch recorded.
+            if let Some(reason) = hook_notes.values().find_map(|note| note.stop.clone()) {
+                observer.observe(TurnProgress::Notice(format!("stopped by hook: {reason}")));
+                transcript.extend(appended);
+                break TurnStop::HookStopped;
+            }
             if let Some(reason) = canceled {
                 observer.observe(TurnProgress::TextDelta(format!(
                     "canceled at a step boundary: {reason}"
@@ -1546,7 +1652,7 @@ impl TurnDriver {
                 let command = match stop {
                     TurnStop::Canceled => RunCommand::Cancel,
                     TurnStop::NeedsInput | TurnStop::ExternalWait => RunCommand::Pause,
-                    TurnStop::Final
+                    TurnStop::Final | TurnStop::HookStopped
                         if self.goal.is_none() || acceptance == AcceptanceState::Satisfied =>
                     {
                         RunCommand::Complete
@@ -1701,11 +1807,23 @@ pub async fn execute_action_with_approval(
     observer: &Arc<dyn TurnObserver>,
     cancellation: &CancellationToken,
 ) -> Result<ToolExecutionView, HarnessError> {
-    match gate_action(tools, request, options, sequence, observer, cancellation).await? {
+    // A host action has no model to read hook context; its notices are shown.
+    let mut hook_note = crate::HookResponse::default();
+    match gate_action(
+        tools,
+        request,
+        options,
+        sequence,
+        observer,
+        cancellation,
+        &mut hook_note,
+    )
+    .await?
+    {
         Gated::Done(result) => result,
         Gated::Ready(ready) => {
             let outcome = tools.run_begun(&ready.begun, cancellation.clone()).await;
-            complete_action(tools, ready, outcome, observer, cancellation).await
+            complete_action(tools, ready, outcome, observer, cancellation, &mut hook_note).await
         }
     }
 }
@@ -1738,14 +1856,19 @@ async fn gate_action(
     sequence: u32,
     observer: &Arc<dyn TurnObserver>,
     cancellation: &CancellationToken,
+    hook_note: &mut crate::HookResponse,
 ) -> Result<Gated, HarnessError> {
-    let prepared = tools.prepare(request).await?;
-    let decision = match (tools.decision(&prepared), &options.approvals) {
+    let decide = |prepared: &PreparedToolRequest| match (
+        tools.decision(prepared),
+        &options.approvals,
+    ) {
         (Decision::Ask, ApprovalMode::Auto) => Decision::Allow {
             reason: "explicit auto approval".to_owned(),
         },
         (decision, _) => decision,
     };
+    let mut prepared = tools.prepare(request.clone()).await?;
+    let mut decision = decide(&prepared);
     if matches!(&decision, Decision::Blocked(_) | Decision::Deny(_)) {
         return Ok(Gated::Done(
             tools
@@ -1753,12 +1876,54 @@ async fn gate_action(
                 .await,
         ));
     }
-    if let Some(reason) = tools.run_pre_tool_hooks(&prepared, cancellation).await {
-        observer.observe(TurnProgress::Notice(format!("blocked by hook: {reason}")));
-        return Ok(Gated::Done(
-            tools.record_hook_block(&prepared, &reason).await,
-        ));
+    let answer = tools.run_pre_tool_hooks(&prepared, cancellation).await;
+    for notice in &answer.notices {
+        observer.observe(TurnProgress::Notice(notice.clone()));
     }
+    hook_note.stop.clone_from(&answer.stop);
+    if let Some(reason) = &answer.block {
+        observer.observe(TurnProgress::Notice(format!("blocked by hook: {reason}")));
+        return Ok(Gated::Done(tools.record_hook_block(&prepared, reason).await));
+    }
+    // `updatedInput`: the hook rewrote the call. The new input is the same tool
+    // with other arguments, and it is prepared and judged by the policy again,
+    // so a hook can narrow a call but never carry it past a rule.
+    if let Some(updated) = &answer.updated_input {
+        let rewritten = serde_json::from_value::<CodingToolAction>(updated.clone())
+            .ok()
+            .filter(|action| action.kind() == prepared.final_action.kind());
+        let Some(action) = rewritten else {
+            let reason =
+                "a pre_tool_use hook returned an updatedInput that is not this tool's input";
+            observer.observe(TurnProgress::Notice(format!("blocked by hook: {reason}")));
+            return Ok(Gated::Done(tools.record_hook_block(&prepared, reason).await));
+        };
+        observer.observe(TurnProgress::Info(format!(
+            "a pre_tool_use hook changed the call: {}",
+            summarize_action(&action)
+        )));
+        let mut request = request;
+        request.action = action;
+        prepared = tools.prepare(request).await?;
+        decision = decide(&prepared);
+        if matches!(&decision, Decision::Blocked(_) | Decision::Deny(_)) {
+            return Ok(Gated::Done(
+                tools
+                    .execute_with_cancellation(prepared, None, cancellation.clone())
+                    .await,
+            ));
+        }
+    }
+    // `permissionDecision: "ask"`: the user is asked even where the policy
+    // would allow. The other way round is not offered: a hook cannot answer an
+    // approval the policy asks for.
+    if answer.ask
+        && matches!(decision, Decision::Allow { .. })
+        && !matches!(options.approvals, ApprovalMode::Auto)
+    {
+        decision = Decision::Ask;
+    }
+    hook_note.context.extend(answer.context);
     notify_action_approval_required(tools, &prepared, &decision, observer, cancellation).await;
     let (approval, granted_gate) = resolve_action_approval(
         tools,
@@ -1799,6 +1964,7 @@ async fn complete_action(
     outcome: Result<crate::service::Dispatched, HarnessError>,
     observer: &Arc<dyn TurnObserver>,
     cancellation: &CancellationToken,
+    hook_note: &mut crate::HookResponse,
 ) -> Result<ToolExecutionView, HarnessError> {
     let ReadyAction {
         begun,
@@ -1809,8 +1975,17 @@ async fn complete_action(
     if let Some((gate, request_id)) = granted_gate {
         gate.action_completed(&request_id);
     }
-    if execution.is_ok() {
-        run_post_tool_hooks(tools, &prepared, observer, cancellation).await;
+    if let Ok(view) = &execution {
+        let answer = run_post_tool_hooks(tools, &prepared, view, observer, cancellation).await;
+        // `decision: "block"` after a call cannot undo it; its reason reaches
+        // the model with the result, as Claude Code hands it back.
+        if let Some(reason) = answer.block {
+            hook_note.context.push(reason);
+        }
+        hook_note.context.extend(answer.context);
+        if answer.stop.is_some() {
+            hook_note.stop = answer.stop;
+        }
     }
     execution
 }
@@ -1940,28 +2115,27 @@ async fn resolve_action_approval(
     Ok((approval, granted_gate))
 }
 
+/// The `post_tool_use` hooks of a call that ran: they read its input and its
+/// result (`tool_input`, `tool_response`) and may add to what the model reads.
 async fn run_post_tool_hooks(
     tools: &ToolExecutionService,
     prepared: &PreparedToolRequest,
+    view: &ToolExecutionView,
     observer: &Arc<dyn TurnObserver>,
     cancellation: &CancellationToken,
-) {
-    let payload = json!({
-        "event": "post_tool_use",
-        "session_id": prepared.request.session_id.as_str(),
-        "task_id": prepared.request.task_id.as_str(),
-        "cwd": prepared.workspace_root_text,
-        "tool": {
-            "name": prepared.final_action.kind().as_str(),
-            "args_digest": prepared.action_hash.as_str(),
-        },
-    });
-    for notice in tools
-        .run_event_hooks("post_tool_use", payload, cancellation.clone())
-        .await
-    {
-        observer.observe(TurnProgress::Notice(notice));
+) -> crate::HookResponse {
+    let name = prepared.final_action.kind().as_str();
+    let mut payload = crate::service::tool_hook_payload(prepared, "post_tool_use");
+    payload["tool_response"] = Value::String(render_tool_output(name, &view.output));
+    let payload =
+        crate::hooks::fit_payload(payload, &["/tool_response", "/tool_input", "/tool/args"]);
+    let answer = tools
+        .event_hooks("post_tool_use", &payload, cancellation)
+        .await;
+    for notice in &answer.notices {
+        observer.observe(TurnProgress::Notice(notice.clone()));
     }
+    answer
 }
 
 /// Build the proposal the user answers.
@@ -2079,6 +2253,16 @@ fn progress_sink(
     })
 }
 
+/// Why a settled call did not do its work, for its card: a refusal, or a run
+/// whose outcome is unknown. `None` for a call that ran.
+fn failure_detail(output: &ToolOutput) -> Option<String> {
+    match output {
+        ToolOutput::Denied { code, reason } => Some(format!("{code}: {reason}")),
+        ToolOutput::OutcomeUnknown { reason } => Some(reason.clone()),
+        _ => None,
+    }
+}
+
 /// Show one finished call of a parallel batch: its output and its card, as the
 /// results loop shows a call it settles itself.
 fn announce_settled(
@@ -2089,10 +2273,7 @@ fn announce_settled(
 ) {
     match done {
         Ok(view) => {
-            let blocked = match &view.output {
-                ToolOutput::Denied { code, reason } => Some(format!("{code}: {reason}")),
-                _ => None,
-            };
+            let blocked = failure_detail(&view.output);
             observer.observe(TurnProgress::ToolOutput {
                 name: name.to_owned(),
                 call_id: call_id.to_owned(),
@@ -2551,7 +2732,7 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
         ),
         // A refusal in words, not the debug form `Denied { code: .., reason: .. }`.
         ToolOutput::Denied { code, reason } => format!("{name} failed ({code}): {reason}"),
-        other @ ToolOutput::OutcomeUnknown { .. } => format!("{name}: {other:?}"),
+        ToolOutput::OutcomeUnknown { reason } => format!("{name} outcome unknown: {reason}"),
     };
     truncate_text(&body, TOOL_RESULT_LIMIT)
 }

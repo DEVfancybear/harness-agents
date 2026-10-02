@@ -10,6 +10,7 @@ mod capture;
 mod contracts;
 mod edit_diff;
 mod execution;
+mod hooks;
 mod loop_service;
 mod policy;
 mod process;
@@ -63,6 +64,7 @@ pub use process::{
 // place the driver writes it.
 pub use harness_runtime::AcceptanceState;
 pub use secrets::{HostEnvironmentSecrets, SecretResolver};
+pub use hooks::{HOOK_EVENTS, HookResponse, fit_payload, hook_matches, run_hooks};
 pub use service::{
     ConfiguredToolHook, ExternalToolDispatcher, ToolDispatchAuthorization, ToolExecutionService,
     ToolObserver, git_diff_from, git_head_commit,

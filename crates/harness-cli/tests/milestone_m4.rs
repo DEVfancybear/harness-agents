@@ -4366,3 +4366,232 @@ async fn a_read_whose_result_was_shortened_may_be_made_again() {
     drop(driver);
     close(store).await;
 }
+
+// ---------------------------------------------------------------------------
+// G09 hooks: Claude Code's answers, carrying prime-agent's loop hook powers
+// ---------------------------------------------------------------------------
+
+/// A hook that runs `script` (PowerShell on Windows, `sh` elsewhere).
+fn script_hook(event: &str, matcher: Option<&str>, script: &str) -> harness_tools::ConfiguredToolHook {
+    #[cfg(windows)]
+    let (command, args) = (
+        "pwsh".to_owned(),
+        vec![
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            script.to_owned(),
+        ],
+    );
+    #[cfg(not(windows))]
+    let (command, args) = ("sh".to_owned(), vec!["-c".to_owned(), script.to_owned()]);
+    harness_tools::ConfiguredToolHook {
+        event: event.to_owned(),
+        matcher: matcher.map(str::to_owned),
+        command,
+        args,
+        timeout_seconds: 30,
+        source: "g09 test".to_owned(),
+    }
+}
+
+/// One turn against `responses` with `hooks`; the outcome and what the model saw.
+async fn hooked_turn(
+    bench: &Bench,
+    hooks: Vec<harness_tools::ConfiguredToolHook>,
+    responses: Vec<Vec<ProviderStreamEvent>>,
+) -> (TurnOutcome, Vec<ProviderRequest>) {
+    let store = bench.open_store().await;
+    let provider = Arc::new(ScriptedProvider::new(responses));
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let driver = TurnDriver::new(
+        Arc::clone(&runtime),
+        ToolExecutionService::new(Arc::clone(&store)).with_hooks(hooks),
+    );
+    let request = RunRequest::new(
+        SessionId::generate(),
+        TaskId::generate(),
+        InputId::generate(),
+        "work on the parser",
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("workspace"),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    let options = TurnOptions {
+        workspace_root: bench.workspace.clone(),
+        actor_id: "g09.test".to_owned(),
+        approvals: ApprovalMode::Auto,
+        limits: TurnLimits::default(),
+    };
+    let outcome = driver
+        .run_turn(request, options, Arc::new(SilentObserver), CancellationToken::new())
+        .await
+        .expect("turn succeeds");
+    let seen = provider.seen();
+    drop(driver);
+    drop(runtime);
+    drop(provider);
+    close(store).await;
+    (outcome, seen)
+}
+
+fn answer(text: &str) -> Vec<ProviderStreamEvent> {
+    vec![
+        ProviderStreamEvent::started(),
+        ProviderStreamEvent::text(text),
+        ProviderStreamEvent::completed("stop"),
+    ]
+}
+
+fn call(name: &str, arguments: &str) -> Vec<ProviderStreamEvent> {
+    vec![
+        ProviderStreamEvent::started(),
+        ProviderStreamEvent::tool_delta("c-1", name, arguments),
+        ProviderStreamEvent::completed("tool_calls"),
+    ]
+}
+
+/// prime-agent's continuation hook as Claude Code's `Stop` hook: a stop hook that
+/// blocks hands the model its reason and the turn goes on; the second stop is
+/// marked `stop_hook_active` and the hook lets it through.
+#[tokio::test]
+async fn g09_a_stop_hook_that_blocks_sends_the_turn_on() {
+    let bench = bench();
+    #[cfg(windows)]
+    let script = r#"$i = [Console]::In.ReadToEnd() | ConvertFrom-Json; if (-not $i.stop_hook_active) { Write-Output '{"decision":"block","reason":"run the tests first"}' }; exit 0"#;
+    #[cfg(not(windows))]
+    let script = r#"if grep -q '"stop_hook_active":false'; then printf '%s' '{"decision":"block","reason":"run the tests first"}'; fi; exit 0"#;
+    let (outcome, seen) = hooked_turn(
+        &bench,
+        vec![script_hook("stop", None, script)],
+        vec![answer("first answer"), answer("tests pass")],
+    )
+    .await;
+    assert_eq!(outcome.stop, TurnStop::Final);
+    assert_eq!(outcome.final_text, "tests pass");
+    assert_eq!(seen.len(), 2, "one more model call, then the hook let it stop");
+    assert!(
+        seen[1].messages.iter().any(|message| message.role == MessageRole::User
+            && message.content.contains("Stop hook feedback:\nrun the tests first")),
+        "the reason reaches the model"
+    );
+}
+
+/// prime-agent's `after_tool_call` as Claude Code's `PostToolUse`: the hook reads
+/// the call's result and what it adds reaches the model with that result.
+#[tokio::test]
+async fn g09_post_tool_use_reads_the_result_and_adds_to_it() {
+    let bench = bench();
+    #[cfg(windows)]
+    let script = r#"$i = [Console]::In.ReadToEnd() | ConvertFrom-Json; if ($i.tool_response -like '*BUG parser*' -and $i.tool_name -eq 'read_file') { Write-Output '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"parser.txt is generated; edit the grammar instead"}}' }; exit 0"#;
+    #[cfg(not(windows))]
+    let script = r#"if grep -q 'BUG parser'; then printf '%s' '{"hookSpecificOutput":{"additionalContext":"parser.txt is generated; edit the grammar instead"}}'; fi; exit 0"#;
+    let (outcome, seen) = hooked_turn(
+        &bench,
+        vec![script_hook("post_tool_use", Some("read_file"), script)],
+        vec![
+            call("read_file", r#"{"path":"src/parser.txt"}"#),
+            answer("noted"),
+        ],
+    )
+    .await;
+    assert_eq!(outcome.stop, TurnStop::Final);
+    let result = seen[1]
+        .messages
+        .iter()
+        .find(|message| message.role == MessageRole::Tool)
+        .expect("the tool result");
+    assert!(result.content.contains("BUG parser"), "{}", result.content);
+    assert!(
+        result
+            .content
+            .contains("Hook feedback:\nparser.txt is generated; edit the grammar instead"),
+        "{}",
+        result.content
+    );
+}
+
+/// prime-agent's `terminate`: `continue: false` ends the turn after the batch,
+/// with the call it was asked about run and recorded.
+#[tokio::test]
+async fn g09_continue_false_ends_the_turn_after_the_batch() {
+    let bench = bench();
+    #[cfg(windows)]
+    let script = r#"$null = [Console]::In.ReadToEnd(); Write-Output '{"continue":false,"stopReason":"budget for reads spent"}'; exit 0"#;
+    #[cfg(not(windows))]
+    let script = r#"cat >/dev/null; printf '%s' '{"continue":false,"stopReason":"budget for reads spent"}'; exit 0"#;
+    let (outcome, seen) = hooked_turn(
+        &bench,
+        vec![script_hook("post_tool_use", None, script)],
+        vec![
+            call("read_file", r#"{"path":"src/parser.txt"}"#),
+            answer("never asked"),
+        ],
+    )
+    .await;
+    assert_eq!(outcome.stop, TurnStop::HookStopped);
+    assert_eq!(seen.len(), 1, "no model call after the stop");
+    assert_eq!(outcome.executions.len(), 1, "the call itself ran");
+}
+
+/// Claude Code's `updatedInput`: the hook rewrites the call, and the rewritten
+/// call is what runs.
+#[tokio::test]
+async fn g09_pre_tool_use_updated_input_rewrites_the_call() {
+    let bench = bench();
+    let updated = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":{"kind":"write_file","path":"src/rewritten.txt","content":"from the hook","expected_hash":null}}}"#;
+    #[cfg(windows)]
+    let script = format!("$null = [Console]::In.ReadToEnd(); Write-Output '{updated}'; exit 0");
+    #[cfg(not(windows))]
+    let script = format!("cat >/dev/null; printf '%s' '{updated}'; exit 0");
+    let (outcome, _) = hooked_turn(
+        &bench,
+        vec![script_hook("pre_tool_use", Some("write_file"), &script)],
+        vec![
+            call("write_file", r#"{"path":"src/asked.txt","content":"from the model"}"#),
+            answer("written"),
+        ],
+    )
+    .await;
+    assert_eq!(outcome.stop, TurnStop::Final);
+    assert!(!bench.workspace.join("src/asked.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(bench.workspace.join("src/rewritten.txt")).expect("rewritten"),
+        "from the hook"
+    );
+}
+
+/// Claude Code's `permissionDecision: "deny"` blocks like exit 2, and the
+/// reason reaches the model.
+#[tokio::test]
+async fn g09_pre_tool_use_json_deny_blocks_with_its_reason() {
+    let bench = bench();
+    let denied = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"src is frozen during the release"}}"#;
+    #[cfg(windows)]
+    let script = format!("$null = [Console]::In.ReadToEnd(); Write-Output '{denied}'; exit 0");
+    #[cfg(not(windows))]
+    let script = format!("cat >/dev/null; printf '%s' '{denied}'; exit 0");
+    let (_, seen) = hooked_turn(
+        &bench,
+        vec![script_hook("pre_tool_use", Some("write_.*"), &script)],
+        vec![
+            call("write_file", r#"{"path":"src/asked.txt","content":"x"}"#),
+            answer("blocked"),
+        ],
+    )
+    .await;
+    assert!(!bench.workspace.join("src/asked.txt").exists());
+    let result = seen[1]
+        .messages
+        .iter()
+        .find(|message| message.role == MessageRole::Tool)
+        .expect("the tool result");
+    assert!(
+        result.content.contains("src is frozen during the release"),
+        "{}",
+        result.content
+    );
+}

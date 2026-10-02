@@ -693,7 +693,15 @@ impl HarnessConfigV2 {
         for (event, hooks) in &self.hooks {
             if !matches!(
                 event.as_str(),
-                "pre_tool_use" | "post_tool_use" | "stop" | "notification"
+                "pre_tool_use"
+                    | "post_tool_use"
+                    | "stop"
+                    | "subagent_stop"
+                    | "notification"
+                    | "user_prompt_submit"
+                    | "session_start"
+                    | "session_end"
+                    | "pre_compact"
             ) {
                 return Err(HarnessError::new(
                     ErrorCode::ConfigParseError,

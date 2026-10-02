@@ -384,7 +384,28 @@ The command table, its order, wording and aliases follow prime-agent's `slash-co
 
 Config v2 merges default → user (`<config-dir>/config.toml`) → trusted project (`.harness/config.toml`, then `.harness/config.local.toml` for local permissions) → environment → CLI. `/config` identifies each value's source. Untrusted projects cannot load project config, hooks or skills. `/trust` requires confirmation. Profiles and models can be selected for the next turn.
 
-`[permissions]` supports `mode = "ask" | "auto-edit" | "full-auto"`, `allow`, and `deny`; deny and protected paths take priority. Approval uses `y` (one action), `a` (the turn), and `n` (deny). `A` proposes a persistent rule, written to `.harness/config.local.toml` only after separate confirmation. Headless does not grant approval implicitly. `--allowed-tools`, `--disallowed-tools`, and `--approval` use the same policy. `[hooks]` accepts `pre_tool_use`, `post_tool_use`, and `stop`; hooks load only from trusted layers, have a timeout, and cannot turn ask into allow. `/hooks` shows effective hooks.
+`[permissions]` supports `mode = "ask" | "auto-edit" | "full-auto"`, `allow`, and `deny`; deny and protected paths take priority. Approval uses `y` (one action), `a` (the turn), and `n` (deny). `A` proposes a persistent rule, written to `.harness/config.local.toml` only after separate confirmation. Headless does not grant approval implicitly. `--allowed-tools`, `--disallowed-tools`, and `--approval` use the same policy. `[hooks]` follows Claude Code's hook model; hooks load only from trusted layers, have a timeout (at most 60 s), and cannot turn ask into allow. `/hooks` shows effective hooks.
+
+```toml
+[[hooks.pre_tool_use]]
+matcher = "write_file|edit_file"   # `*`, names joined with `|`, or a regex such as `git_.*`
+command = "python"                 # an executable, not shell text
+args = ["scripts/guard.py"]
+timeout_seconds = 10
+```
+
+| Event | When | What a hook can do |
+|---|---|---|
+| `pre_tool_use` | before a tool call, after the policy | block it (exit 2, `decision: "block"`, or `permissionDecision: "deny"`); ask the user even where the policy allows (`"ask"`); rewrite the arguments (`updatedInput`, judged by the policy again); add `additionalContext` |
+| `post_tool_use` | after a call that ran | read `tool_input` and `tool_response`; send feedback to the model (`decision: "block"` + `reason`, `additionalContext`) |
+| `stop` / `subagent_stop` | the main agent / a delegated child finishes | `decision: "block"` + `reason` sends the turn on with the reason; `stop_hook_active` is `true` on the second stop |
+| `user_prompt_submit` | before a prompt is sent | block it; stdout or `additionalContext` is added to the prompt |
+| `session_start` | before a conversation's first prompt | stdout or `additionalContext` is added to the prompt |
+| `session_end` | the app closes | observe only |
+| `pre_compact` | before `/compact` | observe only |
+| `notification` | a question or an approval waits | observe only |
+
+A hook gets one JSON object on stdin (`hook_event_name`, `session_id`, `cwd`, and per event `tool_name`, `tool_input`, `tool_response`, `prompt`, `last_assistant_message`, `stop_hook_active`), at most 8 KiB, secret-looking arguments redacted. Exit 0 goes on; exit 2 blocks with the first line of stdout (else stderr) as the reason. Exit 0 with a JSON object on stdout is read for `continue: false` + `stopReason` (end the turn, `hook_stopped`), `systemMessage` (shown to the user), `decision`/`reason`, and `hookSpecificOutput`. Any other exit or a timeout blocks a `pre_tool_use` call and is only reported for the other events. `permissionDecision: "allow"` is not honored: a hook cannot answer an approval.
 
 `[mcp_servers.<name>]` configures stdio or Streamable HTTP. Stdio uses `command`, `args`, `cwd`, and `env` secret references; HTTP bearer comes from an environment variable. `enabled_tools`, `disabled_tools`, `tool_timeout` (maximum 120 seconds), and `required` constrain a server. Servers start on demand. In chat, prime-agent's `/mcp add <name> [--env KEY=VALUE] [--cwd DIR] [--force] -- <command> [args...]` (or `--url <https-url> [--bearer-token-env-var VAR]`), `/mcp list`, `/mcp get <name>` and `/mcp remove <name>` manage servers in `mcp-servers.json` beside the user config, read at the user layer and effective from the next turn, without rewriting `config.toml`; bare `/mcp` shows each server's status. `ha mcp add|list|get|remove` edits `config.toml` from the command line. MCP tools cross the same policy/approval gate and leave receipts. Skills are discovered in `<config-dir>/skills`, `~/.agents/skills`, and trusted project roots (`.agents/skills`, `.harness/skills`). The initial prompt carries names and descriptions only; activation loads content by digest.
 

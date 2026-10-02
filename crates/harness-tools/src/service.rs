@@ -37,50 +37,33 @@ use crate::{
 };
 use harness_store_sqlite::HistoryScope;
 
-fn hook_matches(matcher: Option<&str>, tool_name: &str) -> bool {
-    matcher.is_none_or(|matcher| {
-        matcher
-            .split('|')
-            .map(str::trim)
-            .any(|pattern| pattern == "*" || pattern == tool_name)
-    })
-}
-
-fn tool_hook_payload(prepared: &PreparedToolRequest, event: &str) -> Value {
+/// The stdin of a tool hook: ha's fields (`event`, `tool.name`, `tool.args`)
+/// and Claude Code's (`hook_event_name`, `tool_name`, `tool_input`), with
+/// secret-looking arguments redacted and the whole bounded to 8 KiB.
+pub(crate) fn tool_hook_payload(prepared: &PreparedToolRequest, event: &str) -> Value {
     let mut args = prepared
         .final_action
         .canonical_value()
         .unwrap_or_else(|_| json!({"unavailable": true}));
     redact_hook_arguments(&mut args);
-    let mut payload = json!({
-        "event": event,
-        "session_id": prepared.request.session_id.as_str(),
-        "task_id": prepared.request.task_id.as_str(),
-        "tool": {
-            "name": prepared.final_action.kind().as_str(),
-            "args_digest": prepared.action_hash.as_str(),
-            "args": args,
-        },
-        "cwd": prepared.workspace_root_text,
-    });
-    if serde_json::to_vec(&payload).is_ok_and(|bytes| bytes.len() <= 8 * 1024) {
-        return payload;
-    }
-    let args = payload["tool"]["args"].to_string();
-    let mut preview = args.chars().take(5_000).collect::<String>();
-    payload["tool"]["args"] = json!({"truncated": true, "preview": preview});
-    while serde_json::to_vec(&payload).is_ok_and(|bytes| bytes.len() > 8 * 1024) {
-        if preview.is_empty() {
-            payload["tool"]["args"] = json!({"truncated": true});
-            break;
-        }
-        preview = preview
-            .chars()
-            .take(preview.chars().count().saturating_sub(256))
-            .collect();
-        payload["tool"]["args"] = json!({"truncated": true, "preview": preview});
-    }
-    payload
+    let name = prepared.final_action.kind().as_str();
+    crate::hooks::fit_payload(
+        json!({
+            "event": event,
+            "hook_event_name": event,
+            "session_id": prepared.request.session_id.as_str(),
+            "task_id": prepared.request.task_id.as_str(),
+            "tool": {
+                "name": name,
+                "args_digest": prepared.action_hash.as_str(),
+                "args": args.clone(),
+            },
+            "tool_name": name,
+            "tool_input": args,
+            "cwd": prepared.workspace_root_text,
+        }),
+        &["/tool_input", "/tool/args"],
+    )
 }
 
 fn redact_hook_arguments(value: &mut Value) {
@@ -108,54 +91,6 @@ fn redact_hook_arguments(value: &mut Value) {
         Value::Array(values) => values.iter_mut().for_each(redact_hook_arguments),
         _ => {}
     }
-}
-
-async fn run_configured_hook(
-    hook: &ConfiguredToolHook,
-    mut payload: Value,
-    cancellation: CancellationToken,
-) -> Result<(), String> {
-    payload["event"] = Value::String(hook.event.clone());
-    let input =
-        serde_json::to_vec(&payload).map_err(|_| "hook input is invalid JSON".to_owned())?;
-    let cwd = payload["cwd"]
-        .as_str()
-        .map_or_else(|| Path::new("."), Path::new);
-    let result = process::run_hook_command(
-        cwd,
-        &hook.command,
-        &hook.args,
-        &input,
-        hook.timeout_seconds.min(60).saturating_mul(1000),
-        cancellation,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    if result.status == process::HookProcessStatus::TimedOut {
-        return Err("hook timed out".to_owned());
-    }
-    if result.status == process::HookProcessStatus::Canceled {
-        return Err("hook was canceled".to_owned());
-    }
-    if result.exit_code == Some(0) {
-        return Ok(());
-    }
-    let reason = if result.exit_code == Some(2) {
-        result
-            .stdout
-            .trim()
-            .lines()
-            .next()
-            .or_else(|| result.stderr.trim().lines().next())
-            .filter(|line| !line.is_empty())
-            .map_or_else(
-                || "hook exited with status 2".to_owned(),
-                |line| line.chars().take(512).collect::<String>(),
-            )
-    } else {
-        format!("hook exited with status {:?}", result.exit_code)
-    };
-    Err(reason)
 }
 
 /// Read the current repository commit through the bounded Git process runner.
@@ -357,6 +292,12 @@ impl ToolExecutionService {
         self
     }
 
+    /// The hooks this service runs.
+    #[must_use]
+    pub fn hooks(&self) -> &[ConfiguredToolHook] {
+        &self.hooks
+    }
+
     /// Run observational hooks. Their failures are returned as notices for the
     /// caller and never alter a completed action or receipt.
     pub async fn run_event_hooks(
@@ -365,45 +306,39 @@ impl ToolExecutionService {
         payload: Value,
         cancellation: CancellationToken,
     ) -> Vec<String> {
-        let tool_name = payload["tool"]["name"].as_str();
-        let hooks = self
-            .hooks
-            .iter()
-            .filter(|hook| {
-                hook.event == event
-                    && tool_name.is_none_or(|name| hook_matches(hook.matcher.as_deref(), name))
-            })
-            .collect::<Vec<_>>();
-        let mut notices = Vec::new();
-        for hook in hooks {
-            if let Err(reason) =
-                run_configured_hook(hook, payload.clone(), cancellation.clone()).await
-            {
-                notices.push(format!(
-                    "{event} hook from {} failed: {reason}",
-                    hook.source
-                ));
-            }
-        }
-        notices
+        self.event_hooks(event, &payload, &cancellation).await.notices
     }
 
+    /// Run the hooks of `event` and return what they answered: a block, a
+    /// stop, context for the model, messages for the user.
+    pub async fn event_hooks(
+        &self,
+        event: &str,
+        payload: &Value,
+        cancellation: &CancellationToken,
+    ) -> crate::HookResponse {
+        let tool_name = payload["tool"]["name"].as_str();
+        crate::hooks::run_hooks(&self.hooks, event, tool_name, payload, false, cancellation).await
+    }
+
+    /// The `pre_tool_use` hooks of a prepared call. A hook that fails blocks
+    /// the call.
     pub(crate) async fn run_pre_tool_hooks(
         &self,
         prepared: &PreparedToolRequest,
         cancellation: &CancellationToken,
-    ) -> Option<String> {
+    ) -> crate::HookResponse {
         let name = prepared.final_action.kind().as_str();
         let payload = tool_hook_payload(prepared, "pre_tool_use");
-        for hook in self.hooks.iter().filter(|hook| {
-            hook.event == "pre_tool_use" && hook_matches(hook.matcher.as_deref(), name)
-        }) {
-            match run_configured_hook(hook, payload.clone(), cancellation.clone()).await {
-                Ok(()) => {}
-                Err(reason) => return Some(format!("{} ({})", reason, hook.source)),
-            }
-        }
-        None
+        crate::hooks::run_hooks(
+            &self.hooks,
+            "pre_tool_use",
+            Some(name),
+            &payload,
+            true,
+            cancellation,
+        )
+        .await
     }
 
     /// Record a pre-hook refusal with its stable error code and ordinary receipt.

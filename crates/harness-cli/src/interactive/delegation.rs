@@ -2606,6 +2606,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 prompt.push_str(&message);
             }
             let driver = TurnDriver::new(Arc::clone(&runtime), tools)
+                .as_subagent()
                 .with_external(ExternalTools::new(
                     Arc::clone(&child_tools) as Arc<dyn ExternalToolCatalog>
                 ))

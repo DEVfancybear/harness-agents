@@ -389,7 +389,28 @@ Bảng lệnh, thứ tự, mô tả và alias theo `slash-commands.ts` của pri
 
 Config v2 hợp nhất default → user (`<config-dir>/config.toml`) → project đã trust (`.harness/config.toml`, rồi `.harness/config.local.toml` cho permission local) → env → CLI. `/config` chỉ ra nguồn của giá trị; project chưa trust không nạp config, hook hoặc skill của project. `/trust` yêu cầu xác nhận. Profile và model có thể chọn cho lượt tiếp theo.
 
-`[permissions]` hỗ trợ `mode = "ask" | "auto-edit" | "full-auto"`, `allow` và `deny`; deny và protected path luôn thắng allow. Panel có `y` (một action), `a` (cả lượt), `n` (từ chối); `A` đề xuất rule lâu dài nhưng chỉ ghi vào `.harness/config.local.toml` sau xác nhận riêng. Headless không tự duyệt khi chưa cấp quyền. `--allowed-tools`, `--disallowed-tools` và `--approval` dùng cùng policy. `[hooks]` nhận `pre_tool_use`, `post_tool_use`, `stop`; hook chỉ được từ lớp đã trust, có timeout và không thể biến quyết định ask thành allow. `/hooks` xem hook có hiệu lực.
+`[permissions]` hỗ trợ `mode = "ask" | "auto-edit" | "full-auto"`, `allow` và `deny`; deny và protected path luôn thắng allow. Panel có `y` (một action), `a` (cả lượt), `n` (từ chối); `A` đề xuất rule lâu dài nhưng chỉ ghi vào `.harness/config.local.toml` sau xác nhận riêng. Headless không tự duyệt khi chưa cấp quyền. `--allowed-tools`, `--disallowed-tools` và `--approval` dùng cùng policy. `[hooks]` theo mô hình hook của Claude Code; hook chỉ nạp từ lớp đã trust, có timeout (tối đa 60 giây) và không thể biến quyết định ask thành allow. `/hooks` xem hook có hiệu lực.
+
+```toml
+[[hooks.pre_tool_use]]
+matcher = "write_file|edit_file"   # `*`, các tên nối bằng `|`, hoặc regex như `git_.*`
+command = "python"                 # một file thực thi, không phải lệnh shell
+args = ["scripts/guard.py"]
+timeout_seconds = 10
+```
+
+| Event | Khi nào | Hook làm được gì |
+|---|---|---|
+| `pre_tool_use` | trước một lần gọi tool, sau policy | chặn (exit 2, `decision: "block"` hoặc `permissionDecision: "deny"`); hỏi người dùng cả khi policy cho phép (`"ask"`); sửa tham số (`updatedInput`, policy xét lại); thêm `additionalContext` |
+| `post_tool_use` | sau một lần gọi đã chạy | đọc `tool_input` và `tool_response`; gửi phản hồi cho model (`decision: "block"` + `reason`, `additionalContext`) |
+| `stop` / `subagent_stop` | agent chính / agent con kết thúc | `decision: "block"` + `reason` cho lượt chạy tiếp với lý do đó; lần dừng thứ hai có `stop_hook_active` là `true` |
+| `user_prompt_submit` | trước khi gửi prompt | chặn prompt; stdout hoặc `additionalContext` được thêm vào prompt |
+| `session_start` | trước prompt đầu tiên của cuộc hội thoại | stdout hoặc `additionalContext` được thêm vào prompt |
+| `session_end` | app đóng | chỉ quan sát |
+| `pre_compact` | trước `/compact` | chỉ quan sát |
+| `notification` | có câu hỏi hoặc yêu cầu duyệt đang chờ | chỉ quan sát |
+
+Hook nhận một object JSON qua stdin (`hook_event_name`, `session_id`, `cwd`, và tùy event: `tool_name`, `tool_input`, `tool_response`, `prompt`, `last_assistant_message`, `stop_hook_active`), tối đa 8 KiB, tham số giống bí mật bị che. Exit 0 là đi tiếp; exit 2 là chặn, lý do là dòng đầu stdout (không có thì stderr). Exit 0 kèm object JSON trên stdout được đọc các trường `continue: false` + `stopReason` (kết thúc lượt, `hook_stopped`), `systemMessage` (hiện cho người dùng), `decision`/`reason` và `hookSpecificOutput`. Exit khác hoặc quá thời gian thì chặn lần gọi ở `pre_tool_use`, còn ở event khác chỉ báo lại. `permissionDecision: "allow"` không được áp dụng: hook không thể trả lời thay một yêu cầu duyệt.
 
 `[mcp_servers.<name>]` cấu hình stdio hoặc Streamable HTTP. Stdio dùng `command`, `args`, `cwd`, `env` dạng secret ref; HTTP bearer đọc từ env. `enabled_tools`, `disabled_tools`, `tool_timeout` (tối đa 120 giây), `required` giới hạn server. Server được khởi động khi cần. Trong chat, lệnh của prime-agent `/mcp add <name> [--env KEY=VALUE] [--cwd DIR] [--force] -- <command> [args...]` (hoặc `--url <https-url> [--bearer-token-env-var VAR]`), `/mcp list`, `/mcp get <name>` và `/mcp remove <name>` quản lý server trong `mcp-servers.json` cạnh config người dùng, được đọc ở tầng user và có hiệu lực từ lượt sau, không viết lại `config.toml`; `/mcp` không kèm tham số cho xem trạng thái từng server. `ha mcp add|list|get|remove` sửa `config.toml` từ dòng lệnh. Tool MCP đi qua cùng policy/approval và có receipt. Skills tìm ở `<config-dir>/skills`, `~/.agents/skills` và project đã trust (`.agents/skills`, `.harness/skills`); prompt ban đầu chỉ chứa tên và mô tả, nội dung nạp theo digest khi kích hoạt.
 

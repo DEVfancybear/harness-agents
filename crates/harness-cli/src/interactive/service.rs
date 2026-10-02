@@ -2402,6 +2402,81 @@ impl harness_tools::QuestionHost for ChannelQuestionHost {
     }
 }
 
+/// Run the hooks that come before a prompt reaches the model. `Ok` carries the
+/// context they added for the model; `Err` the reason a hook blocked the prompt.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the turn's identity and its event channel, as run_turn holds them"
+)]
+async fn prompt_hooks(
+    hooks: &[harness_tools::ConfiguredToolHook],
+    request: &SubmitRequest,
+    first_prompt: bool,
+    session_id: &SessionId,
+    task_id: &TaskId,
+    workspace_root: &Path,
+    cancellation: &CancellationToken,
+    send: &impl Fn(SessionEvent),
+) -> Result<Option<String>, String> {
+    if hooks.is_empty() || request.refine.is_some() {
+        return Ok(None);
+    }
+    let base = |event: &str| {
+        serde_json::json!({
+            "event": event,
+            "hook_event_name": event,
+            "session_id": session_id.as_str(),
+            "task_id": task_id.as_str(),
+            "cwd": workspace_root.to_string_lossy(),
+        })
+    };
+    let notify = |answer: &harness_tools::HookResponse| {
+        for message in &answer.notices {
+            send(SessionEvent::Notice {
+                message: message.clone(),
+            });
+        }
+    };
+    if let Some(guidance) = &request.compact_guidance {
+        let mut payload = base("pre_compact");
+        payload["trigger"] = serde_json::json!("manual");
+        payload["custom_instructions"] = serde_json::json!(guidance);
+        let answer =
+            harness_tools::run_hooks(hooks, "pre_compact", None, &payload, false, cancellation)
+                .await;
+        notify(&answer);
+        return Ok(None);
+    }
+    let mut context = Vec::new();
+    if first_prompt {
+        let mut payload = base("session_start");
+        payload["source"] = serde_json::json!("startup");
+        let answer =
+            harness_tools::run_hooks(hooks, "session_start", None, &payload, false, cancellation)
+                .await;
+        notify(&answer);
+        context.extend(answer.context);
+    }
+    let mut payload = base("user_prompt_submit");
+    payload["prompt"] = serde_json::json!(request.text);
+    let payload = harness_tools::fit_payload(payload, &["/prompt"]);
+    let answer = harness_tools::run_hooks(
+        hooks,
+        "user_prompt_submit",
+        None,
+        &payload,
+        false,
+        cancellation,
+    )
+    .await;
+    notify(&answer);
+    if let Some(reason) = answer.block.or(answer.stop) {
+        return Err(reason);
+    }
+    context.extend(answer.context);
+    Ok((!context.is_empty()).then(|| context.join("\n")))
+}
+
 /// The messages that reached a turn's inbox after its last step: prime-agent
 /// keeps a steer the run did not take for the next one, so they are handed back
 /// instead of being dropped with the run.
@@ -3105,16 +3180,50 @@ impl AgentSessionService {
 /// wait for that here; anywhere else the kernel is killed with the process.
 impl Drop for AgentSessionService {
     fn drop(&mut self) {
-        let Some(repl) = self.repl.take() else {
-            return;
-        };
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
         if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
             return;
         }
-        tokio::task::block_in_place(|| handle.block_on(repl.dispose()));
+        // Claude Code's `SessionEnd`: the app is closing. It only observes; what it
+        // prints cannot keep the session open.
+        let hooks = super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .map(|config| config.hooks)
+        .unwrap_or_default();
+        if hooks.iter().any(|hook| hook.event == "session_end") {
+            let session = self
+                .previous_session
+                .lock()
+                .ok()
+                .and_then(|session| session.as_ref().map(ToString::to_string));
+            let payload = serde_json::json!({
+                "event": "session_end",
+                "hook_event_name": "session_end",
+                "session_id": session,
+                "task_id": self.task_id.as_str(),
+                "cwd": self.workspace_root.to_string_lossy(),
+                "reason": "exit",
+            });
+            tokio::task::block_in_place(|| {
+                handle.block_on(harness_tools::run_hooks(
+                    &hooks,
+                    "session_end",
+                    None,
+                    &payload,
+                    false,
+                    &CancellationToken::new(),
+                ));
+            });
+        }
+        if let Some(repl) = self.repl.take() {
+            tokio::task::block_in_place(|| handle.block_on(repl.dispose()));
+        }
     }
 }
 
@@ -5272,7 +5381,7 @@ async fn run_turn(
     active_inbox: Arc<Mutex<Option<ActiveTurnInbox>>>,
     gate: Arc<ChannelApprovalGate>,
     limits: TurnLimits,
-    request: SubmitRequest,
+    mut request: SubmitRequest,
     cancellation: CancellationToken,
     writer_gate: Arc<tokio::sync::Mutex<()>>,
     goal: GoalRecord,
@@ -5589,6 +5698,33 @@ async fn run_turn(
     if let Ok(mut tier) = service_tier.lock() {
         tier.clone_from(&config.service_tier);
     }
+    // The session and prompt hooks, as Claude Code runs them: `pre_compact`
+    // before a compaction, `session_start` before a conversation's first
+    // prompt, `user_prompt_submit` before every prompt. What they add for the
+    // model rides with the prompt; a blocked prompt is not sent.
+    let hook_context = match prompt_hooks(
+        &config.hooks,
+        &request,
+        source.is_none(),
+        &session_id,
+        &task_id,
+        &workspace_root,
+        &cancellation,
+        &send,
+    )
+    .await
+    {
+        Ok(context) => context,
+        Err(reason) => {
+            if let Ok(store) = Arc::try_unwrap(store) {
+                let _ = store.close().await;
+            }
+            send(SessionEvent::RunTerminal {
+                outcome: RunOutcome::Blocked(format!("prompt blocked by hook: {reason}")),
+            });
+            return;
+        }
+    };
 
     // A workspace root keeps one project identity, whether or not memory is on: a
     // generated id per turn would put every project-scoped record this turn writes
@@ -6165,6 +6301,9 @@ async fn run_turn(
     }
     // The file text becomes part of the message itself, so what runs is what the user
     // handed over: the API has no file block, and text is the only shape a file travels in.
+    if let Some(context) = &hook_context {
+        request.text = format!("{}\n\n<hook_context>\n{context}\n</hook_context>", request.text);
+    }
     let mut prompt = format!(
         "{}{}",
         request.text,
@@ -6620,6 +6759,7 @@ async fn run_turn(
                 TurnStop::Unverified => {
                     RunOutcome::Blocked("the final answer could not be verified".to_owned())
                 }
+                TurnStop::HookStopped => RunOutcome::Blocked("stopped by a hook".to_owned()),
             }
         }
         // Esc while the model answers or before it was asked: the user stopped
@@ -7864,6 +8004,61 @@ mod tests {
             .close()
             .await
             .expect("close store");
+    }
+
+    /// Claude Code's `SessionStart` and `UserPromptSubmit`: what they print rides
+    /// with the prompt, and a prompt hook that blocks keeps the prompt back.
+    #[tokio::test]
+    async fn g09_prompt_hooks_add_context_or_block_the_prompt() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let session = harness_types::SessionId::generate();
+        let task = harness_types::TaskId::generate();
+        let shown = Mutex::new(Vec::new());
+        let send = |event: SessionEvent| shown.lock().expect("events").push(event);
+        let context = super::prompt_hooks(
+            &[
+                hook("session_start", None, 30, &hook_read_stdin_script("on branch main", 0)),
+                hook(
+                    "user_prompt_submit",
+                    None,
+                    30,
+                    &hook_read_stdin_script(
+                        r#"{"hookSpecificOutput":{"additionalContext":"the parser is in src/"}}"#,
+                        0,
+                    ),
+                ),
+            ],
+            &request(),
+            true,
+            &session,
+            &task,
+            workspace.path(),
+            &harness_providers::CancellationToken::new(),
+            &send,
+        )
+        .await
+        .expect("the prompt goes through");
+        assert_eq!(
+            context.as_deref(),
+            Some("on branch main\nthe parser is in src/")
+        );
+        let blocked = super::prompt_hooks(
+            &[hook(
+                "user_prompt_submit",
+                None,
+                30,
+                &hook_read_stdin_script(r#"{"decision":"block","reason":"no secrets in prompts"}"#, 0),
+            )],
+            &request(),
+            false,
+            &session,
+            &task,
+            workspace.path(),
+            &harness_providers::CancellationToken::new(),
+            &send,
+        )
+        .await;
+        assert_eq!(blocked, Err("no secrets in prompts (test fixture)".to_owned()));
     }
 
     #[tokio::test]
