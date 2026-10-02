@@ -17,6 +17,7 @@ mod secrets;
 mod service;
 mod truncate;
 mod turn_driver;
+mod validation;
 mod workspace;
 
 pub use capture::{

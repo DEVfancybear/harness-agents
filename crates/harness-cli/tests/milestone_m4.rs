@@ -188,6 +188,8 @@ impl ModelProvider for ScriptedProvider {
 /// Holds the first provider response until a durable inbox command is queued.
 /// This exercises the same boundary the interactive service relies on.
 struct SteeringProvider {
+    /// The first answer is a final one, with no tool call.
+    first_final: bool,
     calls: AtomicUsize,
     first_call_started: Arc<tokio::sync::Notify>,
     release_first_call: Arc<tokio::sync::Notify>,
@@ -196,7 +198,12 @@ struct SteeringProvider {
 
 impl SteeringProvider {
     fn new() -> Self {
+        Self::answering(false)
+    }
+
+    fn answering(first_final: bool) -> Self {
         Self {
+            first_final,
             calls: AtomicUsize::new(0),
             first_call_started: Arc::new(tokio::sync::Notify::new()),
             release_first_call: Arc::new(tokio::sync::Notify::new()),
@@ -216,8 +223,24 @@ impl ModelProvider for SteeringProvider {
         let request_id = request.request_id.clone();
         let started = Arc::clone(&self.first_call_started);
         let release = Arc::clone(&self.release_first_call);
+        let first_final = self.first_final;
         Box::pin(async move {
-            if call == 0 {
+            if call == 0 && first_final {
+                started.notify_one();
+                release.notified().await;
+                let mut events = vec![
+                    ProviderStreamEvent::started(),
+                    ProviderStreamEvent::text("done in one step"),
+                    ProviderStreamEvent::completed("stop"),
+                ];
+                if let Some(ProviderStreamEvent::Started {
+                    request_id: started_id,
+                }) = events.first_mut()
+                {
+                    *started_id = request_id;
+                }
+                Ok(events)
+            } else if call == 0 {
                 started.notify_one();
                 release.notified().await;
                 let mut events = vec![
@@ -3421,6 +3444,214 @@ async fn g04_mutating_receipt_has_before_after_hash() {
     close(store).await;
 }
 
+/// Run one turn whose first model call waits while `steer` is queued.
+async fn steered_turn(
+    first_final: bool,
+    limits: TurnLimits,
+    steer: &str,
+) -> (TurnOutcome, Vec<ProviderRequest>, Vec<String>) {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let provider = Arc::new(SteeringProvider::answering(first_final));
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let inbox = RunInbox::new(Arc::clone(&store));
+    let driver = TurnDriver::new(
+        Arc::clone(&runtime),
+        ToolExecutionService::new(Arc::clone(&store)),
+    )
+    .with_inbox(inbox.clone());
+    let session = SessionId::generate();
+    let request = RunRequest::new(
+        session.clone(),
+        TaskId::generate(),
+        InputId::generate(),
+        "inspect the parser",
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("workspace"),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    let options = TurnOptions {
+        workspace_root: bench.workspace.clone(),
+        actor_id: "g06.test".to_owned(),
+        approvals: ApprovalMode::Auto,
+        limits,
+    };
+    let started = Arc::clone(&provider.first_call_started);
+    let driver_task = tokio::spawn(async move {
+        driver
+            .run_turn(
+                request,
+                options,
+                Arc::new(SilentObserver),
+                CancellationToken::new(),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("the first model call starts");
+    let run = store
+        .latest_run(&session)
+        .await
+        .expect("latest run query")
+        .expect("run is persisted before provider dispatch");
+    inbox
+        .steer(&run, steer, harness_runtime::now_unix_ms())
+        .await
+        .expect("steering command is durably queued");
+    provider.release_first_call.notify_one();
+    let outcome = tokio::time::timeout(Duration::from_secs(30), driver_task)
+        .await
+        .expect("driver finishes within the bound")
+        .expect("driver task joins")
+        .expect("turn succeeds");
+    let requests = provider.seen.lock().expect("request log").clone();
+    // What the turn left in the inbox for the next one.
+    let unread = inbox
+        .claim(&run, 64, harness_runtime::now_unix_ms())
+        .await
+        .expect("claim")
+        .iter()
+        .filter_map(RunInbox::steering_text)
+        .collect();
+    drop(inbox);
+    drop(runtime);
+    drop(provider);
+    close(store).await;
+    (outcome, requests, unread)
+}
+
+/// pa-agent polls steering after the tool batch: a message sent while the
+/// model wrote its tool calls reaches the next call after the assistant's calls
+/// and their results, not before them.
+#[tokio::test]
+async fn g06_a_steer_follows_the_tool_results_it_arrived_after() {
+    let (outcome, requests, _) = steered_turn(
+        false,
+        TurnLimits::default(),
+        "Keep the existing parser format",
+    )
+    .await;
+    assert_eq!(outcome.stop, TurnStop::Final);
+    let messages = &requests[1].messages;
+    let position = |predicate: &dyn Fn(&harness_providers::ProviderMessage) -> bool| {
+        messages.iter().position(predicate)
+    };
+    let steer = position(&|message| message.content.contains("Keep the existing parser format"))
+        .expect("the steer reaches the next call");
+    let calls = position(&|message| !message.tool_calls.is_empty()).expect("the assistant's calls");
+    let result = position(&|message| message.role == MessageRole::Tool).expect("the tool result");
+    assert!(
+        calls < steer && result < steer,
+        "the steer follows the calls ({calls}) and their result ({result}), at {steer}: {messages:#?}"
+    );
+}
+
+/// A steer the turn cannot act on - it already took its last step - stays
+/// unread, so the next turn gets it, instead of being marked delivered and
+/// dropped.
+#[tokio::test]
+async fn g06_a_steer_at_the_step_limit_is_left_for_the_next_turn() {
+    let limits = TurnLimits {
+        max_steps: 1,
+        ..TurnLimits::default()
+    };
+    let (outcome, requests, unread) = steered_turn(true, limits, "also update the docs").await;
+    assert_eq!(outcome.stop, TurnStop::Final);
+    assert_eq!(requests.len(), 1, "no step is left for it");
+    assert_eq!(
+        unread,
+        ["also update the docs"],
+        "it waits for the next turn"
+    );
+}
+
+/// pa-agent's `validateToolArguments` coercion: a limit sent as the string
+/// "5" is read as 5 instead of failing the call; an argument the schema does
+/// not allow fails it with every problem named and the arguments echoed.
+#[tokio::test]
+async fn g06_tool_arguments_are_coerced_and_validated_against_the_schema() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                "read-coerced",
+                "read_file",
+                serde_json::json!({"path": "src/parser.txt", "limit": "5"}).to_string(),
+            ),
+            ProviderStreamEvent::tool_delta(
+                "read-invalid",
+                "read_file",
+                serde_json::json!({"path": "src/parser.txt", "colour": "red"}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("done"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let driver = TurnDriver::new(
+        Arc::clone(&runtime),
+        ToolExecutionService::new(Arc::clone(&store)),
+    );
+    let request = RunRequest::new(
+        SessionId::generate(),
+        TaskId::generate(),
+        InputId::generate(),
+        "read the parser",
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("workspace"),
+    )
+    .with_tool_schemas(coding_tool_schemas());
+    let options = TurnOptions {
+        workspace_root: bench.workspace.clone(),
+        actor_id: "g06.test".to_owned(),
+        approvals: ApprovalMode::Auto,
+        limits: TurnLimits::default(),
+    };
+    let outcome = driver
+        .run_turn(
+            request,
+            options,
+            Arc::new(SilentObserver),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn succeeds");
+    assert_eq!(outcome.stop, TurnStop::Final);
+    let requests = provider.seen();
+    let results = requests[1]
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Tool)
+        .map(|message| message.content.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        results[0].starts_with("read_file src/parser.txt"),
+        "the string limit was coerced and the file read: {results:?}"
+    );
+    assert!(
+        results[1].starts_with("Validation failed for tool \"read_file\":\n")
+            && results[1].contains("  - colour: Property is not allowed by additionalProperties")
+            && results[1].contains("Received arguments:"),
+        "{results:?}"
+    );
+    drop(driver);
+    drop(runtime);
+    drop(provider);
+    close(store).await;
+}
 #[tokio::test]
 async fn g06_steer_reaches_the_driver_mid_run() {
     let bench = bench();

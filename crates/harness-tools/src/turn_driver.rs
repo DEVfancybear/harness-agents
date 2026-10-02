@@ -927,6 +927,12 @@ impl TurnDriver {
                 // belongs to this turn, as prime-agent's loop polls its steering
                 // queue after every assistant turn: the model reads it and the
                 // turn goes on, instead of the message waiting for a new turn.
+                // With no step left the inbox is not read: a steer claimed here
+                // would be marked delivered and dropped with the turn, where an
+                // unread one is carried to the next turn.
+                if steps >= options.limits.max_steps {
+                    break TurnStop::Final;
+                }
                 let (steering, canceled) = self.claim_inbox(&result.run_id).await?;
                 if let Some(reason) = canceled {
                     observer.observe(TurnProgress::TextDelta(format!(
@@ -934,7 +940,7 @@ impl TurnDriver {
                     )));
                     break TurnStop::Canceled;
                 }
-                if !steering.is_empty() && steps < options.limits.max_steps {
+                if !steering.is_empty() {
                     steps += 1;
                     observer.observe(TurnProgress::StepStarted { step: steps });
                     if !result.response.trim().is_empty() {
@@ -973,9 +979,12 @@ impl TurnDriver {
                 break TurnStop::ToolLimit;
             }
 
-            // A safe boundary: steering is delivered and a cancel stops the turn
-            // before any queued work executes.
-            let (mut appended, canceled) = self.claim_inbox(&result.run_id).await?;
+            // A safe boundary: a cancel stops the turn before any queued work
+            // executes. Steering read here waits until the tool results are in:
+            // it arrived after the model wrote these calls, so it follows them
+            // and their results, as pa-agent polls steering after the batch.
+            let (early_steering, canceled) = self.claim_inbox(&result.run_id).await?;
+            let mut appended = Vec::new();
             if let Some(reason) = canceled {
                 observer.observe(TurnProgress::TextDelta(format!(
                     "canceled at a step boundary: {reason}"
@@ -1070,7 +1079,9 @@ impl TurnDriver {
             let parallel = result.tool_calls.len() > 1
                 && !result.tool_calls.iter().any(|call| runs_alone(&call.name));
             let mut slots: Vec<(String, String, Slot)> = Vec::new();
-            for (call, transcript_id) in result.tool_calls.clone().into_iter().zip(transcript_ids) {
+            for (mut call, transcript_id) in
+                result.tool_calls.clone().into_iter().zip(transcript_ids)
+            {
                 tool_calls += 1;
                 let name = call.name.clone();
                 observer.observe(TurnProgress::ToolStarted {
@@ -1091,6 +1102,28 @@ impl TurnDriver {
                         ), reason.to_owned()),
                     ));
                     continue;
+                }
+                // pa-agent's `validateToolArguments` before every call: the
+                // arguments are checked against the schema the model was shown,
+                // with its primitive coercion (`"50"` for an integer is 50), and a
+                // failure names every problem and echoes what was sent.
+                if let Some(schema) = parameters_schema(&request.tool_schemas, &name) {
+                    let sent: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+                    match crate::validation::validate_tool_arguments(&name, schema, &sent) {
+                        Ok(coerced) => {
+                            if coerced != sent {
+                                call.arguments = coerced.to_string();
+                            }
+                        }
+                        Err(message) => {
+                            slots.push((
+                                name.clone(),
+                                transcript_id,
+                                Slot::Failed(message, "invalid arguments".to_owned()),
+                            ));
+                            continue;
+                        }
+                    }
                 }
                 if name == "ask_user" {
                     for notice in self
@@ -1267,6 +1300,18 @@ impl TurnDriver {
                     }
                     Slot::Ready(_) | Slot::Taken => {}
                 }
+            }
+
+            // pa-agent's steering poll after the tool batch: what the user sent
+            // while the tools ran reaches this next call, not the one after it.
+            let (late_steering, canceled) = self.claim_inbox(&result.run_id).await?;
+            appended.extend(early_steering);
+            appended.extend(late_steering);
+            if let Some(reason) = canceled {
+                observer.observe(TurnProgress::TextDelta(format!(
+                    "canceled at a step boundary: {reason}"
+                )));
+                break TurnStop::Canceled;
             }
 
             steps += 1;
@@ -2079,6 +2124,17 @@ fn goal_evidence(result: &RunResult, executions: &[ToolExecutionView]) -> GoalEv
 /// loses that identity hands back a named call with no arguments and an anonymous
 /// call holding them. Neither is executable, and the model has to be told which
 /// half was wrong instead of being told the tool was denied.
+/// The parameters schema the model was shown for `name`, in the
+/// OpenAI-style function shape the schemas use (or the bare one).
+fn parameters_schema<'a>(schemas: &'a [Value], name: &str) -> Option<&'a Value> {
+    schemas.iter().find_map(|schema| {
+        let function = schema.get("function").unwrap_or(schema);
+        (function.get("name").and_then(Value::as_str) == Some(name))
+            .then(|| function.get("parameters"))
+            .flatten()
+    })
+}
+
 fn malformed_call(call: &NormalizedToolCall) -> Option<&'static str> {
     if call.name.trim().is_empty() {
         return Some("the function name is missing");
