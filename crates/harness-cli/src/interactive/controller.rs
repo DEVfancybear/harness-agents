@@ -1445,6 +1445,28 @@ impl InteractiveController {
                     .saturating_add(text.bytes().filter(|byte| *byte == b'\n').count());
                 self.pending_text.push_str(&text);
             }
+            SessionEvent::StreamRestarted => {
+                // The provider stream failed part-way and the runtime is asking
+                // again: the retry repeats the answer from its start, so the
+                // text the failed attempt streamed is dropped instead of being
+                // shown twice. Lines already committed to the scrollback stay,
+                // and the notice says the answer below replaces them.
+                let committed = !self.last_answer.is_empty();
+                self.pending_text.clear();
+                self.pending_newlines = 0;
+                self.pending_thinking.clear();
+                self.push_history(
+                    effects,
+                    HistoryItem::Notice {
+                        message: if committed {
+                            "the provider stream failed part-way; retrying - the answer above was cut off and is written again below".to_owned()
+                        } else {
+                            "the provider stream failed part-way; retrying".to_owned()
+                        },
+                    },
+                );
+                effects.push(Effect::Redraw);
+            }
             SessionEvent::ThinkingDelta { text } => {
                 // Reasoning is one row, not one row per delta: it is gathered and
                 // committed when answer text arrives or the step ends. Providers
@@ -7809,6 +7831,35 @@ Command: \"npm run build\""
         assert!(!crate::interactive::input::LineEditor::new().scroll_overlay(5));
     }
 
+    /// A model call retried after its stream failed part-way: the live text of
+    /// the failed attempt is dropped, a notice says so, and the retry's answer
+    /// is the only one shown.
+    #[test]
+    fn a_restarted_stream_drops_the_failed_attempts_text() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "work");
+        for event in [
+            SessionEvent::TextDelta {
+                text: "Hel".to_owned(),
+            },
+            SessionEvent::StreamRestarted,
+            SessionEvent::TextDelta {
+                text: "Hello".to_owned(),
+            },
+        ] {
+            harness.events.send(event).expect("event");
+        }
+        let effects = harness.controller.pump_events();
+        assert_eq!(harness.controller.ui_state().live_text, "Hello");
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::History(HistoryItem::Notice { message }) if message.contains("retrying")
+            )),
+            "{effects:?}"
+        );
+    }
     #[test]
     fn t04_stream_text_shows_in_the_live_block_before_run_terminal() {
         let mut harness = tui_bench(true);

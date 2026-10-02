@@ -63,6 +63,10 @@ impl Default for TurnLimits {
 pub enum TurnProgress {
     TextDelta(String),
     ThinkingDelta(String),
+    /// The model call started over: a retry after the stream failed part-way
+    /// sends the answer again from its start, so what the failed attempt
+    /// streamed is no longer the answer.
+    StreamRestarted,
     Usage {
         prompt_tokens: u64,
         completion_tokens: u64,
@@ -1933,7 +1937,15 @@ fn summarize_action(action: &CodingToolAction) -> String {
 
 fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
     let observer = Arc::clone(observer);
+    // Every attempt of one model call opens with `Started`; a second one means
+    // the runtime is retrying, and the deltas that follow repeat the answer.
+    let attempts = std::sync::atomic::AtomicUsize::new(0);
     Arc::new(move |event: ProviderStreamEvent| match event {
+        ProviderStreamEvent::Started { .. } => {
+            if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                observer.observe(TurnProgress::StreamRestarted);
+            }
+        }
         ProviderStreamEvent::TextDelta { text } => observer.observe(TurnProgress::TextDelta(text)),
         ProviderStreamEvent::ThinkingDelta { text } => {
             observer.observe(TurnProgress::ThinkingDelta(text));
@@ -2756,5 +2768,45 @@ mod repeated_read_tests {
             );
             assert!(repeated_read(&mut counts, &[page]).is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_restart_tests {
+    use std::sync::{Arc, Mutex};
+
+    use harness_providers::ProviderStreamEvent;
+
+    use super::{TurnObserver, TurnProgress, sink_for};
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<TurnProgress>>);
+
+    impl TurnObserver for Recorder {
+        fn observe(&self, progress: TurnProgress) {
+            self.0.lock().expect("log").push(progress);
+        }
+    }
+
+    /// A retried model call streams its answer again from the start: the
+    /// observer is told before the repeat, so the partial text of the failed
+    /// attempt is not shown twice.
+    #[test]
+    fn a_second_attempt_of_one_call_is_announced_before_its_text() {
+        let recorder = Arc::new(Recorder::default());
+        let observer: Arc<dyn TurnObserver> = recorder.clone();
+        let sink = sink_for(&observer);
+        sink(ProviderStreamEvent::started());
+        sink(ProviderStreamEvent::text("Hel"));
+        sink(ProviderStreamEvent::started());
+        sink(ProviderStreamEvent::text("Hello"));
+        assert_eq!(
+            *recorder.0.lock().expect("log"),
+            [
+                TurnProgress::TextDelta("Hel".to_owned()),
+                TurnProgress::StreamRestarted,
+                TurnProgress::TextDelta("Hello".to_owned()),
+            ]
+        );
     }
 }

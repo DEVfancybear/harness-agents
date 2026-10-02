@@ -694,6 +694,9 @@ pub enum SessionEvent {
     ThinkingDelta {
         text: String,
     },
+    /// The model call started over after its stream failed part-way: what it
+    /// streamed so far is not the answer.
+    StreamRestarted,
     CostUpdated {
         label: String,
     },

@@ -2849,6 +2849,7 @@ impl TurnObserver for ExplorerObserver {
             }
             TurnProgress::TextDelta(_)
             | TurnProgress::ThinkingDelta(_)
+            | TurnProgress::StreamRestarted
             | TurnProgress::ToolSettled { .. }
             | TurnProgress::ToolOutput { .. }
             | TurnProgress::Info(_) => {}
