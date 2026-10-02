@@ -1257,6 +1257,114 @@ async fn p3_c23_project_identity_requires_explicit_reassociation() {
     close_writer(store).await;
 }
 
+/// A coder's worktree is checked out from the host's own clone of the project,
+/// so its Git common directory is not the checkout's. Measured: every tool call
+/// of a delegated coder failed `project_identity_conflict`. The worktree the
+/// host issued and recorded for the project is that explicit association; a
+/// worktree nobody issued still is not.
+#[tokio::test]
+async fn p3_c23_a_host_issued_coder_worktree_belongs_to_its_project() {
+    let temp = TempDir::new().expect("temporary store");
+    let root = setup_workspace(&temp);
+    let clone = temp.path().join("delegation-source.git");
+    let git = |cwd: &Path, args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git starts");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(
+        temp.path(),
+        &[
+            "clone",
+            "--local",
+            "--no-hardlinks",
+            "--quiet",
+            root.to_str().expect("root path Unicode"),
+            clone.to_str().expect("clone path Unicode"),
+        ],
+    );
+    let issued = temp.path().join("worktrees").join("wt-issued");
+    let stray = temp.path().join("worktrees").join("wt-stray");
+    for (path, branch) in [(&issued, "harness/p5/issued"), (&stray, "harness/p5/stray")] {
+        git(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                path.to_str().expect("worktree path Unicode"),
+            ],
+        );
+    }
+    let store = writer(&temp).await;
+    let (session_id, task_id, project_id) = admit(&store, &root).await;
+    store
+        .upsert_worktree(&harness_store_sqlite::WorktreeRecordRow {
+            worktree_id: "wt-issued".to_owned(),
+            task_id: task_id.clone(),
+            run_id: harness_types::AgentRunId::generate(),
+            project_id,
+            base_commit: "base".to_owned(),
+            base_branch: "harness/base/issued".to_owned(),
+            branch: "harness/p5/issued".to_owned(),
+            path: issued.to_str().expect("worktree path Unicode").to_owned(),
+            write_scope: vec![".".to_owned()],
+            state: "ready".to_owned(),
+            input_fingerprint: harness_types::ContentHash::from_bytes(b"input"),
+            result_fingerprint: None,
+            generation: 1,
+        })
+        .await
+        .expect("the host records the worktree it issued");
+    let tools = ToolExecutionService::new(Arc::clone(&store));
+    let read = || CodingToolAction::ReadFile {
+        path: "src/parser.txt".to_owned(),
+        offset: None,
+        limit: None,
+    };
+    tools
+        .prepare(request(
+            &session_id,
+            &task_id,
+            &root,
+            "fixture.actor",
+            read(),
+        ))
+        .await
+        .expect("the checkout itself prepares");
+    tools
+        .prepare(request(
+            &session_id,
+            &task_id,
+            &issued,
+            "fixture.coder",
+            read(),
+        ))
+        .await
+        .expect("the issued coder worktree prepares");
+    let stray = tools
+        .prepare(request(
+            &session_id,
+            &task_id,
+            &stray,
+            "fixture.coder",
+            read(),
+        ))
+        .await
+        .expect_err("a worktree the host never issued is still another root");
+    assert_eq!(stray.code(), ErrorCode::ProjectIdentityConflict);
+    drop(tools);
+    close_writer(store).await;
+}
+
 #[tokio::test]
 async fn p3_c29_secret_output_is_redacted_and_artifact_scope_is_enforced() {
     let temp = TempDir::new().expect("temporary store");

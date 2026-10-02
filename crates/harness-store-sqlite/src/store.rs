@@ -4013,6 +4013,29 @@ fn validate_project_registration(record: &ProjectRegistrationRecord) -> Result<(
     Ok(())
 }
 
+/// Whether `record`'s root is a worktree the host issued to this project.
+async fn issued_worktree(
+    transaction: &mut Transaction<'_, Sqlite>,
+    record: &ProjectRegistrationRecord,
+) -> Result<bool, StoreError> {
+    let paths: Vec<String> =
+        sqlx::query_scalar("SELECT path FROM delegation_worktrees WHERE project_id = ?")
+            .bind(record.project_id.as_str())
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(|error| {
+                database_error(
+                    ErrorCode::StorageWriteFailed,
+                    "read issued worktrees",
+                    error,
+                )
+            })?;
+    let root = std::path::Path::new(&record.canonical_root);
+    Ok(paths
+        .iter()
+        .any(|path| std::fs::canonicalize(path).is_ok_and(|issued| issued.as_path() == root)))
+}
+
 async fn insert_project_registration(
     transaction: &mut Transaction<'_, Sqlite>,
     record: &ProjectRegistrationRecord,
@@ -4084,7 +4107,12 @@ async fn insert_project_registration(
                     error,
                 )
             })?;
-    for row in prior {
+    // A coder's worktree is checked out from the host's own clone of the
+    // project, so its Git common directory is the clone's. The host recorded
+    // the worktree for this project when it issued it: that record is the
+    // explicit association, and a root nobody issued still needs one.
+    let issued = issued_worktree(transaction, record).await?;
+    for row in prior.iter().filter(|_| !issued) {
         let prior_common_dir: Option<String> = row.try_get("git_common_dir").map_err(|_| {
             StoreError::new(
                 ErrorCode::StorageWriteFailed,
