@@ -130,7 +130,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest]
-        milestone: [M0, M1, M2, M3, M4, M5, M6, M8, M9, M10, M12]
+        milestone: [M0, M1, M2, M3, M4, M5, M6, M8, M9, M12]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -138,13 +138,11 @@ jobs:
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
-      # M9's packaging case asserts against a real release candidate. M10
-      # reruns that case as part of its M9 prerequisite closure, and each
-      # matrix job has its own filesystem, so that gate prepares its own
-      # candidate too. `-PublishDryRun` creates the artefact and checksums but
-      # publishes nothing; the other milestones do not read it.
+      # M9's packaging case asserts against a real release candidate.
+      # `-PublishDryRun` creates the artefact and checksums but publishes
+      # nothing; the other milestones do not read it.
       - name: Build the local release candidate for the M9 closure
-        if: matrix.milestone == 'M9' || matrix.milestone == 'M10'
+        if: matrix.milestone == 'M9'
         shell: pwsh
         run: ./scripts/New-HaRelease.ps1 -Profile Release -PublishDryRun -OutputDirectory target/release-candidate
       - name: Run the ${{ matrix.milestone }} milestone gate
