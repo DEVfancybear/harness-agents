@@ -1442,7 +1442,7 @@ fn clip_result(text: &str) -> String {
     clipped
 }
 
-/// The last verified text the model sent in one session, if it sent any.
+/// The last verified answer or explicitly canceled partial text in a session.
 ///
 /// A completed transport alone is not enough: truncated responses stay out.
 /// Attempt ids are time-ordered, so the newest completed attempt is the one the
@@ -1465,7 +1465,10 @@ async fn final_answer(
         let Ok(response) = harness_providers::assemble_stream(&events) else {
             continue;
         };
-        if !response.is_dispatchable() {
+        // An explicitly canceled attempt keeps the text the user already saw;
+        // unlike a transport EOF, it is intentionally an unfinished reply.
+        // Only text is replayed here, never its incomplete tool calls.
+        if attempt.state != "canceled" && !response.is_dispatchable() {
             continue;
         }
         let text = response.text.trim();
@@ -2068,6 +2071,16 @@ impl RuntimeService {
             // replay at the turn-driver boundary.
             let result = result.and_then(|events| {
                 let assembled = assemble_stream(&events)?;
+                // Some adapters end cleanly when canceled instead of returning
+                // ProviderCanceled. Preserve their partial text through the same
+                // canceled-attempt path, without accepting a truncated EOF.
+                if cancellation.is_cancelled() && !assembled.is_dispatchable() {
+                    streamed = events;
+                    return Err(ProviderError::new(
+                        ErrorCode::ProviderCanceled,
+                        "provider stream canceled",
+                    ));
+                }
                 if assembled.finish_reason.is_none()
                     && assembled.text.is_empty()
                     && assembled.reasoning.is_empty()

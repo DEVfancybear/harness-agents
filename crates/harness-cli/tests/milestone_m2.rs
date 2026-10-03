@@ -791,7 +791,7 @@ async fn a07_a_canceled_answer_keeps_what_it_streamed() {
         }
     });
     let session = SessionId::generate();
-    let _ended = runtime
+    let error = runtime
         .run_streaming(
             RunRequest::new(
                 session.clone(),
@@ -803,7 +803,9 @@ async fn a07_a_canceled_answer_keeps_what_it_streamed() {
             cancellation,
             sink,
         )
-        .await;
+        .await
+        .expect_err("the run is canceled even when the adapter ends cleanly");
+    assert_eq!(error.code(), ErrorCode::ProviderCanceled);
     let history = runtime
         .conversation_history(&session)
         .await
