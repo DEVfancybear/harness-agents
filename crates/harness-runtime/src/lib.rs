@@ -1365,6 +1365,9 @@ async fn interrupted_steps(
             serde_json::from_value::<Vec<ProviderStreamEvent>>(attempt.events.clone()).ok()
         })
         .filter_map(|events| harness_providers::assemble_stream(&events).ok())
+        // A transport EOF can be stored as completed while the turn is still
+        // unverified. Never replay its unfinished text or unapproved calls.
+        .filter(harness_providers::ProviderResponse::is_dispatchable)
         .collect::<Vec<_>>();
     if responses
         .last()
@@ -1439,8 +1442,9 @@ fn clip_result(text: &str) -> String {
     clipped
 }
 
-/// The last text the model sent in one session, if it sent any.
+/// The last verified text the model sent in one session, if it sent any.
 ///
+/// A completed transport alone is not enough: truncated responses stay out.
 /// Attempt ids are time-ordered, so the newest completed attempt is the one the
 /// turn ended on. When that attempt only asked for tools and the turn stopped
 /// there, the newest attempt that did say something is what the user last read.
@@ -1461,6 +1465,9 @@ async fn final_answer(
         let Ok(response) = harness_providers::assemble_stream(&events) else {
             continue;
         };
+        if !response.is_dispatchable() {
+            continue;
+        }
         let text = response.text.trim();
         if !text.is_empty() {
             return Ok(Some(text.to_owned()));
@@ -2053,9 +2060,30 @@ impl RuntimeService {
                         .await
                 }
             };
+            // A clean EOF without a terminal marker or any output is a
+            // failed attempt, not a completed response. Keep the retry in this
+            // loop so its request, attempt bound and usage accounting stay the
+            // same as other provider failures. Any payload (including private
+            // reasoning or an incomplete tool call) still fails closed without
+            // replay at the turn-driver boundary.
+            let result = result.and_then(|events| {
+                let assembled = assemble_stream(&events)?;
+                if assembled.finish_reason.is_none()
+                    && assembled.text.is_empty()
+                    && assembled.reasoning.is_empty()
+                    && assembled.reasoning_signature.is_none()
+                    && assembled.tool_calls.is_empty()
+                {
+                    Err(ProviderError::new(
+                        ErrorCode::ProviderProtocol,
+                        "provider stream ended without a terminal marker and produced no output",
+                    ))
+                } else {
+                    Ok((events, assembled))
+                }
+            });
             match result {
-                Ok(events) => {
-                    let assembled = assemble_stream(&events)?;
+                Ok((events, assembled)) => {
                     // Settle this attempt before anything else reads the
                     // result: measured when the response has text, unknown
                     // when it does not (an empty response is not free).

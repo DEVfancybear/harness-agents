@@ -527,6 +527,184 @@ async fn m3_01_one_input_distinct_steps() {
 }
 
 #[tokio::test]
+async fn m3_01_empty_unterminated_stream_retries_without_completing_the_attempt() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptStep::Events(vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text(""),
+        ]),
+        ScriptStep::Events(vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("recovered answer"),
+            ProviderStreamEvent::completed("stop"),
+        ]),
+    ]));
+    let (runtime, budget_id) = runtime_for(&store, provider.clone(), None, Some(100_000)).await;
+    let session = SessionId::generate();
+    let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)));
+    let outcome = driver
+        .run_turn(
+            request(
+                &bench.workspace,
+                session.clone(),
+                TaskId::generate(),
+                "fix it",
+            ),
+            options(&bench.workspace),
+            Arc::new(RecordingObserver::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the empty response is retried");
+    assert_eq!(outcome.stop, TurnStop::Final);
+    assert_eq!(outcome.final_text, "recovered answer");
+    assert_eq!(provider.calls(), 2);
+    let attempts = store.list_provider_attempts(&session).await.unwrap();
+    assert_eq!(attempts.len(), 2);
+    let failed = attempts
+        .iter()
+        .find(|attempt| attempt.attempt_number == 1)
+        .unwrap();
+    let completed = attempts
+        .iter()
+        .find(|attempt| attempt.attempt_number == 2)
+        .unwrap();
+    assert_eq!(failed.state, "failed");
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("provider_protocol")
+    );
+    assert!(failed.response_hash.is_none());
+    assert_eq!(completed.state, "completed");
+    assert_eq!(
+        failed.request_id, completed.request_id,
+        "retry uses the frozen request"
+    );
+    let budget = BudgetLedger::new(Arc::clone(&store))
+        .view(&budget_id.unwrap())
+        .await
+        .unwrap();
+    let reservation = BudgetLedger::new(Arc::clone(&store))
+        .reservation(&format!("attempt:{}:0:1", outcome.run_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reservation.state, BudgetReservationState::Unknown);
+    assert!(
+        budget.account.spent_tokens >= reservation.upper_bound_tokens,
+        "the failed attempt is not free"
+    );
+    drop(driver);
+    close(store).await;
+}
+
+#[tokio::test]
+async fn m3_01_empty_unterminated_stream_exhausts_the_retry_bound() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let provider = Arc::new(ScriptedProvider::new(vec![ScriptStep::Events(vec![
+        ProviderStreamEvent::started(),
+        ProviderStreamEvent::text(""),
+    ])]));
+    let (runtime, _) = runtime_for(&store, provider.clone(), None, None).await;
+    let session = SessionId::generate();
+    let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)));
+    let error = driver
+        .run_turn(
+            request(
+                &bench.workspace,
+                session.clone(),
+                TaskId::generate(),
+                "fix it",
+            ),
+            options(&bench.workspace),
+            Arc::new(RecordingObserver::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("empty attempts cannot complete the run");
+    assert_eq!(error.code(), ErrorCode::ProviderProtocol);
+    assert_eq!(
+        provider.calls(),
+        RuntimeConfig::default().max_attempts as usize
+    );
+    let attempts = store.list_provider_attempts(&session).await.unwrap();
+    assert_eq!(attempts.len(), provider.calls());
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt.state == "failed" && attempt.response_hash.is_none())
+    );
+    drop(driver);
+    close(store).await;
+}
+
+#[tokio::test]
+async fn m3_01_payload_bearing_unterminated_streams_are_not_retried() {
+    for payload in [
+        ProviderStreamEvent::text("partial answer"),
+        ProviderStreamEvent::text(" "),
+        ProviderStreamEvent::thinking("private partial reasoning"),
+        ProviderStreamEvent::ThinkingSignature {
+            signature: "partial-signature".to_owned(),
+        },
+        ProviderStreamEvent::tool_delta("", "", ""),
+        ProviderStreamEvent::tool_delta("call-1", "read_file", r#"{"path":"a.txt"}"#),
+    ] {
+        let bench = bench();
+        let store = bench.open_store().await;
+        let provider = Arc::new(ScriptedProvider::new(vec![ScriptStep::Events(vec![
+            ProviderStreamEvent::started(),
+            payload,
+        ])]));
+        let (runtime, _) = runtime_for(&store, provider.clone(), None, None).await;
+        let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)));
+        let outcome = driver
+            .run_turn(
+                request(
+                    &bench.workspace,
+                    SessionId::generate(),
+                    TaskId::generate(),
+                    "fix it",
+                ),
+                options(&bench.workspace),
+                Arc::new(RecordingObserver::default()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("partial output is reported, not dispatched");
+        assert_eq!(outcome.stop, TurnStop::Unverified);
+        assert_eq!(provider.calls(), 1);
+        assert!(outcome.executions.is_empty());
+        let history = harness_runtime::conversation_history(&store, &outcome.session_id)
+            .await
+            .unwrap();
+        assert!(
+            !history.interrupted_replayed,
+            "unverified calls are not replayed"
+        );
+        assert_eq!(history.messages.len(), 2);
+        assert_eq!(
+            history.messages[1].content,
+            "(no reply was recorded for this turn)"
+        );
+        assert!(
+            history
+                .messages
+                .iter()
+                .all(|message| message.tool_calls.is_empty())
+        );
+        drop(driver);
+        close(store).await;
+    }
+}
+
+#[tokio::test]
 async fn m3_01_incomplete_stream_is_not_dispatched() {
     let bench = bench();
     let store = bench.open_store().await;

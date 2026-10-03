@@ -306,9 +306,23 @@ impl ChildLaunch {
 #[derive(Clone, Debug)]
 enum ChildState {
     Running,
-    Done { answer: String, detail: Value },
-    Failed { error: String },
-    Cancelled { reason: String },
+    Done {
+        answer: String,
+        detail: Value,
+    },
+    Failed {
+        error: String,
+    },
+    /// A later turn failed, but this earlier terminal answer is still useful.
+    /// It is not a successful completion of the delegated task.
+    Partial {
+        answer: String,
+        detail: Value,
+        error: String,
+    },
+    Cancelled {
+        reason: String,
+    },
 }
 
 impl ChildState {
@@ -375,6 +389,9 @@ impl ChildRecord {
             ChildState::Done { answer, .. } => {
                 ("completed", Some(clip(answer, self.answer_file.as_deref())))
             }
+            ChildState::Partial { answer, .. } => {
+                ("error", Some(clip(answer, self.answer_file.as_deref())))
+            }
             ChildState::Failed { .. } | ChildState::Cancelled { .. } => ("error", None),
         };
         json!({
@@ -395,6 +412,12 @@ impl ChildRecord {
             "answer_preview": answer,
             "replied_since_task": self.replied,
             "progress_note": self.notes.back(),
+            "partial": matches!(self.state, ChildState::Partial { .. }),
+            "error": match &self.state {
+                ChildState::Failed { error } | ChildState::Partial { error, .. } => Some(error),
+                ChildState::Cancelled { reason } => Some(reason),
+                _ => None,
+            },
         })
     }
 
@@ -407,6 +430,11 @@ impl ChildRecord {
                 Some(clip(answer, self.answer_file.as_deref())),
                 None,
             ),
+            ChildState::Partial { answer, error, .. } => (
+                "error",
+                Some(clip(answer, self.answer_file.as_deref())),
+                Some(error.clone()),
+            ),
             ChildState::Failed { error } => ("error", None, Some(error.clone())),
             ChildState::Cancelled { reason } => ("cancelled", None, Some(reason.clone())),
         };
@@ -416,6 +444,7 @@ impl ChildRecord {
             "session_dir": session_dir,
             "status": status,
             "settled": self.state.settled(),
+            "partial": matches!(self.state, ChildState::Partial { .. }),
             "answer_preview": answer,
             "error": error,
             "duration_ms": self.state.settled().then(|| self.elapsed_ms()),
@@ -430,6 +459,9 @@ impl ChildRecord {
             ChildState::Running => format!("running, {}", self.activity),
             ChildState::Done { .. } => "completed".to_owned(),
             ChildState::Failed { error } => format!("failed: {}", first_line(error)),
+            ChildState::Partial { error, .. } => {
+                format!("failed (partial answer): {}", first_line(error))
+            }
             ChildState::Cancelled { reason } => format!("cancelled: {}", first_line(reason)),
         };
         let indent = "  ".repeat(usize::try_from(self.depth.saturating_sub(1)).unwrap_or(0));
@@ -465,6 +497,10 @@ fn terminal_notice(
     match state {
         ChildState::Running => None,
         ChildState::Failed { error } => Some(format!("[child-failed child:{name}]\n\n{error}")),
+        ChildState::Partial { answer, error, .. } => Some(format!(
+            "[child-failed child:{name}]\n\n{error}\n\nLast verified answer (partial): {}",
+            clip(answer, answer_file)
+        )),
         ChildState::Cancelled { reason } => Some(if reason.trim().is_empty() {
             format!("[child-exited: cancelled child:{name}]")
         } else {
@@ -582,40 +618,45 @@ impl AgentsShared {
 
     /// Record a settled worker and tell the parent when nobody is waiting for it.
     fn settle(&self, task_id: &TaskId, outcome: WorkerOutcome) {
-        let notice = self.update(task_id, |child| {
-            child.duration_ms = Some(child.elapsed_ms());
-            child.state = if child.cancellation.is_cancelled() {
-                ChildState::Cancelled {
-                    reason: child.cancel_reason.clone().unwrap_or_default(),
+        let notice =
+            self.update(task_id, |child| {
+                child.duration_ms = Some(child.elapsed_ms());
+                child.state = if child.cancellation.is_cancelled() {
+                    ChildState::Cancelled {
+                        reason: child.cancel_reason.clone().unwrap_or_default(),
+                    }
+                } else {
+                    outcome_state(child.role, outcome)
+                };
+                if let ChildState::Done { detail, .. } | ChildState::Partial { detail, .. } =
+                    &child.state
+                    && let Some(count) = detail["tool_calls"].as_u64()
+                {
+                    child.tool_calls = u32::try_from(count).unwrap_or(u32::MAX);
                 }
-            } else {
-                outcome_state(child.role, outcome)
-            };
-            if let ChildState::Done { detail, .. } = &child.state
-                && let Some(count) = detail["tool_calls"].as_u64()
-            {
-                child.tool_calls = u32::try_from(count).unwrap_or(u32::MAX);
-            }
-            if let (ChildState::Done { answer, .. }, Some(dir)) = (&child.state, self.answers.get())
-                && answer.chars().count() > RLM_ANSWER_MAX_CHARS
-            {
-                child.answer_file = save_answer(dir, &child.task_id, answer);
-            }
-            let notice = (child.waiters == 0 && !child.suppress_notice)
-                .then(|| {
-                    terminal_notice(
-                        &child.name,
-                        &child.state,
-                        child.replied,
-                        child.answer_file.as_deref(),
-                    )
-                })
-                .flatten();
-            (
-                child.parent.clone(),
-                notice.map(|notice| (child.name.clone(), notice)),
-            )
-        });
+                if let (
+                    ChildState::Done { answer, .. } | ChildState::Partial { answer, .. },
+                    Some(dir),
+                ) = (&child.state, self.answers.get())
+                    && answer.chars().count() > RLM_ANSWER_MAX_CHARS
+                {
+                    child.answer_file = save_answer(dir, &child.task_id, answer);
+                }
+                let notice = (child.waiters == 0 && !child.suppress_notice)
+                    .then(|| {
+                        terminal_notice(
+                            &child.name,
+                            &child.state,
+                            child.replied,
+                            child.answer_file.as_deref(),
+                        )
+                    })
+                    .flatten();
+                (
+                    child.parent.clone(),
+                    notice.map(|notice| (child.name.clone(), notice)),
+                )
+            });
         self.cancel_descendants(task_id, "its parent agent finished");
         match notice {
             // A nested child reports to the child that spawned it, which reads
@@ -1062,9 +1103,34 @@ fn outcome_state(role: AgentRole, outcome: WorkerOutcome) -> ChildState {
             };
         }
     };
-    ChildState::Done {
-        answer: report.summary,
-        detail: report.detail,
+    if report.outcome == DelegatedOutcome::Completed {
+        return ChildState::Done {
+            answer: report.summary,
+            detail: report.detail,
+        };
+    }
+    let error = report.detail["error"].as_str().map_or_else(
+        || {
+            format!(
+                "{}: {} reported {}",
+                ErrorCode::ResultIncomplete.as_str(),
+                role.as_str(),
+                report.outcome.as_str()
+            )
+        },
+        str::to_owned,
+    );
+    if report.outcome == DelegatedOutcome::Failed
+        && report.detail["partial"] == true
+        && !report.summary.trim().is_empty()
+    {
+        ChildState::Partial {
+            answer: report.summary,
+            detail: report.detail,
+            error,
+        }
+    } else {
+        ChildState::Failed { error }
     }
 }
 
@@ -1074,11 +1140,18 @@ fn state_payload(role: AgentRole, name: &str, state: &ChildState) -> Value {
         ChildState::Running => json!({
             "role": role.as_str(), "status": "running", "name": name,
         }),
-        ChildState::Done { answer, detail } => json!({
+        ChildState::Done { answer, detail } | ChildState::Partial { answer, detail, .. } => json!({
             "role": role.as_str(),
-            "status": "completed",
+            "status": if matches!(state, ChildState::Partial { .. }) { "failed" } else { "completed" },
+            "partial": matches!(state, ChildState::Partial { .. }),
+            "error": match state { ChildState::Partial { error, .. } => Some(error), _ => None },
             "name": name,
-            "text": answer,
+            // External tool results expose `text` to the model, not this whole
+            // object. Keep the failure/partial warning in that text as well.
+            "text": if matches!(state, ChildState::Partial { .. }) {
+                terminal_notice(name, state, false, None).unwrap_or_default()
+            } else { answer.clone() },
+            "partial_answer": if matches!(state, ChildState::Partial { .. }) { Some(answer) } else { None },
             "receipts_digest": detail["receipts_digest"],
             "steps": detail["steps"],
             "tool_calls": detail["tool_calls"],
@@ -2658,6 +2731,8 @@ impl WorkerBackend for InteractiveWorkerBackend {
             let mut steps = 0_u32;
             let mut tool_calls = 0_u32;
             let mut executions = Vec::new();
+            let mut last_verified = None;
+            let mut follow_up_error = None;
             let outcome = loop {
                 self.shared.update(&task_id, |child| child.in_turn = true);
                 let run_request = RunRequest::new(
@@ -2694,20 +2769,26 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     .lock()
                     .map_or_else(|_| "n/a".to_owned(), |tracker| tracker.display());
                 self.shared.update(&task_id, |child| child.cost = cost);
-                if let Some(error) = observer
+                let result =
+                    result.map_err(|error| OrchestratorError::new(error.code(), error.to_string()));
+                let result = if let Some(error) = observer
                     .budget_error
                     .lock()
                     .ok()
                     .and_then(|error| error.clone())
                 {
-                    return WorkerOutcome::Failed { error };
-                }
+                    Err(error)
+                } else {
+                    result
+                };
                 let outcome = match result {
                     Ok(outcome) => outcome,
                     Err(error) => {
-                        return WorkerOutcome::Failed {
-                            error: OrchestratorError::new(error.code(), error.to_string()),
-                        };
+                        if let Some(last) = last_verified {
+                            follow_up_error = Some(error);
+                            break last;
+                        }
+                        return WorkerOutcome::Failed { error };
                     }
                 };
                 steps += outcome.steps;
@@ -2726,14 +2807,17 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 // answer"), so the parent could not tell a child that broke from one
                 // that finished.
                 if let Some(reason) = stopped_short(outcome.stop) {
-                    return WorkerOutcome::Failed {
-                        error: OrchestratorError::new(
-                            ErrorCode::ResultIncomplete,
-                            format!(
-                                "{role_name} stopped without an answer: {reason} ({steps} step(s), {tool_calls} tool call(s))"
-                            ),
+                    let error = OrchestratorError::new(
+                        ErrorCode::ResultIncomplete,
+                        format!(
+                            "{role_name} stopped without an answer: {reason} ({steps} step(s), {tool_calls} tool call(s))"
                         ),
-                    };
+                    );
+                    if let Some(last) = last_verified {
+                        follow_up_error = Some(error);
+                        break last;
+                    }
+                    return WorkerOutcome::Failed { error };
                 }
                 let Some(next) = self.shared.quiet(&task_id, &request.cancellation).await else {
                     break outcome;
@@ -2743,6 +2827,11 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     MessageRole::Assistant,
                     outcome.final_text.clone(),
                 ));
+                // Only a terminal, nonempty answer can survive a failed follow-up.
+                // Never replace it with text from an unverified turn.
+                if !outcome.final_text.trim().is_empty() {
+                    last_verified = Some(outcome);
+                }
                 prompt = next.join("\n\n");
                 session_id = SessionId::generate();
                 let _ = store.release_task_lease(&task_id).await;
@@ -2755,6 +2844,12 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     reason: "the child was stopped".to_owned(),
                 };
             }
+            // A failed driver call has no TurnOutcome, but the observer already
+            // counted any tools it started. Do not erase those counts at settle.
+            let tool_calls = self
+                .shared
+                .update(&task_id, |child| child.tool_calls.max(tool_calls))
+                .unwrap_or(tool_calls);
             let receipts = serde_json::to_vec(&executions).unwrap_or_default();
             let receipts_digest = ContentHash::from_bytes(&receipts).as_str().to_owned();
             let (prompt_tokens, completion_tokens) =
@@ -2774,7 +2869,11 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     role: request.brief.role,
                     generation: request.generation,
                 },
-                outcome: DelegatedOutcome::Completed,
+                outcome: if follow_up_error.is_some() {
+                    DelegatedOutcome::Failed
+                } else {
+                    DelegatedOutcome::Completed
+                },
                 summary,
                 artifact_refs: Vec::new(),
                 base_revision: request.brief.base_commit.clone(),
@@ -2786,6 +2885,9 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     retries: 0,
                 },
                 detail: json!({
+                    "partial": follow_up_error.is_some(),
+                    "error": follow_up_error.as_ref().map(ToString::to_string),
+                    "failed_session_id": follow_up_error.as_ref().map(|_| &session_id),
                     "session_id": outcome.session_id,
                     "depth": depth,
                     "steps": steps,
@@ -3829,6 +3931,8 @@ mod real_worker_tests {
         Tool(&'static str, Value),
         /// A stream that fails, as a provider whose body cannot be decoded.
         Broken,
+        /// A clean EOF without a terminal marker (empty or carrying text).
+        Unterminated(&'static str),
         Delay(u64, Box<Reply>),
     }
 
@@ -3889,6 +3993,12 @@ mod real_worker_tests {
                             harness_types::ErrorCode::ProviderProtocol,
                             "malformed provider SSE JSON",
                         ));
+                    }
+                    Reply::Unterminated(text) => {
+                        return Ok(vec![
+                            ProviderStreamEvent::Started { request_id },
+                            ProviderStreamEvent::text(text),
+                        ]);
                     }
                     Reply::Delay(..) => unreachable!("delays were played above"),
                 };
@@ -4422,6 +4532,142 @@ mod real_worker_tests {
             last.contains("[child-exited: no-reply child:") && last.contains("inner late"),
             "the grandchild's notice opened the child's last turn: {last}"
         );
+    }
+
+    /// No earlier terminal answer means a failed stream has nothing to salvage.
+    #[tokio::test]
+    async fn a_failed_first_turn_has_no_partial_answer() {
+        for failure in [
+            Reply::Broken,
+            Reply::Unterminated(""),
+            Reply::Unterminated("cut off"),
+        ] {
+            let mut bench = bench();
+            let provider = Routed::new(move |_| failure.clone());
+            let host = host(&bench, provider.clone());
+            spawn(&host, "first", "first task").await;
+            let state = state_of(&bench.agents, "first").await;
+            assert!(matches!(state, ChildState::Failed { .. }));
+            let collected = host
+                .rlm_requests()
+                .handle(&json!({
+                    "type": "rlm.collect", "targets": ["first"], "timeout_ms": 0
+                }))
+                .await
+                .expect("known")
+                .expect("collect");
+            let result = &collected["results"][0];
+            assert_eq!(result["status"], "error");
+            assert_eq!(result["settled"], true);
+            assert_eq!(result["partial"], false);
+            assert!(result["answer_preview"].is_null());
+            assert!(
+                result["error"]
+                    .as_str()
+                    .is_some_and(|error| !error.is_empty())
+            );
+            match next_child_event(&mut bench.events).await {
+                SessionEvent::ChildSettled { notice, .. } => {
+                    assert!(notice.starts_with("[child-failed child:first]"), "{notice}");
+                    assert!(!notice.contains("Last verified answer"), "{notice}");
+                }
+                other => panic!("expected failure notice: {other:?}"),
+            }
+            assert!(provider.requests_of("first task").len() <= 3);
+        }
+    }
+
+    /// A verified answer remains collectable if the subtree follow-up fails.
+    /// The failed follow-up's text is not promoted to a verified answer.
+    #[tokio::test]
+    async fn a_failed_follow_up_keeps_the_last_verified_answer_as_partial() {
+        for failure in [
+            Reply::Broken,
+            Reply::Unterminated(""),
+            Reply::Unterminated("cut off"),
+        ] {
+            let mut bench = bench();
+            let provider = Routed::new(move |request| {
+                if is_child(request, "inner task") {
+                    Reply::Delay(400, Box::new(Reply::Text("inner late")))
+                } else if last_text(request).contains("[child-exited") {
+                    failure.clone()
+                } else if tool_results(request) == 0 {
+                    Reply::Tool(
+                        "delegate",
+                        json!({"role": "explorer", "brief": "inner task", "wait": false}),
+                    )
+                } else {
+                    Reply::Text("outer verified answer")
+                }
+            });
+            let host = host(&bench, provider.clone());
+            spawn(&host, "outer", "outer task").await;
+            let state = state_of(&bench.agents, "outer").await;
+            let payload =
+                super::state_payload(harness_orchestrator::AgentRole::Explorer, "outer", &state);
+            assert_eq!(payload["status"], "failed", "{payload}");
+            assert_eq!(payload["partial"], true, "{payload}");
+            assert_eq!(payload["partial_answer"], "outer verified answer");
+            let text = payload["text"].as_str().expect("model-visible text");
+            assert!(text.starts_with("[child-failed child:outer]"), "{text}");
+            assert!(
+                text.contains("Last verified answer (partial): outer verified answer"),
+                "{text}"
+            );
+            assert!(
+                payload["error"]
+                    .as_str()
+                    .is_some_and(|error| !error.is_empty())
+            );
+            assert_eq!(payload["tool_calls"], 1);
+            for _ in 0..2 {
+                let collected = host
+                    .rlm_requests()
+                    .handle(&json!({
+                        "type": "rlm.collect", "targets": ["outer"], "timeout_ms": 0
+                    }))
+                    .await
+                    .expect("known")
+                    .expect("collect");
+                let result = &collected["results"][0];
+                assert_eq!(result["status"], "error");
+                assert_eq!(result["settled"], true);
+                assert_eq!(result["partial"], true);
+                assert_eq!(result["answer_preview"], "outer verified answer");
+                assert_eq!(result["error"], payload["error"]);
+            }
+            let listed = host
+                .rlm_requests()
+                .handle(&json!({"type": "rlm.list_subagents"}))
+                .await
+                .expect("known")
+                .expect("list");
+            let outer = listed["subagents"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .find(|row| row["session_name"] == "outer")
+                .expect("outer");
+            assert_eq!(outer["status"], "error");
+            assert_eq!(outer["partial"], true);
+            assert_eq!(outer["answer_preview"], "outer verified answer");
+            match next_child_event(&mut bench.events).await {
+                SessionEvent::ChildSettled { notice, .. } => {
+                    assert!(notice.starts_with("[child-failed child:outer]"), "{notice}");
+                    assert!(
+                        notice.contains("Last verified answer (partial): outer verified answer"),
+                        "{notice}"
+                    );
+                    assert!(!notice.contains("partial): cut off"), "{notice}");
+                }
+                other => panic!("expected failure notice: {other:?}"),
+            }
+            assert!(
+                provider.requests_of("outer task").len() <= 5,
+                "retries are bounded"
+            );
+        }
     }
 
     /// `RLM_MAX_DEPTH` 0 stops the root from spawning, with prime-agent's error;
