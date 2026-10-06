@@ -1410,6 +1410,7 @@ dependencies = [
 name = "harness-tools"
 version = "0.2.1"
 dependencies = [
+ "fancy-regex 0.16.2",
  "globset",
  "harness-providers",
  "harness-runtime",

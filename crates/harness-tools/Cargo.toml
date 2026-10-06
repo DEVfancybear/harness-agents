@@ -12,6 +12,9 @@ harness-runtime = { path = "../harness-runtime" }
 harness-session = { path = "../harness-session" }
 harness-store-sqlite = { path = "../harness-store-sqlite" }
 harness-types = { path = "../harness-types" }
+# prime-agent's destructive-git guard is written with look-ahead patterns;
+# this version is already in Cargo.lock.
+fancy-regex = "=0.16.2"
 globset.workspace = true
 ignore.workspace = true
 process-wrap.workspace = true

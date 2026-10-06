@@ -10,6 +10,7 @@ mod capture;
 mod contracts;
 mod edit_diff;
 mod execution;
+mod git_guard;
 mod hooks;
 mod loop_service;
 mod policy;

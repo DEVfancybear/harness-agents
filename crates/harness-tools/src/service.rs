@@ -1622,6 +1622,17 @@ impl ToolExecutionService {
                 isolation,
                 ..
             } => {
+                // prime-agent's dirty-tree guard: a git discard that would
+                // throw away uncommitted work is refused before it runs.
+                if let Some(reason) =
+                    crate::git_guard::refusal(root, command, cancellation.clone(), &self.spool)
+                        .await
+                {
+                    return Ok(Dispatched::plain(ToolOutput::Denied {
+                        code: ErrorCode::PolicyDenied.as_str().to_owned(),
+                        reason,
+                    }));
+                }
                 let lease = self
                     .begin_backend_lease(prepared, action, *timeout_ms, *isolation, execution_id)
                     .await?;
