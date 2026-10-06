@@ -1932,6 +1932,28 @@ struct ChannelObserver {
     tool_started: Mutex<Vec<(String, String, Instant)>>,
 }
 
+impl ChannelObserver {
+    /// One model call's usage: the session's cost and cache share, and how full
+    /// the context is now. Returns the cost event; the others are sent here.
+    fn record_usage(&self, usage: CostUsage) -> SessionEvent {
+        let (label, cache) = if let Ok(mut tracker) = self.cost_tracker.lock() {
+            tracker.record(self.model_price, usage);
+            (tracker.display(), tracker.cache_label())
+        } else {
+            ("n/a".to_owned(), None)
+        };
+        if let Some(label) = cache {
+            let _ = self.sender.send(SessionEvent::CacheUpdated { label });
+        }
+        let tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+        let _ = self.sender.send(SessionEvent::UsageUpdated {
+            label: usage_label(tokens, self.context_window, &self.provider_id),
+            tokens,
+        });
+        SessionEvent::CostUpdated { label }
+    }
+}
+
 impl TurnObserver for ChannelObserver {
     fn observe(&self, progress: TurnProgress) {
         let event = match progress {
@@ -1955,34 +1977,12 @@ impl TurnObserver for ChannelObserver {
                 completion_tokens,
                 cache_read_tokens,
                 cache_write_tokens,
-            } => {
-                let (label, cache) = if let Ok(mut tracker) = self.cost_tracker.lock() {
-                    tracker.record(
-                        self.model_price,
-                        CostUsage {
-                            input_tokens: prompt_tokens,
-                            output_tokens: completion_tokens,
-                            cache_read_tokens,
-                            cache_write_tokens,
-                        },
-                    );
-                    (tracker.display(), tracker.cache_label())
-                } else {
-                    ("n/a".to_owned(), None)
-                };
-                if let Some(label) = cache {
-                    let _ = self.sender.send(SessionEvent::CacheUpdated { label });
-                }
-                let _ = self.sender.send(SessionEvent::UsageUpdated {
-                    label: usage_label(
-                        prompt_tokens.saturating_add(completion_tokens),
-                        self.context_window,
-                        &self.provider_id,
-                    ),
-                    tokens: prompt_tokens.saturating_add(completion_tokens),
-                });
-                Some(SessionEvent::CostUpdated { label })
-            }
+            } => Some(self.record_usage(CostUsage {
+                input_tokens: prompt_tokens,
+                output_tokens: completion_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            })),
             // Step boundaries are what the status bar counts (`step 2/8`).
             TurnProgress::StepStarted { step } => Some(SessionEvent::StepStarted { step }),
             TurnProgress::ToolStarted {

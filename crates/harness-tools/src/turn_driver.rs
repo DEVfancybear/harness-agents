@@ -2416,7 +2416,7 @@ fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
                 observer.observe(now);
             }
         }
-        _ => {}
+        ProviderStreamEvent::ThinkingSignature { .. } => {}
     })
 }
 

@@ -1228,7 +1228,7 @@ pub fn chat_completions_endpoint(endpoint: &str) -> String {
 }
 
 /// Whether `HA_CACHE_RETENTION=long` asks providers to keep the prompt cache
-/// longer: an hour on Anthropic, a day on OpenAI's Responses API.
+/// longer: an hour on Anthropic, a day on `OpenAI`'s Responses API.
 #[must_use]
 pub fn cache_retention_long() -> bool {
     std::env::var("HA_CACHE_RETENTION").is_ok_and(|value| value.trim() == "long")
@@ -1258,7 +1258,7 @@ pub struct OpenAiChatOptions {
     pub thinking: Option<Thinking>,
     /// Extra headers, such as `OpenCode`'s session header.
     pub headers: Vec<(String, String)>,
-    /// OpenAI's `prompt_cache_key`: requests with the same key are routed to the
+    /// `OpenAI`'s `prompt_cache_key`: requests with the same key are routed to the
     /// same cache, so a conversation keeps hitting its own prefix. Sent only to
     /// endpoints that take it.
     pub prompt_cache_key: Option<String>,
@@ -2136,7 +2136,7 @@ mod sse_limit_tests {
         assert_eq!(error.code(), ErrorCode::OutputLimitExceeded);
     }
 
-    /// DeepSeek reports its cache in its own fields: a hit must reach the cost and
+    /// `DeepSeek` reports its cache in its own fields: a hit must reach the cost and
     /// the cache rate, not read as a full-price prompt.
     #[test]
     fn deepseek_cache_hits_are_read_from_its_own_usage_fields() {

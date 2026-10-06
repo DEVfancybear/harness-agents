@@ -688,7 +688,7 @@ mod tests {
         .expect("adapter")
     }
 
-    /// The conversation's id keys its cache route; OpenAI reads at most 64
+    /// The conversation's id keys its cache route; `OpenAI` reads at most 64
     /// characters of it.
     #[test]
     fn the_prompt_cache_key_is_the_session_and_at_most_64_characters() {
