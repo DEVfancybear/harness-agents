@@ -2846,6 +2846,9 @@ impl InteractiveController {
             SessionEvent::ConversationRead { .. } | SessionEvent::HtmlExported { .. } => {}
             SessionEvent::TreeRead { turns, leaf } => {
                 self.tree_turns.clone_from(&turns);
+                // `/tree <number>` and `/tree label <number>` count the turns
+                // on the path to the leaf, as the numbered list showed them.
+                self.turn_points = tree_path(&turns, leaf.as_deref());
                 self.open_tree(&turns, leaf.as_deref(), effects);
             }
         }
@@ -5605,6 +5608,24 @@ const PERMISSION_MODES: [(&str, &str); 3] = [
         "nothing asks: every tool runs unasked; deny rules still apply",
     ),
 ];
+
+/// The turns from the conversation's root to `leaf`, each with its message.
+fn tree_path(turns: &[super::events::TreeTurn], leaf: Option<&str>) -> Vec<(String, String)> {
+    let mut path = Vec::new();
+    let mut current = leaf.map(str::to_owned);
+    while let Some(session) = current.take() {
+        let Some(turn) = turns.iter().find(|turn| turn.session == session) else {
+            break;
+        };
+        if path.len() > turns.len() {
+            break;
+        }
+        path.push((turn.session.clone(), turn.question.clone()));
+        current.clone_from(&turn.parent);
+    }
+    path.reverse();
+    path
+}
 
 #[cfg(test)]
 mod tests {
