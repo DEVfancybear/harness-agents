@@ -285,7 +285,10 @@ pub fn hotkey_lines() -> Vec<String> {
         ("Ctrl-K / Ctrl-Y", "cut to line end / paste what was cut"),
         ("Alt-D / Alt-Backspace", "erase the next / previous word"),
         ("Ctrl/Alt-Left/Right", "move by word (also Alt-B / Alt-F)"),
-        ("Ctrl-Z / Ctrl-Shift-Z", "undo / redo in the prompt (also Ctrl--)"),
+        (
+            "Ctrl-Z / Ctrl-Shift-Z",
+            "undo / redo in the prompt (also Ctrl--)",
+        ),
         ("Ctrl-T", "swap the characters around the cursor"),
         ("Ctrl-D", "delete forward; on an empty prompt, quit"),
         ("Ctrl-V", "paste an image or path from the clipboard"),

@@ -41,8 +41,28 @@ pub enum Block {
 pub fn render(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut fence: Option<Fence> = None;
-    for raw in text.split('\n') {
-        let trimmed = raw.trim_end_matches('\r');
+    let source = text.split('\n').collect::<Vec<_>>();
+    let mut index = 0;
+    while index < source.len() {
+        let trimmed = source[index].trim_end_matches('\r');
+        index += 1;
+        // prime-agent's GFM tables, outside code blocks.
+        if fence.is_none()
+            && super::markdown_table::is_table_start(
+                trimmed,
+                source.get(index).map(|next| next.trim_end_matches('\r')),
+            )
+        {
+            index -= 1;
+            let table = super::markdown_table::parse(&source, &mut index);
+            lines.extend(super::markdown_table::render(
+                &table,
+                width,
+                theme,
+                &|cell| inline_spans(cell, theme),
+            ));
+            continue;
+        }
         if let Some(label) = trimmed.trim_start().strip_prefix("```") {
             // The fence is a border, not content: prime-agent draws no fence rows.
             match fence.take() {
@@ -223,6 +243,47 @@ fn inline_spans(line: &str, theme: &Theme) -> Vec<Span<'static>> {
                 pending.push(('*', inline_style(false, strong, theme)));
                 pending.push(('*', inline_style(false, strong, theme)));
             }
+            continue;
+        }
+        // prime-agent's links: `[text](url)` shows the text underlined with
+        // the URL after it, and a bare URL is underlined, so both can be
+        // read and copied.
+        if character == '['
+            && !at_code
+            && let Some(close) = rest.find("](")
+            && let Some(end) = rest[close + 2..].find(')')
+        {
+            let label = &rest[..close];
+            let url = &rest[close + 2..close + 2 + end];
+            if !label.is_empty() && !url.is_empty() && !url.contains(char::is_whitespace) {
+                let link = inline_style(false, strong, theme).add_modifier(Modifier::UNDERLINED);
+                pending.extend(label.chars().map(|character| (character, link)));
+                if label != url {
+                    let dim = theme.md_quote;
+                    pending.extend(
+                        format!(" ({url})")
+                            .chars()
+                            .map(|character| (character, dim)),
+                    );
+                }
+                rest = &rest[close + 2 + end + 1..];
+                continue;
+            }
+        }
+        if !at_code
+            && (character == 'h')
+            && (rest.starts_with("ttps://") || rest.starts_with("ttp://"))
+        {
+            let length = rest
+                .find(|character: char| {
+                    character.is_whitespace() || matches!(character, ')' | '>' | '"' | '\'')
+                })
+                .unwrap_or(rest.len());
+            let url = format!("h{}", rest[..length].trim_end_matches(['.', ',', ';', ':']));
+            let used = url.len() - 1;
+            let link = inline_style(false, strong, theme).add_modifier(Modifier::UNDERLINED);
+            pending.extend(url.chars().map(|character| (character, link)));
+            rest = &rest[used..];
             continue;
         }
         pending.push((character, inline_style(at_code, strong, theme)));

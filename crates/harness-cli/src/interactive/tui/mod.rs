@@ -19,6 +19,7 @@ pub mod history;
 pub mod icons;
 pub mod layout;
 pub mod markdown;
+mod markdown_table;
 #[cfg(test)]
 mod preview;
 pub mod theme;
