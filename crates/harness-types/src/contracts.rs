@@ -744,6 +744,30 @@ pub struct McpServerConfigV2 {
     pub url: Option<String>,
     #[serde(default)]
     pub bearer_token_env: Option<String>,
+    /// prime-agent's `enabled`: `false` keeps the server configured but does
+    /// not start it. Omitted means enabled.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// prime-agent's `headers`, for a Streamable HTTP server: static values
+    /// that are not secrets. A secret header is named in `header_env`.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Headers whose values come from environment variables (header name to
+    /// variable name), so a secret is never written in configuration.
+    #[serde(default)]
+    pub header_env: BTreeMap<String, String>,
+    /// prime-agent's `startupTimeoutMs`, in seconds: how long the server may
+    /// take to start and answer the handshake.
+    #[serde(default)]
+    pub startup_timeout_seconds: Option<u64>,
+}
+
+impl McpServerConfigV2 {
+    /// Whether the server is started.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
 }
 
 impl McpServerConfigV2 {
@@ -754,6 +778,8 @@ impl McpServerConfigV2 {
                 self.command.as_deref().is_none_or(str::is_empty)
                     || self.url.is_some()
                     || self.bearer_token_env.is_some()
+                    || !self.headers.is_empty()
+                    || !self.header_env.is_empty()
                     || self.args.len() > 64
                     || self.args.iter().any(|value| value.len() > 4096)
                     || self.env.iter().any(|(key, value)| {
@@ -784,6 +810,20 @@ impl McpServerConfigV2 {
                                 .chars()
                                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
                     })
+                    || self.headers.len() + self.header_env.len() > 32
+                    || self.headers.iter().any(|(header, value)| {
+                        !is_header_name(header)
+                            || value.len() > 4096
+                            || value.chars().any(char::is_control)
+                            || is_secret_header(header)
+                    })
+                    || self.header_env.iter().any(|(header, variable)| {
+                        !is_header_name(header)
+                            || variable.is_empty()
+                            || !variable
+                                .chars()
+                                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                    })
             }
             _ => true,
         };
@@ -796,6 +836,9 @@ impl McpServerConfigV2 {
             || self
                 .tool_timeout_seconds
                 .is_some_and(|seconds| seconds == 0 || seconds > 120)
+            || self
+                .startup_timeout_seconds
+                .is_some_and(|seconds| seconds == 0 || seconds > 600)
             || self.enabled_tools.len() > 256
             || self.disabled_tools.len() > 256
             || self
@@ -813,6 +856,24 @@ impl McpServerConfigV2 {
         }
         Ok(())
     }
+}
+
+fn is_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+/// A header that carries a credential: its value must come from the
+/// environment (`header_env`), never from configuration.
+fn is_secret_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "authorization"
+        || ["key", "token", "secret", "password", "auth", "cookie"]
+            .iter()
+            .any(|needle| name.contains(needle))
 }
 
 fn is_secret_env_name(name: &str) -> bool {

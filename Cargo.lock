@@ -1293,6 +1293,7 @@ dependencies = [
  "harness-session",
  "harness-tools",
  "harness-types",
+ "http",
  "process-wrap",
  "rmcp",
  "schemars",

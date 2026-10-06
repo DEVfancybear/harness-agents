@@ -12,6 +12,8 @@ harness-providers = { path = "../harness-providers" }
 harness-session = { path = "../harness-session" }
 harness-tools = { path = "../harness-tools" }
 harness-types = { path = "../harness-types" }
+# The header types rmcp's HTTP transport takes; this version is in Cargo.lock.
+http = "=1.5.0"
 process-wrap.workspace = true
 schemars.workspace = true
 rmcp = { version = "=3.4.0", default-features = false, features = ["client", "server", "macros", "schemars", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest"] }

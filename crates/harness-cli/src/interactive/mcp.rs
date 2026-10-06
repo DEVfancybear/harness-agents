@@ -99,12 +99,25 @@ impl ActiveMcp {
     ) -> Result<Self, HarnessError> {
         let runtime = Arc::new(McpRuntime::new());
         let mut report = Vec::new();
+        // prime-agent's `enabled: false`: configured, not started.
+        let configs = configs
+            .into_iter()
+            .filter(|(_, config)| config.is_enabled())
+            .collect::<BTreeMap<_, _>>();
         for (name, config) in &configs {
             if let Err(error) = config.validate(name) {
                 return Err(HarnessError::new(error.code(), error.to_string()));
             }
             let scope = ScopeId::generate();
-            let client = connect_one(name, config, workspace, scope, callback_factory(name)).await;
+            let connecting = connect_one(name, config, workspace, scope, callback_factory(name));
+            let client = match config.startup_timeout_seconds {
+                Some(seconds) => {
+                    harness_extensions::mcp::MCP_STARTUP_TIMEOUT_MS
+                        .scope(seconds.saturating_mul(1000), connecting)
+                        .await
+                }
+                None => connecting.await,
+            };
             match client {
                 Ok(client) => {
                     runtime
@@ -856,9 +869,24 @@ async fn connect_one(
                     })
                 })
                 .transpose()?;
-            McpClient::connect_streamable_http_with_callbacks(
+            let mut headers = config
+                .headers
+                .iter()
+                .map(|(header, value)| (header.clone(), value.clone()))
+                .collect::<Vec<_>>();
+            for (header, variable) in &config.header_env {
+                let value = std::env::var(variable).map_err(|_| {
+                    harness_extensions::ExtensionError::new(
+                        ErrorCode::PolicyDenied,
+                        format!("MCP {name} requires the header environment variable {variable}"),
+                    )
+                })?;
+                headers.push((header.clone(), value));
+            }
+            McpClient::connect_streamable_http_with_headers(
                 config.url.as_deref().unwrap_or_default(),
                 token.as_deref(),
+                &headers,
                 Some(callbacks),
                 scope,
                 generation,

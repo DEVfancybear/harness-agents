@@ -113,6 +113,7 @@ pub fn run(command: McpCommand) -> Result<(), HarnessError> {
                 required,
                 url,
                 bearer_token_env,
+                ..McpServerConfigV2::default()
             };
             config.validate(&name)?;
             mutate_server(&name, config, project, false)?;

@@ -80,6 +80,18 @@ pub const MCP_MAX_RESOURCE_TEMPLATES: usize = 256;
 /// Deadline for one discovery page walk.
 pub const MCP_DISCOVERY_TIMEOUT_MS: u64 = 10_000;
 
+tokio::task_local! {
+    /// A server's own startup bound (prime-agent's `startupTimeoutMs`) for the
+    /// handshake made inside it, in place of [`MCP_DISCOVERY_TIMEOUT_MS`].
+    pub static MCP_STARTUP_TIMEOUT_MS: u64;
+}
+
+fn handshake_timeout_ms() -> u64 {
+    MCP_STARTUP_TIMEOUT_MS
+        .try_with(|ms| *ms)
+        .unwrap_or(MCP_DISCOVERY_TIMEOUT_MS)
+}
+
 /// Deadline for one resource read.
 pub const MCP_READ_TIMEOUT_MS: u64 = 10_000;
 
@@ -606,15 +618,16 @@ impl McpClient {
                 format!("cannot start the MCP server: {error}"),
             )
         })?;
+        let handshake_ms = handshake_timeout_ms();
         let running = timeout(
-            Duration::from_millis(MCP_DISCOVERY_TIMEOUT_MS),
+            Duration::from_millis(handshake_ms),
             McpClientHandler::new(callbacks).serve(transport),
         )
         .await
         .map_err(|_| {
             ExtensionError::new(
                 ErrorCode::ProcessTimedOut,
-                format!("MCP handshake exceeded {MCP_DISCOVERY_TIMEOUT_MS}ms"),
+                format!("MCP handshake exceeded {handshake_ms}ms"),
             )
         })?
         .map_err(|error| {
@@ -641,6 +654,27 @@ impl McpClient {
     pub async fn connect_streamable_http_with_callbacks(
         url: &str,
         bearer_token: Option<&str>,
+        callbacks: Option<Arc<dyn McpRequestCallbacks>>,
+        scope_id: ScopeId,
+        generation: u64,
+    ) -> Result<Self, ExtensionError> {
+        Self::connect_streamable_http_with_headers(
+            url,
+            bearer_token,
+            &[],
+            callbacks,
+            scope_id,
+            generation,
+        )
+        .await
+    }
+
+    /// [`Self::connect_streamable_http_with_callbacks`] with extra request
+    /// headers (prime-agent's MCP `headers`).
+    pub async fn connect_streamable_http_with_headers(
+        url: &str,
+        bearer_token: Option<&str>,
+        headers: &[(String, String)],
         callbacks: Option<Arc<dyn McpRequestCallbacks>>,
         scope_id: ScopeId,
         generation: u64,
@@ -677,16 +711,36 @@ impl McpClient {
         if let Some(token) = bearer_token.filter(|token| !token.is_empty()) {
             config = config.auth_header(token.to_owned());
         }
+        let mut custom = std::collections::HashMap::new();
+        for (name, value) in headers {
+            let name = http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                ExtensionError::new(
+                    ErrorCode::InvalidPayload,
+                    format!("MCP header {name} is invalid"),
+                )
+            })?;
+            let value = http::HeaderValue::from_str(value).map_err(|_| {
+                ExtensionError::new(
+                    ErrorCode::InvalidPayload,
+                    format!("MCP header {name} has an invalid value"),
+                )
+            })?;
+            custom.insert(name, value);
+        }
+        if !custom.is_empty() {
+            config = config.custom_headers(custom);
+        }
         let transport = StreamableHttpClientTransport::from_config(config);
+        let handshake_ms = handshake_timeout_ms();
         let running = timeout(
-            Duration::from_millis(MCP_DISCOVERY_TIMEOUT_MS),
+            Duration::from_millis(handshake_ms),
             McpClientHandler::new(callbacks).serve(transport),
         )
         .await
         .map_err(|_| {
             ExtensionError::new(
                 ErrorCode::ProcessTimedOut,
-                format!("MCP HTTP handshake exceeded {MCP_DISCOVERY_TIMEOUT_MS}ms"),
+                format!("MCP HTTP handshake exceeded {handshake_ms}ms"),
             )
         })?
         .map_err(|error| {
