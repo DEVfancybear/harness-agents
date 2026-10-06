@@ -126,7 +126,25 @@ pub struct LineEditor {
     /// The buffer is a secret: it is masked in every rendered form and never
     /// becomes history. Set only by an explicit in-app request.
     secret: bool,
+    /// prime-agent's undo and redo stacks: the buffer and cursor before each
+    /// edit. Typing a word is one step, as fish and prime coalesce it.
+    undo: Vec<(String, usize)>,
+    redo: Vec<(String, usize)>,
+    /// The kind of the last edit, for that coalescing.
+    typing: bool,
+    /// prime-agent's kill ring: what Ctrl+K, Ctrl+U and Ctrl+W removed.
+    kill_ring: Vec<String>,
+    /// Large pastes shown as `[paste #N +L lines]` markers, by marker.
+    pastes: Vec<(String, String)>,
+    paste_count: usize,
 }
+
+/// prime-agent's large-paste threshold: more than 10 lines or 1000 characters
+/// becomes one marker in the prompt, expanded when the prompt is sent.
+const LARGE_PASTE_LINES: usize = 10;
+const LARGE_PASTE_CHARS: usize = 1000;
+/// prime-agent's `MAX_HISTORY`-sized bound on undo steps.
+const MAX_UNDO: usize = 100;
 
 /// The character a secret buffer is rendered with.
 pub const SECRET_MASK: char = '•';
@@ -410,6 +428,94 @@ impl LineEditor {
     #[allow(clippy::too_many_lines, reason = "one arm per key, in key order")]
     #[must_use]
     pub fn handle(&mut self, key: Key) -> InputOutcome {
+        // An edit records the state before it, for undo; a word being typed
+        // is one step. Any other key ends the word.
+        match &key {
+            Key::Char(character) if !character.is_control() => {
+                self.checkpoint(!character.is_whitespace());
+            }
+            Key::Newline
+            | Key::Paste(_)
+            | Key::Backspace
+            | Key::Delete
+            | Key::EraseToLineStart
+            | Key::EraseWord
+            | Key::KillToLineEnd
+            | Key::Yank
+            | Key::EraseWordForward
+            | Key::Transpose => self.checkpoint(false),
+            Key::Undo | Key::Redo => {}
+            _ => self.typing = false,
+        }
+        match key {
+            Key::Undo => return self.step_history(true),
+            Key::Redo => return self.step_history(false),
+            Key::WordLeft => {
+                let target = self.word_start();
+                if target == self.cursor {
+                    return InputOutcome::Unchanged;
+                }
+                self.cursor = target;
+                self.refresh_suggestion();
+                return InputOutcome::Redraw;
+            }
+            Key::WordRight => {
+                let target = self.word_end();
+                if target == self.cursor {
+                    return InputOutcome::Unchanged;
+                }
+                self.cursor = target;
+                self.refresh_suggestion();
+                return InputOutcome::Redraw;
+            }
+            Key::KillToLineEnd => {
+                let mut end = self.line_end();
+                // At the end of a line, Ctrl+K joins the next one.
+                if end == self.cursor && end < self.char_len() {
+                    end += 1;
+                }
+                if end == self.cursor {
+                    return InputOutcome::Unchanged;
+                }
+                self.kill(self.cursor, end);
+                return InputOutcome::Redraw;
+            }
+            Key::Yank => {
+                let Some(text) = self.kill_ring.last().cloned() else {
+                    return InputOutcome::Unchanged;
+                };
+                self.insert(&text);
+                self.refresh_suggestion();
+                return InputOutcome::Redraw;
+            }
+            Key::EraseWordForward => {
+                let end = self.word_end();
+                if end == self.cursor {
+                    return InputOutcome::Unchanged;
+                }
+                self.kill(self.cursor, end);
+                return InputOutcome::Redraw;
+            }
+            Key::Transpose => {
+                let length = self.char_len();
+                if length < 2 || self.cursor == 0 {
+                    return InputOutcome::Unchanged;
+                }
+                // At the end the last two characters swap, as readline does.
+                let at = if self.cursor >= length {
+                    length - 1
+                } else {
+                    self.cursor
+                };
+                let mut characters = self.buffer.chars().collect::<Vec<_>>();
+                characters.swap(at - 1, at);
+                self.buffer = characters.into_iter().collect();
+                self.cursor = (at + 1).min(length);
+                self.refresh_suggestion();
+                return InputOutcome::Redraw;
+            }
+            _ => {}
+        }
         match key {
             Key::Char(character) if !character.is_control() => {
                 self.insert(&character.to_string());
@@ -427,13 +533,45 @@ impl LineEditor {
                 InputOutcome::Redraw
             }
             Key::Paste(text) => {
-                self.insert(&normalize_paste(&text));
+                let text = normalize_paste(&text);
+                let lines = text.split('\n').count();
+                let characters = text.chars().count();
+                if !self.secret && (lines > LARGE_PASTE_LINES || characters > LARGE_PASTE_CHARS) {
+                    // prime-agent's large-paste marker: the prompt stays
+                    // readable, and the text goes out with the prompt.
+                    self.paste_count += 1;
+                    let marker = if lines > LARGE_PASTE_LINES {
+                        format!("[paste #{} +{lines} lines]", self.paste_count)
+                    } else {
+                        format!("[paste #{} {characters} chars]", self.paste_count)
+                    };
+                    self.pastes.push((marker.clone(), text));
+                    self.insert(&marker);
+                } else {
+                    self.insert(&text);
+                }
                 self.refresh_suggestion();
                 InputOutcome::Redraw
             }
             Key::Backspace => {
                 if self.cursor == 0 {
                     return InputOutcome::Unchanged;
+                }
+                // A paste marker is one unit: it goes whole, with its text.
+                let before = &self.buffer[..self.byte_offset(self.cursor)];
+                if let Some(marker) = self
+                    .pastes
+                    .iter()
+                    .map(|(marker, _)| marker.clone())
+                    .find(|marker| before.ends_with(marker.as_str()))
+                {
+                    let start = self.cursor - marker.chars().count();
+                    let (from, to) = (self.byte_offset(start), self.byte_offset(self.cursor));
+                    self.buffer.replace_range(from..to, "");
+                    self.cursor = start;
+                    self.pastes.retain(|(known, _)| *known != marker);
+                    self.refresh_suggestion();
+                    return InputOutcome::Redraw;
                 }
                 self.remove_before();
                 self.refresh_suggestion();
@@ -492,10 +630,7 @@ impl LineEditor {
                 if start == self.cursor {
                     return InputOutcome::Unchanged;
                 }
-                let (from, to) = (self.byte_offset(start), self.byte_offset(self.cursor));
-                self.buffer.replace_range(from..to, "");
-                self.cursor = start;
-                self.refresh_suggestion();
+                self.kill(start, self.cursor);
                 InputOutcome::Redraw
             }
             Key::EraseWord => {
@@ -506,10 +641,7 @@ impl LineEditor {
                 if target == self.cursor {
                     return InputOutcome::Unchanged;
                 }
-                let (from, to) = (self.byte_offset(target), self.byte_offset(self.cursor));
-                self.buffer.replace_range(from..to, "");
-                self.cursor = target;
-                self.refresh_suggestion();
+                self.kill(target, self.cursor);
                 InputOutcome::Redraw
             }
             Key::Tab => {
@@ -569,10 +701,24 @@ impl LineEditor {
             Key::EndOfInput => {
                 if self.buffer.is_empty() {
                     InputOutcome::Exit
+                } else if self.cursor < self.char_len() {
+                    // prime-agent's Ctrl+D: delete forward while there is text.
+                    self.checkpoint(false);
+                    self.remove_at();
+                    self.refresh_suggestion();
+                    InputOutcome::Redraw
                 } else {
                     InputOutcome::Unchanged
                 }
             }
+            Key::WordLeft
+            | Key::WordRight
+            | Key::KillToLineEnd
+            | Key::Yank
+            | Key::EraseWordForward
+            | Key::Undo
+            | Key::Redo
+            | Key::Transpose => InputOutcome::Unchanged,
             // Control characters are not typed text; Resize and the repaint key
             // only need the redraw the host already performs on its own.
             Key::Char(_)
@@ -601,10 +747,16 @@ impl LineEditor {
         if self.secret {
             return InputOutcome::Secret(self.take_secret());
         }
-        let submitted = std::mem::take(&mut self.buffer);
+        let mut submitted = std::mem::take(&mut self.buffer);
         if self.history.last() != Some(&submitted) {
             self.history.push(submitted.clone());
         }
+        // The paste markers go out as the text they stand for.
+        for (marker, text) in std::mem::take(&mut self.pastes) {
+            submitted = submitted.replacen(&marker, &text, 1);
+        }
+        self.undo.clear();
+        self.redo.clear();
         self.cursor = 0;
         self.history_index = None;
         self.draft.clear();
@@ -713,6 +865,71 @@ impl LineEditor {
             .char_indices()
             .nth(cursor)
             .map_or(self.buffer.len(), |(index, _)| index)
+    }
+
+    /// Record the state before an edit. Typing within a word (`coalesce`)
+    /// adds to the step the word's first character opened.
+    fn checkpoint(&mut self, coalesce: bool) {
+        if coalesce && self.typing {
+            return;
+        }
+        self.undo.push((self.buffer.clone(), self.cursor));
+        if self.undo.len() > MAX_UNDO {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+        self.typing = coalesce;
+    }
+
+    /// Undo (`back`) or redo one step.
+    fn step_history(&mut self, back: bool) -> InputOutcome {
+        let (from, to) = if back {
+            (&mut self.undo, &mut self.redo)
+        } else {
+            (&mut self.redo, &mut self.undo)
+        };
+        let Some((buffer, cursor)) = from.pop() else {
+            return InputOutcome::Unchanged;
+        };
+        to.push((std::mem::replace(&mut self.buffer, buffer), self.cursor));
+        self.cursor = cursor.min(self.buffer.chars().count());
+        self.typing = false;
+        self.refresh_suggestion();
+        InputOutcome::Redraw
+    }
+
+    /// Remove the characters `start..end` into the kill ring.
+    fn kill(&mut self, start: usize, end: usize) {
+        let (from, to) = (self.byte_offset(start), self.byte_offset(end));
+        let killed = self.buffer[from..to].to_owned();
+        self.buffer.replace_range(from..to, "");
+        self.cursor = start;
+        self.kill_ring.push(killed);
+        if self.kill_ring.len() > 32 {
+            self.kill_ring.remove(0);
+        }
+        self.refresh_suggestion();
+    }
+
+    /// The cell after the word at or after the cursor (readline's
+    /// forward-word: skip spaces, then the word).
+    fn word_end(&self) -> usize {
+        let offset = self.byte_offset(self.cursor);
+        let mut characters = self.buffer[offset..].chars().peekable();
+        let mut index = self.cursor;
+        while characters
+            .next_if(|character| character.is_whitespace())
+            .is_some()
+        {
+            index += 1;
+        }
+        while characters
+            .next_if(|character| !character.is_whitespace())
+            .is_some()
+        {
+            index += 1;
+        }
+        index
     }
 
     fn insert(&mut self, text: &str) {

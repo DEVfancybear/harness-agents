@@ -289,6 +289,23 @@ fn map_key(key: KeyEvent) -> Key {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
         KeyCode::Char('c') if control => Key::Interrupt,
+        // prime-agent's editing keys (`keybindings/definitions.rs`).
+        KeyCode::Char('k') if control => Key::KillToLineEnd,
+        KeyCode::Char('y') if control => Key::Yank,
+        KeyCode::Char('t') if control => Key::Transpose,
+        KeyCode::Char('b') if control => Key::Left,
+        KeyCode::Char('f') if control => Key::Right,
+        KeyCode::Char('z' | 'Z') if control && key.modifiers.contains(KeyModifiers::SHIFT) => {
+            Key::Redo
+        }
+        KeyCode::Char('z' | '-' | '_') if control => Key::Undo,
+        KeyCode::Char('b') if alt => Key::WordLeft,
+        KeyCode::Char('f') if alt => Key::WordRight,
+        KeyCode::Char('d') if alt => Key::EraseWordForward,
+        KeyCode::Delete if alt => Key::EraseWordForward,
+        KeyCode::Backspace if alt || control => Key::EraseWord,
+        KeyCode::Left if alt || control => Key::WordLeft,
+        KeyCode::Right if alt || control => Key::WordRight,
         KeyCode::Char('d') if control => Key::EndOfInput,
         KeyCode::Char('a') if control => Key::LineStart,
         KeyCode::Char('e') if control => Key::LineEnd,

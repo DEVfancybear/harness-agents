@@ -85,6 +85,21 @@ mod wire_instant {
 #[allow(dead_code, reason = "T03 consumes the composer keys")]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Key {
+    /// prime-agent's word motion (Ctrl/Alt+Left/Right, Alt+B/F).
+    WordLeft,
+    WordRight,
+    /// Ctrl+K: delete to the end of the line, into the kill ring.
+    KillToLineEnd,
+    /// Ctrl+Y: insert the last killed text.
+    Yank,
+    /// Alt+D / Alt+Delete: delete the word after the cursor.
+    EraseWordForward,
+    /// Ctrl+- / Ctrl+Z: undo the last edit of the prompt.
+    Undo,
+    /// Ctrl+Shift+Z: redo what undo took back.
+    Redo,
+    /// Ctrl+T: swap the two characters around the cursor.
+    Transpose,
     Char(char),
     Backspace,
     Delete,
