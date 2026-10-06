@@ -327,7 +327,10 @@ fn map_key(key: KeyEvent) -> Key {
         KeyCode::Char('b') if alt => Key::WordLeft,
         KeyCode::Char('f') if alt => Key::WordRight,
         KeyCode::Char('d') | KeyCode::Delete if alt => Key::EraseWordForward,
-        KeyCode::Backspace if alt || control => Key::EraseWord,
+        // prime-agent's deleteWordBackward is Alt+Backspace (and Ctrl+W), not
+        // Ctrl+Backspace: ConPTY reports a plain Backspace as BS, which reads
+        // as Ctrl+Backspace, and must delete one character.
+        KeyCode::Backspace if alt => Key::EraseWord,
         KeyCode::Left if alt || control => Key::WordLeft,
         KeyCode::Right if alt || control => Key::WordRight,
         KeyCode::Char('d') if control => Key::EndOfInput,

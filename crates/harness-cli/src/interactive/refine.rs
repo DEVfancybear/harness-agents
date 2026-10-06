@@ -44,6 +44,7 @@ impl Cadence {
     /// Count a finished turn and the tool calls it made. When a review is due and
     /// none is running, it is claimed: the counts restart and the number of turns it
     /// covers is returned. [`Cadence::release`] ends the claim.
+    #[cfg(test)]
     pub fn turn_finished(&self, tool_calls: u32) -> Option<u32> {
         self.turn_finished_every(tool_calls, AUTO_REFINE_TURN_INTERVAL)
     }

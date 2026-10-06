@@ -2633,9 +2633,13 @@ fn q07_pty_btw_answers_in_a_panel() {
         .find(|(_, request)| request_text(request).contains("<side_question>"))
         .map(|(_, request)| request.clone())
         .expect("the side question reached the provider");
+    // prime-agent's side question declares the session's tools (and refuses
+    // every call), so the request reads like the session's own.
     assert!(
-        side["tools"].as_array().is_none_or(Vec::is_empty),
-        "a side question has no tools"
+        side["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "a side question declares the session's tools"
     );
     finish(session);
 }
@@ -2672,7 +2676,8 @@ fn q08_pty_fork_then_answer() {
     session.send("/fork\r");
     std::thread::sleep(Duration::from_millis(300));
     session.send("\r");
-    session.wait_for("<number>", Duration::from_secs(30));
+    // prime-agent's fork selector opens; Esc leaves it.
+    session.wait_for("fork từ tin nhắn", Duration::from_secs(30));
     session.send("\u{1b}");
     std::thread::sleep(Duration::from_millis(300));
     session.send("/fork 2\r");
@@ -3031,7 +3036,11 @@ fn m01_pty_import_continues_an_exported_conversation() {
     // The export is a turn of its own; /new waits for it to end.
     session.wait_for("session export written", Duration::from_secs(20));
     std::thread::sleep(Duration::from_millis(500));
+    // `/new [prompt]` takes an argument: the first Enter types `/new ` from
+    // the menu and the second runs it.
     session.send("/new\r");
+    std::thread::sleep(Duration::from_millis(300));
+    session.send("\r");
     session.wait_for("starting a fresh conversation", Duration::from_secs(20));
     session.send("/import saved.jsonl\r");
     session.wait_for("Session imported from", Duration::from_secs(20));
@@ -3472,11 +3481,12 @@ fn d04_pty_a_worker_that_dies_comes_back_with_its_agents() {
     run_cli_json(&temp, &project, &["shutdown", "--force", "--json"]);
 }
 
-/// D05: a conversation with a scheduled job is opened again when the project's
-/// worker starts, so the job fires with no terminal open.
+/// D05: prime-agent's no-auto-resume contract: a conversation with a
+/// scheduled job stays dormant when the project's worker starts again - the
+/// job fires only while its conversation runs.
 #[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
 #[test]
-fn d05_pty_a_scheduled_conversation_is_opened_when_the_worker_starts() {
+fn d05_pty_a_scheduled_conversation_stays_dormant_when_the_worker_starts() {
     let provider = ScriptedSse::start(|_| Reply::Text("answer-d05".to_owned()));
     let (temp, project) = sandbox();
     let env = provider_env(&temp, &provider.endpoint());
@@ -3496,17 +3506,22 @@ fn d05_pty_a_scheduled_conversation_is_opened_when_the_worker_starts() {
     // Every agent stops; the job stays with the conversation.
     run_cli_json(&temp, &project, &["shutdown", "--force", "--json"]);
     std::thread::sleep(Duration::from_secs(2));
-    // The next terminal starts the project's worker, which opens the
-    // conversation again beside the terminal's own agent.
+    // The next terminal starts the project's worker: only the terminal's own
+    // agent runs; the scheduled conversation is not reopened.
     let mut next = PtySession::spawn(&project, &env);
     next.keep_workers();
     next.wait_for("Harness Agents", Duration::from_secs(30));
-    let back = wait_for_agent(&temp, &project, Duration::from_mins(1), |agent| {
-        agent["conversation"] == conversation
-    });
+    let own = wait_for_agent(&temp, &project, Duration::from_mins(1), |_| true);
+    std::thread::sleep(Duration::from_secs(5));
+    let agents = listed_agents(&temp, &project);
     next.send("/quit\r");
     let _ = next.wait_exit(Duration::from_secs(20));
-    assert_eq!(back["scheduled"], true, "{back}");
+    assert!(
+        agents
+            .iter()
+            .all(|agent| agent["conversation"] != conversation),
+        "the scheduled conversation stayed dormant: {agents:?} (own: {own})"
+    );
     run_cli_json(&temp, &project, &["shutdown", "--force", "--json"]);
 }
 
