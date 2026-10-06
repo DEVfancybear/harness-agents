@@ -578,6 +578,43 @@ pub trait SessionPort: Send {
     fn side_question(&mut self, _question: &str) -> Result<(), String> {
         Err("side questions are not available here".to_owned())
     }
+    /// Read the conversation's messages; they arrive as
+    /// [`SessionEvent::ConversationRead`].
+    fn read_conversation(&mut self) -> Result<(), String> {
+        Err("this backend keeps no conversation".to_owned())
+    }
+    /// prime-agent's `exportToHtml`: write the conversation as a standalone
+    /// HTML page (`output` relative to the project, or the default name);
+    /// the outcome arrives as [`SessionEvent::HtmlExported`].
+    fn export_html(&mut self, _output: Option<String>) -> Result<(), String> {
+        Err("Cannot export an in-memory session".to_owned())
+    }
+    /// The session's input and output tokens and its cost in US dollars.
+    fn session_usage(&self) -> (u64, u64, f64) {
+        (0, 0, 0.0)
+    }
+    /// prime-agent's `setAutoCompactionEnabled`, kept as the `compaction.enabled`
+    /// setting.
+    fn set_auto_compaction(&mut self, _enabled: bool) -> Result<(), String> {
+        Err("this backend does not compact".to_owned())
+    }
+    /// Whether the context is compacted on its own when it fills.
+    fn auto_compaction(&self) -> bool {
+        true
+    }
+    /// prime-agent's `setAutoRetryEnabled`, kept as the `retry.enabled` setting.
+    fn set_auto_retry(&mut self, _enabled: bool) -> Result<(), String> {
+        Err("this backend does not retry".to_owned())
+    }
+    /// prime-agent's `setSteeringMode` / `setFollowUpMode`, kept as the
+    /// `steeringMode` / `followUpMode` settings.
+    fn set_queue_mode(
+        &mut self,
+        _steering: bool,
+        _mode: super::queue::QueueMode,
+    ) -> Result<(), String> {
+        Err("this backend keeps no queue".to_owned())
+    }
     /// Start a browser sign-in; returns the URL to open. The outcome arrives as
     /// [`SessionEvent::LoginFinished`].
     fn begin_sign_in(&mut self, _provider: &str) -> Result<String, String> {
@@ -1315,6 +1352,10 @@ pub struct LiveTurn {
     selection: Mutex<LiveSelection>,
     /// The session model a turn left for the backup model, until it answers again.
     left_primary: Arc<Mutex<Option<String>>>,
+    /// prime-agent's `compaction.enabled: false`: turns do not compact on their own.
+    auto_compaction_off: std::sync::atomic::AtomicBool,
+    /// prime-agent's `retry.enabled: false`: a failed model call is not retried.
+    auto_retry_off: std::sync::atomic::AtomicBool,
 }
 
 /// The model and the thinking level a running turn's next call uses.
@@ -1325,6 +1366,21 @@ struct LiveSelection {
 }
 
 impl LiveTurn {
+    /// The switches prime-agent keeps as settings: `compaction.enabled` and
+    /// `retry.enabled` (both on unless set to `false`).
+    fn from_settings(config_file: &Path) -> Self {
+        let off = |key: &str| {
+            super::config::load_setting(config_file, key)
+                .and_then(|value| value.get("enabled").and_then(serde_json::Value::as_bool))
+                == Some(false)
+        };
+        Self {
+            auto_compaction_off: std::sync::atomic::AtomicBool::new(off("compaction")),
+            auto_retry_off: std::sync::atomic::AtomicBool::new(off("retry")),
+            ..Self::default()
+        }
+    }
+
     /// A new turn starts from what it resolved.
     fn start(&self, level: harness_providers::ThinkingLevel) {
         if let Ok(mut current) = self.selection.lock() {
@@ -3120,7 +3176,7 @@ impl AgentSessionService {
             heartbeats,
             schedules,
             gate_cancellation: None,
-            live: Arc::new(LiveTurn::default()),
+            live: Arc::new(LiveTurn::from_settings(&context.paths.config_file)),
             auto_refine,
         }
     }
@@ -5272,19 +5328,153 @@ impl SessionPort for AgentSessionService {
     }
 
     fn queue_modes(&self) -> (super::queue::QueueMode, super::queue::QueueMode) {
-        let parse = |mode: Option<&String>| {
+        let parse = |mode: Option<&String>, setting: &str| {
             mode.and_then(|mode| super::queue::QueueMode::parse(mode))
+                .or_else(|| {
+                    // prime-agent's `steeringMode` / `followUpMode` settings.
+                    super::config::load_setting(&self.config_file, setting)
+                        .and_then(|value| value.as_str().and_then(super::queue::QueueMode::parse))
+                })
                 .unwrap_or_default()
         };
         self.configured().map_or_else(
             |_| Default::default(),
             |config| {
                 (
-                    parse(config.queue_modes.0.as_ref()),
-                    parse(config.queue_modes.1.as_ref()),
+                    parse(config.queue_modes.0.as_ref(), "steeringMode"),
+                    parse(config.queue_modes.1.as_ref(), "followUpMode"),
                 )
             },
         )
+    }
+
+    fn set_queue_mode(
+        &mut self,
+        steering: bool,
+        mode: super::queue::QueueMode,
+    ) -> Result<(), String> {
+        let value = match mode {
+            super::queue::QueueMode::All => "all",
+            super::queue::QueueMode::OneAtATime => "one-at-a-time",
+        };
+        super::config::save_setting(
+            &self.config_file,
+            if steering {
+                "steeringMode"
+            } else {
+                "followUpMode"
+            },
+            Some(serde_json::json!(value)),
+        )
+    }
+
+    fn set_auto_compaction(&mut self, enabled: bool) -> Result<(), String> {
+        save_nested_setting(&self.config_file, "compaction", "enabled", enabled)?;
+        self.live
+            .auto_compaction_off
+            .store(!enabled, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn auto_compaction(&self) -> bool {
+        !self
+            .live
+            .auto_compaction_off
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn set_auto_retry(&mut self, enabled: bool) -> Result<(), String> {
+        save_nested_setting(&self.config_file, "retry", "enabled", enabled)?;
+        self.live
+            .auto_retry_off
+            .store(!enabled, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn session_usage(&self) -> (u64, u64, f64) {
+        self.cost_tracker.lock().map_or((0, 0, 0.0), |tracker| {
+            let (input, output) = tracker.tokens();
+            (input, output, tracker.total_usd())
+        })
+    }
+
+    fn read_conversation(&mut self) -> Result<(), String> {
+        let source = self
+            .previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.clone());
+        let store_dir = self.store_dir.clone();
+        let sender = self.sender.clone();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            let messages = match source {
+                None => Vec::new(),
+                Some(source) => match SqliteStore::open_read_only(store_dir).await {
+                    Ok(store) => harness_runtime::conversation_history(&store, &source)
+                        .await
+                        .map(|history| prime_messages(&history.messages))
+                        .unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                },
+            };
+            let _ = sender.send(SessionEvent::ConversationRead { messages });
+        });
+        Ok(())
+    }
+
+    fn export_html(&mut self, output: Option<String>) -> Result<(), String> {
+        let source = self
+            .previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.clone())
+            .ok_or_else(|| "Cannot export an in-memory session".to_owned())?;
+        let config = self.configured()?;
+        let store_dir = self.store_dir.clone();
+        let data_dir = self.data_dir.clone();
+        let environment = self.environment.clone();
+        let task_id = self.task_id.clone();
+        let workspace_root = self.workspace_root.clone();
+        let sender = self.sender.clone();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            let result = async {
+                let store = SqliteStore::open_read_only(store_dir)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let html = render_session_html(
+                    &store,
+                    &task_id,
+                    Some(&source),
+                    &environment,
+                    &data_dir,
+                    &config.api_key_env,
+                    &config.model,
+                )
+                .await?;
+                // prime-agent: a relative path lands in the session's project,
+                // and the default is `<app>-session-<id>.html`.
+                let path = output.map_or_else(
+                    || workspace_root.join(format!("ha-session-{}.html", task_id.as_str())),
+                    |output| {
+                        let output = PathBuf::from(output);
+                        if output.is_absolute() {
+                            output
+                        } else {
+                            workspace_root.join(output)
+                        }
+                    },
+                );
+                std::fs::write(&path, html).map_err(|error| error.to_string())?;
+                Ok::<_, String>(path.display().to_string())
+            }
+            .await;
+            let _ = sender.send(SessionEvent::HtmlExported { result });
+        });
+        Ok(())
     }
 
     fn fullscreen_prefs(&self) -> super::tui::fullscreen::Prefs {
@@ -6207,12 +6397,16 @@ async fn run_turn(
         data_dir.clone(),
     )
     .map(|provider| {
-        let router = provider.router_for(
-            sender.clone(),
-            &environment,
-            thinking_level,
-            RuntimeConfig::default().max_attempts,
-        );
+        let max_attempts = if live
+            .auto_retry_off
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            1
+        } else {
+            RuntimeConfig::default().max_attempts
+        };
+        let router =
+            provider.router_for(sender.clone(), &environment, thinking_level, max_attempts);
         Arc::new(provider.with_router(router)) as Arc<dyn ModelProvider>
     });
     let provider = match provider {
@@ -6951,6 +7145,12 @@ async fn run_turn(
     });
     if let Some(imported) = imported {
         run_request = run_request.with_conversation(imported);
+    }
+    if live
+        .auto_compaction_off
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        run_request = run_request.without_auto_compaction();
     }
     // A fork's first turn carries the conversation up to its fork point, as a
     // continued turn carries the one before it.
@@ -7826,6 +8026,59 @@ fn export_secrets(
 }
 
 /// `/export session.html`: the conversation as one self-contained page.
+/// Set `key` inside the object setting `section` (`compaction.enabled`),
+/// keeping its other keys.
+fn save_nested_setting(
+    config_file: &Path,
+    section: &str,
+    key: &str,
+    value: bool,
+) -> Result<(), String> {
+    let mut object = super::config::load_setting(config_file, section)
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    object[key] = serde_json::json!(value);
+    super::config::save_setting(config_file, section, Some(object))
+}
+
+/// A conversation's messages in prime-agent's message shapes (`get_messages`):
+/// user and assistant text, the assistant's tool calls, and tool results.
+fn prime_messages(messages: &[harness_providers::ProviderMessage]) -> Vec<serde_json::Value> {
+    use harness_providers::MessageRole;
+    messages
+        .iter()
+        .filter_map(|message| match message.role {
+            MessageRole::System => None,
+            MessageRole::User => Some(serde_json::json!({
+                "role": "user",
+                "content": [{ "type": "text", "text": message.content }],
+            })),
+            MessageRole::Assistant => {
+                let mut content = Vec::new();
+                if !message.content.is_empty() {
+                    content.push(serde_json::json!({ "type": "text", "text": message.content }));
+                }
+                for call in &message.tool_calls {
+                    let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                        .unwrap_or_else(|_| serde_json::json!(call.arguments));
+                    content.push(serde_json::json!({
+                        "type": "toolCall",
+                        "id": call.call_id,
+                        "name": call.name,
+                        "arguments": arguments,
+                    }));
+                }
+                Some(serde_json::json!({ "role": "assistant", "content": content }))
+            }
+            MessageRole::Tool => Some(serde_json::json!({
+                "role": "toolResult",
+                "toolCallId": message.tool_call_id,
+                "content": [{ "type": "text", "text": message.content }],
+            })),
+        })
+        .collect()
+}
+
 async fn render_session_html(
     store: &SqliteStore,
     task_id: &TaskId,

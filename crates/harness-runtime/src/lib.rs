@@ -552,6 +552,15 @@ pub struct RunRequest {
 }
 
 impl RunRequest {
+    /// prime-agent's `setAutoCompactionEnabled(false)`: this input never
+    /// compacts the context on its own; a context over the window is the
+    /// turn's overflow.
+    #[must_use]
+    pub fn without_auto_compaction(self) -> Self {
+        self.auto_compaction_attempted.store(true, Ordering::SeqCst);
+        self
+    }
+
     #[must_use]
     pub fn new(
         session_id: SessionId,

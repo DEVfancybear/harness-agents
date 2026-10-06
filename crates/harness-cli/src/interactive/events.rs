@@ -717,6 +717,16 @@ pub enum TurnsPurpose {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionEvent {
+    /// The conversation's messages, in prime-agent's message shapes, as
+    /// [`super::service::SessionPort::read_conversation`] asked for them.
+    ConversationRead {
+        messages: Vec<serde_json::Value>,
+    },
+    /// The outcome of [`super::service::SessionPort::export_html`]: the
+    /// written path, or why nothing was written.
+    HtmlExported {
+        result: Result<String, String>,
+    },
     Accepted {
         input_id: InputId,
     },

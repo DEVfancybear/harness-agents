@@ -2493,6 +2493,8 @@ impl InteractiveController {
                 self.close_run_grant();
                 self.finish_pending_exit(effects);
             }
+            // The RPC mode's reads; the app asks for neither.
+            SessionEvent::ConversationRead { .. } | SessionEvent::HtmlExported { .. } => {}
         }
     }
 
