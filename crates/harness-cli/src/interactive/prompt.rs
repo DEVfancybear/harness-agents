@@ -115,6 +115,30 @@ impl SystemPromptBuilder {
     }
 }
 
+/// A whole system prompt the way prime-agent's `system_prompt_breakdown`
+/// assembles one: `--system-prompt` in place of the static layers when given,
+/// the dynamic tail, then each `--append-system-prompt` text.
+#[must_use]
+pub fn assemble(
+    custom: Option<&str>,
+    environment: &PromptEnvironment<'_>,
+    tools: &[&str],
+    appended: &[String],
+) -> String {
+    let mut sections = vec![match custom.filter(|custom| !custom.trim().is_empty()) {
+        Some(custom) => custom.to_owned(),
+        None => SystemPromptBuilder::build(environment, tools).text,
+    }];
+    sections.push(dynamic_tail(environment, None, 0));
+    sections.extend(
+        appended
+            .iter()
+            .filter(|text| !text.trim().is_empty())
+            .cloned(),
+    );
+    sections.join("\n\n")
+}
+
 /// prime-agent's dynamic tail, after the skills and MCP blocks: the kernel's
 /// packages, the environment, and the session's place in the agent tree.
 #[must_use]

@@ -245,6 +245,7 @@ pub async fn run(request: HeadlessRequest) -> Result<ExitCode, HarnessError> {
                 approval: request.options.approval.clone(),
                 allowed_tools: request.options.allowed_tools.clone(),
                 disallowed_tools: request.options.disallowed_tools.clone(),
+                model: request.options.model.clone(),
                 ..ConfigOverrides::default()
             },
         )
@@ -311,7 +312,20 @@ pub async fn run_with(
         approval: request.options.approval.clone(),
         allowed_tools: request.options.allowed_tools.clone(),
         disallowed_tools: request.options.disallowed_tools.clone(),
+        model: request.options.model.clone(),
         ..ConfigOverrides::default()
+    };
+    // prime-agent's `--thinking`: a level the run names must be one.
+    let thinking_override = match request.options.thinking.as_deref() {
+        Some(level) => Some(harness_providers::ThinkingLevel::parse(level).ok_or_else(|| {
+            HarnessError::new(
+                ErrorCode::InvalidPayload,
+                format!(
+                    "--thinking {level:?} is not a level: off, minimal, low, medium, high, xhigh or max"
+                ),
+            )
+        })?),
+        None => None,
     };
     let mut resolved_config = super::config::resolve_layers(
         &context.paths.config_file,
@@ -451,7 +465,9 @@ pub async fn run_with(
                 context.paths.data_dir.clone(),
             )),
             capabilities,
-            harness_providers::ThinkingLevel::parse(&config.thinking).unwrap_or_default(),
+            thinking_override.unwrap_or_else(|| {
+                harness_providers::ThinkingLevel::parse(&config.thinking).unwrap_or_default()
+            }),
             task_id.as_ref(),
             &context.paths.data_dir,
         )
@@ -570,6 +586,38 @@ pub async fn run_with(
         request.prompt,
         attachments::attachment_blocks(&attached.files)
     );
+    // The system prompt of the app, built from prime-agent's layers for the
+    // tools this run has; a run used to get one generic sentence.
+    // `--system-prompt` replaces the static layers and `--append-system-prompt`
+    // adds to the end, as prime-agent's print mode takes them.
+    let system_prompt = {
+        let (git_branch, changed_files) = super::service::prompt_git_facts(&context.project.root);
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let shell = if cfg!(windows) { "PowerShell" } else { "sh" };
+        let tool_names = tool_schemas
+            .iter()
+            .filter_map(|schema| {
+                schema
+                    .pointer("/function/name")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .collect::<Vec<_>>();
+        super::prompt::assemble(
+            request.options.system_prompt.as_deref(),
+            &super::prompt::PromptEnvironment {
+                os: std::env::consts::OS,
+                shell,
+                cwd: &context.project.root,
+                project_root: &context.project.root,
+                git_branch: git_branch.as_deref(),
+                changed_files,
+                date_iso: &today,
+                limits: bounds::limits_from_environment(environment),
+            },
+            &tool_names,
+            &request.options.append_system_prompt,
+        )
+    };
     let run_request = RunRequest::new(
         session_id.clone(),
         task_id.clone(),
@@ -577,7 +625,8 @@ pub async fn run_with(
         prompt,
         observation,
     )
-    .with_tool_schemas(tool_schemas);
+    .with_tool_schemas(tool_schemas)
+    .with_system_policy(system_prompt);
     // Memory is prime-agent's continual harness state, as in the app: this run reads
     // the digest of what the model has kept, ranked for this prompt.
     let harness_state = super::harness::merge(

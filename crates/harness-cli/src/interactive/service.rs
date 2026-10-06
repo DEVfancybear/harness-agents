@@ -7826,7 +7826,7 @@ fn shell_output(output: &ToolOutput) -> (String, bool) {
     (text, successful)
 }
 
-fn prompt_git_facts(root: &Path) -> (Option<String>, Option<usize>) {
+pub(super) fn prompt_git_facts(root: &Path) -> (Option<String>, Option<usize>) {
     let branch = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(root)

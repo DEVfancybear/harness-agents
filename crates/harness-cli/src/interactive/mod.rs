@@ -135,6 +135,18 @@ pub struct HeadlessOptions {
     pub allowed_tools: Vec<String>,
     /// Temporary tool deny patterns for this one run.
     pub disallowed_tools: Vec<String>,
+    /// prime-agent's `--model`: the model of this one run, `provider/id` or an id.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// prime-agent's `--thinking`: the thinking level of this one run.
+    #[serde(default)]
+    pub thinking: Option<String>,
+    /// prime-agent's `--system-prompt`: replaces the static prompt layers.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// prime-agent's `--append-system-prompt`, repeatable: added at the end.
+    #[serde(default)]
+    pub append_system_prompt: Vec<String>,
 }
 
 /// Validate parser output into a launch mode.

@@ -248,6 +248,16 @@ struct ChatArgs {
     /// Token budget for a headless run; the run reserves against it.
     #[arg(long, requires = "headless")]
     budget: Option<u64>,
+    /// Thinking level for a headless run: off, minimal, low, medium, high,
+    /// xhigh or max.
+    #[arg(long, requires = "headless")]
+    thinking: Option<String>,
+    /// Replace the system prompt's static layers for a headless run.
+    #[arg(long = "system-prompt", requires = "headless")]
+    system_prompt: Option<String>,
+    /// Text added at the end of the system prompt of a headless run; repeatable.
+    #[arg(long = "append-system-prompt", requires = "headless")]
+    append_system_prompt: Vec<String>,
 }
 
 /// `ha exec` shares the headless runner with `ha chat --headless`.
@@ -280,6 +290,18 @@ struct ExecArgs {
     max_turns: Option<u32>,
     #[arg(long)]
     budget: Option<u64>,
+    /// The model of this run: `provider/id` or an unambiguous id.
+    #[arg(long)]
+    model: Option<String>,
+    /// Thinking level: off, minimal, low, medium, high, xhigh or max.
+    #[arg(long)]
+    thinking: Option<String>,
+    /// Replace the system prompt's static layers.
+    #[arg(long = "system-prompt")]
+    system_prompt: Option<String>,
+    /// Text added at the end of the system prompt; repeatable.
+    #[arg(long = "append-system-prompt")]
+    append_system_prompt: Vec<String>,
     /// Deterministic fixture provider, labelled in machine output.
     #[arg(long)]
     mock: bool,
@@ -291,7 +313,7 @@ impl From<ExecArgs> for ChatArgs {
             cwd: args.cwd,
             resume: args.resume,
             continue_session: args.continue_session,
-            model: None,
+            model: args.model,
             profile: None,
             approval: args.approval,
             allowed_tools: args.allowed_tools,
@@ -308,6 +330,9 @@ impl From<ExecArgs> for ChatArgs {
             max_continuations: None,
             max_turns: args.max_turns,
             budget: args.budget,
+            thinking: args.thinking,
+            system_prompt: args.system_prompt,
+            append_system_prompt: args.append_system_prompt,
         }
     }
 }
@@ -357,6 +382,10 @@ impl ChatArgs {
                 approval: self.approval.clone(),
                 allowed_tools: self.allowed_tools.clone(),
                 disallowed_tools: self.disallowed_tools.clone(),
+                model: self.model.clone(),
+                thinking: self.thinking.clone(),
+                system_prompt: self.system_prompt.clone(),
+                append_system_prompt: self.append_system_prompt.clone(),
             },
         )?;
         match &mut mode {
@@ -373,11 +402,9 @@ impl ChatArgs {
                     .disallowed_tools
                     .clone_from(&self.disallowed_tools);
             }
-            interactive::LaunchMode::Headless { .. }
-                if self.model.is_some() || self.profile.is_some() =>
-            {
+            interactive::LaunchMode::Headless { .. } if self.profile.is_some() => {
                 return Err(interactive::UsageError::new(
-                    "--model and --profile apply to interactive chat only",
+                    "--profile applies to interactive chat only",
                 ));
             }
             interactive::LaunchMode::Headless { .. } => {}
