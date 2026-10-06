@@ -969,10 +969,13 @@ pub fn commands(
         .iter()
         .map(|path| (path.clone(), "prompt"))
         .collect();
-    let mut legacy_roots = vec![(config_dir.join("commands"), "user config")];
+    // A trusted project's command overrides the user's of the same name,
+    // as ha's `commands/` folders always did: the first one loaded wins.
+    let mut legacy_roots = Vec::new();
     if project_trusted {
         legacy_roots.push((workspace.join(".harness/commands"), "trusted project"));
     }
+    legacy_roots.push((config_dir.join("commands"), "user config"));
     for (root, source) in legacy_roots {
         let Ok(entries) = std::fs::read_dir(&root) else {
             continue;
