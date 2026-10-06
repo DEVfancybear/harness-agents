@@ -469,6 +469,46 @@ fn split_recent(
     (messages[..cut].to_vec(), messages[cut..].to_vec())
 }
 
+/// How many user turns a compaction's cut moves at a time. See [`split_recent_aligned`].
+const COMPACTION_CUT_STRIDE: usize = 8;
+
+/// [`split_recent`], with the cut held still across turns.
+///
+/// The cut of [`split_recent`] moves with every new turn, so a conversation past
+/// its compaction threshold summarised a different older part at every turn: a
+/// summary call per turn, and a new first message - the start of the cached
+/// prefix - so every turn missed the provider's cache entirely. Here the cut sits
+/// only on every [`COMPACTION_CUT_STRIDE`]th user message counted from the start,
+/// the latest such point at or before the natural cut: the older part, and so its
+/// summary (kept by its content in the summary cache), stays the same for several
+/// turns. The recent end then keeps more than `keep`, up to `max_keep`; past that,
+/// or when no grid point summarises anything, it falls back to the natural cut.
+fn split_recent_aligned(
+    messages: &[ProviderMessage],
+    keep: u64,
+    max_keep: u64,
+) -> (Vec<ProviderMessage>, Vec<ProviderMessage>) {
+    let (older, recent) = split_recent(messages, keep);
+    let natural = older.len();
+    let aligned = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == MessageRole::User)
+        .map(|(index, _)| index)
+        .enumerate()
+        .filter(|(ordinal, index)| {
+            *ordinal > 0 && ordinal % COMPACTION_CUT_STRIDE == 0 && *index <= natural
+        })
+        .map(|(_, index)| index)
+        .last();
+    match aligned {
+        Some(cut) if messages_tokens(&messages[cut..]) <= max_keep => {
+            (messages[..cut].to_vec(), messages[cut..].to_vec())
+        }
+        _ => (older, recent),
+    }
+}
+
 /// Summaries already written, by the content they summarise, so a later turn
 /// over the same earlier conversation does not ask the model again.
 fn summary_cache() -> &'static Mutex<std::collections::HashMap<String, String>> {
@@ -2113,7 +2153,8 @@ impl RuntimeService {
         let before = estimate(&attempt);
         if !fits(&attempt) {
             let keep = KEEP_RECENT_TOKENS.min(threshold / 4);
-            let (older, recent) = split_recent(&request.conversation, keep);
+            let (older, recent) =
+                split_recent_aligned(&request.conversation, keep, (threshold / 2).max(keep));
             if !older.is_empty() {
                 let dropped = messages_tokens(&older);
                 let budget = (config.compaction_reserve_tokens * 4 / 5)
@@ -3744,6 +3785,65 @@ mod context_fit_tests {
         assert_eq!(messages[5].content, big, "the newest result is kept whole");
         assert_eq!(messages[1].role, MessageRole::Tool);
         assert_eq!(messages[0].tool_calls.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod compaction_cut_tests {
+    use super::{COMPACTION_CUT_STRIDE, split_recent_aligned};
+    use harness_providers::{MessageRole, ProviderMessage};
+
+    fn conversation(turns: usize) -> Vec<ProviderMessage> {
+        (0..turns)
+            .flat_map(|turn| {
+                [
+                    ProviderMessage::new(
+                        MessageRole::User,
+                        format!("question {turn} {}", "q".repeat(400)),
+                    ),
+                    ProviderMessage::new(
+                        MessageRole::Assistant,
+                        format!("answer {turn} {}", "a".repeat(400)),
+                    ),
+                ]
+            })
+            .collect()
+    }
+
+    /// The older part a compaction summarises stays the same while turns are
+    /// added, so its summary is written once and the prefix after it keeps hitting
+    /// the provider's cache; it moves only every stride of user turns.
+    #[test]
+    fn the_cut_stays_put_while_turns_are_added() {
+        let keep = 2_000;
+        let max_keep = 8_000;
+        let mut cuts = Vec::new();
+        for turns in 30..30 + COMPACTION_CUT_STRIDE {
+            let messages = conversation(turns);
+            let (older, recent) = split_recent_aligned(&messages, keep, max_keep);
+            assert!(!older.is_empty());
+            assert_eq!(older.len() + recent.len(), messages.len());
+            assert_eq!(
+                recent[0].role,
+                MessageRole::User,
+                "the recent end starts a turn"
+            );
+            cuts.push(older.len());
+        }
+        cuts.dedup();
+        assert!(
+            cuts.len() <= 2,
+            "the cut moved at most once over a stride: {cuts:?}"
+        );
+    }
+
+    /// When the aligned cut would keep more than the limit, the natural cut is used.
+    #[test]
+    fn a_cut_that_keeps_too_much_falls_back_to_the_natural_one() {
+        let messages = conversation(30);
+        let (natural_older, _) = super::split_recent(&messages, 2_000);
+        let (older, _) = split_recent_aligned(&messages, 2_000, 2_000);
+        assert_eq!(older.len(), natural_older.len());
     }
 }
 
