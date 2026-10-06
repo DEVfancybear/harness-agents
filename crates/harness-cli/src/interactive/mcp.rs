@@ -808,6 +808,7 @@ fn subscription_is_nonempty(filter: &harness_extensions::rmcp::model::Subscripti
             .is_some_and(|resources| !resources.is_empty())
 }
 
+#[allow(clippy::too_many_lines)] // one arm per transport
 async fn connect_one(
     name: &str,
     config: &McpServerConfigV2,

@@ -65,6 +65,7 @@ pub struct Plan {
 
 /// Lay one frame out inside `area`.
 #[must_use]
+#[allow(clippy::too_many_lines)] // one frame, top to bottom, in reading order
 pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
     let empty = Rect::new(area.x, area.y, 0, 0);
     if area.width < 12 || area.height < 5 || (state.modal.is_some() && area.height < 7) {

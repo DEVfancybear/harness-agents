@@ -145,7 +145,8 @@ struct Rpc {
     tool_output: Option<String>,
     last_answer: Option<String>,
     last_error: Option<String>,
-    /// A `compact` waiting for its run to end: its id.
+    /// A `compact` waiting for its run to end: its id (a command may have none).
+    #[allow(clippy::option_option)] // no compaction, or one with or without an id
     compacting: Option<Option<Value>>,
     /// A `compact` asked for while a turn ran: it starts when the turn ends.
     compact_next: Option<(Option<Value>, Option<String>)>,
@@ -202,17 +203,17 @@ impl Rpc {
         self.message = Message::default();
     }
 
-    fn delta(&mut self, kind: &str, delta: String) {
+    fn delta(&mut self, kind: &str, delta: &str) {
         if !self.message.started {
             self.message.started = true;
             let message = self.message.value(None, None);
             self.emit(json!({ "type": "message_start", "message": message }));
         }
         let index = if kind == "thinking_delta" {
-            self.message.thinking.push_str(&delta);
+            self.message.thinking.push_str(delta);
             0
         } else {
-            self.message.text.push_str(&delta);
+            self.message.text.push_str(delta);
             usize::from(!self.message.thinking.is_empty())
         };
         let message = self.message.value(None, None);
@@ -225,8 +226,8 @@ impl Rpc {
 
     fn event(&mut self, event: SessionEvent) {
         match event {
-            SessionEvent::TextDelta { text } => self.delta("text_delta", text),
-            SessionEvent::ThinkingDelta { text } => self.delta("thinking_delta", text),
+            SessionEvent::TextDelta { text } => self.delta("text_delta", &text),
+            SessionEvent::ThinkingDelta { text } => self.delta("thinking_delta", &text),
             SessionEvent::StreamRestarted => self.message = Message::default(),
             SessionEvent::ToolStarted {
                 name,
@@ -319,7 +320,6 @@ impl Rpc {
             self.emit(response);
         } else {
             let (stop_reason, error_message) = match outcome {
-                RunOutcome::Done => ("stop", None),
                 RunOutcome::Canceled => ("aborted", None),
                 RunOutcome::Failed(reason) => (
                     "error",
@@ -355,6 +355,7 @@ impl Rpc {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // prime-agent's command table, one arm per command
     fn command(&mut self, id: Option<Value>, name: &str, payload: &Value) {
         let text = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_owned);
         let outcome: Result<Option<Value>, String> = match name {
@@ -362,7 +363,10 @@ impl Rpc {
                 None => Err("prompt requires a message".to_owned()),
                 Some(message) if self.running => {
                     match payload.get("streamingBehavior").and_then(Value::as_str) {
-                        Some("steer") => self.steer(message),
+                        Some("steer") => {
+                            self.steer(message);
+                            Ok(None)
+                        }
                         Some("followUp") => {
                             self.paused = false;
                             self.follow_ups.push_back(message);
@@ -380,7 +384,10 @@ impl Rpc {
             },
             "steer" | "follow_up" => match text("message") {
                 None => Err(format!("{name} requires a message")),
-                Some(message) if self.running && name == "steer" => self.steer(message),
+                Some(message) if self.running && name == "steer" => {
+                    self.steer(message);
+                    Ok(None)
+                }
                 Some(message) if self.running => {
                     self.paused = false;
                     self.follow_ups.push_back(message);
@@ -466,12 +473,11 @@ impl Rpc {
 
     /// A steer into the running turn; one it cannot take yet waits in the
     /// steering lane.
-    fn steer(&mut self, message: String) -> Result<Option<Value>, String> {
+    fn steer(&mut self, message: String) {
         self.paused = false;
         if self.service.steer(&message).is_err() {
             self.steering.push_back(message);
         }
-        Ok(None)
     }
 
     fn model(&self) -> Value {

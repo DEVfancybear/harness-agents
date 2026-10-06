@@ -851,6 +851,7 @@ fn error_report_json(error: &HarnessError) -> serde_json::Value {
 
 /// Route the launch contract added by `HA_LAUNCH` H01, then fall back to the
 /// unchanged legacy dispatch for every existing subcommand.
+#[allow(clippy::too_many_lines)] // the launch table, one arm per entry point
 async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
     let Cli {
         command,

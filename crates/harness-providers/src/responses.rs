@@ -518,7 +518,9 @@ impl ResponsesSseDecoder {
         let value: Value = serde_json::from_str(&data)
             .map_err(|_| protocol("provider SSE data is invalid JSON"))?;
         match value["type"].as_str().unwrap_or_default() {
-            "response.output_text.delta" => {
+            // A refusal streams as its own delta; it is the answer the user
+            // reads, as prime-agent shows it.
+            "response.output_text.delta" | "response.refusal.delta" => {
                 if let Some(delta) = value["delta"].as_str() {
                     events.push(ProviderStreamEvent::text(delta));
                 }
@@ -543,13 +545,6 @@ impl ResponsesSseDecoder {
                     self.streamed.insert(item_id, arguments.clone());
                     self.saw_call = true;
                     events.push(ProviderStreamEvent::tool_delta(call_id, name, arguments));
-                }
-            }
-            // A refusal streams as its own delta; it is the answer the user
-            // reads, as prime-agent shows it.
-            "response.refusal.delta" => {
-                if let Some(delta) = value["delta"].as_str() {
-                    events.push(ProviderStreamEvent::text(delta));
                 }
             }
             "response.function_call_arguments.delta" => {

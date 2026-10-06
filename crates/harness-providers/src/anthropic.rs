@@ -72,6 +72,7 @@ impl AnthropicMessagesAdapter {
         })
     }
 
+    #[allow(clippy::too_many_lines)] // the Messages API body, field by field
     fn request_body(request: &ProviderRequest, thinking: Option<&crate::Thinking>) -> Value {
         let mut system = Vec::new();
         let mut messages = Vec::new();
@@ -299,6 +300,7 @@ impl ModelProvider for AnthropicMessagesAdapter {
 impl AnthropicMessagesAdapter {
     /// One request: decoded events go out through `sender` frame by frame; a
     /// failure is returned for the caller to send last.
+    #[allow(clippy::too_many_lines)] // one request, from the body to the last frame
     fn call(
         &self,
         request: ProviderRequest,
@@ -482,6 +484,7 @@ impl AnthropicSseDecoder {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // one SSE event per arm, in the protocol's order
     fn handle_frame(
         &mut self,
         frame: &[u8],

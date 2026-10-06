@@ -948,6 +948,7 @@ pub fn run_loop<R: TuiRenderer>(
     result.map(|code| Outcome { code, renderer })
 }
 
+#[allow(clippy::too_many_lines)] // one event loop: keys, events, ticks, the frame
 fn run_loop_inner(
     renderer: &mut impl TuiRenderer,
     controller: &mut impl Frontend,

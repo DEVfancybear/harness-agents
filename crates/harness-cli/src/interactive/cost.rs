@@ -1,6 +1,7 @@
 //! Session cost calculations from configured per-million token prices.
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(clippy::struct_field_names)] // the catalog's price names
 pub struct ModelPrice {
     pub input_per_mtok: f64,
     pub output_per_mtok: f64,
@@ -11,6 +12,7 @@ pub struct ModelPrice {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(clippy::struct_field_names)] // the provider's usage names
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,

@@ -256,8 +256,9 @@ fn inline_spans(line: &str, theme: &Theme) -> Vec<Span<'static>> {
             let label = &rest[..close];
             let url = &rest[close + 2..close + 2 + end];
             if !label.is_empty() && !url.is_empty() && !url.contains(char::is_whitespace) {
-                let link = inline_style(false, strong, theme).add_modifier(Modifier::UNDERLINED);
-                pending.extend(label.chars().map(|character| (character, link)));
+                let link_style =
+                    inline_style(false, strong, theme).add_modifier(Modifier::UNDERLINED);
+                pending.extend(label.chars().map(|character| (character, link_style)));
                 if label != url {
                     let dim = theme.md_quote;
                     pending.extend(
@@ -281,8 +282,8 @@ fn inline_spans(line: &str, theme: &Theme) -> Vec<Span<'static>> {
                 .unwrap_or(rest.len());
             let url = format!("h{}", rest[..length].trim_end_matches(['.', ',', ';', ':']));
             let used = url.len() - 1;
-            let link = inline_style(false, strong, theme).add_modifier(Modifier::UNDERLINED);
-            pending.extend(url.chars().map(|character| (character, link)));
+            let link_style = inline_style(false, strong, theme).add_modifier(Modifier::UNDERLINED);
+            pending.extend(url.chars().map(|character| (character, link_style)));
             rest = &rest[used..];
             continue;
         }

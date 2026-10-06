@@ -2956,6 +2956,7 @@ impl AgentSessionService {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_lines)] // every session field, set once
     pub fn new_with_overrides(
         context: &LaunchContext,
         environment: LaunchEnvironment,
@@ -5150,7 +5151,7 @@ impl SessionPort for AgentSessionService {
                     let response = harness_providers::assemble_stream(&events)
                         .map_err(|error| error.to_string())?;
                     if response.tool_calls.is_empty() {
-                        answer = response.text.trim().to_owned();
+                        response.text.trim().clone_into(&mut answer);
                         break;
                     }
                     super::side_question::refuse_calls(&mut messages, &response);

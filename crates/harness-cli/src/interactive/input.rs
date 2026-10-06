@@ -749,10 +749,10 @@ impl LineEditor {
             | Key::Redo
             | Key::Transpose
             | Key::ExternalEditor
-            | Key::SetDraft(_) => InputOutcome::Unchanged,
+            | Key::SetDraft(_)
             // Control characters are not typed text; Resize and the repaint key
             // only need the redraw the host already performs on its own.
-            Key::Char(_)
+            | Key::Char(_)
             | Key::PageUp
             | Key::Mouse(_)
             | Key::ViewportTop

@@ -4218,6 +4218,7 @@ impl InteractiveController {
 
     /// prime-agent's `/login`: pick a provider, then type its API key into the
     /// masked prompt, or sign in in the browser.
+    #[allow(clippy::too_many_lines)] // the login menu: providers, then Serper
     fn login_command(&mut self, argument: Option<&str>, effects: &mut Vec<Effect>) {
         if self.phase.has_active_run() {
             self.push_history(
@@ -4270,11 +4271,14 @@ impl InteractiveController {
                 lines.push(format!("  {:<14}{} · {how}{state}", entry.id, entry.name));
             }
             if !for_subagents {
-                let state = stored
+                let state = if stored
                     .iter()
                     .any(|(id, _)| id == super::web::SERPER_CREDENTIAL)
-                    .then_some(" · logged in (api_key)")
-                    .unwrap_or_default();
+                {
+                    " · logged in (api_key)"
+                } else {
+                    ""
+                };
                 lines.push(format!(
                     "  {:<14}Serper (web search) · API key{state}",
                     super::web::SERPER_CREDENTIAL

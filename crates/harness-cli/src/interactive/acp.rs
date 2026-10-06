@@ -158,7 +158,7 @@ struct Acp {
 }
 
 impl Acp {
-    fn update(&mut self, update: Value) {
+    fn update(&mut self, update: &Value) {
         let Some(session) = &self.session else {
             return;
         };
@@ -195,7 +195,7 @@ impl Acp {
                     }),
                 ));
             }
-            "session/new" => self.new_session(id, params),
+            "session/new" => self.new_session(&id, params),
             "session/prompt" => self.prompt(id, params),
             "session/close" => {
                 let known = self.session.as_ref().is_some_and(|session| {
@@ -230,10 +230,10 @@ impl Acp {
         }
     }
 
-    fn new_session(&mut self, id: Value, params: &Value) {
+    fn new_session(&mut self, id: &Value, params: &Value) {
         if self.session.is_some() {
             self.out.push(error_response(
-                &id,
+                id,
                 INTERNAL_ERROR,
                 "ha ACP mode hosts one session per connection; start another ha process for a second session",
                 None,
@@ -261,7 +261,7 @@ impl Acp {
             Ok(context) => context,
             Err(message) => {
                 self.out
-                    .push(error_response(&id, INTERNAL_ERROR, &message, None));
+                    .push(error_response(id, INTERNAL_ERROR, &message, None));
                 return;
             }
         };
@@ -276,7 +276,7 @@ impl Acp {
             .conversation_id()
             .unwrap_or_else(|| InputId::generate().as_str().to_owned());
         self.out
-            .push(response(&id, &json!({ "sessionId": session_id })));
+            .push(response(id, &json!({ "sessionId": session_id })));
         self.events = Some(events);
         self.session = Some(Session {
             id: session_id,
@@ -359,12 +359,12 @@ impl Acp {
         session.message.clone().unwrap_or_default()
     }
 
-    fn chunk(&mut self, kind: &str, text: String) {
+    fn chunk(&mut self, kind: &str, text: &str) {
         if text.is_empty() {
             return;
         }
         let message_id = self.message_id();
-        self.update(json!({
+        self.update(&json!({
             "sessionUpdate": kind,
             "messageId": message_id,
             "content": { "type": "text", "text": text },
@@ -373,8 +373,8 @@ impl Acp {
 
     fn event(&mut self, event: SessionEvent) {
         match event {
-            SessionEvent::TextDelta { text } => self.chunk("agent_message_chunk", text),
-            SessionEvent::ThinkingDelta { text } => self.chunk("agent_thought_chunk", text),
+            SessionEvent::TextDelta { text } => self.chunk("agent_message_chunk", &text),
+            SessionEvent::ThinkingDelta { text } => self.chunk("agent_thought_chunk", &text),
             SessionEvent::ToolStarted {
                 name,
                 call_id,
@@ -391,7 +391,7 @@ impl Acp {
                 } else {
                     (name.clone(), args)
                 };
-                self.update(json!({
+                self.update(&json!({
                     "sessionUpdate": "tool_call",
                     "toolCallId": call_id,
                     "title": title,
@@ -426,7 +426,7 @@ impl Acp {
                         { "type": "content", "content": { "type": "text", "text": output } }
                     ]);
                 }
-                self.update(update);
+                self.update(&update);
             }
             SessionEvent::ApprovalRequired { request_id, .. } => {
                 if let Some(session) = &mut self.session {

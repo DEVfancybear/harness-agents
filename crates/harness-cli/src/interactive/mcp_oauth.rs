@@ -4,7 +4,7 @@
 //! One login discovers the server's OAuth metadata - RFC 9728 protected
 //! resource metadata (the `WWW-Authenticate` `resource_metadata` pointer,
 //! else its well-known location), then the authorization server's RFC 8414
-//! or OpenID metadata, or the origin's own when there is no resource
+//! or `OpenID` metadata, or the origin's own when there is no resource
 //! metadata - registers a client (RFC 7591) unless one is configured, runs
 //! the PKCE authorization-code flow against a loopback callback on ports
 //! 53700-53709 (or a pasted redirect URL), and exchanges the code. The
@@ -81,7 +81,7 @@ fn resource_metadata_url(resource: &Url) -> String {
     url
 }
 
-/// RFC 8414 and pathful OpenID metadata locations for an issuer.
+/// RFC 8414 and pathful `OpenID` metadata locations for an issuer.
 fn authorization_server_metadata_urls(issuer: &Url) -> Vec<String> {
     let path = if issuer.path() == "/" {
         String::new()
@@ -466,17 +466,16 @@ pub fn login(
 ) -> Result<(), String> {
     progress(&format!("Discovering OAuth metadata for {server}..."));
     let (metadata, resource) = discover(url)?;
-    let client_id = match client_id {
-        Some(client_id) => client_id.to_owned(),
-        None => {
-            let endpoint = metadata.registration_endpoint.as_deref().ok_or_else(|| {
-                format!(
-                    "{server} does not support dynamic client registration and no client id was configured; pass --client-id"
-                )
-            })?;
-            progress("Registering OAuth client...");
-            register_client(endpoint, server)?
-        }
+    let client_id = if let Some(client_id) = client_id {
+        client_id.to_owned()
+    } else {
+        let endpoint = metadata.registration_endpoint.as_deref().ok_or_else(|| {
+            format!(
+                "{server} does not support dynamic client registration and no client id was configured; pass --client-id"
+            )
+        })?;
+        progress("Registering OAuth client...");
+        register_client(endpoint, server)?
     };
     let verifier = base64url(&super::oauth::random_bytes());
     let challenge = base64url(&sha2::Sha256::digest(verifier.as_bytes()));

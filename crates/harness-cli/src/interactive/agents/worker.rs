@@ -1134,6 +1134,7 @@ fn resolve_context(
 }
 
 /// One connection: the token, then requests, or a terminal once it attaches.
+#[allow(clippy::too_many_lines)] // the protocol's request table
 fn serve(worker: &Arc<Worker>, stream: TcpStream) {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(HELLO_TIMEOUT));
