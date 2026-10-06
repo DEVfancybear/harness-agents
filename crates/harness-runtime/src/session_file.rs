@@ -73,6 +73,10 @@ pub fn read_session_file(text: &str) -> Result<(SessionFileHeader, Vec<ProviderM
     let (_, first) = lines.next().ok_or("the file is empty")?;
     let header: Value =
         serde_json::from_str(first).map_err(|_| "line 1 is not a session header".to_owned())?;
+    // A prime-agent session file (no `app`, format version 2 or 3).
+    if header["type"] == "session" && header["app"].is_null() {
+        return read_prime_session(&header, lines);
+    }
     if header["type"] != "session" || header["app"] != "ha" {
         return Err(
             "line 1 is not an ha session header (export one with /export <file>.jsonl)".to_owned(),
@@ -104,6 +108,156 @@ pub fn read_session_file(text: &str) -> Result<(SessionFileHeader, Vec<ProviderM
         messages.push(message);
     }
     Ok((parsed, messages))
+}
+
+/// Read a prime-agent session file (`pa-types` `FileEntry`): the branch the
+/// newest entry ends, walked back through `parentId`, with the latest
+/// compaction on it applied as prime builds a context - its summary, then the
+/// entries it kept, then the ones after it.
+fn read_prime_session<'a>(
+    header: &Value,
+    lines: impl Iterator<Item = (usize, &'a str)>,
+) -> Result<(SessionFileHeader, Vec<ProviderMessage>), String> {
+    let mut entries = Vec::new();
+    for (index, line) in lines {
+        let value: Value =
+            serde_json::from_str(line).map_err(|_| format!("line {} is not JSON", index + 1))?;
+        entries.push(value);
+    }
+    // The branch: from the newest entry back to the root. A file without
+    // entry ids (version 1) is one line of entries already.
+    let by_id = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| Some((entry["id"].as_str()?.to_owned(), index)))
+        .collect::<std::collections::HashMap<_, _>>();
+    let path = if by_id.is_empty() {
+        (0..entries.len()).collect::<Vec<_>>()
+    } else {
+        let mut path = Vec::new();
+        let mut at = entries.iter().rposition(|entry| entry["id"].is_string());
+        let mut seen = std::collections::HashSet::new();
+        while let Some(index) = at {
+            if !seen.insert(index) {
+                break;
+            }
+            path.push(index);
+            at = entries[index]["parentId"]
+                .as_str()
+                .and_then(|parent| by_id.get(parent).copied());
+        }
+        path.reverse();
+        path
+    };
+    let mut messages = Vec::new();
+    let compaction = path
+        .iter()
+        .rposition(|index| entries[*index]["type"] == "compaction");
+    let kept = match compaction {
+        Some(position) => {
+            let entry = &entries[path[position]];
+            messages.push(ProviderMessage::new(
+                MessageRole::User,
+                format!(
+                    "[The conversation before this point was compacted. Summary of it:]\n\n{}",
+                    entry["summary"].as_str().unwrap_or_default()
+                ),
+            ));
+            let first_kept = entry["firstKeptEntryId"].as_str().unwrap_or_default();
+            let start = path[..position]
+                .iter()
+                .position(|index| entries[*index]["id"] == first_kept)
+                .unwrap_or(position);
+            path[start..position]
+                .iter()
+                .chain(&path[position + 1..])
+                .copied()
+                .collect::<Vec<_>>()
+        }
+        None => path,
+    };
+    for index in kept {
+        let entry = &entries[index];
+        match entry["type"].as_str() {
+            Some("message") => messages.extend(prime_message(&entry["message"])),
+            Some("branch_summary") => {
+                if let Some(summary) = entry["summary"].as_str() {
+                    messages.push(ProviderMessage::new(
+                        MessageRole::User,
+                        format!("[Summary of a branch of this conversation:]\n\n{summary}"),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    let parsed = SessionFileHeader {
+        id: header["id"].as_str().unwrap_or_default().to_owned(),
+        timestamp_ms: 0,
+        cwd: header["cwd"].as_str().unwrap_or_default().to_owned(),
+        title: None,
+    };
+    Ok((parsed, messages))
+}
+
+/// The text of prime-agent message content: a string, or the text blocks of
+/// a block list.
+fn prime_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// One prime-agent `AgentMessage` as the messages ha sends a model.
+fn prime_message(message: &Value) -> Option<ProviderMessage> {
+    match message["role"].as_str()? {
+        "user" | "custom" => {
+            let text = prime_text(&message["content"]);
+            (!text.trim().is_empty()).then(|| ProviderMessage::new(MessageRole::User, text))
+        }
+        "assistant" => {
+            let blocks = message["content"].as_array().cloned().unwrap_or_default();
+            let text = prime_text(&message["content"]);
+            let calls = blocks
+                .iter()
+                .filter(|block| block["type"] == "toolCall")
+                .map(|block| {
+                    harness_providers::ProviderToolCall::new(
+                        block["id"].as_str().unwrap_or_default(),
+                        block["name"].as_str().unwrap_or_default(),
+                        block["arguments"].to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if text.trim().is_empty() && calls.is_empty() {
+                return None;
+            }
+            Some(ProviderMessage::assistant_with_calls(text, calls))
+        }
+        "toolResult" => Some(ProviderMessage::tool_result(
+            message["toolCallId"].as_str().unwrap_or_default(),
+            prime_text(&message["content"]),
+        )),
+        "bashExecution" => Some(ProviderMessage::new(
+            MessageRole::User,
+            format!(
+                "[The user ran `{}`]\n{}",
+                message["command"].as_str().unwrap_or_default(),
+                message["output"].as_str().unwrap_or_default()
+            ),
+        )),
+        "branchSummary" | "compactionSummary" => message["summary"]
+            .as_str()
+            .map(|summary| ProviderMessage::new(MessageRole::User, summary.to_owned())),
+        _ => None,
+    }
 }
 
 /// The note that leads an imported conversation, so the model knows where the
@@ -159,16 +313,51 @@ mod tests {
     #[test]
     fn a_file_that_is_not_an_ha_session_is_refused_with_its_line() {
         assert!(read_session_file("").is_err());
-        let prime = "{\"type\":\"session\",\"version\":3,\"id\":\"x\"}\n";
+        let other = "{\"type\":\"transcript\",\"id\":\"x\"}\n";
         assert!(
-            read_session_file(prime)
-                .expect_err("not ha")
+            read_session_file(other)
+                .expect_err("not a session")
                 .contains("not an ha session header")
         );
         let broken = "{\"type\":\"session\",\"version\":1,\"app\":\"ha\"}\nnot json\n";
         assert_eq!(
             read_session_file(broken).expect_err("broken"),
             "line 2 is not JSON"
+        );
+    }
+
+    /// A prime-agent v3 file is read along the branch its newest entry ends,
+    /// with the latest compaction applied: its summary, the entries it kept,
+    /// then the ones after it. An abandoned branch is left out.
+    #[test]
+    fn a_prime_agent_session_is_imported_along_its_branch() {
+        let lines = [
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-10-01T00:00:00Z","cwd":"/work"}"#,
+            r#"{"type":"message","id":"a","parentId":null,"message":{"role":"user","content":"old question"}}"#,
+            r#"{"type":"message","id":"b","parentId":"a","message":{"role":"assistant","content":[{"type":"text","text":"old answer"}]}}"#,
+            r#"{"type":"message","id":"c","parentId":"b","message":{"role":"user","content":[{"type":"text","text":"read it"}]}}"#,
+            r#"{"type":"message","id":"d","parentId":"c","message":{"role":"assistant","content":[{"type":"toolCall","id":"t1","name":"read","arguments":{"path":"a.rs"}}]}}"#,
+            r#"{"type":"message","id":"e","parentId":"d","message":{"role":"toolResult","toolCallId":"t1","toolName":"read","content":[{"type":"text","text":"fn main() {}"}]}}"#,
+            r#"{"type":"compaction","id":"f","parentId":"e","summary":"the user asked about a.rs","firstKeptEntryId":"c","tokensBefore":9000}"#,
+            r#"{"type":"message","id":"g","parentId":"f","message":{"role":"user","content":"abandoned"}}"#,
+            r#"{"type":"message","id":"h","parentId":"f","message":{"role":"assistant","content":[{"type":"text","text":"it is empty"}]}}"#,
+        ];
+        let (header, messages) = read_session_file(&lines.join("\n")).expect("a prime session");
+        assert_eq!(header.id, "s1");
+        assert_eq!(header.cwd, "/work");
+        let texts = messages
+            .iter()
+            .map(|message| (message.role, message.content.as_str()))
+            .collect::<Vec<_>>();
+        assert!(texts[0].1.contains("the user asked about a.rs"));
+        assert_eq!(texts[1], (MessageRole::User, "read it"));
+        assert_eq!(messages[2].tool_calls[0].name, "read");
+        assert_eq!(texts[3], (MessageRole::Tool, "fn main() {}"));
+        assert_eq!(texts[4], (MessageRole::Assistant, "it is empty"));
+        assert_eq!(
+            messages.len(),
+            5,
+            "the old turns and the abandoned branch are left out"
         );
     }
 }
