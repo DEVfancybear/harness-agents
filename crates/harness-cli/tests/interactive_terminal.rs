@@ -3602,7 +3602,7 @@ fn i22_agents_view_opens_returns_and_stops() {
     wait_for_normalized(&session, "No sessions yet.", Duration::from_secs(30));
     wait_for_normalized(&session, "ctrl+n new", Duration::from_secs(10));
     session.send("\u{e}");
-    wait_for_normalized(&session, "> Nhập yêu cầu", Duration::from_secs(60));
+    wait_for_normalized(&session, "> Nhập yêu cầu", Duration::from_mins(1));
     session.send("\u{1b}[D");
     wait_for_normalized(&session, "Idle (1)", Duration::from_secs(30));
     session.send("\u{18}");
