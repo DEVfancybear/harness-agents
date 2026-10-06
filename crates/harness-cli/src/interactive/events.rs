@@ -624,6 +624,9 @@ pub struct UiState {
     pub queued_input: bool,
     /// How many messages wait in the queue.
     pub queued_count: usize,
+    /// prime-agent's queued strip: `<lane>: <first line>` per queued message.
+    #[serde(default)]
+    pub queued_previews: Vec<String>,
     /// The provider-usage wait line, while a rate-limited turn waits.
     pub provider_wait: Option<String>,
     /// The last submitted request, so the status bar can name it.

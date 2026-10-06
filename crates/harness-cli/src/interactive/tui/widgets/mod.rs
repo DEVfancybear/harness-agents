@@ -8,6 +8,7 @@ pub mod approval;
 pub mod composer;
 pub mod help;
 pub mod picker;
+pub mod queue;
 pub mod status;
 pub mod suggest;
 
@@ -88,6 +89,9 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
             }
             None => {}
         }
+    }
+    if let Some(area) = plan.queue {
+        queue::render(frame, area, state, theme);
     }
     // The slash-command menu sits between the upper region and the composer: it
     // belongs to the draft being typed, not to the conversation above it.

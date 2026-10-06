@@ -48,6 +48,8 @@ pub struct Plan {
     pub modal: Option<Rect>,
     /// The slash-command menu, when the composer is offering one.
     pub suggest: Option<Rect>,
+    /// prime-agent's queued-message strip, while messages wait.
+    pub queue: Option<Rect>,
     pub composer: Rect,
     pub status: Rect,
     pub hints: Rect,
@@ -70,6 +72,7 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
             live: None,
             modal: None,
             suggest: None,
+            queue: None,
             composer: area,
             status: empty,
             hints: empty,
@@ -113,21 +116,25 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
         y += height;
         rect
     };
-    let (live, modal, suggest) = if let Some(modal) = &state.modal {
-        (None, Some(take(modal_rows(modal, available))), None)
+    let (live, modal, queue, suggest) = if let Some(modal) = &state.modal {
+        (None, Some(take(modal_rows(modal, available))), None, None)
     } else {
         let menu_rows = u16::try_from(state.suggestions.len())
             .unwrap_or(u16::MAX)
             .min(MAX_SUGGEST_ROWS)
             .min(available);
+        // The queued strip comes before the live block: what waits stays in
+        // view, and the running output gets the rows left over.
+        let queue_rows = super::widgets::queue::rows(state).min(available - menu_rows);
         // One blank row keeps the running output off the composer's border,
         // when there is a row to spare for it.
-        let room = available - menu_rows;
+        let room = available - menu_rows - queue_rows;
         let rows = live_rows(state, area.width).min(room.saturating_sub(u16::from(room >= 2)));
         let live = (rows > 0).then(|| take(rows));
         let _spacer = live.filter(|_| room >= 2).map(|_| take(1));
+        let queue = (queue_rows > 0).then(|| take(queue_rows));
         let suggest = (menu_rows > 0).then(|| take(menu_rows));
-        (live, None, suggest)
+        (live, None, queue, suggest)
     };
     let composer = take(composer_height);
     let hints = take(1);
@@ -139,9 +146,10 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
     let slack = area
         .height
         .saturating_sub(status.y + status.height - area.y);
-    let (live, modal, suggest, composer, hints, status) = (
+    let (live, modal, queue, suggest, composer, hints, status) = (
         live.map(|rect| drop_rows(rect, slack)),
         modal.map(|rect| drop_rows(rect, slack)),
+        queue.map(|rect| drop_rows(rect, slack)),
         suggest.map(|rect| drop_rows(rect, slack)),
         drop_rows(composer, slack),
         drop_rows(hints, slack),
@@ -164,6 +172,7 @@ pub fn plan(area: Rect, state: &UiState, _theme: &Theme) -> Plan {
         live,
         modal,
         suggest,
+        queue,
         composer,
         status,
         hints,
@@ -308,6 +317,7 @@ mod tests {
             granted_for_run: false,
             queued_input: false,
             queued_count: 0,
+            queued_previews: Vec::new(),
             provider_wait: None,
             last_request: None,
             run_started_at: None,
@@ -325,6 +335,27 @@ mod tests {
             service_tier: None,
             goal: None,
         }
+    }
+
+    #[test]
+    /// prime-agent's queued strip sits directly above the composer: one row
+    /// per queued message and the hint.
+    fn the_queued_strip_sits_above_the_composer() {
+        let area = Rect::new(0, 0, 80, 16);
+        let mut queued = state(AppPhase::Running);
+        queued.queued_previews = vec![
+            "Steering: look again".to_owned(),
+            "Follow-up: then test".to_owned(),
+        ];
+        let outline = plan(area, &queued, &Theme::plain());
+        let strip = outline.queue.expect("a strip while messages wait");
+        assert_eq!(strip.height, 3);
+        assert_eq!(strip.y + strip.height, outline.composer.y);
+        assert!(
+            plan(area, &state(AppPhase::Running), &Theme::plain())
+                .queue
+                .is_none()
+        );
     }
 
     #[test]
@@ -474,9 +505,9 @@ mod tests {
     #[test]
     fn slash_the_menu_sits_above_the_composer_which_keeps_the_cursor() {
         let mut state = state(AppPhase::Ready);
-        state.buffer = "/res".to_owned();
-        state.cursor = 4;
-        state.suggestions = matching("/res");
+        state.buffer = "/resu".to_owned();
+        state.cursor = 5;
+        state.suggestions = matching("/resu");
         let outline = plan(Rect::new(0, 0, 80, 12), &state, &Theme::plain());
         let menu = outline.suggest.expect("the menu has a row");
         assert_eq!(menu.height, 1, "one match, one row");

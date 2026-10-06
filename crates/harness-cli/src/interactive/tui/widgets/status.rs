@@ -367,6 +367,7 @@ mod tests {
             granted_for_run: false,
             queued_input: false,
             queued_count: 0,
+            queued_previews: Vec::new(),
             provider_wait: None,
             last_request: None,
             run_started_at: None,

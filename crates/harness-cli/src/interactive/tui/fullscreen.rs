@@ -685,7 +685,7 @@ where
                     area.height.saturating_sub(floor),
                 );
                 let plan = layout::plan(dock_area, state, &theme);
-                dock_top = [plan.live, plan.modal, plan.suggest]
+                dock_top = [plan.live, plan.modal, plan.queue, plan.suggest]
                     .into_iter()
                     .flatten()
                     .chain([plan.composer])

@@ -104,6 +104,19 @@ impl InputQueue {
         Some(taken.join("\n\n"))
     }
 
+    /// prime-agent's preview rows (`formatQueuedMessagePreview`): the lane
+    /// label and the message's first line, oldest first.
+    #[must_use]
+    pub fn previews(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .map(|(lane, text)| {
+                let first = text.lines().next().unwrap_or_default();
+                format!("{}: {first}", lane.label())
+            })
+            .collect()
+    }
+
     /// Remove the message at `index` (0-based, oldest first).
     pub fn remove(&mut self, index: usize) -> Option<(Lane, String)> {
         (index < self.items.len()).then(|| self.items.remove(index))

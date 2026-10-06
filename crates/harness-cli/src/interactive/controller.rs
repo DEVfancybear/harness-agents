@@ -651,6 +651,7 @@ impl InteractiveController {
             granted_for_run: self.granted_for_run,
             queued_input: !self.queue.is_empty(),
             queued_count: self.queue.len(),
+            queued_previews: self.queue.previews(),
             provider_wait: self.provider_wait.clone(),
             last_request: self.last_request.clone(),
             run_started_at: self.run_started_at,

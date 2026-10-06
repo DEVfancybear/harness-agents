@@ -343,6 +343,7 @@ mod tests {
             granted_for_run: false,
             queued_input: false,
             queued_count: 0,
+            queued_previews: Vec::new(),
             provider_wait: None,
             last_request: None,
             run_started_at: None,
@@ -416,9 +417,9 @@ mod tests {
         let mut idle = state(AppPhase::Ready);
         assert!(hint(&idle).contains("Ctrl-J"));
 
-        idle.buffer = "/res".to_owned();
-        idle.cursor = 4;
-        idle.suggestions = crate::interactive::input::matching("/res");
+        idle.buffer = "/resu".to_owned();
+        idle.cursor = 5;
+        idle.suggestions = crate::interactive::input::matching("/resu");
         let menu = hint(&idle);
         assert!(
             menu.contains("Tab/Enter") && menu.contains("Esc"),

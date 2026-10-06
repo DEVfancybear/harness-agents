@@ -117,6 +117,7 @@ mod tests {
             granted_for_run: false,
             queued_input: false,
             queued_count: 0,
+            queued_previews: Vec::new(),
             provider_wait: None,
             last_request: None,
             run_started_at: None,
@@ -167,7 +168,7 @@ mod tests {
         let text = plain_text(&rows(&state("/at", 0), &Theme::plain()));
         assert!(text.contains("/attach <path>"), "{text}");
         assert_eq!(
-            plain_text(&rows(&state("/res", 0), &Theme::plain())).trim_start_matches("  ❯ "),
+            plain_text(&rows(&state("/resu", 0), &Theme::plain())).trim_start_matches("  ❯ "),
             format!(
                 "{:<NAME_COLUMN$}{}",
                 "/resume [id]", "Open the session picker, or resume a session by id"
