@@ -454,6 +454,14 @@
             "null"
           ]
         },
+        "verifier": {
+          "default": null,
+          "description": "The model the independent verifier runs on; it judges a goal before the\ngoal completes. Defaults to the delegated children's model.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "wait_for_usage": {
           "default": null,
           "description": "Wait for a rate-limited provider to recover instead of failing (default true).",
@@ -506,6 +514,76 @@
           "default": null,
           "type": [
             "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "VerifyCheckV2": {
+      "additionalProperties": false,
+      "description": "One `[[verify.checks]]` entry.",
+      "properties": {
+        "command": {
+          "description": "The shell command; exit 0 passes.",
+          "type": "string"
+        },
+        "hint": {
+          "default": null,
+          "description": "How to fix a failure, told to the agent with the check's output.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "A short name shown in results, such as `types` or `tests`.",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "default": null,
+          "description": "This check's time limit, in seconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "command"
+      ],
+      "type": "object"
+    },
+    "VerifyConfigV2": {
+      "additionalProperties": false,
+      "description": "`[verify]`: what \"done\" means for this project, as commands.",
+      "properties": {
+        "checks": {
+          "default": [],
+          "description": "The checks, run in order; the first that fails stops the run. Put the\ncheap ones (format, types, lint) before the slow ones (tests, e2e).",
+          "items": {
+            "$ref": "#/$defs/VerifyCheckV2"
+          },
+          "type": "array"
+        },
+        "judge": {
+          "default": null,
+          "description": "Whether an independent verifier agent judges a goal after its checks\npass and before it completes (default true).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "timeout_seconds": {
+          "default": null,
+          "description": "Default time limit of one check, in seconds (300 when omitted).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
             "null"
           ]
         }
@@ -652,6 +730,18 @@
         }
       ],
       "default": null
+    },
+    "verify": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/VerifyConfigV2"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The project's own checks, which the harness runs itself - not the model -\nbefore a goal or a feature counts as done, and as autonomous gates."
     }
   },
   "required": [

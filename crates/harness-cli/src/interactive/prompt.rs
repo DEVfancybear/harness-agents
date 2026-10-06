@@ -62,7 +62,7 @@ const OPINIONATED_LAYER: &str = include_str!("prompts/opinionated.md");
 /// prime-agent's `buildSubagentGuidance`, mapped to ha's `delegate` tool.
 const SUBAGENT_GUIDANCE: &str = "# Delegating to sub-agents\n\
 \n\
-Delegate independent, self-contained work with the `delegate` tool: role `explorer` investigates, role `coder` implements in an isolated worktree. Request independent delegations together in one step so they run in parallel.\n\
+Delegate independent, self-contained work with the `delegate` tool: role `explorer` investigates, role `coder` implements in an isolated worktree, role `verifier` checks finished work with a fresh context and cannot edit - ask one before you call substantial work done, since you are too generous grading your own. Request independent delegations together in one step so they run in parallel.\n\
 Large child outputs belong in files that you read selectively.\n\
 Delegate parallel context-heavy research or independent implementation; do a single known lookup, edit, or command inline.";
 

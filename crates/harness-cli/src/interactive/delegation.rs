@@ -1505,7 +1505,7 @@ impl SessionAgents {
         }
         let run_id = AgentRunId::generate();
         let (workspace, base_commit, base_snapshot, worktree) = match role {
-            AgentRole::Explorer => (
+            AgentRole::Explorer | AgentRole::Verifier => (
                 launch.workspace.clone(),
                 launch.workspace.base_commit.clone(),
                 launch.workspace.observed_fingerprint.as_str().to_owned(),
@@ -1691,9 +1691,57 @@ impl DelegateHost {
         })
     }
 
+    /// The verifier the harness itself starts on this turn's launch, to judge
+    /// work the turn's model says is done.
+    #[must_use]
+    pub fn verifier(&self) -> VerifierHandle {
+        VerifierHandle {
+            agents: Arc::clone(&self.agents),
+            launch: self.launch.clone(),
+            cancellation: self.dispatcher.parent_cancellation.clone(),
+        }
+    }
+
     #[cfg(test)]
     fn delegate_tool(&self) -> &DelegateTool {
         &self.dispatcher
+    }
+}
+
+/// A verifier child the harness starts and waits for: the agent that did the
+/// work never grades it.
+#[derive(Clone)]
+pub struct VerifierHandle {
+    agents: Arc<SessionAgents>,
+    launch: ChildLaunch,
+    cancellation: CancellationToken,
+}
+
+impl VerifierHandle {
+    /// Run a verifier on `brief` - on `model` when one is named, else the
+    /// children's default - and return its answer.
+    ///
+    /// # Errors
+    /// The verifier could not start, failed, or was stopped.
+    pub async fn judge(&self, brief: String, model: Option<&str>) -> Result<String, String> {
+        let launch = self.launch.for_model(model)?;
+        let (task_id, _) = self
+            .agents
+            .start(AgentRole::Verifier, brief, None, &launch, None)
+            .await
+            .map_err(|error| error.to_string())?;
+        match self
+            .agents
+            .shared
+            .wait(&task_id, None, Some(&self.cancellation))
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            Some(ChildState::Done { answer, .. }) => Ok(answer),
+            Some(ChildState::Partial { error, .. } | ChildState::Failed { error }) => Err(error),
+            Some(ChildState::Cancelled { reason }) => Err(reason),
+            Some(ChildState::Running) | None => Err("the verifier's record is gone".to_owned()),
+        }
     }
 }
 
@@ -1705,11 +1753,11 @@ impl ExternalToolCatalog for DelegateCatalog {
             "type": "function",
             "function": {
                 "name": "delegate",
-                "description": "Delegate a bounded explorer or an isolated-worktree coder to investigate or implement the brief. By default the call waits for the child's answer; with wait=false it returns at once, the child keeps running after this turn, and its result arrives later as a [child-exited ...] or [child-failed ...] message.",
+                "description": "Delegate a bounded explorer or an isolated-worktree coder to investigate or implement the brief, or a verifier to check work independently: a verifier starts with a fresh context, cannot edit, runs what shows whether the work holds and ends with VERDICT: PASS or VERDICT: FAIL - use it before you call work done, since the agent that wrote the work is too generous grading it. By default the call waits for the child's answer; with wait=false it returns at once, the child keeps running after this turn, and its result arrives later as a [child-exited ...] or [child-failed ...] message.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "role": {"type": "string", "enum": ["explorer", "coder"]},
+                        "role": {"type": "string", "enum": ["explorer", "coder", "verifier"]},
                         "brief": {"type": "string", "minLength": 1, "maxLength": MAX_BRIEF_BYTES},
                         "wait": {"type": "boolean", "description": "Wait for the child's answer (default true)."}
                     },
@@ -1749,10 +1797,11 @@ impl DelegateTool {
         let role = match object.get("role").and_then(Value::as_str) {
             Some("explorer") => AgentRole::Explorer,
             Some("coder") => AgentRole::Coder,
+            Some("verifier") => AgentRole::Verifier,
             _ => {
                 return Err(HarnessError::new(
                     ErrorCode::InvalidPayload,
-                    "delegate role must be explorer or coder",
+                    "delegate role must be explorer, coder or verifier",
                 ));
             }
         };
@@ -1967,6 +2016,34 @@ async fn persist_worktree(
 /// An explorer does it in its parent's workspace, a coder in its own worktree.
 fn child_policy(parent: &ToolPolicy) -> ToolPolicy {
     parent.clone()
+}
+
+/// The tools a verifier is neither offered nor allowed: it reads and runs, and
+/// what it judges stays as the agent that did the work left it.
+const VERIFIER_DENIED_TOOLS: [&str; 3] = ["apply_patch", "write_file", "edit_file"];
+
+/// The parent's policy with every editing tool denied, whatever the mode.
+fn verifier_policy(parent: &ToolPolicy) -> ToolPolicy {
+    let mut rules = parent.tool_rules();
+    rules.extend(VERIFIER_DENIED_TOOLS.iter().map(|tool| {
+        harness_tools::ToolPatternRule::deny(
+            format!("{tool}(*)"),
+            "a verifier does not edit the work it checks",
+        )
+    }));
+    parent.clone().with_tool_rules(rules)
+}
+
+/// The coding tools without the editing ones.
+fn verifier_schemas() -> Vec<Value> {
+    coding_tool_schemas()
+        .into_iter()
+        .filter(|schema| {
+            schema["function"]["name"]
+                .as_str()
+                .is_none_or(|name| !VERIFIER_DENIED_TOOLS.contains(&name))
+        })
+        .collect()
 }
 
 /// The tools a child has beyond the coding tools: the parent's web tools, and
@@ -2595,6 +2672,8 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     (child.depth < child.max_depth, child.depth)
                 })
                 .unwrap_or((false, 1));
+            // A verifier judges what it is shown; it does not hand the judging on.
+            let can_spawn = can_spawn && request.brief.role != AgentRole::Verifier;
             let spawn_line = if can_spawn {
                 " You can split your work with the delegate tool: it starts explorer children of your own, and you are not finished until they are - their results reach you as [child-exited ...] or [child-failed ...] messages."
             } else {
@@ -2613,6 +2692,12 @@ impl WorkerBackend for InteractiveWorkerBackend {
                             " You cannot delegate again."
                         }
                     ),
+                ),
+                AgentRole::Verifier => (
+                    launch.workspace_root.clone(),
+                    verifier_policy(&child_policy(&launch.parent_policy)),
+                    verifier_schemas(),
+                    super::verify::VERIFIER_POLICY.to_owned(),
                 ),
                 AgentRole::Coder => {
                     let Some(worktree) = request.worktree.as_ref() else {
@@ -3947,7 +4032,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             schema["parameters"]["properties"]["role"]["enum"],
-            serde_json::json!(["explorer", "coder"])
+            serde_json::json!(["explorer", "coder", "verifier"])
         );
     }
 }
@@ -4150,6 +4235,58 @@ mod real_worker_tests {
             assert!(std::time::Instant::now() < deadline, "the child settles");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// A verifier judges with its own context and no editing tools - an edit it
+    /// tries is denied, whatever the mode - and the harness reads its verdict.
+    #[tokio::test]
+    async fn a_verifier_cannot_edit_and_its_verdict_comes_back() {
+        let bench = bench();
+        let provider = Scripted::new(vec![
+            Reply::Tool(
+                "write_file",
+                json!({"path": "a.txt", "content": "changed by the verifier\n"}),
+            ),
+            Reply::Text("a.txt:1 still says a\nVERDICT: FAIL"),
+        ]);
+        let host = host(&bench, Arc::clone(&provider) as Arc<dyn ModelProvider>);
+        let answer = host
+            .verifier()
+            .judge("judge whether a.txt says b".to_owned(), None)
+            .await
+            .expect("the verifier answers");
+        assert_eq!(
+            crate::interactive::verify::verdict(&answer),
+            crate::interactive::verify::Verdict::Fail,
+            "{answer}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(bench.repo.join("a.txt")).expect("file"),
+            "a\n",
+            "the verifier's edit was refused"
+        );
+        let seen = provider.seen.lock().expect("seen");
+        let first = &seen[0];
+        let tools = first
+            .tool_schemas
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(tools.contains(&"read_file"), "{tools:?}");
+        assert!(tools.contains(&"run_shell"), "{tools:?}");
+        for editing in ["write_file", "edit_file", "apply_patch", "delegate"] {
+            assert!(!tools.contains(&editing), "{editing} offered: {tools:?}");
+        }
+        let instructions = first
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            instructions.contains("independent verifier"),
+            "{instructions}"
+        );
     }
 
     /// Several children spawned at once from the kernel each run to an answer.

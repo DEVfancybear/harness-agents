@@ -2217,6 +2217,17 @@ impl InteractiveController {
                     },
                 );
             }
+            SessionEvent::Verified { passed, lines } => {
+                self.reference(
+                    if passed {
+                        "/verify: passed"
+                    } else {
+                        "/verify: failed"
+                    },
+                    lines,
+                    effects,
+                );
+            }
             SessionEvent::GatesChecked { result, state } => {
                 self.gates_pending = false;
                 // A turn the user started meanwhile owns the session now; the gates'
@@ -2869,7 +2880,16 @@ impl InteractiveController {
             Err(message) => self.push_history(effects, HistoryItem::Error { message }),
             Ok(command) => {
                 match command {
-                    super::autonomous::Command::On(options) => {
+                    super::autonomous::Command::On(mut options) => {
+                        // Without `--gate`, the project's own checks are the gates:
+                        // the run ends when they pass, not when the model stops.
+                        if options.gates.is_none() && self.autonomous.gates.commands.is_empty() {
+                            let checks = self.service.verify_checks();
+                            if !checks.is_empty() {
+                                options.gates =
+                                    Some(checks.into_iter().map(|check| check.command).collect());
+                            }
+                        }
                         // One driver at a time: autonomous mode and a goal both
                         // carry the conversation on by themselves.
                         if let Some(goal) = &mut self.goal
@@ -2994,6 +3014,19 @@ impl InteractiveController {
                 }
             }
         }
+    }
+
+    /// What `/review [focus]` asks the model: an independent verifier's judgement
+    /// of the work, reported as the verifier gave it.
+    fn review_request(focus: Option<&str>) -> String {
+        let focus = focus
+            .map(str::trim)
+            .filter(|focus| !focus.is_empty())
+            .map(|focus| format!(" Focus: {focus}."))
+            .unwrap_or_default();
+        format!(
+            "Review the work in this workspace with an independent verifier.{focus} Call delegate with role \"verifier\" and a self-contained brief: what was asked, what changed (from git status and git diff), and what must hold for it to be right. Then report the verifier's findings and its verdict as it gave them, without softening them, and say which you agree need fixing."
+        )
     }
 
     /// Start the accounting for a new turn.
@@ -3619,6 +3652,32 @@ impl InteractiveController {
                 }
             }
             "/goal" => self.goal_command(raw_argument, &mut effects),
+            "/verify" => {
+                let checks = self.service.verify_checks().len();
+                match self.service.run_verify() {
+                    Ok(()) if checks == 0 => self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "no [[verify.checks]] configured: add them to .harness/config.toml (name, command, hint)".to_owned(),
+                    }),
+                    Ok(()) => self.push_history(&mut effects, HistoryItem::Notice {
+                        message: format!("running {checks} verification check(s)..."),
+                    }),
+                    Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                }
+            }
+            "/features" => match self.service.features() {
+                Ok(lines) => self.reference("/features", lines, &mut effects),
+                Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+            },
+            "/review" => {
+                if self.phase.has_active_run() {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "a review starts when the running turn has finished".to_owned(),
+                    });
+                } else {
+                    self.continuations = 0;
+                    effects.extend(self.dispatch(Self::review_request(raw_argument), false));
+                }
+            }
             "/effort" => {
                 if let Some(level) = argument {
                     // Allowed while the agent works, as in prime-agent and Claude
@@ -5276,6 +5335,8 @@ mod tests {
         tier: Arc<Mutex<Option<String>>>,
         /// Every answer handed to a waiting child, by its question id.
         child_answers: Arc<Mutex<Vec<(String, String)>>>,
+        /// The project's `[verify]` checks.
+        verify_checks: Arc<Mutex<Vec<crate::interactive::verify::Check>>>,
     }
 
     impl SessionPort for RecordingPort {
@@ -5310,6 +5371,10 @@ mod tests {
 
         fn cancel_gates(&mut self) {
             *self.gate_cancels.lock().expect("gate cancel log") += 1;
+        }
+
+        fn verify_checks(&self) -> Vec<crate::interactive::verify::Check> {
+            self.verify_checks.lock().expect("checks").clone()
         }
 
         fn scoped_models(&mut self, argument: Option<&str>) -> Result<Vec<String>, String> {
@@ -9562,6 +9627,44 @@ Command: \"npm run build\""
             "{plain}"
         );
         assert_eq!(submissions(&harness).len(), 2, "a pass ends the run");
+    }
+
+    /// Without `--gate`, the project's `[verify]` checks are the gates: the run
+    /// ends when they pass, not when the model stops.
+    #[test]
+    fn autonomous_takes_the_projects_checks_as_its_gates() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        harness.port.verify_checks.lock().expect("checks").push(
+            crate::interactive::verify::Check {
+                name: "tests".to_owned(),
+                command: "cargo test".to_owned(),
+                hint: None,
+                timeout_ms: 1_000,
+            },
+        );
+        let plain = effects_to_plain(&submit_text(&mut harness.controller, "/autonomous on")).join(
+            "
+",
+        );
+        assert!(plain.contains("Gates: \"cargo test\"."), "{plain}");
+        let _ = submit_text(&mut harness.controller, "fix it");
+        done(&mut harness);
+        let jobs = harness.port.gate_jobs.lock().expect("gates").clone();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].commands, ["cargo test"]);
+    }
+
+    /// `/review` asks the model for an independent verifier's judgement.
+    #[test]
+    fn review_asks_for_an_independent_verifier() {
+        let mut harness = bench(true);
+        let _ = harness.controller.boot_lines();
+        let _ = submit_text(&mut harness.controller, "/review the parser change");
+        let sent = submissions(&harness);
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("role \"verifier\""), "{sent:?}");
+        assert!(sent[0].contains("Focus: the parser change."), "{sent:?}");
     }
 
     /// Q14: without gates the run continues until a budget is spent, and a turn

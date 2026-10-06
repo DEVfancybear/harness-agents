@@ -8,9 +8,16 @@
 //! `/goal pause`, `/goal resume`, `/goal clear` and `/goal status` manage it; Ctrl-C
 //! pauses it. The objective is stored with the task, so `/resume` brings it back,
 //! paused.
+//!
+//! The model's call is a request, not the decision: before the goal completes the
+//! harness runs the project's `[verify]` checks, then an independent verifier - a
+//! child with a fresh context that cannot edit - judges the work. Either failing
+//! keeps the goal active and tells the model what to fix, so an agent cannot end
+//! its goal by grading its own work.
 
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use harness_session::{ContextBlock, ContextBlockKind};
 use harness_tools::{
@@ -89,11 +96,27 @@ pub fn goal_block(objective: &str) -> ContextBlock {
     )
 }
 
+/// What the harness checks before a goal completes.
+#[derive(Clone)]
+pub struct GoalCheck {
+    pub root: PathBuf,
+    pub objective: String,
+    pub checks: Vec<super::verify::Check>,
+    /// The independent verifier and the model it runs on, when goals are judged.
+    pub judge: Option<(super::delegation::VerifierHandle, Option<String>)>,
+    /// The turn's cancellation: stopping the turn stops its checks.
+    pub cancellation: harness_providers::CancellationToken,
+}
+
 /// The `goal_complete` tool of one turn.
 #[derive(Clone)]
 pub struct GoalHost {
     sender: UnboundedSender<SessionEvent>,
     completed: Arc<AtomicBool>,
+    check: Option<Arc<GoalCheck>>,
+    /// The workspace as it was when a verification last failed: asking again
+    /// without changing anything is answered without running anything.
+    failed_at: Arc<Mutex<Option<super::autonomous::Snapshot>>>,
 }
 
 impl GoalHost {
@@ -102,7 +125,112 @@ impl GoalHost {
         Self {
             sender,
             completed: Arc::new(AtomicBool::new(false)),
+            check: None,
+            failed_at: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Verify the goal before it completes.
+    #[must_use]
+    pub fn with_check(mut self, check: GoalCheck) -> Self {
+        self.check = Some(Arc::new(check));
+        self
+    }
+
+    fn notice(&self, message: String) {
+        let _ = self.sender.send(SessionEvent::Notice { message });
+    }
+
+    /// Remember the workspace as the failed verification left it: checks and
+    /// the verifier's commands may write files themselves.
+    async fn remember_failure(&self, root: &std::path::Path) {
+        let workspace = super::autonomous::snapshot(root).await;
+        if let Ok(mut failed) = self.failed_at.lock() {
+            *failed = workspace;
+        }
+    }
+
+    /// The model says the goal is done: verify it, and complete it only when the
+    /// checks and the verifier agree. `Ok` is the completion, `Err` what is left
+    /// to fix - both written for the model.
+    ///
+    /// # Errors
+    /// The goal is not verified; the text says why and what to fix.
+    pub async fn finish(&self, summary: &str) -> Result<String, String> {
+        let Some(check) = self.check.clone() else {
+            self.complete(summary);
+            return Ok(format!("The goal is marked complete: {summary}"));
+        };
+        let workspace = super::autonomous::snapshot(&check.root).await;
+        let unchanged = workspace.is_some()
+            && self
+                .failed_at
+                .lock()
+                .is_ok_and(|failed| failed.as_ref() == workspace.as_ref());
+        if unchanged {
+            return Err("The goal is NOT complete, and it was not verified again: nothing in the workspace changed since the last verification failed. Fix what that verification reported, then call goal_complete again.".to_owned());
+        }
+        if !check.checks.is_empty() {
+            self.notice(format!(
+                "goal: running {} verification check(s) before it can complete",
+                check.checks.len()
+            ));
+        }
+        let report = super::verify::run(&check.root, &check.checks, &check.cancellation).await;
+        if let Some(failure) = report.failure_text() {
+            self.remember_failure(&check.root).await;
+            if let Some(run) = report.failure() {
+                self.notice(format!(
+                    "goal: check `{}` {}; the goal stays active",
+                    run.name, run.exit_text
+                ));
+            }
+            return Err(format!("The goal is NOT complete. {failure}"));
+        }
+        let mut evidence = report.evidence();
+        if let Some((verifier, model)) = &check.judge {
+            self.notice("goal: an independent verifier is checking the work".to_owned());
+            let changes = super::verify::changes(&check.root).await;
+            let brief = super::verify::goal_brief(&check.objective, summary, &report, &changes);
+            match verifier.judge(brief, model.as_deref()).await {
+                Ok(answer) => match super::verify::verdict(&answer) {
+                    super::verify::Verdict::Pass => {
+                        evidence.push_str("; independent verifier: PASS");
+                    }
+                    verdict => {
+                        self.remember_failure(&check.root).await;
+                        self.notice(format!(
+                            "goal: the verifier {}; the goal stays active",
+                            if verdict == super::verify::Verdict::Fail {
+                                "found problems"
+                            } else {
+                                "gave no verdict"
+                            }
+                        ));
+                        return Err(format!(
+                            "The goal is NOT complete: an independent verifier did not accept it.
+
+The verifier's findings:
+{}
+
+Fix every finding, check it yourself, then call goal_complete again.",
+                            answer.trim()
+                        ));
+                    }
+                },
+                Err(error) => {
+                    self.notice(format!(
+                        "goal: the verifier could not judge the work ({error})"
+                    ));
+                    return Err(format!(
+                        "The goal is NOT complete: the independent verifier could not judge it ({error}). Call goal_complete again to retry the verification."
+                    ));
+                }
+            }
+        }
+        let verified = format!("{summary} [verified: {evidence}]");
+        self.complete(&verified);
+        Ok(format!("The goal is complete and verified: {verified}"))
     }
 
     /// Mark the goal complete: the turn erases it from the task, and the controller
@@ -167,7 +295,7 @@ impl ExternalToolCatalog for GoalCatalog {
             "type": "function",
             "function": {
                 "name": "goal_complete",
-                "description": "Mark the active goal as finished. Call it only when the goal is fully done and verified.",
+                "description": "Ask to mark the active goal as finished. Call it only when the goal is fully done and you verified it. The harness then runs the project's checks and an independent verifier judges the work; the goal completes only if both pass, otherwise the result says what to fix.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -186,7 +314,7 @@ impl ExternalToolCatalog for GoalCatalog {
             tool_name: name.to_owned(),
             arguments: arguments.clone(),
             parent_invocation_id: None,
-            timeout_ms: 5_000,
+            timeout_ms: 3_600_000,
         })
     }
 }
@@ -228,11 +356,13 @@ impl ExternalToolDispatcher for GoalHost {
                 ));
             }
             let summary = Self::summary(arguments)?;
-            self.complete(&summary);
+            // A goal that is not verified yet is not an error of the call: the
+            // model reads what to fix and goes on.
+            let text = self.finish(&summary).await.unwrap_or_else(|left| left);
             Ok(ToolOutput::ExternalTool {
                 plugin_id: "goal".to_owned(),
                 tool_name: "goal_complete".to_owned(),
-                payload: json!({ "text": format!("The goal is marked complete: {summary}") }),
+                payload: json!({ "text": text }),
                 inflight: 1,
             })
         })
@@ -399,5 +529,102 @@ mod tests {
         let _ = SessionEvent::GoalCompleted {
             summary: String::new(),
         };
+    }
+
+    fn checked(
+        root: &std::path::Path,
+        command: &str,
+    ) -> (GoalHost, tokio::sync::mpsc::UnboundedReceiver<SessionEvent>) {
+        let (sender, events) = tokio::sync::mpsc::unbounded_channel();
+        let host = GoalHost::new(sender).with_check(super::GoalCheck {
+            root: root.to_path_buf(),
+            objective: "ship it".to_owned(),
+            checks: vec![crate::interactive::verify::Check {
+                name: "tests".to_owned(),
+                command: command.to_owned(),
+                hint: Some("make the tests pass".to_owned()),
+                timeout_ms: 30_000,
+            }],
+            judge: None,
+            cancellation: harness_providers::CancellationToken::new(),
+        });
+        (host, events)
+    }
+
+    fn completions(events: &mut tokio::sync::mpsc::UnboundedReceiver<SessionEvent>) -> Vec<String> {
+        let mut completed = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let SessionEvent::GoalCompleted { summary } = event {
+                completed.push(summary);
+            }
+        }
+        completed
+    }
+
+    /// The model's `goal_complete` is a request: a failing project check keeps the
+    /// goal active and tells the model what failed and how to fix it.
+    #[tokio::test]
+    async fn a_failing_check_keeps_the_goal_and_says_how_to_fix_it() {
+        let root = tempfile::tempdir().expect("root");
+        let (host, mut events) = checked(root.path(), "echo 2 tests failed; exit 1");
+        let left = host.finish("all done").await.expect_err("not verified");
+        assert!(left.contains("The goal is NOT complete"), "{left}");
+        assert!(left.contains("2 tests failed"), "{left}");
+        assert!(left.contains("How to fix: make the tests pass"), "{left}");
+        assert!(!host.completed());
+        assert!(completions(&mut events).is_empty());
+    }
+
+    /// Asking again without changing anything runs nothing; a change runs again.
+    #[tokio::test]
+    async fn an_unchanged_workspace_is_not_verified_again() {
+        let root = tempfile::tempdir().expect("root");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q"]);
+        // `git diff HEAD` needs a commit to compare with.
+        git(&[
+            "-c",
+            "user.email=ha@example.invalid",
+            "-c",
+            "user.name=ha",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "start",
+        ]);
+        std::fs::write(root.path().join("marker"), "1").expect("marker");
+        let (host, _events) = checked(root.path(), "echo ran >> runs.log; exit 1");
+        host.finish("done").await.expect_err("fails");
+        let again = host.finish("done").await.expect_err("still not done");
+        assert!(again.contains("not verified again"), "{again}");
+        let runs = std::fs::read_to_string(root.path().join("runs.log")).expect("log");
+        assert_eq!(runs.lines().count(), 1, "the check ran once");
+        std::fs::write(root.path().join("marker"), "2").expect("change");
+        host.finish("done").await.expect_err("fails again");
+        let runs = std::fs::read_to_string(root.path().join("runs.log")).expect("log");
+        assert_eq!(runs.lines().count(), 2, "a change runs the check again");
+    }
+
+    /// Passing checks complete the goal, with their evidence in its summary.
+    #[tokio::test]
+    async fn passing_checks_complete_the_goal_with_evidence() {
+        let root = tempfile::tempdir().expect("root");
+        let (host, mut events) = checked(root.path(), "echo ok");
+        let done = host.finish("shipped").await.expect("verified");
+        assert!(done.contains("complete and verified"), "{done}");
+        assert!(host.completed());
+        let completed = completions(&mut events);
+        assert_eq!(completed.len(), 1);
+        assert!(
+            completed[0].starts_with("shipped [verified: 1 check(s) passed: tests (`echo ok`)"),
+            "{completed:?}"
+        );
     }
 }

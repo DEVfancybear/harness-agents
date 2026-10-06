@@ -216,6 +216,9 @@ pub fn help_card_lines() -> Vec<String> {
             "Run",
             &[
                 "/goal",
+                "/verify",
+                "/review",
+                "/features",
                 "/autonomous",
                 "/schedule",
                 "/heartbeat",

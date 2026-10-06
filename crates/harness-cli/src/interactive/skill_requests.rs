@@ -301,7 +301,7 @@ impl SkillRequests {
         })
     }
 
-    fn goal(&self, kind: &str, request: &Value) -> Result<Value, String> {
+    async fn goal(&self, kind: &str, request: &Value) -> Result<Value, String> {
         match kind {
             "goal.get" => Ok(self.goal_response()),
             "goal.create" => {
@@ -340,14 +340,19 @@ impl SkillRequests {
                 let Some(objective) = self.objective() else {
                     return Err("there is no goal to complete".to_owned());
                 };
-                if !self.completed.swap(true, Ordering::SeqCst) {
+                if !self.completed.load(Ordering::SeqCst) {
                     let summary = format!("completed: {objective}");
                     match &self.goal_host {
-                        Some(host) => host.complete(&summary),
+                        // The harness verifies before it completes; what is left
+                        // reaches the kernel as the call's error.
+                        Some(host) => {
+                            host.finish(&summary).await?;
+                        }
                         None => {
                             let _ = self.sender.send(SessionEvent::GoalCompleted { summary });
                         }
                     }
+                    self.completed.store(true, Ordering::SeqCst);
                 }
                 Ok(self.goal_response())
             }
@@ -455,7 +460,7 @@ impl HostRequests for SkillRequests {
                     "provider": self.model.provider,
                     "input": if self.model.images { json!(["text", "image"]) } else { json!(["text"]) },
                 })),
-                kind if kind.starts_with("goal.") => self.goal(kind, request),
+                kind if kind.starts_with("goal.") => self.goal(kind, request).await,
                 kind if kind.starts_with("compact.") => self.compact(kind, request),
                 kind if kind.starts_with("refine.") => self.refine(kind, request),
                 _ => return None,

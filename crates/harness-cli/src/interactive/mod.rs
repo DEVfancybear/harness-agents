@@ -28,6 +28,7 @@ pub mod events;
 pub mod export_html;
 pub mod extensions;
 pub mod external_editor;
+pub mod features;
 pub mod frontend;
 pub mod goal;
 pub mod harness;
@@ -62,6 +63,7 @@ pub mod store_lease;
 pub mod terminal;
 pub mod tui;
 pub mod update_check;
+pub mod verify;
 pub mod view;
 pub mod web;
 

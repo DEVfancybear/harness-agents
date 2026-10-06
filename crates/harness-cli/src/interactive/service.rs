@@ -110,6 +110,7 @@ mod g03_model_selection_tests {
             agents_default_model: None,
             queue_modes: (None, None),
             routing: super::super::config::Routing::default(),
+            verify: super::super::verify::Verify::default(),
             credential: super::CredentialSource::Environment {
                 variable: String::new(),
             },
@@ -404,6 +405,19 @@ pub trait SessionPort: Send {
     /// Where `rlm.create_session` starts a separate top-level session; only a
     /// background agent has one.
     fn set_session_host(&mut self, _host: Arc<dyn super::agents::SessionHost>) {}
+    /// The project's `[verify]` checks.
+    fn verify_checks(&self) -> Vec<super::verify::Check> {
+        Vec::new()
+    }
+    /// `/verify`: run the project's checks now; the report arrives as
+    /// [`SessionEvent::Verified`].
+    fn run_verify(&mut self) -> Result<(), String> {
+        Err("this backend cannot run checks".to_owned())
+    }
+    /// `/features`: the project's feature list.
+    fn features(&self) -> Result<Vec<String>, String> {
+        Err("this backend has no workspace".to_owned())
+    }
     /// Run autonomous quality gates in the workspace; the verdict arrives as
     /// [`SessionEvent::GatesChecked`].
     fn run_gates(&mut self, _job: super::autonomous::GateJob) -> Result<(), String> {
@@ -883,6 +897,8 @@ pub struct ProviderConfig {
     pub queue_modes: (Option<String>, Option<String>),
     /// `[routing]`: scoped, auxiliary, backup and image models.
     pub routing: super::config::Routing,
+    /// `[verify]`: the project's checks and whether a verifier judges goals.
+    pub verify: super::verify::Verify,
     /// Name of the source that holds the key; never the key.
     pub credential: CredentialSource,
     /// The service tier the session asked for (`/tier`, `/fast`), before it is
@@ -1028,6 +1044,7 @@ pub(super) fn resolve_provider_with_overrides(
         agents_default_model: resolved.agents_default_model,
         queue_modes: resolved.queue_modes,
         routing: resolved.routing,
+        verify: resolved.verify,
         credential,
         service_tier: None,
     })
@@ -4500,6 +4517,41 @@ impl SessionPort for AgentSessionService {
         self.agents.set_session_host(host);
     }
 
+    fn verify_checks(&self) -> Vec<super::verify::Check> {
+        self.configured()
+            .map(|config| config.verify.checks)
+            .unwrap_or_default()
+    }
+
+    fn run_verify(&mut self) -> Result<(), String> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        let checks = self.verify_checks();
+        let sender = self.sender.clone();
+        let root = self.workspace_root.clone();
+        let cancellation = CancellationToken::new();
+        handle.spawn(async move {
+            let report = super::verify::run(&root, &checks, &cancellation).await;
+            let _ = sender.send(SessionEvent::Verified {
+                passed: report.passed(),
+                lines: report.lines(),
+            });
+        });
+        Ok(())
+    }
+
+    fn features(&self) -> Result<Vec<String>, String> {
+        Ok(super::features::load(&self.workspace_root)?.map_or_else(
+            || {
+                vec![format!(
+                    "no feature list: the agent creates {} with its feature tool when work is split into features",
+                    super::features::FEATURES_FILE
+                )]
+            },
+            |list| list.lines(),
+        ))
+    }
+
     fn run_gates(&mut self, job: super::autonomous::GateJob) -> Result<(), String> {
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| "the application service needs an async runtime".to_owned())?;
@@ -6691,8 +6743,30 @@ async fn run_turn(
         &workspace_root,
         skill_catalog.as_ref(),
     );
-    let goal_host =
-        matches!(goal, GoalRecord::Active(_)).then(|| super::goal::GoalHost::new(sender.clone()));
+    // The model's `goal_complete` is a request: the project's checks run, then an
+    // independent verifier judges, before the goal completes.
+    let goal_host = match &goal {
+        GoalRecord::Active(objective) => Some(
+            super::goal::GoalHost::new(sender.clone()).with_check(super::goal::GoalCheck {
+                root: workspace_root.clone(),
+                objective: objective.clone(),
+                checks: config.verify.checks.clone(),
+                judge: delegate_host
+                    .as_ref()
+                    .filter(|_| config.verify.judge)
+                    .map(|host| (host.verifier(), config.routing.verifier.clone())),
+                cancellation: cancellation.clone(),
+            }),
+        ),
+        _ => None,
+    };
+    // The project's feature list: the model works it, the harness verifies it.
+    let feature_host = Some(super::features::FeatureHost::new(
+        workspace_root.clone(),
+        config.verify.checks.clone(),
+        cancellation.clone(),
+        sender.clone(),
+    ));
     let kernel_skills = skill_catalog
         .as_ref()
         .map(|catalog| {
@@ -6773,6 +6847,7 @@ async fn run_turn(
         skill_host.as_ref(),
         web_host.as_ref(),
         goal_host.as_ref(),
+        feature_host.as_ref(),
         repl_host.as_ref(),
     ) {
         tools = tools.with_external(dispatcher);
@@ -6785,6 +6860,7 @@ async fn run_turn(
         skill_host.as_ref(),
         web_host.as_ref(),
         goal_host.as_ref(),
+        feature_host.as_ref(),
         repl_host.as_ref(),
     );
     let driver = match &external_tools {
@@ -6940,6 +7016,10 @@ async fn run_turn(
     }
     if let GoalRecord::Active(objective) = &goal {
         project_blocks.push(super::goal::goal_block(objective));
+    }
+    // Where the project's feature list stands, and its rules.
+    if let Some(block) = super::features::context_block(&workspace_root) {
+        project_blocks.push(block);
     }
     // Memory is prime-agent's continual harness state: the model keeps it through
     // `rlm.harness`, and every turn carries a digest of it ranked for this task.
