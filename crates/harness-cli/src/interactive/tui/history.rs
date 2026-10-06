@@ -1120,6 +1120,10 @@ fn banner_rows(lines: &[String], width: u16, theme: &Theme) -> Vec<Line<'static>
                 "Service:",
                 "Permissions:",
                 "Thinking:",
+                "Cost:",
+                "Context:",
+                "Cache:",
+                "Chat:",
                 "Nhập yêu cầu.",
             ]
             .iter()

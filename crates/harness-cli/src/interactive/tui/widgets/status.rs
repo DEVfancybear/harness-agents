@@ -125,6 +125,10 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
     // gauge, because it is the one number nothing else on the screen repeats.
     let telemetry = |theme: &Theme| -> Vec<Vec<Span<'static>>> {
         let cost = cost_label(state).map(|cost| Span::styled(cost, theme.dim));
+        // How much of the session's prompt came from the provider's cache: a
+        // falling share is the first sign a prefix stopped holding still.
+        let cache =
+            cache_label(state).map(|share| Span::styled(format!("⚡ cache {share}"), theme.dim));
         let context =
             context_label(state).map(|value| Span::styled(format!("◔ ctx {value}"), theme.dim));
         let detail = (matches!(state.phase, AppPhase::Ready | AppPhase::WaitingInput)
@@ -134,7 +138,8 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
             parts.into_iter().flatten().collect()
         };
         vec![
-            joined(vec![cost.clone(), context.clone(), detail]),
+            joined(vec![cost.clone(), cache.clone(), context.clone(), detail]),
+            joined(vec![cost.clone(), cache, context.clone()]),
             joined(vec![cost, context.clone()]),
             joined(vec![context]),
             Vec::new(),
@@ -326,6 +331,13 @@ fn context_label(state: &UiState) -> Option<String> {
         .header
         .iter()
         .find_map(|line| line.strip_prefix("Context: ").map(str::to_owned))
+}
+
+fn cache_label(state: &UiState) -> Option<String> {
+    state
+        .header
+        .iter()
+        .find_map(|line| line.strip_prefix("Cache: ").map(str::to_owned))
 }
 
 fn cost_label(state: &UiState) -> Option<String> {

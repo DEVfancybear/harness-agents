@@ -754,6 +754,10 @@ pub enum SessionEvent {
     CostUpdated {
         label: String,
     },
+    /// The session's share of prompt tokens read from the provider's cache (`87%`).
+    CacheUpdated {
+        label: String,
+    },
     /// How full the context window is and the provider's tightest limit, after
     /// a response reported its usage (`12% · 123k/1M · 5h 34%`).
     UsageUpdated {

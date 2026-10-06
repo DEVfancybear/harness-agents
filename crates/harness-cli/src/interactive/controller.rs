@@ -1709,6 +1709,19 @@ impl InteractiveController {
                 }
                 effects.push(Effect::Redraw);
             }
+            SessionEvent::CacheUpdated { label } => {
+                let line = format!("Cache: {label}");
+                if let Some(existing) = self
+                    .header
+                    .iter_mut()
+                    .find(|entry| entry.starts_with("Cache:"))
+                {
+                    *existing = line;
+                } else {
+                    self.header.push(line);
+                }
+                effects.push(Effect::Redraw);
+            }
             SessionEvent::CostUpdated { label } => {
                 let line = format!("Cost: {label}");
                 if let Some(existing) = self

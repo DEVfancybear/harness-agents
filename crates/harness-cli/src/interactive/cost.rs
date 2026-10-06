@@ -28,6 +28,9 @@ pub struct CostTracker {
     unpriced_usage: bool,
     input_tokens: u64,
     output_tokens: u64,
+    /// Of `input_tokens`, how many were read from and written to the prompt cache.
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
     /// The last request's prompt plus its answer: what the context holds now, as
     /// prime-agent reads it off the latest response's usage.
     context_tokens: Option<u64>,
@@ -38,6 +41,12 @@ impl CostTracker {
         self.has_usage = true;
         self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(usage.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(usage.cache_write_tokens);
         self.context_tokens = Some(usage.input_tokens.saturating_add(usage.output_tokens));
         match calculate_cost(price, usage) {
             Some(cost) if !self.unpriced_usage => self.total_usd += cost,
@@ -56,6 +65,19 @@ impl CostTracker {
     #[must_use]
     pub const fn context_tokens(&self) -> Option<u64> {
         self.context_tokens
+    }
+
+    /// How much of the session's prompt tokens the provider read from its cache,
+    /// as a percentage: `87%`. The share a session pays the cache price for is
+    /// the one number that says whether its prefix stays still; Claude Code's
+    /// team treats a drop in it as an incident. `None` before any usage.
+    #[must_use]
+    pub fn cache_label(&self) -> Option<String> {
+        if self.input_tokens == 0 {
+            return None;
+        }
+        let percent = self.cache_read_tokens.saturating_mul(100) / self.input_tokens;
+        Some(format!("{}%", percent.min(100)))
     }
 
     /// A new conversation starts with an empty context.
@@ -133,6 +155,33 @@ pub fn context_label(used: u64, window: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ModelPrice, Usage, calculate_cost, context_label, format_tokens};
+
+    /// The cache share is the session's prompt tokens read from the cache.
+    #[test]
+    fn the_cache_share_is_read_tokens_over_prompt_tokens() {
+        let mut tracker = super::CostTracker::default();
+        assert_eq!(tracker.cache_label(), None);
+        tracker.record(
+            None,
+            super::Usage {
+                input_tokens: 1_000,
+                output_tokens: 10,
+                cache_read_tokens: 0,
+                cache_write_tokens: 1_000,
+            },
+        );
+        assert_eq!(tracker.cache_label().as_deref(), Some("0%"));
+        tracker.record(
+            None,
+            super::Usage {
+                input_tokens: 3_000,
+                output_tokens: 10,
+                cache_read_tokens: 2_000,
+                cache_write_tokens: 0,
+            },
+        );
+        assert_eq!(tracker.cache_label().as_deref(), Some("50%"));
+    }
 
     #[test]
     fn token_counts_read_like_prime_agents() {

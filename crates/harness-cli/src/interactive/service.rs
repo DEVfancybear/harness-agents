@@ -1956,7 +1956,7 @@ impl TurnObserver for ChannelObserver {
                 cache_read_tokens,
                 cache_write_tokens,
             } => {
-                let label = if let Ok(mut tracker) = self.cost_tracker.lock() {
+                let (label, cache) = if let Ok(mut tracker) = self.cost_tracker.lock() {
                     tracker.record(
                         self.model_price,
                         CostUsage {
@@ -1966,10 +1966,13 @@ impl TurnObserver for ChannelObserver {
                             cache_write_tokens,
                         },
                     );
-                    tracker.display()
+                    (tracker.display(), tracker.cache_label())
                 } else {
-                    "n/a".to_owned()
+                    ("n/a".to_owned(), None)
                 };
+                if let Some(label) = cache {
+                    let _ = self.sender.send(SessionEvent::CacheUpdated { label });
+                }
                 let _ = self.sender.send(SessionEvent::UsageUpdated {
                     label: usage_label(
                         prompt_tokens.saturating_add(completion_tokens),
