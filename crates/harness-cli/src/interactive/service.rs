@@ -5666,7 +5666,7 @@ async fn run_turn(
         return;
     }
 
-    if request.text == "/undo" || request.text.starts_with("/export ") {
+    if request.text == "/undo" || request.text == "/share" || request.text.starts_with("/export ") {
         run_session_file_action(
             sender,
             store,
@@ -6998,6 +6998,58 @@ async fn run_session_file_action(
     }
 }
 
+/// prime-agent's `/share`: the session as HTML in a secret GitHub gist
+/// (`gh gist create --public=false`), whose URL is reported. The page is
+/// written under the data directory, never into the workspace.
+async fn share_session(
+    sender: &UnboundedSender<SessionEvent>,
+    store: &Arc<SqliteStore>,
+    task_id: &TaskId,
+    source: Option<&SessionId>,
+    environment: &LaunchEnvironment,
+    data_dir: &Path,
+    config: &super::config::ResolvedConfig,
+) -> Result<RunOutcome, String> {
+    let html = render_session_html(
+        store,
+        task_id,
+        source,
+        environment,
+        data_dir,
+        &config.provider.api_key_env,
+        &config.provider.model,
+    )
+    .await?;
+    let dir = data_dir.join("share");
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("the page could not be written: {error}"))?;
+    let file = dir.join(format!("{}.html", task_id.as_str()));
+    std::fs::write(&file, html)
+        .map_err(|error| format!("the page could not be written: {error}"))?;
+    let output = tokio::process::Command::new("gh")
+        .args(["gist", "create", "--public=false"])
+        .arg(&file)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|_| {
+            "GitHub CLI (gh) is not installed. Install it from https://cli.github.com/".to_owned()
+        })?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if message.is_empty() {
+            "gh gist create failed".to_owned()
+        } else {
+            message
+        });
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let _ = sender.send(SessionEvent::Notice {
+        message: format!("shared as a secret gist: {url}"),
+    });
+    Ok(RunOutcome::Done)
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_session_file_action_inner(
     sender: &UnboundedSender<SessionEvent>,
@@ -7060,6 +7112,18 @@ async fn run_session_file_action_inner(
         *previous = Some(session_id.clone());
     }
 
+    if request.text == "/share" {
+        return share_session(
+            sender,
+            &store,
+            &task_id,
+            source.as_ref(),
+            &environment,
+            &data_dir,
+            &config,
+        )
+        .await;
+    }
     let is_undo = request.text == "/undo";
     let action = if is_undo {
         latest_undo_action(&store, &task_id, &project_id, &workspace_root).await?

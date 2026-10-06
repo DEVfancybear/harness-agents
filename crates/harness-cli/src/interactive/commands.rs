@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 52] = [
+pub const SLASH_COMMANDS: [SlashCommand; 53] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -73,7 +73,12 @@ pub const SLASH_COMMANDS: [SlashCommand; 52] = [
     command(
         "/export",
         "[path]",
-        "Export session (Markdown default, or specify path: .md/.jsonl)",
+        "Export session (HTML default, or specify path: .html/.md/.jsonl)",
+    ),
+    command(
+        "/share",
+        "",
+        "Share session as a secret GitHub gist (needs the gh CLI)",
     ),
     command("/copy", "", "Copy last agent message to clipboard"),
     SlashCommand {
@@ -110,7 +115,7 @@ pub const SLASH_COMMANDS: [SlashCommand; 52] = [
     },
     SlashCommand {
         aliases: &["/clear"],
-        ..command("/new", "", "Start a new session")
+        ..command("/new", "[prompt]", "Start a new session")
     },
     command(
         "/compact",

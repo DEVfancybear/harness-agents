@@ -3403,7 +3403,8 @@ impl InteractiveController {
             }
             "/undo" => self.start_host_action("/undo".to_owned(), &mut effects),
             "/export" => {
-                let path = raw_argument.unwrap_or("session-export.md");
+                // prime-agent exports HTML unless a path says otherwise.
+                let path = raw_argument.unwrap_or("session-export.html");
                 let path_value = std::path::Path::new(path);
                 if path_value.is_absolute()
                     || path_value.components().any(|component| {
@@ -3419,6 +3420,15 @@ impl InteractiveController {
                     });
                 } else {
                     self.start_host_action(format!("/export {path}"), &mut effects);
+                }
+            }
+            "/share" => {
+                if self.phase.has_active_run() {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "wait for the running turn to finish before sharing".to_owned(),
+                    });
+                } else {
+                    self.start_host_action("/share".to_owned(), &mut effects);
                 }
             }
             "/copy" => {
@@ -3636,6 +3646,11 @@ impl InteractiveController {
                             message: message.to_owned(),
                         },
                     );
+                    // prime-agent's `/new [prompt]`: the new conversation starts
+                    // with that prompt.
+                    if let Some(prompt) = raw_argument.map(str::trim).filter(|prompt| !prompt.is_empty()) {
+                        effects.extend(self.dispatch(prompt.to_owned(), false));
+                    }
                 }
             }
             "/model" => {
