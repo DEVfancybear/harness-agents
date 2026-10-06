@@ -1932,6 +1932,9 @@ impl TurnObserver for ChannelObserver {
             TurnProgress::TextDelta(text) => Some(SessionEvent::TextDelta { text }),
             TurnProgress::ThinkingDelta(text) => Some(SessionEvent::ThinkingDelta { text }),
             TurnProgress::StreamRestarted => Some(SessionEvent::StreamRestarted),
+            TurnProgress::ToolCallStreaming { name } => {
+                Some(SessionEvent::ToolCallWriting { name })
+            }
             TurnProgress::ToolProgress { call_id, text, .. } => {
                 Some(SessionEvent::ToolProgress { call_id, text })
             }

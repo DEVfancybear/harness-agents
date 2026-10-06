@@ -634,6 +634,9 @@ pub struct UiState {
     /// prime-agent's queued strip: `<lane>: <first line>` per queued message.
     #[serde(default)]
     pub queued_previews: Vec<String>,
+    /// prime-agent's "Writing code": a tool call's arguments are streaming.
+    #[serde(default)]
+    pub writing_code: bool,
     /// The provider-usage wait line, while a rate-limited turn waits.
     pub provider_wait: Option<String>,
     /// The last submitted request, so the status bar can name it.
@@ -743,6 +746,11 @@ pub enum SessionEvent {
     /// The model call started over after its stream failed part-way: what it
     /// streamed so far is not the answer.
     StreamRestarted,
+    /// prime-agent's `toolcall_start`: the model is writing a tool call's
+    /// arguments; the working line says so until the call runs.
+    ToolCallWriting {
+        name: String,
+    },
     CostUpdated {
         label: String,
     },

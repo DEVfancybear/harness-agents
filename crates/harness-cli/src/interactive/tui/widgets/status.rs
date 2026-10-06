@@ -220,6 +220,8 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
                 "Canceling"
             } else if !state.open_tools.is_empty() {
                 "Executing"
+            } else if state.writing_code {
+                "Writing code"
             } else if state.live_text.is_empty() {
                 "Thinking"
             } else {
@@ -390,6 +392,7 @@ mod tests {
             queued_input: false,
             queued_count: 0,
             queued_previews: Vec::new(),
+            writing_code: false,
             provider_wait: None,
             last_request: None,
             run_started_at: None,

@@ -72,6 +72,11 @@ pub enum TurnProgress {
         call_id: String,
         text: String,
     },
+    /// prime-agent's `toolcall_start` / `toolcall_delta`: the model is writing
+    /// the arguments of a tool call (reported once per call).
+    ToolCallStreaming {
+        name: String,
+    },
     /// The model call started over: a retry after the stream failed part-way
     /// sends the answer again from its start, so what the failed attempt
     /// streamed is no longer the answer.
@@ -2313,7 +2318,21 @@ fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
     // Every attempt of one model call opens with `Started`; a second one means
     // the runtime is retrying, and the deltas that follow repeat the answer.
     let attempts = std::sync::atomic::AtomicUsize::new(0);
+    let streaming_call = std::sync::Mutex::new(String::new());
     Arc::new(move |event: ProviderStreamEvent| match event {
+        ProviderStreamEvent::ToolCallDelta { call_id, name, .. } => {
+            let first = streaming_call.lock().is_ok_and(|mut current| {
+                if *current == call_id {
+                    false
+                } else {
+                    current.clone_from(&call_id);
+                    true
+                }
+            });
+            if first {
+                observer.observe(TurnProgress::ToolCallStreaming { name });
+            }
+        }
         ProviderStreamEvent::Started { .. } => {
             if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
                 observer.observe(TurnProgress::StreamRestarted);

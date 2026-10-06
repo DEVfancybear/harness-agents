@@ -304,6 +304,8 @@ pub struct InteractiveController {
     escape_armed_at: Option<Instant>,
     /// The shared picker is prime-agent's tree (or fork) selector.
     turn_picker: Option<super::events::TurnsPurpose>,
+    /// A tool call's arguments are streaming (prime-agent's "Writing code").
+    writing_code: bool,
     /// The prompt the app was started with, until it is sent.
     initial_prompt: Option<String>,
     /// The provider whose API key the masked prompt is collecting.
@@ -404,6 +406,7 @@ impl InteractiveController {
             exit_armed_at: None,
             escape_armed_at: None,
             turn_picker: None,
+            writing_code: false,
             initial_prompt: None,
             login_provider: None,
             login_scope: super::credentials::Scope::Main,
@@ -655,6 +658,7 @@ impl InteractiveController {
             queued_input: !self.queue.is_empty(),
             queued_count: self.queue.len(),
             queued_previews: self.queue.previews(),
+            writing_code: self.writing_code,
             provider_wait: self.provider_wait.clone(),
             last_request: self.last_request.clone(),
             run_started_at: self.run_started_at,
@@ -1611,7 +1615,12 @@ impl InteractiveController {
             // An empty answer delta (a frame that carries only reasoning) is not
             // answer text: it must not commit the reasoning gathered so far.
             SessionEvent::TextDelta { text } if text.is_empty() => {}
+            SessionEvent::ToolCallWriting { .. } => {
+                self.writing_code = true;
+                effects.push(Effect::Redraw);
+            }
             SessionEvent::TextDelta { text } => {
+                self.writing_code = false;
                 self.flush_thinking(effects);
                 self.pending_newlines = self
                     .pending_newlines
@@ -1641,6 +1650,7 @@ impl InteractiveController {
                 effects.push(Effect::Redraw);
             }
             SessionEvent::ThinkingDelta { text } => {
+                self.writing_code = false;
                 // Reasoning is one row, not one row per delta: it is gathered and
                 // committed when answer text arrives or the step ends. Providers
                 // can interleave reasoning with answer tokens. Keep the TUI's
@@ -1701,6 +1711,7 @@ impl InteractiveController {
                 summary,
                 input,
             } => {
+                self.writing_code = false;
                 self.flush_stream(effects);
                 self.tool_calls = self.tool_calls.saturating_add(1);
                 self.open_tools
@@ -5027,6 +5038,7 @@ impl InteractiveController {
     }
 
     fn finish_run(&mut self) {
+        self.writing_code = false;
         self.pending_approval = None;
         self.approval_queue.clear();
         self.pending_mcp_elicitation = None;
