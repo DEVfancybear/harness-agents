@@ -38,9 +38,26 @@ pub struct Cadence {
     turns: std::sync::atomic::AtomicU32,
     tool_calls: std::sync::atomic::AtomicU32,
     running: std::sync::atomic::AtomicBool,
+    /// Learned skills used since the last review.
+    in_play: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl Cadence {
+    /// Remember the learned skills a turn used, for the next review.
+    pub fn note_in_play(&self, used: std::collections::BTreeSet<String>) {
+        if let Ok(mut in_play) = self.in_play.lock() {
+            in_play.extend(used);
+        }
+    }
+
+    /// The learned skills used since the last review; the next one starts empty.
+    pub fn take_in_play(&self) -> Vec<String> {
+        self.in_play
+            .lock()
+            .map(|mut in_play| std::mem::take(&mut *in_play).into_iter().collect())
+            .unwrap_or_default()
+    }
+
     /// Count a finished turn and the tool calls it made. When a review is due and
     /// none is running, it is claimed: the counts restart and the number of turns it
     /// covers is returned. [`Cadence::release`] ends the claim.
@@ -107,6 +124,31 @@ pub struct DeferredReview {
     pub task: String,
     pub session: String,
     pub turns: u32,
+    /// Learned skills the ended session used since its last review.
+    pub in_play: Vec<String>,
+}
+
+/// The file in a conversation's local harness scope naming the last session an
+/// automatic review read.
+const WATERMARK_FILE: &str = "review_watermark";
+
+/// The last session of the conversation an earlier review already read.
+#[must_use]
+pub fn reviewed_through(local: &Path) -> Option<String> {
+    std::fs::read_to_string(local.join(WATERMARK_FILE))
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|session| !session.is_empty())
+}
+
+/// Remember that a review read the conversation up to `session`.
+pub fn mark_reviewed(local: &Path, session: &str) {
+    if std::fs::create_dir_all(local).is_ok() {
+        let temporary = local.join(format!("{WATERMARK_FILE}.tmp"));
+        if std::fs::write(&temporary, session).is_ok() {
+            let _ = std::fs::rename(&temporary, local.join(WATERMARK_FILE));
+        }
+    }
 }
 
 /// Leave a review for the next turn in this project.
@@ -116,7 +158,7 @@ pub fn defer_review(project_dir: &Path, review: &DeferredReview) -> Result<(), S
     let name = slug(&review.task, "task");
     let temporary = dir.join(format!(".{name}.tmp"));
     let text =
-        json!({"task": review.task, "session": review.session, "turns": review.turns, "at": now()})
+        json!({"task": review.task, "session": review.session, "turns": review.turns, "in_play": review.in_play, "at": now()})
             .to_string();
     std::fs::write(&temporary, text).map_err(|error| format!("deferred review: {error}"))?;
     std::fs::rename(&temporary, dir.join(format!("{name}.json")))
@@ -155,6 +197,16 @@ pub fn take_deferred_reviews(project_dir: &Path) -> Vec<DeferredReview> {
                     .as_u64()
                     .and_then(|turns| u32::try_from(turns).ok())
                     .unwrap_or(0),
+                in_play: value["in_play"]
+                    .as_array()
+                    .map(|names| {
+                        names
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             });
         }
     }
@@ -195,6 +247,8 @@ Scope and persistence policy:
 - Create or update the smallest relevant component: repeated delegation roles should become subagent specs, repeated procedures should become skills, durable facts/preferences should become memories, and narrow behavioral policies should become prompt addendums.
 - When an edit is persisted, include metadata such as `{"scope":"local"}` or `{"scope":"global"}` when that helps future review understand the intended blast radius.
 
+When the conversation holds a line saying the turns above it were already reviewed, take lessons from the turns after that line; the earlier ones are context, and what they taught is already in the harness state or the learned skills.
+
 Use the trajectory, current continual harness state, and prior refinement history. Prefer
 small evidence-backed edits. If prior refinements caused issues, rollback or
 replace the faulty editable entries. Never edit source files directly. Output
@@ -226,7 +280,7 @@ JSON only with this exact shape:
 const AUTO_REFINE_REVIEW_SYSTEM_PROMPT: &str = r#"You are the automatic /refine review gate of ha, a coding agent.
 
 Decide whether this checkpoint should run /refine. Auto /refine writes local continual harness state by default, so approve when the trajectory contains evidence useful to this session's future turns.
-Reject one-off noise, unsupported hypotheses, and transient tool outputs. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified lessons likely to be reused in future sessions.
+Reject one-off noise, unsupported hypotheses, and transient tool outputs. When the conversation holds a line saying the turns above it were already reviewed, judge only the turns after it. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified lessons likely to be reused in future sessions.
 
 Return JSON only:
 {
@@ -234,6 +288,9 @@ Return JSON only:
   "rationale": "short reason",
   "instructions": "optional concise instructions for /refine if shouldRefine is true"
 }"#;
+
+/// What `/learn` asks of a refinement.
+const LEARN_INSTRUCTIONS: &str = "The user ran /learn: keep what this conversation taught as learned skills (skillFiles) - corrected approaches, non-trivial techniques and fixes, setup steps that unblocked a tool, and the user's preferences about how this kind of work is done. Compare first and patch a learned skill that already covers the class of work; rewrite a stale rule the conversation superseded. Use memory edits only for plain facts. If nothing meets the bar, propose nothing and say why.";
 
 /// What one refinement is asked to do.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -247,6 +304,21 @@ pub struct RefineOptions {
 }
 
 impl RefineOptions {
+    /// `/learn [focus]`: a refinement asked to keep what the conversation taught
+    /// as learned skills (autoharness's `/learn`), through the same chain.
+    #[must_use]
+    pub fn learn(focus: &str) -> Self {
+        let mut instructions = LEARN_INSTRUCTIONS.to_owned();
+        if !focus.trim().is_empty() {
+            instructions.push_str("\nFocus: ");
+            instructions.push_str(focus.trim());
+        }
+        Self {
+            instructions: Some(instructions),
+            ..Self::default()
+        }
+    }
+
     /// `/refine [--global] [--rollback <id>] [--curate] [instructions]`.
     #[must_use]
     pub fn parse(arguments: &str) -> Self {
@@ -272,6 +344,9 @@ impl RefineOptions {
 pub struct Learning {
     pub layers: super::learned::Layers,
     pub context: super::learned::PromoteContext,
+    /// Learned skills loaded during the turns under review: the ones in play,
+    /// patched first when the conversation shows them wrong (autoharness).
+    pub in_play: Vec<String>,
 }
 
 impl Learning {
@@ -303,6 +378,7 @@ impl Learning {
                 taken,
                 workspace: workspace.to_path_buf(),
             },
+            in_play: Vec::new(),
         }
     }
 
@@ -318,7 +394,7 @@ impl Learning {
         if taken.is_empty() {
             "(none)".clone_into(&mut taken);
         }
-        vec![
+        let mut parts = vec![
             format!(
                 "<learned_skills>\n{}\n</learned_skills>",
                 super::learned::library_overview(&super::learned::library(&self.layers))
@@ -333,7 +409,14 @@ impl Learning {
                 },
                 super::learned::SPEC
             ),
-        ]
+        ];
+        if !self.in_play.is_empty() {
+            parts.push(format!(
+                "<learned_skills_in_play>\n{}\nThese learned skills were loaded during the turns under review. If the conversation shows one was wrong, missing a step or outdated, patch that skill first: it is the one that was followed.\n</learned_skills_in_play>",
+                self.in_play.join(", ")
+            ));
+        }
+        parts
     }
 }
 
@@ -674,6 +757,9 @@ struct Proposal {
     skill_files: Vec<Value>,
     /// Learned-skill changes a rollback undoes, newest first.
     skill_restores: Vec<Value>,
+    /// Learned-skill intents already promoted (with their repair), recorded as
+    /// they are.
+    skill_records: Vec<Value>,
 }
 
 impl Proposal {
@@ -705,6 +791,7 @@ impl Proposal {
                 })
                 .unwrap_or_default(),
             skill_restores: Vec::new(),
+            skill_records: Vec::new(),
         }
     }
 }
@@ -721,10 +808,29 @@ impl Refinement {
         self.record["id"].as_str().unwrap_or_default()
     }
 
+    /// The edits that count: an intent refused and then handed to the repair
+    /// pass is reported apart, not as a failure.
     fn edits(&self) -> Vec<&Value> {
         self.record["appliedEdits"]
             .as_array()
-            .map(|edits| edits.iter().collect())
+            .map(|edits| {
+                edits
+                    .iter()
+                    .filter(|edit| edit["superseded"] != true)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn superseded(&self) -> Vec<&Value> {
+        self.record["appliedEdits"]
+            .as_array()
+            .map(|edits| {
+                edits
+                    .iter()
+                    .filter(|edit| edit["superseded"] == true)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -845,6 +951,13 @@ impl Refinement {
             first = format!("{first} · rollback of {target}");
         }
         let mut lines = vec![first];
+        for edit in self.superseded() {
+            lines.push(format!(
+                "Refused learned skill `{}`, sent back for repair: {}",
+                edit["id"].as_str().unwrap_or("?"),
+                edit["error"].as_str().unwrap_or("")
+            ));
+        }
         for edit in self.edits() {
             let entry_scope = edit["level"]
                 .as_str()
@@ -1042,33 +1155,9 @@ fn apply_skill_files(
     learning: Option<&Learning>,
     applied_edits: &mut Vec<Value>,
 ) {
+    applied_edits.extend(proposal.skill_records.iter().cloned());
     for intent in &proposal.skill_files {
-        let parsed = super::learned::Intent::from_value(intent);
-        let mut record = json!({
-            "action": parsed.action,
-            "kind": SKILL_FILE_KIND,
-            "id": parsed.name,
-            "reason": parsed.reason,
-        });
-        match learning {
-            None => {
-                record["applied"] = json!(false);
-                record["error"] = json!("learned skills are unavailable in this session");
-            }
-            Some(learning) => {
-                let verdict = super::learned::promote(&learning.layers, &parsed, &learning.context);
-                record["applied"] = json!(verdict.ok);
-                if let Some(layer) = verdict.layer {
-                    record["level"] = json!(layer.as_str());
-                }
-                if verdict.ok {
-                    record["undo"] = verdict.undo;
-                } else {
-                    record["error"] = json!(verdict.findings.join("; "));
-                }
-            }
-        }
-        applied_edits.push(record);
+        applied_edits.push(promote_one(intent, learning));
     }
     for change in &proposal.skill_restores {
         let action = change["action"].as_str().unwrap_or_default();
@@ -1097,6 +1186,139 @@ fn apply_skill_files(
         }
         applied_edits.push(record);
     }
+}
+
+/// Promote one learned-skill intent and record the verdict as a refinement edit.
+fn promote_one(intent: &Value, learning: Option<&Learning>) -> Value {
+    let parsed = super::learned::Intent::from_value(intent);
+    let mut record = json!({
+        "action": parsed.action,
+        "kind": SKILL_FILE_KIND,
+        "id": parsed.name,
+        "reason": parsed.reason,
+    });
+    match learning {
+        None => {
+            record["applied"] = json!(false);
+            record["error"] = json!("learned skills are unavailable in this session");
+        }
+        Some(learning) => {
+            let verdict = super::learned::promote(&learning.layers, &parsed, &learning.context);
+            record["applied"] = json!(verdict.ok);
+            if let Some(layer) = verdict.layer {
+                record["level"] = json!(layer.as_str());
+            }
+            if verdict.ok {
+                record["undo"] = verdict.undo;
+            } else {
+                record["error"] = json!(verdict.findings.join("; "));
+            }
+        }
+    }
+    record
+}
+
+const REPAIR_SYSTEM_PROMPT: &str = r#"You repair learned-skill intents for ha, a coding agent.
+
+The promoter refused the intents below; each carries the findings that refused it. Return each one fixed so that it passes every check in <learned_skill_format>, keeping its lesson: shorten a body over the line limit by keeping the rule in SKILL.md and moving detail into references/<topic>.md carried in `files` and pointed at from SKILL.md; cut a description to one sentence that says when to use the skill; reference or drop unreferenced files; choose another name when one is taken; patch a skill that already exists instead of creating it again; use level project when a global skill names this workspace. Drop an intent that cannot be fixed without losing its point, or whose finding is about safety or secrets. Keep reason and evidence.
+
+Return JSON only: {"skillFiles": [ ...the fixed intents... ]}"#;
+
+/// Promote learned-skill intents, and give the refused ones one repair pass: the
+/// promoter's findings go back to the model, and what it fixes is promoted again.
+/// A lesson refused for a long body or a bad pointer is not lost (the lint is a
+/// floor, and a single refusal used to drop the whole lesson).
+async fn promote_with_repair(
+    provider: &Arc<dyn ModelProvider>,
+    model: &str,
+    learning: &Learning,
+    intents: &[Value],
+) -> Vec<Value> {
+    let mut records = intents
+        .iter()
+        .map(|intent| promote_one(intent, Some(learning)))
+        .collect::<Vec<_>>();
+    let refused = intents
+        .iter()
+        .zip(&records)
+        .filter(|(_, record)| record["applied"] != true)
+        .map(|(intent, record)| json!({"intent": intent, "findings": record["error"]}))
+        .collect::<Vec<_>>();
+    if refused.is_empty() {
+        return records;
+    }
+    let mut parts = vec![format!(
+        "<refused_intents>\n{}\n</refused_intents>",
+        serde_json::to_string_pretty(&refused).unwrap_or_default()
+    )];
+    parts.extend(learning.prompt_parts());
+    let repaired = match complete(
+        provider,
+        model,
+        REPAIR_SYSTEM_PROMPT,
+        parts.join("\n\n"),
+        REFINEMENT_MAX_OUTPUT_TOKENS,
+    )
+    .await
+    .and_then(|text| extract_json(&text))
+    {
+        Ok(value) => value["skillFiles"].as_array().cloned().unwrap_or_default(),
+        Err(_) => return records,
+    };
+    for record in &mut records {
+        if record["applied"] != true {
+            record["superseded"] = json!(true);
+        }
+    }
+    for intent in repaired.iter().filter(|intent| intent.is_object()) {
+        let mut record = promote_one(intent, Some(learning));
+        record["repaired"] = json!(true);
+        records.push(record);
+    }
+    records
+}
+
+/// Keep an account of what a run did to the learned library, for `/skills`.
+fn record_learning_run(learning: &Learning, refinement: &Refinement, trigger: &str) {
+    let skill_edits = refinement
+        .edits()
+        .into_iter()
+        .filter(|edit| edit["kind"] == SKILL_FILE_KIND)
+        .collect::<Vec<_>>();
+    let landed = skill_edits
+        .iter()
+        .filter(|edit| edit["applied"] == true)
+        .map(|edit| {
+            format!(
+                "{} {}",
+                edit["action"].as_str().unwrap_or("?"),
+                edit["id"].as_str().unwrap_or("?")
+            )
+        })
+        .collect::<Vec<_>>();
+    let refused = skill_edits
+        .iter()
+        .filter(|edit| edit["applied"] != true)
+        .map(|edit| {
+            format!(
+                "{}: {}",
+                edit["id"].as_str().unwrap_or("?"),
+                edit["error"].as_str().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>();
+    super::learned::record_run(
+        &learning.layers,
+        &json!({
+            "at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "trigger": trigger,
+            "refinement": refinement.id(),
+            "summary": refinement.summary(),
+            "landed": landed,
+            "refused": refused,
+            "repaired": refinement.superseded().len(),
+        }),
+    );
 }
 
 /// `rollbackProposal`: restore each applied edit's snapshot, newest first.
@@ -1157,6 +1379,7 @@ fn rollback_proposal(target: &Value) -> Proposal {
         edits,
         skill_files: Vec::new(),
         skill_restores: skill_changes,
+        skill_records: Vec::new(),
     }
 }
 
@@ -1294,15 +1517,29 @@ pub async fn refine(
     if !value.is_object() {
         return Err("the refiner JSON must be an object".to_owned());
     }
-    apply(
+    let mut proposal = Proposal::from_value(&value);
+    if let Some(learning) = learning
+        && !proposal.skill_files.is_empty()
+    {
+        proposal.skill_records =
+            promote_with_repair(provider, model, learning, &proposal.skill_files).await;
+        proposal.skill_files.clear();
+    }
+    let refinement = apply(
         scopes,
-        &Proposal::from_value(&value),
+        &proposal,
         &id,
         options.global,
         None,
         Some(&baseline),
         learning,
-    )
+    )?;
+    if let Some(learning) = learning
+        && !proposal.skill_records.is_empty()
+    {
+        record_learning_run(learning, &refinement, "refine");
+    }
+    Ok(refinement)
 }
 
 /// How many requests in a layer pass between automatic curations: consolidation
@@ -1319,7 +1556,7 @@ Refinements write learned SKILL.md skills one conversation at a time, so the lib
 
 Rules:
 - Only the learned skills listed below exist for you. Never name, absorb into, or recreate any other skill.
-- Judge overlap on content. Usage counts are not shown and are not your concern; retiring unused skills is the lifecycle's job.
+- Judge overlap on content, never on usage counts: retiring unused skills is the lifecycle's job, and a count of zero is no evidence of a bad skill. The one use for the counts: a skill past probation that was never used likely has a description that does not name what the user types - patch its description.
 - Do not ask whether two skills are distinct. Ask whether a maintainer would write them as N separate skills or as one skill with N subsections. When the answer is one, merge.
 - Consolidate a cluster in one of three ways: patch the broadest member to add a labeled subsection for each sibling's unique content, then delete each sibling with absorbed_into set to it; or create a new umbrella skill and delete the absorbed siblings with absorbed_into set to it; or move narrow but valuable detail into the umbrella's references/<topic>.md (carried in `files`, pointed at from SKILL.md) and delete the sibling.
 - Order matters: the umbrella's create/patch/update comes before the deletes that name it.
@@ -1388,12 +1625,15 @@ pub async fn curate(
     let mut proposal = Proposal::from_value(&value);
     // The curator changes learned skills only.
     proposal.edits.clear();
+    proposal.skill_records =
+        promote_with_repair(provider, model, learning, &proposal.skill_files).await;
+    proposal.skill_files.clear();
     proposal.rationale = format!(
         "{} (library snapshot: {})",
         proposal.rationale,
         snapshot.display()
     );
-    apply(
+    let refinement = apply(
         scopes,
         &proposal,
         &refinement_id(),
@@ -1401,7 +1641,9 @@ pub async fn curate(
         None,
         None,
         Some(learning),
-    )
+    )?;
+    record_learning_run(learning, &refinement, "curate");
+    Ok(refinement)
 }
 
 /// The automatic review's verdict (`AutoRefineReview`).
@@ -1423,10 +1665,18 @@ pub async fn review(
 ) -> Result<Review, String> {
     let history = history(scopes);
     let learned = learning.map_or_else(String::new, |learning| {
-        format!(
+        let mut block = format!(
             "<learned_skills>\n{}\n</learned_skills>",
             super::learned::library_overview(&super::learned::library(&learning.layers))
-        )
+        );
+        if !learning.in_play.is_empty() {
+            let _ = write!(
+                block,
+                "\n<learned_skills_in_play>\n{}\nA learned skill in play that the conversation shows wrong or incomplete is worth refining.\n</learned_skills_in_play>",
+                learning.in_play.join(", ")
+            );
+        }
+        block
     });
     let prompt = [
         format!("<trigger>\nturn_interval; {turns_since_last_review} assistant turns since last auto-refine review\n</trigger>"),
@@ -1670,8 +1920,9 @@ mod tests {
             ]
         })
         .to_string();
+        // The repair pass drops what it cannot fix: an invalid name.
         let provider: std::sync::Arc<dyn harness_providers::ModelProvider> =
-            std::sync::Arc::new(harness_providers::MockProvider::text(reply.as_str()));
+            Replies::new(&[reply, json!({"skillFiles": []}).to_string()]);
         let result = super::refine(
             &provider,
             "fixture-model",
@@ -1682,10 +1933,7 @@ mod tests {
         )
         .await
         .expect("refined");
-        assert_eq!(
-            result.header(),
-            "Harness partially refined · 1/2 edits applied"
-        );
+        assert_eq!(result.header(), "Harness refined");
         let details = result.details();
         assert!(
             details.contains(&"Created project learned skill `ci-test-debugging`".to_owned()),
@@ -1841,6 +2089,141 @@ mod tests {
         assert!(refused.contains("at least 2"), "{refused}");
     }
 
+    /// A model that answers each call with the next reply, and keeps what it was
+    /// asked.
+    struct Replies {
+        answers: Vec<harness_providers::MockProvider>,
+        calls: std::sync::atomic::AtomicUsize,
+        prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Replies {
+        fn new(replies: &[String]) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                answers: replies
+                    .iter()
+                    .map(|reply| harness_providers::MockProvider::text(reply.as_str()))
+                    .collect(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                prompts: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn prompt(&self, index: usize) -> String {
+            self.prompts.lock().expect("prompts")[index].clone()
+        }
+    }
+
+    impl harness_providers::ModelProvider for Replies {
+        fn capabilities(&self) -> harness_providers::ModelCapabilities {
+            self.answers[0].capabilities()
+        }
+
+        fn stream(
+            &self,
+            request: harness_providers::ProviderRequest,
+            cancellation: harness_providers::CancellationToken,
+        ) -> harness_providers::ProviderFuture {
+            let index = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .min(self.answers.len() - 1);
+            self.prompts.lock().expect("prompts").push(
+                request
+                    .messages
+                    .iter()
+                    .map(|message| message.content.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            self.answers[index].stream(request, cancellation)
+        }
+    }
+
+    /// A lesson the promoter refused is not lost: the findings go back to the
+    /// model once, and the fixed intent lands. The refusal is shown apart, the
+    /// run is kept for `/skills`, and the skills in play reach the refiner.
+    #[tokio::test]
+    async fn a_refused_lesson_is_repaired_once_and_lands() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let workspace = directory.path().join("workspace");
+        let layers = crate::interactive::learned::Layers::new(
+            &directory.path().join("config"),
+            &directory.path().join("data"),
+            &workspace,
+            true,
+        );
+        let mut learning = super::Learning::new(layers.clone(), &workspace, None);
+        learning.in_play = vec!["rust-testing".to_owned()];
+        let body = |lines: usize| {
+            let steps = (0..lines)
+                .map(|line| format!("step {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "---\nname: ci-debugging\ndescription: Use when a test fails only on CI.\ncategory: testing\n---\n{steps}\n"
+            )
+        };
+        let intent = |lines: usize| {
+            json!({"action": "create", "name": "ci-debugging", "level": "project",
+                   "body": body(lines), "reason": "r", "evidence": "e"})
+        };
+        let provider = Replies::new(&[
+            json!({"summary": "keep the CI steps", "skillFiles": [intent(40)]}).to_string(),
+            json!({"skillFiles": [intent(5)]}).to_string(),
+        ]);
+        let dynamic: std::sync::Arc<dyn harness_providers::ModelProvider> = provider.clone();
+        let result = super::refine(
+            &dynamic,
+            "fixture-model",
+            "[User]: debug CI",
+            &scopes,
+            &RefineOptions::learn("CI"),
+            Some(&learning),
+        )
+        .await
+        .expect("refined");
+        assert_eq!(result.header(), "Harness refined");
+        let details = result.details();
+        assert!(
+            details
+                .iter()
+                .any(|line| line.contains("sent back for repair") && line.contains("altitude")),
+            "{details:?}"
+        );
+        assert!(crate::interactive::learned::is_learned(
+            &layers.project.clone().expect("project"),
+            "ci-debugging"
+        ));
+        let first = provider.prompt(0);
+        assert!(
+            first.contains("The user ran /learn") && first.contains("Focus: CI"),
+            "{first}"
+        );
+        assert!(
+            first.contains("<learned_skills_in_play>\nrust-testing"),
+            "{first}"
+        );
+        let repair = provider.prompt(1);
+        assert!(
+            repair.contains("<refused_intents>") && repair.contains("altitude"),
+            "{repair}"
+        );
+        let runs = crate::interactive::learned::recent_runs(&layers, 5);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["repaired"], 1);
+        assert_eq!(runs[0]["landed"][0], "create ci-debugging");
+
+        // The review watermark is the conversation's own.
+        assert_eq!(super::reviewed_through(&scopes.local), None);
+        super::mark_reviewed(&scopes.local, "session-7");
+        assert_eq!(
+            super::reviewed_through(&scopes.local).as_deref(),
+            Some("session-7")
+        );
+    }
+
     #[test]
     fn the_review_cadence_counts_turns_and_tool_calls_and_runs_one_at_a_time() {
         let cadence = super::Cadence::default();
@@ -1880,6 +2263,7 @@ mod tests {
             task: "task-1".to_owned(),
             session: "session-9".to_owned(),
             turns: 2,
+            in_play: vec!["rust-testing".to_owned()],
         };
         super::defer_review(directory.path(), &review).expect("deferred");
         assert_eq!(super::take_deferred_reviews(directory.path()), vec![review]);

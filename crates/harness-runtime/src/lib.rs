@@ -1569,7 +1569,9 @@ const TRANSCRIPT_RESULT_TAIL_CHARS: usize = 500;
 ///
 /// Tool calls carry a 1-based `#N` and their results repeat it, so repeated calls
 /// of one tool pair unambiguously. Results are cut to their head and tail. Only
-/// the newest `max_turns` turns are read.
+/// the newest `max_turns` turns are read. After the turn of `reviewed_through`,
+/// the line [`REVIEWED_MARKER`] says what came before was already reviewed, so a
+/// refinement learns from the new turns instead of learning the old ones again.
 ///
 /// # Errors
 /// The store cannot be read.
@@ -1577,6 +1579,7 @@ pub async fn conversation_transcript(
     store: &SqliteStore,
     session_id: &SessionId,
     max_turns: usize,
+    reviewed_through: Option<&SessionId>,
 ) -> Result<String, RuntimeError> {
     let turns = conversation_turns(store, session_id).await?;
     let mut parts = Vec::new();
@@ -1649,9 +1652,16 @@ pub async fn conversation_transcript(
                 }
             }
         }
+        if reviewed_through == Some(session) {
+            parts.push(REVIEWED_MARKER.to_owned());
+        }
     }
     Ok(parts.join("\n\n"))
 }
+
+/// The transcript line after which the turns are new to refinement.
+pub const REVIEWED_MARKER: &str =
+    "[The turns above were already reviewed by an earlier refinement; learn from the turns below.]";
 
 /// `key=<json value>` pairs, as prime-agent prints a call's arguments.
 fn transcript_arguments(arguments: &str) -> String {

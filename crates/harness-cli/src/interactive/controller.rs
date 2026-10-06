@@ -3690,7 +3690,7 @@ impl InteractiveController {
                     self.push_history(&mut effects, HistoryItem::User { text });
                 }
             }
-            "/refine" => {
+            name @ ("/refine" | "/learn") => {
                 if self.phase.has_active_run() {
                     self.push_history(&mut effects, HistoryItem::Notice {
                         message: "cannot refine while a run is active; wait for it to finish".to_owned(),
@@ -3700,9 +3700,14 @@ impl InteractiveController {
                 } else {
                     let arguments = raw_argument.unwrap_or_default().to_owned();
                     let text = if arguments.is_empty() {
-                        "/refine".to_owned()
+                        name.to_owned()
                     } else {
-                        format!("/refine {arguments}")
+                        format!("{name} {arguments}")
+                    };
+                    let options = if name == "/learn" {
+                        super::refine::RefineOptions::learn(&arguments)
+                    } else {
+                        super::refine::RefineOptions::parse(&arguments)
                     };
                     self.continuations = 0;
                     self.fresh_run(Instant::now(), Some(text.clone()));
@@ -3712,7 +3717,7 @@ impl InteractiveController {
                         answer_question_id: None,
                         shell_prefix: None,
                         compact_guidance: None,
-                        refine: Some(super::refine::RefineOptions::parse(&arguments)),
+                        refine: Some(options),
                     });
                     self.push_history(&mut effects, HistoryItem::User { text });
                 }

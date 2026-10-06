@@ -459,13 +459,20 @@ pub fn usage(layers: &Layers, layer: Layer) -> (u64, BTreeMap<String, Usage>) {
     (value["requests"].as_u64().unwrap_or(0), skills)
 }
 
-/// Count what one finished turn did with learned skills: activations are uses,
+/// Count what one finished turn did with learned skills, and say which learned
+/// skills it used: activations are uses,
 /// `read_skill_file` and a `read_file` inside a learned skill's folder are views.
 pub fn record_turn(
     layers: &Layers,
     workspace: &Path,
     executions: &[harness_tools::ToolExecutionView],
-) {
+) -> BTreeSet<String> {
+    let mut used = BTreeSet::new();
+    let mut count = |name: &str, kind: UseKind| {
+        if record_use(layers, name, kind) {
+            used.insert(name.to_owned());
+        }
+    };
     for execution in executions {
         match &execution.output {
             harness_tools::ToolOutput::SkillActivated { block } => {
@@ -474,7 +481,7 @@ pub fn record_turn(
                     .strip_prefix("skill:")
                     .and_then(|reference| reference.rsplit_once('@').map(|(name, _)| name))
                 {
-                    record_use(layers, name, UseKind::Use);
+                    count(name, UseKind::Use);
                 }
             }
             harness_tools::ToolOutput::ExternalTool {
@@ -484,7 +491,7 @@ pub fn record_turn(
                 ..
             } if plugin_id == "skill" && tool_name == "read_skill_file" => {
                 if let Some(name) = payload["name"].as_str() {
-                    record_use(layers, name, UseKind::View);
+                    count(name, UseKind::View);
                 }
             }
             harness_tools::ToolOutput::ReadFile { path, .. } => {
@@ -500,13 +507,14 @@ pub fn record_turn(
                             relative.components().next()
                         && relative.components().count() > 1
                     {
-                        record_use(layers, &name.to_string_lossy(), UseKind::View);
+                        count(&name.to_string_lossy(), UseKind::View);
                     }
                 }
             }
             _ => {}
         }
     }
+    used
 }
 
 // ---------------------------------------------------------------------------
@@ -662,14 +670,22 @@ pub fn library_overview(skills: &[LearnedSkill]) -> String {
     }
     let mut groups: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for skill in skills {
+        let seen = skill.requests.saturating_sub(skill.usage.anchor);
+        let probation = if seen < skill.layer.maturity() {
+            ", on probation"
+        } else {
+            ""
+        };
         groups
             .entry(skill.category.as_str())
             .or_default()
             .push(format!(
-                "- {} [{}]: {}",
+                "- {} [{}]: {} (used {}, viewed {} in {seen} requests{probation})",
                 skill.name,
                 skill.layer.as_str(),
-                skill.description
+                skill.description,
+                skill.usage.uses,
+                skill.usage.views,
             ));
     }
     groups
@@ -677,6 +693,54 @@ pub fn library_overview(skills: &[LearnedSkill]) -> String {
         .map(|(category, lines)| format!("## {category}\n{}", lines.join("\n")))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The line the system prompt adds under the skill list, naming the skills ha
+/// learned: the host's list does not tell them apart, and what was learned from
+/// this user's own work is the first thing to check (autoharness injects its own
+/// index for the same reason).
+#[must_use]
+pub fn prompt_note(skills: &[LearnedSkill]) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+    let names = skills
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "Learned skills - written by ha from earlier work with this user, in this project or across projects: {names}. When the task matches one, activate it before you start; it records how this user wants that work done."
+    ))
+}
+
+/// The most learning runs `runs.jsonl` keeps.
+const RUNS_KEPT: usize = 200;
+
+/// Record what one refinement or curation did to the learned library, so a run
+/// that happened in the background is not silent (autoharness's run account).
+pub fn record_run(layers: &Layers, run: &Value) {
+    let path = layers.usage_dir.join("runs.jsonl");
+    let mut lines = std::fs::read_to_string(&path)
+        .map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
+        .unwrap_or_default();
+    lines.push(run.to_string());
+    let start = lines.len().saturating_sub(RUNS_KEPT);
+    let _ = write_atomic(&path, &(lines[start..].join("\n") + "\n"));
+}
+
+/// The newest learning runs, newest first.
+#[must_use]
+pub fn recent_runs(layers: &Layers, limit: usize) -> Vec<Value> {
+    std::fs::read_to_string(layers.usage_dir.join("runs.jsonl"))
+        .map(|text| {
+            text.lines()
+                .rev()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .take(limit)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1933,6 +1997,36 @@ mod tests {
                 .iter()
                 .any(|root| root.path == canonical.join(".harness/skills")),
             "the worktree's catalogue reads the main checkout's learned skills"
+        );
+    }
+
+    /// The refiner sees how each learned skill fared, and the system prompt
+    /// names the learned skills so they are checked first.
+    #[test]
+    fn the_library_reports_use_and_the_prompt_names_learned_skills() {
+        let directory = tempfile::tempdir().expect("dir");
+        let layers = layers(directory.path());
+        assert_eq!(super::prompt_note(&library(&layers)), None);
+        assert!(
+            promote(
+                &layers,
+                &create("ci-test-debugging", "Run it alone."),
+                &PromoteContext::default()
+            )
+            .ok
+        );
+        assert!(record_use(&layers, "ci-test-debugging", UseKind::Use));
+        super::count_request(&layers);
+        let skills = library(&layers);
+        let overview = super::library_overview(&skills);
+        assert!(
+            overview.contains("(used 1, viewed 0 in 1 requests, on probation)"),
+            "{overview}"
+        );
+        let note = super::prompt_note(&skills).expect("a note");
+        assert!(
+            note.contains("ci-test-debugging") && note.contains("activate it"),
+            "{note}"
         );
     }
 

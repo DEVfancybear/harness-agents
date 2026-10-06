@@ -3404,6 +3404,7 @@ impl Drop for AgentSessionService {
                     task: self.task_id.as_str().to_owned(),
                     session,
                     turns,
+                    in_play: self.refine_cadence.take_in_play(),
                 },
             );
         }
@@ -4012,6 +4013,7 @@ impl SessionPort for AgentSessionService {
     )]
     fn skills_rows(&self) -> Vec<super::events::RefLine> {
         use super::events::{BadgeKind, RefLine};
+        use std::fmt::Write as _;
         let trusted = super::config::resolve_layers(
             &self.config_file,
             &self.workspace_root,
@@ -4120,6 +4122,55 @@ impl SessionPort for AgentSessionService {
                     meta: entry.version.clone(),
                     badges,
                     detail: entry.description.clone(),
+                });
+            }
+            rows.push(RefLine::Blank);
+        }
+        // What learning did lately, background runs included: a run nobody saw
+        // is not lost.
+        let runs = super::learned::recent_runs(
+            &super::learned::Layers::new(
+                &self.global_config_dir,
+                &self.data_dir,
+                &self.workspace_root,
+                trusted,
+            ),
+            5,
+        );
+        if !runs.is_empty() {
+            rows.push(RefLine::Heading {
+                title: "✦ Recent learning".to_owned(),
+                note: format!("{}", runs.len()),
+            });
+            for run in &runs {
+                let list = |field: &str| {
+                    run[field]
+                        .as_array()
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        })
+                        .unwrap_or_default()
+                };
+                let landed = list("landed");
+                let refused = list("refused");
+                let mut detail = if landed.is_empty() {
+                    "nothing landed".to_owned()
+                } else {
+                    format!("landed: {landed}")
+                };
+                if !refused.is_empty() {
+                    let _ = write!(detail, " · refused: {refused}");
+                }
+                rows.push(RefLine::Item {
+                    glyph: "·".to_owned(),
+                    name: run["trigger"].as_str().unwrap_or("refine").to_owned(),
+                    meta: run["at"].as_str().unwrap_or_default().to_owned(),
+                    badges: Vec::new(),
+                    detail,
                 });
             }
             rows.push(RefLine::Blank);
@@ -5568,6 +5619,9 @@ struct AutoRefine {
     scopes: super::refine::HarnessScopes,
     learning: super::refine::Learning,
     turns: u32,
+    /// The newest session the review reads; once reviewed, the next review
+    /// treats the conversation up to it as already learned from.
+    reviewed: String,
 }
 
 impl AutoRefine {
@@ -5592,6 +5646,7 @@ impl AutoRefine {
                 curate: false,
             },
             Ok(review) => {
+                super::refine::mark_reviewed(&self.scopes.local, &self.reviewed);
                 send(SessionEvent::Notice {
                     message: format!("auto-refine: nothing to refine ({})", review.rationale),
                 });
@@ -5614,7 +5669,10 @@ impl AutoRefine {
         )
         .await
         {
-            Ok(refinement) => send(refined_event(&refinement)),
+            Ok(refinement) => {
+                super::refine::mark_reviewed(&self.scopes.local, &self.reviewed);
+                send(refined_event(&refinement));
+            }
             Err(error) => send(SessionEvent::Notice {
                 message: format!("refine failed: {error}"),
             }),
@@ -5628,10 +5686,17 @@ const REFINE_TRANSCRIPT_TURNS: usize = 50;
 
 /// The conversation a refinement reads: prime-agent's serialized transcript, with
 /// what the tools were asked and what they returned.
-async fn refine_transcript(store: &SqliteStore, session: &SessionId) -> String {
-    harness_runtime::conversation_transcript(store, session, REFINE_TRANSCRIPT_TURNS)
-        .await
-        .unwrap_or_default()
+/// The turns an earlier review of this conversation read are marked as such.
+async fn refine_transcript(store: &SqliteStore, session: &SessionId, local: &Path) -> String {
+    let reviewed = super::refine::reviewed_through(local).and_then(|id| SessionId::parse(id).ok());
+    harness_runtime::conversation_transcript(
+        store,
+        session,
+        REFINE_TRANSCRIPT_TURNS,
+        reviewed.as_ref(),
+    )
+    .await
+    .unwrap_or_default()
 }
 
 /// What `/refine` needs to write learned skills in this workspace.
@@ -6382,16 +6447,17 @@ async fn run_turn(
             local: super::harness::local_dir(&data_dir, task_id.as_str()),
         };
         let conversation = match source.as_ref() {
-            Some(source_session) => refine_transcript(&store, source_session).await,
+            Some(source_session) => refine_transcript(&store, source_session, &scopes.local).await,
             None => String::new(),
         };
-        let learning = refine_learning(
+        let mut learning = refine_learning(
             &global_config_dir,
             &data_dir,
             &workspace_root,
             &environment,
             config.project_trusted,
         );
+        learning.in_play = refine_cadence.take_in_play();
         let result = super::refine::refine(
             &helper_provider,
             &helper_model,
@@ -6407,6 +6473,13 @@ async fn run_turn(
         }
         match result {
             Ok(refinement) => {
+                // A rollback or a curation read no conversation.
+                if options.rollback.is_none()
+                    && !options.curate
+                    && let Some(source_session) = source.as_ref()
+                {
+                    super::refine::mark_reviewed(&scopes.local, source_session.as_str());
+                }
                 send(refined_event(&refinement));
                 send(SessionEvent::RunTerminal {
                     outcome: RunOutcome::Done,
@@ -6843,6 +6916,11 @@ async fn run_turn(
     if let Some(catalog) = &skill_catalog {
         built_prompt.text =
             super::prompt::append_skill_metadata(built_prompt.text, catalog.entries());
+        if let Some(note) = super::learned::prompt_note(&super::learned::library(&learning.layers))
+        {
+            built_prompt.text.push_str("\n\n");
+            built_prompt.text.push_str(&note);
+        }
     }
     // The session-specific tail last, after everything that is stable for the
     // session, so the provider's prompt cache keeps what comes before it.
@@ -7120,11 +7198,11 @@ async fn run_turn(
                 let _ = sender.send(event);
             });
         }
-        super::learned::record_turn(
+        refine_cadence.note_in_play(super::learned::record_turn(
             &learning.layers,
             &learning.context.workspace,
             &turn.executions,
-        );
+        ));
         if super::learned::lifecycle_enabled(&environment) {
             for (layer, name) in super::learned::run_lifecycle(&learning.layers) {
                 send(SessionEvent::Notice {
@@ -7162,7 +7240,9 @@ async fn run_turn(
                 global: super::harness::global_dir(&data_dir),
                 local: super::harness::local_dir(&data_dir, goal_task.as_str()),
             };
-            let conversation = refine_transcript(&store, &session_id).await;
+            let conversation = refine_transcript(&store, &session_id, &scopes.local).await;
+            let mut learning = learning.clone();
+            learning.in_play = refine_cadence.take_in_play();
             if let Some(options) = requested {
                 // The user asked: the refinement is part of the turn, and it covers
                 // the review that came due with it.
@@ -7176,7 +7256,10 @@ async fn run_turn(
                 )
                 .await
                 {
-                    Ok(refinement) => send(refined_event(&refinement)),
+                    Ok(refinement) => {
+                        super::refine::mark_reviewed(&scopes.local, session_id.as_str());
+                        send(refined_event(&refinement));
+                    }
                     Err(error) => send(SessionEvent::Notice {
                         message: format!("refine failed: {error}"),
                     }),
@@ -7196,8 +7279,9 @@ async fn run_turn(
                     model: config.model.clone(),
                     conversation,
                     scopes,
-                    learning: learning.clone(),
+                    learning,
                     turns,
+                    reviewed: session_id.as_str().to_owned(),
                 };
                 let cadence = Arc::clone(&refine_cadence);
                 tokio::spawn(async move {
@@ -7214,10 +7298,13 @@ async fn run_turn(
             let Ok(ended) = SessionId::parse(deferred.session.clone()) else {
                 continue;
             };
-            let conversation = refine_transcript(&store, &ended).await;
+            let local = super::harness::local_dir(&data_dir, &deferred.task);
+            let conversation = refine_transcript(&store, &ended, &local).await;
             if conversation.is_empty() {
                 continue;
             }
+            let mut ended_learning = learning.clone();
+            ended_learning.in_play.clone_from(&deferred.in_play);
             let background = AutoRefine {
                 sender: sender.clone(),
                 helper_provider: Arc::clone(&helper_provider),
@@ -7227,10 +7314,11 @@ async fn run_turn(
                 conversation,
                 scopes: super::refine::HarnessScopes {
                     global: super::harness::global_dir(&data_dir),
-                    local: super::harness::local_dir(&data_dir, &deferred.task),
+                    local,
                 },
-                learning: learning.clone(),
+                learning: ended_learning,
                 turns: deferred.turns,
+                reviewed: deferred.session.clone(),
             };
             send(SessionEvent::Notice {
                 message: format!(
