@@ -65,6 +65,9 @@ pub fn roots(
                 break;
             }
         }
+        // Skills ha learned live in the main checkout, also when the workspace
+        // is one of its linked worktrees.
+        paths.push(super::learned::project_skill_root(workspace));
         for path in paths {
             if path.is_dir() && !roots.iter().any(|root| root.path == path) {
                 roots.push(TrustedSkillRoot::new(path, SkillSource::TrustedProject));

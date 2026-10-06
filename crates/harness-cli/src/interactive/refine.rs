@@ -23,8 +23,143 @@ use serde_json::{Map, Value, json};
 const STATE_FILE: &str = "harness_state.json";
 const HISTORY_FILE: &str = "refinements.jsonl";
 const KINDS: [&str; 4] = ["prompt", "memory", "skill", "subagent"];
+/// How a learned-skill change is recorded among a refinement's edits.
+const SKILL_FILE_KIND: &str = "skill_file";
 /// How many assistant turns pass between automatic reviews (prime-agent's default).
 pub const AUTO_REFINE_TURN_INTERVAL: u32 = 25;
+/// How many tool calls make a review due before twenty-five turns do. Work is
+/// counted in tool calls, as autoharness counts it: one long agentic turn holds
+/// as much to learn from as many short ones, and a turn that only talks holds less.
+pub const AUTO_REFINE_TOOL_CALL_INTERVAL: u32 = 50;
+
+/// When the automatic review is due, and whether one is already running.
+#[derive(Debug, Default)]
+pub struct Cadence {
+    turns: std::sync::atomic::AtomicU32,
+    tool_calls: std::sync::atomic::AtomicU32,
+    running: std::sync::atomic::AtomicBool,
+}
+
+impl Cadence {
+    /// Count a finished turn and the tool calls it made. When a review is due and
+    /// none is running, it is claimed: the counts restart and the number of turns it
+    /// covers is returned. [`Cadence::release`] ends the claim.
+    pub fn turn_finished(&self, tool_calls: u32) -> Option<u32> {
+        self.turn_finished_every(tool_calls, AUTO_REFINE_TURN_INTERVAL)
+    }
+
+    /// [`Cadence::turn_finished`] with prime-agent's `autoRefine.turnInterval`
+    /// in place of the default twenty-five turns.
+    pub fn turn_finished_every(&self, tool_calls: u32, turn_interval: u32) -> Option<u32> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let turns = self.turns.fetch_add(1, SeqCst) + 1;
+        let calls = self.tool_calls.fetch_add(tool_calls, SeqCst) + tool_calls;
+        if turns < turn_interval && calls < AUTO_REFINE_TOOL_CALL_INTERVAL {
+            return None;
+        }
+        if self.running.swap(true, SeqCst) {
+            return None;
+        }
+        self.turns.store(0, SeqCst);
+        self.tool_calls.store(0, SeqCst);
+        Some(turns)
+    }
+
+    /// The claimed review finished.
+    pub fn release(&self) {
+        self.running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The session is ending: what it did since the last review, when that is
+    /// enough to be worth one (autoharness's `SessionEnd` flush). Claims it, so it
+    /// is handed off once.
+    pub fn take_tail(&self) -> Option<u32> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let turns = self.turns.load(SeqCst);
+        let calls = self.tool_calls.load(SeqCst);
+        if turns == 0 || (turns < TAIL_MIN_TURNS && calls < TAIL_MIN_TOOL_CALLS) {
+            return None;
+        }
+        if self.running.load(SeqCst) {
+            return None;
+        }
+        self.turns.store(0, SeqCst);
+        self.tool_calls.store(0, SeqCst);
+        Some(turns)
+    }
+}
+
+/// The least a session must have done since its last review for its end to be
+/// reviewed: fewer is a conversation, not a stretch of work to learn from.
+pub const TAIL_MIN_TURNS: u32 = 5;
+pub const TAIL_MIN_TOOL_CALLS: u32 = 10;
+
+/// Where a session that ended with work not yet reviewed leaves it, in the
+/// project's data directory.
+const DEFERRED_DIR: &str = "refine-pending";
+
+/// A review a session handed off as it ended. Exiting does not wait for a model
+/// call; the next turn in the project runs the review in the background.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeferredReview {
+    pub task: String,
+    pub session: String,
+    pub turns: u32,
+}
+
+/// Leave a review for the next turn in this project.
+pub fn defer_review(project_dir: &Path, review: &DeferredReview) -> Result<(), String> {
+    let dir = project_dir.join(DEFERRED_DIR);
+    std::fs::create_dir_all(&dir).map_err(|error| format!("deferred review: {error}"))?;
+    let name = slug(&review.task, "task");
+    let temporary = dir.join(format!(".{name}.tmp"));
+    let text =
+        json!({"task": review.task, "session": review.session, "turns": review.turns, "at": now()})
+            .to_string();
+    std::fs::write(&temporary, text).map_err(|error| format!("deferred review: {error}"))?;
+    std::fs::rename(&temporary, dir.join(format!("{name}.json")))
+        .map_err(|error| format!("deferred review: {error}"))
+}
+
+/// Take every review left in this project. Each is removed as it is read, so two
+/// sessions never run the same one; one lost to a crash is simply not reviewed.
+#[must_use]
+pub fn take_deferred_reviews(project_dir: &Path) -> Vec<DeferredReview> {
+    let dir = project_dir.join(DEFERRED_DIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut reviews = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let claimed = path.with_extension(format!("claimed-{}", std::process::id()));
+        if std::fs::rename(&path, &claimed).is_err() {
+            continue; // another session took it first
+        }
+        let value = std::fs::read_to_string(&claimed)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        let _ = std::fs::remove_file(&claimed);
+        if let Some(value) = value
+            && let (Some(task), Some(session)) = (value["task"].as_str(), value["session"].as_str())
+        {
+            reviews.push(DeferredReview {
+                task: task.to_owned(),
+                session: session.to_owned(),
+                turns: value["turns"]
+                    .as_u64()
+                    .and_then(|turns| u32::try_from(turns).ok())
+                    .unwrap_or(0),
+            });
+        }
+    }
+    reviews.sort_by(|left, right| left.task.cmp(&right.task));
+    reviews
+}
 const REFINEMENT_MAX_OUTPUT_TOKENS: u32 = 8192;
 const REVIEW_MAX_OUTPUT_TOKENS: u32 = 4096;
 const CONVERSATION_CHARS: usize = 80_000;
@@ -46,6 +181,7 @@ Continual harness components:
 - prompt: supplemental prompt notes only. The base system prompt is immutable and MUST NOT be rewritten.
 - memory: durable facts, decisions, failures, preferences, and outcomes.
 - skill: installed Python REPL skill. Skill create/update edits MUST include a `reference` object with `{"type":"python"}`, a Python import, and a callable or call pattern; they also MUST include an `arguments` object describing accepted inputs, required fields, defaults, and constraints. Use `{}` for `arguments` only when the Python callable truly needs no external inputs. Include the RLM-native call form `await <skill_import>(...)`.
+- skillFiles (not an edit kind): learned SKILL.md skills - reusable instructions the agent loads with activate_skill. Propose them as `skillFiles` intents following <learned_skill_format>; when that block is absent, leave `skillFiles` empty.
 - subagent: reusable delegation specs, including purpose, instructions, and when to invoke. Include the RLM-native call form: compose a concise task prompt and spawn with `handle = await rlm.spawn("sub-task", name="worker")`; admission returns immediately with `rlm_child_id`, `name`, `session_dir`, and `model`, never the child's answer. Collect results with `await rlm.collect([handle], timeout_ms=...)` before the turn ends. Do not invent wrappers like `run_subagent(...)`.
 
 Scope and persistence policy:
@@ -54,7 +190,7 @@ Scope and persistence policy:
 - Entry ids in the harness overview may carry a display-only `local:` or `global:` prefix. Always use the bare id (no prefix) in edits.
 - All edits in one refinement apply only to the requested scope's store. During a local refinement, global entries are read-only context: never propose update or delete edits for them; create a local entry instead when a session-specific override is genuinely needed.
 - Project/workspace-specific lessons may be persisted globally only when the title, path, or content explicitly names the project/workspace and the lesson is likely to be reused in future conversations for that project. Prefer local edits when the lesson only belongs in the current conversation.
-- Use memory for declarative facts and preferences, skill for repeatable procedures exposed as Python calls, prompt for narrow behavioral policy addendums, and subagent for reusable delegation roles.
+- Use memory for declarative facts and preferences, skillFiles for repeatable procedures and corrected approaches written as instructions, skill for repeatable procedures exposed as Python calls, prompt for narrow behavioral policy addendums, and subagent for reusable delegation roles.
 - Create or update the smallest relevant component: repeated delegation roles should become subagent specs, repeated procedures should become skills, durable facts/preferences should become memories, and narrow behavioral policies should become prompt addendums.
 - When an edit is persisted, include metadata such as `{"scope":"local"}` or `{"scope":"global"}` when that helps future review understand the intended blast radius.
 
@@ -80,6 +216,9 @@ JSON only with this exact shape:
       "metadata": {},
       "reason": "why this edit is useful"
     }
+  ],
+  "skillFiles": [
+    {"action": "create|update|patch|remove_file|delete", "name": "learned-skill-name", "reason": "why", "evidence": "verbatim quote"}
   ]
 }"#;
 
@@ -102,10 +241,12 @@ pub struct RefineOptions {
     pub global: bool,
     /// Roll back this refinement instead of planning a new one.
     pub rollback: Option<String>,
+    /// Consolidate the learned skill library instead of reading the conversation.
+    pub curate: bool,
 }
 
 impl RefineOptions {
-    /// `/refine [--global] [--rollback <id>] [instructions]`.
+    /// `/refine [--global] [--rollback <id>] [--curate] [instructions]`.
     #[must_use]
     pub fn parse(arguments: &str) -> Self {
         let mut options = Self::default();
@@ -115,12 +256,83 @@ impl RefineOptions {
             match word {
                 "--global" => options.global = true,
                 "--rollback" => options.rollback = words.next().map(str::to_owned),
+                "--curate" => options.curate = true,
                 _ => rest.push(word),
             }
         }
         let instructions = rest.join(" ");
         options.instructions = (!instructions.is_empty()).then_some(instructions);
         options
+    }
+}
+
+/// What `/refine` needs to write learned SKILL.md skills.
+#[derive(Clone, Debug)]
+pub struct Learning {
+    pub layers: super::learned::Layers,
+    pub context: super::learned::PromoteContext,
+}
+
+impl Learning {
+    /// The workspace's layers, with the names every other skill in the catalogue
+    /// already holds.
+    #[must_use]
+    pub fn new(
+        layers: super::learned::Layers,
+        workspace: &Path,
+        catalog: Option<&harness_extensions::SkillCatalog>,
+    ) -> Self {
+        let learned = super::learned::library(&layers)
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let taken = catalog
+            .map(|catalog| {
+                catalog
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.name.clone())
+                    .filter(|name| !learned.contains(name))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            layers,
+            context: super::learned::PromoteContext {
+                taken,
+                workspace: workspace.to_path_buf(),
+            },
+        }
+    }
+
+    /// The prompt blocks that show the refiner the learned library and its format.
+    fn prompt_parts(&self) -> Vec<String> {
+        let mut taken = self
+            .context
+            .taken
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if taken.is_empty() {
+            "(none)".clone_into(&mut taken);
+        }
+        vec![
+            format!(
+                "<learned_skills>\n{}\n</learned_skills>",
+                super::learned::library_overview(&super::learned::library(&self.layers))
+            ),
+            format!("<other_skill_names>\n{taken}\n</other_skill_names>"),
+            format!(
+                "<learned_skill_format>\nProject skills: {}.\n{}\n</learned_skill_format>",
+                if self.layers.project.is_some() {
+                    "available"
+                } else {
+                    "unavailable (the project is not trusted); use level global"
+                },
+                super::learned::SPEC
+            ),
+        ]
     }
 }
 
@@ -457,6 +669,10 @@ struct Proposal {
     rationale: String,
     expected_outcome: String,
     edits: Vec<Edit>,
+    /// Learned-skill intents, promoted after the harness edits.
+    skill_files: Vec<Value>,
+    /// Learned-skill changes a rollback undoes, newest first.
+    skill_restores: Vec<Value>,
 }
 
 impl Proposal {
@@ -477,6 +693,17 @@ impl Proposal {
                         .collect()
                 })
                 .unwrap_or_default(),
+            skill_files: value["skillFiles"]
+                .as_array()
+                .map(|intents| {
+                    intents
+                        .iter()
+                        .filter(|intent| intent.is_object())
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            skill_restores: Vec::new(),
         }
     }
 }
@@ -552,7 +779,9 @@ impl Refinement {
             .iter()
             .all(|edit| edit["kind"].as_str() == Some(kind))
         {
-            let noun = if kind == "memory" {
+            let noun = if kind == SKILL_FILE_KIND {
+                format!("learned skill{}", plural(applied.len()))
+            } else if kind == "memory" {
                 if applied.len() == 1 {
                     "memory"
                 } else {
@@ -616,18 +845,24 @@ impl Refinement {
         }
         let mut lines = vec![first];
         for edit in self.edits() {
-            let entry_scope = edit["after"]["scope"]
+            let entry_scope = edit["level"]
                 .as_str()
+                .or_else(|| edit["after"]["scope"].as_str())
                 .or_else(|| edit["before"]["scope"].as_str())
                 .unwrap_or(scope);
             let action = edit["action"].as_str().unwrap_or("change");
-            let kind = edit["kind"].as_str().unwrap_or("entry");
+            let kind = match edit["kind"].as_str().unwrap_or("entry") {
+                SKILL_FILE_KIND => "learned skill",
+                kind => kind,
+            };
             let id = edit["id"].as_str().unwrap_or("?");
             if edit["applied"] == true {
                 let verb = match action {
                     "create" => "Created",
                     "update" => "Updated",
                     "delete" => "Deleted",
+                    "patch" => "Patched",
+                    "restore" => "Restored",
                     _ => "Changed",
                 };
                 lines.push(format!("{verb} {entry_scope} {kind} `{id}`"));
@@ -661,6 +896,7 @@ fn apply(
     global: bool,
     rollback_of: Option<&str>,
     baseline: Option<&Value>,
+    learning: Option<&Learning>,
 ) -> Result<Refinement, String> {
     let dir = scopes.dir(global);
     let scope = if global { "global" } else { "local" };
@@ -752,6 +988,7 @@ fn apply(
         record["applied"] = json!(true);
         applied_edits.push(record);
     }
+    apply_skill_files(proposal, learning, &mut applied_edits);
     let changes = applied_edits
         .iter()
         .filter(|edit| edit["applied"] == true)
@@ -797,10 +1034,75 @@ fn apply(
     Ok(Refinement { record })
 }
 
+/// Promote the proposal's learned-skill intents, and undo a rollback's, recording
+/// each as one edit of the refinement.
+fn apply_skill_files(
+    proposal: &Proposal,
+    learning: Option<&Learning>,
+    applied_edits: &mut Vec<Value>,
+) {
+    for intent in &proposal.skill_files {
+        let parsed = super::learned::Intent::from_value(intent);
+        let mut record = json!({
+            "action": parsed.action,
+            "kind": SKILL_FILE_KIND,
+            "id": parsed.name,
+            "reason": parsed.reason,
+        });
+        match learning {
+            None => {
+                record["applied"] = json!(false);
+                record["error"] = json!("learned skills are unavailable in this session");
+            }
+            Some(learning) => {
+                let verdict = super::learned::promote(&learning.layers, &parsed, &learning.context);
+                record["applied"] = json!(verdict.ok);
+                if let Some(layer) = verdict.layer {
+                    record["level"] = json!(layer.as_str());
+                }
+                if verdict.ok {
+                    record["undo"] = verdict.undo;
+                } else {
+                    record["error"] = json!(verdict.findings.join("; "));
+                }
+            }
+        }
+        applied_edits.push(record);
+    }
+    for change in &proposal.skill_restores {
+        let action = change["action"].as_str().unwrap_or_default();
+        let name = change["id"].as_str().unwrap_or_default();
+        let mut record = json!({
+            "action": "restore",
+            "kind": SKILL_FILE_KIND,
+            "id": name,
+            "level": change["level"],
+            "reason": format!("Rollback of {action}"),
+        });
+        let result = learning
+            .ok_or_else(|| "learned skills are unavailable in this session".to_owned())
+            .and_then(|learning| {
+                super::learned::restore(
+                    &learning.layers,
+                    action,
+                    name,
+                    change["level"].as_str().unwrap_or_default(),
+                    &change["undo"],
+                )
+            });
+        record["applied"] = json!(result.is_ok());
+        if let Err(error) = result {
+            record["error"] = json!(error);
+        }
+        applied_edits.push(record);
+    }
+}
+
 /// `rollbackProposal`: restore each applied edit's snapshot, newest first.
 fn rollback_proposal(target: &Value) -> Proposal {
     let id = target["id"].as_str().unwrap_or("?");
     let mut edits = Vec::new();
+    let mut skill_changes = Vec::new();
     for edit in target["appliedEdits"]
         .as_array()
         .into_iter()
@@ -808,6 +1110,10 @@ fn rollback_proposal(target: &Value) -> Proposal {
         .rev()
     {
         if edit["applied"] != true {
+            continue;
+        }
+        if edit["kind"] == SKILL_FILE_KIND {
+            skill_changes.push(edit.clone());
             continue;
         }
         let before = &edit["before"];
@@ -848,6 +1154,8 @@ fn rollback_proposal(target: &Value) -> Proposal {
         rationale: format!("Restores continual harness state snapshots from refinement {id}."),
         expected_outcome: "Faulty refinement edits are reverted.".to_owned(),
         edits,
+        skill_files: Vec::new(),
+        skill_restores: skill_changes,
     }
 }
 
@@ -910,9 +1218,21 @@ pub async fn refine(
     conversation: &str,
     scopes: &HarnessScopes,
     options: &RefineOptions,
+    learning: Option<&Learning>,
 ) -> Result<Refinement, String> {
     let history = history(scopes);
     let id = refinement_id();
+    if options.curate && options.rollback.is_none() {
+        let learning = learning.ok_or("learned skills are unavailable in this session")?;
+        return curate(
+            provider,
+            model,
+            scopes,
+            learning,
+            options.instructions.as_deref(),
+        )
+        .await;
+    }
     if let Some(target_id) = &options.rollback {
         let target = history
             .iter()
@@ -928,6 +1248,7 @@ pub async fn refine(
             global,
             Some(target_id),
             None,
+            learning,
         );
     }
     let scope_instruction = if options.global {
@@ -951,6 +1272,9 @@ pub async fn refine(
         ),
         format!("<scope_policy>\n{scope_instruction}\n</scope_policy>"),
     ];
+    if let Some(learning) = learning {
+        parts.extend(learning.prompt_parts());
+    }
     if let Some(instructions) = &options.instructions {
         parts.push(format!(
             "<user_refine_instructions>\n{instructions}\n</user_refine_instructions>"
@@ -976,6 +1300,106 @@ pub async fn refine(
         options.global,
         None,
         Some(&baseline),
+        learning,
+    )
+}
+
+/// How many requests in a layer pass between automatic curations: consolidation
+/// reads the whole library, so it is much rarer than a review (autoharness's
+/// `CONSOLIDATE_EVERY_N`).
+pub const CURATE_EVERY_REQUESTS: u64 = 250;
+/// The fewest learned skills worth consolidating.
+pub const CURATE_MIN_SKILLS: usize = 2;
+const CURATE_MAX_OUTPUT_TOKENS: u32 = 16_384;
+
+const CURATOR_SYSTEM_PROMPT: &str = r#"You are the learned-skill curator of ha, a coding agent. After tigerless-labs/autoharness.
+
+Refinements write learned SKILL.md skills one conversation at a time, so the library drifts toward many narrow, session-shaped skills. Your job is to fold them into fewer class-level skills an agent can find: one broad skill with labeled subsections is easier to match than five narrow siblings. This is a consolidation pass, not an audit.
+
+Rules:
+- Only the learned skills listed below exist for you. Never name, absorb into, or recreate any other skill.
+- Judge overlap on content. Usage counts are not shown and are not your concern; retiring unused skills is the lifecycle's job.
+- Do not ask whether two skills are distinct. Ask whether a maintainer would write them as N separate skills or as one skill with N subsections. When the answer is one, merge.
+- Consolidate a cluster in one of three ways: patch the broadest member to add a labeled subsection for each sibling's unique content, then delete each sibling with absorbed_into set to it; or create a new umbrella skill and delete the absorbed siblings with absorbed_into set to it; or move narrow but valuable detail into the umbrella's references/<topic>.md (carried in `files`, pointed at from SKILL.md) and delete the sibling.
+- Order matters: the umbrella's create/patch/update comes before the deletes that name it.
+- Keep each absorbed skill's support files: carry what the umbrella needs in its `files` and rewrite pointers to them. Never leave instructions pointing at a file in a deleted skill.
+- When the umbrella and a sibling disagree, resolve it in the umbrella; a merged skill that argues with itself is worse than the two it replaced.
+- Every create/update carries `category:`; an umbrella and what it absorbs share one. Also patch a kept skill whose category is missing or `general` when its class is plain.
+- `reason` and `evidence` are required on every intent; `evidence` quotes the overlapping skill lines that justify the merge.
+- When nothing is worth folding, return an empty skillFiles array.
+
+Return JSON only:
+{
+  "summary": "one sentence",
+  "rationale": "which clusters were folded and why",
+  "expectedOutcome": "what the library looks like after",
+  "skillFiles": [ ...intents in <learned_skill_format>... ]
+}"#;
+
+/// The curator: one model pass over the whole learned library that folds narrow
+/// skills into class-level ones, through the same promoter as a refinement. The
+/// library is snapshotted first. Recorded as a refinement in the global scope, so
+/// `/refine --rollback <id>` undoes it.
+pub async fn curate(
+    provider: &Arc<dyn ModelProvider>,
+    model: &str,
+    scopes: &HarnessScopes,
+    learning: &Learning,
+    instructions: Option<&str>,
+) -> Result<Refinement, String> {
+    let skills = super::learned::library(&learning.layers);
+    if skills.len() < CURATE_MIN_SKILLS {
+        return Err(format!(
+            "there are {} learned skill(s); curation needs at least {CURATE_MIN_SKILLS}",
+            skills.len()
+        ));
+    }
+    let snapshot = super::learned::snapshot(&learning.layers)?;
+    let mut parts = vec![
+        format!(
+            "<learned_skills>\n{}\n</learned_skills>",
+            super::learned::library_overview(&skills)
+        ),
+        format!(
+            "<learned_skill_documents>\n{}\n</learned_skill_documents>",
+            super::learned::library_documents(&learning.layers)
+        ),
+    ];
+    parts.extend(learning.prompt_parts().into_iter().skip(1));
+    if let Some(instructions) = instructions {
+        parts.push(format!(
+            "<user_curate_instructions>\n{instructions}\n</user_curate_instructions>"
+        ));
+    }
+    parts.push("Return only JSON. If nothing is worth folding, return an empty skillFiles array with a rationale.".to_owned());
+    let text = complete(
+        provider,
+        model,
+        CURATOR_SYSTEM_PROMPT,
+        parts.join("\n\n"),
+        CURATE_MAX_OUTPUT_TOKENS,
+    )
+    .await?;
+    let value = extract_json(&text)?;
+    if !value.is_object() {
+        return Err("the curator JSON must be an object".to_owned());
+    }
+    let mut proposal = Proposal::from_value(&value);
+    // The curator changes learned skills only.
+    proposal.edits.clear();
+    proposal.rationale = format!(
+        "{} (library snapshot: {})",
+        proposal.rationale,
+        snapshot.display()
+    );
+    apply(
+        scopes,
+        &proposal,
+        &refinement_id(),
+        true,
+        None,
+        None,
+        Some(learning),
     )
 }
 
@@ -994,15 +1418,26 @@ pub async fn review(
     conversation: &str,
     scopes: &HarnessScopes,
     turns_since_last_review: u32,
+    learning: Option<&Learning>,
 ) -> Result<Review, String> {
     let history = history(scopes);
+    let learned = learning.map_or_else(String::new, |learning| {
+        format!(
+            "<learned_skills>\n{}\n</learned_skills>",
+            super::learned::library_overview(&super::learned::library(&learning.layers))
+        )
+    });
     let prompt = [
         format!("<trigger>\nturn_interval; {turns_since_last_review} assistant turns since last auto-refine review\n</trigger>"),
         format!("<current_harness_state>\n{}\n</current_harness_state>", overview(scopes)),
         format!("<refinement_history>\n{}\n</refinement_history>", history_for_prompt(&history)),
         format!("<conversation>\n{}\n</conversation>", tail(conversation, REVIEW_CONVERSATION_CHARS)),
-        "Return shouldRefine=true when the trajectory contains evidence useful to this session's future turns. Prefer local harness edits for current task progress, temporary blockers, and current-run coordination. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified facts likely to be reused in future sessions.".to_owned(),
+        learned,
+        "Return shouldRefine=true when the trajectory contains evidence useful to this session's future turns. Prefer local harness edits for current task progress, temporary blockers, and current-run coordination. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified facts likely to be reused in future sessions. A corrected approach or reusable technique that belongs in a learned skill (a new one, or a patch to one listed above) is also worth refining.".to_owned(),
     ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
     .join("\n\n");
     let text = complete(
         provider,
@@ -1021,22 +1456,6 @@ pub async fn review(
             .to_owned(),
         instructions: value["instructions"].as_str().map(str::to_owned),
     })
-}
-
-/// A conversation's turns as the refiner reads them (`serializeConversation`).
-#[must_use]
-pub fn serialize_turns(turns: &[(String, String)]) -> String {
-    turns
-        .iter()
-        .flat_map(|(question, answer)| {
-            [
-                (!question.is_empty()).then(|| format!("[User]: {question}")),
-                (!answer.is_empty()).then(|| format!("[Assistant]: {answer}")),
-            ]
-        })
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("\n\n")
 }
 
 #[cfg(test)]
@@ -1062,6 +1481,7 @@ mod tests {
                 instructions: Some("keep the tab rule".to_owned()),
                 global: true,
                 rollback: None,
+                curate: false,
             }
         );
         assert_eq!(
@@ -1110,7 +1530,8 @@ mod tests {
                 {"action": "delete", "kind": "memory", "id": "missing"}
             ]
         }));
-        let result = apply(&scopes, &proposal, "refine_1", false, None, None).expect("applied");
+        let result =
+            apply(&scopes, &proposal, "refine_1", false, None, None, None).expect("applied");
         let state = load_raw(&scopes.local);
         assert_eq!(
             state["entries"]["memory"]["indentation"]["content"],
@@ -1148,7 +1569,7 @@ mod tests {
                 {"action": "update", "kind": "memory", "id": "indentation", "title": "Indentation", "content": "Tabs, width 4"}
             ]
         }));
-        let second = apply(&scopes, &update, "refine_2", false, None, None).expect("updated");
+        let second = apply(&scopes, &update, "refine_2", false, None, None, None).expect("updated");
         assert_eq!(
             load_raw(&scopes.local)["entries"]["memory"]["indentation"]["version"],
             2
@@ -1159,6 +1580,7 @@ mod tests {
             "refine_3",
             false,
             Some("refine_2"),
+            None,
             None,
         )
         .expect("rolled back");
@@ -1192,6 +1614,7 @@ mod tests {
 [Assistant]: ok",
             &scopes,
             &RefineOptions::parse("--global"),
+            None,
         )
         .await
         .expect("refined");
@@ -1210,11 +1633,259 @@ mod tests {
             "conversation",
             &scopes,
             25,
+            None,
         )
         .await
         .expect("reviewed");
         assert!(review.should_refine);
         assert_eq!(review.instructions.as_deref(), Some("record it"));
+    }
+
+    /// autoharness's chain through `/refine`: the model proposes learned-skill
+    /// intents, the promoter lands the clean one and refuses the other with its
+    /// reason, and rolling the refinement back retires what it created.
+    #[tokio::test]
+    async fn a_refinement_writes_a_learned_skill_and_its_rollback_retires_it() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let workspace = directory.path().join("workspace");
+        let layers = crate::interactive::learned::Layers::new(
+            &directory.path().join("config"),
+            &directory.path().join("data"),
+            &workspace,
+            true,
+        );
+        let learning = super::Learning::new(layers.clone(), &workspace, None);
+        let reply = json!({
+            "summary": "keep the CI rule",
+            "edits": [],
+            "skillFiles": [
+                {
+                    "action": "create", "name": "ci-test-debugging", "level": "project",
+                    "body": "---\nname: ci-test-debugging\ndescription: Use when a Rust test fails only on CI.\ncategory: testing\n---\nRun the failing test alone with --locked first.\n",
+                    "reason": "the user corrected it twice", "evidence": "[User]: use --locked"
+                },
+                {"action": "create", "name": "Bad Name", "body": "x", "reason": "r", "evidence": "e"}
+            ]
+        })
+        .to_string();
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> =
+            std::sync::Arc::new(harness_providers::MockProvider::text(reply.as_str()));
+        let result = super::refine(
+            &provider,
+            "fixture-model",
+            "[User]: use --locked",
+            &scopes,
+            &RefineOptions::default(),
+            Some(&learning),
+        )
+        .await
+        .expect("refined");
+        assert_eq!(
+            result.header(),
+            "Harness partially refined · 1/2 edits applied"
+        );
+        let details = result.details();
+        assert!(
+            details.contains(&"Created project learned skill `ci-test-debugging`".to_owned()),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|line| line.contains("Bad Name") && line.contains("routing")),
+            "{details:?}"
+        );
+        let root = layers.project.clone().expect("trusted project");
+        assert!(crate::interactive::learned::is_learned(
+            &root,
+            "ci-test-debugging"
+        ));
+
+        let rollback = super::refine(
+            &provider,
+            "fixture-model",
+            "",
+            &scopes,
+            &RefineOptions::parse(&format!("--rollback {}", result.id())),
+            Some(&learning),
+        )
+        .await
+        .expect("rolled back");
+        assert_eq!(
+            rollback.header(),
+            "Harness rollback completed · 1 edit applied"
+        );
+        assert!(!crate::interactive::learned::is_learned(
+            &root,
+            "ci-test-debugging"
+        ));
+        assert!(root.join(".archive/ci-test-debugging/SKILL.md").is_file());
+    }
+
+    /// The curator folds a narrow learned skill into a broader one: the library is
+    /// snapshotted, the umbrella is patched before the sibling it absorbs is
+    /// archived, and the whole pass rolls back like a refinement.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "one curation, then its rollback")]
+    async fn the_curator_folds_a_sibling_into_its_umbrella_and_rolls_back() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let workspace = directory.path().join("workspace");
+        let layers = crate::interactive::learned::Layers::new(
+            &directory.path().join("config"),
+            &directory.path().join("data"),
+            &workspace,
+            true,
+        );
+        let learning = super::Learning::new(layers.clone(), &workspace, None);
+        let skill = |name: &str, body: &str| {
+            json!({
+                "action": "create", "name": name, "level": "project",
+                "body": format!("---\nname: {name}\ndescription: Use when Rust tests fail.\ncategory: testing\n---\n{body}\n"),
+                "reason": "r", "evidence": "e",
+            })
+        };
+        for intent in [
+            skill("rust-testing", "Run one test alone first."),
+            skill("ci-flaky-test", "Retry a flaky CI test once."),
+        ] {
+            let parsed = crate::interactive::learned::Intent::from_value(&intent);
+            assert!(crate::interactive::learned::promote(&layers, &parsed, &learning.context).ok);
+        }
+        let reply = json!({
+            "summary": "fold the CI retry into rust-testing",
+            "skillFiles": [
+                {"action": "patch", "name": "rust-testing", "old_string": "Run one test alone first.",
+                 "new_string": "Run one test alone first.\n\n## Flaky on CI\nRetry once.",
+                 "reason": "same class", "evidence": "- ci-flaky-test [project]"},
+                {"action": "delete", "name": "ci-flaky-test", "absorbed_into": "rust-testing",
+                 "reason": "absorbed", "evidence": "- ci-flaky-test [project]"}
+            ]
+        })
+        .to_string();
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> =
+            std::sync::Arc::new(harness_providers::MockProvider::text(reply.as_str()));
+        let options = RefineOptions::parse("--curate");
+        assert!(options.curate);
+        let result = super::refine(
+            &provider,
+            "fixture-model",
+            "",
+            &scopes,
+            &options,
+            Some(&learning),
+        )
+        .await
+        .expect("curated");
+        assert_eq!(result.record["scope"], "global");
+        assert_eq!(result.header(), "Harness refined");
+        let root = layers.project.clone().expect("project");
+        assert!(!crate::interactive::learned::is_learned(
+            &root,
+            "ci-flaky-test"
+        ));
+        assert!(
+            std::fs::read_to_string(root.join("rust-testing/SKILL.md"))
+                .expect("umbrella")
+                .contains("## Flaky on CI")
+        );
+        let snapshots = directory.path().join("data/skill-snapshots");
+        let snapshot = std::fs::read_dir(&snapshots)
+            .expect("a snapshot")
+            .flatten()
+            .next()
+            .expect("one snapshot")
+            .path();
+        assert!(snapshot.join("project/ci-flaky-test/SKILL.md").is_file());
+
+        let rollback = super::refine(
+            &provider,
+            "fixture-model",
+            "",
+            &scopes,
+            &RefineOptions::parse(&format!("--rollback {}", result.id())),
+            Some(&learning),
+        )
+        .await
+        .expect("rolled back");
+        assert_eq!(
+            rollback.header(),
+            "Harness rollback completed · 2 edits applied"
+        );
+        assert!(crate::interactive::learned::is_learned(
+            &root,
+            "ci-flaky-test"
+        ));
+        assert!(
+            !std::fs::read_to_string(root.join("rust-testing/SKILL.md"))
+                .expect("umbrella")
+                .contains("## Flaky on CI")
+        );
+
+        let alone = tempfile::tempdir().expect("dir");
+        let empty = super::Learning::new(
+            crate::interactive::learned::Layers::new(
+                alone.path(),
+                alone.path(),
+                alone.path(),
+                true,
+            ),
+            alone.path(),
+            None,
+        );
+        let refused = super::curate(&provider, "fixture-model", &scopes, &empty, None)
+            .await
+            .expect_err("nothing to fold");
+        assert!(refused.contains("at least 2"), "{refused}");
+    }
+
+    #[test]
+    fn the_review_cadence_counts_turns_and_tool_calls_and_runs_one_at_a_time() {
+        let cadence = super::Cadence::default();
+        assert_eq!(cadence.turn_finished(10), None);
+        assert_eq!(
+            cadence.turn_finished(super::AUTO_REFINE_TOOL_CALL_INTERVAL),
+            Some(2),
+            "a long agentic turn brings the review forward"
+        );
+        for _ in 0..super::AUTO_REFINE_TURN_INTERVAL {
+            assert_eq!(cadence.turn_finished(0), None, "one review at a time");
+        }
+        cadence.release();
+        assert_eq!(
+            cadence.turn_finished(0),
+            Some(super::AUTO_REFINE_TURN_INTERVAL + 1)
+        );
+    }
+
+    /// A session's end hands its unreviewed work to the next turn once, and only
+    /// when there was enough of it.
+    #[test]
+    fn a_session_end_leaves_its_tail_for_the_next_turn_once() {
+        let cadence = super::Cadence::default();
+        assert_eq!(cadence.turn_finished(3), None);
+        assert_eq!(
+            cadence.take_tail(),
+            None,
+            "one short turn is not worth a review"
+        );
+        assert_eq!(cadence.turn_finished(super::TAIL_MIN_TOOL_CALLS), None);
+        assert_eq!(cadence.take_tail(), Some(2));
+        assert_eq!(cadence.take_tail(), None, "handed off once");
+
+        let directory = tempfile::tempdir().expect("dir");
+        let review = super::DeferredReview {
+            task: "task-1".to_owned(),
+            session: "session-9".to_owned(),
+            turns: 2,
+        };
+        super::defer_review(directory.path(), &review).expect("deferred");
+        assert_eq!(super::take_deferred_reviews(directory.path()), vec![review]);
+        assert!(
+            super::take_deferred_reviews(directory.path()).is_empty(),
+            "a deferred review is taken by one turn only"
+        );
     }
 
     #[test]
@@ -1224,16 +1895,17 @@ mod tests {
         let create = Proposal::from_value(&json!({"edits": [
             {"action": "create", "kind": "memory", "id": "note", "title": "Note", "content": "one"}
         ]}));
-        apply(&scopes, &create, "r1", false, None, None).expect("created");
+        apply(&scopes, &create, "r1", false, None, None, None).expect("created");
         let baseline = load_raw(&scopes.local);
         let concurrent = Proposal::from_value(&json!({"edits": [
             {"action": "update", "kind": "memory", "id": "note", "title": "Note", "content": "two"}
         ]}));
-        apply(&scopes, &concurrent, "r2", false, None, None).expect("changed meanwhile");
+        apply(&scopes, &concurrent, "r2", false, None, None, None).expect("changed meanwhile");
         let planned = Proposal::from_value(&json!({"edits": [
             {"action": "update", "kind": "memory", "id": "note", "title": "Note", "content": "three"}
         ]}));
-        let result = apply(&scopes, &planned, "r3", false, None, Some(&baseline)).expect("applied");
+        let result =
+            apply(&scopes, &planned, "r3", false, None, Some(&baseline), None).expect("applied");
         assert_eq!(
             result.record["appliedEdits"][0]["error"],
             "entry changed during refinement planning"

@@ -1556,6 +1556,133 @@ async fn interrupted_steps(
     Ok(Some(steps))
 }
 
+/// How much of one tool result the transcript keeps: the head up to this many
+/// characters, with [`TRANSCRIPT_RESULT_TAIL_CHARS`] of its end (prime-agent's
+/// `TOOL_RESULT_MAX_CHARS` and `TOOL_RESULT_TAIL_CHARS`).
+const TRANSCRIPT_RESULT_CHARS: usize = 2_000;
+const TRANSCRIPT_RESULT_TAIL_CHARS: usize = 500;
+
+/// The conversation `session_id` ends, as text for a model to read rather than
+/// continue: prime-agent's `serializeConversation`. Every turn gives its question,
+/// each model call's text and tool calls, and each call's result, so a refinement
+/// learns from what the tools did and returned, not only from what was said.
+///
+/// Tool calls carry a 1-based `#N` and their results repeat it, so repeated calls
+/// of one tool pair unambiguously. Results are cut to their head and tail. Only
+/// the newest `max_turns` turns are read.
+///
+/// # Errors
+/// The store cannot be read.
+pub async fn conversation_transcript(
+    store: &SqliteStore,
+    session_id: &SessionId,
+    max_turns: usize,
+) -> Result<String, RuntimeError> {
+    let turns = conversation_turns(store, session_id).await?;
+    let mut parts = Vec::new();
+    if turns.len() > max_turns {
+        parts.push(format!(
+            "[{} earlier turn(s) are not shown]",
+            turns.len() - max_turns
+        ));
+    }
+    let mut index = 0_usize;
+    for (session, question) in turns.iter().skip(turns.len().saturating_sub(max_turns)) {
+        if !question.trim().is_empty() {
+            parts.push(format!("[User]: {question}"));
+        }
+        let mut attempts = store.list_provider_attempts(session).await?;
+        attempts.retain(|attempt| matches!(attempt.state.as_str(), "completed" | "canceled"));
+        attempts.sort_by(|left, right| left.attempt_id.as_str().cmp(right.attempt_id.as_str()));
+        let results = store.recovered_tool_results(session).await?;
+        let mut seen = std::collections::BTreeSet::new();
+        for attempt in &attempts {
+            let Some(response) =
+                serde_json::from_value::<Vec<ProviderStreamEvent>>(attempt.events.clone())
+                    .ok()
+                    .and_then(|events| harness_providers::assemble_stream(&events).ok())
+            else {
+                continue;
+            };
+            if !response.text.trim().is_empty() {
+                parts.push(format!("[Assistant]: {}", response.text.trim()));
+            }
+            // An unfinished response's calls never ran.
+            if !response.is_dispatchable() {
+                continue;
+            }
+            let calls = response
+                .tool_calls
+                .iter()
+                .filter(|call| seen.insert(call.call_id.clone()))
+                .map(|call| {
+                    index += 1;
+                    (index, call)
+                })
+                .collect::<Vec<_>>();
+            if calls.is_empty() {
+                continue;
+            }
+            parts.push(format!(
+                "[Assistant tool calls]: {}",
+                calls
+                    .iter()
+                    .map(|(index, call)| format!(
+                        "#{index} {}({})",
+                        call.name,
+                        transcript_arguments(&call.arguments)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+            for (index, call) in calls {
+                if let Some(result) = results
+                    .iter()
+                    .rfind(|result| result.call_id.as_deref() == Some(call.call_id.as_str()))
+                    && !result.text.trim().is_empty()
+                {
+                    parts.push(format!(
+                        "[Tool result ({}) #{index}]: {}",
+                        call.name,
+                        head_and_tail(&result.text)
+                    ));
+                }
+            }
+        }
+    }
+    Ok(parts.join("\n\n"))
+}
+
+/// `key=<json value>` pairs, as prime-agent prints a call's arguments.
+fn transcript_arguments(arguments: &str) -> String {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(Value::Object(fields)) => fields
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => arguments.to_owned(),
+    }
+}
+
+/// A tool result cut to its head and tail, saying how much was left out.
+fn head_and_tail(text: &str) -> String {
+    let count = text.chars().count();
+    if count <= TRANSCRIPT_RESULT_CHARS {
+        return text.to_owned();
+    }
+    let head_chars = TRANSCRIPT_RESULT_CHARS.saturating_sub(TRANSCRIPT_RESULT_TAIL_CHARS + 80);
+    let head = text.chars().take(head_chars).collect::<String>();
+    let tail = text
+        .chars()
+        .skip(count - TRANSCRIPT_RESULT_TAIL_CHARS)
+        .collect::<String>();
+    format!(
+        "{head}\n\n[... {} characters truncated; first {head_chars} and last {TRANSCRIPT_RESULT_TAIL_CHARS} kept ...]\n\n{tail}",
+        count - head_chars - TRANSCRIPT_RESULT_TAIL_CHARS
+    )
+}
+
 /// What the model reads for a call of an earlier turn that has no recorded
 /// result. Saying "interrupted" for all of them made a refused `write_file`
 /// look like it might have written, so the model re-read files it had never
