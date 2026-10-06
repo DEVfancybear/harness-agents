@@ -1373,6 +1373,7 @@ dependencies = [
  "harness-session",
  "harness-store-sqlite",
  "harness-types",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

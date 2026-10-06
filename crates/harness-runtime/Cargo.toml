@@ -12,6 +12,7 @@ harness-providers = { path = "../harness-providers" }
 harness-session = { path = "../harness-session" }
 harness-store-sqlite = { path = "../harness-store-sqlite" }
 harness-types = { path = "../harness-types" }
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

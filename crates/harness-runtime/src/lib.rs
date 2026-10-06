@@ -291,6 +291,57 @@ fn retry_backoff(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(base_ms - spread + offset)
 }
 
+/// prime-agent's `overflow.rs`: the error texts with which providers say a
+/// request does not fit the model's context window. Rate-limit texts are not
+/// overflows even when they mention tokens.
+#[must_use]
+pub fn is_context_overflow(message: &str) -> bool {
+    use std::sync::OnceLock;
+    static PATTERNS: OnceLock<(Vec<regex::Regex>, Vec<regex::Regex>)> = OnceLock::new();
+    let (overflow, not_overflow) = PATTERNS.get_or_init(|| {
+        let compile = |patterns: &[&str]| {
+            patterns
+                .iter()
+                .filter_map(|pattern| regex::Regex::new(pattern).ok())
+                .collect::<Vec<_>>()
+        };
+        (
+            compile(&[
+                r"prompt is too long",
+                r"request_too_large",
+                r"input is too long for requested model",
+                r"exceeds the context window",
+                r"(?i)input token count.*exceeds the maximum",
+                r"(?i)maximum prompt length is \d+",
+                r"(?i)reduce the length of the messages",
+                r"(?i)maximum context length is \d+ tokens",
+                r"(?i)exceeds the model's maximum context length",
+                r"(?i)exceeds the limit of \d+",
+                r"(?i)exceeds the available context size",
+                r"(?i)greater than the context length",
+                r"(?i)context window exceeds limit",
+                r"(?i)exceeded model token limit",
+                r"(?i)too large for model with \d+ maximum context length",
+                r"(?i)model_context_window_exceeded",
+                r"(?i)combined input and output tokens",
+                r"(?i)accepts at most \d+ combined",
+                r"(?i)reduce the input length or requested output length",
+                r"(?i)prompt too long; exceeded (?:max )?context length",
+                r"(?i)context[_ ]length[_ ]exceeded",
+                r"(?i)too many tokens",
+                r"(?i)token limit exceeded",
+            ]),
+            compile(&[
+                r"(?i)(Throttling error|Service unavailable):",
+                r"(?i)rate limit",
+                r"(?i)too many requests",
+            ]),
+        )
+    });
+    !not_overflow.iter().any(|pattern| pattern.is_match(message))
+        && overflow.iter().any(|pattern| pattern.is_match(message))
+}
+
 fn compaction_threshold(config: &RuntimeConfig) -> u64 {
     let window = config.context_window_tokens;
     let effective_reserve = config.compaction_reserve_tokens.min(window / 4);
@@ -1610,7 +1661,7 @@ impl RuntimeService {
         request: RunRequest,
         cancellation: CancellationToken,
     ) -> Result<RunResult, RuntimeError> {
-        self.run_inner(request, cancellation, None, true, Vec::new())
+        self.run_recovering_overflow(request, cancellation, None, true, Vec::new())
             .await
     }
 
@@ -1624,7 +1675,7 @@ impl RuntimeService {
         cancellation: CancellationToken,
         sink: ProviderEventSink,
     ) -> Result<RunResult, RuntimeError> {
-        self.run_inner(request, cancellation, Some(sink), true, Vec::new())
+        self.run_recovering_overflow(request, cancellation, Some(sink), true, Vec::new())
             .await
     }
 
@@ -1640,6 +1691,47 @@ impl RuntimeService {
         cancellation: CancellationToken,
         sink: Option<ProviderEventSink>,
     ) -> Result<RunResult, RuntimeError> {
+        self.run_recovering_overflow(request, cancellation, sink, false, appended)
+            .await
+    }
+
+    /// prime-agent's overflow recovery: when the provider refuses the request
+    /// because it does not fit the model's context, the session is compacted,
+    /// this turn's tool results are shortened, and the step is sent once more.
+    /// The pre-send check only estimates, and a request it let through used to
+    /// fail the turn outright. The input was admitted by the first attempt, so
+    /// the retry admits nothing.
+    async fn run_recovering_overflow(
+        &self,
+        request: RunRequest,
+        cancellation: CancellationToken,
+        sink: Option<ProviderEventSink>,
+        admit_input: bool,
+        appended: Vec<ProviderMessage>,
+    ) -> Result<RunResult, RuntimeError> {
+        let first = self
+            .run_inner(
+                request.clone(),
+                cancellation.clone(),
+                sink.clone(),
+                admit_input,
+                appended.clone(),
+            )
+            .await;
+        let Err(error) = &first else {
+            return first;
+        };
+        if cancellation.is_cancelled() || !is_context_overflow(&error.to_string()) {
+            return first;
+        }
+        let Ok(compacted) = self.compact(&request.session_id).await else {
+            return first;
+        };
+        let mut request = request;
+        request.continuation_context = Some(compacted.packet.content);
+        let mut appended = appended;
+        let budget = messages_tokens(&appended) / 2;
+        fit_tool_results(&mut appended, budget);
         self.run_inner(request, cancellation, sink, false, appended)
             .await
     }
