@@ -94,6 +94,9 @@ pub struct ReasoningModel {
     /// The level map; `None` for a level means the model does not offer it, a
     /// missing level means the default spelling.
     pub map: &'static [(ThinkingLevel, Option<&'static str>)],
+    /// The model's declared output ceiling: a thinking budget folded into
+    /// `max_tokens` never asks for more.
+    pub max_tokens: Option<u64>,
 }
 
 /// The levels a model offers (`pi-ai`'s `getSupportedThinkingLevels`).
@@ -153,6 +156,24 @@ pub fn provider_name(model: Option<ReasoningModel>, level: ThinkingLevel) -> Str
         return level.as_str().to_owned();
     }
     mapped(model, level)
+}
+
+/// How a Responses model spells reasoning off (prime-agent): its map's value,
+/// `"none"` when the map does not mention it, and nothing when the map says
+/// the model cannot turn it off (`null`).
+#[must_use]
+pub fn off_name(model: Option<ReasoningModel>) -> Option<String> {
+    match model.and_then(|model| {
+        model
+            .map
+            .iter()
+            .find(|(candidate, _)| *candidate == ThinkingLevel::Off)
+            .map(|(_, value)| *value)
+    }) {
+        Some(Some(name)) => Some(name.to_owned()),
+        Some(None) => None,
+        None => Some("none".to_owned()),
+    }
 }
 
 /// The levels a model offers, each under the name its provider uses, once per
@@ -254,7 +275,11 @@ pub fn reasoning_from_catalog(
         }),
         Err(_) => &[],
     };
-    ReasoningModel { reasoning, map }
+    ReasoningModel {
+        reasoning,
+        map,
+        max_tokens: None,
+    }
 }
 
 impl Thinking {
@@ -326,15 +351,30 @@ impl Thinking {
             body["output_config"] = json!({ "effort": effort });
             return;
         }
-        // `adjustMaxTokensForThinking`: xhigh and max are clamped to high.
-        let budget: u64 = match level {
+        // `adjustMaxTokensForThinking`: xhigh and max are clamped to high; the
+        // sum is held to the model's ceiling, and the budget leaves room for
+        // an answer of at least 1024 tokens.
+        let mut budget: u64 = match level {
             ThinkingLevel::Minimal | ThinkingLevel::Off => 1024,
             ThinkingLevel::Low => 2048,
             ThinkingLevel::Medium => 8192,
             ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => 16_384,
         };
         let base = body["max_tokens"].as_u64().unwrap_or(4096);
-        body["max_tokens"] = json!(base + budget);
+        let ceiling = description
+            .and_then(|model| model.max_tokens)
+            .filter(|ceiling| *ceiling > 0)
+            .unwrap_or(u64::MAX);
+        let max_tokens = base.saturating_add(budget).min(ceiling);
+        if max_tokens <= 1024 {
+            // No room for budget thinking: the request goes without it.
+            body["max_tokens"] = json!(max_tokens);
+            return;
+        }
+        if max_tokens <= budget {
+            budget = max_tokens.saturating_sub(1024).max(1024);
+        }
+        body["max_tokens"] = json!(max_tokens);
         body["thinking"] = json!({
             "type": "enabled",
             "budget_tokens": budget,

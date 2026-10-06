@@ -1683,9 +1683,119 @@ pub(super) fn build_provider(
         Vec::new()
     };
     // The model's levels, from the catalog as prime-agent reads them.
-    let catalog_reasoning = super::providers::Catalog::load(data_dir)
+    let catalog_model = super::providers::Catalog::load(data_dir)
         .find(&format!("{}/{}", config.provider_id, config.model))
+        .cloned();
+    let catalog_reasoning = catalog_model
+        .as_ref()
         .map(super::providers::Model::reasoning_model);
+    // prime-agent sends every request the model's output budget; without one
+    // the provider's default applied (Anthropic's was a fixed 8192).
+    let max_output = catalog_model
+        .as_ref()
+        .and_then(super::providers::Model::request_max_tokens)
+        .and_then(|tokens| u32::try_from(tokens).ok());
+    let provider = build_adapter(
+        config,
+        credentials,
+        capabilities,
+        thinking_level,
+        session,
+        extra_headers,
+        catalog_reasoning,
+    )?;
+    Ok(match max_output {
+        Some(max_output) => Arc::new(DefaultMaxOutput {
+            inner: provider,
+            max_output,
+        }),
+        None => provider,
+    })
+}
+
+/// prime-agent's `effective_request_max_tokens`: the output a request really
+/// asks for - the model's budget, plus the thinking budget Anthropic folds into
+/// `max_tokens` on models without adaptive thinking - so the compaction
+/// threshold leaves room for it. Never less than the configured reservation.
+pub(super) fn effective_output_tokens(
+    config: &ProviderConfig,
+    data_dir: &Path,
+    level: harness_providers::ThinkingLevel,
+) -> u64 {
+    let Some(model) = super::providers::Catalog::load(data_dir)
+        .find(&format!("{}/{}", config.provider_id, config.model))
+        .cloned()
+    else {
+        return config.output_reservation_tokens;
+    };
+    let base = model.request_max_tokens().unwrap_or(0);
+    let folds = config.protocol == "anthropic_messages"
+        && model.reasoning
+        && level != harness_providers::ThinkingLevel::Off
+        && !harness_providers::thinking::supports_adaptive_thinking(&model.id.to_ascii_lowercase());
+    let effective = if folds && base > 0 {
+        let budget = match level {
+            harness_providers::ThinkingLevel::Minimal | harness_providers::ThinkingLevel::Off => {
+                1024
+            }
+            harness_providers::ThinkingLevel::Low => 2048,
+            harness_providers::ThinkingLevel::Medium => 8192,
+            _ => 16_384,
+        };
+        base.saturating_add(budget)
+            .min(model.max_tokens.filter(|max| *max > 0).unwrap_or(u64::MAX))
+    } else {
+        base
+    };
+    effective.max(config.output_reservation_tokens)
+}
+
+/// A request that names no output budget gets the model's.
+struct DefaultMaxOutput {
+    inner: Arc<dyn ModelProvider>,
+    max_output: u32,
+}
+
+impl DefaultMaxOutput {
+    fn fill(&self, mut request: ProviderRequest) -> ProviderRequest {
+        if request.max_output_tokens.is_none() {
+            request.max_output_tokens = Some(self.max_output);
+        }
+        request
+    }
+}
+
+impl ModelProvider for DefaultMaxOutput {
+    fn capabilities(&self) -> ModelCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn stream(
+        &self,
+        request: ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> harness_providers::ProviderFuture {
+        self.inner.stream(self.fill(request), cancellation)
+    }
+
+    fn stream_events(
+        &self,
+        request: ProviderRequest,
+        cancellation: CancellationToken,
+    ) -> harness_providers::ProviderEventStream {
+        self.inner.stream_events(self.fill(request), cancellation)
+    }
+}
+
+fn build_adapter(
+    config: &ProviderConfig,
+    credentials: Arc<dyn harness_providers::CredentialResolver>,
+    capabilities: ModelCapabilities,
+    thinking_level: harness_providers::ThinkingLevel,
+    session: &str,
+    extra_headers: Vec<(String, String)>,
+    catalog_reasoning: Option<harness_providers::thinking::ReasoningModel>,
+) -> Result<Arc<dyn ModelProvider>, ProviderError> {
     let chat_thinking_format = match config.thinking_format.as_deref() {
         Some("deepseek") => harness_providers::ThinkingFormat::DeepSeek,
         Some(_) => harness_providers::ThinkingFormat::ReasoningEffort,
@@ -1737,6 +1847,7 @@ pub(super) fn build_provider(
                 reasoning: catalog_reasoning
                     .filter(|model| model.reasoning)
                     .map(|model| harness_providers::thinking::clamp(Some(model), thinking_level)),
+                reasoning_model: catalog_reasoning,
                 headers: extra_headers,
                 session_id: Some(session.to_owned()),
                 // A tier the model does not take is sent as `default`.
@@ -5921,7 +6032,7 @@ async fn run_turn(
         Arc::clone(&provider),
         RuntimeConfig {
             context_window_tokens: config.context_window_tokens,
-            output_reservation_tokens: config.output_reservation_tokens,
+            output_reservation_tokens: effective_output_tokens(&config, &data_dir, thinking_level),
             compaction_reserve_tokens: config.compaction_reserve_tokens,
             max_retry_after_seconds: config.max_retry_after_seconds,
             ..RuntimeConfig::default()
@@ -6185,7 +6296,11 @@ async fn run_turn(
             })),
             runtime_config: RuntimeConfig {
                 context_window_tokens: config.context_window_tokens,
-                output_reservation_tokens: config.output_reservation_tokens,
+                output_reservation_tokens: effective_output_tokens(
+                    &config,
+                    &data_dir,
+                    thinking_level,
+                ),
                 compaction_reserve_tokens: config.compaction_reserve_tokens,
                 max_retry_after_seconds: config.max_retry_after_seconds,
                 ..RuntimeConfig::default()
@@ -6437,6 +6552,18 @@ async fn run_turn(
         built_prompt.text =
             super::prompt::append_skill_metadata(built_prompt.text, catalog.entries());
     }
+    // The session-specific tail last, after everything that is stable for the
+    // session, so the provider's prompt cache keeps what comes before it.
+    built_prompt.text.push_str(
+        "
+
+",
+    );
+    built_prompt.text.push_str(&super::prompt::dynamic_tail(
+        &prompt_environment,
+        repl_host.is_some().then(super::repl::kernel_packages),
+        0,
+    ));
     let mut project_blocks = loaded_instructions.blocks;
     if let Ok(active) = active_skills.lock() {
         project_blocks.extend(

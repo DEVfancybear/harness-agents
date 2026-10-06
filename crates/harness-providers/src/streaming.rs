@@ -158,6 +158,11 @@ pub(crate) fn adapter_stream(
                 }
             };
             let mut body = crate::chat_body(&request, thinking.as_ref());
+            // The streamed request asks for the same output budget the
+            // buffered one does; it used to send none.
+            if let Some(max_tokens) = request.max_output_tokens {
+                body["max_tokens"] = serde_json::json!(max_tokens);
+            }
             if !request.tool_schemas.is_empty()
                 && let Some(object) = body.as_object_mut()
             {

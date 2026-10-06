@@ -893,12 +893,16 @@ impl ProviderError {
 /// the retry owner can honour it instead of guessing.
 #[must_use]
 pub fn http_status_error(status: u16, retry_after: Option<Duration>) -> ProviderError {
+    // prime-agent's failure kinds: a forbidden request, a missing model or an
+    // oversized body is permanent - retrying it three times only delays the
+    // error - while a timeout or an overloaded server (408, 529) is worth
+    // another try.
     let code = match status {
-        400 | 422 => ErrorCode::InvalidPayload,
-        401 => ErrorCode::MissingAuthority,
+        400 | 404 | 413 | 422 => ErrorCode::InvalidPayload,
+        401 | 403 => ErrorCode::MissingAuthority,
         402 => ErrorCode::BudgetExhausted,
         429 => ErrorCode::RateLimited,
-        500 | 502 | 503 | 504 => ErrorCode::ServiceUnavailable,
+        408 | 500 | 502 | 503 | 504 | 529 => ErrorCode::ServiceUnavailable,
         _ => ErrorCode::ProviderProtocol,
     };
     ProviderError::new(code, format!("provider returned HTTP {status}"))
@@ -1288,7 +1292,11 @@ impl OpenAiChatAdapter {
         validate_endpoint(&endpoint)?;
         let client = Client::builder()
             .connect_timeout(connect_timeout)
-            .timeout(request_timeout)
+            // prime-agent bounds the wait for an answer, never the answer: a
+            // whole-request timeout cut every stream longer than it (a long
+            // thinking answer, a big file write). A read that stays silent
+            // this long still fails, so a hung socket cannot park a turn.
+            .read_timeout(request_timeout)
             // No redirects: a 307/308 would re-send the full body — conversation,
             // inline images and tool schemas — to whatever host the response
             // names, and the bearer token would follow a same-origin hop.
@@ -1319,10 +1327,14 @@ pub(crate) fn chat_body(request: &ProviderRequest, thinking: Option<&Thinking>) 
     } else {
         wire_messages(&request.messages)
     };
+    // prime-agent asks for usage on a streamed answer (`include_usage`):
+    // without it an OpenAI-compatible endpoint sends none, and context and
+    // cost read empty.
     let mut body = json!({
         "model": request.model,
         "messages": messages,
         "stream": true,
+        "stream_options": {"include_usage": true},
     });
     // Sent only when set, as prime-agent does: some gateways refuse a null.
     if let Some(temperature) = request.temperature {
@@ -1689,23 +1701,39 @@ impl SseDecoder {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        // prime-agent reads usage from whichever chunk carries it: a frame of
+        // its own, the last frame alongside its choice, or (Moonshot) inside
+        // the choice. Only the choice-less frame used to be read.
+        let usage = value
+            .get("usage")
+            .and_then(Value::as_object)
+            .or_else(|| {
+                choices
+                    .first()
+                    .and_then(|choice| choice.get("usage"))
+                    .and_then(Value::as_object)
+            })
+            .map(|usage| {
+                let number = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+                ProviderStreamEvent::usage(
+                    number("prompt_tokens"),
+                    number("completion_tokens"),
+                    number("total_tokens"),
+                )
+            });
         if choices.is_empty() {
             // A usage-only frame carries no choice. Dropping it lost token
             // accounting silently, and refusing it turned a valid stream into an
             // error, so it becomes its own event (A06).
-            if let Some(usage) = value.get("usage").and_then(Value::as_object) {
-                let number = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-                return Ok(vec![ProviderStreamEvent::usage(
-                    number("prompt_tokens"),
-                    number("completion_tokens"),
-                    number("total_tokens"),
-                )]);
+            if let Some(usage) = usage {
+                return Ok(vec![usage]);
             }
             return Err(ProviderError::new(
                 ErrorCode::ProviderProtocol,
                 "provider SSE frame has no choice",
             ));
         }
+        events.extend(usage);
         for (choice_index, choice) in choices.iter().enumerate() {
             let choice_index = u64::try_from(choice_index).unwrap_or(u64::MAX);
             let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));

@@ -47,8 +47,12 @@ pub enum ResponsesFlavor {
 /// What one adapter sends besides the conversation.
 #[derive(Clone, Debug, Default)]
 pub struct ResponsesOptions {
-    /// The session's reasoning effort; `None` or `Off` sends no reasoning field.
+    /// The session's reasoning effort, for a reasoning model; `None` for a
+    /// model that does not reason, which is sent no reasoning field.
     pub reasoning: Option<ThinkingLevel>,
+    /// The model's level map, for the provider's spelling of each level
+    /// (prime-agent's `thinkingLevelMap`).
+    pub reasoning_model: Option<crate::thinking::ReasoningModel>,
     /// Extra headers, such as `OpenCode`'s session header.
     pub headers: Vec<(String, String)>,
     /// Identifies the conversation, for prompt caching and the Codex session header.
@@ -80,7 +84,11 @@ impl OpenAiResponsesAdapter {
         super::validate_endpoint(&endpoint)?;
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(super::DEFAULT_CONNECT_TIMEOUT_SECONDS))
-            .timeout(Duration::from_secs(
+            // prime-agent bounds the wait for an answer, never the answer: a
+            // whole-request timeout cut every stream longer than it (a long
+            // thinking answer, a big file write). A read that stays silent
+            // this long still fails, so a hung socket cannot park a turn.
+            .read_timeout(Duration::from_secs(
                 super::DEFAULT_REQUEST_TIMEOUT_SECONDS * 3,
             ))
             .redirect(reqwest::redirect::Policy::none())
@@ -129,17 +137,35 @@ impl OpenAiResponsesAdapter {
         if let Some(session) = &self.options.session_id {
             body["prompt_cache_key"] = json!(session);
         }
-        if let Some(level) = self
-            .options
-            .reasoning
-            .filter(|level| *level != ThinkingLevel::Off)
-        {
-            let effort = match level {
-                ThinkingLevel::Max => "xhigh",
-                other => other.as_str(),
-            };
-            body["reasoning"] = json!({"effort": effort, "summary": "auto"});
-            body["include"] = json!(["reasoning.encrypted_content"]);
+        match self.options.reasoning {
+            // prime-agent sends "off" too: with no reasoning field the server's
+            // default effort (medium) applied, and was paid for. A model whose
+            // map has no "off" spelling (`null`) is sent nothing.
+            Some(ThinkingLevel::Off) => {
+                if let Some(effort) = crate::thinking::off_name(self.options.reasoning_model) {
+                    body["reasoning"] = json!({ "effort": effort });
+                }
+            }
+            Some(level) => {
+                let effort =
+                    match crate::thinking::provider_name(self.options.reasoning_model, level) {
+                        // The API's highest effort, when the map names none.
+                        name if name == "max"
+                            && self.options.reasoning_model.is_none_or(|model| {
+                                !model
+                                    .map
+                                    .iter()
+                                    .any(|(candidate, _)| *candidate == ThinkingLevel::Max)
+                            }) =>
+                        {
+                            "xhigh".to_owned()
+                        }
+                        name => name,
+                    };
+                body["reasoning"] = json!({"effort": effort, "summary": "auto"});
+                body["include"] = json!(["reasoning.encrypted_content"]);
+            }
+            None => {}
         }
         if let Some(tier) = &self.options.service_tier {
             body["service_tier"] = json!(tier);
@@ -519,6 +545,13 @@ impl ResponsesSseDecoder {
                     events.push(ProviderStreamEvent::tool_delta(call_id, name, arguments));
                 }
             }
+            // A refusal streams as its own delta; it is the answer the user
+            // reads, as prime-agent shows it.
+            "response.refusal.delta" => {
+                if let Some(delta) = value["delta"].as_str() {
+                    events.push(ProviderStreamEvent::text(delta));
+                }
+            }
             "response.function_call_arguments.delta" => {
                 let item_id = value["item_id"].as_str().unwrap_or_default();
                 if let Some((call_id, name)) = self.calls.get(item_id)
@@ -569,8 +602,16 @@ impl ResponsesSseDecoder {
                 let output = usage["output_tokens"].as_u64().unwrap_or(0);
                 let total = usage["total_tokens"].as_u64().unwrap_or(input + output);
                 events.push(ProviderStreamEvent::usage(input, output, total));
+                // prime-agent reads why a response is incomplete: a content
+                // filter is not a length cut, and says so.
                 let reason = if value["type"] == "response.incomplete" {
-                    "length"
+                    match response
+                        .pointer("/incomplete_details/reason")
+                        .and_then(Value::as_str)
+                    {
+                        Some("content_filter") => "content_filter",
+                        _ => "length",
+                    }
                 } else if self.saw_call {
                     "tool_calls"
                 } else {
@@ -630,6 +671,7 @@ mod tests {
                 headers: Vec::new(),
                 session_id: Some("session-1".to_owned()),
                 service_tier: None,
+                reasoning_model: None,
             },
         )
         .expect("adapter")
@@ -809,6 +851,7 @@ mod tests {
                 headers: Vec::new(),
                 session_id: None,
                 service_tier: None,
+                reasoning_model: None,
             },
         )
         .expect("adapter");

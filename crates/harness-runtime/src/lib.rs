@@ -274,14 +274,30 @@ impl RuntimeConfig {
     }
 }
 
+/// prime-agent's compaction trigger: the window less the output the request
+/// asks for and the reserve, and never above 95% of the window.
+/// prime-agent's provider retry delay: 2 s for the first retry, doubling,
+/// at most 30 s, with up to 20% jitter either way.
+fn retry_backoff(attempt: u32) -> std::time::Duration {
+    let base_ms = 2_000_u64
+        .saturating_mul(1_u64 << attempt.saturating_sub(1).min(4))
+        .min(30_000);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| u64::from(since.subsec_nanos()));
+    // A spread of -20%..+20% from the clock's low digits.
+    let spread = base_ms / 5;
+    let offset = nanos % (2 * spread + 1);
+    std::time::Duration::from_millis(base_ms - spread + offset)
+}
+
 fn compaction_threshold(config: &RuntimeConfig) -> u64 {
-    let effective_reserve = config
-        .compaction_reserve_tokens
-        .min(config.context_window_tokens / 4);
-    config
-        .context_window_tokens
+    let window = config.context_window_tokens;
+    let effective_reserve = config.compaction_reserve_tokens.min(window / 4);
+    window
         .saturating_sub(config.output_reservation_tokens)
         .saturating_sub(effective_reserve)
+        .min(window / 20 * 19)
 }
 
 /// The estimated tokens of messages as they are sent: their text and their calls.
@@ -2091,6 +2107,31 @@ impl RuntimeService {
                         ErrorCode::ProviderProtocol,
                         "provider stream ended without a terminal marker and produced no output",
                     ))
+                } else if let Some(reason) = assembled
+                    .finish_reason
+                    .as_deref()
+                    .filter(|reason| matches!(*reason, "refusal" | "content_filter" | "sensitive"))
+                {
+                    // prime-agent's refusal and safety stops: the provider
+                    // declined, which is no final answer and no reason to retry.
+                    Err(ProviderError::new(
+                        ErrorCode::PolicyDenied,
+                        match reason {
+                            "content_filter" => {
+                                "the provider's content filter stopped the answer".to_owned()
+                            }
+                            _ => format!("the provider refused to answer ({reason})"),
+                        },
+                    ))
+                } else if assembled.finish_reason.is_none() {
+                    // prime-agent's stream drop: a body cut off after some
+                    // output (a gateway or proxy closing it) is re-issued, as
+                    // its silent retry does, instead of ending the turn on half
+                    // an answer. The repeat's text replaces this attempt's.
+                    Err(ProviderError::new(
+                        ErrorCode::ProviderProtocol,
+                        "provider stream dropped before it finished",
+                    ))
                 } else {
                     Ok((events, assembled))
                 }
@@ -2178,7 +2219,13 @@ impl RuntimeService {
                     if !retryable || attempts >= config.max_attempts {
                         break;
                     }
-                    if let Some(wait) = retry_after {
+                    // The provider's `Retry-After` when it gave one, else
+                    // prime-agent's backoff: 2 s doubling, with 20% jitter so
+                    // retries from many sessions do not arrive together.
+                    // Retrying at once hit an overloaded provider three times
+                    // in a row.
+                    let wait = retry_after.unwrap_or_else(|| retry_backoff(attempts));
+                    {
                         let wait = wait.min(std::time::Duration::from_secs(
                             config.max_retry_after_seconds.min(30),
                         ));

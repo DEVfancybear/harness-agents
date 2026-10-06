@@ -49,7 +49,11 @@ impl AnthropicMessagesAdapter {
         super::validate_endpoint(&endpoint)?;
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(super::DEFAULT_CONNECT_TIMEOUT_SECONDS))
-            .timeout(Duration::from_secs(super::DEFAULT_REQUEST_TIMEOUT_SECONDS))
+            // prime-agent bounds the wait for an answer, never the answer: a
+            // whole-request timeout cut every stream longer than it (a long
+            // thinking answer, a big file write). A read that stays silent
+            // this long still fails, so a hung socket cannot park a turn.
+            .read_timeout(Duration::from_secs(super::DEFAULT_REQUEST_TIMEOUT_SECONDS))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| {

@@ -1927,6 +1927,12 @@ fn write_runtime(data_dir: &Path) -> Result<PathBuf, String> {
 /// The kernel venv, as prime-agent's `kernel/bootstrap.ts` builds it - with `uv`
 /// first, and, where `uv` is missing or fails, with the system Python's own `venv`
 /// and `pip`, so the kernel still gets its packages.
+/// The packages the kernel's venv is built with, for the prompt's package line.
+#[must_use]
+pub fn kernel_packages() -> &'static [&'static str] {
+    &venv::PACKAGES
+}
+
 mod venv {
     use std::path::{Path, PathBuf};
     use std::process::Stdio;

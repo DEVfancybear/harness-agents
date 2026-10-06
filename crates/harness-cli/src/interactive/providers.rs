@@ -184,7 +184,15 @@ pub struct Model {
     /// The environment variable a `models.json` provider reads its key from.
     #[serde(skip)]
     pub key_variable: Option<String>,
+    /// `max_tokens` was written in `models.json`: it is sent as it is, where a
+    /// catalog value is capped (prime-agent's `maxTokensExplicit`).
+    #[serde(skip)]
+    pub max_tokens_explicit: bool,
 }
+
+/// prime-agent's `REQUEST_MAX_TOKENS_CAP`: catalogs advertise far more output
+/// than a turn needs, so a catalog value is capped unless configured.
+pub const REQUEST_MAX_TOKENS_CAP: u64 = 32_000;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -207,14 +215,29 @@ pub struct Compat {
 }
 
 impl Model {
+    /// prime-agent's `default_request_max_tokens`: the output budget a request
+    /// asks for, `None` when the model declares none.
+    #[must_use]
+    pub fn request_max_tokens(&self) -> Option<u64> {
+        let declared = self.max_tokens.filter(|tokens| *tokens > 0)?;
+        Some(if self.max_tokens_explicit {
+            declared
+        } else {
+            declared.min(REQUEST_MAX_TOKENS_CAP)
+        })
+    }
+
     /// What the model offers for reasoning, from its catalog entry, as prime-agent
     /// reads it from its registry.
     #[must_use]
     pub fn reasoning_model(&self) -> harness_providers::thinking::ReasoningModel {
-        harness_providers::thinking::reasoning_from_catalog(
-            self.reasoning,
-            &self.thinking_level_map.clone().unwrap_or_default(),
-        )
+        harness_providers::thinking::ReasoningModel {
+            max_tokens: self.max_tokens,
+            ..harness_providers::thinking::reasoning_from_catalog(
+                self.reasoning,
+                &self.thinking_level_map.clone().unwrap_or_default(),
+            )
+        }
     }
 
     /// The environment variable the key is read from: the one `models.json`

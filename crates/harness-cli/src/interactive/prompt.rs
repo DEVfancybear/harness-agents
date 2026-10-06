@@ -51,35 +51,13 @@ Prefer short sentences, common words, and concrete verbs. State one main action 
 Keep necessary technical terms, names, commands, code, paths, and exact quoted text unchanged. State uncertainty directly.\n\
 Treat this as clarity guidance, not a claim of formal ASD-STE100 compliance. Preserve a user-requested format, tone, terminology, and necessary precision.";
 
-/// prime-agent's `REPL_CONTROL_PROMPT`, for the parts ha's runtime provides.
-const REPL_CONTROL: &str = "The `ipython` tool is a persistent Python REPL - the agent's long-lived control environment for reasoning, context management, state, and tool orchestration. Top-level `await` works directly. Use it to keep intermediate variables, inspect and transform outputs, and write small helper functions.\n\
-\n\
-Python is the orchestration language: use Python for loops, conditionals, parsing, and state. Use `bash()` to invoke programs, not to write shell programs - no shell loops or heredocs; do those in Python.\n\
-\n\
-Do not assume the REPL is the native runtime of the external thing being investigated. A repository, package, service, dataset, paper, website, benchmark, or API may have its own environment and normal interface. Evaluate external systems through their own interface, then use the REPL to coordinate the process and analyze what comes back.\n\
-\n\
-`bash(command)` starts a shell command in the background and returns a handle immediately: `h = bash('npm test')`. Use `h.pid` / `h.running` for liveness, `h.tail(n)` / `h.output()` for combined stdout+stderr so far, `h.poll()` for a non-blocking result, `h.kill()` to terminate, and `await h` (or `await bash('cmd')`) for the completed result with exit_code, output, and duration. Prefer bash() for long-running commands so the turn keeps working. Run shell commands with `bash()`, not `subprocess`/`os.system`: subprocess calls block the kernel, show the user nothing while they run, and spawn processes the harness cannot see or stop.\n\
-\n\
-Important: do not install dependencies into the kernel just to make an external project import or run there. If a project import, test, script, CLI, or dependency check is needed, run it through that project's own environment and normal command interface. Treat failures from that native environment as the relevant result.\n\
-\n\
-Use Python for reading, searching, and editing files - it gives you reusable variables you can slice, filter, and act on without re-reading. Always assign read/search results to named variables so you can revisit them later.\n\
-\n\
-Each `bash()` call is its own process, so shell state does not persist between calls; use `os.chdir(...)` for the working directory and `os.environ[...]` for environment variables - both persist in the REPL and apply to later `bash()` calls.\n\
-\n\
-Python state in the kernel persists across cells: named variables, helper functions, classes, imports, notes, parsed outputs, and helper data structures all remain available in every later turn.";
-
-/// prime-agent's recursion block of `buildRlmPrompt`, for the `rlm` calls ha serves.
-///
-/// ha's children are explorer workers that write through the turn's store, so unlike
-/// prime-agent's they cannot outlive the turn; the block says so.
-const REPL_RECURSION: &str = "An `rlm` object is already in your global namespace. `await rlm.spawn('sub-task', name='api-reviewer')` spawns a child and returns immediately after task admission with `rlm_child_id`, `name`, `session_dir`, and `model`; it never waits for or returns the child's answer.
-`name` is required: choose a stable child name that is unique among siblings.
-A child runs on your model; omit `model`, or pass exactly the selector `await rlm.find_models()` returns. Children also inherit your thinking level; the `thinking` option overrides it with any level the resolved child model supports, and an unsupported level fails spawn.
-Use `await rlm.list_subagents()` to recover direct child handles after admission.
-Fan-in results with `await rlm.collect(targets, timeout_ms=0)`: it returns typed snapshots of direct children (status, answer preview, error); an explicit timeout blocks only that call until the children settle or the deadline passes.
-In ha a child cannot outlive the turn: collect the results you need with a positive `timeout_ms` before you end the turn - children still running when the turn ends are canceled.
-Spawn independent children in separate calls. Delete a direct child explicitly with `await rlm.delete_subagent(child)` when it is no longer needed.
-For implementation work, use the `delegate` tool with role `coder`.";
+/// prime-agent's static layers (`prompts/layers/*.md`): the programmatic-tool
+/// reference, the mandatory usage rules and the opinionated defaults. `core.md`
+/// is prime's with the product name and its first sentence fitted to ha, whose
+/// model has native tools besides `ipython`; the other two are verbatim.
+const CORE_LAYER: &str = include_str!("prompts/core.md");
+const USAGE_LAYER: &str = include_str!("prompts/usage.md");
+const OPINIONATED_LAYER: &str = include_str!("prompts/opinionated.md");
 
 /// prime-agent's `buildSubagentGuidance`, mapped to ha's `delegate` tool.
 const SUBAGENT_GUIDANCE: &str = "# Delegating to sub-agents\n\
@@ -92,64 +70,114 @@ impl SystemPromptBuilder {
     /// Build the prompt for a turn whose model is offered `tools` (every advertised
     /// tool name, core and external).
     #[must_use]
-    pub fn build(environment: &PromptEnvironment<'_>, tools: &[&str]) -> BuiltPrompt {
+    ///
+    /// This is the cache-stable prefix, as prime-agent orders its prompt: it
+    /// changes only with the tool set. Everything that changes between turns -
+    /// the date, the Git state, the turn limits - goes in [`dynamic_tail`],
+    /// after the skills and MCP blocks, so a provider's prompt cache keeps the
+    /// prefix. Putting the changed-file count first lost the whole cache on
+    /// every edit.
+    pub fn build(_environment: &PromptEnvironment<'_>, tools: &[&str]) -> BuiltPrompt {
         let has = |name: &str| tools.contains(&name);
-        let mut parts: Vec<String> = vec![
-            "You are ha, a general purpose coding agent that uses code and tools to solve tasks in the user's project.".to_owned(),
-            "You solve tasks by breaking down problems into sub-tasks, writing and executing code, observing results, and iterating one step at a time.".to_owned(),
-            "When you are done, stop calling tools and state your final answer.".to_owned(),
-            String::new(),
-        ];
-        if has("delegate") {
-            parts.push(DELEGATION_WORK.to_owned());
-        }
-        parts.push(LONG_RUNNING_WORK.to_owned());
-        parts.push(String::new());
-        parts.push(USER_PROGRESS.to_owned());
-        parts.push(String::new());
-        parts.push(SIMPLIFIED_TECHNICAL.to_owned());
-        parts.push(String::new());
-        parts.push(format!("Working directory: {}", environment.cwd.display()));
-        parts.push(format!(
-            "Project root: {}",
-            environment.project_root.display()
-        ));
-        parts.push(format!("Current date: {}", environment.date_iso));
-        parts.push(format!(
-            "OS: {}; shell: {}; git branch: {}; changed files: {}",
-            environment.os,
-            environment.shell,
-            environment.git_branch.unwrap_or("unknown"),
-            environment
-                .changed_files
-                .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
-        ));
-        parts.push(format!(
-            "Turn limits: max_steps={}; max_tool_calls={}; deadline_seconds={}",
-            super::bounds::bound_label(u64::from(environment.limits.max_steps)),
-            super::bounds::bound_label(u64::from(environment.limits.max_tool_calls)),
-            super::bounds::bound_label(environment.limits.deadline.as_secs()),
-        ));
-        if has("ipython") && has("delegate") {
-            parts.push(String::new());
-            parts.push(REPL_RECURSION.to_owned());
-        }
+        let mut parts: Vec<String> = vec![[
+            "You are ha, a general purpose coding agent that uses code and tools to solve tasks in the user's project.",
+            "You solve tasks by breaking down problems into sub-tasks, writing and executing code, observing results, and iterating one step at a time.",
+            "When you are done, stop calling tools and state your final answer.",
+        ]
+        .join("
+")];
         if has("ipython") {
-            parts.push(String::new());
-            parts.push(REPL_CONTROL.to_owned());
+            parts.push(CORE_LAYER.trim().to_owned());
+            parts.push(USAGE_LAYER.trim().to_owned());
+            parts.push(OPINIONATED_LAYER.trim().to_owned());
+        } else {
+            // Without the REPL the layers' Python rules do not apply; the
+            // workflow sentences they carry stay.
+            if has("delegate") {
+                parts.push(DELEGATION_WORK.to_owned());
+            }
+            parts.push(LONG_RUNNING_WORK.to_owned());
+            parts.push(USER_PROGRESS.to_owned());
+            parts.push(SIMPLIFIED_TECHNICAL.to_owned());
         }
-        let mut text = parts.join("\n");
         if has("delegate") {
-            text.push_str("\n\n");
-            text.push_str(SUBAGENT_GUIDANCE);
+            parts.push(SUBAGENT_GUIDANCE.to_owned());
         }
         let guidelines = additional_guidance(&has);
         if !guidelines.is_empty() {
-            text.push_str("\n\n# Additional Guidance\n\n");
-            text.push_str(&guidelines.join("\n"));
+            parts.push(format!(
+                "# Additional Guidance
+
+{}",
+                guidelines.join(
+                    "
+"
+                )
+            ));
         }
-        BuiltPrompt { text }
+        BuiltPrompt {
+            text: parts.join(
+                "
+
+",
+            ),
+        }
     }
+}
+
+/// prime-agent's dynamic tail, after the skills and MCP blocks: the kernel's
+/// packages, the environment, and the session's place in the agent tree.
+#[must_use]
+pub fn dynamic_tail(
+    environment: &PromptEnvironment<'_>,
+    packages: Option<&[&str]>,
+    depth: u32,
+) -> String {
+    let mut sections = Vec::new();
+    if let Some(packages) = packages.filter(|packages| !packages.is_empty()) {
+        sections.push(format!(
+            "Pre-installed Python packages: {}.
+Install additional packages with `uv pip install <pkg>` (this is a uv-managed venv with no pip module).",
+            packages.join(", ")
+        ));
+    }
+    sections.push(
+        [
+            format!("Current date: {}", environment.date_iso),
+            format!("Working directory: {}", environment.cwd.display()),
+            format!("Project root: {}", environment.project_root.display()),
+            format!(
+                "OS: {}; shell: {}; git branch: {}; changed files: {}",
+                environment.os,
+                environment.shell,
+                environment.git_branch.unwrap_or("unknown"),
+                environment
+                    .changed_files
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+            ),
+            format!(
+                "Turn limits: max_steps={}; max_tool_calls={}; deadline_seconds={}",
+                super::bounds::bound_label(u64::from(environment.limits.max_steps)),
+                super::bounds::bound_label(u64::from(environment.limits.max_tool_calls)),
+                super::bounds::bound_label(environment.limits.deadline.as_secs()),
+            ),
+        ]
+        .join(
+            "
+",
+        ),
+    );
+    if packages.is_some() {
+        sections.push(format!(
+            "Recursive agent depth: {depth}{}",
+            if depth == 0 { " (root)" } else { " (not root)" }
+        ));
+    }
+    sections.join(
+        "
+
+",
+    )
 }
 
 /// prime-agent's skill lines of `buildRlmPrompt` for a session with the REPL: the

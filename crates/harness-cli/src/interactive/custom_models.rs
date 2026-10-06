@@ -240,6 +240,7 @@ fn build(
             cache_write: cost.cache_write,
         })),
         context_window: Some(definition.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW)),
+        max_tokens_explicit: definition.max_tokens.is_some(),
         max_tokens: Some(definition.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
         compat: definition.compat,
         thinking_level_map: None,
