@@ -10,6 +10,42 @@ use harness_providers::{MessageRole, ProviderMessage};
 /// prime-agent's instruction for the first side question, word for word.
 pub const SIDE_QUESTION_INSTRUCTION: &str = "The user asked this via `/btw` — a temporary side thread cloned from the main conversation to answer a question without interrupting the main work. Tools (including `ipython`) are deactivated in this side thread and return an error if called; answer using only the conversation context above. The user may send follow-up side questions. Nothing here is added to the main session, so don't start or plan main-session work from this thread.";
 
+/// prime-agent's bound on a side question's turns: a model that keeps calling
+/// the refused tools gets three chances to answer.
+pub const MAX_TURNS: usize = 3;
+
+/// prime-agent's `SIDE_QUESTION_TOOL_BLOCKED`: the result every call gets.
+pub const TOOL_BLOCKED: &str =
+    "Tools are deactivated in this side thread. Answer from the conversation context.";
+
+/// Answer each call of `response` with the refusal, so the model answers in
+/// words on the next turn.
+pub fn refuse_calls(
+    messages: &mut Vec<ProviderMessage>,
+    response: &harness_providers::ProviderResponse,
+) {
+    messages.push(ProviderMessage::assistant_with_calls(
+        response.text.clone(),
+        response
+            .tool_calls
+            .iter()
+            .map(|call| {
+                harness_providers::ProviderToolCall::new(
+                    call.call_id.clone(),
+                    call.name.clone(),
+                    call.arguments.clone(),
+                )
+            })
+            .collect(),
+    ));
+    for call in &response.tool_calls {
+        messages.push(ProviderMessage::tool_result(
+            call.call_id.clone(),
+            TOOL_BLOCKED,
+        ));
+    }
+}
+
 /// prime-agent's side-question message: the instruction leads the first one.
 #[must_use]
 pub fn prompt(question: &str, first: bool) -> String {

@@ -2074,6 +2074,7 @@ pub struct AgentSessionService {
     project_id: Arc<Mutex<Option<String>>>,
     context_summary: Arc<Mutex<Vec<String>>>,
     system_prompt: Arc<Mutex<String>>,
+    turn_tools: Arc<Mutex<Vec<serde_json::Value>>>,
     active_skills: Arc<Mutex<BTreeMap<String, harness_extensions::SkillActivation>>>,
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
@@ -3034,6 +3035,7 @@ impl AgentSessionService {
             resumed_task: Arc::new(Mutex::new(None)),
             session_start: Arc::new(Mutex::new(Some("startup"))),
             system_prompt: Arc::new(Mutex::new(String::new())),
+            turn_tools: Arc::new(Mutex::new(Vec::new())),
             active_skills: Arc::new(Mutex::new(BTreeMap::new())),
             pending_mcp_elicitations: Arc::new(Mutex::new(HashMap::new())),
             mcp_status: Arc::new(Mutex::new(Vec::new())),
@@ -3475,6 +3477,7 @@ impl SessionPort for AgentSessionService {
         let auto_allowed_count = Arc::clone(&self.auto_allowed_count);
         let context_summary = Arc::clone(&self.context_summary);
         let system_prompt = Arc::clone(&self.system_prompt);
+        let turn_tools = Arc::clone(&self.turn_tools);
         let active_skills = Arc::clone(&self.active_skills);
         let pending_mcp_elicitations = Arc::clone(&self.pending_mcp_elicitations);
         let mcp_status = Arc::clone(&self.mcp_status);
@@ -3520,6 +3523,7 @@ impl SessionPort for AgentSessionService {
                 auto_allowed_count,
                 context_summary,
                 system_prompt,
+                turn_tools,
                 active_skills,
                 pending_mcp_elicitations,
                 mcp_status,
@@ -5073,6 +5077,11 @@ impl SessionPort for AgentSessionService {
             .map(|prompt| prompt.clone())
             .unwrap_or_default();
         let thread = Arc::clone(&self.side_thread);
+        let tools = self
+            .turn_tools
+            .lock()
+            .map(|tools| tools.clone())
+            .unwrap_or_default();
         let store_dir = self.store_dir.clone();
         let sender = self.sender.clone();
         let model = config.model;
@@ -5093,23 +5102,37 @@ impl SessionPort for AgentSessionService {
                     None => (None, Vec::new()),
                 };
                 let earlier = thread.lock().map(|turns| turns.clone()).unwrap_or_default();
-                let messages = super::side_question::messages(
+                let mut messages = super::side_question::messages(
                     &system_prompt,
                     summary.as_deref(),
                     history,
                     &earlier,
                     &question,
                 );
-                // No tools: the side thread answers from the conversation alone.
-                let request =
-                    harness_providers::ProviderRequest::new(RequestId::generate(), model, messages);
-                let events = provider
-                    .stream(request, CancellationToken::new())
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let response = harness_providers::assemble_stream(&events)
-                    .map_err(|error| error.to_string())?;
-                let answer = response.text.trim().to_owned();
+                // prime-agent's side question: the session's tools are declared
+                // so the request shares the conversation's cached prefix, and
+                // every call is refused; at most three turns.
+                let mut answer = String::new();
+                for _ in 0..super::side_question::MAX_TURNS {
+                    let request = harness_providers::ProviderRequest::new(
+                        RequestId::generate(),
+                        model.clone(),
+                        messages.clone(),
+                    )
+                    .with_tool_schemas(tools.clone());
+                    let events = provider
+                        .stream(request, CancellationToken::new())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let response = harness_providers::assemble_stream(&events)
+                        .map_err(|error| error.to_string())?;
+                    if response.tool_calls.is_empty() {
+                        answer = response.text.trim().to_owned();
+                        break;
+                    }
+                    super::side_question::refuse_calls(&mut messages, &response);
+                }
+                let answer = answer;
                 if answer.is_empty() {
                     return Err("the model gave no answer".to_owned());
                 }
@@ -5523,6 +5546,7 @@ async fn run_turn(
     auto_allowed_count: Arc<AtomicUsize>,
     context_summary: Arc<Mutex<Vec<String>>>,
     system_prompt: Arc<Mutex<String>>,
+    turn_tools: Arc<Mutex<Vec<serde_json::Value>>>,
     active_skills: Arc<Mutex<BTreeMap<String, harness_extensions::SkillActivation>>>,
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
@@ -6647,7 +6671,12 @@ async fn run_turn(
         built_prompt.text
     })
     .with_project_rules(project_blocks)
-    .with_tool_schemas(tool_schemas);
+    .with_tool_schemas({
+        if let Ok(mut kept) = turn_tools.lock() {
+            kept.clone_from(&tool_schemas);
+        }
+        tool_schemas
+    });
     if let Some(imported) = imported {
         run_request = run_request.with_conversation(imported);
     }
