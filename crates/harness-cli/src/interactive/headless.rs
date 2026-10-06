@@ -121,13 +121,13 @@ impl TurnObserver for HeadlessObserver {
     fn observe(&self, progress: TurnProgress) {
         match &progress {
             TurnProgress::TextDelta(text) => {
-                self.stream_event("text.delta", &serde_json::json!({"text": text}))
+                self.stream_event("text.delta", &serde_json::json!({"text": text}));
             }
             TurnProgress::ThinkingDelta(text) => {
-                self.stream_event("thinking.delta", &serde_json::json!({"text": text}))
+                self.stream_event("thinking.delta", &serde_json::json!({"text": text}));
             }
             TurnProgress::StreamRestarted => {
-                self.stream_event("stream.restarted", &serde_json::json!({}))
+                self.stream_event("stream.restarted", &serde_json::json!({}));
             }
             TurnProgress::ToolProgress { name, text, .. } => self.stream_event(
                 "tool.progress",

@@ -44,6 +44,17 @@ pub mod mcp_config;
 pub mod mcp_oauth;
 pub mod oauth;
 pub mod offline;
+#[allow(
+    dead_code,
+    unused_imports,
+    clippy::collapsible_if,
+    clippy::items_after_statements,
+    clippy::type_complexity,
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    clippy::unused_self,
+    reason = "prime-agent's package manager is ported whole, as prime wrote it; ha calls part of its API"
+)]
 pub mod packages;
 pub mod paths;
 pub mod permissions;

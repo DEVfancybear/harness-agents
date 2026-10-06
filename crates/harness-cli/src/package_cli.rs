@@ -120,6 +120,7 @@ pub fn agent_dir() -> Result<PathBuf, HarnessError> {
         .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf))
 }
 
+#[allow(clippy::needless_pass_by_value, reason = "it is map_err's callback")]
 fn failure(error: anyhow::Error) -> HarnessError {
     HarnessError::new(ErrorCode::ConfigReadError, format!("Error: {error}"))
 }

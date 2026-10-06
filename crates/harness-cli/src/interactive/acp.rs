@@ -15,6 +15,7 @@
 //! gated action is refused, as `ha exec` refuses it.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -274,6 +275,10 @@ fn http_url_ok(url: &str) -> bool {
 /// prime-agent's `resolve_acp_mcp_servers` and `acp_mcp_tool_names`: the
 /// client's `mcpServers`, as ha's MCP server configuration. `Err` carries
 /// the code and the message prime answers with.
+#[allow(
+    clippy::too_many_lines,
+    reason = "prime-agent's admission rules, one check per line"
+)]
 fn admit_mcp_servers(
     servers: &[Value],
     cwd: &Path,
@@ -672,7 +677,7 @@ impl Acp {
                     if !text.is_empty() {
                         text.push('\n');
                     }
-                    text.push_str(&format!("\"{}\"", path.display()));
+                    let _ = write!(text, "\"{}\"", path.display());
                 }
                 Err(reason) => {
                     self.out.push(error_response(
@@ -827,7 +832,7 @@ impl Acp {
     }
 
     /// prime-agent's `session_info_update`, under its `_meta` namespace.
-    fn info_update(&mut self, meta: Value) {
+    fn info_update(&mut self, meta: &Value) {
         self.update(&json!({
             "sessionUpdate": "session_info_update",
             "_meta": { "ai.primeintellect.prime-agent": meta },
@@ -939,15 +944,15 @@ impl Acp {
                 if let Some(budget) = token_budget {
                     goal["tokenBudget"] = json!(budget);
                 }
-                self.info_update(json!({ "goal": goal }));
+                self.info_update(&json!({ "goal": goal }));
             }
             SessionEvent::GoalCompleted { .. } => {
-                self.info_update(json!({ "goal": { "status": "complete" } }));
+                self.info_update(&json!({ "goal": { "status": "complete" } }));
             }
             SessionEvent::Refined {
                 summary, details, ..
             } => {
-                self.info_update(json!({ "refinement": {
+                self.info_update(&json!({ "refinement": {
                     "status": "complete",
                     "summary": summary,
                     "changes": details,

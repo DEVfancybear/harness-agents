@@ -338,7 +338,7 @@ impl Rpc {
                 }));
             }
             SessionEvent::TurnsListed { turns, .. } => self.turns_listed(&turns),
-            SessionEvent::ConversationRead { messages } => self.conversation_read(messages),
+            SessionEvent::ConversationRead { messages } => self.conversation_read(&messages),
             SessionEvent::HtmlExported { result } => {
                 if let Some(index) = self
                     .pending
@@ -402,7 +402,7 @@ impl Rpc {
     }
 
     /// The messages `get_messages` or `get_session_stats` waited for.
-    fn conversation_read(&mut self, messages: Vec<Value>) {
+    fn conversation_read(&mut self, messages: &[Value]) {
         let Some(index) = self
             .pending
             .iter()
@@ -419,7 +419,7 @@ impl Rpc {
                 ));
             }
             Pending::Stats(id) => {
-                let stats = self.stats(&messages);
+                let stats = self.stats(messages);
                 self.emit(success(id.as_ref(), "get_session_stats", Some(stats)));
             }
             _ => {}
@@ -734,8 +734,9 @@ impl Rpc {
                     Some(enabled) => self.service.set_auto_retry(enabled).map(|()| None),
                 }
             }
-            // prime-agent's `abortRetry` always answers success.
-            "abort_retry" => Ok(None),
+            // prime-agent's `abortRetry` always answers success, as do
+            // `unobserve` and `abort_bash` in-process.
+            "abort_retry" | "unobserve" | "abort_bash" => Ok(None),
             "switch_session" => match text("sessionPath") {
                 None => Err("switch_session requires a sessionPath".to_owned()),
                 Some(session) => self
@@ -804,7 +805,6 @@ impl Rpc {
                 "Unknown active session: {}",
                 text("activeSessionId").unwrap_or_default()
             )),
-            "unobserve" | "abort_bash" => Ok(None),
             "bash" => Err(BASH_BACKEND_GAP.to_owned()),
             "get_last_assistant_text" => Ok(Some(json!({ "text": self.last_answer }))),
             "set_session_name" => match text("name").map(|name| name.trim().to_owned()) {

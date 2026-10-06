@@ -76,6 +76,10 @@ struct Gutter {
     show: bool,
 }
 
+/// One pending row of the visual-structure walk: id, indent, just
+/// branched, show connector, is last, gutters, virtual root child.
+type Walk = (String, usize, bool, bool, bool, Vec<Gutter>, bool);
+
 #[derive(Clone, Debug)]
 struct Flat {
     entry: Entry,
@@ -292,7 +296,7 @@ impl TreeView {
         self.active_path.clear();
         let mut current = self.leaf.clone();
         let mut visited = HashSet::new();
-        while let Some(id) = current {
+        while let Some(id) = current.take() {
             let Some(index) = self.index_of(&id) else {
                 break;
             };
@@ -300,7 +304,7 @@ impl TreeView {
                 break;
             }
             self.active_path.insert(id);
-            current = self.flat[index].entry.parent.clone();
+            current.clone_from(&self.flat[index].entry.parent);
         }
     }
 
@@ -360,6 +364,10 @@ impl TreeView {
 
     /// prime's `recalculate_visual_structure`: the visible parent of each
     /// visible row, and the indents and connectors over the visible tree.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "prime-agent's two passes, kept together"
+    )]
     fn recalculate(&mut self) {
         self.visible_parent.clear();
         self.visible_children.clear();
@@ -398,7 +406,7 @@ impl TreeView {
             .cloned()
             .unwrap_or_default();
         self.multiple_roots = roots.len() > 1;
-        let mut stack: Vec<(String, usize, bool, bool, bool, Vec<Gutter>, bool)> = Vec::new();
+        let mut stack: Vec<Walk> = Vec::new();
         for (index, root) in roots.iter().enumerate().rev() {
             stack.push((
                 root.clone(),
@@ -479,7 +487,7 @@ impl TreeView {
         }
         let mut current = id.map(str::to_owned);
         let mut seen = HashSet::new();
-        while let Some(id) = current {
+        while let Some(id) = current.take() {
             if let Some(position) = self
                 .filtered
                 .iter()
@@ -570,6 +578,10 @@ impl TreeView {
     }
 
     /// One key, prime's `TreeList.handle_key` and the selector's modes.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "prime-agent's key table, one arm per binding"
+    )]
     pub fn handle_key(&mut self, key: &Key) -> TreeAction {
         match &mut self.mode {
             Mode::Label { id, input } => {
@@ -604,7 +616,7 @@ impl TreeView {
                     Key::Up => {
                         *selected = selected
                             .checked_sub(1)
-                            .unwrap_or(SUMMARIZE_OPTIONS.len() - 1)
+                            .unwrap_or(SUMMARIZE_OPTIONS.len() - 1);
                     }
                     Key::Down => *selected = (*selected + 1) % SUMMARIZE_OPTIONS.len(),
                     Key::Esc => self.mode = Mode::Tree,
@@ -690,7 +702,7 @@ impl TreeView {
                 None => self.selected = self.segment_start(true),
             },
             Key::PageUp | Key::Left => {
-                self.selected = self.selected.saturating_sub(self.max_visible)
+                self.selected = self.selected.saturating_sub(self.max_visible);
             }
             Key::PageDown | Key::Right => {
                 if !self.filtered.is_empty() {
@@ -791,7 +803,7 @@ impl TreeView {
                 selected: position == self.selected,
                 prefix: self.prefix(node),
                 folded: self.folded.contains(&node.entry.id)
-                    && !(node.show_connector && !node.virtual_root_child),
+                    && (!node.show_connector || node.virtual_root_child),
                 active: self.active_path.contains(&node.entry.id),
                 label: node.entry.label.clone(),
                 label_time: if self.show_label_times {

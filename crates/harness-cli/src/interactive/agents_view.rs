@@ -20,6 +20,7 @@
 //! ha's store keeps every conversation, so deleting a saved one hides it
 //! from the listings rather than removing it. Not ported: the cost column.
 
+use std::fmt::Write as _;
 use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -152,6 +153,7 @@ fn first_line(text: &str) -> String {
 
 /// The rows: running and idle agents, then the saved conversations no agent
 /// runs. With a query, one flat list ranked by prime-agent's fuzzy match.
+#[cfg(test)]
 #[must_use]
 pub fn rows(
     live: &[client::Listed],
@@ -195,7 +197,7 @@ pub fn rows_with(
             .unwrap_or_else(|| agent.id.clone());
         // prime-agent's row heartbeat count.
         if agent.heartbeats > 0 {
-            title.push_str(&format!(" ◷{}", agent.heartbeats));
+            let _ = write!(title, " ◷{}", agent.heartbeats);
         }
         rows.push(Row {
             section: if running {

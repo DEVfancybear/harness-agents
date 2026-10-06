@@ -274,49 +274,48 @@ pub fn views(services: &[Service], connections: &Connections<'_>) -> Vec<Value> 
 fn catalog_card(service: &Service, connections: &Connections<'_>) -> Value {
     let configured = connections.servers.get(&service.id);
     let uses_oauth = matches!(service.auth.as_str(), "oauth" | "unknown");
-    let (status, connection_ids, hint): (&str, Vec<String>, Option<String>) = match configured {
-        // prime's `pending`: credentials exist but no verified handshake yet;
-        // ha checks a server when the session first calls it.
-        Some(server) => {
-            let url = server.url.clone().unwrap_or_default();
-            if uses_oauth
-                && server.bearer_token_env.is_none()
-                && !(connections.signed_in)(&service.id, &url)
-            {
-                (
-                    "not_connected",
-                    Vec::new(),
-                    Some(format!("Sign in with /mcp login {}.", service.id)),
-                )
-            } else {
-                ("pending", vec![service.id.clone()], None)
-            }
+    // prime's `pending`: credentials exist but no verified handshake yet; ha
+    // checks a server when the session first calls it.
+    let (status, connection_ids, hint): (&str, Vec<String>, Option<String>) = if let Some(server) =
+        configured
+    {
+        let url = server.url.clone().unwrap_or_default();
+        if uses_oauth
+            && server.bearer_token_env.is_none()
+            && !(connections.signed_in)(&service.id, &url)
+        {
+            (
+                "not_connected",
+                Vec::new(),
+                Some(format!("Sign in with /mcp login {}.", service.id)),
+            )
+        } else {
+            ("pending", vec![service.id.clone()], None)
         }
-        None => {
-            let hint = if !service.ready {
-                Some(service.setup_reason.clone().unwrap_or_else(|| {
-                    "This service requires manual setup before it can be connected.".to_owned()
-                }))
-            } else if service.url.is_none() {
-                Some("This service uses a stdio adapter or a tenant URL template. Add it manually with /mcp add.".to_owned())
-            } else if service.auth == "api_key" {
-                Some("This service requires an API key. Add it manually with /mcp add.".to_owned())
-            } else if service.auth == "none" {
-                Some("No login required. Add it manually with /mcp add to use it.".to_owned())
-            } else if !service.metadata_reviewed {
-                Some("OAuth support has not been verified. Connect checks capabilities and asks for approval before login.".to_owned())
-            } else {
-                None
-            };
-            let status = if (!service.ready || service.url.is_none()) && service.auth != "none"
-                || service.auth == "api_key"
-            {
-                "setup_required"
-            } else {
-                "not_connected"
-            };
-            (status, Vec::new(), hint)
-        }
+    } else {
+        let hint = if !service.ready {
+            Some(service.setup_reason.clone().unwrap_or_else(|| {
+                "This service requires manual setup before it can be connected.".to_owned()
+            }))
+        } else if service.url.is_none() {
+            Some("This service uses a stdio adapter or a tenant URL template. Add it manually with /mcp add.".to_owned())
+        } else if service.auth == "api_key" {
+            Some("This service requires an API key. Add it manually with /mcp add.".to_owned())
+        } else if service.auth == "none" {
+            Some("No login required. Add it manually with /mcp add to use it.".to_owned())
+        } else if !service.metadata_reviewed {
+            Some("OAuth support has not been verified. Connect checks capabilities and asks for approval before login.".to_owned())
+        } else {
+            None
+        };
+        let status = if (!service.ready || service.url.is_none()) && service.auth != "none"
+            || service.auth == "api_key"
+        {
+            "setup_required"
+        } else {
+            "not_connected"
+        };
+        (status, Vec::new(), hint)
     };
     let mut card = json!({
         "serviceId": service.id,
