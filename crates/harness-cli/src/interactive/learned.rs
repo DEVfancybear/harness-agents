@@ -114,7 +114,7 @@ impl Layers {
     ) -> Self {
         Self {
             global: config_dir.join("skills"),
-            project: project_trusted.then(|| workspace.join(".harness").join("skills")),
+            project: project_trusted.then(|| project_skill_root(workspace)),
             usage_dir: data_dir.join("skill-usage"),
         }
     }
@@ -172,6 +172,68 @@ pub fn lifecycle_enabled(environment: &super::paths::LaunchEnvironment) -> bool 
                 "off" | "0" | "false" | "no"
             )
         })
+}
+
+/// Where a workspace's learned project skills live: `.harness/skills` of the
+/// checkout it belongs to. A linked Git worktree belongs to its main checkout, as
+/// autoharness remaps it, so what is learned in a worktree survives the worktree
+/// and every worktree of the repository shares one library.
+#[must_use]
+pub fn project_skill_root(workspace: &Path) -> PathBuf {
+    main_checkout(workspace).join(".harness").join("skills")
+}
+
+/// The main checkout of a linked Git worktree, or the workspace itself: a plain
+/// checkout, a directory inside one, a directory outside Git, or a `git` that
+/// cannot answer.
+#[must_use]
+pub fn main_checkout(workspace: &Path) -> PathBuf {
+    type Checkouts = std::collections::HashMap<PathBuf, PathBuf>;
+    static CACHE: LazyLock<std::sync::Mutex<Checkouts>> =
+        LazyLock::new(|| std::sync::Mutex::new(Checkouts::new()));
+    if let Some(found) = CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(workspace).cloned())
+    {
+        return found;
+    }
+    let found = linked_worktree_main(workspace).unwrap_or_else(|| workspace.to_path_buf());
+    if let Ok(mut cache) = CACHE.lock() {
+        cache.insert(workspace.to_path_buf(), found.clone());
+    }
+    found
+}
+
+fn linked_worktree_main(workspace: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "--git-dir", "--git-common-dir"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let mut lines = text.lines().map(str::trim);
+    let resolve = |line: &str| {
+        let path = Path::new(line);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            workspace.join(path)
+        };
+        std::fs::canonicalize(&path).ok()
+    };
+    let git_dir = resolve(lines.next()?)?;
+    let common_dir = resolve(lines.next()?)?;
+    // Only a linked worktree is remapped: its git directory sits under the main
+    // checkout's `.git/worktrees`. A bare repository has no checkout to remap to.
+    if git_dir == common_dir || common_dir.file_name()? != ".git" {
+        return None;
+    }
+    common_dir.parent().map(Path::to_path_buf)
 }
 
 /// Whether `root/name` is a live skill ha wrote.
@@ -260,13 +322,106 @@ fn bump(usage: &mut Value, name: &str, field: &str) {
 
 /// One more request reached every present layer: the denominator use is measured
 /// against.
-pub fn count_request(layers: &Layers) {
+///
+/// Returns the count of the narrowest layer present - the project's when it is
+/// trusted - which paces the curator.
+pub fn count_request(layers: &Layers) -> u64 {
+    let mut counted = 0;
     for (layer, root) in layers.present() {
         update_usage(&layers.usage_file(layer, root), |usage| {
-            let requests = usage["requests"].as_u64().unwrap_or(0);
-            usage["requests"] = json!(requests + 1);
+            let requests = usage["requests"].as_u64().unwrap_or(0) + 1;
+            usage["requests"] = json!(requests);
+            counted = requests;
         });
     }
+    counted
+}
+
+/// How many pre-curation snapshots are kept.
+const SNAPSHOTS_KEPT: usize = 5;
+
+/// Copy every live learned skill aside before a curation: a merge is the one
+/// change a single rename cannot undo, so the library as it was stays on disk
+/// (`<data>/skill-snapshots/<time>/<layer>/<name>`). The five newest are kept.
+pub fn snapshot(layers: &Layers) -> Result<PathBuf, String> {
+    let base = layers.usage_dir.parent().map_or_else(
+        || layers.usage_dir.join("snapshots"),
+        |data| data.join("skill-snapshots"),
+    );
+    let target = base.join(chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string());
+    for (layer, root) in layers.present() {
+        for name in learned_names(root) {
+            copy_tree(&root.join(&name), &target.join(layer.as_str()).join(&name))?;
+        }
+    }
+    let mut kept = std::fs::read_dir(&base)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    kept.sort();
+    for old in kept.iter().take(kept.len().saturating_sub(SNAPSHOTS_KEPT)) {
+        let _ = std::fs::remove_dir_all(old);
+    }
+    Ok(target)
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|error| format!("snapshot {}: {error}", to.display()))?;
+    let entries =
+        std::fs::read_dir(from).map_err(|error| format!("snapshot {}: {error}", from.display()))?;
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let destination = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &destination)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), &destination)
+                .map_err(|error| format!("snapshot {}: {error}", destination.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Every live learned skill in full - its `SKILL.md` and the names of its files -
+/// for the curator, which judges overlap on content.
+#[must_use]
+pub fn library_documents(layers: &Layers) -> String {
+    let mut parts = Vec::new();
+    for (layer, root) in layers.present() {
+        for name in learned_names(root) {
+            let directory = root.join(&name);
+            let document = std::fs::read_to_string(directory.join("SKILL.md")).unwrap_or_default();
+            let mut files = Vec::new();
+            for folder in SUBFILE_DIRS {
+                if let Ok(entries) = std::fs::read_dir(directory.join(folder)) {
+                    files.extend(
+                        entries.flatten().map(|entry| {
+                            format!("{folder}/{}", entry.file_name().to_string_lossy())
+                        }),
+                    );
+                }
+            }
+            files.sort();
+            parts.push(format!(
+                "### {name} [{}]\nFiles: {}\n{}",
+                layer.as_str(),
+                if files.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    files.join(", ")
+                },
+                document.trim()
+            ));
+        }
+    }
+    parts.join("\n\n")
 }
 
 /// Count a use of `name`, when it is a learned skill.
@@ -848,14 +1003,16 @@ fn mentions(body: &str, path: &str) -> bool {
 
 /// The workspace's path in the spellings a skill might use.
 fn local_path_spellings(workspace: &Path) -> Vec<String> {
-    let display = workspace.to_string_lossy().into_owned();
-    if display.len() < 4 {
-        return Vec::new();
+    let mut spellings = Vec::new();
+    for path in [workspace.to_path_buf(), main_checkout(workspace)] {
+        let display = path.to_string_lossy().into_owned();
+        if display.len() < 4 {
+            continue;
+        }
+        spellings.push(display.to_lowercase());
+        spellings.push(display.replace('\\', "/").to_lowercase());
     }
-    let mut spellings = vec![
-        display.to_lowercase(),
-        display.replace('\\', "/").to_lowercase(),
-    ];
+    spellings.sort();
     spellings.dedup();
     spellings
 }
@@ -1693,6 +1850,90 @@ mod tests {
         let root = layers.project.clone().expect("project");
         assert!(is_learned(&root, "kept"));
         assert!(root.join(".archive/idle/SKILL.md").is_file());
+    }
+
+    /// A skill learned in a linked worktree lands in the main checkout, where it
+    /// outlives the worktree and every worktree finds it.
+    #[test]
+    fn a_linked_worktree_learns_into_its_main_checkout() {
+        let directory = tempfile::tempdir().expect("dir");
+        let main = directory.path().join("main");
+        std::fs::create_dir_all(&main).expect("main");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(status.status.success(), "git {args:?}: {status:?}");
+        };
+        git(&main, &["init", "-q"]);
+        std::fs::write(main.join("README"), "x").expect("file");
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-q", "-m", "init"]);
+        let linked = directory.path().join("linked");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                linked.to_str().expect("path"),
+                "-b",
+                "side",
+            ],
+        );
+
+        let canonical = std::fs::canonicalize(&main).expect("canonical main");
+        assert_eq!(super::main_checkout(&linked), canonical);
+        assert_eq!(
+            super::main_checkout(&main),
+            main,
+            "a main checkout stays itself"
+        );
+        let layers = Layers::new(
+            &directory.path().join("config"),
+            &directory.path().join("data"),
+            &linked,
+            true,
+        );
+        assert_eq!(
+            layers.project.as_deref(),
+            Some(canonical.join(".harness/skills").as_path())
+        );
+        assert!(
+            promote(
+                &layers,
+                &create("worktree-lesson", "Learned in a worktree."),
+                &PromoteContext::default()
+            )
+            .ok
+        );
+        assert!(is_learned(
+            &canonical.join(".harness/skills"),
+            "worktree-lesson"
+        ));
+        let roots = crate::interactive::skills::roots(
+            &directory.path().join("config"),
+            &linked,
+            &crate::interactive::paths::LaunchEnvironment::default(),
+            true,
+        );
+        assert!(
+            roots
+                .iter()
+                .any(|root| root.path == canonical.join(".harness/skills")),
+            "the worktree's catalogue reads the main checkout's learned skills"
+        );
     }
 
     #[test]

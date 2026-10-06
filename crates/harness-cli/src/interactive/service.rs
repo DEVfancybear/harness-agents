@@ -5355,6 +5355,7 @@ impl AutoRefine {
                 instructions: review.instructions,
                 global: false,
                 rollback: None,
+                curate: false,
             },
             Ok(review) => {
                 send(SessionEvent::Notice {
@@ -5385,6 +5386,18 @@ impl AutoRefine {
             }),
         }
     }
+}
+
+/// How many of the newest turns a refinement reads, tool calls and results
+/// included; the refiner keeps the tail of that within its own budget.
+const REFINE_TRANSCRIPT_TURNS: usize = 50;
+
+/// The conversation a refinement reads: prime-agent's serialized transcript, with
+/// what the tools were asked and what they returned.
+async fn refine_transcript(store: &SqliteStore, session: &SessionId) -> String {
+    harness_runtime::conversation_transcript(store, session, REFINE_TRANSCRIPT_TURNS)
+        .await
+        .unwrap_or_default()
 }
 
 /// What `/refine` needs to write learned skills in this workspace.
@@ -6133,10 +6146,7 @@ async fn run_turn(
             local: super::harness::local_dir(&data_dir, task_id.as_str()),
         };
         let conversation = match source.as_ref() {
-            Some(source_session) => harness_runtime::conversation_history(&store, source_session)
-                .await
-                .map(|history| super::refine::serialize_turns(&history.turns()))
-                .unwrap_or_default(),
+            Some(source_session) => refine_transcript(&store, source_session).await,
             None => String::new(),
         };
         let learning = refine_learning(
@@ -6802,7 +6812,39 @@ async fn run_turn(
     // What the turn did with learned skills counts toward whether they survive, and
     // the lifecycle archives the ones that did not earn their place.
     if let Ok(turn) = &outcome {
-        super::learned::count_request(&learning.layers);
+        let requests = super::learned::count_request(&learning.layers);
+        // Every so many requests the curator folds the learned library into
+        // class-level skills, beside the conversation like the review.
+        if auto_refine
+            && !cancellation.is_cancelled()
+            && requests > 0
+            && requests.is_multiple_of(super::refine::CURATE_EVERY_REQUESTS)
+            && super::learned::library(&learning.layers).len() >= super::refine::CURATE_MIN_SKILLS
+        {
+            let sender = sender.clone();
+            let provider = Arc::clone(&provider);
+            let model = config.model.clone();
+            let scopes = super::refine::HarnessScopes {
+                global: super::harness::global_dir(&data_dir),
+                local: super::harness::local_dir(&data_dir, goal_task.as_str()),
+            };
+            let learning = learning.clone();
+            send(SessionEvent::Notice {
+                message: "skills: consolidating the learned skill library in the background"
+                    .to_owned(),
+            });
+            tokio::spawn(async move {
+                let event = match super::refine::curate(&provider, &model, &scopes, &learning, None)
+                    .await
+                {
+                    Ok(refinement) => refined_event(&refinement),
+                    Err(error) => SessionEvent::Notice {
+                        message: format!("skills: curation skipped: {error}"),
+                    },
+                };
+                let _ = sender.send(event);
+            });
+        }
         super::learned::record_turn(
             &learning.layers,
             &learning.context.workspace,
@@ -6835,10 +6877,7 @@ async fn run_turn(
                 global: super::harness::global_dir(&data_dir),
                 local: super::harness::local_dir(&data_dir, goal_task.as_str()),
             };
-            let conversation = harness_runtime::conversation_history(&store, &session_id)
-                .await
-                .map(|history| super::refine::serialize_turns(&history.turns()))
-                .unwrap_or_default();
+            let conversation = refine_transcript(&store, &session_id).await;
             if let Some(options) = requested {
                 // The user asked: the refinement is part of the turn, and it covers
                 // the review that came due with it.
@@ -6890,10 +6929,7 @@ async fn run_turn(
             let Ok(ended) = SessionId::parse(deferred.session.clone()) else {
                 continue;
             };
-            let conversation = harness_runtime::conversation_history(&store, &ended)
-                .await
-                .map(|history| super::refine::serialize_turns(&history.turns()))
-                .unwrap_or_default();
+            let conversation = refine_transcript(&store, &ended).await;
             if conversation.is_empty() {
                 continue;
             }

@@ -2132,3 +2132,66 @@ async fn m3_01_runtime_schema_upgrade() {
     assert_eq!(revisions.get("runtime").copied(), Some(99));
     reader.close().await.expect("reader closes");
 }
+
+/// What `/refine` reads: prime-agent's serialized transcript, with each tool call
+/// numbered and its result paired by that number, so a refinement learns from
+/// what the tools did and returned as well as from what was said.
+#[tokio::test]
+async fn the_refine_transcript_carries_tool_calls_and_their_results() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    std::fs::write(bench.workspace.join("notes.txt"), "todo: ship it\n").expect("fixture file");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptStep::Events(vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("Looking for it."),
+            ProviderStreamEvent::tool_delta(
+                "call-1",
+                "search_text",
+                json!({"query": "todo", "path": "."}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ]),
+        ScriptStep::Events(vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("fixture finished"),
+            ProviderStreamEvent::completed("stop"),
+        ]),
+    ]));
+    let (runtime, _) = runtime_for(&store, provider.clone(), None, None).await;
+    let session = SessionId::generate();
+    let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)));
+    driver
+        .run_turn(
+            request(
+                &bench.workspace,
+                session.clone(),
+                TaskId::generate(),
+                "find the todo",
+            ),
+            options(&bench.workspace),
+            Arc::new(RecordingObserver::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn runs");
+    let transcript = harness_runtime::conversation_transcript(&store, &session, 50)
+        .await
+        .expect("transcript");
+    for expected in [
+        "[User]: find the todo",
+        "[Assistant]: Looking for it.",
+        "[Assistant tool calls]: #1 search_text(",
+        "query=\"todo\"",
+        "[Tool result (search_text) #1]:",
+        "notes.txt",
+        "[Assistant]: fixture finished",
+    ] {
+        assert!(
+            transcript.contains(expected),
+            "{expected} in:\n{transcript}"
+        );
+    }
+    drop(driver);
+    close(store).await;
+}

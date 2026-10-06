@@ -235,10 +235,12 @@ pub struct RefineOptions {
     pub global: bool,
     /// Roll back this refinement instead of planning a new one.
     pub rollback: Option<String>,
+    /// Consolidate the learned skill library instead of reading the conversation.
+    pub curate: bool,
 }
 
 impl RefineOptions {
-    /// `/refine [--global] [--rollback <id>] [instructions]`.
+    /// `/refine [--global] [--rollback <id>] [--curate] [instructions]`.
     #[must_use]
     pub fn parse(arguments: &str) -> Self {
         let mut options = Self::default();
@@ -248,6 +250,7 @@ impl RefineOptions {
             match word {
                 "--global" => options.global = true,
                 "--rollback" => options.rollback = words.next().map(str::to_owned),
+                "--curate" => options.curate = true,
                 _ => rest.push(word),
             }
         }
@@ -1213,6 +1216,17 @@ pub async fn refine(
 ) -> Result<Refinement, String> {
     let history = history(scopes);
     let id = refinement_id();
+    if options.curate && options.rollback.is_none() {
+        let learning = learning.ok_or("learned skills are unavailable in this session")?;
+        return curate(
+            provider,
+            model,
+            scopes,
+            learning,
+            options.instructions.as_deref(),
+        )
+        .await;
+    }
     if let Some(target_id) = &options.rollback {
         let target = history
             .iter()
@@ -1284,6 +1298,105 @@ pub async fn refine(
     )
 }
 
+/// How many requests in a layer pass between automatic curations: consolidation
+/// reads the whole library, so it is much rarer than a review (autoharness's
+/// `CONSOLIDATE_EVERY_N`).
+pub const CURATE_EVERY_REQUESTS: u64 = 250;
+/// The fewest learned skills worth consolidating.
+pub const CURATE_MIN_SKILLS: usize = 2;
+const CURATE_MAX_OUTPUT_TOKENS: u32 = 16_384;
+
+const CURATOR_SYSTEM_PROMPT: &str = r#"You are the learned-skill curator of ha, a coding agent. After tigerless-labs/autoharness.
+
+Refinements write learned SKILL.md skills one conversation at a time, so the library drifts toward many narrow, session-shaped skills. Your job is to fold them into fewer class-level skills an agent can find: one broad skill with labeled subsections is easier to match than five narrow siblings. This is a consolidation pass, not an audit.
+
+Rules:
+- Only the learned skills listed below exist for you. Never name, absorb into, or recreate any other skill.
+- Judge overlap on content. Usage counts are not shown and are not your concern; retiring unused skills is the lifecycle's job.
+- Do not ask whether two skills are distinct. Ask whether a maintainer would write them as N separate skills or as one skill with N subsections. When the answer is one, merge.
+- Consolidate a cluster in one of three ways: patch the broadest member to add a labeled subsection for each sibling's unique content, then delete each sibling with absorbed_into set to it; or create a new umbrella skill and delete the absorbed siblings with absorbed_into set to it; or move narrow but valuable detail into the umbrella's references/<topic>.md (carried in `files`, pointed at from SKILL.md) and delete the sibling.
+- Order matters: the umbrella's create/patch/update comes before the deletes that name it.
+- Keep each absorbed skill's support files: carry what the umbrella needs in its `files` and rewrite pointers to them. Never leave instructions pointing at a file in a deleted skill.
+- When the umbrella and a sibling disagree, resolve it in the umbrella; a merged skill that argues with itself is worse than the two it replaced.
+- Every create/update carries `category:`; an umbrella and what it absorbs share one. Also patch a kept skill whose category is missing or `general` when its class is plain.
+- `reason` and `evidence` are required on every intent; `evidence` quotes the overlapping skill lines that justify the merge.
+- When nothing is worth folding, return an empty skillFiles array.
+
+Return JSON only:
+{
+  "summary": "one sentence",
+  "rationale": "which clusters were folded and why",
+  "expectedOutcome": "what the library looks like after",
+  "skillFiles": [ ...intents in <learned_skill_format>... ]
+}"#;
+
+/// The curator: one model pass over the whole learned library that folds narrow
+/// skills into class-level ones, through the same promoter as a refinement. The
+/// library is snapshotted first. Recorded as a refinement in the global scope, so
+/// `/refine --rollback <id>` undoes it.
+pub async fn curate(
+    provider: &Arc<dyn ModelProvider>,
+    model: &str,
+    scopes: &HarnessScopes,
+    learning: &Learning,
+    instructions: Option<&str>,
+) -> Result<Refinement, String> {
+    let skills = super::learned::library(&learning.layers);
+    if skills.len() < CURATE_MIN_SKILLS {
+        return Err(format!(
+            "there are {} learned skill(s); curation needs at least {CURATE_MIN_SKILLS}",
+            skills.len()
+        ));
+    }
+    let snapshot = super::learned::snapshot(&learning.layers)?;
+    let mut parts = vec![
+        format!(
+            "<learned_skills>\n{}\n</learned_skills>",
+            super::learned::library_overview(&skills)
+        ),
+        format!(
+            "<learned_skill_documents>\n{}\n</learned_skill_documents>",
+            super::learned::library_documents(&learning.layers)
+        ),
+    ];
+    parts.extend(learning.prompt_parts().into_iter().skip(1));
+    if let Some(instructions) = instructions {
+        parts.push(format!(
+            "<user_curate_instructions>\n{instructions}\n</user_curate_instructions>"
+        ));
+    }
+    parts.push("Return only JSON. If nothing is worth folding, return an empty skillFiles array with a rationale.".to_owned());
+    let text = complete(
+        provider,
+        model,
+        CURATOR_SYSTEM_PROMPT,
+        parts.join("\n\n"),
+        CURATE_MAX_OUTPUT_TOKENS,
+    )
+    .await?;
+    let value = extract_json(&text)?;
+    if !value.is_object() {
+        return Err("the curator JSON must be an object".to_owned());
+    }
+    let mut proposal = Proposal::from_value(&value);
+    // The curator changes learned skills only.
+    proposal.edits.clear();
+    proposal.rationale = format!(
+        "{} (library snapshot: {})",
+        proposal.rationale,
+        snapshot.display()
+    );
+    apply(
+        scopes,
+        &proposal,
+        &refinement_id(),
+        true,
+        None,
+        None,
+        Some(learning),
+    )
+}
+
 /// The automatic review's verdict (`AutoRefineReview`).
 #[derive(Clone, Debug)]
 pub struct Review {
@@ -1339,22 +1452,6 @@ pub async fn review(
     })
 }
 
-/// A conversation's turns as the refiner reads them (`serializeConversation`).
-#[must_use]
-pub fn serialize_turns(turns: &[(String, String)]) -> String {
-    turns
-        .iter()
-        .flat_map(|(question, answer)| {
-            [
-                (!question.is_empty()).then(|| format!("[User]: {question}")),
-                (!answer.is_empty()).then(|| format!("[Assistant]: {answer}")),
-            ]
-        })
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1378,6 +1475,7 @@ mod tests {
                 instructions: Some("keep the tab rule".to_owned()),
                 global: true,
                 rollback: None,
+                curate: false,
             }
         );
         assert_eq!(
@@ -1617,6 +1715,123 @@ mod tests {
             "ci-test-debugging"
         ));
         assert!(root.join(".archive/ci-test-debugging/SKILL.md").is_file());
+    }
+
+    /// The curator folds a narrow learned skill into a broader one: the library is
+    /// snapshotted, the umbrella is patched before the sibling it absorbs is
+    /// archived, and the whole pass rolls back like a refinement.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "one curation, then its rollback")]
+    async fn the_curator_folds_a_sibling_into_its_umbrella_and_rolls_back() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let workspace = directory.path().join("workspace");
+        let layers = crate::interactive::learned::Layers::new(
+            &directory.path().join("config"),
+            &directory.path().join("data"),
+            &workspace,
+            true,
+        );
+        let learning = super::Learning::new(layers.clone(), &workspace, None);
+        let skill = |name: &str, body: &str| {
+            json!({
+                "action": "create", "name": name, "level": "project",
+                "body": format!("---\nname: {name}\ndescription: Use when Rust tests fail.\ncategory: testing\n---\n{body}\n"),
+                "reason": "r", "evidence": "e",
+            })
+        };
+        for intent in [
+            skill("rust-testing", "Run one test alone first."),
+            skill("ci-flaky-test", "Retry a flaky CI test once."),
+        ] {
+            let parsed = crate::interactive::learned::Intent::from_value(&intent);
+            assert!(crate::interactive::learned::promote(&layers, &parsed, &learning.context).ok);
+        }
+        let reply = json!({
+            "summary": "fold the CI retry into rust-testing",
+            "skillFiles": [
+                {"action": "patch", "name": "rust-testing", "old_string": "Run one test alone first.",
+                 "new_string": "Run one test alone first.\n\n## Flaky on CI\nRetry once.",
+                 "reason": "same class", "evidence": "- ci-flaky-test [project]"},
+                {"action": "delete", "name": "ci-flaky-test", "absorbed_into": "rust-testing",
+                 "reason": "absorbed", "evidence": "- ci-flaky-test [project]"}
+            ]
+        })
+        .to_string();
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> =
+            std::sync::Arc::new(harness_providers::MockProvider::text(reply.as_str()));
+        let options = RefineOptions::parse("--curate");
+        assert!(options.curate);
+        let result = super::refine(
+            &provider,
+            "fixture-model",
+            "",
+            &scopes,
+            &options,
+            Some(&learning),
+        )
+        .await
+        .expect("curated");
+        assert_eq!(result.record["scope"], "global");
+        assert_eq!(result.header(), "Harness refined");
+        let root = layers.project.clone().expect("project");
+        assert!(!crate::interactive::learned::is_learned(
+            &root,
+            "ci-flaky-test"
+        ));
+        assert!(
+            std::fs::read_to_string(root.join("rust-testing/SKILL.md"))
+                .expect("umbrella")
+                .contains("## Flaky on CI")
+        );
+        let snapshots = directory.path().join("data/skill-snapshots");
+        let snapshot = std::fs::read_dir(&snapshots)
+            .expect("a snapshot")
+            .flatten()
+            .next()
+            .expect("one snapshot")
+            .path();
+        assert!(snapshot.join("project/ci-flaky-test/SKILL.md").is_file());
+
+        let rollback = super::refine(
+            &provider,
+            "fixture-model",
+            "",
+            &scopes,
+            &RefineOptions::parse(&format!("--rollback {}", result.id())),
+            Some(&learning),
+        )
+        .await
+        .expect("rolled back");
+        assert_eq!(
+            rollback.header(),
+            "Harness rollback completed · 2 edits applied"
+        );
+        assert!(crate::interactive::learned::is_learned(
+            &root,
+            "ci-flaky-test"
+        ));
+        assert!(
+            !std::fs::read_to_string(root.join("rust-testing/SKILL.md"))
+                .expect("umbrella")
+                .contains("## Flaky on CI")
+        );
+
+        let alone = tempfile::tempdir().expect("dir");
+        let empty = super::Learning::new(
+            crate::interactive::learned::Layers::new(
+                alone.path(),
+                alone.path(),
+                alone.path(),
+                true,
+            ),
+            alone.path(),
+            None,
+        );
+        let refused = super::curate(&provider, "fixture-model", &scopes, &empty, None)
+            .await
+            .expect_err("nothing to fold");
+        assert!(refused.contains("at least 2"), "{refused}");
     }
 
     #[test]

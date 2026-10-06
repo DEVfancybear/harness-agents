@@ -119,7 +119,7 @@ pub const SLASH_COMMANDS: [SlashCommand; 52] = [
     ),
     command(
         "/refine",
-        "[--global] [--rollback <id>] [instructions]",
+        "[--global] [--rollback <id>] [--curate] [instructions]",
         "Refine continual harness prompt notes, skills, subagents, and memory",
     ),
     SlashCommand {

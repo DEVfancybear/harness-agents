@@ -359,6 +359,7 @@ impl SkillRequests {
                         instructions: instructions.or(previous.instructions),
                         global: global || previous.global,
                         rollback: None,
+                        curate: false,
                     });
                 }
                 Ok(json!({
