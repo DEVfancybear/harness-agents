@@ -113,6 +113,18 @@ enum Command {
     Mcp(mcp_cli::McpCommand),
     /// P7 recovery hardening: doctor, backup, restore, retention, GC and release matrix.
     Maintenance(maintenance_cli::MaintenanceCommand),
+    /// The models of the catalog you can call (prime-agent's `model list`).
+    #[command(subcommand)]
+    Model(ModelCommand),
+    /// Print the system prompt a run in this project is sent.
+    Prompt {
+        /// The project directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Print the prompt's static prefix and dynamic tail as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// List the background agents (sessions keep running after the terminal closes).
     #[command(alias = "list")]
     Agents {
@@ -258,6 +270,17 @@ struct ChatArgs {
     /// Text added at the end of the system prompt of a headless run; repeatable.
     #[arg(long = "append-system-prompt", requires = "headless")]
     append_system_prompt: Vec<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelCommand {
+    /// List the catalog models with a credential, optionally matching a search.
+    List {
+        search: Option<String>,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `ha exec` shares the headless runner with `ha chat --headless`.
@@ -697,6 +720,8 @@ fn legacy_command(cli: &Cli) -> bool {
             Command::Chat(_)
                 | Command::Exec(_)
                 | Command::Agents { .. }
+                | Command::Model(_)
+                | Command::Prompt { .. }
                 | Command::Attach { .. }
                 | Command::Send { .. }
                 | Command::Stop { .. }
@@ -780,6 +805,12 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
             run_chat(args.into(), stdin_dash).await
         }
         Some(Command::Agents { json }) => interactive::agents::list_command(json),
+        Some(Command::Model(ModelCommand::List { search, json })) => {
+            interactive::cli_extras::model_list(search.as_deref(), json)
+        }
+        Some(Command::Prompt { cwd, json }) => {
+            interactive::cli_extras::prompt(cwd.as_deref(), json)
+        }
         Some(Command::Attach { agent }) => interactive::app::attach(&agent),
         Some(Command::Send {
             from,
@@ -1030,6 +1061,8 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
             Command::Chat(_)
             | Command::Exec(_)
             | Command::Agents { .. }
+            | Command::Model(_)
+            | Command::Prompt { .. }
             | Command::Attach { .. }
             | Command::Send { .. }
             | Command::Stop { .. }
