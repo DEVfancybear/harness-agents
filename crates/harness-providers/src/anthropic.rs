@@ -79,14 +79,31 @@ impl AnthropicMessagesAdapter {
         for message in &request.messages {
             match message.role {
                 super::MessageRole::System => system.push(message.content.clone()),
-                super::MessageRole::Tool => messages.push(json!({
-                    "role": "user",
-                    "content": [{
+                super::MessageRole::Tool => {
+                    let block = json!({
                         "type": "tool_result",
                         "tool_use_id": tool_use_id(message.tool_call_id.as_deref().unwrap_or("missing-call-id")),
                         "content": content_with_images(&message.content, &message.attachments)
-                    }]
-                })),
+                    });
+                    // The results of one batch of calls go back as one user message,
+                    // as the API documents: one block position for the cache's
+                    // lookback instead of one per call.
+                    let previous_holds_results = messages.last().is_some_and(|last: &Value| {
+                        last["role"] == "user"
+                            && last["content"].as_array().is_some_and(|blocks| {
+                                blocks.iter().all(|block| block["type"] == "tool_result")
+                            })
+                    });
+                    if previous_holds_results
+                        && let Some(blocks) = messages
+                            .last_mut()
+                            .and_then(|last| last["content"].as_array_mut())
+                    {
+                        blocks.push(block);
+                    } else {
+                        messages.push(json!({"role": "user", "content": [block]}));
+                    }
+                }
                 super::MessageRole::User => messages.push(json!({
                     "role": "user",
                     "content": content_with_images(&message.content, &message.attachments)
@@ -161,28 +178,23 @@ impl AnthropicMessagesAdapter {
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
-        if let Some(last) = body["messages"]
-            .as_array_mut()
-            .and_then(|messages| messages.last_mut())
-            .filter(|message| message["role"] == "user")
-        {
-            if let Some(text) = last["content"].as_str().map(str::to_owned) {
-                last["content"] = json!([{
-                    "type": "text",
-                    "text": text,
-                    "cache_control": cache_control,
-                }]);
-            } else if let Some(block) = last["content"]
-                .as_array_mut()
-                .and_then(|blocks| blocks.last_mut())
-                .filter(|block| {
-                    matches!(
-                        block["type"].as_str(),
-                        Some("text" | "image" | "tool_result")
-                    )
-                })
-            {
-                block["cache_control"] = cache_control;
+        // The moving breakpoint goes on the last user message. The fourth goes on
+        // the user message before it - where the previous request of this
+        // conversation put its own - so that entry is read by an exact match
+        // however many blocks the step added: the API only looks 20 blocks back
+        // from a breakpoint, and a long batch of calls can pass that.
+        if let Some(messages) = body["messages"].as_array_mut() {
+            let users = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message["role"] == "user")
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let last_is_user = messages.last().is_some_and(|last| last["role"] == "user");
+            if last_is_user {
+                for index in users.iter().rev().take(2) {
+                    mark_cache_breakpoint(&mut messages[*index], &cache_control);
+                }
             }
         }
         if let Some(thinking) = thinking {
@@ -217,10 +229,32 @@ fn tool_use_id(id: &str) -> String {
     }
 }
 
+/// Put `cache_control` on the last block of a user message that can carry one.
+fn mark_cache_breakpoint(message: &mut Value, cache_control: &Value) {
+    if let Some(text) = message["content"].as_str().map(str::to_owned) {
+        message["content"] = json!([{
+            "type": "text",
+            "text": text,
+            "cache_control": cache_control,
+        }]);
+    } else if let Some(block) = message["content"]
+        .as_array_mut()
+        .and_then(|blocks| blocks.last_mut())
+        .filter(|block| {
+            matches!(
+                block["type"].as_str(),
+                Some("text" | "image" | "tool_result")
+            )
+        })
+    {
+        block["cache_control"] = cache_control.clone();
+    }
+}
+
 /// prime-agent's `cache_control`: an ephemeral breakpoint, five minutes by
 /// default, an hour with `HA_CACHE_RETENTION=long`.
 fn cache_control() -> Value {
-    if std::env::var("HA_CACHE_RETENTION").is_ok_and(|value| value.trim() == "long") {
+    if crate::cache_retention_long() {
         json!({"type": "ephemeral", "ttl": "1h"})
     } else {
         json!({"type": "ephemeral"})
@@ -649,6 +683,49 @@ mod tests {
             write!(stream, "{response}").expect("fixture response");
         });
         (format!("http://{address}/v1/messages"), thread)
+    }
+
+    /// A batch of tool results goes back as one user message, and the cache has a
+    /// breakpoint on the system prompt, the last tool, the last user message and
+    /// the user message before it - where the previous request wrote its entry.
+    #[test]
+    fn tool_results_share_one_message_and_two_user_breakpoints_are_set() {
+        let calls = vec![
+            crate::ProviderToolCall::new("call-a", "read_file", r#"{"path":"a.rs"}"#),
+            crate::ProviderToolCall::new("call-b", "read_file", r#"{"path":"b.rs"}"#),
+        ];
+        let request = crate::ProviderRequest::new(
+            harness_types::RequestId::generate(),
+            "claude-opus-5-5",
+            vec![
+                ProviderMessage::new(crate::MessageRole::System, "stable system prompt"),
+                ProviderMessage::new(crate::MessageRole::User, "read both files"),
+                ProviderMessage::assistant_with_calls("", calls),
+                ProviderMessage::tool_result("call-a", "fn a() {}"),
+                ProviderMessage::tool_result("call-b", "fn b() {}"),
+            ],
+        );
+        let body = AnthropicMessagesAdapter::request_body(&request, None);
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 3, "{body:#}");
+        let results = messages[2]["content"].as_array().expect("blocks");
+        assert_eq!(results.len(), 2, "both results in one message: {body:#}");
+        assert!(results.iter().all(|block| block["type"] == "tool_result"));
+        assert_eq!(
+            results[1]["cache_control"]["type"], "ephemeral",
+            "the moving breakpoint: {body:#}"
+        );
+        assert!(results[0].get("cache_control").is_none(), "{body:#}");
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"]["type"], "ephemeral",
+            "the previous request's breakpoint: {body:#}"
+        );
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        let marks = body.to_string().matches("cache_control").count();
+        assert!(
+            marks <= 4,
+            "the API takes at most four breakpoints: {marks}"
+        );
     }
 
     fn adapter(endpoint: String) -> AnthropicMessagesAdapter {

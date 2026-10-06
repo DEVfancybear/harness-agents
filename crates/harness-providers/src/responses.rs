@@ -135,7 +135,14 @@ impl OpenAiResponsesAdapter {
             body["parallel_tool_calls"] = json!(true);
         }
         if let Some(session) = &self.options.session_id {
-            body["prompt_cache_key"] = json!(session);
+            // OpenAI keys a cache route by at most 64 characters (pi clamps the same).
+            body["prompt_cache_key"] = json!(session.chars().take(64).collect::<String>());
+            // `HA_CACHE_RETENTION=long` keeps the conversation's prefix for a day
+            // instead of minutes, as pi's long retention does; the ChatGPT backend
+            // decides its own retention and is sent nothing.
+            if !codex && crate::cache_retention_long() {
+                body["prompt_cache_retention"] = json!("24h");
+            }
         }
         match self.options.reasoning {
             // prime-agent sends "off" too: with no reasoning field the server's
@@ -599,7 +606,13 @@ impl ResponsesSseDecoder {
                 let cached = usage["input_tokens_details"]["cached_tokens"]
                     .as_u64()
                     .unwrap_or(0);
-                events.push(ProviderStreamEvent::usage(input, output, total).with_cache(cached, 0));
+                // GPT-5.6 and later charge a cache write and say how much was written.
+                let written = usage["input_tokens_details"]["cache_write_tokens"]
+                    .as_u64()
+                    .unwrap_or(0);
+                events.push(
+                    ProviderStreamEvent::usage(input, output, total).with_cache(cached, written),
+                );
                 // prime-agent reads why a response is incomplete: a content
                 // filter is not a length cut, and says so.
                 let reason = if value["type"] == "response.incomplete" {
@@ -673,6 +686,26 @@ mod tests {
             },
         )
         .expect("adapter")
+    }
+
+    /// The conversation's id keys its cache route; OpenAI reads at most 64
+    /// characters of it.
+    #[test]
+    fn the_prompt_cache_key_is_the_session_and_at_most_64_characters() {
+        let request = ProviderRequest::new(
+            RequestId::generate(),
+            "gpt-5.5",
+            vec![ProviderMessage::new(MessageRole::User, "hi")],
+        );
+        let body = adapter(ResponsesFlavor::Api).request_body(&request);
+        assert_eq!(body["prompt_cache_key"], "session-1");
+        let mut long = adapter(ResponsesFlavor::Api);
+        long.options.session_id = Some("x".repeat(100));
+        let key = long.request_body(&request)["prompt_cache_key"]
+            .as_str()
+            .expect("key")
+            .to_owned();
+        assert_eq!(key.chars().count(), 64);
     }
 
     /// prime-agent sends the chosen tier as the top-level `service_tier`, and

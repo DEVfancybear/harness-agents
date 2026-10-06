@@ -1227,6 +1227,13 @@ pub fn chat_completions_endpoint(endpoint: &str) -> String {
     trimmed.to_owned()
 }
 
+/// Whether `HA_CACHE_RETENTION=long` asks providers to keep the prompt cache
+/// longer: an hour on Anthropic, a day on OpenAI's Responses API.
+#[must_use]
+pub fn cache_retention_long() -> bool {
+    std::env::var("HA_CACHE_RETENTION").is_ok_and(|value| value.trim() == "long")
+}
+
 /// Default seconds allowed to establish one provider connection.
 pub const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 10;
 /// Default seconds allowed for one provider call end to end.
@@ -1238,6 +1245,7 @@ pub struct OpenAiChatAdapter {
     capabilities: ModelCapabilities,
     thinking: Option<Thinking>,
     headers: Vec<(String, String)>,
+    prompt_cache_key: Option<String>,
     client: Client,
 }
 
@@ -1250,6 +1258,10 @@ pub struct OpenAiChatOptions {
     pub thinking: Option<Thinking>,
     /// Extra headers, such as `OpenCode`'s session header.
     pub headers: Vec<(String, String)>,
+    /// OpenAI's `prompt_cache_key`: requests with the same key are routed to the
+    /// same cache, so a conversation keeps hitting its own prefix. Sent only to
+    /// endpoints that take it.
+    pub prompt_cache_key: Option<String>,
 }
 
 impl OpenAiChatAdapter {
@@ -1344,6 +1356,7 @@ impl OpenAiChatAdapter {
             capabilities,
             thinking: options.thinking,
             headers: options.headers,
+            prompt_cache_key: options.prompt_cache_key,
             client,
         })
     }
@@ -1478,9 +1491,13 @@ impl ModelProvider for OpenAiChatAdapter {
         let thinking = self.thinking;
         let provider_id = self.capabilities.provider_id.clone();
         let headers = self.headers.clone();
+        let prompt_cache_key = self.prompt_cache_key.clone();
         Box::pin(async move {
             let token = credentials.resolve()?;
             let mut body = chat_body(&request, thinking.as_ref());
+            if let Some(key) = prompt_cache_key {
+                body["prompt_cache_key"] = json!(key);
+            }
             if let Some(max_tokens) = request.max_output_tokens {
                 body["max_tokens"] = json!(max_tokens);
             }
@@ -1745,11 +1762,15 @@ impl SseDecoder {
             })
             .map(|usage| {
                 let number = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+                // OpenAI's `prompt_tokens_details.cached_tokens`, or DeepSeek's
+                // `prompt_cache_hit_tokens` (DeepSeek sends both; an endpoint that
+                // copies only one of them is read either way).
                 let cached = usage
                     .get("prompt_tokens_details")
                     .and_then(|details| details.get("cached_tokens"))
                     .and_then(Value::as_u64)
-                    .unwrap_or(0);
+                    .unwrap_or(0)
+                    .max(number("prompt_cache_hit_tokens"));
                 ProviderStreamEvent::usage(
                     number("prompt_tokens"),
                     number("completion_tokens"),
@@ -2113,6 +2134,20 @@ mod sse_limit_tests {
             .feed(frame(&json!({"content": "67890"})).as_bytes())
             .expect_err("many small frames still hit the output cap");
         assert_eq!(error.code(), ErrorCode::OutputLimitExceeded);
+    }
+
+    /// DeepSeek reports its cache in its own fields: a hit must reach the cost and
+    /// the cache rate, not read as a full-price prompt.
+    #[test]
+    fn deepseek_cache_hits_are_read_from_its_own_usage_fields() {
+        let mut decoder = SseDecoder::new();
+        let events = decoder
+            .feed(b"data: {\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":20,\"total_tokens\":1020,\"prompt_cache_hit_tokens\":900,\"prompt_cache_miss_tokens\":100}}\n\n")
+            .expect("usage frame");
+        assert_eq!(
+            events,
+            vec![super::ProviderStreamEvent::usage(1000, 20, 1020).with_cache(900, 0)]
+        );
     }
 
     #[test]
@@ -2566,6 +2601,7 @@ mod g03_openai_wire_snapshot_tests {
                     model: None,
                 }),
                 headers: Vec::new(),
+                prompt_cache_key: None,
             },
         )
         .expect("generic OpenAI Chat adapter");
