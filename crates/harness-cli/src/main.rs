@@ -77,11 +77,12 @@ struct Cli {
     /// catalog, model lists, update check). `HA_OFFLINE=1` does the same.
     #[arg(long, global = true)]
     offline: bool,
-    /// prime-agent's `--mode rpc`: JSON commands on stdin, JSON responses
-    /// and session events on stdout, one per line.
-    #[arg(long, value_parser = ["rpc"])]
+    /// prime-agent's headless modes: `rpc` (JSON commands on stdin, JSON
+    /// responses and session events on stdout, one per line) or `acp` (the
+    /// Agent Client Protocol over stdio, for editors).
+    #[arg(long, value_parser = ["rpc", "acp"])]
     mode: Option<String>,
-    /// The model for `--mode rpc`, as `/model` takes it.
+    /// The model for `--mode rpc` or `--mode acp`, as `/model` takes it.
     #[arg(long, requires = "mode")]
     model: Option<String>,
 }
@@ -861,14 +862,16 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
     if offline {
         interactive::offline::enable();
     }
-    if mode.as_deref() == Some("rpc") {
-        return Box::pin(interactive::rpc::run(
-            interactive::config::ConfigOverrides {
-                model,
-                ..interactive::config::ConfigOverrides::default()
-            },
-        ))
-        .await;
+    if let Some(mode) = mode {
+        let overrides = interactive::config::ConfigOverrides {
+            model,
+            ..interactive::config::ConfigOverrides::default()
+        };
+        return if mode == "acp" {
+            Box::pin(interactive::acp::run(overrides)).await
+        } else {
+            Box::pin(interactive::rpc::run(overrides)).await
+        };
     }
     match command {
         None if message.is_some() && !std::io::IsTerminal::is_terminal(&std::io::stdin()) => {

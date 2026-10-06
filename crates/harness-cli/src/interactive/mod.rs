@@ -5,6 +5,7 @@
 //! minimal boot shell with the controller/renderer pair. Nothing here starts a
 //! provider, a store writer or a network call.
 
+pub mod acp;
 pub mod agents;
 pub mod allowlist;
 pub mod app;
