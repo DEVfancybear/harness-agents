@@ -362,6 +362,8 @@ struct ChatArgs {
     /// `APPEND_SYSTEM.md` does too).
     #[arg(long = "append-system-prompt")]
     append_system_prompt: Vec<String>,
+    #[command(flatten)]
+    autonomous: AutonomousFlags,
 }
 
 #[derive(Debug, Subcommand)]
@@ -420,6 +422,63 @@ struct ExecArgs {
     /// Deterministic fixture provider, labelled in machine output.
     #[arg(long)]
     mock: bool,
+    #[command(flatten)]
+    autonomous: AutonomousFlags,
+}
+
+/// prime-agent's `--autonomous*` flags: any of them turns autonomous mode on
+/// for a headless run.
+#[derive(Clone, Debug, Default, Args)]
+struct AutonomousFlags {
+    /// Keep working after each turn until the quality gates pass or a limit
+    /// is reached (prime-agent's autonomous mode).
+    #[arg(long)]
+    autonomous: bool,
+    /// A quality gate command run after each turn; repeatable.
+    #[arg(long = "autonomous-gate", value_name = "COMMAND")]
+    autonomous_gate: Vec<String>,
+    /// How many times a failing gate is retried.
+    #[arg(long = "autonomous-gate-retries", value_parser = clap::value_parser!(u64).range(1..))]
+    autonomous_gate_retries: Option<u64>,
+    /// How long one gate may run, in milliseconds.
+    #[arg(long = "autonomous-gate-timeout-ms", value_parser = clap::value_parser!(u64).range(1..))]
+    autonomous_gate_timeout_ms: Option<u64>,
+    /// The most continuations the run may take.
+    #[arg(long = "autonomous-max-continuations", value_parser = clap::value_parser!(u64).range(1..))]
+    autonomous_max_continuations: Option<u64>,
+    /// The most turns the run may take.
+    #[arg(long = "autonomous-max-turns", value_parser = clap::value_parser!(u64).range(1..))]
+    autonomous_max_turns: Option<u64>,
+    /// The most tokens the run may use.
+    #[arg(long = "autonomous-max-tokens", value_parser = clap::value_parser!(u64).range(1..))]
+    autonomous_max_tokens: Option<u64>,
+    /// How long the run may take, in milliseconds.
+    #[arg(long = "autonomous-timeout-ms", value_parser = clap::value_parser!(u64).range(1..))]
+    autonomous_timeout_ms: Option<u64>,
+}
+
+impl AutonomousFlags {
+    /// prime-agent's `AutonomousConfig::from_args`: `None` when no flag was given.
+    fn options(&self) -> Option<interactive::autonomous::Options> {
+        let gate_options = !self.autonomous_gate.is_empty()
+            || self.autonomous_gate_retries.is_some()
+            || self.autonomous_gate_timeout_ms.is_some();
+        let any = self.autonomous
+            || gate_options
+            || self.autonomous_max_continuations.is_some()
+            || self.autonomous_max_turns.is_some()
+            || self.autonomous_max_tokens.is_some()
+            || self.autonomous_timeout_ms.is_some();
+        any.then(|| interactive::autonomous::Options {
+            max_continuations: self.autonomous_max_continuations,
+            max_turns: self.autonomous_max_turns,
+            max_tokens: self.autonomous_max_tokens,
+            timeout_ms: self.autonomous_timeout_ms,
+            gates: gate_options.then(|| self.autonomous_gate.clone()),
+            gate_retries: self.autonomous_gate_retries,
+            gate_timeout_ms: self.autonomous_gate_timeout_ms,
+        })
+    }
 }
 
 impl From<ExecArgs> for ChatArgs {
@@ -448,6 +507,7 @@ impl From<ExecArgs> for ChatArgs {
             thinking: args.thinking,
             system_prompt: args.system_prompt,
             append_system_prompt: args.append_system_prompt,
+            autonomous: args.autonomous,
         }
     }
 }
@@ -501,8 +561,18 @@ impl ChatArgs {
                 thinking: self.thinking.clone(),
                 system_prompt: self.system_prompt.clone(),
                 append_system_prompt: self.append_system_prompt.clone(),
+                autonomous: self.autonomous.options(),
             },
         )?;
+        if matches!(mode, interactive::LaunchMode::Interactive { .. })
+            && self.autonomous.options().is_some()
+        {
+            // prime-agent reads the flags in print mode only; in the app
+            // `/autonomous on` takes the same options.
+            return Err(interactive::UsageError::new(
+                "--autonomous applies to a headless run (ha exec); in the app use /autonomous on",
+            ));
+        }
         match &mut mode {
             interactive::LaunchMode::Interactive {
                 config_overrides, ..

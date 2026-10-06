@@ -160,6 +160,10 @@ pub struct HeadlessOptions {
     /// prime-agent's `--append-system-prompt`, repeatable: added at the end.
     #[serde(default)]
     pub append_system_prompt: Vec<String>,
+    /// prime-agent's `--autonomous*` flags: the run continues after each turn
+    /// until its gates pass or a budget runs out.
+    #[serde(default)]
+    pub autonomous: Option<self::autonomous::Options>,
 }
 
 /// Validate parser output into a launch mode.
