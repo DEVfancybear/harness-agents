@@ -24,6 +24,7 @@ mod markdown_table;
 mod preview;
 pub mod prompt_highlight;
 pub mod theme;
+pub mod toast;
 pub mod widgets;
 
 use std::io;
@@ -388,6 +389,7 @@ where
             .draw(|frame| {
                 let plan = layout::plan(frame.area(), state, &theme);
                 widgets::render(frame, &plan, state, &theme);
+                toast::render(frame, frame.area(), &theme);
                 if let Some((x, y)) = plan.cursor {
                     frame.set_cursor_position((x, y));
                 }
@@ -1006,7 +1008,7 @@ fn run_loop_inner(
                 effects.extend(from_key);
             }
         }
-        if renderer.tick_viewport() {
+        if renderer.tick_viewport() || toast::prune_expired() {
             redraw = true;
         }
         if resized_at.is_some_and(|at| at.elapsed() >= RESIZE_SETTLE) {
@@ -1115,14 +1117,15 @@ fn fullscreen_input(
         let panel_open = controller.ui_state().modal.is_some();
         let outcome = renderer.mouse(*input, panel_open);
         if let Some(text) = outcome.copied {
-            effects.push(match renderer.copy_text(&text) {
-                Ok(()) => Effect::History(HistoryItem::Notice {
-                    message: "Copied selection to clipboard".to_owned(),
-                }),
-                Err(error) => Effect::History(HistoryItem::Error {
+            match renderer.copy_text(&text) {
+                Ok(()) => {
+                    toast::push("Copied selection to clipboard");
+                    effects.push(Effect::Redraw);
+                }
+                Err(error) => effects.push(Effect::History(HistoryItem::Error {
                     message: format!("Failed to copy selection: {error}"),
-                }),
-            });
+                })),
+            }
         }
         return Some(outcome.redraw);
     }
@@ -1165,15 +1168,13 @@ fn apply(renderer: &mut impl TuiRenderer, effects: Vec<Effect>) -> Result<Step, 
         }
         flush_history(renderer, &mut pending)?;
         match effect {
+            // prime-agent acknowledges a copy with a toast, not a row the
+            // transcript keeps.
             Effect::Copy(text) => {
                 renderer
                     .copy_text(&text)
                     .map_err(|error| terminal_error(&error))?;
-                renderer
-                    .insert_history(&HistoryItem::Notice {
-                        message: "copied to clipboard".to_owned(),
-                    })
-                    .map_err(|error| terminal_error(&error))?;
+                toast::push("Copied last agent message to clipboard");
             }
             Effect::Bell => renderer.bell().map_err(|error| terminal_error(&error))?,
             Effect::Reprint(detail) => renderer

@@ -722,6 +722,8 @@ where
                     );
                 }
                 widgets::render(frame, &plan, state, &theme);
+                // prime-agent's toasts, over the window's top rows.
+                super::toast::render(frame, window, &theme);
                 if let Some((x, y)) = plan.cursor {
                     frame.set_cursor_position((x, y));
                 }
