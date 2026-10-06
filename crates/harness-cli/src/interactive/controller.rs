@@ -323,6 +323,8 @@ pub struct InteractiveController {
     autonomous: super::autonomous::Autonomous,
     /// The autonomous quality gates are running; their verdict decides what follows.
     gates_pending: bool,
+    /// `/handoff --reset`: a fresh conversation follows the handoff turn.
+    handoff_reset: bool,
     /// The session's tokens when the running turn started, for its share.
     turn_tokens_start: u64,
 }
@@ -416,6 +418,7 @@ impl InteractiveController {
             tier_label: None,
             autonomous: super::autonomous::Autonomous::default(),
             gates_pending: false,
+            handoff_reset: false,
             turn_tokens_start: 0,
         }
     }
@@ -2438,6 +2441,30 @@ impl InteractiveController {
                     self.finish_pending_exit(effects);
                     return;
                 }
+                // `/handoff --reset`: once the handoff is written, a fresh
+                // conversation starts from it.
+                if self.handoff_reset {
+                    self.handoff_reset = false;
+                    if matches!(outcome, RunOutcome::Done) {
+                        self.close_run_grant();
+                        effects.extend(
+                            self.command(&format!(
+                                "/new {}",
+                                super::lifecycle::CONTINUE_FROM_HANDOFF
+                            )),
+                        );
+                        self.finish_pending_exit(effects);
+                        return;
+                    }
+                    self.push_history(
+                        effects,
+                        HistoryItem::Notice {
+                            message:
+                                "the handoff turn did not finish; the conversation was not reset"
+                                    .to_owned(),
+                        },
+                    );
+                }
                 // After `finish_run`: a continuation is a new request, and the phase has
                 // to be idle again before the service will accept one.
                 effects.extend(self.maybe_continue(&outcome));
@@ -3145,6 +3172,15 @@ impl InteractiveController {
         let name = super::commands::canonical(typed);
         match name {
             "/quit" => {
+                // What would trip the next session is said on the way out.
+                for line in self.service.clean_state() {
+                    self.push_history(
+                        &mut effects,
+                        HistoryItem::Notice {
+                            message: format!("before you go: {line}"),
+                        },
+                    );
+                }
                 // A background agent keeps working: only this client goes away.
                 if self.detachable {
                     effects.push(Effect::Exit(EXIT_SUCCESS));
@@ -3664,10 +3700,43 @@ impl InteractiveController {
                     Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
                 }
             }
+            "/checks" => match self.service.checks(raw_argument) {
+                Ok(lines) => self.reference("/checks", lines, &mut effects),
+                Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+            },
+            "/doctor" => match self.service.doctor() {
+                Ok(lines) => self.reference("/doctor", lines, &mut effects),
+                Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+            },
             "/features" => match self.service.features() {
                 Ok(lines) => self.reference("/features", lines, &mut effects),
                 Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
             },
+            "/handoff" => {
+                if self.phase.has_active_run() {
+                    self.push_history(&mut effects, HistoryItem::Notice {
+                        message: "a handoff is written when the running turn has finished".to_owned(),
+                    });
+                } else {
+                    let mut focus = raw_argument.unwrap_or_default().to_owned();
+                    self.handoff_reset = focus.split_whitespace().any(|word| word == "--reset");
+                    focus = focus
+                        .split_whitespace()
+                        .filter(|word| *word != "--reset")
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if self.handoff_reset {
+                        self.push_history(&mut effects, HistoryItem::Notice {
+                            message: "after the handoff is written, a fresh conversation starts from it".to_owned(),
+                        });
+                    }
+                    self.continuations = 0;
+                    effects.extend(self.dispatch(
+                        super::lifecycle::handoff_request(Some(&focus)),
+                        false,
+                    ));
+                }
+            }
             "/review" => {
                 if self.phase.has_active_run() {
                     self.push_history(&mut effects, HistoryItem::Notice {

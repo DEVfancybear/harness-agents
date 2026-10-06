@@ -418,6 +418,18 @@ pub trait SessionPort: Send {
     fn features(&self) -> Result<Vec<String>, String> {
         Err("this backend has no workspace".to_owned())
     }
+    /// What leaving now would leave the next session to trip over.
+    fn clean_state(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// `/doctor`: how ready the repository is for an agent.
+    fn doctor(&self) -> Result<Vec<String>, String> {
+        Err("this backend has no workspace".to_owned())
+    }
+    /// `/checks`: the checks refinements proposed, and the user's verdict.
+    fn checks(&mut self, _argument: Option<&str>) -> Result<Vec<String>, String> {
+        Err("this backend has no workspace".to_owned())
+    }
     /// Run autonomous quality gates in the workspace; the verdict arrives as
     /// [`SessionEvent::GatesChecked`].
     fn run_gates(&mut self, _job: super::autonomous::GateJob) -> Result<(), String> {
@@ -2104,6 +2116,8 @@ pub struct AgentSessionService {
     system_prompt: Arc<Mutex<String>>,
     turn_tools: Arc<Mutex<Vec<serde_json::Value>>>,
     active_skills: Arc<Mutex<BTreeMap<String, harness_extensions::SkillActivation>>>,
+    /// The subdirectory instructions each conversation has been given.
+    nested_instructions: Arc<Mutex<std::collections::BTreeSet<(String, PathBuf)>>>,
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
     /// The session's delegated children and the store they share with its turns.
@@ -3121,6 +3135,7 @@ impl AgentSessionService {
             system_prompt: Arc::new(Mutex::new(String::new())),
             turn_tools: Arc::new(Mutex::new(Vec::new())),
             active_skills: Arc::new(Mutex::new(BTreeMap::new())),
+            nested_instructions: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             pending_mcp_elicitations: Arc::new(Mutex::new(HashMap::new())),
             mcp_status: Arc::new(Mutex::new(Vec::new())),
             agents,
@@ -3557,6 +3572,10 @@ impl SessionPort for AgentSessionService {
             .map(|config| (config.provider_id, config.model))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one clone per piece of session state the turn shares, handed over in one place"
+    )]
     fn submit(&mut self, request: SubmitRequest) {
         self.gate.clear_turn_rules();
         let cancellation = CancellationToken::new();
@@ -3590,6 +3609,7 @@ impl SessionPort for AgentSessionService {
         let system_prompt = Arc::clone(&self.system_prompt);
         let turn_tools = Arc::clone(&self.turn_tools);
         let active_skills = Arc::clone(&self.active_skills);
+        let nested_instructions = Arc::clone(&self.nested_instructions);
         let pending_mcp_elicitations = Arc::clone(&self.pending_mcp_elicitations);
         let mcp_status = Arc::clone(&self.mcp_status);
         let agents = Arc::clone(&self.agents);
@@ -3636,6 +3656,7 @@ impl SessionPort for AgentSessionService {
                 system_prompt,
                 turn_tools,
                 active_skills,
+                nested_instructions,
                 pending_mcp_elicitations,
                 mcp_status,
                 agents,
@@ -4538,6 +4559,39 @@ impl SessionPort for AgentSessionService {
             });
         });
         Ok(())
+    }
+
+    fn clean_state(&self) -> Vec<String> {
+        super::lifecycle::clean_state(&self.workspace_root)
+    }
+
+    fn checks(&mut self, argument: Option<&str>) -> Result<Vec<String>, String> {
+        let config = self.configured()?;
+        let layers = super::learned::Layers::new(
+            &self.global_config_dir,
+            &self.data_dir,
+            &self.workspace_root,
+            config.project_trusted,
+        );
+        super::checks::command(&layers, &self.workspace_root, argument)
+    }
+
+    fn doctor(&self) -> Result<Vec<String>, String> {
+        let config = self.configured()?;
+        let facts = super::doctor::Facts {
+            trusted: config.project_trusted,
+            checks: config.verify.checks.len(),
+            judge: config.verify.judge,
+            hooks: config.hooks.len(),
+            mcp_servers: config.mcp_servers.len(),
+        };
+        let subsystems = super::doctor::audit(
+            &self.global_config_dir,
+            &self.workspace_root,
+            &self.caller_dir,
+            &facts,
+        );
+        Ok(super::doctor::lines(&self.workspace_root, &subsystems))
     }
 
     fn features(&self) -> Result<Vec<String>, String> {
@@ -5883,6 +5937,7 @@ async fn run_turn(
     system_prompt: Arc<Mutex<String>>,
     turn_tools: Arc<Mutex<Vec<serde_json::Value>>>,
     active_skills: Arc<Mutex<BTreeMap<String, harness_extensions::SkillActivation>>>,
+    nested_instructions: Arc<Mutex<std::collections::BTreeSet<(String, PathBuf)>>>,
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
     agents: Arc<super::delegation::SessionAgents>,
@@ -6510,6 +6565,7 @@ async fn run_turn(
             config.project_trusted,
         );
         learning.in_play = refine_cadence.take_in_play();
+        learning.project_checks.clone_from(&config.verify.checks);
         let result = super::refine::refine(
             &helper_provider,
             &helper_model,
@@ -6733,7 +6789,7 @@ async fn run_turn(
         .as_ref()
         .map(|catalog| super::skills::SkillHost::new(catalog.clone(), Arc::clone(&active_skills)));
     // The skills ha learned, where `/refine` writes them and their use is counted.
-    let learning = super::refine::Learning::new(
+    let mut learning = super::refine::Learning::new(
         super::learned::Layers::new(
             &global_config_dir,
             &data_dir,
@@ -6743,6 +6799,7 @@ async fn run_turn(
         &workspace_root,
         skill_catalog.as_ref(),
     );
+    learning.project_checks.clone_from(&config.verify.checks);
     // The model's `goal_complete` is a request: the project's checks run, then an
     // independent verifier judges, before the goal completes.
     let goal_host = match &goal {
@@ -6839,7 +6896,13 @@ async fn run_turn(
     };
     let mut tools = ToolExecutionService::new(Arc::clone(&store))
         .with_policy(tool_policy)
-        .with_hooks(config.hooks.clone());
+        .with_hooks(config.hooks.clone())
+        .with_result_context(Arc::new(super::instructions::NestedInstructions::new(
+            &workspace_root,
+            &caller_dir,
+            task_id.as_str(),
+            nested_instructions,
+        )));
     if let Some(dispatcher) = super::mcp::combined_dispatcher_with_delegate(
         active_mcp.as_ref(),
         active_extensions.as_ref(),
@@ -7019,6 +7082,12 @@ async fn run_turn(
     }
     // Where the project's feature list stands, and its rules.
     if let Some(block) = super::features::context_block(&workspace_root) {
+        project_blocks.push(block);
+    }
+    // A session's first prompt starts from where the last one left the project.
+    if start_source.is_some()
+        && let Some(block) = super::lifecycle::startup_brief(&workspace_root)
+    {
         project_blocks.push(block);
     }
     // Memory is prime-agent's continual harness state: the model keeps it through

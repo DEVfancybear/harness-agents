@@ -235,6 +235,7 @@ Continual harness components:
 - memory: durable facts, decisions, failures, preferences, and outcomes.
 - skill: installed Python REPL skill. Skill create/update edits MUST include a `reference` object with `{"type":"python"}`, a Python import, and a callable or call pattern; they also MUST include an `arguments` object describing accepted inputs, required fields, defaults, and constraints. Use `{}` for `arguments` only when the Python callable truly needs no external inputs. Include the RLM-native call form `await <skill_import>(...)`.
 - skillFiles (not an edit kind): learned SKILL.md skills - reusable instructions the agent loads with activate_skill. Propose them as `skillFiles` intents following <learned_skill_format>; when that block is absent, leave `skillFiles` empty.
+- checks (not an edit kind): a mistake a command can detect, proposed as a project check following <check_proposals>; when that block is absent, leave `checks` empty.
 - subagent: reusable delegation specs, including purpose, instructions, and when to invoke. Include the RLM-native call form: compose a concise task prompt and spawn with `handle = await rlm.spawn("sub-task", name="worker")`; admission returns immediately with `rlm_child_id`, `name`, `session_dir`, and `model`, never the child's answer. Collect results with `await rlm.collect([handle], timeout_ms=...)` before the turn ends. Do not invent wrappers like `run_subagent(...)`.
 
 Scope and persistence policy:
@@ -274,6 +275,9 @@ JSON only with this exact shape:
   ],
   "skillFiles": [
     {"action": "create|update|patch|remove_file|delete", "name": "learned-skill-name", "reason": "why", "evidence": "verbatim quote"}
+  ],
+  "checks": [
+    {"name": "kebab-name", "command": "one shell line", "hint": "what is wrong and how to fix it", "reason": "why", "evidence": "verbatim quote"}
   ]
 }"#;
 
@@ -347,6 +351,8 @@ pub struct Learning {
     /// Learned skills loaded during the turns under review: the ones in play,
     /// patched first when the conversation shows them wrong (autoharness).
     pub in_play: Vec<String>,
+    /// The project's `[verify]` checks, so a proposed check is not a copy.
+    pub project_checks: Vec<super::verify::Check>,
 }
 
 impl Learning {
@@ -379,6 +385,7 @@ impl Learning {
                 workspace: workspace.to_path_buf(),
             },
             in_play: Vec::new(),
+            project_checks: Vec::new(),
         }
     }
 
@@ -410,6 +417,9 @@ impl Learning {
                 super::learned::SPEC
             ),
         ];
+        if self.layers.project.is_some() {
+            parts.push(super::checks::prompt_part(&self.project_checks));
+        }
         if !self.in_play.is_empty() {
             parts.push(format!(
                 "<learned_skills_in_play>\n{}\nThese learned skills were loaded during the turns under review. If the conversation shows one was wrong, missing a step or outdated, patch that skill first: it is the one that was followed.\n</learned_skills_in_play>",
@@ -760,6 +770,8 @@ struct Proposal {
     /// Learned-skill intents already promoted (with their repair), recorded as
     /// they are.
     skill_records: Vec<Value>,
+    /// Checks proposed for the user's review.
+    checks: Vec<Value>,
 }
 
 impl Proposal {
@@ -792,6 +804,16 @@ impl Proposal {
                 .unwrap_or_default(),
             skill_restores: Vec::new(),
             skill_records: Vec::new(),
+            checks: value["checks"]
+                .as_array()
+                .map(|checks| {
+                    checks
+                        .iter()
+                        .filter(|check| check.is_object())
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -967,6 +989,7 @@ impl Refinement {
             let action = edit["action"].as_str().unwrap_or("change");
             let kind = match edit["kind"].as_str().unwrap_or("entry") {
                 SKILL_FILE_KIND => "learned skill",
+                "check" => "check (waiting for /checks accept)",
                 kind => kind,
             };
             let id = edit["id"].as_str().unwrap_or("?");
@@ -977,6 +1000,7 @@ impl Refinement {
                     "delete" => "Deleted",
                     "patch" => "Patched",
                     "restore" => "Restored",
+                    "propose" => "Proposed",
                     _ => "Changed",
                 };
                 lines.push(format!("{verb} {entry_scope} {kind} `{id}`"));
@@ -1103,6 +1127,15 @@ fn apply(
         applied_edits.push(record);
     }
     apply_skill_files(proposal, learning, &mut applied_edits);
+    if let Some(learning) = learning
+        && !proposal.checks.is_empty()
+    {
+        applied_edits.extend(super::checks::propose(
+            &learning.layers,
+            &proposal.checks,
+            &learning.project_checks,
+        ));
+    }
     let changes = applied_edits
         .iter()
         .filter(|edit| edit["applied"] == true)
@@ -1380,6 +1413,7 @@ fn rollback_proposal(target: &Value) -> Proposal {
         skill_files: Vec::new(),
         skill_restores: skill_changes,
         skill_records: Vec::new(),
+        checks: Vec::new(),
     }
 }
 
@@ -1895,6 +1929,58 @@ mod tests {
     /// autoharness's chain through `/refine`: the model proposes learned-skill
     /// intents, the promoter lands the clean one and refuses the other with its
     /// reason, and rolling the refinement back retires what it created.
+    #[tokio::test]
+    async fn a_refinement_proposes_a_check_for_review_instead_of_running_it() {
+        let directory = tempfile::tempdir().expect("dir");
+        let scopes = scopes(directory.path());
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let layers = crate::interactive::learned::Layers::new(
+            &directory.path().join("config"),
+            &directory.path().join("data"),
+            &workspace,
+            true,
+        );
+        let learning = super::Learning::new(layers.clone(), &workspace, None);
+        let reply = json!({
+            "summary": "turn the repeated renderer fix into a check",
+            "edits": [],
+            "checks": [{
+                "name": "no-fs-in-renderer",
+                "command": "exit 0",
+                "hint": "Renderer code must not import fs; move file access to preload/file-ops.ts.",
+                "reason": "the same review comment came twice",
+                "evidence": "[User]: again, no fs in the renderer"
+            }]
+        })
+        .to_string();
+        let provider: std::sync::Arc<dyn harness_providers::ModelProvider> = Replies::new(&[reply]);
+        let result = super::refine(
+            &provider,
+            "fixture-model",
+            "[User]: again, no fs in the renderer",
+            &scopes,
+            &RefineOptions::default(),
+            Some(&learning),
+        )
+        .await
+        .expect("refined");
+        let details = result.details().join("\n");
+        assert!(
+            details
+                .contains("Proposed local check (waiting for /checks accept) `no-fs-in-renderer`"),
+            "{details}"
+        );
+        let waiting = crate::interactive::checks::command(&layers, &workspace, None)
+            .expect("list")
+            .join("\n");
+        assert!(waiting.contains("no-fs-in-renderer  `exit 0`"), "{waiting}");
+        assert!(
+            !workspace.join(".harness/config.toml").exists(),
+            "nothing joins [verify] before the user accepts it"
+        );
+    }
+
     #[tokio::test]
     async fn a_refinement_writes_a_learned_skill_and_its_rollback_retires_it() {
         let directory = tempfile::tempdir().expect("dir");

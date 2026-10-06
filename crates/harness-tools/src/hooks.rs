@@ -61,6 +61,9 @@ pub struct HookResponse {
     /// Messages for the user (`systemMessage`) and failures of hooks that did
     /// not answer.
     pub notices: Vec<String>,
+    /// What the host itself adds for the model, shown apart from the hooks'
+    /// feedback (instructions of a directory the call reached).
+    pub host_context: Vec<String>,
 }
 
 impl HookResponse {
@@ -77,12 +80,19 @@ impl HookResponse {
             self.stop = other.stop;
         }
         self.notices.extend(other.notices);
+        self.host_context.extend(other.host_context);
     }
 
     /// The context lines joined for the model, or `None` when there are none.
     #[must_use]
     pub fn context_text(&self) -> Option<String> {
         (!self.context.is_empty()).then(|| self.context.join("\n"))
+    }
+
+    /// The host's own context for the model, when there is any.
+    #[must_use]
+    pub fn host_context_text(&self) -> Option<String> {
+        (!self.host_context.is_empty()).then(|| self.host_context.join("\n\n"))
     }
 }
 

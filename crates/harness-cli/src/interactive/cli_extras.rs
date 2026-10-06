@@ -150,6 +150,55 @@ pub fn model_list(search: Option<&str>, json: bool) -> Result<ExitCode, HarnessE
 ///
 /// # Errors
 /// The project directory cannot be opened.
+/// `ha doctor`: the harness audit of a project, as `/doctor` shows it.
+///
+/// # Errors
+/// The working directory or the configuration cannot be read.
+pub fn doctor(cwd: Option<&Path>, json: bool) -> Result<ExitCode, HarnessError> {
+    let cwd = match cwd {
+        Some(cwd) => cwd.to_path_buf(),
+        None => std::env::current_dir()
+            .map_err(|error| HarnessError::new(ErrorCode::StorageOpenFailed, error.to_string()))?,
+    };
+    let environment = LaunchEnvironment::capture();
+    let paths = super::paths::resolve(&PathRequest {
+        platform: HostPlatform::current(),
+        environment: &environment,
+        explicit_data_dir: None,
+    })
+    .map_err(|error| HarnessError::new(ErrorCode::StorageOpenFailed, error.to_string()))?;
+    let root = cwd.clone();
+    let config = super::config::resolve_layers(
+        &paths.config_file,
+        &root,
+        &environment,
+        &super::config::ConfigOverrides::default(),
+    )?;
+    let facts = super::doctor::Facts {
+        trusted: config.project_trusted,
+        checks: config.verify.checks.len(),
+        judge: config.verify.judge,
+        hooks: config.hooks.len(),
+        mcp_servers: config.mcp_servers.len(),
+    };
+    let global_config_dir = paths
+        .config_file
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let subsystems = super::doctor::audit(&global_config_dir, &root, &cwd, &facts);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&super::doctor::json(&subsystems)).unwrap_or_default()
+        );
+    } else {
+        for line in super::doctor::lines(&root, &subsystems) {
+            println!("{line}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn prompt(cwd: Option<&Path>, json: bool) -> Result<ExitCode, HarnessError> {
     let root = match cwd {
         Some(cwd) => cwd.to_path_buf(),

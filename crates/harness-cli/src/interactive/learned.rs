@@ -898,7 +898,7 @@ pub fn redact(text: &str) -> String {
 
 /// The secret rules `text` trips. Personal data is not refused in a skill: an
 /// example address is ordinary documentation.
-fn secret_hits(text: &str) -> Vec<&'static str> {
+pub(crate) fn secret_hits(text: &str) -> Vec<&'static str> {
     SECRET_RULES
         .iter()
         .filter(|rule| rule.family == "secret" && rule.pattern.is_match(text))
@@ -932,7 +932,7 @@ static UNSAFE_RULES: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     .collect()
 });
 
-fn unsafe_hits(text: &str) -> Vec<&'static str> {
+pub(crate) fn unsafe_hits(text: &str) -> Vec<&'static str> {
     let mut families = UNSAFE_RULES
         .iter()
         .filter(|(_, pattern)| pattern.is_match(text))
