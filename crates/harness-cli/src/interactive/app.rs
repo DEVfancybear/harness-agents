@@ -368,6 +368,7 @@ pub(super) fn controller_for_with_overrides(
         // skips every startup download.
         if !super::offline::is_offline(environment) {
             super::providers::refresh_in_background(&context.paths.data_dir);
+            super::mcp_catalog::refresh_in_background(&context.paths.data_dir);
             super::providers::refresh_listed_models_for_logins(
                 environment,
                 &context.paths.data_dir,

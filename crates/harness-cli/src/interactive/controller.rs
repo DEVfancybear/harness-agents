@@ -304,6 +304,8 @@ pub struct InteractiveController {
     escape_armed_at: Option<Instant>,
     /// The shared picker is prime-agent's tree (or fork) selector.
     turn_picker: Option<super::events::TurnsPurpose>,
+    /// The shared picker is `/plugins`: the service id of each row.
+    plugin_picker: Option<Vec<String>>,
     /// A tool call's arguments are streaming (prime-agent's "Writing code").
     writing_code: bool,
     /// The prompt the app was started with, until it is sent.
@@ -410,6 +412,7 @@ impl InteractiveController {
             exit_armed_at: None,
             escape_armed_at: None,
             turn_picker: None,
+            plugin_picker: None,
             writing_code: false,
             initial_prompt: None,
             initial_thinking: None,
@@ -738,6 +741,12 @@ impl InteractiveController {
             }
             if self.file_picker_active {
                 return Some(Modal::FilePicker {
+                    items: picker.items().to_vec(),
+                    selected: picker.selected(),
+                });
+            }
+            if self.plugin_picker.is_some() {
+                return Some(Modal::ServicePicker {
                     items: picker.items().to_vec(),
                     selected: picker.selected(),
                 });
@@ -1076,9 +1085,24 @@ impl InteractiveController {
                     self.file_picker_active = false;
                     self.file_picker_query.clear();
                     self.turn_picker = None;
+                    self.plugin_picker = None;
                     return vec![Effect::Redraw];
                 }
                 Key::Enter => {
+                    if let Some(ids) = self.plugin_picker.take() {
+                        let chosen = self
+                            .editor
+                            .picker()
+                            .and_then(|picker| ids.get(picker.selected()))
+                            .cloned();
+                        self.editor.close_picker();
+                        let mut effects = Vec::new();
+                        if let Some(id) = chosen {
+                            self.connect_plugin(&id, &mut effects);
+                        }
+                        effects.push(Effect::Redraw);
+                        return effects;
+                    }
                     if let Some(purpose) = self.turn_picker.take() {
                         let chosen = self.editor.picker().map(|picker| picker.selected() + 1);
                         self.editor.close_picker();
@@ -1342,6 +1366,94 @@ impl InteractiveController {
             return;
         }
         self.branch_command("/tree", words.first().copied(), effects);
+    }
+
+    /// prime-agent's `/plugins [search]`: the service catalog, connected
+    /// first; Enter connects the highlighted service. `/plugins connect <id>`
+    /// connects one directly (the plain renderer's way).
+    fn plugins_command(&mut self, argument: Option<&str>, effects: &mut Vec<Effect>) {
+        let argument = argument.map(str::trim).unwrap_or_default();
+        if let Some(id) = argument.strip_prefix("connect ") {
+            self.connect_plugin(id.trim(), effects);
+            effects.push(Effect::Redraw);
+            return;
+        }
+        let cards = self.service.plugin_cards();
+        let mut cards = if argument.is_empty() {
+            cards
+        } else {
+            super::mcp_catalog::search(&cards, argument, cards.len())
+        };
+        if cards.is_empty() {
+            self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: format!("No services match \"{argument}\""),
+                },
+            );
+            effects.push(Effect::Redraw);
+            return;
+        }
+        let rank = |card: &serde_json::Value| match card["connectionStatus"].as_str() {
+            Some("connected") => 0,
+            Some("pending") => 1,
+            Some("not_connected") => 2,
+            _ => 3,
+        };
+        cards.sort_by_key(rank);
+        let rows: Vec<String> = cards
+            .iter()
+            .map(|card| {
+                let status = card["connectionStatus"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .replace('_', " ");
+                let category = card["category"].as_str().unwrap_or_default();
+                let description: String = card["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(80)
+                    .collect();
+                format!(
+                    "{} · {status}{} · {description}",
+                    card["label"].as_str().unwrap_or_default(),
+                    if category.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {category}")
+                    }
+                )
+            })
+            .collect();
+        let ids: Vec<String> = cards
+            .iter()
+            .map(|card| card["serviceId"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        if self.plain {
+            let mut lines: Vec<String> = rows
+                .iter()
+                .zip(&ids)
+                .map(|(row, id)| format!("{row}  [{id}]"))
+                .collect();
+            lines.push(String::new());
+            lines.push("connect one with /plugins connect <id>".to_owned());
+            self.reference("/plugins", lines, effects);
+        } else {
+            self.editor.open_picker(rows);
+            self.plugin_picker = Some(ids);
+        }
+        effects.push(Effect::Redraw);
+    }
+
+    fn connect_plugin(&mut self, id: &str, effects: &mut Vec<Effect>) {
+        match self.service.connect_plugin(id) {
+            Ok(message) => self.push_history(effects, HistoryItem::Notice { message }),
+            Err(message) => self.push_history(effects, HistoryItem::Error { message }),
+        }
     }
 
     fn branch_command(&mut self, name: &str, argument: Option<&str>, effects: &mut Vec<Effect>) {
@@ -3288,6 +3400,7 @@ impl InteractiveController {
                     }
                 }
             }
+            "/plugins" => self.plugins_command(raw_argument, &mut effects),
             "/queue" => self.queue_command(raw_argument, &mut effects),
             "/stash" => return self.stash_prompt(),
             "/autonomous" => self.autonomous_command(raw_argument, &mut effects),

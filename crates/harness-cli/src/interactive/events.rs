@@ -480,6 +480,8 @@ pub enum Modal {
     Picker { items: Vec<String>, selected: usize },
     /// Git-aware workspace file picker opened by `@` in the composer.
     FilePicker { items: Vec<String>, selected: usize },
+    /// prime-agent's `/plugins` service catalog; Enter connects a service.
+    ServicePicker { items: Vec<String>, selected: usize },
     /// prime-agent's tree selector (`/tree`) or its fork selector (`/fork`):
     /// the conversation's messages, the highlighted one picked with Enter.
     TurnPicker {

@@ -39,6 +39,7 @@ pub mod instructions;
 pub mod keybindings;
 pub mod learned;
 pub mod mcp;
+pub mod mcp_catalog;
 pub mod mcp_config;
 pub mod mcp_oauth;
 pub mod oauth;

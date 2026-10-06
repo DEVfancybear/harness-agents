@@ -282,6 +282,15 @@ pub trait SessionPort: Send {
     fn manage_mcp(&mut self, _args: &[String]) -> Result<Vec<String>, String> {
         Err("this backend does not manage MCP servers".to_owned())
     }
+    /// prime-agent's service-catalog cards (`/plugins`).
+    fn plugin_cards(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    /// Connect a catalog service: add it as an MCP server and sign in. The
+    /// sign-in's progress arrives as notices; the answer says what started.
+    fn connect_plugin(&mut self, _id: &str) -> Result<String, String> {
+        Err("this backend does not manage MCP servers".to_owned())
+    }
     fn agents_summary(&self) -> Vec<String> {
         vec!["no delegated workers have run in this session".to_owned()]
     }
@@ -3847,7 +3856,111 @@ impl SessionPort for AgentSessionService {
         }
     }
 
+    fn plugin_cards(&self) -> Vec<serde_json::Value> {
+        let servers = super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .map(|resolved| resolved.mcp_servers)
+        .unwrap_or_default();
+        super::mcp_catalog::session_cards(
+            &self.global_config_dir,
+            &self.data_dir,
+            &servers,
+            &super::credentials::resolve_path(&self.environment, &self.data_dir),
+        )
+    }
+
+    fn connect_plugin(&mut self, id: &str) -> Result<String, String> {
+        let service = super::mcp_catalog::load(&self.global_config_dir, &self.data_dir)
+            .into_iter()
+            .find(|service| service.id == id)
+            .ok_or_else(|| format!("no service {id} in the catalog"))?;
+        if !service.connectable() {
+            return Err(format!(
+                "{} cannot be connected from /plugins: {}",
+                service.label,
+                if service.auth == "api_key" {
+                    "it needs an API key; add it with /mcp add".to_owned()
+                } else {
+                    service
+                        .setup_reason
+                        .clone()
+                        .unwrap_or_else(|| "it needs manual setup; add it with /mcp add".to_owned())
+                }
+            ));
+        }
+        let url = service.url.clone().unwrap_or_default();
+        let configured = super::config::resolve_layers(
+            &self.config_file,
+            &self.workspace_root,
+            &self.environment,
+            &self.config_overrides,
+        )
+        .map(|resolved| resolved.mcp_servers)
+        .map_err(|error| error.to_string())?;
+        if !configured.contains_key(id) {
+            super::mcp_config::run(
+                &self.config_file,
+                &[
+                    "add".to_owned(),
+                    id.to_owned(),
+                    "--url".to_owned(),
+                    url.clone(),
+                ],
+                &configured,
+            )?;
+        }
+        self.start_mcp_login(id, &url);
+        Ok(format!(
+            "Connecting {}: sign in in the browser; the connection activates on the next call",
+            service.label
+        ))
+    }
+
     fn manage_mcp(&mut self, args: &[String]) -> Result<Vec<String>, String> {
+        // prime-agent's `/mcp login <service>` and `/mcp logout <service>`.
+        match (args.first().map(String::as_str), args.get(1)) {
+            (Some("login"), Some(name)) => {
+                let configured = super::config::resolve_layers(
+                    &self.config_file,
+                    &self.workspace_root,
+                    &self.environment,
+                    &self.config_overrides,
+                )
+                .map(|resolved| resolved.mcp_servers)
+                .map_err(|error| error.to_string())?;
+                let url = match configured.get(name.as_str()) {
+                    Some(server) => server
+                        .url
+                        .clone()
+                        .filter(|_| server.transport.as_deref() == Some("streamable_http"))
+                        .ok_or_else(|| {
+                            format!("MCP server {name} is not a Streamable HTTP server")
+                        })?,
+                    // A catalog service that is not configured yet connects as
+                    // `/plugins` connects it.
+                    None => return self.connect_plugin(name).map(|line| vec![line]),
+                };
+                self.start_mcp_login(name, &url);
+                return Ok(vec![format!("Signing in to MCP server {name}...")]);
+            }
+            (Some("logout"), Some(name)) => {
+                let removed = super::credentials::remove(
+                    &super::credentials::resolve_path(&self.environment, &self.data_dir),
+                    &super::mcp_oauth::credential_key(name),
+                )
+                .map_err(|error| error.to_string())?;
+                return Ok(vec![if removed {
+                    format!("Signed out of MCP server {name}")
+                } else {
+                    format!("MCP server {name} has no sign-in")
+                }]);
+            }
+            _ => {}
+        }
         let configured = super::config::resolve_layers(
             &self.config_file,
             &self.workspace_root,
@@ -5677,6 +5790,31 @@ impl AgentSessionService {
         self.mark_session_start("resume");
     }
 
+    /// Run prime-agent's MCP sign-in for `server` at `url` off the UI thread;
+    /// each step arrives as a notice.
+    fn start_mcp_login(&self, server: &str, url: &str) {
+        let sender = self.sender.clone();
+        let auth_path = super::credentials::resolve_path(&self.environment, &self.data_dir);
+        let server = server.to_owned();
+        let url = url.to_owned();
+        let _ = std::thread::Builder::new()
+            .name("ha-mcp-login".to_owned())
+            .spawn(move || {
+                let progress = |message: &str| {
+                    let _ = sender.send(SessionEvent::Notice {
+                        message: message.to_owned(),
+                    });
+                };
+                let message =
+                    match super::mcp_oauth::login(&server, &url, None, None, &auth_path, &progress)
+                    {
+                        Ok(()) => format!("Signed in to MCP server {server}"),
+                        Err(error) => format!("MCP sign-in for {server} failed: {error}"),
+                    };
+                progress(&message);
+            });
+    }
+
     /// The next prompt opens a session for `source`.
     fn mark_session_start(&self, source: &'static str) {
         if let Ok(mut pending) = self.session_start.lock() {
@@ -6864,10 +7002,18 @@ async fn run_turn(
             // Always answered, even with no server configured: an unanswered
             // `mcp.list_connections` reached the model as "request failed", and it
             // kept retrying a bridge that had nothing behind it.
-            chain.push(Arc::new(super::skill_requests::McpRequests::new(
-                config.mcp_servers.clone(),
-                workspace_root.clone(),
-            )));
+            chain.push(Arc::new(
+                super::skill_requests::McpRequests::new(
+                    config.mcp_servers.clone(),
+                    workspace_root.clone(),
+                )
+                .with_plugins(super::mcp_catalog::session_cards(
+                    &global_config_dir,
+                    &data_dir,
+                    &config.mcp_servers,
+                    &super::credentials::resolve_path(&environment, &data_dir),
+                )),
+            ));
             let requests: Arc<dyn super::repl::HostRequests> =
                 Arc::new(super::skill_requests::ChainedRequests(chain));
             super::repl::ReplHost::for_turn(

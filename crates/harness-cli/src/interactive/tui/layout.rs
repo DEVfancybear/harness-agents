@@ -227,6 +227,7 @@ fn modal_rows(modal: &Modal, available: u16) -> u16 {
         // reservation would be clipped off the bottom of the viewport instead.
         Modal::Approval { summary, .. } => super::widgets::approval::requested_rows(summary),
         Modal::Picker { items, .. }
+        | Modal::ServicePicker { items, .. }
         | Modal::FilePicker { items, .. }
         | Modal::TurnPicker { items, .. } => u16::try_from(items.len() + 2).unwrap_or(u16::MAX),
         Modal::Question {
