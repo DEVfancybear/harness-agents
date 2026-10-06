@@ -883,8 +883,34 @@ async fn connect_one(
                 })?;
                 headers.push((header.clone(), value));
             }
+            // prime-agent's MCP OAuth: a server signed in with `ha mcp login`
+            // and given no credential of its own sends its access token.
+            let url = config.url.as_deref().unwrap_or_default();
+            let token = match token {
+                Some(token) => Some(token),
+                None if !headers
+                    .iter()
+                    .any(|(header, _)| header.eq_ignore_ascii_case("authorization")) =>
+                {
+                    let environment = super::paths::LaunchEnvironment::capture();
+                    super::paths::resolve(&super::paths::PathRequest {
+                        platform: super::paths::HostPlatform::current(),
+                        environment: &environment,
+                        explicit_data_dir: None,
+                    })
+                    .ok()
+                    .map(|paths| super::credentials::resolve_path(&environment, &paths.data_dir))
+                    .map(|auth| super::mcp_oauth::bearer(&auth, name, url))
+                    .transpose()
+                    .map_err(|message| {
+                        harness_extensions::ExtensionError::new(ErrorCode::PolicyDenied, message)
+                    })?
+                    .flatten()
+                }
+                None => None,
+            };
             McpClient::connect_streamable_http_with_headers(
-                config.url.as_deref().unwrap_or_default(),
+                url,
                 token.as_deref(),
                 &headers,
                 Some(callbacks),

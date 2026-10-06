@@ -84,6 +84,20 @@ pub enum Credential {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account_id: Option<String>,
     },
+    /// prime-agent's MCP OAuth tokens, bound to the server URL they were
+    /// issued for, the token endpoint, the client and the resource.
+    McpOauth {
+        access: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refresh: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires: Option<i64>,
+        endpoint: String,
+        token_endpoint: String,
+        client_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+    },
 }
 
 impl Credential {
@@ -97,7 +111,7 @@ impl Credential {
     pub fn secret(&self) -> &str {
         match self {
             Self::ApiKey { key } => key,
-            Self::Oauth { access, .. } => access,
+            Self::Oauth { access, .. } | Self::McpOauth { access, .. } => access,
         }
     }
 
@@ -107,6 +121,7 @@ impl Credential {
         match self {
             Self::ApiKey { .. } => "API key",
             Self::Oauth { .. } => "sign-in",
+            Self::McpOauth { .. } => "MCP sign-in",
         }
     }
 }
@@ -387,6 +402,9 @@ pub fn secrets(path: &Path) -> Vec<String> {
             Credential::Oauth {
                 access, refresh, ..
             } => vec![access, refresh],
+            Credential::McpOauth {
+                access, refresh, ..
+            } => std::iter::once(access).chain(refresh).collect(),
         })
         .filter(|secret| !secret.trim().is_empty())
         .collect()

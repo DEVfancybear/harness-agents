@@ -63,6 +63,21 @@ enum McpSubcommand {
         #[arg(long)]
         project: bool,
     },
+    /// prime-agent's MCP OAuth: sign in to a Streamable HTTP server.
+    Login {
+        name: String,
+        /// A pre-registered client id, for servers without dynamic
+        /// client registration.
+        #[arg(long)]
+        client_id: Option<String>,
+        /// The scopes to ask for; the server's advertised ones by default.
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        project: bool,
+    },
+    /// Forget a server's MCP OAuth sign-in.
+    Logout { name: String },
 }
 
 #[allow(clippy::too_many_lines)]
@@ -172,6 +187,51 @@ pub fn run(command: McpCommand) -> Result<(), HarnessError> {
             }
             Ok(())
         }
+        McpSubcommand::Login {
+            name,
+            client_id,
+            scope,
+            project,
+        } => {
+            let table = read_servers(project)?;
+            let url = table
+                .get(&name)
+                .filter(|config| config.transport.as_deref() == Some("streamable_http"))
+                .and_then(|config| config.url.clone())
+                .ok_or_else(|| {
+                    HarnessError::new(
+                        ErrorCode::ExtensionNotFound,
+                        format!("MCP server {name} is not a configured Streamable HTTP server"),
+                    )
+                })?;
+            let auth = auth_path()?;
+            crate::interactive::mcp_oauth::login(
+                &name,
+                &url,
+                client_id.as_deref(),
+                scope.as_deref(),
+                &auth,
+                &|message| println!("{message}"),
+            )
+            .map_err(|message| HarnessError::new(ErrorCode::PolicyDenied, message))?;
+            println!("Signed in to MCP server {name}");
+            Ok(())
+        }
+        McpSubcommand::Logout { name } => {
+            let removed = crate::interactive::credentials::remove(
+                &auth_path()?,
+                &crate::interactive::mcp_oauth::credential_key(&name),
+            )?;
+            println!(
+                "{}",
+                if removed {
+                    format!("Signed out of MCP server {name}")
+                } else {
+                    format!("MCP server {name} has no sign-in")
+                }
+            );
+            Ok(())
+        }
         McpSubcommand::Remove { name, project } => {
             mutate_server(&name, McpServerConfigV2::default(), project, true)?;
             println!(
@@ -181,6 +241,20 @@ pub fn run(command: McpCommand) -> Result<(), HarnessError> {
             Ok(())
         }
     }
+}
+
+/// Where `/login` keeps credentials; MCP sign-ins live beside them.
+fn auth_path() -> Result<PathBuf, HarnessError> {
+    let environment = crate::interactive::paths::LaunchEnvironment::capture();
+    let paths = crate::interactive::paths::resolve(&crate::interactive::paths::PathRequest {
+        platform: crate::interactive::paths::HostPlatform::current(),
+        environment: &environment,
+        explicit_data_dir: None,
+    })?;
+    Ok(crate::interactive::credentials::resolve_path(
+        &environment,
+        &paths.data_dir,
+    ))
 }
 
 fn layer_name(project: bool) -> &'static str {

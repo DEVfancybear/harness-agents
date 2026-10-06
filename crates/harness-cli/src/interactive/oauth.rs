@@ -329,7 +329,7 @@ fn now_ms() -> i64 {
 /// 32 unpredictable bytes without another dependency: the standard library's
 /// hasher keys are drawn from the operating system's random source, and each
 /// `RandomState` gets fresh keys.
-fn random_bytes() -> [u8; 32] {
+pub(super) fn random_bytes() -> [u8; 32] {
     use std::hash::{BuildHasher, Hasher};
     let mut digest = sha2::Sha256::new();
     for index in 0..8_u64 {
@@ -359,7 +359,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Percent-encode everything but the unreserved characters.
-fn encode(value: &str) -> String {
+pub(super) fn encode(value: &str) -> String {
     value
         .bytes()
         .map(|byte| {
@@ -372,7 +372,7 @@ fn encode(value: &str) -> String {
         .collect()
 }
 
-fn decode(value: &str) -> String {
+pub(super) fn decode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
