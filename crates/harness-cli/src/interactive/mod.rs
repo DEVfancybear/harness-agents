@@ -6,6 +6,7 @@
 //! provider, a store writer or a network call.
 
 pub mod agents;
+pub mod allowlist;
 pub mod app;
 pub mod attachments;
 pub mod autonomous;

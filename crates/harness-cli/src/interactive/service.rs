@@ -958,6 +958,9 @@ pub(super) fn resolve_provider_with_overrides(
             resolved.provider.protocol
         ));
     }
+    // prime-agent's `allowedModels`: a model outside it fails loudly, with no
+    // fallback to another model.
+    super::allowlist::check(user_path, &resolved.provider.id, &resolved.provider.model)?;
     let credential = credentials::source_for(
         environment,
         data_dir,
@@ -1434,6 +1437,7 @@ impl super::delegation::ChildModels for ServiceChildModels {
                         "Requested subagent model \"{reference}\" failed authentication preflight: log in to {provider} with /login"
                     ),
                 })?;
+        super::allowlist::check(&self.config_file, &entry.provider, &entry.id)?;
         let price = config.model_price;
         let reasoning = Some(entry.reasoning_model());
         let level = match level {
@@ -4241,6 +4245,7 @@ impl SessionPort for AgentSessionService {
         // selection: provider, wire format and endpoint together, as prime-agent's
         // model selector sets its default model.
         if let Some(entry) = super::providers::Catalog::load(&self.data_dir).find(model) {
+            super::allowlist::check(&self.config_file, &entry.provider, &entry.id)?;
             let selection = super::config::Selection {
                 provider: entry.provider.clone(),
                 model: entry.id.clone(),

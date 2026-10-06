@@ -41,6 +41,8 @@ ratatui.workspace = true
 # HA_TUI T01/D1: cell width after NFC, so Vietnamese text cannot shift the cursor.
 unicode-width.workspace = true
 unicode-normalization.workspace = true
+# prime-agent's `allowedModels` glob patterns.
+globset.workspace = true
 # Syntax highlighting for code blocks, diffs and file contents in the TUI, as
 # prime-agent highlights them (it uses highlight.js through cli-highlight).
 # Sublime/TextMate grammars with the pure-Rust regex engine, so no C library

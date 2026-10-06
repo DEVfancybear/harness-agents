@@ -1253,6 +1253,7 @@ dependencies = [
  "crossterm",
  "encoding_rs",
  "futures-util",
+ "globset",
  "harness-extensions",
  "harness-kernel",
  "harness-maintenance",
