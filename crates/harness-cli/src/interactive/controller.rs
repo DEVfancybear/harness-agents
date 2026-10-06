@@ -297,6 +297,8 @@ pub struct InteractiveController {
     /// When ctrl+c last found nothing to interrupt or clear, for the second press
     /// that exits (prime-agent's "Press ctrl+c again to exit").
     exit_armed_at: Option<Instant>,
+    /// prime-agent's double-Escape: when the first idle Escape was pressed.
+    escape_armed_at: Option<Instant>,
     /// The provider whose API key the masked prompt is collecting.
     login_provider: Option<String>,
     /// Whose login the running `/login` or `/subagent-login` saves.
@@ -393,6 +395,7 @@ impl InteractiveController {
             pending_tool_output: None,
             detail: super::events::Detail::default(),
             exit_armed_at: None,
+            escape_armed_at: None,
             login_provider: None,
             login_scope: super::credentials::Scope::Main,
             signing_in: None,
@@ -1064,6 +1067,24 @@ impl InteractiveController {
         }
         if key == Key::Esc && self.phase == AppPhase::Running {
             return self.interrupt();
+        }
+        // prime-agent's double-Escape on an idle prompt: a second press within
+        // half a second clears the draft, or opens the session tree when the
+        // prompt is empty.
+        if key == Key::Esc && !self.phase.has_active_run() && self.signing_in.is_none() {
+            if self
+                .escape_armed_at
+                .take()
+                .is_some_and(|armed| armed.elapsed() < Duration::from_millis(500))
+            {
+                if self.editor.is_empty() {
+                    return self.command("/tree");
+                }
+                self.editor.set_text("");
+                return vec![Effect::Redraw];
+            }
+            self.escape_armed_at = Some(Instant::now());
+            return Vec::new();
         }
         if key == Key::Esc && self.signing_in.is_some() && self.editor.is_empty() {
             self.signing_in = None;
