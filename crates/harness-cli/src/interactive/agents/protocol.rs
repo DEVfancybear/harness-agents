@@ -54,6 +54,14 @@ pub enum Request {
     Stop {
         agent: String,
     },
+    /// prime-agent's `abort`: end the agent's running turn; the agent stays.
+    Abort {
+        agent: String,
+    },
+    /// prime-agent's `get_last_assistant_text`.
+    LastAnswer {
+        agent: String,
+    },
     Rename {
         agent: String,
         name: String,

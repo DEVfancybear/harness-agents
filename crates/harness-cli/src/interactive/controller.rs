@@ -417,6 +417,21 @@ impl InteractiveController {
     /// What keeps a background agent from being idle: a run, a question or an
     /// approval it waits on, a child still working, or a job it will start.
     #[must_use]
+    /// prime-agent's `abort` from outside the terminal: cancel the running
+    /// turn. `false`, and nothing done, when there is none.
+    pub fn abort_run(&mut self) -> (bool, Vec<Effect>) {
+        if !self.phase.has_active_run() {
+            return (false, Vec::new());
+        }
+        (true, self.interrupt())
+    }
+
+    /// The last answer the model gave, as `/copy` takes it.
+    #[must_use]
+    pub fn last_answer(&self) -> &str {
+        &self.last_answer
+    }
+
     pub fn is_busy(&self) -> bool {
         self.phase.has_active_run()
             || self.pending_approval.is_some()

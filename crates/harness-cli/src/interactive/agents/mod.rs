@@ -194,6 +194,7 @@ pub fn send_command(
     from: Option<String>,
     mode: protocol::SendMode,
     json: bool,
+    wait: bool,
 ) -> Result<ExitCode, HarnessError> {
     let registry = client::user_registry().map_err(failure)?;
     let listed = client::find(&registry, selector).map_err(failure)?;
@@ -207,6 +208,22 @@ pub fn send_command(
         })
         .map_err(failure)?;
     let status = value["status"].as_str().unwrap_or("delivered");
+    if wait {
+        // prime-agent's `prompt_and_wait`: the turn the message started runs
+        // to its end, and its answer is the result.
+        let answer = wait_for_answer(&registry, &listed.agent.id)?;
+        if json {
+            print_json(&serde_json::json!({
+                "schema_version": 1,
+                "agent": listed.agent.id,
+                "deliveryStatus": status,
+                "text": answer,
+            }));
+        } else {
+            println!("{answer}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     if json {
         print_json(&serde_json::json!({
             "schema_version": 1,
@@ -215,6 +232,61 @@ pub fn send_command(
         }));
     } else {
         println!("{status} to {}", listed.agent.display_name());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Wait until agent `id` has started on what was sent and gone idle again,
+/// then read its answer.
+fn wait_for_answer(registry: &std::path::Path, id: &str) -> Result<String, HarnessError> {
+    let started = std::time::Instant::now();
+    let mut seen_working = false;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let listed = client::find(registry, id).map_err(failure)?;
+        let working = listed.agent.status != "ready" || listed.agent.busy;
+        seen_working |= working;
+        // A message that started nothing visible within a few seconds has
+        // been answered already, or was queued behind nothing.
+        if !working && (seen_working || started.elapsed() > std::time::Duration::from_secs(5)) {
+            let mut connection = client::open(&listed).map_err(failure)?;
+            let value = connection
+                .call(&protocol::Request::LastAnswer {
+                    agent: id.to_owned(),
+                })
+                .map_err(failure)?;
+            return Ok(value["text"].as_str().unwrap_or_default().to_owned());
+        }
+    }
+}
+
+/// `ha abort`: end an agent's running turn; the agent stays.
+///
+/// # Errors
+/// No such agent.
+pub fn abort_command(selector: &str, json: bool) -> Result<ExitCode, HarnessError> {
+    let registry = client::user_registry().map_err(failure)?;
+    let listed = client::find(&registry, selector).map_err(failure)?;
+    let mut connection = client::open(&listed).map_err(failure)?;
+    let value = connection
+        .call(&protocol::Request::Abort {
+            agent: listed.agent.id.clone(),
+        })
+        .map_err(failure)?;
+    let aborted = value["aborted"].as_bool().unwrap_or(false);
+    if json {
+        print_json(&serde_json::json!({
+            "schema_version": 1,
+            "agent": listed.agent.id,
+            "aborted": aborted,
+        }));
+    } else if aborted {
+        println!(
+            "aborted the running turn of {}",
+            listed.agent.display_name()
+        );
+    } else {
+        println!("{} has no running turn", listed.agent.display_name());
     }
     Ok(ExitCode::SUCCESS)
 }

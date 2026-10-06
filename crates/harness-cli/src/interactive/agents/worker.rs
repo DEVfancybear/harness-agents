@@ -146,6 +146,12 @@ enum Command {
         mode: SendMode,
         reply: Sender<&'static str>,
     },
+    Abort {
+        reply: Sender<bool>,
+    },
+    LastAnswer {
+        reply: Sender<String>,
+    },
     Stop,
 }
 
@@ -596,6 +602,30 @@ impl Worker {
             .map_err(|_| format!("agent {id} did not answer"))
     }
 
+    /// End the agent's running turn; `false` when it was not running one.
+    fn abort(&self, selector: &str) -> Result<bool, String> {
+        let id = self.resolve(selector)?;
+        let (reply, answer) = mpsc::channel();
+        self.inbox(&id)?
+            .send(Command::Abort { reply })
+            .map_err(|_| format!("agent {id} has stopped"))?;
+        answer
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| format!("agent {id} did not answer"))
+    }
+
+    /// The agent's last answer.
+    fn last_answer(&self, selector: &str) -> Result<String, String> {
+        let id = self.resolve(selector)?;
+        let (reply, answer) = mpsc::channel();
+        self.inbox(&id)?
+            .send(Command::LastAnswer { reply })
+            .map_err(|_| format!("agent {id} has stopped"))?;
+        answer
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| format!("agent {id} did not answer"))
+    }
+
     fn rename(&self, selector: &str, name: &str) -> Result<AgentInfo, String> {
         let name = name.trim();
         if name.is_empty() || name.chars().any(char::is_whitespace) {
@@ -940,6 +970,14 @@ impl Agent {
                 self.forward(&effects, None);
                 let _ = reply.send(outcome);
             }
+            Command::Abort { reply } => {
+                let (aborted, effects) = self.controller.abort_run();
+                self.forward(&effects, None);
+                let _ = reply.send(aborted);
+            }
+            Command::LastAnswer { reply } => {
+                let _ = reply.send(self.controller.last_answer().to_owned());
+            }
             Command::Stop => return true,
         }
         false
@@ -1137,6 +1175,16 @@ fn serve(worker: &Arc<Worker>, stream: TcpStream) {
                 worker
                     .stop(&agent)
                     .map(|info| serde_json::to_value(info).unwrap_or_default()),
+            ),
+            Request::Abort { agent } => reply_of(
+                worker
+                    .abort(&agent)
+                    .map(|aborted| json!({ "aborted": aborted })),
+            ),
+            Request::LastAnswer { agent } => reply_of(
+                worker
+                    .last_answer(&agent)
+                    .map(|text| json!({ "text": text })),
             ),
             Request::Rename { agent, name } => reply_of(
                 worker

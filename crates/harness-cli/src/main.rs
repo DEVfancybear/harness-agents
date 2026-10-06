@@ -148,11 +148,21 @@ enum Command {
         /// Queue the message after the current turn.
         #[arg(long)]
         follow_up: bool,
+        /// Wait for the agent to finish and print its answer.
+        #[arg(long)]
+        wait: bool,
         /// Print JSON.
         #[arg(long)]
         json: bool,
         agent: String,
         message: String,
+    },
+    /// End a background agent's running turn; the agent keeps running.
+    Abort {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+        agent: String,
     },
     /// Stop a background agent.
     Stop {
@@ -724,6 +734,7 @@ fn legacy_command(cli: &Cli) -> bool {
                 | Command::Prompt { .. }
                 | Command::Attach { .. }
                 | Command::Send { .. }
+                | Command::Abort { .. }
                 | Command::Stop { .. }
                 | Command::Rename { .. }
                 | Command::Shutdown { .. }
@@ -812,10 +823,12 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
             interactive::cli_extras::prompt(cwd.as_deref(), json)
         }
         Some(Command::Attach { agent }) => interactive::app::attach(&agent),
+        Some(Command::Abort { agent, json }) => interactive::agents::abort_command(&agent, json),
         Some(Command::Send {
             from,
             steer,
             follow_up,
+            wait,
             json,
             agent,
             message,
@@ -827,7 +840,7 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
             } else {
                 interactive::agents::protocol::SendMode::Auto
             };
-            interactive::agents::send_command(&agent, message, from, mode, json)
+            interactive::agents::send_command(&agent, message, from, mode, json, wait)
         }
         Some(Command::Stop { agent, json }) => interactive::agents::stop_command(&agent, json),
         Some(Command::Rename { agent, name, json }) => {
@@ -1065,6 +1078,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
             | Command::Prompt { .. }
             | Command::Attach { .. }
             | Command::Send { .. }
+            | Command::Abort { .. }
             | Command::Stop { .. }
             | Command::Rename { .. }
             | Command::Shutdown { .. }
