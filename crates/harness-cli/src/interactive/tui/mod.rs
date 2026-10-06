@@ -669,12 +669,25 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
         }
     }
 
+    /// Copy through the system clipboard and, as prime-agent's clipboard
+    /// chain does, through OSC 52 too: a terminal reached over SSH, in tmux or
+    /// in a container has no system clipboard here, and the escape sequence
+    /// reaches the clipboard of the machine the user sits at.
     fn copy_text(&mut self, text: &str) -> io::Result<()> {
-        let mut clipboard =
-            arboard::Clipboard::new().map_err(|error| io::Error::other(error.to_string()))?;
-        clipboard
-            .set_text(text.to_owned())
-            .map_err(|error| io::Error::other(error.to_string()))
+        let system = arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.set_text(text.to_owned()))
+            .map_err(|error| io::Error::other(error.to_string()));
+        let remote = std::env::var_os("SSH_CONNECTION").is_some()
+            || std::env::var_os("SSH_TTY").is_some()
+            || std::env::var_os("TMUX").is_some();
+        if (system.is_err() || remote)
+            && let Some(sequence) = osc52_sequence(text)
+        {
+            self.backend.write(&sequence)?;
+            self.backend.flush()?;
+            return Ok(());
+        }
+        system
     }
 
     fn bell(&mut self) -> io::Result<()> {
@@ -693,6 +706,23 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
         self.backend.write("\r\n")?;
         self.backend.flush()
     }
+}
+
+/// prime-agent's OSC 52 clipboard write (`osc52.rs`): the text base64-encoded
+/// for clipboard `c`, `None` above its 100 000-character cap. Inside tmux the
+/// sequence is passed through to the outer terminal.
+fn osc52_sequence(text: &str) -> Option<String> {
+    use base64::Engine;
+    if text.len().div_ceil(3) * 4 > 100_000 {
+        return None;
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let sequence = format!("\x1b]52;c;{encoded}\x07");
+    Some(if std::env::var_os("TMUX").is_some() {
+        format!("\x1bPtmux;\x1b{sequence}\x1b\\")
+    } else {
+        sequence
+    })
 }
 
 /// Renderer that paints through a `TestBackend` and mirrors what it drew into the
