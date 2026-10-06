@@ -2971,15 +2971,20 @@ impl AgentSessionService {
             config_overrides.model.clone(),
         )));
         let writer_gate = Arc::new(tokio::sync::Mutex::new(()));
-        let auto_refine = !environment
-            .value("HA_AUTO_REFINE")
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "off" | "0" | "false" | "no"
-                )
-            });
+        // prime-agent's `autoRefine.enabled` setting, which HA_AUTO_REFINE=off
+        // still overrides.
+        let auto_refine = super::config::load_setting(&context.paths.config_file, "autoRefine")
+            .and_then(|setting| setting.get("enabled").and_then(serde_json::Value::as_bool))
+            .unwrap_or(true)
+            && !environment
+                .value("HA_AUTO_REFINE")
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "off" | "0" | "false" | "no"
+                    )
+                });
         let repl = super::repl::ReplShared::from_environment(
             &environment,
             &context.paths.data_dir,
@@ -6835,7 +6840,17 @@ async fn run_turn(
             .ok()
             .and_then(|mut pending| pending.take());
         let turns = turns_since_review.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let review_due = auto_refine && turns >= super::refine::AUTO_REFINE_TURN_INTERVAL;
+        // prime-agent's `autoRefine.turnInterval`, 25 by default.
+        let interval = super::config::load_setting(&config_file, "autoRefine")
+            .and_then(|setting| {
+                setting
+                    .get("turnInterval")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .and_then(|interval| u32::try_from(interval).ok())
+            .filter(|interval| *interval > 0)
+            .unwrap_or(super::refine::AUTO_REFINE_TURN_INTERVAL);
+        let review_due = auto_refine && turns >= interval;
         if requested.is_some() || review_due {
             let scopes = super::refine::HarnessScopes {
                 global: super::harness::global_dir(&data_dir),
