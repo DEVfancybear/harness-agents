@@ -187,6 +187,9 @@ impl AnthropicMessagesAdapter {
     }
 }
 
+const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
+const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+
 /// prime-agent's `cache_control`: an ephemeral breakpoint, five minutes by
 /// default, an hour with `HA_CACHE_RETENTION=long`.
 fn cache_control() -> Value {
@@ -283,12 +286,35 @@ impl AnthropicMessagesAdapter {
         let thinking = self.thinking;
         let headers = self.headers.clone();
         let provider_id = self.capabilities.provider_id.clone();
+        // prime-agent's beta features: tool input streamed as it is written
+        // when the request has tools, and thinking between tool calls on the
+        // models without adaptive thinking.
+        let mut betas = Vec::new();
+        if !request.tool_schemas.is_empty() {
+            betas.push(FINE_GRAINED_TOOL_STREAMING_BETA);
+        }
+        if thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking.level != crate::ThinkingLevel::Off)
+            && !crate::thinking::supports_adaptive_thinking(&request.model.to_ascii_lowercase())
+        {
+            betas.push(INTERLEAVED_THINKING_BETA);
+        }
+        let beta = betas.join(",");
         async move {
             let token = credentials.resolve()?;
+            let post = headers
+                .iter()
+                .fold(client.post(endpoint), |post, (name, value)| {
+                    post.header(name, value)
+                });
+            let post = if beta.is_empty() {
+                post
+            } else {
+                post.header("anthropic-beta", beta)
+            };
             let response = tokio::select! {
-                result = headers
-                    .iter()
-                    .fold(client.post(endpoint), |post, (name, value)| post.header(name, value))
+                result = post
                     .header("x-api-key", token)
                     .header("anthropic-version", ANTHROPIC_VERSION)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
