@@ -260,6 +260,153 @@ fn wait_for_answer(registry: &std::path::Path, id: &str) -> Result<String, Harne
     }
 }
 
+/// Run `/schedule <argument>` in one agent's conversation.
+fn schedule_call(listed: &client::Listed, argument: &str) -> Result<Vec<String>, String> {
+    let mut connection = client::open(listed)?;
+    let value = connection.call(&protocol::Request::Schedule {
+        agent: listed.agent.id.clone(),
+        argument: argument.to_owned(),
+    })?;
+    Ok(value["lines"]
+        .as_array()
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(|line| line.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// A `/schedule list` line: `<job id> <status> ...`.
+fn job_line(line: &str) -> Option<(&str, &str)> {
+    let mut words = line.split_whitespace();
+    let id = words.next().filter(|id| id.starts_with("job-"))?;
+    Some((id, words.next()?))
+}
+
+/// prime-agent's `schedule list [--all] [agent] [--json]`: the scheduled
+/// prompts of one agent or of every agent; without `--all` only the ones
+/// still to run.
+///
+/// # Errors
+/// No such agent.
+pub fn schedule_list(
+    selector: Option<&str>,
+    all: bool,
+    json: bool,
+) -> Result<ExitCode, HarnessError> {
+    let registry = client::user_registry().map_err(failure)?;
+    let agents = match selector {
+        Some(selector) => vec![client::find(&registry, selector).map_err(failure)?],
+        None => client::list_all(&registry),
+    };
+    let mut jobs = Vec::new();
+    for listed in &agents {
+        let Ok(lines) = schedule_call(listed, "list") else {
+            continue;
+        };
+        for line in lines {
+            let Some((id, status)) = job_line(&line) else {
+                continue;
+            };
+            if !all && !matches!(status, "active" | "paused") {
+                continue;
+            }
+            jobs.push((listed.agent.display_name(), id.to_owned(), line.clone()));
+        }
+    }
+    if json {
+        print_json(&serde_json::json!({
+            "schema_version": 1,
+            "jobs": jobs
+                .iter()
+                .map(|(agent, id, line)| serde_json::json!({ "agent": agent, "id": id, "line": line }))
+                .collect::<Vec<_>>(),
+        }));
+    } else if jobs.is_empty() {
+        println!("No scheduled prompts.");
+    } else {
+        for (agent, _, line) in &jobs {
+            println!("{agent} {line}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// prime-agent's `schedule add <agent> <schedule> -- <message>`.
+///
+/// # Errors
+/// No such agent, or a schedule the agent does not take.
+pub fn schedule_add(
+    selector: &str,
+    when: &str,
+    message: &str,
+    json: bool,
+) -> Result<ExitCode, HarnessError> {
+    let registry = client::user_registry().map_err(failure)?;
+    let listed = client::find(&registry, selector).map_err(failure)?;
+    let lines = schedule_call(&listed, &format!("add {when} -- {message}")).map_err(failure)?;
+    let line = lines.first().cloned().unwrap_or_default();
+    if json {
+        print_json(&serde_json::json!({
+            "schema_version": 1,
+            "agent": listed.agent.id,
+            "job": line.strip_prefix("scheduled ").unwrap_or(&line),
+        }));
+    } else {
+        println!("{line}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// prime-agent's `schedule cancel <job-id>`. ha's job ids are counted per
+/// conversation, so an id two agents share needs the agent before it.
+///
+/// # Errors
+/// No such job, or an id more than one agent has.
+pub fn schedule_cancel(
+    selector: Option<&str>,
+    job: &str,
+    json: bool,
+) -> Result<ExitCode, HarnessError> {
+    let registry = client::user_registry().map_err(failure)?;
+    let listed = if let Some(selector) = selector {
+        client::find(&registry, selector).map_err(failure)?
+    } else {
+        let mut owners = client::list_all(&registry)
+            .into_iter()
+            .filter(|listed| {
+                schedule_call(listed, "list").is_ok_and(|lines| {
+                    lines
+                        .iter()
+                        .any(|line| job_line(line).is_some_and(|(id, _)| id == job))
+                })
+            })
+            .collect::<Vec<_>>();
+        match owners.len() {
+            0 => return Err(failure(format!("no scheduled job {job}"))),
+            1 => owners.remove(0),
+            _ => {
+                return Err(failure(format!(
+                    "more than one agent has {job}: ha schedule cancel <agent> {job}"
+                )));
+            }
+        }
+    };
+    let lines = schedule_call(&listed, &format!("cancel {job}")).map_err(failure)?;
+    if json {
+        print_json(&serde_json::json!({
+            "schema_version": 1,
+            "agent": listed.agent.id,
+            "job": lines.first(),
+        }));
+    } else {
+        println!("Cancelled {job} of {}", listed.agent.display_name());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `ha abort`: end an agent's running turn; the agent stays.
 ///
 /// # Errors

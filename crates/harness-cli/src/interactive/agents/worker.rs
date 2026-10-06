@@ -152,6 +152,10 @@ enum Command {
     LastAnswer {
         reply: Sender<String>,
     },
+    Schedule {
+        argument: String,
+        reply: Sender<Result<Vec<String>, String>>,
+    },
     Stop,
 }
 
@@ -626,6 +630,21 @@ impl Worker {
             .map_err(|_| format!("agent {id} did not answer"))
     }
 
+    /// Run `/schedule <argument>` in the agent's conversation.
+    fn schedule(&self, selector: &str, argument: &str) -> Result<Vec<String>, String> {
+        let id = self.resolve(selector)?;
+        let (reply, answer) = mpsc::channel();
+        self.inbox(&id)?
+            .send(Command::Schedule {
+                argument: argument.to_owned(),
+                reply,
+            })
+            .map_err(|_| format!("agent {id} has stopped"))?;
+        answer
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| format!("agent {id} did not answer"))?
+    }
+
     fn rename(&self, selector: &str, name: &str) -> Result<AgentInfo, String> {
         let name = name.trim();
         if name.is_empty() || name.chars().any(char::is_whitespace) {
@@ -981,6 +1000,9 @@ impl Agent {
             Command::LastAnswer { reply } => {
                 let _ = reply.send(self.controller.last_answer().to_owned());
             }
+            Command::Schedule { argument, reply } => {
+                let _ = reply.send(self.controller.schedule(&argument));
+            }
             Command::Stop => return true,
         }
         false
@@ -1188,6 +1210,11 @@ fn serve(worker: &Arc<Worker>, stream: TcpStream) {
                 worker
                     .last_answer(&agent)
                     .map(|text| json!({ "text": text })),
+            ),
+            Request::Schedule { agent, argument } => reply_of(
+                worker
+                    .schedule(&agent, &argument)
+                    .map(|lines| json!({ "lines": lines })),
             ),
             Request::Rename { agent, name } => reply_of(
                 worker

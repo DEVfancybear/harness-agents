@@ -435,6 +435,14 @@ impl InteractiveController {
         &self.last_answer
     }
 
+    /// `/schedule` from outside the terminal (`ha schedule`).
+    ///
+    /// # Errors
+    /// The command's own usage or store errors.
+    pub fn schedule(&mut self, argument: &str) -> Result<Vec<String>, String> {
+        self.service.schedule(Some(argument))
+    }
+
     pub fn is_busy(&self) -> bool {
         self.phase.has_active_run()
             || self.pending_approval.is_some()

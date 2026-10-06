@@ -62,6 +62,12 @@ pub enum Request {
     LastAnswer {
         agent: String,
     },
+    /// prime-agent's `cron.*`: the agent's `/schedule` with this argument
+    /// (`list`, `add <when> -- <prompt>`, `cancel <id>`).
+    Schedule {
+        agent: String,
+        argument: String,
+    },
     Rename {
         agent: String,
         name: String,

@@ -27,6 +27,42 @@ use harness_types::{
 /// Personal coding-agent harness.
 ///
 /// Bare `ha` opens the interactive app; `ha exec` runs one prompt headless.
+/// prime-agent's `schedule <list|add|cancel>`.
+#[derive(Debug, Subcommand)]
+enum ScheduleCommand {
+    /// List scheduled prompts.
+    List {
+        /// Include completed and cancelled ones.
+        #[arg(long, short = 'a')]
+        all: bool,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+        agent: Option<String>,
+    },
+    /// Schedule a prompt: `ha schedule add worker "0 9 * * 1-5" -- "Check open work"`.
+    /// The schedule may be a cron expression or a supported one-time schedule.
+    Add {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+        agent: String,
+        #[arg(required = true, num_args = 1..)]
+        schedule: Vec<String>,
+        #[arg(last = true, required = true, num_args = 1..)]
+        message: Vec<String>,
+    },
+    /// Cancel a scheduled prompt.
+    Cancel {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+        /// `[agent] <job-id>`: the agent is needed when two have the id.
+        #[arg(required = true, num_args = 1..=2)]
+        target: Vec<String>,
+    },
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "ha", version, about, args_conflicts_with_subcommands = true)]
 struct Cli {
@@ -166,6 +202,9 @@ enum Command {
         agent: String,
         message: String,
     },
+    /// Manage prompts that run later or on a recurring schedule.
+    #[command(subcommand)]
+    Schedule(ScheduleCommand),
     /// End a background agent's running turn; the agent keeps running.
     Abort {
         /// Print JSON.
@@ -743,6 +782,7 @@ fn legacy_command(cli: &Cli) -> bool {
                 | Command::Prompt { .. }
                 | Command::Attach { .. }
                 | Command::Send { .. }
+                | Command::Schedule(_)
                 | Command::Abort { .. }
                 | Command::Stop { .. }
                 | Command::Rename { .. }
@@ -864,6 +904,30 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
         }
         Some(Command::Attach { agent }) => interactive::app::attach(&agent),
         Some(Command::Abort { agent, json }) => interactive::agents::abort_command(&agent, json),
+        Some(Command::Schedule(command)) => match command {
+            ScheduleCommand::List { all, json, agent } => {
+                interactive::agents::schedule_list(agent.as_deref(), all, json)
+            }
+            ScheduleCommand::Add {
+                json,
+                agent,
+                schedule,
+                message,
+            } => interactive::agents::schedule_add(
+                &agent,
+                &schedule.join(" "),
+                &message.join(" "),
+                json,
+            ),
+            ScheduleCommand::Cancel { json, target } => {
+                let (agent, job) = match target.as_slice() {
+                    [job] => (None, job.as_str()),
+                    [agent, job, ..] => (Some(agent.as_str()), job.as_str()),
+                    [] => unreachable!("clap requires a job id"),
+                };
+                interactive::agents::schedule_cancel(agent, job, json)
+            }
+        },
         Some(Command::Send {
             from,
             steer,
@@ -1120,6 +1184,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
             | Command::Prompt { .. }
             | Command::Attach { .. }
             | Command::Send { .. }
+            | Command::Schedule(_)
             | Command::Abort { .. }
             | Command::Stop { .. }
             | Command::Rename { .. }
