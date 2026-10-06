@@ -133,21 +133,67 @@ impl AnthropicMessagesAdapter {
         if let Some(max_tokens) = request.max_output_tokens {
             body["max_tokens"] = json!(max_tokens);
         }
+        // prime-agent's prompt caching: breakpoints on the system prompt, the
+        // last tool and the last user message, so the next request of the
+        // conversation reads its prefix from the cache instead of paying for it
+        // again. Without them Anthropic caches nothing.
+        let cache_control = cache_control();
         if !system.is_empty() {
-            body["system"] = json!(system.join("\n\n"));
+            body["system"] = json!([{
+                "type": "text",
+                "text": system.join("\n\n"),
+                "cache_control": cache_control,
+            }]);
         }
-        let tools = request
+        let mut tools = request
             .tool_schemas
             .iter()
             .filter_map(anthropic_tool_schema)
             .collect::<Vec<_>>();
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = cache_control.clone();
+        }
         if !tools.is_empty() {
             body["tools"] = json!(tools);
+        }
+        if let Some(last) = body["messages"]
+            .as_array_mut()
+            .and_then(|messages| messages.last_mut())
+            .filter(|message| message["role"] == "user")
+        {
+            if let Some(text) = last["content"].as_str().map(str::to_owned) {
+                last["content"] = json!([{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": cache_control,
+                }]);
+            } else if let Some(block) = last["content"]
+                .as_array_mut()
+                .and_then(|blocks| blocks.last_mut())
+                .filter(|block| {
+                    matches!(
+                        block["type"].as_str(),
+                        Some("text" | "image" | "tool_result")
+                    )
+                })
+            {
+                block["cache_control"] = cache_control;
+            }
         }
         if let Some(thinking) = thinking {
             thinking.apply_anthropic(&mut body, &request.model);
         }
         body
+    }
+}
+
+/// prime-agent's `cache_control`: an ephemeral breakpoint, five minutes by
+/// default, an hour with `HA_CACHE_RETENTION=long`.
+fn cache_control() -> Value {
+    if std::env::var("HA_CACHE_RETENTION").is_ok_and(|value| value.trim() == "long") {
+        json!({"type": "ephemeral", "ttl": "1h"})
+    } else {
+        json!({"type": "ephemeral"})
     }
 }
 

@@ -6554,11 +6554,7 @@ async fn run_turn(
     }
     // The session-specific tail last, after everything that is stable for the
     // session, so the provider's prompt cache keeps what comes before it.
-    built_prompt.text.push_str(
-        "
-
-",
-    );
+    built_prompt.text.push_str("\n\n");
     built_prompt.text.push_str(&super::prompt::dynamic_tail(
         &prompt_environment,
         repl_host.is_some().then(super::repl::kernel_packages),

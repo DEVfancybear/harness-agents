@@ -84,8 +84,7 @@ impl SystemPromptBuilder {
             "You solve tasks by breaking down problems into sub-tasks, writing and executing code, observing results, and iterating one step at a time.",
             "When you are done, stop calling tools and state your final answer.",
         ]
-        .join("
-")];
+        .join("\n")];
         if has("ipython") {
             parts.push(CORE_LAYER.trim().to_owned());
             parts.push(USAGE_LAYER.trim().to_owned());
@@ -106,21 +105,12 @@ impl SystemPromptBuilder {
         let guidelines = additional_guidance(&has);
         if !guidelines.is_empty() {
             parts.push(format!(
-                "# Additional Guidance
-
-{}",
-                guidelines.join(
-                    "
-"
-                )
+                "# Additional Guidance\n\n{}",
+                guidelines.join("\n")
             ));
         }
         BuiltPrompt {
-            text: parts.join(
-                "
-
-",
-            ),
+            text: parts.join("\n\n"),
         }
     }
 }
@@ -136,8 +126,7 @@ pub fn dynamic_tail(
     let mut sections = Vec::new();
     if let Some(packages) = packages.filter(|packages| !packages.is_empty()) {
         sections.push(format!(
-            "Pre-installed Python packages: {}.
-Install additional packages with `uv pip install <pkg>` (this is a uv-managed venv with no pip module).",
+            "Pre-installed Python packages: {}.\nInstall additional packages with `uv pip install <pkg>` (this is a uv-managed venv with no pip module).",
             packages.join(", ")
         ));
     }
@@ -162,10 +151,7 @@ Install additional packages with `uv pip install <pkg>` (this is a uv-managed ve
                 super::bounds::bound_label(environment.limits.deadline.as_secs()),
             ),
         ]
-        .join(
-            "
-",
-        ),
+        .join("\n"),
     );
     if packages.is_some() {
         sections.push(format!(
@@ -173,11 +159,7 @@ Install additional packages with `uv pip install <pkg>` (this is a uv-managed ve
             if depth == 0 { " (root)" } else { " (not root)" }
         ));
     }
-    sections.join(
-        "
-
-",
-    )
+    sections.join("\n\n")
 }
 
 /// prime-agent's skill lines of `buildRlmPrompt` for a session with the REPL: the
