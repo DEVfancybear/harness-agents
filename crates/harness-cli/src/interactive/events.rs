@@ -720,6 +720,9 @@ pub enum SessionEvent {
     /// a response reported its usage (`12% · 123k/1M · 5h 34%`).
     UsageUpdated {
         label: String,
+        /// The input and output tokens of the call, which a goal's budget
+        /// spends.
+        tokens: u64,
     },
     /// A model step started; the status bar counts these.
     StepStarted {
@@ -805,6 +808,8 @@ pub enum SessionEvent {
     /// The model started a goal through the `goal` skill.
     GoalCreated {
         objective: String,
+        /// prime-agent's goal token budget, when one was given.
+        token_budget: Option<u64>,
     },
     /// The model renamed its own session (`rlm.rename` without a target).
     RenameRequested {

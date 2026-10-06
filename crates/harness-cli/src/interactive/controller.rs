@@ -1525,7 +1525,21 @@ impl InteractiveController {
                 self.pending_thinking.push_str(&text);
                 effects.push(Effect::Redraw);
             }
-            SessionEvent::UsageUpdated { label } => {
+            SessionEvent::UsageUpdated { label, tokens } => {
+                // prime-agent's goal accounting: every call of a goal's turns
+                // spends its budget, and the crossing steers the model to wrap
+                // up instead of starting new work.
+                if let Some(goal) = &mut self.goal
+                    && goal.spend(tokens)
+                {
+                    let steer = super::goal::budget_limit_text(goal);
+                    let _ = self.service.steer(&steer);
+                    self.pending_notices.push_back(format!(
+                        "goal budget spent ({} of {} tokens); the model is asked to wrap up",
+                        goal.tokens_used,
+                        goal.token_budget.unwrap_or_default()
+                    ));
+                }
                 let line = format!("Context: {label}");
                 if let Some(existing) = self
                     .header
@@ -2149,7 +2163,10 @@ impl InteractiveController {
                     },
                 );
             }
-            SessionEvent::GoalCreated { objective } => {
+            SessionEvent::GoalCreated {
+                objective,
+                token_budget,
+            } => {
                 self.flush_stream(effects);
                 self.service.set_goal(Some(objective.clone()));
                 self.push_history(
@@ -2160,7 +2177,7 @@ impl InteractiveController {
                         ),
                     },
                 );
-                self.goal = Some(GoalState::new(objective));
+                self.goal = Some(GoalState::new(objective).with_budget(token_budget));
             }
             SessionEvent::CompactRequested { instructions } => {
                 self.pending_compact = Some(instructions.unwrap_or_default());
@@ -2597,7 +2614,7 @@ impl InteractiveController {
             return vec![Effect::History(HistoryItem::Notice { message })];
         }
         goal.continuations += 1;
-        let text = super::goal::continuation_text(&goal.objective);
+        let text = super::goal::continuation_text(goal);
         let mut effects = vec![Effect::History(HistoryItem::Notice {
             message: format!(
                 "goal not complete yet; continuing ({} of {}) - Ctrl-C or /goal pause stops this",
@@ -2782,6 +2799,7 @@ impl InteractiveController {
                 goal.status = GoalStatus::Active;
                 goal.continuations = 0;
                 let objective = goal.objective.clone();
+                let continuation = super::goal::continuation_text(goal);
                 self.autonomous_yields_to_goal(effects);
                 self.service.set_goal(Some(objective.clone()));
                 self.push_history(effects, HistoryItem::Notice {
@@ -2789,7 +2807,7 @@ impl InteractiveController {
                 });
                 if !self.phase.has_active_run() {
                     self.continuations = 0;
-                    effects.extend(self.dispatch(super::goal::continuation_text(&objective), true));
+                    effects.extend(self.dispatch(continuation, true));
                 }
             }
             "clear" => {
@@ -9066,6 +9084,7 @@ Command: \"npm run build\""
             .events
             .send(SessionEvent::GoalCreated {
                 objective: "ship the release".to_owned(),
+                token_budget: None,
             })
             .expect("goal event");
         harness

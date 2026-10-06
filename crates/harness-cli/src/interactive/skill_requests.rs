@@ -229,6 +229,8 @@ pub struct SkillRequests {
     compact_scheduled: AtomicBool,
     /// The session's usage, for what the context holds now.
     usage: Option<Arc<std::sync::Mutex<super::cost::CostTracker>>>,
+    /// The token budget of a goal this turn created.
+    token_budget: std::sync::Mutex<Option<u64>>,
 }
 
 impl SkillRequests {
@@ -252,6 +254,7 @@ impl SkillRequests {
             completed: AtomicBool::new(false),
             compact_scheduled: AtomicBool::new(false),
             usage: None,
+            token_budget: std::sync::Mutex::new(None),
         }
     }
 
@@ -270,8 +273,9 @@ impl SkillRequests {
             .or_else(|| self.goal.clone())
     }
 
-    /// `goalHostResponse`: the goal serialized the way the `goal` skill reads it. ha
-    /// keeps no token budget, so the budget fields are null.
+    /// `goalHostResponse`: the goal serialized the way the `goal` skill reads it.
+    /// The budget is the one this turn's `goal.create` set; what it has spent is
+    /// the app's to count, so `tokens_used` stays null here.
     fn goal_response(&self) -> Value {
         let Some(objective) = self.objective() else {
             return json!({ "goal": null, "remaining_tokens": null, "completion_budget_report": null });
@@ -286,7 +290,7 @@ impl SkillRequests {
                 "goal_id": null,
                 "objective": objective,
                 "status": status,
-                "token_budget": null,
+                "token_budget": self.token_budget.lock().ok().and_then(|budget| *budget),
                 "tokens_used": null,
                 "time_used_seconds": null,
                 "created_at": null,
@@ -306,9 +310,16 @@ impl SkillRequests {
                     .map(str::trim)
                     .filter(|objective| !objective.is_empty())
                     .ok_or("goal.create objective must be a string")?;
-                if !request["token_budget"].is_null() {
-                    return Err("goal token budgets are not available in ha; create the goal without token_budget".to_owned());
-                }
+                // prime-agent's `validate_goal_budget`: a positive integer.
+                let token_budget = match &request["token_budget"] {
+                    Value::Null => None,
+                    value => Some(
+                        value
+                            .as_u64()
+                            .filter(|budget| *budget > 0)
+                            .ok_or("Goal token budget must be a positive integer.")?,
+                    ),
+                };
                 if self.objective().is_some() && !self.completed.load(Ordering::SeqCst) {
                     return Err("cannot create a new goal because this thread already has an active goal; run `await goal.complete()` when it is achieved, or ask the user to clear it with /goal clear".to_owned());
                 }
@@ -316,8 +327,12 @@ impl SkillRequests {
                     *created = Some(objective.to_owned());
                 }
                 self.completed.store(false, Ordering::SeqCst);
+                if let Ok(mut budget) = self.token_budget.lock() {
+                    *budget = token_budget;
+                }
                 let _ = self.sender.send(SessionEvent::GoalCreated {
                     objective: objective.to_owned(),
+                    token_budget,
                 });
                 Ok(self.goal_response())
             }
@@ -502,7 +517,7 @@ mod tests {
             .expect("ok");
         assert_eq!(created["goal"]["status"], "active");
         assert!(
-            matches!(events.try_recv(), Ok(SessionEvent::GoalCreated { objective }) if objective == "ship it")
+            matches!(events.try_recv(), Ok(SessionEvent::GoalCreated { objective, .. }) if objective == "ship it")
         );
         assert!(
             host.handle(&json!({"type": "goal.create", "objective": "another"}))

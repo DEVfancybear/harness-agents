@@ -1955,6 +1955,7 @@ impl TurnObserver for ChannelObserver {
                         self.context_window,
                         &self.provider_id,
                     ),
+                    tokens: prompt_tokens.saturating_add(completion_tokens),
                 });
                 Some(SessionEvent::CostUpdated { label })
             }
