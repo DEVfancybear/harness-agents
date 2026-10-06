@@ -765,6 +765,20 @@ impl InteractiveController {
                     };
                     (entry.id.to_owned(), format!("{}{state}", entry.name))
                 })
+                .chain([(
+                    super::web::SERPER_CREDENTIAL.to_owned(),
+                    format!(
+                        "Serper (web search){}",
+                        if stored
+                            .iter()
+                            .any(|(id, _)| id == super::web::SERPER_CREDENTIAL)
+                        {
+                            " · logged in"
+                        } else {
+                            ""
+                        }
+                    ),
+                )])
                 .collect(),
         );
         self.editor.set_argument_options(
@@ -3908,6 +3922,21 @@ impl InteractiveController {
                 ];
             }
         };
+        if provider == super::web::SERPER_CREDENTIAL {
+            let mut effects = Vec::new();
+            self.push_history(
+                &mut effects,
+                HistoryItem::Notice {
+                    message: format!(
+                        "Saved the Serper key for web search to {}; web_search uses Google from the next turn. The value is never shown, logged or kept in history.",
+                        source.describe()
+                    ),
+                },
+            );
+            self.refresh_menu();
+            effects.push(Effect::Redraw);
+            return effects;
+        }
         if self.login_scope == super::credentials::Scope::Subagent {
             self.credential_scope(super::credentials::Scope::Main);
             let name = super::providers::provider(&provider)
@@ -4050,6 +4079,19 @@ impl InteractiveController {
             return;
         }
         let for_subagents = self.login_scope == super::credentials::Scope::Subagent;
+        // prime-agent's "Serper (web search)" entry: the key web_search and
+        // the websearch skill read, kept in the credential file.
+        if argument == Some(super::web::SERPER_CREDENTIAL) && !for_subagents {
+            self.login_provider = Some(super::web::SERPER_CREDENTIAL.to_owned());
+            self.editor.begin_secret_entry();
+            self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: "Enter the Serper API key for web search (a free key from https://serper.dev): it is masked, never kept in history, and saved to the credential file. Esc cancels.".to_owned(),
+                },
+            );
+            return;
+        }
         let Some(provider) = argument.and_then(super::providers::provider) else {
             let (stored, command) = if for_subagents {
                 (
@@ -4076,6 +4118,17 @@ impl InteractiveController {
                     super::providers::Login::OAuth => "browser sign-in",
                 };
                 lines.push(format!("  {:<14}{} · {how}{state}", entry.id, entry.name));
+            }
+            if !for_subagents {
+                let state = stored
+                    .iter()
+                    .any(|(id, _)| id == super::web::SERPER_CREDENTIAL)
+                    .then_some(" · logged in (api_key)")
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "  {:<14}Serper (web search) · API key{state}",
+                    super::web::SERPER_CREDENTIAL
+                ));
             }
             self.reference(command, lines, effects);
             return;

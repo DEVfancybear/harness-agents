@@ -34,8 +34,12 @@ def _resolve_api_key() -> str:
     if env_key:
         return env_key
 
+    # ha keeps the key `/login serper` saved in its own credential file.
+    ha_file = os.environ.get("HA_CREDENTIAL_FILE", "").strip()
     try:
-        auth = json.loads((_agent_dir() / "auth.json").read_text())
+        auth = json.loads(
+            (Path(ha_file) if ha_file else _agent_dir() / "auth.json").read_text()
+        )
         cred = auth.get("serper") if isinstance(auth, dict) else None
         if isinstance(cred, dict) and cred.get("type") == "api_key":
             return _resolve_config_value(str(cred.get("key") or ""))
@@ -150,8 +154,8 @@ async def run(
         return (
             "This Python skill needs a Serper API key, and none is configured.\n"
             "Use the web_search tool instead: it needs no key, and web_fetch opens the results.\n"
-            "For Google results here, the user can get a free key at https://serper.dev and set\n"
-            "SERPER_API_KEY in the environment Harness Agents is started from."
+            "For Google results here, the user can get a free key at https://serper.dev and run\n"
+            "/login serper (or set SERPER_API_KEY)."
         )
 
     if timeout is None:

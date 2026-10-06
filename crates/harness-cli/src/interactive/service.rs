@@ -6269,7 +6269,7 @@ async fn run_turn(
             return;
         }
     };
-    let web_host = super::web::WebHost::from_environment(&environment);
+    let web_host = super::web::WebHost::from_environment(&environment, &data_dir);
     // Children run on a provider of their own, fixed at the model this turn
     // started with: `/model` in a later turn does not switch a child mid-task.
     let child_provider = LiveProvider::build_scoped(

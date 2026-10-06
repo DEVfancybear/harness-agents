@@ -1403,6 +1403,15 @@ impl Kernel {
                 std::process::id().to_string(),
             )
             .env("PRIME_AGENT_CODING_AGENT_DIR", data_dir.join("repl"))
+            // Where `/login serper` keeps the web-search key, for the
+            // `websearch` skill; the path, never the key.
+            .env(
+                "HA_CREDENTIAL_FILE",
+                super::credentials::resolve_file(
+                    &super::paths::LaunchEnvironment::capture(),
+                    data_dir,
+                ),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

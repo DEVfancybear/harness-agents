@@ -514,7 +514,7 @@ pub async fn run_with(
     };
     // The web tools, as the app has them: a scripted run that is asked about
     // current events can search and read pages too. `HA_WEB=off` removes them.
-    let web_host = super::web::WebHost::from_environment(environment);
+    let web_host = super::web::WebHost::from_environment(environment, &context.paths.data_dir);
     let mut tools = ToolExecutionService::new(Arc::clone(&store))
         .with_policy(tool_policy)
         .with_hooks(resolved_config.hooks.clone());

@@ -42,6 +42,9 @@ pub const WEB_VARIABLE: &str = "HA_WEB";
 pub const SERPER_KEY_VARIABLE: &str = "SERPER_API_KEY";
 
 const SERPER_ENDPOINT: &str = "https://google.serper.dev/search";
+
+/// The credential-file entry `/login serper` saves, prime-agent's `serper` id.
+pub const SERPER_CREDENTIAL: &str = "serper";
 const FALLBACK_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 const USER_AGENT: &str =
     "Mozilla/5.0 (compatible; ha/0.1; +https://github.com/DEVfancybear/harness-agents)";
@@ -74,8 +77,13 @@ struct WebInner {
 
 impl WebHost {
     /// The web tools as the environment configures them, or `None` when turned off.
+    /// The Serper key is `SERPER_API_KEY`, else the one `/login serper` saved
+    /// in the credential file under `data_dir`, as prime-agent keeps it.
     #[must_use]
-    pub fn from_environment(environment: &LaunchEnvironment) -> Option<Self> {
+    pub fn from_environment(
+        environment: &LaunchEnvironment,
+        data_dir: &std::path::Path,
+    ) -> Option<Self> {
         let value = |name: &str| {
             environment
                 .value(name)
@@ -92,8 +100,17 @@ impl WebHost {
         }) {
             return None;
         }
+        let saved = || {
+            super::credentials::load(
+                &super::credentials::resolve_file(environment, data_dir),
+                SERPER_CREDENTIAL,
+            )
+            .ok()
+            .flatten()
+            .map(|credential| credential.secret().to_owned())
+        };
         Self::build(
-            value(SERPER_KEY_VARIABLE),
+            value(SERPER_KEY_VARIABLE).or_else(saved),
             SERPER_ENDPOINT.to_owned(),
             FALLBACK_ENDPOINT.to_owned(),
             false,
@@ -383,7 +400,7 @@ impl WebHost {
         if !status.is_success() || hits.is_empty() {
             return Ok(format!(
                 "No results were returned (the keyless search provider answered {status}; it may be rate-limiting). \
-                 Try a different query, or ask the user to set {SERPER_KEY_VARIABLE} (a free key from https://serper.dev) for Google results."
+                 Try a different query, or ask the user to run /login serper (a free key from https://serper.dev) for Google results."
             ));
         }
         Ok(hits

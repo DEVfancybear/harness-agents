@@ -166,7 +166,7 @@ pub fn prompt(cwd: Option<&Path>, json: bool) -> Result<ExitCode, HarnessError> 
                 .and_then(serde_json::Value::as_str)
         })
         .collect::<Vec<_>>();
-    if super::web::WebHost::from_environment(&environment).is_some() {
+    if super::web::WebHost::from_environment(&environment, &data_dir(&environment)?).is_some() {
         names.extend(["web_search", "web_fetch"]);
     }
     let (git_branch, changed_files) = super::service::prompt_git_facts(&root);
