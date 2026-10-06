@@ -274,6 +274,12 @@ impl LineEditor {
         self.picker = Some(Picker { items, selected: 0 });
     }
 
+    /// Open the picker with `selected` highlighted.
+    pub fn open_picker_at(&mut self, items: Vec<String>, selected: usize) {
+        let selected = selected.min(items.len().saturating_sub(1));
+        self.picker = Some(Picker { items, selected });
+    }
+
     pub fn close_picker(&mut self) {
         self.picker = None;
     }

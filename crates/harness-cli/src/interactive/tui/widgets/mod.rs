@@ -55,6 +55,13 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
             Some(crate::interactive::events::Modal::FilePicker { items, selected }) => {
                 picker::render_files(frame, area, items, *selected, theme);
             }
+            Some(crate::interactive::events::Modal::TurnPicker {
+                items,
+                selected,
+                fork,
+            }) => {
+                picker::render_turns(frame, area, items, *selected, *fork, theme);
+            }
             Some(crate::interactive::events::Modal::Question {
                 prompt,
                 options,

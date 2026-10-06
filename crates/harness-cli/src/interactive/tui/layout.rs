@@ -225,9 +225,9 @@ fn modal_rows(modal: &Modal, available: u16) -> u16 {
         // The panel owns its own height: a row added to it without raising the
         // reservation would be clipped off the bottom of the viewport instead.
         Modal::Approval { summary, .. } => super::widgets::approval::requested_rows(summary),
-        Modal::Picker { items, .. } | Modal::FilePicker { items, .. } => {
-            u16::try_from(items.len() + 2).unwrap_or(u16::MAX)
-        }
+        Modal::Picker { items, .. }
+        | Modal::FilePicker { items, .. }
+        | Modal::TurnPicker { items, .. } => u16::try_from(items.len() + 2).unwrap_or(u16::MAX),
         Modal::Question {
             prompt, options, ..
         } => u16::try_from(prompt.lines().count() + options.len() + 3).unwrap_or(u16::MAX),

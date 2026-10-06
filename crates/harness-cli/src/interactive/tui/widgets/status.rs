@@ -160,6 +160,28 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
                 theme.dim,
             ));
         }
+        (
+            Some(Modal::TurnPicker {
+                items,
+                selected,
+                fork,
+            }),
+            _,
+        ) => {
+            push(Span::styled(
+                format!(
+                    " {} {}/{}",
+                    if *fork { "fork" } else { "tree" },
+                    selected + 1,
+                    items.len().max(1)
+                ),
+                theme.accent,
+            ));
+            push(Span::styled(
+                " · ↑↓ chọn · Enter · Esc".to_owned(),
+                theme.dim,
+            ));
+        }
         (Some(Modal::FilePicker { items, selected }), _) => {
             push(Span::styled(
                 format!(" files {}/{}", selected + 1, items.len().max(1)),

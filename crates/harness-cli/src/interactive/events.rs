@@ -480,6 +480,13 @@ pub enum Modal {
     Picker { items: Vec<String>, selected: usize },
     /// Git-aware workspace file picker opened by `@` in the composer.
     FilePicker { items: Vec<String>, selected: usize },
+    /// prime-agent's tree selector (`/tree`) or its fork selector (`/fork`):
+    /// the conversation's messages, the highlighted one picked with Enter.
+    TurnPicker {
+        items: Vec<String>,
+        selected: usize,
+        fork: bool,
+    },
     /// A model question; an option is picked with the arrows and Enter or by its
     /// number, and free text typed in the composer is accepted too.
     Question {

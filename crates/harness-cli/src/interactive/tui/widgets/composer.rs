@@ -269,6 +269,10 @@ pub fn hint(state: &UiState) -> String {
         Some(Modal::Approval { .. }) => " DUYỆT · y chạy · a cả lượt · n từ chối ".to_owned(),
         Some(Modal::Picker { .. }) => " PHIÊN · ↑↓ chọn · Enter · Esc ".to_owned(),
         Some(Modal::FilePicker { .. }) => " TỆP · ↑↓ chọn · Enter · Esc ".to_owned(),
+        Some(Modal::TurnPicker { fork: false, .. }) => {
+            " CÂY · ↑↓ chọn · Enter tiếp tục từ đây · Esc ".to_owned()
+        }
+        Some(Modal::TurnPicker { fork: true, .. }) => " FORK · ↑↓ chọn · Enter · Esc ".to_owned(),
         Some(Modal::Question { options, .. }) => {
             if options.is_empty() {
                 " TRẢ LỜI · Enter gửi ".to_owned()

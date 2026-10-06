@@ -26,6 +26,23 @@ pub fn render_files(
     render_named(frame, area, items, selected, theme, " chọn file ");
 }
 
+/// Draw prime-agent's tree selector (`/tree`) or fork selector (`/fork`).
+pub fn render_turns(
+    frame: &mut Frame,
+    area: Rect,
+    items: &[String],
+    selected: usize,
+    fork: bool,
+    theme: &Theme,
+) {
+    let title = if fork {
+        " fork từ tin nhắn "
+    } else {
+        " cây hội thoại "
+    };
+    render_named(frame, area, items, selected, theme, title);
+}
+
 /// Draw a model question: the prompt, then its options as a menu with the
 /// highlighted one marked, scrolled so the highlight is always in view.
 pub fn render_question(

@@ -302,6 +302,8 @@ pub struct InteractiveController {
     exit_armed_at: Option<Instant>,
     /// prime-agent's double-Escape: when the first idle Escape was pressed.
     escape_armed_at: Option<Instant>,
+    /// The shared picker is prime-agent's tree (or fork) selector.
+    turn_picker: Option<super::events::TurnsPurpose>,
     /// The prompt the app was started with, until it is sent.
     initial_prompt: Option<String>,
     /// The provider whose API key the masked prompt is collecting.
@@ -401,6 +403,7 @@ impl InteractiveController {
             detail: super::events::Detail::default(),
             exit_armed_at: None,
             escape_armed_at: None,
+            turn_picker: None,
             initial_prompt: None,
             login_provider: None,
             login_scope: super::credentials::Scope::Main,
@@ -699,6 +702,13 @@ impl InteractiveController {
             });
         }
         if let Some(picker) = self.editor.picker() {
+            if let Some(purpose) = self.turn_picker {
+                return Some(Modal::TurnPicker {
+                    items: picker.items().to_vec(),
+                    selected: picker.selected(),
+                    fork: purpose == super::events::TurnsPurpose::Fork,
+                });
+            }
             if self.file_picker_active {
                 return Some(Modal::FilePicker {
                     items: picker.items().to_vec(),
@@ -1038,9 +1048,24 @@ impl InteractiveController {
                     self.editor.close_picker();
                     self.file_picker_active = false;
                     self.file_picker_query.clear();
+                    self.turn_picker = None;
                     return vec![Effect::Redraw];
                 }
                 Key::Enter => {
+                    if let Some(purpose) = self.turn_picker.take() {
+                        let chosen = self.editor.picker().map(|picker| picker.selected() + 1);
+                        self.editor.close_picker();
+                        let mut effects = Vec::new();
+                        if let Some(number) = chosen {
+                            let name = match purpose {
+                                super::events::TurnsPurpose::Fork => "/fork",
+                                super::events::TurnsPurpose::Tree => "/tree",
+                            };
+                            self.branch_command(name, Some(&number.to_string()), &mut effects);
+                        }
+                        effects.push(Effect::Redraw);
+                        return effects;
+                    }
                     if self.file_picker_active {
                         let chosen = self
                             .editor
@@ -1355,6 +1380,16 @@ impl InteractiveController {
             ]),
         }
         self.turn_points = turns;
+        // prime-agent's tree and fork selectors: the messages in a menu, the
+        // current one highlighted; Enter picks, Esc leaves. The plain
+        // renderer keeps the numbered list.
+        if !self.plain {
+            let items = lines[..last].to_vec();
+            self.editor.open_picker_at(items, last - 1);
+            self.turn_picker = Some(purpose);
+            effects.push(Effect::Redraw);
+            return;
+        }
         let title = match purpose {
             super::events::TurnsPurpose::Fork => "/fork",
             super::events::TurnsPurpose::Tree => "/tree",
@@ -5822,6 +5857,28 @@ mod tests {
             })
             .expect("turns");
         let _ = harness.controller.pump_events();
+    }
+
+    /// prime-agent's fork selector: in the TUI the messages open as a menu on
+    /// the latest one, and Enter forks before the highlighted message.
+    #[test]
+    fn the_fork_selector_picks_with_the_arrows() {
+        use crate::interactive::events::TurnsPurpose;
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        submit_text(&mut harness.controller, "/fork");
+        turns_listed(&mut harness, TurnsPurpose::Fork);
+        assert!(matches!(
+            harness.controller.ui_state().modal,
+            Some(Modal::TurnPicker { selected: 2, fork: true, .. })
+        ));
+        let _ = harness.controller.handle_key(Key::Up);
+        let _ = harness.controller.handle_key(Key::Enter);
+        assert_eq!(
+            harness.port.branches.lock().expect("branches").last(),
+            Some(&"fork s2 before=true".to_owned())
+        );
+        assert!(harness.controller.ui_state().modal.is_none());
     }
 
     /// Q08: /fork lists the user's messages, then forks before the chosen one and
