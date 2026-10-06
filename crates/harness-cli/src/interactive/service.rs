@@ -578,6 +578,15 @@ pub trait SessionPort: Send {
     fn clone_conversation(&mut self) -> Result<(), String> {
         Err("this backend keeps no conversation".to_owned())
     }
+    /// prime-agent's `/tree` selector data; it arrives as
+    /// [`SessionEvent::TreeRead`].
+    fn read_tree(&mut self) -> Result<(), String> {
+        Err("this backend keeps no conversation".to_owned())
+    }
+    /// The turn the conversation's next message follows.
+    fn conversation_leaf(&self) -> Option<String> {
+        None
+    }
     /// `/tree`: continue this conversation from after the turn of `session`.
     fn switch_to(&mut self, _session: &str) -> Result<(), String> {
         Err("this backend keeps no conversation".to_owned())
@@ -5333,6 +5342,81 @@ impl SessionPort for AgentSessionService {
         self.start_fork(ForkPlan {
             from,
             before: false,
+        });
+        Ok(())
+    }
+
+    fn conversation_leaf(&self) -> Option<String> {
+        self.previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.as_ref().map(|session| session.as_str().to_owned()))
+    }
+
+    fn read_tree(&mut self) -> Result<(), String> {
+        let leaf = self
+            .previous_session
+            .lock()
+            .ok()
+            .and_then(|source| source.clone());
+        let store_dir = self.store_dir.clone();
+        let task_id = self.task_id.clone();
+        let sender = self.sender.clone();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        handle.spawn(async move {
+            let Some(leaf) = leaf else {
+                let _ = sender.send(SessionEvent::TreeRead {
+                    turns: Vec::new(),
+                    leaf: None,
+                });
+                return;
+            };
+            let read = async {
+                let store = SqliteStore::open_read_only(store_dir)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let tree = harness_runtime::conversation_tree(&store, &leaf)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let task = conversation_task(&store, Some(&leaf), task_id).await;
+                let mut turns = Vec::new();
+                for turn in tree {
+                    let label = store
+                        .session_setting(
+                            &task,
+                            &format!("{TURN_LABEL_PREFIX}{}", turn.session.as_str()),
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|label| !label.is_empty());
+                    turns.push(super::events::TreeTurn {
+                        session: turn.session.as_str().to_owned(),
+                        parent: turn.parent.map(|parent| parent.as_str().to_owned()),
+                        question: turn.question,
+                        answer: turn.answer,
+                        label,
+                        label_time: None,
+                        created_at: turn.created_at,
+                    });
+                }
+                Ok::<_, String>(turns)
+            }
+            .await;
+            match read {
+                Ok(turns) => {
+                    let _ = sender.send(SessionEvent::TreeRead {
+                        turns,
+                        leaf: Some(leaf.as_str().to_owned()),
+                    });
+                }
+                Err(error) => {
+                    let _ = sender.send(SessionEvent::Notice {
+                        message: format!("the conversation could not be read: {error}"),
+                    });
+                }
+            }
         });
         Ok(())
     }

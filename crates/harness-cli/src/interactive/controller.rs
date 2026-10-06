@@ -306,6 +306,10 @@ pub struct InteractiveController {
     turn_picker: Option<super::events::TurnsPurpose>,
     /// The shared picker is `/plugins`: the service id of each row.
     plugin_picker: Option<Vec<String>>,
+    /// prime-agent's `/tree` selector, while it is open.
+    tree_view: Option<super::tree_view::TreeView>,
+    /// The turns the selector was opened over.
+    tree_turns: Vec<super::events::TreeTurn>,
     /// A tool call's arguments are streaming (prime-agent's "Writing code").
     writing_code: bool,
     /// The prompt the app was started with, until it is sent.
@@ -418,6 +422,8 @@ impl InteractiveController {
             escape_armed_at: None,
             turn_picker: None,
             plugin_picker: None,
+            tree_view: None,
+            tree_turns: Vec::new(),
             writing_code: false,
             initial_prompt: None,
             agent_messages_paused: false,
@@ -735,6 +741,11 @@ impl InteractiveController {
 
     /// The modal panel for the current state, if any.
     fn modal(&self) -> Option<Modal> {
+        if self.pending_approval.is_none()
+            && let Some(view) = &self.tree_view
+        {
+            return Some(Modal::Tree(view.modal()));
+        }
         if let Some(pending) = &self.pending_approval {
             return Some(Modal::Approval {
                 request_id: pending.request_id.clone(),
@@ -944,6 +955,17 @@ impl InteractiveController {
         reason = "this is the single ordered keyboard state machine for modal, running, and composer input"
     )]
     pub fn handle_key(&mut self, key: Key) -> Vec<Effect> {
+        // prime-agent's `/tree` selector owns the keyboard while it is open.
+        if self.pending_approval.is_none()
+            && let Some(view) = &mut self.tree_view
+            && !matches!(key, Key::Resize { .. } | Key::Mouse(_))
+        {
+            let action = view.handle_key(&key);
+            let mut effects = Vec::new();
+            self.tree_action(action, &mut effects);
+            effects.push(Effect::Redraw);
+            return effects;
+        }
         if key == Key::Redraw {
             return vec![Effect::Redraw];
         }
@@ -1394,7 +1416,132 @@ impl InteractiveController {
             self.branch_command("/tree", Some(number), effects);
             return;
         }
+        // prime-agent's tree selector; the plain renderer keeps the list.
+        if words.is_empty() && !self.plain && self.service.read_tree().is_ok() {
+            effects.push(Effect::Redraw);
+            return;
+        }
         self.branch_command("/tree", words.first().copied(), effects);
+    }
+
+    fn tree_question(&self, session: &str) -> Option<String> {
+        self.tree_turns
+            .iter()
+            .find(|turn| turn.session == session)
+            .map(|turn| turn.question.clone())
+    }
+
+    fn tree_parent(&self, session: &str) -> Option<String> {
+        self.tree_turns
+            .iter()
+            .find(|turn| turn.session == session)
+            .and_then(|turn| turn.parent.clone())
+    }
+
+    /// Open the `/tree` selector over the conversation's turns.
+    fn open_tree(
+        &mut self,
+        turns: &[super::events::TreeTurn],
+        leaf: Option<&str>,
+        effects: &mut Vec<Effect>,
+    ) {
+        // prime-agent's `branchSummary.skipPrompt`: pick without the choice.
+        let skip = super::config::load_setting(&self.context.paths.config_file, "branchSummary")
+            .and_then(|setting| {
+                setting
+                    .get("skipPrompt")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(false);
+        match super::tree_view::TreeView::new(turns, leaf, 15, skip) {
+            Some(view) => self.tree_view = Some(view),
+            None => self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: "Nothing to show yet".to_owned(),
+                },
+            ),
+        }
+        effects.push(Effect::Redraw);
+    }
+
+    /// What the tree selector asked for.
+    fn tree_action(&mut self, action: super::tree_view::TreeAction, effects: &mut Vec<Effect>) {
+        use super::tree_view::TreeAction;
+        match action {
+            TreeAction::None => {}
+            TreeAction::Cancel => self.tree_view = None,
+            TreeAction::Label { session, label } => {
+                if let Err(message) = self
+                    .service
+                    .label_turn(&session, label.as_deref().unwrap_or_default())
+                {
+                    self.push_history(effects, HistoryItem::Error { message });
+                }
+            }
+            TreeAction::Navigate {
+                target,
+                summarize,
+                custom,
+            } => {
+                self.tree_view = None;
+                self.navigate_tree(&target, summarize, custom, effects);
+            }
+        }
+    }
+
+    /// prime-agent's `navigateTree`: an answer becomes the point the next
+    /// message follows; a message puts its text back in the editor and the
+    /// conversation continues from the turn before it.
+    fn navigate_tree(
+        &mut self,
+        target: &str,
+        summarize: bool,
+        custom: Option<String>,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some((user, session)) = super::tree_view::parse_id(target) else {
+            return;
+        };
+        let leaf = self.service.conversation_leaf();
+        if !user && leaf.as_deref() == Some(session) {
+            self.push_history(
+                effects,
+                HistoryItem::Notice {
+                    message: "Already at this point".to_owned(),
+                },
+            );
+            return;
+        }
+        let question = self.tree_question(session).unwrap_or_default();
+        let parent = if user {
+            self.tree_parent(session)
+        } else {
+            Some(session.to_owned())
+        };
+        if summarize && let Err(message) = self.service.plan_branch_summary(custom) {
+            self.push_history(effects, HistoryItem::Error { message });
+            return;
+        }
+        let result = match parent {
+            Some(parent) => self.service.switch_to(&parent),
+            // A conversation's first message: a fork before it starts afresh.
+            None => self.service.fork(session, true),
+        };
+        match result {
+            Ok(()) => {
+                if user {
+                    self.editor.set_text(&question);
+                }
+                self.push_history(
+                    effects,
+                    HistoryItem::Notice {
+                        message: "Navigated to selected point".to_owned(),
+                    },
+                );
+            }
+            Err(message) => self.push_history(effects, HistoryItem::Error { message }),
+        }
     }
 
     /// prime-agent's `agent_messages_status|pause|resume|clear` for this agent.
@@ -2685,6 +2832,10 @@ impl InteractiveController {
             }
             // The RPC mode's reads; the app asks for neither.
             SessionEvent::ConversationRead { .. } | SessionEvent::HtmlExported { .. } => {}
+            SessionEvent::TreeRead { turns, leaf } => {
+                self.tree_turns.clone_from(&turns);
+                self.open_tree(&turns, leaf.as_deref(), effects);
+            }
         }
     }
 

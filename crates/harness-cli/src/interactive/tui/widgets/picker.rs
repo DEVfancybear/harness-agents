@@ -43,6 +43,106 @@ pub fn render_turns(
     render_named(frame, area, items, selected, theme, title);
 }
 
+/// prime-agent's `/tree` selector: the tree rows (cursor, gutters and
+/// connectors, the active-path dot, the label, the role and the text), the
+/// `(n/total)` footer with the filter, and the label, summary or custom
+/// prompt input under them.
+pub fn render_tree(
+    frame: &mut Frame,
+    area: Rect,
+    tree: &crate::interactive::events::TreeModal,
+    theme: &Theme,
+) {
+    use crate::interactive::events::TreePrompt;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if tree.rows.is_empty() {
+        lines.push(Line::from(Span::styled("  No entries found", theme.muted)));
+    }
+    for row in &tree.rows {
+        let mut spans = vec![
+            Span::raw(if row.selected { "› " } else { "  " }),
+            Span::styled(row.prefix.clone(), theme.dim),
+        ];
+        if row.folded {
+            spans.push(Span::styled("⊞ ", theme.accent));
+        }
+        if row.active {
+            spans.push(Span::styled("• ", theme.accent));
+        }
+        if let Some(label) = &row.label {
+            spans.push(Span::styled(format!("[{label}] "), theme.warning));
+        }
+        if let Some(time) = &row.label_time {
+            spans.push(Span::styled(
+                format!("{} ", time.get(..16).unwrap_or(time)),
+                theme.muted,
+            ));
+        }
+        if row.user {
+            spans.push(Span::styled("user: ", theme.accent));
+            spans.push(Span::raw(row.text.clone()));
+        } else {
+            spans.push(Span::styled("assistant: ", theme.tool_ok));
+            if row.empty {
+                spans.push(Span::styled("(no content)", theme.muted));
+            } else {
+                spans.push(Span::raw(row.text.clone()));
+            }
+        }
+        if row.selected {
+            for span in &mut spans {
+                span.style = span.style.patch(theme.selection);
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    let search = if tree.search.is_empty() {
+        String::new()
+    } else {
+        format!("  search: {}", tree.search)
+    };
+    lines.push(Line::from(Span::styled(
+        format!("  {}{search}", tree.footer),
+        theme.muted,
+    )));
+    match &tree.prompt {
+        Some(TreePrompt::Label { input }) => {
+            lines.push(Line::from(Span::styled(
+                "  Label (empty clears):",
+                theme.title,
+            )));
+            lines.push(Line::from(format!("  › {input}")));
+        }
+        Some(TreePrompt::Summarize { options, selected }) => {
+            lines.push(Line::from(Span::styled("  Summarize branch?", theme.title)));
+            lines.extend(rows(options, *selected, theme));
+        }
+        Some(TreePrompt::Custom { input }) => {
+            lines.push(Line::from(Span::styled(
+                "  Custom summarization instructions:",
+                theme.title,
+            )));
+            lines.push(Line::from(format!("  › {input}")));
+        }
+        None => {}
+    }
+    let height = usize::from(area.height.saturating_sub(2));
+    let lines: Vec<Line<'static>> = lines
+        .into_iter()
+        .rev()
+        .take(height)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.border)
+        .title(Span::styled(" cây hội thoại ", theme.title));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 /// Draw a model question: the prompt, then its options as a menu with the
 /// highlighted one marked, scrolled so the highlight is always in view.
 pub fn render_question(

@@ -150,6 +150,13 @@ fn zones(state: &UiState, theme: &Theme) -> (Vec<Span<'static>>, Vec<Vec<Span<'s
             ));
             push(Span::styled(" · y chạy · n từ chối".to_owned(), theme.dim));
         }
+        (Some(Modal::Tree(tree)), _) => {
+            push(Span::styled(format!(" tree {}", tree.footer), theme.accent));
+            push(Span::styled(
+                " · ↑↓ chọn · Enter · Esc".to_owned(),
+                theme.dim,
+            ));
+        }
         (Some(Modal::ServicePicker { items, selected }), _) => {
             push(Span::styled(
                 format!(" services {}/{}", selected + 1, items.len().max(1)),
