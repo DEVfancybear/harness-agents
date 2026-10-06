@@ -33,6 +33,7 @@ pub mod headless;
 pub mod heartbeat;
 pub mod input;
 pub mod instructions;
+pub mod keybindings;
 pub mod mcp;
 pub mod mcp_config;
 pub mod oauth;

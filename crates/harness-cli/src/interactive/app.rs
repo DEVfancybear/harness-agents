@@ -125,6 +125,7 @@ fn run_terminal(
     notice: Option<&str>,
     launch: &AppLaunch,
 ) -> Result<u8, HarnessError> {
+    super::keybindings::install(&context.paths.config_file);
     let mut backend = CrosstermBackend;
     let size = backend.size().unwrap_or((TUI_MIN_COLUMNS, TUI_MIN_ROWS));
     let fallback = tui_fallback_reason(launch.plain, environment, size.0, size.1);
@@ -192,6 +193,13 @@ pub fn attach(selector: &str) -> Result<ExitCode, HarnessError> {
         ));
     }
     let environment = LaunchEnvironment::capture();
+    if let Ok(paths) = super::paths::resolve(&super::paths::PathRequest {
+        platform: super::paths::HostPlatform::current(),
+        environment: &environment,
+        explicit_data_dir: None,
+    }) {
+        super::keybindings::install(&paths.config_file);
+    }
     let guard = RawModeGuard::enter()
         .map_err(|error| refused(format!("ha attach needs an interactive terminal ({error})")))?;
     let backend = CrosstermBackend;

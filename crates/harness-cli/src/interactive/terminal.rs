@@ -277,7 +277,9 @@ pub fn leave_fullscreen(mouse: bool) -> io::Result<()> {
 
 fn map_event(event: Event) -> Key {
     match event {
-        Event::Key(key) if key.kind != KeyEventKind::Release => map_key(key),
+        Event::Key(key) if key.kind != KeyEventKind::Release => {
+            super::keybindings::apply(&key, map_key(key))
+        }
         Event::Paste(text) => Key::Paste(text),
         Event::Resize(columns, rows) => Key::Resize { columns, rows },
         Event::Mouse(mouse) => map_mouse(mouse).map_or(Key::Unknown, Key::Mouse),
