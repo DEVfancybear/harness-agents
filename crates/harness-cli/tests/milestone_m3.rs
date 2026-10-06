@@ -1177,6 +1177,86 @@ async fn m3_03_budget_reservation_atomicity() {
     close(store).await;
 }
 
+/// Every provider caches a request by its prefix, so each step of a turn must send
+/// the previous step's request unchanged and only append to it: the system prompt,
+/// the turn's input packet and every earlier step stay byte for byte the same. A
+/// step that rewrote any of them would miss the cache for the whole turn so far.
+#[tokio::test]
+async fn each_step_of_a_turn_extends_the_previous_request_unchanged() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let call = |id: &str, query: &str| {
+        ScriptStep::Events(vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                id,
+                "search_text",
+                json!({"query": query, "path": "."}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ])
+    };
+    // A `task_update` changes the turn's working state, which the packet renders:
+    // the packet must still be the one the first step sent.
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptStep::Events(vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta(
+                "call-1",
+                "task_update",
+                json!({"note": "search for beta next"}).to_string(),
+            ),
+            ProviderStreamEvent::completed("tool_calls"),
+        ]),
+        call("call-2", "beta"),
+        call("call-3", "gamma"),
+        ScriptStep::Events(vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("done"),
+            ProviderStreamEvent::completed("stop"),
+        ]),
+    ]));
+    let (runtime, _) = runtime_for(&store, provider.clone(), None, None).await;
+    let run_request = request(
+        &bench.workspace,
+        SessionId::generate(),
+        TaskId::generate(),
+        "find the three words",
+    );
+    let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)));
+    let outcome = driver
+        .run_turn(
+            run_request,
+            options(&bench.workspace),
+            Arc::new(RecordingObserver::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("turn runs");
+    assert_eq!(outcome.stop, TurnStop::Final);
+    let seen = provider.seen();
+    assert_eq!(seen.len(), 4, "four model calls");
+    for step in 1..seen.len() {
+        let before = &seen[step - 1].messages;
+        let after = &seen[step].messages;
+        assert!(after.len() > before.len(), "step {step} appends");
+        for (index, (old, new)) in before.iter().zip(after.iter()).enumerate() {
+            assert_eq!(
+                old, new,
+                "step {step} rewrote message {index} of the previous request ({:?})",
+                old.role
+            );
+        }
+        assert_eq!(
+            seen[step - 1].tool_schemas,
+            seen[step].tool_schemas,
+            "step {step} changed the tools, the first part of the cached prefix"
+        );
+    }
+    drop(driver);
+    close(store).await;
+}
+
 #[tokio::test]
 async fn m3_03_loop_detection() {
     let bench = bench();

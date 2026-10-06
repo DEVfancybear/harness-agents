@@ -1840,6 +1840,9 @@ pub struct RuntimeService {
     /// How many compactions this runtime has published, so a host can follow
     /// one that ran inside a turn (prime-agent's kernel-state sync).
     compactions: Arc<AtomicU32>,
+    /// The input packet each running turn sent at its first step, by
+    /// `session|input`. See the packet note where the request is assembled.
+    turn_packets: Arc<Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl RuntimeService {
@@ -1865,6 +1868,7 @@ impl RuntimeService {
             budget: None,
             evaluator: default_evaluator(),
             compactions: Arc::new(AtomicU32::new(0)),
+            turn_packets: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -2244,18 +2248,40 @@ impl RuntimeService {
             *last_context = Some((request.session_id.clone(), built.clone()));
         }
         let capabilities = self.provider.capabilities();
+        // The packet is the turn's input, and every later step of the turn sends it
+        // again ahead of the steps' own messages: it is in the middle of the cached
+        // prefix. It used to be built again at every step from the recovered state,
+        // so a `task_update` note, a skill activated mid-turn or a call's receipt
+        // changed it, and every step after missed the cache for the whole turn so
+        // far. A turn now sends the packet of its first step at every step; what
+        // changed since is in the steps' own messages, which the model reads too.
+        // A step that compacted the context sends its new packet, which is kept.
+        let packet_key = format!("{}|{}", request.session_id, request.input_id);
+        let packet = {
+            let fresh = appended.is_empty() || request.continuation_context.is_some();
+            match self.turn_packets.lock() {
+                Ok(mut packets) if fresh => {
+                    if packets.len() >= 64 {
+                        packets.clear();
+                    }
+                    packets.insert(packet_key, built.packet.content.clone());
+                    built.packet.content.clone()
+                }
+                Ok(packets) => packets
+                    .get(&packet_key)
+                    .cloned()
+                    .unwrap_or_else(|| built.packet.content.clone()),
+                Err(_) => built.packet.content.clone(),
+            }
+        };
         // An attached image is content blocks on the user message, and the same message
         // names it: the packet is text, so without the marker the model would be looking
         // at something it cannot refer to.
         let user_message = if request.images.is_empty() {
-            ProviderMessage::new(MessageRole::User, built.packet.content.clone())
+            ProviderMessage::new(MessageRole::User, packet)
         } else {
             ProviderMessage::user_with_images(
-                format!(
-                    "{}\n\n{}",
-                    built.packet.content,
-                    image_marker(&request.images)
-                ),
+                format!("{}\n\n{}", packet, image_marker(&request.images)),
                 request.images.clone(),
             )
         };
