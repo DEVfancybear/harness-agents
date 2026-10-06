@@ -2583,7 +2583,7 @@ mod g03_openai_wire_snapshot_tests {
         let body = receiver.recv().expect("captured request body");
         assert_eq!(
             String::from_utf8(body).expect("UTF-8 body"),
-            r#"{"messages":[{"content":"hello","role":"user"}],"model":"fixture-model","stream":true,"thinking":{"type":"disabled"}}"#
+            r#"{"messages":[{"content":"hello","role":"user"}],"model":"fixture-model","stream":true,"stream_options":{"include_usage":true},"thinking":{"type":"disabled"}}"#
         );
     }
 }

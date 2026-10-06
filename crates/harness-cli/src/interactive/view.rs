@@ -190,7 +190,7 @@ pub fn help_card_lines() -> Vec<String> {
             "Session",
             &[
                 "/new", "/resume", "/name", "/session", "/compact", "/refine", "/context", "/copy",
-                "/export", "/import", "/undo",
+                "/export", "/share", "/import", "/undo",
             ],
         ),
         (
@@ -218,6 +218,8 @@ pub fn help_card_lines() -> Vec<String> {
                 "/goal",
                 "/autonomous",
                 "/schedule",
+                "/heartbeat",
+                "/heartbeats",
                 "/steer",
                 "/queue",
                 "/stash",

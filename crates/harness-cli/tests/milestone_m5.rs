@@ -593,19 +593,28 @@ async fn g07_compact_uses_the_model_and_records_the_source() {
     assert!(!result.fallback_used);
     assert!(result.packet.content.contains("remaining: run tests"));
     let seen = provider.seen();
+    assert!(
+        seen[0]
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::User),
+        "the conversation is a user message"
+    );
+    // prime-agent's structured checkpoint format.
     let prompt = seen[0]
         .messages
         .iter()
-        .find(|message| message.role == MessageRole::User)
-        .expect("summary prompt is a user message")
-        .content
-        .as_str();
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = prompt.as_str();
     for required in [
-        "objective",
-        "work completed",
-        "files touched",
-        "decisions",
-        "remaining",
+        "objective: repair parser safely",
+        "## Goal",
+        "## Progress",
+        "## Key Decisions",
+        "## Next Steps",
+        "## Critical Context",
     ] {
         assert!(
             prompt.contains(required),

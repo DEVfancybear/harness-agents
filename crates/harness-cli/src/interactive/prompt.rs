@@ -307,7 +307,7 @@ fn escape_xml(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{PromptEnvironment, SystemPromptBuilder};
+    use super::{PromptEnvironment, SystemPromptBuilder, assemble};
     use harness_tools::TurnLimits;
     use std::path::Path;
 
@@ -326,15 +326,15 @@ mod tests {
 
     #[test]
     fn g01_system_prompt_contains_environment_and_no_secret() {
-        let prompt = SystemPromptBuilder::build(&environment(), &["read_file"]);
-        assert!(prompt.text.contains("windows"), "{}", prompt.text);
-        assert!(prompt.text.contains("feature/agent"), "{}", prompt.text);
-        assert!(
-            prompt.text.contains("C:/work/project/sub"),
-            "{}",
-            prompt.text
-        );
-        assert!(!prompt.text.contains("sentinel-secret"));
+        // The environment rides prime-agent's dynamic tail, so the static
+        // prefix stays the same from turn to turn (the provider's prompt cache).
+        let prefix = SystemPromptBuilder::build(&environment(), &["read_file"]).text;
+        assert!(!prefix.contains("feature/agent"), "{prefix}");
+        let prompt = assemble(None, &environment(), &["read_file"], &[]);
+        assert!(prompt.contains("windows"), "{prompt}");
+        assert!(prompt.contains("feature/agent"), "{prompt}");
+        assert!(prompt.contains("C:/work/project/sub"), "{prompt}");
+        assert!(!prompt.contains("sentinel-secret"));
     }
 
     /// prime-agent's loop contract is stated in the base, whatever tools are active.
@@ -355,18 +355,19 @@ mod tests {
     fn tool_blocks_follow_the_active_tools() {
         let bare = SystemPromptBuilder::build(&environment(), &["read_file"]).text;
         assert!(!bare.contains("Delegating to sub-agents"));
-        assert!(!bare.contains("persistent Python REPL"));
+        assert!(!bare.contains("persistent CPython REPL"));
         assert!(!bare.contains("web_search"));
         let full =
             SystemPromptBuilder::build(&environment(), &["delegate", "ipython", "web_search"]).text;
         assert!(full.contains("# Delegating to sub-agents"));
-        assert!(full.contains("persistent Python REPL"));
+        assert!(full.contains("persistent CPython REPL"));
         assert!(full.contains("rlm.spawn"));
+        // prime-agent's core layer describes `rlm.spawn` with the REPL, as
+        // prime-agent's prompt does; the tail says how deep the agent is.
         assert!(
-            !SystemPromptBuilder::build(&environment(), &["ipython"])
+            SystemPromptBuilder::build(&environment(), &["ipython"])
                 .text
-                .contains("rlm.spawn"),
-            "without workers there is no rlm.spawn to describe"
+                .contains("rlm.spawn")
         );
         assert!(full.contains("web_search"));
     }

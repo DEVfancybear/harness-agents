@@ -644,8 +644,12 @@ async fn m3_01_empty_unterminated_stream_exhausts_the_retry_bound() {
     close(store).await;
 }
 
+/// prime-agent's stream drop: a stream that ends without its terminal marker
+/// - after text, reasoning, a signature or a half-written call - is re-issued,
+/// and once the retries run out the turn fails with the drop; nothing the cut
+/// stream carried is ever dispatched.
 #[tokio::test]
-async fn m3_01_payload_bearing_unterminated_streams_are_not_retried() {
+async fn m3_01_payload_bearing_unterminated_streams_are_retried_then_fail() {
     for payload in [
         ProviderStreamEvent::text("partial answer"),
         ProviderStreamEvent::text(" "),
@@ -664,7 +668,7 @@ async fn m3_01_payload_bearing_unterminated_streams_are_not_retried() {
         ])]));
         let (runtime, _) = runtime_for(&store, provider.clone(), None, None).await;
         let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)));
-        let outcome = driver
+        let error = driver
             .run_turn(
                 request(
                     &bench.workspace,
@@ -677,28 +681,12 @@ async fn m3_01_payload_bearing_unterminated_streams_are_not_retried() {
                 CancellationToken::new(),
             )
             .await
-            .expect("partial output is reported, not dispatched");
-        assert_eq!(outcome.stop, TurnStop::Unverified);
-        assert_eq!(provider.calls(), 1);
-        assert!(outcome.executions.is_empty());
-        let history = harness_runtime::conversation_history(&store, &outcome.session_id)
-            .await
-            .unwrap();
+            .expect_err("a dropped stream is no answer");
         assert!(
-            !history.interrupted_replayed,
-            "unverified calls are not replayed"
+            error.to_string().contains("dropped before it finished"),
+            "{error}"
         );
-        assert_eq!(history.messages.len(), 2);
-        assert_eq!(
-            history.messages[1].content,
-            "(no reply was recorded for this turn)"
-        );
-        assert!(
-            history
-                .messages
-                .iter()
-                .all(|message| message.tool_calls.is_empty())
-        );
+        assert!(provider.calls() > 1, "the dropped stream was re-issued");
         drop(driver);
         close(store).await;
     }
@@ -709,8 +697,8 @@ async fn m3_01_incomplete_stream_is_not_dispatched() {
     let bench = bench();
     let store = bench.open_store().await;
     // A06 at the loop level: the stream never reached a terminal marker and
-    // its one call has unparseable arguments. The response is reported, but
-    // nothing may execute and the turn is not a completed answer.
+    // its one call has unparseable arguments. It is re-issued as prime-agent's
+    // stream drop is, and when every attempt drops nothing executes.
     let provider = Arc::new(ScriptedProvider::new(vec![ScriptStep::Events(vec![
         ProviderStreamEvent::started(),
         ProviderStreamEvent::tool_delta("call-1", "search_text", "{\"query\":".to_owned()),
@@ -718,7 +706,7 @@ async fn m3_01_incomplete_stream_is_not_dispatched() {
     let (runtime, _) = runtime_for(&store, provider.clone(), None, None).await;
     let driver = TurnDriver::new(runtime, ToolExecutionService::new(Arc::clone(&store)))
         .with_goal(goal_with(EvidenceKind::ToolExecution, 2, 1));
-    let outcome = driver
+    let error = driver
         .run_turn(
             request(
                 &bench.workspace,
@@ -731,18 +719,11 @@ async fn m3_01_incomplete_stream_is_not_dispatched() {
             CancellationToken::new(),
         )
         .await
-        .expect("turn runs");
-    assert_eq!(outcome.stop, TurnStop::Unverified);
-    assert_eq!(outcome.acceptance, AcceptanceState::Unverified);
-    assert!(outcome.executions.is_empty(), "nothing may execute");
-    assert_eq!(
-        provider.calls(),
-        1,
-        "a truncated stream is not retried as a turn"
+        .expect_err("a dropped stream is no answer");
+    assert!(
+        error.to_string().contains("dropped before it finished"),
+        "{error}"
     );
-    let run = store.run_by_id(&outcome.run_id).await.unwrap().unwrap();
-    assert_eq!(run.state, RunState::Failed);
-    assert_eq!(run.stop_reason.as_deref(), Some("unverified"));
     drop(driver);
     close(store).await;
 }

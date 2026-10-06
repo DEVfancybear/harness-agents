@@ -503,22 +503,24 @@ mod tests {
             .expect("known")
             .expect("ok");
         assert!(reply["goal"].is_null());
+        // prime-agent's `validate_goal_budget`: a positive integer, or none.
         assert!(
-            host.handle(&json!({"type": "goal.create", "objective": "x", "token_budget": 5}))
+            host.handle(&json!({"type": "goal.create", "objective": "x", "token_budget": 0}))
                 .await
                 .expect("known")
                 .is_err(),
-            "ha has no token budgets"
+            "a budget must be a positive integer"
         );
         let created = host
-            .handle(&json!({"type": "goal.create", "objective": "ship it"}))
+            .handle(&json!({"type": "goal.create", "objective": "ship it", "token_budget": 5000}))
             .await
             .expect("known")
             .expect("ok");
         assert_eq!(created["goal"]["status"], "active");
-        assert!(
-            matches!(events.try_recv(), Ok(SessionEvent::GoalCreated { objective, .. }) if objective == "ship it")
-        );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SessionEvent::GoalCreated { objective, token_budget: Some(5000) }) if objective == "ship it"
+        ));
         assert!(
             host.handle(&json!({"type": "goal.create", "objective": "another"}))
                 .await

@@ -1393,7 +1393,7 @@ mod tests {
     #[test]
     fn t03_tab_completes_only_a_unique_slash_command() {
         let mut editor = LineEditor::new();
-        type_text(&mut editor, "/res");
+        type_text(&mut editor, "/resu");
         assert_eq!(names(&editor), ["/resume"]);
         assert_eq!(
             editor.handle(Key::Tab),
@@ -1497,7 +1497,7 @@ mod tests {
     #[test]
     fn inline_slash_completion_only_replaces_text_at_the_cursor() {
         let mut editor = LineEditor::new();
-        type_text(&mut editor, "Mở /he sau");
+        type_text(&mut editor, "Mở /hel sau");
         for _ in 0..4 {
             let _ = editor.handle(Key::Left);
         }
@@ -1604,7 +1604,7 @@ mod tests {
             "a dismissed menu accepts nothing"
         );
 
-        type_text(&mut editor, "s");
+        type_text(&mut editor, "su");
         assert_eq!(names(&editor), ["/resume"], "the next edit brings it back");
     }
 

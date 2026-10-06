@@ -1152,7 +1152,15 @@ impl InteractiveController {
         // prime-agent's double-Escape on an idle prompt: a second press within
         // half a second clears the draft, or opens the session tree when the
         // prompt is empty.
-        if key == Key::Esc && !self.phase.has_active_run() && self.signing_in.is_none() {
+        // Only where Escape has nothing else to do: a masked key entry or an open
+        // menu keeps its own Escape, and the first press still does what Escape
+        // does.
+        if key == Key::Esc
+            && !self.phase.has_active_run()
+            && self.signing_in.is_none()
+            && !self.editor.secret_entry()
+            && self.editor.suggestions().is_empty()
+        {
             if self
                 .escape_armed_at
                 .take()
@@ -1165,7 +1173,6 @@ impl InteractiveController {
                 return vec![Effect::Redraw];
             }
             self.escape_armed_at = Some(Instant::now());
-            return Vec::new();
         }
         if key == Key::Esc && self.signing_in.is_some() && self.editor.is_empty() {
             self.signing_in = None;
@@ -7209,7 +7216,7 @@ Command: \"npm run build\""
         assert_eq!(state.suggestion_selected, 0);
         assert_eq!(state.buffer, "/", "and the draft is untouched");
 
-        type_text(&mut harness.controller, "res");
+        type_text(&mut harness.controller, "resu");
         let state = harness.controller.ui_state();
         assert_eq!(
             state
@@ -7227,7 +7234,7 @@ Command: \"npm run build\""
             0,
             "one match: the highlight cannot move off it"
         );
-        assert_eq!(harness.controller.ui_state().buffer, "/res");
+        assert_eq!(harness.controller.ui_state().buffer, "/resu");
     }
 
     /// Tab accepts the highlighted command even when several match - that is what
@@ -7290,7 +7297,7 @@ Command: \"npm run build\""
     fn slash_enter_picks_a_row_and_runs_it_when_it_is_whole() {
         let mut harness = tui_bench(true);
         let _ = harness.controller.boot_lines();
-        type_text(&mut harness.controller, "/he");
+        type_text(&mut harness.controller, "/hel");
         let _ = harness.controller.handle_key(Key::Enter);
         assert!(
             matches!(

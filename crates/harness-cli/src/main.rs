@@ -24,9 +24,6 @@ use harness_types::{
     PluginManifest, ProjectId, ScopeId, ServiceContract, SessionId, TaskId, WorkspaceObservation,
 };
 
-/// Personal coding-agent harness.
-///
-/// Bare `ha` opens the interactive app; `ha exec` runs one prompt headless.
 /// prime-agent's `schedule <list|add|cancel>`.
 #[derive(Debug, Subcommand)]
 enum ScheduleCommand {
@@ -63,6 +60,9 @@ enum ScheduleCommand {
     },
 }
 
+/// Personal coding-agent harness.
+///
+/// Bare `ha` opens the interactive app; `ha exec` runs one prompt headless.
 #[derive(Debug, Parser)]
 #[command(name = "ha", version, about, args_conflicts_with_subcommands = true)]
 struct Cli {
