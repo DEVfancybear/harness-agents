@@ -667,12 +667,7 @@ mod tests {
             let body = r#"{"access_token":"fresh","expires_in":3600}"#;
             write!(
                 stream,
-                "HTTP/1.1 200 OK
-Content-Type: application/json
-Content-Length: {}
-Connection: close
-
-{body}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             )
             .expect("response");

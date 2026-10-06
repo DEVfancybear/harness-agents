@@ -10022,15 +10022,9 @@ Command: \"npm run build\""
             harness.controller.handle_key(Key::ExternalEditor),
             vec![Effect::EditExternally("draft".to_owned())]
         );
-        let _ = harness.controller.handle_key(Key::SetDraft(
-            "edited
-lines"
-                .to_owned(),
-        ));
-        assert_eq!(
-            harness.controller.editor.text(),
-            "edited
-lines"
-        );
+        let _ = harness
+            .controller
+            .handle_key(Key::SetDraft("edited\nlines".to_owned()));
+        assert_eq!(harness.controller.editor.text(), "edited\nlines");
     }
 }

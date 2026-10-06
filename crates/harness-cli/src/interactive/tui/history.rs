@@ -114,7 +114,7 @@ pub fn render(item: &HistoryItem, width: u16, theme: &Theme, detail: Detail) -> 
         } => run_rows(outcome, *steps, *tool_calls, *elapsed, width, theme),
         // prime-agent shows no row for an admitted input: the user box is the record.
         HistoryItem::RunAccepted { .. } => Vec::new(),
-        HistoryItem::Error { message } => error_rows(message, width, theme),
+        HistoryItem::Error { message } => error_rows(message, width, theme, detail),
         HistoryItem::Message { text } => vec![Line::from(Span::raw(text.clone()))],
         HistoryItem::Notice { message } => notice_rows(message, width, theme),
         HistoryItem::AgentExchange { from, to, text } => {
@@ -323,7 +323,64 @@ fn injected_prompt(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> 
 }
 
 /// prime-agent's `⚠ Error: msg`, after a blank row.
-fn error_rows(message: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+/// prime-agent's `startsStackContext`: the leading rows of a traceback.
+fn starts_stack_context(line: &str) -> bool {
+    line.starts_with("Traceback ")
+        || (line.starts_with("File ") && line.contains(", line "))
+        || (line.starts_with("Cell In[") && line.contains(", line "))
+        || line.starts_with("---->")
+}
+
+/// prime-agent's `summarizeErrorDetails`: the first line, or the last line
+/// outside the stack context when the error opens with a traceback.
+fn summarize_error(text: &str) -> String {
+    let lines = text
+        .split('\n')
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    let Some(first) = lines.first() else {
+        return "Error".to_owned();
+    };
+    if lines.len() > 1 && starts_stack_context(first.trim()) {
+        return lines
+            .iter()
+            .rev()
+            .find(|line| {
+                !starts_stack_context(line.trim_start())
+                    && !line.starts_with(' ')
+                    && !line.starts_with('\t')
+            })
+            .map_or_else(|| "Error".to_owned(), |line| line.trim().to_owned());
+    }
+    first.trim().to_owned()
+}
+
+/// prime-agent's `CollapsibleErrorComponent`: a multi-line error shows its
+/// summary line until the detail mode is expanded (Ctrl+O); an error ending
+/// in the login hint reads as one line, as prime-agent's
+/// `formatInlineLoginRecoveryMessage` does.
+fn error_rows(
+    message: &str,
+    width: u16,
+    theme: &Theme,
+    detail: super::super::events::Detail,
+) -> Vec<Line<'static>> {
+    const LOGIN_RECOVERY: &str = "Run /login to update credentials.";
+    let normalized = message.replace("\r\n", "\n").replace('\r', "\n");
+    let normalized = normalized.trim_end();
+    let inline_login = normalized
+        .strip_suffix(&format!("\n\n{LOGIN_RECOVERY}"))
+        .map(str::trim_end)
+        .filter(|base| !base.is_empty() && !base.contains('\n'))
+        .map(|base| format!("{base} · {LOGIN_RECOVERY}"));
+    let shown = match inline_login {
+        Some(line) => line,
+        None if normalized.contains('\n') && detail != super::super::events::Detail::Expanded => {
+            summarize_error(normalized)
+        }
+        None => normalized.to_owned(),
+    };
+    let message = shown.as_str();
     let mut rows = vec![Line::default()];
     rows.extend(margined(
         vec![
@@ -1257,6 +1314,61 @@ fn wrap_words(spans: Vec<Span<'static>>, width: usize, hang: usize) -> Vec<Line<
 #[cfg(test)]
 mod tests {
     use super::{render, wrap_spans};
+
+    /// prime-agent's collapsible error: a traceback shows its last line until
+    /// the detail mode is expanded; the login hint stays on the line.
+    #[test]
+    fn a_multi_line_error_collapses_to_its_summary() {
+        assert_eq!(
+            super::summarize_error(
+                "Traceback (most recent call last):\n  File \"x.py\", line 1, in <module>\nValueError: bad"
+            ),
+            "ValueError: bad"
+        );
+        assert_eq!(super::summarize_error("first\nsecond"), "first");
+        let text = |detail| {
+            super::error_rows(
+                "boom\nat frame one\nat frame two",
+                80,
+                &crate::interactive::tui::theme::Theme::plain(),
+                detail,
+            )
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+        };
+        let collapsed = text(crate::interactive::events::Detail::Collapsed);
+        assert!(
+            collapsed.contains("boom") && !collapsed.contains("frame two"),
+            "{collapsed}"
+        );
+        assert!(text(crate::interactive::events::Detail::Expanded).contains("frame two"));
+        let login = super::error_rows(
+            "401 Unauthorized\n\nRun /login to update credentials.",
+            80,
+            &crate::interactive::tui::theme::Theme::plain(),
+            crate::interactive::events::Detail::Collapsed,
+        )
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(
+            login.contains("401 Unauthorized · Run /login to update credentials."),
+            "{login}"
+        );
+    }
     use crate::interactive::events::{Detail, HistoryItem, RunOutcome, ToolState};
     use crate::interactive::tui::markdown::plain_text;
     use crate::interactive::tui::theme::Theme;
