@@ -2324,18 +2324,50 @@ fn announce_settled(
     }
 }
 
+/// The usage of the model call in flight: held until the call completes.
+#[derive(Default)]
+struct UsageHold {
+    held: Option<TurnProgress>,
+    completed: bool,
+}
+
+impl UsageHold {
+    /// A usage report: held while the call streams, passed on after it completed.
+    fn report(&mut self, report: TurnProgress) -> Option<TurnProgress> {
+        if self.completed {
+            Some(report)
+        } else {
+            self.held = Some(report);
+            None
+        }
+    }
+
+    /// The call completed: what it reported last.
+    fn complete(&mut self) -> Option<TurnProgress> {
+        self.completed = true;
+        self.held.take()
+    }
+
+    /// A new attempt starts: what the last one reported and never completed.
+    fn restart(&mut self) -> Option<TurnProgress> {
+        self.completed = false;
+        self.held.take()
+    }
+}
+
 fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
     let observer = Arc::clone(observer);
     // Every attempt of one model call opens with `Started`; a second one means
     // the runtime is retrying, and the deltas that follow repeat the answer.
     let attempts = std::sync::atomic::AtomicUsize::new(0);
     let streaming_call = std::sync::Mutex::new(String::new());
-    // What this attempt has already reported. Some endpoints repeat the call's
-    // cumulative usage on every frame (OpenCode does); passing each frame on
-    // counted one call many times over in the session's cost. Only the growth
-    // since the last frame is passed on, so repeated totals add nothing and a
-    // provider that reports once is passed on whole.
-    let reported = std::sync::Mutex::new([0_u64; 4]);
+    // One usage per model call. Some endpoints repeat the call's cumulative usage
+    // on every frame (OpenCode does): passing each frame on counted one call many
+    // times over in the session's cost. The latest report of an attempt is held
+    // and passed on, whole, once the attempt has completed; a report that comes
+    // after the completion (Anthropic's final usage) is passed on at once, and an
+    // attempt that is retried passes on what it reported before it ends.
+    let usage = std::sync::Mutex::new(UsageHold::default());
     Arc::new(move |event: ProviderStreamEvent| match event {
         ProviderStreamEvent::ToolCallDelta { call_id, name, .. } => {
             let first = streaming_call.lock().is_ok_and(|mut current| {
@@ -2351,11 +2383,16 @@ fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
             }
         }
         ProviderStreamEvent::Started { .. } => {
-            if let Ok(mut reported) = reported.lock() {
-                *reported = [0; 4];
+            if let Some(held) = usage.lock().ok().and_then(|mut hold| hold.restart()) {
+                observer.observe(held);
             }
             if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
                 observer.observe(TurnProgress::StreamRestarted);
+            }
+        }
+        ProviderStreamEvent::Completed { .. } => {
+            if let Some(held) = usage.lock().ok().and_then(|mut hold| hold.complete()) {
+                observer.observe(held);
             }
         }
         ProviderStreamEvent::TextDelta { text } => observer.observe(TurnProgress::TextDelta(text)),
@@ -2369,27 +2406,14 @@ fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
             cache_write_tokens,
             ..
         } => {
-            let now = [
+            let report = TurnProgress::Usage {
                 prompt_tokens,
                 completion_tokens,
                 cache_read_tokens,
                 cache_write_tokens,
-            ];
-            let growth = reported.lock().map_or(now, |mut reported| {
-                let growth =
-                    std::array::from_fn(|index| now[index].saturating_sub(reported[index]));
-                for (seen, value) in reported.iter_mut().zip(now) {
-                    *seen = (*seen).max(value);
-                }
-                growth
-            });
-            if growth.iter().any(|value| *value > 0) {
-                observer.observe(TurnProgress::Usage {
-                    prompt_tokens: growth[0],
-                    completion_tokens: growth[1],
-                    cache_read_tokens: growth[2],
-                    cache_write_tokens: growth[3],
-                });
+            };
+            if let Some(now) = usage.lock().ok().and_then(|mut hold| hold.report(report)) {
+                observer.observe(now);
             }
         }
         _ => {}
@@ -3241,45 +3265,52 @@ mod stream_restart_tests {
     }
 
     /// Some endpoints repeat a call's cumulative usage on every frame; the session's
-    /// cost must count the call once.
+    /// cost must count the call once, with its last, whole report.
     #[test]
     fn repeated_cumulative_usage_is_counted_once() {
         let recorder = Arc::new(Recorder::default());
         let observer: Arc<dyn TurnObserver> = recorder.clone();
         let sink = sink_for(&observer);
+        let reports = |recorder: &Recorder| {
+            recorder
+                .0
+                .lock()
+                .expect("log")
+                .iter()
+                .filter_map(|progress| match progress {
+                    TurnProgress::Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        cache_read_tokens,
+                        cache_write_tokens,
+                    } => Some([
+                        *prompt_tokens,
+                        *completion_tokens,
+                        *cache_read_tokens,
+                        *cache_write_tokens,
+                    ]),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
         sink(ProviderStreamEvent::started());
         sink(ProviderStreamEvent::usage(1000, 10, 1010).with_cache(800, 0));
         sink(ProviderStreamEvent::usage(1000, 10, 1010).with_cache(800, 0));
         sink(ProviderStreamEvent::usage(1000, 25, 1025).with_cache(800, 0));
-        let mut totals = [0_u64; 4];
-        for progress in recorder.0.lock().expect("log").iter() {
-            if let TurnProgress::Usage {
-                prompt_tokens,
-                completion_tokens,
-                cache_read_tokens,
-                cache_write_tokens,
-            } = progress
-            {
-                totals[0] += prompt_tokens;
-                totals[1] += completion_tokens;
-                totals[2] += cache_read_tokens;
-                totals[3] += cache_write_tokens;
-            }
-        }
-        assert_eq!(totals, [1000, 25, 800, 0]);
-        // A second call is counted in full.
+        assert!(
+            reports(&recorder).is_empty(),
+            "nothing counts while the call streams"
+        );
+        sink(ProviderStreamEvent::completed("stop"));
+        assert_eq!(reports(&recorder), vec![[1000, 25, 800, 0]]);
+        // Anthropic reports after the completion; that report counts as it comes.
         sink(ProviderStreamEvent::started());
+        sink(ProviderStreamEvent::completed("stop"));
         sink(ProviderStreamEvent::usage(1200, 5, 1205).with_cache(1000, 0));
-        let calls = recorder
-            .0
-            .lock()
-            .expect("log")
-            .iter()
-            .filter(|progress| matches!(progress, TurnProgress::Usage { .. }))
-            .count();
         assert_eq!(
-            calls, 3,
-            "two growths of the first call, one for the second"
+            reports(&recorder),
+            vec![[1000, 25, 800, 0], [1200, 5, 1000, 0]],
+            "one whole report per call"
         );
     }
 
