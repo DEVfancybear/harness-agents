@@ -21,7 +21,7 @@ use super::terminal::{CrosstermBackend, RawModeGuard, TerminalBackend};
 use super::view;
 
 /// Validated interactive launch request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AppLaunch {
     pub cwd: Option<PathBuf>,
     pub resume: Option<String>,
@@ -142,7 +142,13 @@ fn run_terminal(
         );
         let prefs = super::tui::fullscreen::prefs(environment, &context.paths.config_file);
         match super::agents::client::start_attached(context, spec, size.0) {
-            Ok(mut remote) => return run_remote(backend, &mut remote, prefs),
+            Ok(mut remote) => {
+                let code = run_remote(backend, &mut remote, prefs)?;
+                if code == super::agents_view::AGENTS_VIEW_EXIT {
+                    return agents_view_loop(context, environment, None);
+                }
+                return Ok(code);
+            }
             Err(error) => eprintln!(
                 "ha: the background agent could not start ({error}); this terminal runs the session\r"
             ),
@@ -173,10 +179,97 @@ fn run_remote(
     prefs: super::tui::fullscreen::Prefs,
 ) -> Result<u8, HarnessError> {
     let code = super::tui::run(backend, remote, None, prefs)?;
-    if let Some(hint) = super::agents::detach_hint(remote) {
+    if code != super::agents_view::AGENTS_VIEW_EXIT
+        && let Some(hint) = super::agents::detach_hint(remote)
+    {
         eprintln!("{hint}");
     }
     Ok(code)
+}
+
+/// prime-agent's agents-view loop: the view, then the session it opened,
+/// then the view again when that session asks for it (Left on an empty
+/// prompt, a bare `/resume`); any other way out of the session ends the loop.
+/// The caller holds raw mode.
+///
+/// # Errors
+/// The console cannot hold the view, or a session could not start.
+pub fn agents_view_loop(
+    context: &LaunchContext,
+    environment: &LaunchEnvironment,
+    mut notice: Option<String>,
+) -> Result<u8, HarnessError> {
+    let refused = |message: String| HarnessError::new(ErrorCode::RuntimeBlocked, message);
+    loop {
+        let choice =
+            super::agents_view::run(context, environment, notice.take()).map_err(refused)?;
+        let backend = CrosstermBackend;
+        let size = backend.size().unwrap_or((TUI_MIN_COLUMNS, TUI_MIN_ROWS));
+        let prefs = super::tui::fullscreen::prefs(environment, &context.paths.config_file);
+        let attached = match choice {
+            super::agents_view::Choice::Quit => return Ok(0),
+            super::agents_view::Choice::Open(listed) => {
+                super::agents::client::RemoteFrontend::attach(
+                    &listed.descriptor,
+                    &listed.agent.id,
+                    size.0,
+                )
+            }
+            super::agents_view::Choice::Resume(session_id) => {
+                let spec = super::agents::spec_for_launch(
+                    context,
+                    environment,
+                    None,
+                    Some(session_id),
+                    false,
+                    &super::config::ConfigOverrides::default(),
+                );
+                super::agents::client::start_attached(context, spec, size.0)
+            }
+            super::agents_view::Choice::New => {
+                let spec = super::agents::spec_for_launch(
+                    context,
+                    environment,
+                    None,
+                    None,
+                    false,
+                    &super::config::ConfigOverrides::default(),
+                );
+                super::agents::client::start_attached(context, spec, size.0)
+            }
+        };
+        let mut remote = match attached {
+            Ok(remote) => remote,
+            Err(error) => {
+                notice = Some(error);
+                continue;
+            }
+        };
+        let code = run_remote(backend, &mut remote, prefs)?;
+        if code != super::agents_view::AGENTS_VIEW_EXIT {
+            return Ok(code);
+        }
+    }
+}
+
+/// prime-agent's `agents`: the agents view of this directory's project, in
+/// this terminal.
+///
+/// # Errors
+/// The console cannot hold the view.
+pub fn agents_view_command() -> Result<ExitCode, HarnessError> {
+    super::terminal::install_panic_hook();
+    let environment = LaunchEnvironment::capture();
+    let context = resolve_context(&AppLaunch::default(), &environment)?;
+    super::keybindings::install(&context.paths.config_file);
+    let _guard = RawModeGuard::enter().map_err(|error| {
+        HarnessError::new(
+            ErrorCode::RuntimeBlocked,
+            format!("the agents view needs an interactive terminal ({error})"),
+        )
+    })?;
+    let code = agents_view_loop(&context, &environment, None)?;
+    Ok(ExitCode::from(code))
 }
 
 /// `ha attach <agent>`: this terminal becomes the agent's.
@@ -223,7 +316,13 @@ pub fn attach(selector: &str) -> Result<ExitCode, HarnessError> {
         },
         |paths| super::tui::fullscreen::prefs(&environment, &paths.config_file),
     );
-    let code = run_remote(backend, &mut remote, prefs)?;
+    let mut code = run_remote(backend, &mut remote, prefs)?;
+    // The session asked for the agents view: the view of this directory's
+    // project, then whatever it opens.
+    if code == super::agents_view::AGENTS_VIEW_EXIT {
+        let context = resolve_context(&AppLaunch::default(), &environment)?;
+        code = agents_view_loop(&context, &environment, None)?;
+    }
     drop(guard);
     Ok(ExitCode::from(code))
 }

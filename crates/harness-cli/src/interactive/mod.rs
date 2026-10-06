@@ -7,6 +7,7 @@
 
 pub mod acp;
 pub mod agents;
+pub mod agents_view;
 pub mod allowlist;
 pub mod app;
 pub mod attachments;

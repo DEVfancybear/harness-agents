@@ -2944,6 +2944,56 @@ fn conversation_heads(
     (sessions, turns)
 }
 
+/// One saved conversation of a project, as the agents view lists it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SavedConversation {
+    /// The newest session of the conversation: what a resume continues.
+    pub session_id: String,
+    pub task_id: String,
+    pub title: Option<String>,
+    /// `provider/model` the conversation last talked to, when known.
+    pub model: Option<String>,
+    /// When its newest turn started (`YYYY-MM-DD HH:MM:SS`, UTC).
+    pub updated_at: String,
+    pub turns: usize,
+}
+
+/// The saved conversations of the project whose store is `store_dir`, newest
+/// first, as `/resume` lists them; nothing when the store cannot be read.
+pub async fn saved_conversations(store_dir: PathBuf, limit: usize) -> Vec<SavedConversation> {
+    let Ok(store) = SqliteStore::open_read_only(store_dir).await else {
+        return Vec::new();
+    };
+    let Ok(summaries) = store.list_sessions().await else {
+        return Vec::new();
+    };
+    let summaries = user_conversation_sessions(&store, summaries).await;
+    let (summaries, turns) = conversation_heads(summaries);
+    let mut saved = Vec::new();
+    for summary in summaries.into_iter().take(limit) {
+        let title = store
+            .session_setting(&summary.task_id, "title")
+            .await
+            .ok()
+            .flatten();
+        let model = store
+            .session_model(&summary.session_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|(provider, model)| format!("{provider}/{model}"));
+        saved.push(SavedConversation {
+            session_id: summary.session_id.as_str().to_owned(),
+            task_id: summary.task_id.as_str().to_owned(),
+            title,
+            model,
+            updated_at: summary.created_at.clone(),
+            turns: turns.get(summary.task_id.as_str()).copied().unwrap_or(1),
+        });
+    }
+    saved
+}
+
 impl AgentSessionService {
     #[must_use]
     #[cfg(test)]

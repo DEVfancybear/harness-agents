@@ -178,9 +178,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// List the background agents (sessions keep running after the terminal closes).
-    #[command(alias = "list")]
+    /// prime-agent's agents view: every running agent and this project's
+    /// saved conversations, to open, reply to, rename or stop. Prints the
+    /// list instead when not in a terminal or with --json.
     Agents {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the background agents (sessions keep running after the terminal closes).
+    List {
         /// Print JSON.
         #[arg(long)]
         json: bool,
@@ -786,6 +793,7 @@ fn legacy_command(cli: &Cli) -> bool {
             Command::Chat(_)
                 | Command::Exec(_)
                 | Command::Agents { .. }
+                | Command::List { .. }
                 | Command::Model(_)
                 | Command::Prompt { .. }
                 | Command::Attach { .. }
@@ -917,7 +925,16 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
             let stdin_dash = args.prompt.as_deref() == Some("-");
             run_chat(args.into(), stdin_dash).await
         }
-        Some(Command::Agents { json }) => interactive::agents::list_command(json),
+        Some(Command::Agents { json })
+            if !json
+                && std::io::IsTerminal::is_terminal(&std::io::stdin())
+                && std::io::IsTerminal::is_terminal(&std::io::stdout()) =>
+        {
+            interactive::app::agents_view_command()
+        }
+        Some(Command::Agents { json } | Command::List { json }) => {
+            interactive::agents::list_command(json)
+        }
         Some(Command::Model(ModelCommand::List { search, json })) => {
             interactive::cli_extras::model_list(search.as_deref(), json)
         }
@@ -1204,6 +1221,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
             Command::Chat(_)
             | Command::Exec(_)
             | Command::Agents { .. }
+            | Command::List { .. }
             | Command::Model(_)
             | Command::Prompt { .. }
             | Command::Attach { .. }

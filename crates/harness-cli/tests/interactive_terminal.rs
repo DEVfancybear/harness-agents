@@ -3590,3 +3590,29 @@ fn d07_pty_two_terminals_share_one_agent() {
     run_cli_json(&temp, &project, &["shutdown", "--force", "--json"]);
     let _ = first.wait_exit(Duration::from_secs(20));
 }
+
+/// prime-agent's agents view: `ha agents` lists every session; Ctrl+N starts
+/// one, Left on its empty prompt comes back to the view with the agent listed
+/// as idle, Ctrl+X twice stops it, and Esc leaves.
+#[ignore = "needs a real console; run scripts/Invoke-HaPtyAcceptance.ps1"]
+#[test]
+fn i22_agents_view_opens_returns_and_stops() {
+    let (temp, project) = sandbox();
+    let mut session = PtySession::spawn_process(&project, &base_env(&temp), &["agents"], &[]);
+    wait_for_normalized(&session, "No sessions yet.", Duration::from_secs(30));
+    wait_for_normalized(&session, "ctrl+n new", Duration::from_secs(10));
+    session.send("\u{e}");
+    wait_for_normalized(&session, "> Nhập yêu cầu", Duration::from_secs(60));
+    session.send("\u{1b}[D");
+    wait_for_normalized(&session, "Idle (1)", Duration::from_secs(30));
+    session.send("\u{18}");
+    wait_for_normalized(
+        &session,
+        "Press ctrl+x again to stop",
+        Duration::from_secs(10),
+    );
+    session.send("\u{18}");
+    wait_for_normalized(&session, "stopped", Duration::from_secs(30));
+    session.send("\u{1b}");
+    assert_eq!(session.wait_exit(Duration::from_secs(20)), Some(0));
+}

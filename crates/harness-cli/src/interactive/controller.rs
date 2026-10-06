@@ -1174,6 +1174,19 @@ impl InteractiveController {
             }
             self.escape_armed_at = Some(Instant::now());
         }
+        // prime-agent's agents-back: Left on an empty prompt hands this
+        // terminal to the agents view; the agent keeps running.
+        if key == Key::Left
+            && self.detachable
+            && self.editor.is_empty()
+            && self.editor.suggestions().is_empty()
+            && self.editor.picker().is_none()
+            && self.editor.overlay().is_none()
+            && self.pending_approval.is_none()
+            && self.pending_question.is_none()
+        {
+            return vec![Effect::Exit(super::agents_view::AGENTS_VIEW_EXIT)];
+        }
         if key == Key::Esc && self.signing_in.is_some() && self.editor.is_empty() {
             self.signing_in = None;
             self.service.cancel_sign_in();
@@ -3855,6 +3868,11 @@ impl InteractiveController {
                                 .to_owned(),
                     },
                 );
+            }
+            // prime-agent's bare `/resume` opens the agents view, from a
+            // session the background worker hosts.
+            "/resume" if argument.is_none() && self.detachable => {
+                return vec![Effect::Exit(super::agents_view::AGENTS_VIEW_EXIT)];
             }
             "/resume" => match argument {
                 None => {
