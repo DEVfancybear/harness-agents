@@ -34,6 +34,7 @@ pub mod instructions;
 pub mod mcp;
 pub mod mcp_config;
 pub mod oauth;
+pub mod offline;
 pub mod paths;
 pub mod permissions;
 pub mod project;

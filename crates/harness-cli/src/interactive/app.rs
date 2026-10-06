@@ -255,11 +255,17 @@ pub(super) fn controller_for_with_overrides(
         Box::new(FixtureService::new(channel.sender()))
     } else {
         // prime-agent refreshes its model catalog in the background; the snapshot
-        // compiled in keeps working when the download fails.
-        super::providers::refresh_in_background(&context.paths.data_dir);
-        super::providers::refresh_listed_models_for_logins(environment, &context.paths.data_dir);
-        if super::update_check::enabled(environment, &context.paths.config_file) {
-            super::update_check::refresh_in_background(&context.paths.data_dir);
+        // compiled in keeps working when the download fails. Offline mode
+        // skips every startup download.
+        if !super::offline::is_offline(environment) {
+            super::providers::refresh_in_background(&context.paths.data_dir);
+            super::providers::refresh_listed_models_for_logins(
+                environment,
+                &context.paths.data_dir,
+            );
+            if super::update_check::enabled(environment, &context.paths.config_file) {
+                super::update_check::refresh_in_background(&context.paths.data_dir);
+            }
         }
         Box::new(AgentSessionService::new_with_overrides(
             context,

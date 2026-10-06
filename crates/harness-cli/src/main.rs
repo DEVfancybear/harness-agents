@@ -37,6 +37,10 @@ struct Cli {
     /// added to it and the answer is printed, as `ha exec` prints it.
     #[arg(value_name = "MESSAGE")]
     message: Option<String>,
+    /// prime-agent's offline mode: no startup network operations (model
+    /// catalog, model lists, update check). `HA_OFFLINE=1` does the same.
+    #[arg(long, global = true)]
+    offline: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -800,7 +804,14 @@ fn error_report_json(error: &HarnessError) -> serde_json::Value {
 /// Route the launch contract added by `HA_LAUNCH` H01, then fall back to the
 /// unchanged legacy dispatch for every existing subcommand.
 async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
-    let Cli { command, message } = cli;
+    let Cli {
+        command,
+        message,
+        offline,
+    } = cli;
+    if offline {
+        interactive::offline::enable();
+    }
     match command {
         None if message.is_some() && !std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
             // prime-agent's print mode for piped input: the input follows
@@ -902,6 +913,7 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
             Box::pin(legacy_run(Cli {
                 command: Some(command),
                 message: None,
+                offline: false,
             }))
             .await?;
             Ok(ExitCode::SUCCESS)
