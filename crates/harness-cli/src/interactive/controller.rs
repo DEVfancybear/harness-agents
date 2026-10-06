@@ -5870,7 +5870,11 @@ mod tests {
         turns_listed(&mut harness, TurnsPurpose::Fork);
         assert!(matches!(
             harness.controller.ui_state().modal,
-            Some(Modal::TurnPicker { selected: 2, fork: true, .. })
+            Some(Modal::TurnPicker {
+                selected: 2,
+                fork: true,
+                ..
+            })
         ));
         let _ = harness.controller.handle_key(Key::Up);
         let _ = harness.controller.handle_key(Key::Enter);

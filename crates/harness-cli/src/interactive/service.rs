@@ -505,6 +505,10 @@ pub trait SessionPort: Send {
     fn provider_id(&self) -> Option<String> {
         None
     }
+    /// The provider and model id the next turn runs on.
+    fn current_model(&self) -> Option<(String, String)> {
+        None
+    }
     /// `provider/model` and its name, for every catalog model whose provider has a
     /// credential: what the `/model` menu offers.
     fn model_options(&self) -> Vec<(String, String)> {
@@ -3453,6 +3457,12 @@ impl SessionPort for AgentSessionService {
             Ok(config) => format!("{} via {}", config.model, config.endpoint),
             Err(_) => "setup required (no provider configured)".to_owned(),
         }
+    }
+
+    fn current_model(&self) -> Option<(String, String)> {
+        self.configured()
+            .ok()
+            .map(|config| (config.provider_id, config.model))
     }
 
     fn submit(&mut self, request: SubmitRequest) {

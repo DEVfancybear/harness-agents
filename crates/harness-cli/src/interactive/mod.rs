@@ -47,6 +47,7 @@ pub mod queue;
 pub mod refine;
 pub mod repl;
 pub mod routing;
+pub mod rpc;
 pub mod schedules;
 pub mod service;
 pub mod service_tier;
