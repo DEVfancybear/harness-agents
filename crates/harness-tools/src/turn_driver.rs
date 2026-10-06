@@ -396,6 +396,13 @@ const TRANSCRIPT_BUDGET_BYTES: usize = 200_000;
 /// How many of the newest tool results always stay whole.
 const KEEP_RECENT_RESULTS: usize = 6;
 
+/// Once the transcript is over budget it is cut down to this share of it, not
+/// to just under it. Every shortened result rewrites a message the provider
+/// already cached, and everything after it misses; cutting just enough meant a
+/// long turn rewrote one more old result at every step, so every step missed.
+/// Cutting a quarter of headroom at once lets the next steps append untouched.
+const TRIM_TARGET_PERCENT: usize = 75;
+
 /// What an elided tool result is replaced with.
 const ELIDED_RESULT: &str =
     "[earlier tool result shortened to save context; call the tool again if you need it]";
@@ -433,6 +440,7 @@ fn trim_transcript(
     if total <= budget {
         return Vec::new();
     }
+    let target = budget / 100 * TRIM_TARGET_PERCENT;
     let results = transcript
         .iter()
         .enumerate()
@@ -442,7 +450,7 @@ fn trim_transcript(
     let eligible = results.len().saturating_sub(keep_recent);
     let mut elided = Vec::new();
     for &index in results.iter().take(eligible) {
-        if total <= budget {
+        if total <= target {
             break;
         }
         let message = &mut transcript[index];
@@ -1002,9 +1010,12 @@ impl TurnDriver {
                             }
                             // The continuation instruction is host policy, not
                             // user text: the input was admitted once and this
-                            // never creates a second input identity.
+                            // never creates a second input identity. It goes in as
+                            // a user-role message: providers fold every system
+                            // message into the system prompt, so a system one here
+                            // changed the cached prefix and lost the conversation.
                             transcript.push(ProviderMessage::new(
-                                MessageRole::System,
+                                MessageRole::User,
                                 format!(
                                     "The goal is not complete yet. Next action: {next_action}. Produce the missing evidence, then answer again."
                                 ),
@@ -2319,6 +2330,12 @@ fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
     // the runtime is retrying, and the deltas that follow repeat the answer.
     let attempts = std::sync::atomic::AtomicUsize::new(0);
     let streaming_call = std::sync::Mutex::new(String::new());
+    // What this attempt has already reported. Some endpoints repeat the call's
+    // cumulative usage on every frame (OpenCode does); passing each frame on
+    // counted one call many times over in the session's cost. Only the growth
+    // since the last frame is passed on, so repeated totals add nothing and a
+    // provider that reports once is passed on whole.
+    let reported = std::sync::Mutex::new([0_u64; 4]);
     Arc::new(move |event: ProviderStreamEvent| match event {
         ProviderStreamEvent::ToolCallDelta { call_id, name, .. } => {
             let first = streaming_call.lock().is_ok_and(|mut current| {
@@ -2334,6 +2351,9 @@ fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
             }
         }
         ProviderStreamEvent::Started { .. } => {
+            if let Ok(mut reported) = reported.lock() {
+                *reported = [0; 4];
+            }
             if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
                 observer.observe(TurnProgress::StreamRestarted);
             }
@@ -2349,12 +2369,28 @@ fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
             cache_write_tokens,
             ..
         } => {
-            observer.observe(TurnProgress::Usage {
+            let now = [
                 prompt_tokens,
                 completion_tokens,
                 cache_read_tokens,
                 cache_write_tokens,
+            ];
+            let growth = reported.lock().map_or(now, |mut reported| {
+                let growth =
+                    std::array::from_fn(|index| now[index].saturating_sub(reported[index]));
+                for (seen, value) in reported.iter_mut().zip(now) {
+                    *seen = (*seen).max(value);
+                }
+                growth
             });
+            if growth.iter().any(|value| *value > 0) {
+                observer.observe(TurnProgress::Usage {
+                    prompt_tokens: growth[0],
+                    completion_tokens: growth[1],
+                    cache_read_tokens: growth[2],
+                    cache_write_tokens: growth[3],
+                });
+            }
         }
         _ => {}
     })
@@ -3093,6 +3129,26 @@ mod transcript_budget_tests {
         assert!(transcript[0].content.starts_with("step 0"));
     }
 
+    /// A trimmed transcript keeps a quarter of headroom, so the steps that follow
+    /// append to it without rewriting an older result: every rewrite is a cache
+    /// miss for the whole conversation after it.
+    #[test]
+    fn a_trim_leaves_headroom_so_the_next_steps_append_untouched() {
+        let mut transcript = (0..20)
+            .flat_map(|index| step(index, 15_000))
+            .collect::<Vec<_>>();
+        assert!(!trim_transcript(&mut transcript, 200_000, 6).is_empty());
+        for index in 20..24 {
+            let before = transcript.clone();
+            transcript.extend(step(index, 5_000));
+            assert!(
+                trim_transcript(&mut transcript, 200_000, 6).is_empty(),
+                "step {index} rewrote an older result"
+            );
+            assert_eq!(&transcript[..before.len()], &before[..]);
+        }
+    }
+
     #[test]
     fn a_transcript_within_budget_is_left_alone() {
         let mut transcript = (0..3)
@@ -3182,6 +3238,49 @@ mod stream_restart_tests {
         fn observe(&self, progress: TurnProgress) {
             self.0.lock().expect("log").push(progress);
         }
+    }
+
+    /// Some endpoints repeat a call's cumulative usage on every frame; the session's
+    /// cost must count the call once.
+    #[test]
+    fn repeated_cumulative_usage_is_counted_once() {
+        let recorder = Arc::new(Recorder::default());
+        let observer: Arc<dyn TurnObserver> = recorder.clone();
+        let sink = sink_for(&observer);
+        sink(ProviderStreamEvent::started());
+        sink(ProviderStreamEvent::usage(1000, 10, 1010).with_cache(800, 0));
+        sink(ProviderStreamEvent::usage(1000, 10, 1010).with_cache(800, 0));
+        sink(ProviderStreamEvent::usage(1000, 25, 1025).with_cache(800, 0));
+        let mut totals = [0_u64; 4];
+        for progress in recorder.0.lock().expect("log").iter() {
+            if let TurnProgress::Usage {
+                prompt_tokens,
+                completion_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            } = progress
+            {
+                totals[0] += prompt_tokens;
+                totals[1] += completion_tokens;
+                totals[2] += cache_read_tokens;
+                totals[3] += cache_write_tokens;
+            }
+        }
+        assert_eq!(totals, [1000, 25, 800, 0]);
+        // A second call is counted in full.
+        sink(ProviderStreamEvent::started());
+        sink(ProviderStreamEvent::usage(1200, 5, 1205).with_cache(1000, 0));
+        let calls = recorder
+            .0
+            .lock()
+            .expect("log")
+            .iter()
+            .filter(|progress| matches!(progress, TurnProgress::Usage { .. }))
+            .count();
+        assert_eq!(
+            calls, 3,
+            "two growths of the first call, one for the second"
+        );
     }
 
     /// A retried model call streams its answer again from the start: the

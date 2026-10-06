@@ -1827,6 +1827,12 @@ fn build_adapter(
                     model: catalog_reasoning,
                 }),
                 headers: extra_headers,
+                // OpenAI routes a cache by this key; other Chat endpoints may
+                // refuse an unknown field, so only OpenAI's own is sent it.
+                prompt_cache_key: config
+                    .endpoint
+                    .contains("api.openai.com")
+                    .then(|| session.chars().take(64).collect()),
             },
         )
         .map(|adapter| Arc::new(adapter) as Arc<dyn ModelProvider>),
@@ -6539,10 +6545,14 @@ async fn run_turn(
     let web_host = super::web::WebHost::from_environment(&environment, &data_dir);
     // Children run on a provider of their own, fixed at the model this turn
     // started with: `/model` in a later turn does not switch a child mid-task.
+    // Their cache key is the conversation's with `:agents` after it, as Codex
+    // keys a sub-session `{source}:{parent}`: siblings share their prefix with
+    // each other, and their traffic does not crowd the parent's cache route.
+    let child_cache_key = format!("{}:agents", task_id.as_ref());
     let child_provider = LiveProvider::build_scoped(
         &config,
         thinking_level,
-        task_id.as_ref(),
+        &child_cache_key,
         &data_dir,
         credentials::Scope::Subagent,
     )

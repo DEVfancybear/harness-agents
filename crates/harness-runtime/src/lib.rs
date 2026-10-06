@@ -482,11 +482,24 @@ const FITTED_RESULT: &str = "[this earlier tool result was removed to keep the c
 
 /// Shorten the oldest tool results until `messages` fit `budget` tokens, keeping
 /// the newest ones whole. Returns how many were shortened.
+///
+/// It cuts to three quarters of the budget, not just under it: each shortened
+/// result rewrites a message the provider cached, so cutting just enough made
+/// every following step of a long turn rewrite one more and miss the cache.
 fn fit_tool_results(messages: &mut [ProviderMessage], budget: u64) -> usize {
     let mut total = messages_tokens(messages);
+    if total <= budget {
+        return 0;
+    }
+    let target = budget / 4 * 3;
+    let newest = messages
+        .iter()
+        .rposition(|message| message.role == MessageRole::Tool);
     let mut shortened = 0;
-    for message in messages.iter_mut() {
-        if total <= budget {
+    for (index, message) in messages.iter_mut().enumerate() {
+        // The headroom is taken from older results only: once the budget is met,
+        // the newest result stays whole.
+        if total <= target || (total <= budget && Some(index) == newest) {
             break;
         }
         if message.role != MessageRole::Tool || message.content == FITTED_RESULT {
@@ -1413,8 +1426,10 @@ pub async fn conversation_history(
         messages.extend(imported_history(store, root).await?);
     }
     if omitted > 0 {
+        // A user-role note: every adapter folds system messages into the system
+        // prompt, so a system one here made the cached prefix differ by turn.
         messages.push(ProviderMessage::new(
-            MessageRole::System,
+            MessageRole::User,
             format!(
                 "{omitted} earlier turn(s) of this conversation are not shown; only the most recent ones follow."
             ),

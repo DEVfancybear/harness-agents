@@ -264,8 +264,10 @@ fn prime_message(message: &Value) -> Option<ProviderMessage> {
 /// earlier turns came from.
 #[must_use]
 pub fn imported_note(header: &SessionFileHeader) -> ProviderMessage {
+    // A user-role note, so the system prompt - the cache's prefix - stays the
+    // conversation's own.
     ProviderMessage::new(
-        MessageRole::System,
+        MessageRole::User,
         format!(
             "The conversation below was imported from a session file{}; it continues here.",
             header
