@@ -227,6 +227,8 @@ pub struct SkillRequests {
     created: std::sync::Mutex<Option<String>>,
     completed: AtomicBool,
     compact_scheduled: AtomicBool,
+    /// The session's usage, for what the context holds now.
+    usage: Option<Arc<std::sync::Mutex<super::cost::CostTracker>>>,
 }
 
 impl SkillRequests {
@@ -249,7 +251,15 @@ impl SkillRequests {
             created: std::sync::Mutex::new(None),
             completed: AtomicBool::new(false),
             compact_scheduled: AtomicBool::new(false),
+            usage: None,
         }
+    }
+
+    /// Read the context's size from the session's usage, for `compact.status`.
+    #[must_use]
+    pub fn with_usage(mut self, usage: Arc<std::sync::Mutex<super::cost::CostTracker>>) -> Self {
+        self.usage = Some(usage);
+        self
     }
 
     fn objective(&self) -> Option<String> {
@@ -374,12 +384,27 @@ impl SkillRequests {
     /// requesting cell, so `compact.run` only schedules it for the turn's end.
     fn compact(&self, kind: &str, request: &Value) -> Result<Value, String> {
         match kind {
-            "compact.status" => Ok(json!({
-                "tokens": null,
-                "context_window": self.context_window,
-                "percent": null,
-                "scheduled": self.compact_scheduled.load(Ordering::SeqCst),
-            })),
+            // prime-agent's `context_usage`: the context the latest response
+            // reported, against the window; unknown before a response.
+            "compact.status" => {
+                let tokens = self
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.lock().ok()?.context_tokens());
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "a percentage of token counts far below 2^52"
+                )]
+                let percent = tokens.filter(|_| self.context_window > 0).map(|tokens| {
+                    (tokens as f64 * 1000.0 / self.context_window as f64).round() / 10.0
+                });
+                Ok(json!({
+                    "tokens": tokens,
+                    "context_window": self.context_window,
+                    "percent": percent,
+                    "scheduled": self.compact_scheduled.load(Ordering::SeqCst),
+                }))
+            }
             "compact.run" => {
                 let instructions = match &request["instructions"] {
                     Value::Null => None,

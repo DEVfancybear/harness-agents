@@ -6363,8 +6363,8 @@ async fn run_turn(
         Some(shared) => {
             // `rlm.spawn` and its family run on this turn's delegated workers; the
             // other skills' requests are answered from the session's state.
-            let skills: Arc<dyn super::repl::HostRequests> =
-                Arc::new(super::skill_requests::SkillRequests::new(
+            let skills: Arc<dyn super::repl::HostRequests> = Arc::new(
+                super::skill_requests::SkillRequests::new(
                     Arc::clone(&refine_request),
                     sender.clone(),
                     super::skill_requests::ModelInfo {
@@ -6378,7 +6378,9 @@ async fn run_turn(
                         _ => None,
                     },
                     goal_host.clone(),
-                ));
+                )
+                .with_usage(Arc::clone(&cost_tracker)),
+            );
             let mut chain: Vec<Arc<dyn super::repl::HostRequests>> = vec![
                 skills,
                 Arc::clone(&heartbeats) as Arc<dyn super::repl::HostRequests>,
