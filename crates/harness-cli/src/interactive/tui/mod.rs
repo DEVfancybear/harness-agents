@@ -22,6 +22,7 @@ pub mod markdown;
 mod markdown_table;
 #[cfg(test)]
 mod preview;
+pub mod prompt_highlight;
 pub mod theme;
 pub mod widgets;
 

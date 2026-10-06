@@ -40,12 +40,21 @@ pub fn render(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// One dim row with prime-agent's one-cell left pad, cut with `...`.
+/// One dim row with prime-agent's one-cell left pad, cut with `...`; the
+/// message after its lane label is highlighted as the prompt is.
 fn row(text: &str, width: usize, theme: &Theme) -> Line<'static> {
-    Line::from(vec![
-        Span::raw(" "),
-        Span::styled(truncate(text, width), theme.dim),
-    ])
+    let shown = truncate(text, width);
+    let mut spans = vec![Span::raw(" ")];
+    match shown.split_once(": ") {
+        Some((label, message)) if text != HINT => {
+            spans.push(Span::styled(format!("{label}: "), theme.dim));
+            spans.extend(super::super::prompt_highlight::spans(
+                message, theme.dim, theme, true, None,
+            ));
+        }
+        _ => spans.push(Span::styled(shown, theme.dim)),
+    }
+    Line::from(spans)
 }
 
 /// `text` cut to `width` cells, ending in `...` when it was cut.

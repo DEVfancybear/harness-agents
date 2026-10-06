@@ -155,12 +155,28 @@ pub fn render(frame: &mut Frame, plan: &Plan, state: &UiState, theme: &Theme) {
     } else {
         for (index, row) in visible.iter().enumerate() {
             let absolute = index + usize::from(plan.composer_scroll);
-            let body = if absolute == 0 {
-                format!("{prefix}{row}")
+            // prime-agent's prompt highlighting: the command on the first row,
+            // `@path` and `--flag` tokens on every row. A row with nothing to
+            // colour stays one run.
+            let spans = super::super::prompt_highlight::spans(
+                row,
+                ratatui::style::Style::default(),
+                theme,
+                absolute == 0,
+                (absolute == 0).then_some(state.cursor),
+            );
+            let line = if spans.len() == 1 {
+                Line::from(if absolute == 0 {
+                    format!("{prefix}{row}")
+                } else {
+                    (*row).clone()
+                })
+            } else if absolute == 0 {
+                Line::from([vec![Span::raw(prefix.to_owned())], spans].concat())
             } else {
-                (*row).clone()
+                Line::from(spans)
             };
-            lines.push(Line::from(body));
+            lines.push(line);
         }
     }
     // The border is the box's state: an idle box is the accent, a working one is
