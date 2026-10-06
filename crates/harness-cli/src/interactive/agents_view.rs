@@ -7,19 +7,26 @@
 //! agent, resuming a saved conversation as one - and the session's own Left
 //! on an empty prompt (or a bare `/resume`) comes back here. Space writes a
 //! reply: sent to an agent, or the prompt a saved conversation resumes
-//! with in the background. Ctrl+R renames an agent, Ctrl+X stops one (press
-//! twice), Ctrl+N starts a new session, Esc leaves. The roster refreshes
-//! every second.
+//! with in the background. Ctrl+R renames an agent, Ctrl+X stops a running
+//! one or deletes a saved one (press twice), Ctrl+N starts a new session, Esc
+//! leaves. The roster refreshes every second.
 //!
-//! Not ported: prime-agent's scoped subagent tree (ha's children live inside
-//! one conversation, not as sessions of their own), the cost column, mouse
-//! hover, and deleting a saved session file.
+//! prime-agent's subagent forest: an agent with subagents carries one
+//! `N subagents (M running)` line; Alt+Right expands it to the subagents
+//! (running first, nested by depth) and Ctrl+O shows the program each was
+//! spawned with. A row shows its heartbeats as `◷N`. The mouse selects a row
+//! with a click and scrolls with the wheel.
+//!
+//! ha's store keeps every conversation, so deleting a saved one hides it
+//! from the listings rather than removing it. Not ported: the cost column.
 
 use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+};
 use crossterm::{execute, terminal};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -71,6 +78,19 @@ pub enum Target {
     Saved(SavedConversation),
 }
 
+/// prime-agent's row shapes (`RowKind`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RowKind {
+    /// A top-level agent or saved session.
+    Agent,
+    /// The `N subagents (M running)` line under an agent.
+    SubagentSummary,
+    /// A nested subagent of an expanded line.
+    Subagent,
+    /// A subagent's spawn program, read-only.
+    Code,
+}
+
 /// One session row.
 #[derive(Clone, Debug)]
 pub struct Row {
@@ -80,6 +100,25 @@ pub struct Row {
     pub model: String,
     pub age: String,
     pub target: Target,
+    pub kind: RowKind,
+    /// Nesting depth: 0 for an agent row.
+    pub depth: usize,
+}
+
+impl Row {
+    /// prime-agent's `selectable`: a program line is read-only context.
+    #[must_use]
+    pub fn selectable(&self) -> bool {
+        self.kind != RowKind::Code
+    }
+}
+
+/// What the forest shows: the expanded subagent lines and the parents whose
+/// spawn programs show.
+#[derive(Clone, Debug, Default)]
+pub struct Forest {
+    pub expanded: std::collections::HashSet<String>,
+    pub programs: std::collections::HashSet<String>,
 }
 
 /// What the user chose.
@@ -120,6 +159,19 @@ pub fn rows(
     query: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<Row> {
+    rows_with(live, saved, query, now, &Forest::default())
+}
+
+/// [`rows`] with the forest's expanded lines and shown programs.
+#[must_use]
+#[allow(clippy::too_many_lines)] // prime-agent's row builder, one shape per arm
+pub fn rows_with(
+    live: &[client::Listed],
+    saved: &[SavedConversation],
+    query: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    forest: &Forest,
+) -> Vec<Row> {
     let mut rows = Vec::new();
     for listed in live {
         let agent = &listed.agent;
@@ -135,12 +187,16 @@ pub fn rows(
                     | "waiting_mcp_input"
                     | "canceling"
             );
-        let title = agent
+        let mut title = agent
             .name
             .clone()
             .or_else(|| agent.last_request.as_deref().map(first_line))
             .filter(|title| !title.is_empty())
             .unwrap_or_else(|| agent.id.clone());
+        // prime-agent's row heartbeat count.
+        if agent.heartbeats > 0 {
+            title.push_str(&format!(" ◷{}", agent.heartbeats));
+        }
         rows.push(Row {
             section: if running {
                 Section::Running
@@ -156,7 +212,62 @@ pub fn rows(
                 age_label(agent.idle_seconds)
             },
             target: Target::Live(Box::new(listed.clone())),
+            kind: RowKind::Agent,
+            depth: 0,
         });
+        // prime-agent's subagent forest: one summary line, expanded to the
+        // subagents, running first.
+        if !agent.subagents.is_empty() {
+            let section = rows.last().map_or(Section::Idle, |row| row.section);
+            let running = agent
+                .subagents
+                .iter()
+                .filter(|child| child.status == "running")
+                .count();
+            let parent = format!("live:{}", agent.id);
+            let expanded = forest.expanded.contains(&parent);
+            rows.push(Row {
+                section,
+                identity: format!("subagents:{}", agent.id),
+                title: format!(
+                    "{} {} subagents ({running} running)",
+                    if expanded { "▾" } else { "▸" },
+                    agent.subagents.len()
+                ),
+                model: String::new(),
+                age: String::new(),
+                target: Target::Live(Box::new(listed.clone())),
+                kind: RowKind::SubagentSummary,
+                depth: 1,
+            });
+            if expanded {
+                for child in &agent.subagents {
+                    let depth = usize::try_from(child.depth).unwrap_or(1).max(1) + 1;
+                    rows.push(Row {
+                        section,
+                        identity: format!("sub:{}:{}", agent.id, child.name),
+                        title: format!("{} · {}", child.name, child.status),
+                        model: child.model.clone(),
+                        age: String::new(),
+                        target: Target::Live(Box::new(listed.clone())),
+                        kind: RowKind::Subagent,
+                        depth,
+                    });
+                    if forest.programs.contains(&parent) && !child.program.trim().is_empty() {
+                        rows.push(Row {
+                            section,
+                            identity: format!("code:{}:{}", agent.id, child.name),
+                            title: first_line(&child.program),
+                            model: String::new(),
+                            age: String::new(),
+                            target: Target::Live(Box::new(listed.clone())),
+                            kind: RowKind::Code,
+                            depth: depth + 1,
+                        });
+                    }
+                }
+            }
+        }
     }
     let live_tasks = live
         .iter()
@@ -181,8 +292,11 @@ pub fn rows(
             model: conversation.model.clone().unwrap_or_else(|| "-".to_owned()),
             age,
             target: Target::Saved(conversation.clone()),
+            kind: RowKind::Agent,
+            depth: 0,
         });
     }
+    // A stable sort: a forest stays under its agent.
     rows.sort_by_key(|row| row.section);
     let query = query.trim();
     if query.is_empty() {
@@ -190,6 +304,7 @@ pub fn rows(
     }
     let mut ranked = rows
         .into_iter()
+        .filter(|row| row.kind == RowKind::Agent)
         .filter_map(|row| {
             let haystack = format!("{} {} {}", row.title, row.model, row.identity);
             super::commands::fuzzy_score(query, &haystack.to_lowercase()).map(|score| (score, row))
@@ -218,11 +333,21 @@ struct View {
     selected: Option<String>,
     status: Option<String>,
     stop_armed: Option<(String, Instant)>,
+    forest: Forest,
+    /// Where the list's first row was drawn, for the mouse.
+    list_rows: std::cell::RefCell<Vec<(u16, String)>>,
+    store_dir: PathBuf,
 }
 
 impl View {
     fn rows(&self) -> Vec<Row> {
-        rows(&self.live, &self.saved, &self.query, chrono::Utc::now())
+        rows_with(
+            &self.live,
+            &self.saved,
+            &self.query,
+            chrono::Utc::now(),
+            &self.forest,
+        )
     }
 
     /// The selected row, kept on its identity while the roster changes.
@@ -240,13 +365,35 @@ impl View {
 
     fn move_selection(&mut self, delta: isize) {
         let rows = self.rows();
-        let Some(index) = self.selection(&rows) else {
+        let Some(mut index) = self.selection(&rows) else {
             return;
         };
-        let next = index
-            .saturating_add_signed(delta)
-            .min(rows.len().saturating_sub(1));
-        self.selected = Some(rows[next].identity.clone());
+        // Program lines are read-only: the selection steps over them.
+        loop {
+            let next = index
+                .saturating_add_signed(delta)
+                .min(rows.len().saturating_sub(1));
+            if next == index {
+                break;
+            }
+            index = next;
+            if rows[index].selectable() {
+                break;
+            }
+        }
+        if rows[index].selectable() {
+            self.selected = Some(rows[index].identity.clone());
+        }
+    }
+
+    /// The agent row a nested row belongs to.
+    fn parent_identity(row: &Row) -> Option<String> {
+        match &row.target {
+            Target::Live(listed) if row.kind != RowKind::Agent => {
+                Some(format!("live:{}", listed.agent.id))
+            }
+            _ => None,
+        }
     }
 
     fn refresh(&mut self) {
@@ -299,9 +446,17 @@ pub fn run(
         selected: None,
         status: notice,
         stop_armed: None,
+        forest: Forest::default(),
+        list_rows: std::cell::RefCell::new(Vec::new()),
+        store_dir: context.project_store_dir(),
     };
     let mut stdout = io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen).map_err(|error| error.to_string())?;
+    execute!(
+        stdout,
+        terminal::EnterAlternateScreen,
+        event::EnableMouseCapture
+    )
+    .map_err(|error| error.to_string())?;
     let result = (|| -> Result<Choice, String> {
         let mut screen = Terminal::new(CrosstermBackend::new(io::stdout()))
             .map_err(|error| error.to_string())?;
@@ -324,11 +479,32 @@ pub fn run(
                         return Ok(choice);
                     }
                 }
+                // prime-agent's mouse: a click selects a row, the wheel moves.
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::Down(_) => {
+                        let hit = view
+                            .list_rows
+                            .borrow()
+                            .iter()
+                            .find(|(y, _)| *y == mouse.row)
+                            .map(|(_, identity)| identity.clone());
+                        if let Some(identity) = hit {
+                            view.selected = Some(identity);
+                        }
+                    }
+                    MouseEventKind::ScrollUp => view.move_selection(-1),
+                    MouseEventKind::ScrollDown => view.move_selection(1),
+                    _ => {}
+                },
                 _ => {}
             }
         }
     })();
-    let _ = execute!(stdout, terminal::LeaveAlternateScreen);
+    let _ = execute!(
+        stdout,
+        event::DisableMouseCapture,
+        terminal::LeaveAlternateScreen
+    );
     let _ = stdout.flush();
     result
 }
@@ -383,8 +559,37 @@ fn handle_key(
         KeyCode::Down => view.move_selection(1),
         KeyCode::Home => view.selected = view.rows().first().map(|row| row.identity.clone()),
         KeyCode::End => view.selected = view.rows().last().map(|row| row.identity.clone()),
+        // prime-agent's `app.agents.expand` (Alt+Right): open or close the
+        // selected agent's subagent line.
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+            if let Some(row) = view.selected_row() {
+                let parent = View::parent_identity(&row).unwrap_or(row.identity.clone());
+                if !view.forest.expanded.remove(&parent) {
+                    view.forest.expanded.insert(parent);
+                }
+            }
+        }
+        // prime-agent's `app.agents.program` (Ctrl+O): show the programs the
+        // subagents were spawned with.
+        KeyCode::Char('o') if control => {
+            if let Some(row) = view.selected_row() {
+                let parent = View::parent_identity(&row).unwrap_or(row.identity.clone());
+                view.forest.expanded.insert(parent.clone());
+                if !view.forest.programs.remove(&parent) {
+                    view.forest.programs.insert(parent);
+                }
+            }
+        }
         KeyCode::Enter | KeyCode::Right => {
             let row = view.selected_row()?;
+            // The subagent line opens like Alt+Right; a subagent opens its agent.
+            if row.kind == RowKind::SubagentSummary {
+                let parent = View::parent_identity(&row).unwrap_or(row.identity.clone());
+                if !view.forest.expanded.remove(&parent) {
+                    view.forest.expanded.insert(parent);
+                }
+                return None;
+            }
             match row.target {
                 Target::Live(listed) => {
                     if listed.descriptor.build != super::agents::registry::build_identity() {
@@ -445,10 +650,34 @@ fn handle_key(
                     view.stop_armed = Some((identity, Instant::now()));
                 }
             }
-            Some(_) => {
-                view.status = Some(
-                    "a saved conversation is not running; there is nothing to stop".to_owned(),
-                );
+            // prime-agent's delete of a saved session (press twice).
+            Some(Row {
+                target: Target::Saved(conversation),
+                identity,
+                title,
+                ..
+            }) => {
+                let armed = view.stop_armed.take().is_some_and(|(armed, at)| {
+                    armed == identity && at.elapsed() < Duration::from_secs(3)
+                });
+                if armed {
+                    view.status = Some(
+                        match super::service::hide_conversation(
+                            &view.store_dir,
+                            &conversation.task_id,
+                        ) {
+                            Ok(()) => {
+                                view.saved
+                                    .retain(|saved| saved.task_id != conversation.task_id);
+                                format!("deleted {title}")
+                            }
+                            Err(error) => format!("could not delete {title}: {error}"),
+                        },
+                    );
+                } else {
+                    view.status = Some(format!("Press ctrl+x again to delete {title}"));
+                    view.stop_armed = Some((identity, Instant::now()));
+                }
             }
             None => {}
         },
@@ -673,6 +902,7 @@ fn draw(frame: &mut ratatui::Frame, view: &View, theme: &Theme) {
             frame,
         );
     } else {
+        view.list_rows.borrow_mut().clear();
         // Keep the selected row in view.
         let selected_identity = selected.map(|index| rows[index].identity.as_str());
         let selected_item = items
@@ -691,17 +921,26 @@ fn draw(frame: &mut ratatui::Frame, view: &View, theme: &Theme) {
                     theme.muted,
                 )),
                 Item::Row(row) => {
+                    if row.selectable() {
+                        view.list_rows
+                            .borrow_mut()
+                            .push((area.y + y, row.identity.clone()));
+                    }
                     let is_selected = Some(row.identity.as_str()) == selected_identity;
                     let marker = if is_selected { "❯ " } else { "  " };
+                    let indent = "  ".repeat(row.depth);
+                    let title = format!("{indent}{}", row.title);
                     let text = format!(
                         "{marker}{}  {}  {:>age_width$}",
-                        cell(&row.title, name_width),
+                        cell(&title, name_width),
                         cell(&row.model, model_width),
                         row.age
                     );
                     let style = if is_selected {
                         theme.selection
-                    } else if row.section == Section::Inactive {
+                    } else if row.kind == RowKind::Code {
+                        theme.muted
+                    } else if row.section == Section::Inactive || row.kind != RowKind::Agent {
                         theme.dim
                     } else {
                         ratatui::style::Style::default()
@@ -729,8 +968,21 @@ fn draw(frame: &mut ratatui::Frame, view: &View, theme: &Theme) {
             hints.push("ctrl+r rename".to_owned());
         }
         hints.push("space reply".to_owned());
-        if running {
-            hints.push("ctrl+x stop".to_owned());
+        hints.push(
+            if running {
+                "ctrl+x stop"
+            } else {
+                "ctrl+x delete"
+            }
+            .to_owned(),
+        );
+        if running
+            && rows
+                .iter()
+                .any(|other| other.kind == RowKind::SubagentSummary)
+        {
+            hints.push("alt+→ subagents".to_owned());
+            hints.push("ctrl+o program".to_owned());
         }
     }
     hints.push("ctrl+n new".to_owned());
@@ -776,6 +1028,8 @@ mod tests {
                 last_request: Some("fix the parser\nplease".to_owned()),
                 idle_seconds: 120,
                 worker_pid: 1,
+                subagents: Vec::new(),
+                heartbeats: 0,
             },
         }
     }
@@ -817,5 +1071,52 @@ mod tests {
         let hits = rows(&live, &saved, "old", now);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "old work");
+    }
+
+    #[test]
+    fn subagents_nest_under_their_agent_as_prime_nests_them() {
+        use super::{Forest, RowKind, rows_with};
+        use crate::interactive::agents::protocol::SubagentInfo;
+        let now = chrono::Utc::now();
+        let mut parent = agent("a1", "running", "t1");
+        parent.agent.heartbeats = 2;
+        parent.agent.subagents = vec![
+            SubagentInfo {
+                name: "scout".to_owned(),
+                status: "running".to_owned(),
+                model: "m".to_owned(),
+                depth: 1,
+                program: "look at the parser".to_owned(),
+            },
+            SubagentInfo {
+                name: "done".to_owned(),
+                status: "completed".to_owned(),
+                model: "m".to_owned(),
+                depth: 1,
+                program: String::new(),
+            },
+        ];
+        let live = [parent];
+        let closed = rows_with(&live, &[], "", now, &Forest::default());
+        assert_eq!(closed.len(), 2);
+        assert!(closed[0].title.ends_with("◷2"), "{}", closed[0].title);
+        assert_eq!(closed[1].kind, RowKind::SubagentSummary);
+        assert!(closed[1].title.contains("2 subagents (1 running)"));
+        let mut forest = Forest::default();
+        forest.expanded.insert("live:a1".to_owned());
+        forest.programs.insert("live:a1".to_owned());
+        let open = rows_with(&live, &[], "", now, &forest);
+        let kinds = open.iter().map(|row| row.kind).collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                RowKind::Agent,
+                RowKind::SubagentSummary,
+                RowKind::Subagent,
+                RowKind::Code,
+                RowKind::Subagent,
+            ]
+        );
+        assert!(!open[3].selectable());
     }
 }

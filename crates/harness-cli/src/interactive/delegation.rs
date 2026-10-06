@@ -9,6 +9,13 @@
 //! Ctrl+C stops the parent's turn, not its children; `/agents stop`, `/new` and a
 //! resume into another conversation stop them.
 //!
+//! prime-agent keeps its children: a message to a child that finished wakes it
+//! for a follow-up turn in the same conversation, and the spawn ledger
+//! (`<data>/delegation/ledger/<conversation>.json`) brings a conversation's
+//! children back - listed, collectable and reachable - when the conversation is
+//! opened again, after `/resume` or a worker restart. A child that was running
+//! when its worker went away comes back as failed.
+//!
 //! Children write through the session's [`SharedStore`]: the store stays open while
 //! a turn or a child holds a lease on it.
 
@@ -373,9 +380,169 @@ struct ChildRecord {
     /// Messages and its own children's notices that arrived between its turns;
     /// its next turn opens with them.
     pending: Vec<String>,
+    /// What a follow-up run needs: the brief, the run, its worktree, the
+    /// generation the next dispatch takes.
+    brief: Option<TaskBrief>,
+    run_id: Option<AgentRunId>,
+    worktree: Option<WorktreeRecord>,
+    generation: u32,
+    /// The child's conversation so far, for the turn a message wakes it for.
+    history: Vec<ProviderMessage>,
+    /// The message the next (follow-up) run opens with.
+    wake: Option<String>,
+    /// The task the child was given, for a brief rebuilt after a restart.
+    objective: String,
 }
 
+/// One child in the spawn ledger.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct LedgerEntry {
+    task_id: String,
+    name: String,
+    role: String,
+    model: String,
+    depth: u32,
+    max_depth: u32,
+    parent: Option<String>,
+    /// `running`, `completed`, `partial`, `error` or `cancelled`.
+    status: String,
+    answer: Option<String>,
+    error: Option<String>,
+    duration_ms: Option<i64>,
+    tool_calls: u32,
+    objective: String,
+    /// The conversation, as `(role, text)`.
+    history: Vec<(String, String)>,
+}
+
+/// How many messages of a child's conversation the ledger keeps.
+const LEDGER_HISTORY: usize = 40;
+
 impl ChildRecord {
+    fn ledger_entry(&self) -> LedgerEntry {
+        let (status, answer, error) = match &self.state {
+            ChildState::Running => ("running", None, None),
+            ChildState::Done { answer, .. } => ("completed", Some(answer.clone()), None),
+            ChildState::Partial { answer, error, .. } => {
+                ("partial", Some(answer.clone()), Some(error.clone()))
+            }
+            ChildState::Failed { error } => ("error", None, Some(error.clone())),
+            ChildState::Cancelled { reason } => ("cancelled", None, Some(reason.clone())),
+        };
+        LedgerEntry {
+            task_id: self.task_id.as_str().to_owned(),
+            name: self.name.clone(),
+            role: self.role.as_str().to_owned(),
+            model: self.model.clone(),
+            depth: self.depth,
+            max_depth: self.max_depth,
+            parent: self
+                .parent
+                .as_ref()
+                .map(|parent| parent.as_str().to_owned()),
+            status: status.to_owned(),
+            answer,
+            error,
+            duration_ms: Some(self.elapsed_ms()),
+            tool_calls: self.tool_calls,
+            objective: self.objective.clone(),
+            history: self
+                .history
+                .iter()
+                .skip(self.history.len().saturating_sub(LEDGER_HISTORY))
+                .map(|message| {
+                    (
+                        match message.role {
+                            MessageRole::User => "user",
+                            _ => "assistant",
+                        }
+                        .to_owned(),
+                        message.content.clone(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// A child the ledger brings back. One that was running when its worker
+    /// went away failed, as prime-agent reports an interrupted child.
+    fn from_ledger(entry: LedgerEntry) -> Option<Self> {
+        let task_id = TaskId::parse(entry.task_id).ok()?;
+        let role = match entry.role.as_str() {
+            "coder" => AgentRole::Coder,
+            _ => AgentRole::Explorer,
+        };
+        let state = match entry.status.as_str() {
+            "completed" => ChildState::Done {
+                answer: entry.answer.unwrap_or_default(),
+                detail: Value::Null,
+            },
+            "partial" => ChildState::Partial {
+                answer: entry.answer.unwrap_or_default(),
+                detail: Value::Null,
+                error: entry.error.unwrap_or_default(),
+            },
+            "cancelled" => ChildState::Cancelled {
+                reason: entry.error.unwrap_or_default(),
+            },
+            "running" => ChildState::Failed {
+                error: "the child was interrupted: its worker stopped before it finished"
+                    .to_owned(),
+            },
+            _ => ChildState::Failed {
+                error: entry.error.unwrap_or_default(),
+            },
+        };
+        Some(Self {
+            task_id,
+            name: entry.name,
+            role,
+            model: entry.model,
+            started: Instant::now(),
+            duration_ms: entry.duration_ms,
+            state,
+            cancellation: CancellationToken::new(),
+            cancel_reason: None,
+            waiters: 0,
+            deleted: false,
+            suppress_notice: true,
+            replied: false,
+            session_id: None,
+            backlog: Vec::new(),
+            notes: VecDeque::new(),
+            last_note: None,
+            activity: "inactive".to_owned(),
+            activity_tool: None,
+            answer_file: None,
+            tool_calls: entry.tool_calls,
+            cost: "n/a".to_owned(),
+            parent: entry.parent.and_then(|parent| TaskId::parse(parent).ok()),
+            depth: entry.depth,
+            max_depth: entry.max_depth,
+            in_turn: false,
+            pending: Vec::new(),
+            brief: None,
+            run_id: None,
+            worktree: None,
+            generation: 1,
+            history: entry
+                .history
+                .into_iter()
+                .map(|(role, text)| {
+                    ProviderMessage::new(
+                        if role == "user" {
+                            MessageRole::User
+                        } else {
+                            MessageRole::Assistant
+                        },
+                        text,
+                    )
+                })
+                .collect(),
+            wake: None,
+            objective: entry.objective,
+        })
+    }
     fn elapsed_ms(&self) -> i64 {
         self.duration_ms.unwrap_or_else(|| {
             i64::try_from(self.started.elapsed().as_millis()).unwrap_or(i64::MAX)
@@ -542,6 +709,12 @@ struct AgentsShared {
     /// Where a child's `ask_user` reaches the user, when the session has a
     /// screen to ask on.
     question_host: Mutex<Option<Arc<dyn harness_tools::QuestionHost>>>,
+    /// The spawn ledger of the conversation in use.
+    ledger_dir: std::sync::OnceLock<PathBuf>,
+    ledger_path: Mutex<Option<PathBuf>>,
+    /// The launch of the latest turn: what a woken child that came back from
+    /// the ledger runs with.
+    default_launch: Mutex<Option<ChildLaunch>>,
 }
 
 /// One message between two agents of the family.
@@ -576,6 +749,39 @@ impl AgentsShared {
             agents: std::sync::OnceLock::new(),
             session_host: Mutex::new(None),
             answers: std::sync::OnceLock::new(),
+            ledger_dir: std::sync::OnceLock::new(),
+            ledger_path: Mutex::new(None),
+            default_launch: Mutex::new(None),
+        }
+    }
+
+    /// Write the spawn ledger of the conversation in use (prime-agent's
+    /// spawn ledger): every child that was not deleted.
+    fn persist_ledger(&self) {
+        let Some(path) = self.ledger_path.lock().ok().and_then(|path| path.clone()) else {
+            return;
+        };
+        let entries: Vec<LedgerEntry> = self.children.lock().map_or_else(
+            |_| Vec::new(),
+            |children| {
+                children
+                    .iter()
+                    .filter(|child| !child.deleted)
+                    .map(ChildRecord::ledger_entry)
+                    .collect()
+            },
+        );
+        if entries.is_empty() && !path.exists() {
+            return;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(&entries) {
+            let staged = path.with_extension("json.staged");
+            if std::fs::write(&staged, text).is_ok() {
+                let _ = std::fs::rename(&staged, &path);
+            }
         }
     }
 
@@ -658,6 +864,7 @@ impl AgentsShared {
                 )
             });
         self.cancel_descendants(task_id, "its parent agent finished");
+        self.persist_ledger();
         match notice {
             // A nested child reports to the child that spawned it, which reads
             // the notice when its turn ends (prime-agent's `waitForRlmQuiescence`).
@@ -804,6 +1011,20 @@ impl AgentsShared {
         task_id: &TaskId,
         text: String,
     ) -> Result<&'static str, String> {
+        // prime-agent: a message to a child that finished wakes it for an
+        // ordinary follow-up turn in the same conversation.
+        if self
+            .update(task_id, |child| child.state.settled())
+            .unwrap_or(false)
+        {
+            let agents = self
+                .agents
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .ok_or("the session's agents are gone")?;
+            agents.wake(task_id, text)?;
+            return Ok("delivered");
+        }
         let session = self
             .update(task_id, |child| {
                 if child.state.settled() {
@@ -1266,6 +1487,7 @@ impl SessionAgents {
         backend: &Arc<dyn WorkerBackend>,
     ) -> Result<Arc<Self>, HarnessError> {
         let _ = shared.answers.set(state_root.join("answers"));
+        let _ = shared.ledger_dir.set(state_root.join("ledger"));
         let workspace_manager = Arc::new(WorkspaceManager::new(state_root));
         let schedulers = (0..RLM_MAX_DEPTH_CAP)
             .map(|_| {
@@ -1423,10 +1645,174 @@ impl SessionAgents {
                 if !child.state.settled() {
                     child.cancel_reason = Some("the conversation was closed".to_owned());
                     child.cancellation.cancel();
+                    // The ledger keeps it as the conversation left it.
+                    child.state = ChildState::Cancelled {
+                        reason: "the conversation was closed".to_owned(),
+                    };
+                    child.duration_ms = Some(child.elapsed_ms());
                 }
+            }
+        }
+        self.shared.persist_ledger();
+        if let Ok(mut path) = self.shared.ledger_path.lock() {
+            *path = None;
+        }
+        if let Ok(mut children) = self.shared.children.lock() {
+            for child in children.iter_mut() {
                 child.deleted = true;
             }
         }
+    }
+
+    /// The children as the agents view nests them, the running ones first.
+    #[must_use]
+    pub fn view_rows(&self) -> Vec<super::agents::protocol::SubagentInfo> {
+        let mut rows: Vec<super::agents::protocol::SubagentInfo> =
+            self.shared.children.lock().map_or_else(
+                |_| Vec::new(),
+                |children| {
+                    children
+                        .iter()
+                        .filter(|child| !child.deleted)
+                        .map(|child| super::agents::protocol::SubagentInfo {
+                            name: child.name.clone(),
+                            status: match child.state {
+                                ChildState::Running => "running",
+                                ChildState::Done { .. } => "completed",
+                                _ => "error",
+                            }
+                            .to_owned(),
+                            model: child.model.clone(),
+                            depth: child.depth,
+                            program: child.objective.clone(),
+                        })
+                        .collect()
+                },
+            );
+        rows.sort_by_key(|row| row.status != "running");
+        rows
+    }
+
+    /// prime-agent's ledger reseed: the conversation `conversation` is the
+    /// one in use; its children come back from its spawn ledger, settled.
+    pub fn bind_ledger(&self, conversation: &str) {
+        let Some(dir) = self.shared.ledger_dir.get() else {
+            return;
+        };
+        let path = dir.join(format!("{conversation}.json"));
+        let entries: Vec<LedgerEntry> = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        if let Ok(mut children) = self.shared.children.lock() {
+            for entry in entries {
+                if children
+                    .iter()
+                    .any(|child| !child.deleted && child.task_id.as_str() == entry.task_id)
+                {
+                    continue;
+                }
+                if let Some(record) = ChildRecord::from_ledger(entry) {
+                    children.push(record);
+                }
+            }
+        }
+        if let Ok(mut current) = self.shared.ledger_path.lock() {
+            *current = Some(path);
+        }
+        self.shared.persist_ledger();
+    }
+
+    /// Wake a finished child with `text`: a follow-up run of its task that
+    /// continues its conversation (prime-agent's revival of an inactive
+    /// child). The child reports as it did when it first ran.
+    fn wake(self: &Arc<Self>, task_id: &TaskId, text: String) -> Result<(), String> {
+        let launch = self
+            .shared
+            .launches
+            .lock()
+            .ok()
+            .and_then(|launches| launches.get(task_id).cloned())
+            .or_else(|| {
+                self.shared
+                    .default_launch
+                    .lock()
+                    .ok()
+                    .and_then(|launch| launch.clone())
+            })
+            .ok_or("the child cannot be woken before its parent has run a turn")?;
+        let cancellation = CancellationToken::new();
+        let (depth, brief, run_id, generation, worktree) = self
+            .shared
+            .update(task_id, |child| {
+                if child.deleted {
+                    return Err("the child was deleted".to_owned());
+                }
+                if !child.state.settled() {
+                    return Err("the child is still running".to_owned());
+                }
+                let brief = match child.brief.clone() {
+                    Some(brief) => brief,
+                    // A child that came back from the ledger: an explorer's
+                    // brief is rebuilt over the current workspace; a coder's
+                    // worktree does not come back.
+                    None if child.role == AgentRole::Explorer => {
+                        explorer_brief(task_id, &child.objective, &launch)
+                    }
+                    None => {
+                        return Err(
+                            "a coder's worktree does not survive a restart; spawn a new coder"
+                                .to_owned(),
+                        );
+                    }
+                };
+                child.brief = Some(brief.clone());
+                let run_id = child.run_id.clone().unwrap_or_else(AgentRunId::generate);
+                child.run_id = Some(run_id.clone());
+                child.generation += 1;
+                child.state = ChildState::Running;
+                child.started = Instant::now();
+                child.duration_ms = None;
+                child.cancellation = cancellation.clone();
+                child.cancel_reason = None;
+                child.suppress_notice = false;
+                child.replied = false;
+                child.wake = Some(text);
+                "queued".clone_into(&mut child.activity);
+                Ok((
+                    child.depth,
+                    brief,
+                    run_id,
+                    child.generation,
+                    child.worktree.clone(),
+                ))
+            })
+            .ok_or("no such child")??;
+        if let Ok(mut launches) = self.shared.launches.lock() {
+            launches.entry(task_id.clone()).or_insert(launch);
+        }
+        let index = usize::try_from(depth.saturating_sub(1)).unwrap_or(usize::MAX);
+        let scheduler = self
+            .schedulers
+            .get(index)
+            .ok_or("the child's depth has no scheduler")?;
+        self.ensure_pump();
+        scheduler
+            .dispatch(WorkerRequest {
+                task_id: task_id.clone(),
+                run_id,
+                generation: generation.into(),
+                depth,
+                brief,
+                worktree,
+                cancellation,
+            })
+            .map_err(|error| error.to_string())?;
+        if let Some(dispatched) = self.dispatched.get(index) {
+            dispatched.notify_one();
+        }
+        self.shared.persist_ledger();
+        Ok(())
     }
 
     fn ensure_pump(self: &Arc<Self>) {
@@ -1625,8 +2011,16 @@ impl SessionAgents {
                 max_depth,
                 in_turn: false,
                 pending: Vec::new(),
+                brief: Some(brief.clone()),
+                run_id: Some(run_id.clone()),
+                worktree: worktree.clone(),
+                generation: 1,
+                history: Vec::new(),
+                wake: None,
+                objective: brief_text.clone(),
             });
         }
+        self.shared.persist_ledger();
         if let Ok(mut launches) = self.shared.launches.lock() {
             launches.insert(task_id.clone(), launch.clone());
         }
@@ -1659,6 +2053,34 @@ impl SessionAgents {
     }
 }
 
+/// An explorer's brief over `launch`'s workspace: what a child that came back
+/// from the spawn ledger is woken with.
+fn explorer_brief(task_id: &TaskId, objective: &str, launch: &ChildLaunch) -> TaskBrief {
+    TaskBrief {
+        schema_version: harness_orchestrator::DELEGATION_CONTRACT_VERSION,
+        task_id: task_id.clone(),
+        title: objective.chars().take(80).collect(),
+        objective: objective.to_owned(),
+        acceptance_criteria: vec!["return a concise report answering the brief".to_owned()],
+        inputs: vec!["current workspace snapshot".to_owned()],
+        base_snapshot: launch.workspace.observed_fingerprint.as_str().to_owned(),
+        base_commit: launch.workspace.base_commit.clone(),
+        workspace: launch.workspace.clone(),
+        grants: DelegationGrants {
+            project_id: launch.workspace.project_id.clone(),
+            task_id: task_id.clone(),
+            actions: vec![GrantAction::Read],
+            write_scope: Vec::new(),
+            edit_workspace: false,
+            max_depth: RLM_MAX_DEPTH_CAP,
+            budget: DelegationBudget::default(),
+        },
+        expected_artifacts: Vec::new(),
+        deadline_unix_ms: None,
+        role: AgentRole::Explorer,
+    }
+}
+
 /// The session's children as one turn sees them: its `delegate` tool and its
 /// kernel's `rlm.*` requests, both starting children with this turn's launch.
 pub struct DelegateHost {
@@ -1675,6 +2097,9 @@ impl DelegateHost {
         launch: ChildLaunch,
         parent_cancellation: CancellationToken,
     ) -> Self {
+        if let Ok(mut current) = agents.shared.default_launch.lock() {
+            *current = Some(launch.clone());
+        }
         Self {
             agents: Arc::clone(agents),
             catalog: Arc::new(DelegateCatalog),
@@ -2461,6 +2886,7 @@ impl RlmChildren {
         self.agents
             .shared
             .cancel_descendants(&task_id, "Deleted by parent orchestrator");
+        self.agents.shared.persist_ledger();
         row
     }
 
@@ -2613,12 +3039,13 @@ impl WorkerBackend for InteractiveWorkerBackend {
             let task_id = request.task_id.clone();
             let task_key = task_id.as_str().to_owned();
             let role_name = request.brief.role.as_str().to_owned();
+            // The launch stays: a message can wake the child for another run.
             let Some(launch) = self
                 .shared
                 .launches
                 .lock()
                 .ok()
-                .and_then(|mut launches| launches.remove(&task_id))
+                .and_then(|launches| launches.get(&task_id).cloned())
             else {
                 return WorkerOutcome::Failed {
                     error: OrchestratorError::new(
@@ -2748,11 +3175,19 @@ impl WorkerBackend for InteractiveWorkerBackend {
             let _ = store
                 .set_session_setting(&task_id, DELEGATED_CHILD_SETTING, &role_name)
                 .await;
-            // prime-agent frames a child's task as `[task from parent]`.
-            let mut prompt = format!(
-                "{CHILD_PROMPT_HEAD}\n\nAnswer the delegated task below. Return concise results and identify changed files or findings with paths.\n\nBrief:\n{}",
-                request.brief.objective
-            );
+            // A woken child's run opens with the message that woke it, over
+            // its conversation so far; a new one with its task, which
+            // prime-agent frames as `[task from parent]`.
+            let (wake, history) = self
+                .shared
+                .update(&task_id, |child| (child.wake.take(), child.history.clone()))
+                .unwrap_or_default();
+            let mut prompt = wake.unwrap_or_else(|| {
+                format!(
+                    "{CHILD_PROMPT_HEAD}\n\nAnswer the delegated task below. Return concise results and identify changed files or findings with paths.\n\nBrief:\n{}",
+                    request.brief.objective
+                )
+            });
             for message in backlog {
                 prompt.push_str("\n\n");
                 prompt.push_str(&message);
@@ -2806,7 +3241,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
             // The child's turns: its task, then - while children of its own
             // report back - one more turn over what they said, until its whole
             // subtree is quiet (prime-agent's `waitForRlmQuiescence`).
-            let mut conversation = Vec::new();
+            let mut conversation = history;
             let mut steps = 0_u32;
             let mut tool_calls = 0_u32;
             let mut executions = Vec::new();
@@ -2923,6 +3358,15 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     reason: "the child was stopped".to_owned(),
                 };
             }
+            // The conversation so far, for the turn a later message wakes it for.
+            let mut history = conversation.clone();
+            history.push(ProviderMessage::new(MessageRole::User, prompt.clone()));
+            history.push(ProviderMessage::new(
+                MessageRole::Assistant,
+                outcome.final_text.clone(),
+            ));
+            self.shared
+                .update(&task_id, |child| child.history = history);
             // A failed driver call has no TurnOutcome, but the observer already
             // counted any tools it started. Do not erase those counts at settle.
             let tool_calls = self
@@ -4003,10 +4447,11 @@ mod real_worker_tests {
     use serde_json::{Value, json};
     use tokio::sync::mpsc::UnboundedReceiver;
 
-    use super::{ChildState, DelegateHost, SessionAgents};
+    use super::{ChildRecord, ChildState, DelegateHost, LedgerEntry, SessionAgents};
     use crate::interactive::events::SessionEvent;
     use crate::interactive::service::ChannelApprovalGate;
     use crate::interactive::store_lease::SharedStore;
+    use harness_types::TaskId;
 
     /// One reply of a scripted model.
     #[derive(Clone)]
@@ -4405,6 +4850,116 @@ mod real_worker_tests {
         assert!(
             !seen.contains("[steering correction from the user]\n[agent-message"),
             "an agent message is not the user's steering: {seen}"
+        );
+    }
+
+    /// prime-agent: a message to a child that finished wakes it for a
+    /// follow-up turn over its conversation so far.
+    #[tokio::test]
+    async fn a_message_wakes_a_finished_child() {
+        let bench = bench();
+        let provider = Scripted::new(vec![
+            Reply::Text("first answer"),
+            Reply::Text("second answer"),
+        ]);
+        let host = host(&bench, Arc::clone(&provider) as Arc<dyn ModelProvider>);
+        spawn(&host, "worker", "look around").await;
+        assert!(matches!(
+            state_of(&bench.agents, "worker").await,
+            ChildState::Done { .. }
+        ));
+        let receipts = host
+            .rlm_requests()
+            .handle(&json!({
+                "type": "agent_message.send",
+                "message": "one more thing",
+                "receiver_role": "child",
+                "receiver_name": "worker",
+            }))
+            .await
+            .expect("known")
+            .expect("send");
+        assert_eq!(
+            receipts["receipts"][0]["deliveryStatus"],
+            json!("delivered")
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let task_id = bench.agents.shared.find(None, "worker").expect("child");
+            let answer = bench
+                .agents
+                .shared
+                .update(&task_id, |child| match &child.state {
+                    ChildState::Done { answer, .. } => Some(answer.clone()),
+                    _ => None,
+                });
+            if answer.flatten().as_deref() == Some("second answer") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the woken child never answered"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let seen = provider.requests_text();
+        assert!(
+            seen.contains("first answer"),
+            "the follow-up carries the history: {seen}"
+        );
+        assert!(seen.contains("one more thing"), "{seen}");
+    }
+
+    /// prime-agent's spawn ledger: a conversation opened again lists its
+    /// children, a running one as interrupted.
+    #[tokio::test]
+    async fn the_ledger_brings_a_conversations_children_back() {
+        let bench = bench();
+        let provider = Scripted::new(vec![Reply::Text("kept answer")]);
+        let host = host(&bench, Arc::clone(&provider) as Arc<dyn ModelProvider>);
+        bench.agents.bind_ledger("conversation-a");
+        spawn(&host, "keeper", "remember this").await;
+        assert!(matches!(
+            state_of(&bench.agents, "keeper").await,
+            ChildState::Done { .. }
+        ));
+        // Leaving the conversation closes its children; opening it again
+        // brings them back from the ledger.
+        bench.agents.reset();
+        assert!(bench.agents.shared.find(None, "keeper").is_none());
+        bench.agents.bind_ledger("conversation-a");
+        let task_id = bench
+            .agents
+            .shared
+            .find(None, "keeper")
+            .expect("back from the ledger");
+        let answer = bench
+            .agents
+            .shared
+            .update(&task_id, |child| match &child.state {
+                ChildState::Done { answer, .. } => answer.clone(),
+                _ => String::new(),
+            });
+        assert_eq!(answer.as_deref(), Some("kept answer"));
+        let entry = LedgerEntry {
+            task_id: TaskId::generate().as_str().to_owned(),
+            name: "gone".to_owned(),
+            role: "explorer".to_owned(),
+            model: "m".to_owned(),
+            depth: 1,
+            max_depth: 2,
+            parent: None,
+            status: "running".to_owned(),
+            answer: None,
+            error: None,
+            duration_ms: Some(5),
+            tool_calls: 0,
+            objective: "x".to_owned(),
+            history: Vec::new(),
+        };
+        let record = ChildRecord::from_ledger(entry).expect("record");
+        assert!(
+            matches!(record.state, ChildState::Failed { ref error } if error.contains("interrupted"))
         );
     }
 

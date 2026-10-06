@@ -406,6 +406,14 @@ pub trait SessionPort: Send {
     fn has_scheduled_work(&self) -> bool {
         false
     }
+    /// The session's subagents, for the agents view.
+    fn subagents(&self) -> Vec<super::agents::protocol::SubagentInfo> {
+        Vec::new()
+    }
+    /// How many heartbeats the session keeps.
+    fn heartbeat_count(&self) -> usize {
+        0
+    }
     /// The conversation this session is in.
     fn conversation_id(&self) -> Option<String> {
         None
@@ -3034,7 +3042,35 @@ pub struct SavedConversation {
 
 /// The saved conversations of the project whose store is `store_dir`, newest
 /// first, as `/resume` lists them; nothing when the store cannot be read.
+/// The saved conversations the agents view deleted: listed nowhere again.
+/// ha's store keeps every conversation durably, so a delete hides it.
+#[must_use]
+pub fn hidden_conversations_path(store_dir: &Path) -> PathBuf {
+    store_dir.join("hidden-conversations.json")
+}
+
+/// Hide the saved conversation `task` from the listings.
+///
+/// # Errors
+/// The list could not be written.
+pub fn hide_conversation(store_dir: &Path, task: &str) -> Result<(), String> {
+    let path = hidden_conversations_path(store_dir);
+    let mut hidden: Vec<String> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    if !hidden.iter().any(|known| known == task) {
+        hidden.push(task.to_owned());
+    }
+    let text = serde_json::to_string_pretty(&hidden).map_err(|error| error.to_string())?;
+    std::fs::write(&path, text).map_err(|error| error.to_string())
+}
+
 pub async fn saved_conversations(store_dir: PathBuf, limit: usize) -> Vec<SavedConversation> {
+    let hidden: Vec<String> = std::fs::read_to_string(hidden_conversations_path(&store_dir))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
     let Ok(store) = SqliteStore::open_read_only(store_dir).await else {
         return Vec::new();
     };
@@ -3044,7 +3080,11 @@ pub async fn saved_conversations(store_dir: PathBuf, limit: usize) -> Vec<SavedC
     let summaries = user_conversation_sessions(&store, summaries).await;
     let (summaries, turns) = conversation_heads(summaries);
     let mut saved = Vec::new();
-    for summary in summaries.into_iter().take(limit) {
+    for summary in summaries
+        .into_iter()
+        .filter(|summary| !hidden.iter().any(|task| task == summary.task_id.as_str()))
+        .take(limit)
+    {
         let title = store
             .session_setting(&summary.task_id, "title")
             .await
@@ -3133,6 +3173,7 @@ impl AgentSessionService {
         }
         let (agents, child_questions) = session_agents(context, &sender, &gate);
         let task_id = TaskId::generate();
+        agents.bind_ledger(task_id.as_str());
         let schedules = Arc::new(super::schedules::Schedules::default());
         schedules.bind(super::schedules::path_for(
             &context.paths.data_dir,
@@ -3201,6 +3242,7 @@ impl AgentSessionService {
 
     /// The jobs of the conversation this session is now in.
     fn follow_schedules(&self) {
+        self.agents.bind_ledger(self.task_id.as_str());
         self.schedules.bind(super::schedules::path_for(
             &self.data_dir,
             self.task_id.as_str(),
@@ -3370,6 +3412,7 @@ impl AgentSessionService {
         let store_dir = self.store_dir.clone();
         let schedules = Arc::clone(&self.schedules);
         let heartbeats = Arc::clone(&self.heartbeats);
+        let agents = Arc::clone(&self.agents);
         let data_dir = self.data_dir.clone();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
@@ -3392,6 +3435,9 @@ impl AgentSessionService {
                     // The resumed conversation's scheduled jobs come back with it.
                     schedules.bind(super::schedules::path_for(&data_dir, task.as_str()));
                     heartbeats.bind(super::heartbeat::path_for(&data_dir, task.as_str()));
+                    // prime-agent: a reopened conversation lists and reaches its
+                    // children again.
+                    agents.bind_ledger(task.as_str());
                     store
                         .session_setting(&task, super::goal::GOAL_SETTING)
                         .await
@@ -4613,6 +4659,14 @@ impl SessionPort for AgentSessionService {
 
     fn has_scheduled_work(&self) -> bool {
         self.schedules.has_active() || self.heartbeats.has_active()
+    }
+
+    fn subagents(&self) -> Vec<super::agents::protocol::SubagentInfo> {
+        self.agents.view_rows()
+    }
+
+    fn heartbeat_count(&self) -> usize {
+        self.heartbeats.count()
     }
 
     fn conversation_id(&self) -> Option<String> {

@@ -154,6 +154,25 @@ pub struct AgentInfo {
     pub last_request: Option<String>,
     pub idle_seconds: u64,
     pub worker_pid: u32,
+    /// The agent's subagents (prime-agent's agents-view forest).
+    #[serde(default)]
+    pub subagents: Vec<SubagentInfo>,
+    /// How many heartbeats the agent keeps (prime-agent's row `◷` count).
+    #[serde(default)]
+    pub heartbeats: usize,
+}
+
+/// One subagent of an agent, as the agents view nests it.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubagentInfo {
+    pub name: String,
+    /// `running`, `completed` or `error`.
+    pub status: String,
+    pub model: String,
+    /// 1 for the agent's own children.
+    pub depth: u32,
+    /// What the child was spawned with (prime-agent's spawn program).
+    pub program: String,
 }
 
 impl AgentInfo {

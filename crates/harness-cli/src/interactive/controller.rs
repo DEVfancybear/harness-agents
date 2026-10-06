@@ -487,6 +487,18 @@ impl InteractiveController {
         self.service.has_scheduled_work()
     }
 
+    /// The agent's subagents, for the agents view's forest.
+    #[must_use]
+    pub fn subagents(&self) -> Vec<super::agents::protocol::SubagentInfo> {
+        self.service.subagents()
+    }
+
+    /// How many heartbeats the agent keeps.
+    #[must_use]
+    pub fn heartbeat_count(&self) -> usize {
+        self.service.heartbeat_count()
+    }
+
     /// The model this agent's turns use, as the session port names it.
     #[must_use]
     pub fn model_label(&self) -> String {

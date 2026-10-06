@@ -886,6 +886,8 @@ impl Agent {
                 last_request: None,
                 idle_seconds: 0,
                 worker_pid: std::process::id(),
+                subagents: Vec::new(),
+                heartbeats: 0,
             },
             last_activity: Instant::now(),
         }));
@@ -1050,7 +1052,11 @@ impl Agent {
         let busy = self.controller.is_busy();
         let scheduled = self.controller.has_scheduled_work();
         let conversation = self.controller.conversation_id();
+        let subagents = self.controller.subagents();
+        let heartbeats = self.controller.heartbeat_count();
         if let Ok(mut status) = self.status.lock() {
+            status.info.subagents = subagents;
+            status.info.heartbeats = heartbeats;
             state.phase.label().clone_into(&mut status.info.status);
             status.info.busy = busy;
             status.info.scheduled = scheduled;
@@ -1620,6 +1626,8 @@ mod tests {
             last_request: None,
             idle_seconds: 0,
             worker_pid: 1,
+            subagents: Vec::new(),
+            heartbeats: 0,
         }
     }
 
