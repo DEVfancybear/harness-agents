@@ -419,6 +419,27 @@ pub fn tasks_with_active_jobs(data_dir: &Path) -> Vec<String> {
     tasks
 }
 
+/// Cancel every job of a conversation that is stopped, as prime-agent's stop
+/// cancels the session's scheduled jobs: a stopped agent's schedule must not
+/// bring it back. The number of jobs cancelled.
+pub fn cancel_conversation(data_dir: &Path, task: &str, now: DateTime<Utc>) -> usize {
+    let path = path_for(data_dir, task);
+    let mut jobs = load(&path);
+    let mut cancelled = 0;
+    for job in &mut jobs {
+        if matches!(job.status, Status::Active | Status::Paused) {
+            job.status = Status::Cancelled;
+            job.next_run_at = None;
+            job.updated_at = now;
+            cancelled += 1;
+        }
+    }
+    if cancelled > 0 && save(&path, &jobs).is_err() {
+        return 0;
+    }
+    cancelled
+}
+
 fn load(path: &Path) -> Vec<Job> {
     std::fs::read_to_string(path)
         .ok()
@@ -656,7 +677,10 @@ pub fn command(schedules: &Schedules, argument: Option<&str>) -> Result<Vec<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, Schedules, Status, command, next_cron_after, parse_schedule, path_for};
+    use super::{
+        Kind, Schedules, Status, cancel_conversation, command, next_cron_after, parse_schedule,
+        path_for, tasks_with_active_jobs,
+    };
     use crate::interactive::heartbeat::Delivery;
     use chrono::{Local, TimeZone, Timelike, Utc};
 
@@ -814,5 +838,22 @@ mod tests {
         let cancelled = command(&second, Some("cancel job-1")).unwrap();
         assert!(cancelled[0].starts_with("job-1 cancelled"));
         let _ = Status::Active;
+    }
+
+    /// prime-agent's stop cleanup: stopping an agent cancels its conversation's
+    /// jobs, so no later worker start reopens it for them.
+    #[test]
+    fn a_stopped_conversations_jobs_are_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let schedules = Schedules::default();
+        schedules.bind(path_for(dir.path(), "task-a"));
+        command(&schedules, Some("add every 10m -- check the build")).unwrap();
+        command(&schedules, Some("add every 1h -- standup")).unwrap();
+        command(&schedules, Some("pause job-2")).unwrap();
+        assert_eq!(tasks_with_active_jobs(dir.path()), ["task-a"]);
+        assert_eq!(cancel_conversation(dir.path(), "task-a", Utc::now()), 2);
+        assert!(tasks_with_active_jobs(dir.path()).is_empty());
+        assert_eq!(cancel_conversation(dir.path(), "task-a", Utc::now()), 0);
+        assert_eq!(cancel_conversation(dir.path(), "task-none", Utc::now()), 0);
     }
 }

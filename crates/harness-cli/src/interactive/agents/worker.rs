@@ -325,10 +325,13 @@ impl Worker {
 
     /// Start again what the last worker left, as prime-agent's supervisor
     /// restores a dead worker's sessions: the journal's agents on their ids
-    /// and conversations, then every conversation of this project with a
-    /// scheduled job (a `/schedule` job or a quota park) that is not open.
-    /// They run on this worker's environment - the one the terminal that
-    /// started it had - since an agent's own is never written.
+    /// and conversations. They run on this worker's environment - the one the
+    /// terminal that started it had - since an agent's own is never written.
+    ///
+    /// prime-agent's no-auto-resume contract: a conversation that was not
+    /// running stays down. Its scheduled jobs stay dormant until the user opens
+    /// it; opening every conversation with an active job brought back old
+    /// sessions nobody had running.
     fn recover(self: &Arc<Self>) {
         let environment = LaunchEnvironment::capture().pairs();
         let spec = |conversation: String, name: Option<String>, id: Option<String>| CreateAgent {
@@ -350,7 +353,13 @@ impl Worker {
             .as_ref()
             .map(|journal| journal.agents.clone())
             .unwrap_or_default();
-        if wanted.is_empty() && scheduled.is_empty() {
+        if wanted.is_empty() {
+            if !scheduled.is_empty() {
+                log(&format!(
+                    "{} conversation(s) with scheduled jobs stay dormant until opened",
+                    scheduled.len()
+                ));
+            }
             return;
         }
         let newest = self.newest_sessions();
@@ -374,28 +383,14 @@ impl Worker {
                 )),
             }
         }
-        let live = self
-            .list()
-            .into_iter()
-            .filter_map(|agent| agent.conversation)
-            .collect::<std::collections::BTreeSet<_>>();
-        for task in scheduled {
-            if open.contains(&task) || live.contains(&task) {
-                continue;
-            }
-            // A task of another project's store has no session here.
-            let Some(session) = newest.get(&task) else {
-                continue;
-            };
-            match self.create(spec(session.clone(), None, None)) {
-                Ok(info) => log(&format!(
-                    "agent {} opened a conversation with scheduled work",
-                    info.id
-                )),
-                Err(error) => log(&format!(
-                    "a conversation with scheduled work could not be opened: {error}"
-                )),
-            }
+        let dormant = scheduled
+            .iter()
+            .filter(|task| !open.contains(*task))
+            .count();
+        if dormant > 0 {
+            log(&format!(
+                "{dormant} conversation(s) with scheduled jobs stay dormant until opened"
+            ));
         }
         self.keep_journal();
     }
@@ -640,11 +635,29 @@ impl Worker {
         drop(agents);
         let info = info_of(&agent.status);
         let _ = agent.inbox.send(Command::Stop);
-        if let Some(thread) = agent.thread.take() {
-            std::thread::spawn(move || {
+        let thread = agent.thread.take();
+        // prime-agent's stop cleanup: the conversation's scheduled jobs are
+        // cancelled once the agent has let go of them, so the next worker does
+        // not reopen what the user stopped.
+        let data_dir = self.registry.parent().map(std::path::Path::to_path_buf);
+        let conversation = info.conversation.clone();
+        std::thread::spawn(move || {
+            if let Some(thread) = thread {
                 let _ = thread.join();
-            });
-        }
+            }
+            if let (Some(data_dir), Some(task)) = (data_dir, conversation) {
+                let cancelled = super::super::schedules::cancel_conversation(
+                    &data_dir,
+                    &task,
+                    chrono::Utc::now(),
+                );
+                if cancelled > 0 {
+                    log(&format!(
+                        "{cancelled} scheduled job(s) of the stopped agent were cancelled"
+                    ));
+                }
+            }
+        });
         log(&format!("agent {id} stopped"));
         self.keep_journal();
         Ok(info)
