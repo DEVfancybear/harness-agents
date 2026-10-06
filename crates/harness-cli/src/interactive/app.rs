@@ -249,6 +249,7 @@ pub(super) fn controller_for_with_overrides(
     plain: bool,
     config_overrides: super::config::ConfigOverrides,
 ) -> InteractiveController {
+    let initial_prompt = config_overrides.initial_prompt.clone();
     let channel = SessionChannel::new();
     let service: Box<dyn SessionPort> = if fixture {
         Box::new(FixtureService::new(channel.sender()))
@@ -269,6 +270,7 @@ pub(super) fn controller_for_with_overrides(
     };
     InteractiveController::new(context, service, channel, plain)
         .with_continuations(super::bounds::continuations_from_environment(environment))
+        .with_initial_prompt(initial_prompt)
 }
 
 /// Whether the cursor sits at the start of a line, so partial output is never

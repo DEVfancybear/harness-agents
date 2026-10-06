@@ -299,6 +299,8 @@ pub struct InteractiveController {
     exit_armed_at: Option<Instant>,
     /// prime-agent's double-Escape: when the first idle Escape was pressed.
     escape_armed_at: Option<Instant>,
+    /// The prompt the app was started with, until it is sent.
+    initial_prompt: Option<String>,
     /// The provider whose API key the masked prompt is collecting.
     login_provider: Option<String>,
     /// Whose login the running `/login` or `/subagent-login` saves.
@@ -396,6 +398,7 @@ impl InteractiveController {
             detail: super::events::Detail::default(),
             exit_armed_at: None,
             escape_armed_at: None,
+            initial_prompt: None,
             login_provider: None,
             login_scope: super::credentials::Scope::Main,
             signing_in: None,
@@ -534,6 +537,14 @@ impl InteractiveController {
     #[must_use]
     pub fn with_continuations(mut self, budget: u32) -> Self {
         self.max_continuations = budget;
+        self
+    }
+
+    /// prime-agent's initial message: the prompt `ha "..."` was started with,
+    /// sent as soon as the app is up.
+    #[must_use]
+    pub fn with_initial_prompt(mut self, prompt: Option<String>) -> Self {
+        self.initial_prompt = prompt.filter(|prompt| !prompt.trim().is_empty());
         self
     }
 
@@ -1142,6 +1153,11 @@ impl InteractiveController {
     /// Move everything the session port produced into effects.
     pub fn pump_events(&mut self) -> Vec<Effect> {
         let mut effects = self.deliver_heartbeats();
+        if !self.phase.has_active_run()
+            && let Some(prompt) = self.initial_prompt.take()
+        {
+            effects.extend(self.submit(prompt));
+        }
         let events = self.channel.drain();
         if events.is_empty() {
             if !effects.is_empty() {

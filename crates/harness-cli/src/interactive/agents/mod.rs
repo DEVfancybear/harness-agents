@@ -83,7 +83,7 @@ pub fn spec_for_launch(
         profile: overrides.profile.clone(),
         approval: overrides.approval.clone(),
         name: None,
-        prompt: None,
+        prompt: overrides.initial_prompt.clone(),
         thinking: None,
         id: None,
     }

@@ -81,6 +81,9 @@ pub struct ConfigOverrides {
     pub approval: Option<String>,
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,
+    /// prime-agent's initial message (`ha "fix the parser"`): sent as the
+    /// first prompt once the app is up.
+    pub initial_prompt: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

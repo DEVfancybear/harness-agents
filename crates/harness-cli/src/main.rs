@@ -28,10 +28,15 @@ use harness_types::{
 ///
 /// Bare `ha` opens the interactive app; `ha exec` runs one prompt headless.
 #[derive(Debug, Parser)]
-#[command(name = "ha", version, about)]
+#[command(name = "ha", version, about, args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// prime-agent's initial message: `ha "fix the parser"` opens the app and
+    /// sends it; with input piped in (`cat log | ha "why?"`) the input is
+    /// added to it and the answer is printed, as `ha exec` prints it.
+    #[arg(value_name = "MESSAGE")]
+    message: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -795,15 +800,39 @@ fn error_report_json(error: &HarnessError) -> serde_json::Value {
 /// Route the launch contract added by `HA_LAUNCH` H01, then fall back to the
 /// unchanged legacy dispatch for every existing subcommand.
 async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
-    let Cli { command } = cli;
+    let Cli { command, message } = cli;
     match command {
+        None if message.is_some() && !std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
+            // prime-agent's print mode for piped input: the input follows
+            // the message, and the answer is printed.
+            use std::io::Read;
+            let mut piped = String::new();
+            let _ = std::io::stdin()
+                .take(10 * 1024 * 1024)
+                .read_to_string(&mut piped);
+            let message = message.unwrap_or_default();
+            let prompt = if piped.trim().is_empty() {
+                message
+            } else {
+                format!("{message}\n\n{piped}")
+            };
+            let Some(Command::Exec(args)) =
+                Cli::parse_from(["ha", "exec", "--", prompt.as_str()]).command
+            else {
+                unreachable!("`ha exec` parses as Command::Exec")
+            };
+            run_chat(args.into(), false).await
+        }
         None => {
             Box::pin(interactive::launch(interactive::LaunchMode::Interactive {
                 cwd: None,
                 resume: None,
                 fixture: false,
                 plain: interactive::plain_requested_from_environment(),
-                config_overrides: interactive::config::ConfigOverrides::default(),
+                config_overrides: interactive::config::ConfigOverrides {
+                    initial_prompt: message,
+                    ..interactive::config::ConfigOverrides::default()
+                },
             }))
             .await
         }
@@ -872,6 +901,7 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
         Some(command) => {
             Box::pin(legacy_run(Cli {
                 command: Some(command),
+                message: None,
             }))
             .await?;
             Ok(ExitCode::SUCCESS)
