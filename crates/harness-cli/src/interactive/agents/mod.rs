@@ -197,17 +197,28 @@ pub fn send_command(
     wait: bool,
 ) -> Result<ExitCode, HarnessError> {
     let registry = client::user_registry().map_err(failure)?;
-    let listed = client::find(&registry, selector).map_err(failure)?;
-    let mut connection = client::open(&listed).map_err(failure)?;
-    let value = connection
-        .call(&protocol::Request::Send {
-            agent: listed.agent.id.clone(),
-            text,
-            from,
-            mode,
-        })
-        .map_err(failure)?;
-    let status = value["status"].as_str().unwrap_or("delivered");
+    let (listed, status) = match client::find(&registry, selector) {
+        Ok(listed) => {
+            let mut connection = client::open(&listed).map_err(failure)?;
+            let value = connection
+                .call(&protocol::Request::Send {
+                    agent: listed.agent.id.clone(),
+                    text,
+                    from,
+                    mode,
+                })
+                .map_err(failure)?;
+            let status = value["status"].as_str().unwrap_or("delivered").to_owned();
+            (listed, status)
+        }
+        // prime-agent wakes a saved session a message is sent to: a
+        // conversation of this project, named by its session id, starts again
+        // as an agent with the message as its first prompt.
+        Err(unknown) => match wake_saved(&registry, selector, text) {
+            Some(woken) => (woken.map_err(failure)?, "delivered".to_owned()),
+            None => return Err(failure(unknown)),
+        },
+    };
     if wait {
         // prime-agent's `prompt_and_wait`: the turn the message started runs
         // to its end, and its answer is the result.
@@ -234,6 +245,43 @@ pub fn send_command(
         println!("{status} to {}", listed.agent.display_name());
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// prime-agent's `wake_saved_target`: a selector no running agent answers to
+/// that is a saved conversation's session id resumes it as a new agent of this
+/// directory's project, whose first prompt is `text`. `None` when the selector
+/// is not a session id.
+fn wake_saved(
+    registry: &std::path::Path,
+    selector: &str,
+    text: String,
+) -> Option<Result<client::Listed, String>> {
+    harness_types::SessionId::parse(selector.to_owned()).ok()?;
+    Some((|| {
+        let environment = LaunchEnvironment::capture();
+        let context = super::bootstrap::resolve(super::bootstrap::LaunchRequest {
+            cwd: None,
+            caller_dir: std::env::current_dir().map_err(|error| error.to_string())?,
+            platform: super::paths::HostPlatform::current(),
+            environment: environment.clone(),
+            explicit_data_dir: None,
+        })
+        .map_err(|error| error.to_string())?;
+        let overrides = super::config::ConfigOverrides {
+            initial_prompt: Some(text),
+            ..super::config::ConfigOverrides::default()
+        };
+        let spec = spec_for_launch(
+            &context,
+            &environment,
+            None,
+            Some(selector.to_owned()),
+            false,
+            &overrides,
+        );
+        let agent = client::create_in(&context, spec)?;
+        client::find(registry, &agent.id)
+    })())
 }
 
 /// Wait until agent `id` has started on what was sent and gone idle again,
