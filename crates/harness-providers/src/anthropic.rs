@@ -82,7 +82,7 @@ impl AnthropicMessagesAdapter {
                     "role": "user",
                     "content": [{
                         "type": "tool_result",
-                        "tool_use_id": message.tool_call_id.as_deref().unwrap_or("missing-call-id"),
+                        "tool_use_id": tool_use_id(message.tool_call_id.as_deref().unwrap_or("missing-call-id")),
                         "content": content_with_images(&message.content, &message.attachments)
                     }]
                 })),
@@ -94,9 +94,13 @@ impl AnthropicMessagesAdapter {
                     let mut blocks = Vec::new();
                     // A signed thinking block goes back first, as the API requires when
                     // thinking is on and the turn continues after a tool call.
+                    // Only Anthropic's own signature goes back: a turn answered by
+                    // another provider (a backup model) carries an OpenAI
+                    // reasoning item there, which Anthropic would reject.
                     if thinking.is_some()
                         && let Some(reasoning) = &message.reasoning
                         && let Some(signature) = &reasoning.signature
+                        && !signature.trim_start().starts_with('{')
                     {
                         blocks.push(json!({
                             "type": "thinking",
@@ -112,7 +116,7 @@ impl AnthropicMessagesAdapter {
                             .unwrap_or_else(|_| json!({}));
                         blocks.push(json!({
                             "type":"tool_use",
-                            "id":call.call_id,
+                            "id":tool_use_id(&call.call_id),
                             "name":call.name,
                             "input":input
                         }));
@@ -189,6 +193,28 @@ impl AnthropicMessagesAdapter {
 
 const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+
+/// prime-agent's `normalizeToolCallId` for Anthropic: a call id another
+/// provider made (Kimi's `functions.read:0`, a Responses `call_...|fc_...`)
+/// becomes one Anthropic accepts - letters, digits, `_` and `-`, at most 64.
+fn tool_use_id(id: &str) -> String {
+    let normalized = id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect::<String>();
+    if normalized.is_empty() {
+        "call".to_owned()
+    } else {
+        normalized
+    }
+}
 
 /// prime-agent's `cache_control`: an ephemeral breakpoint, five minutes by
 /// default, an hour with `HA_CACHE_RETENTION=long`.
