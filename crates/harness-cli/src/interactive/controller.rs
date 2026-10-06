@@ -310,6 +310,11 @@ pub struct InteractiveController {
     writing_code: bool,
     /// The prompt the app was started with, until it is sent.
     initial_prompt: Option<String>,
+    /// prime-agent's `agentMessagesPaused`: other agents' messages are refused.
+    agent_messages_paused: bool,
+    /// The queued messages other agents sent, which `/agents messages clear`
+    /// drops.
+    agent_messages_queued: Vec<String>,
     /// `--thinking`: the level the session starts at, until it is applied.
     initial_thinking: Option<String>,
     /// `--goal`: the goal the session starts with, until it is set.
@@ -415,6 +420,8 @@ impl InteractiveController {
             plugin_picker: None,
             writing_code: false,
             initial_prompt: None,
+            agent_messages_paused: false,
+            agent_messages_queued: Vec::new(),
             initial_thinking: None,
             initial_goal: None,
             login_provider: None,
@@ -504,6 +511,28 @@ impl InteractiveController {
     /// prime-agent's daemon delivers one: an idle agent starts a turn with it, a
     /// busy one reads it at its next step (`auto`, `steer`) or after the turn
     /// (`follow_up`). Returns what happened: `delivered` or `queued`.
+    /// Whether other agents' messages are refused (`/agents messages pause`).
+    #[must_use]
+    pub const fn agent_messages_paused(&self) -> bool {
+        self.agent_messages_paused
+    }
+
+    /// [`Self::deliver_external`] for a message another agent sent: one that
+    /// waits in the queue can be cleared with `/agents messages clear`.
+    pub fn deliver_external_from(
+        &mut self,
+        text: String,
+        steer: bool,
+        from_agent: bool,
+        effects: &mut Vec<Effect>,
+    ) -> &'static str {
+        let outcome = self.deliver_external(text.clone(), steer, effects);
+        if from_agent && outcome == "queued" {
+            self.agent_messages_queued.push(text);
+        }
+        outcome
+    }
+
     pub fn deliver_external(
         &mut self,
         text: String,
@@ -1366,6 +1395,55 @@ impl InteractiveController {
             return;
         }
         self.branch_command("/tree", words.first().copied(), effects);
+    }
+
+    /// prime-agent's `agent_messages_status|pause|resume|clear` for this agent.
+    fn agent_messages_command(&mut self, action: &str, effects: &mut Vec<Effect>) {
+        let status = |paused: bool| {
+            format!(
+                "agent messaging {} · at most 16,384 characters a message · 20 pending · 3 per sender per second",
+                if paused { "paused" } else { "active" }
+            )
+        };
+        let message = match action {
+            "status" => status(self.agent_messages_paused),
+            "pause" => {
+                self.agent_messages_paused = true;
+                let cleared = self.clear_agent_messages();
+                format!("{} · {cleared} queued message(s) dropped", status(true))
+            }
+            "resume" => {
+                self.agent_messages_paused = false;
+                status(false)
+            }
+            "clear" => format!(
+                "{} queued agent message(s) dropped",
+                self.clear_agent_messages()
+            ),
+            other => {
+                self.push_history(
+                    effects,
+                    HistoryItem::Error {
+                        message: format!(
+                            "unknown /agents messages action {other:?}: status, pause, resume or clear"
+                        ),
+                    },
+                );
+                effects.push(Effect::Redraw);
+                return;
+            }
+        };
+        self.push_history(effects, HistoryItem::Notice { message });
+        effects.push(Effect::Redraw);
+    }
+
+    /// prime-agent's `clearQueuedAgentMessages`: only messages other agents
+    /// sent, never the user's own queue.
+    fn clear_agent_messages(&mut self) -> usize {
+        let sent = std::mem::take(&mut self.agent_messages_queued);
+        self.queue
+            .remove_where(|text| sent.iter().any(|queued| queued == text))
+            .len()
     }
 
     /// prime-agent's `/plugins [search]`: the service catalog, connected
@@ -3494,6 +3572,11 @@ impl InteractiveController {
                         }
                     }
                     effects.push(Effect::Redraw);
+                }
+                // prime-agent's agent-message ingestion controls
+                // (`agent_messages_status|pause|resume|clear`).
+                Some(("messages", action)) if !action.trim().is_empty() => {
+                    self.agent_messages_command(action.trim(), &mut effects);
                 }
                 Some(("messages", _)) => {
                     self.reference("/agents messages", self.service.agent_exchanges(), &mut effects);

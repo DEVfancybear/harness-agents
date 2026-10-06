@@ -1041,6 +1041,22 @@ impl AgentsShared {
     }
 }
 
+/// prime-agent's root sibling delivery: steering delivery to another
+/// top-level agent, its sender this agent's name.
+fn message_root_sibling(
+    host: &dyn super::agents::SessionHost,
+    request: &Value,
+) -> Result<Value, String> {
+    let (message, _, name) = message_arguments(request)?;
+    let name = name.ok_or("receiver_name is required for a sibling")?;
+    let sender = host.agent_name().unwrap_or_else(|| "root".to_owned());
+    let status = host.message_sibling(
+        &name,
+        &format!("[agent-message from sibling:{sender}]\n\n{message}"),
+    )?;
+    Ok(json!({ "receipts": [receipt(&name, &sender, &message, &status)] }))
+}
+
 fn receipt(target: &str, from: &str, message: &str, status: &str) -> Value {
     let mut receipt = json!({
         "id": format!("msg-{}", harness_runtime::now_unix_ms()),
@@ -2485,11 +2501,23 @@ impl RlmChildren {
         Ok(json!({ "models": find_rlm_model_matches(query, &models, limit) }))
     }
 
+    /// The session host, when this session runs as a background agent.
+    fn host(&self) -> Option<Arc<dyn super::agents::SessionHost>> {
+        self.agents
+            .shared
+            .session_host
+            .lock()
+            .ok()
+            .and_then(|host| host.clone())
+    }
+
     fn observe(&self, kind: &str, request: &Value) -> Result<Value, String> {
         if kind == "agent_observe.list" {
             let children = self.list()?;
+            // prime-agent: "roots are siblings" - the other top-level agents.
+            let siblings = self.host().map(|host| host.siblings()).unwrap_or_default();
             return Ok(
-                json!({ "parent": null, "siblings": [], "children": children["subagents"] }),
+                json!({ "parent": null, "siblings": siblings, "children": children["subagents"] }),
             );
         }
         let target = request["target"].as_str().unwrap_or_default().to_owned();
@@ -2552,9 +2580,19 @@ impl HostRequests for RlmChildren {
                 "agent_observe.list" | "agent_observe.get" | "agent_observe.recent" => {
                     self.observe(kind, request)
                 }
-                // The root agent has no parent and no siblings; it messages its
-                // children.
-                "agent_message.send" => self.agents.shared.send_from_parent(request).await,
+                // The root agent has no parent; its siblings are the other
+                // top-level agents, and it messages its children.
+                "agent_message.send" => {
+                    let role = request["receiver_role"].as_str().unwrap_or_default();
+                    match (role, self.host()) {
+                        ("sibling", Some(host)) => message_root_sibling(host.as_ref(), request),
+                        ("sibling", None) => Err(
+                            "this agent runs without the background service, so it has no siblings"
+                                .to_owned(),
+                        ),
+                        _ => self.agents.shared.send_from_parent(request).await,
+                    }
+                }
                 _ => return None,
             })
         })
