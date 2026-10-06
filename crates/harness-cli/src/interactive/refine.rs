@@ -64,6 +64,95 @@ impl Cadence {
         self.running
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// The session is ending: what it did since the last review, when that is
+    /// enough to be worth one (autoharness's `SessionEnd` flush). Claims it, so it
+    /// is handed off once.
+    pub fn take_tail(&self) -> Option<u32> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let turns = self.turns.load(SeqCst);
+        let calls = self.tool_calls.load(SeqCst);
+        if turns == 0 || (turns < TAIL_MIN_TURNS && calls < TAIL_MIN_TOOL_CALLS) {
+            return None;
+        }
+        if self.running.load(SeqCst) {
+            return None;
+        }
+        self.turns.store(0, SeqCst);
+        self.tool_calls.store(0, SeqCst);
+        Some(turns)
+    }
+}
+
+/// The least a session must have done since its last review for its end to be
+/// reviewed: fewer is a conversation, not a stretch of work to learn from.
+pub const TAIL_MIN_TURNS: u32 = 5;
+pub const TAIL_MIN_TOOL_CALLS: u32 = 10;
+
+/// Where a session that ended with work not yet reviewed leaves it, in the
+/// project's data directory.
+const DEFERRED_DIR: &str = "refine-pending";
+
+/// A review a session handed off as it ended. Exiting does not wait for a model
+/// call; the next turn in the project runs the review in the background.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeferredReview {
+    pub task: String,
+    pub session: String,
+    pub turns: u32,
+}
+
+/// Leave a review for the next turn in this project.
+pub fn defer_review(project_dir: &Path, review: &DeferredReview) -> Result<(), String> {
+    let dir = project_dir.join(DEFERRED_DIR);
+    std::fs::create_dir_all(&dir).map_err(|error| format!("deferred review: {error}"))?;
+    let name = slug(&review.task, "task");
+    let temporary = dir.join(format!(".{name}.tmp"));
+    let text =
+        json!({"task": review.task, "session": review.session, "turns": review.turns, "at": now()})
+            .to_string();
+    std::fs::write(&temporary, text).map_err(|error| format!("deferred review: {error}"))?;
+    std::fs::rename(&temporary, dir.join(format!("{name}.json")))
+        .map_err(|error| format!("deferred review: {error}"))
+}
+
+/// Take every review left in this project. Each is removed as it is read, so two
+/// sessions never run the same one; one lost to a crash is simply not reviewed.
+#[must_use]
+pub fn take_deferred_reviews(project_dir: &Path) -> Vec<DeferredReview> {
+    let dir = project_dir.join(DEFERRED_DIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut reviews = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let claimed = path.with_extension(format!("claimed-{}", std::process::id()));
+        if std::fs::rename(&path, &claimed).is_err() {
+            continue; // another session took it first
+        }
+        let value = std::fs::read_to_string(&claimed)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        let _ = std::fs::remove_file(&claimed);
+        if let Some(value) = value
+            && let (Some(task), Some(session)) = (value["task"].as_str(), value["session"].as_str())
+        {
+            reviews.push(DeferredReview {
+                task: task.to_owned(),
+                session: session.to_owned(),
+                turns: value["turns"]
+                    .as_u64()
+                    .and_then(|turns| u32::try_from(turns).ok())
+                    .unwrap_or(0),
+            });
+        }
+    }
+    reviews.sort_by(|left, right| left.task.cmp(&right.task));
+    reviews
 }
 const REFINEMENT_MAX_OUTPUT_TOKENS: u32 = 8192;
 const REVIEW_MAX_OUTPUT_TOKENS: u32 = 4096;
@@ -1546,6 +1635,35 @@ mod tests {
         assert_eq!(
             cadence.turn_finished(0),
             Some(super::AUTO_REFINE_TURN_INTERVAL + 1)
+        );
+    }
+
+    /// A session's end hands its unreviewed work to the next turn once, and only
+    /// when there was enough of it.
+    #[test]
+    fn a_session_end_leaves_its_tail_for_the_next_turn_once() {
+        let cadence = super::Cadence::default();
+        assert_eq!(cadence.turn_finished(3), None);
+        assert_eq!(
+            cadence.take_tail(),
+            None,
+            "one short turn is not worth a review"
+        );
+        assert_eq!(cadence.turn_finished(super::TAIL_MIN_TOOL_CALLS), None);
+        assert_eq!(cadence.take_tail(), Some(2));
+        assert_eq!(cadence.take_tail(), None, "handed off once");
+
+        let directory = tempfile::tempdir().expect("dir");
+        let review = super::DeferredReview {
+            task: "task-1".to_owned(),
+            session: "session-9".to_owned(),
+            turns: 2,
+        };
+        super::defer_review(directory.path(), &review).expect("deferred");
+        assert_eq!(super::take_deferred_reviews(directory.path()), vec![review]);
+        assert!(
+            super::take_deferred_reviews(directory.path()).is_empty(),
+            "a deferred review is taken by one turn only"
         );
     }
 

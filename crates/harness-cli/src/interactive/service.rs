@@ -3185,6 +3185,26 @@ impl AgentSessionService {
 /// wait for that here; anywhere else the kernel is killed with the process.
 impl Drop for AgentSessionService {
     fn drop(&mut self) {
+        // autoharness's `SessionEnd` flush: work since the last automatic review is
+        // reviewed too. Exiting must not wait for a model call, so it is left for
+        // the next turn in this project, which runs it in the background.
+        if self.auto_refine
+            && let Some(session) = self
+                .previous_session
+                .lock()
+                .ok()
+                .and_then(|session| session.as_ref().map(ToString::to_string))
+            && let Some(turns) = self.refine_cadence.take_tail()
+        {
+            let _ = super::refine::defer_review(
+                &self.store_dir,
+                &super::refine::DeferredReview {
+                    task: self.task_id.as_str().to_owned(),
+                    session,
+                    turns,
+                },
+            );
+        }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -6861,6 +6881,43 @@ async fn run_turn(
                     cadence.release();
                 });
             }
+        }
+    }
+    // A session that ended with work not yet reviewed left the review here: it runs
+    // beside this conversation, on the ended one's turns and harness scope.
+    if auto_refine && outcome.is_ok() && !cancellation.is_cancelled() {
+        for deferred in super::refine::take_deferred_reviews(&store_dir) {
+            let Ok(ended) = SessionId::parse(deferred.session.clone()) else {
+                continue;
+            };
+            let conversation = harness_runtime::conversation_history(&store, &ended)
+                .await
+                .map(|history| super::refine::serialize_turns(&history.turns()))
+                .unwrap_or_default();
+            if conversation.is_empty() {
+                continue;
+            }
+            let background = AutoRefine {
+                sender: sender.clone(),
+                helper_provider: Arc::clone(&helper_provider),
+                helper_model: helper_model.clone(),
+                provider: Arc::clone(&provider),
+                model: config.model.clone(),
+                conversation,
+                scopes: super::refine::HarnessScopes {
+                    global: super::harness::global_dir(&data_dir),
+                    local: super::harness::local_dir(&data_dir, &deferred.task),
+                },
+                learning: learning.clone(),
+                turns: deferred.turns,
+            };
+            send(SessionEvent::Notice {
+                message: format!(
+                    "auto-refine: reviewing the last {} turn(s) of an earlier session in the background",
+                    deferred.turns
+                ),
+            });
+            tokio::spawn(background.run());
         }
     }
     // A finished goal is not brought back by `/resume`.
