@@ -84,6 +84,16 @@ pub struct ConfigOverrides {
     /// prime-agent's initial message (`ha "fix the parser"`): sent as the
     /// first prompt once the app is up.
     pub initial_prompt: Option<String>,
+    /// prime-agent's `--thinking`: the thinking level the session starts at.
+    pub thinking: Option<String>,
+    /// `--goal`: a goal set as the session starts, as `/goal` sets one.
+    pub goal: Option<String>,
+    /// `--system-prompt`: replaces the static layers of the system prompt
+    /// (and a `SYSTEM.md`).
+    pub system_prompt: Option<String>,
+    /// `--append-system-prompt`, repeatable: added at the end of the system
+    /// prompt (in place of an `APPEND_SYSTEM.md`).
+    pub append_system_prompt: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

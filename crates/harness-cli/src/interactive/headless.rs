@@ -591,6 +591,31 @@ pub async fn run_with(
     // `--system-prompt` replaces the static layers and `--append-system-prompt`
     // adds to the end, as prime-agent's print mode takes them.
     let system_prompt = {
+        let config_dir = context
+            .paths
+            .config_file
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        // prime-agent's resource loader: a `SYSTEM.md` stands in for
+        // `--system-prompt`, an `APPEND_SYSTEM.md` for `--append-system-prompt`.
+        let custom = request.options.system_prompt.clone().or_else(|| {
+            super::resources::system_prompt(
+                &context.project.root,
+                config_dir,
+                resolved_config.project_trusted,
+            )
+        });
+        let appended = if request.options.append_system_prompt.is_empty() {
+            super::resources::append_system_prompt(
+                &context.project.root,
+                config_dir,
+                resolved_config.project_trusted,
+            )
+            .into_iter()
+            .collect::<Vec<_>>()
+        } else {
+            request.options.append_system_prompt.clone()
+        };
         let (git_branch, changed_files) = super::service::prompt_git_facts(&context.project.root);
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let shell = if cfg!(windows) { "PowerShell" } else { "sh" };
@@ -603,7 +628,7 @@ pub async fn run_with(
             })
             .collect::<Vec<_>>();
         super::prompt::assemble(
-            request.options.system_prompt.as_deref(),
+            custom.as_deref(),
             &super::prompt::PromptEnvironment {
                 os: std::env::consts::OS,
                 shell,
@@ -615,7 +640,7 @@ pub async fn run_with(
                 limits: bounds::limits_from_environment(environment),
             },
             &tool_names,
-            &request.options.append_system_prompt,
+            &appended,
         )
     };
     let run_request = RunRequest::new(

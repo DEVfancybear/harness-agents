@@ -6826,6 +6826,22 @@ async fn run_turn(
         })
         .collect::<Vec<_>>();
     let mut built_prompt = SystemPromptBuilder::build(&prompt_environment, &prompt_tools);
+    // prime-agent's custom prompt: `--system-prompt`, else a `SYSTEM.md`,
+    // replaces the static layers; the session's blocks still follow it.
+    if let Some(custom) = turn_overrides
+        .system_prompt
+        .clone()
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| {
+            super::resources::system_prompt(
+                &workspace_root,
+                &global_config_dir,
+                config.project_trusted,
+            )
+        })
+    {
+        built_prompt.text = custom;
+    }
     if repl_host.is_some()
         && let Some(block) = super::prompt::python_skills_block(&kernel_skill_imports)
     {
@@ -6852,6 +6868,22 @@ async fn run_turn(
         repl_host.is_some().then(super::repl::kernel_packages),
         0,
     ));
+    // `--append-system-prompt`, else an `APPEND_SYSTEM.md`, closes the prompt.
+    let appended = if turn_overrides.append_system_prompt.is_empty() {
+        super::resources::append_system_prompt(
+            &workspace_root,
+            &global_config_dir,
+            config.project_trusted,
+        )
+        .into_iter()
+        .collect()
+    } else {
+        turn_overrides.append_system_prompt.clone()
+    };
+    for text in appended.iter().filter(|text| !text.trim().is_empty()) {
+        built_prompt.text.push_str("\n\n");
+        built_prompt.text.push_str(text);
+    }
     let mut project_blocks = loaded_instructions.blocks;
     if let Ok(active) = active_skills.lock() {
         project_blocks.extend(

@@ -812,6 +812,9 @@ impl Agent {
             model: spec.model.clone(),
             profile: spec.profile.clone(),
             approval: spec.approval.clone(),
+            goal: spec.goal.clone(),
+            system_prompt: spec.system_prompt.clone(),
+            append_system_prompt: spec.append_system_prompt.clone(),
             ..ConfigOverrides::default()
         };
         let mut controller = super::super::app::controller_for_with_overrides(
@@ -829,6 +832,7 @@ impl Agent {
                 name: None,
                 resume: None,
                 thinking: None,
+                goal: None,
                 id: None,
                 cwd: Some(context.project.root.clone()),
                 caller_dir: context.project.root.clone(),

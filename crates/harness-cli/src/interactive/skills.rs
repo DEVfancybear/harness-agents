@@ -87,15 +87,40 @@ pub fn discover(
     project_trusted: bool,
 ) -> Result<SkillCatalog, HarnessError> {
     let bundled = materialize_bundled_skills(config_dir)?;
-    let mut roots = vec![TrustedSkillRoot::new(bundled, SkillSource::Builtin)];
+    let mut roots = vec![TrustedSkillRoot::new(bundled.clone(), SkillSource::Builtin)];
     roots.extend(self::roots(
         config_dir,
         workspace,
         environment,
         project_trusted,
     ));
-    SkillCatalog::discover(&roots)
+    // prime-agent's package manager: package skills and the `skills` settings
+    // arrays add documents, and the settings turn resources off.
+    let resources =
+        super::resources::resolve(config_dir, workspace, project_trusted, Some(bundled));
+    for (path, project) in resources.added_skills {
+        if !roots.iter().any(|root| root.path == path) {
+            roots.push(TrustedSkillRoot::new(
+                path,
+                if project {
+                    SkillSource::TrustedProject
+                } else {
+                    SkillSource::User
+                },
+            ));
+        }
+    }
+    SkillCatalog::discover_excluding(&roots, &resources.disabled_skills)
         .map_err(|error| HarnessError::new(error.code(), error.to_string()))
+}
+
+/// Where ha's bundled skills are on disk (written there on first use): the
+/// package manager's built-in skills directory.
+///
+/// # Errors
+/// The bundled files could not be written.
+pub fn bundled_skills_root(config_dir: &Path) -> Result<PathBuf, HarnessError> {
+    materialize_bundled_skills(config_dir)
 }
 
 fn materialize_bundled_skills(config_dir: &Path) -> Result<PathBuf, HarnessError> {
@@ -928,96 +953,265 @@ pub struct PromptCommand {
     pub source: String,
 }
 
+/// The prompt templates of a workspace (prime-agent's
+/// `load_prompt_templates`): what the package manager resolves (the
+/// `prompts` settings arrays, `.harness/prompts`, the config directory's
+/// `prompts/` and package prompts), then ha's earlier `commands/` folders.
+/// The first template of a name wins.
 pub fn commands(
     config_dir: &Path,
     workspace: &Path,
     project_trusted: bool,
 ) -> Result<Vec<PromptCommand>, HarnessError> {
-    let mut roots = vec![(config_dir.join("commands"), "user config")];
+    let resources = super::resources::resolve(config_dir, workspace, project_trusted, None);
+    let mut files: Vec<(PathBuf, &str)> = resources
+        .prompts
+        .iter()
+        .map(|path| (path.clone(), "prompt"))
+        .collect();
+    let mut legacy_roots = vec![(config_dir.join("commands"), "user config")];
     if project_trusted {
-        roots.push((workspace.join(".harness/commands"), "trusted project"));
+        legacy_roots.push((workspace.join(".harness/commands"), "trusted project"));
     }
-    let mut loaded = Vec::new();
-    for (root, source) in roots {
-        if !root.is_dir() {
+    for (root, source) in legacy_roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
             continue;
-        }
-        let mut files = std::fs::read_dir(&root)
-            .map_err(|error| {
-                HarnessError::new(
-                    ErrorCode::ConfigReadError,
-                    format!("{} cannot be read: {error}", root.display()),
-                )
-            })?
+        };
+        let mut paths = entries
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "md"))
+            .filter(|path| {
+                !resources
+                    .disabled_prompts
+                    .contains(&super::packages::canonicalize_path(path))
+            })
             .collect::<Vec<_>>();
-        files.sort();
-        for path in files {
-            if loaded.len() >= MAX_COMMANDS {
-                return Err(HarnessError::new(
-                    ErrorCode::FrameLimitExceeded,
-                    "prompt command catalog is over its 256 file limit",
-                ));
-            }
-            let metadata = std::fs::metadata(&path).map_err(|error| {
-                HarnessError::new(
-                    ErrorCode::ConfigReadError,
-                    format!("{} cannot be inspected: {error}", path.display()),
-                )
-            })?;
-            if metadata.len() > MAX_COMMAND_BYTES {
-                return Err(HarnessError::new(
-                    ErrorCode::FrameLimitExceeded,
-                    format!("prompt command {} is over 256 KiB", path.display()),
-                ));
-            }
-            let document = std::fs::read_to_string(&path).map_err(|error| {
-                HarnessError::new(
-                    ErrorCode::ConfigReadError,
-                    format!("{} cannot be read: {error}", path.display()),
-                )
-            })?;
-            let name = path.file_stem().map_or_else(
-                || String::from("command"),
-                |stem| stem.to_string_lossy().into_owned(),
-            );
-            let (front, body) = split_front_matter(&document);
-            let description = front_value(front, "description").unwrap_or_default();
-            let argument_hint = front_value(front, "argument-hint").unwrap_or_default();
-            if !name
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-            {
-                continue;
-            }
-            loaded.push(PromptCommand {
-                name,
-                description,
-                argument_hint,
-                body: body.to_owned(),
-                source: source.to_owned(),
-            });
-        }
+        paths.sort();
+        files.extend(paths.into_iter().map(|path| (path, source)));
     }
-    loaded.sort_by(|left, right| {
-        left.name
-            .cmp(&right.name)
-            .then(left.source.cmp(&right.source))
-    });
-    loaded.dedup_by(|left, right| left.name == right.name);
+    let mut loaded: Vec<PromptCommand> = Vec::new();
+    for (path, source) in files {
+        if loaded.len() >= MAX_COMMANDS {
+            return Err(HarnessError::new(
+                ErrorCode::FrameLimitExceeded,
+                "prompt command catalog is over its 256 file limit",
+            ));
+        }
+        let metadata = std::fs::metadata(&path).map_err(|error| {
+            HarnessError::new(
+                ErrorCode::ConfigReadError,
+                format!("{} cannot be inspected: {error}", path.display()),
+            )
+        })?;
+        if metadata.len() > MAX_COMMAND_BYTES {
+            return Err(HarnessError::new(
+                ErrorCode::FrameLimitExceeded,
+                format!("prompt command {} is over 256 KiB", path.display()),
+            ));
+        }
+        let Ok(document) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let name = path.file_name().map_or_else(
+            || String::from("command"),
+            |name| name.to_string_lossy().trim_end_matches(".md").to_owned(),
+        );
+        if loaded.iter().any(|command| command.name == name) {
+            continue;
+        }
+        let (front, body) = split_front_matter(&document);
+        let mut description = front_value(front, "description").unwrap_or_default();
+        if description.is_empty()
+            && let Some(first_line) = body.lines().map(str::trim).find(|line| !line.is_empty())
+        {
+            // prime: the first non-empty line, cut at 60 characters.
+            let characters: Vec<char> = first_line.chars().collect();
+            description = if characters.len() > 60 {
+                characters[..60].iter().collect::<String>() + "..."
+            } else {
+                first_line.to_owned()
+            };
+        }
+        loaded.push(PromptCommand {
+            name,
+            description,
+            argument_hint: front_value(front, "argument-hint").unwrap_or_default(),
+            body: body.to_owned(),
+            source: source.to_owned(),
+        });
+    }
     Ok(loaded)
 }
 
+/// Expand a template with prime-agent's `substitute_args`: `$1`..`$N`, `$@`,
+/// `$ARGUMENTS` and `${@:N[:L]}` slices; argument values are not substituted
+/// again.
 pub fn expand(command: &PromptCommand, raw_arguments: &str) -> String {
-    let values = split_arguments(raw_arguments);
-    let mut result = command.body.replace("$ARGUMENTS", raw_arguments);
-    for index in 1..=9 {
-        let value = values.get(index - 1).map_or("", String::as_str);
-        result = result.replace(&format!("${index}"), value);
+    substitute_args(&command.body, &parse_command_args(raw_arguments))
+}
+
+/// Parse command arguments respecting quoted strings (bash-style); an
+/// explicitly quoted token is an argument even when empty.
+fn parse_command_args(args_string: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quote: Option<char> = None;
+    let mut quoted = false;
+    for character in args_string.chars() {
+        if let Some(quote) = in_quote {
+            if character == quote {
+                in_quote = None;
+            } else {
+                current.push(character);
+            }
+        } else if character == '"' || character == '\'' {
+            in_quote = Some(character);
+            quoted = true;
+        } else if character.is_whitespace() {
+            if !current.is_empty() || quoted {
+                args.push(std::mem::take(&mut current));
+                quoted = false;
+            }
+        } else {
+            current.push(character);
+        }
     }
-    result
+    if !current.is_empty() || quoted {
+        args.push(current);
+    }
+    args
+}
+
+/// prime-agent's `substitute_args`.
+fn substitute_args(content: &str, args: &[String]) -> String {
+    let all_args = args.join(" ");
+    let mut out = String::with_capacity(content.len());
+    let characters: Vec<char> = content.chars().collect();
+    let mut index = 0;
+    while index < characters.len() {
+        if characters[index] != '$' {
+            out.push(characters[index]);
+            index += 1;
+            continue;
+        }
+        let Some(&next) = characters.get(index + 1) else {
+            out.push('$');
+            break;
+        };
+        if next == '{' {
+            if let Some(close) = characters[index + 2..].iter().position(|c| *c == '}') {
+                let inner: String = characters[index + 2..index + 2 + close].iter().collect();
+                if let Some(rest) = inner.strip_prefix("@:") {
+                    let mut parts = rest.splitn(2, ':');
+                    let start = parts
+                        .next()
+                        .unwrap_or("0")
+                        .parse::<usize>()
+                        .unwrap_or(1)
+                        .saturating_sub(1);
+                    let length = parts.next().and_then(|length| length.parse::<usize>().ok());
+                    let slice: Vec<&str> = args
+                        .iter()
+                        .skip(start)
+                        .take(length.unwrap_or(usize::MAX))
+                        .map(String::as_str)
+                        .collect();
+                    out.push_str(&slice.join(" "));
+                    index += 2 + close + 1;
+                    continue;
+                }
+            }
+            out.push('$');
+            index += 1;
+            continue;
+        }
+        if characters[index..].starts_with(&['$', 'A', 'R', 'G', 'U', 'M', 'E', 'N', 'T', 'S']) {
+            out.push_str(&all_args);
+            index += "$ARGUMENTS".len();
+            continue;
+        }
+        if next == '@' {
+            out.push_str(&all_args);
+            index += 2;
+            continue;
+        }
+        if next.is_ascii_digit() {
+            let mut end = index + 1;
+            while end < characters.len() && characters[end].is_ascii_digit() {
+                end += 1;
+            }
+            let number: String = characters[index + 1..end].iter().collect();
+            let position: usize = number.parse().unwrap_or(0);
+            if let Some(value) = position
+                .checked_sub(1)
+                .and_then(|position| args.get(position))
+            {
+                out.push_str(value);
+            }
+            index = end;
+            continue;
+        }
+        out.push('$');
+        index += 1;
+    }
+    out
+}
+
+#[cfg(test)]
+mod prompt_template_tests {
+    use super::*;
+
+    #[test]
+    fn command_args_quoting() {
+        assert_eq!(
+            parse_command_args("a \"b c\" 'd e' \"\""),
+            vec!["a", "b c", "d e", ""]
+        );
+        assert_eq!(parse_command_args("  "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn substitutes_positional_and_slices() {
+        let args = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        assert_eq!(substitute_args("$1 and $2", &args), "one and two");
+        assert_eq!(substitute_args("$@", &args), "one two three");
+        assert_eq!(substitute_args("$ARGUMENTS", &args), "one two three");
+        assert_eq!(substitute_args("${@:2}", &args), "two three");
+        assert_eq!(substitute_args("${@:2:1}", &args), "two");
+        assert_eq!(substitute_args("${@:9}", &args), "");
+        assert_eq!(substitute_args("$5", &args), "");
+        assert_eq!(substitute_args("plain text", &args), "plain text");
+        assert_eq!(substitute_args("cost is $10", &args), "cost is ");
+    }
+
+    #[test]
+    fn prompts_load_from_the_prompts_folders_before_commands() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = temporary.path().join("config");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(config.join("prompts")).expect("prompts");
+        std::fs::create_dir_all(config.join("commands")).expect("commands");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(config.join("prompts/fix.md"), "Fix ${@:2} in $1").expect("fix");
+        std::fs::write(config.join("commands/fix.md"), "older fix").expect("old fix");
+        std::fs::write(config.join("commands/legacy.md"), "Legacy $ARGUMENTS").expect("legacy");
+        let commands = commands(&config, &workspace, false).expect("commands");
+        let fix = commands
+            .iter()
+            .find(|command| command.name == "fix")
+            .expect("fix");
+        assert_eq!(fix.description, "Fix ${@:2} in $1");
+        assert_eq!(expand(fix, "src a b"), "Fix a b in src");
+        assert!(commands.iter().any(|command| command.name == "legacy"));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.name == "fix")
+                .count(),
+            1
+        );
+    }
 }
 
 fn split_front_matter(document: &str) -> (&str, &str) {
@@ -1042,26 +1236,4 @@ fn front_value(front: &str, key: &str) -> Option<String> {
         let (candidate, value) = line.trim().split_once(':')?;
         (candidate.trim() == key).then(|| value.trim().trim_matches(['"', '\'']).to_owned())
     })
-}
-
-fn split_arguments(raw: &str) -> Vec<String> {
-    let mut values = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    for character in raw.chars() {
-        match (quote, character) {
-            (Some(active), ch) if ch == active => quote = None,
-            (None, '"' | '\'') => quote = Some(character),
-            (None, ch) if ch.is_whitespace() => {
-                if !current.is_empty() {
-                    values.push(std::mem::take(&mut current));
-                }
-            }
-            (_, ch) => current.push(ch),
-        }
-    }
-    if !current.is_empty() {
-        values.push(current);
-    }
-    values
 }

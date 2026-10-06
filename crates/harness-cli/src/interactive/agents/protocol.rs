@@ -123,6 +123,15 @@ pub struct CreateAgent {
     /// The first message, sent as soon as the agent starts (`rlm.create_session`).
     pub prompt: Option<String>,
     pub thinking: Option<String>,
+    /// `--goal`: set as the agent starts.
+    #[serde(default)]
+    pub goal: Option<String>,
+    /// `--system-prompt` of the launch.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// `--append-system-prompt` of the launch.
+    #[serde(default)]
+    pub append_system_prompt: Vec<String>,
     /// The id a recovered agent keeps; a new agent gets one.
     #[serde(default)]
     pub id: Option<String>,

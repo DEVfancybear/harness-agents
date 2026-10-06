@@ -308,6 +308,10 @@ pub struct InteractiveController {
     writing_code: bool,
     /// The prompt the app was started with, until it is sent.
     initial_prompt: Option<String>,
+    /// `--thinking`: the level the session starts at, until it is applied.
+    initial_thinking: Option<String>,
+    /// `--goal`: the goal the session starts with, until it is set.
+    initial_goal: Option<String>,
     /// The provider whose API key the masked prompt is collecting.
     login_provider: Option<String>,
     /// Whose login the running `/login` or `/subagent-login` saves.
@@ -408,6 +412,8 @@ impl InteractiveController {
             turn_picker: None,
             writing_code: false,
             initial_prompt: None,
+            initial_thinking: None,
+            initial_goal: None,
             login_provider: None,
             login_scope: super::credentials::Scope::Main,
             signing_in: None,
@@ -562,6 +568,23 @@ impl InteractiveController {
     #[must_use]
     pub fn with_initial_prompt(mut self, prompt: Option<String>) -> Self {
         self.initial_prompt = prompt.filter(|prompt| !prompt.trim().is_empty());
+        self
+    }
+
+    /// prime-agent's `--thinking`: the thinking level the session starts at,
+    /// applied as `/effort` applies one.
+    #[must_use]
+    pub fn with_initial_thinking(mut self, level: Option<String>) -> Self {
+        self.initial_thinking = level.filter(|level| !level.trim().is_empty());
+        self
+    }
+
+    /// `--goal`: the goal the session starts with, set as `/goal <objective>`
+    /// sets one. With an initial message the message is the first turn and
+    /// the goal continues it.
+    #[must_use]
+    pub fn with_initial_goal(mut self, goal: Option<String>) -> Self {
+        self.initial_goal = goal.filter(|goal| !goal.trim().is_empty());
         self
     }
 
@@ -1228,6 +1251,21 @@ impl InteractiveController {
     /// Move everything the session port produced into effects.
     pub fn pump_events(&mut self) -> Vec<Effect> {
         let mut effects = self.deliver_heartbeats();
+        if let Some(level) = self.initial_thinking.take()
+            && let Err(message) = self.service.set_thinking(&level)
+        {
+            self.push_history(&mut effects, HistoryItem::Notice { message });
+        }
+        if !self.phase.has_active_run()
+            && let Some(objective) = self.initial_goal.take()
+        {
+            if self.initial_prompt.is_some() {
+                self.goal = Some(GoalState::new(objective.clone()));
+                self.service.set_goal(Some(objective));
+            } else {
+                self.goal_command(Some(&objective), &mut effects);
+            }
+        }
         if !self.phase.has_active_run()
             && let Some(prompt) = self.initial_prompt.take()
         {

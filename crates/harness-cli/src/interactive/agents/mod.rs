@@ -84,7 +84,10 @@ pub fn spec_for_launch(
         approval: overrides.approval.clone(),
         name: None,
         prompt: overrides.initial_prompt.clone(),
-        thinking: None,
+        thinking: overrides.thinking.clone(),
+        goal: overrides.goal.clone(),
+        system_prompt: overrides.system_prompt.clone(),
+        append_system_prompt: overrides.append_system_prompt.clone(),
         id: None,
     }
 }
