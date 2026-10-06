@@ -6845,14 +6845,21 @@ async fn run_turn(
             super::prompt::append_skill_metadata(built_prompt.text, catalog.entries());
     }
     // The session-specific tail last, after everything that is stable for the
-    // session, so the provider's prompt cache keeps what comes before it.
+    // session. What changes between turns - the date, the branch, the changed
+    // files - is the turn's input instead, so the system prompt, and with it
+    // every cached message after it, stays byte for byte the same.
     built_prompt.text.push_str("\n\n");
-    built_prompt.text.push_str(&super::prompt::dynamic_tail(
+    built_prompt.text.push_str(&super::prompt::session_tail(
         &prompt_environment,
         repl_host.is_some().then(super::repl::kernel_packages),
         0,
     ));
-    let mut project_blocks = loaded_instructions.blocks;
+    let mut project_blocks = vec![harness_session::ContextBlock::mandatory(
+        "environment",
+        harness_session::ContextBlockKind::Instruction,
+        super::prompt::volatile_facts(&prompt_environment),
+    )];
+    project_blocks.extend(loaded_instructions.blocks);
     if let Ok(active) = active_skills.lock() {
         project_blocks.extend(
             active

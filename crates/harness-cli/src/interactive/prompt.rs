@@ -141,8 +141,48 @@ pub fn assemble(
 
 /// prime-agent's dynamic tail, after the skills and MCP blocks: the kernel's
 /// packages, the environment, and the session's place in the agent tree.
+///
+/// It is [`session_tail`] followed by [`volatile_facts`]. A one-shot prompt (`ha
+/// exec`, `ha prompt`) prints it whole; the interactive app keeps only the session
+/// tail in the system prompt and sends the volatile facts with each turn's input.
 #[must_use]
 pub fn dynamic_tail(
+    environment: &PromptEnvironment<'_>,
+    packages: Option<&[&str]>,
+    depth: u32,
+) -> String {
+    format!(
+        "{}\n\n{}",
+        session_tail(environment, packages, depth),
+        volatile_facts(environment)
+    )
+}
+
+/// The facts that change while a session runs: the date, the Git branch and how
+/// many files are changed. They are the turn's input, never the system prompt:
+/// every provider caches a request by its prefix (tools, then system, then the
+/// messages), so a system prompt that names the changed-file count lost the whole
+/// cached conversation on every edit - Codex sends its environment as a user
+/// message for the same reason.
+#[must_use]
+pub fn volatile_facts(environment: &PromptEnvironment<'_>) -> String {
+    [
+        format!("Current date: {}", environment.date_iso),
+        format!(
+            "Git branch: {}; changed files: {}",
+            environment.git_branch.unwrap_or("unknown"),
+            environment
+                .changed_files
+                .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+        ),
+    ]
+    .join("\n")
+}
+
+/// The part of the dynamic tail that holds for the whole session: the kernel's
+/// packages, where the session works, the platform, its limits and its depth.
+#[must_use]
+pub fn session_tail(
     environment: &PromptEnvironment<'_>,
     packages: Option<&[&str]>,
     depth: u32,
@@ -156,18 +196,9 @@ pub fn dynamic_tail(
     }
     sections.push(
         [
-            format!("Current date: {}", environment.date_iso),
             format!("Working directory: {}", environment.cwd.display()),
             format!("Project root: {}", environment.project_root.display()),
-            format!(
-                "OS: {}; shell: {}; git branch: {}; changed files: {}",
-                environment.os,
-                environment.shell,
-                environment.git_branch.unwrap_or("unknown"),
-                environment
-                    .changed_files
-                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
-            ),
+            format!("OS: {}; shell: {}", environment.os, environment.shell),
             format!(
                 "Turn limits: max_steps={}; max_tool_calls={}; deadline_seconds={}",
                 super::bounds::bound_label(u64::from(environment.limits.max_steps)),
@@ -322,6 +353,38 @@ mod tests {
             date_iso: "2026-09-23",
             limits: TurnLimits::default(),
         }
+    }
+
+    /// The system prompt is cached by every provider as a prefix; only the session
+    /// tail may be in it. The date and the Git facts change between turns and so
+    /// belong to the turn's input.
+    #[test]
+    fn the_session_tail_holds_nothing_that_changes_between_turns() {
+        let cwd = std::path::PathBuf::from("/work/demo");
+        let environment =
+            |date: &'static str, branch: &'static str, changed: usize| super::PromptEnvironment {
+                os: "windows",
+                shell: "PowerShell",
+                cwd: &cwd,
+                project_root: &cwd,
+                git_branch: Some(branch),
+                changed_files: Some(changed),
+                date_iso: date,
+                limits: TurnLimits::default(),
+            };
+        let first = super::session_tail(&environment("2026-10-06", "main", 0), None, 0);
+        let later = super::session_tail(&environment("2026-10-07", "fix", 12), None, 0);
+        assert_eq!(first, later, "the session tail must not change: {first}");
+        let facts = super::volatile_facts(&environment("2026-10-07", "fix", 12));
+        assert!(
+            facts.contains("2026-10-07") && facts.contains("fix") && facts.contains("12"),
+            "{facts}"
+        );
+        let whole = super::dynamic_tail(&environment("2026-10-07", "fix", 12), None, 0);
+        assert!(
+            whole.starts_with(&later) && whole.ends_with(&facts),
+            "{whole}"
+        );
     }
 
     #[test]
