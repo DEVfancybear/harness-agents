@@ -3770,6 +3770,9 @@ impl InteractiveController {
                     let mut lines = vec![format!("backend: {label}")];
                     lines.extend(self.service.provider_diagnostics());
                     self.reference("/model", lines, &mut effects);
+                    // prime-agent's bare `/model` opens the model selector: the
+                    // catalog menu, filtered as the user types.
+                    self.editor.open_argument_menu("/model");
                 }
             }
             "/resume" if self.phase.has_active_run() => {
@@ -9903,5 +9906,18 @@ Command: \"npm run build\""
             effects.contains(&Effect::Copy("final answer".to_owned())),
             "{effects:#?}"
         );
+    }
+
+    #[test]
+    fn a_bare_model_command_opens_the_model_menu() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        harness.controller.editor.set_argument_options(
+            "/model",
+            vec![("openai/gpt-5".to_owned(), "GPT-5".to_owned())],
+        );
+        let _ = submit_text(&mut harness.controller, "/model");
+        assert_eq!(harness.controller.editor.text(), "/model ");
+        assert!(!harness.controller.editor.suggestions().is_empty());
     }
 }

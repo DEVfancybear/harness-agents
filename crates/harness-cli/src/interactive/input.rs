@@ -363,6 +363,18 @@ impl LineEditor {
         self.cursor = text.chars().count();
     }
 
+    /// Put `/command ` on the line with its argument menu open, as prime-agent's
+    /// bare `/model` opens the model selector. `false` when the command offers
+    /// no values.
+    pub fn open_argument_menu(&mut self, command: &str) -> bool {
+        if self.argument_options.get(command).is_none_or(Vec::is_empty) {
+            return false;
+        }
+        self.set_text(&format!("{command} "));
+        self.refresh_suggestion();
+        !self.suggestion.is_empty()
+    }
+
     /// Start collecting a secret: one masked line, no completion, no picker.
     ///
     /// Called only from an explicit user request. Nothing here touches the
