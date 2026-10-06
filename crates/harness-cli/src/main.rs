@@ -2070,3 +2070,38 @@ fn diagnostics_json(diagnostics: &StoreDiagnostics) -> serde_json::Value {
 fn store_error(error: StoreError) -> HarnessError {
     error.into_harness_error()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command, ScheduleCommand};
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn a_bare_message_and_schedule_add_parse_as_prime_writes_them() {
+        let cli = Cli::parse_from(["ha", "fix the parser"]);
+        assert_eq!(cli.message.as_deref(), Some("fix the parser"));
+        assert!(cli.command.is_none());
+        let cli = Cli::parse_from([
+            "ha", "schedule", "add", "worker", "0", "9", "*", "*", "1-5", "--", "Check", "open",
+            "work",
+        ]);
+        let Some(Command::Schedule(ScheduleCommand::Add {
+            agent,
+            schedule,
+            message,
+            ..
+        })) = cli.command
+        else {
+            panic!("schedule add");
+        };
+        assert_eq!(agent, "worker");
+        assert_eq!(schedule.join(" "), "0 9 * * 1-5");
+        assert_eq!(message.join(" "), "Check open work");
+        assert!(Cli::parse_from(["ha", "--offline", "agents"]).offline);
+    }
+}
