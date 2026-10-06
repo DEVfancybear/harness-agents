@@ -94,6 +94,9 @@ pub struct ConfigOverrides {
     /// `--append-system-prompt`, repeatable: added at the end of the system
     /// prompt (in place of an `APPEND_SYSTEM.md`).
     pub append_system_prompt: Vec<String>,
+    /// MCP servers this session alone adds (an ACP client's `mcpServers`):
+    /// held in memory, never written to configuration.
+    pub mcp_servers: BTreeMap<String, McpServerConfigV2>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -566,6 +569,9 @@ pub fn resolve_layers(
         apply_queue(&mut queue_modes, &config, ConfigLayer::Local, &mut entries)?;
         apply_routing(&mut routing, &config, ConfigLayer::Local, &mut entries);
     }
+
+    // The session's own servers (ACP `mcpServers`) come last.
+    mcp_servers.extend(overrides.mcp_servers.clone());
 
     let mut profile = overrides.profile.clone().or_else(|| {
         environment

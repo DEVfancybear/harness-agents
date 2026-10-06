@@ -3,16 +3,23 @@
 //! host an agent (Zed and the like).
 //!
 //! Served: `initialize`, `session/new` (one session per connection, as
-//! prime-agent hosts it, opened in the `cwd` it names), `session/prompt`
-//! (text, embedded resources and resource links joined into the message),
-//! the `session/cancel` notification and `session/close`. While a prompt
-//! runs, `session/update` notifications stream `agent_message_chunk`,
-//! `agent_thought_chunk`, `tool_call` and `tool_call_update`; the prompt is
+//! prime-agent hosts it, opened in the `cwd` it names, with the client's
+//! `mcpServers`), `session/prompt` (text, images, embedded resources and
+//! resource links), `session/set_config_option` (prime's `model` and
+//! `thought_level` pickers), the `session/cancel` notification and
+//! `session/close`. While a prompt runs, `session/update` notifications
+//! stream `agent_message_chunk`, `agent_thought_chunk`, `tool_call` and
+//! `tool_call_update`, plus `session_info_update` for goals and refinements
+//! and `config_option_update` when the pickers change; the prompt is
 //! answered with its `stopReason`. Nobody answers an approval here, so a
 //! gated action is refused, as `ha exec` refuses it.
 
+use std::collections::{BTreeMap, HashSet};
 use std::io::BufRead;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use harness_types::McpServerConfigV2;
 
 use harness_types::{HarnessError, InputId};
 use serde_json::{Value, json};
@@ -86,8 +93,58 @@ fn parse_line(line: &str) -> Result<Incoming, Value> {
     })
 }
 
-/// prime-agent's `parse_prompt_blocks`: text blocks, embedded resources (uri
-/// line, then text) and resource links (the uri), joined by newlines.
+/// prime-agent's `PromptBlockError::InvalidImage`.
+const INVALID_IMAGE: &str = "image block requires base64 `data` and `mimeType` strings";
+
+/// An image block of a prompt: base64 data and its type.
+#[derive(Debug, PartialEq, Eq)]
+struct ImageBlock {
+    data: String,
+    mime_type: String,
+}
+
+/// prime-agent's `parse_prompt_blocks`: the text (text blocks, embedded
+/// resources as their uri line then text, resource links as their uri,
+/// joined by newlines) and the image blocks.
+fn prompt_blocks(prompt: &[Value]) -> Result<(String, Vec<ImageBlock>), &'static str> {
+    let mut images = Vec::new();
+    for block in prompt {
+        if block.get("type").and_then(Value::as_str) == Some("image") {
+            match (
+                block.get("data").and_then(Value::as_str),
+                block.get("mimeType").and_then(Value::as_str),
+            ) {
+                (Some(data), Some(mime_type)) => images.push(ImageBlock {
+                    data: data.to_owned(),
+                    mime_type: mime_type.to_owned(),
+                }),
+                _ => return Err(INVALID_IMAGE),
+            }
+        }
+    }
+    Ok((prompt_text(prompt), images))
+}
+
+/// Keep an ACP image beside the pasted ones (`<data>/attachments`) and name
+/// it in the message, the way a pasted screenshot reaches the model.
+fn save_image(directory: &Path, image: &ImageBlock) -> Result<PathBuf, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(image.data.trim())
+        .map_err(|_| INVALID_IMAGE.to_owned())?;
+    let extension = match image.mime_type.as_str() {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "png",
+    };
+    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let path = directory.join(format!("acp-{}.{extension}", InputId::generate().as_str()));
+    std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+/// prime-agent's text half of `parse_prompt_blocks`.
 fn prompt_text(prompt: &[Value]) -> String {
     let mut texts = Vec::new();
     for block in prompt {
@@ -139,9 +196,260 @@ fn stop_reason(outcome: &RunOutcome) -> Result<&'static str, String> {
     }
 }
 
+/// prime-agent's `SERVER_NAME_PATTERN` (`/^[A-Za-z0-9][A-Za-z0-9_-]{0,max-1}$/`).
+fn name_matches(name: &str, max: usize) -> bool {
+    let mut characters = name.chars();
+    characters.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && characters.clone().count() < max
+        && characters.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The `name`/`value` pairs of an entry; one malformed item drops the entry.
+fn pair_list(object: &serde_json::Map<String, Value>, key: &str) -> Option<Vec<(String, String)>> {
+    object
+        .get(key)?
+        .as_array()?
+        .iter()
+        .map(|entry| {
+            Some((
+                entry.get("name")?.as_str()?.to_owned(),
+                entry.get("value")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect()
+}
+
+/// prime-agent's `entries`: duplicates (headers case-insensitively) and
+/// malformed names or values refuse the server.
+fn checked_pairs(
+    server: &str,
+    label: &str,
+    values: Vec<(String, String)>,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut seen = HashSet::new();
+    let mut result = BTreeMap::new();
+    for (name, value) in values {
+        if name.is_empty() {
+            return Err(format!("MCP server {server} has an empty {label} name"));
+        }
+        let identity = if label == "header" {
+            name.to_lowercase()
+        } else {
+            name.clone()
+        };
+        if !seen.insert(identity) {
+            return Err(format!("MCP server {server} has duplicate {label} {name}"));
+        }
+        if label == "header" {
+            let token = name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+.^_`|~-".contains(c));
+            let printable = value
+                .chars()
+                .all(|c| c == '\t' || (' '..='~').contains(&c) || c as u32 >= 0x80);
+            if !token || !printable {
+                return Err(format!("MCP server {server} has an invalid HTTP header"));
+            }
+        } else if name.contains('=') || name.contains('\0') || value.contains('\0') {
+            return Err(format!(
+                "MCP server {server} has an invalid environment entry"
+            ));
+        }
+        result.insert(name, value);
+    }
+    Ok(result)
+}
+
+/// An http(s) URL without embedded credentials (prime's `validate_http_url`).
+fn http_url_ok(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once(':') else {
+        return false;
+    };
+    let scheme = scheme.to_lowercase();
+    let rest = rest.trim_start_matches("//");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    (scheme == "http" || scheme == "https") && !authority.contains('@')
+}
+
+/// prime-agent's `resolve_acp_mcp_servers` and `acp_mcp_tool_names`: the
+/// client's `mcpServers`, as ha's MCP server configuration. `Err` carries
+/// the code and the message prime answers with.
+fn admit_mcp_servers(
+    servers: &[Value],
+    cwd: &Path,
+) -> Result<BTreeMap<String, McpServerConfigV2>, (i64, String)> {
+    let invalid = |reason: String| (INVALID_PARAMS, reason);
+    let mut admitted = BTreeMap::new();
+    for server in servers {
+        // Entries that do not match the ACP `McpServer` union are dropped.
+        let Some(object) = server.as_object() else {
+            continue;
+        };
+        let Some(name) = object.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let kind = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let config = match kind {
+            "http" | "sse" | "acp" => {
+                let shape_ok = if kind == "acp" {
+                    object.get("serverId").and_then(Value::as_str).is_some()
+                } else {
+                    object.get("url").and_then(Value::as_str).is_some()
+                        && pair_list(object, "headers").is_some()
+                };
+                if !shape_ok {
+                    continue;
+                }
+                if kind != "http" {
+                    if !name_matches(name, 64) {
+                        return Err(invalid(SERVER_NAME_RULE.to_owned()));
+                    }
+                    return Err(invalid(format!(
+                        "MCP server {name} uses unsupported {kind} transport"
+                    )));
+                }
+                None
+            }
+            _ => Some(()),
+        };
+        if !name_matches(name, 64) {
+            return Err(invalid(SERVER_NAME_RULE.to_owned()));
+        }
+        if admitted.contains_key(name) {
+            return Err(invalid(format!("duplicate MCP server name: {name}")));
+        }
+        let entry = if config.is_none() {
+            let url = object
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !http_url_ok(url) {
+                return Err(invalid(format!(
+                    "MCP server {name} must use an HTTP(S) URL without embedded credentials"
+                )));
+            }
+            let headers = checked_pairs(
+                name,
+                "header",
+                pair_list(object, "headers").unwrap_or_default(),
+            )
+            .map_err(invalid)?;
+            McpServerConfigV2 {
+                transport: Some("streamable_http".to_owned()),
+                url: Some(url.to_owned()),
+                headers,
+                ..McpServerConfigV2::default()
+            }
+        } else {
+            let (Some(command), Some(args), Some(env)) = (
+                object.get("command").and_then(Value::as_str),
+                object
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .and_then(|args| {
+                        args.iter()
+                            .map(|arg| arg.as_str().map(str::to_owned))
+                            .collect::<Option<Vec<_>>>()
+                    }),
+                pair_list(object, "env"),
+            ) else {
+                continue;
+            };
+            if command.is_empty() {
+                return Err(invalid(format!("MCP server {name} has no stdio command")));
+            }
+            if command.contains('\0') || args.iter().any(|arg| arg.contains('\0')) {
+                return Err(invalid(format!(
+                    "MCP server {name} has an invalid stdio command"
+                )));
+            }
+            McpServerConfigV2 {
+                transport: Some("stdio".to_owned()),
+                command: Some(command.to_owned()),
+                args,
+                env: checked_pairs(name, "environment", env).map_err(invalid)?,
+                cwd: Some(cwd.display().to_string()),
+                ..McpServerConfigV2::default()
+            }
+        };
+        admitted.insert(name.to_owned(), entry);
+    }
+    // prime's tool-name check: `mcp_list_tools_<name>` stays within 64.
+    if let Some(name) = admitted.keys().find(|name| !name_matches(name, 48)) {
+        return Err((
+            INTERNAL_ERROR,
+            format!("Invalid ACP MCP server name: {name}"),
+        ));
+    }
+    Ok(admitted)
+}
+
+const SERVER_NAME_RULE: &str = "MCP server names must start with an alphanumeric character and contain at most 64 alphanumeric, underscore, or hyphen characters";
+
+/// prime-agent's opaque model value: the serialized `[provider, model-id]`.
+fn model_value(provider: &str, model: &str) -> String {
+    json!([provider, model]).to_string()
+}
+
+/// prime-agent's `session_config_options`: a `model` select over the models
+/// that can be called (the current one always selectable) and, when the
+/// model has levels other than `off`, a `thought_level` select.
+fn config_options(service: &dyn SessionPort) -> Vec<Value> {
+    let Some((provider, model)) = service.current_model() else {
+        return Vec::new();
+    };
+    let mut available: Vec<(String, String)> = Vec::new();
+    for (reference, name) in service.model_options() {
+        let (option_provider, option_model) = reference.split_once('/').unwrap_or(("", &reference));
+        let value = model_value(option_provider, option_model);
+        let label = format!("{name} ({option_provider})");
+        match available.iter_mut().find(|(key, _)| *key == value) {
+            Some(slot) => slot.1 = label,
+            None => available.push((value, label)),
+        }
+    }
+    let current = model_value(&provider, &model);
+    if !available.iter().any(|(value, _)| *value == current) {
+        available.push((current.clone(), format!("{model} ({provider})")));
+    }
+    let mut options = vec![json!({
+        "id": "model",
+        "name": "Model",
+        "type": "select",
+        "category": "model",
+        "currentValue": current,
+        "options": available
+            .iter()
+            .map(|(value, name)| json!({ "value": value, "name": name }))
+            .collect::<Vec<_>>(),
+    })];
+    let levels = service.thinking_levels();
+    if levels.iter().any(|level| level != "off") {
+        options.push(json!({
+            "id": "thought_level",
+            "name": "Reasoning effort",
+            "type": "select",
+            "category": "thought_level",
+            "currentValue": service.thinking_level().unwrap_or_else(|| "off".to_owned()),
+            "options": levels
+                .iter()
+                .map(|level| json!({ "value": level, "name": level }))
+                .collect::<Vec<_>>(),
+        }));
+    }
+    options
+}
+
 struct Session {
     id: String,
     service: Box<dyn SessionPort>,
+    /// Where the prompt's images are kept.
+    attachments: PathBuf,
+    /// The picker options last published.
+    published: Vec<Value>,
     /// The `session/prompt` waiting for its run to end.
     prompt: Option<Value>,
     message: Option<String>,
@@ -184,7 +492,8 @@ impl Acp {
                         "protocolVersion": 1,
                         "agentCapabilities": {
                             "loadSession": false,
-                            "promptCapabilities": { "image": false, "embeddedContext": true },
+                            "promptCapabilities": { "image": true, "embeddedContext": true },
+                            "mcpCapabilities": { "http": true },
                             "sessionCapabilities": { "close": {} },
                         },
                         "agentInfo": {
@@ -196,6 +505,7 @@ impl Acp {
                 ));
             }
             "session/new" => self.new_session(&id, params),
+            "session/set_config_option" => self.set_config_option(&id, params),
             "session/prompt" => self.prompt(id, params),
             "session/close" => {
                 let known = self.session.as_ref().is_some_and(|session| {
@@ -265,22 +575,51 @@ impl Acp {
                 return;
             }
         };
+        let servers = params
+            .get("mcpServers")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mcp_servers = match admit_mcp_servers(&servers, &context.project.root) {
+            Ok(servers) => servers,
+            Err((code, message)) => {
+                let frame = if code == INVALID_PARAMS {
+                    error_response(
+                        id,
+                        INVALID_PARAMS,
+                        "Invalid params",
+                        Some(&json!({ "reason": message })),
+                    )
+                } else {
+                    error_response(id, code, &message, None)
+                };
+                self.out.push(frame);
+                return;
+            }
+        };
+        let mut overrides = self.overrides.clone();
+        overrides.mcp_servers = mcp_servers;
         let (sender, events) = mpsc::unbounded_channel();
         let service = super::service::AgentSessionService::new_with_overrides(
             &context,
             environment,
             sender,
-            self.overrides.clone(),
+            overrides,
         );
         let session_id = service
             .conversation_id()
             .unwrap_or_else(|| InputId::generate().as_str().to_owned());
-        self.out
-            .push(response(id, &json!({ "sessionId": session_id })));
+        let published = config_options(&service);
+        self.out.push(response(
+            id,
+            &json!({ "sessionId": session_id, "configOptions": published }),
+        ));
         self.events = Some(events);
         self.session = Some(Session {
             id: session_id,
             service: Box::new(service),
+            attachments: context.paths.data_dir.join("attachments"),
+            published,
             prompt: None,
             message: None,
             messages: 0,
@@ -315,7 +654,37 @@ impl Acp {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let text = prompt_text(&blocks);
+        let (mut text, images) = match prompt_blocks(&blocks) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                self.out.push(error_response(
+                    &id,
+                    INVALID_PARAMS,
+                    "Invalid params",
+                    Some(&json!({ "reason": reason })),
+                ));
+                return;
+            }
+        };
+        for image in &images {
+            match save_image(&session.attachments, image) {
+                Ok(path) => {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&format!("\"{}\"", path.display()));
+                }
+                Err(reason) => {
+                    self.out.push(error_response(
+                        &id,
+                        INVALID_PARAMS,
+                        "Invalid params",
+                        Some(&json!({ "reason": reason })),
+                    ));
+                    return;
+                }
+            }
+        }
         if text.trim().is_empty() {
             self.out.push(error_response(
                 &id,
@@ -336,6 +705,133 @@ impl Acp {
             compact_guidance: None,
             refine: None,
         });
+    }
+
+    /// prime-agent's `session/set_config_option`: apply the `model` or
+    /// `thought_level` selection and answer the refreshed options.
+    fn set_config_option(&mut self, id: &Value, params: &Value) {
+        let requested = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let invalid = |reason: String| {
+            error_response(
+                id,
+                INVALID_PARAMS,
+                "Invalid params",
+                Some(&json!({ "reason": reason })),
+            )
+        };
+        let Some(session) = self
+            .session
+            .as_mut()
+            .filter(|session| session.id == requested)
+        else {
+            self.out
+                .push(invalid(format!("Unknown ACP session: {requested}")));
+            return;
+        };
+        let config_id = params
+            .get("configId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let value = params.get("value").and_then(Value::as_str);
+        let applied = match (config_id, value) {
+            ("model", Some(value)) => {
+                let current = session
+                    .service
+                    .current_model()
+                    .map(|(provider, model)| model_value(&provider, &model));
+                if current.as_deref() == Some(value) {
+                    Ok(())
+                } else {
+                    let chosen =
+                        session
+                            .service
+                            .model_options()
+                            .into_iter()
+                            .find(|(reference, _)| {
+                                let (provider, model) =
+                                    reference.split_once('/').unwrap_or(("", reference));
+                                model_value(provider, model) == value
+                            });
+                    match chosen {
+                        None => Err(invalid(format!("Unavailable model: {value}"))),
+                        Some((reference, _)) => session
+                            .service
+                            .set_model(&reference)
+                            .map(|_| ())
+                            .map_err(|message| {
+                                error_response(
+                                    id,
+                                    INTERNAL_ERROR,
+                                    "Internal error",
+                                    Some(&json!({ "details": message })),
+                                )
+                            }),
+                    }
+                }
+            }
+            ("thought_level", Some(value)) => {
+                let levels = session.service.thinking_levels();
+                if levels.iter().any(|level| level != "off")
+                    && levels.iter().any(|level| level == value)
+                {
+                    session
+                        .service
+                        .set_thinking(value)
+                        .map(|_| ())
+                        .map_err(|message| {
+                            error_response(
+                                id,
+                                INTERNAL_ERROR,
+                                "Internal error",
+                                Some(&json!({ "details": message })),
+                            )
+                        })
+                } else {
+                    Err(invalid(format!("Unsupported reasoning effort: {value}")))
+                }
+            }
+            (other, _) => Err(invalid(format!("Unknown config option: {other}"))),
+        };
+        if let Err(frame) = applied {
+            self.out.push(frame);
+            return;
+        }
+        self.refresh_options();
+        let options = self
+            .session
+            .as_ref()
+            .map(|session| session.published.clone())
+            .unwrap_or_default();
+        self.out
+            .push(response(id, &json!({ "configOptions": options })));
+    }
+
+    /// prime-agent's `refreshConfig`: publish `config_option_update` when the
+    /// options changed.
+    fn refresh_options(&mut self) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let options = config_options(session.service.as_ref());
+        if options == session.published {
+            return;
+        }
+        session.published.clone_from(&options);
+        self.update(&json!({
+            "sessionUpdate": "config_option_update",
+            "configOptions": options,
+        }));
+    }
+
+    /// prime-agent's `session_info_update`, under its `_meta` namespace.
+    fn info_update(&mut self, meta: Value) {
+        self.update(&json!({
+            "sessionUpdate": "session_info_update",
+            "_meta": { "ai.primeintellect.prime-agent": meta },
+        }));
     }
 
     fn notification(&mut self, method: &str, params: &Value) {
@@ -435,11 +931,37 @@ impl Acp {
                         .answer(&request_id, ApprovalDecision::Denied);
                 }
             }
+            SessionEvent::GoalCreated {
+                objective,
+                token_budget,
+            } => {
+                let mut goal = json!({ "status": "active", "objective": objective });
+                if let Some(budget) = token_budget {
+                    goal["tokenBudget"] = json!(budget);
+                }
+                self.info_update(json!({ "goal": goal }));
+            }
+            SessionEvent::GoalCompleted { .. } => {
+                self.info_update(json!({ "goal": { "status": "complete" } }));
+            }
+            SessionEvent::Refined {
+                summary, details, ..
+            } => {
+                self.info_update(json!({ "refinement": {
+                    "status": "complete",
+                    "summary": summary,
+                    "changes": details,
+                }}));
+            }
             // A turn that broke is over, as the app's controller ends it.
             SessionEvent::RecoverableError { message } => {
                 self.finish(&RunOutcome::Failed(message));
             }
-            SessionEvent::RunTerminal { outcome } => self.finish(&outcome),
+            SessionEvent::RunTerminal { outcome } => {
+                self.finish(&outcome);
+                // A turn can change the model (the backup) or its levels.
+                self.refresh_options();
+            }
             _ => {}
         }
     }
@@ -526,8 +1048,73 @@ pub async fn run(overrides: ConfigOverrides) -> Result<ExitCode, HarnessError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Incoming, parse_line, prompt_text, tool_kind};
+    use super::{
+        INTERNAL_ERROR, INVALID_PARAMS, Incoming, admit_mcp_servers, parse_line, prompt_blocks,
+        prompt_text, tool_kind,
+    };
     use serde_json::json;
+
+    #[test]
+    fn mcp_servers_are_admitted_as_prime_admits_them() {
+        let cwd = std::path::Path::new("/work");
+        let admitted = admit_mcp_servers(
+            &[
+                json!({ "name": "files", "command": "mcp-files", "args": ["--ro"], "env": [{ "name": "LEVEL", "value": "1" }] }),
+                json!({ "name": "web", "type": "http", "url": "https://mcp.example/x", "headers": [] }),
+                json!({ "name": "broken" }),
+            ],
+            cwd,
+        )
+        .expect("admitted");
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(admitted["files"].command.as_deref(), Some("mcp-files"));
+        assert_eq!(
+            admitted["web"].transport.as_deref(),
+            Some("streamable_http")
+        );
+        assert_eq!(
+            admit_mcp_servers(
+                &[json!({ "name": "a", "type": "sse", "url": "https://x", "headers": [] })],
+                cwd
+            )
+            .unwrap_err(),
+            (
+                INVALID_PARAMS,
+                "MCP server a uses unsupported sse transport".to_owned()
+            )
+        );
+        assert_eq!(
+            admit_mcp_servers(
+                &[json!({ "name": "a", "type": "http", "url": "https://u:p@x", "headers": [] })],
+                cwd
+            )
+            .unwrap_err()
+            .1,
+            "MCP server a must use an HTTP(S) URL without embedded credentials"
+        );
+        let long = "a".repeat(50);
+        assert_eq!(
+            admit_mcp_servers(
+                &[json!({ "name": long, "command": "c", "args": [], "env": [] })],
+                cwd
+            )
+            .unwrap_err()
+            .0,
+            INTERNAL_ERROR
+        );
+    }
+
+    #[test]
+    fn prompt_images_need_data_and_a_type() {
+        let (text, images) = prompt_blocks(&[
+            json!({ "type": "text", "text": "what is this?" }),
+            json!({ "type": "image", "data": "aGk=", "mimeType": "image/png" }),
+        ])
+        .expect("parsed");
+        assert_eq!(text, "what is this?");
+        assert_eq!(images.len(), 1);
+        assert!(prompt_blocks(&[json!({ "type": "image", "data": "aGk=" })]).is_err());
+    }
 
     #[test]
     fn frames_and_prompts_read_as_prime_reads_them() {
