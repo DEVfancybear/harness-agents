@@ -527,6 +527,37 @@ pub struct ReplShared {
     reaped: AtomicBool,
     /// The session's own kernel requests, answered between turns too.
     session_host: std::sync::Mutex<Option<Arc<dyn HostRequests>>>,
+    /// prime-agent's `ipython_state` notice from the last compaction, until the
+    /// next prompt carries it to the model.
+    compaction_notice: std::sync::Mutex<Option<String>>,
+}
+
+/// How long the namespace listing may take after a compaction (prime-agent's
+/// `KERNEL_STATE_LISTING_TIMEOUT_MS`): a stuck kernel leaves the names out.
+const KERNEL_STATE_LISTING_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// prime-agent's post-compaction `[python-state]` notice: the kernel outlived
+/// the compaction, what the pruning removed, and which names are defined.
+/// `names` is `None` when the listing failed.
+#[must_use]
+pub fn compaction_notice(pruned: Option<&[String]>, names: Option<&[String]>) -> String {
+    let detail = match names {
+        None => String::new(),
+        Some(names) if !names.is_empty() => {
+            format!(" These names are still defined: {}.", names.join(", "))
+        }
+        Some(_) => " You have not defined any names yet.".to_owned(),
+    };
+    let pruned_detail = match pruned {
+        Some(pruned) if !pruned.is_empty() => format!(
+            " Variables above the per-variable snapshot limit were removed: {}.",
+            pruned.join(", ")
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "[python-state]\n\nYour Python kernel persisted through compaction; its remaining variables, imports, and helpers are still available.{pruned_detail}{detail}"
+    )
 }
 
 #[derive(Default)]
@@ -560,6 +591,7 @@ impl ReplShared {
             link: std::sync::Mutex::new(None),
             reaped: AtomicBool::new(false),
             session_host: std::sync::Mutex::new(None),
+            compaction_notice: std::sync::Mutex::new(None),
         }
     }
 
@@ -898,6 +930,66 @@ impl ReplShared {
             return None;
         };
         result.map(|result| result.pruned)
+    }
+
+    /// prime-agent's `listNamespaceNames`: the live user-defined top-level names.
+    /// `None` when no kernel runs, a cell holds it, or the listing failed.
+    pub async fn list_namespace_names(&self) -> Option<Vec<String>> {
+        let mut slot = self.kernel.lock().await;
+        let kernel = slot.kernel.as_mut()?;
+        if !kernel.link.is_open() || kernel.in_flight.is_some() {
+            return None;
+        }
+        let finished = kernel
+            .run(
+                json!({ "type": "list_names" }),
+                KERNEL_STATE_LISTING_TIMEOUT,
+            )
+            .await
+            .ok()?;
+        if finished.done["status"] != "ok" {
+            return None;
+        }
+        Some(
+            finished.done["names"]
+                .as_array()?
+                .iter()
+                .filter_map(|name| name.as_str().map(str::to_owned))
+                .collect(),
+        )
+    }
+
+    /// Whether a kernel is running.
+    pub async fn has_running_kernel(&self) -> bool {
+        self.kernel
+            .lock()
+            .await
+            .kernel
+            .as_ref()
+            .is_some_and(|kernel| kernel.link.is_open())
+    }
+
+    /// prime-agent's `_syncKernelStateAfterCompaction`: with a kernel running,
+    /// prune, list the names, and keep the `[python-state]` notice for the next
+    /// prompt. The names pruned, for the user's notice.
+    pub async fn sync_after_compaction(&self) -> Option<Vec<String>> {
+        if !self.has_running_kernel().await {
+            return None;
+        }
+        let pruned = self.prune_oversized_variables().await;
+        let names = self.list_namespace_names().await;
+        if names.is_none() && !self.has_running_kernel().await {
+            return pruned;
+        }
+        if let Ok(mut notice) = self.compaction_notice.lock() {
+            *notice = Some(compaction_notice(pruned.as_deref(), names.as_deref()));
+        }
+        pruned
+    }
+
+    /// The `[python-state]` notice the last compaction left, once.
+    pub fn take_compaction_notice(&self) -> Option<String> {
+        self.compaction_notice.lock().ok()?.take()
     }
 
     /// Reap, once per app session, the kernels a crashed `ha` left running.
@@ -3189,5 +3281,20 @@ mod tests {
             Some(super::KERNEL_RESTART_NOTICE)
         );
         assert_eq!(super::start_notice(false, &Revival::NoSnapshot), None);
+    }
+
+    #[test]
+    fn the_compaction_notice_is_prime_agents() {
+        let names = ["df".to_owned(), "x".to_owned()];
+        let pruned = ["big".to_owned()];
+        assert_eq!(
+            super::compaction_notice(Some(&pruned), Some(&names)),
+            "[python-state]\n\nYour Python kernel persisted through compaction; its remaining variables, imports, and helpers are still available. Variables above the per-variable snapshot limit were removed: big. These names are still defined: df, x."
+        );
+        assert!(
+            super::compaction_notice(None, Some(&[]))
+                .ends_with("You have not defined any names yet.")
+        );
+        assert!(super::compaction_notice(None, None).ends_with("are still available."));
     }
 }

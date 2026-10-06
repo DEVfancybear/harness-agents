@@ -1655,6 +1655,9 @@ pub struct RuntimeService {
     /// The last recovered session's fold, so the next step of the turn reads
     /// only the events committed since.
     recovery: Arc<Mutex<Option<harness_session::RecoveryCache>>>,
+    /// How many compactions this runtime has published, so a host can follow
+    /// one that ran inside a turn (prime-agent's kernel-state sync).
+    compactions: Arc<AtomicU32>,
 }
 
 impl RuntimeService {
@@ -1679,7 +1682,14 @@ impl RuntimeService {
             recovery: Arc::new(Mutex::new(None)),
             budget: None,
             evaluator: default_evaluator(),
+            compactions: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// How many compactions this runtime has published.
+    #[must_use]
+    pub fn compactions(&self) -> u32 {
+        self.compactions.load(Ordering::SeqCst)
     }
     #[must_use]
     pub fn with_summarizer(mut self, summarizer: Arc<dyn SummaryProvider>) -> Self {
@@ -2788,6 +2798,7 @@ impl RuntimeService {
                             false,
                         )
                         .await?;
+                    self.compactions.fetch_add(1, Ordering::SeqCst);
                     return Ok(CompactionResult {
                         covered_through: built.packet.through_event_seq,
                         packet: built.packet,

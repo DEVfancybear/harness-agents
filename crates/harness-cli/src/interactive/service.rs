@@ -6127,10 +6127,11 @@ async fn run_turn(
             let _ = store.close().await;
         }
         // prime-agent's `_syncKernelStateAfterCompaction`: the kernel's namespace is
-        // snapshotted and the variables too large to snapshot are removed with it.
+        // snapshotted and the variables too large to snapshot are removed with it;
+        // the next prompt tells the model the kernel lived on (`[python-state]`).
         if result.is_ok()
             && let Some(repl) = &repl
-            && let Some(pruned) = repl.prune_oversized_variables().await
+            && let Some(pruned) = repl.sync_after_compaction().await
             && !pruned.is_empty()
         {
             send(SessionEvent::Notice {
@@ -6514,6 +6515,11 @@ async fn run_turn(
             request.text
         );
     }
+    // prime-agent's `ipython_state` row: after a compaction the model reads, ahead
+    // of the next message, that the kernel and its names lived on.
+    if let Some(notice) = repl.as_ref().and_then(|repl| repl.take_compaction_notice()) {
+        request.text = format!("{notice}\n\n{}", request.text);
+    }
     let mut prompt = format!(
         "{}{}",
         request.text,
@@ -6760,6 +6766,21 @@ async fn run_turn(
     // The turn's children belong to the session: they keep running, and what they
     // find reaches the parent as a notice.
     drop(delegate_host);
+
+    // prime-agent syncs the kernel after every compaction, the automatic ones a
+    // turn ran included: the next prompt says the kernel and its names lived on.
+    if runtime.compactions() > 0
+        && let Some(repl) = &repl
+        && let Some(pruned) = repl.sync_after_compaction().await
+        && !pruned.is_empty()
+    {
+        send(SessionEvent::Notice {
+            message: format!(
+                "python: variables over the snapshot size limit were removed: {}",
+                pruned.join(", ")
+            ),
+        });
+    }
 
     if let Some(built) = runtime.context_result(&session_id) {
         let mut lines = vec![
