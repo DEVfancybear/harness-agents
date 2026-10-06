@@ -59,7 +59,7 @@ const fn command(
 /// Built-in commands in the order the menu and `/help` list them: prime-agent's
 /// commands first, in prime-agent's order and words, then the ones only this app
 /// has.
-pub const SLASH_COMMANDS: [SlashCommand; 53] = [
+pub const SLASH_COMMANDS: [SlashCommand; 55] = [
     command("/model", "[search]", "Select model (opens selector UI)"),
     SlashCommand {
         aliases: &["/thinking"],
@@ -79,6 +79,16 @@ pub const SLASH_COMMANDS: [SlashCommand; 53] = [
         "/share",
         "",
         "Share session as a secret GitHub gist (needs the gh CLI)",
+    ),
+    command(
+        "/heartbeat",
+        "[every <dur>] [--steer|--follow-up] <instr>",
+        "Add a recurring heartbeat to this session",
+    ),
+    command(
+        "/heartbeats",
+        "[pause|resume|delete <id>]",
+        "View and manage this session's heartbeats",
     ),
     command("/copy", "", "Copy last agent message to clipboard"),
     SlashCommand {

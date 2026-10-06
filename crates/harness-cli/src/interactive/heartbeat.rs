@@ -5,11 +5,15 @@
 //! current session; each one re-sends its instruction on its interval as
 //! `[heartbeat: every 5m run#N]`. A `steer` heartbeat reaches a running turn at once,
 //! through the same inbox `/steer` uses; a `follow_up` one waits for the turn to end.
-//! They live as long as the app session, like prime-agent's session-internal ones.
+//! They are kept in `<data dir>/heartbeats/<task id>.json`, as prime-agent keeps
+//! them in its cron store, so they survive a restart and an update and come back
+//! with their conversation. `/heartbeat` and `/heartbeats` manage them by hand.
 
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// prime-agent's `DEFAULT_HEARTBEAT_SCHEDULE`.
@@ -17,7 +21,8 @@ pub const DEFAULT_SCHEDULE: &str = "every 5m";
 const MIN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How a due heartbeat reaches the session.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Delivery {
     /// Interrupt the running turn so the heartbeat runs promptly (the default).
     Steer,
@@ -51,7 +56,7 @@ pub struct Due {
     pub delivery: Delivery,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Heartbeat {
     id: String,
     paused: bool,
@@ -59,21 +64,63 @@ struct Heartbeat {
     delivery: Delivery,
     instruction: String,
     expression: String,
+    #[serde(with = "millis")]
     interval: Duration,
     created_at: String,
     updated_at: String,
-    next_run: Instant,
+    /// Wall-clock milliseconds, so the next run survives a restart.
+    next_run_ms: u64,
     last_run_at: Option<String>,
     run_count: u64,
+}
+
+mod millis {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(u64::try_from(value.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
+        u64::deserialize(deserializer).map(Duration::from_millis)
+    }
+}
+
+/// Wall-clock milliseconds at the monotonic instant `at`.
+fn wall_ms(at: Instant) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        });
+    let ahead = at.saturating_duration_since(Instant::now());
+    let behind = Instant::now().saturating_duration_since(at);
+    now.saturating_add(u64::try_from(ahead.as_millis()).unwrap_or(u64::MAX))
+        .saturating_sub(u64::try_from(behind.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn after(interval: Duration) -> u64 {
+    wall_ms(Instant::now()).saturating_add(u64::try_from(interval.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Drop a stopped conversation's heartbeats, as prime-agent's stop cleanup
+/// cancels its cron jobs; `true` when there were any.
+pub fn cancel_conversation(data_dir: &Path, task: &str) -> bool {
+    std::fs::remove_file(path_for(data_dir, task)).is_ok()
+}
+
+/// Where a conversation's heartbeats are kept.
+#[must_use]
+pub fn path_for(data_dir: &Path, task: &str) -> PathBuf {
+    data_dir.join("heartbeats").join(format!("{task}.json"))
 }
 
 impl Heartbeat {
     /// `rlmHeartbeatHostResponse`.
     fn response(&self) -> Value {
-        let next = self
-            .next_run
-            .saturating_duration_since(Instant::now())
-            .as_secs();
+        let next = self.next_run_ms.saturating_sub(wall_ms(Instant::now())) / 1000;
         json!({
             "id": self.id,
             "status": if self.paused { "paused" } else { "active" },
@@ -159,14 +206,60 @@ impl super::repl::HostRequests for Heartbeats {
     }
 }
 
-/// The heartbeats of one app session.
+/// The heartbeats of the conversation the session is in.
 #[derive(Default)]
 pub struct Heartbeats {
     items: Mutex<Vec<Heartbeat>>,
     next_id: Mutex<u64>,
+    /// The file they are kept in, once the session is in a conversation.
+    path: Mutex<Option<PathBuf>>,
 }
 
 impl Heartbeats {
+    /// Follow the conversation whose heartbeats live at `path`: they are read
+    /// back, as prime-agent's restore re-arms a session's cron jobs.
+    pub fn bind(&self, path: PathBuf) {
+        let Ok(mut current) = self.path.lock() else {
+            return;
+        };
+        if current.as_ref() == Some(&path) {
+            return;
+        }
+        let loaded = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Vec<Heartbeat>>(&text).ok())
+            .unwrap_or_default();
+        let highest = loaded
+            .iter()
+            .filter_map(|heartbeat| heartbeat.id.strip_prefix("heartbeat-")?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        if let Ok(mut items) = self.items.lock() {
+            *items = loaded;
+        }
+        if let Ok(mut next) = self.next_id.lock() {
+            *next = highest;
+        }
+        *current = Some(path);
+    }
+
+    /// Write the heartbeats back, through a staged copy so a crash keeps the old
+    /// file.
+    fn save(&self, items: &[Heartbeat]) {
+        let Some(path) = self.path.lock().ok().and_then(|path| path.clone()) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let Ok(text) = serde_json::to_string_pretty(items) else {
+            return;
+        };
+        let staged = path.with_extension("json.staged");
+        if std::fs::write(&staged, text).is_ok() {
+            let _ = std::fs::rename(&staged, &path);
+        }
+    }
     fn id(&self) -> String {
         let mut next = self
             .next_id
@@ -240,12 +333,13 @@ impl Heartbeats {
                     interval,
                     created_at: now.clone(),
                     updated_at: now,
-                    next_run: Instant::now() + interval,
+                    next_run_ms: after(interval),
                     last_run_at: None,
                     run_count: 0,
                 };
                 let response = heartbeat.response();
                 items.push(heartbeat);
+                self.save(&items);
                 Ok(json!({ "heartbeat": response }))
             }
             "rlm_heartbeat.update" => {
@@ -289,7 +383,7 @@ impl Heartbeats {
                     let (expression, every) = parse_schedule(Some(&interval))?;
                     heartbeat.expression = expression;
                     heartbeat.interval = every;
-                    heartbeat.next_run = Instant::now() + every;
+                    heartbeat.next_run_ms = after(every);
                 }
                 if let Some(label) = label {
                     heartbeat.label =
@@ -302,12 +396,14 @@ impl Heartbeats {
                     Some("pause") => heartbeat.paused = true,
                     Some("resume") => {
                         heartbeat.paused = false;
-                        heartbeat.next_run = Instant::now() + heartbeat.interval;
+                        heartbeat.next_run_ms = after(heartbeat.interval);
                     }
                     _ => {}
                 }
                 heartbeat.updated_at = now_label();
-                Ok(json!({ "heartbeat": heartbeat.response() }))
+                let response = heartbeat.response();
+                self.save(&items);
+                Ok(json!({ "heartbeat": response }))
             }
             "rlm_heartbeat.delete" => {
                 let id = request["id"]
@@ -317,6 +413,7 @@ impl Heartbeats {
                     .iter()
                     .position(|heartbeat| heartbeat.id == id)
                     .map(|index| items.remove(index));
+                self.save(&items);
                 Ok(json!({ "heartbeat": removed.map(|heartbeat| heartbeat.response()) }))
             }
             _ => Err(format!("unknown RLM heartbeat request type \"{kind}\"")),
@@ -338,14 +435,17 @@ impl Heartbeats {
             return Vec::new();
         };
         let mut due = Vec::new();
+        let now_ms = wall_ms(now);
         for heartbeat in items.iter_mut().filter(|heartbeat| !heartbeat.paused) {
-            if heartbeat.next_run > now {
+            if heartbeat.next_run_ms > now_ms {
                 continue;
             }
             heartbeat.run_count += 1;
             heartbeat.last_run_at = Some(now_label());
-            // A session that was busy for several intervals runs once, not once per miss.
-            heartbeat.next_run = now + heartbeat.interval;
+            // A session that was busy for several intervals - or closed - runs
+            // once, not once per miss.
+            heartbeat.next_run_ms = now_ms
+                .saturating_add(u64::try_from(heartbeat.interval.as_millis()).unwrap_or(u64::MAX));
             due.push(Due {
                 text: format!(
                     "[heartbeat: {} run#{}]\n\n{}",
@@ -356,7 +456,92 @@ impl Heartbeats {
                 delivery: heartbeat.delivery,
             });
         }
+        if !due.is_empty() {
+            self.save(&items);
+        }
         due
+    }
+
+    /// prime-agent's `/heartbeats` and `/heartbeat`: list, or add with
+    /// `every <interval> [--steer|--follow-up] <instruction>`, or pause,
+    /// resume and delete by id.
+    pub fn command(&self, argument: Option<&str>) -> Result<Vec<String>, String> {
+        let argument = argument.map(str::trim).unwrap_or_default();
+        let mut words = argument.split_whitespace();
+        match words.next() {
+            None | Some("list") => {
+                let listed = self.handle("rlm_heartbeat.list", &json!({}))?;
+                let rows = listed["heartbeats"].as_array().cloned().unwrap_or_default();
+                if rows.is_empty() {
+                    return Ok(vec![
+                        "no heartbeats; /heartbeat every 10m <instruction> adds one".to_owned(),
+                    ]);
+                }
+                Ok(rows
+                    .iter()
+                    .map(|row| {
+                        format!(
+                            "{} {} {} ({}) next {} runs {}: {}",
+                            row["id"].as_str().unwrap_or_default(),
+                            row["status"].as_str().unwrap_or_default(),
+                            row["schedule"]["expression"].as_str().unwrap_or_default(),
+                            row["delivery_mode"].as_str().unwrap_or_default(),
+                            row["next_run_at"].as_str().unwrap_or("-"),
+                            row["run_count"],
+                            row["instruction"].as_str().unwrap_or_default(),
+                        )
+                    })
+                    .collect())
+            }
+            Some(action @ ("pause" | "resume")) => {
+                let id = words.next().ok_or("usage: /heartbeats pause|resume <id>")?;
+                let updated =
+                    self.handle("rlm_heartbeat.update", &json!({"id": id, "status": action}))?;
+                if updated["heartbeat"].is_null() {
+                    return Err(format!("no heartbeat {id}"));
+                }
+                Ok(vec![format!("{id} {action}d")])
+            }
+            Some("delete" | "stop" | "remove") => {
+                let id = words.next().ok_or("usage: /heartbeats delete <id>")?;
+                let removed = self.handle("rlm_heartbeat.delete", &json!({"id": id}))?;
+                if removed["heartbeat"].is_null() {
+                    return Err(format!("no heartbeat {id}"));
+                }
+                Ok(vec![format!("{id} deleted")])
+            }
+            Some("every" | "each") => {
+                let rest = argument.split_once(char::is_whitespace).map_or("", |(_, rest)| rest);
+                let mut parts = rest.split_whitespace();
+                let interval = parts.next().ok_or("usage: /heartbeat every <interval> <instruction>")?;
+                let mut delivery = None;
+                let mut instruction = Vec::new();
+                for word in parts {
+                    match word {
+                        "--steer" if instruction.is_empty() => delivery = Some("steer"),
+                        "--follow-up" if instruction.is_empty() => delivery = Some("follow_up"),
+                        other => instruction.push(other),
+                    }
+                }
+                let created = self.handle(
+                    "rlm_heartbeat.create",
+                    &json!({
+                        "instruction": instruction.join(" "),
+                        "interval": format!("every {interval}"),
+                        "delivery_mode": delivery,
+                    }),
+                )?;
+                Ok(vec![format!(
+                    "{} active {}",
+                    created["heartbeat"]["id"].as_str().unwrap_or_default(),
+                    created["heartbeat"]["schedule"]["expression"].as_str().unwrap_or_default()
+                )])
+            }
+            Some(_) => Err(
+                "usage: /heartbeat every <interval> [--steer|--follow-up] <instruction> · /heartbeats [pause|resume|delete <id>]"
+                    .to_owned(),
+            ),
+        }
     }
 }
 

@@ -3147,6 +3147,22 @@ impl InteractiveController {
                 Ok(lines) => self.reference("/schedule", lines, &mut effects),
                 Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
             },
+            "/heartbeats" | "/heartbeat" => {
+                // `/heartbeat <instruction>` adds one, as prime-agent's does.
+                let argument = match (name, raw_argument) {
+                    ("/heartbeat", Some(text))
+                        if !text.trim_start().starts_with("every ")
+                            && !text.trim_start().starts_with("each ") =>
+                    {
+                        Some(format!("every 5m {text}"))
+                    }
+                    (_, argument) => argument.map(str::to_owned),
+                };
+                match self.service.heartbeat(argument.as_deref()) {
+                    Ok(lines) => self.reference(name, lines, &mut effects),
+                    Err(message) => self.push_history(&mut effects, HistoryItem::Error { message }),
+                }
+            }
             "/scoped-models" => match self.service.scoped_models(raw_argument) {
                 Ok(lines) => {
                     self.reference("/scoped-models", lines, &mut effects);

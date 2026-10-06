@@ -381,6 +381,10 @@ pub trait SessionPort: Send {
     fn schedule(&mut self, _argument: Option<&str>) -> Result<Vec<String>, String> {
         Err("this backend keeps no schedules".to_owned())
     }
+    /// `/heartbeat` and `/heartbeats`: this conversation's heartbeats.
+    fn heartbeat(&mut self, _argument: Option<&str>) -> Result<Vec<String>, String> {
+        Err("this backend keeps no heartbeats".to_owned())
+    }
     /// The session's input and output tokens so far, for autonomous budgets.
     fn session_tokens(&self) -> u64 {
         0
@@ -2992,6 +2996,11 @@ impl AgentSessionService {
             &context.paths.data_dir,
             task_id.as_str(),
         ));
+        let heartbeats = Arc::new(super::heartbeat::Heartbeats::default());
+        heartbeats.bind(super::heartbeat::path_for(
+            &context.paths.data_dir,
+            task_id.as_str(),
+        ));
         Self {
             sender,
             store_dir: context.project_store_dir(),
@@ -3039,7 +3048,7 @@ impl AgentSessionService {
             thinking: None,
             service_tier: Arc::new(Mutex::new(None)),
             turns_since_review: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            heartbeats: Arc::new(super::heartbeat::Heartbeats::default()),
+            heartbeats,
             schedules,
             gate_cancellation: None,
             live: Arc::new(LiveTurn::default()),
@@ -3050,6 +3059,10 @@ impl AgentSessionService {
     /// The jobs of the conversation this session is now in.
     fn follow_schedules(&self) {
         self.schedules.bind(super::schedules::path_for(
+            &self.data_dir,
+            self.task_id.as_str(),
+        ));
+        self.heartbeats.bind(super::heartbeat::path_for(
             &self.data_dir,
             self.task_id.as_str(),
         ));
@@ -3213,6 +3226,7 @@ impl AgentSessionService {
         let resumed_task = Arc::clone(&self.resumed_task);
         let store_dir = self.store_dir.clone();
         let schedules = Arc::clone(&self.schedules);
+        let heartbeats = Arc::clone(&self.heartbeats);
         let data_dir = self.data_dir.clone();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
@@ -3234,6 +3248,7 @@ impl AgentSessionService {
                     }
                     // The resumed conversation's scheduled jobs come back with it.
                     schedules.bind(super::schedules::path_for(&data_dir, task.as_str()));
+                    heartbeats.bind(super::heartbeat::path_for(&data_dir, task.as_str()));
                     store
                         .session_setting(&task, super::goal::GOAL_SETTING)
                         .await
@@ -4273,6 +4288,10 @@ impl SessionPort for AgentSessionService {
 
     fn schedule(&mut self, argument: Option<&str>) -> Result<Vec<String>, String> {
         super::schedules::command(&self.schedules, argument)
+    }
+
+    fn heartbeat(&mut self, argument: Option<&str>) -> Result<Vec<String>, String> {
+        self.heartbeats.command(argument)
     }
 
     fn session_tokens(&self) -> u64 {

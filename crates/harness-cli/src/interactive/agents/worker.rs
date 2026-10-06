@@ -686,6 +686,9 @@ impl Worker {
                         "{cancelled} scheduled job(s) of the stopped agent were cancelled"
                     ));
                 }
+                if super::super::heartbeat::cancel_conversation(&data_dir, &task) {
+                    log("the stopped agent's heartbeats were cancelled");
+                }
             }
         });
         log(&format!("agent {id} stopped"));
