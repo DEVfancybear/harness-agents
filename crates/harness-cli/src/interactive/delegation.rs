@@ -2940,6 +2940,8 @@ impl TurnObserver for ExplorerObserver {
             TurnProgress::Usage {
                 prompt_tokens,
                 completion_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
             } => {
                 if let Ok(mut usage) = self.token_usage.lock() {
                     usage.0 = usage.0.saturating_add(prompt_tokens);
@@ -2951,6 +2953,8 @@ impl TurnObserver for ExplorerObserver {
                         CostUsage {
                             input_tokens: prompt_tokens,
                             output_tokens: completion_tokens,
+                            cache_read_tokens,
+                            cache_write_tokens,
                         },
                     );
                     let cost = tracker.display();

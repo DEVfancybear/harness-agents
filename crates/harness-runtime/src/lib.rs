@@ -1060,6 +1060,7 @@ fn provider_usage(events: &[ProviderStreamEvent]) -> Option<u64> {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            ..
         } => {
             let total = if *total_tokens > 0 {
                 *total_tokens

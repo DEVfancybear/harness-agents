@@ -373,6 +373,8 @@ struct AnthropicSseDecoder {
     saw_message_stop: bool,
     tools: BTreeMap<u64, (String, String)>,
     prompt_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
     output_tokens: u64,
 }
 
@@ -406,11 +408,14 @@ impl AnthropicSseDecoder {
         if !self.saw_message_stop {
             return Err(protocol("provider stream ended before message_stop"));
         }
-        events.push(ProviderStreamEvent::usage(
-            self.prompt_tokens,
-            self.output_tokens,
-            self.prompt_tokens.saturating_add(self.output_tokens),
-        ));
+        events.push(
+            ProviderStreamEvent::usage(
+                self.prompt_tokens,
+                self.output_tokens,
+                self.prompt_tokens.saturating_add(self.output_tokens),
+            )
+            .with_cache(self.cache_read_tokens, self.cache_write_tokens),
+        );
         if !events
             .iter()
             .any(|event| matches!(event, ProviderStreamEvent::Started { .. }))
@@ -464,6 +469,12 @@ impl AnthropicSseDecoder {
                 .iter()
                 .filter_map(|field| value["message"]["usage"][field].as_u64())
                 .sum();
+                self.cache_read_tokens = value["message"]["usage"]["cache_read_input_tokens"]
+                    .as_u64()
+                    .unwrap_or(0);
+                self.cache_write_tokens = value["message"]["usage"]["cache_creation_input_tokens"]
+                    .as_u64()
+                    .unwrap_or(0);
             }
             "content_block_start" => {
                 let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);

@@ -601,7 +601,10 @@ impl ResponsesSseDecoder {
                 let input = usage["input_tokens"].as_u64().unwrap_or(0);
                 let output = usage["output_tokens"].as_u64().unwrap_or(0);
                 let total = usage["total_tokens"].as_u64().unwrap_or(input + output);
-                events.push(ProviderStreamEvent::usage(input, output, total));
+                let cached = usage["input_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .unwrap_or(0);
+                events.push(ProviderStreamEvent::usage(input, output, total).with_cache(cached, 0));
                 // prime-agent reads why a response is incomplete: a content
                 // filter is not a length cut, and says so.
                 let reason = if value["type"] == "response.incomplete" {

@@ -1027,6 +1027,8 @@ fn apply_models(
                 super::cost::ModelPrice {
                     input_per_mtok: input,
                     output_per_mtok: output,
+                    cache_read_per_mtok: None,
+                    cache_write_per_mtok: None,
                 },
             );
             set_explain(

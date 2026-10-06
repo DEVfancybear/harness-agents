@@ -687,6 +687,12 @@ pub enum ProviderStreamEvent {
         prompt_tokens: u64,
         completion_tokens: u64,
         total_tokens: u64,
+        /// Of `prompt_tokens`, those read from the provider's prompt cache.
+        #[serde(default)]
+        cache_read_tokens: u64,
+        /// Of `prompt_tokens`, those written to the provider's prompt cache.
+        #[serde(default)]
+        cache_write_tokens: u64,
     },
     Completed {
         finish_reason: String,
@@ -732,6 +738,30 @@ impl ProviderStreamEvent {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        }
+    }
+
+    /// The same usage, saying how much of the prompt came from (`read`) or
+    /// went into (`write`) the provider's prompt cache, as prime-agent prices
+    /// those tokens apart.
+    #[must_use]
+    pub fn with_cache(self, read: u64, write: u64) -> Self {
+        match self {
+            Self::Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                ..
+            } => Self::Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                cache_read_tokens: read,
+                cache_write_tokens: write,
+            },
+            other => other,
         }
     }
     #[must_use]
@@ -1715,11 +1745,17 @@ impl SseDecoder {
             })
             .map(|usage| {
                 let number = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+                let cached = usage
+                    .get("prompt_tokens_details")
+                    .and_then(|details| details.get("cached_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 ProviderStreamEvent::usage(
                     number("prompt_tokens"),
                     number("completion_tokens"),
                     number("total_tokens"),
                 )
+                .with_cache(cached, 0)
             });
         if choices.is_empty() {
             // A usage-only frame carries no choice. Dropping it lost token

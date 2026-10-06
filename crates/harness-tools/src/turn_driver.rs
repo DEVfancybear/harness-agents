@@ -79,6 +79,9 @@ pub enum TurnProgress {
     Usage {
         prompt_tokens: u64,
         completion_tokens: u64,
+        /// Of `prompt_tokens`, read from and written to the prompt cache.
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
     },
     StepStarted {
         step: u32,
@@ -2323,11 +2326,15 @@ fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
         ProviderStreamEvent::Usage {
             prompt_tokens,
             completion_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
             ..
         } => {
             observer.observe(TurnProgress::Usage {
                 prompt_tokens,
                 completion_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
             });
         }
         _ => {}

@@ -4,12 +4,19 @@
 pub struct ModelPrice {
     pub input_per_mtok: f64,
     pub output_per_mtok: f64,
+    /// prime-agent prices cached input apart: a read from the cache and a
+    /// write to it. `None` prices them as ordinary input.
+    pub cache_read_per_mtok: Option<f64>,
+    pub cache_write_per_mtok: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Of `input_tokens`, read from and written to the prompt cache.
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -67,10 +74,18 @@ impl CostTracker {
 /// Return `None` when the selected model has no complete price configuration.
 pub fn calculate_cost(price: Option<ModelPrice>, usage: Usage) -> Option<f64> {
     let price = price?;
-    let input_tokens = f64::from(u32::try_from(usage.input_tokens).ok()?);
-    let output_tokens = f64::from(u32::try_from(usage.output_tokens).ok()?);
-    let total =
-        (input_tokens * price.input_per_mtok + output_tokens * price.output_per_mtok) / 1_000_000.0;
+    let tokens = |count: u64| u32::try_from(count).ok().map(f64::from);
+    let uncached = usage
+        .input_tokens
+        .saturating_sub(usage.cache_read_tokens)
+        .saturating_sub(usage.cache_write_tokens);
+    let total = (tokens(uncached)? * price.input_per_mtok
+        + tokens(usage.cache_read_tokens)?
+            * price.cache_read_per_mtok.unwrap_or(price.input_per_mtok)
+        + tokens(usage.cache_write_tokens)?
+            * price.cache_write_per_mtok.unwrap_or(price.input_per_mtok)
+        + tokens(usage.output_tokens)? * price.output_per_mtok)
+        / 1_000_000.0;
     total.is_finite().then_some(total)
 }
 
@@ -132,10 +147,13 @@ mod tests {
             Some(ModelPrice {
                 input_per_mtok: 3.0,
                 output_per_mtok: 6.0,
+                cache_read_per_mtok: None,
+                cache_write_per_mtok: None,
             }),
             Usage {
                 input_tokens: 1_000,
                 output_tokens: 2_000,
+                ..Usage::default()
             },
         );
         assert_eq!(cost, Some(0.015));

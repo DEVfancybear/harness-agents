@@ -129,6 +129,8 @@ pub fn config_for(
         .map(|cost| super::cost::ModelPrice {
             input_per_mtok: cost.input,
             output_per_mtok: cost.output,
+            cache_read_per_mtok: Some(cost.cache_read),
+            cache_write_per_mtok: Some(cost.cache_write),
         });
     if let Some(window) = entry.context_window {
         config.context_window_tokens = window;

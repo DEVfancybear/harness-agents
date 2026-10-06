@@ -988,6 +988,8 @@ pub(super) fn resolve_provider_with_overrides(
                 .map(|cost| ModelPrice {
                     input_per_mtok: cost.input,
                     output_per_mtok: cost.output,
+                    cache_read_per_mtok: Some(cost.cache_read),
+                    cache_write_per_mtok: Some(cost.cache_write),
                 })
         });
     let max_retry_after_seconds = resolved.retry_after_max_seconds;
@@ -1930,6 +1932,8 @@ impl TurnObserver for ChannelObserver {
             TurnProgress::Usage {
                 prompt_tokens,
                 completion_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
             } => {
                 let label = if let Ok(mut tracker) = self.cost_tracker.lock() {
                     tracker.record(
@@ -1937,6 +1941,8 @@ impl TurnObserver for ChannelObserver {
                         CostUsage {
                             input_tokens: prompt_tokens,
                             output_tokens: completion_tokens,
+                            cache_read_tokens,
+                            cache_write_tokens,
                         },
                     );
                     tracker.display()
