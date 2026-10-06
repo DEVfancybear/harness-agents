@@ -17,6 +17,7 @@
 - **Works toward a goal.** `/goal <objective>` keeps the app working across turns until the model calls `goal_complete` (at most 10 automatic turns, then it pauses). `/goal status|pause|resume|clear`; Ctrl-C pauses it, and `/resume` brings it back paused. Long turns shorten their oldest tool results to stay within the context budget.
 - **Resumes conversations.** `/resume` lists your conversations (one row each) and replays the chosen one's questions and answers to the model and on screen.
 - **Uses skills.** Agent Skills directories (`SKILL.md` plus references and scripts) from the bundled set, `~/.agents/skills`, a trusted project's `.agents/skills`, or any folder in `HA_SKILL_PATHS` (e.g. `~/.claude/skills`). The model activates a matching skill by name and reads its files with `read_skill_file`; `/skills` lists them, `/skill:<name>` runs one.
+- **Learns skills.** `/refine` (and the automatic review every 25 turns or 50 tool calls, run in the background) can write `SKILL.md` skills of its own into `.harness/skills` (trusted project) or `<config-dir>/skills` (global). A checker lands only a skill that passes its lint (format, size, safety, secrets) and keeps a ledger of why it changed. Their use is counted; one never used is archived to `.archive/` after its probation. `/skills` shows each one's use.
 - **Extends.** MCP servers (`/mcp add` in chat, or `ha mcp add`), prompt templates and hooks.
 
 ### Platform status
@@ -89,6 +90,8 @@ Settings merge default → user `config.toml` → trusted project `.harness/conf
 | `HA_TURN_MAX_STEPS` / `HA_TURN_MAX_TOOL_CALLS` | no limit | Model calls and tool calls per turn before it pauses; unset, a turn runs until the model is done, you stop it, or the tokens run out |
 | `HA_TURN_DEADLINE_SECONDS` / `HA_TURN_CONTINUATIONS` | 900 / 2 | Time per turn; automatic continuations after a bound |
 | `HA_SKILL_PATHS` | — | Extra skill directories, separated like `PATH` |
+| `HA_AUTO_REFINE` | on | `off` stops the automatic refine review |
+| `HA_SKILL_LIFECYCLE` | on | `off` keeps every learned skill, used or not |
 | `SERPER_API_KEY` | — | Google results for `web_search` (without it: DuckDuckGo) |
 | `HA_WEB` | on | `off` removes `web_search` and `web_fetch` |
 | `HA_REPL` | on | `off` removes the `ipython` tool |
@@ -124,6 +127,7 @@ CI (`.github/workflows/ci.yml`) runs the phase gates (`scripts/Verify-Phase.ps1`
 - **Làm tới khi xong mục tiêu.** `/goal <mục tiêu>` giữ ứng dụng làm việc qua nhiều lượt cho tới khi model gọi `goal_complete` (tối đa 10 lượt tự động, sau đó tạm dừng). `/goal status|pause|resume|clear`; Ctrl-C tạm dừng mục tiêu, `/resume` khôi phục nó ở trạng thái tạm dừng. Lượt dài tự rút gọn các kết quả tool cũ nhất để không vượt ngân sách context.
 - **Tiếp tục hội thoại.** `/resume` liệt kê các hội thoại (mỗi hội thoại một dòng) và phát lại các câu hỏi, câu trả lời của hội thoại được chọn cho model và trên màn hình.
 - **Dùng skill.** Thư mục Agent Skills (`SKILL.md` cùng references và scripts) từ bộ tích hợp sẵn, `~/.agents/skills`, `.agents/skills` của project đã trust, hoặc bất kỳ thư mục nào trong `HA_SKILL_PATHS` (ví dụ `~/.claude/skills`). Model kích hoạt skill phù hợp theo tên và đọc file của skill bằng `read_skill_file`; `/skills` liệt kê, `/skill:<name>` chạy một skill.
+- **Tự học skill.** `/refine` (và lượt tự xem xét mỗi 25 lượt hoặc 50 lần gọi tool, chạy nền) có thể tự viết skill `SKILL.md` vào `.harness/skills` (project đã trust) hoặc `<config-dir>/skills` (global). Bộ kiểm tra chỉ ghi skill qua được lint (định dạng, độ dài, an toàn, secret) và lưu sổ lý do mỗi lần thay đổi. Lượt dùng được đếm; skill không ai dùng hết thời gian thử việc sẽ bị chuyển vào `.archive/`. `/skills` hiện số lượt dùng của từng skill.
 - **Mở rộng.** MCP server (`/mcp add` trong chat, hoặc `ha mcp add`), prompt template và hook.
 
 ### Nền tảng
@@ -196,6 +200,8 @@ Cấu hình được gộp theo thứ tự mặc định → `config.toml` của
 | `HA_TURN_MAX_STEPS` / `HA_TURN_MAX_TOOL_CALLS` | không giới hạn | Số lời gọi model và tool mỗi lượt trước khi tạm dừng; không đặt thì lượt chạy tới khi model xong, bạn dừng, hoặc hết token |
 | `HA_TURN_DEADLINE_SECONDS` / `HA_TURN_CONTINUATIONS` | 900 / 2 | Thời gian mỗi lượt; số lần tự tiếp tục sau khi chạm giới hạn |
 | `HA_SKILL_PATHS` | — | Thư mục skill bổ sung, phân tách như `PATH` |
+| `HA_AUTO_REFINE` | on | `off` tắt lượt tự xem xét refine |
+| `HA_SKILL_LIFECYCLE` | on | `off` giữ mọi skill đã học, kể cả skill không dùng |
 | `SERPER_API_KEY` | — | Kết quả Google cho `web_search` (không có thì dùng DuckDuckGo) |
 | `HA_WEB` | bật | `off` để gỡ `web_search` và `web_fetch` |
 | `HA_REPL` | bật | `off` để gỡ tool `ipython` |

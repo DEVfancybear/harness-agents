@@ -1977,8 +1977,8 @@ pub struct AgentSessionService {
     /// The service tier `/tier` or `/fast` chose - or, once a turn has read it,
     /// the one the conversation keeps - for the next model calls.
     service_tier: Arc<Mutex<Option<String>>>,
-    /// Turns since the last automatic refine review.
-    turns_since_review: Arc<std::sync::atomic::AtomicU32>,
+    /// Turns and tool calls since the last automatic refine review.
+    refine_cadence: Arc<super::refine::Cadence>,
     /// The agent's own recurring prompts (`rlm_heartbeat`), for the whole session.
     heartbeats: Arc<super::heartbeat::Heartbeats>,
     /// `/schedule` jobs of the conversation in use, kept on disk.
@@ -2920,7 +2920,7 @@ impl AgentSessionService {
             repl,
             thinking: None,
             service_tier: Arc::new(Mutex::new(None)),
-            turns_since_review: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            refine_cadence: Arc::new(super::refine::Cadence::default()),
             heartbeats: Arc::new(super::heartbeat::Heartbeats::default()),
             schedules,
             gate_cancellation: None,
@@ -3363,7 +3363,7 @@ impl SessionPort for AgentSessionService {
         let repl = self.repl.clone();
         let thinking = self.thinking;
         let service_tier = Arc::clone(&self.service_tier);
-        let turns_since_review = Arc::clone(&self.turns_since_review);
+        let refine_cadence = Arc::clone(&self.refine_cadence);
         let heartbeats = Arc::clone(&self.heartbeats);
         let live = Arc::clone(&self.live);
         let auto_refine = self.auto_refine;
@@ -3407,7 +3407,7 @@ impl SessionPort for AgentSessionService {
                 repl,
                 thinking,
                 service_tier,
-                turns_since_review,
+                refine_cadence,
                 auto_refine,
                 heartbeats,
                 live,
@@ -3837,6 +3837,14 @@ impl SessionPort for AgentSessionService {
             }
             rows.push(RefLine::Blank);
         }
+        // The skills ha wrote for itself are marked, with how they have been used
+        // since they landed: what decides whether they survive.
+        let learned = super::learned::library(&super::learned::Layers::new(
+            &self.global_config_dir,
+            &self.data_dir,
+            &self.workspace_root,
+            trusted,
+        ));
         let mut sources: Vec<&str> = Vec::new();
         for entry in catalog.entries() {
             if !sources.contains(&entry.source.as_str()) {
@@ -3864,6 +3872,17 @@ impl SessionPort for AgentSessionService {
                 let mut badges = Vec::new();
                 if is_active {
                     badges.push(("active".to_owned(), BadgeKind::Ok));
+                }
+                if let Some(skill) = learned.iter().find(|skill| skill.name == entry.name) {
+                    badges.push((
+                        format!(
+                            "learned · {} use, {} view in {} requests",
+                            skill.usage.uses,
+                            skill.usage.views,
+                            skill.requests.saturating_sub(skill.usage.anchor)
+                        ),
+                        BadgeKind::Neutral,
+                    ));
                 }
                 rows.push(RefLine::Item {
                     glyph: "✦".to_owned(),
@@ -3950,6 +3969,17 @@ impl SessionPort for AgentSessionService {
             .ok_or_else(|| format!("no skill named {name}; /skills lists them"))?;
         let content = std::fs::read_to_string(&entry.path)
             .map_err(|error| format!("skill {name} could not be read: {error}"))?;
+        // Running a learned skill is a use of it, counted as the model's are.
+        super::learned::record_use(
+            &super::learned::Layers::new(
+                &self.global_config_dir,
+                &self.data_dir,
+                &self.workspace_root,
+                trusted,
+            ),
+            name,
+            super::learned::UseKind::Use,
+        );
         // The user ran it: it is active for the session, so the model may
         // activate it and read its files although it cannot start it itself.
         if let Ok(activation) = catalog.activate(name, None, 0)
@@ -5273,6 +5303,87 @@ impl AgentSessionService {
     }
 }
 
+/// One automatic refine review, and the refinement it approves, run off the turn.
+struct AutoRefine {
+    sender: UnboundedSender<SessionEvent>,
+    helper_provider: Arc<dyn ModelProvider>,
+    helper_model: String,
+    provider: Arc<dyn ModelProvider>,
+    model: String,
+    conversation: String,
+    scopes: super::refine::HarnessScopes,
+    learning: super::refine::Learning,
+    turns: u32,
+}
+
+impl AutoRefine {
+    async fn run(self) {
+        let send = |event| {
+            let _ = self.sender.send(event);
+        };
+        let options = match super::refine::review(
+            &self.helper_provider,
+            &self.helper_model,
+            &self.conversation,
+            &self.scopes,
+            self.turns,
+            Some(&self.learning),
+        )
+        .await
+        {
+            Ok(review) if review.should_refine => super::refine::RefineOptions {
+                instructions: review.instructions,
+                global: false,
+                rollback: None,
+            },
+            Ok(review) => {
+                send(SessionEvent::Notice {
+                    message: format!("auto-refine: nothing to refine ({})", review.rationale),
+                });
+                return;
+            }
+            Err(error) => {
+                send(SessionEvent::Notice {
+                    message: format!("auto-refine review skipped: {error}"),
+                });
+                return;
+            }
+        };
+        match super::refine::refine(
+            &self.provider,
+            &self.model,
+            &self.conversation,
+            &self.scopes,
+            &options,
+            Some(&self.learning),
+        )
+        .await
+        {
+            Ok(refinement) => send(refined_event(&refinement)),
+            Err(error) => send(SessionEvent::Notice {
+                message: format!("refine failed: {error}"),
+            }),
+        }
+    }
+}
+
+/// What `/refine` needs to write learned skills in this workspace.
+fn refine_learning(
+    global_config_dir: &Path,
+    data_dir: &Path,
+    workspace_root: &Path,
+    environment: &LaunchEnvironment,
+    trusted: bool,
+) -> super::refine::Learning {
+    let catalog =
+        super::skills::discover(global_config_dir, workspace_root, environment, trusted).ok();
+    super::refine::Learning::new(
+        super::learned::Layers::new(global_config_dir, data_dir, workspace_root, trusted),
+        workspace_root,
+        catalog.as_ref(),
+    )
+}
+
 /// prime-agent's refinement outcome row, from what `/refine` applied.
 fn refined_event(refinement: &super::refine::Refinement) -> SessionEvent {
     SessionEvent::Refined {
@@ -5406,7 +5517,7 @@ async fn run_turn(
     repl: Option<Arc<super::repl::ReplShared>>,
     thinking: Option<harness_providers::ThinkingLevel>,
     service_tier: Arc<Mutex<Option<String>>>,
-    turns_since_review: Arc<std::sync::atomic::AtomicU32>,
+    refine_cadence: Arc<super::refine::Cadence>,
     auto_refine: bool,
     heartbeats: Arc<super::heartbeat::Heartbeats>,
     live: Arc<LiveTurn>,
@@ -6008,12 +6119,20 @@ async fn run_turn(
                 .unwrap_or_default(),
             None => String::new(),
         };
+        let learning = refine_learning(
+            &global_config_dir,
+            &data_dir,
+            &workspace_root,
+            &environment,
+            config.project_trusted,
+        );
         let result = super::refine::refine(
             &helper_provider,
             &helper_model,
             &conversation,
             &scopes,
             &options,
+            Some(&learning),
         )
         .await;
         drop(runtime);
@@ -6218,6 +6337,17 @@ async fn run_turn(
     let skill_host = skill_catalog
         .as_ref()
         .map(|catalog| super::skills::SkillHost::new(catalog.clone(), Arc::clone(&active_skills)));
+    // The skills ha learned, where `/refine` writes them and their use is counted.
+    let learning = super::refine::Learning::new(
+        super::learned::Layers::new(
+            &global_config_dir,
+            &data_dir,
+            &workspace_root,
+            config.project_trusted,
+        ),
+        &workspace_root,
+        skill_catalog.as_ref(),
+    );
     let goal_host =
         matches!(goal, GoalRecord::Active(_)).then(|| super::goal::GoalHost::new(sender.clone()));
     let kernel_skills = skill_catalog
@@ -6649,14 +6779,38 @@ async fn run_turn(
     // every twenty-five turns an automatic review that refines when the trajectory
     // holds something worth keeping. A canceled turn ends now: no model call runs
     // after the user asked it to stop.
+    // What the turn did with learned skills counts toward whether they survive, and
+    // the lifecycle archives the ones that did not earn their place.
+    if let Ok(turn) = &outcome {
+        super::learned::count_request(&learning.layers);
+        super::learned::record_turn(
+            &learning.layers,
+            &learning.context.workspace,
+            &turn.executions,
+        );
+        if super::learned::lifecycle_enabled(&environment) {
+            for (layer, name) in super::learned::run_lifecycle(&learning.layers) {
+                send(SessionEvent::Notice {
+                    message: format!(
+                        "skills: archived the learned {} skill {name} (unused, or least used over capacity); move it back from .archive to revive it",
+                        layer.as_str()
+                    ),
+                });
+            }
+        }
+    }
     if outcome.is_ok() && !cancellation.is_cancelled() {
         let requested = refine_request
             .lock()
             .ok()
             .and_then(|mut pending| pending.take());
-        let turns = turns_since_review.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let review_due = auto_refine && turns >= super::refine::AUTO_REFINE_TURN_INTERVAL;
-        if requested.is_some() || review_due {
+        let tool_calls = outcome.as_ref().map_or(0, |turn| turn.tool_calls);
+        let review = if auto_refine {
+            refine_cadence.turn_finished(tool_calls)
+        } else {
+            None
+        };
+        if requested.is_some() || review.is_some() {
             let scopes = super::refine::HarnessScopes {
                 global: super::harness::global_dir(&data_dir),
                 local: super::harness::local_dir(&data_dir, goal_task.as_str()),
@@ -6665,48 +6819,16 @@ async fn run_turn(
                 .await
                 .map(|history| super::refine::serialize_turns(&history.turns()))
                 .unwrap_or_default();
-            let options = if let Some(options) = requested {
-                Some(options)
-            } else {
-                turns_since_review.store(0, std::sync::atomic::Ordering::SeqCst);
-                match super::refine::review(
-                    &helper_provider,
-                    &helper_model,
-                    &conversation,
-                    &scopes,
-                    turns,
-                )
-                .await
-                {
-                    Ok(review) if review.should_refine => Some(super::refine::RefineOptions {
-                        instructions: review.instructions,
-                        global: false,
-                        rollback: None,
-                    }),
-                    Ok(review) => {
-                        send(SessionEvent::Notice {
-                            message: format!(
-                                "auto-refine: nothing to refine ({})",
-                                review.rationale
-                            ),
-                        });
-                        None
-                    }
-                    Err(error) => {
-                        send(SessionEvent::Notice {
-                            message: format!("auto-refine review skipped: {error}"),
-                        });
-                        None
-                    }
-                }
-            };
-            if let Some(options) = options {
+            if let Some(options) = requested {
+                // The user asked: the refinement is part of the turn, and it covers
+                // the review that came due with it.
                 match super::refine::refine(
                     &provider,
                     &config.model,
                     &conversation,
                     &scopes,
                     &options,
+                    Some(&learning),
                 )
                 .await
                 {
@@ -6715,6 +6837,29 @@ async fn run_turn(
                         message: format!("refine failed: {error}"),
                     }),
                 }
+                if review.is_some() {
+                    refine_cadence.release();
+                }
+            } else if let Some(turns) = review {
+                // The automatic review runs beside the conversation, not in the
+                // turn: the user is not kept waiting on it, and in the background
+                // agent it finishes after the terminal is closed.
+                let background = AutoRefine {
+                    sender: sender.clone(),
+                    helper_provider: Arc::clone(&helper_provider),
+                    helper_model: helper_model.clone(),
+                    provider: Arc::clone(&provider),
+                    model: config.model.clone(),
+                    conversation,
+                    scopes,
+                    learning: learning.clone(),
+                    turns,
+                };
+                let cadence = Arc::clone(&refine_cadence);
+                tokio::spawn(async move {
+                    background.run().await;
+                    cadence.release();
+                });
             }
         }
     }
