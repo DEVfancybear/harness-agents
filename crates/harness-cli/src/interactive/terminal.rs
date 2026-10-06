@@ -161,6 +161,28 @@ impl ModeControl for SystemModes {
     }
 }
 
+/// prime-agent's `TerminalHandoff::stop`: the console as a child program
+/// expects it - cooked, the cursor shown, no paste or wheel translation.
+pub fn release_for_child() {
+    let modes = SystemModes;
+    modes.disable_paste();
+    modes.disable_alternate_scroll();
+    modes.disable();
+    let _ = execute!(io::stdout(), cursor::Show);
+}
+
+/// prime-agent's `TerminalHandoff::resume`: the modes the app runs in, back.
+///
+/// # Errors
+/// The console refused raw mode.
+pub fn reclaim_after_child() -> io::Result<()> {
+    let modes = SystemModes;
+    modes.enable()?;
+    modes.enable_paste();
+    modes.enable_alternate_scroll();
+    Ok(())
+}
+
 /// Raw mode plus bracketed paste, restored when the guard is dropped.
 #[derive(Debug)]
 pub struct RawModeGuard {
@@ -293,6 +315,7 @@ fn map_key(key: KeyEvent) -> Key {
         KeyCode::Char('k') if control => Key::KillToLineEnd,
         KeyCode::Char('y') if control => Key::Yank,
         KeyCode::Char('t') if control => Key::Transpose,
+        KeyCode::Char('g') if control => Key::ExternalEditor,
         KeyCode::Char('b') if control => Key::Left,
         KeyCode::Char('f') if control => Key::Right,
         KeyCode::Char('z' | 'Z') if control && key.modifiers.contains(KeyModifiers::SHIFT) => {

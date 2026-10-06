@@ -151,6 +151,12 @@ pub trait TuiRenderer {
     fn fullscreen(&self) -> bool {
         false
     }
+    /// prime-agent's terminal handoff: give the console to `run` (the external
+    /// editor) with raw mode and the viewport off, then take it back.
+    fn hand_off(&mut self, run: &mut dyn FnMut()) -> io::Result<()> {
+        run();
+        Ok(())
+    }
     /// Enter or leave prime-agent's fullscreen rendering (`/fullscreen`).
     fn set_fullscreen(&mut self, _on: bool) -> io::Result<()> {
         Ok(())
@@ -598,6 +604,24 @@ impl<T: TerminalBackend> TuiRenderer for RuntimeRenderer<T> {
         matches!(self.screen, Screen::Fullscreen(_))
     }
 
+    /// prime-agent's `TerminalHandoff`: the viewport is erased (or the
+    /// alternate screen left), the console released to the child, then taken
+    /// back; the caller repaints the screen.
+    fn hand_off(&mut self, run: &mut dyn FnMut()) -> io::Result<()> {
+        match &mut self.screen {
+            Screen::Inline(inline) => inline.finish()?,
+            Screen::Fullscreen(_) => super::terminal::leave_fullscreen(self.mouse)?,
+        }
+        super::terminal::release_for_child();
+        run();
+        super::terminal::reclaim_after_child()?;
+        if let Screen::Fullscreen(screen) = &mut self.screen {
+            super::terminal::enter_fullscreen(self.mouse)?;
+            screen.clear()?;
+        }
+        Ok(())
+    }
+
     /// prime-agent's `enterFullscreen` / `exitFullscreen`: the alternate screen
     /// takes the conversation over, and leaving it prints what arrived while it
     /// was up into the primary screen's scrollback.
@@ -1009,6 +1033,10 @@ fn run_loop_inner(
         if !redraw && effects.is_empty() {
             continue;
         }
+        let external = effects.iter().find_map(|effect| match effect {
+            Effect::EditExternally(draft) => Some(draft.clone()),
+            _ => None,
+        });
         renderer
             .begin_update()
             .map_err(|error| terminal_error(&error))?;
@@ -1026,7 +1054,50 @@ fn run_loop_inner(
         if let Step::Exit(code) = step? {
             return Ok(code);
         }
+        if let Some(draft) = external {
+            let edited = edit_externally(renderer, controller, &draft)?;
+            renderer
+                .begin_update()
+                .map_err(|error| terminal_error(&error))?;
+            let step = apply(renderer, edited);
+            let drawn = renderer
+                .draw_state(&controller.ui_state())
+                .map_err(|error| terminal_error(&error));
+            renderer
+                .end_update()
+                .map_err(|error| terminal_error(&error))?;
+            drawn?;
+            if let Step::Exit(code) = step? {
+                return Ok(code);
+            }
+        }
     }
+}
+
+/// prime-agent's `openExternalEditor`: hand the console to `$VISUAL`/`$EDITOR`
+/// on the draft, take it back, and put what was saved on the prompt. Without
+/// an editor, prime-agent's warning row; a failed run is an error row.
+fn edit_externally(
+    renderer: &mut impl TuiRenderer,
+    controller: &mut impl Frontend,
+    draft: &str,
+) -> Result<Vec<Effect>, HarnessError> {
+    let Some(command) = super::external_editor::editor_command() else {
+        return Ok(vec![Effect::History(HistoryItem::Notice {
+            message: super::external_editor::NO_EDITOR.to_owned(),
+        })]);
+    };
+    let mut outcome = None;
+    renderer
+        .hand_off(&mut || outcome = Some(super::external_editor::edit(&command, draft)))
+        .map_err(|error| terminal_error(&error))?;
+    let mut effects = vec![Effect::Reprint(controller.ui_state().detail)];
+    match outcome {
+        Some(Ok(Some(text))) => effects.extend(controller.handle_key(Key::SetDraft(text))),
+        Some(Ok(None)) | None => {}
+        Some(Err(message)) => effects.push(Effect::History(HistoryItem::Error { message })),
+    }
+    Ok(effects)
 }
 
 /// prime-agent's `handleFullscreenInput`: a mouse report is consumed here and
@@ -1120,7 +1191,12 @@ fn apply(renderer: &mut impl TuiRenderer, effects: Vec<Effect>) -> Result<Step, 
                 .retitle(&lines)
                 .map_err(|error| terminal_error(&error))?,
             // History rows were gathered above; a redraw is the frame's own draw.
-            Effect::History(_) | Effect::Stream(_) | Effect::Thinking(_) | Effect::Redraw => {}
+            // The external editor runs after the frame, in the event loop.
+            Effect::History(_)
+            | Effect::Stream(_)
+            | Effect::Thinking(_)
+            | Effect::Redraw
+            | Effect::EditExternally(_) => {}
             Effect::Exit(code) => {
                 renderer.finish().map_err(|error| terminal_error(&error))?;
                 return Ok(Step::Exit(code));

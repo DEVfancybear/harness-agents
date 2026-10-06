@@ -100,6 +100,11 @@ pub enum Key {
     Redo,
     /// Ctrl+T: swap the two characters around the cursor.
     Transpose,
+    /// Ctrl+G: prime-agent's `app.editor.external` - edit the draft in
+    /// `$VISUAL`/`$EDITOR`.
+    ExternalEditor,
+    /// The draft as the external editor saved it: it replaces the prompt.
+    SetDraft(String),
     Char(char),
     Backspace,
     Delete,

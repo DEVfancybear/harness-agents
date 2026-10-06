@@ -76,6 +76,9 @@ pub enum Effect {
     Redraw,
     /// Enter or leave prime-agent's fullscreen rendering (`/fullscreen`).
     Fullscreen(bool),
+    /// prime-agent's external-editor handoff: the terminal edits this draft in
+    /// `$VISUAL`/`$EDITOR` and sends the result back as [`Key::SetDraft`].
+    EditExternally(String),
     /// The opening banner names a model or a thinking level that has changed: draw
     /// it again with these lines, wherever the banner still is on screen.
     Banner(Vec<String>),
@@ -867,6 +870,20 @@ impl InteractiveController {
     pub fn handle_key(&mut self, key: Key) -> Vec<Effect> {
         if key == Key::Redraw {
             return vec![Effect::Redraw];
+        }
+        // prime-agent's `app.editor.external`: the prompt's draft, while no
+        // approval or question holds the keyboard.
+        if self.pending_approval.is_none() && self.pending_question.is_none() {
+            match key {
+                Key::ExternalEditor => {
+                    return vec![Effect::EditExternally(self.editor.expanded_text())];
+                }
+                Key::SetDraft(text) => {
+                    self.editor.set_text(&text);
+                    return vec![Effect::Redraw];
+                }
+                _ => {}
+            }
         }
         if key == Key::Stash && self.pending_approval.is_none() && self.pending_question.is_none() {
             return self.stash_prompt();
@@ -6469,6 +6486,7 @@ Command: \"npm run build\""
                 | Effect::Redraw
                 | Effect::ClearViewport
                 | Effect::Fullscreen(_)
+                | Effect::EditExternally(_)
                 | Effect::Exit(_) => {}
             }
         }
@@ -9919,5 +9937,26 @@ Command: \"npm run build\""
         let _ = submit_text(&mut harness.controller, "/model");
         assert_eq!(harness.controller.editor.text(), "/model ");
         assert!(!harness.controller.editor.suggestions().is_empty());
+    }
+
+    #[test]
+    fn ctrl_g_hands_the_draft_out_and_takes_the_edit_back() {
+        let mut harness = tui_bench(true);
+        let _ = harness.controller.boot_lines();
+        type_text(&mut harness.controller, "draft");
+        assert_eq!(
+            harness.controller.handle_key(Key::ExternalEditor),
+            vec![Effect::EditExternally("draft".to_owned())]
+        );
+        let _ = harness.controller.handle_key(Key::SetDraft(
+            "edited
+lines"
+                .to_owned(),
+        ));
+        assert_eq!(
+            harness.controller.editor.text(),
+            "edited
+lines"
+        );
     }
 }

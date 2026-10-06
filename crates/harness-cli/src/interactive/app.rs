@@ -388,7 +388,8 @@ fn step(
             | Effect::Banner(_)
             | Effect::Bell
             | Effect::ClearViewport
-            | Effect::Fullscreen(_) => {}
+            | Effect::Fullscreen(_)
+            | Effect::EditExternally(_) => {}
             Effect::Copy(_) => {
                 backend
                     .write("/copy is available in TUI mode; the plain renderer does not access the clipboard\r\n")
@@ -628,7 +629,8 @@ fn render_line_mode(
             | Effect::Banner(_)
             | Effect::Bell
             | Effect::ClearViewport
-            | Effect::Fullscreen(_) => {}
+            | Effect::Fullscreen(_)
+            | Effect::EditExternally(_) => {}
             Effect::Copy(_) => writeln!(
                 output,
                 "/copy is available in TUI mode; the plain renderer does not access the clipboard"

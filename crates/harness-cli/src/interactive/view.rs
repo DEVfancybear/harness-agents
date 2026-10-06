@@ -290,6 +290,7 @@ pub fn hotkey_lines() -> Vec<String> {
             "undo / redo in the prompt (also Ctrl--)",
         ),
         ("Ctrl-T", "swap the characters around the cursor"),
+        ("Ctrl-G", "edit the message in $VISUAL / $EDITOR"),
         ("Ctrl-D", "delete forward; on an empty prompt, quit"),
         ("Ctrl-V", "paste an image or path from the clipboard"),
         (

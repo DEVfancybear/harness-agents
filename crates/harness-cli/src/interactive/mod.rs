@@ -25,6 +25,7 @@ pub mod detector;
 pub mod events;
 pub mod export_html;
 pub mod extensions;
+pub mod external_editor;
 pub mod frontend;
 pub mod goal;
 pub mod harness;

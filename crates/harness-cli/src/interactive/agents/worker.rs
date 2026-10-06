@@ -1059,10 +1059,11 @@ impl Agent {
         }
         let state = self.controller.ui_state();
         let text = serde_json::to_string(&state).unwrap_or_default();
-        // What the other terminals draw: the effects without the exit.
+        // What the other terminals draw: the effects without the exit, and
+        // without the external editor only the terminal that asked runs.
         let shared = effects
             .iter()
-            .filter(|effect| !matches!(effect, Effect::Exit(_)))
+            .filter(|effect| !matches!(effect, Effect::Exit(_) | Effect::EditExternally(_)))
             .cloned()
             .collect::<Vec<_>>();
         let mut gone = Vec::new();

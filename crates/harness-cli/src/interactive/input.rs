@@ -363,6 +363,17 @@ impl LineEditor {
         self.cursor = text.chars().count();
     }
 
+    /// The draft with its paste markers expanded, as it would be sent: what
+    /// the external editor is handed.
+    #[must_use]
+    pub fn expanded_text(&self) -> String {
+        let mut text = self.buffer.clone();
+        for (marker, pasted) in &self.pastes {
+            text = text.replacen(marker, pasted, 1);
+        }
+        text
+    }
+
     /// Put `/command ` on the line with its argument menu open, as prime-agent's
     /// bare `/model` opens the model selector. `false` when the command offers
     /// no values.
@@ -730,7 +741,9 @@ impl LineEditor {
             | Key::EraseWordForward
             | Key::Undo
             | Key::Redo
-            | Key::Transpose => InputOutcome::Unchanged,
+            | Key::Transpose
+            | Key::ExternalEditor
+            | Key::SetDraft(_) => InputOutcome::Unchanged,
             // Control characters are not typed text; Resize and the repaint key
             // only need the redraw the host already performs on its own.
             Key::Char(_)
