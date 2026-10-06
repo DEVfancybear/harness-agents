@@ -2383,6 +2383,46 @@ impl RlmChildren {
         Ok(json!({ "subagents": self.rows(&targets, false)? }))
     }
 
+    /// prime-agent's `rlm.rename`: the calling session, or a direct child
+    /// chosen by handle, row or id. A child's name stays unique among its
+    /// siblings, as `rlm.spawn` keeps it.
+    fn rename(&self, request: &Value) -> Result<Value, String> {
+        let name = request["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or("rlm.rename needs a non-empty name")?
+            .to_owned();
+        if name.chars().count() > 60 {
+            return Err("a name is at most 60 characters".to_owned());
+        }
+        let Some(selector) = request["session_id"].as_str() else {
+            let _ = self
+                .agents
+                .shared
+                .sender
+                .send(SessionEvent::RenameRequested { name: name.clone() });
+            return Ok(json!({ "name": name }));
+        };
+        let task_id = self
+            .select(&[selector.to_owned()])?
+            .pop()
+            .ok_or("no such child")?;
+        let taken = self.agents.shared.children.lock().is_ok_and(|children| {
+            children
+                .iter()
+                .any(|child| !child.deleted && child.name == name && child.task_id != task_id)
+        });
+        if taken {
+            return Err(format!("a child named {name:?} already exists"));
+        }
+        self.agents
+            .shared
+            .update(&task_id, |child| child.name.clone_from(&name))
+            .ok_or("no such child")?;
+        Ok(json!({ "name": name }))
+    }
+
     fn delete(&self, request: &Value) -> Result<Value, String> {
         let selector = request["target"].as_str().unwrap_or_default().to_owned();
         let task_id = self
@@ -2501,6 +2541,7 @@ impl HostRequests for RlmChildren {
                 "rlm.collect" => self.collect(request).await,
                 "rlm.list_subagents" => self.list(),
                 "rlm.delete_subagent" => self.delete(request),
+                "rlm.rename" => self.rename(request),
                 "rlm.find_models" => self.models(request),
                 "rlm.progress.note" => Err(
                     "progress notes are sent by child agents; this is the root agent".to_owned(),

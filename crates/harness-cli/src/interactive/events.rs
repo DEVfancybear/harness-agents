@@ -806,6 +806,10 @@ pub enum SessionEvent {
     GoalCreated {
         objective: String,
     },
+    /// The model renamed its own session (`rlm.rename` without a target).
+    RenameRequested {
+        name: String,
+    },
     /// The model asked, through the `compact` skill, for a compaction when the turn ends.
     CompactRequested {
         instructions: Option<String>,

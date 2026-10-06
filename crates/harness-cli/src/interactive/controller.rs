@@ -2165,6 +2165,13 @@ impl InteractiveController {
             SessionEvent::CompactRequested { instructions } => {
                 self.pending_compact = Some(instructions.unwrap_or_default());
             }
+            SessionEvent::RenameRequested { name } => {
+                let message = self
+                    .service
+                    .rename(&name)
+                    .unwrap_or_else(|error| format!("the session could not be renamed: {error}"));
+                self.push_history(effects, HistoryItem::Notice { message });
+            }
             SessionEvent::GoalRestored { objective } => {
                 let mut goal = GoalState::new(objective);
                 goal.status = GoalStatus::Paused;
