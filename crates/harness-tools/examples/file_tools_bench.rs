@@ -11,6 +11,7 @@
 //! folder, which is never changed.
 
 use std::{
+    fmt::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -58,13 +59,14 @@ fn args() -> Args {
 /// A file of about 4 KiB that reads like Rust, with one editable marker line.
 fn source_file(index: usize) -> String {
     let mut text = format!("//! Module {index}.\n\nuse std::collections::HashMap;\n\n");
-    text.push_str(&format!("pub const VALUE_{index}: u64 = 0;\n\n"));
+    let _ = write!(text, "pub const VALUE_{index}: u64 = 0;\n\n");
     for function in 0..12 {
-        text.push_str(&format!(
+        let _ = write!(
+            text,
             "/// Compute item {function} of module {index}.\npub fn compute_{index}_{function}(input: &HashMap<String, u64>) -> u64 {{\n    let total = input.values().copied().sum::<u64>();\n    total.wrapping_mul({function}).wrapping_add({index})\n}}\n\n"
-        ));
+        );
     }
-    if index % 20 == 0 {
+    if index.is_multiple_of(20) {
         text.push_str("// NEEDLE_MARKER: a rare literal the search finds in one file in twenty.\n");
     }
     text
@@ -204,6 +206,11 @@ impl Bench {
 }
 
 #[tokio::main]
+#[allow(
+    clippy::too_many_lines,
+    clippy::single_match_else,
+    reason = "one benchmark, read top to bottom"
+)]
 async fn main() {
     let args = args();
     let temp = std::env::temp_dir().join(format!("ha-file-tools-bench-{}", InputId::generate()));

@@ -397,11 +397,11 @@ pub(crate) fn ensure_watched(root: &Path) -> bool {
         // A watcher that lost events cannot vouch for any cache.
         Err(_) => note_change(),
     };
-    let watcher = notify::recommended_watcher(handler).and_then(|mut watcher| {
+    let started = notify::recommended_watcher(handler).and_then(|mut watcher| {
         watcher.watch(root, notify::RecursiveMode::Recursive)?;
         Ok(watcher)
     });
-    let watched = match watcher {
+    let watched = match started {
         Ok(watcher) => Watched {
             _watcher: Some(watcher),
             active: true,

@@ -270,7 +270,7 @@ pub(crate) fn search(
         .map_or(4, std::num::NonZeroUsize::get)
         .clamp(1, 16);
     let block = threads * 16;
-    let mut matches = Vec::new();
+    let mut hits = Vec::new();
     let mut output_bytes = 0_usize;
     for chunk in candidates.chunks(block) {
         let scanned = scan_block(
@@ -294,9 +294,9 @@ pub(crate) fn search(
             })?;
             let path = relative_text(relative);
             for hit in raw {
-                if matches.len() == MAX_SEARCH_MATCHES {
+                if hits.len() == MAX_SEARCH_MATCHES {
                     return Ok(Found {
-                        matches,
+                        matches: hits,
                         truncated: true,
                     });
                 }
@@ -308,12 +308,12 @@ pub(crate) fn search(
                     .saturating_add(path.len());
                 if output_bytes.saturating_add(cost) > DEFAULT_MAX_BYTES {
                     return Ok(Found {
-                        matches,
+                        matches: hits,
                         truncated: true,
                     });
                 }
                 output_bytes = output_bytes.saturating_add(cost);
-                matches.push(SearchMatch {
+                hits.push(SearchMatch {
                     path: path.clone(),
                     line: u64::try_from(hit.line.saturating_add(1)).unwrap_or(u64::MAX),
                     column: u64::try_from(hit.column.saturating_add(1)).unwrap_or(u64::MAX),
@@ -330,7 +330,7 @@ pub(crate) fn search(
         }
     }
     Ok(Found {
-        matches,
+        matches: hits,
         truncated: false,
     })
 }

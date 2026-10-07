@@ -680,7 +680,7 @@ pub(crate) fn glob_files(
     let walk = tool_walk(root, requested, "glob")?;
     let mut paths = Vec::new();
     let mut truncated = !walk.complete;
-    for file in walk.files.iter() {
+    for file in &walk.files {
         if matcher.is_match(Path::new(&file.relative)) {
             if paths.len() == MAX_GLOB_MATCHES {
                 truncated = true;

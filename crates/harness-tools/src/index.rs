@@ -273,18 +273,17 @@ pub(crate) fn candidates(
         let mut all = indexes()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match all.get(root) {
-            Some(index) => Arc::clone(index),
-            None => {
-                let large = mode == Mode::Always
-                    || root_walk(root).is_ok_and(|walk| walk.files.len() >= INDEX_MIN_FILES);
-                if !large {
-                    return None;
-                }
-                let index = Arc::new(RwLock::new(Index::default()));
-                all.insert(root.to_owned(), Arc::clone(&index));
-                index
+        if let Some(index) = all.get(root) {
+            Arc::clone(index)
+        } else {
+            let large = mode == Mode::Always
+                || root_walk(root).is_ok_and(|walk| walk.files.len() >= INDEX_MIN_FILES);
+            if !large {
+                return None;
             }
+            let index = Arc::new(RwLock::new(Index::default()));
+            all.insert(root.to_owned(), Arc::clone(&index));
+            index
         }
     };
     if mode == Mode::Always && !index.read().is_ok_and(|index| index.ready) {
@@ -414,6 +413,10 @@ fn product(left: &[Vec<u8>], right: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per kind of pattern node, read together"
+)]
 fn analyze(hir: &Hir) -> Info {
     match hir.kind() {
         HirKind::Empty | HirKind::Look(_) => Info {

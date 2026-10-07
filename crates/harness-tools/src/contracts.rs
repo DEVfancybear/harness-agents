@@ -1153,6 +1153,10 @@ const fn is_false(value: &bool) -> bool {
     !*value
 }
 
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
 const fn is_zero(value: &u64) -> bool {
     *value == 0
 }
