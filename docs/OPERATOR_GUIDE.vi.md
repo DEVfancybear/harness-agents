@@ -5,8 +5,10 @@ Ngôn ngữ: [English](OPERATOR_GUIDE.en.md)
 Tài liệu này dành cho người phải chạy, sao lưu, phục hồi, chuyển đổi và thanh lý
 một thư mục dữ liệu harness. Nó nêu đúng những lệnh có trong bản phát hành này,
 mỗi lệnh từ chối làm gì, và những giới hạn mà người vận hành không được phát hiện
-muộn. Đây là tài liệu vận hành đi kèm
-[P7_RELEASE.vi.md](implementation/P7_RELEASE.vi.md).
+muộn. Về cách các phần khớp nhau, xem
+[ARCHITECTURE_OVERVIEW.vi.md](ARCHITECTURE_OVERVIEW.vi.md) và
+[PLUGIN_ARCHITECTURE.vi.md](PLUGIN_ARCHITECTURE.vi.md); về TUI, xem
+[TUI.md](TUI.md).
 
 ## 1. Bản phát hành này là gì
 
@@ -23,24 +25,32 @@ phải một dịch vụ mạng.
 - **Không có server để kết nối.** Endpoint MCP từ xa và sandbox cấp hệ điều hành
   được công bố là không hỗ trợ trong ma trận phát hành; cô lập transport không
   phải là sandbox.
-- **Không có artifact phát hành nào được công bố.** Bản dựng Windows được phase
-  gate chạy; `scripts/New-HaRelease.ps1` build một bản candidate cục bộ kèm
-  checksum ([BUILD_AND_RELEASE.md](BUILD_AND_RELEASE.md)), nhưng không có gì được ký
-  hay phát hành.
+- **Artifact phát hành do script release tạo ra.** Bản dựng Windows được các gate
+  kiểm thử chạy; `scripts/New-HaRelease.ps1` build một bundle candidate kèm
+  checksum ([BUILD_AND_RELEASE.md](BUILD_AND_RELEASE.md)). Ma trận phát hành vẫn báo
+  artifact đã công bố là chưa kiểm chứng, và không có gì được ký code.
 - **Linux đang chờ hỗ trợ.** Job CI của Linux vẫn chạy để theo dõi nhưng không chặn
   push; ma trận phát hành báo Linux là `unverified`.
 - **Thông tin xác thực provider không được kiểm chứng.** Các gate không gọi API
   mô hình trả phí, nên không có tuyên bố phát hành nào phụ thuộc vào nó.
 
-Nguồn có thẩm quyền và đọc được bằng máy cho tất cả những điều trên là
-`ha maintenance release-matrix --json`. Nếu tài liệu này và kết quả đó khác nhau,
-kết quả đúng và tài liệu là lỗi.
+Phát biểu đọc được bằng máy về trạng thái kiểm chứng là
+`ha maintenance release-matrix --json`. Danh sách `capabilities` của nó vẫn báo
+`background_daemon` là `unsupported` (ma trận là bảng thận trọng, cập nhật bằng tay);
+worker nền ở [12.7](#127-agent-chạy-nền) có tồn tại và được mô tả ở đó. Với nền tảng,
+benchmark và các kiểm tra chưa chạy thì kết quả đó có thẩm quyền.
 
 ## 2. Chẩn đoán một thư mục dữ liệu
 
 ```console
 ha maintenance doctor --data-dir <DATA_DIR> --json
+ha maintenance doctor --cwd <PROJECT> --json
 ```
+
+Mọi lệnh con `maintenance` nhận `--data-dir` đều có thể dùng `--cwd <PROJECT>` thay
+thế (đặt trước hoặc sau lệnh con); nó tìm store của project như `ha chat` làm. Lệnh
+này không phải `ha doctor` ([12.1](#121-công-cụ-của-agent)), lệnh audit mức sẵn sàng
+của một repository cho agent, không phải một thư mục dữ liệu.
 
 `doctor` mở store ở chế độ ghi, báo cáo các revision schema tìm thấy, thiết lập
 `SQLite` đang áp dụng, số lượng session, task được giao, artifact và retention, và
@@ -214,7 +224,7 @@ benchmark chưa đo vẫn được nêu là chưa đo ngay cả khi mọi nền 
 
 ## 9. Những gì người vận hành không được giả định
 
-- Không tiến trình nền nào giữ hệ thống gọn gàng. Nếu bạn không chạy `gc`, không gì
+- Không tiến trình nền nào giữ store gọn gàng. Nếu bạn không chạy `gc`, không gì
   được thu gom; nếu bạn không chạy `backup`, không gì được bảo vệ.
 - Phục hồi không phải một công tắc. Nó tạo ra một thư mục ứng viên; kích hoạt nó là
   quyết định của người vận hành với hệ quả riêng.
@@ -240,6 +250,15 @@ benchmark chưa đo vẫn được nêu là chưa đo ngay cả khi mọi nền 
 | `ha maintenance gc` | Thu gom artifact không tham chiếu, không pin, đã cũ | Không bao giờ; nó báo những gì được giữ và vì sao |
 | `ha maintenance migrate-copy` | Chuyển đổi store trên một bản sao | Đích đã có dữ liệu; nguồn không có store |
 | `ha maintenance release-matrix` | Báo cáo nền tảng, capability và tính trung thực của benchmark | Không bao giờ; nó báo những gì chưa kiểm chứng |
+| `ha maintenance support-bundle` | Ghi một bundle có giới hạn, đã che (metadata, số lượng, revision schema, tham chiếu tương quan; với `--config <FILE>` có thêm config đã che) cho host bạn không với tới được; mỗi lần che được đếm trong manifest | Thư mục `--into` đã có file |
+
+Các lệnh cấp cao nhất khác được mô tả ở đúng chỗ của chúng: `ha`/`ha chat`/`ha exec`
+([12](#12-sử-dụng-ha-tương-tác-và-headless), [12.4](#124-automation)), `ha agents|list|attach|send|abort|stop|rename|shutdown|schedule`
+([12.7](#127-agent-chạy-nền), [12.8](#128-thêm-từ-prime-agent)), `ha mcp` ([12.3](#123-config-v2-quyền-và-hook)),
+`ha package` và `ha config` ([12.9](#129-gói-tài-nguyên-và-phần-còn-lại-của-prime-agent)), `ha model` và `ha prompt` ([12.8](#128-thêm-từ-prime-agent)), `ha doctor` ([12.1](#121-công-cụ-của-agent)).
+Các nhóm còn lại - `init`, `sessions`, `status`, `input`, `plugins`, `run`, `resume`, `continue`,
+`context`, `session`, `code`, `sandbox`, `tasks` và `extensions` - là lệnh kiểm tra và fixture mức thấp
+cho phát triển và các gate (`ha <nhóm> --help` liệt kê chúng); người vận hành không cần đến.
 
 ## 11. Đưa CLI vào terminal
 
@@ -286,8 +305,8 @@ Từ bản này script còn:
 Chạy `pwsh -NoProfile -File scripts/Install-Ha.ps1 -SelfTest` để tự kiểm chứng các luật
 trên mà không cài vào đâu thật.
 
-Cả hai đường đều build từ đúng cây source mà phase gate kiểm; chỉ khác cargo profile.
-Nếu bạn muốn đúng artifact mà release gate đã chạy, hãy dùng profile release mặc định.
+Cả hai đường đều build từ cùng một cây source; chỉ khác cargo profile.
+Nếu bạn muốn đúng artifact mà các test đã chạy, hãy dùng profile release mặc định.
 
 Gỡ lại:
 
@@ -308,8 +327,8 @@ pwsh -NoProfile -File scripts/Install-Ha.ps1 -Uninstall -Destination <DIR> -Remo
   thêm (nó in ra entry đó kèm cách gỡ). Lệnh thứ hai xóa luôn entry — cần cờ riêng vì lần
   cài cũng cần `-ModifyUserPath` mới được ghi vào User PATH.
 - Cả hai đều **không** đụng config và session data của bạn. Hiện **chưa** có lệnh nào xóa dữ
-  liệu người dùng: kế hoạch có nêu một đường `purge` riêng kèm kiểm tra path containment và
-  xác nhận, nhưng nó **chưa** được implement, nên đừng trông vào nó.
+  liệu người dùng (không có đường `purge`); muốn xóa config và thư mục dữ liệu thì tự
+  xóa tay.
 
 Hai điều cần biết sau khi cài:
 
@@ -447,7 +466,7 @@ ha exec "Continue the task" --continue --goal "Task complete" --max-turns 4 --ou
 
 ### 12.5. Giới hạn và kiểm tra
 
-Khi model gọi nhiều tool một lúc, chúng chạy song song như prime-agent; một lô có `ipython`, tool ghi file, `run_process`, `run_shell` hoặc `ask_user` thì chạy lần lượt từng lệnh. Phê duyệt, intent và receipt vẫn theo đúng thứ tự gọi. Tool chỉ đọc không còn lấy fingerprint workspace, và fingerprint chỉ hash lại những file đổi kích thước hoặc thời gian sửa. `run_shell` dùng `pwsh` trên Windows và `powershell.exe` khi thiếu `pwsh`; receipt ghi shell được chọn. Strict isolation chỉ được báo khi backend đã đo hỗ trợ. `/status` và `/config` là điểm bắt đầu khi provider hoặc quyền không như dự kiến. Giống prime-agent, một lượt không bị giới hạn số bước, số tool call hay thời gian: lượt chạy tới khi model xong, bạn dừng, hoặc hết token; `HA_TURN_MAX_STEPS`, `HA_TURN_MAX_TOOL_CALLS` và `HA_TURN_DEADLINE_SECONDS` đặt giới hạn nếu cần, và lượt chạm giới hạn được tự tiếp tục tối đa hai lần (`HA_TURN_CONTINUATIONS`). Toàn bộ hội thoại được giữ, và khi một yêu cầu gần đầy cửa sổ của model (cửa sổ trừ phần dành cho câu trả lời và phần dự trữ tối đa 16384 token) thì được compact như prime-agent: các lượt cũ thành bản tóm tắt do model viết, phần gần nhất (khoảng 20000 token) giữ nguyên văn, sau đó các kết quả tool cũ của lượt được rút gọn, rồi lượt chạy tiếp. `/compact` và checkpoint tự động tóm tắt toàn bộ hội thoại, không chỉ lượt cuối. Chỉ yêu cầu vẫn không vừa cửa sổ mới báo lỗi. Nếu `ha` chạy như bản cũ, `Get-Command ha -All` cho biết file thực thi nào đang chạy; cài lại bằng `scripts/Install-Ha.ps1`. Các gate M0–M6, H và PTY có evidence riêng. Linux đang chờ hỗ trợ: job CI của Linux không chặn push, và không có tuyên bố nào về Linux được suy ra từ nó.
+Khi model gọi nhiều tool một lúc, chúng chạy song song như prime-agent; một lô có `ipython`, tool ghi file, `run_process`, `run_shell` hoặc `ask_user` thì chạy lần lượt từng lệnh. Phê duyệt, intent và receipt vẫn theo đúng thứ tự gọi. Tool chỉ đọc không còn lấy fingerprint workspace, và fingerprint chỉ hash lại những file đổi kích thước hoặc thời gian sửa. `run_shell` dùng `pwsh` trên Windows và `powershell.exe` khi thiếu `pwsh`; receipt ghi shell được chọn. Strict isolation chỉ được báo khi backend đã đo hỗ trợ. `/status` và `/config` là điểm bắt đầu khi provider hoặc quyền không như dự kiến. Giống prime-agent, một lượt không bị giới hạn số bước, số tool call hay thời gian: lượt chạy tới khi model xong, bạn dừng, hoặc hết token; `HA_TURN_MAX_STEPS`, `HA_TURN_MAX_TOOL_CALLS` và `HA_TURN_DEADLINE_SECONDS` đặt giới hạn nếu cần, và lượt chạm giới hạn được tự tiếp tục tối đa hai lần (`HA_TURN_CONTINUATIONS`). Toàn bộ hội thoại được giữ, và khi một yêu cầu gần đầy cửa sổ của model (cửa sổ trừ phần dành cho câu trả lời và phần dự trữ tối đa 16384 token) thì được compact như prime-agent: các lượt cũ thành bản tóm tắt do model viết, phần gần nhất (khoảng 20000 token) giữ nguyên văn, sau đó các kết quả tool cũ của lượt được rút gọn, rồi lượt chạy tiếp. `/compact` và checkpoint tự động tóm tắt toàn bộ hội thoại, không chỉ lượt cuối. Chỉ yêu cầu vẫn không vừa cửa sổ mới báo lỗi. Nếu `ha` chạy như bản cũ, `Get-Command ha -All` cho biết file thực thi nào đang chạy; cài lại bằng `scripts/Install-Ha.ps1`. Các gate Bộ unit, integration và PTY có evidence riêng (`scripts/Invoke-HaPtyAcceptance.ps1` chạy các ca PTY mà `cargo test` bỏ qua). Linux đang chờ hỗ trợ: job CI của Linux không chặn push, và không có tuyên bố nào về Linux được suy ra từ nó.
 
 ### 12.6. `/resume`
 

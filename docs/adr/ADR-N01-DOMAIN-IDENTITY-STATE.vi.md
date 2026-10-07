@@ -2,7 +2,7 @@
 
 **Trạng thái:** accepted trong M0 (21/09/2026).
 **Phạm vi:** identity/state/acceptance dùng chung cho M0–M12.
-**Thay thế:** không. ADR-0001 (P0 foundation boundaries) vẫn hiệu lực.
+**Thay thế:** không. (Bản ghi P0 ADR-0001 đã được gỡ ngày 07/10/2026; các quy tắc của nó nằm trong code và chuỗi ADR này.)
 
 ## 1. Bối cảnh
 

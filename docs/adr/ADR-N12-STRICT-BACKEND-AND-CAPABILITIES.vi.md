@@ -2,10 +2,7 @@
 
 **Trạng thái:** accepted trong M12 · **Ngày:** 23/09/2026 · **Phạm vi:** M12-01..M12-04
 
-[Implementation handbook](../implementation/README.vi.md) · [Support matrix](../support/STRICT_EXECUTION_SUPPORT.vi.md) · [ADR-N11](ADR-N11-SCHEDULE-AND-DAEMON-SEMANTICS.vi.md)
-
-> Runbook M12 gọi ADR đến hạn là "ADR-N11"; đó là cách đánh số ở thời điểm lập kế hoạch. M11 đã dùng N11, nên ADR của
-> M12 là **N12**. Không có ADR nào bị bỏ qua.
+[Support matrix](../support/STRICT_EXECUTION_SUPPORT.vi.md)
 
 ## 1. Bối cảnh
 
@@ -26,7 +23,7 @@ enforce?**
 ### D1 — Backend được chọn là Job Object containment đang có, **được đo**; không thêm backend thứ hai
 
 Không có cơ chế mới nào được thêm vào đường chạy. Cái M12 thêm là **measurement, tên gọi và từ chối**. Lý do: (a) một
-backend thứ hai không có bằng chứng sẽ là một tuyên bố không kiểm được; (b) ADR-N10 D1 — ưu tiên thứ đã có trong lock
+backend thứ hai không có bằng chứng sẽ là một tuyên bố không kiểm được; (b) ưu tiên thứ đã có trong lock
 và đã có test; (c) containment hiện tại chưa từng được chứng minh bằng negative control, và đó là khoảng trống thật.
 
 ### D2 — Capability là **đo được**, và `unsupported` phải có bằng chứng dương

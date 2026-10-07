@@ -5,8 +5,10 @@ Ngôn ngữ: [Tiếng Việt](OPERATOR_GUIDE.vi.md)
 This guide is written for the person who has to run, back up, restore, migrate and
 retire a harness data directory. It states the commands that exist in this
 release, what each one refuses to do, and the limits an operator must not
-discover the hard way. It is the operator-facing companion to
-[P7_RELEASE.en.md](implementation/P7_RELEASE.en.md).
+discover the hard way. For how the pieces fit together, see
+[ARCHITECTURE_OVERVIEW.en.md](ARCHITECTURE_OVERVIEW.en.md) and
+[PLUGIN_ARCHITECTURE.en.md](PLUGIN_ARCHITECTURE.en.md); for the TUI,
+[TUI.md](TUI.md).
 
 ## 1. What this release is
 
@@ -22,24 +24,33 @@ What that means in practice:
 - **There is no server to connect to.** Remote MCP endpoints and OS-level
   sandboxing are declared unsupported in the release matrix; transport isolation
   is not a sandbox.
-- **There is no published release artifact.** Windows builds are exercised by
-  the phase gates; `scripts/New-HaRelease.ps1` builds a local candidate with
-  checksums ([BUILD_AND_RELEASE.md](BUILD_AND_RELEASE.md)), but nothing was signed
-  or published.
+- **Release artifacts come from the release script.** Windows builds are exercised
+  by the test gates; `scripts/New-HaRelease.ps1` builds a candidate bundle with
+  checksums ([BUILD_AND_RELEASE.md](BUILD_AND_RELEASE.md)). The release matrix still
+  reports published artifacts as unverified, and nothing is code-signed.
 - **Linux support is pending.** Its CI job runs for visibility and does not gate a
   push; the release matrix reports Linux as `unverified`.
 - **Provider credentials are not exercised.** The gates never call a paid model
   API, so no release claim depends on one.
 
-The authoritative, machine-readable statement of all of this is
-`ha maintenance release-matrix --json`. If this guide and that output ever
-disagree, the output is correct and the guide is a bug.
+The machine-readable statement of the verification state is
+`ha maintenance release-matrix --json`. Its `capabilities` list still reports
+`background_daemon` as `unsupported` (the matrix is a conservative, hand-kept
+table); the background worker of [12.7](#127-background-agents) exists and is
+documented there. For platforms, benchmarks and unverified checks the output is
+authoritative.
 
 ## 2. Diagnosing a data directory
 
 ```console
 ha maintenance doctor --data-dir <DATA_DIR> --json
+ha maintenance doctor --cwd <PROJECT> --json
 ```
+
+Every `maintenance` subcommand that takes `--data-dir` can instead take
+`--cwd <PROJECT>` (before or after the subcommand), which resolves the project's
+store the way `ha chat` does. This is not the same as `ha doctor` ([12.1](#121-agent-tools)),
+which audits a repository's readiness for an agent, not a data directory.
 
 `doctor` opens the store writable, reports the schema revisions it found, the
 `SQLite` settings in force, the session, delegated-task, artifact and retention
@@ -221,7 +232,7 @@ platform is green.
 
 ## 9. What an operator must not assume
 
-- No background process keeps the system tidy. If you do not run `gc`, nothing is
+- No background process keeps the store tidy. If you do not run `gc`, nothing is
   collected; if you do not run `backup`, nothing is protected.
 - A restore is not a switch. It produces a candidate directory; activating it is
   an operator decision with its own consequences.
@@ -246,6 +257,15 @@ platform is green.
 | `ha maintenance gc` | Collect unreferenced, unpinned, old artifacts | Never; it reports what it retained and why |
 | `ha maintenance migrate-copy` | Migrate a store on a copy | The destination is occupied; the source has no store |
 | `ha maintenance release-matrix` | Report platforms, capabilities and benchmark honesty | Never; it reports what is unverified |
+| `ha maintenance support-bundle` | Write a bounded, redacted bundle (metadata, counts, schema revisions, correlation references; with `--config <FILE>` the redacted config) for a host you cannot reach; every redaction is counted in its manifest | The `--into` directory already holds files |
+
+Other top-level commands are covered where they belong: `ha`/`ha chat`/`ha exec`
+([12](#12-interactive-and-headless-ha), [12.4](#124-automation)), `ha agents|list|attach|send|abort|stop|rename|shutdown|schedule`
+([12.7](#127-background-agents), [12.8](#128-more-from-prime-agent)), `ha mcp` ([12.3](#123-config-v2-permissions-and-hooks)),
+`ha package` and `ha config` ([12.9](#129-packages-resources-and-the-rest-of-prime-agent)), `ha model` and `ha prompt` ([12.8](#128-more-from-prime-agent)), `ha doctor` ([12.1](#121-agent-tools)).
+The remaining groups - `init`, `sessions`, `status`, `input`, `plugins`, `run`, `resume`, `continue`,
+`context`, `session`, `code`, `sandbox`, `tasks` and `extensions` - are lower-level inspection and
+fixture commands for development and gates (`ha <group> --help` lists them); an operator does not need them.
 
 ## 11. Getting the CLI into your terminal
 
@@ -273,14 +293,24 @@ pwsh -NoProfile -File scripts/Install-Ha.ps1 -SkipBuild            # install the
 ```
 
 What the script does **not** do, on purpose: it downloads nothing, it publishes
-nothing to a package registry, and it never edits your `PATH`. When the install
-directory is not on `PATH`, it prints the exact directory to add instead of
-changing your profile behind your back. It also prints the installed path and the
-`ha --version` output, so you can see which binary you are about to run.
+nothing to a package registry, and it does not edit your `PATH` unless you pass
+`-ModifyUserPath`. When the install directory is not on `PATH`, it prints the exact
+directory to add instead of changing your profile behind your back; with
+`-ModifyUserPath` it touches only the **User** PATH (appended once, de-duplicated,
+never the Machine or process PATH) and says a new terminal is needed to see it. It
+also prints the installed path and the `ha --version` output, so you can see which
+binary you are about to run.
 
-Both routes build from the same source tree the phase gate tests; only the cargo
-profile differs. If you want the exact artifact the release gate exercised, use
-the default release profile.
+The script also installs exactly the artifact Cargo reports, verifying the digest
+and `--version` of the staged copy before replacing anything and keeping the old
+file as a rollback; writes an `ha.install.json` manifest beside the binary (version,
+sha256, source, build commit, owned files) so update and uninstall touch only its
+own files; classifies a failed replace (`in_use`: close the app and retry, the script
+kills no process; `access_denied`); and warns when another `ha` comes earlier on
+`PATH` without deleting it. `-SelfTest` checks these rules without installing anything.
+
+Both routes build from the same source tree; only the cargo profile differs. If you
+want the exact artifact the tests exercised, use the default release profile.
 
 Removing it again:
 
@@ -302,8 +332,8 @@ pwsh -NoProfile -File scripts/Install-Ha.ps1 -Uninstall -Destination <DIR> -Remo
   removes the entry too: it needs its own switch because installing also needed
   `-ModifyUserPath` before writing to the User PATH.
 - Neither touches your config or session data. There is currently **no** command that deletes
-  user data: the plan describes a separate `purge` route with path containment and
-  confirmation, but it is **not** implemented, so do not count on it.
+  user data (no `purge` route exists); remove the config and data directories by hand if you want
+  them gone.
 
 Two things to know after installing:
 
@@ -442,7 +472,7 @@ ha exec "Continue the task" --continue --goal "Task complete" --max-turns 4 --ou
 
 ### 12.5. Limits and checks
 
-When the model asks for several tools at once they run side by side, as in prime-agent; a batch holding `ipython`, a file write, `run_process`, `run_shell` or `ask_user` runs one call at a time. Approvals, intents and receipts stay in call order. Read-only tools no longer fingerprint the workspace, and a fingerprint rehashes only files whose size or modification time changed. On Windows `run_shell` uses `pwsh`, falling back to `powershell.exe` when pwsh is missing; the receipt records the selected shell. Strict isolation is claimed only where a measured backend supports it. Start with `/status` and `/config` when provider or permissions differ from expectations. As in prime-agent, a turn has no step, tool-call or time bound: it runs until the model is done, you stop it, or the tokens run out; `HA_TURN_MAX_STEPS`, `HA_TURN_MAX_TOOL_CALLS` and `HA_TURN_DEADLINE_SECONDS` set one, and a turn that hits it is continued automatically up to twice (`HA_TURN_CONTINUATIONS`). The whole conversation is kept, and when a request nears the model's window (the window minus the answer's room and a reserve of up to 16384 tokens) it is compacted as prime-agent does: the earlier turns become a summary the model writes while the recent end (about 20000 tokens) stays word for word, then the turn's oldest tool results are shortened, and the turn goes on. `/compact` and the automatic checkpoint summarise the whole conversation, not only the last turn. Only a request that still cannot fit the window fails. If `ha` behaves like an older build, `Get-Command ha -All` shows which executable runs; reinstall with `scripts/Install-Ha.ps1`. M0–M6, H, and PTY gates have separate evidence. Linux support is pending: its CI job does not gate a push, and no Linux claim is made from it.
+When the model asks for several tools at once they run side by side, as in prime-agent; a batch holding `ipython`, a file write, `run_process`, `run_shell` or `ask_user` runs one call at a time. Approvals, intents and receipts stay in call order. Read-only tools no longer fingerprint the workspace, and a fingerprint rehashes only files whose size or modification time changed. On Windows `run_shell` uses `pwsh`, falling back to `powershell.exe` when pwsh is missing; the receipt records the selected shell. Strict isolation is claimed only where a measured backend supports it. Start with `/status` and `/config` when provider or permissions differ from expectations. As in prime-agent, a turn has no step, tool-call or time bound: it runs until the model is done, you stop it, or the tokens run out; `HA_TURN_MAX_STEPS`, `HA_TURN_MAX_TOOL_CALLS` and `HA_TURN_DEADLINE_SECONDS` set one, and a turn that hits it is continued automatically up to twice (`HA_TURN_CONTINUATIONS`). The whole conversation is kept, and when a request nears the model's window (the window minus the answer's room and a reserve of up to 16384 tokens) it is compacted as prime-agent does: the earlier turns become a summary the model writes while the recent end (about 20000 tokens) stays word for word, then the turn's oldest tool results are shortened, and the turn goes on. `/compact` and the automatic checkpoint summarise the whole conversation, not only the last turn. Only a request that still cannot fit the window fails. If `ha` behaves like an older build, `Get-Command ha -All` shows which executable runs; reinstall with `scripts/Install-Ha.ps1`. The unit, integration and PTY suites have separate evidence (`scripts/Invoke-HaPtyAcceptance.ps1` runs the PTY cases that `cargo test` skips). Linux support is pending: its CI job does not gate a push, and no Linux claim is made from it.
 
 ### 12.6. `/resume`
 

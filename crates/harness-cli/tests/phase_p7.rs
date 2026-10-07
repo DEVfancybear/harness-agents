@@ -1541,19 +1541,6 @@ async fn p7_s07_operator_docs_and_release_record_are_consistent() {
             .is_some_and(|verdict| verdict.contains("unmeasured")),
         "an unmeasured target must never be reported as achieved"
     );
-
-    // The implementation status documents agree with each other and name P7.
-    for name in [
-        "implementation/README.en.md",
-        "implementation/README.vi.md",
-        "implementation/P7_RELEASE.en.md",
-        "implementation/P7_RELEASE.vi.md",
-    ] {
-        let path = root.join("docs").join(name);
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("{name} must exist: {error}"));
-        assert!(!text.trim().is_empty(), "{name} must not be empty");
-    }
 }
 
 // ---------------------------------------------------------------------------

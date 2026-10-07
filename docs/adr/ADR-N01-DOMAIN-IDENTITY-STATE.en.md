@@ -2,7 +2,7 @@
 
 **Status:** accepted in M0 (2026-09-21).
 **Scope:** identity/state/acceptance shared by M0–M12.
-**Supersedes:** nothing. ADR-0001 (P0 foundation boundaries) remains in force.
+**Supersedes:** nothing. (The P0 foundation-boundaries record ADR-0001 was retired on 2026-10-07; its rules live in the code and in this ADR series.)
 
 ## 1. Context
 

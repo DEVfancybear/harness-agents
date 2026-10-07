@@ -6,7 +6,7 @@
     "P/H cases stay owned and reported there. A selector is listed here only when the test exists.",
     "`status` uses the plan vocabulary: planned, in_progress, implemented_unverified, verified_local,",
     "accepted, blocked. `implemented_unverified` means the test exists and runs; it is not a verdict.",
-    "A01-A36 are cross-layer acceptance cases from docs/implementation/ACCEPTANCE_MAP.vi.md and stay",
+    "A01-A36 are cross-layer acceptance cases from tests/acceptance and stay",
     "`planned` until their owner milestone implements them. Removed capabilities have no active milestone owner;",
     "retired acceptance cases name no selector."
   ],
@@ -14,7 +14,6 @@
     {
       "id": "M0",
       "title": "Foundation và executable contracts",
-      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": [],
       "status": "implemented_unverified",
       "integration_target": "milestone_m0",
@@ -118,7 +117,6 @@
     {
       "id": "M1",
       "title": "SQLite store, journal và recovery",
-      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M0"],
       "status": "implemented_unverified",
       "integration_target": "milestone_m1",
@@ -199,7 +197,6 @@
     {
       "id": "M2",
       "title": "Provider protocol và incremental stream",
-      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M0"],
       "status": "implemented_unverified",
       "integration_target": "milestone_m2",
@@ -290,7 +287,6 @@
     {
       "id": "M3",
       "title": "TurnDriver, human input và bounded goals",
-      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M1", "M2"],
       "status": "verified_local",
       "integration_target": "milestone_m3",
@@ -386,7 +382,6 @@
     {
       "id": "M4",
       "title": "Coding tools và host runner",
-      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M3"],
       "status": "in_progress",
       "integration_target": "milestone_m4",
@@ -460,7 +455,6 @@
     {
       "id": "M5",
       "title": "Context, compaction và source continuity",
-      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M4"],
       "status": "in_progress",
       "integration_target": "milestone_m5",
@@ -550,7 +544,6 @@
     {
       "id": "M6",
       "title": "Skills, MCP và versioned extensions",
-      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M5"],
       "status": "in_progress",
       "integration_target": "milestone_m6",
@@ -636,7 +629,6 @@
     {
       "id": "M8",
       "title": "Durable DAG và worktree integration",
-      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M6"],
       "status": "in_progress",
       "integration_target": "milestone_m8",
@@ -680,8 +672,7 @@
       ],
       "unit_tests": [],
       "fixtures": [
-        "crates/harness-cli/tests/milestone_m8.rs",
-        "docs/ARCHITECTURE_REVIEW.vi.md"
+        "crates/harness-cli/tests/milestone_m8.rs"
       ],
       "gate": {
         "script": "scripts/Verify-Milestone.ps1",
@@ -708,7 +699,6 @@
     {
       "id": "M9",
       "title": "Data lifecycle và CLI release",
-      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M8"],
       "status": "in_progress",
       "integration_target": "milestone_m9",
@@ -751,8 +741,7 @@
       ],
       "unit_tests": [],
       "fixtures": [
-        "crates/harness-cli/tests/milestone_m9.rs",
-        "docs/ARCHITECTURE_REVIEW.vi.md"
+        "crates/harness-cli/tests/milestone_m9.rs"
       ],
       "gate": {
         "script": "scripts/Verify-Milestone.ps1",
@@ -780,7 +769,6 @@
     {
       "id": "M12",
       "title": "Strict execution backend",
-      "runbook": "docs/implementation/README.vi.md",
       "prerequisites": ["M4"],
       "status": "in_progress",
       "integration_target": "milestone_m12",
@@ -851,7 +839,6 @@
         "crates/harness-tools/src/execution/probe.rs",
         "crates/harness-tools/src/execution/probe_control.rs",
         "docs/PLUGIN_ARCHITECTURE.vi.md",
-        "docs/implementation/README.vi.md",
         "docs/support/STRICT_EXECUTION_SUPPORT.vi.md"
       ],
       "gate": {

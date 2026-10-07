@@ -2,7 +2,7 @@
 
 **Trạng thái:** accepted trong M9 · **Ngày:** 23/09/2026 · **Phạm vi:** M9-01..M9-04
 
-[Architecture overview](../ARCHITECTURE_OVERVIEW.vi.md) · [Implementation handbook](../implementation/README.vi.md) · [ADR-N02](ADR-N02-STORE-OWNERSHIP-DURABILITY.vi.md)
+[Architecture overview](../ARCHITECTURE_OVERVIEW.vi.md) · [ADR-N02](ADR-N02-STORE-OWNERSHIP-DURABILITY.vi.md)
 
 ## 1. Bối cảnh
 
