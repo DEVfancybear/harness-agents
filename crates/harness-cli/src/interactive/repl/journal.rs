@@ -152,17 +152,34 @@ pub async fn reap_stale(dir: &Path, own: u32) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        let Some(owner) = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_suffix(".jsonl"))
-            .and_then(|pid| pid.parse::<u32>().ok())
-        else {
-            continue;
+    let journals = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let owner = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".jsonl"))
+                .and_then(|pid| pid.parse::<u32>().ok())?;
+            (owner != own).then_some((owner, path))
+        })
+        .collect::<Vec<_>>();
+    if journals.is_empty() {
+        return;
+    }
+    // One process listing answers every owner: a tasklist per journal costs a
+    // process spawn each on Windows. Without a trustworthy listing each owner
+    // is asked on its own, as before.
+    let running = running_pids().await;
+    for (owner, path) in journals {
+        let alive = match &running {
+            // pid 0 is the idle process in a listing, never a dead `ha`.
+            Some(running) => {
+                owner != 0 && (owner == std::process::id() || running.contains(&owner))
+            }
+            None => process_alive(owner).await,
         };
-        if owner == own || process_alive(owner).await {
+        if alive {
             continue;
         }
         let contents = std::fs::read_to_string(&path).unwrap_or_default();
@@ -311,6 +328,41 @@ pub async fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// Every running pid from one `tasklist` on Windows, or `None` when the listing
+/// cannot be trusted (it must at least show this process). Elsewhere per-pid
+/// checks are already cheap, so there is no listing.
+async fn running_pids() -> Option<std::collections::HashSet<u32>> {
+    #[cfg(windows)]
+    {
+        let mut command = quiet(system32(&["tasklist.exe"]));
+        command.args(["/FO", "CSV", "/NH"]);
+        let output = output(command, QUERY_TIMEOUT).await?;
+        if !output.status.success() {
+            return None;
+        }
+        tasklist_pids(&String::from_utf8_lossy(&output.stdout), std::process::id())
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// The pids of a full `tasklist /FO CSV /NH`, trusted only when `own` is listed.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn tasklist_pids(stdout: &str, own: u32) -> Option<std::collections::HashSet<u32>> {
+    let pids = stdout
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix('"')?;
+            let (_, rest) = rest.split_once("\",\"")?;
+            let (reported, _) = rest.split_once('"')?;
+            reported.parse::<u32>().ok()
+        })
+        .collect::<std::collections::HashSet<_>>();
+    pids.contains(&own).then_some(pids)
+}
+
 /// `tasklist /FO CSV /NH`: a row whose second field is exactly the pid means
 /// alive, nothing but `INFO:` lines means gone, anything else is unknown.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -444,6 +496,15 @@ mod tests {
             ),
             Some(false)
         );
+    }
+
+    #[test]
+    fn a_full_listing_is_trusted_only_when_it_shows_this_process() {
+        let listing = "\"System\",\"4\",\"Services\",\"0\",\"1 K\"\r\n\"ha.exe\",\"77\",\"Console\",\"1\",\"9 K\"\r\n";
+        let pids = super::tasklist_pids(listing, 77).expect("trusted");
+        assert!(pids.contains(&4) && pids.contains(&77) && !pids.contains(&7));
+        assert_eq!(super::tasklist_pids(listing, 78), None);
+        assert_eq!(super::tasklist_pids("ERROR: access denied", 77), None);
     }
 
     /// A dead owner's journal is reaped and removed; an identity that no longer
