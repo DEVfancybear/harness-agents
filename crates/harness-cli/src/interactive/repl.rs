@@ -144,13 +144,15 @@ pub struct CellOutput {
 
 /// Code every new kernel runs first, as prime-agent's bootstrap cell does: the
 /// `rlm` namespace and `bash` are globals, and output has no colour codes.
+/// `mcp` is imported on its first use: most turns never call it, and the
+/// import was a large share of a kernel's start.
 const BOOTSTRAP_CODE: &str = "import asyncio\n\
 import os as _ha_os\n\
 _ha_os.environ[\"NO_COLOR\"] = \"1\"\n\
 import rlm as _ha_rlm_module\n\
 rlm = _ha_rlm_module.rlm\n\
 bash = _ha_rlm_module.bash\n\
-import rlm.mcp as mcp\n\
+mcp = _ha_rlm_module._LazyModule(\"rlm.mcp\", globals(), \"mcp\")\n\
 del _ha_os";
 
 /// The answer to one host request: `None` when the type has no handler.
