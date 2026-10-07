@@ -470,6 +470,24 @@ impl SqliteStore {
         rows.iter().map(step_from_row).collect()
     }
 
+    /// How many steps a run has frozen: the index the next step takes.
+    ///
+    /// The runtime used to read and decode every step of the run to learn this
+    /// one number, once per step, so a long turn paid for the square of its
+    /// length; the `(run_id, step_index)` index answers it without the rows.
+    pub async fn run_step_count(&self, run_id: &AgentRunId) -> Result<u64, StoreError> {
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM run_steps WHERE run_id = ?")
+            .bind(run_id.as_str())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| {
+                database_error(ErrorCode::StorageWriteFailed, "count run steps", error)
+            })?;
+        u64::try_from(count).map_err(|_| {
+            StoreError::new(ErrorCode::StorageWriteFailed, "run step count is invalid")
+        })
+    }
+
     /// Freeze one run step and its budget reservation in one transaction.
     ///
     /// The run revision CAS makes the boundary explicit: a step is frozen only
