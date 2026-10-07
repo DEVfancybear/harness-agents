@@ -26,18 +26,55 @@ use serde_json::Value;
 ///
 /// Returns the preformatted validation error message when the arguments fail
 /// the tool's schema checks (after coercion).
+#[cfg(test)]
 pub fn validate_tool_arguments(
     tool_name: &str,
     schema: &Value,
     arguments: &Value,
 ) -> Result<Value, String> {
     let mut args = arguments.clone();
-    coerce(schema, &mut args);
+    let mut changed = false;
+    coerce(schema, &mut args, &mut changed);
     let mut errors = Vec::new();
     check(schema, &args, "", &mut errors);
     if errors.is_empty() {
         return Ok(args);
     }
+    Err(validation_message(tool_name, &errors, arguments))
+}
+
+/// `validate_tool_arguments` for arguments still in their JSON text, as a
+/// provider sends them: `Ok(None)` when they pass unchanged, `Ok(Some(_))`
+/// with the coerced arguments when coercion changed something.
+///
+/// The arguments are parsed once and coerced in place. The by-reference form
+/// copies the whole value first to keep the original for the error message,
+/// and its caller then compared the two trees - for a 1 MB `write_file` that
+/// was two extra passes over the content on every call. Here the original is
+/// re-read from the text only when validation fails.
+///
+/// # Errors
+///
+/// The same preformatted message as `validate_tool_arguments`. Text that is
+/// not JSON is validated as `null`, as that caller always did.
+pub fn validate_tool_arguments_json(
+    tool_name: &str,
+    schema: &Value,
+    arguments: &str,
+) -> Result<Option<Value>, String> {
+    let mut args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+    let mut changed = false;
+    coerce(schema, &mut args, &mut changed);
+    let mut errors = Vec::new();
+    check(schema, &args, "", &mut errors);
+    if errors.is_empty() {
+        return Ok(changed.then_some(args));
+    }
+    let original: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+    Err(validation_message(tool_name, &errors, &original))
+}
+
+fn validation_message(tool_name: &str, errors: &[(String, String)], arguments: &Value) -> String {
     let error_lines = errors
         .iter()
         .map(|(path, message)| format!("  - {path}: {message}"))
@@ -50,9 +87,9 @@ pub fn validate_tool_arguments(
     };
     let received =
         serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string());
-    Err(format!(
+    format!(
         "Validation failed for tool \"{tool_name}\":\n{error_lines}\n\nReceived arguments:\n{received}"
-    ))
+    )
 }
 
 fn schema_type(schema: &Value) -> Vec<&str> {
@@ -66,10 +103,10 @@ fn schema_type(schema: &Value) -> Vec<&str> {
 /// Primitive coercion mirroring `TypeBox` `Value.Convert`: string values are
 /// parsed into number/boolean when the schema requests it, and number/boolean
 /// values are stringified when the schema requests a string.
-fn coerce(schema: &Value, value: &mut Value) {
+fn coerce(schema: &Value, value: &mut Value, changed: &mut bool) {
     let types = schema_type(schema);
     if types.is_empty() {
-        coerce_children(schema, value);
+        coerce_children(schema, value, changed);
         return;
     }
     for ty in types {
@@ -77,50 +114,57 @@ fn coerce(schema: &Value, value: &mut Value) {
             ("number", Value::String(s)) => {
                 if let Ok(n) = s.trim().parse::<f64>() {
                     *value = number_value(n);
-                    return coerce_children(schema, value);
+                    *changed = true;
+                    return coerce_children(schema, value, changed);
                 }
             }
             ("integer", Value::String(s)) => {
                 if let Ok(n) = s.trim().parse::<i64>() {
                     *value = Value::from(n);
-                    return coerce_children(schema, value);
+                    *changed = true;
+                    return coerce_children(schema, value, changed);
                 }
             }
             ("boolean", Value::String(s)) => {
                 let lower = s.trim().to_ascii_lowercase();
                 if lower == "true" {
                     *value = Value::Bool(true);
-                    return coerce_children(schema, value);
+                    *changed = true;
+                    return coerce_children(schema, value, changed);
                 }
                 if lower == "false" {
                     *value = Value::Bool(false);
-                    return coerce_children(schema, value);
+                    *changed = true;
+                    return coerce_children(schema, value, changed);
                 }
             }
             ("string", Value::Number(n)) => {
                 *value = Value::String(n.to_string());
-                return coerce_children(schema, value);
+                *changed = true;
+                return coerce_children(schema, value, changed);
             }
             ("string", Value::Bool(b)) => {
                 *value = Value::String(b.to_string());
-                return coerce_children(schema, value);
+                *changed = true;
+                return coerce_children(schema, value, changed);
             }
             _ => {}
         }
     }
-    coerce_children(schema, value);
+    coerce_children(schema, value, changed);
 }
 
-fn coerce_children(schema: &Value, value: &mut Value) {
-    let properties = match schema.get("properties") {
-        Some(Value::Object(p)) => p.clone(),
-        _ => return,
+fn coerce_children(schema: &Value, value: &mut Value, changed: &mut bool) {
+    // Borrowed, not cloned: the schema and the value are separate trees, and a
+    // copy of the properties map per object level was most of the cost.
+    let Some(Value::Object(properties)) = schema.get("properties") else {
+        return;
     };
     match value {
         Value::Object(map) => {
-            for (key, sub_schema) in &properties {
+            for (key, sub_schema) in properties {
                 if let Some(v) = map.get_mut(key) {
-                    coerce(sub_schema, v);
+                    coerce(sub_schema, v, changed);
                 }
             }
             // Coerce entries under `additionalProperties: { ... }` schemas too.
@@ -128,7 +172,7 @@ fn coerce_children(schema: &Value, value: &mut Value) {
                 if additional_schema.is_object() {
                     for (key, v) in map.iter_mut() {
                         if !properties.contains_key(key) {
-                            coerce(additional_schema, v);
+                            coerce(additional_schema, v, changed);
                         }
                     }
                 }
@@ -139,12 +183,12 @@ fn coerce_children(schema: &Value, value: &mut Value) {
                 // Positional tuple validation; coerce each pair.
                 for (i, item) in items.iter_mut().enumerate() {
                     if let Some(s) = item_schemas.get(i) {
-                        coerce(s, item);
+                        coerce(s, item, changed);
                     }
                 }
             } else if let Some(item_schema) = schema.get("items") {
                 for item in items.iter_mut() {
-                    coerce(item_schema, item);
+                    coerce(item_schema, item, changed);
                 }
             }
         }
@@ -358,6 +402,30 @@ mod tests {
         )
         .expect("coerced");
         assert_eq!(coerced, json!({"path": "7", "limit": 50, "regex": true}));
+    }
+
+    /// The text form says whether coercion changed anything, and fails with
+    /// the same message, echoing the arguments as they were sent.
+    #[test]
+    fn the_text_form_reports_changes_and_fails_alike() {
+        let schema = read_file_schema();
+        assert_eq!(
+            super::validate_tool_arguments_json("read_file", &schema, r#"{"path":"a"}"#),
+            Ok(None)
+        );
+        assert_eq!(
+            super::validate_tool_arguments_json(
+                "read_file",
+                &schema,
+                r#"{"path":"a","limit":"5"}"#
+            ),
+            Ok(Some(json!({"path": "a", "limit": 5})))
+        );
+        let sent = json!({"path": "a", "limit": "0"});
+        assert_eq!(
+            super::validate_tool_arguments_json("read_file", &schema, &sent.to_string()),
+            validate_tool_arguments("read_file", &schema, &sent).map(Some)
+        );
     }
 
     /// Every problem is named, with its path, and the arguments are echoed,

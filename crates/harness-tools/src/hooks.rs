@@ -100,6 +100,11 @@ impl HookResponse {
 /// regular expression, as Claude Code matches (`mcp__.*`, `Edit|Write`).
 #[must_use]
 pub fn hook_matches(matcher: Option<&str>, tool_name: &str) -> bool {
+    // Matchers come from configuration, so there are few of them, and every
+    // tool call checks each one: compile each once per process.
+    static COMPILED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<regex::Regex>>>,
+    > = std::sync::OnceLock::new();
     let Some(matcher) = matcher.map(str::trim).filter(|matcher| !matcher.is_empty()) else {
         return true;
     };
@@ -110,7 +115,16 @@ pub fn hook_matches(matcher: Option<&str>, tool_name: &str) -> bool {
     {
         return true;
     }
-    regex::Regex::new(&format!("^(?:{matcher})$")).is_ok_and(|pattern| pattern.is_match(tool_name))
+    let compiled = COMPILED.get_or_init(Default::default);
+    let Ok(mut compiled) = compiled.lock() else {
+        return regex::Regex::new(&format!("^(?:{matcher})$"))
+            .is_ok_and(|pattern| pattern.is_match(tool_name));
+    };
+    compiled
+        .entry(matcher.to_owned())
+        .or_insert_with(|| regex::Regex::new(&format!("^(?:{matcher})$")).ok())
+        .as_ref()
+        .is_some_and(|pattern| pattern.is_match(tool_name))
 }
 
 /// The hooks configured for `event` that select `tool_name` (every one of
@@ -298,6 +312,11 @@ pub fn fit_payload(mut payload: Value, pointers: &[&str]) -> Value {
     const LIMIT: usize = 8 * 1024;
     let size =
         |payload: &Value| serde_json::to_vec(payload).map_or(usize::MAX, |bytes| bytes.len());
+    // Compact JSON serializes a value the same wherever it sits, so the whole
+    // payload is measured once and each cut adjusts the total by the slot's own
+    // size: a megabyte of tool output is no longer re-serialized on every
+    // shrinking pass.
+    let mut total = size(&payload);
     for pointer in pointers {
         let Some(original) = payload.pointer(pointer).map(|value| match value {
             Value::String(text) => text.clone(),
@@ -305,8 +324,9 @@ pub fn fit_payload(mut payload: Value, pointers: &[&str]) -> Value {
         }) else {
             continue;
         };
+        let mut slot_size = payload.pointer(pointer).map_or(0, size);
         let mut keep = original.chars().count();
-        while size(&payload) > LIMIT {
+        while total > LIMIT {
             keep = if keep > 256 { keep * 3 / 4 } else { 0 };
             let cut = if keep == 0 {
                 serde_json::json!({ "truncated": true })
@@ -314,8 +334,11 @@ pub fn fit_payload(mut payload: Value, pointers: &[&str]) -> Value {
                 let preview: String = original.chars().take(keep).collect();
                 serde_json::json!({ "truncated": true, "preview": preview })
             };
+            let cut_size = size(&cut);
             if let Some(slot) = payload.pointer_mut(pointer) {
                 *slot = cut;
+                total = total.saturating_sub(slot_size).saturating_add(cut_size);
+                slot_size = cut_size;
             }
             if keep == 0 {
                 break;

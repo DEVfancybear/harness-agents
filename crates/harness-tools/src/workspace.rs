@@ -1140,6 +1140,31 @@ fn hash_cache() -> &'static Mutex<HashCache> {
 
 const RACY_WINDOW: Duration = Duration::from_secs(2);
 
+/// Entries the hash cache may hold beyond the files of the walk at hand.
+const HASH_CACHE_SLACK: usize = 64 * 1024;
+
+/// Keep the hash cache from growing for as long as the host runs.
+///
+/// Files are deleted and renamed, and a long session over several worktrees
+/// visits many roots; nothing ever removed their entries. Once the cache holds
+/// far more than the walk being hashed, it keeps only that walk's files: a hash
+/// dropped this way is a cache miss later, never a wrong answer.
+fn bound_hash_cache(cache: &mut HashCache, files: &[WalkFile]) {
+    if cache.len()
+        <= files
+            .len()
+            .saturating_mul(2)
+            .saturating_add(HASH_CACHE_SLACK)
+    {
+        return;
+    }
+    let current = files
+        .iter()
+        .map(|file| file.absolute.as_path())
+        .collect::<HashSet<_>>();
+    cache.retain(|path, _| current.contains(path.as_path()));
+}
+
 /// Hash every file, reusing cached hashes and reading the rest on all cores.
 fn hash_files(files: &[WalkFile]) -> Result<Vec<Option<ContentHash>>, HarnessError> {
     let now = SystemTime::now();
@@ -1186,6 +1211,9 @@ fn hash_files(files: &[WalkFile]) -> Result<Vec<Option<ContentHash>>, HarnessErr
             .collect::<Vec<_>>()
     });
     let mut cache = hash_cache().lock().ok();
+    if let Some(cache) = cache.as_mut() {
+        bound_hash_cache(cache, files);
+    }
     for (index, hash) in computed {
         let hash = hash?;
         let file = &files[index];

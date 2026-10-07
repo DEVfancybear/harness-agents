@@ -95,13 +95,11 @@ fn redact_hook_arguments(value: &mut Value) {
 /// Read the current repository commit through the bounded Git process runner.
 /// A missing or uncommitted HEAD is represented as `None`.
 pub async fn git_head_commit(root: &Path) -> Result<Option<String>, HarnessError> {
-    let output = process::run_structured(
+    let output = process::run_internal_git(
         root,
-        "git",
         &["rev-parse".to_owned(), "HEAD".to_owned()],
         15_000,
         CancellationToken::new(),
-        &ProcessEnvironment::empty(),
         &crate::capture::ProcessSpoolConfig::default(),
     )
     .await?;
@@ -125,9 +123,8 @@ pub async fn git_diff_from(root: &Path, base_commit: &str) -> Result<String, Har
             "stored Git base is not a full commit id",
         ));
     }
-    let output = process::run_structured(
+    let output = process::run_internal_git(
         root,
-        "git",
         &[
             "diff".to_owned(),
             "--no-ext-diff".to_owned(),
@@ -136,7 +133,6 @@ pub async fn git_diff_from(root: &Path, base_commit: &str) -> Result<String, Har
         ],
         15_000,
         CancellationToken::new(),
-        &ProcessEnvironment::empty(),
         &crate::capture::ProcessSpoolConfig::default(),
     )
     .await?;
@@ -364,6 +360,13 @@ impl ToolExecutionService {
         crate::hooks::run_hooks(&self.hooks, event, tool_name, payload, false, cancellation).await
     }
 
+    /// Whether any hook of `event` selects the tool `name`.
+    pub(crate) fn has_tool_hooks(&self, event: &str, name: &str) -> bool {
+        crate::hooks::hooks_for(&self.hooks, event, Some(name))
+            .next()
+            .is_some()
+    }
+
     /// The `pre_tool_use` hooks of a prepared call. A hook that fails blocks
     /// the call.
     pub(crate) async fn run_pre_tool_hooks(
@@ -372,6 +375,12 @@ impl ToolExecutionService {
         cancellation: &CancellationToken,
     ) -> crate::HookResponse {
         let name = prepared.final_action.kind().as_str();
+        // Most configurations have no hook for most tools; the payload is a
+        // canonical serialization of the whole call (a large write included),
+        // so it is only built for a hook that will read it.
+        if !self.has_tool_hooks("pre_tool_use", name) {
+            return crate::HookResponse::default();
+        }
         let payload = tool_hook_payload(prepared, "pre_tool_use");
         crate::hooks::run_hooks(
             &self.hooks,
@@ -1689,9 +1698,8 @@ impl ToolExecutionService {
                 self.finish_backend_lease(lease, output).await
             }
             CodingToolAction::GitStatus => {
-                let output = process::run_structured(
+                let output = process::run_internal_git(
                     root,
-                    "git",
                     &[
                         "status".to_owned(),
                         "--porcelain=v1".to_owned(),
@@ -1700,7 +1708,6 @@ impl ToolExecutionService {
                     ],
                     15_000,
                     cancellation,
-                    &ProcessEnvironment::empty(),
                     &self.spool,
                 )
                 .await?;
@@ -1712,30 +1719,16 @@ impl ToolExecutionService {
                     args.push("--".to_owned());
                     args.push(path.clone());
                 }
-                let output = process::run_structured(
-                    root,
-                    "git",
-                    &args,
-                    15_000,
-                    cancellation,
-                    &ProcessEnvironment::empty(),
-                    &self.spool,
-                )
-                .await?;
+                let output =
+                    process::run_internal_git(root, &args, 15_000, cancellation, &self.spool)
+                        .await?;
                 Ok(Dispatched::plain(git_output("diff", output)))
             }
             CodingToolAction::GitLog { path, limit } => {
                 let args = git_log_arguments(path.as_deref(), *limit);
-                let output = process::run_structured(
-                    root,
-                    "git",
-                    &args,
-                    15_000,
-                    cancellation,
-                    &ProcessEnvironment::empty(),
-                    &self.spool,
-                )
-                .await?;
+                let output =
+                    process::run_internal_git(root, &args, 15_000, cancellation, &self.spool)
+                        .await?;
                 Ok(Dispatched::plain(git_output("log", output)))
             }
             CodingToolAction::TaskUpdate { .. } => Err(HarnessError::new(
@@ -1932,20 +1925,20 @@ impl ToolExecutionService {
         let (artifact, captured_bytes, capture_hash, capture_truncated, capture_tail) =
             match &output.capture {
                 Some(capture) => {
-                    let bytes = std::fs::read(&capture.path).map_err(|error| {
-                        HarnessError::new(
-                            ErrorCode::ArtifactWriteFailed,
-                            format!("cannot read the finished capture: {error}"),
-                        )
-                    })?;
+                    let bytes = capture.payload()?;
+                    let tail = capture.tail_of(&bytes);
+                    // Flushed before it returns: the lease record written next
+                    // already names this artifact, so its bytes must be durable
+                    // before any row points at them. The store hashes the bytes
+                    // it writes, and that digest is the one the receipt carries.
                     let published = self.store.publish_artifact(&bytes).map_err(store_error)?;
-                    let _ = std::fs::remove_file(&capture.path);
+                    let hash = published.content_hash.clone();
                     (
                         Some(published),
                         capture.bytes,
-                        Some(capture.hash.clone()),
+                        Some(hash),
                         capture.truncated,
-                        capture.tail.clone(),
+                        tail,
                     )
                 }
                 None => (None, 0, None, false, String::new()),
