@@ -1012,6 +1012,47 @@ fn scan_entry(path: &Path, source: SkillSource) -> Result<SkillCatalogEntry, Ext
             ),
         ));
     }
+    // Discovery runs every turn and every menu refresh, and hashing every
+    // SKILL.md each time was most of its cost. A file whose length and
+    // modification time are unchanged reuses its last scan. That is safe even
+    // against a rewrite that keeps both: activation hashes the file again and
+    // refuses one that no longer matches the catalogued digest.
+    let scans = SCANS.get_or_init(std::sync::Mutex::default);
+    let modified = metadata.modified().ok();
+    if let Some(modified) = modified
+        && let Ok(scans) = scans.lock()
+        && let Some((len, seen, entry)) = scans.get(path)
+        && *len == metadata.len()
+        && *seen == modified
+    {
+        return Ok(SkillCatalogEntry {
+            skill_id: SkillId::generate(),
+            source,
+            ..entry.clone()
+        });
+    }
+    let entry = scan_entry_uncached(path, source, &metadata)?;
+    if let Some(modified) = modified
+        && let Ok(mut scans) = scans.lock()
+    {
+        scans.insert(
+            path.to_path_buf(),
+            (metadata.len(), modified, entry.clone()),
+        );
+    }
+    Ok(entry)
+}
+
+/// The last scan of each skill file, with the length and modification time
+/// it was scanned at.
+type Scans = std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime, SkillCatalogEntry)>;
+static SCANS: std::sync::OnceLock<std::sync::Mutex<Scans>> = std::sync::OnceLock::new();
+
+fn scan_entry_uncached(
+    path: &Path,
+    source: SkillSource,
+    metadata: &std::fs::Metadata,
+) -> Result<SkillCatalogEntry, ExtensionError> {
     let head = read_prefix(path, MAX_SKILL_HEAD_BYTES)?;
     let head_text = String::from_utf8_lossy(&head).into_owned();
     let mut file = std::fs::File::open(path).map_err(|error| {

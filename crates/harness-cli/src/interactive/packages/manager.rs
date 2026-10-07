@@ -506,9 +506,10 @@ impl PackageManager {
         let (program, args) = npm::npm_command(self.settings.settings().npm_command.as_ref());
         // ha resolves resources on every skill and prompt lookup, so the npm
         // root is asked once per npm command for the process (prime keeps it
-        // per manager).
-        static ROOTS: std::sync::Mutex<Vec<((String, Vec<String>), PathBuf)>> =
-            std::sync::Mutex::new(Vec::new());
+        // per manager). A failure is kept too: without npm on PATH every
+        // lookup spawned a process only to fail again the same way.
+        type Roots = Vec<((String, Vec<String>), std::result::Result<PathBuf, String>)>;
+        static ROOTS: std::sync::Mutex<Roots> = std::sync::Mutex::new(Vec::new());
         let key = (program.clone(), args.clone());
         if let Some(root) = ROOTS.lock().ok().and_then(|roots| {
             roots
@@ -516,13 +517,14 @@ impl PackageManager {
                 .find(|(cached, _)| *cached == key)
                 .map(|(_, root)| root.clone())
         }) {
-            return Ok(root);
+            return root.map_err(anyhow::Error::msg);
         }
-        let root = npm::discover_global_npm_root(&program, &args)?;
+        let root =
+            npm::discover_global_npm_root(&program, &args).map_err(|error| format!("{error:#}"));
         if let Ok(mut roots) = ROOTS.lock() {
             roots.push((key, root.clone()));
         }
-        Ok(root)
+        root.map_err(anyhow::Error::msg)
     }
 
     pub(super) fn install_npm(
