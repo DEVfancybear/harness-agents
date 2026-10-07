@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "harness-cli"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "harness-extensions"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "harness-kernel",
  "harness-providers",
@@ -1311,7 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "harness-kernel"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "harness-types",
  "thiserror 2.0.20",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "harness-maintenance"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "harness-session",
  "harness-store-sqlite",
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "harness-orchestrator"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "harness-kernel",
  "harness-providers",
@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "harness-providers"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1370,7 +1370,7 @@ dependencies = [
 
 [[package]]
 name = "harness-runtime"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "futures-util",
  "harness-providers",
@@ -1387,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "harness-session"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "harness-store-sqlite",
  "harness-types",
@@ -1398,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "harness-store-sqlite"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "fs2",
  "harness-types",
@@ -1412,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "harness-tools"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "fancy-regex 0.16.2",
  "globset",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "harness-types"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "schemars",
  "serde",
