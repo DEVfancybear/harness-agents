@@ -1259,17 +1259,50 @@ fn provider_usage(events: &[ProviderStreamEvent]) -> Option<u64> {
 
 /// Private reasoning is a live TUI-only signal and is never committed to a
 /// provider attempt transcript.
-fn durable_provider_events(events: &[ProviderStreamEvent]) -> Vec<&ProviderStreamEvent> {
-    events
-        .iter()
-        .filter(|event| {
-            !matches!(
-                event,
+///
+/// The stream's deltas are joined before they are committed: a provider sends a
+/// few tokens per delta, so an answer of a few thousand words was a few thousand
+/// `{"kind":"text_delta",...}` objects, written once and decoded again by every
+/// later turn that replays it. Every reader of the attempt goes through
+/// [`assemble_stream`], which concatenates text and appends a call's arguments
+/// in order - a run of text deltas, or of one call's deltas, assembles to
+/// exactly what its joined delta does, so the response and its hash are the
+/// same. Only adjacent deltas are joined; the order of everything else stays.
+fn durable_provider_events(events: &[ProviderStreamEvent]) -> Vec<ProviderStreamEvent> {
+    let mut durable: Vec<ProviderStreamEvent> = Vec::new();
+    for event in events {
+        match (durable.last_mut(), event) {
+            (
+                _,
                 ProviderStreamEvent::ThinkingDelta { .. }
-                    | ProviderStreamEvent::ThinkingSignature { .. }
-            )
-        })
-        .collect()
+                | ProviderStreamEvent::ThinkingSignature { .. },
+            ) => {}
+            (
+                Some(ProviderStreamEvent::TextDelta { text }),
+                ProviderStreamEvent::TextDelta { text: delta },
+            ) => text.push_str(delta),
+            (
+                Some(ProviderStreamEvent::ToolCallDelta {
+                    call_id,
+                    name,
+                    arguments,
+                }),
+                ProviderStreamEvent::ToolCallDelta {
+                    call_id: next_call,
+                    name: next_name,
+                    arguments: next_arguments,
+                },
+            ) if call_id == next_call => {
+                // The assembler keeps the last non-empty name it saw for a call.
+                if !next_name.is_empty() {
+                    name.clone_from(next_name);
+                }
+                arguments.push_str(next_arguments);
+            }
+            _ => durable.push(event.clone()),
+        }
+    }
+    durable
 }
 
 /// How many earlier turns a continued conversation replays at most.
@@ -1493,9 +1526,10 @@ pub async fn conversation_history(
             // killed) never gave an answer; what it did is its record. It is
             // replayed as it happened, the way prime-agent keeps an aborted turn's
             // messages, so "continue" continues the work instead of starting over.
-            let body = match interrupted_steps(store, &session).await? {
+            let attempts = decoded_attempts(store, &session).await?;
+            let body = match interrupted_steps(store, &session, &attempts).await? {
                 Some(steps) => TurnBody::Steps(steps),
-                None => TurnBody::Answer(final_answer(store, &session).await?),
+                None => TurnBody::Answer(final_answer_of(&attempts)),
             };
             turns.push((question, body));
         }
@@ -1608,6 +1642,106 @@ enum TurnBody {
     Steps(Vec<ProviderMessage>),
 }
 
+/// One provider attempt of a session, its events assembled once.
+struct DecodedAttempt {
+    attempt_id: String,
+    request_id: harness_types::RequestId,
+    state: String,
+    /// The assembled response; `None` when the events do not decode or assemble,
+    /// which every reader skips.
+    response: Option<harness_providers::ProviderResponse>,
+}
+
+/// A session's decoded attempts and the store mark they were decoded at.
+struct DecodedSession {
+    mark: (i64, i64, String),
+    attempts: Arc<Vec<DecodedAttempt>>,
+}
+
+/// How many sessions' decoded attempts are kept before the cache starts over.
+const DECODED_SESSIONS_MAX: usize = 4_096;
+
+/// Decoded attempts by database and session.
+fn decoded_sessions()
+-> &'static Mutex<std::collections::HashMap<(std::path::PathBuf, String), DecodedSession>> {
+    static CACHE: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<(std::path::PathBuf, String), DecodedSession>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The provider attempts of a session, in the store's order, each assembled.
+///
+/// Every follow-up turn replays the whole conversation, and each earlier turn's
+/// answer is in its attempts' streamed events: rebuilding it decoded every delta
+/// of every earlier turn again - twice, once to see whether the turn was
+/// interrupted and once for its answer - so the work of a turn grew with the
+/// square of the conversation. A settled turn's attempts never change (they are
+/// only ever inserted), so what was assembled is kept per session and reused
+/// while the store's mark for the session (its attempt count and newest
+/// attempt) is the one it was assembled at; any new attempt, from this process or
+/// another, changes the mark and the session is read again. The cache is keyed
+/// by the database file too, so two data directories never share an entry.
+async fn decoded_attempts(
+    store: &SqliteStore,
+    session_id: &SessionId,
+) -> Result<Arc<Vec<DecodedAttempt>>, RuntimeError> {
+    // The mark is read before the attempts: an attempt that lands in between is
+    // then in the decoded list but not in the mark, which only costs a re-read
+    // next time. The other order could keep a list older than its mark.
+    let Some(mark) = store.provider_attempts_mark(session_id).await? else {
+        return Ok(Arc::new(Vec::new()));
+    };
+    let key = (
+        store.paths().database_path.clone(),
+        session_id.as_str().to_owned(),
+    );
+    if let Ok(cache) = decoded_sessions().lock()
+        && let Some(entry) = cache.get(&key)
+        && entry.mark == mark
+    {
+        return Ok(Arc::clone(&entry.attempts));
+    }
+    let attempts = Arc::new(
+        store
+            .list_provider_attempts(session_id)
+            .await?
+            .into_iter()
+            .map(|attempt| DecodedAttempt {
+                response: serde_json::from_value::<Vec<ProviderStreamEvent>>(attempt.events)
+                    .ok()
+                    .and_then(|events| assemble_stream(&events).ok()),
+                attempt_id: attempt.attempt_id.as_str().to_owned(),
+                request_id: attempt.request_id,
+                state: attempt.state,
+            })
+            .collect::<Vec<_>>(),
+    );
+    if let Ok(mut cache) = decoded_sessions().lock() {
+        if cache.len() >= DECODED_SESSIONS_MAX {
+            cache.clear();
+        }
+        cache.insert(
+            key,
+            DecodedSession {
+                mark,
+                attempts: Arc::clone(&attempts),
+            },
+        );
+    }
+    Ok(attempts)
+}
+
+/// The attempts in one of `states`, oldest first: attempt ids are time-ordered.
+fn attempts_in<'a>(attempts: &'a [DecodedAttempt], states: &[&str]) -> Vec<&'a DecodedAttempt> {
+    let mut kept = attempts
+        .iter()
+        .filter(|attempt| states.contains(&attempt.state.as_str()))
+        .collect::<Vec<_>>();
+    kept.sort_by(|left, right| left.attempt_id.cmp(&right.attempt_id));
+    kept
+}
+
 /// How much of one tool result an interrupted turn replays.
 const REPLAYED_RESULT_CHARS: usize = 2000;
 
@@ -1621,19 +1755,14 @@ const REPLAYED_RESULT_CHARS: usize = 2000;
 async fn interrupted_steps(
     store: &SqliteStore,
     session_id: &SessionId,
+    attempts: &[DecodedAttempt],
 ) -> Result<Option<Vec<ProviderMessage>>, RuntimeError> {
-    let mut attempts = store.list_provider_attempts(session_id).await?;
-    attempts.retain(|attempt| attempt.state == "completed");
-    attempts.sort_by(|left, right| left.attempt_id.as_str().cmp(right.attempt_id.as_str()));
-    let responses = attempts
-        .iter()
-        .filter_map(|attempt| {
-            serde_json::from_value::<Vec<ProviderStreamEvent>>(attempt.events.clone()).ok()
-        })
-        .filter_map(|events| harness_providers::assemble_stream(&events).ok())
+    let responses = attempts_in(attempts, &["completed"])
+        .into_iter()
+        .filter_map(|attempt| attempt.response.as_ref())
         // A transport EOF can be stored as completed while the turn is still
         // unverified. Never replay its unfinished text or unapproved calls.
-        .filter(harness_providers::ProviderResponse::is_dispatchable)
+        .filter(|response| response.is_dispatchable())
         .collect::<Vec<_>>();
     if responses
         .last()
@@ -1721,17 +1850,12 @@ pub async fn conversation_transcript(
         if !question.trim().is_empty() {
             parts.push(format!("[User]: {question}"));
         }
-        let mut attempts = store.list_provider_attempts(session).await?;
-        attempts.retain(|attempt| matches!(attempt.state.as_str(), "completed" | "canceled"));
-        attempts.sort_by(|left, right| left.attempt_id.as_str().cmp(right.attempt_id.as_str()));
+        let decoded = decoded_attempts(store, session).await?;
+        let attempts = attempts_in(&decoded, &["completed", "canceled"]);
         let results = store.recovered_tool_results(session).await?;
         let mut seen = std::collections::BTreeSet::new();
         for attempt in &attempts {
-            let Some(response) =
-                serde_json::from_value::<Vec<ProviderStreamEvent>>(attempt.events.clone())
-                    .ok()
-                    .and_then(|events| harness_providers::assemble_stream(&events).ok())
-            else {
+            let Some(response) = attempt.response.as_ref() else {
                 continue;
             };
             if !response.text.trim().is_empty() {
@@ -1855,17 +1979,18 @@ async fn final_answer(
     store: &SqliteStore,
     session_id: &SessionId,
 ) -> Result<Option<String>, RuntimeError> {
-    let mut attempts = store.list_provider_attempts(session_id).await?;
+    Ok(final_answer_of(&decoded_attempts(store, session_id).await?))
+}
+
+/// [`final_answer`] over a session's already decoded attempts.
+fn final_answer_of(attempts: &[DecodedAttempt]) -> Option<String> {
     // A canceled attempt keeps what it had streamed (pa-agent's aborted
     // assistant message), so the answer the user stopped is the turn's reply.
-    attempts.retain(|attempt| matches!(attempt.state.as_str(), "completed" | "canceled"));
-    attempts.sort_by(|left, right| left.attempt_id.as_str().cmp(right.attempt_id.as_str()));
-    for attempt in attempts.iter().rev() {
-        let Ok(events) = serde_json::from_value::<Vec<ProviderStreamEvent>>(attempt.events.clone())
-        else {
-            continue;
-        };
-        let Ok(response) = harness_providers::assemble_stream(&events) else {
+    for attempt in attempts_in(attempts, &["completed", "canceled"])
+        .into_iter()
+        .rev()
+    {
+        let Some(response) = attempt.response.as_ref() else {
             continue;
         };
         // An explicitly canceled attempt keeps the text the user already saw;
@@ -1876,10 +2001,10 @@ async fn final_answer(
         }
         let text = response.text.trim();
         if !text.is_empty() {
-            return Ok(Some(text.to_owned()));
+            return Some(text.to_owned());
         }
     }
-    Ok(None)
+    None
 }
 
 /// How many bytes of request a set of canonical messages costs.
@@ -1925,6 +2050,16 @@ pub struct RuntimeService {
     /// The input packet each running turn sent at its first step, by
     /// `session|input`. See the packet note where the request is assembled.
     turn_packets: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    /// The tool definitions the context was last measured with, their digests
+    /// and rendered length. See `tool_schema_facts`.
+    tool_schema_facts: Arc<Mutex<Option<ToolSchemaFacts>>>,
+}
+
+/// What the context builder records about a request's tool definitions.
+struct ToolSchemaFacts {
+    schemas: Vec<Value>,
+    digests: Vec<String>,
+    bytes: usize,
 }
 
 impl RuntimeService {
@@ -1951,6 +2086,7 @@ impl RuntimeService {
             evaluator: default_evaluator(),
             compactions: Arc::new(AtomicU32::new(0)),
             turn_packets: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            tool_schema_facts: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2372,13 +2508,15 @@ impl RuntimeService {
             request.system_policy.clone(),
         )];
         // Earlier turns come before the new question, as they did when they were
-        // said; the packet that follows is this turn's own input.
-        conversation.extend(request.conversation.clone());
+        // said; the packet that follows is this turn's own input. Nothing reads
+        // the request's messages after this point, so they are moved, not copied:
+        // the earlier turns are the bulk of a long conversation's request.
+        conversation.append(&mut request.conversation);
         conversation.push(user_message);
         // A resumed turn replays committed tool results before this step's own
         // appended messages, so the model sees what already executed exactly
         // once and the pairing stays valid.
-        conversation.extend(request.recovered_messages.clone());
+        conversation.append(&mut request.recovered_messages);
         // Continuation turns carry the tool results back to the model.
         conversation.extend(appended);
         // The protocol is validated before anything is frozen or dispatched: a
@@ -2396,7 +2534,7 @@ impl RuntimeService {
             capabilities.model.clone(),
             conversation,
         )
-        .with_tool_schemas(request.tool_schemas.clone());
+        .with_tool_schemas(std::mem::take(&mut request.tool_schemas));
         harness_providers::CapabilityMatrix::from_capabilities(&capabilities)
             .validate(&provider_request)
             .map_err(|error| {
@@ -2447,7 +2585,7 @@ impl RuntimeService {
         });
         let manifest_hash = ContentHash::from_canonical_json(&manifest_content)
             .map_err(|error| RuntimeError::new(error.code(), error.to_string()))?;
-        let step_index = u32::try_from(self.store.run_steps(&run.run_id).await?.len())
+        let step_index = u32::try_from(self.store.run_step_count(&run.run_id).await?)
             .map_err(|_| RuntimeError::new(ErrorCode::InvalidPayload, "too many run steps"))?;
         let attempt_bound = built
             .packet
@@ -3642,25 +3780,22 @@ impl RuntimeService {
         if views.is_empty() {
             return Ok(Vec::new());
         }
-        let Some(frozen) = self
+        // Only the newest request's id is needed; listing the requests rebuilt and
+        // re-hashed every step's whole transcript to find it.
+        let Some(frozen_request_id) = self
             .store
-            .list_frozen_requests(source_session_id)
+            .latest_frozen_request_id(source_session_id)
             .await?
-            .pop()
         else {
             return Ok(Vec::new());
         };
-        let attempts = self.store.list_provider_attempts(source_session_id).await?;
+        let attempts = decoded_attempts(&self.store, source_session_id).await?;
         let Some(attempt) = attempts.iter().rfind(|attempt| {
-            attempt.request_id == frozen.request_id && attempt.state == "completed"
+            attempt.request_id == frozen_request_id && attempt.state == "completed"
         }) else {
             return Ok(Vec::new());
         };
-        let Ok(events) = serde_json::from_value::<Vec<ProviderStreamEvent>>(attempt.events.clone())
-        else {
-            return Ok(Vec::new());
-        };
-        let Ok(response) = harness_providers::assemble_stream(&events) else {
+        let Some(response) = attempt.response.as_ref() else {
             return Ok(Vec::new());
         };
         if response.tool_calls.is_empty() {
@@ -3723,6 +3858,42 @@ impl RuntimeService {
         Ok(self.last_attempts.load(Ordering::SeqCst))
     }
 
+    /// The canonical digest of each tool definition and their rendered length.
+    ///
+    /// The context is built at least once per step and up to four times when it
+    /// is compacted, and each build canonicalised, hashed and rendered every
+    /// definition - the same ones every step of every turn. They are kept with
+    /// the definitions they describe and reused while the definitions compare
+    /// equal, which is far cheaper than canonicalising and hashing them again.
+    fn tool_schema_facts(&self, schemas: &[Value]) -> (Vec<String>, usize) {
+        if let Ok(facts) = self.tool_schema_facts.lock()
+            && let Some(facts) = facts.as_ref()
+            && facts.schemas == schemas
+        {
+            return (facts.digests.clone(), facts.bytes);
+        }
+        let digests = schemas
+            .iter()
+            .map(|schema| {
+                ContentHash::from_canonical_json(schema)
+                    .map(|hash| hash.as_str().to_owned())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let bytes = schemas
+            .iter()
+            .map(|schema| schema.to_string().len())
+            .sum::<usize>();
+        if let Ok(mut facts) = self.tool_schema_facts.lock() {
+            *facts = Some(ToolSchemaFacts {
+                schemas: schemas.to_vec(),
+                digests: digests.clone(),
+                bytes,
+            });
+        }
+        (digests, bytes)
+    }
+
     fn build_context(
         &self,
         request: &RunRequest,
@@ -3754,22 +3925,10 @@ impl RuntimeService {
         // Everything the request carries that this compiler does not write: the
         // system policy, the tool definitions, the user message and any images.
         // A budget that ignores them is a budget for the wrong thing.
-        let tool_digests = request
-            .tool_schemas
-            .iter()
-            .map(|schema| {
-                ContentHash::from_canonical_json(schema)
-                    .map(|hash| hash.as_str().to_owned())
-                    .unwrap_or_default()
-            })
-            .collect::<Vec<_>>();
+        let (tool_digests, tool_bytes) = self.tool_schema_facts(&request.tool_schemas);
         let fixed_request_bytes = request.system_policy.len()
             + request.text.len()
-            + request
-                .tool_schemas
-                .iter()
-                .map(|schema| schema.to_string().len())
-                .sum::<usize>()
+            + tool_bytes
             + request
                 .images
                 .iter()
@@ -4110,5 +4269,58 @@ mod run_state_tests {
         assert_eq!(RunStateEvent::Started.as_str(), "run.started");
         assert_eq!(RunStateEvent::Completed.as_str(), "run.completed");
         assert_eq!(RunStateEvent::Disposed.as_str(), "run.disposed");
+    }
+}
+
+#[cfg(test)]
+mod durable_events_tests {
+    use super::{assemble_stream, durable_provider_events};
+    use harness_providers::ProviderStreamEvent;
+
+    fn text(delta: &str) -> ProviderStreamEvent {
+        ProviderStreamEvent::TextDelta {
+            text: delta.to_owned(),
+        }
+    }
+
+    fn call(call_id: &str, name: &str, arguments: &str) -> ProviderStreamEvent {
+        ProviderStreamEvent::ToolCallDelta {
+            call_id: call_id.to_owned(),
+            name: name.to_owned(),
+            arguments: arguments.to_owned(),
+        }
+    }
+
+    /// Joined deltas assemble to the response the stream did, reasoning left out.
+    #[test]
+    fn joined_deltas_assemble_to_the_same_response() {
+        let stream = vec![
+            text("Hel"),
+            ProviderStreamEvent::ThinkingDelta {
+                text: "private".to_owned(),
+            },
+            text("lo "),
+            text("there"),
+            call("a", "read_file", "{\"pa"),
+            call("a", "", "th\":"),
+            call("b", "grep", "{}"),
+            call("a", "read_file", "\"x\"}"),
+            text("!"),
+            ProviderStreamEvent::Completed {
+                finish_reason: "tool_calls".to_owned(),
+            },
+        ];
+        let durable = durable_provider_events(&stream);
+        // Three text deltas around the reasoning, and two of call `a`, are one each.
+        assert_eq!(durable.len(), 6, "{durable:?}");
+        assert!(
+            durable
+                .iter()
+                .all(|event| !matches!(event, ProviderStreamEvent::ThinkingDelta { .. }))
+        );
+        let joined = assemble_stream(&durable).expect("joined stream assembles");
+        let mut expected = assemble_stream(&stream).expect("stream assembles");
+        expected.reasoning.clear();
+        assert_eq!(joined, expected);
     }
 }

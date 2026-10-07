@@ -26,56 +26,71 @@ const RELOCATION_REFUSAL: &str = "Refusing to run this destructive git command: 
 /// How many dirty paths the refusal lists before eliding the rest.
 pub(crate) const MAX_DIRTY_PATHS_LISTED: usize = 10;
 
-/// JavaScript `\s` character class.
-const S: &str = r"[\t\n\x0B\f\r \u{00A0}\u{1680}\u{2000}-\u{200A}\u{2028}\u{2029}\u{202F}\u{205F}\u{3000}\u{FEFF}]";
+/// JavaScript's `\s` character class.
+fn is_js_whitespace(character: char) -> bool {
+    matches!(
+        character,
+        '\t' | '\n' | '\x0B' | '\x0C' | '\r' | ' ' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
+    )
+}
 
 /// JS `str.split(/\s+/)` (leading/trailing empty tokens removed).
+///
+/// A plain character split: it runs on every shell command the model sends,
+/// and compiling a regex for it each time cost more than the split.
 fn split_ws(text: &str) -> Vec<&str> {
-    let pattern = format!("^{S}+|{S}+");
-    let re = fancy_regex::Regex::new(&pattern).expect("split_ws regex");
-    let mut parts = Vec::new();
-    let mut rest = text;
-    // Split on runs of whitespace, discarding empty leading segments.
-    while let Some(m) = re.find(rest).ok().flatten() {
-        if m.start() > 0 {
-            parts.push(&rest[..m.start()]);
-        }
-        rest = &rest[m.end()..];
-    }
-    if !rest.is_empty() {
-        parts.push(rest);
-    }
-    parts
+    text.split(is_js_whitespace)
+        .filter(|part| !part.is_empty())
+        .collect()
 }
 
 /// git global options between `git` and the subcommand.
 const GIT_GLOBAL_OPTIONS: &str = r#"(?:-{1,2}[^\s;&|]+(?:\s+(?:"[^"]*"|'[^']*'|[^\s;&|]+))?\s+)*"#;
 
-fn discard_checkout_pattern() -> fancy_regex::Regex {
+/// A regex compiled once per process. Every `run_shell` call is checked
+/// against these, and a backtracking regex this size costs far more to
+/// compile than to run.
+type Pattern = std::sync::LazyLock<fancy_regex::Regex>;
+
+static DISCARD_CHECKOUT: Pattern = Pattern::new(|| {
     fancy_regex::Regex::new(&format!(
         r"\bgit\s+{GIT_GLOBAL_OPTIONS}checkout\s+(?:(?:(?:-[fm]|--ours|--theirs|--conflict=\S+)\s+)*(?:--\s+)?(?:\.\/?|:\/)|[^\s;&|()]+\s+(?:--\s+)?(?:\.\/?|:\/)|(?:-f|--force)\s+[^\s;&|()]+)(?=\s|$|[;&|)])"
     ))
     .expect("checkout discard regex")
-}
+});
 
-fn discard_restore_pattern() -> fancy_regex::Regex {
+static DISCARD_RESTORE: Pattern = Pattern::new(|| {
     fancy_regex::Regex::new(&format!(
         r"\bgit\s+{GIT_GLOBAL_OPTIONS}restore\s+(?:(?:--source|--worktree)(?:=\S+)?\s+|-s(?:\s+\S+|[^\s]+)\s+|-W\s+|--\s+)?(?:\.\/?|:\/)(?=\s|$|[;&|)])"
     ))
     .expect("restore discard regex")
-}
+});
 
-fn discard_reset_pattern() -> fancy_regex::Regex {
+static DISCARD_RESET: Pattern = Pattern::new(|| {
     fancy_regex::Regex::new(&format!(
         r"\bgit\s+{GIT_GLOBAL_OPTIONS}reset\s+(?:(?:-[^\s;&|]+)\s+)*--hard\b"
     ))
     .expect("reset discard regex")
-}
+});
 
-fn discard_clean_pattern() -> fancy_regex::Regex {
+static DISCARD_CLEAN: Pattern = Pattern::new(|| {
     fancy_regex::Regex::new(&format!(r"\bgit\s+{GIT_GLOBAL_OPTIONS}clean\s+([^;&|]*)"))
         .expect("clean discard regex")
-}
+});
+
+static ASSIGNMENT: Pattern = Pattern::new(|| {
+    fancy_regex::Regex::new(r#"^[A-Za-z_][A-Za-z0-9_]*=[^\s$`;&|()<>"!]+$"#)
+        .expect("assignment regex")
+});
+
+static CD: Pattern = Pattern::new(|| fancy_regex::Regex::new(r"\b(cd|pushd)\b").expect("cd regex"));
 
 fn is_forced_clean_segment(args: &str) -> bool {
     let tokens: Vec<&str> = split_ws(args);
@@ -179,16 +194,17 @@ fn mask_quoted_spans(command: &str) -> Vec<char> {
 pub fn find_destructive_git_discard_commands(command: &str) -> Vec<usize> {
     let masked: String = mask_quoted_spans(command).into_iter().collect();
     let mut indices: Vec<usize> = Vec::new();
-    for pattern in [
-        discard_checkout_pattern(),
-        discard_restore_pattern(),
-        discard_reset_pattern(),
-    ] {
+    // A command that never names git cannot hold a discard; most shell
+    // commands are builds and tests, so this skips the regexes for them.
+    if !masked.contains("git") {
+        return indices;
+    }
+    for pattern in [&DISCARD_CHECKOUT, &DISCARD_RESTORE, &DISCARD_RESET] {
         for m in pattern.find_iter(&masked).flatten() {
             indices.push(m.start());
         }
     }
-    for caps in discard_clean_pattern().captures_iter(&masked).flatten() {
+    for caps in DISCARD_CLEAN.captures_iter(&masked).flatten() {
         if let Some(args) = caps.get(1) {
             if is_forced_clean_segment(args.as_str()) {
                 indices.push(caps.get(0).map(|m| m.start()).unwrap_or_default());
@@ -229,26 +245,30 @@ pub(crate) enum DiscardProbeResolution {
 const SEPARATORS: [&str; 5] = ["&&", "||", ";", "|", "\n"];
 
 /// Split keeping separators (TS: `split(/(&&|\|\||;|\||\n)/)`).
+///
+/// One pass over the bytes: every separator is ASCII, so a match can only
+/// start on a character boundary and the slices between them stay valid UTF-8.
 fn split_with_separators(text: &str) -> Vec<String> {
     let mut parts = Vec::new();
-    let mut current = String::new();
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0usize;
-    while i < chars.len() {
-        let rest: String = chars[i..].iter().collect();
-        if let Some(sep) = SEPARATORS.iter().find(|s| rest.starts_with(**s)) {
-            if !current.is_empty() {
-                parts.push(std::mem::take(&mut current));
+    let mut segment_start = 0usize;
+    let mut index = 0usize;
+    while index < text.len() {
+        if let Some(separator) = SEPARATORS
+            .iter()
+            .find(|separator| text.as_bytes()[index..].starts_with(separator.as_bytes()))
+        {
+            if segment_start < index {
+                parts.push(text[segment_start..index].to_owned());
             }
-            parts.push(sep.to_string());
-            i += sep.chars().count();
+            parts.push((*separator).to_owned());
+            index += separator.len();
+            segment_start = index;
         } else {
-            current.push(chars[i]);
-            i += 1;
+            index += 1;
         }
     }
-    if !current.is_empty() {
-        parts.push(current);
+    if segment_start < text.len() {
+        parts.push(text[segment_start..].to_owned());
     }
     parts
 }
@@ -349,10 +369,8 @@ pub fn resolve_discard_probe_target(
     // target repository; replay them in the probe, or refuse when they cannot.
     let last_segment = split_on_separators(prefix).pop().unwrap_or_default();
     let leading_tokens: Vec<&str> = split_ws(last_segment.trim());
-    let assignment_re = fancy_regex::Regex::new(r#"^[A-Za-z_][A-Za-z0-9_]*=[^\s$`;&|()<>"!]+$"#)
-        .expect("assignment regex");
     for token in &leading_tokens {
-        if assignment_re.is_match(token).unwrap_or(false) {
+        if ASSIGNMENT.is_match(token).unwrap_or(false) {
             continue; // replayable assignment
         }
         // Wrappers that cannot change directory or select another repository.
@@ -378,8 +396,7 @@ pub fn resolve_discard_probe_target(
     };
 
     // cd relocations earlier in the command.
-    let cd_re = fancy_regex::Regex::new(r"\b(cd|pushd)\b").expect("cd regex");
-    let has_cd = cd_re.is_match(prefix).unwrap_or(false) || prefix.contains('(');
+    let has_cd = CD.is_match(prefix).unwrap_or(false) || prefix.contains('(');
     let mut persistent_cd_args: Vec<String> = Vec::new();
     let mut grouped_cd_args: Vec<String> = Vec::new();
     let mut saw_cd = false;
@@ -428,7 +445,7 @@ pub fn resolve_discard_probe_target(
                     saw_cd = true;
                     cd_pending_separator = true;
                     grouped_cd_args.push(arg.to_string());
-                } else if cd_re.is_match(trimmed).unwrap_or(false) {
+                } else if CD.is_match(trimmed).unwrap_or(false) {
                     return DiscardProbeResolution::Unresolvable;
                 }
                 if paren_depth == 0 {
@@ -545,16 +562,25 @@ pub(crate) async fn refusal(
         }
     }
     for (probe, includes_ignored) in probes {
-        let Ok(result) = crate::process::run_shell(
-            root,
-            &probe,
-            15_000,
-            cancellation.clone(),
-            &crate::secrets::ProcessEnvironment::empty(),
-            spool,
-        )
-        .await
-        else {
+        // A probe without a cd chain or env assignments is a bare `git status`
+        // whose tokens carry no quotes, escapes or substitutions (the resolver
+        // refuses those), so git is started directly with the same tokens. On
+        // Windows the shell is PowerShell, whose start-up costs several times
+        // the status itself; only a relocation still needs it to replay `cd`.
+        let tokens = split_ws(&probe);
+        // A relocation is a `cd ... && ` chain or env assignments before `git`.
+        let direct = !probe.contains("&&") && tokens.first() == Some(&"git");
+        let run = if direct {
+            let args = tokens[1..]
+                .iter()
+                .map(|token| (*token).to_owned())
+                .collect::<Vec<_>>();
+            crate::process::run_internal_git(root, &args, 15_000, cancellation.clone(), spool).await
+        } else {
+            crate::process::run_internal_shell(root, &probe, 15_000, cancellation.clone(), spool)
+                .await
+        };
+        let Ok(result) = run else {
             continue;
         };
         if result.exit_code != Some(0) {
@@ -607,4 +633,79 @@ pub(crate) fn format_dirty_tree_refusal(
         "To discard these changes intentionally, set {BASH_DESTRUCTIVE_GIT_BYPASS_ENV}=1."
     ));
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_keep_separators_and_multibyte_text_in_one_pass() {
+        assert_eq!(
+            split_with_separators("cd é && git reset --hard; ls|wc\nx||y"),
+            [
+                "cd é ",
+                "&&",
+                " git reset --hard",
+                ";",
+                " ls",
+                "|",
+                "wc",
+                "\n",
+                "x",
+                "||",
+                "y"
+            ]
+        );
+        assert_eq!(split_on_separators("a&&b"), ["a", "b"]);
+        assert!(split_with_separators("").is_empty());
+        assert_eq!(
+            split_ws("  git\u{3000}status \t-s  "),
+            ["git", "status", "-s"]
+        );
+    }
+
+    #[test]
+    fn discards_are_found_and_quoted_text_is_not() {
+        assert_eq!(
+            find_destructive_git_discard_commands("git reset --hard"),
+            [0]
+        );
+        assert_eq!(
+            find_destructive_git_discard_commands("cargo test && git checkout -- ."),
+            [14]
+        );
+        assert_eq!(
+            find_destructive_git_discard_commands("git clean -fd").len(),
+            1
+        );
+        assert!(find_destructive_git_discard_commands("git clean -nfd").is_empty());
+        assert!(find_destructive_git_discard_commands("echo 'git reset --hard'").is_empty());
+        assert!(find_destructive_git_discard_commands("cargo test --workspace").is_empty());
+    }
+
+    #[test]
+    fn probes_follow_cd_chains_and_dash_c() {
+        assert_eq!(
+            resolve_discard_probe_target("git reset --hard", 0, 0),
+            DiscardProbeResolution::NotRelocated
+        );
+        let command = "cd sub && git -C inner clean -xfd";
+        let index = command.find("git").unwrap();
+        assert_eq!(
+            resolve_discard_probe_target(command, index, 0),
+            DiscardProbeResolution::Target(DiscardProbeTarget {
+                relocation_prefix: Some("cd sub && ".to_owned()),
+                git_status_command:
+                    "git -C inner status --porcelain --untracked-files=all --ignored=matching"
+                        .to_owned(),
+            })
+        );
+        let command = "cd $HOME && git reset --hard";
+        let index = command.find("git").unwrap();
+        assert_eq!(
+            resolve_discard_probe_target(command, index, 0),
+            DiscardProbeResolution::Unresolvable
+        );
+    }
 }

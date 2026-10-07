@@ -66,6 +66,9 @@ pub const PYTHON_VARIABLE: &str = "HA_PYTHON";
 pub const UV_VARIABLE: &str = "HA_UV";
 /// An explicit POSIX shell for `bash()`; on Windows Git Bash is found by itself.
 pub const SHELL_VARIABLE: &str = "HA_REPL_SHELL";
+/// `off` (or `0`, `false`, `no`) starts the kernel on the first cell only,
+/// instead of in the background when a turn begins.
+pub const PREWARM_VARIABLE: &str = "HA_REPL_PREWARM";
 
 /// The protocol the vendored runtime speaks.
 const PROTOCOL_VERSION: u64 = 3;
@@ -530,6 +533,10 @@ pub struct ReplShared {
     /// prime-agent's `ipython_state` notice from the last compaction, until the
     /// next prompt carries it to the model.
     compaction_notice: std::sync::Mutex<Option<String>>,
+    /// Whether a turn starts the kernel ahead of its first cell.
+    prewarm: bool,
+    /// The background start [`Self::prewarm`] spawned, aborted by disposing.
+    prewarming: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 /// How long the namespace listing may take after a compaction (prime-agent's
@@ -567,6 +574,9 @@ struct KernelSlot {
     lost: bool,
     /// How the interpreter was set up was said once.
     announced: bool,
+    /// What a prewarmed kernel's start would have told its first cell (the
+    /// start notice and the skills note), kept until that cell runs.
+    start_notes: Option<(Option<String>, Option<String>)>,
 }
 
 impl ReplShared {
@@ -592,6 +602,8 @@ impl ReplShared {
             reaped: AtomicBool::new(false),
             session_host: std::sync::Mutex::new(None),
             compaction_notice: std::sync::Mutex::new(None),
+            prewarm: false,
+            prewarming: std::sync::Mutex::new(None),
         }
     }
 
@@ -639,6 +651,12 @@ impl ReplShared {
             .or_else(default_shell);
         let mut shared = Self::new(data_dir, workspace, value(PYTHON_VARIABLE), shell);
         shared.uv_override = value(UV_VARIABLE).map(PathBuf::from);
+        shared.prewarm = !value(PREWARM_VARIABLE).is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "off" | "0" | "false" | "no"
+            )
+        });
         Some(Arc::new(shared))
     }
 
@@ -718,6 +736,7 @@ impl ReplShared {
     /// with it.
     fn lose(&self, slot: &mut KernelSlot) {
         slot.kernel = None;
+        slot.start_notes = None;
         slot.lost = true;
         self.set_link(None);
     }
@@ -753,13 +772,15 @@ impl ReplShared {
         // starts that conversation's own kernel.
         if let Some(previous) = slot.kernel.take_if(|kernel| kernel.snapshot != target) {
             self.set_link(None);
+            slot.start_notes = None;
             previous.shutdown(true).await;
         }
         let (notice, mut setup_note) = if slot.kernel.is_none() {
             self.start_kernel(&mut slot, &python, setup, target, harness)
                 .await?
         } else {
-            (None, None)
+            // A prewarmed kernel's first cell says what its start would have.
+            slot.start_notes.take().unwrap_or_default()
         };
         let kernel = slot.kernel.as_mut().expect("the kernel was just started");
         // Host requests - a cell's own and those of tasks it left running - are
@@ -846,6 +867,48 @@ impl ReplShared {
         Ok((notice, skills))
     }
 
+    /// Start the conversation's kernel in the background, as prime-agent prewarms
+    /// a top-level session's: spawning Python and importing the runtime takes a
+    /// second or more on Windows, which the first cell otherwise waits for. A
+    /// kernel already running is left alone - the cell decides whether it is the
+    /// right conversation's - and so is a start already under way. A start that
+    /// fails is undone, so the cell tries again and reports why.
+    fn prewarm(self: &Arc<Self>, harness: &KernelContext) {
+        if !self.prewarm {
+            return;
+        }
+        let mut prewarming = self
+            .prewarming
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if prewarming.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        let this = Arc::clone(self);
+        let harness = harness.clone();
+        *prewarming = Some(tokio::spawn(async move {
+            let (python, setup) = this.kernel_python().await;
+            let Some(python) = python else {
+                return;
+            };
+            let mut slot = this.kernel.lock().await;
+            if slot.kernel.is_some() {
+                return;
+            }
+            let (lost, announced) = (slot.lost, slot.announced);
+            let target = SnapshotTarget::of(&harness);
+            if let Ok(notes) = this
+                .start_kernel(&mut slot, &python, setup, target, Some(&harness))
+                .await
+            {
+                slot.start_notes = Some(notes);
+            } else {
+                slot.lost = lost;
+                slot.announced = announced;
+            }
+        }));
+    }
+
     /// prime-agent's `scheduleSnapshot`: one snapshot a moment after the last cell of
     /// a burst, taken when no cell holds the kernel.
     fn schedule_snapshot(self: &Arc<Self>) {
@@ -893,6 +956,17 @@ impl ReplShared {
     /// flight get a moment, and the kernel is asked to shut down before it is
     /// killed. The next cell starts a kernel again.
     pub async fn dispose(&self) {
+        // A kernel still starting in the background is not waited for: its
+        // child dies with the aborted start (`kill_on_drop`).
+        let prewarming = self
+            .prewarming
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(prewarming) = prewarming {
+            prewarming.abort();
+            let _ = prewarming.await;
+        }
         // The final snapshot supersedes a pending one.
         self.snapshot_epoch.fetch_add(1, Ordering::SeqCst);
         let link = self
@@ -908,6 +982,7 @@ impl ReplShared {
         else {
             return;
         };
+        slot.start_notes = None;
         if let Some(kernel) = slot.kernel.take() {
             self.set_link(None);
             kernel.shutdown(true).await;
@@ -2012,6 +2087,16 @@ fn write_runtime(data_dir: &Path) -> Result<PathBuf, String> {
     }
     let root = data_dir.join("runtime").join(format!("rlm-{hash:016x}"));
     let package = root.join("rlm");
+    // Written once every file was: a later start skips reading them all back.
+    let marker = root.join(".complete");
+    let digest = format!("{hash:016x}");
+    if std::fs::read_to_string(&marker).is_ok_and(|written| written == digest)
+        && RUNTIME_FILES
+            .iter()
+            .all(|(name, _)| package.join(name).is_file())
+    {
+        return Ok(root);
+    }
     std::fs::create_dir_all(&package)
         .map_err(|error| format!("the REPL runtime could not be written: {error}"))?;
     for (name, body) in RUNTIME_FILES {
@@ -2022,6 +2107,7 @@ fn write_runtime(data_dir: &Path) -> Result<PathBuf, String> {
         std::fs::write(&path, body)
             .map_err(|error| format!("the REPL runtime could not be written: {error}"))?;
     }
+    let _ = std::fs::write(&marker, digest);
     Ok(root)
 }
 
@@ -2375,6 +2461,7 @@ impl ReplHost {
         if !shared.available().await {
             return None;
         }
+        shared.prewarm(&harness);
         Some(Self {
             shared: Arc::clone(shared),
             host,

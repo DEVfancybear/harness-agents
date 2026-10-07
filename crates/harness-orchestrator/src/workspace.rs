@@ -6,10 +6,11 @@
 //! a security boundary.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
+    time::{Duration, SystemTime},
 };
 
 use harness_types::{AgentRunId, ContentHash, ErrorCode, ProjectId, TaskId};
@@ -118,40 +119,18 @@ impl WorkspaceManager {
     ) -> Result<InputInspection, OrchestratorError> {
         let root = root.as_ref().to_path_buf();
         let _guard = self.git_lock.lock().await;
-        if !git_ok(&root, &["rev-parse", "--git-dir"]) {
-            return Ok(InputInspection::Dirty(vec![DirtyReason::NotARepository]));
-        }
-        let mut reasons = Vec::new();
-        let status = git(
-            &root,
-            &["status", "--porcelain=v1", "--untracked-files=all"],
-        )?;
-        for line in status.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let code = line.get(0..2).unwrap_or("??");
-            let path = line.get(3..).unwrap_or("").trim().to_owned();
-            let reason = if code.starts_with("??") {
-                DirtyReason::UntrackedFile { path }
-            } else if code.chars().next().is_some_and(|c| c != ' ' && c != '?') {
-                DirtyReason::StagedChange { path }
-            } else {
-                DirtyReason::TrackedModification { path }
-            };
-            reasons.push(reason);
-        }
-        if !reasons.is_empty() {
-            return Ok(InputInspection::Dirty(reasons));
-        }
-        let head = git(&root, &["rev-parse", "HEAD"])?.trim().to_owned();
-        let branch = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"])?
-            .trim()
-            .to_owned();
-        if branch == "HEAD" || branch.is_empty() {
-            return Ok(InputInspection::Dirty(vec![DirtyReason::DetachedHead]));
-        }
-        let fingerprint = fingerprint_locked(&root)?;
+        let inspected = {
+            let root = root.clone();
+            blocking(move || inspect_locked(&root)).await?
+        };
+        let (head, branch, fingerprint) = match inspected {
+            Inspected::Dirty(reasons) => return Ok(InputInspection::Dirty(reasons)),
+            Inspected::Clean {
+                head,
+                branch,
+                fingerprint,
+            } => (head, branch, fingerprint),
+        };
         // A verified inspection is what creates the registration, so a linked
         // worktree created from this snapshot keeps the same project identity.
         let project_id = self.register_project(&root, project_id.clone());
@@ -172,7 +151,7 @@ impl WorkspaceManager {
     ) -> Result<ContentHash, OrchestratorError> {
         let root = root.as_ref().to_path_buf();
         let _guard = self.git_lock.lock().await;
-        fingerprint_locked(&root)
+        blocking(move || fingerprint_locked(&root)).await
     }
 
     /// Create one editing worktree for one worker on its own branch.
@@ -200,64 +179,25 @@ impl WorkspaceManager {
             .to_owned();
         let worktree_id = format!("wt-{suffix}");
         let path = self.state_root.join("worktrees").join(&worktree_id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                OrchestratorError::new(
-                    ErrorCode::ArtifactWriteFailed,
-                    format!("cannot create worktree parent: {error}"),
-                )
-            })?;
-        }
         let branch = format!("harness/p5/{suffix}");
-        let clone_source = self.state_root.join("integration").join("source.git");
-        if let Some(parent) = clone_source.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                OrchestratorError::new(
-                    ErrorCode::ArtifactWriteFailed,
-                    format!("cannot create integration root: {error}"),
-                )
-            })?;
-        }
-        // Clone from the verified snapshot rather than reusing the user's
-        // checkout, so the worker has an isolated object store.
-        if !clone_source.is_dir() {
-            git(
-                &source,
-                &[
-                    "clone",
-                    "--local",
-                    "--no-hardlinks",
-                    "--quiet",
-                    &source.to_string_lossy(),
-                    &clone_source.to_string_lossy(),
-                ],
-            )?;
-        }
         let base_branch = format!("harness/base/{suffix}");
-        git(
-            &clone_source,
-            &["branch", "--force", &base_branch, &snapshot.base_commit],
-        )?;
-        git(
-            &clone_source,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &branch,
-                &path.to_string_lossy(),
-                &snapshot.base_commit,
-            ],
-        )?;
-        git(
-            &clone_source,
-            &["config", "user.email", "harness-p5@localhost"],
-        )?;
-        git(&clone_source, &["config", "user.name", "harness-p5"])?;
-        // A worktree inherits configuration, but an explicit local identity
-        // keeps a worker commit deterministic regardless of host Git identity.
-        git(&path, &["config", "user.email", "harness-p5@localhost"])?;
-        git(&path, &["config", "user.name", "harness-p5"])?;
+        {
+            let (source, path) = (source.clone(), path.clone());
+            let (branch, base_branch) = (branch.clone(), base_branch.clone());
+            let clone_source = self.state_root.join("integration").join("source.git");
+            let base_commit = snapshot.base_commit.clone();
+            blocking(move || {
+                add_worktree_locked(
+                    &source,
+                    &clone_source,
+                    &path,
+                    &branch,
+                    &base_branch,
+                    &base_commit,
+                )
+            })
+            .await?;
+        }
         // The verified snapshot is the only source of the project identity.
         let project_id = self
             .registered_project(&source)
@@ -388,6 +328,173 @@ impl WorkspaceManager {
     }
 }
 
+/// Run Git work off the async workers: every call blocks on a child process,
+/// and a fingerprint reads the whole tree.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, OrchestratorError> + Send + 'static,
+) -> Result<T, OrchestratorError> {
+    tokio::task::spawn_blocking(work).await.map_err(|error| {
+        OrchestratorError::new(
+            ErrorCode::ProcessCanceled,
+            format!("workspace inspection did not finish: {error}"),
+        )
+    })?
+}
+
+enum Inspected {
+    Dirty(Vec<DirtyReason>),
+    Clean {
+        head: String,
+        branch: String,
+        fingerprint: ContentHash,
+    },
+}
+
+/// The blocking body of [`WorkspaceManager::inspect_input`], under the Git lock.
+fn inspect_locked(root: &Path) -> Result<Inspected, OrchestratorError> {
+    if !git_ok(root, &["rev-parse", "--git-dir"]) {
+        return Ok(Inspected::Dirty(vec![DirtyReason::NotARepository]));
+    }
+    // Status, the HEAD names and the file listing are independent reads, so
+    // they run side by side; the names and listing go unused for a dirty tree.
+    let (status, names, listing) = std::thread::scope(|scope| {
+        let names = scope.spawn(|| git(root, &["rev-parse", "HEAD", "--abbrev-ref", "HEAD"]));
+        let listing = scope.spawn(|| list_files(root));
+        let status = git(root, &["status", "--porcelain=v1", "--untracked-files=all"]);
+        (status, join_git(names), join_git(listing))
+    });
+    let status = status?;
+    let mut reasons = Vec::new();
+    for line in status.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let code = line.get(0..2).unwrap_or("??");
+        let path = line.get(3..).unwrap_or("").trim().to_owned();
+        let reason = if code.starts_with("??") {
+            DirtyReason::UntrackedFile { path }
+        } else if code.chars().next().is_some_and(|c| c != ' ' && c != '?') {
+            DirtyReason::StagedChange { path }
+        } else {
+            DirtyReason::TrackedModification { path }
+        };
+        reasons.push(reason);
+    }
+    if !reasons.is_empty() {
+        return Ok(Inspected::Dirty(reasons));
+    }
+    let names = names?;
+    let mut names = names.lines().map(str::trim);
+    let head = names.next().unwrap_or_default().to_owned();
+    let branch = names.next().unwrap_or_default().to_owned();
+    if branch == "HEAD" || branch.is_empty() {
+        return Ok(Inspected::Dirty(vec![DirtyReason::DetachedHead]));
+    }
+    let fingerprint = fingerprint_of(root, &head, &listing?)?;
+    Ok(Inspected::Clean {
+        head,
+        branch,
+        fingerprint,
+    })
+}
+
+fn join_git<T>(
+    handle: std::thread::ScopedJoinHandle<'_, Result<T, OrchestratorError>>,
+) -> Result<T, OrchestratorError> {
+    handle.join().unwrap_or_else(|_| {
+        Err(OrchestratorError::new(
+            ErrorCode::ProcessCanceled,
+            "a git query panicked",
+        ))
+    })
+}
+
+/// The identity worker commits are made with.
+const WORKER_EMAIL: &str = "harness-p5@localhost";
+const WORKER_NAME: &str = "harness-p5";
+
+/// The blocking body of [`WorkspaceManager::create_worktree`], under the Git lock.
+fn add_worktree_locked(
+    source: &Path,
+    clone_source: &Path,
+    path: &Path,
+    branch: &str,
+    base_branch: &str,
+    base_commit: &str,
+) -> Result<(), OrchestratorError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            OrchestratorError::new(
+                ErrorCode::ArtifactWriteFailed,
+                format!("cannot create worktree parent: {error}"),
+            )
+        })?;
+    }
+    if let Some(parent) = clone_source.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            OrchestratorError::new(
+                ErrorCode::ArtifactWriteFailed,
+                format!("cannot create integration root: {error}"),
+            )
+        })?;
+    }
+    // Clone from the verified snapshot rather than reusing the user's
+    // checkout, so the worker has an isolated object store.
+    if !clone_source.is_dir() {
+        git(
+            source,
+            &[
+                "clone",
+                "--local",
+                "--no-hardlinks",
+                "--quiet",
+                &source.to_string_lossy(),
+                &clone_source.to_string_lossy(),
+            ],
+        )?;
+    }
+    git(
+        clone_source,
+        &["branch", "--force", base_branch, base_commit],
+    )?;
+    git(
+        clone_source,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            &path.to_string_lossy(),
+            base_commit,
+        ],
+    )?;
+    // An explicit local identity keeps a worker commit deterministic
+    // regardless of host Git identity. A linked worktree reads and writes the
+    // clone's own config (no `extensions.worktreeConfig` here), so one write
+    // covers both, and none is needed once the clone has it. Only the clone's
+    // own file counts: a global identity is what this one overrides.
+    let identity = git(
+        clone_source,
+        &["config", "--local", "--get-regexp", r"^user\.(email|name)$"],
+    )
+    .unwrap_or_default();
+    let mut identity = identity.lines().map(str::trim).collect::<Vec<_>>();
+    identity.sort_unstable();
+    let expected = [
+        format!("user.email {WORKER_EMAIL}"),
+        format!("user.name {WORKER_NAME}"),
+    ];
+    if identity
+        .iter()
+        .copied()
+        .ne(expected.iter().map(String::as_str))
+    {
+        git(clone_source, &["config", "user.email", WORKER_EMAIL])?;
+        git(clone_source, &["config", "user.name", WORKER_NAME])?;
+    }
+    Ok(())
+}
+
 /// Uncommitted and untracked paths reported by Git for a worktree.
 ///
 /// A rename or copy line reports `old -> new`; both sides are changes to the
@@ -508,7 +615,15 @@ fn parse_shortstat(stats: &str) -> (u64, u64) {
 }
 
 pub(crate) fn fingerprint_locked(root: &Path) -> Result<ContentHash, OrchestratorError> {
-    let head = git(root, &["rev-parse", "HEAD"])?.trim().to_owned();
+    let (head, listing) = std::thread::scope(|scope| {
+        let listing = scope.spawn(|| list_files(root));
+        (git(root, &["rev-parse", "HEAD"]), join_git(listing))
+    });
+    fingerprint_of(root, head?.trim(), &listing?)
+}
+
+/// Every tracked or untracked-but-not-ignored file, sorted.
+fn list_files(root: &Path) -> Result<Vec<String>, OrchestratorError> {
     let listing = git(
         root,
         &["ls-files", "--cached", "--others", "--exclude-standard"],
@@ -520,27 +635,113 @@ pub(crate) fn fingerprint_locked(root: &Path) -> Result<ContentHash, Orchestrato
         .map(str::to_owned)
         .collect::<Vec<_>>();
     entries.sort();
+    Ok(entries)
+}
+
+/// HEAD plus every listed file's content hash, hashed. Files are hashed on a
+/// few threads, and a file whose length and modification time match an
+/// earlier hash of it reuses that hash.
+fn fingerprint_of(
+    root: &Path,
+    head: &str,
+    entries: &[String],
+) -> Result<ContentHash, OrchestratorError> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, 8);
+    let chunk = entries.len().div_ceil(threads).max(1);
+    let digests = std::thread::scope(|scope| {
+        let workers = entries
+            .chunks(chunk)
+            .map(|part| {
+                scope.spawn(move || {
+                    part.iter()
+                        .map(|relative| file_digest(&root.join(relative)))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut digests = Vec::with_capacity(entries.len());
+        for worker in workers {
+            digests.extend(join_git(worker)?);
+        }
+        Ok::<_, OrchestratorError>(digests)
+    })?;
     let mut records = vec![format!("head\u{0}{head}")];
-    for relative in &entries {
-        let absolute = root.join(relative);
-        // Stream the file: a fingerprint must not load a whole tree into memory,
-        // and an unreadable file is a typed failure, not silently an empty file.
-        let mut file = std::fs::File::open(&absolute).map_err(|error| {
-            OrchestratorError::new(
-                ErrorCode::StorageOpenFailed,
-                format!("cannot read workspace file {}: {error}", absolute.display()),
-            )
-        })?;
-        let digest = ContentHash::from_reader(&mut file).map_err(|error| {
-            OrchestratorError::new(
-                ErrorCode::StorageOpenFailed,
-                format!("cannot hash workspace file {}: {error}", absolute.display()),
-            )
-        })?;
+    for (relative, digest) in entries.iter().zip(&digests) {
         records.push(format!("{relative}\u{0}{}", digest.as_str()));
     }
     let joined = records.join("\n");
     Ok(ContentHash::from_bytes(joined.as_bytes()))
+}
+
+/// A file hash taken earlier: valid while the file keeps its length and
+/// modification time.
+struct CachedDigest {
+    len: u64,
+    modified: SystemTime,
+    digest: ContentHash,
+}
+
+/// How long after its modification time a file's hash may be cached. A write
+/// in the same clock tick as the hash could keep both its length and its time,
+/// so - as Git treats a "racily clean" index entry - a recent file is always
+/// hashed again.
+const RACY_WINDOW: Duration = Duration::from_secs(3);
+/// More entries than this and the cache starts over, so a huge tree cannot
+/// grow it without bound.
+const DIGEST_CACHE_LIMIT: usize = 500_000;
+
+fn digest_cache() -> &'static StdMutex<HashMap<PathBuf, CachedDigest>> {
+    static CACHE: OnceLock<StdMutex<HashMap<PathBuf, CachedDigest>>> = OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn file_digest(absolute: &Path) -> Result<ContentHash, OrchestratorError> {
+    let unreadable = |error: std::io::Error| {
+        OrchestratorError::new(
+            ErrorCode::StorageOpenFailed,
+            format!("cannot read workspace file {}: {error}", absolute.display()),
+        )
+    };
+    // Stream the file: a fingerprint must not load a whole tree into memory,
+    // and an unreadable file is a typed failure, not silently an empty file.
+    let mut file = std::fs::File::open(absolute).map_err(unreadable)?;
+    let stamp = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| Some((metadata.len(), metadata.modified().ok()?)));
+    if let Some((len, modified)) = stamp
+        && let Ok(cache) = digest_cache().lock()
+        && let Some(cached) = cache.get(absolute)
+        && cached.len == len
+        && cached.modified == modified
+    {
+        return Ok(cached.digest.clone());
+    }
+    let digest = ContentHash::from_reader(&mut file).map_err(|error| {
+        OrchestratorError::new(
+            ErrorCode::StorageOpenFailed,
+            format!("cannot hash workspace file {}: {error}", absolute.display()),
+        )
+    })?;
+    if let Some((len, modified)) = stamp
+        && modified.elapsed().is_ok_and(|age| age >= RACY_WINDOW)
+        && let Ok(mut cache) = digest_cache().lock()
+    {
+        if cache.len() >= DIGEST_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(
+            absolute.to_path_buf(),
+            CachedDigest {
+                len,
+                modified,
+                digest: digest.clone(),
+            },
+        );
+    }
+    Ok(digest)
 }
 
 fn git(root: &Path, arguments: &[&str]) -> Result<String, OrchestratorError> {
@@ -592,5 +793,36 @@ mod scope_tests {
             )
             .is_empty()
         );
+    }
+
+    /// A cached hash is reused only for the same length and time; an edit of
+    /// the same length moves the time, and a fresh file is never cached.
+    #[test]
+    fn a_cached_file_hash_follows_every_edit() {
+        use std::time::{Duration, SystemTime};
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("a.txt");
+        let write = |body: &str, age: Option<u64>| {
+            std::fs::write(&path, body).expect("written");
+            if let Some(age) = age {
+                let file = std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .expect("opened");
+                file.set_modified(SystemTime::now() - Duration::from_secs(age))
+                    .expect("dated");
+            }
+        };
+        write("one", Some(60));
+        let first = super::file_digest(&path).expect("hashed");
+        assert_eq!(super::file_digest(&path).expect("hashed"), first);
+        write("two", Some(30));
+        let second = super::file_digest(&path).expect("hashed");
+        assert_ne!(second, first, "same length, new time: hashed again");
+        write("one", None);
+        assert_eq!(super::file_digest(&path).expect("hashed"), first);
+        write("six", None);
+        assert_ne!(super::file_digest(&path).expect("hashed"), first);
     }
 }

@@ -136,6 +136,19 @@ fn materialize_bundled_skills(config_dir: &Path) -> Result<PathBuf, HarnessError
 }
 
 fn install_bundled_file(path: &Path, bytes: &[u8]) -> Result<(), HarnessError> {
+    // Discovery runs every turn and every menu refresh; reading and comparing
+    // all the bundled files (some 2.8 MB) each time cost more than the rest of
+    // discovery. A file this process already found intact, or wrote, is
+    // trusted again while its length and modification time stay what they
+    // were, so a tampered or deleted file is still repaired on the next call.
+    static VERIFIED: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, super::config::FileStamp>>> =
+        std::sync::OnceLock::new();
+    let verified = VERIFIED.get_or_init(Mutex::default);
+    let remember = |stamp: Option<super::config::FileStamp>| {
+        if let (Some(stamp), Ok(mut verified)) = (stamp, verified.lock()) {
+            verified.insert(path.to_path_buf(), stamp);
+        }
+    };
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -147,7 +160,21 @@ fn install_bundled_file(path: &Path, bytes: &[u8]) -> Result<(), HarnessError> {
                     ),
                 ));
             }
-            if std::fs::read(path).map_err(|error| bundled_io_error(&error))? == bytes {
+            let stamp = metadata
+                .modified()
+                .ok()
+                .map(|modified| (metadata.len(), modified));
+            if stamp.is_some()
+                && verified
+                    .lock()
+                    .is_ok_and(|verified| verified.get(path) == stamp.as_ref())
+            {
+                return Ok(());
+            }
+            if usize::try_from(metadata.len()).is_ok_and(|len| len == bytes.len())
+                && std::fs::read(path).map_err(|error| bundled_io_error(&error))? == bytes
+            {
+                remember(stamp);
                 return Ok(());
             }
         }
@@ -156,7 +183,9 @@ fn install_bundled_file(path: &Path, bytes: &[u8]) -> Result<(), HarnessError> {
     }
     std::fs::create_dir_all(path.parent().expect("bundled file has a parent"))
         .map_err(|error| bundled_io_error(&error))?;
-    std::fs::write(path, bytes).map_err(|error| bundled_io_error(&error))
+    std::fs::write(path, bytes).map_err(|error| bundled_io_error(&error))?;
+    remember(super::config::file_stamp(path));
+    Ok(())
 }
 
 fn bundled_io_error(error: &std::io::Error) -> HarnessError {

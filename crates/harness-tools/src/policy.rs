@@ -526,11 +526,32 @@ impl ToolPolicy {
 }
 
 fn pattern_matches(pattern: &str, target: &str) -> bool {
-    globset::GlobBuilder::new(pattern)
-        .case_insensitive(cfg!(windows))
-        .build()
-        .ok()
-        .is_some_and(|glob| glob.compile_matcher().is_match(target))
+    // Every decision checks every rule, two or three times over, and building
+    // a glob matcher costs far more than running one. Rules come from
+    // configuration and confirmed approvals, so there are few distinct
+    // patterns; the cap only guards against a host that is never restarted.
+    const MAX_CACHED_PATTERNS: usize = 1024;
+    static COMPILED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<globset::GlobMatcher>>>,
+    > = std::sync::OnceLock::new();
+    let compile = || {
+        globset::GlobBuilder::new(pattern)
+            .case_insensitive(cfg!(windows))
+            .build()
+            .ok()
+            .map(|glob| glob.compile_matcher())
+    };
+    let Ok(mut compiled) = COMPILED.get_or_init(Default::default).lock() else {
+        return compile().is_some_and(|matcher| matcher.is_match(target));
+    };
+    if compiled.len() >= MAX_CACHED_PATTERNS && !compiled.contains_key(pattern) {
+        compiled.clear();
+    }
+    compiled
+        .entry(pattern.to_owned())
+        .or_insert_with(compile)
+        .as_ref()
+        .is_some_and(|matcher| matcher.is_match(target))
 }
 
 fn tool_pattern_target(action: &CodingToolAction) -> String {
@@ -617,20 +638,35 @@ fn validate_action_shape(action: &CodingToolAction) -> Result<(), HarnessError> 
         CodingToolAction::Glob { pattern, .. } if pattern.trim().is_empty() => Err(
             HarnessError::new(ErrorCode::InvalidPayload, "glob pattern must not be empty"),
         ),
-        CodingToolAction::EditFile { old_string, .. } if old_string.is_empty() => {
+        CodingToolAction::EditFile {
+            old_string, edits, ..
+        } if old_string.is_empty() && edits.is_empty() => Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            "edit_file old_string must not be empty",
+        )),
+        action @ CodingToolAction::EditFile { edits, .. }
+            if edits.len() > crate::contracts::EDIT_FILE_MAX_EDITS =>
+        {
+            let _ = action;
             Err(HarnessError::new(
                 ErrorCode::InvalidPayload,
-                "edit_file old_string must not be empty",
+                format!(
+                    "edit_file may carry at most {} edits",
+                    crate::contracts::EDIT_FILE_MAX_EDITS
+                ),
             ))
         }
-        CodingToolAction::EditFile {
-            old_string,
-            new_string,
-            ..
-        } if old_string.contains('\0') || new_string.contains('\0') => Err(HarnessError::new(
-            ErrorCode::BinaryContentDenied,
-            "edit_file text must not contain NUL",
-        )),
+        action @ CodingToolAction::EditFile { .. }
+            if action
+                .edit_specs()
+                .iter()
+                .any(|spec| spec.old_string.contains('\0') || spec.new_string.contains('\0')) =>
+        {
+            Err(HarnessError::new(
+                ErrorCode::BinaryContentDenied,
+                "edit_file text must not contain NUL",
+            ))
+        }
         CodingToolAction::WriteFile { content, .. }
             if content.contains('\0') || content.len() > 1024 * 1024 =>
         {

@@ -175,12 +175,93 @@ pub fn settings_path(user_path: &Path) -> PathBuf {
     user_path.with_file_name("settings.json")
 }
 
+/// Which models edit by hashline anchors: the global setting `hashline` -
+/// `true`, or a list of model patterns read as `allowedModels` reads them -
+/// with `HA_HASHLINE` (`1`/`0`) over it. Off by default.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum HashlineRule {
+    #[default]
+    Off,
+    On,
+    Models(Vec<String>),
+}
+
+impl HashlineRule {
+    #[must_use]
+    pub fn load(user_path: &Path, environment: Option<&std::ffi::OsStr>) -> Self {
+        match environment.and_then(std::ffi::OsStr::to_str).map(str::trim) {
+            Some("1" | "on" | "true") => return Self::On,
+            Some("0" | "off" | "false") => return Self::Off,
+            _ => {}
+        }
+        match load_setting(user_path, "hashline") {
+            Some(serde_json::Value::Bool(true)) => Self::On,
+            Some(serde_json::Value::Array(items)) => Self::Models(
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+            _ => Self::Off,
+        }
+    }
+
+    /// Whether `provider/model` edits by anchors.
+    #[must_use]
+    pub fn applies(&self, selector: &str) -> bool {
+        match self {
+            Self::Off => false,
+            Self::On => true,
+            Self::Models(patterns) => super::allowlist::model_allowed(selector, patterns),
+        }
+    }
+}
+
 /// One global setting; a missing or unreadable file has none.
 #[must_use]
 pub fn load_setting(user_path: &Path, key: &str) -> Option<serde_json::Value> {
-    let text = std::fs::read_to_string(settings_path(user_path)).ok()?;
-    let settings: serde_json::Value = serde_json::from_str(&text).ok()?;
-    settings.get(key).cloned().filter(|value| !value.is_null())
+    // Some twenty call sites read one setting each, several per turn and per
+    // menu refresh; parsing the file once per change is enough. The file's
+    // length and modification time say whether it changed since.
+    let path = settings_path(user_path);
+    let stamp = file_stamp(&path)?;
+    let mut parsed = parsed_settings();
+    if parsed.get(&path).is_none_or(|(seen, _)| *seen != stamp) {
+        let settings = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        parsed.insert(path.clone(), (stamp, settings));
+    }
+    parsed
+        .get(&path)?
+        .1
+        .as_ref()?
+        .get(key)
+        .cloned()
+        .filter(|value| !value.is_null())
+}
+
+/// The settings files parsed so far, by path, with the stamp they were read at.
+fn parsed_settings()
+-> std::sync::MutexGuard<'static, BTreeMap<PathBuf, (FileStamp, Option<serde_json::Value>)>> {
+    type Parsed = BTreeMap<PathBuf, (FileStamp, Option<serde_json::Value>)>;
+    static PARSED: std::sync::OnceLock<std::sync::Mutex<Parsed>> = std::sync::OnceLock::new();
+    PARSED
+        .get_or_init(std::sync::Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A file's length and modification time: what a cache keyed on a file
+/// compares to tell whether it changed. `None` when the file is missing.
+pub type FileStamp = (u64, std::time::SystemTime);
+
+/// The [`FileStamp`] of `path`, `None` when it cannot be read.
+#[must_use]
+pub fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
 }
 
 /// Set one global setting (`None` removes it), keeping the others.
@@ -212,7 +293,13 @@ pub fn save_setting(
     let text = serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?;
     let staged = path.with_extension("json.staged");
     std::fs::write(&staged, text).map_err(|error| error.to_string())?;
-    std::fs::rename(&staged, &path).map_err(|error| error.to_string())
+    // A save of the same length inside the clock's tick keeps the stamp
+    // (Windows file times move in ~15 ms steps), so forget the parse outright,
+    // holding the cache so no reader parses the old file in between.
+    let mut parsed = parsed_settings();
+    let renamed = std::fs::rename(&staged, &path).map_err(|error| error.to_string());
+    parsed.remove(&path);
+    renamed
 }
 
 /// The file `/scoped-models` saves the scope in, beside the user config: it

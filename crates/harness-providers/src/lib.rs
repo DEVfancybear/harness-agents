@@ -1239,6 +1239,43 @@ pub const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 10;
 /// Default seconds allowed for one provider call end to end.
 pub const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 
+/// The process-wide HTTP client for one pair of transport timeouts.
+///
+/// The CLI builds a fresh adapter every turn (and more for child agents, the
+/// router's backup and the auxiliary model). A `Client` built per adapter owns
+/// its own TLS config and connection pool, so every turn's first model call
+/// redid TCP and TLS. A `Client` is a cheap handle around a shared pool, so
+/// handing out clones of one per timeout pair keeps warm connections across
+/// turns while each adapter still sees exactly the timeouts it asked for.
+/// Every adapter uses the same policy otherwise (no redirects), so the
+/// timeouts are the whole key.
+fn shared_client(connect_timeout: Duration, read_timeout: Duration) -> Result<Client, String> {
+    type Clients = std::sync::Mutex<BTreeMap<(Duration, Duration), Client>>;
+    static CLIENTS: std::sync::OnceLock<Clients> = std::sync::OnceLock::new();
+    let mut clients = CLIENTS
+        .get_or_init(Clients::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(client) = clients.get(&(connect_timeout, read_timeout)) {
+        return Ok(client.clone());
+    }
+    let client = Client::builder()
+        .connect_timeout(connect_timeout)
+        // prime-agent bounds the wait for an answer, never the answer: a
+        // whole-request timeout cut every stream longer than it (a long
+        // thinking answer, a big file write). A read that stays silent
+        // this long still fails, so a hung socket cannot park a turn.
+        .read_timeout(read_timeout)
+        // No redirects: a 307/308 would re-send the full body — conversation,
+        // inline images and tool schemas — to whatever host the response
+        // names, and the bearer token would follow a same-origin hop.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| error.to_string())?;
+    clients.insert((connect_timeout, read_timeout), client.clone());
+    Ok(client)
+}
+
 pub struct OpenAiChatAdapter {
     endpoint: String,
     credentials: Arc<dyn CredentialResolver>,
@@ -1332,24 +1369,12 @@ impl OpenAiChatAdapter {
             ));
         }
         validate_endpoint(&endpoint)?;
-        let client = Client::builder()
-            .connect_timeout(connect_timeout)
-            // prime-agent bounds the wait for an answer, never the answer: a
-            // whole-request timeout cut every stream longer than it (a long
-            // thinking answer, a big file write). A read that stays silent
-            // this long still fails, so a hung socket cannot park a turn.
-            .read_timeout(request_timeout)
-            // No redirects: a 307/308 would re-send the full body — conversation,
-            // inline images and tool schemas — to whatever host the response
-            // names, and the bearer token would follow a same-origin hop.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|error| {
-                ProviderError::new(
-                    ErrorCode::ProviderProtocol,
-                    format!("provider client is not buildable: {error}"),
-                )
-            })?;
+        let client = shared_client(connect_timeout, request_timeout).map_err(|error| {
+            ProviderError::new(
+                ErrorCode::ProviderProtocol,
+                format!("provider client is not buildable: {error}"),
+            )
+        })?;
         Ok(Self {
             endpoint,
             credentials,

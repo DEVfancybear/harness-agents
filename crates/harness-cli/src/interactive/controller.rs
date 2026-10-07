@@ -2010,6 +2010,13 @@ impl InteractiveController {
         }
     }
 
+    /// The tick [`Self::ui_state`] would report, without building the state:
+    /// a background agent ships only this when nothing else changed.
+    #[must_use]
+    pub const fn tick_count(&self) -> u64 {
+        self.tick
+    }
+
     #[allow(clippy::too_many_lines, reason = "one arm per session event")]
     fn apply_event(&mut self, event: SessionEvent, effects: &mut Vec<Effect>) {
         match event {

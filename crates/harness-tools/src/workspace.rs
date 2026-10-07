@@ -11,24 +11,21 @@ use std::{
 use globset::Glob;
 use harness_store_sqlite::ProjectRegistrationRecord;
 use harness_types::{ContentHash, ErrorCode, HarnessError, ProjectId, WorkspaceObservation};
-use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{
+    contracts::EditSpec,
     contracts::{SearchMatch, observation},
-    edit_diff::{PlannedEdit, plan_edit},
-    truncate::{
-        DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, TruncatedBy, TruncationLimits, format_size,
-        truncate_head, truncate_line,
-    },
+    edit_diff::{PlannedEdit, plan_edits},
+    truncate::{TruncatedBy, TruncationLimits, format_size, truncate_head},
+    walk::{TOOL_WALK_DEADLINE, Walk, WalkFile, cached_walk, note_change, relative_text},
 };
 
 pub(crate) const MAX_TEXT_FILE_BYTES: usize = 1024 * 1024;
 #[cfg(test)]
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
-const MAX_WALK_ENTRIES: usize = 4096;
 /// Most entries one `list_files` or `search_text` result carries.
 pub(crate) const MAX_SEARCH_MATCHES: usize = 512;
 
@@ -193,15 +190,25 @@ pub(crate) fn inspect_identity(root: &Path) -> Result<WorkspaceIdentity, Harness
 /// tens of milliseconds. The answer only changes when a repository is created or
 /// removed, so the cache is keyed by whether the root has a `.git` entry.
 fn cached_git_common_dir(root: &Path) -> Option<String> {
-    type GitDirs = HashMap<(PathBuf, bool), Option<String>>;
+    cached_git_path(root, "--git-common-dir")
+}
+
+/// The Git directory of the root's own worktree, where its `HEAD` and index
+/// live; the common directory for the main worktree.
+fn cached_git_dir(root: &Path) -> Option<String> {
+    cached_git_path(root, "--git-dir")
+}
+
+fn cached_git_path(root: &Path, flag: &'static str) -> Option<String> {
+    type GitDirs = HashMap<(PathBuf, bool, &'static str), Option<String>>;
     static CACHE: OnceLock<Mutex<GitDirs>> = OnceLock::new();
-    let key = (root.to_owned(), root.join(".git").exists());
+    let key = (root.to_owned(), root.join(".git").exists(), flag);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(value) = cache.lock().ok().and_then(|map| map.get(&key).cloned()) {
         return value;
     }
-    let value = git_output(root, ["rev-parse", "--git-common-dir"])
-        .and_then(|value| canonicalize_git_path(root, &value));
+    let value =
+        git_output(root, ["rev-parse", flag]).and_then(|value| canonicalize_git_path(root, &value));
     // No answer for a root that has a `.git` entry is a `git` that failed this
     // once (a timeout, a lock), not a root outside a repository: it is asked
     // again next time instead of being remembered for the whole session, where it
@@ -214,13 +221,137 @@ fn cached_git_common_dir(root: &Path) -> Option<String> {
     value
 }
 
+/// What the repository files say `HEAD` is.
+enum HeadRead {
+    Commit(String),
+    /// A repository with no commit yet, or no repository.
+    Unborn,
+    /// Something these files do not settle (a reftable, a symbolic ref chain):
+    /// `git` is asked.
+    Unknown,
+}
+
+fn is_commit_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The commit `HEAD` names, read from the repository's own files: `HEAD`, the
+/// loose ref it points at, or `packed-refs`. A `git rev-parse HEAD` process on
+/// every write cost tens of milliseconds on Windows.
+fn head_from_files(root: &Path) -> HeadRead {
+    let (Some(git_dir), Some(common)) = (cached_git_dir(root), cached_git_common_dir(root)) else {
+        return if cached_git_common_dir(root).is_none() && !root.join(".git").exists() {
+            HeadRead::Unborn
+        } else {
+            HeadRead::Unknown
+        };
+    };
+    let (git_dir, common) = (PathBuf::from(git_dir), PathBuf::from(common));
+    if common.join("reftable").exists() {
+        return HeadRead::Unknown;
+    }
+    let Ok(head) = fs::read_to_string(git_dir.join("HEAD")) else {
+        return HeadRead::Unknown;
+    };
+    let head = head.trim();
+    let Some(reference) = head.strip_prefix("ref:").map(str::trim) else {
+        return if is_commit_id(head) {
+            HeadRead::Commit(head.to_owned())
+        } else {
+            HeadRead::Unknown
+        };
+    };
+    if !reference.starts_with("refs/") || reference.split('/').any(|part| part == "..") {
+        return HeadRead::Unknown;
+    }
+    for base in [&git_dir, &common] {
+        if let Ok(text) = fs::read_to_string(base.join(reference)) {
+            let commit = text.trim();
+            return if is_commit_id(commit) {
+                HeadRead::Commit(commit.to_owned())
+            } else {
+                HeadRead::Unknown
+            };
+        }
+    }
+    if let Ok(packed) = fs::read_to_string(common.join("packed-refs")) {
+        for line in packed.lines() {
+            if let Some((commit, name)) = line.split_once(' ')
+                && name == reference
+                && !line.starts_with(['#', '^'])
+            {
+                return if is_commit_id(commit) {
+                    HeadRead::Commit(commit.to_owned())
+                } else {
+                    HeadRead::Unknown
+                };
+            }
+        }
+    }
+    HeadRead::Unborn
+}
+
+/// The commit at `HEAD`, or `None` outside a repository and before its first
+/// commit, as `git rev-parse HEAD` answers.
+pub(crate) fn git_head(root: &Path) -> Option<String> {
+    match head_from_files(root) {
+        HeadRead::Commit(commit) => Some(commit),
+        HeadRead::Unborn => None,
+        HeadRead::Unknown => git_output(root, ["rev-parse", "HEAD"]),
+    }
+}
+
+/// The branch `HEAD` is on, as `git rev-parse --abbrev-ref HEAD` names it: the
+/// short branch name, `HEAD` when detached, `None` outside a repository and
+/// before the first commit. Read from the repository's files like
+/// [`git_head`], so the prompt of every turn no longer waits on a `git`
+/// process; `git` answers only when the files cannot.
+#[must_use]
+pub fn git_branch(root: &Path) -> Option<String> {
+    let asked = || git_output(root, ["rev-parse", "--abbrev-ref", "HEAD"]);
+    match head_from_files(root) {
+        HeadRead::Unborn => None,
+        HeadRead::Unknown => asked(),
+        HeadRead::Commit(_) => {
+            let head = fs::read_to_string(PathBuf::from(cached_git_dir(root)?).join("HEAD"));
+            match head.as_deref().map(str::trim) {
+                Ok(head) => match head.strip_prefix("ref:").map(str::trim) {
+                    None => Some("HEAD".to_owned()),
+                    Some(reference) => reference
+                        .strip_prefix("refs/heads/")
+                        .map(str::to_owned)
+                        .or_else(asked),
+                },
+                Err(_) => asked(),
+            }
+        }
+    }
+}
+
+/// The hash of the worktree's Git index, through the same size-and-time hash
+/// cache as the workspace files.
+fn git_index_hash(root: &Path) -> Option<ContentHash> {
+    let index = PathBuf::from(cached_git_dir(root)?).join("index");
+    let metadata = fs::metadata(&index).ok()?;
+    let file = WalkFile {
+        absolute: index,
+        relative: String::new(),
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    };
+    hash_files(std::slice::from_ref(&file))
+        .ok()?
+        .into_iter()
+        .next()
+        .flatten()
+}
+
 pub(crate) fn inspect_workspace(
     root: &Path,
     project_id: ProjectId,
 ) -> Result<WorkspaceDescriptor, HarnessError> {
     let identity = inspect_identity(root)?;
-    let git_head =
-        git_output(&identity.root, ["rev-parse", "HEAD"]).unwrap_or_else(|| "not_git".to_owned());
+    let git_head = git_head(&identity.root).unwrap_or_else(|| "not_git".to_owned());
     let fingerprint = workspace_fingerprint(&identity.root, &git_head)?;
     Ok(WorkspaceDescriptor {
         project_id,
@@ -264,46 +395,35 @@ pub(crate) fn workspace_fingerprint(
     root: &Path,
     git_head: &str,
 ) -> Result<ContentHash, HarnessError> {
-    // `git status` runs on its own thread while the files are walked and hashed.
-    let (files, status) = std::thread::scope(|scope| {
-        let status = scope.spawn(|| {
-            git_output(root, ["status", "--porcelain=v1", "--untracked-files=all"])
-                .unwrap_or_else(|| "not_git".to_owned())
-        });
-        let files = if too_large(root) {
-            Ok(None)
+    // The walk is the one the tools share: taken again only when something
+    // changed since the last one.
+    let walked = if too_large(root) {
+        None
+    } else {
+        let walk = cached_walk(root, root, Some(Instant::now() + FINGERPRINT_WALK_DEADLINE))?;
+        if walk.complete {
+            Some(walk)
         } else {
-            match walk_files_within(
-                root,
-                MAX_FINGERPRINT_ENTRIES,
-                Some(Instant::now() + FINGERPRINT_WALK_DEADLINE),
-            ) {
-                Ok(files) => hash_files(&files).map(|hashes| Some((files, hashes))),
-                Err(error) if error.code() == ErrorCode::OutputLimitExceeded => {
-                    remember_too_large(root);
-                    Ok(None)
-                }
-                Err(error) => Err(error),
-            }
-        };
-        (
-            files,
-            status.join().unwrap_or_else(|_| "not_git".to_owned()),
-        )
-    });
-    let Some((files, hashes)) = files? else {
+            remember_too_large(root);
+            None
+        }
+    };
+    let Some(walk) = walked else {
         // Measured: started in the user's home folder, the walk took 32 seconds
         // to reach the bound and then failed every turn before it reached the
         // model, and Ctrl+C waited for it. A workspace this large is fingerprinted
         // by its Git state alone, and remembered as such for the process.
+        let status = git_output(root, ["status", "--porcelain=v1", "--untracked-files=all"])
+            .unwrap_or_else(|| "not_git".to_owned());
         return ContentHash::from_canonical_json(&json!({
             "git_head": git_head,
             "git_status": status,
             "files": "unobserved: the workspace is too large to walk",
         }));
     };
-    let mut entries = Vec::with_capacity(files.len());
-    for (item, hash) in files.iter().zip(hashes) {
+    let hashes = hash_files(&walk.files)?;
+    let mut entries = Vec::with_capacity(walk.files.len());
+    for (item, hash) in walk.files.iter().zip(hashes) {
         match hash {
             Some(hash) => entries.push(json!({"path": item.relative, "content_hash": hash})),
             // Present but locked by another process. The path stays in the
@@ -318,9 +438,12 @@ pub(crate) fn workspace_fingerprint(
             })),
         }
     }
+    // What `git status` added beyond the files themselves is the index: what
+    // is staged. Its bytes say the same, without a `git` process per call
+    // (tens of milliseconds each on Windows, twice per write).
     ContentHash::from_canonical_json(&json!({
         "git_head": git_head,
-        "git_status": status,
+        "git_index": git_index_hash(root),
         "files": entries,
     }))
 }
@@ -525,10 +648,13 @@ pub(crate) fn read_text_output(path: &Path) -> Result<TextOutput, HarnessError> 
     })
 }
 
-pub(crate) fn list_files(
+/// The walk a tool lists, globs or searches: `requested` inside `root`, from
+/// the shared cache.
+pub(crate) fn tool_walk(
     root: &Path,
     requested: Option<&str>,
-) -> Result<(Vec<String>, bool), HarnessError> {
+    tool: &str,
+) -> Result<std::sync::Arc<Walk>, HarnessError> {
     let base = match requested {
         Some(path) => resolve_relative(root, path, true)?,
         None => root.to_owned(),
@@ -536,27 +662,39 @@ pub(crate) fn list_files(
     if !base.is_dir() {
         return Err(HarnessError::new(
             ErrorCode::InvalidPayload,
-            "list_files path must be a directory",
+            format!("{tool} path must be a directory"),
         ));
     }
-    let files = walk_files(&base)?;
-    let mut paths = Vec::new();
-    let mut truncated = false;
-    for file in files {
-        let relative = file.absolute.strip_prefix(root).map_err(|_| {
-            HarnessError::new(
-                ErrorCode::WorkspaceEscape,
-                "listed path escaped workspace root",
-            )
-        })?;
-        if paths.len() == MAX_SEARCH_MATCHES {
-            truncated = true;
-            break;
-        }
-        paths.push(relative_text(relative));
-    }
-    Ok((paths, truncated))
+    cached_walk(root, &base, Some(Instant::now() + TOOL_WALK_DEADLINE))
 }
+
+fn root_relative(root: &Path, file: &WalkFile) -> Result<String, HarnessError> {
+    let relative = file.absolute.strip_prefix(root).map_err(|_| {
+        HarnessError::new(
+            ErrorCode::WorkspaceEscape,
+            "listed path escaped workspace root",
+        )
+    })?;
+    Ok(relative_text(relative))
+}
+
+pub(crate) fn list_files(
+    root: &Path,
+    requested: Option<&str>,
+) -> Result<(Vec<String>, bool), HarnessError> {
+    let walk = tool_walk(root, requested, "list_files")?;
+    let mut paths = Vec::new();
+    for file in walk.files.iter().take(MAX_SEARCH_MATCHES) {
+        paths.push(root_relative(root, file)?);
+    }
+    Ok((
+        paths,
+        walk.files.len() > MAX_SEARCH_MATCHES || !walk.complete,
+    ))
+}
+
+/// Most paths one `glob` result carries.
+pub(crate) const MAX_GLOB_MATCHES: usize = 2_000;
 
 pub(crate) fn glob_files(
     root: &Path,
@@ -566,27 +704,19 @@ pub(crate) fn glob_files(
     let matcher = Glob::new(pattern)
         .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error.to_string()))?
         .compile_matcher();
-    let base = match requested {
-        Some(path) => resolve_relative(root, path, true)?,
-        None => root.to_owned(),
-    };
-    if !base.is_dir() {
-        return Err(HarnessError::new(
-            ErrorCode::InvalidPayload,
-            "glob path must be a directory",
-        ));
-    }
-    let files = walk_files(&base)?;
+    let walk = tool_walk(root, requested, "glob")?;
     let mut paths = Vec::new();
-    for file in files {
+    let mut truncated = !walk.complete;
+    for file in &walk.files {
         if matcher.is_match(Path::new(&file.relative)) {
-            let relative = file.absolute.strip_prefix(root).map_err(|_| {
-                HarnessError::new(ErrorCode::WorkspaceEscape, "glob path escaped workspace")
-            })?;
-            paths.push(relative_text(relative));
+            if paths.len() == MAX_GLOB_MATCHES {
+                truncated = true;
+                break;
+            }
+            paths.push(root_relative(root, file)?);
         }
     }
-    Ok((paths, false))
+    Ok((paths, truncated))
 }
 
 pub(crate) fn validate_glob(pattern: &str) -> Result<(), HarnessError> {
@@ -618,12 +748,10 @@ pub(crate) fn validate_search(
         .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error.to_string()))
 }
 
-/// One search result line, redacted and cut by characters with prime-agent's
-/// visible marker, so the model knows to read the file for the rest of it.
-fn search_line(line: &str) -> String {
-    truncate_line(&redact_text(line), GREP_MAX_LINE_LENGTH).0
-}
-
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the search tool's arguments, as the model sends them"
+)]
 pub(crate) fn search_text(
     root: &Path,
     query: &str,
@@ -632,107 +760,47 @@ pub(crate) fn search_text(
     case_insensitive: bool,
     glob: Option<&str>,
     context_lines: u32,
+    anchors: bool,
 ) -> Result<SearchOutput, HarnessError> {
     validate_search(query, use_regex, case_insensitive)?;
-    let pattern = if use_regex {
-        query.to_owned()
-    } else {
-        regex::escape(query)
-    };
-    let matcher = RegexBuilder::new(&pattern)
-        .case_insensitive(case_insensitive)
-        .build()
-        .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error.to_string()))?;
-    let file_matcher = glob
-        .map(|pattern| {
-            Glob::new(pattern)
-                .map(|glob| glob.compile_matcher())
-                .map_err(|error| HarnessError::new(ErrorCode::InvalidPayload, error.to_string()))
-        })
-        .transpose()?;
-    let base = match requested {
-        Some(path) => resolve_relative(root, path, true)?,
-        None => root.to_owned(),
-    };
-    if !base.is_dir() {
-        return Err(HarnessError::new(
-            ErrorCode::InvalidPayload,
-            "search_text path must be a directory",
-        ));
+    // A search the stream prefetched, or the same search made again, while
+    // nothing changed: the result it would compute now.
+    let key = crate::prefetch::search_key(
+        root,
+        &[
+            &query,
+            &requested,
+            &use_regex,
+            &case_insensitive,
+            &glob,
+            &context_lines,
+            &anchors,
+        ],
+    );
+    if let Some(kept) = crate::prefetch::kept_search(&key) {
+        return Ok(kept);
     }
-    let mut found_matches = Vec::new();
-    let mut truncated = false;
-    let mut output_bytes = 0_usize;
-    for file in walk_files(&base)? {
-        if file_matcher
-            .as_ref()
-            .is_some_and(|matcher| !matcher.is_match(Path::new(&file.relative)))
-        {
-            continue;
-        }
-        let Ok(text) = read_text(&file.absolute) else {
-            continue;
-        };
-        let lines = text.lines().collect::<Vec<_>>();
-        for (line_index, line) in lines.iter().enumerate() {
-            for found in matcher.find_iter(line) {
-                if found_matches.len() == MAX_SEARCH_MATCHES {
-                    truncated = true;
-                    break;
-                }
-                let start = line_index.saturating_sub(usize::try_from(context_lines).unwrap_or(0));
-                let end = line_index
-                    .saturating_add(usize::try_from(context_lines).unwrap_or(0))
-                    .saturating_add(1)
-                    .min(lines.len());
-                let context = lines[start..end]
-                    .iter()
-                    .enumerate()
-                    .filter(|(offset, _)| start + *offset != line_index)
-                    .map(|(_, context_line)| search_line(context_line))
-                    .collect::<Vec<_>>();
-                let preview = search_line(line);
-                let relative = file.absolute.strip_prefix(root).map_err(|_| {
-                    HarnessError::new(
-                        ErrorCode::WorkspaceEscape,
-                        "searched path escaped workspace root",
-                    )
-                })?;
-                let path = relative_text(relative);
-                let context_bytes = context.iter().map(String::len).sum::<usize>();
-                if output_bytes
-                    .saturating_add(preview.len())
-                    .saturating_add(context_bytes)
-                    .saturating_add(path.len())
-                    > DEFAULT_MAX_BYTES
-                {
-                    truncated = true;
-                    break;
-                }
-                output_bytes = output_bytes
-                    .saturating_add(preview.len())
-                    .saturating_add(context_bytes)
-                    .saturating_add(path.len());
-                found_matches.push(SearchMatch {
-                    path,
-                    line: u64::try_from(line_index.saturating_add(1)).unwrap_or(u64::MAX),
-                    column: u64::try_from(found.start().saturating_add(1)).unwrap_or(u64::MAX),
-                    preview,
-                    context,
-                });
-            }
-            if truncated {
-                break;
-            }
-        }
-        if truncated {
-            break;
-        }
-    }
-    Ok(SearchOutput {
-        matches: found_matches,
-        truncated,
-    })
+    let stamp = crate::walk::generation();
+    let watched = crate::walk::ensure_watched(root);
+    let walk = tool_walk(root, requested, "search_text")?;
+    let found = crate::search::search(
+        root,
+        &walk,
+        &crate::search::SearchQuery {
+            query,
+            use_regex,
+            case_insensitive,
+            glob,
+            context_lines,
+            anchors,
+        },
+    )?;
+    let output = SearchOutput {
+        matches: found.matches,
+        truncated: found.truncated || !walk.complete,
+    };
+    crate::prefetch::keep_search(key, &output, stamp, watched);
+    Ok(output)
 }
 
 /// Read a numbered line range, cut to the shared output limits.
@@ -740,12 +808,13 @@ pub(crate) fn search_text(
 /// A range that stops before the end of the file says so in the text, with the
 /// `offset` that continues it (prime-agent's read notice, with ha's zero-based
 /// offset), so the model pages on instead of re-reading the same slice.
+#[cfg(test)]
 pub(crate) fn read_file_range(
     path: &Path,
     offset: u64,
     limit: u32,
 ) -> Result<TextOutput, HarnessError> {
-    Ok(numbered_range(&read_text(path)?, offset, limit))
+    Ok(numbered_range(&read_text(path)?, offset, limit, false))
 }
 
 /// Read a file once and return its numbered range together with the hash of
@@ -755,22 +824,36 @@ pub(crate) fn read_file_range_with_hash(
     path: &Path,
     offset: u64,
     limit: u32,
+    anchors: bool,
 ) -> Result<(TextOutput, ContentHash), HarnessError> {
     let text = read_text(path)?;
     let hash = ContentHash::from_bytes(text.as_bytes());
-    Ok((numbered_range(&text, offset, limit), hash))
+    Ok((numbered_range(&text, offset, limit, anchors), hash))
 }
 
-fn numbered_range(text: &str, offset: u64, limit: u32) -> TextOutput {
+fn numbered_range(text: &str, offset: u64, limit: u32, anchors: bool) -> TextOutput {
     let lines = text.lines().collect::<Vec<_>>();
     let total = lines.len();
     let start = usize::try_from(offset).unwrap_or(usize::MAX).min(total);
     let count = usize::try_from(limit).unwrap_or(usize::MAX);
     let end = start.saturating_add(count).min(total);
+    // With hashline editing on, each line carries the anchor an edit names it
+    // by (`12#a3: text`).
     let numbered = lines[start..end]
         .iter()
         .enumerate()
-        .map(|(index, line)| format!("{}: {}", start + index + 1, redact_text(line)))
+        .map(|(index, line)| {
+            let number = start + index + 1;
+            if anchors {
+                format!(
+                    "{}: {}",
+                    crate::edit_diff::line_anchor(number, line),
+                    redact_text(line)
+                )
+            } else {
+                format!("{number}: {}", redact_text(line))
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let limits = TruncationLimits::default();
@@ -905,6 +988,9 @@ fn write_text_checked_locked(
     }
     let existed = path.exists();
     let before_hash = if existed {
+        // Read once, under the file's mutation lock, immediately before the
+        // atomic replacement: a changed or unreadable preimage is never
+        // overwritten.
         let current = read_text(path)?;
         let hash = ContentHash::from_bytes(current.as_bytes());
         let Some(expected_hash) = expected_hash else {
@@ -930,19 +1016,13 @@ fn write_text_checked_locked(
         ContentHash::from_canonical_json(&serde_json::json!({"exists": false}))?
     };
     if existed {
-        // Close the ordinary stale-edit case immediately before the atomic
-        // replacement. A changed or unreadable preimage is never overwritten.
-        let current = read_text(path)?;
-        let current_hash = ContentHash::from_bytes(current.as_bytes());
-        if Some(&current_hash) != expected_hash {
-            return Err(HarnessError::new(
-                ErrorCode::StaleWorkspace,
-                "expected_hash changed immediately before file replacement",
-            ));
-        }
-        write_text_atomically(path, replacement)?;
+        let written = write_text_atomically(path, replacement);
+        note_change();
+        written?;
     } else {
-        create_text_atomically(path, replacement)?;
+        let created = create_text_atomically(path, replacement);
+        note_change();
+        created?;
     }
     let after = read_text(path)?;
     if after != replacement {
@@ -967,30 +1047,27 @@ fn write_text_checked_locked(
 pub(crate) fn edit_text(
     path: &Path,
     display_path: &str,
-    old_string: &str,
-    new_string: &str,
-    replace_all: bool,
+    edits: &[EditSpec],
 ) -> Result<(WorkspaceMutation, String), HarnessError> {
     let _guard = lock_file_mutation(path);
     let current = read_text(path)?;
-    let planned = plan_edit_text(&current, old_string, new_string, replace_all, display_path)?;
+    let planned = plan_edit_text(&current, edits, display_path)?;
     let expected = ContentHash::from_bytes(current.as_bytes());
     let mut mutation = write_text_checked_locked(path, Some(&expected), &planned.content)?;
     mutation.replacements = planned.replacements;
     Ok((mutation, planned.diff))
 }
 
-/// Plan an `edit_file` replacement of `current` without writing it: exact
-/// match first, then prime-agent's normalized match (see [`crate::edit_diff`]).
-/// `display_path` only names the file in an error.
+/// Plan the replacements of an `edit_file` call on `current` without writing
+/// them: exact match first, then prime-agent's normalized match, then by
+/// whole lines with indentation set aside, or by hashline anchors (see
+/// [`crate::edit_diff`]). `display_path` only names the file in an error.
 pub(crate) fn plan_edit_text(
     current: &str,
-    old_string: &str,
-    new_string: &str,
-    replace_all: bool,
+    edits: &[EditSpec],
     display_path: &str,
 ) -> Result<PlannedEdit, HarnessError> {
-    plan_edit(current, old_string, new_string, replace_all, display_path)
+    plan_edits(current, edits, display_path)
 }
 
 pub(crate) fn redact_text(text: &str) -> String {
@@ -1028,7 +1105,10 @@ pub(crate) fn redact_text(text: &str) -> String {
 /// walk tried to leave the workspace when it only could not look inside. The
 /// escape code stays reserved for a walk that really left the root, and for any
 /// other walker failure whose nature is not established here.
-fn deny_read_error(path: &Path, error: &(dyn std::fmt::Display + 'static)) -> HarnessError {
+pub(crate) fn deny_read_error(
+    path: &Path,
+    error: &(dyn std::fmt::Display + 'static),
+) -> HarnessError {
     HarnessError::new(
         ErrorCode::StorageOpenFailed,
         format!(
@@ -1038,20 +1118,7 @@ fn deny_read_error(path: &Path, error: &(dyn std::fmt::Display + 'static)) -> Ha
     )
 }
 
-fn walk_failure(path: &Path, error: &ignore::Error) -> HarnessError {
-    if error
-        .io_error()
-        .is_some_and(|io_error| io_error.kind() == ErrorKind::PermissionDenied)
-    {
-        return deny_read_error(path, error);
-    }
-    HarnessError::new(
-        ErrorCode::WorkspaceEscape,
-        format!("workspace walk failed: {error}"),
-    )
-}
-
-fn entry_failure(path: &Path, error: &std::io::Error) -> HarnessError {
+pub(crate) fn entry_failure(path: &Path, error: &std::io::Error) -> HarnessError {
     if error.kind() == ErrorKind::PermissionDenied {
         return deny_read_error(path, error);
     }
@@ -1060,15 +1127,6 @@ fn entry_failure(path: &Path, error: &std::io::Error) -> HarnessError {
         format!("cannot inspect workspace walk entry: {error}"),
     )
 }
-
-fn walk_files(root: &Path) -> Result<Vec<WalkFile>, HarnessError> {
-    walk_files_bounded(root, MAX_WALK_ENTRIES)
-}
-
-/// The walk behind the workspace fingerprint: every file, up to a far higher
-/// bound than a listing shown to the model, so a large repository is still
-/// fingerprinted instead of failing every write.
-const MAX_FINGERPRINT_ENTRIES: usize = 200_000;
 
 /// How long the fingerprint walk may take before the workspace counts as too
 /// large to observe file by file.
@@ -1092,90 +1150,6 @@ fn remember_too_large(root: &Path) {
     }
 }
 
-fn walk_files_bounded(root: &Path, bound: usize) -> Result<Vec<WalkFile>, HarnessError> {
-    walk_files_within(root, bound, None)
-}
-
-fn walk_files_within(
-    root: &Path,
-    bound: usize,
-    deadline: Option<Instant>,
-) -> Result<Vec<WalkFile>, HarnessError> {
-    let mut files = Vec::new();
-    // `.gitignore` applies outside a Git repository too: a folder that is not a
-    // repository (a home folder, an unpacked project) still names what it keeps
-    // out, `node_modules` first among them.
-    let walker = WalkBuilder::new(root)
-        .hidden(false)
-        .follow_links(false)
-        .require_git(false)
-        .git_ignore(true)
-        .git_global(false)
-        .git_exclude(true)
-        .ignore(true)
-        .parents(true)
-        .build();
-    for item in walker {
-        let item = match item {
-            Ok(item) => item,
-            Err(error) => {
-                // The walker wraps the failing path in its own error types, so
-                // recover the location instead of leaving the message anonymous.
-                let path = match &error {
-                    ignore::Error::WithPath { path, .. } => path.clone(),
-                    _ => root.to_owned(),
-                };
-                return Err(walk_failure(&path, &error));
-            }
-        };
-        let path = item.path();
-        if path == root {
-            continue;
-        }
-        let metadata = match fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) => return Err(entry_failure(path, &error)),
-        };
-        if is_link_or_reparse(path)? || !metadata.is_file() {
-            continue;
-        }
-        let relative = path.strip_prefix(root).map_err(|_| {
-            HarnessError::new(ErrorCode::WorkspaceEscape, "workspace walk escaped root")
-        })?;
-        if is_sensitive_relative(relative) {
-            continue;
-        }
-        if files.len() == bound {
-            return Err(HarnessError::new(
-                ErrorCode::OutputLimitExceeded,
-                "workspace walk exceeded the P3 entry bound",
-            ));
-        }
-        if deadline.is_some_and(|deadline| Instant::now() > deadline) {
-            return Err(HarnessError::new(
-                ErrorCode::OutputLimitExceeded,
-                "workspace walk ran past its deadline",
-            ));
-        }
-        files.push(WalkFile {
-            absolute: path.to_owned(),
-            relative: relative_text(relative),
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-        });
-    }
-    files.sort_by(|left, right| left.relative.cmp(&right.relative));
-    Ok(files)
-}
-
-#[derive(Clone, Debug)]
-struct WalkFile {
-    absolute: PathBuf,
-    relative: String,
-    len: u64,
-    modified: Option<SystemTime>,
-}
-
 /// Content hashes of workspace files, by path, size and modification time.
 ///
 /// Every tool call fingerprints the workspace, and reading every file every time
@@ -1192,6 +1166,31 @@ fn hash_cache() -> &'static Mutex<HashCache> {
 }
 
 const RACY_WINDOW: Duration = Duration::from_secs(2);
+
+/// Entries the hash cache may hold beyond the files of the walk at hand.
+const HASH_CACHE_SLACK: usize = 64 * 1024;
+
+/// Keep the hash cache from growing for as long as the host runs.
+///
+/// Files are deleted and renamed, and a long session over several worktrees
+/// visits many roots; nothing ever removed their entries. Once the cache holds
+/// far more than the walk being hashed, it keeps only that walk's files: a hash
+/// dropped this way is a cache miss later, never a wrong answer.
+fn bound_hash_cache(cache: &mut HashCache, files: &[WalkFile]) {
+    if cache.len()
+        <= files
+            .len()
+            .saturating_mul(2)
+            .saturating_add(HASH_CACHE_SLACK)
+    {
+        return;
+    }
+    let current = files
+        .iter()
+        .map(|file| file.absolute.as_path())
+        .collect::<HashSet<_>>();
+    cache.retain(|path, _| current.contains(path.as_path()));
+}
 
 /// Hash every file, reusing cached hashes and reading the rest on all cores.
 fn hash_files(files: &[WalkFile]) -> Result<Vec<Option<ContentHash>>, HarnessError> {
@@ -1239,6 +1238,9 @@ fn hash_files(files: &[WalkFile]) -> Result<Vec<Option<ContentHash>>, HarnessErr
             .collect::<Vec<_>>()
     });
     let mut cache = hash_cache().lock().ok();
+    if let Some(cache) = cache.as_mut() {
+        bound_hash_cache(cache, files);
+    }
     for (index, hash) in computed {
         let hash = hash?;
         let file = &files[index];
@@ -1557,17 +1559,11 @@ fn is_sensitive_relative(path: &Path) -> bool {
         let Component::Normal(value) = component else {
             return true;
         };
-        let value = value.to_string_lossy().to_ascii_lowercase();
-        if matches!(value.as_str(), ".git" | ".harness" | ".env")
-            || value.starts_with(".env.")
-            || value.contains("credential")
-            || value.contains("secret")
-            || value.contains("password")
-            || value.contains("private_key")
-        {
+        let value = value.to_string_lossy();
+        if crate::walk::sensitive_component(&value) {
             return true;
         }
-        last = Some(value);
+        last = Some(value.to_ascii_lowercase());
     }
     last.is_some_and(|name| {
         matches!(
@@ -1577,13 +1573,46 @@ fn is_sensitive_relative(path: &Path) -> bool {
     })
 }
 
-fn relative_text(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The branch read from the repository files is what `git rev-parse
+    /// --abbrev-ref HEAD` says: nothing before the first commit, the branch
+    /// name on a branch and `HEAD` when detached.
+    #[test]
+    fn the_branch_read_from_files_matches_git() {
+        let root = std::env::temp_dir().join(format!("br-{}", harness_types::InputId::generate()));
+        std::fs::create_dir_all(&root).expect("root");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("git");
+            assert!(status.status.success(), "git {args:?}");
+        };
+        let asked = || git_output(&root, ["rev-parse", "--abbrev-ref", "HEAD"]);
+        git(&["init", "-q", "-b", "feature/x"]);
+        assert_eq!(git_branch(&root), None, "no commit yet");
+        std::fs::write(root.join("a.txt"), "a").expect("file");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "one"]);
+        assert_eq!(git_branch(&root).as_deref(), Some("feature/x"));
+        assert_eq!(git_branch(&root), asked());
+        git(&["checkout", "-q", "--detach"]);
+        assert_eq!(git_branch(&root).as_deref(), Some("HEAD"));
+        assert_eq!(git_branch(&root), asked());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     /// A folder that is not a Git repository still keeps out what its
     /// `.gitignore` names; a walk past its deadline counts as too large; and a
@@ -1595,8 +1624,9 @@ mod tests {
         std::fs::write(root.join(".gitignore"), "node_modules/\n").expect("ignore");
         std::fs::write(root.join("node_modules").join("pkg").join("a.js"), "x").expect("dep");
         std::fs::write(root.join("main.py"), "print(1)").expect("file");
-        let walked = walk_files_bounded(&root, 100).expect("walk");
+        let walked = crate::walk::walk_files_within(&root, 100, None).expect("walk");
         let names = walked
+            .files
             .iter()
             .map(|file| file.relative.as_str())
             .collect::<Vec<_>>();
@@ -1606,13 +1636,13 @@ mod tests {
             "outside Git too, .gitignore keeps node_modules out: {names:?}"
         );
 
-        let late = walk_files_within(
+        let late = crate::walk::walk_files_within(
             &root,
             100,
             Instant::now().checked_sub(Duration::from_secs(1)),
         )
-        .expect_err("past the deadline");
-        assert_eq!(late.code(), ErrorCode::OutputLimitExceeded);
+        .expect("a walk past its deadline returns what it has");
+        assert!(!late.complete, "past the deadline the walk is incomplete");
 
         let walked_print = workspace_fingerprint(&root, "not_git").expect("walked");
         remember_too_large(&root);
@@ -1731,17 +1761,31 @@ mod tests {
         )
         .expect("file");
         let root = fs::canonicalize(directory.path()).expect("root");
-        let output = search_text(&root, "needle", None, false, false, None, 0).expect("search");
+        let output =
+            search_text(&root, "needle", None, false, false, None, 0, false).expect("search");
         assert_eq!(output.matches.len(), 1);
         let preview = &output.matches[0].preview;
         assert!(preview.ends_with("... [truncated]"), "{preview}");
-        assert_eq!(preview.chars().count(), GREP_MAX_LINE_LENGTH + 15);
+        assert_eq!(
+            preview.chars().count(),
+            crate::truncate::GREP_MAX_LINE_LENGTH + 15
+        );
+    }
+
+    fn spec(old: &str, new: &str) -> EditSpec {
+        EditSpec {
+            old_string: old.to_owned(),
+            new_string: new.to_owned(),
+            replace_all: false,
+            start: None,
+            end: None,
+        }
     }
 
     #[test]
     fn edits_of_a_crlf_file_keep_its_line_endings_and_return_the_diff() {
         let (_directory, path) = scratch_file("one\r\ntwo\r\n");
-        let (mutation, diff) = edit_text(&path, "f.txt", "two\n", "2\n", false).expect("edit");
+        let (mutation, diff) = edit_text(&path, "f.txt", &[spec("two\n", "2\n")]).expect("edit");
         assert_eq!(mutation.replacements, 1);
         assert_eq!(fs::read_to_string(&path).expect("read"), "one\r\n2\r\n");
         assert_eq!(diff, [" 1 one", "-2 two", "+2 2"].join("\n"));
@@ -1767,9 +1811,7 @@ mod tests {
                     edit_text(
                         path,
                         "f.txt",
-                        &format!("line {n}\n"),
-                        &format!("edited {n}\n"),
-                        false,
+                        &[spec(&format!("line {n}\n"), &format!("edited {n}\n"))],
                     )
                     .expect("every edit lands");
                 });
@@ -1901,7 +1943,7 @@ mod tests {
             );
             return;
         }
-        let result = walk_files(&root);
+        let result = crate::walk::walk_files_within(&root, 1000, None);
         let error = result.expect_err("an unreadable directory must not be skipped silently");
         drop(denial);
 

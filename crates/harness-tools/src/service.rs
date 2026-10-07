@@ -30,9 +30,8 @@ use crate::{
     secrets::{HostEnvironmentSecrets, ProcessEnvironment, SecretResolver},
     workspace::{
         apply_text_patch, edit_text, glob_files, inspect_workspace, inspect_workspace_for_read,
-        list_files, plan_edit_text, read_file_range, read_file_range_with_hash, read_text,
-        redact_text, resolve_relative, search_text, validate_glob, validate_search,
-        write_text_checked,
+        list_files, plan_edit_text, read_file_range_with_hash, read_text, redact_text,
+        resolve_relative, search_text, validate_glob, validate_search, write_text_checked,
     },
 };
 use harness_store_sqlite::HistoryScope;
@@ -96,13 +95,11 @@ fn redact_hook_arguments(value: &mut Value) {
 /// Read the current repository commit through the bounded Git process runner.
 /// A missing or uncommitted HEAD is represented as `None`.
 pub async fn git_head_commit(root: &Path) -> Result<Option<String>, HarnessError> {
-    let output = process::run_structured(
+    let output = process::run_internal_git(
         root,
-        "git",
         &["rev-parse".to_owned(), "HEAD".to_owned()],
         15_000,
         CancellationToken::new(),
-        &ProcessEnvironment::empty(),
         &crate::capture::ProcessSpoolConfig::default(),
     )
     .await?;
@@ -126,9 +123,8 @@ pub async fn git_diff_from(root: &Path, base_commit: &str) -> Result<String, Har
             "stored Git base is not a full commit id",
         ));
     }
-    let output = process::run_structured(
+    let output = process::run_internal_git(
         root,
-        "git",
         &[
             "diff".to_owned(),
             "--no-ext-diff".to_owned(),
@@ -137,7 +133,6 @@ pub async fn git_diff_from(root: &Path, base_commit: &str) -> Result<String, Har
         ],
         15_000,
         CancellationToken::new(),
-        &ProcessEnvironment::empty(),
         &crate::capture::ProcessSpoolConfig::default(),
     )
     .await?;
@@ -238,6 +233,9 @@ pub struct ToolExecutionService {
     /// measured.
     capabilities: Option<Arc<crate::CapabilityMatrix>>,
     result_context: Option<Arc<dyn ToolResultContext>>,
+    /// Hashline anchors in `read_file` and `search_text` results; the schemas
+    /// the model is shown say the same (`coding_tool_schemas_for`).
+    hashline: bool,
 }
 
 impl ToolExecutionService {
@@ -253,7 +251,23 @@ impl ToolExecutionService {
             hooks: Vec::new(),
             capabilities: None,
             result_context: None,
+            hashline: false,
         }
+    }
+
+    /// Show `read_file` and `search_text` lines with their hashline anchors
+    /// (`12#a3`), which `edit_file` edits may name instead of quoting the
+    /// text. Pair it with `coding_tool_schemas_for(true)`.
+    #[must_use]
+    pub const fn with_hashline(mut self, hashline: bool) -> Self {
+        self.hashline = hashline;
+        self
+    }
+
+    /// Whether `read_file` and `search_text` results carry hashline anchors.
+    #[must_use]
+    pub const fn hashline(&self) -> bool {
+        self.hashline
     }
 
     /// Add host context to the results of calls that ran.
@@ -346,6 +360,13 @@ impl ToolExecutionService {
         crate::hooks::run_hooks(&self.hooks, event, tool_name, payload, false, cancellation).await
     }
 
+    /// Whether any hook of `event` selects the tool `name`.
+    pub(crate) fn has_tool_hooks(&self, event: &str, name: &str) -> bool {
+        crate::hooks::hooks_for(&self.hooks, event, Some(name))
+            .next()
+            .is_some()
+    }
+
     /// The `pre_tool_use` hooks of a prepared call. A hook that fails blocks
     /// the call.
     pub(crate) async fn run_pre_tool_hooks(
@@ -354,6 +375,12 @@ impl ToolExecutionService {
         cancellation: &CancellationToken,
     ) -> crate::HookResponse {
         let name = prepared.final_action.kind().as_str();
+        // Most configurations have no hook for most tools; the payload is a
+        // canonical serialization of the whole call (a large write included),
+        // so it is only built for a hook that will read it.
+        if !self.has_tool_hooks("pre_tool_use", name) {
+            return crate::HookResponse::default();
+        }
         let payload = tool_hook_payload(prepared, "pre_tool_use");
         crate::hooks::run_hooks(
             &self.hooks,
@@ -466,16 +493,10 @@ impl ToolExecutionService {
                 };
                 (path.as_str(), before, replacement.clone())
             }
-            CodingToolAction::EditFile {
-                path,
-                old_string,
-                new_string,
-                replace_all,
-            } => {
+            action @ CodingToolAction::EditFile { path, .. } => {
                 let target = resolve_relative(root, path, false)?;
                 let before = read_text(&target)?;
-                let after =
-                    plan_edit_text(&before, old_string, new_string, *replace_all, path)?.content;
+                let after = plan_edit_text(&before, &action.edit_specs(), path)?.content;
                 (path.as_str(), before, after)
             }
             _ => return Ok(None),
@@ -575,8 +596,10 @@ impl ToolExecutionService {
             .register_project(workspace.registration())
             .await
             .map_err(store_error)?;
-        Self::validate_workspace_action(&workspace.root, &request.action)?;
-        Self::validate_workspace_action(&workspace.root, &final_action)?;
+        if request.action != final_action {
+            Self::validate_workspace_action(&workspace.root, &request.action, true)?;
+        }
+        Self::validate_workspace_action(&workspace.root, &final_action, true)?;
         let action_hash = final_action.canonical_hash()?;
         Ok(PreparedToolRequest {
             request,
@@ -801,7 +824,9 @@ impl ToolExecutionService {
                 .record_denied_begun(&prepared, execution_id, Some(&approval), code, &reason)
                 .await;
         }
-        Self::validate_workspace_action(&prepared.workspace_root, &transformed)?;
+        // The file content is checked again by the preconditions below, after
+        // the identity check; here only the paths and bounds.
+        Self::validate_workspace_action(&prepared.workspace_root, &transformed, false)?;
         // The dispatch must act on the workspace the approval named: the same root
         // and repository. Its file contents are not compared: an indexer, an
         // editor or the app's own export writes files while a turn runs, and a
@@ -913,6 +938,20 @@ impl ToolExecutionService {
     /// Second phase: the side effect, with no journal write, so begun calls can
     /// run side by side.
     pub(crate) async fn run_begun(
+        &self,
+        call: &BegunCall,
+        cancellation: CancellationToken,
+    ) -> Result<Dispatched, HarnessError> {
+        let outcome = self.run_begun_inner(call, cancellation).await;
+        // A process, an extension tool or a write may have changed any file:
+        // cached walks, hashes and index entries are not trusted past it.
+        if !is_read_only(&call.transformed) {
+            crate::walk::note_change();
+        }
+        outcome
+    }
+
+    async fn run_begun_inner(
         &self,
         call: &BegunCall,
         cancellation: CancellationToken,
@@ -1133,6 +1172,7 @@ impl ToolExecutionService {
     fn validate_workspace_action(
         root: &Path,
         action: &CodingToolAction,
+        check_content: bool,
     ) -> Result<(), HarnessError> {
         match action {
             CodingToolAction::ReadFile { path, .. }
@@ -1198,7 +1238,9 @@ impl ToolExecutionService {
                     ));
                 }
                 let target = resolve_relative(root, path, false)?;
-                if target.exists() {
+                if !check_content {
+                    // The preconditions read the file; only the parent below.
+                } else if target.exists() {
                     let current = read_text(&target)?;
                     let current_hash = ContentHash::from_bytes(current.as_bytes());
                     if expected_hash.as_ref() != Some(&current_hash) {
@@ -1226,15 +1268,12 @@ impl ToolExecutionService {
                     ));
                 }
             }
-            CodingToolAction::EditFile {
-                path,
-                old_string,
-                new_string,
-                replace_all,
-            } => {
+            CodingToolAction::EditFile { path, .. } => {
                 let target = resolve_relative(root, path, false)?;
-                let current = read_text(&target)?;
-                let _ = plan_edit_text(&current, old_string, new_string, *replace_all, path)?;
+                if check_content {
+                    let current = read_text(&target)?;
+                    let _ = plan_edit_text(&current, &action.edit_specs(), path)?;
+                }
             }
             _ => {}
         }
@@ -1258,22 +1297,13 @@ impl ToolExecutionService {
     ) -> Result<(), HarnessError> {
         let root = prepared.workspace_root.as_path();
         match action {
-            CodingToolAction::ReadFile {
-                path,
-                offset,
-                limit,
-            } => {
+            CodingToolAction::ReadFile { path, .. } => {
                 // Deterministic content-policy failures (binary or unsupported
                 // encoding) are denied before an intent is created. A later
                 // disappearance/race remains an ordinary settled/unknown
                 // dispatch result, never an unsafe success.
                 let target = resolve_relative(root, path, false)?;
                 let _ = read_text(&target)?;
-                let _ = read_file_range(
-                    &target,
-                    offset.unwrap_or(0),
-                    limit.unwrap_or(crate::contracts::READ_FILE_DEFAULT_LINES),
-                )?;
             }
             CodingToolAction::Glob { pattern, .. } => validate_glob(pattern)?,
             CodingToolAction::SearchText {
@@ -1329,15 +1359,10 @@ impl ToolExecutionService {
                     Err(error) => return Err(error),
                 }
             }
-            CodingToolAction::EditFile {
-                path,
-                old_string,
-                new_string,
-                replace_all,
-            } => {
+            CodingToolAction::EditFile { path, .. } => {
                 let target = resolve_relative(root, path, false)?;
                 let current = read_text(&target)?;
-                let _ = plan_edit_text(&current, old_string, new_string, *replace_all, path)?;
+                let _ = plan_edit_text(&current, &action.edit_specs(), path)?;
             }
             CodingToolAction::ReadProcessOutput {
                 artifact_id,
@@ -1482,6 +1507,7 @@ impl ToolExecutionService {
                     &target,
                     offset.unwrap_or(0),
                     limit.unwrap_or(crate::contracts::READ_FILE_DEFAULT_LINES),
+                    self.hashline,
                 )?;
                 Ok(Dispatched::plain(ToolOutput::ReadFile {
                     path: path.replace('\\', "/"),
@@ -1513,6 +1539,7 @@ impl ToolExecutionService {
                     *case_insensitive,
                     glob.as_deref(),
                     context_lines.unwrap_or(0),
+                    self.hashline,
                 )?;
                 Ok(Dispatched::plain(ToolOutput::SearchText {
                     matches: output.matches,
@@ -1526,8 +1553,10 @@ impl ToolExecutionService {
             } => {
                 let target = resolve_relative(root, path, false)?;
                 let before = read_text(&target)?;
-                let artifact = self.publish_before_content(Some(&before))?;
-                let mutation = apply_text_patch(&target, expected_hash, replacement)?;
+                let artifact = self.stage_before_content(Some(&before))?;
+                let mutation = self.while_flushing(artifact.as_ref(), || {
+                    apply_text_patch(&target, expected_hash, replacement)
+                })?;
                 let output = ToolOutput::ApplyPatch {
                     path: path.replace('\\', "/"),
                     before_hash: mutation.before_hash.clone(),
@@ -1546,7 +1575,7 @@ impl ToolExecutionService {
                 } else {
                     None
                 };
-                let artifact = self.publish_before_content(before.as_deref())?;
+                let artifact = self.stage_before_content(before.as_deref())?;
                 if let Some(parent) = target.parent()
                     && !parent.exists()
                 {
@@ -1560,7 +1589,9 @@ impl ToolExecutionService {
                     // still resolves there before anything is written.
                     resolve_relative(root, path, false)?;
                 }
-                let mutation = write_text_checked(&target, expected_hash.as_ref(), content)?;
+                let mutation = self.while_flushing(artifact.as_ref(), || {
+                    write_text_checked(&target, expected_hash.as_ref(), content)
+                })?;
                 let output = ToolOutput::WriteFile {
                     path: path.replace('\\', "/"),
                     before_hash: mutation.before_hash.clone(),
@@ -1568,17 +1599,13 @@ impl ToolExecutionService {
                 };
                 Ok(Dispatched { output, artifact })
             }
-            CodingToolAction::EditFile {
-                path,
-                old_string,
-                new_string,
-                replace_all,
-            } => {
+            CodingToolAction::EditFile { path, .. } => {
                 let target = resolve_relative(root, path, false)?;
                 let before = read_text(&target)?;
-                let artifact = self.publish_before_content(Some(&before))?;
+                let artifact = self.stage_before_content(Some(&before))?;
+                let edits = action.edit_specs();
                 let (mutation, diff) =
-                    edit_text(&target, path, old_string, new_string, *replace_all)?;
+                    self.while_flushing(artifact.as_ref(), || edit_text(&target, path, &edits))?;
                 let output = ToolOutput::EditFile {
                     path: path.replace('\\', "/"),
                     before_hash: mutation.before_hash.clone(),
@@ -1671,9 +1698,8 @@ impl ToolExecutionService {
                 self.finish_backend_lease(lease, output).await
             }
             CodingToolAction::GitStatus => {
-                let output = process::run_structured(
+                let output = process::run_internal_git(
                     root,
-                    "git",
                     &[
                         "status".to_owned(),
                         "--porcelain=v1".to_owned(),
@@ -1682,7 +1708,6 @@ impl ToolExecutionService {
                     ],
                     15_000,
                     cancellation,
-                    &ProcessEnvironment::empty(),
                     &self.spool,
                 )
                 .await?;
@@ -1694,30 +1719,16 @@ impl ToolExecutionService {
                     args.push("--".to_owned());
                     args.push(path.clone());
                 }
-                let output = process::run_structured(
-                    root,
-                    "git",
-                    &args,
-                    15_000,
-                    cancellation,
-                    &ProcessEnvironment::empty(),
-                    &self.spool,
-                )
-                .await?;
+                let output =
+                    process::run_internal_git(root, &args, 15_000, cancellation, &self.spool)
+                        .await?;
                 Ok(Dispatched::plain(git_output("diff", output)))
             }
             CodingToolAction::GitLog { path, limit } => {
                 let args = git_log_arguments(path.as_deref(), *limit);
-                let output = process::run_structured(
-                    root,
-                    "git",
-                    &args,
-                    15_000,
-                    cancellation,
-                    &ProcessEnvironment::empty(),
-                    &self.spool,
-                )
-                .await?;
+                let output =
+                    process::run_internal_git(root, &args, 15_000, cancellation, &self.spool)
+                        .await?;
                 Ok(Dispatched::plain(git_output("log", output)))
             }
             CodingToolAction::TaskUpdate { .. } => Err(HarnessError::new(
@@ -1914,20 +1925,20 @@ impl ToolExecutionService {
         let (artifact, captured_bytes, capture_hash, capture_truncated, capture_tail) =
             match &output.capture {
                 Some(capture) => {
-                    let bytes = std::fs::read(&capture.path).map_err(|error| {
-                        HarnessError::new(
-                            ErrorCode::ArtifactWriteFailed,
-                            format!("cannot read the finished capture: {error}"),
-                        )
-                    })?;
+                    let bytes = capture.payload()?;
+                    let tail = capture.tail_of(&bytes);
+                    // Flushed before it returns: the lease record written next
+                    // already names this artifact, so its bytes must be durable
+                    // before any row points at them. The store hashes the bytes
+                    // it writes, and that digest is the one the receipt carries.
                     let published = self.store.publish_artifact(&bytes).map_err(store_error)?;
-                    let _ = std::fs::remove_file(&capture.path);
+                    let hash = published.content_hash.clone();
                     (
                         Some(published),
                         capture.bytes,
-                        Some(capture.hash.clone()),
+                        Some(hash),
                         capture.truncated,
-                        capture.tail.clone(),
+                        tail,
                     )
                 }
                 None => (None, 0, None, false, String::new()),
@@ -2021,22 +2032,32 @@ impl ToolExecutionService {
             .retain(|pending| pending.execution_id != execution_id);
         state.revision = sequence;
         state.through_event_seq = sequence;
-        // A read changed nothing: its workspace after is the one it started from.
-        let after_fingerprint = if is_read_only(&prepared.final_action) {
-            prepared.workspace_fingerprint.clone()
-        } else {
-            inspect_workspace(&prepared.workspace_root, prepared.project_id.clone()).map_or_else(
-                |_| prepared.workspace_fingerprint.clone(),
-                |workspace| workspace.fingerprint,
-            )
-        };
         // A process capture is its own durable evidence: the receipt points at
         // the captured bytes rather than at a re-serialization of them. Every
         // other output keeps the long-standing behavior of publishing its own
-        // model-facing view.
-        let artifact = match artifact {
-            Some(artifact) => Some(artifact),
-            None => self.publish_output_artifact(&output)?,
+        // model-facing view: a read's unflushed, a write's flushed while the
+        // workspace is fingerprinted after it, and before the receipt commits.
+        let read_only = is_read_only(&prepared.final_action);
+        let staged = match artifact {
+            Some(artifact) => (Some(artifact), false),
+            None => (self.publish_output_artifact(&output)?, !read_only),
+        };
+        let (artifact, flush) = staged;
+        let after_fingerprint = if read_only {
+            // A read changed nothing: its workspace after is the one it started from.
+            prepared.workspace_fingerprint.clone()
+        } else {
+            let observe = || {
+                inspect_workspace(&prepared.workspace_root, prepared.project_id.clone())
+                    .map_or_else(
+                        |_| prepared.workspace_fingerprint.clone(),
+                        |workspace| workspace.fingerprint,
+                    )
+            };
+            match artifact.as_ref().filter(|_| flush) {
+                Some(published) => self.while_flushing(Some(published), || Ok(observe()))?,
+                None => observe(),
+            }
         };
         let (before_hash, after_hash) = match &output {
             ToolOutput::ApplyPatch {
@@ -2228,6 +2249,11 @@ impl ToolExecutionService {
         Ok(view)
     }
 
+    /// The model-facing view of a call's output, as evidence, in place but not
+    /// flushed. What a read returned can be read again, so it is never
+    /// flushed: a flush costs more than the whole read (70-80 ms on Windows)
+    /// and only a power loss could make the difference. The caller flushes a
+    /// write's output itself, beside other work.
     fn publish_output_artifact(
         &self,
         output: &ToolOutput,
@@ -2239,12 +2265,42 @@ impl ToolExecutionService {
             )
         })?;
         self.store
-            .publish_artifact(&bytes)
+            .publish_artifact_unsynced(&bytes)
             .map(Some)
             .map_err(store_error)
     }
 
-    fn publish_before_content(
+    /// Run a workspace mutation while the pre-edit artifact is flushed beside
+    /// it. The artifact is in place before the mutation starts, as before; its
+    /// flush and the mutation's own now overlap instead of following each
+    /// other, and both are done before the receipt is committed.
+    fn while_flushing<T>(
+        &self,
+        artifact: Option<&PublishedArtifact>,
+        mutation: impl FnOnce() -> Result<T, HarnessError>,
+    ) -> Result<T, HarnessError> {
+        let Some(artifact) = artifact else {
+            return mutation();
+        };
+        let (flushed, result) = std::thread::scope(|scope| {
+            let flush = scope.spawn(|| self.store.sync_artifact(artifact));
+            let result = mutation();
+            (flush.join(), result)
+        });
+        let value = result?;
+        match flushed {
+            Ok(Ok(())) => Ok(value),
+            Ok(Err(error)) => Err(store_error(error)),
+            Err(_) => Err(HarnessError::new(
+                ErrorCode::ArtifactWriteFailed,
+                "the pre-edit artifact flush stopped unexpectedly",
+            )),
+        }
+    }
+
+    /// The pre-edit content, in place but not yet flushed: see
+    /// [`Self::while_flushing`].
+    fn stage_before_content(
         &self,
         before: Option<&str>,
     ) -> Result<Option<PublishedArtifact>, HarnessError> {
@@ -2258,7 +2314,7 @@ impl ToolExecutionService {
             ));
         }
         self.store
-            .publish_artifact(before.as_bytes())
+            .publish_artifact_unsynced(before.as_bytes())
             .map(Some)
             .map_err(store_error)
     }

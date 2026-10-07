@@ -12,14 +12,18 @@ mod edit_diff;
 mod execution;
 mod git_guard;
 mod hooks;
+mod index;
 mod loop_service;
 mod policy;
+mod prefetch;
 mod process;
+mod search;
 mod secrets;
 mod service;
 mod truncate;
 mod turn_driver;
 mod validation;
+mod walk;
 mod workspace;
 
 pub use capture::{
@@ -28,13 +32,15 @@ pub use capture::{
     parse_capture_header,
 };
 pub use contracts::{
-    ApprovalGrant, AskUserInput, CaptureStream, CodingToolAction, ENV_REFERENCE_PREFIX,
-    EffectClass, EnvBinding, GIT_LOG_DEFAULT_LIMIT, GIT_LOG_MAX_LIMIT, HISTORY_READ_DEFAULT_BYTES,
-    HISTORY_READ_MAX_BYTES, HISTORY_SEARCH_DEFAULT_LIMIT, HISTORY_SEARCH_MAX_LIMIT, HistoryHitView,
-    IsolationMode, MAX_ENV_BINDINGS, PROCESS_OUTPUT_PAGE_DEFAULT_BYTES,
-    PROCESS_OUTPUT_PAGE_MAX_BYTES, PreparedToolRequest, TOOL_CONTRACT_VERSION, ToolCapabilities,
+    ApprovalGrant, AskUserInput, CaptureStream, CodingToolAction, EDIT_FILE_MAX_EDITS,
+    ENV_REFERENCE_PREFIX, EditSpec, EffectClass, EnvBinding, GIT_LOG_DEFAULT_LIMIT,
+    GIT_LOG_MAX_LIMIT, HISTORY_READ_DEFAULT_BYTES, HISTORY_READ_MAX_BYTES,
+    HISTORY_SEARCH_DEFAULT_LIMIT, HISTORY_SEARCH_MAX_LIMIT, HistoryHitView, IsolationMode,
+    MAX_ENV_BINDINGS, PROCESS_OUTPUT_PAGE_DEFAULT_BYTES, PROCESS_OUTPUT_PAGE_MAX_BYTES,
+    PreparedToolRequest, READ_FILE_MAX_PATHS, TOOL_CONTRACT_VERSION, ToolCapabilities,
     ToolDescriptor, ToolExecutionView, ToolKind, ToolOutput, ToolRequest, coding_tool_descriptors,
-    coding_tool_names, coding_tool_schemas, effect_class_for, normalize_env_bindings,
+    coding_tool_names, coding_tool_schemas, coding_tool_schemas_for, effect_class_for,
+    normalize_env_bindings,
 };
 pub use loop_service::{CodingLoopResult, CodingLoopService};
 // M12: the measured capability set, the probe that produces it, and the profile
@@ -76,5 +82,6 @@ pub use turn_driver::{
     TurnOutcome, TurnProgress, TurnStop, execute_action_with_approval,
 };
 pub use workspace::{
-    is_sensitive_workspace_path, observe_workspace, observed_file_hash, workspace_registration,
+    git_branch, is_sensitive_workspace_path, observe_workspace, observed_file_hash,
+    workspace_registration,
 };

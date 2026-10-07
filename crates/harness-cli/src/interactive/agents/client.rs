@@ -15,6 +15,16 @@ use super::protocol::{self, AgentInfo, CreateAgent, Reply, Request};
 use super::registry::{self, Descriptor};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// The first try at a worker's port. The kernel completes a loopback
+/// handshake for a listening socket at once, however busy the worker is, but
+/// on Windows a closed port is retried for about two seconds before it is
+/// refused: a stale descriptor costs this, and a live one that missed it
+/// still gets [`CONNECT_TIMEOUT`].
+const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+/// How often a replaced worker's process is looked up while its descriptor
+/// stays: each look is a `tasklist` on Windows, and a clean exit removes the
+/// descriptor anyway.
+const LIVENESS_EVERY: Duration = Duration::from_secs(1);
 /// How long a question to the worker may take; starting an agent is the slow one.
 const CALL_TIMEOUT: Duration = Duration::from_secs(150);
 /// How long a new worker has to write its descriptor.
@@ -129,8 +139,12 @@ impl Connection {
     /// # Errors
     /// The worker does not answer, or refuses the token.
     pub fn open(descriptor: &Descriptor) -> Result<Self, String> {
+        Self::open_within(descriptor, CONNECT_TIMEOUT)
+    }
+
+    fn open_within(descriptor: &Descriptor, limit: Duration) -> Result<Self, String> {
         let address = SocketAddr::from(([127, 0, 0, 1], descriptor.port));
-        let stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
+        let stream = TcpStream::connect_timeout(&address, limit)
             .map_err(|error| format!("the worker at {address} does not answer: {error}"))?;
         let _ = stream.set_nodelay(true);
         stream
@@ -169,13 +183,17 @@ impl Connection {
 #[must_use]
 pub fn connect(directory: &Path, key: &str) -> Option<(Descriptor, Connection)> {
     let descriptor = registry::read(&registry::descriptor_path(directory, key))?;
-    if let Ok(connection) = Connection::open(&descriptor) {
+    if let Ok(connection) = Connection::open_within(&descriptor, PROBE_TIMEOUT) {
         return Some((descriptor, connection));
     }
     if !super::registry::process_is_alive(descriptor.pid) {
         registry::remove_if_owned(directory, key, descriptor.pid);
+        return None;
     }
-    None
+    // Alive (or unknown): the short probe may only have been unlucky.
+    Connection::open(&descriptor)
+        .ok()
+        .map(|connection| (descriptor, connection))
 }
 
 /// The project's worker, started when there is none.
@@ -259,12 +277,19 @@ fn replace_old_worker(
         again.call(&Request::Shutdown)?;
     }
     let deadline = Instant::now() + REPLACE_TIMEOUT;
+    let mut next_lookup = Instant::now() + LIVENESS_EVERY;
     while Instant::now() < deadline {
         let path = registry::descriptor_path(directory, key);
-        if registry::read(&path).is_none_or(|current| current.pid != descriptor.pid)
-            || !registry::process_is_alive(descriptor.pid)
-        {
+        // The old worker removes its descriptor as the last thing it does;
+        // the process table only matters for one that died before that.
+        if registry::read(&path).is_none_or(|current| current.pid != descriptor.pid) {
             return Ok(());
+        }
+        if Instant::now() >= next_lookup {
+            if !registry::process_is_alive(descriptor.pid) {
+                return Ok(());
+            }
+            next_lookup = Instant::now() + LIVENESS_EVERY;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -376,19 +401,21 @@ pub fn create_in(context: &LaunchContext, spec: CreateAgent) -> Result<AgentInfo
     create_with_worker(context, spec).map(|(_, info)| info)
 }
 
+/// The agent, and the connection that created it: the worker takes more
+/// requests on it, so a terminal can attach without a second handshake.
 fn create_with_worker(
     context: &LaunchContext,
     spec: CreateAgent,
-) -> Result<(Descriptor, AgentInfo), String> {
+) -> Result<(Connection, AgentInfo), String> {
     let directory = registry::directory(&context.paths.data_dir);
-    let (descriptor, mut connection) = ensure(
+    let (_, mut connection) = ensure(
         &directory,
         &context.project_store_dir(),
         &context.project.root,
     )?;
     let value = connection.call(&Request::Create(Box::new(spec)))?;
     let info = serde_json::from_value(value).map_err(|error| error.to_string())?;
-    Ok((descriptor, info))
+    Ok((connection, info))
 }
 
 /// One agent and the worker it runs in.
@@ -452,8 +479,8 @@ pub fn start_attached(
     spec: CreateAgent,
     columns: u16,
 ) -> Result<RemoteFrontend, String> {
-    let (descriptor, agent) = create_with_worker(context, spec)?;
-    RemoteFrontend::attach(&descriptor, &agent.id, columns)
+    let (connection, agent) = create_with_worker(context, spec)?;
+    RemoteFrontend::attach_over(connection, &agent.id, columns)
 }
 
 /// An agent's controller, reached over its worker's socket: what the TUI
@@ -488,7 +515,12 @@ impl RemoteFrontend {
     /// # Errors
     /// The worker or the agent is gone.
     pub fn attach(descriptor: &Descriptor, id: &str, columns: u16) -> Result<Self, String> {
-        let Connection { mut reader, writer } = Connection::open(descriptor)?;
+        Self::attach_over(Connection::open(descriptor)?, id, columns)
+    }
+
+    /// Attach to agent `id` over a connection that already said hello.
+    fn attach_over(connection: Connection, id: &str, columns: u16) -> Result<Self, String> {
+        let Connection { mut reader, writer } = connection;
         let mut writer = writer;
         protocol::write_line(
             &mut writer,
@@ -558,9 +590,24 @@ impl RemoteFrontend {
     /// The effects one reply carries, keeping its view state.
     fn absorb(&mut self, reply: Result<Reply, String>) -> Vec<Effect> {
         match reply {
-            Ok(Reply::Frame { effects, state } | Reply::Ack { effects, state, .. }) => {
+            Ok(
+                Reply::Frame {
+                    effects,
+                    state,
+                    tick,
+                }
+                | Reply::Ack {
+                    effects,
+                    state,
+                    tick,
+                    ..
+                },
+            ) => {
                 if let Some(state) = state {
                     self.state = *state;
+                }
+                if let Some(tick) = tick {
+                    self.state.tick = tick;
                 }
                 if effects
                     .iter()
@@ -641,11 +688,13 @@ impl Frontend for RemoteFrontend {
                     seq: answered,
                     effects: produced,
                     state,
+                    tick,
                 })) if answered == seq => {
                     effects.extend(self.absorb(Ok(Reply::Ack {
                         seq: answered,
                         effects: produced,
                         state,
+                        tick,
                     })));
                     return effects;
                 }

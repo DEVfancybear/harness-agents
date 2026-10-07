@@ -16,6 +16,8 @@ use harness_types::{ErrorCode, HarnessError};
 use similar::{ChangeTag, TextDiff};
 use unicode_normalization::UnicodeNormalization;
 
+use crate::contracts::EditSpec;
+
 /// Lines of unchanged context shown around each change in an edit diff.
 pub(crate) const DIFF_CONTEXT_LINES: usize = 4;
 
@@ -167,6 +169,12 @@ pub(crate) fn apply_edit_to_normalized_content(
         _ => normalized_content.to_owned(),
     };
     let Some(found) = fuzzy_find_text(&base_content, &old_text) else {
+        // Codex's last rung: whole lines that match once leading and trailing
+        // whitespace are set aside - a model that got the indentation wrong.
+        // The replacement is re-indented by the same difference.
+        if let Some(applied) = apply_by_trimmed_lines(&base_content, &old_text, &new_text, path)? {
+            return Ok(applied);
+        }
         // Measured: a model whose earlier results were shortened sent an edit it
         // had already made, and read only "could not find" - so it tried again.
         // When the replacement text is what the file holds, it is told so.
@@ -240,6 +248,235 @@ pub(crate) fn apply_edit_to_normalized_content(
     })
 }
 
+/// The byte span of every run of whole lines in `content` that equals
+/// `old_lines` once each line's surrounding whitespace is set aside (and its
+/// quotes, dashes and spaces normalized), with the line each starts on.
+fn trimmed_line_matches(content: &str, old_lines: &[&str]) -> Vec<(usize, usize, usize)> {
+    let key = |line: &str| normalize_for_fuzzy_match(line).trim().to_owned();
+    let wanted = old_lines.iter().map(|line| key(line)).collect::<Vec<_>>();
+    let mut starts = vec![0];
+    starts.extend(content.match_indices('\n').map(|(at, _)| at + 1));
+    let lines = starts
+        .iter()
+        .enumerate()
+        .map(|(index, start)| {
+            let end = starts.get(index + 1).map_or(content.len(), |next| next - 1);
+            (*start, end, key(&content[*start..end]))
+        })
+        .collect::<Vec<_>>();
+    if wanted.is_empty() || wanted.len() > lines.len() {
+        return Vec::new();
+    }
+    (0..=lines.len() - wanted.len())
+        .filter(|first| {
+            wanted
+                .iter()
+                .enumerate()
+                .all(|(offset, line)| lines[first + offset].2 == *line)
+        })
+        .map(|first| (lines[first].0, lines[first + wanted.len() - 1].1, first + 1))
+        .collect()
+}
+
+fn leading_whitespace(line: &str) -> &str {
+    &line[..line.len() - line.trim_start().len()]
+}
+
+/// The indentation tier of [`apply_edit_to_normalized_content`]: `Ok(None)`
+/// when no run of whole lines matches.
+fn apply_by_trimmed_lines(
+    content: &str,
+    old_text: &str,
+    new_text: &str,
+    path: &str,
+) -> Result<Option<AppliedEdit>, HarnessError> {
+    let old_block = old_text.trim_matches('\n');
+    let old_lines = old_block.split('\n').collect::<Vec<_>>();
+    if old_lines.iter().all(|line| line.trim().is_empty()) {
+        return Ok(None);
+    }
+    let found = trimmed_line_matches(content, &old_lines);
+    let (start, end) = match found.as_slice() {
+        [] => return Ok(None),
+        [(start, end, _)] => (*start, *end),
+        many => {
+            let lines = many
+                .iter()
+                .map(|(_, _, line)| line.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(HarnessError::new(
+                ErrorCode::EditAmbiguous,
+                format!(
+                    "Found {} occurrences of the text in {path} (lines {lines}) once indentation is ignored. The text must be unique. Please provide more context to make it unique.",
+                    many.len()
+                ),
+            ));
+        }
+    };
+    // The indentation the model wrote, and the one the file has, taken from
+    // the first line that is not blank.
+    let first = old_lines
+        .iter()
+        .position(|line| !line.trim().is_empty())
+        .unwrap_or(0);
+    let model_indent = leading_whitespace(old_lines[first]);
+    let file_line = content[start..end]
+        .split('\n')
+        .nth(first)
+        .unwrap_or_default();
+    let file_indent = leading_whitespace(file_line);
+    let new_block = new_text.trim_matches('\n');
+    let reindented = new_block
+        .split('\n')
+        .map(|line| {
+            if line.trim().is_empty() {
+                line.to_owned()
+            } else if let Some(rest) = line.strip_prefix(model_indent) {
+                format!("{file_indent}{rest}")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let new_content = format!("{}{reindented}{}", &content[..start], &content[end..]);
+    if new_content == content {
+        return Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            format!(
+                "No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
+            ),
+        ));
+    }
+    Ok(Some(AppliedEdit {
+        base_content: content.to_owned(),
+        new_content,
+        replacements: 1,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Hashline anchors
+// ---------------------------------------------------------------------------
+
+/// The two-character hash of one line, as hashline output shows it after the
+/// line number (`12#a3`). Trailing whitespace is not part of it, so a line
+/// whose only change is invisible keeps its anchor.
+pub(crate) fn line_hash(line: &str) -> String {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in line.trim_end().bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!(
+        "{:02x}",
+        (hash ^ (hash >> 8) ^ (hash >> 16) ^ (hash >> 24)) & 0xff
+    )
+}
+
+/// The `LINE#HASH` anchor of line `number` (1-based) whose text is `line`.
+/// A byte-order mark at the start of the file is not part of line 1.
+pub(crate) fn line_anchor(number: usize, line: &str) -> String {
+    let line = if number == 1 {
+        line.strip_prefix(BOM).unwrap_or(line)
+    } else {
+        line
+    };
+    format!("{number}#{}", line_hash(line))
+}
+
+/// `12#a3` as a line number and a hash.
+fn parse_anchor(anchor: &str, path: &str) -> Result<(usize, String), HarnessError> {
+    let invalid = || {
+        HarnessError::new(
+            ErrorCode::InvalidPayload,
+            format!(
+                "edit anchor {anchor:?} for {path} is not LINE#HASH: copy it from the read_file or search_text line it names, as in 12#a3"
+            ),
+        )
+    };
+    let (line, hash) = anchor.trim().split_once('#').ok_or_else(invalid)?;
+    let line = line.trim().parse::<usize>().map_err(|_| invalid())?;
+    let hash = hash.trim().trim_end_matches(':').to_ascii_lowercase();
+    if line == 0 || hash.len() != 2 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid());
+    }
+    Ok((line, hash))
+}
+
+/// Replace the lines from `start` to `end` (inclusive; `end` defaults to
+/// `start`) with `new_text`, after checking each anchor still names the line
+/// it was read from.
+fn apply_anchored(
+    content: &str,
+    start: &str,
+    end: Option<&str>,
+    new_text: &str,
+    path: &str,
+) -> Result<AppliedEdit, HarnessError> {
+    let lines = content.split('\n').collect::<Vec<_>>();
+    // A file ending in a newline has no line after it to anchor.
+    let count = if content.ends_with('\n') {
+        lines.len() - 1
+    } else {
+        lines.len()
+    };
+    let (first, first_hash) = parse_anchor(start, path)?;
+    let (last, last_hash) = match end {
+        Some(end) => parse_anchor(end, path)?,
+        None => (first, first_hash.clone()),
+    };
+    if last < first {
+        return Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            format!(
+                "edit anchors for {path} run backwards: {start} is after {}",
+                end.unwrap_or(start)
+            ),
+        ));
+    }
+    for (line, hash) in [(first, &first_hash), (last, &last_hash)] {
+        let current = (line <= count).then(|| lines[line - 1]);
+        if current.is_none_or(|text| line_hash(text) != *hash) {
+            let around = (line.saturating_sub(2).max(1)..=(line + 2).min(count))
+                .map(|number| {
+                    format!(
+                        "{number}#{}: {}",
+                        line_hash(lines[number - 1]),
+                        lines[number - 1]
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(HarnessError::new(
+                ErrorCode::StaleWorkspace,
+                format!(
+                    "Line {line}#{hash} of {path} is not what it was when it was read; read the file again. It now reads:\n{around}"
+                ),
+            ));
+        }
+    }
+    let mut kept = lines[..first - 1].to_vec();
+    let replacement = new_text.trim_end_matches('\n');
+    if !new_text.is_empty() {
+        kept.extend(replacement.split('\n'));
+    }
+    kept.extend_from_slice(&lines[last..]);
+    let new_content = kept.join("\n");
+    if new_content == content {
+        return Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            format!("No changes made to {path}. The replacement produced identical content."),
+        ));
+    }
+    Ok(AppliedEdit {
+        base_content: content.to_owned(),
+        new_content,
+        replacements: 1,
+    })
+}
+
 /// A planned edit of a whole file: the bytes to write and the diff to show.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PlannedEdit {
@@ -253,6 +490,7 @@ pub(crate) struct PlannedEdit {
 
 /// Plan one edit of a file's current text, as prime's edit tool does: strip the
 /// BOM, match in LF space, then restore the BOM and the file's line ending.
+#[cfg(test)]
 pub(crate) fn plan_edit(
     current: &str,
     old_text: &str,
@@ -260,24 +498,79 @@ pub(crate) fn plan_edit(
     replace_all: bool,
     path: &str,
 ) -> Result<PlannedEdit, HarnessError> {
+    plan_edits(
+        current,
+        &[EditSpec {
+            old_string: old_text.to_owned(),
+            new_string: new_text.to_owned(),
+            replace_all,
+            start: None,
+            end: None,
+        }],
+        path,
+    )
+}
+
+/// Plan the edits of one `edit_file` call, in order, each on the result of
+/// the one before: a match by text (exact, normalized, then by lines with
+/// their indentation set aside) or by hashline anchors. The file is written
+/// once, with all of them, or not at all.
+pub(crate) fn plan_edits(
+    current: &str,
+    edits: &[EditSpec],
+    path: &str,
+) -> Result<PlannedEdit, HarnessError> {
     let (bom, text) = strip_bom(current);
     let ending = detect_line_ending(text);
-    let normalized = normalize_to_lf(text);
-    let applied =
-        apply_edit_to_normalized_content(&normalized, old_text, new_text, replace_all, path)?;
-    let content = format!(
-        "{bom}{}",
-        restore_line_endings(&applied.new_content, ending)
-    );
-    let (diff, _) = generate_diff_string(
-        &applied.base_content,
-        &applied.new_content,
-        DIFF_CONTEXT_LINES,
-        1,
-    );
+    let mut content = normalize_to_lf(text);
+    let mut base: Option<String> = None;
+    let mut replacements = 0_u64;
+    for (index, step) in edits.iter().enumerate() {
+        let applied = match &step.start {
+            Some(start) => apply_anchored(
+                &content,
+                start,
+                step.end.as_deref(),
+                &normalize_to_lf(&step.new_string),
+                path,
+            ),
+            None => apply_edit_to_normalized_content(
+                &content,
+                &step.old_string,
+                &step.new_string,
+                step.replace_all,
+                path,
+            ),
+        }
+        .map_err(|error| {
+            if edits.len() > 1 {
+                HarnessError::new(
+                    error.code(),
+                    format!(
+                        "edit {} of {} failed, and none of them was written: {}",
+                        index + 1,
+                        edits.len(),
+                        error.message()
+                    ),
+                )
+            } else {
+                error
+            }
+        })?;
+        base.get_or_insert(applied.base_content);
+        content = applied.new_content;
+        replacements = replacements.saturating_add(applied.replacements);
+    }
+    let base = base.ok_or_else(|| {
+        HarnessError::new(
+            ErrorCode::InvalidPayload,
+            format!("edit_file for {path} names no edit: give old_string and new_string, or edits"),
+        )
+    })?;
+    let (diff, _) = generate_diff_string(&base, &content, DIFF_CONTEXT_LINES, 1);
     Ok(PlannedEdit {
-        content,
-        replacements: applied.replacements,
+        content: format!("{bom}{}", restore_line_endings(&content, ending)),
+        replacements,
         diff,
     })
 }
@@ -535,6 +828,97 @@ mod tests {
             ]
             .join("\n")
         );
+    }
+
+    #[test]
+    fn wrong_indentation_matches_whole_lines_and_is_reindented() {
+        let current = "fn main() {\n    if ready {\n        go();\n    }\n}\n";
+        let planned = plan(
+            current,
+            "if ready {\n    go();\n}",
+            "if ready {\n    stop();\n}",
+        )
+        .expect("indentation tier");
+        assert_eq!(
+            planned.content,
+            "fn main() {\n    if ready {\n        stop();\n    }\n}\n"
+        );
+        let twice = plan("  a\n  b\nx\n    a\n    b\n", "a\nb", "c").expect_err("ambiguous");
+        assert_eq!(twice.code(), ErrorCode::EditAmbiguous);
+        assert!(twice.to_string().contains("lines 1, 4"), "{twice}");
+    }
+
+    #[test]
+    fn several_edits_apply_in_order_and_all_or_nothing() {
+        let spec = |old: &str, new: &str| EditSpec {
+            old_string: old.to_owned(),
+            new_string: new.to_owned(),
+            replace_all: false,
+            start: None,
+            end: None,
+        };
+        let planned = plan_edits(
+            "one\ntwo\nthree\n",
+            &[spec("one", "1"), spec("1\ntwo", "1\n2")],
+            "f.txt",
+        )
+        .expect("two edits");
+        assert_eq!(planned.content, "1\n2\nthree\n");
+        assert_eq!(planned.replacements, 2);
+        let failed = plan_edits("one\n", &[spec("one", "1"), spec("zzz", "y")], "f.txt")
+            .expect_err("second fails");
+        assert!(
+            failed
+                .to_string()
+                .contains("edit 2 of 2 failed, and none of them was written"),
+            "{failed}"
+        );
+    }
+
+    #[test]
+    fn hashline_anchors_replace_the_lines_they_name_and_refuse_stale_ones() {
+        let current = "alpha\nbeta\ngamma\ndelta\n";
+        let anchor = |line: usize, text: &str| format!("{line}#{}", line_hash(text));
+        let planned = plan_edits(
+            current,
+            &[EditSpec {
+                old_string: String::new(),
+                new_string: "B\nC".to_owned(),
+                replace_all: false,
+                start: Some(anchor(2, "beta")),
+                end: Some(anchor(3, "gamma")),
+            }],
+            "f.txt",
+        )
+        .expect("anchored");
+        assert_eq!(planned.content, "alpha\nB\nC\ndelta\n");
+        let deleted = plan_edits(
+            current,
+            &[EditSpec {
+                old_string: String::new(),
+                new_string: String::new(),
+                replace_all: false,
+                start: Some(anchor(4, "delta")),
+                end: None,
+            }],
+            "f.txt",
+        )
+        .expect("delete a line");
+        assert_eq!(deleted.content, "alpha\nbeta\ngamma\n");
+        let stale = plan_edits(
+            current,
+            &[EditSpec {
+                old_string: String::new(),
+                new_string: "x".to_owned(),
+                replace_all: false,
+                start: Some(anchor(2, "not beta")),
+                end: None,
+            }],
+            "f.txt",
+        )
+        .expect_err("stale anchor");
+        assert_eq!(stale.code(), ErrorCode::StaleWorkspace);
+        assert!(stale.to_string().contains(&anchor(2, "beta")), "{stale}");
     }
 
     #[test]

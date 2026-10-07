@@ -2,8 +2,9 @@
 //!
 //! A tool process may write a log far larger than anything the host should hold
 //! in memory, and a model still has to be able to read the part it needs. The
-//! capture therefore streams each output stream straight to a spool file,
-//! keeping only a bounded head preview and a bounded tail preview in memory, and
+//! capture therefore streams each output stream to a spool file once it
+//! outgrows a small in-memory buffer, keeping only a bounded head preview and a
+//! bounded tail preview in memory, and
 //! publishes the spooled bytes as a durable artifact the model can page through
 //! with `read_process_output`.
 //!
@@ -17,10 +18,10 @@
 //!     the spool file, the published artifact, or a preview.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use harness_types::{ContentHash, ErrorCode, HarnessError};
+use harness_types::{ErrorCode, HarnessError};
 
 /// Serialization revision of the capture header that precedes the raw bytes.
 pub const CAPTURE_HEADER_VERSION: u16 = 1;
@@ -351,11 +352,25 @@ impl TailWindow {
     }
 }
 
+/// Captured bytes a stream keeps in memory before it spills to a spool file.
+///
+/// Most tool processes - `git status`, a hook, a guard probe, a short build
+/// step - write a few kilobytes. Creating, writing, reopening and deleting a
+/// file for each of their streams costs more on a Windows disk with antivirus
+/// scanning than the process itself, so a stream only gets a file once it has
+/// outgrown this. The bound keeps memory per stream fixed: a stream past it
+/// holds nothing but the previews.
+pub(crate) const SPILL_THRESHOLD_BYTES: usize = 64 * 1024;
+
 /// One stream being spooled.
 #[derive(Debug)]
 pub(crate) struct SpoolWriter {
-    file: File,
-    path: PathBuf,
+    /// The spool file, once the stream outgrew [`SPILL_THRESHOLD_BYTES`].
+    file: Option<(File, SpoolFile)>,
+    /// The captured bytes while the stream is still small enough to keep.
+    memory: Vec<u8>,
+    root: PathBuf,
+    label: String,
     captured: u64,
     /// Everything the stream produced, including the bytes the quota dropped.
     seen: u64,
@@ -372,21 +387,18 @@ impl SpoolWriter {
         limits: SpoolLimits,
         label: &str,
     ) -> Result<Self, HarnessError> {
+        // The directory is still created up front, although the file may never
+        // be: a spool location that cannot be written is a misconfiguration the
+        // call reports, whether or not this particular process wrote enough to
+        // need it.
         std::fs::create_dir_all(root)
             .map_err(|error| spool_error("create the spool directory", &error))?;
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or_default();
-        let path = root.join(format!("{label}-{}-{stamp}.capture", std::process::id()));
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| spool_error("create a spool file", &error))?;
+        sweep_stale_spool_files(root);
         Ok(Self {
-            file,
-            path,
+            file: None,
+            memory: Vec::new(),
+            root: root.to_owned(),
+            label: label.to_owned(),
             captured: 0,
             seen: 0,
             quota: limits.max_capture_bytes,
@@ -398,7 +410,7 @@ impl SpoolWriter {
     }
 
     /// Write one already-redacted chunk, keeping only the head preview and the
-    /// rolling tail in memory.
+    /// rolling tail in memory once the stream has spilled.
     pub(crate) fn write(&mut self, chunk: &[u8]) -> Result<(), HarnessError> {
         self.seen += chunk.len() as u64;
         self.tail.push(chunk);
@@ -411,21 +423,62 @@ impl SpoolWriter {
         if take < chunk.len() {
             self.truncated = true;
         }
-        if take > 0 {
-            self.file
-                .write_all(&chunk[..take])
-                .map_err(|error| spool_error("write a spool file", &error))?;
-            self.captured += take as u64;
+        if take == 0 {
+            return Ok(());
         }
+        if self.file.is_none() && self.memory.len() + take > SPILL_THRESHOLD_BYTES {
+            self.spill()?;
+        }
+        match &mut self.file {
+            Some((file, _)) => file
+                .write_all(&chunk[..take])
+                .map_err(|error| spool_error("write a spool file", &error))?,
+            None => self.memory.extend_from_slice(&chunk[..take]),
+        }
+        self.captured += take as u64;
+        Ok(())
+    }
+
+    /// Move the bytes kept so far into a spool file, which takes every later
+    /// write.
+    fn spill(&mut self) -> Result<(), HarnessError> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let path = self.root.join(format!(
+            "{}-{}-{stamp}.capture",
+            self.label,
+            std::process::id()
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| spool_error("create a spool file", &error))?;
+        // From here on the file is owned by its guard, so a failed write below
+        // still removes it.
+        let guard = SpoolFile { path };
+        file.write_all(&self.memory)
+            .map_err(|error| spool_error("write a spool file", &error))?;
+        self.memory = Vec::new();
+        self.file = Some((file, guard));
         Ok(())
     }
 
     pub(crate) fn finish(self) -> SpooledStream {
-        // The spool file is staging: it is read back immediately and then
-        // published through the store, which is what flushes and fsyncs the
-        // durable copy. Syncing here would only add latency per process call.
+        // The spool file is staging: it is read back once and then published
+        // through the store, which is what flushes and fsyncs the durable copy.
+        // Syncing here would only add latency per process call.
+        let body = match self.file {
+            Some((file, guard)) => {
+                drop(file);
+                SpoolBody::File(guard)
+            }
+            None => SpoolBody::Memory(self.memory),
+        };
         SpooledStream {
-            path: self.path,
+            body,
             captured: self.captured,
             seen: self.seen,
             truncated: self.truncated,
@@ -435,10 +488,52 @@ impl SpoolWriter {
     }
 }
 
-/// One finished stream: its bytes are on disk, its previews are in memory.
+/// A spool file that is removed when the last owner lets go of it.
+///
+/// Every caller of the process runner gets a capture, and most of them - the
+/// git tools, hooks, guard probes, quality gates - only read its previews and
+/// never publish it. Tying the file's life to a value instead of to the one
+/// caller that published it is what keeps the spool directory from filling up
+/// with files nobody will read again.
+#[derive(Debug)]
+pub(crate) struct SpoolFile {
+    path: PathBuf,
+}
+
+impl Drop for SpoolFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Where one finished stream's captured bytes are.
+#[derive(Debug)]
+pub(crate) enum SpoolBody {
+    Memory(Vec<u8>),
+    File(SpoolFile),
+}
+
+impl SpoolBody {
+    /// Append the captured bytes to `payload`.
+    fn append_to(&self, payload: &mut Vec<u8>) -> Result<(), HarnessError> {
+        match self {
+            Self::Memory(bytes) => {
+                payload.extend_from_slice(bytes);
+                Ok(())
+            }
+            Self::File(file) => File::open(&file.path)
+                .and_then(|mut input| input.read_to_end(payload))
+                .map(|_| ())
+                .map_err(|error| spool_error("read a spool file", &error)),
+        }
+    }
+}
+
+/// One finished stream: its captured bytes in memory or on disk, its previews
+/// in memory.
 #[derive(Debug)]
 pub(crate) struct SpooledStream {
-    pub(crate) path: PathBuf,
+    pub(crate) body: SpoolBody,
     pub(crate) captured: u64,
     /// Bytes the stream produced, captured or not.
     pub(crate) seen: u64,
@@ -447,16 +542,24 @@ pub(crate) struct SpooledStream {
     pub(crate) tail: StreamTail,
 }
 
-/// The published shape of a capture: bytes on disk, previews in memory.
+/// The finished shape of a capture: what the artifact will hold, and the
+/// previews in memory.
+///
+/// The artifact bytes are only assembled when a caller publishes them
+/// ([`FinalizedCapture::payload`]): the callers that never publish do not pay
+/// for a copy, a hash, or a file of their own. The streams' storage is shared,
+/// so a clone of a result does not remove a spool file another clone still
+/// needs.
 #[derive(Clone, Debug)]
 pub(crate) struct FinalizedCapture {
-    pub(crate) path: PathBuf,
+    header: CaptureHeader,
+    streams: std::sync::Arc<(SpoolBody, SpoolBody)>,
+    /// Length of the artifact [`Self::payload`] assembles.
     pub(crate) bytes: u64,
-    pub(crate) hash: ContentHash,
     pub(crate) truncated: bool,
+    tail_preview_bytes: usize,
     pub(crate) stdout_head: String,
     pub(crate) stderr_head: String,
-    pub(crate) tail: String,
     /// Whether each preview is shorter than the stream it previews. This is the
     /// model-facing meaning of "truncated"; the header written into the artifact
     /// says whether the *capture* stopped at the quota, which is a different
@@ -467,15 +570,48 @@ pub(crate) struct FinalizedCapture {
     pub(crate) stderr_tail: StreamTail,
 }
 
-/// Assemble `header + stdout + stderr` into the artifact payload.
+impl FinalizedCapture {
+    /// Assemble `header + stdout + stderr`: exactly the bytes to publish.
+    ///
+    /// The capture quota bounds both sections, so this is at most twice the
+    /// quota plus one header line - the same bytes a publisher has to hand the
+    /// store anyway, now read once instead of copied, re-read to hash, and
+    /// re-read again to publish.
+    pub(crate) fn payload(&self) -> Result<Vec<u8>, HarnessError> {
+        let line = header_line(&self.header);
+        let mut payload = Vec::with_capacity(usize::try_from(self.bytes).unwrap_or(line.len()));
+        payload.extend_from_slice(line.as_bytes());
+        self.streams.0.append_to(&mut payload)?;
+        self.streams.1.append_to(&mut payload)?;
+        if payload.len() as u64 != self.bytes {
+            // A spool file changed under the host between the run and the
+            // publish. Publishing it would make the receipt describe bytes the
+            // header does not frame.
+            return Err(HarnessError::new(
+                ErrorCode::ArtifactWriteFailed,
+                "the spooled capture changed before it was published",
+            ));
+        }
+        Ok(payload)
+    }
+
+    /// The last bytes of an assembled payload, as lossy text: the tail preview
+    /// a receipt carries, taken from the bytes a reader will get back.
+    pub(crate) fn tail_of(&self, payload: &[u8]) -> String {
+        let start = payload.len().saturating_sub(self.tail_preview_bytes);
+        String::from_utf8_lossy(&payload[start..]).into_owned()
+    }
+}
+
+/// Frame both streams as one capture.
 ///
-/// Both streams are copied through the redactor in chunks, so the only memory
-/// this uses is the copy buffer plus the bounded previews.
+/// Nothing is copied here: the bytes stay where the streams left them until a
+/// caller publishes the capture.
 pub(crate) fn finalize_capture(
     stdout: SpooledStream,
     stderr: SpooledStream,
     limits: SpoolLimits,
-) -> Result<FinalizedCapture, HarnessError> {
+) -> FinalizedCapture {
     let header = CaptureHeader {
         schema_version: CAPTURE_HEADER_VERSION,
         stdout_bytes: stdout.captured,
@@ -484,78 +620,64 @@ pub(crate) fn finalize_capture(
         stderr_truncated: stderr.truncated,
         quota_bytes: limits.max_capture_bytes,
     };
-    let line = header_line(&header);
-    let path = stdout.path.with_extension("artifact");
-    let mut payload =
-        File::create(&path).map_err(|error| spool_error("create a capture", &error))?;
-    payload
-        .write_all(line.as_bytes())
-        .map_err(|error| spool_error("write a capture header", &error))?;
-    copy_into(&stdout.path, &mut payload)?;
-    copy_into(&stderr.path, &mut payload)?;
-    payload
-        .flush()
-        .map_err(|error| spool_error("flush a capture", &error))?;
-    drop(payload);
-    let bytes = std::fs::metadata(&path)
-        .map_err(|error| spool_error("measure a capture", &error))?
-        .len();
-    // Hash exactly the bytes that will be published, streaming, so the digest a
-    // receipt carries is the digest of the artifact a reader will get back.
-    let mut reader = File::open(&path).map_err(|error| spool_error("read a capture", &error))?;
-    let hash = ContentHash::from_reader(&mut reader)
-        .map_err(|error| spool_error("hash a capture", &error))?;
-    let tail = read_tail(&path, limits.tail_preview_bytes)?;
-    let stdout_preview_truncated = stdout.seen > stdout.head.len() as u64;
-    let stderr_preview_truncated = stderr.seen > stderr.head.len() as u64;
-    let _ = std::fs::remove_file(&stdout.path);
-    let _ = std::fs::remove_file(&stderr.path);
-    Ok(FinalizedCapture {
-        path,
+    let bytes = header.header_len() + stdout.captured + stderr.captured;
+    FinalizedCapture {
+        header,
         bytes,
-        hash,
         truncated: stdout.truncated || stderr.truncated,
+        tail_preview_bytes: limits.tail_preview_bytes,
+        stdout_preview_truncated: stdout.seen > stdout.head.len() as u64,
+        stderr_preview_truncated: stderr.seen > stderr.head.len() as u64,
         stdout_head: stdout.head,
         stderr_head: stderr.head,
-        tail,
-        stdout_preview_truncated,
-        stderr_preview_truncated,
         stdout_tail: stdout.tail,
         stderr_tail: stderr.tail,
-    })
-}
-
-fn copy_into(source: &Path, payload: &mut File) -> Result<(), HarnessError> {
-    let mut input = File::open(source).map_err(|error| spool_error("read a spool file", &error))?;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = input
-            .read(&mut buffer)
-            .map_err(|error| spool_error("read a spool file", &error))?;
-        if read == 0 {
-            break;
-        }
-        payload
-            .write_all(&buffer[..read])
-            .map_err(|error| spool_error("write a capture", &error))?;
+        streams: std::sync::Arc::new((stdout.body, stderr.body)),
     }
-    Ok(())
 }
 
-/// The last `limit` bytes of a file, as lossy text.
-pub(crate) fn read_tail(path: &Path, limit: usize) -> Result<String, HarnessError> {
-    let mut file = File::open(path).map_err(|error| spool_error("read a capture", &error))?;
-    let length = file
-        .metadata()
-        .map_err(|error| spool_error("measure a capture", &error))?
-        .len();
-    let start = length.saturating_sub(limit as u64);
-    file.seek(SeekFrom::Start(start))
-        .map_err(|error| spool_error("seek a capture", &error))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|error| spool_error("read a capture tail", &error))?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+/// Remove what earlier hosts left in a spool directory, once per process.
+///
+/// Hosts before 0.2.4 copied every capture into a `.artifact` file that only
+/// the published-process path removed, so a git tool, a hook or a guard probe
+/// left one behind each run - thousands in a busy temp directory. Only those
+/// files are swept, and only once they are an hour old: a `.capture` file may
+/// belong to a long command another host is running right now, and an hour is
+/// far past the moment an older host reads its `.artifact` back.
+fn sweep_stale_spool_files(root: &Path) {
+    static SWEPT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if SWEPT.set(()).is_err() {
+        return;
+    }
+    let root = root.to_owned();
+    // A directory with thousands of files takes a while to list; no call
+    // waits for it.
+    let _ = std::thread::Builder::new()
+        .name("ha-spool-sweep".to_owned())
+        .spawn(move || {
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                return;
+            };
+            let cutoff = std::time::Duration::from_hours(1);
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_none_or(|extension| extension != "artifact")
+                {
+                    continue;
+                }
+                let stale = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > cutoff);
+                if stale {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        });
 }
 
 fn spool_error(action: &str, error: &std::io::Error) -> HarnessError {
@@ -612,6 +734,69 @@ mod tests {
         );
         assert_eq!(tail.total_lines, 3001);
         assert_eq!(tail.total_bytes, 3 * chunk.len() as u64 + 4);
+    }
+
+    fn spool_entries(root: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(root)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default()
+    }
+
+    fn spooled(root: &Path, label: &str, chunks: &[&[u8]]) -> SpooledStream {
+        let mut writer =
+            SpoolWriter::create(root, SpoolLimits::default(), label).expect("spool writer");
+        for chunk in chunks {
+            writer.write(chunk).expect("spooled write");
+        }
+        writer.finish()
+    }
+
+    #[test]
+    fn a_small_capture_never_touches_the_spool_directory() {
+        let root = tempfile::tempdir().expect("spool root");
+        let capture = finalize_capture(
+            spooled(root.path(), "stdout", &[b"## main\n"]),
+            spooled(root.path(), "stderr", &[]),
+            SpoolLimits::default(),
+        );
+        assert!(spool_entries(root.path()).is_empty());
+        let payload = capture.payload().expect("payload");
+        assert_eq!(payload.len() as u64, capture.bytes);
+        let header = parse_capture_header(&payload).expect("header");
+        let start = usize::try_from(header.stdout_offset()).unwrap();
+        assert_eq!(&payload[start..], b"## main\n");
+    }
+
+    #[test]
+    fn a_large_capture_spills_and_its_file_goes_with_the_last_owner() {
+        let root = tempfile::tempdir().expect("spool root");
+        let big = vec![b'x'; SPILL_THRESHOLD_BYTES + 10];
+        let capture = finalize_capture(
+            spooled(root.path(), "stdout", &[b"head ", &big]),
+            spooled(root.path(), "stderr", &[b"warning\n"]),
+            SpoolLimits::default(),
+        );
+        assert_eq!(spool_entries(root.path()).len(), 1, "only stdout spilled");
+        let payload = capture.payload().expect("payload");
+        let header = parse_capture_header(&payload).expect("header");
+        assert_eq!(header.stdout_bytes, 5 + big.len() as u64);
+        let stderr = usize::try_from(header.stderr_offset()).unwrap();
+        assert_eq!(&payload[stderr..], b"warning\n");
+        assert_eq!(
+            capture.tail_of(&payload),
+            String::from_utf8_lossy(&payload[payload.len() - DEFAULT_TAIL_PREVIEW_BYTES..])
+        );
+        // A clone shares the file; only the last owner removes it. No `.artifact`
+        // copy is ever made, whoever the caller is.
+        let clone = capture.clone();
+        drop(capture);
+        assert_eq!(spool_entries(root.path()).len(), 1);
+        drop(clone);
+        assert!(
+            spool_entries(root.path()).is_empty(),
+            "{:?}",
+            spool_entries(root.path())
+        );
     }
 
     #[test]

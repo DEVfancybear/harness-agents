@@ -783,6 +783,10 @@ impl TurnDriver {
                 .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
         }
         let started = Instant::now();
+        // A streamed read starts its work before the stream ends (see
+        // `crate::prefetch`); the gate still runs it, in order, afterwards.
+        let prefetcher =
+            crate::prefetch::StreamPrefetcher::new(&options.workspace_root, self.tools.hashline());
         let session_id = request.session_id.clone();
         let task_id = request.task_id.clone();
         let input_id = request.input_id.clone();
@@ -833,13 +837,17 @@ impl TurnDriver {
                         source,
                         request.clone(),
                         cancellation.clone(),
-                        sink_for(&observer),
+                        sink_with(&observer, prefetcher.clone()),
                     )
                     .await
             }
             None => {
                 self.runtime
-                    .run_streaming(request.clone(), cancellation.clone(), sink_for(&observer))
+                    .run_streaming(
+                        request.clone(),
+                        cancellation.clone(),
+                        sink_with(&observer, prefetcher.clone()),
+                    )
                     .await
             }
         };
@@ -1026,7 +1034,7 @@ impl TurnDriver {
                                     request.clone(),
                                     transcript.clone(),
                                     cancellation.clone(),
-                                    Some(sink_for(&observer)),
+                                    Some(sink_with(&observer, prefetcher.clone())),
                                 )
                                 .await
                                 .map_err(|error| {
@@ -1069,7 +1077,7 @@ impl TurnDriver {
                             request.clone(),
                             transcript.clone(),
                             cancellation.clone(),
-                            Some(sink_for(&observer)),
+                            Some(sink_with(&observer, prefetcher.clone())),
                         )
                         .await
                         .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
@@ -1118,7 +1126,7 @@ impl TurnDriver {
                             request.clone(),
                             transcript.clone(),
                             cancellation.clone(),
-                            Some(sink_for(&observer)),
+                            Some(sink_with(&observer, prefetcher.clone())),
                         )
                         .await
                         .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
@@ -1233,14 +1241,17 @@ impl TurnDriver {
                 )
                 .with_reasoning(result.reasoning.clone()),
             );
-            // prime-agent's `executeToolCalls`: a batch runs its calls side by side
-            // unless one of them must run alone. Gates, approvals and intents go
-            // one at a time in call order; the side effects run concurrently on the
-            // runtime's worker threads; receipts and results are committed in call
-            // order, so the journal and the transcript read as if run in sequence.
-            let parallel = result.tool_calls.len() > 1
-                && !result.tool_calls.iter().any(|call| runs_alone(&call.name));
+            // prime-agent's `executeToolCalls`, by segment: the calls between two
+            // calls that must run alone run side by side, and a call that must run
+            // alone runs after everything before it and before everything after
+            // it - as Codex's read/write lock orders them. A write no longer makes
+            // its whole batch sequential: the reads before it still run together,
+            // and so do the reads after it, which then see what it wrote. Gates,
+            // approvals and intents go one at a time in call order; results reach
+            // the model in call order, so the transcript reads as if run in
+            // sequence.
             let mut slots: Vec<(String, String, Slot)> = Vec::new();
+            let mut announced = HashSet::new();
             // What the tool hooks of this batch answered, by transcript id: text
             // for the model under each result, and a stop for the turn.
             let mut hook_notes: std::collections::HashMap<String, crate::HookResponse> =
@@ -1275,13 +1286,13 @@ impl TurnDriver {
                 // with its primitive coercion (`"50"` for an integer is 50), and a
                 // failure names every problem and echoes what was sent.
                 if let Some(schema) = parameters_schema(&request.tool_schemas, &name) {
-                    let sent: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
-                    match crate::validation::validate_tool_arguments(&name, schema, &sent) {
-                        Ok(coerced) => {
-                            if coerced != sent {
-                                call.arguments = coerced.to_string();
-                            }
-                        }
+                    match crate::validation::validate_tool_arguments_json(
+                        &name,
+                        schema,
+                        &call.arguments,
+                    ) {
+                        Ok(None) => {}
+                        Ok(Some(coerced)) => call.arguments = coerced.to_string(),
                         Err(message) => {
                             slots.push((
                                 name.clone(),
@@ -1291,6 +1302,17 @@ impl TurnDriver {
                             continue;
                         }
                     }
+                }
+                if runs_alone(&name) {
+                    run_ready_slots(
+                        &self.tools,
+                        &mut slots,
+                        &observer,
+                        &cancellation,
+                        &mut hook_notes,
+                        &mut announced,
+                    )
+                    .await?;
                 }
                 if name == "ask_user" {
                     for notice in self
@@ -1358,6 +1380,86 @@ impl TurnDriver {
                         }
                     }
                 }
+                // `read_file` with `paths`: one call, several files. Each file
+                // crosses the gate as its own read, with its own intent and
+                // receipt; they run side by side and come back as one result.
+                if name == "read_file"
+                    && let Some((paths, offset, limit)) = read_paths(&call.arguments)
+                {
+                    let mut parts: Vec<Option<Result<ToolExecutionView, HarnessError>>> =
+                        Vec::new();
+                    let mut ready_parts = Vec::new();
+                    for path in paths {
+                        let request = ToolRequest::new(
+                            result.session_id.clone(),
+                            result.task_id.clone(),
+                            options.actor_id.clone(),
+                            options.workspace_root.clone(),
+                            CodingToolAction::ReadFile {
+                                path,
+                                offset,
+                                limit,
+                            },
+                        );
+                        let request = if call.call_id.trim().is_empty() {
+                            request
+                        } else {
+                            request.with_call_id(call.call_id.clone())
+                        };
+                        match gate_action(
+                            &self.tools,
+                            request,
+                            &options,
+                            tool_calls,
+                            &observer,
+                            &cancellation,
+                            hook_notes.entry(transcript_id.clone()).or_default(),
+                        )
+                        .await
+                        {
+                            Ok(Gated::Done(done)) => parts.push(Some(done)),
+                            Ok(Gated::Ready(ready)) => {
+                                ready_parts.push((parts.len(), ready));
+                                parts.push(None);
+                            }
+                            Err(error) => parts.push(Some(Err(error))),
+                        }
+                    }
+                    let mut running = tokio::task::JoinSet::new();
+                    for (position, ready) in ready_parts {
+                        let tools = self.tools.clone();
+                        let cancellation = cancellation.clone();
+                        running.spawn(async move {
+                            let outcome = tools.run_begun(&ready.begun, cancellation).await;
+                            (position, ready, outcome)
+                        });
+                    }
+                    while let Some(joined) = running.join_next().await {
+                        let (position, ready, outcome) = joined.map_err(|error| {
+                            HarnessError::new(
+                                ErrorCode::ProviderProtocol,
+                                format!("a tool task stopped unexpectedly: {error}"),
+                            )
+                        })?;
+                        parts[position] = Some(
+                            complete_action(
+                                &self.tools,
+                                ready,
+                                outcome,
+                                &observer,
+                                &cancellation,
+                                hook_notes.entry(transcript_id.clone()).or_default(),
+                            )
+                            .await,
+                        );
+                    }
+                    slots.push((
+                        name,
+                        transcript_id,
+                        Slot::Many(parts.into_iter().flatten().collect()),
+                    ));
+                    continue;
+                }
                 let gated = match self.resolve_action(&call) {
                     Ok(action) => {
                         let request = ToolRequest::new(
@@ -1389,8 +1491,10 @@ impl TurnDriver {
                     Err(error) => Err(error),
                 };
                 let slot = match gated {
-                    Ok(Gated::Done(done)) => Slot::Done(done),
-                    Ok(Gated::Ready(ready)) if parallel => Slot::Ready(ready),
+                    Ok(Gated::Ready(ready)) if !runs_alone(&name) => Slot::Ready(ready),
+                    // A call that ran alone is settled and shown as soon as it is
+                    // done, as a segment's calls are: what comes after it in the
+                    // batch has not run yet.
                     Ok(Gated::Ready(ready)) => {
                         let outcome = crate::process::TOOL_PROGRESS
                             .scope(
@@ -1398,71 +1502,44 @@ impl TurnDriver {
                                 self.tools.run_begun(&ready.begun, cancellation.clone()),
                             )
                             .await;
-                        Slot::Done(
-                            complete_action(
-                                &self.tools,
-                                ready,
-                                outcome,
-                                &observer,
-                                &cancellation,
-                                hook_notes.entry(transcript_id.clone()).or_default(),
-                            )
-                            .await,
+                        let done = complete_action(
+                            &self.tools,
+                            ready,
+                            outcome,
+                            &observer,
+                            &cancellation,
+                            hook_notes.entry(transcript_id.clone()).or_default(),
                         )
+                        .await;
+                        announce_settled(&observer, &name, &transcript_id, &done);
+                        announced.insert(slots.len());
+                        Slot::Done(done)
                     }
-                    Err(error) => Slot::Done(Err(error)),
+                    Ok(Gated::Done(done)) => {
+                        announce_settled(&observer, &name, &transcript_id, &done);
+                        announced.insert(slots.len());
+                        Slot::Done(done)
+                    }
+                    Err(error) => {
+                        let done = Err(error);
+                        announce_settled(&observer, &name, &transcript_id, &done);
+                        announced.insert(slots.len());
+                        Slot::Done(done)
+                    }
                 };
                 slots.push((name, transcript_id, slot));
             }
 
-            // The side effects of a parallel batch, each on its own task.
-            let mut running = tokio::task::JoinSet::new();
-            let slot_names = slots
-                .iter()
-                .map(|(name, transcript_id, _)| (name.clone(), transcript_id.clone()))
-                .collect::<Vec<_>>();
-            for (index, (_, _, slot)) in slots.iter_mut().enumerate() {
-                if let Slot::Ready(_) = slot {
-                    let Slot::Ready(ready) = std::mem::replace(slot, Slot::Taken) else {
-                        continue;
-                    };
-                    let tools = self.tools.clone();
-                    let cancellation = cancellation.clone();
-                    let sink = progress_sink(&observer, &slot_names[index].0, &slot_names[index].1);
-                    running.spawn(async move {
-                        let outcome = crate::process::TOOL_PROGRESS
-                            .scope(sink, tools.run_begun(&ready.begun, cancellation))
-                            .await;
-                        (index, ready, outcome)
-                    });
-                }
-            }
-            // pa-agent's `tool_execution_end` in completion order: a call that
-            // finished is settled and shown as soon as it is done, not after the
-            // slowest call of the batch. The results still reach the model in
-            // call order, below.
-            let mut announced = HashSet::new();
-            while let Some(joined) = running.join_next().await {
-                let (index, ready, outcome) = joined.map_err(|error| {
-                    HarnessError::new(
-                        ErrorCode::ProviderProtocol,
-                        format!("a tool task stopped unexpectedly: {error}"),
-                    )
-                })?;
-                let (name, transcript_id, _) = &slots[index];
-                let done = complete_action(
-                    &self.tools,
-                    ready,
-                    outcome,
-                    &observer,
-                    &cancellation,
-                    hook_notes.entry(transcript_id.clone()).or_default(),
-                )
-                .await;
-                announce_settled(&observer, name, transcript_id, &done);
-                announced.insert(index);
-                slots[index].2 = Slot::Done(done);
-            }
+            // The last segment's side effects.
+            run_ready_slots(
+                &self.tools,
+                &mut slots,
+                &observer,
+                &cancellation,
+                &mut hook_notes,
+                &mut announced,
+            )
+            .await?;
 
             // Results in call order.
             for (index, (name, transcript_id, slot)) in slots.into_iter().enumerate() {
@@ -1540,6 +1617,44 @@ impl TurnDriver {
                         });
                         appended.push(ProviderMessage::tool_result(transcript_id, text));
                     }
+                    Slot::Many(parts) => {
+                        let mut texts = Vec::new();
+                        let mut failures = Vec::new();
+                        for part in parts {
+                            match part {
+                                Ok(view) => {
+                                    self.remember_hash(&view.output);
+                                    if let Some(detail) = failure_detail(&view.output) {
+                                        failures.push(detail);
+                                    }
+                                    texts.push(render_tool_output(&name, &view.output));
+                                    executions.push(view);
+                                }
+                                Err(error) => {
+                                    failures.push(error.to_string());
+                                    texts.push(format!("tool {name} failed: {error}"));
+                                }
+                            }
+                        }
+                        let rendered = texts.join("\n\n");
+                        observer.observe(TurnProgress::ToolOutput {
+                            name: name.clone(),
+                            call_id: transcript_id.clone(),
+                            text: rendered.clone(),
+                        });
+                        observer.observe(TurnProgress::ToolSettled {
+                            name: name.clone(),
+                            call_id: transcript_id.clone(),
+                            ok: failures.is_empty(),
+                            detail: (!failures.is_empty()).then(|| failures.join("; ")),
+                        });
+                        let note = hook_notes.get(&transcript_id);
+                        let rendered = match note.and_then(crate::HookResponse::context_text) {
+                            Some(context) => format!("{rendered}\n\nHook feedback:\n{context}"),
+                            None => rendered,
+                        };
+                        appended.push(ProviderMessage::tool_result(transcript_id, rendered));
+                    }
                     Slot::Ready(_) | Slot::Taken => {}
                 }
             }
@@ -1606,7 +1721,7 @@ impl TurnDriver {
                     request.clone(),
                     transcript.clone(),
                     cancellation.clone(),
-                    Some(sink_for(&observer)),
+                    Some(sink_with(&observer, prefetcher.clone())),
                 )
                 .await
                 .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
@@ -2022,6 +2137,60 @@ async fn complete_action(
     execution
 }
 
+/// Run the side effects of every gated call waiting in `slots`, each on its
+/// own task, and settle them in completion order (pa-agent's
+/// `tool_execution_end`): a call that finished is shown as soon as it is done,
+/// not after the slowest call of its segment. The results still reach the
+/// model in call order.
+async fn run_ready_slots(
+    tools: &ToolExecutionService,
+    slots: &mut [(String, String, Slot)],
+    observer: &Arc<dyn TurnObserver>,
+    cancellation: &CancellationToken,
+    hook_notes: &mut std::collections::HashMap<String, crate::HookResponse>,
+    announced: &mut HashSet<usize>,
+) -> Result<(), HarnessError> {
+    let mut running = tokio::task::JoinSet::new();
+    for (index, (name, transcript_id, slot)) in slots.iter_mut().enumerate() {
+        if let Slot::Ready(_) = slot {
+            let Slot::Ready(ready) = std::mem::replace(slot, Slot::Taken) else {
+                continue;
+            };
+            let tools = tools.clone();
+            let cancellation = cancellation.clone();
+            let sink = progress_sink(observer, name, transcript_id);
+            running.spawn(async move {
+                let outcome = crate::process::TOOL_PROGRESS
+                    .scope(sink, tools.run_begun(&ready.begun, cancellation))
+                    .await;
+                (index, ready, outcome)
+            });
+        }
+    }
+    while let Some(joined) = running.join_next().await {
+        let (index, ready, outcome) = joined.map_err(|error| {
+            HarnessError::new(
+                ErrorCode::ProviderProtocol,
+                format!("a tool task stopped unexpectedly: {error}"),
+            )
+        })?;
+        let (name, transcript_id, _) = &slots[index];
+        let done = complete_action(
+            tools,
+            ready,
+            outcome,
+            observer,
+            cancellation,
+            hook_notes.entry(transcript_id.clone()).or_default(),
+        )
+        .await;
+        announce_settled(observer, name, transcript_id, &done);
+        announced.insert(index);
+        slots[index].2 = Slot::Done(done);
+    }
+    Ok(())
+}
+
 /// One call of a batch on its way to a result.
 #[allow(
     clippy::large_enum_variant,
@@ -2033,8 +2202,41 @@ enum Slot {
     /// `ask_user` answered through the question host: the text the model gets.
     Answered(String),
     Done(Result<ToolExecutionView, HarnessError>),
+    /// A `read_file` call with `paths`: one result per file, shown as one.
+    Many(Vec<Result<ToolExecutionView, HarnessError>>),
     Ready(Box<ReadyAction>),
     Taken,
+}
+
+/// The files of a `read_file` call that names `paths` (and `path`, first,
+/// when it names both), with the range they share; `None` for a call that
+/// names one file.
+fn read_paths(arguments: &str) -> Option<(Vec<String>, Option<u64>, Option<u32>)> {
+    let value: Value = serde_json::from_str(arguments).ok()?;
+    let listed = value.get("paths")?.as_array()?;
+    let mut paths = value
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .into_iter()
+        .collect::<Vec<_>>();
+    for path in listed {
+        let path = path.as_str()?.to_owned();
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() || paths.len() > crate::contracts::READ_FILE_MAX_PATHS {
+        return None;
+    }
+    let offset = value.get("offset").and_then(Value::as_u64);
+    let limit = value
+        .get("limit")
+        .and_then(Value::as_u64)
+        .and_then(|limit| u32::try_from(limit).ok())
+        .map(|limit| limit.clamp(1, crate::contracts::READ_FILE_MAX_LINES));
+    Some((paths, offset, limit))
 }
 
 /// Whether a batch holding this call runs one call at a time, as prime-agent runs
@@ -2157,6 +2359,14 @@ async fn run_post_tool_hooks(
     cancellation: &CancellationToken,
 ) -> crate::HookResponse {
     let name = prepared.final_action.kind().as_str();
+    // No hook to read it: skip rendering the result and the input again.
+    if !tools.has_tool_hooks("post_tool_use", name) {
+        let mut answer = crate::HookResponse::default();
+        answer
+            .host_context
+            .extend(tools.result_context(&prepared.final_action));
+        return answer;
+    }
     let mut payload = crate::service::tool_hook_payload(prepared, "post_tool_use");
     payload["tool_response"] = Value::String(render_tool_output(name, &view.output));
     let payload =
@@ -2361,7 +2571,15 @@ impl UsageHold {
     }
 }
 
+#[cfg(test)]
 fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
+    sink_with(observer, None)
+}
+
+fn sink_with(
+    observer: &Arc<dyn TurnObserver>,
+    prefetcher: Option<Arc<crate::prefetch::StreamPrefetcher>>,
+) -> ProviderEventSink {
     let observer = Arc::clone(observer);
     // Every attempt of one model call opens with `Started`; a second one means
     // the runtime is retrying, and the deltas that follow repeat the answer.
@@ -2375,7 +2593,14 @@ fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
     // attempt that is retried passes on what it reported before it ends.
     let usage = std::sync::Mutex::new(UsageHold::default());
     Arc::new(move |event: ProviderStreamEvent| match event {
-        ProviderStreamEvent::ToolCallDelta { call_id, name, .. } => {
+        ProviderStreamEvent::ToolCallDelta {
+            call_id,
+            name,
+            arguments,
+        } => {
+            if let Some(prefetcher) = &prefetcher {
+                prefetcher.delta(&call_id, &name, &arguments);
+            }
             let first = streaming_call.lock().is_ok_and(|mut current| {
                 if *current == call_id {
                     false
@@ -2393,10 +2618,16 @@ fn sink_for(observer: &Arc<dyn TurnObserver>) -> ProviderEventSink {
                 observer.observe(held);
             }
             if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                if let Some(prefetcher) = &prefetcher {
+                    prefetcher.restart();
+                }
                 observer.observe(TurnProgress::StreamRestarted);
             }
         }
         ProviderStreamEvent::Completed { .. } => {
+            if let Some(prefetcher) = &prefetcher {
+                prefetcher.finish();
+            }
             if let Some(held) = usage.lock().ok().and_then(|mut hold| hold.complete()) {
                 observer.observe(held);
             }
@@ -2613,7 +2844,9 @@ fn malformed_call(call: &NormalizedToolCall) -> Option<&'static str> {
     if call.name.trim().is_empty() {
         return Some("the function name is missing");
     }
-    if serde_json::from_str::<serde_json::Value>(&call.arguments).is_err() {
+    // Checked without building the value: the arguments are parsed for real
+    // later, and a large write's content need not be copied into a tree here.
+    if serde_json::from_str::<serde::de::IgnoredAny>(&call.arguments).is_err() {
         return Some("the arguments are not complete JSON");
     }
     None
@@ -2665,22 +2898,41 @@ pub(crate) fn render_tool_output(name: &str, output: &ToolOutput) -> String {
                     "\n\n[Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read_file to see full lines.]"
                 );
             }
+            // ripgrep's shape: `path:LINE:COL: text` for a match, and
+            // `path-LINE- text` for the context lines asked for around it, so
+            // the model reads them here instead of opening the file again.
+            let with_context = matches.iter().any(|hit| !hit.context.is_empty());
             let hits = matches
                 .iter()
                 .map(|hit| {
-                    format!(
-                        "{}:{}:{}: {}",
+                    let location = hit.anchor.clone().unwrap_or_else(|| hit.line.to_string());
+                    let found = format!(
+                        "{}:{location}:{}: {}",
                         hit.path,
-                        hit.line,
                         hit.column,
-                        hit.preview.trim()
-                    )
+                        hit.preview.trim_end()
+                    );
+                    if hit.context.is_empty() {
+                        return found;
+                    }
+                    let mut numbers = (hit.context_start..).filter(|line| *line != hit.line);
+                    let mut before = Vec::new();
+                    let mut after = Vec::new();
+                    for text in &hit.context {
+                        let number = numbers.next().unwrap_or_default();
+                        let line = format!("{}-{number}- {}", hit.path, text.trim_end());
+                        if number < hit.line {
+                            before.push(line);
+                        } else {
+                            after.push(line);
+                        }
+                    }
+                    before.push(found);
+                    before.extend(after);
+                    before.join("\n")
                 })
                 .collect::<Vec<_>>()
-                .join(
-                    "
-",
-                );
+                .join(if with_context { "\n--\n" } else { "\n" });
             format!(
                 "search_text{}: {} match(es){}{hits}{notices}",
                 if *truncated { " (truncated)" } else { "" },
@@ -2947,7 +3199,8 @@ fn truncate_text(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tool_output_render_tests {
     use super::{
-        StreamTail, TruncationLimits, render_stream_tail, render_tool_output, split_process_limits,
+        StreamTail, TruncationLimits, read_paths, render_stream_tail, render_tool_output,
+        split_process_limits,
     };
     use crate::{ToolOutput, contracts::SearchMatch};
     use harness_types::ContentHash;
@@ -3095,6 +3348,46 @@ mod tool_output_render_tests {
     }
 
     #[test]
+    fn read_file_with_paths_names_each_file_once() {
+        let (paths, offset, limit) =
+            read_paths(r#"{"path":"a.rs","paths":["b.rs","a.rs","c.rs"],"offset":5,"limit":900}"#)
+                .expect("paths");
+        assert_eq!(paths, ["a.rs", "b.rs", "c.rs"]);
+        assert_eq!(offset, Some(5));
+        assert_eq!(limit, Some(crate::contracts::READ_FILE_MAX_LINES));
+        assert!(
+            read_paths(r#"{"path":"a.rs"}"#).is_none(),
+            "one file is a plain read"
+        );
+        let many = (0..=crate::contracts::READ_FILE_MAX_PATHS)
+            .map(|n| format!("\"f{n}.rs\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(read_paths(&format!(r#"{{"paths":[{many}]}}"#)).is_none());
+    }
+
+    #[test]
+    fn search_context_is_shown_around_its_match() {
+        let output = ToolOutput::SearchText {
+            matches: vec![SearchMatch {
+                path: "a.rs".to_owned(),
+                line: 10,
+                column: 5,
+                preview: "    let hit = 1;".to_owned(),
+                context: vec!["fn main() {".to_owned(), "}".to_owned()],
+                context_start: 9,
+                anchor: None,
+            }],
+            truncated: false,
+        };
+        let rendered = render_tool_output("search_text", &output);
+        assert!(
+            rendered.contains("a.rs-9- fn main() {\na.rs:10:5:     let hit = 1;\na.rs-11- }"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn a_cut_search_says_so_and_how_to_see_full_lines() {
         let output = ToolOutput::SearchText {
             matches: vec![SearchMatch {
@@ -3103,6 +3396,8 @@ mod tool_output_render_tests {
                 column: 1,
                 preview: "long... [truncated]".to_owned(),
                 context: Vec::new(),
+                context_start: 0,
+                anchor: None,
             }],
             truncated: true,
         };

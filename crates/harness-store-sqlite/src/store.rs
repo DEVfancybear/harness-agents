@@ -1514,6 +1514,50 @@ impl SqliteStore {
     /// disk but whose row was never committed is invisible to backup and to
     /// garbage collection.
     pub fn publish_artifact(&self, bytes: &[u8]) -> Result<PublishedArtifact, StoreError> {
+        self.publish_artifact_with(bytes, true)
+    }
+
+    /// Flush a published artifact's bytes to disk.
+    ///
+    /// A flush costs 70-80 ms on a Windows disk with antivirus scanning, more
+    /// than everything else a tool call does. [`Self::publish_artifact`]
+    /// flushes before it returns; a caller that has other work to do first
+    /// publishes with [`Self::publish_artifact_unsynced`] and flushes here, on
+    /// another thread, while that work runs.
+    pub fn sync_artifact(&self, artifact: &PublishedArtifact) -> Result<(), StoreError> {
+        let path = self.paths.data_dir.join(&artifact.relative_path);
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| {
+                StoreError::new(
+                    ErrorCode::ArtifactWriteFailed,
+                    format!("cannot flush artifact bytes: {error}"),
+                )
+            })
+    }
+
+    /// Publish an artifact without waiting for its bytes to reach the disk.
+    ///
+    /// The file is complete and in place when this returns, so every reader in
+    /// this or any later process finds it; only a power loss before the
+    /// operating system writes it back can lose it. That is the right trade
+    /// for evidence that can be produced again - what a read-only tool call
+    /// returned - and for an artifact the caller flushes with
+    /// [`Self::sync_artifact`] before it commits anything that depends on it.
+    pub fn publish_artifact_unsynced(&self, bytes: &[u8]) -> Result<PublishedArtifact, StoreError> {
+        self.publish_artifact_with(bytes, false)
+    }
+
+    /// Write the bytes to a temporary file and rename it into place, flushing
+    /// it first when `flush` is set, so the final name never holds a partial
+    /// file even after a power loss.
+    fn publish_artifact_with(
+        &self,
+        bytes: &[u8],
+        flush: bool,
+    ) -> Result<PublishedArtifact, StoreError> {
         self.fence()?;
         fs::create_dir_all(&self.paths.artifact_dir).map_err(|error| {
             StoreError::new(
@@ -1548,12 +1592,14 @@ impl SqliteStore {
                 format!("cannot write artifact bytes: {error}"),
             )
         })?;
-        file.sync_all().map_err(|error| {
-            StoreError::new(
-                ErrorCode::ArtifactWriteFailed,
-                format!("cannot flush artifact bytes: {error}"),
-            )
-        })?;
+        if flush {
+            file.sync_all().map_err(|error| {
+                StoreError::new(
+                    ErrorCode::ArtifactWriteFailed,
+                    format!("cannot flush artifact bytes: {error}"),
+                )
+            })?;
+        }
         drop(file);
         fs::rename(&temporary_path, &final_path).map_err(|error| {
             StoreError::new(
@@ -2297,28 +2343,50 @@ impl SqliteStore {
         // messages begin with the previous request's is stored as a reference to
         // it plus the messages it adds; `list_frozen_requests` puts it back
         // together and checks it against the hash of the whole request.
-        let messages = record
-            .request_json
-            .get("messages")
-            .and_then(Value::as_array)
-            .cloned();
-        let mut stored = record.request_json.clone();
-        if let (Some(messages), Ok(last)) = (&messages, self.last_frozen.lock())
-            && let Some(last) = last.as_ref()
-            && last.session_id == record.session_id.as_str()
-            && !last.messages.is_empty()
-            && last.messages.len() <= messages.len()
-            && messages[..last.messages.len()] == last.messages[..]
-        {
-            stored["messages"] = Value::Array(messages[last.messages.len()..].to_vec());
-            stored["delta_of"] = Value::String(last.request_id.clone());
-            stored["delta_prefix"] = Value::from(last.messages.len());
-        }
+        //
+        // The request is taken apart rather than copied: its messages are the
+        // whole transcript, and copying them once to remember and once more to
+        // store cost two transcripts per step before anything was written.
+        let mut stored = record.request_json;
+        let mut messages = stored
+            .get_mut("messages")
+            .and_then(Value::as_array_mut)
+            .map(std::mem::take);
+        let delta = match (&messages, self.last_frozen.lock()) {
+            (Some(messages), Ok(last)) => last
+                .as_ref()
+                .filter(|last| {
+                    last.session_id == record.session_id.as_str()
+                        && !last.messages.is_empty()
+                        && last.messages.len() <= messages.len()
+                        && messages[..last.messages.len()] == last.messages[..]
+                })
+                .map(|last| (last.request_id.clone(), last.messages.len())),
+            _ => None,
+        };
+        let stored_json = match (&messages, delta) {
+            (Some(all), Some((delta_of, prefix))) => {
+                stored["messages"] = Value::Array(all[prefix..].to_vec());
+                stored["delta_of"] = Value::String(delta_of);
+                stored["delta_prefix"] = Value::from(prefix);
+                to_json(&stored, "serialize frozen request")?
+            }
+            (Some(_), None) => {
+                stored["messages"] = Value::Array(messages.take().unwrap_or_default());
+                let json = to_json(&stored, "serialize frozen request")?;
+                messages = stored
+                    .get_mut("messages")
+                    .and_then(Value::as_array_mut)
+                    .map(std::mem::take);
+                json
+            }
+            (None, _) => to_json(&stored, "serialize frozen request")?,
+        };
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;
         let result = sqlx::query("INSERT INTO frozen_requests(request_id, packet_id, composition_snapshot_id, session_id, task_id, request_json, content_hash, provider_id, model, config_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(request_id) DO NOTHING")
             .bind(record.request_id.as_str()).bind(record.packet_id.as_str()).bind(record.composition_snapshot_id.as_ref().map(harness_types::CompositionSnapshotId::as_str)).bind(record.session_id.as_str()).bind(record.task_id.as_str())
-            .bind(to_json(&stored, "serialize frozen request")?).bind(record.content_hash.as_str()).bind(&record.provider_id).bind(&record.model).bind(to_i64(record.config_revision, "config revision")?)
+            .bind(stored_json).bind(record.content_hash.as_str()).bind(&record.provider_id).bind(&record.model).bind(to_i64(record.config_revision, "config revision")?)
             .execute(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "persist frozen request", error))?;
         if result.rows_affected() == 0 {
             let existing = sqlx::query_scalar::<_, String>(
@@ -2380,6 +2448,34 @@ impl SqliteStore {
         .transpose()
     }
 
+    /// The id of the last request a session froze, without rebuilding any
+    /// request: `list_frozen_requests` puts every delta-stored request back
+    /// together and checks its hash, which a caller after only the newest id
+    /// paid for every step of the session.
+    pub async fn latest_frozen_request_id(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<RequestId>, StoreError> {
+        let id = sqlx::query_scalar::<_, String>(
+            "SELECT request_id FROM frozen_requests WHERE session_id = ? ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(session_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(ErrorCode::StorageWriteFailed, "read latest request", error)
+        })?;
+        id.map(|id| {
+            RequestId::parse(id).map_err(|_| {
+                StoreError::new(
+                    ErrorCode::StorageWriteFailed,
+                    "stored request ID is invalid",
+                )
+            })
+        })
+        .transpose()
+    }
+
     pub async fn list_frozen_requests(
         &self,
         session_id: &SessionId,
@@ -2417,6 +2513,43 @@ impl SqliteStore {
         rows.into_iter()
             .map(|row| provider_attempt_from_row(&row))
             .collect()
+    }
+
+    /// What identifies the provider attempts a session holds so far - how many,
+    /// and the rowid and id of the newest - without reading their events; `None`
+    /// when it holds none.
+    ///
+    /// Attempts are only ever inserted, never updated or deleted, so an
+    /// unchanged mark means unchanged attempts: a reader that decoded them once
+    /// (the conversation replay decodes every earlier turn's attempts at every
+    /// follow-up turn) can keep what it decoded while the mark holds.
+    pub async fn provider_attempts_mark(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<(i64, i64, String)>, StoreError> {
+        let row = sqlx::query(
+            "SELECT rowid AS last_rowid, attempt_id,
+                (SELECT COUNT(*) FROM provider_attempts WHERE session_id = ?1) AS attempt_count
+             FROM provider_attempts WHERE session_id = ?1 ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(session_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "read provider attempts mark",
+                error,
+            )
+        })?;
+        row.map(|row| {
+            Ok((
+                row_get::<i64>(&row, "attempt_count")?,
+                row_get::<i64>(&row, "last_rowid")?,
+                row_get::<String>(&row, "attempt_id")?,
+            ))
+        })
+        .transpose()
     }
 
     pub async fn write_context_checkpoint_cas(
@@ -3131,6 +3264,19 @@ async fn ensure_runtime_schema(pool: &SqlitePool) -> Result<(), StoreError> {
         "CREATE TABLE IF NOT EXISTS frozen_requests (request_id TEXT PRIMARY KEY, packet_id TEXT NOT NULL, composition_snapshot_id TEXT, session_id TEXT NOT NULL, task_id TEXT NOT NULL, request_json TEXT NOT NULL, content_hash TEXT NOT NULL, provider_id TEXT NOT NULL, model TEXT NOT NULL, config_revision INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS provider_attempts (attempt_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, session_id TEXT NOT NULL, task_id TEXT NOT NULL, attempt_number INTEGER NOT NULL, state TEXT NOT NULL, events_json TEXT NOT NULL, response_hash TEXT, error TEXT)",
         "CREATE TABLE IF NOT EXISTS session_lineage (new_session_id TEXT PRIMARY KEY, source_session_id TEXT NOT NULL, task_id TEXT NOT NULL)",
+        // Every one of these tables is read by session - each step reads the
+        // newest checkpoint and admitted input, and every follow-up turn reads them
+        // and the provider attempts of every earlier turn - and without an index
+        // each read scanned the whole table, every session's rows. They are plain
+        // `IF NOT EXISTS` statements rather than a numbered slice: an index changes
+        // no row and no reader, so an older host opening a database this one
+        // indexed must not refuse it as "newer than it supports", and a database
+        // from before them is indexed the first time this host opens it.
+        "CREATE INDEX IF NOT EXISTS provider_attempts_by_session ON provider_attempts(session_id, attempt_number)",
+        "CREATE INDEX IF NOT EXISTS context_checkpoints_by_session ON context_checkpoints(session_id, revision)",
+        "CREATE INDEX IF NOT EXISTS context_packets_by_session ON context_packets(session_id)",
+        "CREATE INDEX IF NOT EXISTS frozen_requests_by_session ON frozen_requests(session_id)",
+        "CREATE INDEX IF NOT EXISTS inbox_by_session ON inbox(session_id, admitted_sequence)",
     ];
     for statement in statements {
         sqlx::query(statement)
@@ -5109,5 +5255,95 @@ mod g03_session_setting_tests {
             Some("next-model")
         );
         reopened.close().await.expect("close reopened store");
+    }
+}
+
+#[cfg(test)]
+mod per_session_index_tests {
+    use harness_types::{HostId, ProviderAttemptId, RequestId, SessionId, TaskId};
+    use serde_json::json;
+
+    use super::{SqliteStore, WriterOpenOptions};
+    use crate::ProviderAttemptRecord;
+
+    /// Every per-session read the runtime makes at each step and each follow-up
+    /// turn is answered from an index: none of them scans its table.
+    #[tokio::test]
+    async fn per_session_reads_use_an_index() {
+        let directory = tempfile::tempdir().expect("temporary store");
+        let store =
+            SqliteStore::open_writer(WriterOpenOptions::new(directory.path(), HostId::generate()))
+                .await
+                .expect("store migration");
+        let reads = [
+            "SELECT attempt_id FROM provider_attempts WHERE session_id = 'x' ORDER BY attempt_number",
+            "SELECT rowid, attempt_id, (SELECT COUNT(*) FROM provider_attempts WHERE session_id = 'x') FROM provider_attempts WHERE session_id = 'x' ORDER BY rowid DESC LIMIT 1",
+            "SELECT content_json FROM context_checkpoints WHERE session_id = 'x' ORDER BY revision DESC LIMIT 1",
+            "SELECT MAX(revision) FROM context_checkpoints WHERE session_id = 'x'",
+            "SELECT packet_json FROM context_packets WHERE session_id = 'x' ORDER BY rowid DESC LIMIT 1",
+            "SELECT provider_id FROM frozen_requests WHERE session_id = 'x' ORDER BY rowid DESC LIMIT 1",
+            "SELECT event_id FROM inbox WHERE session_id = 'x' ORDER BY admitted_sequence DESC LIMIT 1",
+            "SELECT COUNT(*) FROM inbox WHERE session_id = 'x'",
+            "SELECT COUNT(*) FROM run_steps WHERE run_id = 'x'",
+        ];
+        for read in reads {
+            let rows = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {read}")))
+                .fetch_all(&store.pool)
+                .await
+                .expect("query plan");
+            let details = rows
+                .iter()
+                .map(|row| super::row_get::<String>(row, "detail").expect("plan detail"))
+                .collect::<Vec<_>>();
+            assert!(
+                details.iter().all(|detail| !detail.starts_with("SCAN")),
+                "{read} scans its table: {details:?}"
+            );
+        }
+        store.close().await.expect("close store");
+    }
+
+    /// The attempts mark changes with every attempt a session gains and only
+    /// then, so a reader may keep what it decoded while the mark holds.
+    #[tokio::test]
+    async fn provider_attempts_mark_follows_appends() {
+        let directory = tempfile::tempdir().expect("temporary store");
+        let store =
+            SqliteStore::open_writer(WriterOpenOptions::new(directory.path(), HostId::generate()))
+                .await
+                .expect("store migration");
+        let session = SessionId::generate();
+        let other = SessionId::generate();
+        assert_eq!(store.provider_attempts_mark(&session).await.unwrap(), None);
+        let attempt = |session_id: &SessionId, attempt_number| ProviderAttemptRecord {
+            attempt_id: ProviderAttemptId::generate(),
+            request_id: RequestId::generate(),
+            session_id: session_id.clone(),
+            task_id: TaskId::generate(),
+            attempt_number,
+            state: "completed".to_owned(),
+            events: json!([]),
+            response_hash: None,
+            error: None,
+        };
+        let first = attempt(&session, 1);
+        let first_id = first.attempt_id.as_str().to_owned();
+        store.persist_provider_attempt(first).await.unwrap();
+        let mark = store.provider_attempts_mark(&session).await.unwrap();
+        assert!(matches!(&mark, Some((1, _, id)) if *id == first_id));
+        // Another session's attempt leaves this session's mark alone.
+        store
+            .persist_provider_attempt(attempt(&other, 1))
+            .await
+            .unwrap();
+        assert_eq!(store.provider_attempts_mark(&session).await.unwrap(), mark);
+        store
+            .persist_provider_attempt(attempt(&session, 2))
+            .await
+            .unwrap();
+        let next = store.provider_attempts_mark(&session).await.unwrap();
+        assert!(matches!(&next, Some((2, _, _))));
+        assert_ne!(next, mark);
+        store.close().await.expect("close store");
     }
 }

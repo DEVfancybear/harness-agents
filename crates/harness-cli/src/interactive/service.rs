@@ -27,8 +27,8 @@ use harness_store_sqlite::SqliteStore;
 use harness_tools::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CodingToolAction, IsolationMode,
     PolicyMode, ToolExecutionService, ToolOutput, ToolPatternRule, ToolPolicyRules, TurnDriver,
-    TurnLimits, TurnObserver, TurnOptions, TurnProgress, TurnStop, coding_tool_schemas,
-    execute_action_with_approval, observe_workspace, observed_file_hash, validate_tool_pattern,
+    TurnLimits, TurnObserver, TurnOptions, TurnProgress, TurnStop, execute_action_with_approval,
+    observe_workspace, observed_file_hash, validate_tool_pattern,
 };
 use harness_types::{
     ErrorCode, InputId, QuestionId, RequestId, SessionId, SourceAuthority, TaskId,
@@ -2211,6 +2211,8 @@ pub struct AgentSessionService {
     nested_instructions: Arc<Mutex<std::collections::BTreeSet<(String, PathBuf)>>>,
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
+    /// The MCP servers the last turn connected, kept for the next one.
+    mcp_pool: Arc<super::mcp::McpPool>,
     /// The session's delegated children and the store they share with its turns.
     agents: Arc<super::delegation::SessionAgents>,
     /// The `/btw` side thread of this conversation: its questions and answers.
@@ -3262,6 +3264,7 @@ impl AgentSessionService {
             nested_instructions: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             pending_mcp_elicitations: Arc::new(Mutex::new(HashMap::new())),
             mcp_status: Arc::new(Mutex::new(Vec::new())),
+            mcp_pool: Arc::default(),
             agents,
             side_thread: Arc::new(Mutex::new(Vec::new())),
             fork_plan: None,
@@ -3741,6 +3744,7 @@ impl SessionPort for AgentSessionService {
         let nested_instructions = Arc::clone(&self.nested_instructions);
         let pending_mcp_elicitations = Arc::clone(&self.pending_mcp_elicitations);
         let mcp_status = Arc::clone(&self.mcp_status);
+        let mcp_pool = Arc::clone(&self.mcp_pool);
         let agents = Arc::clone(&self.agents);
         let fork_plan = self.fork_plan.take();
         let branch_plan = self.branch_plan.take();
@@ -3788,6 +3792,7 @@ impl SessionPort for AgentSessionService {
                 nested_instructions,
                 pending_mcp_elicitations,
                 mcp_status,
+                mcp_pool,
                 agents,
                 fork_plan,
                 branch_plan,
@@ -6415,6 +6420,7 @@ async fn run_turn(
     nested_instructions: Arc<Mutex<std::collections::BTreeSet<(String, PathBuf)>>>,
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
+    mcp_pool: Arc<super::mcp::McpPool>,
     agents: Arc<super::delegation::SessionAgents>,
     fork_plan: Option<ForkPlan>,
     branch_plan: Option<super::branch_summary::BranchPlan>,
@@ -7120,11 +7126,15 @@ async fn run_turn(
         .keys()
         .any(|server| request.text.contains(&format!("@{server}:")));
     let active_mcp = if config.mcp_servers.is_empty() {
+        mcp_pool.release().await;
         if let Ok(mut status) = mcp_status.lock() {
             status.clear();
         }
         None
     } else if repl_available && !attaches_mcp_resource {
+        // The kernel starts the servers it uses; ones kept from an earlier
+        // native turn would run twice.
+        mcp_pool.release().await;
         if let Ok(mut status) = mcp_status.lock() {
             *status = config
                 .mcp_servers
@@ -7142,13 +7152,14 @@ async fn run_turn(
         let mcp_notice: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |message| {
             let _ = notice_sender.send(SessionEvent::Notice { message });
         });
-        match super::mcp::ActiveMcp::connect(
-            config.mcp_servers.clone(),
-            &workspace_root,
-            mcp_callback_factory,
-            mcp_notice,
-        )
-        .await
+        match mcp_pool
+            .take(
+                config.mcp_servers.clone(),
+                &workspace_root,
+                mcp_callback_factory,
+                mcp_notice,
+            )
+            .await
         {
             Ok(active) => {
                 let summary = active.summary();
@@ -7188,7 +7199,7 @@ async fn run_turn(
                 message: format!("tool permissions are invalid: {error}"),
             });
             if let Some(active) = active_mcp {
-                let _ = active.shutdown().await;
+                let _ = mcp_pool.finish(active, false).await;
             }
             if let Ok(store) = Arc::try_unwrap(store) {
                 let _ = store.close().await;
@@ -7212,6 +7223,9 @@ async fn run_turn(
     )
     .unwrap_or_else(|_| Arc::clone(&provider));
     // The depth children of this turn may spawn to, read for this conversation.
+    let hashline_rule =
+        super::config::HashlineRule::load(&config_file, environment.value("HA_HASHLINE"));
+    let hashline = hashline_rule.applies(&format!("{}/{}", config.provider_id, config.model));
     let (max_depth, depth_source) =
         resolve_rlm_max_depth(&store, &task_id, &config_file, &environment).await;
     agents.set_max_depth(max_depth, depth_source);
@@ -7248,6 +7262,7 @@ async fn run_turn(
             hooks: config.hooks.clone(),
             parent_policy: tool_policy.clone(),
             child_limits: limits,
+            hashline: hashline_rule.clone(),
             web: web_host
                 .as_ref()
                 .map(|host| (host.tools(), host.dispatcher())),
@@ -7386,6 +7401,7 @@ async fn run_turn(
         _ => None,
     };
     let mut tools = ToolExecutionService::new(Arc::clone(&store))
+        .with_hashline(hashline)
         .with_policy(tool_policy)
         .with_hooks(config.hooks.clone())
         .with_result_context(Arc::new(super::instructions::NestedInstructions::new(
@@ -7421,7 +7437,7 @@ async fn run_turn(
         Some(tools) => driver.with_external(tools.clone()),
         None => driver,
     };
-    let mut tool_schemas = coding_tool_schemas();
+    let mut tool_schemas = harness_tools::coding_tool_schemas_for(hashline);
     if let Some(tools) = &external_tools {
         tool_schemas.extend(tools.schemas());
     }
@@ -7452,6 +7468,17 @@ async fn run_turn(
     if let Some(notice) = repl.as_ref().and_then(|repl| repl.take_compaction_notice()) {
         request.text = format!("{notice}\n\n{}", request.text);
     }
+    // The turn's `git` reads - the prompt's facts and, on a session's first
+    // prompt, the startup brief - run off the async thread, overlapping the
+    // branch summary and the instruction loading below instead of blocking it.
+    let git_facts = {
+        let root = workspace_root.clone();
+        tokio::task::spawn_blocking(move || prompt_git_facts(&root))
+    };
+    let startup_brief = start_source.is_some().then(|| {
+        let root = workspace_root.clone();
+        tokio::task::spawn_blocking(move || super::lifecycle::startup_brief(&root))
+    });
     let mut prompt = format!(
         "{}{}",
         request.text,
@@ -7494,7 +7521,7 @@ async fn run_turn(
             message: format!("AGENTS.md: {} files", loaded_instructions.files.len()),
         });
     }
-    let (git_branch, changed_files) = prompt_git_facts(&workspace_root);
+    let (git_branch, changed_files) = git_facts.await.unwrap_or_default();
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let shell = if cfg!(windows) {
         "PowerShell".to_owned()
@@ -7615,8 +7642,8 @@ async fn run_turn(
         project_blocks.push(block);
     }
     // A session's first prompt starts from where the last one left the project.
-    if start_source.is_some()
-        && let Some(block) = super::lifecycle::startup_brief(&workspace_root)
+    if let Some(brief) = startup_brief
+        && let Ok(Some(block)) = brief.await
     {
         project_blocks.push(block);
     }
@@ -8027,8 +8054,11 @@ async fn run_turn(
     if let Some(active) = active_extensions {
         active.shutdown().await;
     }
+    // The MCP servers wait for the next turn unless this one failed or was
+    // canceled, when a call may still be running in them.
     if let Some(active) = active_mcp {
-        let reports = active.shutdown().await;
+        let keep = outcome.is_ok() && !cancellation.is_cancelled();
+        let reports = mcp_pool.finish(active, keep).await;
         for report in reports.into_iter().filter(|report| !report.drained) {
             send(SessionEvent::Notice {
                 message: format!(
@@ -9108,15 +9138,9 @@ fn shell_output(output: &ToolOutput) -> (String, bool) {
 }
 
 pub(super) fn prompt_git_facts(root: &Path) -> (Option<String>, Option<usize>) {
-    let branch = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(root)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|output| output.trim().to_owned())
-        .filter(|branch| !branch.is_empty());
+    // The branch comes from the repository's files (a `git` process only when
+    // they cannot say), which leaves one process per turn instead of two.
+    let branch = harness_tools::git_branch(root);
     let changed = Command::new("git")
         .args(["status", "--porcelain=v1", "--untracked-files=all"])
         .current_dir(root)

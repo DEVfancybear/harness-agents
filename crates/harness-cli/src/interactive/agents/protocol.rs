@@ -204,12 +204,19 @@ pub enum Reply {
     Frame {
         effects: Vec<Effect>,
         state: Option<Box<UiState>>,
+        /// The spinner's tick when nothing else in the view changed: a few
+        /// bytes instead of the whole state ten times a second.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tick: Option<u64>,
     },
     /// What one key produced.
     Ack {
         seq: u64,
         effects: Vec<Effect>,
         state: Option<Box<UiState>>,
+        /// As in [`Reply::Frame`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tick: Option<u64>,
     },
     /// This terminal is no longer the agent's.
     Detached {
@@ -286,6 +293,7 @@ mod tests {
                     message: "hi".to_owned(),
                 })],
                 state: None,
+                tick: None,
             },
         )
         .expect("written");
@@ -300,6 +308,24 @@ mod tests {
             Some(Reply::Frame { .. })
         ));
         assert!(read_line::<Reply>(&mut reader).expect("read").is_none());
+        // A tick-only frame is a few bytes; a frame without one (an older
+        // worker's) still reads.
+        let ticked = serde_json::to_string(&Reply::Frame {
+            effects: Vec::new(),
+            state: None,
+            tick: Some(7),
+        })
+        .expect("written");
+        assert!(ticked.len() < 64, "{ticked}");
+        assert!(matches!(
+            serde_json::from_str::<Reply>(&ticked).expect("read"),
+            Reply::Frame { tick: Some(7), .. }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Reply>(r#"{"type":"frame","effects":[],"state":null}"#)
+                .expect("read"),
+            Reply::Frame { tick: None, .. }
+        ));
         let send: Request =
             serde_json::from_str(r#"{"op":"send","agent":"a","text":"t"}"#).expect("parsed");
         assert!(matches!(

@@ -3835,6 +3835,89 @@ async fn g06_parallel_calls_settle_in_completion_order() {
     drop(provider);
     close(store).await;
 }
+/// A write splits its batch instead of serializing it: the calls before it run
+/// side by side (the fast one settles first), the write runs alone after them,
+/// and a read after the write sees what it wrote.
+#[tokio::test]
+async fn a_write_splits_its_batch_into_parallel_segments() {
+    let bench = bench();
+    let store = bench.open_store().await;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::tool_delta("c-slow", "slow_tool", "{}"),
+            ProviderStreamEvent::tool_delta("c-fast", "fast_tool", "{}"),
+            ProviderStreamEvent::tool_delta(
+                "c-write",
+                "write_file",
+                r#"{"path":"segment.txt","content":"written by the segment\n"}"#,
+            ),
+            ProviderStreamEvent::tool_delta("c-read", "read_file", r#"{"path":"segment.txt"}"#),
+            ProviderStreamEvent::completed("tool_calls"),
+        ],
+        vec![
+            ProviderStreamEvent::started(),
+            ProviderStreamEvent::text("done"),
+            ProviderStreamEvent::completed("stop"),
+        ],
+    ]));
+    let runtime = Arc::new(RuntimeService::new(
+        Arc::clone(&store),
+        provider.clone(),
+        RuntimeConfig::default(),
+    ));
+    let driver = TurnDriver::new(
+        Arc::clone(&runtime),
+        ToolExecutionService::new(Arc::clone(&store)).with_external(Arc::new(TimedTools)),
+    )
+    .with_external(harness_tools::ExternalTools::new(Arc::new(TimedTools)));
+    let mut schemas = coding_tool_schemas();
+    schemas.extend(harness_tools::ExternalToolCatalog::schemas(&TimedTools));
+    let request = RunRequest::new(
+        SessionId::generate(),
+        TaskId::generate(),
+        InputId::generate(),
+        "read, write, read",
+        observe_workspace(bench.project_id.clone(), &bench.workspace).expect("workspace"),
+    )
+    .with_tool_schemas(schemas);
+    let options = TurnOptions {
+        workspace_root: bench.workspace.clone(),
+        actor_id: "segments.test".to_owned(),
+        approvals: ApprovalMode::Auto,
+        limits: TurnLimits::default(),
+    };
+    let order = Arc::new(SettledOrder::default());
+    let outcome = driver
+        .run_turn(request, options, order.clone(), CancellationToken::new())
+        .await
+        .expect("turn succeeds");
+    assert_eq!(outcome.stop, TurnStop::Final);
+    assert_eq!(
+        *order.0.lock().expect("settled log"),
+        ["c-fast", "c-slow", "c-write", "c-read"],
+        "the calls before the write run together; the write and the read after it follow"
+    );
+    let results = provider.seen()[1]
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Tool)
+        .map(|message| message.content.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        results[0].contains("slow_tool done") && results[1].contains("fast_tool done"),
+        "results stay in call order: {results:?}"
+    );
+    assert!(
+        results[3].contains("written by the segment"),
+        "the read after the write sees it: {results:?}"
+    );
+    drop(driver);
+    drop(runtime);
+    drop(provider);
+    close(store).await;
+}
+
 #[derive(Default)]
 struct ProgressLog(Mutex<Vec<String>>);
 
