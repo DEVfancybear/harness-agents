@@ -180,6 +180,76 @@ fn process_execution_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+/// How many host-internal processes may run at once.
+const INTERNAL_PROCESS_PERMITS: usize = 4;
+
+fn internal_process_permits() -> &'static tokio::sync::Semaphore {
+    static PERMITS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    PERMITS.get_or_init(|| tokio::sync::Semaphore::new(INTERNAL_PROCESS_PERMITS))
+}
+
+/// Which queue a process waits in before it may start.
+///
+/// The model's own processes (`run_shell`, `run_process`, quality gates) share
+/// one host-wide permit: that queue is part of the tool contract (a call
+/// withdrawn while queued never runs, and the receipt says it queued). The
+/// processes the host starts for itself - the git read tools, the
+/// destructive-git guard's status probe, hooks - are short, bounded and
+/// side-effect free as far as the queue is concerned, and serializing them
+/// behind a model's thirty-second build made a parallel batch of git reads run
+/// one at a time. They take one of a few permits of their own instead.
+///
+/// The single permit was never what kept a Job Object safe: every child gets
+/// its own job and its own completion port (process-wrap creates both per
+/// spawn), so two children never read each other's completion messages, and
+/// std serializes the `CreateProcess` calls themselves so pipe handles are not
+/// inherited across children. What still must hold - one `wait` per child and
+/// no `try_wait` before it - is per child and unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessLane {
+    Exclusive,
+    Internal,
+}
+
+/// The permit a running process holds; released when the run ends.
+enum ProcessPermit {
+    Exclusive(
+        #[allow(dead_code, reason = "held for its drop")] tokio::sync::MutexGuard<'static, ()>,
+    ),
+    Internal(
+        #[allow(dead_code, reason = "held for its drop")] tokio::sync::SemaphorePermit<'static>,
+    ),
+}
+
+impl ProcessPermit {
+    /// The permit without waiting, if one is free.
+    fn try_acquire(lane: ProcessLane) -> Option<Self> {
+        match lane {
+            ProcessLane::Exclusive => process_execution_lock()
+                .try_lock()
+                .ok()
+                .map(Self::Exclusive),
+            ProcessLane::Internal => internal_process_permits()
+                .try_acquire()
+                .ok()
+                .map(Self::Internal),
+        }
+    }
+
+    /// Wait for the permit. `None` only if the semaphore were closed, which
+    /// this module never does.
+    async fn acquire(lane: ProcessLane) -> Option<Self> {
+        match lane {
+            ProcessLane::Exclusive => Some(Self::Exclusive(process_execution_lock().lock().await)),
+            ProcessLane::Internal => internal_process_permits()
+                .acquire()
+                .await
+                .ok()
+                .map(Self::Internal),
+        }
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessResult {
@@ -251,6 +321,7 @@ pub(crate) async fn run_structured_with_host(
         spool,
         host,
         None,
+        ProcessLane::Exclusive,
     )
     .await
 }
@@ -307,6 +378,7 @@ pub async fn run_hook_command_with_host(
         &spool,
         host,
         Some(input.to_vec()),
+        ProcessLane::Internal,
     )
     .await?;
     // A hook (a formatter, say) may have rewritten files.
@@ -412,6 +484,77 @@ pub(crate) async fn run_shell_with_host(
     spool: &ProcessSpoolConfig,
     host: &HostEnvironment,
 ) -> Result<ProcessResult, HarnessError> {
+    run_shell_in_lane(
+        root,
+        command,
+        timeout_ms,
+        cancellation,
+        environment,
+        spool,
+        host,
+        ProcessLane::Exclusive,
+    )
+    .await
+}
+
+/// A shell command the host runs for itself (the destructive-git guard's
+/// relocated status probe): it does not queue behind the model's processes.
+pub(crate) async fn run_internal_shell(
+    root: &Path,
+    command: &str,
+    timeout_ms: u64,
+    cancellation: CancellationToken,
+    spool: &ProcessSpoolConfig,
+) -> Result<ProcessResult, HarnessError> {
+    run_shell_in_lane(
+        root,
+        command,
+        timeout_ms,
+        cancellation,
+        &ProcessEnvironment::empty(),
+        spool,
+        &HostEnvironment::from_process(),
+        ProcessLane::Internal,
+    )
+    .await
+}
+
+/// A git command the host runs for itself - the git read tools, the guard's
+/// status probe, the receipts' commit and diff probes. Same scrubbed
+/// environment and bounds as any structured process, but in the internal lane.
+pub(crate) async fn run_internal_git(
+    root: &Path,
+    args: &[String],
+    timeout_ms: u64,
+    cancellation: CancellationToken,
+    spool: &ProcessSpoolConfig,
+) -> Result<ProcessResult, HarnessError> {
+    run(
+        root,
+        "git",
+        args,
+        timeout_ms,
+        cancellation,
+        &ProcessEnvironment::empty(),
+        spool,
+        &HostEnvironment::from_process(),
+        None,
+        ProcessLane::Internal,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_shell_in_lane(
+    root: &Path,
+    command: &str,
+    timeout_ms: u64,
+    cancellation: CancellationToken,
+    environment: &ProcessEnvironment,
+    spool: &ProcessSpoolConfig,
+    host: &HostEnvironment,
+    lane: ProcessLane,
+) -> Result<ProcessResult, HarnessError> {
     #[cfg(windows)]
     let (executable, shell) = windows_shell(host);
     #[cfg(windows)]
@@ -433,6 +576,7 @@ pub(crate) async fn run_shell_with_host(
         spool,
         host,
         None,
+        lane,
     )
     .await?;
     #[cfg(windows)]
@@ -448,12 +592,26 @@ pub(crate) async fn run_shell_with_host(
 
 #[cfg(windows)]
 fn windows_shell(host: &HostEnvironment) -> (String, String) {
-    if host.lookup("PATH").is_some_and(|path| {
-        path.split(';').any(|directory| {
+    // Probing means a stat per PATH directory - dozens on a developer machine,
+    // each one slow under antivirus - and the answer only changes with PATH, so
+    // it is remembered per PATH value. A snapshot with another PATH (a test's,
+    // say) is probed on its own.
+    static FOUND: OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+        OnceLock::new();
+    let path = host.lookup("PATH").unwrap_or_default();
+    let cache = FOUND.get_or_init(Default::default);
+    let cached = cache.lock().ok().and_then(|found| found.get(path).copied());
+    let has_pwsh = cached.unwrap_or_else(|| {
+        let found = path.split(';').any(|directory| {
             let directory = directory.trim_matches('"');
             Path::new(directory).join("pwsh.exe").is_file()
-        })
-    }) {
+        });
+        if let Ok(mut cache) = cache.lock() {
+            cache.insert(path.to_owned(), found);
+        }
+        found
+    });
+    if has_pwsh {
         ("pwsh".to_owned(), "powershell-7".to_owned())
     } else {
         (
@@ -521,6 +679,46 @@ mod windows_shell_tests {
     }
 }
 
+#[cfg(test)]
+mod spool_cleanup_tests {
+    use super::{HostEnvironment, run_structured_with_host};
+    use crate::{
+        capture::{ProcessSpoolConfig, SpoolLimits},
+        secrets::ProcessEnvironment,
+    };
+    use harness_providers::CancellationToken;
+
+    /// A git tool reads the previews and drops the result: before the fix every
+    /// such run left a `.artifact` copy in the spool directory for good.
+    #[tokio::test]
+    async fn a_git_run_leaves_nothing_in_the_spool_directory() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let spool_root = tempfile::tempdir().expect("spool root");
+        let spool = ProcessSpoolConfig::new(spool_root.path(), SpoolLimits::default());
+        let result = run_structured_with_host(
+            workspace.path(),
+            "git",
+            &["--version".to_owned()],
+            30_000,
+            CancellationToken::new(),
+            &ProcessEnvironment::empty(),
+            &spool,
+            &HostEnvironment::from_process(),
+        )
+        .await
+        .expect("git runs");
+        assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
+        assert!(result.stdout.contains("git version"));
+        drop(result);
+        let left: Vec<_> = std::fs::read_dir(spool_root.path())
+            .expect("spool root")
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert!(left.is_empty(), "spool files left behind: {left:?}");
+    }
+}
+
 /// Where a running tool's process output goes as it is written: pa-agent's
 /// `tool_execution_update`, which shows a long command's output while it runs.
 /// The turn driver sets it around a tool call; output is redacted first.
@@ -541,23 +739,30 @@ async fn run(
     spool: &ProcessSpoolConfig,
     host: &HostEnvironment,
     stdin: Option<Vec<u8>>,
+    lane: ProcessLane,
 ) -> Result<ProcessResult, HarnessError> {
-    // Windows Job Object completion ports are process-lifecycle resources. A
-    // single host-wide runner permit makes concurrent tool calls deterministic
-    // and prevents two cleanup waits from starving each other; it does not
-    // bypass the per-process tree ownership or output bounds.
+    // A single host-wide runner permit makes the model's concurrent tool calls
+    // deterministic; host-internal processes have a few permits of their own
+    // (see `ProcessLane`). Neither bypasses the per-process tree ownership or
+    // output bounds.
     //
     // The queue is cancellation-aware: a call withdrawn by its caller must not
     // start a process later, when the permit finally reaches it. The fast path
     // keeps the uncontended case free of a select branch.
-    let (guard, queued) = if let Ok(guard) = process_execution_lock().try_lock() {
+    let (guard, queued) = if let Some(guard) = ProcessPermit::try_acquire(lane) {
         (guard, false)
     } else {
         let guard = tokio::select! {
-            guard = process_execution_lock().lock() => guard,
+            guard = ProcessPermit::acquire(lane) => guard,
             () = cancellation.cancelled() => {
                 return Ok(canceled_before_spawn(executable, true));
             }
+        };
+        let Some(guard) = guard else {
+            return Err(HarnessError::new(
+                ErrorCode::ProcessOutcomeUnknown,
+                "the process permit queue was closed",
+            ));
         };
         (guard, true)
     };
@@ -710,10 +915,10 @@ async fn run(
     drop(child);
     let stdout = join_reader(stdout_reader).await?;
     let stderr = join_reader(stderr_reader).await?;
-    // A capture that cannot be assembled is a real failure, but the process has
-    // already run: the caller turns this into an outcome-unknown receipt rather
-    // than pretending no side effect happened.
-    let capture = finalize_capture(stdout, stderr, limits)?;
+    // Framing copies nothing: the bytes are only assembled by a caller that
+    // publishes them, and a capture that cannot be assembled then is still a
+    // real failure the caller turns into an outcome-unknown receipt.
+    let capture = finalize_capture(stdout, stderr, limits);
     Ok(ProcessResult {
         executable: executable.to_owned(),
         shell: None,

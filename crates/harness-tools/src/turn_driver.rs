@@ -1286,13 +1286,13 @@ impl TurnDriver {
                 // with its primitive coercion (`"50"` for an integer is 50), and a
                 // failure names every problem and echoes what was sent.
                 if let Some(schema) = parameters_schema(&request.tool_schemas, &name) {
-                    let sent: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
-                    match crate::validation::validate_tool_arguments(&name, schema, &sent) {
-                        Ok(coerced) => {
-                            if coerced != sent {
-                                call.arguments = coerced.to_string();
-                            }
-                        }
+                    match crate::validation::validate_tool_arguments_json(
+                        &name,
+                        schema,
+                        &call.arguments,
+                    ) {
+                        Ok(None) => {}
+                        Ok(Some(coerced)) => call.arguments = coerced.to_string(),
                         Err(message) => {
                             slots.push((
                                 name.clone(),
@@ -2359,6 +2359,14 @@ async fn run_post_tool_hooks(
     cancellation: &CancellationToken,
 ) -> crate::HookResponse {
     let name = prepared.final_action.kind().as_str();
+    // No hook to read it: skip rendering the result and the input again.
+    if !tools.has_tool_hooks("post_tool_use", name) {
+        let mut answer = crate::HookResponse::default();
+        answer
+            .host_context
+            .extend(tools.result_context(&prepared.final_action));
+        return answer;
+    }
     let mut payload = crate::service::tool_hook_payload(prepared, "post_tool_use");
     payload["tool_response"] = Value::String(render_tool_output(name, &view.output));
     let payload =
@@ -2836,7 +2844,9 @@ fn malformed_call(call: &NormalizedToolCall) -> Option<&'static str> {
     if call.name.trim().is_empty() {
         return Some("the function name is missing");
     }
-    if serde_json::from_str::<serde_json::Value>(&call.arguments).is_err() {
+    // Checked without building the value: the arguments are parsed for real
+    // later, and a large write's content need not be copied into a tree here.
+    if serde_json::from_str::<serde::de::IgnoredAny>(&call.arguments).is_err() {
         return Some("the arguments are not complete JSON");
     }
     None
