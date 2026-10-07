@@ -3119,7 +3119,9 @@ fn q08b_pty_tree_labels_and_summarizes_the_branch_it_leaves() {
     session.send("/tree\r");
     std::thread::sleep(Duration::from_millis(300));
     session.send("\r");
-    std::thread::sleep(Duration::from_millis(500));
+    // The tree is read from the store in the background: wait for it, with
+    // the cursor on the last of its four entries, before pressing Enter.
+    session.wait_for("(4/4)", Duration::from_secs(30));
     session.send("\r");
     session.wait_for("Already at this point", Duration::from_secs(30));
     session.send("/tree label 1 start-here\r");
