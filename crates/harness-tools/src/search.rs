@@ -365,7 +365,9 @@ fn scan_block(
                                     matchers,
                                     context_lines,
                                     anchors,
-                                    MAX_SEARCH_MATCHES,
+                                    // One past the bound: the extra match is
+                                    // what tells the merge the result was cut.
+                                    MAX_SEARCH_MATCHES + 1,
                                 )
                             });
                         local.push((slot, found));
