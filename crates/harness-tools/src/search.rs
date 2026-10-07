@@ -37,6 +37,8 @@ pub(crate) struct SearchQuery<'a> {
     pub case_insensitive: bool,
     pub glob: Option<&'a str>,
     pub context_lines: u32,
+    /// Hashline anchors on each match (`LINE#HASH`).
+    pub anchors: bool,
 }
 
 pub(crate) struct Found {
@@ -165,6 +167,8 @@ struct RawMatch {
     column: usize,
     preview: String,
     context: Vec<String>,
+    context_start: usize,
+    anchor: Option<String>,
 }
 
 /// Every match in one file, in line and column order, at most `cap` of them.
@@ -172,6 +176,7 @@ fn file_matches(
     text: &str,
     matchers: &Matchers,
     context_lines: usize,
+    anchors: bool,
     cap: usize,
 ) -> Vec<RawMatch> {
     let lines = Lines::new(text);
@@ -196,6 +201,8 @@ fn file_matches(
                 column: hit.start(),
                 preview: search_line(line),
                 context,
+                context_start: start + 1,
+                anchor: anchors.then(|| crate::edit_diff::line_anchor(index + 1, line)),
             });
         }
     };
@@ -266,7 +273,14 @@ pub(crate) fn search(
     let mut matches = Vec::new();
     let mut output_bytes = 0_usize;
     for chunk in candidates.chunks(block) {
-        let scanned = scan_block(&globbed, chunk, &matchers, context_lines, threads);
+        let scanned = scan_block(
+            &globbed,
+            chunk,
+            &matchers,
+            context_lines,
+            query.anchors,
+            threads,
+        );
         for (file_index, raw) in chunk.iter().zip(scanned) {
             if raw.is_empty() {
                 continue;
@@ -303,8 +317,14 @@ pub(crate) fn search(
                     path: path.clone(),
                     line: u64::try_from(hit.line.saturating_add(1)).unwrap_or(u64::MAX),
                     column: u64::try_from(hit.column.saturating_add(1)).unwrap_or(u64::MAX),
+                    context_start: if hit.context.is_empty() {
+                        0
+                    } else {
+                        u64::try_from(hit.context_start).unwrap_or(u64::MAX)
+                    },
                     preview: hit.preview,
                     context: hit.context,
+                    anchor: hit.anchor,
                 });
             }
         }
@@ -322,6 +342,7 @@ fn scan_block(
     chunk: &[usize],
     matchers: &Matchers,
     context_lines: usize,
+    anchors: bool,
     threads: usize,
 ) -> Vec<Vec<RawMatch>> {
     let next = AtomicUsize::new(0);
@@ -337,9 +358,15 @@ fn scan_block(
                         let Some(file_index) = chunk.get(slot) else {
                             break;
                         };
-                        let found = searchable_text(files[*file_index])
-                            .map_or_else(Vec::new, |text| {
-                                file_matches(&text, matchers, context_lines, MAX_SEARCH_MATCHES)
+                        let found =
+                            searchable_text(files[*file_index]).map_or_else(Vec::new, |text| {
+                                file_matches(
+                                    &text,
+                                    matchers,
+                                    context_lines,
+                                    anchors,
+                                    MAX_SEARCH_MATCHES,
+                                )
                             });
                         local.push((slot, found));
                     }
@@ -387,7 +414,7 @@ mod tests {
     fn agree(text: &str, query: &str, regex: bool, insensitive: bool) {
         let matchers = Matchers::new(query, regex, insensitive).expect("pattern");
         for context in [0, 2] {
-            let new = file_matches(text, &matchers, context, usize::MAX)
+            let new = file_matches(text, &matchers, context, false, usize::MAX)
                 .into_iter()
                 .map(|hit| (hit.line, hit.column, hit.context))
                 .collect::<Vec<_>>();

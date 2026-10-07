@@ -275,7 +275,7 @@ pub const fn coding_tool_names() -> &'static [&'static str] {
 /// schema check before it gets here.
 fn allowed_fields(name: &str) -> Option<&'static [&'static str]> {
     Some(match name {
-        "read_file" => &["path", "offset", "limit"],
+        "read_file" => &["path", "paths", "offset", "limit"],
         "list_files" | "git_diff" => &["path"],
         "search_text" => &[
             "query",
@@ -287,7 +287,7 @@ fn allowed_fields(name: &str) -> Option<&'static [&'static str]> {
         ],
         "apply_patch" => &["path", "expected_hash", "replacement"],
         "write_file" => &["path", "content", "expected_hash"],
-        "edit_file" => &["path", "old_string", "new_string", "replace_all"],
+        "edit_file" => &["path", "old_string", "new_string", "replace_all", "edits"],
         "glob" => &["pattern", "path"],
         "run_process" => &["executable", "args", "timeout_ms", "isolation", "env"],
         "run_shell" => &["command", "timeout_ms", "isolation", "env"],
@@ -306,7 +306,19 @@ fn allowed_fields(name: &str) -> Option<&'static [&'static str]> {
 /// typed execution gate and its policy/approval checks.
 #[must_use]
 pub fn coding_tool_schemas() -> Vec<Value> {
-    let mut schemas = workspace_tool_schemas();
+    coding_tool_schemas_for(false)
+}
+
+/// [`coding_tool_schemas`], with hashline editing on or off: with it on,
+/// `read_file` and `search_text` show each line as `LINE#HASH`, and an
+/// `edit_file` edit may name the lines it replaces by those anchors instead of
+/// quoting them (oh-my-pi's hashline edits). The service that runs the calls
+/// must agree: see `ToolExecutionService::with_hashline`. Off by default; most
+/// models edit best by quoting, and some (measured by oh-my-pi: Grok, Sonnet)
+/// best by anchors.
+#[must_use]
+pub fn coding_tool_schemas_for(hashline: bool) -> Vec<Value> {
+    let mut schemas = workspace_tool_schemas(hashline);
     schemas.extend(process_tool_schemas());
     schemas.extend(git_tool_schemas());
     schemas.extend(history_tool_schemas());
@@ -322,17 +334,42 @@ pub fn coding_tool_schemas() -> Vec<Value> {
     schemas
 }
 
-fn workspace_tool_schemas() -> Vec<Value> {
+/// Most files one `read_file` call may name in `paths`.
+pub const READ_FILE_MAX_PATHS: usize = 10;
+
+/// Most replacements one `edit_file` call may carry in `edits`.
+pub const EDIT_FILE_MAX_EDITS: usize = 50;
+
+fn edit_item_schema(hashline: bool) -> Value {
+    let mut properties = json!({
+        "old_string": string_schema(),
+        "new_string": string_schema(),
+        "replace_all": {"type": "boolean"}
+    });
+    if hashline {
+        properties["start"] = json!({"type": "string", "description": "LINE#HASH anchor of the first line to replace, as read_file shows it; instead of old_string."});
+        properties["end"] = json!({"type": "string", "description": "LINE#HASH anchor of the last line to replace; defaults to start."});
+    }
+    json!({"type": "object", "properties": properties, "required": ["new_string"]})
+}
+
+fn workspace_tool_schemas(hashline: bool) -> Vec<Value> {
+    let edit_description = if hashline {
+        "Replace text in one file. Give old_string and new_string for one replacement (old_string must be unique unless replace_all), or edits for several, applied in order and written together. An edit may name lines by the LINE#HASH anchors read_file and search_text show (start, optional end) instead of old_string; a changed line refuses the edit."
+    } else {
+        "Replace text in one file. Give old_string and new_string for one replacement (old_string must be unique unless replace_all), or edits for several, applied in order and written together; old_string is matched exactly, then ignoring trailing whitespace, quote and dash styles, then ignoring indentation."
+    };
     vec![
         function_schema(
             "read_file",
-            "Read bounded UTF-8 text. Optional offset is zero-based lines; a ranged read returns line numbers.",
+            "Read bounded UTF-8 text with line numbers. Optional offset is zero-based lines. Name several files at once with paths (offset and limit then apply to each).",
             json!({
                 "path": string_schema(),
+                "paths": {"type": "array", "items": string_schema(), "minItems": 1, "maxItems": READ_FILE_MAX_PATHS},
                 "offset": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": READ_FILE_MAX_LINES}
             }),
-            &["path"],
+            &[],
         ),
         function_schema(
             "list_files",
@@ -375,14 +412,15 @@ fn workspace_tool_schemas() -> Vec<Value> {
         ),
         function_schema(
             "edit_file",
-            "Replace one exact old_string occurrence; set replace_all only when every occurrence should change.",
+            edit_description,
             json!({
                 "path": string_schema(),
                 "old_string": string_schema(),
                 "new_string": string_schema(),
-                "replace_all": {"type": "boolean"}
+                "replace_all": {"type": "boolean"},
+                "edits": {"type": "array", "items": edit_item_schema(hashline), "minItems": 1, "maxItems": EDIT_FILE_MAX_EDITS}
             }),
-            &["path", "old_string", "new_string"],
+            &["path"],
         ),
         function_schema(
             "glob",
@@ -624,10 +662,16 @@ pub enum CodingToolAction {
     },
     EditFile {
         path: String,
+        #[serde(default)]
         old_string: String,
+        #[serde(default)]
         new_string: String,
         #[serde(default, skip_serializing_if = "is_false")]
         replace_all: bool,
+        /// More replacements, applied in order after the one above (when that
+        /// one is given) and written together with it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        edits: Vec<EditSpec>,
     },
     Glob {
         pattern: String,
@@ -862,12 +906,27 @@ impl CodingToolAction {
                     .map(ContentHash::parse)
                     .transpose()?,
             }),
-            "edit_file" => Ok(Self::EditFile {
-                path: required_string(object, "path")?,
-                old_string: required_string(object, "old_string")?,
-                new_string: required_string(object, "new_string")?,
-                replace_all: parse_optional_bool(object, "replace_all")?.unwrap_or(false),
-            }),
+            "edit_file" => {
+                let edits = parse_edits(object)?;
+                let (old_string, new_string) = if edits.is_empty() {
+                    (
+                        required_string(object, "old_string")?,
+                        required_string(object, "new_string")?,
+                    )
+                } else {
+                    (
+                        parse_optional_string(object, "old_string")?.unwrap_or_default(),
+                        parse_optional_string(object, "new_string")?.unwrap_or_default(),
+                    )
+                };
+                Ok(Self::EditFile {
+                    path: required_string(object, "path")?,
+                    old_string,
+                    new_string,
+                    replace_all: parse_optional_bool(object, "replace_all")?.unwrap_or(false),
+                    edits,
+                })
+            }
             "glob" => Ok(Self::Glob {
                 pattern: required_string(object, "pattern")?,
                 path: optional_path(object),
@@ -1092,6 +1151,95 @@ fn required_string(
 )]
 const fn is_false(value: &bool) -> bool {
     !*value
+}
+
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// One replacement of an `edit_file` call: text to find (`old_string`), or
+/// hashline anchors naming the lines to replace (`start`, `end`).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EditSpec {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub old_string: String,
+    pub new_string: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub replace_all: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+}
+
+impl CodingToolAction {
+    /// The replacements of an `edit_file` action, in order: the top-level
+    /// `old_string`/`new_string` first when given, then `edits`. Empty for
+    /// every other action.
+    #[must_use]
+    pub fn edit_specs(&self) -> Vec<EditSpec> {
+        let Self::EditFile {
+            old_string,
+            new_string,
+            replace_all,
+            edits,
+            ..
+        } = self
+        else {
+            return Vec::new();
+        };
+        let mut specs = Vec::with_capacity(edits.len() + 1);
+        if edits.is_empty() || !old_string.is_empty() {
+            specs.push(EditSpec {
+                old_string: old_string.clone(),
+                new_string: new_string.clone(),
+                replace_all: *replace_all,
+                start: None,
+                end: None,
+            });
+        }
+        specs.extend(edits.iter().cloned());
+        specs
+    }
+}
+
+/// `edits` of an `edit_file` call. A model that sends the array as a JSON
+/// string (prime-agent's `prepare_edit_arguments` meets it) is read the same.
+fn parse_edits(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Vec<EditSpec>, harness_types::HarnessError> {
+    let invalid = |reason: &str| {
+        harness_types::HarnessError::new(
+            harness_types::ErrorCode::InvalidPayload,
+            format!("edit_file edits {reason}"),
+        )
+    };
+    let value = match object.get("edits") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::String(text)) => {
+            serde_json::from_str::<Value>(text).map_err(|_| invalid("must be an array of edits"))?
+        }
+        Some(other) => other.clone(),
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| invalid("must be an array of edits"))?;
+    if items.len() > EDIT_FILE_MAX_EDITS {
+        return Err(invalid(&format!(
+            "may hold at most {EDIT_FILE_MAX_EDITS} edits"
+        )));
+    }
+    items
+        .iter()
+        .map(|item| {
+            let spec: EditSpec = serde_json::from_value(item.clone())
+                .map_err(|error| invalid(&format!("hold an invalid edit: {error}")))?;
+            if spec.old_string.is_empty() && spec.start.is_none() {
+                return Err(invalid("hold an edit with neither old_string nor start"));
+            }
+            Ok(spec)
+        })
+        .collect()
 }
 
 fn parse_optional_bool(
@@ -1605,6 +1753,13 @@ pub struct SearchMatch {
     pub preview: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<String>,
+    /// The line number of the first `context` line; the match line itself is
+    /// not among them.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub context_start: u64,
+    /// The line's `LINE#HASH` anchor when hashline editing is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
 }
 
 /// One journal hit as the model sees it. The preview is for orientation; the
@@ -1676,6 +1831,85 @@ mod search_context_tests {
                 "{bad}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod edit_file_parser_tests {
+    use super::{CodingToolAction, EditSpec};
+
+    #[test]
+    fn edit_file_takes_one_replacement_several_or_both() {
+        let one = CodingToolAction::from_provider_call(
+            "edit_file",
+            r#"{"path":"a.rs","old_string":"x","new_string":"y"}"#,
+        )
+        .expect("one");
+        assert_eq!(one.edit_specs().len(), 1);
+
+        let several = CodingToolAction::from_provider_call(
+            "edit_file",
+            r#"{"path":"a.rs","edits":[{"old_string":"a","new_string":"b"},{"start":"3#0f","new_string":"c"}]}"#,
+        )
+        .expect("several");
+        let specs = several.edit_specs();
+        assert_eq!(specs.len(), 2, "no empty top-level edit: {specs:?}");
+        assert_eq!(specs[1].start.as_deref(), Some("3#0f"));
+
+        // Sent as a JSON string, as some models send arrays.
+        let stringly = CodingToolAction::from_provider_call(
+            "edit_file",
+            r#"{"path":"a.rs","old_string":"x","new_string":"y","edits":"[{\"old_string\":\"a\",\"new_string\":\"b\"}]"}"#,
+        )
+        .expect("stringly");
+        assert_eq!(
+            stringly.edit_specs(),
+            vec![
+                EditSpec {
+                    old_string: "x".to_owned(),
+                    new_string: "y".to_owned(),
+                    replace_all: false,
+                    start: None,
+                    end: None,
+                },
+                EditSpec {
+                    old_string: "a".to_owned(),
+                    new_string: "b".to_owned(),
+                    replace_all: false,
+                    start: None,
+                    end: None,
+                },
+            ]
+        );
+
+        let neither = CodingToolAction::from_provider_call(
+            "edit_file",
+            r#"{"path":"a.rs","edits":[{"new_string":"b"}]}"#,
+        )
+        .expect_err("an edit with nothing to find");
+        assert!(
+            neither.to_string().contains("neither old_string nor start"),
+            "{neither}"
+        );
+        assert!(
+            CodingToolAction::from_provider_call("edit_file", r#"{"path":"a.rs"}"#).is_err(),
+            "no edit at all"
+        );
+    }
+
+    /// An action stored before `edits` existed hashes as it did: the field is
+    /// left out when empty.
+    #[test]
+    fn a_single_edit_serializes_as_before() {
+        let action = CodingToolAction::EditFile {
+            path: "a.rs".to_owned(),
+            old_string: "x".to_owned(),
+            new_string: "y".to_owned(),
+            replace_all: false,
+            edits: Vec::new(),
+        };
+        let value = action.canonical_value().expect("value");
+        assert!(value.get("edits").is_none(), "{value}");
     }
 }
 

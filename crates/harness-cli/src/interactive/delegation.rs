@@ -250,6 +250,8 @@ pub struct ChildLaunch {
     /// inherits its parent's tools: a research brief sent to an explorer without
     /// them could only be answered from the local files.
     pub web: Option<ChildWebTools>,
+    /// Which models edit by hashline anchors; a child's own model decides.
+    pub hashline: super::config::HashlineRule,
 }
 
 impl ChildLaunch {
@@ -3139,6 +3141,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 .unwrap_or((false, 1));
             // A verifier judges what it is shown; it does not hand the judging on.
             let can_spawn = can_spawn && request.brief.role != AgentRole::Verifier;
+            let hashline = launch.hashline.applies(&launch.model.reference);
             let spawn_line = if can_spawn {
                 " You can split your work with the delegate tool: it starts explorer children of your own, and you are not finished until they are - their results reach you as [child-exited ...] or [child-failed ...] messages."
             } else {
@@ -3148,7 +3151,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 AgentRole::Explorer => (
                     launch.workspace_root.clone(),
                     child_policy(&launch.parent_policy),
-                    coding_tool_schemas(),
+                    harness_tools::coding_tool_schemas_for(hashline),
                     format!(
                         "You are a child agent spawned by your parent agent. Task prompts are labeled `[task from parent]`.{} Use agent_message to tell your parent what you found when it helps before you finish.",
                         if can_spawn {
@@ -3189,7 +3192,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                     (
                         PathBuf::from(&worktree.path),
                         child_policy(&launch.parent_policy),
-                        coding_tool_schemas(),
+                        harness_tools::coding_tool_schemas_for(hashline),
                         format!(
                             "You are a delegated coder. Work only in the assigned isolated M8-03 worktree and follow the brief. Tool calls use the host approval and policy service. Leave your changes in that worktree and report what changed; do not claim the changes were merged into the user's checkout.{spawn_line}"
                         ),
@@ -3245,6 +3248,7 @@ impl WorkerBackend for InteractiveWorkerBackend {
                 spawn,
             });
             let tools = ToolExecutionService::new(Arc::clone(&store))
+                .with_hashline(hashline)
                 .with_policy(policy)
                 .with_hooks(launch.hooks.clone())
                 .with_external(Arc::clone(&child_tools) as Arc<dyn ExternalToolDispatcher>);
@@ -4088,6 +4092,7 @@ pub(super) mod tests {
                 .with_mode(harness_tools::PolicyMode::FullAuto),
             child_limits: harness_tools::TurnLimits::default(),
             web: None,
+            hashline: super::super::config::HashlineRule::Off,
         }
     }
 

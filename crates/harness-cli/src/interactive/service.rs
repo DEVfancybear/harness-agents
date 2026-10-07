@@ -27,8 +27,8 @@ use harness_store_sqlite::SqliteStore;
 use harness_tools::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, CodingToolAction, IsolationMode,
     PolicyMode, ToolExecutionService, ToolOutput, ToolPatternRule, ToolPolicyRules, TurnDriver,
-    TurnLimits, TurnObserver, TurnOptions, TurnProgress, TurnStop, coding_tool_schemas,
-    execute_action_with_approval, observe_workspace, observed_file_hash, validate_tool_pattern,
+    TurnLimits, TurnObserver, TurnOptions, TurnProgress, TurnStop, execute_action_with_approval,
+    observe_workspace, observed_file_hash, validate_tool_pattern,
 };
 use harness_types::{
     ErrorCode, InputId, QuestionId, RequestId, SessionId, SourceAuthority, TaskId,
@@ -7212,6 +7212,9 @@ async fn run_turn(
     )
     .unwrap_or_else(|_| Arc::clone(&provider));
     // The depth children of this turn may spawn to, read for this conversation.
+    let hashline_rule =
+        super::config::HashlineRule::load(&config_file, environment.value("HA_HASHLINE"));
+    let hashline = hashline_rule.applies(&format!("{}/{}", config.provider_id, config.model));
     let (max_depth, depth_source) =
         resolve_rlm_max_depth(&store, &task_id, &config_file, &environment).await;
     agents.set_max_depth(max_depth, depth_source);
@@ -7248,6 +7251,7 @@ async fn run_turn(
             hooks: config.hooks.clone(),
             parent_policy: tool_policy.clone(),
             child_limits: limits,
+            hashline: hashline_rule.clone(),
             web: web_host
                 .as_ref()
                 .map(|host| (host.tools(), host.dispatcher())),
@@ -7386,6 +7390,7 @@ async fn run_turn(
         _ => None,
     };
     let mut tools = ToolExecutionService::new(Arc::clone(&store))
+        .with_hashline(hashline)
         .with_policy(tool_policy)
         .with_hooks(config.hooks.clone())
         .with_result_context(Arc::new(super::instructions::NestedInstructions::new(
@@ -7421,7 +7426,7 @@ async fn run_turn(
         Some(tools) => driver.with_external(tools.clone()),
         None => driver,
     };
-    let mut tool_schemas = coding_tool_schemas();
+    let mut tool_schemas = harness_tools::coding_tool_schemas_for(hashline);
     if let Some(tools) = &external_tools {
         tool_schemas.extend(tools.schemas());
     }

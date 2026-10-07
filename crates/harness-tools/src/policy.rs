@@ -617,20 +617,35 @@ fn validate_action_shape(action: &CodingToolAction) -> Result<(), HarnessError> 
         CodingToolAction::Glob { pattern, .. } if pattern.trim().is_empty() => Err(
             HarnessError::new(ErrorCode::InvalidPayload, "glob pattern must not be empty"),
         ),
-        CodingToolAction::EditFile { old_string, .. } if old_string.is_empty() => {
+        CodingToolAction::EditFile {
+            old_string, edits, ..
+        } if old_string.is_empty() && edits.is_empty() => Err(HarnessError::new(
+            ErrorCode::InvalidPayload,
+            "edit_file old_string must not be empty",
+        )),
+        action @ CodingToolAction::EditFile { edits, .. }
+            if edits.len() > crate::contracts::EDIT_FILE_MAX_EDITS =>
+        {
+            let _ = action;
             Err(HarnessError::new(
                 ErrorCode::InvalidPayload,
-                "edit_file old_string must not be empty",
+                format!(
+                    "edit_file may carry at most {} edits",
+                    crate::contracts::EDIT_FILE_MAX_EDITS
+                ),
             ))
         }
-        CodingToolAction::EditFile {
-            old_string,
-            new_string,
-            ..
-        } if old_string.contains('\0') || new_string.contains('\0') => Err(HarnessError::new(
-            ErrorCode::BinaryContentDenied,
-            "edit_file text must not contain NUL",
-        )),
+        action @ CodingToolAction::EditFile { .. }
+            if action
+                .edit_specs()
+                .iter()
+                .any(|spec| spec.old_string.contains('\0') || spec.new_string.contains('\0')) =>
+        {
+            Err(HarnessError::new(
+                ErrorCode::BinaryContentDenied,
+                "edit_file text must not contain NUL",
+            ))
+        }
         CodingToolAction::WriteFile { content, .. }
             if content.contains('\0') || content.len() > 1024 * 1024 =>
         {

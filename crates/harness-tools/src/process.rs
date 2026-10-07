@@ -309,6 +309,8 @@ pub async fn run_hook_command_with_host(
         Some(input.to_vec()),
     )
     .await?;
+    // A hook (a formatter, say) may have rewritten files.
+    crate::walk::note_change();
     Ok(HookProcessResult {
         exit_code: result.exit_code,
         status: if result.timed_out {
@@ -344,6 +346,7 @@ pub async fn run_user_command(
         &ProcessSpoolConfig::default(),
     )
     .await?;
+    crate::walk::note_change();
     Ok(HookProcessResult {
         exit_code: result.exit_code,
         status: if result.timed_out {

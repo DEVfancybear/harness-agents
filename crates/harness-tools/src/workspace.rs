@@ -16,8 +16,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{
+    contracts::EditSpec,
     contracts::{SearchMatch, observation},
-    edit_diff::{PlannedEdit, plan_edit},
+    edit_diff::{PlannedEdit, plan_edits},
     truncate::{TruncatedBy, TruncationLimits, format_size, truncate_head},
     walk::{TOOL_WALK_DEADLINE, Walk, WalkFile, cached_walk, note_change, relative_text},
 };
@@ -732,8 +733,28 @@ pub(crate) fn search_text(
     case_insensitive: bool,
     glob: Option<&str>,
     context_lines: u32,
+    anchors: bool,
 ) -> Result<SearchOutput, HarnessError> {
     validate_search(query, use_regex, case_insensitive)?;
+    // A search the stream prefetched, or the same search made again, while
+    // nothing changed: the result it would compute now.
+    let key = crate::prefetch::search_key(
+        root,
+        &[
+            &query,
+            &requested,
+            &use_regex,
+            &case_insensitive,
+            &glob,
+            &context_lines,
+            &anchors,
+        ],
+    );
+    if let Some(kept) = crate::prefetch::kept_search(&key) {
+        return Ok(kept);
+    }
+    let stamp = crate::walk::generation();
+    let watched = crate::walk::ensure_watched(root);
     let walk = tool_walk(root, requested, "search_text")?;
     let found = crate::search::search(
         root,
@@ -744,12 +765,15 @@ pub(crate) fn search_text(
             case_insensitive,
             glob,
             context_lines,
+            anchors,
         },
     )?;
-    Ok(SearchOutput {
+    let output = SearchOutput {
         matches: found.matches,
         truncated: found.truncated || !walk.complete,
-    })
+    };
+    crate::prefetch::keep_search(key, &output, stamp, watched);
+    Ok(output)
 }
 
 /// Read a numbered line range, cut to the shared output limits.
@@ -763,7 +787,7 @@ pub(crate) fn read_file_range(
     offset: u64,
     limit: u32,
 ) -> Result<TextOutput, HarnessError> {
-    Ok(numbered_range(&read_text(path)?, offset, limit))
+    Ok(numbered_range(&read_text(path)?, offset, limit, false))
 }
 
 /// Read a file once and return its numbered range together with the hash of
@@ -773,22 +797,36 @@ pub(crate) fn read_file_range_with_hash(
     path: &Path,
     offset: u64,
     limit: u32,
+    anchors: bool,
 ) -> Result<(TextOutput, ContentHash), HarnessError> {
     let text = read_text(path)?;
     let hash = ContentHash::from_bytes(text.as_bytes());
-    Ok((numbered_range(&text, offset, limit), hash))
+    Ok((numbered_range(&text, offset, limit, anchors), hash))
 }
 
-fn numbered_range(text: &str, offset: u64, limit: u32) -> TextOutput {
+fn numbered_range(text: &str, offset: u64, limit: u32, anchors: bool) -> TextOutput {
     let lines = text.lines().collect::<Vec<_>>();
     let total = lines.len();
     let start = usize::try_from(offset).unwrap_or(usize::MAX).min(total);
     let count = usize::try_from(limit).unwrap_or(usize::MAX);
     let end = start.saturating_add(count).min(total);
+    // With hashline editing on, each line carries the anchor an edit names it
+    // by (`12#a3: text`).
     let numbered = lines[start..end]
         .iter()
         .enumerate()
-        .map(|(index, line)| format!("{}: {}", start + index + 1, redact_text(line)))
+        .map(|(index, line)| {
+            let number = start + index + 1;
+            if anchors {
+                format!(
+                    "{}: {}",
+                    crate::edit_diff::line_anchor(number, line),
+                    redact_text(line)
+                )
+            } else {
+                format!("{number}: {}", redact_text(line))
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let limits = TruncationLimits::default();
@@ -982,30 +1020,27 @@ fn write_text_checked_locked(
 pub(crate) fn edit_text(
     path: &Path,
     display_path: &str,
-    old_string: &str,
-    new_string: &str,
-    replace_all: bool,
+    edits: &[EditSpec],
 ) -> Result<(WorkspaceMutation, String), HarnessError> {
     let _guard = lock_file_mutation(path);
     let current = read_text(path)?;
-    let planned = plan_edit_text(&current, old_string, new_string, replace_all, display_path)?;
+    let planned = plan_edit_text(&current, edits, display_path)?;
     let expected = ContentHash::from_bytes(current.as_bytes());
     let mut mutation = write_text_checked_locked(path, Some(&expected), &planned.content)?;
     mutation.replacements = planned.replacements;
     Ok((mutation, planned.diff))
 }
 
-/// Plan an `edit_file` replacement of `current` without writing it: exact
-/// match first, then prime-agent's normalized match (see [`crate::edit_diff`]).
-/// `display_path` only names the file in an error.
+/// Plan the replacements of an `edit_file` call on `current` without writing
+/// them: exact match first, then prime-agent's normalized match, then by
+/// whole lines with indentation set aside, or by hashline anchors (see
+/// [`crate::edit_diff`]). `display_path` only names the file in an error.
 pub(crate) fn plan_edit_text(
     current: &str,
-    old_string: &str,
-    new_string: &str,
-    replace_all: bool,
+    edits: &[EditSpec],
     display_path: &str,
 ) -> Result<PlannedEdit, HarnessError> {
-    plan_edit(current, old_string, new_string, replace_all, display_path)
+    plan_edits(current, edits, display_path)
 }
 
 pub(crate) fn redact_text(text: &str) -> String {
@@ -1634,7 +1669,8 @@ mod tests {
         )
         .expect("file");
         let root = fs::canonicalize(directory.path()).expect("root");
-        let output = search_text(&root, "needle", None, false, false, None, 0).expect("search");
+        let output =
+            search_text(&root, "needle", None, false, false, None, 0, false).expect("search");
         assert_eq!(output.matches.len(), 1);
         let preview = &output.matches[0].preview;
         assert!(preview.ends_with("... [truncated]"), "{preview}");
@@ -1644,10 +1680,20 @@ mod tests {
         );
     }
 
+    fn spec(old: &str, new: &str) -> EditSpec {
+        EditSpec {
+            old_string: old.to_owned(),
+            new_string: new.to_owned(),
+            replace_all: false,
+            start: None,
+            end: None,
+        }
+    }
+
     #[test]
     fn edits_of_a_crlf_file_keep_its_line_endings_and_return_the_diff() {
         let (_directory, path) = scratch_file("one\r\ntwo\r\n");
-        let (mutation, diff) = edit_text(&path, "f.txt", "two\n", "2\n", false).expect("edit");
+        let (mutation, diff) = edit_text(&path, "f.txt", &[spec("two\n", "2\n")]).expect("edit");
         assert_eq!(mutation.replacements, 1);
         assert_eq!(fs::read_to_string(&path).expect("read"), "one\r\n2\r\n");
         assert_eq!(diff, [" 1 one", "-2 two", "+2 2"].join("\n"));
@@ -1673,9 +1719,7 @@ mod tests {
                     edit_text(
                         path,
                         "f.txt",
-                        &format!("line {n}\n"),
-                        &format!("edited {n}\n"),
-                        false,
+                        &[spec(&format!("line {n}\n"), &format!("edited {n}\n"))],
                     )
                     .expect("every edit lands");
                 });

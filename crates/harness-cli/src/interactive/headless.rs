@@ -20,7 +20,7 @@ use harness_runtime::{
 use harness_store_sqlite::{SqliteStore, StoreError, WriterOpenOptions};
 use harness_tools::{
     ApprovalMode, ToolExecutionService, ToolOutput, TurnDriver, TurnObserver, TurnOptions,
-    TurnOutcome, TurnProgress, coding_tool_schemas, observe_workspace,
+    TurnOutcome, TurnProgress, observe_workspace,
 };
 use harness_types::{
     AcceptanceCommand, AcceptanceRecord, BudgetId, ContentHash, CriterionEvidence, CriterionState,
@@ -551,7 +551,16 @@ pub async fn run_with(
     // The web tools, as the app has them: a scripted run that is asked about
     // current events can search and read pages too. `HA_WEB=off` removes them.
     let web_host = super::web::WebHost::from_environment(environment, &context.paths.data_dir);
+    let hashline = super::config::HashlineRule::load(
+        &context.paths.config_file,
+        environment.value("HA_HASHLINE"),
+    )
+    .applies(&format!(
+        "{}/{}",
+        resolved_config.provider.id, resolved_config.provider.model
+    ));
     let mut tools = ToolExecutionService::new(Arc::clone(&store))
+        .with_hashline(hashline)
         .with_policy(tool_policy)
         .with_hooks(resolved_config.hooks.clone());
     if let Some(dispatcher) = super::mcp::combined_dispatcher_with_delegate(
@@ -605,7 +614,7 @@ pub async fn run_with(
     };
     // The durable steering/cancel inbox shares this turn's store.
     let driver = driver.with_inbox(RunInbox::new(Arc::clone(&store)));
-    let mut tool_schemas = coding_tool_schemas();
+    let mut tool_schemas = harness_tools::coding_tool_schemas_for(hashline);
     if let Some(external) = &external_tools {
         tool_schemas.extend(external.schemas());
     }

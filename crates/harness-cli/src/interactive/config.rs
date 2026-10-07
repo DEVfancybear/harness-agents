@@ -175,6 +175,49 @@ pub fn settings_path(user_path: &Path) -> PathBuf {
     user_path.with_file_name("settings.json")
 }
 
+/// Which models edit by hashline anchors: the global setting `hashline` -
+/// `true`, or a list of model patterns read as `allowedModels` reads them -
+/// with `HA_HASHLINE` (`1`/`0`) over it. Off by default.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum HashlineRule {
+    #[default]
+    Off,
+    On,
+    Models(Vec<String>),
+}
+
+impl HashlineRule {
+    #[must_use]
+    pub fn load(user_path: &Path, environment: Option<&std::ffi::OsStr>) -> Self {
+        match environment.and_then(std::ffi::OsStr::to_str).map(str::trim) {
+            Some("1" | "on" | "true") => return Self::On,
+            Some("0" | "off" | "false") => return Self::Off,
+            _ => {}
+        }
+        match load_setting(user_path, "hashline") {
+            Some(serde_json::Value::Bool(true)) => Self::On,
+            Some(serde_json::Value::Array(items)) => Self::Models(
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+            _ => Self::Off,
+        }
+    }
+
+    /// Whether `provider/model` edits by anchors.
+    #[must_use]
+    pub fn applies(&self, selector: &str) -> bool {
+        match self {
+            Self::Off => false,
+            Self::On => true,
+            Self::Models(patterns) => super::allowlist::model_allowed(selector, patterns),
+        }
+    }
+}
+
 /// One global setting; a missing or unreadable file has none.
 #[must_use]
 pub fn load_setting(user_path: &Path, key: &str) -> Option<serde_json::Value> {

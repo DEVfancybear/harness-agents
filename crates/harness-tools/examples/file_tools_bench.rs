@@ -363,6 +363,7 @@ async fn main() {
                     old_string: format!("pub const VALUE_{index}: u64 = 0;"),
                     new_string: format!("pub const VALUE_{index}: u64 = 1;"),
                     replace_all: false,
+                    edits: Vec::new(),
                 })
                 .await;
             edit.record(elapsed, outcome.as_ref().map_err(Clone::clone));

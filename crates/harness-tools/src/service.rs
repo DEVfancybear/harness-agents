@@ -237,6 +237,9 @@ pub struct ToolExecutionService {
     /// measured.
     capabilities: Option<Arc<crate::CapabilityMatrix>>,
     result_context: Option<Arc<dyn ToolResultContext>>,
+    /// Hashline anchors in `read_file` and `search_text` results; the schemas
+    /// the model is shown say the same (`coding_tool_schemas_for`).
+    hashline: bool,
 }
 
 impl ToolExecutionService {
@@ -252,7 +255,23 @@ impl ToolExecutionService {
             hooks: Vec::new(),
             capabilities: None,
             result_context: None,
+            hashline: false,
         }
+    }
+
+    /// Show `read_file` and `search_text` lines with their hashline anchors
+    /// (`12#a3`), which `edit_file` edits may name instead of quoting the
+    /// text. Pair it with `coding_tool_schemas_for(true)`.
+    #[must_use]
+    pub const fn with_hashline(mut self, hashline: bool) -> Self {
+        self.hashline = hashline;
+        self
+    }
+
+    /// Whether `read_file` and `search_text` results carry hashline anchors.
+    #[must_use]
+    pub const fn hashline(&self) -> bool {
+        self.hashline
     }
 
     /// Add host context to the results of calls that ran.
@@ -465,16 +484,10 @@ impl ToolExecutionService {
                 };
                 (path.as_str(), before, replacement.clone())
             }
-            CodingToolAction::EditFile {
-                path,
-                old_string,
-                new_string,
-                replace_all,
-            } => {
+            action @ CodingToolAction::EditFile { path, .. } => {
                 let target = resolve_relative(root, path, false)?;
                 let before = read_text(&target)?;
-                let after =
-                    plan_edit_text(&before, old_string, new_string, *replace_all, path)?.content;
+                let after = plan_edit_text(&before, &action.edit_specs(), path)?.content;
                 (path.as_str(), before, after)
             }
             _ => return Ok(None),
@@ -920,6 +933,20 @@ impl ToolExecutionService {
         call: &BegunCall,
         cancellation: CancellationToken,
     ) -> Result<Dispatched, HarnessError> {
+        let outcome = self.run_begun_inner(call, cancellation).await;
+        // A process, an extension tool or a write may have changed any file:
+        // cached walks, hashes and index entries are not trusted past it.
+        if !is_read_only(&call.transformed) {
+            crate::walk::note_change();
+        }
+        outcome
+    }
+
+    async fn run_begun_inner(
+        &self,
+        call: &BegunCall,
+        cancellation: CancellationToken,
+    ) -> Result<Dispatched, HarnessError> {
         let BegunCall {
             prepared,
             execution_id,
@@ -1232,16 +1259,11 @@ impl ToolExecutionService {
                     ));
                 }
             }
-            CodingToolAction::EditFile {
-                path,
-                old_string,
-                new_string,
-                replace_all,
-            } => {
+            CodingToolAction::EditFile { path, .. } => {
                 let target = resolve_relative(root, path, false)?;
                 if check_content {
                     let current = read_text(&target)?;
-                    let _ = plan_edit_text(&current, old_string, new_string, *replace_all, path)?;
+                    let _ = plan_edit_text(&current, &action.edit_specs(), path)?;
                 }
             }
             _ => {}
@@ -1328,15 +1350,10 @@ impl ToolExecutionService {
                     Err(error) => return Err(error),
                 }
             }
-            CodingToolAction::EditFile {
-                path,
-                old_string,
-                new_string,
-                replace_all,
-            } => {
+            CodingToolAction::EditFile { path, .. } => {
                 let target = resolve_relative(root, path, false)?;
                 let current = read_text(&target)?;
-                let _ = plan_edit_text(&current, old_string, new_string, *replace_all, path)?;
+                let _ = plan_edit_text(&current, &action.edit_specs(), path)?;
             }
             CodingToolAction::ReadProcessOutput {
                 artifact_id,
@@ -1481,6 +1498,7 @@ impl ToolExecutionService {
                     &target,
                     offset.unwrap_or(0),
                     limit.unwrap_or(crate::contracts::READ_FILE_DEFAULT_LINES),
+                    self.hashline,
                 )?;
                 Ok(Dispatched::plain(ToolOutput::ReadFile {
                     path: path.replace('\\', "/"),
@@ -1512,6 +1530,7 @@ impl ToolExecutionService {
                     *case_insensitive,
                     glob.as_deref(),
                     context_lines.unwrap_or(0),
+                    self.hashline,
                 )?;
                 Ok(Dispatched::plain(ToolOutput::SearchText {
                     matches: output.matches,
@@ -1571,18 +1590,13 @@ impl ToolExecutionService {
                 };
                 Ok(Dispatched { output, artifact })
             }
-            CodingToolAction::EditFile {
-                path,
-                old_string,
-                new_string,
-                replace_all,
-            } => {
+            CodingToolAction::EditFile { path, .. } => {
                 let target = resolve_relative(root, path, false)?;
                 let before = read_text(&target)?;
                 let artifact = self.stage_before_content(Some(&before))?;
-                let (mutation, diff) = self.while_flushing(artifact.as_ref(), || {
-                    edit_text(&target, path, old_string, new_string, *replace_all)
-                })?;
+                let edits = action.edit_specs();
+                let (mutation, diff) =
+                    self.while_flushing(artifact.as_ref(), || edit_text(&target, path, &edits))?;
                 let output = ToolOutput::EditFile {
                     path: path.replace('\\', "/"),
                     before_hash: mutation.before_hash.clone(),
