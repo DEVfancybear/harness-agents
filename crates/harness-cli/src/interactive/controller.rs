@@ -4968,7 +4968,11 @@ impl InteractiveController {
     /// The tier mark of the status line and `/tier`'s argument menu, as
     /// prime-agent lists the tiers the model takes with the current one marked.
     fn refresh_tier(&mut self) {
-        let (current, available) = self.service.service_tier();
+        let tier = self.service.service_tier();
+        self.show_tier(tier);
+    }
+
+    fn show_tier(&mut self, (current, available): (String, Vec<&'static str>)) {
         self.tier_label = super::service_tier::status_label(Some(&current));
         self.editor.set_argument_options(
             "/tier",
@@ -5005,7 +5009,9 @@ impl InteractiveController {
     }
 
     fn refresh_status(&mut self) {
-        let label = format!("Service: {}", self.service.label());
+        // One snapshot: each getter alone re-resolves every settings layer.
+        let status = self.service.status_snapshot();
+        let label = format!("Service: {}", status.label);
         match self
             .header
             .iter_mut()
@@ -5014,11 +5020,11 @@ impl InteractiveController {
             Some(line) => *line = label,
             None => self.header.push(label),
         }
-        self.thinking_label = self.service.thinking_level();
-        self.refresh_tier();
+        self.thinking_label = status.thinking_level;
+        self.show_tier(status.service_tier);
         // prime-agent rewrites `/effort`'s hint to the levels the model offers,
         // each under the name its provider uses; the one in force is marked.
-        let levels = self.service.thinking_levels();
+        let levels = status.thinking_levels;
         if !levels.is_empty() {
             let current = self.thinking_label.clone();
             self.editor.set_argument_options(
