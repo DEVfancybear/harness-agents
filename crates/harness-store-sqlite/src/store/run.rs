@@ -14,13 +14,14 @@ use serde_json::Value;
 use sqlx::Row;
 
 use super::{
-    SqliteStore, assert_fence_in_tx, database_error, parse_session, parse_task, row_get, to_i64,
-    to_json, to_u64,
+    SqliteStore, assert_fence_in_tx, complete_runtime_command_in_tx, database_error, parse_session,
+    parse_task, row_get, to_i64, to_json, to_u64,
 };
 use crate::{
     BudgetAccountRecord, BudgetReservationRecord, BudgetReservationState, BudgetSettlement,
     QuestionOutcome, QuestionRecord, QuestionState, RunCommandKind, RunCommandRecord,
-    RunCommandState, RunRecord, RunState, RunStepRecord, StoreError, StoreFaultPoint,
+    RunCommandState, RunRecord, RunState, RunStepRecord, RuntimeCommandState, StoreError,
+    StoreFaultPoint,
 };
 
 fn parse_run(value: String) -> Result<AgentRunId, StoreError> {
@@ -639,12 +640,62 @@ impl SqliteStore {
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;
         assert_fence_in_tx(&mut tx, &fence).await?;
+        self.settle_run_step_in_tx(&mut tx, step_id, state, stop_reason, settlement)
+            .await?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit step settlement",
+                error,
+            )
+        })
+    }
+
+    /// Complete the runtime command of a model step and record what the step
+    /// produced, in one commit.
+    ///
+    /// A streamed step settled its command and then its step, two commits per
+    /// model step, and a crash between them left a completed command beside a
+    /// step still `frozen`. Both rows now move together; a stale command owner
+    /// refuses the whole write, as it refused the command's own update before.
+    pub async fn complete_runtime_command_settling_step(
+        &self,
+        command_id: &RuntimeCommandId,
+        owner_generation: u64,
+        command_state: RuntimeCommandState,
+        step_id: &StepId,
+        step_state: &str,
+    ) -> Result<(), StoreError> {
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        assert_fence_in_tx(&mut tx, &fence).await?;
+        complete_runtime_command_in_tx(&mut tx, command_id, owner_generation, command_state, None)
+            .await?;
+        self.settle_run_step_in_tx(&mut tx, step_id, step_state, None, None)
+            .await?;
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit step settlement",
+                error,
+            )
+        })
+    }
+
+    async fn settle_run_step_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        step_id: &StepId,
+        state: &str,
+        stop_reason: Option<&str>,
+        settlement: Option<BudgetSettlement>,
+    ) -> Result<(), StoreError> {
         let updated =
             sqlx::query("UPDATE run_steps SET state = ?, stop_reason = ? WHERE step_id = ?")
                 .bind(state)
                 .bind(stop_reason)
                 .bind(step_id.as_str())
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .map_err(|error| {
                     database_error(ErrorCode::StorageWriteFailed, "settle run step", error)
@@ -656,7 +707,7 @@ impl SqliteStore {
             ));
         }
         if let Some(settlement) = settlement {
-            settle_reservation_in_tx(&mut tx, &settlement).await?;
+            settle_reservation_in_tx(tx, &settlement).await?;
         }
         if self
             .fault_plan_ref()
@@ -667,13 +718,7 @@ impl SqliteStore {
                 "injected failure before budget settlement commit",
             ));
         }
-        tx.commit().await.map_err(|error| {
-            database_error(
-                ErrorCode::StorageWriteFailed,
-                "commit step settlement",
-                error,
-            )
-        })
+        Ok(())
     }
 
     /// Move a run to a terminal or waiting state with a revision CAS.

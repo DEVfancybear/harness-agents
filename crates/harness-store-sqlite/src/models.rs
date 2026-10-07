@@ -430,6 +430,27 @@ pub struct FrozenRequestRecord {
     pub config_revision: u64,
 }
 
+/// A frozen request before its hash is known.
+///
+/// The hash of a frozen request is the canonical hash of its whole JSON, and
+/// the request is the whole transcript so far: hashing it costs a walk of the
+/// transcript and a SHA over it. A caller that only hashed so the store could
+/// check the hash again paid that twice per model step. The store hashes a
+/// draft itself, once, so the stored hash still comes from the stored JSON and
+/// never from the caller.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrozenRequestDraft {
+    pub request_id: RequestId,
+    pub packet_id: ContextPacketId,
+    pub composition_snapshot_id: Option<CompositionSnapshotId>,
+    pub session_id: SessionId,
+    pub task_id: TaskId,
+    pub request_json: Value,
+    pub provider_id: String,
+    pub model: String,
+    pub config_revision: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProviderAttemptRecord {
     pub attempt_id: ProviderAttemptId,

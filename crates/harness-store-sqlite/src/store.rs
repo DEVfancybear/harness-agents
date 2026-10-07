@@ -20,11 +20,11 @@ use sqlx::{
 
 use crate::{
     AdmissionAck, AdmissionCommit, ArtifactPage, CONTEXT_SCHEMA_VERSION, ContextCheckpointRecord,
-    ContextPacketRecord, ContinuationLinkRecord, DataDirectoryMarker, FrozenRequestRecord,
-    HostFence, PersistedPluginManifest, ProjectRegistrationRecord, ProviderAttemptRecord,
-    PublishedArtifact, RUNTIME_SCHEMA_VERSION, ReceiptAck, ReceiptCommit, RecoveredToolResult,
-    RuntimeCommandRecord, RuntimeCommandState, STORE_SCHEMA_VERSION, SessionSummary,
-    SnapshotRecord, SourceWorkMarker, StoreDiagnostics, StoreError, StoreFaultPlan,
+    ContextPacketRecord, ContinuationLinkRecord, DataDirectoryMarker, FrozenRequestDraft,
+    FrozenRequestRecord, HostFence, PersistedPluginManifest, ProjectRegistrationRecord,
+    ProviderAttemptRecord, PublishedArtifact, RUNTIME_SCHEMA_VERSION, ReceiptAck, ReceiptCommit,
+    RecoveredToolResult, RuntimeCommandRecord, RuntimeCommandState, STORE_SCHEMA_VERSION,
+    SessionSummary, SnapshotRecord, SourceWorkMarker, StoreDiagnostics, StoreError, StoreFaultPlan,
     StoreFaultPoint, StorePaths, TOOLS_SCHEMA_VERSION, ToolApprovalBinding, ToolApprovalRecord,
     ToolApprovalState, ToolIntentCommit, ToolIntentRecord, ToolIntentStatus, ToolSettlementCommit,
     ToolTaskUpdateCommit, WriterOpenOptions,
@@ -2333,11 +2333,51 @@ impl SqliteStore {
         row.map(|row| context_packet_from_row(&row)).transpose()
     }
 
+    /// Persist a frozen request whose hash the caller computed; the hash is
+    /// checked against the request before anything is written.
     pub async fn persist_frozen_request(
         &self,
         record: FrozenRequestRecord,
     ) -> Result<(), StoreError> {
         validate_hashed_json(&record.request_json, &record.content_hash)?;
+        self.persist_hashed_frozen_request(record).await
+    }
+
+    /// Hash a frozen request and persist it, returning its hash.
+    ///
+    /// The hash is computed here from the JSON that is stored, exactly as
+    /// `persist_frozen_request` checks it, so the stored hash matches the
+    /// stored request without the request being hashed a second time.
+    pub async fn freeze_request(
+        &self,
+        draft: FrozenRequestDraft,
+    ) -> Result<ContentHash, StoreError> {
+        let content_hash =
+            ContentHash::from_canonical_json(&draft.request_json).map_err(|error| {
+                StoreError::new(error.code(), format!("content is not canonical: {error}"))
+            })?;
+        self.persist_hashed_frozen_request(FrozenRequestRecord {
+            request_id: draft.request_id,
+            packet_id: draft.packet_id,
+            composition_snapshot_id: draft.composition_snapshot_id,
+            session_id: draft.session_id,
+            task_id: draft.task_id,
+            request_json: draft.request_json,
+            content_hash: content_hash.clone(),
+            provider_id: draft.provider_id,
+            model: draft.model,
+            config_revision: draft.config_revision,
+        })
+        .await?;
+        Ok(content_hash)
+    }
+
+    /// The write behind both ways to freeze a request. The record's hash must
+    /// already be the canonical hash of its JSON.
+    async fn persist_hashed_frozen_request(
+        &self,
+        record: FrozenRequestRecord,
+    ) -> Result<(), StoreError> {
         // Every step of a turn sends the whole transcript so far, so storing each
         // request whole cost the square of the turn's length. A request whose
         // messages begin with the previous request's is stored as a reference to
@@ -2631,6 +2671,52 @@ impl SqliteStore {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Enqueue a new runtime command and claim it for this host in one commit.
+    ///
+    /// Every model step enqueued its command and claimed it at once, two
+    /// commits (two fsyncs) per step. Nothing claims a pending command except
+    /// the step that enqueued it - recovery and inspection count `pending` and
+    /// `claimed` alike - so one commit that writes the claimed row leaves every
+    /// reader seeing what it saw after the second commit, and removes the crash
+    /// window in which a command was enqueued but never claimed. A command that
+    /// already exists is claimed as `claim_runtime_command` would claim it.
+    pub async fn enqueue_claimed_runtime_command(
+        &self,
+        mut record: RuntimeCommandRecord,
+        max_attempts: u32,
+    ) -> Result<RuntimeCommandRecord, StoreError> {
+        let fence = self.fence()?;
+        let mut tx = self.begin_write(&fence).await?;
+        if max_attempts == 0 {
+            return Err(StoreError::new(
+                ErrorCode::RetryExhausted,
+                "runtime command retry limit reached",
+            ));
+        }
+        record.state = RuntimeCommandState::Claimed;
+        record.attempts = 1;
+        record.owner_generation = fence.generation;
+        record.last_error = None;
+        let payload = to_json(&record.payload, "serialize runtime command")?;
+        let inserted = sqlx::query("INSERT INTO runtime_commands(command_id, session_id, task_id, state, attempts, owner_generation, payload_json, last_error) VALUES (?, ?, ?, ?, ?, ?, ?, NULL) ON CONFLICT(command_id) DO NOTHING")
+            .bind(record.command_id.as_str()).bind(record.session_id.as_str()).bind(record.task_id.as_str()).bind(record.state.as_str()).bind(i64::from(record.attempts)).bind(to_i64(record.owner_generation, "command generation")?).bind(payload)
+            .execute(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "enqueue runtime command", error))?;
+        if inserted.rows_affected() == 0 {
+            tx.rollback().await.ok();
+            return self
+                .claim_runtime_command(&record.command_id, max_attempts)
+                .await;
+        }
+        tx.commit().await.map_err(|error| {
+            database_error(
+                ErrorCode::StorageWriteFailed,
+                "commit runtime command claim",
+                error,
+            )
+        })?;
+        Ok(record)
+    }
+
     pub async fn runtime_command(
         &self,
         command_id: &RuntimeCommandId,
@@ -2685,14 +2771,7 @@ impl SqliteStore {
         let fence = self.fence()?;
         let mut tx = self.begin_write(&fence).await?;
         assert_fence_in_tx(&mut tx, &fence).await?;
-        let result = sqlx::query("UPDATE runtime_commands SET state = ?, last_error = ? WHERE command_id = ? AND owner_generation = ?")
-            .bind(state.as_str()).bind(error).bind(command_id.as_str()).bind(to_i64(owner_generation, "command generation")?).execute(&mut *tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "complete runtime command", error))?;
-        if result.rows_affected() != 1 {
-            return Err(StoreError::new(
-                ErrorCode::RuntimeCommandConflict,
-                "runtime command owner is stale",
-            ));
-        }
+        complete_runtime_command_in_tx(&mut tx, command_id, owner_generation, state, error).await?;
         tx.commit().await.map_err(|error| {
             database_error(
                 ErrorCode::StorageWriteFailed,
@@ -4559,6 +4638,25 @@ fn snapshot_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SnapshotRecord, St
     })
 }
 
+/// Settle a runtime command its owner still holds, inside the caller's write.
+async fn complete_runtime_command_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    command_id: &RuntimeCommandId,
+    owner_generation: u64,
+    state: RuntimeCommandState,
+    error: Option<&str>,
+) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE runtime_commands SET state = ?, last_error = ? WHERE command_id = ? AND owner_generation = ?")
+        .bind(state.as_str()).bind(error).bind(command_id.as_str()).bind(to_i64(owner_generation, "command generation")?).execute(&mut **tx).await.map_err(|error| database_error(ErrorCode::StorageWriteFailed, "complete runtime command", error))?;
+    if result.rows_affected() != 1 {
+        return Err(StoreError::new(
+            ErrorCode::RuntimeCommandConflict,
+            "runtime command owner is stale",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_hashed_json(content: &Value, expected: &ContentHash) -> Result<(), StoreError> {
     let actual = ContentHash::from_canonical_json(content).map_err(|error| {
         StoreError::new(error.code(), format!("content is not canonical: {error}"))
@@ -5344,6 +5442,120 @@ mod per_session_index_tests {
         let next = store.provider_attempts_mark(&session).await.unwrap();
         assert!(matches!(&next, Some((2, _, _))));
         assert_ne!(next, mark);
+        store.close().await.expect("close store");
+    }
+}
+
+#[cfg(test)]
+mod one_commit_step_tests {
+    use harness_types::{
+        ContentHash, ContextPacketId, HostId, RequestId, RuntimeCommandId, SessionId, TaskId,
+    };
+    use serde_json::json;
+
+    use super::{SqliteStore, WriterOpenOptions};
+    use crate::{FrozenRequestDraft, RuntimeCommandRecord, RuntimeCommandState};
+
+    /// A request frozen from a draft is stored with the canonical hash of its
+    /// JSON, and reads back whole and verified, delta-stored or not.
+    #[tokio::test]
+    async fn freeze_request_hashes_what_it_stores() {
+        let directory = tempfile::tempdir().expect("temporary store");
+        let store =
+            SqliteStore::open_writer(WriterOpenOptions::new(directory.path(), HostId::generate()))
+                .await
+                .expect("store migration");
+        let session_id = SessionId::generate();
+        let task_id = TaskId::generate();
+        let draft = |messages: serde_json::Value| FrozenRequestDraft {
+            request_id: RequestId::generate(),
+            packet_id: ContextPacketId::generate(),
+            composition_snapshot_id: None,
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            request_json: json!({"model": "m", "messages": messages}),
+            provider_id: "p".to_owned(),
+            model: "m".to_owned(),
+            config_revision: 1,
+        };
+        let first = draft(json!([{"role": "user", "content": "a"}]));
+        let first_json = first.request_json.clone();
+        let first_hash = store.freeze_request(first).await.expect("freeze first");
+        assert_eq!(
+            first_hash,
+            ContentHash::from_canonical_json(&first_json).unwrap()
+        );
+        let second = draft(json!([
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"}
+        ]));
+        let second_json = second.request_json.clone();
+        let second_hash = store.freeze_request(second).await.expect("freeze second");
+        let stored = store.list_frozen_requests(&session_id).await.unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].content_hash, first_hash);
+        assert_eq!(stored[1].content_hash, second_hash);
+        assert_eq!(stored[1].request_json, second_json);
+        store.close().await.expect("close store");
+    }
+
+    /// A command enqueued and claimed in one commit is claimed by this host
+    /// once, counts as pending work until it completes, and completes with its
+    /// step.
+    #[tokio::test]
+    async fn enqueued_command_is_claimed_in_one_commit() {
+        let directory = tempfile::tempdir().expect("temporary store");
+        let store =
+            SqliteStore::open_writer(WriterOpenOptions::new(directory.path(), HostId::generate()))
+                .await
+                .expect("store migration");
+        let session_id = SessionId::generate();
+        let command_id = RuntimeCommandId::generate();
+        let record = RuntimeCommandRecord {
+            command_id: command_id.clone(),
+            session_id: session_id.clone(),
+            task_id: TaskId::generate(),
+            state: RuntimeCommandState::Pending,
+            attempts: 0,
+            owner_generation: 0,
+            payload: json!({"text": "hi"}),
+            last_error: None,
+        };
+        let claimed = store
+            .enqueue_claimed_runtime_command(record.clone(), 3)
+            .await
+            .expect("enqueue and claim");
+        assert_eq!(claimed.state, RuntimeCommandState::Claimed);
+        assert_eq!(claimed.attempts, 1);
+        assert_eq!(claimed.owner_generation, store.fence().unwrap().generation);
+        assert_eq!(
+            store.runtime_command(&command_id).await.unwrap(),
+            Some(claimed.clone())
+        );
+        assert_eq!(
+            store.pending_runtime_commands(&session_id).await.unwrap(),
+            1
+        );
+        // The same command again is claimed again, as `claim_runtime_command`
+        // would: one more attempt, never a second row.
+        let again = store
+            .enqueue_claimed_runtime_command(record, 3)
+            .await
+            .expect("claim existing");
+        assert_eq!(again.attempts, 2);
+        store
+            .complete_runtime_command(
+                &command_id,
+                again.owner_generation,
+                RuntimeCommandState::Completed,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.pending_runtime_commands(&session_id).await.unwrap(),
+            0
+        );
         store.close().await.expect("close store");
     }
 }

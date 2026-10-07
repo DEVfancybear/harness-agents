@@ -20,8 +20,9 @@ use harness_session::{
     SessionService,
 };
 use harness_store_sqlite::{
-    ContextCheckpointRecord, ContextPacketRecord, FrozenRequestRecord, ProviderAttemptRecord,
-    RunRecord, RunState, RuntimeCommandRecord, RuntimeCommandState, SqliteStore, StoreError,
+    ContextCheckpointRecord, ContextPacketRecord, FrozenRequestDraft, FrozenRequestRecord,
+    ProviderAttemptRecord, RunRecord, RunState, RuntimeCommandRecord, RuntimeCommandState,
+    SqliteStore, StoreError,
 };
 use harness_types::{
     AgentRunId, BudgetId, BudgetReservationId, ContentHash, ErrorCode, FreezeStepCommit,
@@ -2304,21 +2305,22 @@ impl RuntimeService {
         .await
         .map_err(|error| RuntimeError::new(error.code(), error.message().to_owned()))?;
         let command_id = harness_types::RuntimeCommandId::generate();
-        self.store
-            .enqueue_runtime_command(RuntimeCommandRecord {
-                command_id: command_id.clone(),
-                session_id: request.session_id.clone(),
-                task_id: request.task_id.clone(),
-                state: RuntimeCommandState::Pending,
-                attempts: 0,
-                owner_generation: 0,
-                payload: json!({"input_id": request.input_id, "text": request.text}),
-                last_error: None,
-            })
-            .await?;
+        // Enqueued and claimed in one commit: no one else ever claims it.
         let command = self
             .store
-            .claim_runtime_command(&command_id, config.max_attempts)
+            .enqueue_claimed_runtime_command(
+                RuntimeCommandRecord {
+                    command_id: command_id.clone(),
+                    session_id: request.session_id.clone(),
+                    task_id: request.task_id.clone(),
+                    state: RuntimeCommandState::Pending,
+                    attempts: 0,
+                    owner_generation: 0,
+                    payload: json!({"input_id": request.input_id, "text": request.text}),
+                    last_error: None,
+                },
+                config.max_attempts,
+            )
             .await?;
         self.last_attempts.store(command.attempts, Ordering::SeqCst);
         let recovery = self.recover_step(&session, &request.session_id).await?;
@@ -2557,20 +2559,20 @@ impl RuntimeService {
                 "provider request cannot be serialized",
             )
         })?;
-        let frozen = FrozenRequestRecord {
+        // The store hashes the request as it stores it: hashing it here as well
+        // walked the whole transcript twice per step for one hash.
+        let frozen = FrozenRequestDraft {
             request_id: provider_request.request_id.clone(),
             packet_id: built.packet.packet_id.clone(),
             composition_snapshot_id: None,
             session_id: request.session_id.clone(),
             task_id: request.task_id.clone(),
-            content_hash: ContentHash::from_canonical_json(&request_json)
-                .map_err(|error| RuntimeError::new(error.code(), error.to_string()))?,
             request_json,
             provider_id: capabilities.provider_id,
             model: capabilities.model,
             config_revision: config.config_revision,
         };
-        self.store.persist_frozen_request(frozen).await?;
+        self.store.freeze_request(frozen).await?;
         // Freeze the step and its first attempt's budget reservation together.
         // If this commit fails, nothing was dispatched and the caller gets a
         // typed store error instead of a model call.
@@ -2887,20 +2889,19 @@ impl RuntimeService {
                     false,
                 )
                 .await?;
-            self.store
-                .complete_runtime_command(
-                    &command_id,
-                    command.owner_generation,
-                    RuntimeCommandState::Completed,
-                    None,
-                )
-                .await?;
             AgentState::Running.apply(RunCommand::Complete)?;
             // The step is streamed but the run stays running: the driver owns
             // the loop and either freezes another step or finishes the run with
-            // its typed stop reason.
+            // its typed stop reason. The command and the step settle in one
+            // commit.
             self.store
-                .settle_run_step(&step_id, "streamed", None, None)
+                .complete_runtime_command_settling_step(
+                    &command_id,
+                    command.owner_generation,
+                    RuntimeCommandState::Completed,
+                    &step_id,
+                    "streamed",
+                )
                 .await?;
             let dispatchable = response.is_dispatchable();
             Ok(RunResult {
