@@ -3596,6 +3596,28 @@ impl AgentSessionService {
         });
     }
 
+    /// The task (conversation) of a stored session, read now; `None` when it
+    /// cannot be read, which leaves it to the background lookup.
+    fn session_task_now(&self, session: &SessionId) -> Option<String> {
+        let store_dir = self.store_dir.clone();
+        let session = session.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            runtime.block_on(async move {
+                let store = SqliteStore::open_read_only(store_dir).await.ok()?;
+                let task = store.session_task(&session).await.ok().flatten();
+                let _ = store.close().await;
+                task.map(|task| task.as_str().to_owned())
+            })
+        })
+        .join()
+        .ok()
+        .flatten()
+    }
+
     fn newest_project_session(&self) -> Result<SessionId, String> {
         let store_dir = self.store_dir.clone();
         std::thread::spawn(move || {
@@ -5509,8 +5531,16 @@ impl SessionPort for AgentSessionService {
         if let Ok(mut thread) = self.side_thread.lock() {
             thread.clear();
         }
+        // The conversation is known before this returns: looked up in the
+        // background, it was this session's fresh task id until the lookup
+        // landed, and a worker that wrote its journal in that window - it
+        // does so right after recovering an agent - brought the agent back on
+        // an empty conversation the next time it died.
+        let task = source
+            .as_ref()
+            .and_then(|source| self.session_task_now(source));
         if let Ok(mut resumed) = self.resumed_task.lock() {
-            *resumed = None;
+            *resumed = task;
         }
         if source.is_none() {
             self.task_id = TaskId::generate();

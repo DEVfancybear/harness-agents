@@ -814,6 +814,9 @@ struct Agent {
     last_full: Instant,
     /// A redraw that waits for [`FRAME_EVERY`] to pass.
     redraw_due: bool,
+    /// The worker, whose journal is written again when the agent moves to
+    /// another conversation.
+    worker: Weak<Worker>,
 }
 
 struct Client {
@@ -917,6 +920,7 @@ impl Agent {
             dirty: false,
             last_full: Instant::now(),
             redraw_due: false,
+            worker: Weak::clone(worker),
         };
         if let Some(prompt) = spec.prompt {
             let mut effects = Vec::new();
@@ -1097,7 +1101,9 @@ impl Agent {
         let conversation = self.controller.conversation_id();
         let subagents = self.controller.subagents();
         let heartbeats = self.controller.heartbeat_count();
+        let mut moved = false;
         if let Ok(mut status) = self.status.lock() {
+            moved = status.info.conversation != conversation;
             status.info.subagents = subagents;
             status.info.heartbeats = heartbeats;
             state.phase.label().clone_into(&mut status.info.status);
@@ -1106,6 +1112,13 @@ impl Agent {
             status.info.attached = !self.clients.is_empty();
             status.info.last_request = state.last_request;
             status.info.conversation = conversation;
+        }
+        // The journal names the conversation a worker that dies brings the
+        // agent back on. Written only on the supervisor's sweep, a worker that
+        // died within five seconds of the agent's first turn brought it back
+        // on the empty conversation it started with.
+        if moved && let Some(worker) = self.worker.upgrade() {
+            worker.keep_journal();
         }
     }
 
