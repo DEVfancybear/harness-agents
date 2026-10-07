@@ -53,15 +53,13 @@ async fn p7_s01_release_matrix_is_complete_and_honest() {
         "every platform must state what was actually run"
     );
 
-    // Surfaces an operator might assume are present are declared unsupported.
-    for name in ["os_sandboxing"] {
-        let capability = capability_named(&matrix, name);
-        assert_eq!(capability.status, CapabilityStatus::Unsupported);
-        assert!(
-            !capability.note.trim().is_empty(),
-            "{name} must state why it is unsupported"
-        );
-    }
+    // A surface an operator might assume is present is declared unsupported.
+    let sandboxing = capability_named(&matrix, "os_sandboxing");
+    assert_eq!(sandboxing.status, CapabilityStatus::Unsupported);
+    assert!(
+        !sandboxing.note.trim().is_empty(),
+        "os_sandboxing must state why it is unsupported"
+    );
     // A Linux artifact was built but never published, and that is said plainly.
     assert_eq!(
         capability_named(&matrix, "packaged_linux_artifact").status,

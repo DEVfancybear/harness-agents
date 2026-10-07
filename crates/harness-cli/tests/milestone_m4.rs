@@ -1764,6 +1764,19 @@ fn wait_for_file(path: &Path, timeout: Duration) -> bool {
     false
 }
 
+/// Waits for a file that holds text. A shell's `echo x >> file` creates the file
+/// before it writes, so existence alone can be read while the file is still empty.
+fn wait_for_content(path: &Path, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if std::fs::metadata(path).is_ok_and(|meta| meta.len() > 0) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 fn kill_child(child: &mut std::process::Child) {
     let _ = child.kill();
     let _ = child.wait();
@@ -1915,7 +1928,7 @@ async fn a04_effect_before_receipt() {
         .spawn()
         .expect("fixture host starts");
     assert!(
-        wait_for_file(&marker, Duration::from_mins(1)),
+        wait_for_content(&marker, Duration::from_mins(1)),
         "the fixture process must write its marker"
     );
     // Hard kill while the side effect exists and the receipt does not.
