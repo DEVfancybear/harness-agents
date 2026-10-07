@@ -199,6 +199,7 @@ fn strings_value(values: Vec<String>) -> Value {
 }
 
 fn read_document(path: &Path) -> Value {
+    super::probe::note(path);
     std::fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())

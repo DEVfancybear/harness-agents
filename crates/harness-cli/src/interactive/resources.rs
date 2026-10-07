@@ -13,8 +13,11 @@
 //! rather than installed: an install writes to the terminal the TUI owns.
 //! `ha package install` and `ha package update` install them.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
+use super::packages::probe::{self, Inputs};
 use super::packages::{
     BundledSkillsDir, MetadataSource, MissingSourceAction, PackageManager, PackageManagerOptions,
     ResolvedResource, ResourceOrigin, SettingsManager, SourceScope,
@@ -40,8 +43,49 @@ pub struct SessionResources {
 
 /// Resolve the session resources of `workspace` with the user settings of
 /// `config_dir`.
+///
+/// Every skills discovery and menu refresh asks, and a resolution walks every
+/// skill, prompt and package tree, so the last result per argument set is kept
+/// with the paths it read and reused while none of them changed (see
+/// [`super::packages::probe`]). An install or a removal rewrites a settings
+/// file or a package directory, so it needs no invalidation of its own.
 #[must_use]
 pub fn resolve(
+    config_dir: &Path,
+    workspace: &Path,
+    project_trusted: bool,
+    bundled_skills: Option<PathBuf>,
+) -> SessionResources {
+    type Key = (PathBuf, PathBuf, bool, Option<PathBuf>, Option<PathBuf>);
+    type Cache = Mutex<HashMap<Key, (Inputs, SessionResources)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let key = (
+        config_dir.to_path_buf(),
+        workspace.to_path_buf(),
+        project_trusted,
+        bundled_skills.clone(),
+        // `~/.agents/skills` is one of the roots.
+        super::packages::platform_home_dir(),
+    );
+    let cache = CACHE.get_or_init(Cache::default);
+    if let Some((inputs, resources)) = cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+        && inputs.unchanged()
+    {
+        return resources.clone();
+    }
+    let (resources, inputs) =
+        probe::record(|| resolve_uncached(config_dir, workspace, project_trusted, bundled_skills));
+    cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key, (inputs, resources.clone()));
+    resources
+}
+
+fn resolve_uncached(
     config_dir: &Path,
     workspace: &Path,
     project_trusted: bool,
@@ -244,5 +288,43 @@ mod tests {
         std::fs::write(workspace.join(".harness/prompts/fix.md"), "Fix $@").expect("prompt");
         assert!(resolve(&config, &workspace, false, None).prompts.is_empty());
         assert_eq!(resolve(&config, &workspace, true, None).prompts.len(), 1);
+    }
+
+    #[test]
+    fn a_kept_resolution_sees_new_files_deep_in_a_tree_and_settings_edits() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = temporary.path().join("config");
+        let workspace = temporary.path().join("workspace");
+        let package = temporary.path().join("pkg");
+        skill(&package.join("skills/group"), "first");
+        std::fs::create_dir_all(config.join("prompts")).expect("prompts");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let settings = |package: serde_json::Value| {
+            let document = serde_json::json!({ "packages": [package] });
+            std::fs::write(config.join("settings.json"), document.to_string()).expect("settings");
+        };
+        settings(serde_json::json!(package.display().to_string()));
+        let first = resolve(&config, &workspace, false, None);
+        assert_eq!(first.added_skills.len(), 1, "{first:?}");
+        assert_eq!(resolve(&config, &workspace, false, None), first);
+
+        // Only `skills/group` lists the new skill directory.
+        let second = skill(&package.join("skills/group"), "second");
+        let resources = resolve(&config, &workspace, false, None);
+        assert_eq!(resources.added_skills.len(), 2, "{resources:?}");
+
+        std::fs::write(config.join("prompts/fix.md"), "Fix $@").expect("prompt");
+        assert_eq!(resolve(&config, &workspace, false, None).prompts.len(), 1);
+
+        settings(serde_json::json!({
+            "source": package.display().to_string(),
+            "skills": ["skills/group/first/SKILL.md"],
+        }));
+        let resources = resolve(&config, &workspace, false, None);
+        assert_eq!(
+            resources.disabled_skills,
+            vec![super::super::packages::canonicalize_path(&second)],
+            "{resources:?}"
+        );
     }
 }
