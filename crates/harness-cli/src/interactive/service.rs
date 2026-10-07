@@ -110,6 +110,7 @@ mod g03_model_selection_tests {
             agents_default_model: None,
             queue_modes: (None, None),
             routing: super::super::config::Routing::default(),
+            verify: super::super::verify::Verify::default(),
             credential: super::CredentialSource::Environment {
                 variable: String::new(),
             },
@@ -421,6 +422,31 @@ pub trait SessionPort: Send {
     /// Where `rlm.create_session` starts a separate top-level session; only a
     /// background agent has one.
     fn set_session_host(&mut self, _host: Arc<dyn super::agents::SessionHost>) {}
+    /// The project's `[verify]` checks.
+    fn verify_checks(&self) -> Vec<super::verify::Check> {
+        Vec::new()
+    }
+    /// `/verify`: run the project's checks now; the report arrives as
+    /// [`SessionEvent::Verified`].
+    fn run_verify(&mut self) -> Result<(), String> {
+        Err("this backend cannot run checks".to_owned())
+    }
+    /// `/features`: the project's feature list.
+    fn features(&self) -> Result<Vec<String>, String> {
+        Err("this backend has no workspace".to_owned())
+    }
+    /// What leaving now would leave the next session to trip over.
+    fn clean_state(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// `/doctor`: how ready the repository is for an agent.
+    fn doctor(&self) -> Result<Vec<String>, String> {
+        Err("this backend has no workspace".to_owned())
+    }
+    /// `/checks`: the checks refinements proposed, and the user's verdict.
+    fn checks(&mut self, _argument: Option<&str>) -> Result<Vec<String>, String> {
+        Err("this backend has no workspace".to_owned())
+    }
     /// Run autonomous quality gates in the workspace; the verdict arrives as
     /// [`SessionEvent::GatesChecked`].
     fn run_gates(&mut self, _job: super::autonomous::GateJob) -> Result<(), String> {
@@ -946,6 +972,8 @@ pub struct ProviderConfig {
     pub queue_modes: (Option<String>, Option<String>),
     /// `[routing]`: scoped, auxiliary, backup and image models.
     pub routing: super::config::Routing,
+    /// `[verify]`: the project's checks and whether a verifier judges goals.
+    pub verify: super::verify::Verify,
     /// Name of the source that holds the key; never the key.
     pub credential: CredentialSource,
     /// The service tier the session asked for (`/tier`, `/fast`), before it is
@@ -1091,6 +1119,7 @@ pub(super) fn resolve_provider_with_overrides(
         agents_default_model: resolved.agents_default_model,
         queue_modes: resolved.queue_modes,
         routing: resolved.routing,
+        verify: resolved.verify,
         credential,
         service_tier: None,
     })
@@ -2169,6 +2198,8 @@ pub struct AgentSessionService {
     system_prompt: Arc<Mutex<String>>,
     turn_tools: Arc<Mutex<Vec<serde_json::Value>>>,
     active_skills: Arc<Mutex<BTreeMap<String, harness_extensions::SkillActivation>>>,
+    /// The subdirectory instructions each conversation has been given.
+    nested_instructions: Arc<Mutex<std::collections::BTreeSet<(String, PathBuf)>>>,
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
     /// The session's delegated children and the store they share with its turns.
@@ -3219,6 +3250,7 @@ impl AgentSessionService {
             system_prompt: Arc::new(Mutex::new(String::new())),
             turn_tools: Arc::new(Mutex::new(Vec::new())),
             active_skills: Arc::new(Mutex::new(BTreeMap::new())),
+            nested_instructions: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             pending_mcp_elicitations: Arc::new(Mutex::new(HashMap::new())),
             mcp_status: Arc::new(Mutex::new(Vec::new())),
             agents,
@@ -3524,6 +3556,7 @@ impl Drop for AgentSessionService {
                     task: self.task_id.as_str().to_owned(),
                     session,
                     turns,
+                    in_play: self.refine_cadence.take_in_play(),
                 },
             );
         }
@@ -3659,6 +3692,10 @@ impl SessionPort for AgentSessionService {
             .map(|config| (config.provider_id, config.model))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one clone per piece of session state the turn shares, handed over in one place"
+    )]
     fn submit(&mut self, request: SubmitRequest) {
         self.gate.clear_turn_rules();
         let cancellation = CancellationToken::new();
@@ -3692,6 +3729,7 @@ impl SessionPort for AgentSessionService {
         let system_prompt = Arc::clone(&self.system_prompt);
         let turn_tools = Arc::clone(&self.turn_tools);
         let active_skills = Arc::clone(&self.active_skills);
+        let nested_instructions = Arc::clone(&self.nested_instructions);
         let pending_mcp_elicitations = Arc::clone(&self.pending_mcp_elicitations);
         let mcp_status = Arc::clone(&self.mcp_status);
         let agents = Arc::clone(&self.agents);
@@ -3738,6 +3776,7 @@ impl SessionPort for AgentSessionService {
                 system_prompt,
                 turn_tools,
                 active_skills,
+                nested_instructions,
                 pending_mcp_elicitations,
                 mcp_status,
                 agents,
@@ -4236,6 +4275,7 @@ impl SessionPort for AgentSessionService {
     )]
     fn skills_rows(&self) -> Vec<super::events::RefLine> {
         use super::events::{BadgeKind, RefLine};
+        use std::fmt::Write as _;
         let trusted = super::config::resolve_layers(
             &self.config_file,
             &self.workspace_root,
@@ -4344,6 +4384,55 @@ impl SessionPort for AgentSessionService {
                     meta: entry.version.clone(),
                     badges,
                     detail: entry.description.clone(),
+                });
+            }
+            rows.push(RefLine::Blank);
+        }
+        // What learning did lately, background runs included: a run nobody saw
+        // is not lost.
+        let runs = super::learned::recent_runs(
+            &super::learned::Layers::new(
+                &self.global_config_dir,
+                &self.data_dir,
+                &self.workspace_root,
+                trusted,
+            ),
+            5,
+        );
+        if !runs.is_empty() {
+            rows.push(RefLine::Heading {
+                title: "✦ Recent learning".to_owned(),
+                note: format!("{}", runs.len()),
+            });
+            for run in &runs {
+                let list = |field: &str| {
+                    run[field]
+                        .as_array()
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        })
+                        .unwrap_or_default()
+                };
+                let landed = list("landed");
+                let refused = list("refused");
+                let mut detail = if landed.is_empty() {
+                    "nothing landed".to_owned()
+                } else {
+                    format!("landed: {landed}")
+                };
+                if !refused.is_empty() {
+                    let _ = write!(detail, " · refused: {refused}");
+                }
+                rows.push(RefLine::Item {
+                    glyph: "·".to_owned(),
+                    name: run["trigger"].as_str().unwrap_or("refine").to_owned(),
+                    meta: run["at"].as_str().unwrap_or_default().to_owned(),
+                    badges: Vec::new(),
+                    detail,
                 });
             }
             rows.push(RefLine::Blank);
@@ -4679,6 +4768,74 @@ impl SessionPort for AgentSessionService {
 
     fn set_session_host(&mut self, host: Arc<dyn super::agents::SessionHost>) {
         self.agents.set_session_host(host);
+    }
+
+    fn verify_checks(&self) -> Vec<super::verify::Check> {
+        self.configured()
+            .map(|config| config.verify.checks)
+            .unwrap_or_default()
+    }
+
+    fn run_verify(&mut self) -> Result<(), String> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "the application service needs an async runtime".to_owned())?;
+        let checks = self.verify_checks();
+        let sender = self.sender.clone();
+        let root = self.workspace_root.clone();
+        let cancellation = CancellationToken::new();
+        handle.spawn(async move {
+            let report = super::verify::run(&root, &checks, &cancellation).await;
+            let _ = sender.send(SessionEvent::Verified {
+                passed: report.passed(),
+                lines: report.lines(),
+            });
+        });
+        Ok(())
+    }
+
+    fn clean_state(&self) -> Vec<String> {
+        super::lifecycle::clean_state(&self.workspace_root)
+    }
+
+    fn checks(&mut self, argument: Option<&str>) -> Result<Vec<String>, String> {
+        let config = self.configured()?;
+        let layers = super::learned::Layers::new(
+            &self.global_config_dir,
+            &self.data_dir,
+            &self.workspace_root,
+            config.project_trusted,
+        );
+        super::checks::command(&layers, &self.workspace_root, argument)
+    }
+
+    fn doctor(&self) -> Result<Vec<String>, String> {
+        let config = self.configured()?;
+        let facts = super::doctor::Facts {
+            trusted: config.project_trusted,
+            checks: config.verify.checks.len(),
+            judge: config.verify.judge,
+            hooks: config.hooks.len(),
+            mcp_servers: config.mcp_servers.len(),
+        };
+        let subsystems = super::doctor::audit(
+            &self.global_config_dir,
+            &self.workspace_root,
+            &self.caller_dir,
+            &facts,
+        );
+        Ok(super::doctor::lines(&self.workspace_root, &subsystems))
+    }
+
+    fn features(&self) -> Result<Vec<String>, String> {
+        Ok(super::features::load(&self.workspace_root)?.map_or_else(
+            || {
+                vec![format!(
+                    "no feature list: the agent creates {} with its feature tool when work is split into features",
+                    super::features::FEATURES_FILE
+                )]
+            },
+            |list| list.lines(),
+        ))
     }
 
     fn run_gates(&mut self, job: super::autonomous::GateJob) -> Result<(), String> {
@@ -6034,6 +6191,9 @@ struct AutoRefine {
     scopes: super::refine::HarnessScopes,
     learning: super::refine::Learning,
     turns: u32,
+    /// The newest session the review reads; once reviewed, the next review
+    /// treats the conversation up to it as already learned from.
+    reviewed: String,
 }
 
 impl AutoRefine {
@@ -6058,6 +6218,7 @@ impl AutoRefine {
                 curate: false,
             },
             Ok(review) => {
+                super::refine::mark_reviewed(&self.scopes.local, &self.reviewed);
                 send(SessionEvent::Notice {
                     message: format!("auto-refine: nothing to refine ({})", review.rationale),
                 });
@@ -6080,7 +6241,10 @@ impl AutoRefine {
         )
         .await
         {
-            Ok(refinement) => send(refined_event(&refinement)),
+            Ok(refinement) => {
+                super::refine::mark_reviewed(&self.scopes.local, &self.reviewed);
+                send(refined_event(&refinement));
+            }
             Err(error) => send(SessionEvent::Notice {
                 message: format!("refine failed: {error}"),
             }),
@@ -6094,10 +6258,17 @@ const REFINE_TRANSCRIPT_TURNS: usize = 50;
 
 /// The conversation a refinement reads: prime-agent's serialized transcript, with
 /// what the tools were asked and what they returned.
-async fn refine_transcript(store: &SqliteStore, session: &SessionId) -> String {
-    harness_runtime::conversation_transcript(store, session, REFINE_TRANSCRIPT_TURNS)
-        .await
-        .unwrap_or_default()
+/// The turns an earlier review of this conversation read are marked as such.
+async fn refine_transcript(store: &SqliteStore, session: &SessionId, local: &Path) -> String {
+    let reviewed = super::refine::reviewed_through(local).and_then(|id| SessionId::parse(id).ok());
+    harness_runtime::conversation_transcript(
+        store,
+        session,
+        REFINE_TRANSCRIPT_TURNS,
+        reviewed.as_ref(),
+    )
+    .await
+    .unwrap_or_default()
 }
 
 /// What `/refine` needs to write learned skills in this workspace.
@@ -6232,6 +6403,7 @@ async fn run_turn(
     system_prompt: Arc<Mutex<String>>,
     turn_tools: Arc<Mutex<Vec<serde_json::Value>>>,
     active_skills: Arc<Mutex<BTreeMap<String, harness_extensions::SkillActivation>>>,
+    nested_instructions: Arc<Mutex<std::collections::BTreeSet<(String, PathBuf)>>>,
     pending_mcp_elicitations: Arc<Mutex<HashMap<String, PendingMcpElicitationRequest>>>,
     mcp_status: Arc<Mutex<Vec<String>>>,
     agents: Arc<super::delegation::SessionAgents>,
@@ -6852,16 +7024,18 @@ async fn run_turn(
             local: super::harness::local_dir(&data_dir, task_id.as_str()),
         };
         let conversation = match source.as_ref() {
-            Some(source_session) => refine_transcript(&store, source_session).await,
+            Some(source_session) => refine_transcript(&store, source_session, &scopes.local).await,
             None => String::new(),
         };
-        let learning = refine_learning(
+        let mut learning = refine_learning(
             &global_config_dir,
             &data_dir,
             &workspace_root,
             &environment,
             config.project_trusted,
         );
+        learning.in_play = refine_cadence.take_in_play();
+        learning.project_checks.clone_from(&config.verify.checks);
         let result = super::refine::refine(
             &helper_provider,
             &helper_model,
@@ -6877,6 +7051,13 @@ async fn run_turn(
         }
         match result {
             Ok(refinement) => {
+                // A rollback or a curation read no conversation.
+                if options.rollback.is_none()
+                    && !options.curate
+                    && let Some(source_session) = source.as_ref()
+                {
+                    super::refine::mark_reviewed(&scopes.local, source_session.as_str());
+                }
                 send(refined_event(&refinement));
                 send(SessionEvent::RunTerminal {
                     outcome: RunOutcome::Done,
@@ -7078,7 +7259,7 @@ async fn run_turn(
         .as_ref()
         .map(|catalog| super::skills::SkillHost::new(catalog.clone(), Arc::clone(&active_skills)));
     // The skills ha learned, where `/refine` writes them and their use is counted.
-    let learning = super::refine::Learning::new(
+    let mut learning = super::refine::Learning::new(
         super::learned::Layers::new(
             &global_config_dir,
             &data_dir,
@@ -7088,8 +7269,31 @@ async fn run_turn(
         &workspace_root,
         skill_catalog.as_ref(),
     );
-    let goal_host =
-        matches!(goal, GoalRecord::Active(_)).then(|| super::goal::GoalHost::new(sender.clone()));
+    learning.project_checks.clone_from(&config.verify.checks);
+    // The model's `goal_complete` is a request: the project's checks run, then an
+    // independent verifier judges, before the goal completes.
+    let goal_host = match &goal {
+        GoalRecord::Active(objective) => Some(
+            super::goal::GoalHost::new(sender.clone()).with_check(super::goal::GoalCheck {
+                root: workspace_root.clone(),
+                objective: objective.clone(),
+                checks: config.verify.checks.clone(),
+                judge: delegate_host
+                    .as_ref()
+                    .filter(|_| config.verify.judge)
+                    .map(|host| (host.verifier(), config.routing.verifier.clone())),
+                cancellation: cancellation.clone(),
+            }),
+        ),
+        _ => None,
+    };
+    // The project's feature list: the model works it, the harness verifies it.
+    let feature_host = Some(super::features::FeatureHost::new(
+        workspace_root.clone(),
+        config.verify.checks.clone(),
+        cancellation.clone(),
+        sender.clone(),
+    ));
     let kernel_skills = skill_catalog
         .as_ref()
         .map(|catalog| {
@@ -7170,7 +7374,13 @@ async fn run_turn(
     };
     let mut tools = ToolExecutionService::new(Arc::clone(&store))
         .with_policy(tool_policy)
-        .with_hooks(config.hooks.clone());
+        .with_hooks(config.hooks.clone())
+        .with_result_context(Arc::new(super::instructions::NestedInstructions::new(
+            &workspace_root,
+            &caller_dir,
+            task_id.as_str(),
+            nested_instructions,
+        )));
     if let Some(dispatcher) = super::mcp::combined_dispatcher_with_delegate(
         active_mcp.as_ref(),
         active_extensions.as_ref(),
@@ -7178,6 +7388,7 @@ async fn run_turn(
         skill_host.as_ref(),
         web_host.as_ref(),
         goal_host.as_ref(),
+        feature_host.as_ref(),
         repl_host.as_ref(),
     ) {
         tools = tools.with_external(dispatcher);
@@ -7190,6 +7401,7 @@ async fn run_turn(
         skill_host.as_ref(),
         web_host.as_ref(),
         goal_host.as_ref(),
+        feature_host.as_ref(),
         repl_host.as_ref(),
     );
     let driver = match &external_tools {
@@ -7337,6 +7549,11 @@ async fn run_turn(
     if let Some(catalog) = &skill_catalog {
         built_prompt.text =
             super::prompt::append_skill_metadata(built_prompt.text, catalog.entries());
+        if let Some(note) = super::learned::prompt_note(&super::learned::library(&learning.layers))
+        {
+            built_prompt.text.push_str("\n\n");
+            built_prompt.text.push_str(&note);
+        }
     }
     // The session-specific tail last, after everything that is stable for the
     // session, so the provider's prompt cache keeps what comes before it.
@@ -7372,6 +7589,16 @@ async fn run_turn(
     }
     if let GoalRecord::Active(objective) = &goal {
         project_blocks.push(super::goal::goal_block(objective));
+    }
+    // Where the project's feature list stands, and its rules.
+    if let Some(block) = super::features::context_block(&workspace_root) {
+        project_blocks.push(block);
+    }
+    // A session's first prompt starts from where the last one left the project.
+    if start_source.is_some()
+        && let Some(block) = super::lifecycle::startup_brief(&workspace_root)
+    {
+        project_blocks.push(block);
     }
     // Memory is prime-agent's continual harness state: the model keeps it through
     // `rlm.harness`, and every turn carries a digest of it ranked for this task.
@@ -7636,11 +7863,11 @@ async fn run_turn(
                 let _ = sender.send(event);
             });
         }
-        super::learned::record_turn(
+        refine_cadence.note_in_play(super::learned::record_turn(
             &learning.layers,
             &learning.context.workspace,
             &turn.executions,
-        );
+        ));
         if super::learned::lifecycle_enabled(&environment) {
             for (layer, name) in super::learned::run_lifecycle(&learning.layers) {
                 send(SessionEvent::Notice {
@@ -7678,7 +7905,9 @@ async fn run_turn(
                 global: super::harness::global_dir(&data_dir),
                 local: super::harness::local_dir(&data_dir, goal_task.as_str()),
             };
-            let conversation = refine_transcript(&store, &session_id).await;
+            let conversation = refine_transcript(&store, &session_id, &scopes.local).await;
+            let mut learning = learning.clone();
+            learning.in_play = refine_cadence.take_in_play();
             if let Some(options) = requested {
                 // The user asked: the refinement is part of the turn, and it covers
                 // the review that came due with it.
@@ -7692,7 +7921,10 @@ async fn run_turn(
                 )
                 .await
                 {
-                    Ok(refinement) => send(refined_event(&refinement)),
+                    Ok(refinement) => {
+                        super::refine::mark_reviewed(&scopes.local, session_id.as_str());
+                        send(refined_event(&refinement));
+                    }
                     Err(error) => send(SessionEvent::Notice {
                         message: format!("refine failed: {error}"),
                     }),
@@ -7712,8 +7944,9 @@ async fn run_turn(
                     model: config.model.clone(),
                     conversation,
                     scopes,
-                    learning: learning.clone(),
+                    learning,
                     turns,
+                    reviewed: session_id.as_str().to_owned(),
                 };
                 let cadence = Arc::clone(&refine_cadence);
                 tokio::spawn(async move {
@@ -7730,10 +7963,13 @@ async fn run_turn(
             let Ok(ended) = SessionId::parse(deferred.session.clone()) else {
                 continue;
             };
-            let conversation = refine_transcript(&store, &ended).await;
+            let local = super::harness::local_dir(&data_dir, &deferred.task);
+            let conversation = refine_transcript(&store, &ended, &local).await;
             if conversation.is_empty() {
                 continue;
             }
+            let mut ended_learning = learning.clone();
+            ended_learning.in_play.clone_from(&deferred.in_play);
             let background = AutoRefine {
                 sender: sender.clone(),
                 helper_provider: Arc::clone(&helper_provider),
@@ -7743,10 +7979,11 @@ async fn run_turn(
                 conversation,
                 scopes: super::refine::HarnessScopes {
                     global: super::harness::global_dir(&data_dir),
-                    local: super::harness::local_dir(&data_dir, &deferred.task),
+                    local,
                 },
-                learning: learning.clone(),
+                learning: ended_learning,
                 turns: deferred.turns,
+                reviewed: deferred.session.clone(),
             };
             send(SessionEvent::Notice {
                 message: format!(

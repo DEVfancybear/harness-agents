@@ -623,7 +623,7 @@ async fn git(root: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// prime-agent's `captureGitWorktreeSnapshot`.
-async fn snapshot(root: &Path) -> Option<Snapshot> {
+pub(crate) async fn snapshot(root: &Path) -> Option<Snapshot> {
     let status = git(
         root,
         &[

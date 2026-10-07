@@ -984,6 +984,11 @@ pub enum SessionEvent {
         text: String,
         verbatim: bool,
     },
+    /// `/verify` ran the project's checks.
+    Verified {
+        passed: bool,
+        lines: Vec<String>,
+    },
     /// The autonomous quality gates ran: their verdict and what they remember.
     GatesChecked {
         result: super::autonomous::GateResult,

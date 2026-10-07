@@ -68,7 +68,7 @@ pub use hooks::{HOOK_EVENTS, HookResponse, fit_payload, hook_matches, run_hooks}
 pub use secrets::{HostEnvironmentSecrets, SecretResolver};
 pub use service::{
     ConfiguredToolHook, ExternalToolDispatcher, ToolDispatchAuthorization, ToolExecutionService,
-    ToolObserver, git_diff_from, git_head_commit,
+    ToolObserver, ToolResultContext, git_diff_from, git_head_commit,
 };
 pub use turn_driver::{
     ApprovalAnswer, ApprovalGate, ApprovalMode, ApprovalProposal, ExternalToolCatalog,

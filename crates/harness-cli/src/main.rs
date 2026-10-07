@@ -188,6 +188,16 @@ enum Command {
     /// The models of the catalog you can call (prime-agent's `model list`).
     #[command(subcommand)]
     Model(ModelCommand),
+    /// Audit how ready a project is for an agent: instructions, tools,
+    /// environment, state and feedback, each shortfall with its fix.
+    Doctor {
+        /// The project directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the system prompt a run in this project is sent.
     Prompt {
         /// The project directory.
@@ -893,6 +903,7 @@ fn legacy_command(cli: &Cli) -> bool {
                 | Command::List { .. }
                 | Command::Model(_)
                 | Command::Prompt { .. }
+                | Command::Doctor { .. }
                 | Command::Attach { .. }
                 | Command::Send { .. }
                 | Command::Schedule(_)
@@ -1053,6 +1064,9 @@ async fn run(cli: Cli) -> Result<ExitCode, HarnessError> {
         }
         Some(Command::Prompt { cwd, json }) => {
             interactive::cli_extras::prompt(cwd.as_deref(), json)
+        }
+        Some(Command::Doctor { cwd, json }) => {
+            interactive::cli_extras::doctor(cwd.as_deref(), json)
         }
         Some(Command::Attach { agent }) => interactive::app::attach(&agent),
         Some(Command::Abort { agent, json }) => interactive::agents::abort_command(&agent, json),
@@ -1354,6 +1368,7 @@ async fn legacy_run(cli: Cli) -> Result<(), HarnessError> {
             | Command::List { .. }
             | Command::Model(_)
             | Command::Prompt { .. }
+            | Command::Doctor { .. }
             | Command::Attach { .. }
             | Command::Send { .. }
             | Command::Schedule(_)

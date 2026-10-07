@@ -562,6 +562,7 @@ pub async fn run_with(
         web_host.as_ref(),
         None,
         None,
+        None,
     ) {
         tools = tools.with_external(dispatcher);
     }
@@ -572,6 +573,7 @@ pub async fn run_with(
         None,
         None,
         web_host.as_ref(),
+        None,
         None,
         None,
     );

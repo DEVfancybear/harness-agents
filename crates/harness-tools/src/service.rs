@@ -213,6 +213,13 @@ pub struct ConfiguredToolHook {
     pub source: String,
 }
 
+/// Text the host adds to a call's result for the model once the call ran: what
+/// applies where the call reached, such as the instructions of a directory the
+/// session had not loaded yet.
+pub trait ToolResultContext: Send + Sync {
+    fn context_for(&self, action: &CodingToolAction) -> Vec<String>;
+}
+
 /// The one P3 authority permitted to move a coding proposal across a side
 /// effect. Direct helpers in sibling modules are crate-private.
 #[derive(Clone)]
@@ -230,6 +237,7 @@ pub struct ToolExecutionService {
     /// "refuse": a strict request is never served against capabilities nobody
     /// measured.
     capabilities: Option<Arc<crate::CapabilityMatrix>>,
+    result_context: Option<Arc<dyn ToolResultContext>>,
 }
 
 impl ToolExecutionService {
@@ -244,7 +252,22 @@ impl ToolExecutionService {
             spool: crate::capture::ProcessSpoolConfig::default(),
             hooks: Vec::new(),
             capabilities: None,
+            result_context: None,
         }
+    }
+
+    /// Add host context to the results of calls that ran.
+    #[must_use]
+    pub fn with_result_context(mut self, context: Arc<dyn ToolResultContext>) -> Self {
+        self.result_context = Some(context);
+        self
+    }
+
+    pub(crate) fn result_context(&self, action: &CodingToolAction) -> Vec<String> {
+        self.result_context
+            .as_ref()
+            .map(|context| context.context_for(action))
+            .unwrap_or_default()
     }
 
     /// Supply the capability matrix measured on this host (M12).

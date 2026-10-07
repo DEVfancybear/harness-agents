@@ -233,6 +233,7 @@ mod tests {
             agents_default_model: None,
             queue_modes: (None, None),
             routing: crate::interactive::config::Routing::default(),
+            verify: crate::interactive::verify::Verify::default(),
             explain: vec![ConfigExplainEntry {
                 key: "approval".to_owned(),
                 value: approval.to_owned(),

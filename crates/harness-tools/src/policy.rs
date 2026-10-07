@@ -342,6 +342,10 @@ impl ToolPolicy {
                 ))
                 // Marking the user's own goal complete changes only host state.
                 || (plugin_id == "goal" && tool_name == "goal_complete")
+                // The feature list is host state too; a verification runs only the
+                // project's configured checks unless the feature names commands of
+                // its own, which the model wrote and the user approves.
+                || (plugin_id == "feature" && tool_name == "feature" && !runs_feature_commands(action))
                 // A delegated child's message to its family and its progress note
                 // stay inside the session, as prime-agent's agent messages do.
                 || (plugin_id == "agent"
@@ -554,6 +558,16 @@ fn tool_pattern_target(action: &CodingToolAction) -> String {
 /// Stable `tool(pattern)` proposal used by the approval panel's explicit
 /// always-allow confirmation.
 #[must_use]
+/// A feature verification that runs commands the feature names.
+fn runs_feature_commands(action: &CodingToolAction) -> bool {
+    matches!(
+        action,
+        CodingToolAction::ExternalTool { arguments, .. }
+            if arguments["action"] == "verify"
+                && arguments["commands"].as_array().is_some_and(|commands| !commands.is_empty())
+    )
+}
+
 pub fn tool_pattern_for_action(action: &CodingToolAction) -> String {
     tool_pattern_target(action)
 }
@@ -749,6 +763,38 @@ mod g05_policy_tests {
 
     /// Loading a trusted skill changes nothing, so it does not open a panel; a tool
     /// of any other plugin still asks, and a deny rule still wins.
+    #[test]
+    fn the_feature_list_is_host_state_but_its_own_commands_ask() {
+        let policy = ToolPolicy::new(1, Vec::new());
+        // The feature list is host state; a verification that runs commands the
+        // model wrote for a feature asks first.
+        let feature = |arguments: serde_json::Value| CodingToolAction::ExternalTool {
+            plugin_id: "feature".to_owned(),
+            tool_name: "feature".to_owned(),
+            arguments,
+            parent_invocation_id: None,
+            timeout_ms: 5_000,
+        };
+        for arguments in [
+            serde_json::json!({"action": "add", "title": "x", "verification": ["rm -rf /"]}),
+            serde_json::json!({"action": "verify", "id": "F01"}),
+        ] {
+            assert!(
+                matches!(
+                    policy.decide(&feature(arguments.clone())),
+                    Decision::Allow { .. }
+                ),
+                "{arguments}"
+            );
+        }
+        assert_eq!(
+            policy.decide(&feature(
+                serde_json::json!({"action": "verify", "id": "F01", "commands": ["make test"]})
+            )),
+            Decision::Ask
+        );
+    }
+
     #[test]
     fn reading_the_skill_catalogue_needs_no_approval_but_other_plugins_do() {
         let external = |plugin: &str, tool: &str| CodingToolAction::ExternalTool {
