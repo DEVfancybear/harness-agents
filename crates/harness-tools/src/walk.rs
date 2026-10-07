@@ -17,10 +17,11 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
@@ -377,6 +378,10 @@ pub(crate) fn ensure_watched(root: &Path) -> bool {
     let owned_root = root.to_owned();
     let handler = move |event: notify::Result<notify::Event>| match event {
         Ok(event) => {
+            // Events for one watch arrive in the order they happened, and this
+            // handler takes them one at a time: when a sentinel shows up here,
+            // every change made before it was written has been handled.
+            mark_sentinels(&event.paths);
             if event.need_rescan() {
                 note_change();
                 return;
@@ -414,6 +419,133 @@ pub(crate) fn ensure_watched(root: &Path) -> bool {
     let active = watched.active;
     roots.insert(root.to_owned(), watched);
     active
+}
+
+/// How long [`settle_changes`] waits for the watcher to report its sentinel
+/// before it gives up and invalidates every cache instead.
+const SENTINEL_WAIT: Duration = Duration::from_millis(200);
+
+/// Sentinels written and not yet taken back, by file name: whether the
+/// watcher has reported each. A name not in here (a sentinel's own deletion,
+/// say) is nobody's business.
+fn sentinels() -> &'static (Mutex<HashMap<OsString, bool>>, Condvar) {
+    static SENTINELS: OnceLock<(Mutex<HashMap<OsString, bool>>, Condvar)> = OnceLock::new();
+    SENTINELS.get_or_init(|| (Mutex::new(HashMap::new()), Condvar::new()))
+}
+
+fn mark_sentinels(paths: &[PathBuf]) {
+    let (pending, arrived) = sentinels();
+    let mut pending = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if pending.is_empty() {
+        return;
+    }
+    let mut marked = false;
+    for name in paths.iter().filter_map(|path| path.file_name()) {
+        if let Some(seen) = pending.get_mut(name) {
+            *seen = true;
+            marked = true;
+        }
+    }
+    if marked {
+        arrived.notify_all();
+    }
+}
+
+/// A process this host ran (a shell command, a hook, an extension tool) has
+/// finished, and may have changed files under `root`.
+///
+/// Noting a change outright made the next walk - the after-fingerprint of
+/// the very call that ran the process - walk the whole workspace again, even
+/// after `cargo test` or `git status` that changed nothing a walk returns.
+/// When the root's watcher is running, the watcher already reports every
+/// change that matters; what is missing is knowing it has caught up. So a
+/// sentinel file is written where the watcher sees it but no walk looks
+/// (`.harness` or `.git`, both pruned), and this waits for the watcher to
+/// report it: events for one watch are delivered in order, so by then every
+/// change the process made before it exited has moved the generation if it
+/// could matter. Anything that keeps that from being sure - no watcher, no
+/// such folder, a sentinel not seen in time - notes a change, as before.
+pub(crate) async fn settle_changes(root: &Path) {
+    let root = root.to_owned();
+    let synced = tokio::task::spawn_blocking(move || sync_with_watcher(&root, SENTINEL_WAIT))
+        .await
+        .unwrap_or(false);
+    if !synced {
+        note_change();
+    }
+}
+
+/// Whether the watcher of `root` has reported everything that happened under
+/// it before this call; see [`settle_changes`].
+fn sync_with_watcher(root: &Path, wait: Duration) -> bool {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    if !watcher_active(root) {
+        return false;
+    }
+    // Only a real folder: a junction's contents are not reported by a watch
+    // on the folder that holds it, so a sentinel there would never arrive.
+    let Some(folder) = [".harness", ".git"]
+        .into_iter()
+        .map(|name| root.join(name))
+        .find(|folder| fs::symlink_metadata(folder).is_ok_and(|metadata| metadata.is_dir()))
+    else {
+        return false;
+    };
+    let name = OsString::from(format!(
+        "ha-sync-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let path = folder.join(&name);
+    let (pending, arrived) = sentinels();
+    pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(name.clone(), false);
+    let created = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .is_ok();
+    let mut seen = false;
+    if created {
+        let guard = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (guard, _) = arrived
+            .wait_timeout_while(guard, wait, |pending| {
+                !pending.get(&name).copied().unwrap_or(false)
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        seen = guard.get(&name).copied().unwrap_or(false);
+    }
+    pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&name);
+    if created {
+        let _ = fs::remove_file(&path);
+    }
+    seen
+}
+
+/// Whether `root` (as given, or canonical) has a watcher that reports events.
+/// It is never started here: a watcher started after the process ran would
+/// have missed what it did.
+fn watcher_active(root: &Path) -> bool {
+    let roots = watched_roots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(watched) = roots.get(root) {
+        return watched.active;
+    }
+    fs::canonicalize(root)
+        .ok()
+        .and_then(|canonical| roots.get(&canonical).map(|watched| watched.active))
+        .unwrap_or(false)
 }
 
 fn remember_directories(root: &Path, base: &Path, walk: &Walk) {
@@ -623,6 +755,87 @@ mod tests {
             .map(|file| file.relative.as_str())
             .collect::<Vec<_>>();
         assert_eq!(names, ["deep/lib.rs", "main.rs", "new.rs"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Run `command` in `root` through the platform shell, as a tool call's
+    /// process would: a writer that never notes a change itself.
+    fn run_in(root: &Path, command: &str) {
+        let status = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/C", command])
+                .current_dir(root)
+                .status()
+        } else {
+            std::process::Command::new("sh")
+                .args(["-c", command])
+                .current_dir(root)
+                .status()
+        };
+        assert!(status.expect("shell").success(), "{command}");
+    }
+
+    #[tokio::test]
+    async fn a_file_a_process_wrote_is_in_the_next_walk_after_it_settles() {
+        let root = workspace();
+        let first = cached_walk(&root, &root, None).expect("walk");
+        assert!(
+            !first
+                .files
+                .iter()
+                .any(|file| file.relative == "src/made.rs")
+        );
+        run_in(&root.join("src"), "echo made> made.rs");
+        settle_changes(&root).await;
+        let after = cached_walk(&root, &root, None).expect("walk");
+        assert!(
+            after
+                .files
+                .iter()
+                .any(|file| file.relative == "src/made.rs"),
+            "the process's file is walked"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_process_that_only_reads_leaves_the_cached_walk_trusted() {
+        let root = workspace();
+        let _ = cached_walk(&root, &root, None).expect("walk");
+        if !ensure_watched(&root) {
+            // No watcher (HA_FILE_WATCH=off, or none on this file system):
+            // settling notes a change, which the other test covers.
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let reader = if cfg!(windows) {
+            "type src\\main.rs"
+        } else {
+            "cat src/main.rs"
+        };
+        // Other tests note changes at any moment (the generation is
+        // process-wide), so the reuse is checked on a quiet attempt.
+        let reused = (0..20).any(|_| {
+            let before = cached_walk(&root, &root, None).expect("walk");
+            let stamp = generation();
+            run_in(&root, reader);
+            // The wait is generous only so a loaded machine does not fail it:
+            // the sentinel arriving is under test, not its latency.
+            assert!(
+                sync_with_watcher(&root, Duration::from_secs(10)),
+                "the watcher reported the sentinel, so no change is noted"
+            );
+            let again = cached_walk(&root, &root, None).expect("walk");
+            generation() == stamp && Arc::ptr_eq(&before, &again)
+        });
+        assert!(reused, "a settled read-only process keeps the walk cached");
+        assert!(
+            fs::read_dir(root.join(".git"))
+                .expect("git")
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().starts_with("ha-sync-")),
+            "the sentinel is taken back"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

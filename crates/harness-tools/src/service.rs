@@ -944,9 +944,10 @@ impl ToolExecutionService {
     ) -> Result<Dispatched, HarnessError> {
         let outcome = self.run_begun_inner(call, cancellation).await;
         // A process, an extension tool or a write may have changed any file:
-        // cached walks, hashes and index entries are not trusted past it.
+        // cached walks, hashes and index entries are not trusted past what
+        // the watcher reported of it (or past it at all, without one).
         if !is_read_only(&call.transformed) {
-            crate::walk::note_change();
+            crate::walk::settle_changes(&call.prepared.workspace_root).await;
         }
         outcome
     }
