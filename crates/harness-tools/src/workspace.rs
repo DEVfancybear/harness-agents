@@ -1257,6 +1257,23 @@ fn hash_files(files: &[WalkFile]) -> Result<Vec<Option<ContentHash>>, HarnessErr
     Ok(hashes.into_iter().map(Option::flatten).collect())
 }
 
+/// Flush a workspace file's temporary copy before it is renamed over (or
+/// linked as) the real file.
+///
+/// Without the flush, a power loss soon after a write can leave the user's
+/// file empty or torn: the rename may reach the disk before the bytes do. It
+/// costs about 70 ms per write on a Windows disk with antivirus scanning, so
+/// `HA_WRITE_SYNC=off` skips it for a user who would rather have the speed and
+/// accepts that risk; a crash of ha itself loses nothing either way, since the
+/// operating system still holds the bytes. Only the user's files are
+/// affected: the journal and artifacts keep their own flushes.
+fn flush_workspace_file(file: &File) -> std::io::Result<()> {
+    if std::env::var_os("HA_WRITE_SYNC").is_some_and(|value| value == "off") {
+        return Ok(());
+    }
+    file.sync_all()
+}
+
 fn create_text_atomically(path: &Path, content: &str) -> Result<(), HarnessError> {
     let parent = path.parent().ok_or_else(|| {
         HarnessError::new(
@@ -1282,7 +1299,7 @@ fn create_text_atomically(path: &Path, content: &str) -> Result<(), HarnessError
             Ok(mut file) => {
                 if let Err(error) = file
                     .write_all(content.as_bytes())
-                    .and_then(|()| file.sync_all())
+                    .and_then(|()| flush_workspace_file(&file))
                 {
                     drop(file);
                     let _ = fs::remove_file(&candidate);
@@ -1372,7 +1389,7 @@ fn write_text_atomically(path: &Path, replacement: &str) -> Result<(), HarnessEr
                         format!("cannot write patch temporary file: {error}"),
                     )
                 })?;
-                file.sync_all().map_err(|error| {
+                flush_workspace_file(&file).map_err(|error| {
                     HarnessError::new(
                         ErrorCode::StorageWriteFailed,
                         format!("cannot flush patch temporary file: {error}"),
