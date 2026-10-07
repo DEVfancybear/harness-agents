@@ -1,9 +1,12 @@
-//! Lazy, per-chat-turn MCP connections and the shared external-tool adapters.
+//! Lazy MCP connections, kept across a session's turns, and the shared external-tool adapters.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
-    sync::Arc,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use harness_extensions::{
@@ -79,7 +82,8 @@ impl ExternalToolCatalog for McpCatalog {
     }
 }
 
-/// A connected, bounded set of MCP servers owned by one interactive turn.
+/// A connected, bounded set of MCP servers, opened for one interactive turn
+/// and kept by an [`McpPool`] for the turns after it.
 pub struct ActiveMcp {
     runtime: Arc<McpRuntime>,
     catalog: Arc<McpCatalog>,
@@ -87,6 +91,11 @@ pub struct ActiveMcp {
     configs: BTreeMap<String, McpServerConfigV2>,
     subscription_cancel: harness_providers::CancellationToken,
     subscription_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The configuration and workspace this was connected from, as given.
+    origin: (BTreeMap<String, McpServerConfigV2>, PathBuf),
+    /// Set when a server reported a list change or its subscription ended:
+    /// the advertised catalog may no longer match, so it is not reused.
+    stale: Arc<AtomicBool>,
 }
 
 impl ActiveMcp {
@@ -97,6 +106,8 @@ impl ActiveMcp {
         callback_factory: McpCallbackFactory,
         notice: Arc<dyn Fn(String) + Send + Sync>,
     ) -> Result<Self, HarnessError> {
+        let origin = (configs.clone(), workspace.to_path_buf());
+        let stale = Arc::new(AtomicBool::new(false));
         let runtime = Arc::new(McpRuntime::new());
         let mut report = Vec::new();
         // prime-agent's `enabled: false`: configured, not started.
@@ -108,29 +119,55 @@ impl ActiveMcp {
             if let Err(error) = config.validate(name) {
                 return Err(HarnessError::new(error.code(), error.to_string()));
             }
-            let scope = ScopeId::generate();
-            let connecting = connect_one(name, config, workspace, scope, callback_factory(name));
-            let client = match config.startup_timeout_seconds {
-                Some(seconds) => {
-                    harness_extensions::mcp::MCP_STARTUP_TIMEOUT_MS
-                        .scope(seconds.saturating_mul(1000), connecting)
-                        .await
+        }
+        // The servers start side by side: one after another, a turn waited for
+        // the sum of every server's process start and handshake. They are
+        // attached afterwards in configuration order, as before.
+        let connected = futures_util::future::join_all(configs.iter().map(|(name, config)| {
+            let connecting = connect_one(
+                name,
+                config,
+                workspace,
+                ScopeId::generate(),
+                callback_factory(name),
+            );
+            async move {
+                match config.startup_timeout_seconds {
+                    Some(seconds) => {
+                        harness_extensions::mcp::MCP_STARTUP_TIMEOUT_MS
+                            .scope(seconds.saturating_mul(1000), connecting)
+                            .await
+                    }
+                    None => connecting.await,
                 }
-                None => connecting.await,
-            };
+            }
+        }))
+        .await;
+        let connected = configs.iter().zip(connected).collect::<Vec<_>>();
+        // The first required server that failed, in configuration order, fails
+        // the whole set; the ones that did start are stopped again.
+        if let Some(error) = connected
+            .iter()
+            .find_map(|((name, config), client)| match client {
+                Err(error) if config.required => Some(HarnessError::new(
+                    error.code(),
+                    format!("required MCP server {name} could not start: {error}"),
+                )),
+                _ => None,
+            })
+        {
+            close_started(connected).await;
+            return Err(error);
+        }
+        let mut connected = connected.into_iter();
+        while let Some(((name, _), client)) = connected.next() {
             match client {
                 Ok(client) => {
-                    runtime
-                        .attach(name, client)
-                        .await
-                        .map_err(|error| HarnessError::new(error.code(), error.to_string()))?;
-                }
-                Err(error) if config.required => {
-                    runtime.close_all().await;
-                    return Err(HarnessError::new(
-                        error.code(),
-                        format!("required MCP server {name} could not start: {error}"),
-                    ));
+                    if let Err(error) = runtime.attach(name, client).await {
+                        runtime.close_all().await;
+                        close_started(connected.collect()).await;
+                        return Err(HarnessError::new(error.code(), error.to_string()));
+                    }
                 }
                 Err(error) => report.push(format!("{name}: unavailable ({error})")),
             }
@@ -151,6 +188,7 @@ impl ActiveMcp {
                     let cancellation = subscription_cancel.clone();
                     let notice = Arc::clone(&notice);
                     let server = name.clone();
+                    let stale = Arc::clone(&stale);
                     subscription_tasks.push(tokio::spawn(async move {
                         loop {
                             tokio::select! {
@@ -160,11 +198,16 @@ impl ActiveMcp {
                                 }
                                 result = subscription.next() => match result {
                                     Ok(Some(notification)) => {
+                                        stale.store(true, Ordering::Relaxed);
                                         let summary = format!("MCP {server} notification: {notification:?}");
                                         notice(summary.chars().take(768).collect());
                                     }
-                                    Ok(None) => break,
+                                    Ok(None) => {
+                                        stale.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
                                     Err(error) => {
+                                        stale.store(true, Ordering::Relaxed);
                                         notice(format!("MCP {server} subscription ended: {error}"));
                                         break;
                                     }
@@ -292,7 +335,25 @@ impl ActiveMcp {
             configs,
             subscription_cancel,
             subscription_tasks,
+            origin,
+            stale,
         })
+    }
+
+    /// Whether this set can serve another turn of the same configuration: every
+    /// enabled server is attached and still connected, and none has reported
+    /// a change since the catalog was built. A server that failed to start is
+    /// tried again by connecting anew, as every turn used to.
+    async fn reusable(
+        &self,
+        configs: &BTreeMap<String, McpServerConfigV2>,
+        workspace: &Path,
+    ) -> bool {
+        self.origin.0 == *configs
+            && self.origin.1 == workspace
+            && !self.stale.load(Ordering::Relaxed)
+            && self.runtime.attached_labels().await.len() == self.configs.len()
+            && self.runtime.all_open().await
     }
 
     pub fn tools(&self) -> ExternalTools {
@@ -367,6 +428,184 @@ impl ActiveMcp {
             let _ = task.await;
         }
         self.runtime.drain_all().await
+    }
+}
+
+/// Stop the servers that started for a set that is not going to be used.
+async fn close_started<N>(
+    started: Vec<(N, Result<McpClient, harness_extensions::ExtensionError>)>,
+) {
+    for (_, client) in started {
+        if let Ok(client) = client {
+            client.close().await;
+        }
+    }
+}
+
+/// The turn an MCP server's sampling and elicitation requests reach.
+///
+/// A pooled connection outlives the turn that opened it, while answering a
+/// request needs the turn now running: its provider, its screen and its
+/// cancellation. The connection's callbacks look the turn up here; between
+/// turns a request is refused.
+#[derive(Clone, Default)]
+struct McpTurnSlot(Arc<std::sync::Mutex<Option<McpCallbackFactory>>>);
+
+impl McpTurnSlot {
+    fn set(&self, factory: Option<McpCallbackFactory>) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = factory;
+        }
+    }
+
+    /// Callbacks for a connection, routed to whichever turn holds the slot.
+    fn factory(&self) -> McpCallbackFactory {
+        let slot = self.clone();
+        Arc::new(move |server| {
+            Arc::new(SlotCallbacks {
+                server: server.to_owned(),
+                slot: slot.clone(),
+            })
+        })
+    }
+
+    fn current(&self, server: &str) -> Option<Arc<dyn McpRequestCallbacks>> {
+        let factory = self.0.lock().ok()?.clone()?;
+        Some(factory(server))
+    }
+}
+
+struct SlotCallbacks {
+    server: String,
+    slot: McpTurnSlot,
+}
+
+fn no_turn() -> harness_extensions::rmcp::model::ErrorData {
+    harness_extensions::rmcp::model::ErrorData::internal_error(
+        "no turn is running to answer this MCP request".to_owned(),
+        None,
+    )
+}
+
+impl McpRequestCallbacks for SlotCallbacks {
+    #[allow(deprecated)]
+    fn sample<'a>(
+        &'a self,
+        request: harness_extensions::rmcp::model::CreateMessageRequestParams,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        harness_extensions::rmcp::model::CreateMessageResult,
+                        harness_extensions::rmcp::model::ErrorData,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let current = self.slot.current(&self.server);
+        Box::pin(async move {
+            match current {
+                Some(callbacks) => callbacks.sample(request).await,
+                None => Err(no_turn()),
+            }
+        })
+    }
+
+    #[allow(deprecated)]
+    fn elicit<'a>(
+        &'a self,
+        request: harness_extensions::rmcp::model::ElicitRequestParams,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        harness_extensions::rmcp::model::ElicitResult,
+                        harness_extensions::rmcp::model::ErrorData,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let current = self.slot.current(&self.server);
+        Box::pin(async move {
+            match current {
+                Some(callbacks) => callbacks.elicit(request).await,
+                None => Err(no_turn()),
+            }
+        })
+    }
+}
+
+/// A session's MCP connections, kept between its turns.
+///
+/// Every turn used to start each configured server, handshake, list its
+/// tools and stop it again at the end, which put process starts in front of
+/// every answer. A turn now takes the set the last one left while the
+/// configuration and workspace are unchanged and every server is still
+/// connected, and connects anew otherwise. Turns of one session run one at a
+/// time, so one idle set is enough. Dropping the pool (the session ends)
+/// stops the servers: their processes are killed with their handles.
+#[derive(Default)]
+pub struct McpPool {
+    slot: McpTurnSlot,
+    idle: tokio::sync::Mutex<Option<ActiveMcp>>,
+}
+
+impl McpPool {
+    /// The servers for this turn, whose sampling and elicitation requests go
+    /// to `turn_callbacks` until [`Self::finish`].
+    ///
+    /// # Errors
+    /// A server could not be configured, or a required one did not start.
+    pub async fn take(
+        &self,
+        configs: BTreeMap<String, McpServerConfigV2>,
+        workspace: &Path,
+        turn_callbacks: McpCallbackFactory,
+        notice: Arc<dyn Fn(String) + Send + Sync>,
+    ) -> Result<ActiveMcp, HarnessError> {
+        self.slot.set(Some(turn_callbacks));
+        let idle = self.idle.lock().await.take();
+        if let Some(active) = idle {
+            if active.reusable(&configs, workspace).await {
+                return Ok(active);
+            }
+            let _ = active.shutdown().await;
+        }
+        let connected = ActiveMcp::connect(configs, workspace, self.slot.factory(), notice).await;
+        if connected.is_err() {
+            self.slot.set(None);
+        }
+        connected
+    }
+
+    /// The turn is over. A set it ended cleanly with waits for the next turn;
+    /// one it failed or was canceled with is stopped, so a call left running
+    /// in a server is drained as before. Returns what stopping reported.
+    pub async fn finish(
+        &self,
+        active: ActiveMcp,
+        keep: bool,
+    ) -> Vec<harness_extensions::mcp::McpUnloadReport> {
+        self.slot.set(None);
+        if keep {
+            let mut idle = self.idle.lock().await;
+            if idle.is_none() {
+                *idle = Some(active);
+                return Vec::new();
+            }
+        }
+        active.shutdown().await
+    }
+
+    /// Stop the kept servers: the turn reaches them some other way (the Python
+    /// REPL) or none are configured any more.
+    pub async fn release(&self) {
+        let idle = self.idle.lock().await.take();
+        if let Some(active) = idle {
+            let _ = active.shutdown().await;
+        }
     }
 }
 

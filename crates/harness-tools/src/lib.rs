@@ -82,5 +82,6 @@ pub use turn_driver::{
     TurnOutcome, TurnProgress, TurnStop, execute_action_with_approval,
 };
 pub use workspace::{
-    is_sensitive_workspace_path, observe_workspace, observed_file_hash, workspace_registration,
+    git_branch, is_sensitive_workspace_path, observe_workspace, observed_file_hash,
+    workspace_registration,
 };

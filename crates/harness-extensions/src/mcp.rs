@@ -1428,6 +1428,13 @@ impl McpClient {
         self.generation
     }
 
+    /// Whether the connection still runs: not canceled, and its service loop
+    /// still reads the transport (a server that exited ends the loop).
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        !self.running.is_closed() && !self.running.peer().is_transport_closed()
+    }
+
     /// Stop the client and its server process.
     pub async fn close(self) {
         let _ = self.running.cancel().await;
@@ -2158,6 +2165,17 @@ impl McpRuntime {
     #[must_use]
     pub async fn attached_labels(&self) -> Vec<String> {
         self.servers.lock().await.keys().cloned().collect()
+    }
+
+    /// Whether every attached server's connection still runs, so a host that
+    /// keeps the runtime between uses can tell when to connect again.
+    #[must_use]
+    pub async fn all_open(&self) -> bool {
+        self.servers
+            .lock()
+            .await
+            .values()
+            .all(|client| client.is_open())
     }
 }
 

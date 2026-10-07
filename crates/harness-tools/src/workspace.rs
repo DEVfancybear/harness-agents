@@ -301,6 +301,33 @@ pub(crate) fn git_head(root: &Path) -> Option<String> {
     }
 }
 
+/// The branch `HEAD` is on, as `git rev-parse --abbrev-ref HEAD` names it: the
+/// short branch name, `HEAD` when detached, `None` outside a repository and
+/// before the first commit. Read from the repository's files like
+/// [`git_head`], so the prompt of every turn no longer waits on a `git`
+/// process; `git` answers only when the files cannot.
+#[must_use]
+pub fn git_branch(root: &Path) -> Option<String> {
+    let asked = || git_output(root, ["rev-parse", "--abbrev-ref", "HEAD"]);
+    match head_from_files(root) {
+        HeadRead::Unborn => None,
+        HeadRead::Unknown => asked(),
+        HeadRead::Commit(_) => {
+            let head = fs::read_to_string(PathBuf::from(cached_git_dir(root)?).join("HEAD"));
+            match head.as_deref().map(str::trim) {
+                Ok(head) => match head.strip_prefix("ref:").map(str::trim) {
+                    None => Some("HEAD".to_owned()),
+                    Some(reference) => reference
+                        .strip_prefix("refs/heads/")
+                        .map(str::to_owned)
+                        .or_else(asked),
+                },
+                Err(_) => asked(),
+            }
+        }
+    }
+}
+
 /// The hash of the worktree's Git index, through the same size-and-time hash
 /// cache as the workspace files.
 fn git_index_hash(root: &Path) -> Option<ContentHash> {
@@ -1549,6 +1576,43 @@ fn is_sensitive_relative(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The branch read from the repository files is what `git rev-parse
+    /// --abbrev-ref HEAD` says: nothing before the first commit, the branch
+    /// name on a branch and `HEAD` when detached.
+    #[test]
+    fn the_branch_read_from_files_matches_git() {
+        let root = std::env::temp_dir().join(format!("br-{}", harness_types::InputId::generate()));
+        std::fs::create_dir_all(&root).expect("root");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("git");
+            assert!(status.status.success(), "git {args:?}");
+        };
+        let asked = || git_output(&root, ["rev-parse", "--abbrev-ref", "HEAD"]);
+        git(&["init", "-q", "-b", "feature/x"]);
+        assert_eq!(git_branch(&root), None, "no commit yet");
+        std::fs::write(root.join("a.txt"), "a").expect("file");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "one"]);
+        assert_eq!(git_branch(&root).as_deref(), Some("feature/x"));
+        assert_eq!(git_branch(&root), asked());
+        git(&["checkout", "-q", "--detach"]);
+        assert_eq!(git_branch(&root).as_deref(), Some("HEAD"));
+        assert_eq!(git_branch(&root), asked());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     /// A folder that is not a Git repository still keeps out what its
     /// `.gitignore` names; a walk past its deadline counts as too large; and a

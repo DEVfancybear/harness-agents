@@ -63,10 +63,17 @@ fn handoff(root: &Path, limit: usize) -> Option<(String, bool)> {
 #[must_use]
 pub fn startup_brief(root: &Path) -> Option<ContextBlock> {
     let mut text = String::new();
-    if let Some(log) = git(root, &["log", "--oneline", "-5"]).filter(|log| !log.is_empty()) {
+    // The two reads are independent; each is a process start on Windows, so
+    // they run side by side.
+    let (log, status) = std::thread::scope(|scope| {
+        let status = scope.spawn(|| git(root, &["--no-optional-locks", "status", "--short"]));
+        let log = git(root, &["log", "--oneline", "-5"]);
+        (log, status.join().ok().flatten())
+    });
+    if let Some(log) = log.filter(|log| !log.is_empty()) {
         let _ = write!(text, "Recent commits:\n{log}\n");
     }
-    if let Some(status) = git(root, &["--no-optional-locks", "status", "--short"]) {
+    if let Some(status) = status {
         let lines = status.lines().collect::<Vec<_>>();
         if lines.is_empty() {
             text.push_str("The worktree is clean.\n");

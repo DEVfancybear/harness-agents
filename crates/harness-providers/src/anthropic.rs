@@ -47,21 +47,16 @@ impl AnthropicMessagesAdapter {
     ) -> Result<Self, ProviderError> {
         let endpoint = endpoint.into();
         super::validate_endpoint(&endpoint)?;
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(super::DEFAULT_CONNECT_TIMEOUT_SECONDS))
-            // prime-agent bounds the wait for an answer, never the answer: a
-            // whole-request timeout cut every stream longer than it (a long
-            // thinking answer, a big file write). A read that stays silent
-            // this long still fails, so a hung socket cannot park a turn.
-            .read_timeout(Duration::from_secs(super::DEFAULT_REQUEST_TIMEOUT_SECONDS))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| {
-                ProviderError::new(
-                    ErrorCode::ProviderProtocol,
-                    "provider client is not buildable",
-                )
-            })?;
+        let client = super::shared_client(
+            Duration::from_secs(super::DEFAULT_CONNECT_TIMEOUT_SECONDS),
+            Duration::from_secs(super::DEFAULT_REQUEST_TIMEOUT_SECONDS),
+        )
+        .map_err(|_| {
+            ProviderError::new(
+                ErrorCode::ProviderProtocol,
+                "provider client is not buildable",
+            )
+        })?;
         Ok(Self {
             endpoint,
             credentials,

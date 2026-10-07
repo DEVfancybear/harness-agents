@@ -298,16 +298,37 @@ impl Catalog {
     /// The snapshot compiled into the binary.
     #[must_use]
     pub fn bundled() -> Self {
+        // The snapshot is ~90 KB of JSON and never changes in a process.
+        static BUNDLED_MODELS: std::sync::OnceLock<Vec<Model>> = std::sync::OnceLock::new();
         Self {
-            models: parse(BUNDLED).unwrap_or_default(),
+            models: BUNDLED_MODELS
+                .get_or_init(|| parse(BUNDLED).unwrap_or_default())
+                .clone(),
         }
     }
 
     /// The cached download when it is usable, else the snapshot, plus the models
     /// the providers you are logged in to list themselves. Never touches the
     /// network; [`refresh_in_background`] does that.
+    ///
+    /// A turn and a menu refresh each load the catalog several times, so the
+    /// last result is kept and handed out again while none of the files it was
+    /// built from changed (by length and modification time).
     #[must_use]
     pub fn load(data_dir: &Path) -> Self {
+        let key = LoadKey::of(data_dir);
+        let mut loaded = loaded();
+        if let Some((seen, catalog)) = loaded.as_ref()
+            && *seen == key
+        {
+            return catalog.clone();
+        }
+        let catalog = Self::load_files(data_dir);
+        *loaded = Some((key, catalog.clone()));
+        catalog
+    }
+
+    fn load_files(data_dir: &Path) -> Self {
         let bundled = Self::bundled();
         let cached = std::fs::read_to_string(cache_path(data_dir))
             .ok()
@@ -432,6 +453,47 @@ fn cache_path(data_dir: &Path) -> PathBuf {
     data_dir.join(CACHE_FILE)
 }
 
+/// What [`Catalog::load`] read: the data directory, where `models.json` is,
+/// and the stamp of every file the catalog is built from.
+#[derive(PartialEq)]
+struct LoadKey {
+    data_dir: PathBuf,
+    custom: Option<PathBuf>,
+    stamps: Vec<Option<super::config::FileStamp>>,
+}
+
+impl LoadKey {
+    fn of(data_dir: &Path) -> Self {
+        let custom = super::custom_models::path();
+        let mut stamps = vec![super::config::file_stamp(&cache_path(data_dir))];
+        stamps.extend(
+            LIVE_LISTS
+                .iter()
+                .map(|provider| super::config::file_stamp(&live_path(data_dir, provider.0))),
+        );
+        stamps.push(custom.as_deref().and_then(super::config::file_stamp));
+        Self {
+            data_dir: data_dir.to_path_buf(),
+            custom,
+            stamps,
+        }
+    }
+}
+
+/// The catalog [`Catalog::load`] built last, and from what.
+fn loaded() -> std::sync::MutexGuard<'static, Option<(LoadKey, Catalog)>> {
+    static LOADED: std::sync::Mutex<Option<(LoadKey, Catalog)>> = std::sync::Mutex::new(None);
+    LOADED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Drop the kept catalog after this process rewrote one of its files: a
+/// rewrite of the same length inside the file clock's tick keeps the stamp.
+fn forget_loaded() {
+    *loaded() = None;
+}
+
 /// Providers whose own model list is read, and where (OpenAI-compatible
 /// `GET /models`): the catalog lags behind their releases.
 const LIVE_LISTS: [(&str, &str); 3] = [
@@ -510,6 +572,7 @@ fn refresh_listed_models(data_dir: &Path, provider: &str, key: String) {
             }
             if let Ok(text) = serde_json::to_string(&ids) {
                 let _ = std::fs::write(path, text);
+                forget_loaded();
             }
         });
 }
@@ -568,6 +631,7 @@ pub fn refresh_in_background(data_dir: &Path) {
             let staged = path.with_extension("json.staged");
             if std::fs::write(&staged, text).is_ok() {
                 let _ = std::fs::rename(&staged, &path);
+                forget_loaded();
             }
         });
 }
