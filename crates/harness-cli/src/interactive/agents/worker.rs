@@ -34,7 +34,7 @@ use serde_json::json;
 use super::super::bootstrap::{self, LaunchContext, LaunchRequest};
 use super::super::config::ConfigOverrides;
 use super::super::controller::{Effect, InteractiveController};
-use super::super::events::{HistoryItem, Key};
+use super::super::events::{HistoryItem, Key, UiState};
 use super::super::paths::{HostPlatform, LaunchEnvironment};
 use super::protocol::{self, AgentInfo, CreateAgent, ExecSpec, Reply, Request, SendMode};
 use super::registry::{self, Descriptor};
@@ -44,6 +44,12 @@ use super::{CreateSession, SessionHost};
 const POLL: Duration = Duration::from_millis(20);
 /// The spinner and clocks, as the TUI ticks them.
 const TICK: Duration = Duration::from_millis(100);
+/// The shortest gap between two frames that only redraw (about 30 a second):
+/// a streaming answer redraws on every poll, and each frame ships the view.
+const FRAME_EVERY: Duration = Duration::from_millis(33);
+/// The longest a tick-only frame stands in for the whole view, in case
+/// something changed it without an effect.
+const FULL_EVERY: Duration = Duration::from_secs(1);
 /// How often an agent refreshes what `ha agents` shows about it.
 const STATUS_EVERY: Duration = Duration::from_secs(1);
 /// How often the worker looks for idle agents and for its own descriptor.
@@ -801,13 +807,23 @@ struct Agent {
     /// The terminals attached to it.
     clients: Vec<Client>,
     last_status: Instant,
+    /// A command ran since the view was last sent; it may have changed the
+    /// view without an effect, so the next tick sends the whole view.
+    dirty: bool,
+    /// When the whole view was last compared and sent.
+    last_full: Instant,
+    /// A redraw that waits for [`FRAME_EVERY`] to pass.
+    redraw_due: bool,
 }
 
 struct Client {
     connection: u64,
     out: Sender<Reply>,
-    /// The view state it was last sent, so an unchanged one is not sent again.
+    /// The view state it was last sent, without its tick, so an unchanged one
+    /// is not sent again.
     last_state: String,
+    /// The tick it was last sent.
+    last_tick: u64,
 }
 
 impl Agent {
@@ -898,6 +914,9 @@ impl Agent {
             history,
             clients: Vec::new(),
             last_status: Instant::now(),
+            dirty: false,
+            last_full: Instant::now(),
+            redraw_due: false,
         };
         if let Some(prompt) = spec.prompt {
             let mut effects = Vec::new();
@@ -929,14 +948,35 @@ impl Agent {
                 }
                 return;
             }
-            let mut effects = self.controller.pump_events();
-            if last_tick.elapsed() >= TICK {
+            let pumped = self.controller.pump_events();
+            let ticked = if last_tick.elapsed() >= TICK {
                 last_tick = Instant::now();
-                effects.extend(self.controller.tick());
-            }
-            if !effects.is_empty() {
+                self.controller.tick()
+            } else {
+                Vec::new()
+            };
+            if !pumped.is_empty() || !ticked.is_empty() {
                 self.touch();
-                self.forward(&effects, None);
+            }
+            if !pumped.is_empty() {
+                // Only redraws can wait: anything else is part of the
+                // conversation and keeps its order with the replies to keys.
+                let only_redraw = pumped.iter().all(|effect| matches!(effect, Effect::Redraw));
+                if only_redraw && self.last_full.elapsed() < FRAME_EVERY {
+                    self.redraw_due = true;
+                } else {
+                    self.forward(&pumped, None);
+                }
+            }
+            if !ticked.is_empty() {
+                if self.dirty || self.redraw_due || self.last_full.elapsed() >= FULL_EVERY {
+                    self.forward(&ticked, None);
+                } else {
+                    self.forward_tick();
+                }
+            }
+            if self.redraw_due && self.last_full.elapsed() >= FRAME_EVERY {
+                self.forward(&[Effect::Redraw], None);
             }
             if self.last_status.elapsed() >= STATUS_EVERY {
                 self.refresh_status();
@@ -947,6 +987,8 @@ impl Agent {
     /// Carry out one command; true when the agent must stop.
     fn handle(&mut self, command: Command) -> bool {
         self.touch();
+        // Cleared again by a command that sends the view itself.
+        self.dirty = true;
         match command {
             Command::Attach {
                 connection,
@@ -954,8 +996,8 @@ impl Agent {
                 columns,
             } => {
                 self.controller.set_columns(columns);
-                let state = self.controller.ui_state();
-                let last_state = serde_json::to_string(&state).unwrap_or_default();
+                let mut state = self.controller.ui_state();
+                let (last_state, last_tick) = view_text(&mut state);
                 self.refresh_status();
                 let mut agent = Box::new(info_of(&self.status));
                 agent.attached = true;
@@ -970,6 +1012,7 @@ impl Agent {
                         connection,
                         out,
                         last_state,
+                        last_tick,
                     });
                 }
                 self.refresh_status();
@@ -1090,11 +1133,14 @@ impl Agent {
                 self.history.push_back(item);
             }
         }
+        self.dirty = false;
+        self.redraw_due = false;
+        self.last_full = Instant::now();
         if self.clients.is_empty() {
             return;
         }
-        let state = self.controller.ui_state();
-        let text = serde_json::to_string(&state).unwrap_or_default();
+        let mut state = self.controller.ui_state();
+        let (text, tick) = view_text(&mut state);
         // What the other terminals draw: the effects without the exit, and
         // without the external editor only the terminal that asked runs.
         let shared = effects
@@ -1108,6 +1154,9 @@ impl Agent {
                 client.last_state.clone_from(&text);
                 Box::new(state.clone())
             });
+            // A view that differs only in its tick travels as the tick alone.
+            let ticked = (changed.is_none() && client.last_tick != tick).then_some(tick);
+            client.last_tick = tick;
             let typed =
                 ack.and_then(|(connection, seq)| (connection == client.connection).then_some(seq));
             let reply = match typed {
@@ -1115,24 +1164,27 @@ impl Agent {
                     seq,
                     effects: effects.to_vec(),
                     state: changed,
+                    tick: ticked,
                 },
                 // Exits the agent itself produces reach every terminal.
                 None if ack.is_none() => {
-                    if effects.is_empty() && changed.is_none() {
+                    if effects.is_empty() && changed.is_none() && ticked.is_none() {
                         continue;
                     }
                     Reply::Frame {
                         effects: effects.to_vec(),
                         state: changed,
+                        tick: ticked,
                     }
                 }
                 None => {
-                    if shared.is_empty() && changed.is_none() {
+                    if shared.is_empty() && changed.is_none() && ticked.is_none() {
                         continue;
                     }
                     Reply::Frame {
                         effects: shared.clone(),
                         state: changed,
+                        tick: ticked,
                     }
                 }
             };
@@ -1153,6 +1205,43 @@ impl Agent {
             self.refresh_status();
         }
     }
+
+    /// A frame for a tick that changed nothing but the spinner: the tick
+    /// alone, without building or serializing the view.
+    fn forward_tick(&mut self) {
+        let tick = self.controller.tick_count();
+        let mut gone = Vec::new();
+        for client in &mut self.clients {
+            if client.last_tick == tick {
+                continue;
+            }
+            client.last_tick = tick;
+            let frame = Reply::Frame {
+                effects: vec![Effect::Redraw],
+                state: None,
+                tick: Some(tick),
+            };
+            if client.out.send(frame).is_err() {
+                log(&format!("terminal {} is gone", client.connection));
+                gone.push(client.connection);
+            }
+        }
+        if !gone.is_empty() {
+            self.clients
+                .retain(|client| !gone.contains(&client.connection));
+            self.refresh_status();
+        }
+    }
+}
+
+/// The view as compared between frames, without its tick (which changes ten
+/// times a second during a run and travels on its own), and that tick. The
+/// tick is zeroed in place and restored, so the view is not copied for it.
+fn view_text(state: &mut UiState) -> (String, u64) {
+    let tick = std::mem::take(&mut state.tick);
+    let text = serde_json::to_string(state).unwrap_or_default();
+    state.tick = tick;
+    (text, tick)
 }
 
 fn resolve_context(

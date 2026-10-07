@@ -1105,7 +1105,11 @@ def _taskkill_tree(pid: int) -> bool:
 def _process_start_id(pid: int) -> str | None:
     if os.name == "nt":
         # Mirrors getWindowsProcessStartId in session-lease.ts byte-for-byte so
-        # the host's identity comparison matches the journaled string.
+        # the host's identity comparison matches the journaled string. ctypes
+        # first: a PowerShell spawn costs 0.3-1 s on every bash() call.
+        ticks = _winjob.process_start_ticks(pid)
+        if ticks is not None:
+            return f"win:{ticks}"
         try:
             out = subprocess.run(
                 [

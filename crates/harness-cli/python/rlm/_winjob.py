@@ -118,6 +118,8 @@ def _kernel32():
             ("WaitForSingleObject", [h, _DWORD], _DWORD),
             ("GetExitCodeProcess", [h, p], b),
             ("TerminateProcess", [h, wintypes.UINT], b),
+            ("OpenProcess", [_DWORD, b, _DWORD], h),
+            ("GetProcessTimes", [h, p, p, p, p], b),
         ):
             fn = getattr(k32, name)
             fn.argtypes, fn.restype = argtypes, restype
@@ -368,6 +370,33 @@ def terminate(job: int, exit_code: int = 1) -> bool:
         return bool(_kernel32().TerminateJobObject(job, exit_code))
     except (OSError, AttributeError):
         return False
+
+
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+# .NET ticks count 100 ns from 0001-01-01, FILETIME from 1601-01-01.
+_DOTNET_TICKS_AT_FILETIME_EPOCH = 504_911_232_000_000_000
+
+
+def process_start_ticks(pid: int) -> int | None:
+    """The creation time of `pid` as UTC .NET ticks -- the value the host reads
+    with `Process.StartTime.ToUniversalTime().Ticks` (FromFileTime keeps the
+    ambiguous-DST bit, so that round trip is exact) -- or None when the
+    process cannot be opened. One syscall pair instead of a PowerShell spawn."""
+    try:
+        k32 = _kernel32()
+        if not (handle := k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)):
+            return None
+        try:
+            created, exited, kernel, user = (ctypes.c_uint64() for _ in range(4))
+            if not k32.GetProcessTimes(
+                handle, ctypes.byref(created), ctypes.byref(exited),
+                ctypes.byref(kernel), ctypes.byref(user)):
+                return None
+            return created.value + _DOTNET_TICKS_AT_FILETIME_EPOCH if created.value else None
+        finally:
+            k32.CloseHandle(handle)
+    except (OSError, AttributeError):
+        return None
 
 
 def close(job: int) -> None:
