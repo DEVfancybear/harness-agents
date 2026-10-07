@@ -2054,6 +2054,53 @@ pub struct RuntimeService {
     /// The tool definitions the context was last measured with, their digests
     /// and rendered length. See `tool_schema_facts`.
     tool_schema_facts: Arc<Mutex<Option<ToolSchemaFacts>>>,
+    /// The context packet this runtime stored last, so a step whose packet
+    /// says the same refers to it instead of storing a copy. See
+    /// `same_packet_content`.
+    stored_packet: Arc<Mutex<Option<ContextPacketRecord>>>,
+}
+
+/// Whether a packet just built says what a stored one says.
+///
+/// Every step builds the context again and gave the packet a new id, so a
+/// turn stored one packet per step although most steps - those that read and
+/// changed nothing - built the same text. Only what the build measured or
+/// where it stood differs: the id, the event sequence and checkpoint it was
+/// built through, and the token estimate (which counts the turn's transcript,
+/// not the packet). Everything else - the session and task, the content and
+/// its hash, its sources, memories and versions, and what was left out - must
+/// match. The packet is taken apart field by field, so a field added to it
+/// later does not compile until it is decided here.
+fn same_packet_content(
+    stored: &ContextPacketRecord,
+    built: &harness_session::ContextBuildResult,
+) -> bool {
+    let harness_types::ContextPacket {
+        schema_version,
+        packet_id: _,
+        session_id,
+        task_id,
+        checkpoint_id: _,
+        through_event_seq: _,
+        memory_versions,
+        rendering_version,
+        token_estimate: _,
+        content_hash,
+        content,
+        source_manifest,
+    } = &built.packet;
+    let packet = &stored.packet;
+    stored.composition_snapshot_id.is_none()
+        && stored.omitted_optional == built.omitted_optional
+        && stored.degradation == built.degradation
+        && packet.schema_version == *schema_version
+        && packet.session_id == *session_id
+        && packet.task_id == *task_id
+        && packet.memory_versions == *memory_versions
+        && packet.rendering_version == *rendering_version
+        && packet.content_hash == *content_hash
+        && packet.content == *content
+        && packet.source_manifest == *source_manifest
 }
 
 /// What the context builder records about a request's tool definitions.
@@ -2088,6 +2135,7 @@ impl RuntimeService {
             compactions: Arc::new(AtomicU32::new(0)),
             turn_packets: Arc::new(Mutex::new(std::collections::HashMap::new())),
             tool_schema_facts: Arc::new(Mutex::new(None)),
+            stored_packet: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2485,7 +2533,7 @@ impl RuntimeService {
                 &appended,
             );
         }
-        let built = match attempt {
+        let mut built = match attempt {
             Ok(built) if built.packet.token_estimate <= window => built,
             Ok(built) => return Err(context_overflow(built.packet.token_estimate, window)),
             // Compaction could not make the mandatory part fit: the turn's
@@ -2498,6 +2546,20 @@ impl RuntimeService {
             }
             Err(error) => return Err(error),
         };
+        // A step that read but changed nothing builds the packet it built last
+        // time, under a new id. It is that packet: the step refers to it
+        // instead of storing a copy, and everything that names the step's
+        // packet (its frozen request, its run step and manifest, its result)
+        // names one that is stored.
+        let reused_packet = self.stored_packet.lock().ok().and_then(|stored| {
+            stored
+                .as_ref()
+                .filter(|stored| same_packet_content(stored, &built))
+                .map(|stored| stored.packet.packet_id.clone())
+        });
+        if let Some(packet_id) = &reused_packet {
+            built.packet.packet_id.clone_from(packet_id);
+        }
         if let Ok(mut last_context) = self.last_context.lock() {
             *last_context = Some((request.session_id.clone(), built.clone()));
         }
@@ -2589,14 +2651,22 @@ impl RuntimeService {
                     format!("provider capability refuses this request: {error}"),
                 )
             })?;
-        self.store
-            .persist_context_packet(ContextPacketRecord {
+        if reused_packet.is_none() {
+            let record = ContextPacketRecord {
                 packet: built.packet.clone(),
                 composition_snapshot_id: None,
                 omitted_optional: built.omitted_optional.clone(),
                 degradation: built.degradation.clone(),
-            })
-            .await?;
+            };
+            // Remembered only once stored: a reused id always names a row.
+            if let Ok(mut stored) = self.stored_packet.lock() {
+                *stored = None;
+            }
+            self.store.persist_context_packet(record.clone()).await?;
+            if let Ok(mut stored) = self.stored_packet.lock() {
+                *stored = Some(record);
+            }
+        }
         let request_json = serde_json::to_value(&provider_request).map_err(|_| {
             RuntimeError::new(
                 ErrorCode::InvalidPayload,
@@ -3247,6 +3317,11 @@ impl RuntimeService {
                 .await
             {
                 Ok(()) => {
+                    // The checkpoint's packet is now the session's latest: a
+                    // step does not refer back past it to one stored before.
+                    if let Ok(mut stored) = self.stored_packet.lock() {
+                        *stored = None;
+                    }
                     self.store
                         .persist_context_packet(ContextPacketRecord {
                             packet: built.packet.clone(),

@@ -752,6 +752,62 @@ async fn p2_c14_offline_replay_dispatches_nothing_and_matches_frozen_packet() {
     close_writer(store).await;
 }
 
+/// A step whose context says what the last stored packet says refers to that
+/// packet instead of storing a copy: every frozen request still names a stored
+/// packet, and a step that changed the context stores a new one.
+#[tokio::test]
+async fn p2_unchanged_step_context_reuses_the_stored_packet() {
+    let temp = TempDir::new().unwrap();
+    let store = writer(&temp).await;
+    let provider = Arc::new(MockProvider::text("recorded response"));
+    let runtime = RuntimeService::new(Arc::clone(&store), provider, RuntimeConfig::default());
+    let session_id = SessionId::generate();
+    let task_id = TaskId::generate();
+    let turn = request(session_id.clone(), task_id.clone(), "keep going");
+    let first = runtime.run(turn.clone()).await.unwrap();
+    let mut transcript = Vec::new();
+    for text in ["go on", "and again"] {
+        transcript.push(ProviderMessage::new(
+            MessageRole::Assistant,
+            "recorded response",
+        ));
+        transcript.push(ProviderMessage::new(MessageRole::User, text));
+        let next = runtime
+            .continue_run(&turn, &transcript, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            next.packet_id, first.packet_id,
+            "the context did not change"
+        );
+    }
+    let packets = store.list_context_packets(&session_id).await.unwrap();
+    assert_eq!(packets.len(), 1, "one packet for three unchanged steps");
+    let frozen = store.list_frozen_requests(&session_id).await.unwrap();
+    assert_eq!(frozen.len(), 3);
+    assert!(
+        frozen
+            .iter()
+            .all(|request| request.packet_id == packets[0].packet.packet_id)
+    );
+    // Another session's context is its own, and its packet is stored.
+    let other_session = SessionId::generate();
+    let other = runtime
+        .run(request(
+            other_session.clone(),
+            TaskId::generate(),
+            "keep going",
+        ))
+        .await
+        .unwrap();
+    assert_ne!(other.packet_id, first.packet_id);
+    let packets = store.list_context_packets(&other_session).await.unwrap();
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].packet.packet_id, other.packet_id);
+    drop(runtime);
+    close_writer(store).await;
+}
+
 #[tokio::test]
 async fn p2_k10_config_change_is_boundary_scoped_and_frozen_request_is_immutable() {
     let temp = TempDir::new().unwrap();
